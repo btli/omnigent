@@ -27,9 +27,11 @@ unchanged) and adds only what the provider needs:
 
 ## Requirements
 
-- **A server image built with the `kubernetes` extra** (`pip install
-  'omnigent[kubernetes]'`). The official `omnigent-server` image will bundle it
-  once this provider ships; until then, build the server with the extra.
+- **A server image built with the `kubernetes` extra.** The base image ships no
+  managed-sandbox extras, so build with `--build-arg OMNIGENT_EXTRAS=kubernetes`
+  (`deploy/docker/Dockerfile`) — or otherwise ensure `pip install
+  'omnigent[kubernetes]'` is present in the server image — so `_ensure_sdk()`
+  resolves the client at runtime.
 - **amd64 nodes.** The prebaked host image is amd64-only (`cel-expr-python` has
   no aarch64 wheel), so the launcher always sets `nodeSelector:
   kubernetes.io/arch: amd64` on runner Pods. Make sure the cluster has schedulable
