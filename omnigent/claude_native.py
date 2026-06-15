@@ -3689,6 +3689,7 @@ async def _launch_claude_terminal(
         ap_server_url=str(client.base_url),
         ap_auth_headers=dict(client.headers),
         claude_config=claude_config,
+        session_id=session_id,
     )
     resp = await client.post(
         f"/v1/sessions/{url_component(session_id)}/resources/terminals",
@@ -3819,6 +3820,7 @@ def _claude_terminal_request(
     ap_server_url: str | None = None,
     ap_auth_headers: dict[str, str] | None = None,
     claude_config: ClaudeNativeUcodeConfig | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Build the terminal resource creation body for Claude Code.
@@ -3876,7 +3878,7 @@ def _claude_terminal_request(
     if claude_config is None:
         from omnigent.cswap import integration as _cswap
 
-        spec["env"].update(_cswap.select_launch_env_for_family("anthropic"))
+        spec["env"].update(_cswap.select_launch_env_for_family("anthropic", session_id=session_id))
     if claude_config is not None:
         # The runner's terminal layer inherits the parent process env.
         # Remove provider/session variables that can override the

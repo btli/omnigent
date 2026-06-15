@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -40,6 +41,10 @@ _DEFAULT_LIMIT_COOLDOWN_S = 5 * 3600
 _container: CswapContainer | None = None
 _pools: dict[str, CredentialPool] = {}
 _lazy_attempted = False
+# Guards lazy init against concurrent first-callers (the reactive hook may
+# run in a worker thread via asyncio.to_thread; multiple session forwarders
+# can race the first build).
+_init_lock = threading.Lock()
 
 
 def _utc_day(epoch: int) -> str:
@@ -84,26 +89,33 @@ def _ensure_container() -> CswapContainer | None:
         return _container if _pools else None
     if _lazy_attempted:
         return None
-    _lazy_attempted = True
-    try:
-        from omnigent.cswap.config.pool_config import load_pools
-        from omnigent.cswap.config.pool_config_syncer import sync_pools
-        from omnigent.db.utils import get_or_create_engine, make_managed_session_maker
-        from omnigent.onboarding.provider_config import load_config
-
-        pools = load_pools(load_config())
-        if not pools:
+    # Double-checked locking: only one thread runs the (heavyweight, migration-
+    # running) build; others wait and see the result.
+    with _init_lock:
+        if _container is not None:
+            return _container if _pools else None
+        if _lazy_attempted:
             return None
-        engine = get_or_create_engine(_resolve_db_uri())
-        session_maker = make_managed_session_maker(engine)
-        sync_pools(session_maker, pools)
-        _container = build_container(session_maker)
-        _pools = pools
-        logger.info("cswap lazily initialised with %d pool(s)", len(pools))
-        return _container
-    except Exception:
-        logger.exception("cswap lazy initialisation failed; multi-subscription disabled")
-        return None
+        _lazy_attempted = True
+        try:
+            from omnigent.cswap.config.pool_config import load_pools
+            from omnigent.cswap.config.pool_config_syncer import sync_pools
+            from omnigent.db.utils import get_or_create_engine, make_managed_session_maker
+            from omnigent.onboarding.provider_config import load_config
+
+            pools = load_pools(load_config())
+            if not pools:
+                return None
+            engine = get_or_create_engine(_resolve_db_uri())
+            session_maker = make_managed_session_maker(engine)
+            sync_pools(session_maker, pools)
+            _container = build_container(session_maker)
+            _pools = pools
+            logger.info("cswap lazily initialised with %d pool(s)", len(pools))
+            return _container
+        except Exception:
+            logger.exception("cswap lazy initialisation failed; multi-subscription disabled")
+            return None
 
 
 def is_active() -> bool:
@@ -137,19 +149,26 @@ def select_launch_env_for_family(
         account = container.select_credential.execute(family, int(time.time())).account
         if account is None:
             return {}
-        if session_id:
-            container.registry.bind(session_id, account.id, family)
+        # Build the account-specific env first. Bind the session only when we
+        # actually have account-specific env to apply — otherwise the process
+        # runs on ambient credentials and attributing it to this account would
+        # be a lie (and would mis-route failover/cost).
+        env: dict[str, str] = {}
         if account.is_subscription:
             config_dir = account.config_dir()
             if config_dir:
-                return {_CONFIG_DIR_ENV[family]: os.path.expanduser(config_dir)}
-            return {}
-        from omnigent.cswap.infrastructure.detection.credentials import (
-            resolve_account_api_key,
-        )
+                env = {_CONFIG_DIR_ENV[family]: os.path.expanduser(config_dir)}
+        else:
+            from omnigent.cswap.infrastructure.detection.credentials import (
+                resolve_account_api_key,
+            )
 
-        key = resolve_account_api_key(account)
-        return {_API_KEY_ENV[family]: key} if key else {}
+            key = resolve_account_api_key(account)
+            if key:
+                env = {_API_KEY_ENV[family]: key}
+        if session_id and env:
+            container.registry.bind(session_id, account.id, family)
+        return env
     except Exception:
         logger.exception("cswap account selection failed for family %s", family)
         return {}
@@ -274,12 +293,14 @@ async def run_poll_sweep_once() -> int:
                 detection = await container.gateway.fetch_limit_state(
                     account, now=int(time.time())
                 )
+                if detection is not None:
+                    # Apply the same recovery default so a probe that only
+                    # learns "limited" (e.g. 429 + retry-after, no window) still
+                    # auto-recovers instead of locking the account out.
+                    container.track_usage_limit.execute(_with_recovery(detection))
+                    refreshed += 1
             except Exception:
-                logger.exception("cswap probe failed for account %s", account.id)
-                detection = None
-            if detection is not None:
-                container.track_usage_limit.execute(detection)
-                refreshed += 1
+                logger.exception("cswap probe/track failed for account %s", account.id)
     return refreshed
 
 
@@ -314,45 +335,49 @@ def status_snapshot() -> list[dict[str, object]]:
     container = _ensure_container()
     if container is None:
         return []
-    from omnigent.db.db_models import SqlProviderAccountCost
+    try:
+        from omnigent.db.db_models import SqlProviderAccountCost
 
-    now = int(time.time())
-    today = _utc_day(now)
-    snapshot: list[dict[str, object]] = []
-    for pool in _pools.values():
-        ids = [m.id for m in pool.members]
-        states = container.state_repo.find_many(ids)
-        with container.session_maker() as session:
-            costs: dict[str, float] = {}
+        now = int(time.time())
+        today = _utc_day(now)
+        snapshot: list[dict[str, object]] = []
+        for pool in _pools.values():
+            ids = [m.id for m in pool.members]
+            states = container.state_repo.find_many(ids)
+            with container.session_maker() as session:
+                costs: dict[str, float] = {}
+                for member in pool.members:
+                    row = session.get(SqlProviderAccountCost, (member.id, today))
+                    costs[member.id] = row.cost_usd if row is not None else 0.0
+            accounts: list[dict[str, object]] = []
             for member in pool.members:
-                row = session.get(SqlProviderAccountCost, (member.id, today))
-                costs[member.id] = row.cost_usd if row is not None else 0.0
-        accounts: list[dict[str, object]] = []
-        for member in pool.members:
-            state = states.get(member.id)
-            accounts.append(
+                state = states.get(member.id)
+                accounts.append(
+                    {
+                        "id": member.id,
+                        "name": member.name,
+                        "kind": member.kind,
+                        "priority": member.priority,
+                        "is_active": member.is_active,
+                        "limit_status": state.to_status(now) if state else "unknown",
+                        "window_5h_pct": _window_pct(state, "5h"),
+                        "window_7d_pct": _window_pct(state, "7d"),
+                        "earliest_reset_at": state.earliest_reset_at() if state else None,
+                        "cost_today_usd": costs.get(member.id, 0.0),
+                    }
+                )
+            snapshot.append(
                 {
-                    "id": member.id,
-                    "name": member.name,
-                    "kind": member.kind,
-                    "priority": member.priority,
-                    "is_active": member.is_active,
-                    "limit_status": state.to_status(now) if state else "unknown",
-                    "window_5h_pct": _window_pct(state, "5h"),
-                    "window_7d_pct": _window_pct(state, "7d"),
-                    "earliest_reset_at": state.earliest_reset_at() if state else None,
-                    "cost_today_usd": costs.get(member.id, 0.0),
+                    "name": pool.name,
+                    "family": pool.family,
+                    "failover_mode": pool.failover_mode,
+                    "accounts": accounts,
                 }
             )
-        snapshot.append(
-            {
-                "name": pool.name,
-                "family": pool.family,
-                "failover_mode": pool.failover_mode,
-                "accounts": accounts,
-            }
-        )
-    return snapshot
+        return snapshot
+    except Exception:
+        logger.exception("cswap status_snapshot failed")
+        return []
 
 
 def _window_pct(state: object, label: str) -> int | None:
