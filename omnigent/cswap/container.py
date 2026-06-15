@@ -85,7 +85,5 @@ def build_container(
         notifier=resolved_notifier,
         track_usage_limit=TrackUsageLimitUseCase(state_repo),
         select_credential=SelectCredentialUseCase(selection_policy),
-        failover_on_limit=FailoverOnLimitUseCase(
-            pool_repo, selection_policy, registry, resolved_notifier
-        ),
+        failover_on_limit=FailoverOnLimitUseCase(pool_repo, selection_policy, resolved_notifier),
     )

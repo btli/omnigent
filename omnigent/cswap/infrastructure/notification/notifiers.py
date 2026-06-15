@@ -22,12 +22,11 @@ class LoggingFailoverNotifier(FailoverNotifier):
     def notify(self, event: FailoverEvent) -> None:
         """Log *event* at INFO."""
         logger.info(
-            "cswap failover: session=%s exhausted=%s next=%s mode=%s switched=%s",
+            "cswap failover: session=%s exhausted=%s next-launch=%s mode=%s",
             event.session_id,
             event.exhausted_credential_id,
             event.next_credential_id,
             event.mode,
-            event.switched,
         )
 
 

@@ -53,6 +53,7 @@ def test_container_select_track_failover_round_trip(session_maker: ManagedSessio
         session_id="sess-1", exhausted_credential_id=c1, family="anthropic", now=1000
     )
     assert event is not None
-    assert event.switched is True
+    # Failover recommends c2 for the next launch but does NOT rebind the
+    # running session — so the registry is untouched by failover.
     assert event.next_credential_id == c2
-    assert container.registry.active_credential("sess-1") == c2
+    assert container.registry.active_credential("sess-1") is None

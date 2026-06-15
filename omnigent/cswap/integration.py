@@ -117,8 +117,11 @@ def _ensure_container() -> CswapContainer | None:
             engine = get_or_create_engine(_resolve_db_uri())
             session_maker = make_managed_session_maker(engine)
             sync_pools(session_maker, pools)
-            _container = build_container(session_maker)
+            built = build_container(session_maker)
+            # Publish pools before the container so a concurrent reader never
+            # observes a set container with empty pools (treated as inactive).
             _pools = pools
+            _container = built
             logger.info("cswap lazily initialised with %d pool(s)", len(pools))
             return _container
         except Exception:

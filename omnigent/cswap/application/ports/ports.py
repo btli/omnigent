@@ -138,20 +138,22 @@ class CredentialSelectionPolicy(Protocol):
 class FailoverEvent:
     """Describes a failover outcome for notification.
 
+    The in-flight process keeps running on the exhausted account (it was
+    launched with that account's credentials); failover records the limit
+    so the **next launch** rotates to :attr:`next_credential_id`. The event
+    is what surfaces that recommendation to the user.
+
     :param session_id: The affected session.
     :param exhausted_credential_id: The account that hit its limit.
-    :param next_credential_id: The account selected to take over, or
-        ``None`` when none is available.
+    :param next_credential_id: The account the next launch should use, or
+        ``None`` when none is currently available.
     :param mode: The pool's failover mode.
-    :param switched: ``True`` when the session was auto-rebound to
-        :attr:`next_credential_id`.
     """
 
     session_id: str
     exhausted_credential_id: str
     next_credential_id: str | None
     mode: FailoverMode
-    switched: bool
 
 
 class FailoverNotifier(Protocol):
