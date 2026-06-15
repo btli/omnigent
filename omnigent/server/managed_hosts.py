@@ -1228,26 +1228,32 @@ async def launch_managed_host(
     # table PK, so embed the host_id's leading hex for uniqueness
     # across a user's managed sandboxes.
     host_name = f"managed-{host_id[len('host_') : len('host_') + 8]}"
+    # try/finally so the launcher's connection pool is released on BOTH the
+    # success and the failure path (round-3 FIX-A): a successful launch
+    # discards this launcher, and terminate later builds a different one.
     try:
-        await asyncio.to_thread(launcher.prepare)
-        sandbox_id = await asyncio.to_thread(launcher.provision, host_name)
-    except click.ClickException as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"managed sandbox launch failed: {exc.message}",
-        ) from exc
-    workspace = await _arm_and_start_host(
-        launcher=launcher,
-        config=config,
-        host_store=host_store,
-        host_id=host_id,
-        host_name=host_name,
-        owner=owner,
-        sandbox_id=sandbox_id,
-        repo=repo,
-        on_stage=on_stage,
-    )
-    return ManagedHostLaunch(host_id=host_id, workspace=workspace)
+        try:
+            await asyncio.to_thread(launcher.prepare)
+            sandbox_id = await asyncio.to_thread(launcher.provision, host_name)
+        except click.ClickException as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"managed sandbox launch failed: {exc.message}",
+            ) from exc
+        workspace = await _arm_and_start_host(
+            launcher=launcher,
+            config=config,
+            host_store=host_store,
+            host_id=host_id,
+            host_name=host_name,
+            owner=owner,
+            sandbox_id=sandbox_id,
+            repo=repo,
+            on_stage=on_stage,
+        )
+        return ManagedHostLaunch(host_id=host_id, workspace=workspace)
+    finally:
+        await asyncio.to_thread(launcher.close)
 
 
 async def relaunch_managed_host(
@@ -1300,31 +1306,38 @@ async def relaunch_managed_host(
                 "was launched with is no longer configured on this server"
             ),
         )
-    # The old generation is normally already dead (that is why we are
-    # here), but terminate defensively so a transient tunnel outage
-    # can never leave two live sandboxes claiming one host identity.
-    await _terminate_sandbox_best_effort(launcher, host)
+    # try/finally so the launcher's connection pool is released on BOTH the
+    # success and the failure path (round-3 FIX-A): the same launcher is
+    # reused for the defensive terminate AND the fresh provision, then
+    # discarded on success.
     try:
-        await asyncio.to_thread(launcher.prepare)
-        sandbox_id = await asyncio.to_thread(launcher.provision, host.name)
-    except click.ClickException as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"managed sandbox relaunch failed: {exc.message}",
-        ) from exc
-    workspace = await _arm_and_start_host(
-        launcher=launcher,
-        config=config,
-        host_store=host_store,
-        host_id=host.host_id,
-        host_name=host.name,
-        owner=host.owner,
-        sandbox_id=sandbox_id,
-        repo=repo,
-        on_stage=on_stage,
-        keep_host_on_failure=True,
-    )
-    return ManagedHostLaunch(host_id=host.host_id, workspace=workspace)
+        # The old generation is normally already dead (that is why we are
+        # here), but terminate defensively so a transient tunnel outage
+        # can never leave two live sandboxes claiming one host identity.
+        await _terminate_sandbox_best_effort(launcher, host)
+        try:
+            await asyncio.to_thread(launcher.prepare)
+            sandbox_id = await asyncio.to_thread(launcher.provision, host.name)
+        except click.ClickException as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"managed sandbox relaunch failed: {exc.message}",
+            ) from exc
+        workspace = await _arm_and_start_host(
+            launcher=launcher,
+            config=config,
+            host_store=host_store,
+            host_id=host.host_id,
+            host_name=host.name,
+            owner=host.owner,
+            sandbox_id=sandbox_id,
+            repo=repo,
+            on_stage=on_stage,
+            keep_host_on_failure=True,
+        )
+        return ManagedHostLaunch(host_id=host.host_id, workspace=workspace)
+    finally:
+        await asyncio.to_thread(launcher.close)
 
 
 async def _arm_and_start_host(

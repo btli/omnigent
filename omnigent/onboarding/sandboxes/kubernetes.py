@@ -105,7 +105,10 @@ Kubernetes sandbox Pods, e.g. an org-internal copy of the host image
 
 NAMESPACE_ENV_VAR: str = "OMNIGENT_KUBERNETES_NAMESPACE"
 """Environment variable naming the namespace sandbox Pods are created in.
-Defaults to :data:`_DEFAULT_NAMESPACE`. The server's managed-host
+Defaults to :data:`_DEFAULT_NAMESPACE` (``"omnigent-sandboxes"``, the
+DEDICATED runner namespace the deploy overlay grants the server SA rights
+in — creating Pods in the server's own namespace would 403 and defeat the
+blast-radius split). The server's managed-host
 ``sandbox.kubernetes.namespace`` config takes precedence when set."""
 
 SANDBOX_SECRET_ENV_VAR: str = "OMNIGENT_KUBERNETES_SECRET"
@@ -141,8 +144,13 @@ out-of-cluster fallback. Unset falls back to the ambient
 ``KUBECONFIG`` / ``~/.kube/config`` resolution. Ignored when the
 launcher loads in-cluster ServiceAccount config (the primary path)."""
 
-# Default namespace / ServiceAccount, matching deploy/kubernetes/.
-_DEFAULT_NAMESPACE: str = "omnigent"
+# Default namespace / ServiceAccount, matching the deploy overlay
+# (deploy/kubernetes/overlays/sandbox-runners/). The default namespace is the
+# DEDICATED runner namespace `omnigent-sandboxes` — NOT the server's namespace
+# — because that is where the overlay grants the server SA its scoped pods +
+# pods/exec rights (round-3 FIX-D); creating runner Pods in the server
+# namespace would 403 and defeat the two-namespace blast-radius isolation.
+_DEFAULT_NAMESPACE: str = "omnigent-sandboxes"
 _DEFAULT_SERVICE_ACCOUNT: str = "omnigent-runner"
 
 # Pod resource sizing. Matches the other launchers' 2 vCPU / 4 GiB
@@ -174,6 +182,13 @@ _CONTAINER_NAME: str = "host"
 _POD_READY_TIMEOUT_S: int = 90
 _POD_READY_POLL_S: float = 2.0
 
+# Per-request client timeout for the blocking calls inside the ready wait
+# (round-3 FIX-C). Without it, a stalled apiserver socket blocks the read
+# indefinitely and the patient-wait deadline never fires. Kept short
+# (a few poll intervals) so a hung request becomes a transient read error
+# that the loop logs + retries until the readiness deadline, never a hang.
+_POD_READY_REQUEST_TIMEOUT_S: float = 10.0
+
 # Container ``waiting.reason`` values that are genuinely terminal — the
 # kubelet will NOT self-heal them, so the ready wait fast-fails rather
 # than burning the budget. Deliberately EXCLUDES ImagePull* / ErrImagePull
@@ -196,18 +211,25 @@ _FATAL_WAITING_REASONS: frozenset[str] = frozenset(
 _TRANSIENT_READ_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
 
 # Redaction for command strings before they enter error messages / logs
-# (tri-model FIX-3). _start_host_in_sandbox runs the host with
-# `OMNIGENT_HOST_TOKEN=<launch token>` (and harness creds may ride other
-# env assignments), so an exec timeout / non-zero must not leak the value
-# into the error detail (which becomes an HTTP 502 body + server log).
-# Matches a leading-word env assignment whose KEY contains a sensitive
-# substring (case-insensitive), capturing the key so only the VALUE is
-# masked. ``(?:^|\s)`` + a non-quote/non-space value keeps it a
-# conservative shell-token match.
+# (FIX-3, hardened round-3 FIX-B). _start_host_in_sandbox runs the host with
+# `OMNIGENT_HOST_TOKEN=<launch token>` (and harness creds may ride other env
+# assignments), so an exec timeout / non-zero must not leak the value into
+# the error detail (which becomes an HTTP 502 body + server log).
+#
+# KEY (captured, group 1, so only the VALUE is masked): a shell-token-leading
+# env-assignment name that CONTAINS a credential keyword (case-insensitive),
+# including BARE keyword names — the `[A-Za-z0-9_]*` before the keyword is
+# zero-or-more, so `TOKEN=` / `KEY=` match as well as `OMNIGENT_HOST_TOKEN=`.
+# `(?:^|\s)` anchors to a shell token boundary (assignments are space-separated)
+# so we don't match a keyword mid-word inside some other argument.
+#
+# VALUE (consumed, masked): a single-quoted run, a double-quoted run, OR a bare
+# non-whitespace run — so a quoted value WITH SPACES (`FOO_SECRET='a b'`) is
+# redacted whole, not just its first word.
 _SENSITIVE_ENV_RE: re.Pattern[str] = re.compile(
-    r"(?i)((?:^|\s)[A-Za-z_][A-Za-z0-9_]*"
-    r"(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)[A-Za-z0-9_]*=)"
-    r"[^\s]+"
+    r"(?i)"
+    r"((?:^|\s)[A-Za-z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)[A-Za-z0-9_]*=)"
+    r"(?:'[^']*'|\"[^\"]*\"|[^\s]+)"
 )
 
 # Reserved env names the Pod sets itself (writable-HOME contract + sandbox
@@ -550,7 +572,8 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         :param namespace: Namespace to create Pods in — the server's
             ``sandbox.kubernetes.namespace`` config. ``None`` resolves
             :data:`NAMESPACE_ENV_VAR` and falls back to
-            :data:`_DEFAULT_NAMESPACE`.
+            :data:`_DEFAULT_NAMESPACE` (the dedicated runner namespace
+            ``omnigent-sandboxes``, matching the deploy overlay).
         :param env: Optional names of server-process environment
             variables to inject as literal env — the server's
             ``sandbox.kubernetes.env`` config. ``None`` resolves
@@ -634,17 +657,29 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         self._core = client.CoreV1Api(self._api_client)
         return self._core
 
+    def close(self) -> None:
+        """
+        Release the cached ``ApiClient``'s connection pool — the
+        :class:`SandboxLauncher` lifecycle hook (round-3 FIX-A).
+
+        A fresh launcher is built per managed op (launch / relaunch /
+        teardown), so the server's ``launch_managed_host`` /
+        ``relaunch_managed_host`` call this in a ``finally`` to release the
+        pool on BOTH the success and the failure path (terminate() /
+        _best_effort_delete() also call it). Idempotent and never raises.
+        """
+        self._close_clients()
+
     def _close_clients(self) -> None:
         """
         Close the cached ``ApiClient`` (its urllib3 ``PoolManager``) and
-        drop the cached handles (tri-model FIX-4).
+        drop the cached handles.
 
         A fresh launcher is built per managed op (launch / relaunch /
-        teardown), so an unclosed pool leaks sockets — mirror the Islo
-        launcher closing its ``httpx.Client``. Idempotent (safe to call
-        twice) and best-effort: a close error is swallowed so it can never
-        mask the real operation's result. The next ``_load_core`` rebuilds
-        the client lazily.
+        teardown), so an unclosed pool leaks sockets. Idempotent (safe to
+        call twice) and best-effort: a close error is swallowed so it can
+        never mask the real operation's result. The next ``_load_core``
+        rebuilds the client lazily.
         """
         api_client = self._api_client
         self._api_client = None
@@ -877,36 +912,43 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         :raises click.ClickException: On a terminal state or timeout.
         """
         from kubernetes.client.rest import ApiException
+        from urllib3.exceptions import HTTPError
 
         core = self._load_core()
         deadline = time.monotonic() + _POD_READY_TIMEOUT_S
         last_reason: str | None = None
         while True:
             try:
-                pod = core.read_namespaced_pod(pod_name, namespace)
-            except ApiException as exc:
-                # Transient apiserver hiccups must not abort the launch —
-                # log and retry until the deadline. A definite failure
-                # (403/404/…) surfaces immediately.
-                if _is_transient_read_error(exc):
-                    if time.monotonic() >= deadline:
-                        raise click.ClickException(
-                            self._pod_failure_message(
-                                namespace,
-                                pod_name,
-                                "pod readiness could not be read before the "
-                                f"{_POD_READY_TIMEOUT_S}s deadline "
-                                f"({getattr(exc, 'reason', None) or 'apiserver error'})",
-                            )
-                        ) from exc
-                    click.echo(
-                        f"  → transient error reading pod '{pod_name}' "
-                        f"({getattr(exc, 'reason', None) or 'apiserver error'}); retrying",
-                        err=True,
-                    )
-                    time.sleep(_POD_READY_POLL_S)
-                    continue
-                raise click.ClickException(_format_api_error("read pod", pod_name, exc)) from exc
+                # _request_timeout bounds the blocking socket so a stalled
+                # apiserver can't hang past the readiness deadline (FIX-C).
+                pod = core.read_namespaced_pod(
+                    pod_name, namespace, _request_timeout=_POD_READY_REQUEST_TIMEOUT_S
+                )
+            except (ApiException, HTTPError) as exc:
+                # Transient apiserver hiccups (5xx / 429 / connection error,
+                # and a urllib3 request TIMEOUT from _request_timeout) must
+                # not abort the launch — log and retry until the deadline. A
+                # definite failure (403/404/…) surfaces immediately.
+                if not _is_transient_read_error(exc):
+                    raise click.ClickException(
+                        _format_api_error("read pod", pod_name, exc)
+                    ) from exc
+                reason = _read_error_reason(exc)
+                if time.monotonic() >= deadline:
+                    raise click.ClickException(
+                        self._pod_failure_message(
+                            namespace,
+                            pod_name,
+                            "pod readiness could not be read before the "
+                            f"{_POD_READY_TIMEOUT_S}s deadline ({reason})",
+                        )
+                    ) from exc
+                click.echo(
+                    f"  → transient error reading pod '{pod_name}' ({reason}); retrying",
+                    err=True,
+                )
+                time.sleep(_POD_READY_POLL_S)
+                continue
 
             phase = _pod_phase(pod)
             # ── Terminal / unrecoverable: fast-fail ──
@@ -991,14 +1033,21 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         :returns: A ``"; "``-joined summary, or ``""``.
         """
         from kubernetes.client.rest import ApiException
+        from urllib3.exceptions import HTTPError
 
         try:
             core = self._load_core()
+            # Bounded by _request_timeout (FIX-C): this enrichment runs on the
+            # failure path, so a stalled apiserver must not hang it past the
+            # already-tripped deadline.
             event_list = core.list_namespaced_event(
                 namespace,
                 field_selector=f"involvedObject.name={pod_name}",
+                _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
             )
-        except ApiException:
+        except (ApiException, HTTPError):
+            # Best-effort diagnostic: a failed (or timed-out) events lookup
+            # must never raise and mask the real readiness failure.
             return ""
         parts: list[str] = []
         for event in getattr(event_list, "items", None) or []:
@@ -1284,25 +1333,51 @@ def _redact_command(command: str) -> str:
     return _SENSITIVE_ENV_RE.sub(r"\1***", command)
 
 
-def _is_transient_read_error(exc: k8s_client.ApiException) -> bool:
+def _is_transient_read_error(exc: Exception) -> bool:
     """
-    Report whether a ``read_namespaced_pod`` ``ApiException`` is transient
-    (the apiserver is briefly unavailable) rather than a definite failure
-    (tri-model FIX-2).
+    Report whether a ``read_namespaced_pod`` error is transient (the
+    apiserver is briefly unavailable / the request timed out) rather than a
+    definite failure (FIX-2; FIX-C request timeouts).
 
-    A status in :data:`_TRANSIENT_READ_STATUSES` (5xx / 429), or a missing
-    status (a connection/timeout error the client surfaces as an
-    ``ApiException`` with ``status == 0``/``None``), is treated as
-    retryable. A 4xx like 403 (RBAC) or 404 (Pod gone) is definite and
-    surfaced immediately.
+    Transient (retry until the deadline):
 
-    :param exc: The raised ``ApiException``.
+    - a urllib3 ``HTTPError`` — a connection error, or the request TIMEOUT
+      raised by the ``_request_timeout`` bound (FIX-C); never an HTTP status
+      the apiserver chose.
+    - an ``ApiException`` with a status in :data:`_TRANSIENT_READ_STATUSES`
+      (5xx / 429), or a missing status (``0``/``None`` — a connection/SSL
+      error the client wrapped).
+
+    Definite (surface immediately): a 4xx like 403 (RBAC) or 404 (Pod gone).
+
+    :param exc: The raised exception (``ApiException`` or urllib3
+        ``HTTPError``).
     :returns: ``True`` when the read should be retried.
     """
+    from urllib3.exceptions import HTTPError
+
+    if isinstance(exc, HTTPError):
+        return True
     status = getattr(exc, "status", None)
     if not status:  # 0 / None → connection/timeout, no HTTP response
         return True
     return status in _TRANSIENT_READ_STATUSES
+
+
+def _read_error_reason(exc: Exception) -> str:
+    """
+    Short human reason for a transient read error, for the retry log /
+    timeout message.
+
+    :param exc: The raised ``ApiException`` or urllib3 ``HTTPError``.
+    :returns: The exception's ``reason`` (ApiException) or its class name +
+        message (urllib3), or a generic fallback.
+    """
+    reason = getattr(exc, "reason", None)
+    if reason:
+        return str(reason)
+    text = str(exc).strip()
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
 def _is_transient_exec_error(exc: k8s_client.ApiException) -> bool:

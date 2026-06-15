@@ -31,7 +31,7 @@ def _build_kubernetes_launcher(raw: object) -> KubernetesSandboxLauncher:
     return launcher
 
 
-def test_parse_minimal_kubernetes_config_defaults() -> None:
+def test_parse_minimal_kubernetes_config_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     ``provider: kubernetes`` + ``server_url`` is a complete config: the
     optional ``kubernetes:`` block is omitted, so every constructor field
@@ -39,6 +39,9 @@ def test_parse_minimal_kubernetes_config_defaults() -> None:
     defaults apply), and the config advertises managed launch with the
     kubernetes token TTL.
     """
+    # A dev's ambient namespace override must not leak into the default
+    # assertion below.
+    monkeypatch.delenv("OMNIGENT_KUBERNETES_NAMESPACE", raising=False)
     cfg = parse_sandbox_config(
         {
             "provider": "kubernetes",
@@ -69,6 +72,11 @@ def test_parse_minimal_kubernetes_config_defaults() -> None:
     assert launcher._secret_name is None
     assert launcher._service_account is None
     assert launcher._node_selector is None
+    # FIX-D: with no namespace configured, the launcher's resolved default
+    # is the DEDICATED runner namespace (not the server's "omnigent") — the
+    # overlay grants the server SA rights there, and the server namespace
+    # would 403 + defeat the blast-radius split.
+    assert launcher._resolve_namespace() == "omnigent-sandboxes"
 
 
 def test_parse_full_kubernetes_config_threads_to_launcher() -> None:
@@ -85,7 +93,7 @@ def test_parse_full_kubernetes_config_threads_to_launcher() -> None:
             "kubernetes": {
                 "image": "ghcr.io/me/omnigent-host:latest",
                 "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
-                "namespace": "omnigent",
+                "namespace": "omnigent-sandboxes",
                 "secret_name": "omnigent-creds",
                 "service_account": "omnigent-runner",
                 "node_selector": {"disktype": "ssd", "gpu": "false"},
@@ -97,7 +105,7 @@ def test_parse_full_kubernetes_config_threads_to_launcher() -> None:
     assert launcher._image_ref == "ghcr.io/me/omnigent-host:latest"
     # The launcher stores env names as a tuple internally.
     assert launcher._env_names == ("OPENAI_API_KEY", "GIT_TOKEN")
-    assert launcher._namespace == "omnigent"
+    assert launcher._namespace == "omnigent-sandboxes"
     assert launcher._secret_name == "omnigent-creds"
     assert launcher._service_account == "omnigent-runner"
     assert launcher._node_selector == {"disktype": "ssd", "gpu": "false"}

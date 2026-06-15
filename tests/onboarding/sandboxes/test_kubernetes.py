@@ -21,6 +21,7 @@ from omnigent.onboarding.sandboxes.kubernetes import (
     KubernetesSandboxLauncher,
     _new_pod_name,
     _parse_exec_status,
+    _redact_command,
     build_pod_manifest,
 )
 
@@ -569,7 +570,9 @@ class _FakeCoreV1Api:
         self._state.pods[pod_name] = self._state.pod_factory(pod_name)
         return object()
 
-    def read_namespaced_pod(self, name: str, namespace: str) -> _Pod:
+    def read_namespaced_pod(
+        self, name: str, namespace: str, *, _request_timeout: object = None
+    ) -> _Pod:
         """
         Resolve a registered Pod or raise the fake 404.
 
@@ -577,10 +580,12 @@ class _FakeCoreV1Api:
         apiserver errors on the first N reads before a Pod is returned.
         When ``read_sequence`` is set, successive reads walk it (staying
         on the last element once exhausted) — used to model a Pod that
-        becomes ready only after a few polls.
+        becomes ready only after a few polls. ``_request_timeout`` is
+        captured (FIX-C) so a test can assert the launcher bounds the call.
         """
         del namespace
         self._state.read_count += 1
+        self._state.read_request_timeouts.append(_request_timeout)
         if self._state.read_raises:
             raise self._state.read_raises.pop(0)
         if self._state.read_sequence:
@@ -592,9 +597,12 @@ class _FakeCoreV1Api:
             raise _FakeApiException(status=404, reason="Not Found")
         return pod
 
-    def list_namespaced_event(self, namespace: str, *, field_selector: str) -> _EventList:
+    def list_namespaced_event(
+        self, namespace: str, *, field_selector: str, _request_timeout: object = None
+    ) -> _EventList:
         """Return canned events for the pod-ready failure surface."""
         del namespace, field_selector
+        self._state.event_request_timeouts.append(_request_timeout)
         return _EventList(items=list(self._state.events))
 
     def delete_namespaced_pod(
@@ -656,6 +664,10 @@ class _FakeK8sState:
     :param read_raises: Exceptions successive ``read_namespaced_pod`` calls
         raise (popped front-first) before falling through to the normal
         lookup — models transient apiserver errors during the ready wait.
+    :param read_request_timeouts: ``_request_timeout`` captured per
+        ``read_namespaced_pod`` call (FIX-C assertion).
+    :param event_request_timeouts: ``_request_timeout`` captured per
+        ``list_namespaced_event`` call (FIX-C assertion).
     :param configurations: Every ``Configuration()`` constructed.
     :param api_clients: Every ``ApiClient`` built (for the close assertion).
     """
@@ -684,6 +696,9 @@ class _FakeK8sState:
     read_index: int = 0
     read_count: int = 0
     read_raises: list[Exception] = field(default_factory=list)
+    # _request_timeout captured per read / event call (round-3 FIX-C).
+    read_request_timeouts: list[object] = field(default_factory=list)
+    event_request_timeouts: list[object] = field(default_factory=list)
 
 
 class _FakeConfiguration:
@@ -907,16 +922,26 @@ def test_prepare_wraps_config_failure_with_remediation(fake_k8s: _FakeK8sState) 
 # ── provision ───────────────────────────────────────────────
 
 
-def test_provision_creates_pod_and_returns_name(fake_k8s: _FakeK8sState) -> None:
+def test_provision_creates_pod_in_default_runner_namespace(fake_k8s: _FakeK8sState) -> None:
     """
-    Provision creates one Pod from the default image in the default
+    Provision creates one Pod from the default image in the DEFAULT runner
     namespace and returns the generated (DNS-safe) Pod name.
+
+    FIX-D: the default namespace is the dedicated runner namespace
+    ``omnigent-sandboxes`` (NOT the server's ``omnigent``) — the overlay
+    grants the server SA rights there, and using the server namespace would
+    403 + defeat the blast-radius split. Mutation guard: reverting
+    _DEFAULT_NAMESPACE to "omnigent" fails this.
     """
     pod_name = KubernetesSandboxLauncher().provision("managed-abc")
 
     assert pod_name.startswith("omnigent-managed-abc-")
     [create] = fake_k8s.create_calls
-    assert create.namespace == "omnigent"
+    assert create.namespace == "omnigent-sandboxes"
+    # The manifest's own metadata.namespace must match too.
+    metadata = create.manifest["metadata"]
+    assert isinstance(metadata, dict)
+    assert metadata["namespace"] == "omnigent-sandboxes"
     assert _container(create.manifest)["image"] == DEFAULT_HOST_IMAGE
     # The created Pod is the one returned.
     assert pod_name in fake_k8s.pods
@@ -1126,6 +1151,47 @@ def test_provision_polls_through_transient_read_error_then_succeeds(
 
     assert pod_name.startswith("omnigent-managed-abc-")
     # No cleanup — the launch succeeded after the transient errors cleared.
+    assert fake_k8s.delete_calls == []
+
+
+def test_provision_passes_request_timeout_to_read(fake_k8s: _FakeK8sState) -> None:
+    """
+    FIX-C: every readiness read is bounded by a non-None ``_request_timeout``
+    so a stalled apiserver socket can't hang past the deadline.
+
+    Mutation guard: dropping the kwarg leaves the captured timeout None.
+    """
+    KubernetesSandboxLauncher().provision("managed-abc")
+
+    assert fake_k8s.read_request_timeouts  # at least one read happened
+    assert all(t is not None for t in fake_k8s.read_request_timeouts)
+
+
+def test_provision_treats_request_timeout_as_transient(
+    fake_k8s: _FakeK8sState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    FIX-C: a urllib3 request TIMEOUT (raised by the ``_request_timeout``
+    bound) is a transient read error — logged and retried until the Pod
+    reads ready, NOT a fatal that aborts the launch.
+
+    Mutation guard: if the timeout weren't classified transient it would
+    propagate and fail the launch (and the orphan would be cleaned up).
+    """
+    from urllib3.exceptions import ReadTimeoutError
+
+    monkeypatch.setattr("omnigent.onboarding.sandboxes.kubernetes.time.sleep", lambda _s: None)
+    # First two reads time out at the socket; then the Pod reads ready.
+    fake_k8s.read_raises = [
+        ReadTimeoutError(pool=None, url="/readyz", message="read timed out"),
+        ReadTimeoutError(pool=None, url="/readyz", message="read timed out"),
+    ]
+
+    pod_name = KubernetesSandboxLauncher().provision("managed-abc")
+
+    assert pod_name.startswith("omnigent-managed-abc-")
+    # Retried through the timeouts, no orphan cleanup (launch succeeded).
+    assert fake_k8s.read_count >= 3
     assert fake_k8s.delete_calls == []
 
 
@@ -1482,7 +1548,8 @@ def test_run_execs_bash_lc_and_parses_returncode(fake_k8s: _FakeK8sState) -> Non
     [call] = fake_k8s.exec_calls
     assert call.command == ["bash", "-lc", "echo hi"]
     assert call.pod == pod_name
-    assert call.namespace == "omnigent"
+    # Default runner namespace (FIX-D).
+    assert call.namespace == "omnigent-sandboxes"
     # The bound API method must be the pod-exec connector (not, say, a
     # non-streaming read) — addressed by name on the fake CoreV1Api.
     assert getattr(call.api_method, "__name__", None) == "connect_get_namespaced_pod_exec"
@@ -1577,6 +1644,54 @@ def test_run_stuck_error_redacts_secret_env_in_command(
     message = str(exc.value)
     assert secret not in message
     assert "OMNIGENT_HOST_TOKEN=***" in message
+
+
+@pytest.mark.parametrize(
+    ("command", "secret", "expected_key"),
+    [
+        # FIX-B: single-quoted value WITH SPACES — the whole value must go,
+        # not just its first word (the old non-space matcher leaked the rest).
+        ("FOO_SECRET='abc def ghi' ls", "abc def ghi", "FOO_SECRET=***"),
+        # FIX-B: double-quoted value with spaces.
+        ('FOO_SECRET="abc def ghi" ls', "abc def ghi", "FOO_SECRET=***"),
+        # FIX-B: a BARE credential key (no prefix) must match.
+        ("TOKEN=bare_secret_value omnigent host", "bare_secret_value", "TOKEN=***"),
+        ("KEY=another_bare_secret ls", "another_bare_secret", "KEY=***"),
+        # The real launch shape — bare unquoted token.
+        (
+            "OMNIGENT_HOST_TOKEN=oa_live_realshape setsid nohup omnigent host",
+            "oa_live_realshape",
+            "OMNIGENT_HOST_TOKEN=***",
+        ),
+        # Case-insensitive key keyword, quoted value with spaces (value
+        # fragments are distinctive so they can't collide with the key/args).
+        ("my_password='zzz qqq vvv' run", "zzz qqq vvv", "my_password=***"),
+    ],
+)
+def test_redact_command_masks_whole_value(command: str, secret: str, expected_key: str) -> None:
+    """
+    FIX-B: ``_redact_command`` must mask the ENTIRE sensitive value —
+    single-quoted, double-quoted (incl. embedded spaces), or bare — and
+    match bare credential key names, leaving no part of the secret.
+
+    Mutation guard: the old non-space value class leaks the post-space
+    suffix; a prefix-only key class misses bare ``TOKEN=``.
+    """
+    redacted = _redact_command(command)
+    # No fragment of the secret survives (split on whitespace so a partial
+    # leak of any word is caught).
+    for fragment in secret.split():
+        assert fragment not in redacted, f"leaked {fragment!r} in {redacted!r}"
+    assert expected_key in redacted
+
+
+def test_redact_command_preserves_non_sensitive_tokens() -> None:
+    """
+    FIX-B: env assignments WITHOUT a credential keyword (and ordinary
+    args) are left untouched — redaction must not corrupt the command.
+    """
+    command = "FOO=keepme BAR=alsokeep omnigent host --server https://srv"
+    assert _redact_command(command) == command
 
 
 def test_run_nonzero_returns_when_unchecked(fake_k8s: _FakeK8sState) -> None:
@@ -1862,6 +1977,39 @@ def test_provision_cleanup_closes_api_client_on_readiness_failure(
         KubernetesSandboxLauncher().provision("managed-abc")
     [api_client] = fake_k8s.api_clients
     assert api_client.close_count == 1
+
+
+def test_close_releases_pool_on_the_success_path(fake_k8s: _FakeK8sState) -> None:
+    """
+    FIX-A: the public ``close()`` lifecycle hook releases the pool of a
+    launcher used for a SUCCESSFUL op (provision+run) and discarded without
+    a terminate — the real leak (the server calls this in a finally).
+
+    Mutation guard: a close() that doesn't release the pool leaves
+    close_count at 0.
+    """
+    launcher, pod_name = _provisioned(fake_k8s)
+    fake_k8s.exec_channels = {3: '{"metadata":{},"status":"Success"}'}
+    launcher.run(pod_name, "true")  # successful op, no terminate
+    [api_client] = fake_k8s.api_clients
+
+    launcher.close()
+
+    assert api_client.close_count == 1
+    assert launcher._api_client is None
+    assert launcher._core is None
+
+
+def test_close_is_noop_when_no_client_built(fake_k8s: _FakeK8sState) -> None:
+    """
+    FIX-A: ``close()`` on a launcher that never loaded a client (no API
+    call made) is a harmless no-op — no client to close, no error.
+    """
+    del fake_k8s
+    launcher = KubernetesSandboxLauncher()
+
+    launcher.close()  # must not raise
+    launcher.close()  # idempotent
 
 
 # ── real-client contract ────────────────────────────────────
