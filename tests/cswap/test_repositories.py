@@ -51,6 +51,30 @@ def seeded(session_maker: ManagedSessionMaker) -> ManagedSessionMaker:
     return session_maker
 
 
+def test_limit_state_observe_reports_transition(seeded: ManagedSessionMaker) -> None:
+    repo = SqlUsageLimitStateRepository(seeded)
+    cid = account_id_for("claude-pool", "c1")
+
+    def _limited(at: int) -> LimitState:
+        return LimitState(
+            credential_id=cid,
+            is_limited=True,
+            limited_until=9000,
+            source="reactive",
+            last_checked_at=at,
+        )
+
+    # First observation: prior is None → was available → a real transition.
+    wrote, was_available = repo.observe(_limited(1000))
+    assert wrote is True
+    assert was_available is True
+
+    # Second observation while still limited: NOT available → not a transition.
+    wrote2, was_available2 = repo.observe(_limited(2000))
+    assert wrote2 is True
+    assert was_available2 is False
+
+
 def test_limit_state_upsert_find_and_staleness(seeded: ManagedSessionMaker) -> None:
     repo = SqlUsageLimitStateRepository(seeded)
     cid = account_id_for("claude-pool", "c1")

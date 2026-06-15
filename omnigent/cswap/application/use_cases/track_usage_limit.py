@@ -46,10 +46,13 @@ class TrackUsageLimitUseCase:
         :param detection: The observation to persist.
         :returns: A :class:`TrackUsageLimitResult`.
         """
-        prior = self._state_repo.find(detection.credential_id)
-        was_available = prior is None or prior.is_available_now(detection.observed_at)
         new_state = detection.to_limit_state()
-        wrote = self._state_repo.upsert(new_state, enforce_staleness=detection.source != "manual")
+        # observe() does the prior-read and the write in one serialized
+        # transaction, so the off→on transition is detected atomically (even
+        # across processes) — no double-fire of failover.
+        wrote, was_available = self._state_repo.observe(
+            new_state, enforce_staleness=detection.source != "manual"
+        )
         was_newly_limited = detection.is_limited and was_available and wrote
         return TrackUsageLimitResult(
             state=new_state, was_newly_limited=was_newly_limited, wrote=wrote

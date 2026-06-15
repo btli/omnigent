@@ -19,6 +19,7 @@ from typing import cast
 
 from sqlalchemy import CursorResult, or_, select, update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from omnigent.cswap.application.ports.ports import (
     CostAttributionSink,
@@ -132,12 +133,63 @@ def _limit_state_from_row(row: SqlProviderAccountLimitState) -> LimitState:
     )
 
 
+def _upsert_limit_state(session: Session, state: LimitState, *, enforce_staleness: bool) -> bool:
+    """Guarded-UPSERT a limit-state row within *session*; return whether written.
+
+    The staleness check lives in the ``UPDATE ... WHERE`` clause so it is
+    atomic (concurrent writers cannot read-then-clobber a fresher row). A
+    missing row is inserted via a SAVEPOINT, retrying the guarded UPDATE if a
+    concurrent insert wins the PK race; a non-PK IntegrityError surfaces.
+    """
+    cls = SqlProviderAccountLimitState
+    values = {
+        "limit_status": _status_for(state),
+        "is_limited": state.is_limited,
+        "limited_until": state.limited_until,
+        "windows_json": _windows_to_json(state.windows),
+        "detection_source": state.source,
+        "last_checked_at": state.last_checked_at,
+        "updated_at": now_epoch(),
+    }
+    guarded = update(cls).where(cls.credential_id == state.credential_id)
+    if enforce_staleness and state.last_checked_at is not None:
+        guarded = guarded.where(
+            or_(cls.last_checked_at.is_(None), cls.last_checked_at <= state.last_checked_at)
+        )
+    if _rowcount(session.execute(guarded.values(**values))):
+        return True
+    # No row updated. If one exists, re-run the guarded UPDATE so the staleness
+    # predicate (not a bare existence check) decides — a concurrently-inserted
+    # OLDER row must still be overwritten.
+    if session.get(cls, state.credential_id) is not None:
+        return _rowcount(session.execute(guarded.values(**values))) > 0
+    try:
+        with session.begin_nested():
+            session.add(cls(credential_id=state.credential_id, **values))
+            session.flush()  # surface a concurrent-insert IntegrityError here
+        return True
+    except IntegrityError:
+        if session.get(cls, state.credential_id) is None:
+            raise  # not a PK race (e.g. an FK violation) — surface it
+        return _rowcount(session.execute(guarded.values(**values))) > 0
+
+
 class SqlUsageLimitStateRepository(UsageLimitStateRepository):
     """:class:`UsageLimitStateRepository` over ``provider_account_limit_states``."""
 
-    def __init__(self, session_maker: ManagedSessionMaker) -> None:
-        """:param session_maker: Managed session factory."""
+    def __init__(
+        self,
+        session_maker: ManagedSessionMaker,
+        immediate_session_maker: ManagedSessionMaker | None = None,
+    ) -> None:
+        """:param session_maker: Managed session factory.
+        :param immediate_session_maker: A ``BEGIN IMMEDIATE`` factory used by
+            :meth:`observe` to serialize its read+write across processes.
+            Defaults to *session_maker* (correct in-process; full
+            cross-process atomicity needs the immediate variant).
+        """
         self._session = session_maker
+        self._immediate = immediate_session_maker or session_maker
 
     def find(self, credential_id: str) -> LimitState | None:
         """Return the stored state for *credential_id*, or ``None``."""
@@ -158,47 +210,24 @@ class SqlUsageLimitStateRepository(UsageLimitStateRepository):
             return {row.credential_id: _limit_state_from_row(row) for row in rows}
 
     def upsert(self, state: LimitState, *, enforce_staleness: bool = True) -> bool:
-        """Write *state*, honouring the staleness guard (see port docs).
-
-        The staleness check lives in the ``UPDATE ... WHERE`` clause so it is
-        atomic: concurrent observations (the reactive hook runs in worker
-        threads) cannot read-then-clobber a fresher row. A missing row is
-        inserted via a savepoint, retrying the guarded update if a concurrent
-        insert wins the primary-key race.
-        """
-        cls = SqlProviderAccountLimitState
-        values = {
-            "limit_status": _status_for(state),
-            "is_limited": state.is_limited,
-            "limited_until": state.limited_until,
-            "windows_json": _windows_to_json(state.windows),
-            "detection_source": state.source,
-            "last_checked_at": state.last_checked_at,
-            "updated_at": now_epoch(),
-        }
-        guarded = update(cls).where(cls.credential_id == state.credential_id)
-        if enforce_staleness and state.last_checked_at is not None:
-            guarded = guarded.where(
-                or_(cls.last_checked_at.is_(None), cls.last_checked_at <= state.last_checked_at)
-            )
+        """Write *state*, honouring the staleness guard (see port docs)."""
         with self._session() as session:
-            if _rowcount(session.execute(guarded.values(**values))):
-                return True
-            # No row updated. If one exists, re-run the guarded UPDATE so the
-            # staleness predicate (not a bare existence check) decides the
-            # outcome — a row inserted concurrently may be OLDER than ours and
-            # must still be overwritten.
-            if session.get(cls, state.credential_id) is not None:
-                return _rowcount(session.execute(guarded.values(**values))) > 0
-            try:
-                with session.begin_nested():
-                    session.add(cls(credential_id=state.credential_id, **values))
-                    session.flush()  # surface a concurrent-insert IntegrityError here
-                return True
-            except IntegrityError:
-                if session.get(cls, state.credential_id) is None:
-                    raise  # not a PK race (e.g. an FK violation) — surface it
-                return _rowcount(session.execute(guarded.values(**values))) > 0
+            return _upsert_limit_state(session, state, enforce_staleness=enforce_staleness)
+
+    def observe(self, state: LimitState, *, enforce_staleness: bool = True) -> tuple[bool, bool]:
+        """Atomically write *state* and report ``(wrote, prior_was_available)``.
+
+        Runs in a ``BEGIN IMMEDIATE`` transaction so the prior read and the
+        write are serialized against other processes — two runners reporting
+        the same limit cannot both see the account as available and both
+        decide it was "newly limited" (double-firing failover).
+        """
+        now = state.last_checked_at if state.last_checked_at is not None else now_epoch()
+        with self._immediate() as session:
+            prior = session.get(SqlProviderAccountLimitState, state.credential_id)
+            was_available = prior is None or _limit_state_from_row(prior).is_available_now(now)
+            wrote = _upsert_limit_state(session, state, enforce_staleness=enforce_staleness)
+            return wrote, was_available
 
 
 class SqlCredentialPoolRepository(CredentialPoolRepository):
@@ -280,7 +309,11 @@ class SqlSessionCredentialRegistry(SessionCredentialRegistry):
                     session.add(cls(session_id=session_id, **values))
                     session.flush()
             except IntegrityError:
-                session.execute(upd)
+                # Benign only if a concurrent insert won the PK race (the
+                # retry UPDATE then matches); otherwise (e.g. an FK violation)
+                # surface it rather than silently dropping the binding.
+                if not _rowcount(session.execute(upd)):
+                    raise
 
     def active_credential(self, session_id: str) -> str | None:
         """Return the active account id for *session_id*, or ``None``."""

@@ -51,6 +51,19 @@ class UsageLimitStateRepository(Protocol):
         """
         ...
 
+    def observe(self, state: LimitState, *, enforce_staleness: bool = True) -> tuple[bool, bool]:
+        """Atomically write *state* and report ``(wrote, prior_was_available)``.
+
+        The prior read and the write happen in one serialized transaction so
+        two writers reporting the same limit cannot both see the account as
+        available and both decide it was newly limited.
+
+        :returns: ``(wrote, prior_was_available)`` — ``wrote`` per
+            :meth:`upsert`; ``prior_was_available`` is whether the account
+            was available *before* this observation.
+        """
+        ...
+
 
 class CredentialPoolRepository(Protocol):
     """Read access to synced pools and accounts."""

@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from sqlalchemy import select
 
 from omnigent.cswap.domain.entities.credential_pool import CredentialPool
+from omnigent.cswap.infrastructure.sql_upsert import atomic_upsert
 from omnigent.db.db_models import SqlCredentialPool, SqlProviderAccount
 from omnigent.db.utils import ManagedSessionMaker, now_epoch
 
@@ -56,56 +57,42 @@ def sync_pools(session_maker: ManagedSessionMaker, pools: dict[str, CredentialPo
 
     with session_maker() as session:
         for pool in pools.values():
-            existing_pool = session.get(SqlCredentialPool, pool.id)
-            if existing_pool is None:
-                session.add(
-                    SqlCredentialPool(
-                        id=pool.id,
-                        name=pool.name,
-                        family=pool.family,
-                        failover_mode=pool.failover_mode,
-                        created_at=now,
-                        updated_at=now,
-                    )
-                )
-            else:
-                existing_pool.name = pool.name
-                existing_pool.family = pool.family
-                existing_pool.failover_mode = pool.failover_mode
-                existing_pool.updated_at = now
+            pool_fields = {
+                "name": pool.name,
+                "family": pool.family,
+                "failover_mode": pool.failover_mode,
+                "updated_at": now,
+            }
+            atomic_upsert(
+                session,
+                SqlCredentialPool,
+                where=SqlCredentialPool.id == pool.id,
+                values=pool_fields,
+                insert_values={"id": pool.id, "created_at": now, **pool_fields},
+            )
             pools_upserted += 1
 
             for member in pool.members:
                 desired_account_ids.add(member.id)
-                existing = session.get(SqlProviderAccount, member.id)
-                if existing is None:
-                    session.add(
-                        SqlProviderAccount(
-                            id=member.id,
-                            pool_id=member.pool_id,
-                            name=member.name,
-                            family=member.family,
-                            kind=member.kind,
-                            priority=member.priority,
-                            claude_config_dir=member.claude_config_dir,
-                            codex_config_dir=member.codex_config_dir,
-                            api_key_ref=member.api_key_ref,
-                            is_active=True,
-                            created_at=now,
-                            updated_at=now,
-                        )
-                    )
-                else:
-                    existing.pool_id = member.pool_id
-                    existing.name = member.name
-                    existing.family = member.family
-                    existing.kind = member.kind
-                    existing.priority = member.priority
-                    existing.claude_config_dir = member.claude_config_dir
-                    existing.codex_config_dir = member.codex_config_dir
-                    existing.api_key_ref = member.api_key_ref
-                    existing.is_active = True
-                    existing.updated_at = now
+                acct_fields = {
+                    "pool_id": member.pool_id,
+                    "name": member.name,
+                    "family": member.family,
+                    "kind": member.kind,
+                    "priority": member.priority,
+                    "claude_config_dir": member.claude_config_dir,
+                    "codex_config_dir": member.codex_config_dir,
+                    "api_key_ref": member.api_key_ref,
+                    "is_active": True,
+                    "updated_at": now,
+                }
+                atomic_upsert(
+                    session,
+                    SqlProviderAccount,
+                    where=SqlProviderAccount.id == member.id,
+                    values=acct_fields,
+                    insert_values={"id": member.id, "created_at": now, **acct_fields},
+                )
                 accounts_upserted += 1
 
         # Deactivate accounts that are still active in the DB but no longer
