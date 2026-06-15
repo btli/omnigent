@@ -14,10 +14,11 @@ reads ``is_limited`` + ``limited_until``; the windows are informational.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import cast
 
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -104,6 +105,11 @@ def _windows_from_json(raw: str | None) -> tuple[UsageWindow, ...]:
         for item in items
         if isinstance(item, dict)
     )
+
+
+def _advisory_lock_key(credential_id: str) -> int:
+    """Map a credential id to a stable signed 64-bit PostgreSQL advisory key."""
+    return int.from_bytes(hashlib.sha1(credential_id.encode()).digest()[:8], "big", signed=True)
 
 
 def _status_for(state: LimitState) -> str:
@@ -213,13 +219,20 @@ class SqlUsageLimitStateRepository(UsageLimitStateRepository):
     def observe(self, state: LimitState, *, enforce_staleness: bool = True) -> tuple[bool, bool]:
         """Atomically write *state* and report ``(wrote, prior_was_available)``.
 
-        Runs in a ``BEGIN IMMEDIATE`` transaction so the prior read and the
-        write are serialized against other processes — two runners reporting
-        the same limit cannot both see the account as available and both
-        decide it was "newly limited" (double-firing failover).
+        The prior read and the write are serialized per credential against
+        other processes — so two runners reporting the same limit cannot both
+        see the account as available and both decide it was "newly limited"
+        (double-firing failover). On SQLite that is the immediate session's
+        ``BEGIN IMMEDIATE`` write lock; on PostgreSQL it is a per-credential
+        transaction-scoped advisory lock taken before the read.
         """
         now = state.last_checked_at if state.last_checked_at is not None else now_epoch()
         with self._immediate() as session:
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                session.execute(
+                    text("SELECT pg_advisory_xact_lock(:k)"),
+                    {"k": _advisory_lock_key(state.credential_id)},
+                )
             prior = session.get(SqlProviderAccountLimitState, state.credential_id)
             was_available = prior is None or _limit_state_from_row(prior).is_available_now(now)
             wrote = _upsert_limit_state(session, state, enforce_staleness=enforce_staleness)
