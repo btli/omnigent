@@ -14,6 +14,7 @@ background poller are async.
 
 from __future__ import annotations
 
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -90,6 +91,24 @@ class SessionCredentialRegistry(Protocol):
 
     def active_credential(self, session_id: str) -> str | None:
         """Return the active account id for *session_id*, or ``None``."""
+        ...
+
+    def sessions_for_credentials(
+        self,
+        credential_ids: Sequence[str],
+        *,
+        only_session_ids: Collection[str] | None = None,
+        limit_per: int = 200,
+    ) -> dict[str, list[str]]:
+        """Reverse-lookup bindings for several credentials in one query.
+
+        Returns ``{credential_id: [session_id, ...]}`` — one entry per requested
+        id, most-recently-bound first. The operator reverse of
+        :meth:`active_credential`. Bindings are never deleted, so pass
+        *only_session_ids* (e.g. the caller's live-session set) to restrict the
+        result: the filter is applied in SQL so the per-credential *limit_per*
+        cap counts live sessions, never dead bindings.
+        """
         ...
 
 

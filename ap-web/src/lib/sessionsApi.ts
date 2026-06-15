@@ -15,6 +15,7 @@ import { isMessageItem } from "./conversationItems";
 import type { MessageContentBlock } from "./blocks";
 import { authenticatedFetch } from "./identity";
 import type {
+  ActiveCredential,
   ModelUsage,
   NestedSessionItem,
   SandboxStatus,
@@ -196,6 +197,25 @@ interface SessionResponseWire {
    * `omnigent.server.schemas.SandboxStatus`.
    */
   sandbox_status?: SandboxStatus | null;
+  /**
+   * The multi-subscription account this session is bound to. Absent/`null`
+   * when no credential pool is configured (single-account setups). Mirrors
+   * `omnigent.server.schemas.ActiveCredentialInfo`.
+   */
+  active_credential?: ActiveCredentialWire | null;
+}
+
+/**
+ * Wire shape of `SessionResponse.active_credential`
+ * (`omnigent.server.schemas.ActiveCredentialInfo`). Snake-case; lifted to the
+ * camelCase {@link ActiveCredential} by {@link sessionFromWire}.
+ */
+interface ActiveCredentialWire {
+  id: string;
+  name: string;
+  kind: "subscription" | "api_key";
+  family: "anthropic" | "openai";
+  limit_status: "available" | "limited" | "unknown";
 }
 
 interface SessionItemsResponseWire {
@@ -241,6 +261,23 @@ function usageByModelFromWire(
   return out;
 }
 
+/**
+ * Convert the snake-case `active_credential` wire object into the camelCase
+ * {@link ActiveCredential}, or `null` when absent (single-account setups).
+ */
+function activeCredentialFromWire(
+  wire: ActiveCredentialWire | null | undefined,
+): ActiveCredential | null {
+  if (wire == null) return null;
+  return {
+    id: wire.id,
+    name: wire.name,
+    kind: wire.kind,
+    family: wire.family,
+    limitStatus: wire.limit_status,
+  };
+}
+
 function sessionFromWire(wire: SessionResponseWire): Session {
   return {
     id: wire.id,
@@ -279,6 +316,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     skills: wire.skills ?? [],
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
+    activeCredential: activeCredentialFromWire(wire.active_credential),
   };
 }
 

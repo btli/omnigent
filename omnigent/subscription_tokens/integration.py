@@ -18,6 +18,7 @@ import asyncio
 import logging
 import os
 import threading
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -193,6 +194,13 @@ def select_launch_env_for_family(
         # attributing this account would mis-route failover/cost).
         if session_id and (account.is_subscription or env):
             container.registry.bind(session_id, account.id, family)
+        logger.info(
+            "subscription-token: session=%s %s launch on account %r (%s)",
+            session_id or "-",
+            family,
+            account.name,
+            account.kind,
+        )
         return env
     except Exception:
         logger.exception("subscription-token account selection failed for family %s", family)
@@ -258,6 +266,12 @@ def select_codex_launch(session_id: str | None = None) -> CodexLaunchSelection:
         # which IS this account); an api_key only when its key resolved.
         if session_id and (account.is_subscription or api_key):
             container.registry.bind(session_id, account.id, "openai")
+        logger.info(
+            "subscription-token: session=%s codex launch on account %r (%s)",
+            session_id or "-",
+            account.name,
+            account.kind,
+        )
         return CodexLaunchSelection(config_source=config_source, api_key=api_key)
     except Exception:
         logger.exception("subscription-token codex selection failed")
@@ -287,6 +301,77 @@ def transfer_session_binding(old_session_id: str, new_session_id: str, *, family
             container.registry.bind(new_session_id, credential_id, family)
     except Exception:
         logger.exception("subscription-token session-binding transfer failed")
+
+
+def active_credential_for_session(session_id: str) -> dict[str, object] | None:
+    """Return the account *session_id* is bound to, for display.
+
+    Resolves the binding made at launch to its pool member plus current
+    limit state::
+
+        {"id", "name", "kind", "family", "limit_status"}
+
+    Returns ``None`` when no pool is configured, the session has no binding,
+    or the bound credential is no longer a known pool member. Always safe.
+    """
+    container = _ensure_container()
+    if container is None:
+        return None
+    try:
+        credential_id = container.registry.active_credential(session_id)
+        if not credential_id:
+            return None
+        member, pool = _find_member(credential_id)
+        if member is None or pool is None:
+            return None
+        state = container.state_repo.find_many([credential_id]).get(credential_id)
+        return {
+            "id": member.id,
+            "name": member.name,
+            "kind": member.kind,
+            "family": pool.family,
+            "limit_status": state.to_status(now_epoch()) if state else "unknown",
+        }
+    except Exception:
+        logger.exception("subscription-token active-credential lookup failed")
+        return None
+
+
+def sessions_for_credentials(
+    credential_ids: Sequence[str], *, only_session_ids: Collection[str] | None = None
+) -> dict[str, list[str]]:
+    """Map each of *credential_ids* to the sessions bound to it (operator view).
+
+    Reverse of :func:`active_credential_for_session`. Pass *only_session_ids*
+    (the caller's live-session set) to restrict the result to currently-running
+    sessions — the filter runs in SQL, so a long-running session is never hidden
+    behind newer dead bindings. Returns ``{}`` when no pool is configured or on
+    any error (facade-safe).
+    """
+    container = _ensure_container()
+    if container is None:
+        return {}
+    try:
+        return container.registry.sessions_for_credentials(
+            credential_ids, only_session_ids=only_session_ids
+        )
+    except Exception:
+        logger.exception("subscription-token sessions-for-credentials lookup failed")
+        return {}
+
+
+def _find_member(
+    credential_id: str,
+) -> tuple[ProviderAccount | None, CredentialPool | None]:
+    """Resolve *credential_id* to its ``(member, pool)`` in the active pools.
+
+    :returns: ``(None, None)`` when the id matches no configured member.
+    """
+    for pool in _pools.values():
+        for member in pool.members:
+            if member.id == credential_id:
+                return member, pool
+    return None, None
 
 
 def extract_message_text(data: object) -> str:

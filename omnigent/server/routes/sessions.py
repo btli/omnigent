@@ -181,6 +181,7 @@ from omnigent.server.routes._content_type import (
 )
 from omnigent.server.routes._host_worktree import CreatedWorktree
 from omnigent.server.schemas import (
+    ActiveCredentialInfo,
     AgentObject,
     ChildSessionSummary,
     ConversationDeleted,
@@ -1566,6 +1567,22 @@ def _session_status_from_cache(conversation_id: str) -> Literal["idle", "running
     return "idle"
 
 
+def running_session_ids() -> set[str]:
+    """Return the ids of sessions currently executing a turn.
+
+    A session counts as running while its relay-fed status cache value is
+    ``"running"`` or ``"waiting"`` — the same signal
+    :func:`_session_status_from_cache` collapses to ``"running"``. The
+    subscription-token status route intersects an account's (never-deleted)
+    bindings with this set so ``active_sessions`` reflects the sessions
+    actually consuming the account's quota right now, not every session ever
+    bound to it.
+    """
+    return {
+        cid for cid, cached in _session_status_cache.items() if cached in ("running", "waiting")
+    }
+
+
 def _session_status_with_child_rollup(
     conversation_id: str,
     child_session_ids: list[str],
@@ -1980,6 +1997,7 @@ def _build_session_response(
     host_online: bool | None = None,
     pending_elicitation_events: list[dict[str, Any]] | None = None,
     subtree_usage: dict[str, Any] | None = None,
+    active_credential: ActiveCredentialInfo | None = None,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -2039,6 +2057,10 @@ def _build_session_response(
         ``None`` falls back to this conversation's own ``session_usage``
         (correct for childless sessions). Passed by the snapshot path;
         other callers omit it.
+    :param active_credential: The multi-subscription account the session is
+        bound to (see :class:`ActiveCredentialInfo`), resolved by the snapshot
+        caller from the session's launch binding. ``None`` for single-account
+        setups or callers that don't resolve it.
     :returns: The :class:`SessionResponse` for the API.
     :raises OmnigentError: If ``conv.agent_id`` is ``None``.
     """
@@ -2125,7 +2147,30 @@ def _build_session_response(
         # once the launch succeeds; a failed launch is retained with
         # its reason. Populated by _publish_sandbox_status.
         sandbox_status=_session_sandbox_status_cache.get(conv.id),
+        # The multi-subscription account this session is bound to, resolved by
+        # the snapshot caller from the launch binding. None for single-account
+        # setups; stable for the session's lifetime (failover rebinds the next
+        # launch, never the running process).
+        active_credential=active_credential,
     )
+
+
+def _active_credential_info(data: dict[str, object] | None) -> ActiveCredentialInfo | None:
+    """Lift the subscription-token facade's account dict into the API model.
+
+    :param data: The dict from ``integration.active_credential_for_session``
+        (``{"id", "name", "kind", "family", "limit_status"}``), or ``None``.
+    :returns: The validated :class:`ActiveCredentialInfo`, or ``None`` when
+        *data* is ``None`` or fails validation (best-effort — a malformed
+        account payload must never break a session snapshot).
+    """
+    if not data:
+        return None
+    try:
+        return ActiveCredentialInfo.model_validate(data)
+    except ValidationError:
+        _logger.warning("dropping malformed active-credential payload: %r", data)
+        return None
 
 
 def _publish_input_consumed(
@@ -17508,12 +17553,24 @@ async def _get_session_snapshot(
         if result is not None:
             runner_online = result.runner_online
             host_online = result.host_online
-    # Subtree usage (this session + its sub-agent descendants) so the
-    # displayed cost includes sub-agents — a codex/claude sub-agent's spend
-    # is persisted on its own child conversation, not the parent's, so the
-    # parent's own session_usage would under-report. Off the event loop
-    # because it pages the conversation tree from the store.
-    subtree_usage = await asyncio.to_thread(load_session_usage, conv.id, conv_store)
+    # Two independent store reads, run concurrently off the event loop:
+    #  - subtree usage (this session + its sub-agent descendants) so the
+    #    displayed cost includes sub-agents — a codex/claude sub-agent's spend
+    #    is persisted on its own child conversation, so the parent's own
+    #    session_usage would under-report. It pages the conversation tree.
+    #  - the multi-subscription account this session is bound to (keyed on the
+    #    root conversation, matching cost attribution) for the Web UI's
+    #    per-session credential indicator; None without a pools: config, so
+    #    single-account setups are unaffected.
+    from omnigent.subscription_tokens import integration as _subtokens
+
+    subtree_usage, credential_payload = await asyncio.gather(
+        asyncio.to_thread(load_session_usage, conv.id, conv_store),
+        asyncio.to_thread(
+            _subtokens.active_credential_for_session, conv.root_conversation_id or conv.id
+        ),
+    )
+    active_credential = _active_credential_info(credential_payload)
     return _build_session_response(
         conv,
         items,
@@ -17533,4 +17590,5 @@ async def _get_session_snapshot(
             conv,
         ),
         subtree_usage=subtree_usage,
+        active_credential=active_credential,
     )
