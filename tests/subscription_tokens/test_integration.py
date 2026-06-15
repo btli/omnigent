@@ -23,6 +23,15 @@ def _accounts(snapshot: list[dict[str, object]]) -> list[dict[str, object]]:
     return accounts
 
 
+def _bound_family(session_maker: ManagedSessionMaker, session_id: str) -> str | None:
+    """Return the persisted ``family`` of *session_id*'s binding, or ``None``."""
+    from omnigent.db.db_models import SqlSessionCredentialBinding
+
+    with session_maker() as session:
+        row = session.get(SqlSessionCredentialBinding, session_id)
+        return row.family if row is not None else None
+
+
 @pytest.fixture
 def active_facade(session_maker: ManagedSessionMaker) -> Iterator[ManagedSessionMaker]:
     """Activate the facade over a seeded two-subscription claude pool."""
@@ -135,6 +144,7 @@ def test_transfer_session_binding_carries_account_across_session_ids(
 
     integration.transfer_session_binding("sess-parent", "sess-child", family="openai")
     assert registry.active_credential("sess-child") == parent_cred
+    assert _bound_family(active_openai_facade, "sess-child") == "openai"  # family pinned, not lost
 
     # No-op when the source has no binding — never invents one.
     integration.transfer_session_binding("sess-unbound", "sess-target", family="openai")
@@ -181,6 +191,9 @@ async def test_codex_child_registration_copies_binding_to_child_session(
         )
 
     assert registry.active_credential("conv-child") == parent_cred
+    # Pin the family the call site passes (a regression to a non-openai family
+    # would still satisfy the credential-id assertion above, but not this one).
+    assert _bound_family(active_openai_facade, "conv-child") == "openai"
 
 
 def test_select_launch_env_returns_config_dir_and_binds(
