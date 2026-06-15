@@ -211,24 +211,30 @@ _FATAL_WAITING_REASONS: frozenset[str] = frozenset(
 _TRANSIENT_READ_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
 
 # Redaction for command strings before they enter error messages / logs
-# (FIX-3, hardened round-3 FIX-B). _start_host_in_sandbox runs the host with
-# `OMNIGENT_HOST_TOKEN=<launch token>` (and harness creds may ride other env
-# assignments), so an exec timeout / non-zero must not leak the value into
+# (FIX-3, hardened round-3 FIX-B/FIX-4). _start_host_in_sandbox runs the host
+# with `OMNIGENT_HOST_TOKEN=<launch token>` (and harness creds may ride other
+# env assignments), so an exec timeout / non-zero must not leak the value into
 # the error detail (which becomes an HTTP 502 body + server log).
 #
 # KEY (captured, group 1, so only the VALUE is masked): a shell-token-leading
-# env-assignment name that CONTAINS a credential keyword (case-insensitive),
-# including BARE keyword names — the `[A-Za-z0-9_]*` before the keyword is
-# zero-or-more, so `TOKEN=` / `KEY=` match as well as `OMNIGENT_HOST_TOKEN=`.
-# `(?:^|\s)` anchors to a shell token boundary (assignments are space-separated)
-# so we don't match a keyword mid-word inside some other argument.
+# env-assignment name in which a credential keyword is a FULL underscore-
+# delimited segment (case-insensitive). So `TOKEN=`, `API_KEY=`, `FOO_SECRET=`,
+# `OMNIGENT_HOST_TOKEN=` match, but `MONKEY=` / `HOTKEY=` / `KEYBOARD_LAYOUT=`
+# do NOT (FIX-4 — keyword must be a whole segment, not a substring). The
+# leading `(?:^|[\s;&|(])` matches a shell token boundary — start, whitespace,
+# or a separator like `;`/`&`/`|`/`(` — so `;TOKEN=` is caught too. The
+# segment quantifiers are non-overlapping (each consumes up to a `_`), so the
+# match is linear-time (no catastrophic backtracking).
 #
 # VALUE (consumed, masked): a single-quoted run, a double-quoted run, OR a bare
 # non-whitespace run — so a quoted value WITH SPACES (`FOO_SECRET='a b'`) is
 # redacted whole, not just its first word.
 _SENSITIVE_ENV_RE: re.Pattern[str] = re.compile(
     r"(?i)"
-    r"((?:^|\s)[A-Za-z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)[A-Za-z0-9_]*=)"
+    r"((?:^|[\s;&|(])"
+    r"(?:[A-Za-z0-9]+_)*"
+    r"(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)"
+    r"(?:_[A-Za-z0-9]+)*=)"
     r"(?:'[^']*'|\"[^\"]*\"|[^\s]+)"
 )
 
@@ -808,6 +814,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         """
         _ensure_sdk()
         from kubernetes.client.rest import ApiException
+        from urllib3.exceptions import HTTPError
 
         namespace = self._resolve_namespace()
         image = self._resolve_image()
@@ -829,8 +836,25 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                 node_selector=self._node_selector,
             )
             try:
-                core.create_namespaced_pod(namespace, manifest)
+                # _request_timeout bounds the create so a stalled apiserver
+                # can't hang provision() before the readiness deadline even
+                # starts (round-3 FIX-1).
+                core.create_namespaced_pod(
+                    namespace, manifest, _request_timeout=_POD_READY_REQUEST_TIMEOUT_S
+                )
                 break
+            except HTTPError as exc:
+                # A urllib3 timeout/connection error is AMBIGUOUS: the
+                # apiserver may have accepted the create (the Pod exists)
+                # even though the client gave up — so pod_name (computed
+                # before the call) could now be an orphan. Best-effort
+                # delete it before failing so a client timeout can't leak a
+                # running Pod, then raise a clear error.
+                self._best_effort_delete(namespace, pod_name)
+                raise click.ClickException(
+                    f"timed out creating Kubernetes pod '{pod_name}' "
+                    f"({_read_error_reason(exc)}); cleaned up any orphan and aborting"
+                ) from exc
             except ApiException as exc:
                 # A name collision (another launch raced the same slug)
                 # is recoverable once: regenerate the random suffix and
@@ -865,9 +889,25 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         :param pod_name: The Pod to delete.
         """
         from kubernetes.client.rest import ApiException
+        from urllib3.exceptions import HTTPError
 
         try:
-            self._load_core().delete_namespaced_pod(pod_name, namespace, grace_period_seconds=0)
+            # _request_timeout bounds the cleanup delete so it can't itself
+            # hang (round-3 FIX-2) — this runs on the failure path, often
+            # after a readiness timeout, so it must be bounded AND swallow
+            # urllib3 timeouts/connection errors, not just ApiException.
+            self._load_core().delete_namespaced_pod(
+                pod_name,
+                namespace,
+                grace_period_seconds=0,
+                _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
+            )
+        except HTTPError as exc:
+            click.echo(
+                f"  → warning: could not clean up pod '{pod_name}' after a "
+                f"failed readiness wait ({_read_error_reason(exc)})",
+                err=True,
+            )
         except ApiException as exc:
             if getattr(exc, "status", None) != 404:
                 click.echo(
@@ -1291,15 +1331,36 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         session host needn't linger).
 
         :param sandbox_id: The Pod to delete.
-        :raises click.ClickException: On any delete failure other than
-            not-found.
+        :raises click.ClickException: On any API delete failure other than
+            not-found (a urllib3 timeout/connection error is logged as a
+            best-effort failure, not raised — the managed teardown path
+            must not hang or abort on a stalled apiserver).
         """
         _ensure_sdk()
         from kubernetes.client.rest import ApiException
+        from urllib3.exceptions import HTTPError
 
         namespace = self._resolve_namespace()
         try:
-            self._load_core().delete_namespaced_pod(sandbox_id, namespace, grace_period_seconds=0)
+            # _request_timeout bounds the delete so a stalled apiserver
+            # can't block _terminate_sandbox_best_effort forever (round-3
+            # FIX-3).
+            self._load_core().delete_namespaced_pod(
+                sandbox_id,
+                namespace,
+                grace_period_seconds=0,
+                _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
+            )
+        except HTTPError as exc:
+            # A timeout/connection error is best-effort here: the managed
+            # teardown caller wraps terminate() and must not hang or abort
+            # on a provider hiccup (the provider's lifetime cap reaps a
+            # straggler). Log, don't raise.
+            click.echo(
+                f"  → warning: timed out deleting Kubernetes pod '{sandbox_id}' "
+                f"({_read_error_reason(exc)}); leaving it for the cluster to reap",
+                err=True,
+            )
         except ApiException as exc:
             if exc.status == 404:
                 return

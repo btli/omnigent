@@ -56,7 +56,9 @@ stores into ``create_app``):
            disk_gb: 20
          kubernetes:              # optional block (provider: kubernetes)
            image: ghcr.io/me/omnigent-host:latest  # default: official image
-           namespace: omnigent               # namespace Pods run in
+           namespace: omnigent-sandboxes     # runner-Pod namespace
+                                             # (default; the dedicated ns
+                                             # the overlay grants rights in)
            secret_name: omnigent-creds       # K8s Secret projected into
                                              # every Pod via envFrom
                                              # (harness LLM keys, GIT_TOKEN)

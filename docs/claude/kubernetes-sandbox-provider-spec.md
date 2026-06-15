@@ -79,7 +79,9 @@ constants in the launcher.
 ### Module shape (mirror daytona.py/islo.py conventions: module docstring, constants, `_ensure_sdk`)
 Constants (env overrides, like daytona/islo):
 - `HOST_IMAGE_ENV_VAR = "OMNIGENT_KUBERNETES_HOST_IMAGE"`
-- `NAMESPACE_ENV_VAR = "OMNIGENT_KUBERNETES_NAMESPACE"` (default `"omnigent"`)
+- `NAMESPACE_ENV_VAR = "OMNIGENT_KUBERNETES_NAMESPACE"` (default `"omnigent-sandboxes"` — the
+  dedicated runner namespace the deploy overlay grants the server SA rights in; creating Pods in the
+  server namespace would 403 + defeat the blast-radius split)
 - `SANDBOX_SECRET_ENV_VAR = "OMNIGENT_KUBERNETES_SECRET"` (K8s Secret name for harness creds)
 - `SANDBOX_ENV_PASSTHROUGH_ENV_VAR = "OMNIGENT_KUBERNETES_SANDBOX_ENV"` (comma-sep server env NAMES)
 - `SERVICE_ACCOUNT_ENV_VAR = "OMNIGENT_KUBERNETES_SERVICE_ACCOUNT"` (default `"omnigent-runner"`)

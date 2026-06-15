@@ -558,14 +558,30 @@ class _FakeCoreV1Api:
     def __init__(self, state: _FakeK8sState) -> None:
         self._state = state
 
-    def create_namespaced_pod(self, namespace: str, body: dict[str, object]) -> object:
-        """Record creation and register the resulting Pod."""
-        if self._state.create_raises:
-            raise self._state.create_raises.pop(0)
+    def create_namespaced_pod(
+        self, namespace: str, body: dict[str, object], *, _request_timeout: object = None
+    ) -> object:
+        """
+        Record creation and register the resulting Pod.
+
+        ``_request_timeout`` is captured (FIX-1) so a test can assert the
+        launcher bounds the call. ``create_raises`` (popped front-first)
+        raises BEFORE registering (a definite reject / pre-accept timeout).
+        ``create_register_then_raises`` registers the Pod FIRST and then
+        raises — modelling an apiserver-accepted-but-client-timed-out
+        create whose Pod is now an orphan the launcher must clean up.
+        """
+        self._state.create_request_timeouts.append(_request_timeout)
         metadata = body["metadata"]
         assert isinstance(metadata, dict)
         pod_name = metadata["name"]
         assert isinstance(pod_name, str)
+        if self._state.create_register_then_raises:
+            self._state.create_calls.append(_CreateCall(namespace=namespace, manifest=body))
+            self._state.pods[pod_name] = self._state.pod_factory(pod_name)
+            raise self._state.create_register_then_raises.pop(0)
+        if self._state.create_raises:
+            raise self._state.create_raises.pop(0)
         self._state.create_calls.append(_CreateCall(namespace=namespace, manifest=body))
         self._state.pods[pod_name] = self._state.pod_factory(pod_name)
         return object()
@@ -606,11 +622,21 @@ class _FakeCoreV1Api:
         return _EventList(items=list(self._state.events))
 
     def delete_namespaced_pod(
-        self, name: str, namespace: str, *, grace_period_seconds: int
+        self,
+        name: str,
+        namespace: str,
+        *,
+        grace_period_seconds: int,
+        _request_timeout: object = None,
     ) -> object:
-        """Record the deletion (with grace period) or raise as configured."""
+        """Record the deletion (with grace period) or raise as configured.
+
+        ``_request_timeout`` is captured (FIX-2/FIX-3) so a test can assert
+        the delete is bounded.
+        """
         del namespace
         self._state.delete_calls.append((name, grace_period_seconds))
+        self._state.delete_request_timeouts.append(_request_timeout)
         if self._state.delete_raises:
             raise self._state.delete_raises.pop(0)
         self._state.pods.pop(name, None)
@@ -668,6 +694,13 @@ class _FakeK8sState:
         ``read_namespaced_pod`` call (FIX-C assertion).
     :param event_request_timeouts: ``_request_timeout`` captured per
         ``list_namespaced_event`` call (FIX-C assertion).
+    :param create_request_timeouts: ``_request_timeout`` captured per
+        ``create_namespaced_pod`` call (round-3 FIX-1 assertion).
+    :param delete_request_timeouts: ``_request_timeout`` captured per
+        ``delete_namespaced_pod`` call (round-3 FIX-2/FIX-3 assertion).
+    :param create_register_then_raises: Exceptions ``create_namespaced_pod``
+        raises AFTER registering the Pod (models an accepted-but-client-
+        timed-out create whose Pod is now an orphan; round-3 FIX-1).
     :param configurations: Every ``Configuration()`` constructed.
     :param api_clients: Every ``ApiClient`` built (for the close assertion).
     """
@@ -678,6 +711,7 @@ class _FakeK8sState:
     pods: dict[str, _Pod] = field(default_factory=dict)
     events: list[_Event] = field(default_factory=list)
     create_raises: list[Exception] = field(default_factory=list)
+    create_register_then_raises: list[Exception] = field(default_factory=list)
     delete_raises: list[Exception] = field(default_factory=list)
     exec_channels: dict[int, str] = field(default_factory=dict)
     exec_raises: Exception | None = None
@@ -696,9 +730,11 @@ class _FakeK8sState:
     read_index: int = 0
     read_count: int = 0
     read_raises: list[Exception] = field(default_factory=list)
-    # _request_timeout captured per read / event call (round-3 FIX-C).
+    # _request_timeout captured per API call (round-3 FIX-C / FIX-1..3).
     read_request_timeouts: list[object] = field(default_factory=list)
     event_request_timeouts: list[object] = field(default_factory=list)
+    create_request_timeouts: list[object] = field(default_factory=list)
+    delete_request_timeouts: list[object] = field(default_factory=list)
 
 
 class _FakeConfiguration:
@@ -1167,6 +1203,71 @@ def test_provision_passes_request_timeout_to_read(fake_k8s: _FakeK8sState) -> No
     assert all(t is not None for t in fake_k8s.read_request_timeouts)
 
 
+def test_provision_passes_request_timeout_to_create(fake_k8s: _FakeK8sState) -> None:
+    """
+    round-3 FIX-1: create_namespaced_pod is bounded by a non-None
+    ``_request_timeout`` so a stalled apiserver can't hang provision()
+    before the readiness deadline even starts.
+
+    Mutation guard: dropping the kwarg leaves the captured timeout None.
+    """
+    KubernetesSandboxLauncher().provision("managed-abc")
+
+    assert fake_k8s.create_request_timeouts  # the create happened
+    assert all(t is not None for t in fake_k8s.create_request_timeouts)
+
+
+def test_provision_create_timeout_cleans_up_and_raises(fake_k8s: _FakeK8sState) -> None:
+    """
+    round-3 FIX-1: a urllib3 timeout from create is AMBIGUOUS (the
+    apiserver may have accepted the Pod). provision() best-effort deletes
+    the known pod_name and raises a clear error — never a silent orphan.
+
+    Mutation guard: dropping the create HTTPError handling lets the timeout
+    propagate uncaught with no cleanup delete.
+    """
+    from urllib3.exceptions import ReadTimeoutError
+
+    fake_k8s.create_raises = [
+        ReadTimeoutError(pool=None, url="/api/v1/pods", message="create timed out"),
+    ]
+
+    with pytest.raises(click.ClickException, match="timed out creating"):
+        KubernetesSandboxLauncher().provision("managed-abc")
+
+    # The known pod_name was best-effort deleted (orphan cleanup), with the
+    # bounded grace period.
+    assert len(fake_k8s.delete_calls) == 1
+    deleted_name, grace = fake_k8s.delete_calls[0]
+    assert grace == 0
+    assert deleted_name.startswith("omnigent-managed-abc-")
+
+
+def test_provision_accepted_but_timed_out_create_orphan_is_deleted(
+    fake_k8s: _FakeK8sState,
+) -> None:
+    """
+    round-3 FIX-1: when the apiserver ACCEPTED the create (Pod exists) but
+    the client timed out, the now-orphan Pod must actually be removed by
+    the best-effort cleanup — not left running.
+    """
+    from urllib3.exceptions import ReadTimeoutError
+
+    # create registers the Pod, THEN raises a client timeout.
+    fake_k8s.create_register_then_raises = [
+        ReadTimeoutError(pool=None, url="/api/v1/pods", message="create timed out"),
+    ]
+
+    with pytest.raises(click.ClickException, match="timed out creating"):
+        KubernetesSandboxLauncher().provision("managed-abc")
+
+    # The Pod the apiserver created is gone (cleanup deleted it), so no
+    # orphan survives.
+    assert fake_k8s.pods == {}
+    [(deleted_name, _grace)] = fake_k8s.delete_calls
+    assert deleted_name.startswith("omnigent-managed-abc-")
+
+
 def test_provision_treats_request_timeout_as_transient(
     fake_k8s: _FakeK8sState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1353,6 +1454,37 @@ def test_provision_readiness_cleanup_swallows_delete_failure(
     assert "ServerError" not in str(exc.value)
     # The cleanup was attempted.
     assert len(fake_k8s.delete_calls) == 1
+
+
+def test_best_effort_delete_swallows_urllib3_timeout(fake_k8s: _FakeK8sState) -> None:
+    """
+    round-3 FIX-2: the cleanup delete is bounded AND a urllib3
+    timeout/connection error from it is swallowed (best-effort) so the
+    original readiness failure is preserved — a stalled apiserver on the
+    cleanup path must not hang or change the surfaced error.
+
+    Mutation guard: if _best_effort_delete only caught ApiException, the
+    urllib3 timeout would propagate and replace the original error.
+    """
+    from urllib3.exceptions import ReadTimeoutError
+
+    def _failed(name: str) -> _Pod:
+        return _Pod(status=_PodStatus(phase="Failed"))
+
+    fake_k8s.pod_factory = _failed
+    fake_k8s.delete_raises = [
+        ReadTimeoutError(pool=None, url="/api/v1/pods", message="delete timed out"),
+    ]
+
+    with pytest.raises(click.ClickException) as exc:
+        KubernetesSandboxLauncher().provision("managed-abc")
+    # Original readiness error preserved (not the delete timeout).
+    assert "terminal phase 'Failed'" in str(exc.value)
+    assert "timed out" not in str(exc.value)
+    # The cleanup delete was attempted AND bounded.
+    assert len(fake_k8s.delete_calls) == 1
+    assert fake_k8s.delete_request_timeouts
+    assert all(t is not None for t in fake_k8s.delete_request_timeouts)
 
 
 def test_provision_image_resolution_order(
@@ -1666,16 +1798,23 @@ def test_run_stuck_error_redacts_secret_env_in_command(
         # Case-insensitive key keyword, quoted value with spaces (value
         # fragments are distinctive so they can't collide with the key/args).
         ("my_password='zzz qqq vvv' run", "zzz qqq vvv", "my_password=***"),
+        # FIX-4: a token at a shell separator boundary (`;`) must match.
+        (";TOKEN=semicolon_secret run", "semicolon_secret", ";TOKEN=***"),
+        ("a&&API_KEY=amp_secret", "amp_secret", "API_KEY=***"),
+        # FIX-4: API_KEY (keyword as a full trailing segment) matches.
+        ("API_KEY=apikey_secret run", "apikey_secret", "API_KEY=***"),
     ],
 )
 def test_redact_command_masks_whole_value(command: str, secret: str, expected_key: str) -> None:
     """
-    FIX-B: ``_redact_command`` must mask the ENTIRE sensitive value —
-    single-quoted, double-quoted (incl. embedded spaces), or bare — and
-    match bare credential key names, leaving no part of the secret.
+    FIX-B/FIX-4: ``_redact_command`` must mask the ENTIRE sensitive value —
+    single-quoted, double-quoted (incl. embedded spaces), or bare — match
+    bare credential key names, AND match a key at a shell separator
+    boundary (`;`/`&`/`|`), leaving no part of the secret.
 
     Mutation guard: the old non-space value class leaks the post-space
-    suffix; a prefix-only key class misses bare ``TOKEN=``.
+    suffix; a prefix-only key class misses bare ``TOKEN=``; a `(?:^|\\s)`
+    boundary misses ``;TOKEN=``.
     """
     redacted = _redact_command(command)
     # No fragment of the secret survives (split on whitespace so a partial
@@ -1685,13 +1824,43 @@ def test_redact_command_masks_whole_value(command: str, secret: str, expected_ke
     assert expected_key in redacted
 
 
-def test_redact_command_preserves_non_sensitive_tokens() -> None:
+@pytest.mark.parametrize(
+    "command",
+    [
+        # FIX-4: the keyword must be a FULL underscore-delimited segment, so
+        # these substring matches are NOT redacted (no noisy over-masking).
+        "MONKEY=banana run",
+        "HOTKEY=ctrl+c run",
+        "KEYBOARD_LAYOUT=us run",
+        "TOKENIZER=gpt2 run",
+        # Ordinary non-credential assignments + args are untouched.
+        "FOO=keepme BAR=alsokeep omnigent host --server https://srv",
+    ],
+)
+def test_redact_command_leaves_non_credential_keys_untouched(command: str) -> None:
     """
-    FIX-B: env assignments WITHOUT a credential keyword (and ordinary
-    args) are left untouched — redaction must not corrupt the command.
+    FIX-4: a credential keyword that is only a SUBSTRING of a key segment
+    (MONKEY, HOTKEY, KEYBOARD_LAYOUT, TOKENIZER) must NOT be redacted —
+    redaction is boundary-aware, so the command is returned verbatim.
+
+    Mutation guard: the old substring key class redacts MONKEY=/HOTKEY=.
     """
-    command = "FOO=keepme BAR=alsokeep omnigent host --server https://srv"
     assert _redact_command(command) == command
+
+
+def test_redact_command_is_linear_time_on_long_input() -> None:
+    """
+    FIX-4: the boundary-aware key pattern must stay linear-time (no
+    catastrophic backtracking) on a long, key-like, non-matching input.
+    """
+    import time
+
+    evil = "A_" * 20000 + "TOKEN" + "B" * 20000 + " rest"
+    start = time.perf_counter()
+    _redact_command(evil)
+    elapsed = time.perf_counter() - start
+    # Generous ceiling; catastrophic backtracking would blow well past this.
+    assert elapsed < 1.0, f"redaction took {elapsed:.2f}s — possible backtracking"
 
 
 def test_run_nonzero_returns_when_unchecked(fake_k8s: _FakeK8sState) -> None:
@@ -1909,6 +2078,42 @@ def test_terminate_wraps_non_404_errors(fake_k8s: _FakeK8sState) -> None:
 
     with pytest.raises(click.ClickException, match="ServerError"):
         launcher.terminate("omnigent-x-1")
+
+
+def test_terminate_passes_request_timeout_to_delete(fake_k8s: _FakeK8sState) -> None:
+    """
+    round-3 FIX-3: terminate()'s delete is bounded by a non-None
+    ``_request_timeout`` so a stalled apiserver can't block the managed
+    teardown forever.
+
+    Mutation guard: dropping the kwarg leaves the captured timeout None.
+    """
+    launcher, pod_name = _provisioned(fake_k8s)
+
+    launcher.terminate(pod_name)
+
+    assert fake_k8s.delete_request_timeouts
+    assert all(t is not None for t in fake_k8s.delete_request_timeouts)
+
+
+def test_terminate_handles_delete_timeout_without_raising(fake_k8s: _FakeK8sState) -> None:
+    """
+    round-3 FIX-3: a urllib3 timeout/connection error from terminate()'s
+    delete is best-effort (logged, NOT raised) so the managed teardown
+    caller can't hang or abort on a provider hiccup.
+
+    Mutation guard: if terminate only caught ApiException, the urllib3
+    timeout would propagate and break teardown.
+    """
+    from urllib3.exceptions import ReadTimeoutError
+
+    launcher = KubernetesSandboxLauncher()
+    fake_k8s.delete_raises = [
+        ReadTimeoutError(pool=None, url="/api/v1/pods", message="delete timed out"),
+    ]
+
+    launcher.terminate("omnigent-x-1")  # must not raise / hang
+    assert len(fake_k8s.delete_calls) == 1
 
 
 def test_terminate_closes_api_client(fake_k8s: _FakeK8sState) -> None:
