@@ -62,6 +62,7 @@ def _account_from_row(row: SqlProviderAccount) -> ProviderAccount:
         claude_config_dir=row.claude_config_dir,
         codex_config_dir=row.codex_config_dir,
         api_key_ref=row.api_key_ref,
+        oauth_token_ref=row.oauth_token_ref,
         is_active=row.is_active,
     )
 

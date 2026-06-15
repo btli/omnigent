@@ -44,9 +44,18 @@ def _nested_str(data: dict[str, object], outer: str, inner: str) -> str | None:
 def load_subscription_token(account: ProviderAccount) -> str | None:
     """Load the OAuth access token for a subscription *account*.
 
-    :returns: The bearer token read from the account's isolated config
-        dir, or ``None`` when absent/unreadable.
+    :returns: The bearer token — its ``oauth_token_ref`` (a headless
+        ``claude setup-token`` / Codex token) when set, else the token read
+        from the account's isolated config dir — or ``None`` when
+        absent/unreadable (incl. a non-subscription account).
     """
+    if not account.is_subscription:
+        return None
+    # A token-ref subscription authenticates by that token *only*: if it can't
+    # resolve, skip the probe — never fall back to the ambient ~/.claude /
+    # ~/.codex login, which belongs to a different account (mis-attribution).
+    if account.oauth_token_ref:
+        return resolve_account_oauth_token(account)
     if account.family == "anthropic":
         base = account.claude_config_dir or _DEFAULT_CLAUDE_DIR
         data = _read_json(Path(base) / ".credentials.json")
@@ -79,5 +88,31 @@ def resolve_account_api_key(account: ProviderAccount) -> str | None:
         return None
     try:
         return resolve_secret(account.api_key_ref)
-    except OmnigentError:
+    except (OmnigentError, OSError, ValueError, AttributeError, TypeError):
+        # Best-effort (module contract — never raise): an unresolved ref
+        # (OmnigentError), a corrupt keychain file/JSON (OSError/ValueError), or
+        # a malformed non-str ref (AttributeError/TypeError) all skip the
+        # credential rather than propagate.
+        return None
+
+
+def resolve_account_oauth_token(account: ProviderAccount) -> str | None:
+    """Resolve the headless OAuth token for a subscription *account*, or ``None``.
+
+    For a subscription that authenticates via a token reference
+    (:attr:`~...ProviderAccount.oauth_token_ref` — a ``claude setup-token``
+    OAuth token or a Codex access token) instead of an isolated config dir.
+
+    :returns: The resolved token, or ``None`` when the account has no
+        ``oauth_token_ref`` or the reference cannot be resolved.
+    """
+    if not account.oauth_token_ref:
+        return None
+    try:
+        return resolve_secret(account.oauth_token_ref)
+    except (OmnigentError, OSError, ValueError, AttributeError, TypeError):
+        # Best-effort (module contract — never raise): an unresolved ref
+        # (OmnigentError), a corrupt keychain file/JSON (OSError/ValueError), or
+        # a malformed non-str ref (AttributeError/TypeError) all skip the
+        # credential rather than propagate.
         return None

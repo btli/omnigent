@@ -995,6 +995,7 @@ async def _prepare_codex_terminal(
             ap_auth_headers=headers,
             config_source=codex_config_source,
             openai_api_key=_codex_account.api_key,
+            codex_access_token=_codex_account.access_token,
         )
         app_server.listen_url = codex_ws_url
         event_client: CodexAppServerClient | None = None

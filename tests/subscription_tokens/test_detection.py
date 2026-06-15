@@ -12,6 +12,9 @@ from omnigent.subscription_tokens.domain.value_objects.enums import AccountKind,
 from omnigent.subscription_tokens.infrastructure.detection.composite_usage_limit_gateway import (
     CompositeUsageLimitGateway,
 )
+from omnigent.subscription_tokens.infrastructure.detection.credentials import (
+    load_subscription_token,
+)
 from omnigent.subscription_tokens.infrastructure.detection.probes import (
     probe_anthropic,
     probe_openai,
@@ -184,6 +187,43 @@ async def test_probe_returns_none_on_network_error() -> None:
 
 
 # ── Poller ─────────────────────────────────────────────────
+
+
+def test_load_subscription_token_oauth_ref_unresolved_does_not_fall_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An oauth-only subscription whose token ref can't resolve must NOT fall back
+    # to the ambient ~/.claude login (a different account → mis-attribution).
+    monkeypatch.delenv("MISSING_OAUTH", raising=False)
+    account = ProviderAccount(
+        id="a",
+        name="sub",
+        family="anthropic",
+        kind="subscription",
+        priority=0,
+        oauth_token_ref="env:MISSING_OAUTH",
+    )
+    assert load_subscription_token(account) is None
+
+
+def test_load_subscription_token_oauth_ref_resolves(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PRESENT_OAUTH", "sk-ant-oat-xyz")
+    account = ProviderAccount(
+        id="a",
+        name="sub",
+        family="anthropic",
+        kind="subscription",
+        priority=0,
+        oauth_token_ref="env:PRESENT_OAUTH",
+    )
+    assert load_subscription_token(account) == "sk-ant-oat-xyz"
+
+
+def test_load_subscription_token_non_subscription_returns_none() -> None:
+    account = ProviderAccount(
+        id="a", name="key", family="anthropic", kind="api_key", priority=0, api_key_ref="env:K"
+    )
+    assert load_subscription_token(account) is None
 
 
 def _account(family: Family, kind: AccountKind) -> ProviderAccount:
