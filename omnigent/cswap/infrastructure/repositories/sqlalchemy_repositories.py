@@ -263,23 +263,24 @@ class SqlSessionCredentialRegistry(SessionCredentialRegistry):
         self._session = session_maker
 
     def bind(self, session_id: str, credential_id: str, family: str) -> None:
-        """Record (or rebind) the active account for *session_id*."""
-        now = now_epoch()
+        """Record (or rebind) the active account for *session_id*.
+
+        Atomic UPSERT (UPDATE, else SAVEPOINT INSERT retrying the UPDATE on a
+        concurrent-insert race) so two near-simultaneous first binds for the
+        same session can't raise an IntegrityError.
+        """
+        cls = SqlSessionCredentialBinding
+        values = {"credential_id": credential_id, "family": family, "bound_at": now_epoch()}
+        upd = update(cls).where(cls.session_id == session_id).values(**values)
         with self._session() as session:
-            row = session.get(SqlSessionCredentialBinding, session_id)
-            if row is None:
-                session.add(
-                    SqlSessionCredentialBinding(
-                        session_id=session_id,
-                        credential_id=credential_id,
-                        family=family,
-                        bound_at=now,
-                    )
-                )
-            else:
-                row.credential_id = credential_id
-                row.family = family
-                row.bound_at = now
+            if _rowcount(session.execute(upd)):
+                return
+            try:
+                with session.begin_nested():
+                    session.add(cls(session_id=session_id, **values))
+                    session.flush()
+            except IntegrityError:
+                session.execute(upd)
 
     def active_credential(self, session_id: str) -> str | None:
         """Return the active account id for *session_id*, or ``None``."""

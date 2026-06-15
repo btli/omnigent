@@ -72,3 +72,15 @@ def test_sync_deactivates_removed_accounts(session_maker: ManagedSessionMaker) -
         a = session.get(SqlProviderAccount, account_id_for("claude-pool", "a"))
         assert a is not None
         assert a.is_active is True
+
+
+def test_sync_deletes_pools_absent_from_config(session_maker: ManagedSessionMaker) -> None:
+    sync_pools(session_maker, load_pools(_config([{"name": "a", "claude_config_dir": "~/.a"}])))
+    # Re-sync under a different pool name: the old pool row must be removed so
+    # it can't keep winning family selection with no active members.
+    renamed = {"pools": {"new-pool": {"family": "anthropic", "members": [{"name": "a"}]}}}
+    result = sync_pools(session_maker, load_pools(renamed))
+    assert result.pools_deleted == 1
+    with session_maker() as session:
+        assert session.get(SqlCredentialPool, pool_id_for("claude-pool")) is None
+        assert session.get(SqlCredentialPool, pool_id_for("new-pool")) is not None

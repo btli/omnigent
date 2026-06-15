@@ -55,6 +55,9 @@ _lazy_attempted = False
 # run in a worker thread via asyncio.to_thread; multiple session forwarders
 # can race the first build).
 _init_lock = threading.Lock()
+# Serializes the track + newly-limited gate so concurrent reactive detections
+# for the same account don't double-fire failover.
+_failover_lock = threading.Lock()
 
 
 def activate(container: CswapContainer, pools: dict[str, CredentialPool]) -> None:
@@ -239,16 +242,24 @@ def _track_and_failover(
     session_id: str,
     family: Family,
 ) -> None:
-    """Persist *detection*; fire one-shot failover when newly limited."""
+    """Persist *detection*; fire one-shot failover when newly limited.
+
+    The track + newly-limited check is serialized so two concurrent reactive
+    detections (worker threads) for the SAME account can't both observe it as
+    available and double-fire failover. Limit events are rare, so contention
+    on this lock is negligible.
+    """
     detection = _with_recovery(detection, _cooldown_for(family))
-    result = container.track_usage_limit.execute(detection)
-    if result.was_newly_limited:
-        container.failover_on_limit.execute(
-            session_id=session_id,
-            exhausted_credential_id=detection.credential_id,
-            family=family,
-            now=detection.observed_at,
-        )
+    with _failover_lock:
+        result = container.track_usage_limit.execute(detection)
+        if not result.was_newly_limited:
+            return
+    container.failover_on_limit.execute(
+        session_id=session_id,
+        exhausted_credential_id=detection.credential_id,
+        family=family,
+        now=detection.observed_at,
+    )
 
 
 async def run_poll_sweep_once() -> int:
