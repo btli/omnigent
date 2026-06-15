@@ -55,9 +55,6 @@ _lazy_attempted = False
 # run in a worker thread via asyncio.to_thread; multiple session forwarders
 # can race the first build).
 _init_lock = threading.Lock()
-# Serializes the track + newly-limited gate so concurrent reactive detections
-# for the same account don't double-fire failover.
-_failover_lock = threading.Lock()
 
 
 def activate(container: CswapContainer, pools: dict[str, CredentialPool]) -> None:
@@ -120,7 +117,10 @@ def _ensure_container() -> CswapContainer | None:
             engine = get_or_create_engine(_resolve_db_uri())
             session_maker = make_managed_session_maker(engine)
             sync_pools(session_maker, pools)
-            built = build_container(session_maker)
+            built = build_container(
+                session_maker,
+                immediate_session_maker=make_managed_session_maker(engine, immediate=True),
+            )
             # Publish pools before the container so a concurrent reader never
             # observes a set container with empty pools (treated as inactive).
             _pools = pools
@@ -244,22 +244,19 @@ def _track_and_failover(
 ) -> None:
     """Persist *detection*; fire one-shot failover when newly limited.
 
-    The track + newly-limited check is serialized so two concurrent reactive
-    detections (worker threads) for the SAME account can't both observe it as
-    available and double-fire failover. Limit events are rare, so contention
-    on this lock is negligible.
+    ``track_usage_limit`` detects the off→on transition atomically (its
+    repository ``observe`` serializes the read+write, even across processes),
+    so two concurrent detections for the same account can't both fire.
     """
     detection = _with_recovery(detection, _cooldown_for(family))
-    with _failover_lock:
-        result = container.track_usage_limit.execute(detection)
-        if not result.was_newly_limited:
-            return
-    container.failover_on_limit.execute(
-        session_id=session_id,
-        exhausted_credential_id=detection.credential_id,
-        family=family,
-        now=detection.observed_at,
-    )
+    result = container.track_usage_limit.execute(detection)
+    if result.was_newly_limited:
+        container.failover_on_limit.execute(
+            session_id=session_id,
+            exhausted_credential_id=detection.credential_id,
+            family=family,
+            now=detection.observed_at,
+        )
 
 
 async def run_poll_sweep_once() -> int:

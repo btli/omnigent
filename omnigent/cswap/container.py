@@ -57,18 +57,23 @@ class CswapContainer:
 def build_container(
     session_maker: ManagedSessionMaker,
     *,
+    immediate_session_maker: ManagedSessionMaker | None = None,
     notifier: FailoverNotifier | None = None,
     gateway: UsageLimitGateway | None = None,
 ) -> CswapContainer:
     """Build a :class:`CswapContainer` over *session_maker*.
 
     :param session_maker: Managed session factory bound to the omnigent DB.
+    :param immediate_session_maker: A ``BEGIN IMMEDIATE`` factory used for the
+        atomic newly-limited transition (see
+        :meth:`~omnigent.cswap.application.ports.ports.UsageLimitStateRepository.observe`).
+        Defaults to *session_maker*.
     :param notifier: Failover notifier; defaults to a logging notifier.
     :param gateway: Usage-limit gateway; defaults to the composite poller.
     :returns: A fully-wired container.
     """
     pool_repo = SqlCredentialPoolRepository(session_maker)
-    state_repo = SqlUsageLimitStateRepository(session_maker)
+    state_repo = SqlUsageLimitStateRepository(session_maker, immediate_session_maker)
     registry = SqlSessionCredentialRegistry(session_maker)
     cost_sink = SqlCostAttributionSink(session_maker)
     selection_policy = PriorityCredentialSelectionPolicy(pool_repo, state_repo)

@@ -46,6 +46,13 @@ class FakeStateRepo(UsageLimitStateRepository):
         self.states[state.credential_id] = state
         return True
 
+    def observe(self, state: LimitState, *, enforce_staleness: bool = True) -> tuple[bool, bool]:
+        prior = self.states.get(state.credential_id)
+        now = state.last_checked_at if state.last_checked_at is not None else 0
+        was_available = prior is None or prior.is_available_now(now)
+        wrote = self.upsert(state, enforce_staleness=enforce_staleness)
+        return wrote, was_available
+
 
 class FakePoolRepo(CredentialPoolRepository):
     def __init__(self, pool: CredentialPool) -> None:
