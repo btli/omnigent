@@ -45,6 +45,7 @@ from omnigent.server.performance_metrics import (
 )
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
+from omnigent.server.routes.cswap import create_cswap_router
 from omnigent.server.routes.default_policies import create_default_policies_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
@@ -972,9 +973,25 @@ def create_app(
                 otel_publisher=server_metrics_otel,
             )
         )
+
+        # Multi-subscription (cswap): sync the config `pools:` block into the
+        # DB and start the proactive usage-limit poll loop. Best-effort — a
+        # failure here must never block server startup. Inert when no pool is
+        # configured; polling only runs when OMNIGENT_CSWAP_POLL_ENABLED is set.
+        from omnigent.cswap import integration as cswap_integration
+
+        try:
+            cswap_integration.is_active()  # triggers lazy config→DB sync
+        except Exception:
+            _logger.exception("cswap: startup sync failed; multi-subscription disabled")
+        cswap_poll_task = asyncio.create_task(cswap_integration.poll_loop())
+
         try:
             yield
         finally:
+            cswap_poll_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await cswap_poll_task
             metrics_publish_task.cancel()
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task
@@ -1533,6 +1550,14 @@ def create_app(
         create_policy_registry_router(auth_provider=auth_provider),
         prefix="/v1",
         tags=["policy_registry"],
+    )
+    app.include_router(
+        create_cswap_router(
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+        tags=["cswap"],
     )
 
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───

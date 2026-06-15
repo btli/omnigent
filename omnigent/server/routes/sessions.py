@@ -2742,6 +2742,17 @@ def _accumulate_session_usage(
     conversation_store.set_session_usage(session_id, current)
     # Per-user daily rollup (policy-gated; this is the per-turn delta).
     _record_daily_cost(conv, cost_delta, conversation_store)
+    # Per-account rollup for multi-subscription (cswap): attributes this
+    # turn's cost to the account the session is bound to. No-op (safe) when
+    # no pool is configured or the session has no binding.
+    from omnigent.cswap import integration as _cswap
+
+    _cswap.attribute_cost(
+        session_id,
+        cost_usd=cost_delta,
+        input_tokens=int(input_tokens),
+        output_tokens=int(output_tokens),
+    )
     return _priced_cost_for_display(current)
 
 

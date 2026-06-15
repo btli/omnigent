@@ -2463,6 +2463,21 @@ async def _auto_create_claude_terminal(
     # and ``parent_os_env`` below, launch_terminal falls back to
     # _default_sandbox_for_platform (linux_bwrap), overriding the YAML config.
     agent_os_env = _agent_os_env_from_spec(agent_spec)
+    # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL etc.) when
+    # derived. Empty provider config still forces ENABLE_TOOL_SEARCH=true so
+    # MCP schemas are loaded on demand.
+    terminal_env = build_native_claude_terminal_env(claude_config)
+    # Multi-subscription (cswap) rotation: only on the subscription / own-login
+    # path (claude_config is None). Selects a pool account for the anthropic
+    # family and points the CLI at its isolated CLAUDE_CONFIG_DIR (or injects
+    # a tier-fallback ANTHROPIC_API_KEY). No-op when no `pools:` is configured.
+    if claude_config is None:
+        from omnigent.cswap import integration as _cswap
+
+        terminal_env.update(
+            _cswap.select_launch_env_for_family("anthropic", session_id=session_id)
+        )
+
     env_spec = TerminalEnvSpec(
         os_env=OSEnvSpec(
             type="caller_process",
@@ -2471,10 +2486,7 @@ async def _auto_create_claude_terminal(
         ),
         command="claude",
         args=list(claude_args),
-        # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
-        # etc.) when derived. Empty provider config still forces
-        # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
-        env=build_native_claude_terminal_env(claude_config),
+        env=terminal_env,
         # Strip the ambient Databricks-SDK profile selection from
         # the Claude tmux env. Claude's MCP servers inherit this env,
         # and several construct ``WorkspaceClient`` without pinning
