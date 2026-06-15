@@ -436,11 +436,27 @@ class _CreateCall:
 
 @dataclass
 class _ExecCall:
-    """One recorded exec invocation."""
+    """
+    One recorded exec invocation.
 
+    Records the full call so a test can assert the launcher keeps using
+    streaming mode with the right channels (a tautology-proof check: the
+    test must fail if production drops ``_preload_content=False`` or the
+    ``bash -lc`` wrapper).
+
+    :param api_method: The bound API method passed to ``stream`` (must be
+        ``connect_get_namespaced_pod_exec``).
+    :param pod: Positional pod name.
+    :param namespace: Positional namespace.
+    :param command: The ``command`` kwarg.
+    :param kwargs: Every keyword argument ``stream`` received.
+    """
+
+    api_method: object
     pod: str
     namespace: str
     command: list[str]
+    kwargs: dict[str, object]
 
 
 class _FakeWSClient:
@@ -448,19 +464,23 @@ class _FakeWSClient:
     Canned stand-in for the exec ``WSClient``.
 
     Serves one frame of channel data per ``is_open()``/``update`` cycle,
-    then closes — mirroring the real read loop the launcher drives.
+    then closes — mirroring the real read loop the launcher drives. In
+    ``stuck`` mode it stays open forever and delivers nothing, modelling a
+    wedged stream the read-loop safeguard must abandon.
 
     :param channels: Per-channel text the stream delivers (channel id →
         text), e.g. ``{1: "out", 3: status_frame}``.
+    :param stuck: When True, never close and never deliver a frame.
     """
 
-    def __init__(self, channels: dict[int, str]) -> None:
+    def __init__(self, channels: dict[int, str], *, stuck: bool = False) -> None:
         self._pending = dict(channels)
         self._open = True
+        self._stuck = stuck
         self.closed = False
 
     def is_open(self) -> bool:
-        """Open until every channel has been read out."""
+        """Open until every channel has been read out (or forever if stuck)."""
         return self._open
 
     def update(self, timeout: float = 0) -> None:
@@ -470,6 +490,8 @@ class _FakeWSClient:
     def read_channel(self, channel: int, timeout: float = 0) -> str:
         """Pop a channel's buffered text, then close once all drained."""
         del timeout
+        if self._stuck:
+            return ""
         data = self._pending.pop(channel, "")
         if not self._pending:
             self._open = False
@@ -552,8 +574,15 @@ class _FakeK8sState:
         front-first) before succeeding.
     :param delete_raises: Exceptions successive deletes raise.
     :param exec_channels: Per-channel text the next exec stream serves.
-    :param exec_raises: Exception ``stream`` raises instead of returning
-        a WSClient (models a pod-deleted-mid-run ApiException).
+    :param exec_raises: Exception ``stream`` raises on EVERY open attempt
+        instead of returning a WSClient (models a permanent failure, e.g.
+        a pod deleted for good or a forbidden exec).
+    :param exec_open_raises: Exceptions ``stream`` raises on successive
+        open attempts (popped front-first); once empty, the open
+        succeeds. Models the transient first-exec race + retry.
+    :param exec_stuck: When True, the WSClient stays open forever and
+        never delivers a frame (models a wedged exec the read-loop
+        safeguard must abandon).
     :param ws_clients: Every WSClient ``stream`` handed back (for the
         websocket-close assertion).
     :param incluster_raises: Whether ``load_incluster_config`` raises the
@@ -580,6 +609,8 @@ class _FakeK8sState:
     delete_raises: list[Exception] = field(default_factory=list)
     exec_channels: dict[int, str] = field(default_factory=dict)
     exec_raises: Exception | None = None
+    exec_open_raises: list[Exception] = field(default_factory=list)
+    exec_stuck: bool = False
     ws_clients: list[_FakeWSClient] = field(default_factory=list)
     incluster_raises: bool = False
     kubeconfig_raises: bool = False
@@ -640,15 +671,24 @@ def _install_fake_kubernetes(
             raise _FakeConfigException("no kubeconfig")
 
     def _stream(api_method: object, *args: object, **kwargs: object) -> _FakeWSClient:
-        del api_method
+        if state.exec_open_raises:
+            raise state.exec_open_raises.pop(0)
         if state.exec_raises is not None:
             raise state.exec_raises
         pod = str(args[0])
         namespace = str(args[1])
         command = kwargs["command"]
         assert isinstance(command, list)
-        state.exec_calls.append(_ExecCall(pod=pod, namespace=namespace, command=list(command)))
-        ws = _FakeWSClient(state.exec_channels)
+        state.exec_calls.append(
+            _ExecCall(
+                api_method=api_method,
+                pod=pod,
+                namespace=namespace,
+                command=list(command),
+                kwargs=dict(kwargs),
+            )
+        )
+        ws = _FakeWSClient(state.exec_channels, stuck=state.exec_stuck)
         state.ws_clients.append(ws)
         return ws
 
@@ -972,18 +1012,76 @@ def test_provision_env_passthrough_missing_var_fails_loud(
     assert fake_k8s.create_calls == []
 
 
-def test_provision_regenerates_name_on_conflict(fake_k8s: _FakeK8sState) -> None:
+@pytest.mark.parametrize("reserved", ["HOME", "IS_SANDBOX"])
+def test_provision_env_passthrough_rejects_reserved_names(
+    fake_k8s: _FakeK8sState, monkeypatch: pytest.MonkeyPatch, reserved: str
+) -> None:
+    """
+    A passthrough that names HOME / IS_SANDBOX is rejected loud: letting
+    it through would emit a duplicate env entry that could shadow the
+    writable-HOME emptyDir and break the host's `mkdir -p $HOME/workspace`.
+    Nothing is created.
+    """
+    # Even if the operator has the var set in the server env, it's still
+    # rejected — the reason is the collision, not a missing value.
+    monkeypatch.setenv(reserved, "/somewhere")
+
+    with pytest.raises(click.ClickException, match=f"'{reserved}'.*reserved"):
+        KubernetesSandboxLauncher(env=[reserved]).provision("a")
+    assert fake_k8s.create_calls == []
+
+
+def test_manifest_fixed_env_is_not_duplicated_by_passthrough() -> None:
+    """
+    The writable-HOME guarantee: even constructed directly, HOME appears
+    exactly once (the reserved-name guard lives in the launcher, but the
+    manifest builder must not itself double up the fixed entries).
+    """
+    manifest = build_pod_manifest(
+        pod_name="omnigent-x-1",
+        namespace="omnigent",
+        image="img",
+        service_account="sa",
+        harness_secret=None,
+        env_literals={"OMNIGENT_GATEWAY_URL": "https://gw"},
+        node_selector=None,
+    )
+    env = _container(manifest)["env"]
+    assert isinstance(env, list)
+    home_entries = [e for e in env if isinstance(e, dict) and e.get("name") == "HOME"]
+    assert home_entries == [{"name": "HOME", "value": "/home/omnigent"}]
+
+
+def test_provision_regenerates_name_on_conflict(
+    fake_k8s: _FakeK8sState, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """
     A 409 name collision (two launches raced the same slug) is recovered
-    once with a fresh suffix, rather than failing the whole launch.
+    by retrying with a FRESH name — not the same one (which would just
+    409 again).
+
+    ``_new_pod_name`` is pinned to a deterministic two-name sequence so
+    the test can assert the retry's create used the SECOND name; this
+    fails if production were to retry with the original name.
     """
+    names = iter(["omnigent-a-firstx", "omnigent-a-second"])
+    monkeypatch.setattr(
+        "omnigent.onboarding.sandboxes.kubernetes._new_pod_name",
+        lambda _label: next(names),
+    )
     fake_k8s.create_raises = [_FakeApiException(status=409, reason="AlreadyExists")]
 
     pod_name = KubernetesSandboxLauncher().provision("a")
 
-    # First create conflicted; the retry created the (different) Pod.
-    assert len(fake_k8s.create_calls) == 1
-    assert pod_name in fake_k8s.pods
+    # The first create (with the first name) 409'd and recorded nothing;
+    # the retry created the pod under the SECOND, regenerated name.
+    assert pod_name == "omnigent-a-second"
+    [create] = fake_k8s.create_calls
+    metadata = create.manifest["metadata"]
+    assert isinstance(metadata, dict)
+    assert metadata["name"] == "omnigent-a-second"
+    assert "omnigent-a-second" in fake_k8s.pods
+    assert "omnigent-a-firstx" not in fake_k8s.pods
 
 
 def test_provision_wraps_api_errors_with_reason_and_rbac_hint(
@@ -1020,6 +1118,10 @@ def test_run_execs_bash_lc_and_parses_returncode(fake_k8s: _FakeK8sState) -> Non
     ``run`` execs via ``bash -lc`` (codex S5, for the login-shell venv
     PATH) and returns the exit code parsed from the STATUS frame plus the
     captured streams.
+
+    The exec call's full shape is asserted so the test fails if production
+    drops streaming mode (``_preload_content=False``) or the bash -lc
+    wrapper — i.e. it is not satisfiable by a degenerate implementation.
     """
     launcher, pod_name = _provisioned(fake_k8s)
     fake_k8s.exec_channels = {
@@ -1033,6 +1135,18 @@ def test_run_execs_bash_lc_and_parses_returncode(fake_k8s: _FakeK8sState) -> Non
     [call] = fake_k8s.exec_calls
     assert call.command == ["bash", "-lc", "echo hi"]
     assert call.pod == pod_name
+    assert call.namespace == "omnigent"
+    # The bound API method must be the pod-exec connector (not, say, a
+    # non-streaming read) — addressed by name on the fake CoreV1Api.
+    assert getattr(call.api_method, "__name__", None) == "connect_get_namespaced_pod_exec"
+    # Streaming mode + channel flags: dropping any of these would break
+    # the channel-by-channel STATUS-frame exit-code parsing.
+    assert call.kwargs["_preload_content"] is False
+    assert call.kwargs["tty"] is False
+    assert call.kwargs["stdin"] is False
+    assert call.kwargs["stdout"] is True
+    assert call.kwargs["stderr"] is True
+    assert call.kwargs["command"] == ["bash", "-lc", "echo hi"]
     assert result.returncode == 0
     assert result.stdout == "remote-out\n"
     assert result.stderr == "remote-err\n"
@@ -1106,6 +1220,113 @@ def test_run_raises_when_status_frame_missing(fake_k8s: _FakeK8sState) -> None:
         launcher.run(pod_name, "true")
 
 
+def test_run_retries_transient_container_not_found(
+    fake_k8s: _FakeK8sState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The first ``pods/exec`` can race container-readiness and 404 with
+    "container not found" (codex S2). ``run`` must retry on a short loop
+    and succeed once the container is exec-ready, rather than failing the
+    whole launch.
+    """
+    monkeypatch.setattr("omnigent.onboarding.sandboxes.kubernetes.time.sleep", lambda _s: None)
+    launcher, pod_name = _provisioned(fake_k8s)
+    # First two opens hit the transient race; the third succeeds.
+    fake_k8s.exec_open_raises = [
+        _FakeApiException(status=404, reason="Not Found", body="container not found in pod"),
+        _FakeApiException(status=404, reason="Not Found", body="container is waiting to start"),
+    ]
+    fake_k8s.exec_channels = {1: "ok\n", 3: '{"metadata":{},"status":"Success"}'}
+
+    result = launcher.run(pod_name, "echo hi")
+
+    assert result.returncode == 0
+    assert result.stdout == "ok\n"
+    # Exactly one real exec ran (the two transient opens raised before
+    # recording a call); the open was retried, not the command.
+    assert len(fake_k8s.exec_calls) == 1
+
+
+def test_run_exhausts_transient_retries_then_fails(
+    fake_k8s: _FakeK8sState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A transient exec error that never clears within the retry window
+    surfaces a clear failure (naming the attempts), not an infinite hang.
+    """
+    monkeypatch.setattr("omnigent.onboarding.sandboxes.kubernetes.time.sleep", lambda _s: None)
+    launcher, pod_name = _provisioned(fake_k8s)
+    # Always raise the transient error — more than the retry budget.
+    fake_k8s.exec_open_raises = [
+        _FakeApiException(status=404, reason="Not Found", body="container not found")
+        for _ in range(10)
+    ]
+
+    with pytest.raises(click.ClickException, match="not exec-ready"):
+        launcher.run(pod_name, "echo hi")
+
+
+def test_run_does_not_retry_permanent_exec_error(
+    fake_k8s: _FakeK8sState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A permanent exec failure (e.g. 403 Forbidden) must surface
+    immediately with the RBAC hint — retrying it would only delay a
+    clear, actionable error.
+    """
+    sleeps: list[float] = []
+    monkeypatch.setattr("omnigent.onboarding.sandboxes.kubernetes.time.sleep", sleeps.append)
+    launcher, pod_name = _provisioned(fake_k8s)
+    fake_k8s.exec_raises = _FakeApiException(
+        status=403, reason="Forbidden", body="pods/exec is forbidden"
+    )
+
+    with pytest.raises(click.ClickException, match=r"rbac\.yaml"):
+        launcher.run(pod_name, "echo hi")
+    # No backoff sleeps — a permanent error is not retried.
+    assert sleeps == []
+
+
+def test_run_abandons_wedged_stream_with_output(
+    fake_k8s: _FakeK8sState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A websocket that stays open but never delivers a STATUS frame must be
+    abandoned by the read-loop safeguard (rather than looping forever),
+    and the failure must include any buffered output.
+
+    The idle guard is driven by a fake monotonic clock that jumps past
+    the idle window, so the test is instant and does not depend on the
+    (generous, production) real timeout — proving the guard fires without
+    risking a cut-off of legitimately long commands.
+    """
+    from omnigent.onboarding.sandboxes import kubernetes as k8s_mod
+
+    launcher, pod_name = _provisioned(fake_k8s)
+    fake_k8s.exec_stuck = True
+
+    # A monotonic clock that advances by more than the production idle
+    # window on every call — so the guard trips within a couple of loop
+    # iterations regardless of the (generous) real constant's value. Read
+    # from the module constant so this can't silently drift if the window
+    # is retuned.
+    step = k8s_mod._EXEC_IDLE_TIMEOUT_S + 1.0
+    counter = {"n": 0.0}
+
+    def _fake_monotonic() -> float:
+        value = counter["n"]
+        counter["n"] += step
+        return value
+
+    monkeypatch.setattr("omnigent.onboarding.sandboxes.kubernetes.time.monotonic", _fake_monotonic)
+
+    with pytest.raises(click.ClickException, match="no output"):
+        launcher.run(pod_name, "sleep 999999")
+    # The wedged stream was still closed (no leaked connection).
+    [ws] = fake_k8s.ws_clients
+    assert ws.closed is True
+
+
 # ── terminate ───────────────────────────────────────────────
 
 
@@ -1137,6 +1358,95 @@ def test_terminate_wraps_non_404_errors(fake_k8s: _FakeK8sState) -> None:
 
     with pytest.raises(click.ClickException, match="ServerError"):
         launcher.terminate("omnigent-x-1")
+
+
+# ── real-client contract ────────────────────────────────────
+
+
+def test_real_kubernetes_client_exposes_expected_exec_api() -> None:
+    """
+    Lock the real ``kubernetes`` client's exec API against the exact
+    symbols + channel constants the launcher depends on.
+
+    Every fake-SDK test above stubs this surface, so a future
+    kubernetes-client bump could silently move/rename it and the fakes
+    would keep passing while production broke. This test imports the REAL
+    package (skipped only if it isn't installed) and asserts the contract,
+    so such a break fails CI loudly. The package is in the ``kubernetes``
+    extra, installed in this venv — so this runs, it does not skip.
+    """
+    pytest.importorskip("kubernetes")
+
+    # Exec channel constants the launcher reads stdout/stderr/STATUS from.
+    from kubernetes.stream.ws_client import (
+        ERROR_CHANNEL,
+        STDERR_CHANNEL,
+        STDOUT_CHANNEL,
+        WSClient,
+    )
+
+    assert STDOUT_CHANNEL == 1
+    assert STDERR_CHANNEL == 2
+    assert ERROR_CHANNEL == 3
+
+    # The WSClient surface the run() read loop drives.
+    for method in ("read_channel", "update", "is_open", "close"):
+        assert callable(getattr(WSClient, method)), method
+    # returncode is the property the launcher deliberately does NOT trust
+    # (it parses the STATUS frame instead) — but its presence is part of
+    # the contract we reason about, so assert it exists.
+    assert isinstance(WSClient.returncode, property)
+
+    # The streaming entry point + the exec method it wraps.
+    from kubernetes.stream import stream
+
+    assert callable(stream)
+    from kubernetes.client import CoreV1Api
+
+    assert callable(CoreV1Api.connect_get_namespaced_pod_exec)
+
+    # The exception + config-exception types the launcher catches.
+    from kubernetes.client.rest import ApiException
+
+    assert issubclass(ApiException, Exception)
+    from kubernetes.config.config_exception import ConfigException
+
+    assert issubclass(ConfigException, Exception)
+
+    # The config-loading + isolated-Configuration surface (codex S3).
+    from kubernetes import config
+
+    assert callable(config.load_incluster_config)
+    assert callable(config.load_kube_config)
+    from kubernetes.client import ApiClient, Configuration
+
+    assert callable(Configuration)
+    assert callable(ApiClient)
+
+
+def test_real_wsclient_satisfies_exec_stream_protocol() -> None:
+    """
+    The real ``WSClient`` must structurally satisfy the launcher's
+    internal ``_ExecStream`` Protocol — the typed seam ``_open_exec_stream``
+    returns. If upstream renames a method, this fails (the Protocol is
+    runtime-checkable here only for the assertion).
+    """
+    pytest.importorskip("kubernetes")
+    from typing import Protocol, runtime_checkable
+
+    from kubernetes.stream.ws_client import WSClient
+
+    @runtime_checkable
+    class _ExecStreamRuntime(Protocol):
+        def is_open(self) -> bool: ...
+        def update(self, timeout: float = ...) -> None: ...
+        def read_channel(self, channel: int, timeout: float = ...) -> str: ...
+        def close(self, **kwargs: object) -> None: ...
+
+    # issubclass against a runtime_checkable Protocol checks method
+    # presence — exactly the structural contract _open_exec_stream relies
+    # on.
+    assert issubclass(WSClient, _ExecStreamRuntime)
 
 
 # ── registration ────────────────────────────────────────────

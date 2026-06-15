@@ -68,7 +68,30 @@ from omnigent.onboarding.sandboxes.base import (
 )
 
 if TYPE_CHECKING:
+    from typing import Protocol
+
     from kubernetes import client as k8s_client
+
+    class _ExecStream(Protocol):
+        """
+        The subset of ``kubernetes.stream.ws_client.WSClient`` that
+        :meth:`KubernetesSandboxLauncher.run` drives.
+
+        Declared as a Protocol because the client is a lazy optional
+        import (so the real ``WSClient`` type is unavailable at module
+        load and would only be ``Any`` under the ignore-missing-imports
+        override). The real-client smoke test asserts the actual
+        ``WSClient`` satisfies this exact surface, so the Protocol can't
+        silently drift from the upstream API.
+        """
+
+        def is_open(self) -> bool: ...
+
+        def update(self, timeout: float = ...) -> None: ...
+
+        def read_channel(self, channel: int, timeout: float = ...) -> str: ...
+
+        def close(self, **kwargs: object) -> None: ...
 
 
 # ── Constants ──────────────────────────────────────────
@@ -155,6 +178,50 @@ _FATAL_WAITING_REASONS: frozenset[str] = frozenset(
         "CreateContainerConfigError",
     }
 )
+
+# Reserved env names the Pod sets itself (writable-HOME contract + sandbox
+# marker). A sandbox env passthrough that names one is an operator error:
+# letting it through would emit a duplicate ``env`` entry and the kubelet's
+# precedence is order-dependent, so a user-supplied HOME could shadow the
+# emptyDir mount and break the writable-HOME guarantee. Rejected loud in
+# :meth:`KubernetesSandboxLauncher._resolve_sandbox_env`.
+_RESERVED_ENV_NAMES: frozenset[str] = frozenset({"HOME", "IS_SANDBOX"})
+
+# Transient first-exec race (codex S2): a Pod can report container-ready a
+# beat before the kubelet's exec endpoint can attach, so the first
+# ``pods/exec`` may briefly 404 / "container not found". Retry on a short
+# bounded loop before giving up; a genuinely deleted Pod still surfaces
+# after the window.
+_EXEC_NOT_READY_RETRIES: int = 5
+_EXEC_NOT_READY_BACKOFF_S: float = 1.0
+
+# Substrings (matched case-insensitively against an ApiException's reason +
+# body) that mark the transient "container not ready for exec yet" race —
+# as opposed to a permanent failure (forbidden, deleted-for-good, …).
+_EXEC_TRANSIENT_MARKERS: tuple[str, ...] = (
+    "container not found",
+    "container not running",
+    "is waiting to start",
+    "podinitializing",
+    "containercreating",
+    "unable to upgrade connection",
+)
+
+# Exec read-loop safeguards against a websocket wedged open forever (it
+# never delivers a STATUS frame). Both windows are deliberately GENEROUS —
+# they are escape hatches, not deadlines, and MUST NOT fire for normal
+# work. A legitimate ``git clone`` / ``pip``/``npm`` install of a large
+# repo can take many minutes AND have multi-minute silent stretches (a
+# single large object download, dependency resolution), so:
+#   * the overall cap bounds total runtime at a generous ceiling, and
+#   * the idle cap (no stdout/stderr/STATUS at all for this long) is set
+#     well above any plausible quiet stretch of a real command, so only a
+#     genuinely stuck stream — silent indefinitely — trips it.
+_EXEC_OVERALL_TIMEOUT_S: float = 30 * 60.0
+_EXEC_IDLE_TIMEOUT_S: float = 10 * 60.0
+# Per-frame websocket poll. One second keeps the loop responsive to the
+# idle/overall guards without busy-spinning.
+_EXEC_POLL_S: float = 1.0
 
 # PID-1 reaper run as the Pod's entrypoint (codex M3). It spawns
 # ``sleep infinity`` as a child, forwards SIGTERM/SIGINT to it for prompt
@@ -583,7 +650,8 @@ class KubernetesSandboxLauncher(SandboxLauncher):
 
         :returns: Name → value mapping for literal Pod ``env``.
         :raises click.ClickException: When a configured name is not set
-            in the server process environment.
+            in the server process environment, or names a reserved
+            variable (:data:`_RESERVED_ENV_NAMES`) the Pod sets itself.
         """
         if self._env_names is not None:
             names: Sequence[str] = self._env_names
@@ -595,6 +663,17 @@ class KubernetesSandboxLauncher(SandboxLauncher):
             ]
         resolved: dict[str, str] = {}
         for name in names:
+            if name in _RESERVED_ENV_NAMES:
+                # Passing HOME/IS_SANDBOX would emit a duplicate env entry
+                # and could shadow the writable-HOME emptyDir — reject it
+                # as an operator error rather than silently undermining the
+                # contract.
+                raise click.ClickException(
+                    f"sandbox env passthrough names '{name}', which is reserved "
+                    "by the kubernetes sandbox (the launcher sets it on every "
+                    f"pod) — remove it from sandbox.kubernetes.env / "
+                    f"{SANDBOX_ENV_PASSTHROUGH_ENV_VAR}."
+                )
             value = os.environ.get(name)
             if value is None:
                 raise click.ClickException(
@@ -787,7 +866,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
     def run(self, sandbox_id: str, command: str, *, check: bool = True) -> RemoteCommandResult:
         """
         Run a shell command in the Pod via ``pods/exec`` and capture its
-        output (codex M1, S5).
+        output (codex M1, S2, S5).
 
         The command runs under ``["bash", "-lc", command]`` so the
         image's login-shell venv activation puts ``omnigent`` on PATH
@@ -797,68 +876,89 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         :func:`_parse_exec_status` (``WSClient.returncode`` is
         unreliable).
 
+        Opening the exec stream is retried on the transient first-exec
+        race (the container reports ready a beat before the kubelet's exec
+        endpoint can attach — codex S2); a genuinely missing Pod surfaces
+        after the retry window.
+
         :param sandbox_id: Target Pod name.
         :param command: Shell command to execute remotely.
         :param check: When ``True``, raise on non-zero exit.
         :returns: Exit code plus captured stdout/stderr.
         :raises click.ClickException: If the exec transport fails, the
-            status frame is unusable, or *check* is ``True`` and the
-            command exits non-zero.
+            stream wedges open without resolving, the status frame is
+            unusable, or *check* is ``True`` and the command exits
+            non-zero.
         """
         _ensure_sdk()
-        from kubernetes.client.rest import ApiException
-        from kubernetes.stream import stream
         from kubernetes.stream.ws_client import (
             ERROR_CHANNEL,
             STDERR_CHANNEL,
             STDOUT_CHANNEL,
         )
 
-        namespace = self._resolve_namespace()
-        core = self._load_core()
+        ws = self._open_exec_stream(sandbox_id, command)
         stdout_chunks: list[str] = []
         stderr_chunks: list[str] = []
         error_chunks: list[str] = []
 
-        def _drain() -> None:
+        def _drain() -> bool:
+            """Drain buffered channels; return True if any data arrived."""
+            progressed = False
             out = ws.read_channel(STDOUT_CHANNEL)
             if out:
                 stdout_chunks.append(out)
                 click.echo(out, nl=False)
+                progressed = True
             err = ws.read_channel(STDERR_CHANNEL)
             if err:
                 stderr_chunks.append(err)
                 click.echo(err, nl=False, err=True)
+                progressed = True
             status = ws.read_channel(ERROR_CHANNEL)
             if status:
                 error_chunks.append(status)
+                progressed = True
+            return progressed
 
+        start = time.monotonic()
+        last_progress = start
         try:
-            ws = stream(
-                core.connect_get_namespaced_pod_exec,
-                sandbox_id,
-                namespace,
-                command=["bash", "-lc", command],
-                stderr=True,
-                stdin=False,
-                stdout=True,
-                tty=False,
-                _preload_content=False,
-            )
-            try:
-                while ws.is_open():
-                    ws.update(timeout=1)
-                    _drain()
-                # Drain any frames buffered between the last update and
-                # the socket close.
-                _drain()
-            finally:
-                ws.close()
-        except ApiException as exc:
-            # The Pod may have been deleted mid-run (a racing terminate),
-            # or pods/exec may be forbidden — surface the API reason
-            # through the launcher contract, not a raw client traceback.
-            raise click.ClickException(_format_api_error("exec in pod", sandbox_id, exc)) from exc
+            while ws.is_open():
+                ws.update(timeout=_EXEC_POLL_S)
+                now = time.monotonic()
+                if _drain():
+                    last_progress = now
+                # Safeguards against a websocket wedged open forever (it
+                # never delivers a STATUS frame). Both windows are
+                # generous so a legitimately long clone/install — which
+                # streams output, refreshing last_progress — is never cut
+                # off; these only catch a truly stuck stream.
+                if now - last_progress > _EXEC_IDLE_TIMEOUT_S:
+                    raise click.ClickException(
+                        self._exec_stuck_message(
+                            sandbox_id,
+                            command,
+                            f"produced no output for {_EXEC_IDLE_TIMEOUT_S:.0f}s",
+                            stdout_chunks,
+                            stderr_chunks,
+                        )
+                    )
+                if now - start > _EXEC_OVERALL_TIMEOUT_S:
+                    raise click.ClickException(
+                        self._exec_stuck_message(
+                            sandbox_id,
+                            command,
+                            f"did not complete within {_EXEC_OVERALL_TIMEOUT_S:.0f}s",
+                            stdout_chunks,
+                            stderr_chunks,
+                        )
+                    )
+            # Drain any frames buffered between the last update and the
+            # socket close.
+            _drain()
+        finally:
+            ws.close()
 
         try:
             returncode = _parse_exec_status(error_chunks, sandbox_id)
@@ -872,6 +972,94 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                 f"Remote command failed on pod '{sandbox_id}' (exit {returncode}): {command}"
             )
         return RemoteCommandResult(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def _open_exec_stream(self, sandbox_id: str, command: str) -> _ExecStream:
+        """
+        Open the ``pods/exec`` websocket, retrying the transient
+        first-exec race (codex S2).
+
+        A Pod can report its container ready a beat before the kubelet's
+        exec endpoint can attach, so the first ``connect_get_namespaced_
+        pod_exec`` may briefly fail with a "container not found" /
+        "ContainerCreating" style :class:`ApiException`. Those are
+        retried on a short bounded loop
+        (:data:`_EXEC_NOT_READY_RETRIES` × :data:`_EXEC_NOT_READY_BACKOFF_S`);
+        a permanent failure (forbidden, Pod deleted for good) is raised
+        immediately, and a transient one that outlives the window is
+        raised after it.
+
+        :param sandbox_id: Target Pod name.
+        :param command: Shell command to execute remotely.
+        :returns: The opened ``WSClient`` (``_preload_content=False``).
+        :raises click.ClickException: When the stream cannot be opened.
+        """
+        from kubernetes.client.rest import ApiException
+        from kubernetes.stream import stream
+
+        namespace = self._resolve_namespace()
+        core = self._load_core()
+        last_exc: ApiException | None = None
+        for attempt in range(_EXEC_NOT_READY_RETRIES):
+            try:
+                # Bound to the Protocol-typed local so the Any from the
+                # lazy client import doesn't leak out as the return type.
+                ws: _ExecStream = stream(
+                    core.connect_get_namespaced_pod_exec,
+                    sandbox_id,
+                    namespace,
+                    command=["bash", "-lc", command],
+                    stderr=True,
+                    stdin=False,
+                    stdout=True,
+                    tty=False,
+                    _preload_content=False,
+                )
+                return ws
+            except ApiException as exc:
+                # The Pod may have been deleted mid-run (a racing
+                # terminate), pods/exec may be forbidden, or the container
+                # may just not be exec-ready yet. Only the last case is
+                # retryable; surface the rest immediately.
+                if not _is_transient_exec_error(exc):
+                    raise click.ClickException(
+                        _format_api_error("exec in pod", sandbox_id, exc)
+                    ) from exc
+                last_exc = exc
+                if attempt < _EXEC_NOT_READY_RETRIES - 1:
+                    time.sleep(_EXEC_NOT_READY_BACKOFF_S)
+        # Exhausted the retries on a transient error — the container never
+        # became exec-ready in the window. (last_exc is set: the loop only
+        # falls through here after a transient ApiException each pass.)
+        assert last_exc is not None
+        raise click.ClickException(
+            _format_api_error("exec in pod", sandbox_id, last_exc)
+            + f" (container not exec-ready after {_EXEC_NOT_READY_RETRIES} attempts)"
+        )
+
+    @staticmethod
+    def _exec_stuck_message(
+        sandbox_id: str,
+        command: str,
+        summary: str,
+        stdout_chunks: list[str],
+        stderr_chunks: list[str],
+    ) -> str:
+        """
+        Build the failure message for a wedged exec stream, including any
+        output captured so far (the only diagnostic for a hung command).
+
+        :param sandbox_id: The Pod the exec ran in.
+        :param command: The command that wedged.
+        :param summary: What tripped the guard (idle / overall window).
+        :param stdout_chunks: Captured stdout so far.
+        :param stderr_chunks: Captured stderr so far.
+        :returns: The error message.
+        """
+        message = f"Remote command on pod '{sandbox_id}' {summary} and was abandoned: {command}"
+        tail = ("".join(stdout_chunks) + "".join(stderr_chunks)).strip()
+        if tail:
+            message += f" — output so far: {tail[-2000:]}"
+        return message
 
     def terminate(self, sandbox_id: str) -> None:
         """
@@ -900,6 +1088,27 @@ class KubernetesSandboxLauncher(SandboxLauncher):
 
 
 # ── module helpers ─────────────────────────────────────────
+
+
+def _is_transient_exec_error(exc: k8s_client.ApiException) -> bool:
+    """
+    Report whether an exec ``ApiException`` is the transient first-exec
+    race rather than a permanent failure (codex S2).
+
+    Matches the exception's reason + body (case-insensitively) against
+    :data:`_EXEC_TRANSIENT_MARKERS` — kubelet phrasings for a container
+    that isn't yet attachable. Permanent failures (403 Forbidden, a Pod
+    deleted for good) don't match and are surfaced immediately.
+
+    :param exc: The raised ``ApiException``.
+    :returns: ``True`` when the error looks retryable.
+    """
+    # 403 is always permanent (RBAC), never a not-ready race — short
+    # circuit so a forbidden exec can't be mistaken for transient.
+    if getattr(exc, "status", None) == 403:
+        return False
+    haystack = f"{getattr(exc, 'reason', '') or ''} {getattr(exc, 'body', '') or ''}".lower()
+    return any(marker in haystack for marker in _EXEC_TRANSIENT_MARKERS)
 
 
 def _format_api_error(action: str, pod: str, exc: k8s_client.ApiException) -> str:
