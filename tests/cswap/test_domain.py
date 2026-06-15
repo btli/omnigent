@@ -165,6 +165,21 @@ def test_parse_empty_headers_yields_no_windows() -> None:
     assert parsed.is_limited(200) is False
 
 
+def test_retry_after_parses_seconds_rfc3339_and_http_date() -> None:
+    # Delta seconds.
+    assert RateLimitHeaders.parse_anthropic({"retry-after": "30"}, now=1000).retry_after_at == 1030
+    # RFC 3339.
+    rfc = RateLimitHeaders.parse_anthropic(
+        {"retry-after": "2026-06-14T00:00:10Z"}, now=1000
+    ).retry_after_at
+    assert rfc is not None
+    # RFC 7231 HTTP date.
+    http = RateLimitHeaders.parse_anthropic(
+        {"retry-after": "Wed, 21 Oct 2015 07:28:00 GMT"}, now=1000
+    ).retry_after_at
+    assert http == 1445412480
+
+
 def test_recovery_at_waits_for_latest_exhausted_window() -> None:
     # Both windows exhausted: recover only when the LATER one resets (avoids
     # re-selecting while the 7d window is still at 100%).

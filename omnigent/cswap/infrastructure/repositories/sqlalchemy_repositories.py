@@ -17,7 +17,8 @@ from __future__ import annotations
 import json
 from typing import cast
 
-from sqlalchemy import CursorResult, select, update
+from sqlalchemy import CursorResult, or_, select, update
+from sqlalchemy.exc import IntegrityError
 
 from omnigent.cswap.application.ports.ports import (
     CostAttributionSink,
@@ -103,6 +104,11 @@ def _windows_from_json(raw: str | None) -> tuple[UsageWindow, ...]:
     )
 
 
+def _rowcount(result: object) -> int:
+    """Return the affected-row count of a Core ``execute`` result, or ``0``."""
+    return result.rowcount if isinstance(result, CursorResult) else 0
+
+
 def _status_for(state: LimitState) -> str:
     """Denormalised :data:`LimitStatus` for the stored row.
 
@@ -152,41 +158,42 @@ class SqlUsageLimitStateRepository(UsageLimitStateRepository):
             return {row.credential_id: _limit_state_from_row(row) for row in rows}
 
     def upsert(self, state: LimitState, *, enforce_staleness: bool = True) -> bool:
-        """Write *state*, honouring the staleness guard (see port docs)."""
-        with self._session() as session:
-            row = session.get(SqlProviderAccountLimitState, state.credential_id)
-            if (
-                row is not None
-                and enforce_staleness
-                and row.last_checked_at is not None
-                and state.last_checked_at is not None
-                and row.last_checked_at > state.last_checked_at
-            ):
-                return False
+        """Write *state*, honouring the staleness guard (see port docs).
 
-            # Build the row once; insert it or copy its fields onto the
-            # existing row (no duplicated field list across branches).
-            fresh = SqlProviderAccountLimitState(
-                credential_id=state.credential_id,
-                limit_status=_status_for(state),
-                is_limited=state.is_limited,
-                limited_until=state.limited_until,
-                windows_json=_windows_to_json(state.windows),
-                detection_source=state.source,
-                last_checked_at=state.last_checked_at,
-                updated_at=now_epoch(),
+        The staleness check lives in the ``UPDATE ... WHERE`` clause so it is
+        atomic: concurrent observations (the reactive hook runs in worker
+        threads) cannot read-then-clobber a fresher row. A missing row is
+        inserted via a savepoint, retrying the guarded update if a concurrent
+        insert wins the primary-key race.
+        """
+        cls = SqlProviderAccountLimitState
+        values = {
+            "limit_status": _status_for(state),
+            "is_limited": state.is_limited,
+            "limited_until": state.limited_until,
+            "windows_json": _windows_to_json(state.windows),
+            "detection_source": state.source,
+            "last_checked_at": state.last_checked_at,
+            "updated_at": now_epoch(),
+        }
+        guarded = update(cls).where(cls.credential_id == state.credential_id)
+        if enforce_staleness and state.last_checked_at is not None:
+            guarded = guarded.where(
+                or_(cls.last_checked_at.is_(None), cls.last_checked_at <= state.last_checked_at)
             )
-            if row is None:
-                session.add(fresh)
-            else:
-                row.limit_status = fresh.limit_status
-                row.is_limited = fresh.is_limited
-                row.limited_until = fresh.limited_until
-                row.windows_json = fresh.windows_json
-                row.detection_source = fresh.detection_source
-                row.last_checked_at = fresh.last_checked_at
-                row.updated_at = fresh.updated_at
-            return True
+        with self._session() as session:
+            if _rowcount(session.execute(guarded.values(**values))):
+                return True
+            if session.get(cls, state.credential_id) is not None:
+                return False  # a strictly-newer row exists — staleness guard
+            try:
+                with session.begin_nested():
+                    session.add(cls(credential_id=state.credential_id, **values))
+                return True
+            except IntegrityError:
+                # A concurrent insert won the PK race; the guarded update now
+                # matches (unless that row is already newer, which is correct).
+                return _rowcount(session.execute(guarded.values(**values))) > 0
 
 
 class SqlCredentialPoolRepository(CredentialPoolRepository):
@@ -295,33 +302,39 @@ class SqlCostAttributionSink(CostAttributionSink):
         """Increment the per-account, per-day cost rollup (UPSERT add).
 
         The increment is a single atomic ``UPDATE ... SET col = col + delta``
-        so concurrent turns for the same account/day cannot lose increments;
-        the row is inserted only when the day's first write finds no row.
+        so concurrent turns for the same account/day cannot lose increments.
+        The day's first write inserts via a savepoint, retrying the additive
+        update if a concurrent insert wins the primary-key race.
         """
         now = now_epoch()
         col = SqlProviderAccountCost
-        with self._session() as session:
-            result = session.execute(
-                update(col)
-                .where(col.credential_id == credential_id, col.day_utc == day_utc)
-                .values(
-                    cost_usd=col.cost_usd + cost_usd,
-                    input_tokens=col.input_tokens + input_tokens,
-                    output_tokens=col.output_tokens + output_tokens,
-                    turn_count=col.turn_count + 1,
-                    updated_at=now,
-                )
+        add = (
+            update(col)
+            .where(col.credential_id == credential_id, col.day_utc == day_utc)
+            .values(
+                cost_usd=col.cost_usd + cost_usd,
+                input_tokens=col.input_tokens + input_tokens,
+                output_tokens=col.output_tokens + output_tokens,
+                turn_count=col.turn_count + 1,
+                updated_at=now,
             )
-            updated = result.rowcount if isinstance(result, CursorResult) else 0
-            if not updated:
-                session.add(
-                    col(
-                        credential_id=credential_id,
-                        day_utc=day_utc,
-                        cost_usd=cost_usd,
-                        input_tokens=input_tokens,
-                        output_tokens=output_tokens,
-                        turn_count=1,
-                        updated_at=now,
+        )
+        with self._session() as session:
+            if _rowcount(session.execute(add)):
+                return
+            try:
+                with session.begin_nested():
+                    session.add(
+                        col(
+                            credential_id=credential_id,
+                            day_utc=day_utc,
+                            cost_usd=cost_usd,
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                            turn_count=1,
+                            updated_at=now,
+                        )
                     )
-                )
+            except IntegrityError:
+                # Concurrent first-insert won; the additive update now matches.
+                session.execute(add)
