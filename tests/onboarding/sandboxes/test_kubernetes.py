@@ -1165,6 +1165,39 @@ def test_provision_polls_through_unschedulable_then_times_out(
     assert len(fake_k8s.delete_calls) == 1
 
 
+def test_provision_bounds_event_lookup_with_request_timeout(
+    fake_k8s: _FakeK8sState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    round-3 FIX-4: the events-enrichment lookup (``list_namespaced_event``,
+    run while building the readiness-failure message) is also bounded by a
+    non-None ``_request_timeout`` — like create/read/delete — so a stalled
+    apiserver can't hang the failure path.
+
+    Drives a readiness timeout (so _recent_events runs) and asserts every
+    captured event request-timeout is non-None.
+
+    Mutation guard: dropping the kwarg from list_namespaced_event leaves the
+    captured timeout None.
+    """
+    _trip_deadline_after_polls(monkeypatch)
+
+    def _pending(name: str) -> _Pod:
+        return _Pod(
+            status=_PodStatus(phase="Pending", container_statuses=[_ContainerStatus(ready=False)])
+        )
+
+    fake_k8s.pod_factory = _pending
+    fake_k8s.events = [_Event(reason="FailedScheduling", message="no nodes")]
+
+    with pytest.raises(click.ClickException, match="did not become ready"):
+        KubernetesSandboxLauncher().provision("managed-abc")
+
+    # The events lookup ran (failure message enrichment) AND was bounded.
+    assert fake_k8s.event_request_timeouts
+    assert all(t is not None for t in fake_k8s.event_request_timeouts)
+
+
 def test_provision_polls_through_transient_read_error_then_succeeds(
     fake_k8s: _FakeK8sState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1266,6 +1299,67 @@ def test_provision_accepted_but_timed_out_create_orphan_is_deleted(
     assert fake_k8s.pods == {}
     [(deleted_name, _grace)] = fake_k8s.delete_calls
     assert deleted_name.startswith("omnigent-managed-abc-")
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+def test_provision_ambiguous_create_apiexception_cleans_up_and_raises(
+    fake_k8s: _FakeK8sState, status: int
+) -> None:
+    """
+    round-3 FIX-2: a non-409 create ApiException whose status is NOT a
+    definite client reject (5xx — e.g. 504 Gateway Timeout) is AMBIGUOUS
+    (the apiserver may have accepted the Pod then failed the response), so
+    provision() best-effort deletes the known pod_name before re-raising —
+    no silent orphan.
+
+    Mutation guard: without the ambiguous-ApiException cleanup branch the
+    error raises with delete_calls empty.
+    """
+    fake_k8s.create_raises = [_FakeApiException(status=status, reason="ServerError")]
+
+    with pytest.raises(click.ClickException, match="create pod"):
+        KubernetesSandboxLauncher().provision("managed-abc")
+
+    [(deleted_name, grace)] = fake_k8s.delete_calls
+    assert grace == 0
+    assert deleted_name.startswith("omnigent-managed-abc-")
+
+
+def test_provision_ambiguous_create_apiexception_deletes_real_orphan(
+    fake_k8s: _FakeK8sState,
+) -> None:
+    """
+    round-3 FIX-2: when the apiserver actually created the Pod but then
+    returned a 500, the orphan is removed (not just the delete attempted).
+    """
+    # create registers the Pod, THEN raises a 500 (accepted-but-failed).
+    fake_k8s.create_register_then_raises = [
+        _FakeApiException(status=500, reason="InternalError"),
+    ]
+
+    with pytest.raises(click.ClickException, match="create pod"):
+        KubernetesSandboxLauncher().provision("managed-abc")
+
+    assert fake_k8s.pods == {}
+
+
+@pytest.mark.parametrize("status", [400, 403, 404, 422])
+def test_provision_definite_create_reject_does_not_clean_up(
+    fake_k8s: _FakeK8sState, status: int
+) -> None:
+    """
+    round-3 FIX-2: a definite client reject (400/403/404/422) means the Pod
+    was NOT created — provision() raises WITHOUT a needless cleanup delete.
+
+    Mutation guard: redacting these to also clean up would add a spurious
+    delete here.
+    """
+    fake_k8s.create_raises = [_FakeApiException(status=status, reason="Rejected")]
+
+    with pytest.raises(click.ClickException, match="create pod"):
+        KubernetesSandboxLauncher().provision("managed-abc")
+
+    assert fake_k8s.delete_calls == []
 
 
 def test_provision_treats_request_timeout_as_transient(
@@ -1646,6 +1740,9 @@ def test_provision_wraps_api_errors_with_reason_and_rbac_hint(
     assert "pods is forbidden" in message
     # LOW-1: the remediation points at the real RBAC location.
     assert "deploy/kubernetes/overlays/sandbox-runners/" in message
+    # FIX-2: a definite client reject (403) means the Pod was NOT created,
+    # so there is NO orphan to clean up — no delete attempted.
+    assert fake_k8s.delete_calls == []
 
 
 # ── run ─────────────────────────────────────────────────────
@@ -1696,9 +1793,32 @@ def test_run_execs_bash_lc_and_parses_returncode(fake_k8s: _FakeK8sState) -> Non
     # Exec must name the Pod's single container ("host") explicitly, or a
     # sidecar-injected cluster (Istio/Linkerd) rejects the ambiguous exec.
     assert call.kwargs["container"] == "host"
+    # round-3 FIX-1: the exec OPEN is bounded too (no unbounded blocking
+    # k8s call remains). It must not break streaming reads (asserted by the
+    # streaming/real-client tests passing with this kwarg present).
+    assert call.kwargs["_request_timeout"] is not None
     assert result.returncode == 0
     assert result.stdout == "remote-out\n"
     assert result.stderr == "remote-err\n"
+
+
+def test_run_bounds_exec_open_with_request_timeout(fake_k8s: _FakeK8sState) -> None:
+    """
+    round-3 FIX-1: ``stream()`` (the exec websocket OPEN — the last
+    previously-unbounded blocking k8s call) is invoked with a non-None
+    ``_request_timeout`` so a stalled apiserver can't block the open
+    before the read-loop guards start.
+
+    Mutation guard: dropping the kwarg from the stream() call leaves the
+    captured value absent/None.
+    """
+    launcher, pod_name = _provisioned(fake_k8s)
+    fake_k8s.exec_channels = {3: '{"metadata":{},"status":"Success"}'}
+
+    launcher.run(pod_name, "true")
+
+    [call] = fake_k8s.exec_calls
+    assert call.kwargs.get("_request_timeout") is not None
 
 
 def test_run_parses_nonzero_exit_and_raises_when_checked(fake_k8s: _FakeK8sState) -> None:
@@ -1803,6 +1923,12 @@ def test_run_stuck_error_redacts_secret_env_in_command(
         ("a&&API_KEY=amp_secret", "amp_secret", "API_KEY=***"),
         # FIX-4: API_KEY (keyword as a full trailing segment) matches.
         ("API_KEY=apikey_secret run", "apikey_secret", "API_KEY=***"),
+        # round-3 (final): underscore-edge keys — a LEADING `_SECRET`, a
+        # TRAILING `SECRET_`, and an empty middle segment `MY__SECRET` (the
+        # empty split piece is ignored) — all redact.
+        ("_SECRET=lead_secret run", "lead_secret", "_SECRET=***"),
+        ("SECRET_=trail_secret run", "trail_secret", "SECRET_=***"),
+        ("MY__SECRET=dbl_secret run", "dbl_secret", "MY__SECRET=***"),
     ],
 )
 def test_redact_command_masks_whole_value(command: str, secret: str, expected_key: str) -> None:
@@ -1848,19 +1974,28 @@ def test_redact_command_leaves_non_credential_keys_untouched(command: str) -> No
     assert _redact_command(command) == command
 
 
-def test_redact_command_is_linear_time_on_long_input() -> None:
+def test_redact_command_is_linear_time_on_killer_input() -> None:
     """
-    FIX-4: the boundary-aware key pattern must stay linear-time (no
-    catastrophic backtracking) on a long, key-like, non-matching input.
+    FIX-3 (round-3): the redaction must be genuinely O(n). The KILLER shape
+    is a boundary-anchored underscore run that CONTAINS a credential keyword
+    segment but has NO trailing `=` — exactly what made the old overlapping
+    `(?:[A-Za-z0-9]+_)* keyword (?:_[A-Za-z0-9]+)*` pattern explore O(n)
+    partitions (measured ~22s at this size). The linear rewrite handles it
+    in milliseconds.
+
+    Mutation guard: restoring the overlapping segment-star regex blows this
+    sub-second ceiling apart.
     """
     import time
 
-    evil = "A_" * 20000 + "TOKEN" + "B" * 20000 + " rest"
+    # Leading space = boundary; a_*4000 + key_*4000 = a long key-like run
+    # with a `key` keyword segment; trailing `x`, NO `=` (forces the
+    # backtracking search in the old pattern).
+    killer = " " + "a_" * 4000 + "key_" * 4000 + "x"
     start = time.perf_counter()
-    _redact_command(evil)
+    _redact_command(killer)
     elapsed = time.perf_counter() - start
-    # Generous ceiling; catastrophic backtracking would blow well past this.
-    assert elapsed < 1.0, f"redaction took {elapsed:.2f}s — possible backtracking"
+    assert elapsed < 0.5, f"redaction took {elapsed:.2f}s — catastrophic backtracking"
 
 
 def test_run_nonzero_returns_when_unchecked(fake_k8s: _FakeK8sState) -> None:

@@ -210,32 +210,43 @@ _FATAL_WAITING_REASONS: frozenset[str] = frozenset(
 # these (e.g. 403 Forbidden, 404 deleted) is surfaced immediately.
 _TRANSIENT_READ_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
 
+# ``create_namespaced_pod`` ApiException statuses that DEFINITIVELY mean the
+# Pod was NOT created (a client/validation reject), so no orphan-cleanup is
+# needed (round-3 FIX-2). 409 (conflict) is handled separately (name-regen
+# retry). Any OTHER status — 5xx, or a missing/unknown status — is AMBIGUOUS:
+# the apiserver may have accepted the create then failed the response, so we
+# best-effort delete the known pod_name before re-raising to avoid leaking a
+# running Pod.
+_CREATE_NOT_CREATED_STATUSES: frozenset[int] = frozenset({400, 401, 403, 404, 405, 422})
+
+# Credential key SEGMENTS (uppercase) that mark an env assignment as
+# sensitive. A key is redacted iff one of its ``_``-delimited segments is in
+# this set — so `TOKEN`, `API_KEY`, `FOO_SECRET`, `MY__SECRET` (empty segment
+# ignored), `_SECRET`/`SECRET_` match, but `MONKEY`/`HOTKEY`/`KEYBOARD_LAYOUT`/
+# `TOKENIZER` (keyword only a substring of a segment) do NOT.
+_SENSITIVE_KEY_SEGMENTS: frozenset[str] = frozenset(
+    {"TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL"}
+)
+
 # Redaction for command strings before they enter error messages / logs
-# (FIX-3, hardened round-3 FIX-B/FIX-4). _start_host_in_sandbox runs the host
-# with `OMNIGENT_HOST_TOKEN=<launch token>` (and harness creds may ride other
-# env assignments), so an exec timeout / non-zero must not leak the value into
-# the error detail (which becomes an HTTP 502 body + server log).
+# (FIX-3; reworked round-3 to be genuinely LINEAR-time). _start_host_in_sandbox
+# runs the host with `OMNIGENT_HOST_TOKEN=<launch token>` (and harness creds may
+# ride other env assignments), so an exec timeout / non-zero must not leak the
+# value into the error detail (which becomes an HTTP 502 body + server log).
 #
-# KEY (captured, group 1, so only the VALUE is masked): a shell-token-leading
-# env-assignment name in which a credential keyword is a FULL underscore-
-# delimited segment (case-insensitive). So `TOKEN=`, `API_KEY=`, `FOO_SECRET=`,
-# `OMNIGENT_HOST_TOKEN=` match, but `MONKEY=` / `HOTKEY=` / `KEYBOARD_LAYOUT=`
-# do NOT (FIX-4 — keyword must be a whole segment, not a substring). The
-# leading `(?:^|[\s;&|(])` matches a shell token boundary — start, whitespace,
-# or a separator like `;`/`&`/`|`/`(` — so `;TOKEN=` is caught too. The
-# segment quantifiers are non-overlapping (each consumes up to a `_`), so the
-# match is linear-time (no catastrophic backtracking).
-#
-# VALUE (consumed, masked): a single-quoted run, a double-quoted run, OR a bare
-# non-whitespace run — so a quoted value WITH SPACES (`FOO_SECRET='a b'`) is
-# redacted whole, not just its first word.
+# This matches an env assignment as THREE unambiguous, NON-overlapping runs —
+#   group 1: the leading shell-token boundary (start / whitespace / `;`/`&`/`|`/`(`),
+#   group 2: the whole key, a single `[A-Za-z0-9_]+` run (no nested/overlapping
+#            quantifiers, so matching is O(n) — the previous segment-star
+#            pattern was O(n²) and backtracked catastrophically when the `=`
+#            was absent),
+#   group 3: the value — a single-quoted run, a double-quoted run, OR a bare
+#            non-whitespace run (so a quoted value WITH SPACES is masked whole).
+# Whether to redact is decided in Python (:func:`_redact_command`) by splitting
+# the key on `_` and checking for a credential segment — keeping the regex
+# linear and the keyword match boundary-aware.
 _SENSITIVE_ENV_RE: re.Pattern[str] = re.compile(
-    r"(?i)"
-    r"((?:^|[\s;&|(])"
-    r"(?:[A-Za-z0-9]+_)*"
-    r"(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)"
-    r"(?:_[A-Za-z0-9]+)*=)"
-    r"(?:'[^']*'|\"[^\"]*\"|[^\s]+)"
+    r"(^|[\s;&|(])([A-Za-z0-9_]+)=('[^']*'|\"[^\"]*\"|[^\s]+)"
 )
 
 # Reserved env names the Pod sets itself (writable-HOME contract + sandbox
@@ -858,10 +869,18 @@ class KubernetesSandboxLauncher(SandboxLauncher):
             except ApiException as exc:
                 # A name collision (another launch raced the same slug)
                 # is recoverable once: regenerate the random suffix and
-                # retry. Any other failure surfaces with the API reason.
+                # retry.
                 if exc.status == 409 and attempt == 0:
                     pod_name = _new_pod_name(name)
                     continue
+                # A non-409 failure whose status does NOT definitively mean
+                # "not created" (e.g. 500 / 504 Gateway Timeout, or a
+                # missing status) is AMBIGUOUS: the apiserver may have
+                # accepted the Pod then failed the response, orphaning it.
+                # Best-effort delete the known pod_name before re-raising so
+                # such a create can't leak a running Pod (round-3 FIX-2).
+                if exc.status not in _CREATE_NOT_CREATED_STATUSES:
+                    self._best_effort_delete(namespace, pod_name)
                 raise click.ClickException(_format_api_error("create pod", pod_name, exc)) from exc
 
         # The Pod now exists. If readiness fails (Unschedulable,
@@ -1251,6 +1270,17 @@ class KubernetesSandboxLauncher(SandboxLauncher):
             try:
                 # Bound to the Protocol-typed local so the Any from the
                 # lazy client import doesn't leak out as the return type.
+                #
+                # _request_timeout bounds the exec OPEN — the last blocking
+                # k8s call without a timeout (round-3 FIX-1). It threads
+                # through the generated method to the client's websocket
+                # path; crucially it does NOT shorten the long-lived
+                # streaming reads, because the read loop drives the socket
+                # with explicit select-based `ws.update(timeout=...)` calls,
+                # not the connect timeout. (`_preload_content=False` returns
+                # the WSClient straight after connect; the client only
+                # applies _request_timeout to the blocking read-all path we
+                # never take.)
                 ws: _ExecStream = stream(
                     core.connect_get_namespaced_pod_exec,
                     sandbox_id,
@@ -1266,6 +1296,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                     stdout=True,
                     tty=False,
                     _preload_content=False,
+                    _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
                 )
                 return ws
             except ApiException as exc:
@@ -1379,19 +1410,32 @@ class KubernetesSandboxLauncher(SandboxLauncher):
 def _redact_command(command: str) -> str:
     """
     Redact sensitive env-assignment VALUES in a shell command before it is
-    put into an error message or log (tri-model FIX-3).
+    put into an error message or log (FIX-3).
 
-    Replaces ``FOO_TOKEN=abc`` with ``FOO_TOKEN=***`` for any key matching
-    (case-insensitive) ``TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL`` — so an
-    exec timeout / non-zero exit can't leak the launch token (the host is
-    started with ``OMNIGENT_HOST_TOKEN=<token>``) or harness creds into the
-    surfaced error / HTTP 502 body / server log. The key is preserved for
-    diagnosability; only the value is masked.
+    Replaces ``FOO_TOKEN=abc`` with ``FOO_TOKEN=***`` for any key with a
+    ``_``-delimited segment in :data:`_SENSITIVE_KEY_SEGMENTS`
+    (case-insensitive) — so an exec timeout / non-zero exit can't leak the
+    launch token (the host is started with ``OMNIGENT_HOST_TOKEN=<token>``)
+    or harness creds into the surfaced error / HTTP 502 body / server log.
+    The boundary char and key are preserved (diagnosability); only the
+    value is masked. ``MONKEY=`` / ``HOTKEY=`` / ``KEYBOARD_LAYOUT=`` etc.
+    (keyword only a substring of a segment) are left untouched.
+
+    The regex matches the whole key as one linear run and the redact
+    decision is made here, so this is O(n) (no catastrophic backtracking).
 
     :param command: The shell command, possibly with env assignments.
     :returns: The command with sensitive values masked.
     """
-    return _SENSITIVE_ENV_RE.sub(r"\1***", command)
+
+    def _mask(match: re.Match[str]) -> str:
+        boundary, key, _value = match.group(1), match.group(2), match.group(3)
+        segments = {seg.upper() for seg in key.split("_") if seg}
+        if segments & _SENSITIVE_KEY_SEGMENTS:
+            return f"{boundary}{key}=***"
+        return match.group(0)
+
+    return _SENSITIVE_ENV_RE.sub(_mask, command)
 
 
 def _is_transient_read_error(exc: Exception) -> bool:
