@@ -355,6 +355,21 @@ class _FakeConfigException(Exception):
     """Stands in for ``kubernetes.config.config_exception.ConfigException``."""
 
 
+class _FakeWebSocketException(Exception):
+    """
+    Stands in for ``websocket.WebSocketException``.
+
+    ``websocket-client`` is only a TRANSITIVE dependency of the optional
+    ``kubernetes`` package, so it is ABSENT in CI jobs that run without the
+    kubernetes extra. The launcher's ``run()`` does
+    ``from websocket import WebSocketException`` (to guard the post-loop
+    socket flush), so the fake SDK injection must provide a fake
+    ``websocket`` module too — otherwise that import fails with
+    ``ModuleNotFoundError`` in CI even though every other k8s symbol is
+    faked.
+    """
+
+
 # ── status object stand-ins (mirror V1Pod's attribute shape) ──
 
 
@@ -873,6 +888,17 @@ def _install_fake_kubernetes(
     monkeypatch.setitem(sys.modules, "kubernetes.config.config_exception", config_exc_mod)
     monkeypatch.setitem(sys.modules, "kubernetes.stream", stream_mod)
     monkeypatch.setitem(sys.modules, "kubernetes.stream.ws_client", ws_client_mod)
+
+    # Fake top-level `websocket` module: websocket-client is only a
+    # transitive dep of the optional kubernetes package, so it is absent in
+    # CI jobs without the kubernetes extra. The launcher's run() does
+    # `from websocket import WebSocketException`, so without this fake those
+    # run/exec tests fail with ModuleNotFoundError in CI even though every
+    # k8s symbol is faked. setitem overrides a real-package-absent
+    # `sys.modules["websocket"] = None` too, keeping the tests hermetic.
+    websocket_mod = types.ModuleType("websocket")
+    websocket_mod.WebSocketException = _FakeWebSocketException  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "websocket", websocket_mod)
     return state
 
 
