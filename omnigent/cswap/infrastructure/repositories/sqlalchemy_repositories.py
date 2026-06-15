@@ -5,15 +5,16 @@ ports backed by the tables in :mod:`omnigent.db.db_models`. Each takes a
 :data:`~omnigent.db.utils.ManagedSessionMaker` (commits on success), the
 same construction omnigent's other stores use.
 
-The limit-state row stores up to two windows in ``(window_5h_pct,
-reset_at_5h)`` and ``(window_7d_pct, reset_at_7d)`` slots. For
-subscriptions these are literally the 5h/7d windows; for API keys they
-hold the first two reported budgets. Routing reads only aggregate headroom
-and earliest reset, so the slot labels do not affect selection.
+The limit-state row keeps availability (``is_limited`` + ``limited_until``)
+separate from headroom: the usage windows are serialized to a single
+``windows_json`` column, preserving each window's own label and count
+(subscription ``5h``/``7d``, API-key ``requests``/``tokens``/…). Selection
+reads ``is_limited`` + ``limited_until``; the windows are informational.
 """
 
 from __future__ import annotations
 
+import json
 from typing import cast
 
 from sqlalchemy import select
@@ -60,17 +61,57 @@ def _account_from_row(row: SqlProviderAccount) -> ProviderAccount:
     )
 
 
+def _windows_to_json(windows: tuple[UsageWindow, ...]) -> str | None:
+    """Serialize usage windows to a JSON array, or ``None`` when empty."""
+    if not windows:
+        return None
+    return json.dumps(
+        [
+            {"label": w.label, "utilization_pct": w.utilization_pct, "reset_at": w.reset_at}
+            for w in windows
+        ]
+    )
+
+
+def _windows_from_json(raw: str | None) -> tuple[UsageWindow, ...]:
+    """Parse a windows JSON array back into :class:`UsageWindow` objects."""
+    if not raw:
+        return ()
+    try:
+        items = json.loads(raw)
+    except (ValueError, TypeError):
+        return ()
+    if not isinstance(items, list):
+        return ()
+    return tuple(
+        UsageWindow(
+            label=str(item.get("label", "")),
+            utilization_pct=item.get("utilization_pct"),
+            reset_at=item.get("reset_at"),
+        )
+        for item in items
+        if isinstance(item, dict)
+    )
+
+
+def _status_for(state: LimitState) -> str:
+    """Denormalised :data:`LimitStatus` for the stored row.
+
+    Stored at write time as a snapshot for display/filtering; the
+    authoritative availability check is :meth:`LimitState.is_available_now`.
+    """
+    if state.is_limited:
+        return "limited"
+    return "available" if (state.source or state.windows) else "unknown"
+
+
 def _limit_state_from_row(row: SqlProviderAccountLimitState) -> LimitState:
     """Reconstruct a :class:`LimitState` from its DB row."""
-    windows: list[UsageWindow] = []
-    if row.window_5h_pct is not None or row.reset_at_5h is not None:
-        windows.append(UsageWindow("5h", row.window_5h_pct, row.reset_at_5h))
-    if row.window_7d_pct is not None or row.reset_at_7d is not None:
-        windows.append(UsageWindow("7d", row.window_7d_pct, row.reset_at_7d))
     return LimitState(
         credential_id=row.credential_id,
         is_limited=row.is_limited,
-        windows=tuple(windows),
+        limited_until=row.limited_until,
+        windows=_windows_from_json(row.windows_json),
         source=cast("DetectionSource | None", row.detection_source),
         last_checked_at=row.last_checked_at,
     )
@@ -114,39 +155,28 @@ class SqlUsageLimitStateRepository(UsageLimitStateRepository):
             ):
                 return False
 
-            windows = list(state.windows)
-            w5 = windows[0] if windows else None
-            w7 = windows[1] if len(windows) > 1 else None
-            limit_status = (
-                "limited"
-                if state.is_limited
-                else ("available" if (state.source or state.windows) else "unknown")
+            # Build the row once; insert it or copy its fields onto the
+            # existing row (no duplicated field list across branches).
+            fresh = SqlProviderAccountLimitState(
+                credential_id=state.credential_id,
+                limit_status=_status_for(state),
+                is_limited=state.is_limited,
+                limited_until=state.limited_until,
+                windows_json=_windows_to_json(state.windows),
+                detection_source=state.source,
+                last_checked_at=state.last_checked_at,
+                updated_at=now_epoch(),
             )
-            now = now_epoch()
             if row is None:
-                row = SqlProviderAccountLimitState(
-                    credential_id=state.credential_id,
-                    limit_status=limit_status,
-                    is_limited=state.is_limited,
-                    window_5h_pct=w5.utilization_pct if w5 else None,
-                    window_7d_pct=w7.utilization_pct if w7 else None,
-                    reset_at_5h=w5.reset_at if w5 else None,
-                    reset_at_7d=w7.reset_at if w7 else None,
-                    detection_source=state.source,
-                    last_checked_at=state.last_checked_at,
-                    updated_at=now,
-                )
-                session.add(row)
+                session.add(fresh)
             else:
-                row.limit_status = limit_status
-                row.is_limited = state.is_limited
-                row.window_5h_pct = w5.utilization_pct if w5 else None
-                row.window_7d_pct = w7.utilization_pct if w7 else None
-                row.reset_at_5h = w5.reset_at if w5 else None
-                row.reset_at_7d = w7.reset_at if w7 else None
-                row.detection_source = state.source
-                row.last_checked_at = state.last_checked_at
-                row.updated_at = now
+                row.limit_status = fresh.limit_status
+                row.is_limited = fresh.is_limited
+                row.limited_until = fresh.limited_until
+                row.windows_json = fresh.windows_json
+                row.detection_source = fresh.detection_source
+                row.last_checked_at = fresh.last_checked_at
+                row.updated_at = fresh.updated_at
             return True
 
 

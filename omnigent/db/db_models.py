@@ -885,14 +885,11 @@ class SqlProviderAccountLimitState(Base):
     :param credential_id: The :class:`SqlProviderAccount` id (PK).
     :param limit_status: ``"available"`` / ``"limited"`` / ``"unknown"``.
     :param is_limited: Whether the account is currently rate-limited.
-    :param window_5h_pct: 5-hour window utilization ``0``–``100``, or
-        ``None`` (unknown). For API keys this holds the most-constrained
-        window's utilization.
-    :param window_7d_pct: 7-day window utilization, or ``None``.
-    :param reset_at_5h: Unix epoch seconds the 5h window resets, or
-        ``None``. For API keys, the earliest reset across windows.
-    :param reset_at_7d: Unix epoch seconds the 7d window resets, or
-        ``None``.
+    :param limited_until: Unix epoch seconds the limit lifts, or ``None``
+        (unknown). The authoritative recovery time selection reads.
+    :param windows_json: JSON array of ``{label, utilization_pct, reset_at}``
+        usage windows — informational (headroom ranking + display), arbitrary
+        labels and count. ``None`` / ``"[]"`` when none observed.
     :param detection_source: ``"reactive"`` / ``"poller"`` / ``"manual"``.
     :param last_checked_at: Unix epoch seconds of the observation.
     :param updated_at: Unix epoch seconds of the last write.
@@ -907,10 +904,8 @@ class SqlProviderAccountLimitState(Base):
     )
     limit_status: Mapped[str] = mapped_column(String(16), nullable=False)
     is_limited: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
-    window_5h_pct: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    window_7d_pct: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    reset_at_5h: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    reset_at_7d: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    limited_until: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    windows_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     detection_source: Mapped[str | None] = mapped_column(String(16), nullable=True)
     last_checked_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     updated_at: Mapped[int] = mapped_column(Integer, nullable=False)

@@ -226,3 +226,20 @@ class RateLimitHeaders:
         if status_code == 429 or self.retry_after_at is not None:
             return True
         return any(w.is_exhausted() for w in self.windows)
+
+    def recovery_at(self) -> int | None:
+        """Return the epoch when the limit lifts, or ``None`` if unknown.
+
+        Prefers an explicit ``retry-after``; otherwise the soonest reset
+        among exhausted windows (when an exhausted window resets the account
+        is unblocked); otherwise the soonest reset of any window.
+        """
+        if self.retry_after_at is not None:
+            return self.retry_after_at
+        exhausted = [
+            w.reset_at for w in self.windows if w.is_exhausted() and w.reset_at is not None
+        ]
+        if exhausted:
+            return min(exhausted)
+        resets = [w.reset_at for w in self.windows if w.reset_at is not None]
+        return min(resets) if resets else None

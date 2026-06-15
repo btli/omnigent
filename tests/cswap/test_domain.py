@@ -26,12 +26,18 @@ def _state(
     credential_id: str,
     *,
     is_limited: bool = False,
+    limited_until: int | None = None,
     windows: tuple[UsageWindow, ...] = (),
     last_checked_at: int | None = None,
 ) -> LimitState:
+    # Mirror how detections set limited_until: the soonest known window reset.
+    if is_limited and limited_until is None and windows:
+        resets = [w.reset_at for w in windows if w.reset_at is not None]
+        limited_until = min(resets) if resets else None
     return LimitState(
         credential_id=credential_id,
         is_limited=is_limited,
+        limited_until=limited_until,
         windows=windows,
         source="poller" if (windows or is_limited) else None,
         last_checked_at=last_checked_at,

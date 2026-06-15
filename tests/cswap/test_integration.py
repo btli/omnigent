@@ -57,13 +57,18 @@ def test_select_launch_env_returns_config_dir_and_binds(
     assert snapshot[0]["name"] == "claude-pool"
 
 
-def test_reactive_429_triggers_failover_rebind(active_facade: ManagedSessionMaker) -> None:
+def test_reactive_limit_without_reset_applies_cooldown(
+    active_facade: ManagedSessionMaker,
+) -> None:
     # Bind the session to c1 via a launch selection.
     integration.select_launch_env_for_family("anthropic", session_id="sess-1")
     c1 = account_id_for("claude-pool", "c1")
     c2 = account_id_for("claude-pool", "c2")
 
-    integration.record_rate_limited(family="anthropic", session_id="sess-1")
+    # A limit signal with NO reset headers.
+    integration.record_reactive_text(
+        "Claude usage limit reached.", family="anthropic", session_id="sess-1"
+    )
 
     # c1 is now limited; the next launch selection avoids it.
     env = integration.select_launch_env_for_family("anthropic", session_id="sess-2")
@@ -73,12 +78,12 @@ def test_reactive_429_triggers_failover_rebind(active_facade: ManagedSessionMake
     container = build_container(active_facade)
     assert container.registry.active_credential("sess-1") == c2
 
-    # c1 was limited with no header reset, but the facade applies a default
-    # cooldown so it is NOT permanently locked out (auto-recovers, not unknown).
+    # No header reset, but the facade applied a default cooldown — limited with
+    # a concrete limited_until (auto-recovers, not a permanent lockout).
     snapshot = integration.status_snapshot()
     c1_account = next(a for a in snapshot[0]["accounts"] if a["id"] == c1)  # type: ignore[index]
     assert c1_account["limit_status"] == "limited"
-    assert c1_account["earliest_reset_at"] is not None
+    assert c1_account["limited_until"] is not None
 
 
 def test_reactive_text_usage_limit_triggers_failover(active_facade: ManagedSessionMaker) -> None:
@@ -124,7 +129,9 @@ def test_attribute_cost_and_status_snapshot(active_facade: ManagedSessionMaker) 
 
 def test_mark_available_clears_limit(active_facade: ManagedSessionMaker) -> None:
     integration.select_launch_env_for_family("anthropic", session_id="sess-1")
-    integration.record_rate_limited(family="anthropic", session_id="sess-1")
+    integration.record_reactive_text(
+        "Claude usage limit reached.", family="anthropic", session_id="sess-1"
+    )
     c1 = account_id_for("claude-pool", "c1")
 
     assert integration.mark_available(c1) is True
