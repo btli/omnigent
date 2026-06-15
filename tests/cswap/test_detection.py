@@ -12,6 +12,7 @@ from omnigent.cswap.infrastructure.detection.composite_usage_limit_gateway impor
 from omnigent.cswap.infrastructure.detection.probes import probe_anthropic, probe_openai
 from omnigent.cswap.infrastructure.detection.reactive_output_detector import (
     ReactiveOutputDetector,
+    ReactiveParseResult,
     message_text,
 )
 from omnigent.cswap.infrastructure.detection.usage_endpoint_poller import (
@@ -56,6 +57,20 @@ def test_reactive_extracts_reset_headers_sets_limited_until() -> None:
 def test_reactive_to_detection_none_when_not_limited() -> None:
     result = ReactiveOutputDetector.parse("all good")
     assert ReactiveOutputDetector.to_detection("c", result, observed_at=1) is None
+
+
+def test_reactive_recovery_skips_elapsed_reset() -> None:
+    # 5h reset already elapsed, 7d reset in the future → recover at 7d, NOT the
+    # past 5h (which would mark a still-limited account available → fail loop).
+    parsed = ReactiveParseResult(is_limited=True, reset_at_5h=900, reset_at_7d=5000)
+    det = ReactiveOutputDetector.to_detection("c", parsed, observed_at=1000)
+    assert det is not None
+    assert det.limited_until == 5000
+    # All resets elapsed → None (the facade then applies a cooldown).
+    parsed2 = ReactiveParseResult(is_limited=True, reset_at_5h=800, reset_at_7d=900)
+    det2 = ReactiveOutputDetector.to_detection("c", parsed2, observed_at=1000)
+    assert det2 is not None
+    assert det2.limited_until is None
 
 
 def test_message_text_extracts_real_content_not_repr() -> None:

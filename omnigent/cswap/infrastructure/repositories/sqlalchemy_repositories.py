@@ -18,7 +18,7 @@ import hashlib
 import json
 from typing import cast
 
-from sqlalchemy import and_, or_, select, text, update
+from sqlalchemy import and_, case, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -112,6 +112,11 @@ def _advisory_lock_key(credential_id: str) -> int:
     return int.from_bytes(hashlib.sha1(credential_id.encode()).digest()[:8], "big", signed=True)
 
 
+# Source precedence for breaking a same-(second-resolution)-timestamp staleness
+# tie: a manual override wins over reactive, which wins over a poller probe.
+_SOURCE_PRIORITY = {"manual": 3, "reactive": 2, "poller": 1}
+
+
 def _status_for(state: LimitState) -> str:
     """Denormalised :data:`LimitStatus` for the stored row.
 
@@ -155,8 +160,25 @@ def _upsert_limit_state(session: Session, state: LimitState, *, enforce_stalenes
     }
     guarded = update(cls).where(cls.credential_id == state.credential_id)
     if enforce_staleness and state.last_checked_at is not None:
+        # Reject strictly-newer stored rows. On an equal second-resolution
+        # timestamp, break the tie by source precedence (manual > reactive >
+        # poller) so a same-second poller "available" can't clobber a fresh
+        # reactive "limited".
+        stored_priority = case(
+            (cls.detection_source == "manual", 3),
+            (cls.detection_source == "reactive", 2),
+            (cls.detection_source == "poller", 1),
+            else_=0,
+        )
         guarded = guarded.where(
-            or_(cls.last_checked_at.is_(None), cls.last_checked_at <= state.last_checked_at)
+            or_(
+                cls.last_checked_at.is_(None),
+                cls.last_checked_at < state.last_checked_at,
+                and_(
+                    cls.last_checked_at == state.last_checked_at,
+                    stored_priority <= _SOURCE_PRIORITY.get(state.source or "", 0),
+                ),
+            )
         )
     if rowcount(session.execute(guarded.values(**values))):
         return True
