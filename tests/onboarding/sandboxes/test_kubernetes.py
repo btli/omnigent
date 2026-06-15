@@ -667,6 +667,9 @@ class _FakeK8sState:
     :param exec_open_raises: Exceptions ``stream`` raises on successive
         open attempts (popped front-first); once empty, the open
         succeeds. Models the transient first-exec race + retry.
+    :param exec_open_blocks_s: When > 0, ``stream`` sleeps this long before
+        returning — models a stalled apiserver websocket OPEN that the
+        worker-thread timeout must abandon (round-3 final FIX-1).
     :param exec_stuck: When True, the WSClient stays open forever and
         never delivers a frame (models a wedged exec the read-loop
         safeguard must abandon).
@@ -716,6 +719,7 @@ class _FakeK8sState:
     exec_channels: dict[int, str] = field(default_factory=dict)
     exec_raises: Exception | None = None
     exec_open_raises: list[Exception] = field(default_factory=list)
+    exec_open_blocks_s: float = 0.0
     exec_stuck: bool = False
     exec_status_after_close: str | None = None
     ws_clients: list[_FakeWSClient] = field(default_factory=list)
@@ -796,6 +800,13 @@ def _install_fake_kubernetes(
             raise _FakeConfigException("no kubeconfig")
 
     def _stream(api_method: object, *args: object, **kwargs: object) -> _FakeWSClient:
+        if state.exec_open_blocks_s > 0:
+            # Models a stalled apiserver websocket OPEN. Uses the stdlib
+            # sleep directly (not the module's possibly-monkeypatched
+            # `time`) so the block is real on the worker thread.
+            import time as _stdlib_time
+
+            _stdlib_time.sleep(state.exec_open_blocks_s)
         if state.exec_open_raises:
             raise state.exec_open_raises.pop(0)
         if state.exec_raises is not None:
@@ -1343,18 +1354,42 @@ def test_provision_ambiguous_create_apiexception_deletes_real_orphan(
     assert fake_k8s.pods == {}
 
 
-@pytest.mark.parametrize("status", [400, 403, 404, 422])
+@pytest.mark.parametrize("status", [400, 403, 404, 415, 422, 429])
 def test_provision_definite_create_reject_does_not_clean_up(
     fake_k8s: _FakeK8sState, status: int
 ) -> None:
     """
-    round-3 FIX-2: a definite client reject (400/403/404/422) means the Pod
-    was NOT created — provision() raises WITHOUT a needless cleanup delete.
+    round-3 final FIX-2: any DEFINITE client reject (4xx) means the Pod was
+    NOT created — provision() raises WITHOUT a cleanup delete. Includes 415
+    and 429, which the previous denylist wrongly treated as ambiguous and
+    would have deleted (another launch's same-named Pod).
 
-    Mutation guard: redacting these to also clean up would add a spurious
-    delete here.
+    Mutation guard: a denylist / "delete on any non-4xx-subset" check adds a
+    spurious delete for 415/429 here.
     """
     fake_k8s.create_raises = [_FakeApiException(status=status, reason="Rejected")]
+
+    with pytest.raises(click.ClickException, match="create pod"):
+        KubernetesSandboxLauncher().provision("managed-abc")
+
+    assert fake_k8s.delete_calls == []
+
+
+def test_provision_retry_exhausted_409_does_not_clean_up(fake_k8s: _FakeK8sState) -> None:
+    """
+    round-3 final FIX-2: a 409 conflict that survives the one name-regen
+    retry (still 409 on the second attempt) is a DEFINITE "not created"
+    (the name is taken by another Pod) — provision() must NOT delete it,
+    or it would delete that OTHER launch's Pod.
+
+    Mutation guard: any cleanup path that fires for 409 deletes here.
+    """
+    # First create 409s → name regenerated; second create 409s again →
+    # falls through to the post-409 handling, which must NOT clean up.
+    fake_k8s.create_raises = [
+        _FakeApiException(status=409, reason="AlreadyExists"),
+        _FakeApiException(status=409, reason="AlreadyExists"),
+    ]
 
     with pytest.raises(click.ClickException, match="create pod"):
         KubernetesSandboxLauncher().provision("managed-abc")
@@ -1802,12 +1837,14 @@ def test_run_execs_bash_lc_and_parses_returncode(fake_k8s: _FakeK8sState) -> Non
     assert result.stderr == "remote-err\n"
 
 
-def test_run_bounds_exec_open_with_request_timeout(fake_k8s: _FakeK8sState) -> None:
+def test_run_passes_request_timeout_kwarg_to_exec_open(fake_k8s: _FakeK8sState) -> None:
     """
-    round-3 FIX-1: ``stream()`` (the exec websocket OPEN — the last
-    previously-unbounded blocking k8s call) is invoked with a non-None
-    ``_request_timeout`` so a stalled apiserver can't block the open
-    before the read-loop guards start.
+    round-3 final FIX-1: ``stream()`` is still passed ``_request_timeout``
+    as FUTURE-PROOFING (in case a later kubernetes client honors it for the
+    streaming connect). NOTE: in 36.0.2 this kwarg is INERT for
+    ``_preload_content=False`` — the REAL open bound is the worker-thread
+    timeout exercised by
+    :func:`test_run_exec_open_timeout_is_bounded_by_worker_thread`.
 
     Mutation guard: dropping the kwarg from the stream() call leaves the
     captured value absent/None.
@@ -1819,6 +1856,72 @@ def test_run_bounds_exec_open_with_request_timeout(fake_k8s: _FakeK8sState) -> N
 
     [call] = fake_k8s.exec_calls
     assert call.kwargs.get("_request_timeout") is not None
+
+
+def test_run_exec_open_timeout_is_bounded_by_worker_thread(
+    fake_k8s: _FakeK8sState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    round-3 final FIX-1 (BLOCKER): a stalled exec websocket OPEN must be
+    abandoned by the WORKER-THREAD timeout (the ``_request_timeout`` kwarg
+    is inert for the streaming connect in kubernetes 36.0.2). The stream()
+    open blocks longer than the bound; run() must raise a clear timeout
+    PROMPTLY — not hang.
+
+    Mutation guard: removing the ThreadPoolExecutor/.result(timeout=...)
+    wrapper makes run() block on the sleeping fake open until it returns,
+    so this test would exceed its wall-clock guard (or hang).
+    """
+    import time as _t
+
+    # Tiny bound; the fake open blocks well past it.
+    monkeypatch.setattr(
+        "omnigent.onboarding.sandboxes.kubernetes._POD_READY_REQUEST_TIMEOUT_S", 0.2
+    )
+    launcher, pod_name = _provisioned(fake_k8s)
+    fake_k8s.exec_open_blocks_s = 10.0  # would hang the test without the bound
+
+    started = _t.monotonic()
+    with pytest.raises(click.ClickException, match="timed out opening exec stream"):
+        launcher.run(pod_name, "true")
+    elapsed = _t.monotonic() - started
+
+    # Returned promptly (≈ the 0.2s bound), NOT after the 10s fake block.
+    assert elapsed < 5.0, f"exec-open timeout did not return promptly: {elapsed:.1f}s"
+
+
+def test_run_exec_open_timeout_is_not_retried_as_transient(
+    fake_k8s: _FakeK8sState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    round-3 final FIX-1: an open TIMEOUT is an apiserver stall, NOT the
+    container-not-ready race, so it is raised immediately — it must NOT be
+    consumed as a retryable transient (which would multiply the wait by the
+    retry count).
+
+    Mutation guard: classifying the worker-timeout as transient would retry
+    it and the total elapsed would exceed the single-attempt bound × ~1.
+    """
+    import time as _t
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.sandboxes.kubernetes._POD_READY_REQUEST_TIMEOUT_S", 0.2
+    )
+    # If the timeout were retried, the open would block _EXEC_NOT_READY_RETRIES
+    # times; keep the fake block modest so a buggy retry is still observable
+    # but the test stays fast.
+    monkeypatch.setattr("omnigent.onboarding.sandboxes.kubernetes._EXEC_NOT_READY_BACKOFF_S", 0.0)
+    launcher, pod_name = _provisioned(fake_k8s)
+    fake_k8s.exec_open_blocks_s = 1.0
+
+    started = _t.monotonic()
+    with pytest.raises(click.ClickException, match="timed out opening exec stream"):
+        launcher.run(pod_name, "true")
+    elapsed = _t.monotonic() - started
+
+    # One attempt only (~0.2s bound). Retrying 5× would be ≈1s+; assert well
+    # under a single retry-multiplied window.
+    assert elapsed < 0.6, f"open timeout looks retried (elapsed {elapsed:.2f}s)"
 
 
 def test_run_parses_nonzero_exit_and_raises_when_checked(fake_k8s: _FakeK8sState) -> None:
@@ -1948,6 +2051,43 @@ def test_redact_command_masks_whole_value(command: str, secret: str, expected_ke
     for fragment in secret.split():
         assert fragment not in redacted, f"leaked {fragment!r} in {redacted!r}"
     assert expected_key in redacted
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        # round-3 final FIX-3 — the LEAK case: a NON-sensitive `FOO=` value
+        # must NOT swallow the adjacent `;TOKEN=leak` (the old `[^\s]+` value
+        # class ate it, so the secret was never matched and leaked verbatim).
+        ("FOO=bar;TOKEN=leak", "FOO=bar;TOKEN=***"),
+        # OVER-redaction: the bare value stops at `;`, so the trailing
+        # command survives (old behavior dropped `;echo hi`).
+        ("TOKEN=abc;echo hi", "TOKEN=***;echo hi"),
+        # Other shell separators (`&`, `|`) bound the value the same way.
+        ("FOO=bar&TOKEN=x", "FOO=bar&TOKEN=***"),
+        ("FOO=bar|TOKEN=x", "FOO=bar|TOKEN=***"),
+        ("FOO=bar&&TOKEN=x echo", "FOO=bar&&TOKEN=*** echo"),
+        # Redirection / subshell metacharacters also bound the bare value.
+        ("TOKEN=abc>out", "TOKEN=***>out"),
+        ("TOKEN=abc(x", "TOKEN=***(x"),
+    ],
+)
+def test_redact_command_stops_value_at_shell_separators(command: str, expected: str) -> None:
+    """
+    round-3 final FIX-3: the bare value class stops at shell separators
+    (`;&|()<>`), fixing BOTH (a) over-redaction (a value swallowing an
+    adjacent command) and (b) a LEAK (a non-sensitive ``FOO=`` value
+    swallowing a following ``;TOKEN=secret`` so the secret was never
+    redacted). Asserts the exact output: secret masked, adjacent commands
+    preserved.
+
+    Mutation guard: the old `[^\\s]+` value class fails ``FOO=bar;TOKEN=leak``
+    (leaks the secret) and ``TOKEN=abc;echo hi`` (drops ``;echo hi``).
+    """
+    assert _redact_command(command) == expected
+    # Belt-and-suspenders: the literal secret never survives the leak case.
+    if "leak" in command:
+        assert "leak" not in _redact_command(command)
 
 
 @pytest.mark.parametrize(

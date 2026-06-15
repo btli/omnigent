@@ -49,6 +49,7 @@ Platform notes that shape this launcher:
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import importlib
 import os
@@ -210,14 +211,15 @@ _FATAL_WAITING_REASONS: frozenset[str] = frozenset(
 # these (e.g. 403 Forbidden, 404 deleted) is surfaced immediately.
 _TRANSIENT_READ_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
 
-# ``create_namespaced_pod`` ApiException statuses that DEFINITIVELY mean the
-# Pod was NOT created (a client/validation reject), so no orphan-cleanup is
-# needed (round-3 FIX-2). 409 (conflict) is handled separately (name-regen
-# retry). Any OTHER status — 5xx, or a missing/unknown status — is AMBIGUOUS:
-# the apiserver may have accepted the create then failed the response, so we
-# best-effort delete the known pod_name before re-raising to avoid leaking a
-# running Pod.
-_CREATE_NOT_CREATED_STATUSES: frozenset[int] = frozenset({400, 401, 403, 404, 405, 422})
+# A ``create_namespaced_pod`` outcome is AMBIGUOUS — the apiserver may have
+# accepted the Pod even though the call surfaced an error, so the known
+# pod_name could be an orphan — ONLY for (round-3 final FIX-2):
+#   * a urllib3 transport error/timeout (handled separately), or
+#   * an ApiException with NO status, or a 5xx (500–599).
+# Every DEFINITE client rejection (any 4xx — incl. 409 conflict, 415, 429,
+# 400/403/404/422) means the Pod was NOT created, so it must NOT trigger a
+# cleanup delete (that would delete another launch's Pod of the same name).
+# See :func:`_create_outcome_ambiguous`.
 
 # Credential key SEGMENTS (uppercase) that mark an env assignment as
 # sensitive. A key is redacted iff one of its ``_``-delimited segments is in
@@ -241,12 +243,18 @@ _SENSITIVE_KEY_SEGMENTS: frozenset[str] = frozenset(
 #            pattern was O(n²) and backtracked catastrophically when the `=`
 #            was absent),
 #   group 3: the value — a single-quoted run, a double-quoted run, OR a bare
-#            non-whitespace run (so a quoted value WITH SPACES is masked whole).
+#            run that STOPS at a shell separator (round-3 final FIX-3): the
+#            value class `[^\s;&|()<>]+` excludes `;&|()<>` so the bare value
+#            does NOT swallow an adjacent command. Without that, `TOKEN=abc;echo`
+#            over-redacted `;echo`, and worse `FOO=bar;TOKEN=leak` let the
+#            NON-sensitive `FOO=` match eat `;TOKEN=leak` so the secret was
+#            never matched/redacted (a LEAK). A quoted value WITH SPACES is
+#            still masked whole.
 # Whether to redact is decided in Python (:func:`_redact_command`) by splitting
 # the key on `_` and checking for a credential segment — keeping the regex
 # linear and the keyword match boundary-aware.
 _SENSITIVE_ENV_RE: re.Pattern[str] = re.compile(
-    r"(^|[\s;&|(])([A-Za-z0-9_]+)=('[^']*'|\"[^\"]*\"|[^\s]+)"
+    r"(^|[\s;&|(])([A-Za-z0-9_]+)=('[^']*'|\"[^\"]*\"|[^\s;&|()<>]+)"
 )
 
 # Reserved env names the Pod sets itself (writable-HOME contract + sandbox
@@ -873,13 +881,15 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                 if exc.status == 409 and attempt == 0:
                     pod_name = _new_pod_name(name)
                     continue
-                # A non-409 failure whose status does NOT definitively mean
-                # "not created" (e.g. 500 / 504 Gateway Timeout, or a
-                # missing status) is AMBIGUOUS: the apiserver may have
-                # accepted the Pod then failed the response, orphaning it.
-                # Best-effort delete the known pod_name before re-raising so
-                # such a create can't leak a running Pod (round-3 FIX-2).
-                if exc.status not in _CREATE_NOT_CREATED_STATUSES:
+                # Best-effort delete the known pod_name ONLY when the create
+                # outcome is genuinely AMBIGUOUS (no status, or 5xx): the
+                # apiserver may have accepted the Pod then failed the
+                # response, orphaning it (round-3 final FIX-2). A DEFINITE
+                # client rejection — any 4xx, INCLUDING a retry-exhausted
+                # 409, 415, or 429 — means the Pod was NOT created, so we do
+                # NOT delete (the pod_name could belong to another launch's
+                # Pod).
+                if _create_outcome_ambiguous(exc):
                     self._best_effort_delete(namespace, pod_name)
                 raise click.ClickException(_format_api_error("create pod", pod_name, exc)) from exc
 
@@ -1243,7 +1253,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
     def _open_exec_stream(self, namespace: str, sandbox_id: str, command: str) -> _ExecStream:
         """
         Open the ``pods/exec`` websocket, retrying the transient
-        first-exec race (codex S2).
+        first-exec race (codex S2) and bounding the open (round-3 FIX-1).
 
         A Pod can report its container ready a beat before the kubelet's
         exec endpoint can attach, so the first ``connect_get_namespaced_
@@ -1255,50 +1265,40 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         immediately, and a transient one that outlives the window is
         raised after it.
 
+        The websocket OPEN itself is bounded by a worker-thread timeout
+        (:data:`_POD_READY_REQUEST_TIMEOUT_S`): the kubernetes 36.0.2 client
+        does NOT honor ``_request_timeout`` for the ``_preload_content=
+        False`` connect (the underlying ``websocket.connect`` gets no
+        socket timeout and the default is ``None``), so a stalled apiserver
+        would otherwise block ``stream()`` forever. We run each open in a
+        :class:`~concurrent.futures.ThreadPoolExecutor` and ``.result(
+        timeout=...)``. A connect timeout is an apiserver stall, NOT the
+        container-not-ready race, so it is raised (not retried as
+        transient). The long-lived streaming reads are unaffected — they
+        stay on the explicit select-based ``ws.update(timeout=...)`` in
+        :meth:`run`, not on this connect bound.
+
         :param namespace: Namespace the Pod lives in.
         :param sandbox_id: Target Pod name.
         :param command: Shell command to execute remotely.
         :returns: The opened ``WSClient`` (``_preload_content=False``).
-        :raises click.ClickException: When the stream cannot be opened.
+        :raises click.ClickException: When the stream cannot be opened
+            (forbidden / deleted / not-ready-after-retries / open timeout).
         """
         from kubernetes.client.rest import ApiException
-        from kubernetes.stream import stream
 
-        core = self._load_core()
         last_exc: ApiException | None = None
         for attempt in range(_EXEC_NOT_READY_RETRIES):
             try:
-                # Bound to the Protocol-typed local so the Any from the
-                # lazy client import doesn't leak out as the return type.
-                #
-                # _request_timeout bounds the exec OPEN — the last blocking
-                # k8s call without a timeout (round-3 FIX-1). It threads
-                # through the generated method to the client's websocket
-                # path; crucially it does NOT shorten the long-lived
-                # streaming reads, because the read loop drives the socket
-                # with explicit select-based `ws.update(timeout=...)` calls,
-                # not the connect timeout. (`_preload_content=False` returns
-                # the WSClient straight after connect; the client only
-                # applies _request_timeout to the blocking read-all path we
-                # never take.)
-                ws: _ExecStream = stream(
-                    core.connect_get_namespaced_pod_exec,
-                    sandbox_id,
-                    namespace,
-                    # The Pod has a single container named "host"
-                    # (build_pod_manifest). Naming it explicitly keeps exec
-                    # unambiguous on clusters that inject sidecars (Istio,
-                    # Linkerd), where an unspecified container is rejected.
-                    container=_CONTAINER_NAME,
-                    command=["bash", "-lc", command],
-                    stderr=True,
-                    stdin=False,
-                    stdout=True,
-                    tty=False,
-                    _preload_content=False,
-                    _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
-                )
-                return ws
+                return self._open_exec_stream_once(namespace, sandbox_id, command)
+            except concurrent.futures.TimeoutError as exc:
+                # The connect stalled (apiserver hung), NOT the
+                # container-not-ready race — surface it immediately rather
+                # than burning the retry budget on a hung socket.
+                raise click.ClickException(
+                    f"timed out opening exec stream on pod '{sandbox_id}' after "
+                    f"{_POD_READY_REQUEST_TIMEOUT_S:.0f}s"
+                ) from exc
             except ApiException as exc:
                 # The Pod may have been deleted mid-run (a racing
                 # terminate), pods/exec may be forbidden, or the container
@@ -1319,6 +1319,79 @@ class KubernetesSandboxLauncher(SandboxLauncher):
             _format_api_error("exec in pod", sandbox_id, last_exc)
             + f" (container not exec-ready after {_EXEC_NOT_READY_RETRIES} attempts)"
         )
+
+    def _open_exec_stream_once(self, namespace: str, sandbox_id: str, command: str) -> _ExecStream:
+        """
+        Open the exec websocket ONCE, bounded by a worker-thread timeout
+        (round-3 FIX-1).
+
+        The kubernetes 36.0.2 client leaves the ``_preload_content=False``
+        websocket connect unbounded, so ``stream()`` is run on a worker
+        thread and awaited with ``.result(timeout=_POD_READY_REQUEST_TIMEOUT_S)``.
+
+        On timeout the executor is shut down with ``wait=False,
+        cancel_futures=True`` — NOT a ``with`` block, whose ``__exit__``
+        does ``shutdown(wait=True)`` and would BLOCK on the orphaned
+        still-connecting thread, defeating the timeout. The orphaned worker
+        is left to unwind on its own (it cannot leak a returned WSClient
+        because we never read its result).
+
+        :param namespace: Namespace the Pod lives in.
+        :param sandbox_id: Target Pod name.
+        :param command: Shell command to execute remotely.
+        :returns: The opened ``WSClient``.
+        :raises concurrent.futures.TimeoutError: When the open does not
+            complete within :data:`_POD_READY_REQUEST_TIMEOUT_S`.
+        :raises kubernetes.client.rest.ApiException: When the open fails.
+        """
+        from kubernetes.stream import stream
+
+        core = self._load_core()
+
+        def _open() -> _ExecStream:
+            # _request_timeout is kept as future-proofing (if a later client
+            # honors it for the streaming connect), but it is INERT in
+            # 36.0.2 for _preload_content=False — the REAL bound is the
+            # .result(timeout=...) below.
+            ws: _ExecStream = stream(
+                core.connect_get_namespaced_pod_exec,
+                sandbox_id,
+                namespace,
+                # The Pod has a single container named "host"
+                # (build_pod_manifest). Naming it explicitly keeps exec
+                # unambiguous on clusters that inject sidecars (Istio,
+                # Linkerd), where an unspecified container is rejected.
+                container=_CONTAINER_NAME,
+                command=["bash", "-lc", command],
+                stderr=True,
+                stdin=False,
+                stdout=True,
+                tty=False,
+                _preload_content=False,
+                _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
+            )
+            return ws
+
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="omnigent-k8s-exec-open"
+        )
+        future = executor.submit(_open)
+        try:
+            ws = future.result(timeout=_POD_READY_REQUEST_TIMEOUT_S)
+        except concurrent.futures.TimeoutError:
+            # Do NOT wait for the orphaned connecting thread (that is the
+            # whole point of the timeout) — cancel and return promptly.
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        except BaseException:
+            # The open itself failed (e.g. ApiException) — the worker is
+            # done, so a non-blocking shutdown is fine; re-raise to the
+            # caller's transient-retry handling.
+            executor.shutdown(wait=False)
+            raise
+        # Success: the worker finished, so a normal shutdown won't block.
+        executor.shutdown(wait=True)
+        return ws
 
     @staticmethod
     def _exec_stuck_message(
@@ -1483,6 +1556,29 @@ def _read_error_reason(exc: Exception) -> str:
         return str(reason)
     text = str(exc).strip()
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
+def _create_outcome_ambiguous(exc: k8s_client.ApiException) -> bool:
+    """
+    Report whether a non-409 ``create_namespaced_pod`` ``ApiException`` is
+    AMBIGUOUS — the apiserver may have accepted the Pod despite the error,
+    so the known pod_name could be an orphan to best-effort delete
+    (round-3 final FIX-2).
+
+    Ambiguous (cleanup) = NO status (a wrapped transport error the client
+    surfaced as ``status == 0``/``None``) OR a 5xx (500–599). A DEFINITE
+    client rejection — any 4xx, including 409 conflict, 415, 429,
+    400/403/404/422 — means the Pod was NOT created, so it must NOT trigger
+    cleanup (the pod_name may belong to another concurrent launch).
+
+    :param exc: The raised create ``ApiException`` (already known not to be
+        a 409 the caller handled by name regeneration).
+    :returns: ``True`` only when the Pod may have been created.
+    """
+    status = getattr(exc, "status", None)
+    if not status:  # 0 / None → no HTTP response; the create may have landed
+        return True
+    return bool(500 <= status <= 599)
 
 
 def _is_transient_exec_error(exc: k8s_client.ApiException) -> bool:
