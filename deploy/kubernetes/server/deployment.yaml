@@ -11,12 +11,17 @@
 # - Image is linux/amd64-only -> amd64 nodeSelector. GHCR package is public
 #   (no imagePullSecret).
 # - Alembic migrations run automatically in the entrypoint (no migration Job).
-# - AUTH: setting OMNIGENT_OIDC_ISSUER with OMNIGENT_AUTH_ENABLED=1 selects OIDC
-#   mode; the server runs its own /auth/login + /auth/callback. Works with any
-#   OIDC IdP (Authentik, Keycloak, Auth0, Okta, ...). GOTCHA: Omnigent rejects
-#   logins where email_verified != true — make your IdP assert it.
-#   For a no-auth dev/test bring-up, set OMNIGENT_AUTH_ENABLED=0 and drop the
-#   OMNIGENT_OIDC_* / OMNIGENT_DOMAIN env below.
+# - AUTH (default = built-in `accounts`): with OMNIGENT_AUTH_ENABLED=1 and no
+#   OMNIGENT_OIDC_ISSUER set, the server selects its built-in multi-user
+#   `accounts` provider — username/password, no external IdP, first boot
+#   auto-creates an admin (random password in the pod logs + on the artifact
+#   PVC at /data/admin-credentials), and the admin invites teammates from the
+#   web UI. This matches the deploy default everywhere else (see deploy/README.md
+#   "Auth"). To pin the admin password for a headless bring-up, set
+#   OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD.
+#   Prefer your own IdP? See the "opt-in: OIDC instead of accounts" block below.
+#   For a no-auth dev/test bring-up, set OMNIGENT_AUTH_ENABLED=0 (single shared
+#   "local" user — local dev only, never a network-exposed deploy).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -57,36 +62,72 @@ spec:
               value: "0.0.0.0"
             - name: PORT
               value: "8000"
-            # ---- auth (OIDC). For no-auth dev: set to "0" and delete the rest. ----
-            - name: OMNIGENT_AUTH_ENABLED
-              value: "1"
             - name: OMNIGENT_CONFIG
               value: /etc/omnigent/config.yaml
-            # Browser-facing host. The server derives the OIDC redirect URI
-            # https://<domain>/auth/callback (must match your IdP client's
-            # allowed redirect URIs) and the cookie scope.
-            - name: OMNIGENT_DOMAIN
-              value: omnigent.example.com
-            # Your IdP issuer; the server appends /.well-known/openid-configuration.
-            - name: OMNIGENT_OIDC_ISSUER
-              value: https://YOUR_IDP/application/o/omnigent/
-            - name: OMNIGENT_OIDC_CLIENT_ID
-              value: YOUR_OIDC_CLIENT_ID
-            - name: OMNIGENT_OIDC_CLIENT_SECRET
+            # ---- auth: built-in `accounts` (DEFAULT — multi-user, no IdP) ----
+            # With AUTH_ENABLED=1 and no OIDC issuer, the server runs its
+            # built-in username/password flow with a first-boot admin. For
+            # no-auth dev/test set OMNIGENT_AUTH_ENABLED=0 (and the cookie
+            # secret / base URL below are then unused).
+            - name: OMNIGENT_AUTH_ENABLED
+              value: "1"
+            # 32-byte hex cookie secret that signs the session cookie. REQUIRED
+            # in accounts mode. Generate with `openssl rand -hex 32`.
+            - name: OMNIGENT_ACCOUNTS_COOKIE_SECRET
               valueFrom:
                 secretKeyRef:
                   name: omnigent-secrets
-                  key: oidc-client-secret
-            - name: OMNIGENT_OIDC_COOKIE_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: omnigent-secrets
-                  key: oidc-cookie-secret
+                  key: accounts-cookie-secret
+            # Public URL the browser uses. REQUIRED: it builds the single-use
+            # invite-redeem links and decides whether the session cookie gets
+            # the secure __Host- prefix (HTTPS). Must be the externally-reachable
+            # URL (behind your Ingress/LB), NOT the in-cluster Service address.
+            - name: OMNIGENT_ACCOUNTS_BASE_URL
+              value: "https://omnigent.example.com"
+            # Optional: pin the first-boot admin password for a headless deploy
+            # where you can't read the pod logs. Otherwise a random password is
+            # generated and printed to the logs + written to
+            # /data/admin-credentials on the artifact PVC.
+            # - name: OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD
+            #   valueFrom:
+            #     secretKeyRef: { name: omnigent-secrets, key: accounts-admin-password }
             # A connecting HOST authenticates with the session JWT from
             # `omnigent login`; the default 8h expiry breaks a long-lived host
             # on reconnect. Raise it for unattended hosts (720 = 30d).
-            - name: OMNIGENT_OIDC_SESSION_TTL_HOURS
+            - name: OMNIGENT_ACCOUNTS_SESSION_TTL_HOURS
               value: "720"
+            # ============================================================
+            # OPT-IN: OIDC instead of accounts (bring your own IdP)
+            # ------------------------------------------------------------
+            # To use single sign-on (Authentik, Keycloak, Auth0, Okta, Entra,
+            # Google, GitHub) INSTEAD of the built-in accounts flow, UNCOMMENT
+            # the block below. Setting OMNIGENT_OIDC_ISSUER (with auth enabled)
+            # is what flips the mode to OIDC — the accounts vars above then go
+            # unused, so you can leave them or drop them. The server runs its
+            # own /auth/login + /auth/callback. OIDC requires HTTPS (the session
+            # cookie uses the __Host- prefix). Also switch the Secret over to
+            # its oidc-client-secret / oidc-cookie-secret keys (see
+            # secret.example.yaml).
+            #
+            # GOTCHA: Omnigent rejects logins where email_verified != true —
+            # make your IdP assert it (e.g. Authentik's default OpenID `email`
+            # scope mapping emits false; override it).
+            #
+            # - name: OMNIGENT_DOMAIN          # browser-facing host; the server
+            #   value: omnigent.example.com    #   derives https://<domain>/auth/callback
+            # - name: OMNIGENT_OIDC_ISSUER     # your IdP base URL; the server appends
+            #   value: "https://idp.example.com/"  #   /.well-known/openid-configuration
+            # - name: OMNIGENT_OIDC_CLIENT_ID
+            #   value: YOUR_OIDC_CLIENT_ID
+            # - name: OMNIGENT_OIDC_CLIENT_SECRET
+            #   valueFrom:
+            #     secretKeyRef: { name: omnigent-secrets, key: oidc-client-secret }
+            # - name: OMNIGENT_OIDC_COOKIE_SECRET
+            #   valueFrom:
+            #     secretKeyRef: { name: omnigent-secrets, key: oidc-cookie-secret }
+            # - name: OMNIGENT_OIDC_SESSION_TTL_HOURS   # raise for unattended hosts
+            #   value: "720"                            #   (OIDC equivalent of the accounts TTL above)
+            # ============================================================
           ports:
             - name: http
               containerPort: 8000

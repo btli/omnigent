@@ -64,6 +64,12 @@ deploy/
 │   ├── modal_app.py
 │   └── README.md
 │
+├── kubernetes/        ← Kubernetes manifests (server Deployment + on-cluster
+│   ├── server/           `omnigent host` stopgap for agent compute)
+│   ├── host/
+│   ├── README.md
+│   └── SKILL.md
+│
 ├── trycloudflare/     ← Cloudflare quick tunnel (public URL for a LOCAL server)
 │   └── README.md
 │
@@ -92,7 +98,8 @@ deploy/
 | Deploy to Modal (durable artifact Volume) | Modal | [`modal/README.md`](modal/README.md): `modal deploy`, BYO Neon Postgres |
 | Stand up a quick demo (no DB to provision) | HF Spaces | [`hf-spaces/README.md`](hf-spaces/README.md): Docker Space, SQLite |
 | Share a server running on your **laptop**: demo it to teammates, or let remote runners & cloud sandboxes connect back to it (nothing to deploy) | Cloudflare quick tunnel | `cloudflared tunnel --url http://localhost:6767` |
-| Cloud Run / Kubernetes / other | Docker image | [`docker/README.md`](docker/README.md), then point your platform at the image |
+| Deploy to Kubernetes (server + on-cluster host) | Kubernetes manifests | [`kubernetes/README.md`](kubernetes/README.md): `kubectl apply` the `server/` manifests (built-in accounts auth by default) |
+| Cloud Run / other | Docker image | [`docker/README.md`](docker/README.md), then point your platform at the image |
 
 All deploy paths share the same image (`docker/Dockerfile`): a slim Python
 container running the FastAPI / WebSocket coordinator, with Postgres or
