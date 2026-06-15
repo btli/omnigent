@@ -647,6 +647,8 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             secret_name=_parse_provider_string(raw, "kubernetes", "secret_name"),
             service_account=_parse_provider_string(raw, "kubernetes", "service_account"),
             node_selector=_parse_provider_str_mapping(raw, "kubernetes", "node_selector"),
+            kubeconfig=_parse_provider_string(raw, "kubernetes", "kubeconfig"),
+            in_cluster=_parse_provider_bool(raw, "kubernetes", "in_cluster"),
         )
         token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
     else:
@@ -951,6 +953,8 @@ def _kubernetes_launcher_factory(
     secret_name: str | None,
     service_account: str | None,
     node_selector: dict[str, str] | None,
+    kubeconfig: str | None,
+    in_cluster: bool | None,
 ) -> Callable[[], SandboxLauncher]:
     """
     Build the launcher factory for the YAML ``provider: kubernetes`` path.
@@ -974,6 +978,12 @@ def _kubernetes_launcher_factory(
     :param node_selector: Extra node selector labels merged with the
         mandatory ``kubernetes.io/arch: amd64`` constraint, or ``None``
         for none.
+    :param kubeconfig: Explicit kubeconfig path for the out-of-cluster
+        config fallback, or ``None`` to resolve from the launcher's
+        env-var fallback / the ambient kubeconfig.
+    :param in_cluster: Force the cluster-config source — ``True`` for
+        in-cluster ServiceAccount only, ``False`` for kubeconfig only, or
+        ``None`` to try in-cluster then fall back to kubeconfig.
     :returns: A factory producing parameterized Kubernetes launchers.
     """
 
@@ -988,6 +998,8 @@ def _kubernetes_launcher_factory(
             secret_name=secret_name,
             service_account=service_account,
             node_selector=node_selector,
+            kubeconfig=kubeconfig,
+            in_cluster=in_cluster,
         )
 
     return _build
@@ -1106,6 +1118,29 @@ def _parse_provider_positive_int(raw: dict[str, object], provider: str, key: str
         return None
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise ValueError(f"server config 'sandbox.{provider}.{key}' must be a positive integer")
+    return value
+
+
+def _parse_provider_bool(raw: dict[str, object], provider: str, key: str) -> bool | None:
+    """
+    Extract and validate an optional boolean provider field.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :param provider: Provider block name, e.g. ``"kubernetes"``.
+    :param key: Field name under the provider block, e.g. ``"in_cluster"``.
+    :returns: The boolean, or ``None`` when omitted.
+    :raises ValueError: When the field is present but is not a real
+        boolean (a YAML ``"true"`` string or an int are rejected — a
+        silently-coerced flag would change the cluster-config source).
+    """
+    section = _parse_provider_section(raw, provider)
+    if section is None:
+        return None
+    value = section.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise ValueError(f"server config 'sandbox.{provider}.{key}' must be a boolean")
     return value
 
 

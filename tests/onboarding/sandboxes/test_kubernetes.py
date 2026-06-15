@@ -468,15 +468,30 @@ class _FakeWSClient:
     ``stuck`` mode it stays open forever and delivers nothing, modelling a
     wedged stream the read-loop safeguard must abandon.
 
+    ``status_after_close`` models the fast-command STATUS-frame race: the
+    socket reports closed (``is_open()`` False) with the STATUS frame still
+    unbuffered, and only the post-loop ``update()`` flush surfaces it — so
+    the test fails if the launcher drops that final flush.
+
     :param channels: Per-channel text the stream delivers (channel id →
         text), e.g. ``{1: "out", 3: status_frame}``.
     :param stuck: When True, never close and never deliver a frame.
+    :param status_after_close: STATUS-channel text revealed only by an
+        ``update()`` called after the socket has closed, or ``None``.
     """
 
-    def __init__(self, channels: dict[int, str], *, stuck: bool = False) -> None:
+    def __init__(
+        self,
+        channels: dict[int, str],
+        *,
+        stuck: bool = False,
+        status_after_close: str | None = None,
+    ) -> None:
         self._pending = dict(channels)
         self._open = True
         self._stuck = stuck
+        self._status_after_close = status_after_close
+        self.update_calls = 0
         self.closed = False
 
     def is_open(self) -> bool:
@@ -484,8 +499,17 @@ class _FakeWSClient:
         return self._open
 
     def update(self, timeout: float = 0) -> None:
-        """No-op: the canned channels are already buffered."""
+        """
+        Pull the next frame. When modelling the STATUS-at-close race, an
+        ``update()`` issued AFTER close moves the held-back STATUS frame
+        into the readable buffer (the real client buffers a frame the
+        close-time read missed).
+        """
         del timeout
+        self.update_calls += 1
+        if not self._open and self._status_after_close is not None:
+            self._pending[3] = self._status_after_close
+            self._status_after_close = None
 
     def read_channel(self, channel: int, timeout: float = 0) -> str:
         """Pop a channel's buffered text, then close once all drained."""
@@ -493,6 +517,9 @@ class _FakeWSClient:
         if self._stuck:
             return ""
         data = self._pending.pop(channel, "")
+        # Close once the in-loop frames drain. With a STATUS frame held back
+        # for the post-close flush, the loop still exits here — the launcher
+        # must then recover the STATUS frame via its post-loop update().
         if not self._pending:
             self._open = False
         return data
@@ -583,6 +610,9 @@ class _FakeK8sState:
     :param exec_stuck: When True, the WSClient stays open forever and
         never delivers a frame (models a wedged exec the read-loop
         safeguard must abandon).
+    :param exec_status_after_close: STATUS-channel text the WSClient
+        reveals only via an ``update()`` after the socket closes (models
+        the fast-command STATUS-at-close race).
     :param ws_clients: Every WSClient ``stream`` handed back (for the
         websocket-close assertion).
     :param incluster_raises: Whether ``load_incluster_config`` raises the
@@ -611,6 +641,7 @@ class _FakeK8sState:
     exec_raises: Exception | None = None
     exec_open_raises: list[Exception] = field(default_factory=list)
     exec_stuck: bool = False
+    exec_status_after_close: str | None = None
     ws_clients: list[_FakeWSClient] = field(default_factory=list)
     incluster_raises: bool = False
     kubeconfig_raises: bool = False
@@ -688,7 +719,11 @@ def _install_fake_kubernetes(
                 kwargs=dict(kwargs),
             )
         )
-        ws = _FakeWSClient(state.exec_channels, stuck=state.exec_stuck)
+        ws = _FakeWSClient(
+            state.exec_channels,
+            stuck=state.exec_stuck,
+            status_after_close=state.exec_status_after_close,
+        )
         state.ws_clients.append(ws)
         return ws
 
@@ -1147,6 +1182,9 @@ def test_run_execs_bash_lc_and_parses_returncode(fake_k8s: _FakeK8sState) -> Non
     assert call.kwargs["stdout"] is True
     assert call.kwargs["stderr"] is True
     assert call.kwargs["command"] == ["bash", "-lc", "echo hi"]
+    # Exec must name the Pod's single container ("host") explicitly, or a
+    # sidecar-injected cluster (Istio/Linkerd) rejects the ambiguous exec.
+    assert call.kwargs["container"] == "host"
     assert result.returncode == 0
     assert result.stdout == "remote-out\n"
     assert result.stderr == "remote-err\n"
@@ -1218,6 +1256,32 @@ def test_run_raises_when_status_frame_missing(fake_k8s: _FakeK8sState) -> None:
 
     with pytest.raises(click.ClickException, match="no status frame"):
         launcher.run(pod_name, "true")
+
+
+def test_run_recovers_status_frame_delivered_at_socket_close(fake_k8s: _FakeK8sState) -> None:
+    """
+    A fast command's STATUS frame can land right as the socket closes, so
+    the in-loop reads miss it. The post-loop ``update()`` flush must
+    recover it — otherwise the FIRST call every launch makes
+    (``printf %s "$HOME"``) would spuriously fail with "no status frame".
+
+    The fake withholds the STATUS frame until an ``update()`` issued after
+    the socket has closed, so this passes ONLY because run() performs that
+    final flush.
+    """
+    launcher, pod_name = _provisioned(fake_k8s)
+    # No STATUS in the in-loop channels — only stdout. The success STATUS
+    # is revealed by the post-close flush.
+    fake_k8s.exec_channels = {1: "/home/omnigent\n"}
+    fake_k8s.exec_status_after_close = '{"metadata":{},"status":"Success"}'
+
+    result = launcher.run(pod_name, 'printf %s "$HOME"')
+
+    assert result.returncode == 0
+    assert result.stdout == "/home/omnigent\n"
+    # The post-close flush ran (update called again after the loop exited).
+    [ws] = fake_k8s.ws_clients
+    assert ws.update_calls >= 2
 
 
 def test_run_retries_transient_container_not_found(

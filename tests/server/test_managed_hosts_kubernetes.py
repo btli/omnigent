@@ -89,6 +89,8 @@ def test_parse_full_kubernetes_config_threads_to_launcher() -> None:
                 "secret_name": "omnigent-creds",
                 "service_account": "omnigent-runner",
                 "node_selector": {"disktype": "ssd", "gpu": "false"},
+                "kubeconfig": "/etc/omnigent/kubeconfig",
+                "in_cluster": False,
             },
         }
     )
@@ -99,6 +101,27 @@ def test_parse_full_kubernetes_config_threads_to_launcher() -> None:
     assert launcher._secret_name == "omnigent-creds"
     assert launcher._service_account == "omnigent-runner"
     assert launcher._node_selector == {"disktype": "ssd", "gpu": "false"}
+    # kubeconfig + in_cluster must thread through (the YAML path used to
+    # drop them silently, defeating the out-of-cluster config option).
+    assert launcher._kubeconfig == "/etc/omnigent/kubeconfig"
+    assert launcher._in_cluster is False
+
+
+def test_parse_kubernetes_in_cluster_true_threads_to_launcher() -> None:
+    """
+    ``in_cluster: true`` forces the in-cluster ServiceAccount config path
+    (no kubeconfig fallback) — it must reach the launcher as ``True``.
+    """
+    launcher = _build_kubernetes_launcher(
+        {
+            "provider": "kubernetes",
+            "server_url": "https://srv.example.com/",
+            "kubernetes": {"in_cluster": True},
+        }
+    )
+    assert launcher._in_cluster is True
+    # kubeconfig omitted → None (its own env-var fallback applies).
+    assert launcher._kubeconfig is None
 
 
 def test_parse_kubernetes_factory_builds_launcher_instance() -> None:
@@ -174,6 +197,34 @@ def test_parse_kubernetes_factory_builds_launcher_instance() -> None:
                 "kubernetes": {"env": "OPENAI"},
             },
             "sandbox.kubernetes.env",
+        ),
+        # in_cluster present but a string (YAML "true") — must NOT be
+        # silently coerced; a wrong config source is a loud error.
+        (
+            {
+                "provider": "kubernetes",
+                "server_url": "https://s",
+                "kubernetes": {"in_cluster": "true"},
+            },
+            "sandbox.kubernetes.in_cluster",
+        ),
+        # in_cluster present but an int — also rejected (1 is not a bool).
+        (
+            {
+                "provider": "kubernetes",
+                "server_url": "https://s",
+                "kubernetes": {"in_cluster": 1},
+            },
+            "sandbox.kubernetes.in_cluster",
+        ),
+        # kubeconfig present but not a non-empty string.
+        (
+            {
+                "provider": "kubernetes",
+                "server_url": "https://s",
+                "kubernetes": {"kubeconfig": "  "},
+            },
+            "sandbox.kubernetes.kubeconfig",
         ),
     ],
 )

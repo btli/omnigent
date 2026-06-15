@@ -24,7 +24,9 @@ data:
       # In-cluster service DNS is simplest (no ingress hop); http upgrades to ws
       # for the tunnel. Use your external ingress URL instead if runner Pods
       # must reach the server through it.
-      server_url: http://omnigent.omnigent.svc.cluster.local:8000
+      # In-cluster `service.namespace.svc.cluster.local` DNS form; the base
+      # Service listens on port 80 (targetPort http=8000), so no port suffix.
+      server_url: http://omnigent.omnigent.svc.cluster.local
       kubernetes:
         # Namespace the runner Pods are created in (this namespace).
         namespace: omnigent

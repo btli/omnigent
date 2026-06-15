@@ -49,6 +49,7 @@ Platform notes that shape this launcher:
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import os
 import re
@@ -161,6 +162,11 @@ _RUN_AS_GID: int = 1000
 # Writable HOME for the uid-1000 Pod (the image's /root is unwritable to
 # it). Mounted as an emptyDir and exported as $HOME / workingDir.
 _HOME_DIR: str = "/home/omnigent"
+
+# The Pod's single container name. Single-sourced so build_pod_manifest and
+# the pods/exec call name the same container (exec must target it explicitly
+# on sidecar-injected clusters).
+_CONTAINER_NAME: str = "host"
 
 # Pod-ready wait budget. Consumed inside provision() BEFORE the shared
 # _wait_for_host_online 120s poll, so it is kept tight; transient image
@@ -344,7 +350,7 @@ def build_pod_manifest(
     env.extend({"name": name, "value": value} for name, value in env_literals.items())
 
     container: dict[str, object] = {
-        "name": "host",
+        "name": _CONTAINER_NAME,
         "image": image,
         "workingDir": _HOME_DIR,
         # PID-1 reaper (codex M3): a login shell so the image's
@@ -748,11 +754,11 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                     continue
                 raise click.ClickException(_format_api_error("create pod", pod_name, exc)) from exc
 
-        self._wait_for_pod_ready(pod_name)
+        self._wait_for_pod_ready(namespace, pod_name)
         click.echo(f"  → pod '{pod_name}' is ready")
         return pod_name
 
-    def _wait_for_pod_ready(self, pod_name: str) -> None:
+    def _wait_for_pod_ready(self, namespace: str, pod_name: str) -> None:
         """
         Block until the Pod's container is ready, failing fast on
         terminal states (codex S2 + fast-fail).
@@ -766,12 +772,12 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         ``Unschedulable`` ``PodScheduled`` condition. Every failure
         surfaces recent Pod events and a ``kubectl describe`` hint.
 
+        :param namespace: Namespace the Pod lives in.
         :param pod_name: The Pod to wait on.
         :raises click.ClickException: On a terminal state or timeout.
         """
         from kubernetes.client.rest import ApiException
 
-        namespace = self._resolve_namespace()
         core = self._load_core()
         deadline = time.monotonic() + _POD_READY_TIMEOUT_S
         while True:
@@ -784,6 +790,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
             if phase in ("Failed", "Succeeded"):
                 raise click.ClickException(
                     self._pod_failure_message(
+                        namespace,
                         pod_name,
                         f"pod entered terminal phase '{phase}' before becoming ready",
                     )
@@ -793,13 +800,15 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                 reason, message = fatal
                 detail = f"{reason}: {message}" if message else reason
                 raise click.ClickException(
-                    self._pod_failure_message(pod_name, f"container cannot start ({detail})")
+                    self._pod_failure_message(
+                        namespace, pod_name, f"container cannot start ({detail})"
+                    )
                 )
             unschedulable = _unschedulable_message(pod)
             if unschedulable is not None:
                 raise click.ClickException(
                     self._pod_failure_message(
-                        pod_name, f"pod cannot be scheduled ({unschedulable})"
+                        namespace, pod_name, f"pod cannot be scheduled ({unschedulable})"
                     )
                 )
             if phase == "Running" and _container_ready(pod):
@@ -807,6 +816,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
             if time.monotonic() >= deadline:
                 raise click.ClickException(
                     self._pod_failure_message(
+                        namespace,
                         pod_name,
                         f"pod did not become ready within {_POD_READY_TIMEOUT_S}s "
                         f"(last phase '{phase or 'unknown'}')",
@@ -814,7 +824,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                 )
             time.sleep(_POD_READY_POLL_S)
 
-    def _pod_failure_message(self, pod_name: str, summary: str) -> str:
+    def _pod_failure_message(self, namespace: str, pod_name: str, summary: str) -> str:
         """
         Build a pod-ready failure message, appending recent Pod events
         and a ``kubectl describe`` pointer.
@@ -824,29 +834,29 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         diagnose the failure; best-effort, so an events lookup that
         itself errors is omitted rather than masking the real failure.
 
+        :param namespace: Namespace the Pod lives in.
         :param pod_name: The failed Pod.
         :param summary: The failure summary (what went wrong).
         :returns: The full error message.
         """
-        namespace = self._resolve_namespace()
         message = f"Kubernetes sandbox pod '{pod_name}' {summary}."
-        events = self._recent_events(pod_name)
+        events = self._recent_events(namespace, pod_name)
         if events:
             message += f" Recent events: {events}"
         message += f" Inspect with `kubectl describe pod {pod_name} -n {namespace}`."
         return message
 
-    def _recent_events(self, pod_name: str) -> str:
+    def _recent_events(self, namespace: str, pod_name: str) -> str:
         """
         Return a compact ``reason: message`` summary of the Pod's recent
         events, or empty when none are available.
 
+        :param namespace: Namespace the Pod lives in.
         :param pod_name: The Pod to fetch events for.
         :returns: A ``"; "``-joined summary, or ``""``.
         """
         from kubernetes.client.rest import ApiException
 
-        namespace = self._resolve_namespace()
         try:
             core = self._load_core()
             event_list = core.list_namespaced_event(
@@ -897,7 +907,12 @@ class KubernetesSandboxLauncher(SandboxLauncher):
             STDOUT_CHANNEL,
         )
 
-        ws = self._open_exec_stream(sandbox_id, command)
+        # websocket-client (a kubernetes-client dependency) is the transport
+        # under WSClient; its base exception guards the best-effort final
+        # flush below alongside OSError.
+        from websocket import WebSocketException
+
+        ws = self._open_exec_stream(self._resolve_namespace(), sandbox_id, command)
         stdout_chunks: list[str] = []
         stderr_chunks: list[str] = []
         error_chunks: list[str] = []
@@ -954,8 +969,16 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                             stderr_chunks,
                         )
                     )
-            # Drain any frames buffered between the last update and the
-            # socket close.
+            # A fast command (e.g. the `printf %s "$HOME"` every launch runs
+            # first) can have its STATUS frame buffered right as the socket
+            # closes, so the last in-loop update() may miss it. Pull one
+            # more frame, then drain — otherwise _parse_exec_status sees no
+            # STATUS frame and raises a spurious "no status frame" error.
+            # Best-effort: a closed socket makes update() a no-op, and a
+            # transport error here would only mask the parse below, so the
+            # realistic socket/websocket failures are swallowed.
+            with contextlib.suppress(OSError, WebSocketException):
+                ws.update(timeout=0)
             _drain()
         finally:
             ws.close()
@@ -973,7 +996,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
             )
         return RemoteCommandResult(returncode=returncode, stdout=stdout, stderr=stderr)
 
-    def _open_exec_stream(self, sandbox_id: str, command: str) -> _ExecStream:
+    def _open_exec_stream(self, namespace: str, sandbox_id: str, command: str) -> _ExecStream:
         """
         Open the ``pods/exec`` websocket, retrying the transient
         first-exec race (codex S2).
@@ -988,6 +1011,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         immediately, and a transient one that outlives the window is
         raised after it.
 
+        :param namespace: Namespace the Pod lives in.
         :param sandbox_id: Target Pod name.
         :param command: Shell command to execute remotely.
         :returns: The opened ``WSClient`` (``_preload_content=False``).
@@ -996,7 +1020,6 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         from kubernetes.client.rest import ApiException
         from kubernetes.stream import stream
 
-        namespace = self._resolve_namespace()
         core = self._load_core()
         last_exc: ApiException | None = None
         for attempt in range(_EXEC_NOT_READY_RETRIES):
@@ -1007,6 +1030,11 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                     core.connect_get_namespaced_pod_exec,
                     sandbox_id,
                     namespace,
+                    # The Pod has a single container named "host"
+                    # (build_pod_manifest). Naming it explicitly keeps exec
+                    # unambiguous on clusters that inject sidecars (Istio,
+                    # Linkerd), where an unspecified container is rejected.
+                    container=_CONTAINER_NAME,
                     command=["bash", "-lc", command],
                     stderr=True,
                     stdin=False,

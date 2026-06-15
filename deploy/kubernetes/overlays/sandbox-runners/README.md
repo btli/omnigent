@@ -76,7 +76,7 @@ it, set `OMNIGENT_KUBERNETES_KUBECONFIG` to a kubeconfig path instead.
 ## Troubleshooting
 
 - **Session hangs / host never comes online.** Find the runner Pod
-  (`kubectl get pods -n omnigent -l app.kubernetes.io/component=sandbox-host`,
+  (`kubectl get pods -n omnigent -l omnigent.ai/role=sandbox-host`,
   or watch `kubectl get pods -n omnigent -w` after starting a chat) and read the
   host log: `kubectl exec -n omnigent <pod> -- cat /tmp/omnigent-host.log`.
 - **`pods "..." is forbidden`** — the server isn't running as `omnigent-server`
