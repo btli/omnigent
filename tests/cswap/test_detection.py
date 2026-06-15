@@ -32,7 +32,7 @@ def test_reactive_generic_phrase_requires_claude_mention() -> None:
     assert ReactiveOutputDetector.parse("claude: usage limit reached").is_limited is True
 
 
-def test_reactive_extracts_reset_headers() -> None:
+def test_reactive_extracts_reset_headers_sets_limited_until() -> None:
     text = (
         "claude usage limit reached\n"
         "anthropic-ratelimit-unified-5h-reset: 1700000000\n"
@@ -47,12 +47,37 @@ def test_reactive_extracts_reset_headers() -> None:
     assert detection.is_limited is True
     assert detection.source == "reactive"
     assert detection.observed_at == 1699999999
+    # limited_until is the soonest parsed reset.
+    assert detection.limited_until == 1700000000
     assert {w.label for w in detection.windows} == {"5h", "7d"}
 
 
 def test_reactive_to_detection_none_when_not_limited() -> None:
     result = ReactiveOutputDetector.parse("all good")
     assert ReactiveOutputDetector.to_detection("c", result, observed_at=1) is None
+
+
+def test_reactive_openai_detects_quota_codes() -> None:
+    # Provider-specific error codes match on their own.
+    assert ReactiveOutputDetector.parse("Error: insufficient_quota", family="openai").is_limited
+    assert ReactiveOutputDetector.parse("rate_limit_exceeded", family="openai").is_limited
+    # Generic phrasing needs an openai/gpt/codex mention.
+    assert not ReactiveOutputDetector.parse("rate limit reached", family="openai").is_limited
+    assert ReactiveOutputDetector.parse("OpenAI: rate limit reached", family="openai").is_limited
+    # A Claude limit must NOT match under the openai family.
+    assert not ReactiveOutputDetector.parse(
+        "claude usage limit reached", family="openai"
+    ).is_limited
+
+
+def test_reactive_openai_detection_has_no_reset() -> None:
+    # OpenAI surfaces no reset epoch in transcript text → limited_until None
+    # (the facade applies a cooldown default).
+    parsed = ReactiveOutputDetector.parse("insufficient_quota", family="openai")
+    detection = ReactiveOutputDetector.to_detection("c", parsed, observed_at=100)
+    assert detection is not None
+    assert detection.limited_until is None
+    assert detection.windows == ()
 
 
 # ── Probes (httpx.MockTransport) ───────────────────────────
@@ -150,6 +175,8 @@ async def test_poller_subscription_anthropic_builds_detection() -> None:
     assert detection is not None
     assert detection.is_limited is True
     assert detection.source == "poller"
+    # Recovery time comes from retry-after (1000 + 60).
+    assert detection.limited_until == 1060
 
 
 async def test_poller_api_key_anthropic() -> None:

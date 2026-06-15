@@ -59,8 +59,9 @@ class UsageEndpointPoller(UsageLimitGateway):
         api_key_loader: TokenLoader = resolve_account_api_key,
     ) -> None:
         """:param client_factory: Builds the async HTTP client (injectable
-        for tests). :param token_loader: Loads a subscription OAuth
-        token. :param api_key_loader: Resolves an api_key secret.
+            for tests).
+        :param token_loader: Loads a subscription OAuth token.
+        :param api_key_loader: Resolves an api_key secret.
         """
         self._client_factory = client_factory or _default_client_factory
         self._token_loader = token_loader
@@ -77,11 +78,13 @@ class UsageEndpointPoller(UsageLimitGateway):
         outcome = await self._probe(account, now=now)
         if outcome is None:
             return None
+        is_limited = outcome.rate_limit.is_limited(outcome.status_code)
         return LimitDetectionResult(
             credential_id=account.id,
-            is_limited=outcome.rate_limit.is_limited(outcome.status_code),
+            is_limited=is_limited,
             source="poller",
             observed_at=now,
+            limited_until=outcome.rate_limit.recovery_at() if is_limited else None,
             windows=outcome.rate_limit.windows,
         )
 

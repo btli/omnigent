@@ -18,14 +18,16 @@ import asyncio
 import logging
 import os
 import threading
-import time
-from datetime import datetime, timezone
+from dataclasses import replace
+
+from sqlalchemy import select
 
 from omnigent.cswap.container import CswapContainer, build_container
 from omnigent.cswap.domain.entities.credential_pool import CredentialPool
+from omnigent.cswap.domain.entities.provider_account import ProviderAccount
 from omnigent.cswap.domain.value_objects.enums import Family
-from omnigent.cswap.domain.value_objects.limit_state import LimitDetectionResult
-from omnigent.cswap.domain.value_objects.usage_window import UsageWindow
+from omnigent.cswap.domain.value_objects.limit_state import LimitDetectionResult, LimitState
+from omnigent.db.utils import now_epoch, utc_day
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +47,6 @@ _lazy_attempted = False
 # run in a worker thread via asyncio.to_thread; multiple session forwarders
 # can race the first build).
 _init_lock = threading.Lock()
-
-
-def _utc_day(epoch: int) -> str:
-    """Return the ``YYYY-MM-DD`` UTC day for an epoch timestamp."""
-    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d")
 
 
 def activate(container: CswapContainer, pools: dict[str, CredentialPool]) -> None:
@@ -146,13 +143,9 @@ def select_launch_env_for_family(
     if container is None:
         return {}
     try:
-        account = container.select_credential.execute(family, int(time.time())).account
+        account = container.select_credential.execute(family, now_epoch()).account
         if account is None:
             return {}
-        # Build the account-specific env first. Bind the session only when we
-        # actually have account-specific env to apply — otherwise the process
-        # runs on ambient credentials and attributing it to this account would
-        # be a lie (and would mis-route failover/cost).
         env: dict[str, str] = {}
         if account.is_subscription:
             config_dir = account.config_dir()
@@ -166,7 +159,12 @@ def select_launch_env_for_family(
             key = resolve_account_api_key(account)
             if key:
                 env = {_API_KEY_ENV[family]: key}
-        if session_id and env:
+        # Bind whenever the chosen account is actually the one the process will
+        # use: a subscription always (a dir-less subscription runs on its
+        # default login, which IS this account); an api_key only when its key
+        # resolved (otherwise the process falls back to ambient creds and
+        # attributing this account would mis-route failover/cost).
+        if session_id and (account.is_subscription or env):
             container.registry.bind(session_id, account.id, family)
         return env
     except Exception:
@@ -188,7 +186,7 @@ def record_reactive_text(text: str, *, family: Family, session_id: str) -> None:
             ReactiveOutputDetector,
         )
 
-        parsed = ReactiveOutputDetector.parse(text)
+        parsed = ReactiveOutputDetector.parse(text, family=family)
         if not parsed.is_limited:
             return
         container = _ensure_container()
@@ -197,8 +195,7 @@ def record_reactive_text(text: str, *, family: Family, session_id: str) -> None:
         credential_id = container.registry.active_credential(session_id)
         if not credential_id:
             return
-        now = int(time.time())
-        detection = ReactiveOutputDetector.to_detection(credential_id, parsed, now)
+        detection = ReactiveOutputDetector.to_detection(credential_id, parsed, now_epoch())
         if detection is None:
             return
         _track_and_failover(container, detection, session_id=session_id, family=family)
@@ -206,47 +203,18 @@ def record_reactive_text(text: str, *, family: Family, session_id: str) -> None:
         logger.exception("cswap reactive detection failed")
 
 
-def record_rate_limited(*, family: Family, session_id: str) -> None:
-    """Record an explicit 429 for the session's active account; run failover."""
-    container = _ensure_container()
-    if container is None or not session_id:
-        return
-    try:
-        credential_id = container.registry.active_credential(session_id)
-        if not credential_id:
-            return
-        now = int(time.time())
-        detection = LimitDetectionResult(
-            credential_id=credential_id,
-            is_limited=True,
-            source="reactive",
-            observed_at=now,
-            windows=(UsageWindow("5h", 100, now + _DEFAULT_LIMIT_COOLDOWN_S),),
-        )
-        _track_and_failover(container, detection, session_id=session_id, family=family)
-    except Exception:
-        logger.exception("cswap 429 handling failed")
-
-
 def _with_recovery(detection: LimitDetectionResult) -> LimitDetectionResult:
-    """Ensure a limited detection has a reset time so it can auto-recover.
+    """Ensure a limited detection has a recovery time so it auto-recovers.
 
-    A reactive limit signal often carries no reset (e.g. a 429 with no
-    headers, or "usage limit reached" text without the header lines). Left
-    as-is the account would stay limited until the poller probes it or it is
-    manually cleared — a permanent lockout when polling is disabled. Default
-    a ``5h`` cooldown (Claude's rolling window) so it recovers on its own.
+    A reactive limit often carries no reset (a 429 with no headers, or
+    "usage limit reached" text without the header lines). Without a
+    ``limited_until`` the account would stay limited until the poller probes
+    it or it is manually cleared — a permanent lockout when polling is off.
+    Default a ``5h`` cooldown (Claude's rolling window).
     """
-    if not detection.is_limited or detection.to_limit_state().earliest_reset_at() is not None:
+    if not detection.is_limited or detection.limited_until is not None:
         return detection
-    cooldown = UsageWindow("5h", 100, detection.observed_at + _DEFAULT_LIMIT_COOLDOWN_S)
-    return LimitDetectionResult(
-        credential_id=detection.credential_id,
-        is_limited=True,
-        source=detection.source,
-        observed_at=detection.observed_at,
-        windows=(*detection.windows, cooldown),
-    )
+    return replace(detection, limited_until=detection.observed_at + _DEFAULT_LIMIT_COOLDOWN_S)
 
 
 def _track_and_failover(
@@ -284,24 +252,25 @@ async def run_poll_sweep_once() -> int:
 
     if not is_poll_enabled():
         return 0
-    refreshed = 0
-    for pool in _pools.values():
-        for account in pool.members:
-            if not account.is_active:
-                continue
-            try:
-                detection = await container.gateway.fetch_limit_state(
-                    account, now=int(time.time())
-                )
-                if detection is not None:
-                    # Apply the same recovery default so a probe that only
-                    # learns "limited" (e.g. 429 + retry-after, no window) still
-                    # auto-recovers instead of locking the account out.
-                    container.track_usage_limit.execute(_with_recovery(detection))
-                    refreshed += 1
-            except Exception:
-                logger.exception("cswap probe/track failed for account %s", account.id)
-    return refreshed
+
+    accounts = [m for pool in _pools.values() for m in pool.members if m.is_active]
+
+    async def _probe_one(account: ProviderAccount) -> int:
+        """Probe one account and persist; never raises (per-account isolated)."""
+        try:
+            detection = await container.gateway.fetch_limit_state(account, now=now_epoch())
+            if detection is not None:
+                # Recovery default so a probe that only learns "limited" (e.g.
+                # 429 + retry-after, no window) still auto-recovers.
+                container.track_usage_limit.execute(_with_recovery(detection))
+                return 1
+        except Exception:
+            logger.exception("cswap probe/track failed for account %s", account)
+        return 0
+
+    # Probe all accounts concurrently — independent network calls.
+    results = await asyncio.gather(*(_probe_one(a) for a in accounts))
+    return sum(results)
 
 
 async def poll_loop(*, interval_s: float = 1800.0) -> None:
@@ -326,9 +295,9 @@ def status_snapshot() -> list[dict[str, object]]:
     Shape (one entry per pool)::
 
         {"name", "family", "failover_mode",
-         "accounts": [{"id", "name", "kind", "priority", "limit_status",
-                       "window_5h_pct", "window_7d_pct", "reset_at_5h",
-                       "reset_at_7d", "cost_today_usd"}]}
+         "accounts": [{"id", "name", "kind", "priority", "is_active",
+                       "limit_status", "limited_until", "windows",
+                       "earliest_reset_at", "cost_today_usd"}]}
 
     :returns: A list of pool dicts, or ``[]`` when no pool is configured.
     """
@@ -336,60 +305,62 @@ def status_snapshot() -> list[dict[str, object]]:
     if container is None:
         return []
     try:
-        from omnigent.db.db_models import SqlProviderAccountCost
-
-        now = int(time.time())
-        today = _utc_day(now)
-        snapshot: list[dict[str, object]] = []
-        for pool in _pools.values():
-            ids = [m.id for m in pool.members]
-            states = container.state_repo.find_many(ids)
-            with container.session_maker() as session:
-                costs: dict[str, float] = {}
-                for member in pool.members:
-                    row = session.get(SqlProviderAccountCost, (member.id, today))
-                    costs[member.id] = row.cost_usd if row is not None else 0.0
-            accounts: list[dict[str, object]] = []
-            for member in pool.members:
-                state = states.get(member.id)
-                accounts.append(
-                    {
-                        "id": member.id,
-                        "name": member.name,
-                        "kind": member.kind,
-                        "priority": member.priority,
-                        "is_active": member.is_active,
-                        "limit_status": state.to_status(now) if state else "unknown",
-                        "window_5h_pct": _window_pct(state, "5h"),
-                        "window_7d_pct": _window_pct(state, "7d"),
-                        "earliest_reset_at": state.earliest_reset_at() if state else None,
-                        "cost_today_usd": costs.get(member.id, 0.0),
-                    }
-                )
-            snapshot.append(
-                {
-                    "name": pool.name,
-                    "family": pool.family,
-                    "failover_mode": pool.failover_mode,
-                    "accounts": accounts,
-                }
-            )
-        return snapshot
+        now = now_epoch()
+        all_ids = [m.id for pool in _pools.values() for m in pool.members]
+        states = container.state_repo.find_many(all_ids)
+        costs = _costs_today(container, all_ids, utc_day(now))
+        return [
+            {
+                "name": pool.name,
+                "family": pool.family,
+                "failover_mode": pool.failover_mode,
+                "accounts": [
+                    _account_status(m, states.get(m.id), costs.get(m.id, 0.0), now)
+                    for m in pool.members
+                ],
+            }
+            for pool in _pools.values()
+        ]
     except Exception:
         logger.exception("cswap status_snapshot failed")
         return []
 
 
-def _window_pct(state: object, label: str) -> int | None:
-    """Return the utilization percent of *state*'s window labelled *label*."""
-    from omnigent.cswap.domain.value_objects.limit_state import LimitState
+def _costs_today(
+    container: CswapContainer, credential_ids: list[str], day_utc: str
+) -> dict[str, float]:
+    """Batch-fetch today's per-account cost in a single query."""
+    from omnigent.db.db_models import SqlProviderAccountCost
 
-    if not isinstance(state, LimitState):
-        return None
-    for window in state.windows:
-        if window.label == label:
-            return window.utilization_pct
-    return None
+    if not credential_ids:
+        return {}
+    with container.session_maker() as session:
+        rows = session.execute(
+            select(SqlProviderAccountCost).where(
+                SqlProviderAccountCost.credential_id.in_(credential_ids),
+                SqlProviderAccountCost.day_utc == day_utc,
+            )
+        ).scalars()
+        return {row.credential_id: row.cost_usd for row in rows}
+
+
+def _account_status(
+    member: ProviderAccount, state: LimitState | None, cost_today: float, now: int
+) -> dict[str, object]:
+    """Build one account's status entry for :func:`status_snapshot`."""
+    windows = {w.label: w.utilization_pct for w in state.windows} if state else {}
+    return {
+        "id": member.id,
+        "name": member.name,
+        "kind": member.kind,
+        "priority": member.priority,
+        "is_active": member.is_active,
+        "limit_status": state.to_status(now) if state else "unknown",
+        "limited_until": state.limited_until if state and state.is_limited else None,
+        "windows": windows,
+        "earliest_reset_at": state.earliest_reset_at() if state else None,
+        "cost_today_usd": cost_today,
+    }
 
 
 def mark_available(credential_id: str) -> bool:
@@ -406,7 +377,7 @@ def mark_available(credential_id: str) -> bool:
                 credential_id=credential_id,
                 is_limited=False,
                 source="manual",
-                observed_at=int(time.time()),
+                observed_at=now_epoch(),
             )
         )
         return True
@@ -432,7 +403,7 @@ def attribute_cost(
             return
         container.cost_sink.record_credential_cost(
             credential_id,
-            _utc_day(int(time.time())),
+            utc_day(now_epoch()),
             cost_usd=cost_usd,
             input_tokens=input_tokens,
             output_tokens=output_tokens,

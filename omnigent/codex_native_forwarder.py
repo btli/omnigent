@@ -4449,6 +4449,22 @@ async def _post_external_item(
     :param response_id: Response id for the mirrored Codex turn.
     :returns: None.
     """
+    # Multi-subscription (cswap) reactive detection: scan assistant/system
+    # message text for an OpenAI/Codex quota signal so a limited account is
+    # recorded + failed over. Restricted to assistant/system roles (not user/
+    # tool content) to avoid false positives; offloaded so the rare positive-
+    # match DB write never blocks the forwarder loop. No-op when no pool.
+    if item_type == "message" and isinstance(item_data, dict):
+        if item_data.get("role") in ("assistant", "system"):
+            from omnigent.cswap import integration as _cswap
+
+            await asyncio.to_thread(
+                _cswap.record_reactive_text,
+                str(item_data),
+                family="openai",
+                session_id=session_id,
+            )
+
     response = await _post_session_event(
         client,
         session_id,
