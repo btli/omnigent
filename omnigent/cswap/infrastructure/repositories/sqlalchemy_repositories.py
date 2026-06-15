@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 from typing import cast
 
-from sqlalchemy import CursorResult, or_, select, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -37,6 +37,7 @@ from omnigent.cswap.domain.value_objects.enums import (
 )
 from omnigent.cswap.domain.value_objects.limit_state import LimitState
 from omnigent.cswap.domain.value_objects.usage_window import UsageWindow
+from omnigent.cswap.infrastructure.sql_upsert import atomic_upsert, rowcount
 from omnigent.db.db_models import (
     SqlCredentialPool,
     SqlProviderAccount,
@@ -105,11 +106,6 @@ def _windows_from_json(raw: str | None) -> tuple[UsageWindow, ...]:
     )
 
 
-def _rowcount(result: object) -> int:
-    """Return the affected-row count of a Core ``execute`` result, or ``0``."""
-    return result.rowcount if isinstance(result, CursorResult) else 0
-
-
 def _status_for(state: LimitState) -> str:
     """Denormalised :data:`LimitStatus` for the stored row.
 
@@ -156,13 +152,13 @@ def _upsert_limit_state(session: Session, state: LimitState, *, enforce_stalenes
         guarded = guarded.where(
             or_(cls.last_checked_at.is_(None), cls.last_checked_at <= state.last_checked_at)
         )
-    if _rowcount(session.execute(guarded.values(**values))):
+    if rowcount(session.execute(guarded.values(**values))):
         return True
     # No row updated. If one exists, re-run the guarded UPDATE so the staleness
     # predicate (not a bare existence check) decides — a concurrently-inserted
     # OLDER row must still be overwritten.
     if session.get(cls, state.credential_id) is not None:
-        return _rowcount(session.execute(guarded.values(**values))) > 0
+        return rowcount(session.execute(guarded.values(**values))) > 0
     try:
         with session.begin_nested():
             session.add(cls(credential_id=state.credential_id, **values))
@@ -171,7 +167,7 @@ def _upsert_limit_state(session: Session, state: LimitState, *, enforce_stalenes
     except IntegrityError:
         if session.get(cls, state.credential_id) is None:
             raise  # not a PK race (e.g. an FK violation) — surface it
-        return _rowcount(session.execute(guarded.values(**values))) > 0
+        return rowcount(session.execute(guarded.values(**values))) > 0
 
 
 class SqlUsageLimitStateRepository(UsageLimitStateRepository):
@@ -300,20 +296,14 @@ class SqlSessionCredentialRegistry(SessionCredentialRegistry):
         """
         cls = SqlSessionCredentialBinding
         values = {"credential_id": credential_id, "family": family, "bound_at": now_epoch()}
-        upd = update(cls).where(cls.session_id == session_id).values(**values)
         with self._session() as session:
-            if _rowcount(session.execute(upd)):
-                return
-            try:
-                with session.begin_nested():
-                    session.add(cls(session_id=session_id, **values))
-                    session.flush()
-            except IntegrityError:
-                # Benign only if a concurrent insert won the PK race (the
-                # retry UPDATE then matches); otherwise (e.g. an FK violation)
-                # surface it rather than silently dropping the binding.
-                if not _rowcount(session.execute(upd)):
-                    raise
+            atomic_upsert(
+                session,
+                cls,
+                where=cls.session_id == session_id,
+                values=values,
+                insert_values={"session_id": session_id, **values},
+            )
 
     def active_credential(self, session_id: str) -> str | None:
         """Return the active account id for *session_id*, or ``None``."""
@@ -347,37 +337,25 @@ class SqlCostAttributionSink(CostAttributionSink):
         """
         now = now_epoch()
         col = SqlProviderAccountCost
-        add = (
-            update(col)
-            .where(col.credential_id == credential_id, col.day_utc == day_utc)
-            .values(
-                cost_usd=col.cost_usd + cost_usd,
-                input_tokens=col.input_tokens + input_tokens,
-                output_tokens=col.output_tokens + output_tokens,
-                turn_count=col.turn_count + 1,
-                updated_at=now,
-            )
-        )
         with self._session() as session:
-            if _rowcount(session.execute(add)):
-                return
-            try:
-                with session.begin_nested():
-                    session.add(
-                        col(
-                            credential_id=credential_id,
-                            day_utc=day_utc,
-                            cost_usd=cost_usd,
-                            input_tokens=input_tokens,
-                            output_tokens=output_tokens,
-                            turn_count=1,
-                            updated_at=now,
-                        )
-                    )
-                    session.flush()  # surface a concurrent-insert IntegrityError here
-            except IntegrityError:
-                # A concurrent first-insert won the PK race → the additive
-                # update now matches. If it still matches nothing, the insert
-                # failed for another reason (e.g. an FK violation) — surface it.
-                if not _rowcount(session.execute(add)):
-                    raise
+            atomic_upsert(
+                session,
+                col,
+                where=and_(col.credential_id == credential_id, col.day_utc == day_utc),
+                values={
+                    "cost_usd": col.cost_usd + cost_usd,
+                    "input_tokens": col.input_tokens + input_tokens,
+                    "output_tokens": col.output_tokens + output_tokens,
+                    "turn_count": col.turn_count + 1,
+                    "updated_at": now,
+                },
+                insert_values={
+                    "credential_id": credential_id,
+                    "day_utc": day_utc,
+                    "cost_usd": cost_usd,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "turn_count": 1,
+                    "updated_at": now,
+                },
+            )

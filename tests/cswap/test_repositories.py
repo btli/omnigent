@@ -51,8 +51,11 @@ def seeded(session_maker: ManagedSessionMaker) -> ManagedSessionMaker:
     return session_maker
 
 
-def test_limit_state_observe_reports_transition(seeded: ManagedSessionMaker) -> None:
-    repo = SqlUsageLimitStateRepository(seeded)
+def test_limit_state_observe_reports_transition(
+    seeded: ManagedSessionMaker, immediate_session_maker: ManagedSessionMaker
+) -> None:
+    # Exercise the real BEGIN IMMEDIATE path used in production.
+    repo = SqlUsageLimitStateRepository(seeded, immediate_session_maker)
     cid = account_id_for("claude-pool", "c1")
 
     def _limited(at: int) -> LimitState:
