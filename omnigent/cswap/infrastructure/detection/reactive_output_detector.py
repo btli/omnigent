@@ -86,10 +86,19 @@ class ReactiveParseResult:
     reset_at_5h: int | None = None
     reset_at_7d: int | None = None
 
-    def soonest_reset(self) -> int | None:
-        """Return the soonest parsed reset, or ``None``."""
-        resets = [r for r in (self.reset_at_5h, self.reset_at_7d) if r is not None]
-        return min(resets) if resets else None
+    def recovery_after(self, now: int) -> int | None:
+        """Return the soonest parsed reset still in the future, or ``None``.
+
+        The reactive text says the account is limited but not *which* window
+        was hit. Using the soonest reset that is still ahead of *now* is the
+        least-bad choice: it recovers at the 5h reset for the common 5h limit,
+        but never picks an already-elapsed reset — which would mark a still-
+        limited account available and cause a failover/re-limit loop. When no
+        parsed reset is in the future, returns ``None`` so the facade applies a
+        cooldown instead.
+        """
+        future = [r for r in (self.reset_at_5h, self.reset_at_7d) if r is not None and r > now]
+        return min(future) if future else None
 
 
 def _parse_anthropic(output: str) -> ReactiveParseResult:
@@ -147,6 +156,6 @@ class ReactiveOutputDetector:
             is_limited=True,
             source="reactive",
             observed_at=observed_at,
-            limited_until=parsed.soonest_reset(),
+            limited_until=parsed.recovery_after(observed_at),
             windows=tuple(windows),
         )

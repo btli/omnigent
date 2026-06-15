@@ -110,6 +110,28 @@ def test_limit_state_upsert_find_and_staleness(seeded: ManagedSessionMaker) -> N
     assert repo.find(cid).is_limited is False  # type: ignore[union-attr]
 
 
+def test_staleness_same_second_source_precedence(seeded: ManagedSessionMaker) -> None:
+    repo = SqlUsageLimitStateRepository(seeded)
+    cid = account_id_for("claude-pool", "c1")
+
+    # Reactive "limited" at t=1000.
+    assert repo.upsert(
+        LimitState(
+            cid, is_limited=True, limited_until=9000, source="reactive", last_checked_at=1000
+        )
+    )
+    # A SAME-SECOND poller "available" must NOT clobber the reactive limit
+    # (poller has lower source precedence on a timestamp tie).
+    assert (
+        repo.upsert(LimitState(cid, is_limited=False, source="poller", last_checked_at=1000))
+        is False
+    )
+    assert repo.find(cid).is_limited is True  # type: ignore[union-attr]
+    # A strictly-later poller observation does win.
+    assert repo.upsert(LimitState(cid, is_limited=False, source="poller", last_checked_at=2000))
+    assert repo.find(cid).is_limited is False  # type: ignore[union-attr]
+
+
 def test_limit_state_find_many(seeded: ManagedSessionMaker) -> None:
     repo = SqlUsageLimitStateRepository(seeded)
     c1 = account_id_for("claude-pool", "c1")
