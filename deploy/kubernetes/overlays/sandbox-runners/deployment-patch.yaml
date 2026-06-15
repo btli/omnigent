@@ -1,7 +1,7 @@
 ---
 # Patch the base server Deployment so the kubernetes sandbox provider works:
-#   1. Run as the `omnigent-server` ServiceAccount (bound to the pods + pods/exec
-#      Role in rbac.yaml) so the in-cluster launcher can manage runner Pods.
+#   1. Run as the `omnigent-server` ServiceAccount (bound by rolebinding.yaml to
+#      the pods + pods/exec Role in role.yaml) so the launcher can manage Pods.
 #   2. Mount the sandbox config.yaml and point OMNIGENT_CONFIG at it so the
 #      server parses the `sandbox: provider: kubernetes` section.
 #

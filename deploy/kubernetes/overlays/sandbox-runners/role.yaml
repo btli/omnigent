@@ -1,0 +1,36 @@
+---
+# Namespaced Role granting the server exactly what the launcher calls — nothing
+# more (no list/watch, no pods/log). Bound to omnigent-server via rolebinding.yaml.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: omnigent-sandbox-manager
+  labels:
+    app.kubernetes.io/name: omnigent
+    app.kubernetes.io/component: server
+rules:
+  # Manage the lifecycle of runner Pods, scoped to exactly what the launcher
+  # calls: provision() creates them, the pod-ready wait reads them
+  # (read_namespaced_pod is a `get`), and terminate() deletes them. The
+  # launcher never lists or watches Pods, so those verbs are omitted.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "delete"]
+  # REQUIRED. The provider does not bake `omnigent host` into the Pod's
+  # entrypoint — the Pod just boots `sleep infinity`. Once the container is
+  # ready, the server execs `omnigent host` into it (pods/exec), which dials
+  # back over the managed launch-token tunnel. Without this the server can
+  # create Pods but never start a host in them, and every managed session hangs.
+  # The launcher uses connect_get_namespaced_pod_exec — an HTTP GET, which the
+  # apiserver authorizes as the `get` verb on pods/exec; `create` is kept too
+  # for kubectl/POST-style exec compatibility.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["get", "create"]
+  # Surface scheduler/kubelet events (FailedScheduling, Failed pull, …) in the
+  # provider's error messages when a Pod won't become ready. (No pods/log rule:
+  # the launcher never reads logs via the API — operators debug a stuck host
+  # with their own kubeconfig + `kubectl exec <pod> -- cat /tmp/omnigent-host.log`.)
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list"]

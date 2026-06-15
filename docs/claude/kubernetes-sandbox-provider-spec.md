@@ -3,6 +3,16 @@
 Source of truth for the subagent-driven implementation. Reference impls to mirror:
 `omnigent/onboarding/sandboxes/daytona.py`, `islo.py`, `modal.py`.
 
+> **As-built note.** This is the original plan; a few details were refined during
+> implementation and review. The authoritative as-built artifacts are the code,
+> the overlay under `deploy/kubernetes/overlays/sandbox-runners/` (RBAC is split
+> one-resource-per-file — `serviceaccount-*.yaml`, `role.yaml`, `rolebinding.yaml`
+> — and the Role was narrowed to `pods` create/get/delete, `pods/exec` get+create,
+> `events` list), and the live findings in
+> [`kubernetes-sandbox-homelab-e2e.md`](kubernetes-sandbox-homelab-e2e.md)
+> (notably: the agent-harness Bun crash is a kernel-7.0.0 issue fixed by
+> `node_selector`, not seccomp).
+
 ## What we're building
 A server-managed `sandbox.provider: kubernetes` that spawns an **agent runner Pod on demand**,
 plugging into the EXISTING managed-host launch-token seam (Modal/Daytona/islo/cwsandbox). The Pod

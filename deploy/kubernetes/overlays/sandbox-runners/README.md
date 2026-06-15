@@ -10,12 +10,14 @@ sandbox.
 It layers on `../../base` (the server Deployment/Service/Ingress/PVC are
 unchanged) and adds only what the provider needs:
 
-- **`rbac.yaml`** — the `omnigent-server` ServiceAccount bound to a namespaced
-  Role granting exactly what the launcher calls: `pods` (create/get/delete),
-  `pods/exec` (get+create), and `events` (list, for surfacing scheduler/pull
-  failures) — so the in-cluster launcher can create runner Pods and exec
-  `omnigent host` into them. Plus a deliberately powerless `omnigent-runner`
-  ServiceAccount for the runner Pods.
+- **`serviceaccount-server.yaml` / `serviceaccount-runner.yaml` / `role.yaml` /
+  `rolebinding.yaml`** — the `omnigent-server` ServiceAccount, bound by the
+  RoleBinding to a namespaced Role granting exactly what the launcher calls:
+  `pods` (create/get/delete), `pods/exec` (get+create), and `events` (list, for
+  surfacing scheduler/pull failures) — so the in-cluster launcher can create
+  runner Pods and exec `omnigent host` into them. Plus a deliberately powerless
+  `omnigent-runner` ServiceAccount for the runner Pods. (One resource per file,
+  per the repo's manifest convention.)
 - **`sandbox-config.yaml`** — a `config.yaml` with the `sandbox: provider:
   kubernetes` section, mounted at `/etc/omnigent` (the deployment patch sets
   `OMNIGENT_CONFIG` to it). The server reads the managed-sandbox backend from
