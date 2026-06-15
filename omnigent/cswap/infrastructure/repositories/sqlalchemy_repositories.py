@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 from typing import cast
 
-from sqlalchemy import select
+from sqlalchemy import CursorResult, select, update
 
 from omnigent.cswap.application.ports.ports import (
     CostAttributionSink,
@@ -292,13 +292,30 @@ class SqlCostAttributionSink(CostAttributionSink):
         input_tokens: int,
         output_tokens: int,
     ) -> None:
-        """Increment the per-account, per-day cost rollup (UPSERT add)."""
+        """Increment the per-account, per-day cost rollup (UPSERT add).
+
+        The increment is a single atomic ``UPDATE ... SET col = col + delta``
+        so concurrent turns for the same account/day cannot lose increments;
+        the row is inserted only when the day's first write finds no row.
+        """
         now = now_epoch()
+        col = SqlProviderAccountCost
         with self._session() as session:
-            row = session.get(SqlProviderAccountCost, (credential_id, day_utc))
-            if row is None:
+            result = session.execute(
+                update(col)
+                .where(col.credential_id == credential_id, col.day_utc == day_utc)
+                .values(
+                    cost_usd=col.cost_usd + cost_usd,
+                    input_tokens=col.input_tokens + input_tokens,
+                    output_tokens=col.output_tokens + output_tokens,
+                    turn_count=col.turn_count + 1,
+                    updated_at=now,
+                )
+            )
+            updated = result.rowcount if isinstance(result, CursorResult) else 0
+            if not updated:
                 session.add(
-                    SqlProviderAccountCost(
+                    col(
                         credential_id=credential_id,
                         day_utc=day_utc,
                         cost_usd=cost_usd,
@@ -308,9 +325,3 @@ class SqlCostAttributionSink(CostAttributionSink):
                         updated_at=now,
                     )
                 )
-            else:
-                row.cost_usd += cost_usd
-                row.input_tokens += input_tokens
-                row.output_tokens += output_tokens
-                row.turn_count += 1
-                row.updated_at = now

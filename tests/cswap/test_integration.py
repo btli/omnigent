@@ -63,7 +63,6 @@ def test_reactive_limit_without_reset_applies_cooldown(
     # Bind the session to c1 via a launch selection.
     integration.select_launch_env_for_family("anthropic", session_id="sess-1")
     c1 = account_id_for("claude-pool", "c1")
-    c2 = account_id_for("claude-pool", "c2")
 
     # A limit signal with NO reset headers.
     integration.record_reactive_text(
@@ -74,9 +73,10 @@ def test_reactive_limit_without_reset_applies_cooldown(
     env = integration.select_launch_env_for_family("anthropic", session_id="sess-2")
     assert env == {"CLAUDE_CONFIG_DIR": os.path.expanduser("~/.c2")}
 
-    # Auto failover rebound sess-1 to c2.
+    # Failover does NOT rebind the running session: sess-1 was launched on c1
+    # and keeps running on it (the next launch is what rotates to c2).
     container = build_container(active_facade)
-    assert container.registry.active_credential("sess-1") == c2
+    assert container.registry.active_credential("sess-1") == c1
 
     # No header reset, but the facade applied a default cooldown — limited with
     # a concrete limited_until (auto-recovers, not a permanent lockout).
@@ -98,11 +98,11 @@ def test_reactive_text_usage_limit_triggers_failover(active_facade: ManagedSessi
         session_id="sess-1",
     )
 
-    # c1 limited → next selection avoids it; sess-1 auto-rebound to c2.
+    # c1 limited → next launch avoids it; the running sess-1 stays on c1.
     env = integration.select_launch_env_for_family("anthropic", session_id="sess-2")
     assert env == {"CLAUDE_CONFIG_DIR": os.path.expanduser("~/.c2")}
-    assert build_container(active_facade).registry.active_credential("sess-1") == c2
-    assert c1  # referenced for clarity
+    assert build_container(active_facade).registry.active_credential("sess-1") == c1
+    assert c2  # referenced for clarity
 
 
 def test_reactive_text_non_limit_is_noop(active_facade: ManagedSessionMaker) -> None:

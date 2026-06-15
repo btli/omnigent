@@ -230,18 +230,19 @@ class RateLimitHeaders:
     def recovery_at(self) -> int | None:
         """Return the epoch when the limit lifts, or ``None`` if unknown.
 
-        Prefers an explicit ``retry-after``; otherwise the **latest** reset
-        among exhausted windows — the account is unblocked only once every
-        exhausted constraint has reset (using the soonest would re-select it
-        while a longer window is still at 100%, causing flapping); otherwise
-        the soonest reset of any window.
+        The account is unblocked only once **every** blocking constraint has
+        cleared, so this is the *latest* of: an explicit ``retry-after`` and
+        each exhausted window's reset. (Using the soonest would re-select the
+        account while a longer window is still at 100%, causing flapping.)
+        When nothing is exhausted and there is no ``retry-after``, falls back
+        to the soonest known reset.
         """
-        if self.retry_after_at is not None:
-            return self.retry_after_at
-        exhausted = [
+        blocking = [
             w.reset_at for w in self.windows if w.is_exhausted() and w.reset_at is not None
         ]
-        if exhausted:
-            return max(exhausted)
+        if self.retry_after_at is not None:
+            blocking.append(self.retry_after_at)
+        if blocking:
+            return max(blocking)
         resets = [w.reset_at for w in self.windows if w.reset_at is not None]
         return min(resets) if resets else None

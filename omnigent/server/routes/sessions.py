@@ -2664,13 +2664,14 @@ def _accumulate_session_usage(
     conversation_store.set_session_usage(session_id, current)
     # Per-user daily rollup (policy-gated; this is the per-turn delta).
     _record_daily_cost(conv, cost_delta, conversation_store)
-    # Per-account rollup for multi-subscription (cswap): attributes this
-    # turn's cost to the account the session is bound to. No-op (safe) when
-    # no pool is configured or the session has no binding.
+    # Per-account rollup for multi-subscription (cswap): attribute this turn's
+    # cost to the account the ROOT session is bound to (sub-agents share the
+    # parent's account; only the root session carries the launch binding).
+    # No-op (safe) when no pool is configured or the root has no binding.
     from omnigent.cswap import integration as _cswap
 
     _cswap.attribute_cost(
-        session_id,
+        conv.root_conversation_id if conv else session_id,
         cost_usd=cost_delta,
         input_tokens=int(input_tokens),
         output_tokens=int(output_tokens),
@@ -2830,11 +2831,12 @@ def _persist_native_cumulative_usage(
     _record_daily_cost(conv, new_cost - old_cost, conversation_store)
     # Per-account rollup for multi-subscription (cswap). This is the NATIVE
     # path cswap launches actually use; attribute the cumulative deltas to the
-    # account the session is bound to. No-op (safe) without a pool/binding.
+    # account the ROOT session is bound to (sub-agents share the parent's
+    # account). No-op (safe) without a pool/binding.
     from omnigent.cswap import integration as _cswap
 
     _cswap.attribute_cost(
-        session_id,
+        conv.root_conversation_id if conv else session_id,
         cost_usd=new_cost - old_cost,
         input_tokens=max(0, int(current.get("input_tokens", 0) or 0) - old_input),
         output_tokens=max(0, int(current.get("output_tokens", 0) or 0) - old_output),

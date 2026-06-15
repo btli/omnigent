@@ -61,17 +61,6 @@ class FakePoolRepo(CredentialPoolRepository):
         return list(self.pool.members) if self.pool.family == family else []
 
 
-class FakeRegistry:
-    def __init__(self) -> None:
-        self.bindings: dict[str, str] = {}
-
-    def bind(self, session_id: str, credential_id: str, family: str) -> None:
-        self.bindings[session_id] = credential_id
-
-    def active_credential(self, session_id: str) -> str | None:
-        return self.bindings.get(session_id)
-
-
 class RecordingNotifier:
     def __init__(self) -> None:
         self.events: list[FailoverEvent] = []
@@ -173,40 +162,30 @@ def test_selection_tier_fallback_when_all_subs_limited() -> None:
 
 def _failover(
     failover: FailoverMode, repo: FakeStateRepo
-) -> tuple[FailoverOnLimitUseCase, FakeRegistry, RecordingNotifier]:
+) -> tuple[FailoverOnLimitUseCase, RecordingNotifier]:
     pool_repo = FakePoolRepo(_pool(failover))
     policy = PriorityCredentialSelectionPolicy(pool_repo, repo)
-    registry = FakeRegistry()
     notifier = RecordingNotifier()
-    uc = FailoverOnLimitUseCase(pool_repo, policy, registry, notifier)
-    return uc, registry, notifier
+    uc = FailoverOnLimitUseCase(pool_repo, policy, notifier)
+    return uc, notifier
 
 
 def test_failover_disabled_is_noop() -> None:
-    uc, _registry, notifier = _failover("disabled", FakeStateRepo())
+    uc, notifier = _failover("disabled", FakeStateRepo())
     assert (
         uc.execute(session_id="s", exhausted_credential_id="c1", family="anthropic", now=1) is None
     )
     assert notifier.events == []
 
 
-def test_failover_auto_rebinds_to_alternate() -> None:
-    repo = FakeStateRepo()
-    uc, registry, notifier = _failover("auto", repo)
-    event = uc.execute(session_id="s", exhausted_credential_id="c1", family="anthropic", now=1)
-    assert event is not None
-    assert event.switched is True
-    assert event.next_credential_id == "c2"  # next available subscription
-    assert registry.bindings["s"] == "c2"
-    assert len(notifier.events) == 1
-
-
-def test_failover_notify_does_not_rebind() -> None:
-    repo = FakeStateRepo()
-    uc, registry, notifier = _failover("notify", repo)
-    event = uc.execute(session_id="s", exhausted_credential_id="c1", family="anthropic", now=1)
-    assert event is not None
-    assert event.switched is False
-    assert event.next_credential_id == "c2"
-    assert registry.bindings == {}
-    assert len(notifier.events) == 1
+def test_failover_recommends_alternate_without_rebinding() -> None:
+    # Failover does NOT rebind the running session (it keeps running on the
+    # exhausted account); it recommends the account the next launch should use.
+    for mode in ("auto", "notify"):
+        repo = FakeStateRepo()
+        uc, notifier = _failover(mode, repo)  # type: ignore[arg-type]
+        event = uc.execute(session_id="s", exhausted_credential_id="c1", family="anthropic", now=1)
+        assert event is not None
+        assert event.next_credential_id == "c2"  # next available subscription
+        assert event.mode == mode
+        assert len(notifier.events) == 1

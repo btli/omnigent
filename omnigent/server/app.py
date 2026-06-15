@@ -885,7 +885,9 @@ def create_app(
         from omnigent.cswap import integration as cswap_integration
 
         try:
-            cswap_integration.is_active()  # triggers lazy config→DB sync
+            # Pre-warm off the event loop — the first build runs migrations +
+            # config→DB sync synchronously, which must not block startup.
+            await asyncio.to_thread(cswap_integration.is_active)
         except Exception:
             _logger.exception("cswap: startup sync failed; multi-subscription disabled")
         cswap_poll_task = asyncio.create_task(cswap_integration.poll_loop())

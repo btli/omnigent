@@ -81,8 +81,8 @@ class LimitState:
         :returns: ``0``–``100`` remaining percent (minimum across windows
             that report utilization), or ``None`` when headroom is unknown.
         """
-        remaining = [w.remaining_pct() for w in self.windows if w.remaining_pct() is not None]
-        return min(r for r in remaining if r is not None) if remaining else None
+        remaining = [pct for w in self.windows if (pct := w.remaining_pct()) is not None]
+        return min(remaining) if remaining else None
 
     def to_status(self, now: int) -> LimitStatus:
         """Return the coarse :data:`LimitStatus` at *now*.
