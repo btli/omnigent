@@ -189,6 +189,7 @@ class SqlUsageLimitStateRepository(UsageLimitStateRepository):
             try:
                 with session.begin_nested():
                     session.add(cls(credential_id=state.credential_id, **values))
+                    session.flush()  # surface a concurrent-insert IntegrityError here
                 return True
             except IntegrityError:
                 # A concurrent insert won the PK race; the guarded update now
@@ -335,6 +336,7 @@ class SqlCostAttributionSink(CostAttributionSink):
                             updated_at=now,
                         )
                     )
+                    session.flush()  # surface a concurrent-insert IntegrityError here
             except IntegrityError:
                 # Concurrent first-insert won; the additive update now matches.
                 session.execute(add)
