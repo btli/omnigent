@@ -36,6 +36,12 @@ class ProviderAccount:
         ``CODEX_HOME`` holding this account's login.
     :param api_key_ref: For an api_key account: the secret reference
         (``env:VAR`` / ``keychain:NAME`` / ``$VAR``).
+    :param oauth_token_ref: For a subscription authenticated by a *headless
+        OAuth token* (``claude setup-token`` → ``CLAUDE_CODE_OAUTH_TOKEN``, or a
+        Codex access token → ``CODEX_ACCESS_TOKEN``) rather than an isolated
+        config dir: the secret reference resolving that token. Mutually
+        exclusive with the config dir (the config parser rejects a member that
+        sets both, so launch and the poller never auth as different accounts).
     :param is_active: Soft-delete / disable flag.
     """
 
@@ -48,6 +54,7 @@ class ProviderAccount:
     claude_config_dir: str | None = None
     codex_config_dir: str | None = None
     api_key_ref: str | None = None
+    oauth_token_ref: str | None = None
     is_active: bool = True
 
     @property

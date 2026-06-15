@@ -843,6 +843,9 @@ class SqlProviderAccount(Base):
         else ``None``.
     :param api_key_ref: Secret reference for an api_key account
         (``env:VAR`` / ``keychain:NAME`` / ``$VAR``), else ``None``.
+    :param oauth_token_ref: Secret reference for a subscription
+        authenticated by a headless OAuth token (``claude setup-token`` /
+        Codex access token) instead of a config dir, else ``None``.
     :param is_active: Soft-delete / disable flag.
     :param created_at: Unix epoch seconds first synced.
     :param updated_at: Unix epoch seconds of the last sync.
@@ -863,6 +866,7 @@ class SqlProviderAccount(Base):
     claude_config_dir: Mapped[str | None] = mapped_column(Text, nullable=True)
     codex_config_dir: Mapped[str | None] = mapped_column(Text, nullable=True)
     api_key_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
+    oauth_token_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=true())
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[int] = mapped_column(Integer, nullable=False)

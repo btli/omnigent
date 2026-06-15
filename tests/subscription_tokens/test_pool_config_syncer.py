@@ -35,6 +35,19 @@ def test_sync_inserts_pools_and_accounts(session_maker: ManagedSessionMaker) -> 
         assert acct.is_active is True
 
 
+def test_sync_persists_oauth_token_ref(session_maker: ManagedSessionMaker) -> None:
+    # A token-ref subscription round-trips through the migrated column.
+    config = _config(
+        [{"name": "sub", "kind": "subscription", "oauth_token_ref": "env:CLAUDE_OAUTH_A"}]
+    )
+    sync_pools(session_maker, load_pools(config))
+    with session_maker() as session:
+        acct = session.get(SqlProviderAccount, account_id_for("claude-pool", "sub"))
+        assert acct is not None
+        assert acct.oauth_token_ref == "env:CLAUDE_OAUTH_A"
+        assert acct.claude_config_dir is None
+
+
 def test_sync_is_idempotent_and_updates_fields(session_maker: ManagedSessionMaker) -> None:
     sync_pools(session_maker, load_pools(_config([{"name": "a", "claude_config_dir": "~/.a"}])))
     # Re-sync with a changed config dir → update in place, same row count.

@@ -230,3 +230,31 @@ live set in SQL before the per-credential cap** (`sessions_for_credentials`, rep
 singular method + N-query loop). Opus's hot-path note → `asyncio.gather`. Docstrings clarified
 (launch-binding semantics; best-effort liveness cache). Tests cover the admin gate, the
 live-filter-beats-cap fix, the batched distribution, the mapper, and the chip.
+
+## Headless OAuth subscription tokens (`oauth_token_ref`)
+
+A subscription pool member can authenticate by a **headless OAuth token** (`claude
+setup-token` → `CLAUDE_CODE_OAUTH_TOKEN`; Codex → `CODEX_ACCESS_TOKEN`) instead of an
+isolated config dir — the cleanest way to rotate between multiple Claude/Codex
+**subscriptions** without per-account login dirs:
+
+- New `ProviderAccount.oauth_token_ref` (reference only, e.g. `env:VAR` — never a raw
+  token), a new nullable `provider_accounts.oauth_token_ref` column (additive migration
+  `o1a2b3c4d5e6`, `batch_alter_table` for SQLite), config parse + `resolve_account_oauth_token`.
+- Launch injection: `select_launch_env_for_family` emits `CLAUDE_CODE_OAUTH_TOKEN`;
+  `select_codex_launch` carries `access_token` → `CODEX_ACCESS_TOKEN` (also allowlisted into
+  `codex_terminal_env` so the TUI inherits it). Config dir wins if both present — and the
+  parser **rejects** a member that sets both (launch + poller would otherwise auth as
+  different accounts). The poller's `load_subscription_token` uses the token ref too.
+- **Binding correctness**: a subscription only binds when a credential was applied OR it is a
+  genuine default-login account (no dir, no token ref); an oauth ref that doesn't resolve does
+  not bind (no cost/failover mis-attribution).
+
+### Adversarial review (Opus + Codex + Gemini) — round 4
+
+Gemini CLEAN first pass. Opus (2) + Codex (4) found real issues, all fixed + tested:
+`load_subscription_token` no longer falls back to the ambient `~/.claude`/`~/.codex` login
+when an oauth-only sub's token is unset (mis-attribution); `codex_terminal_env` allowlists
+`CODEX_ACCESS_TOKEN`; the config-dir+`oauth_token_ref` combo is a hard parse error; the poll
+sweep logs `account.id` not the secret-bearing dataclass; the resolvers catch the full
+best-effort tuple. **All three CLEAN on the final round.**

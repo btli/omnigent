@@ -150,6 +150,9 @@ def is_active() -> bool:
 
 _CONFIG_DIR_ENV = {"anthropic": "CLAUDE_CONFIG_DIR", "openai": "CODEX_HOME"}
 _API_KEY_ENV = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
+# Headless OAuth token for a subscription without an isolated config dir
+# (``claude setup-token`` / Codex access token).
+_OAUTH_TOKEN_ENV = {"anthropic": "CLAUDE_CODE_OAUTH_TOKEN", "openai": "CODEX_ACCESS_TOKEN"}
 
 
 def select_launch_env_for_family(
@@ -158,9 +161,11 @@ def select_launch_env_for_family(
     """Select an account for *family* and return the env to launch it with.
 
     For a subscription account this is its isolated config dir
-    (``CLAUDE_CONFIG_DIR`` / ``CODEX_HOME``); for a tier-fallback api_key
-    account it is the resolved key (``ANTHROPIC_API_KEY`` /
-    ``OPENAI_API_KEY``). Binds the session to the chosen account when
+    (``CLAUDE_CONFIG_DIR`` / ``CODEX_HOME``), or — when the subscription
+    authenticates by a headless OAuth token (``oauth_token_ref``) instead of a
+    dir — that token (``CLAUDE_CODE_OAUTH_TOKEN`` / ``CODEX_ACCESS_TOKEN``); for
+    a tier-fallback api_key account it is the resolved key (``ANTHROPIC_API_KEY``
+    / ``OPENAI_API_KEY``). Binds the session to the chosen account when
     *session_id* is given (so reactive failover and cost attribution can
     find it).
 
@@ -176,9 +181,17 @@ def select_launch_env_for_family(
             return {}
         env: dict[str, str] = {}
         if account.is_subscription:
+            from omnigent.subscription_tokens.infrastructure.detection.credentials import (
+                resolve_account_oauth_token,
+            )
+
             config_dir = account.config_dir()
             if config_dir:
                 env = {_CONFIG_DIR_ENV[family]: os.path.expanduser(config_dir)}
+            else:
+                token = resolve_account_oauth_token(account)
+                if token:
+                    env = {_OAUTH_TOKEN_ENV[family]: token}
         else:
             from omnigent.subscription_tokens.infrastructure.detection.credentials import (
                 resolve_account_api_key,
@@ -187,12 +200,18 @@ def select_launch_env_for_family(
             key = resolve_account_api_key(account)
             if key:
                 env = {_API_KEY_ENV[family]: key}
-        # Bind whenever the chosen account is actually the one the process will
-        # use: a subscription always (a dir-less subscription runs on its
-        # default login, which IS this account); an api_key only when its key
-        # resolved (otherwise the process falls back to ambient creds and
-        # attributing this account would mis-route failover/cost).
-        if session_id and (account.is_subscription or env):
+        # Bind whenever the chosen account is the one the process will actually
+        # use: a config dir / resolved api_key / resolved oauth token all set
+        # `env`; a subscription with NEITHER a dir nor a token ref is a
+        # default-login account (the ambient login IS this account). A
+        # subscription whose dir or oauth_token_ref was set but did NOT resolve
+        # is not the running account, so it must not bind (else the process
+        # falls back to ambient creds and attributing this account mis-routes
+        # failover/cost).
+        default_login_sub = (
+            account.is_subscription and not account.config_dir() and not account.oauth_token_ref
+        )
+        if session_id and (env or default_login_sub):
             container.registry.bind(session_id, account.id, family)
         logger.info(
             "subscription-token: session=%s %s launch on account %r (%s)",
@@ -222,10 +241,14 @@ class CodexLaunchSelection:
         auth/config from, or ``None`` (a dir-less subscription / api_key /
         inactive — bridge from the ambient default).
     :param api_key: A tier-fallback account's ``OPENAI_API_KEY``, or ``None``.
+    :param access_token: A subscription account's headless Codex OAuth token
+        (``oauth_token_ref``), exported as ``CODEX_ACCESS_TOKEN`` when the
+        subscription has no config dir to bridge; ``None`` otherwise.
     """
 
     config_source: str | None = None
     api_key: str | None = None
+    access_token: str | None = None
 
     @property
     def config_source_path(self) -> Path | None:
@@ -252,9 +275,17 @@ def select_codex_launch(session_id: str | None = None) -> CodexLaunchSelection:
             return CodexLaunchSelection()
         config_source: str | None = None
         api_key: str | None = None
+        access_token: str | None = None
         if account.is_subscription:
+            from omnigent.subscription_tokens.infrastructure.detection.credentials import (
+                resolve_account_oauth_token,
+            )
+
             config_dir = account.config_dir()
-            config_source = os.path.expanduser(config_dir) if config_dir else None
+            if config_dir:
+                config_source = os.path.expanduser(config_dir)
+            else:
+                access_token = resolve_account_oauth_token(account)
         else:
             from omnigent.subscription_tokens.infrastructure.detection.credentials import (
                 resolve_account_api_key,
@@ -262,9 +293,15 @@ def select_codex_launch(session_id: str | None = None) -> CodexLaunchSelection:
 
             api_key = resolve_account_api_key(account)
         # Bind when the chosen account is the one the process will actually use:
-        # a subscription always (a dir-less one runs on the default codex login,
-        # which IS this account); an api_key only when its key resolved.
-        if session_id and (account.is_subscription or api_key):
+        # a bridged config source / resolved access token / resolved api_key all
+        # count; a subscription with neither a dir nor a token ref is a
+        # default-login codex account. A subscription whose dir/oauth_token_ref
+        # was set but did not resolve is not the running account → don't bind.
+        applied = bool(config_source or access_token or api_key)
+        default_login_sub = (
+            account.is_subscription and not account.config_dir() and not account.oauth_token_ref
+        )
+        if session_id and (applied or default_login_sub):
             container.registry.bind(session_id, account.id, "openai")
         logger.info(
             "subscription-token: session=%s codex launch on account %r (%s)",
@@ -272,7 +309,9 @@ def select_codex_launch(session_id: str | None = None) -> CodexLaunchSelection:
             account.name,
             account.kind,
         )
-        return CodexLaunchSelection(config_source=config_source, api_key=api_key)
+        return CodexLaunchSelection(
+            config_source=config_source, api_key=api_key, access_token=access_token
+        )
     except Exception:
         logger.exception("subscription-token codex selection failed")
         return CodexLaunchSelection()
@@ -483,7 +522,10 @@ async def run_poll_sweep_once() -> int:
                 )
                 return 1
         except Exception:
-            logger.exception("subscription-token probe/track failed for account %s", account)
+            # Log the id only — never the account dataclass, whose repr would
+            # include api_key_ref / oauth_token_ref (a raw secret if an operator
+            # inlined a literal instead of an env:/keychain: reference).
+            logger.exception("subscription-token probe/track failed for account %s", account.id)
         return 0
 
     # Probe all accounts concurrently — independent network calls.
