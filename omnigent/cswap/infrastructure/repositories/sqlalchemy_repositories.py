@@ -184,16 +184,20 @@ class SqlUsageLimitStateRepository(UsageLimitStateRepository):
         with self._session() as session:
             if _rowcount(session.execute(guarded.values(**values))):
                 return True
+            # No row updated. If one exists, re-run the guarded UPDATE so the
+            # staleness predicate (not a bare existence check) decides the
+            # outcome — a row inserted concurrently may be OLDER than ours and
+            # must still be overwritten.
             if session.get(cls, state.credential_id) is not None:
-                return False  # a strictly-newer row exists — staleness guard
+                return _rowcount(session.execute(guarded.values(**values))) > 0
             try:
                 with session.begin_nested():
                     session.add(cls(credential_id=state.credential_id, **values))
                     session.flush()  # surface a concurrent-insert IntegrityError here
                 return True
             except IntegrityError:
-                # A concurrent insert won the PK race; the guarded update now
-                # matches (unless that row is already newer, which is correct).
+                if session.get(cls, state.credential_id) is None:
+                    raise  # not a PK race (e.g. an FK violation) — surface it
                 return _rowcount(session.execute(guarded.values(**values))) > 0
 
 
@@ -338,5 +342,8 @@ class SqlCostAttributionSink(CostAttributionSink):
                     )
                     session.flush()  # surface a concurrent-insert IntegrityError here
             except IntegrityError:
-                # Concurrent first-insert won; the additive update now matches.
-                session.execute(add)
+                # A concurrent first-insert won the PK race → the additive
+                # update now matches. If it still matches nothing, the insert
+                # failed for another reason (e.g. an FK violation) — surface it.
+                if not _rowcount(session.execute(add)):
+                    raise
