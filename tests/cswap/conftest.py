@@ -30,3 +30,14 @@ def session_maker(tmp_path: Path) -> Iterator[ManagedSessionMaker]:
         yield make_managed_session_maker(engine)
     finally:
         clear_engine_cache()
+
+
+@pytest.fixture
+def immediate_session_maker(tmp_path: Path) -> ManagedSessionMaker:
+    """A ``BEGIN IMMEDIATE`` session maker over the same DB as *session_maker*.
+
+    Exercises the production cross-process path used by
+    :meth:`SqlUsageLimitStateRepository.observe`.
+    """
+    engine = get_or_create_engine(f"sqlite:///{tmp_path / 'cswap.db'}")
+    return make_managed_session_maker(engine, immediate=True)
