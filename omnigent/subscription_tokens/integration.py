@@ -264,6 +264,31 @@ def select_codex_launch(session_id: str | None = None) -> CodexLaunchSelection:
         return CodexLaunchSelection()
 
 
+def transfer_session_binding(old_session_id: str, new_session_id: str, *, family: Family) -> None:
+    """Copy *old_session_id*'s account binding onto *new_session_id*.
+
+    The launch binds the selected account to the launch session id, but the
+    native Codex forwarder reuses that one account across session ids that
+    change underneath it: a native ``/clear`` rotates the parent session, and
+    each sub-agent runs in its own child session. The binding is keyed by
+    session id, so without copying it those rotated / child sessions resolve no
+    credential and reactive failover + cost attribution silently stop. Copying
+    keeps the one launched account resolvable across the whole topology.
+
+    No-op when inactive or *old_session_id* has no binding (so a copy never
+    invents a binding the launch did not make).
+    """
+    container = _ensure_container()
+    if container is None:
+        return
+    try:
+        credential_id = container.registry.active_credential(old_session_id)
+        if credential_id:
+            container.registry.bind(new_session_id, credential_id, family)
+    except Exception:
+        logger.exception("subscription-token session-binding transfer failed")
+
+
 def extract_message_text(data: object) -> str:
     """Extract a transcript message item's human-readable text (facade).
 

@@ -1486,6 +1486,14 @@ async def _maybe_rotate_session_on_thread_started(
     )
     target.session_id = new_session_id
     target.thread_id = new_thread_id
+    # The launch bound the OpenAI account to the OLD session id; carry it onto
+    # the rotated session so reactive failover + cost attribution keep resolving
+    # the account after a native /clear. No-op when no pool is configured.
+    from omnigent.subscription_tokens import integration as _subtokens
+
+    await asyncio.to_thread(
+        _subtokens.transfer_session_binding, old_session_id, new_session_id, family="openai"
+    )
     target.delta_coalescer = _OutputTextDeltaCoalescer(ap_client, new_session_id)
     target.usage_coalescer = _SessionUsageCoalescer(ap_client, new_session_id)
     target.elicitation_tracker = _CodexElicitationTaskTracker()
@@ -3540,6 +3548,18 @@ async def _ensure_child_session(
         if child_session_id is None:
             return
         forwarder_state.note_child_thread(child_thread_id, child_session_id)
+        # The sub-agent runs on the parent's launched OpenAI account; copy the
+        # binding onto the child session so an OpenAI limit hit inside the child
+        # records + fails over the right account (reactive detection resolves by
+        # the child's own session id). No-op when no pool is configured.
+        from omnigent.subscription_tokens import integration as _subtokens
+
+        await asyncio.to_thread(
+            _subtokens.transfer_session_binding,
+            parent_session_id,
+            child_session_id,
+            family="openai",
+        )
     # Backfill is done via the codex_client stored on the state.
     codex_client = forwarder_state.codex_client
     if codex_client is not None and forwarder_state.needs_child_thread_backfill(child_thread_id):

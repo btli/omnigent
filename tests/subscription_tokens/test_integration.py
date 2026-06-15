@@ -122,6 +122,24 @@ def test_select_codex_launch_api_key_when_subscriptions_limited(
     assert bound == account_id_for("codex-pool", "xkey")
 
 
+def test_transfer_session_binding_carries_account_across_session_ids(
+    active_openai_facade: ManagedSessionMaker,
+) -> None:
+    # The launch binds the parent; a native /clear rotation or a sub-agent child
+    # gets a new session id that must resolve the same account.
+    integration.select_codex_launch(session_id="sess-parent")
+    registry = build_container(active_openai_facade).registry
+    parent_cred = registry.active_credential("sess-parent")
+    assert parent_cred == account_id_for("codex-pool", "x1")
+
+    integration.transfer_session_binding("sess-parent", "sess-child", family="openai")
+    assert registry.active_credential("sess-child") == parent_cred
+
+    # No-op when the source has no binding — never invents one.
+    integration.transfer_session_binding("sess-unbound", "sess-target", family="openai")
+    assert registry.active_credential("sess-target") is None
+
+
 def test_select_launch_env_returns_config_dir_and_binds(
     active_facade: ManagedSessionMaker,
 ) -> None:
