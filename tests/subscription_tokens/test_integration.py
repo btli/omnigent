@@ -12,6 +12,7 @@ from omnigent.subscription_tokens import integration
 from omnigent.subscription_tokens.config.pool_config import account_id_for, load_pools
 from omnigent.subscription_tokens.config.pool_config_syncer import sync_pools
 from omnigent.subscription_tokens.container import build_container
+from omnigent.subscription_tokens.domain.value_objects.limit_state import LimitState
 
 
 def _accounts(snapshot: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -46,12 +47,79 @@ def active_facade(session_maker: ManagedSessionMaker) -> Iterator[ManagedSession
         integration.deactivate()
 
 
+@pytest.fixture
+def active_openai_facade(session_maker: ManagedSessionMaker) -> Iterator[ManagedSessionMaker]:
+    """Activate the facade over an OpenAI pool: two Codex subs + an api_key."""
+    pools = load_pools(
+        {
+            "pools": {
+                "codex-pool": {
+                    "family": "openai",
+                    "failover": "auto",
+                    "members": [
+                        {"name": "x1", "codex_config_dir": "~/.codex-x1", "priority": 0},
+                        {"name": "x2", "codex_config_dir": "~/.codex-x2", "priority": 1},
+                        {
+                            "name": "xkey",
+                            "kind": "api_key",
+                            "api_key_ref": "env:OAI_TEST_KEY",
+                            "priority": 9,
+                        },
+                    ],
+                }
+            }
+        }
+    )
+    sync_pools(session_maker, pools)
+    integration.activate(build_container(session_maker), pools)
+    try:
+        yield session_maker
+    finally:
+        integration.deactivate()
+
+
 def test_inactive_facade_is_noop() -> None:
     integration.deactivate()
     assert integration.is_active() is False
     assert integration.select_launch_env_for_family("anthropic") == {}
+    assert integration.select_codex_launch(session_id="s") == integration.CodexLaunchSelection()
     assert integration.status_snapshot() == []
     assert integration.mark_available("whatever") is False
+
+
+def test_select_codex_launch_subscription_returns_source_and_binds(
+    active_openai_facade: ManagedSessionMaker,
+) -> None:
+    # Priority-0 subscription is selected; its CODEX_HOME is the bridge source.
+    selection = integration.select_codex_launch(session_id="sess-x")
+    assert selection.config_source == os.path.expanduser("~/.codex-x1")
+    assert selection.api_key is None
+    # Session is bound to x1 so reactive failover + cost attribution resolve.
+    bound = build_container(active_openai_facade).registry.active_credential("sess-x")
+    assert bound == account_id_for("codex-pool", "x1")
+
+
+def test_select_codex_launch_api_key_when_subscriptions_limited(
+    active_openai_facade: ManagedSessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OAI_TEST_KEY", "sk-oai-xyz")
+    # Limit both subscriptions → tier fallback to the api_key account.
+    repo = build_container(active_openai_facade).state_repo
+    for name in ("x1", "x2"):
+        repo.upsert(
+            LimitState(
+                account_id_for("codex-pool", name),
+                is_limited=True,
+                limited_until=10**12,
+                source="manual",
+                last_checked_at=1,
+            )
+        )
+    selection = integration.select_codex_launch(session_id="sess-y")
+    assert selection.config_source is None
+    assert selection.api_key == "sk-oai-xyz"
+    bound = build_container(active_openai_facade).registry.active_credential("sess-y")
+    assert bound == account_id_for("codex-pool", "xkey")
 
 
 def test_select_launch_env_returns_config_dir_and_binds(

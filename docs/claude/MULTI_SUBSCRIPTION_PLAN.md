@@ -143,23 +143,30 @@ single Alembic head `n1a2b3c4d5e6`.
 
 Wired into omnigent:
 - `db_models.py` + migration `n1a2b3c4d5e6` — 5 tables.
-- `claude_native.py` (CLI) + `runner/app.py` (server-spawned) — launch-time account
-  selection → `CLAUDE_CONFIG_DIR` / `CODEX_HOME` / tier-fallback API key injection.
+- `claude_native.py` (CLI) + `runner/app.py` (server-spawned) — launch-time Claude account
+  selection → `CLAUDE_CONFIG_DIR` / tier-fallback API key injection.
+- `codex_native.py` (CLI) + `runner/app.py` (server-spawned) — launch-time **OpenAI/Codex**
+  account selection via `integration.select_codex_launch`. Because Codex isolates each
+  session in a private `CODEX_HOME` and bridges auth/config in from a *source* home, the
+  selected subscription account's `CODEX_HOME` is threaded as `config_source` through
+  `resolve_native_codex_launch` (login check) + `build_codex_native_server` → `start()`
+  (auth bridge), not merged as a flat env override; a tier-fallback api_key is exported as
+  `OPENAI_API_KEY` with codex's `openai` provider forced. The session binds at launch so
+  reactive failover + cost attribution resolve.
 - `host/connect.py` — `CLAUDE_CONFIG_DIR` / `CODEX_HOME` added to the forward allowlist.
 - `server/app.py` lifespan — config→DB sync + proactive poll loop (flag-gated).
 - `cli.py` — points the facade at the server's DB via `OMNIGENT_DATABASE_URI`.
 - `server/routes/sessions.py` — per-account cost attribution in `_accumulate_session_usage`.
 - `server/routes/subscription-tokens.py` — `GET /v1/subscription-tokens/status`, `POST /v1/subscription-tokens/accounts/{id}/mark-available`.
-- `claude_native_forwarder.py` — **reactive in-stream detection**: every forwarded
-  transcript item is scanned (`integration.record_reactive_text`, parse-first so it's
-  regex-only when no pool is configured) for a Claude "usage limit reached" signal,
-  recording the limit + firing failover. `integration.record_rate_limited` is also
-  available for an explicit-429 caller.
+- `claude_native_forwarder.py` + `codex_native_forwarder.py` — **reactive in-stream
+  detection**: every forwarded assistant/system message is scanned
+  (`integration.extract_message_text` → `integration.record_reactive_text`, parse-first so
+  it's regex-only when no pool is configured) for a family usage-limit signal
+  (`family="anthropic"` / `family="openai"`), recording the limit + firing failover. The
+  OpenAI detector requires a provider mention so a quoted error never triggers a bogus
+  failover; OpenAI limits are additionally covered by the proactive poller + 429.
 
 **Follow-ons:**
-- OpenAI/Codex **reactive** text patterns: `ReactiveOutputDetector` is Claude-anchored, so
-  the codex forwarder is intentionally not wired (OpenAI limits are covered by the proactive
-  poller + 429). Add OpenAI-specific phrasing to detect Codex limits reactively.
 - SDK-harness (`claude-sdk`/`codex`/`openai-agents`) launch selection via
   `runtime/workflow.py:_resolve_provider_for_build` + a 429 hook in
   `inner/claude_sdk_executor.py` (only the native CLI/runner path is wired today).

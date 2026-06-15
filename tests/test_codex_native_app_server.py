@@ -226,6 +226,36 @@ def test_build_codex_native_server_uses_profile_host_without_static_token(
     assert 'databricks auth token --profile \\"oss\\"' in overrides
 
 
+def test_build_codex_native_server_threads_subscription_token_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Subscription-aware token management selection reaches the app server.
+
+    A subscription account surfaces as the ``config_source`` bridged into the
+    private home; a tier-fallback api_key surfaces as ``OPENAI_API_KEY`` plus a
+    forced ``openai`` provider appended last (so it wins over routing).
+    """
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server._find_codex_cli",
+        lambda: sys.executable,
+    )
+    account_home = tmp_path / "acct-home"
+    app_server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model=None,
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        config_source=account_home,
+        openai_api_key="sk-oai-test",
+    )
+    assert app_server.config_source == account_home
+    assert app_server.env["OPENAI_API_KEY"] == "sk-oai-test"
+    assert app_server.config_overrides[-1] == 'model_provider="openai"'
+
+
 def _test_app_server(
     tmp_path: Path,
     codex_home: Path,
