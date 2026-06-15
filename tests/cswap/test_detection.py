@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import httpx
 import pytest
 
 from omnigent.cswap.domain.entities.provider_account import ProviderAccount
+from omnigent.cswap.domain.value_objects.enums import AccountKind, Family
 from omnigent.cswap.infrastructure.detection.composite_usage_limit_gateway import (
     CompositeUsageLimitGateway,
 )
@@ -114,8 +117,8 @@ def test_reactive_openai_detection_has_no_reset() -> None:
 # ── Probes (httpx.MockTransport) ───────────────────────────
 
 
-def _client(handler: object) -> httpx.AsyncClient:
-    return httpx.AsyncClient(transport=httpx.MockTransport(handler))  # type: ignore[arg-type]
+def _client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.AsyncClient:
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
 
 async def test_probe_anthropic_subscription_reads_headers() -> None:
@@ -180,12 +183,12 @@ async def test_probe_returns_none_on_network_error() -> None:
 # ── Poller ─────────────────────────────────────────────────
 
 
-def _account(family: str, kind: str) -> ProviderAccount:
+def _account(family: Family, kind: AccountKind) -> ProviderAccount:
     return ProviderAccount(
         id=f"{family}-{kind}",
         name="acct",
-        family=family,  # type: ignore[arg-type]
-        kind=kind,  # type: ignore[arg-type]
+        family=family,
+        kind=kind,
         priority=0,
         claude_config_dir="~/.c" if family == "anthropic" else None,
         codex_config_dir="~/.x" if family == "openai" else None,
@@ -246,6 +249,21 @@ async def test_poller_returns_none_when_no_credential() -> None:
         api_key_loader=lambda acct: None,
     )
     assert await poller.fetch_limit_state(_account("anthropic", "subscription"), now=1) is None
+
+
+@pytest.mark.parametrize("status", [401, 403, 500, 503])
+async def test_poller_ignores_inconclusive_status(status: int) -> None:
+    # A non-2xx / non-429 probe (auth or server error) with no rate-limit
+    # headers must NOT be recorded as an "available" observation: a strictly
+    # later write wins the staleness guard regardless of source, so doing so
+    # could clobber a real reactive limit. It yields no detection at all.
+    poller = UsageEndpointPoller(
+        client_factory=lambda: _client(lambda r: httpx.Response(status, headers={})),
+        token_loader=lambda acct: "tok",
+        api_key_loader=lambda acct: None,
+    )
+    detection = await poller.fetch_limit_state(_account("anthropic", "subscription"), now=1000)
+    assert detection is None
 
 
 def test_is_poll_enabled(monkeypatch: pytest.MonkeyPatch) -> None:

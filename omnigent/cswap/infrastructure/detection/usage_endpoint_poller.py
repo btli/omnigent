@@ -78,6 +78,14 @@ class UsageEndpointPoller(UsageLimitGateway):
         outcome = await self._probe(account, now=now)
         if outcome is None:
             return None
+        # Only a 2xx (live headroom) or an explicit 429 (limited) is a
+        # conclusive observation. An auth (401/403) or server (5xx) error says
+        # nothing about headroom; recording is_limited=False for it would let a
+        # later poll clobber a real reactive "limited" (a strictly-newer write
+        # wins the staleness guard regardless of source), so any other status
+        # yields no observation at all.
+        if not (200 <= outcome.status_code < 300 or outcome.status_code == 429):
+            return None
         is_limited = outcome.rate_limit.is_limited(outcome.status_code)
         return LimitDetectionResult(
             credential_id=account.id,

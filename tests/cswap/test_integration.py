@@ -14,6 +14,13 @@ from omnigent.cswap.container import build_container
 from omnigent.db.utils import ManagedSessionMaker
 
 
+def _accounts(snapshot: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Return the first pool's typed per-account dicts from a status snapshot."""
+    accounts = snapshot[0]["accounts"]
+    assert isinstance(accounts, list)
+    return accounts
+
+
 @pytest.fixture
 def active_facade(session_maker: ManagedSessionMaker) -> Iterator[ManagedSessionMaker]:
     """Activate the facade over a seeded two-subscription claude pool."""
@@ -81,7 +88,7 @@ def test_reactive_limit_without_reset_applies_cooldown(
     # No header reset, but the facade applied a default cooldown — limited with
     # a concrete limited_until (auto-recovers, not a permanent lockout).
     snapshot = integration.status_snapshot()
-    c1_account = next(a for a in snapshot[0]["accounts"] if a["id"] == c1)  # type: ignore[index]
+    c1_account = next(a for a in _accounts(snapshot) if a["id"] == c1)
     assert c1_account["limit_status"] == "limited"
     assert c1_account["limited_until"] is not None
 
@@ -112,7 +119,7 @@ def test_reactive_text_non_limit_is_noop(active_facade: ManagedSessionMaker) -> 
         "Here is the answer to your question.", family="anthropic", session_id="sess-1"
     )
     snapshot = integration.status_snapshot()
-    statuses = {a["id"]: a["limit_status"] for a in snapshot[0]["accounts"]}  # type: ignore[index]
+    statuses = {a["id"]: a["limit_status"] for a in _accounts(snapshot)}
     assert all(s != "limited" for s in statuses.values())
 
 
@@ -125,7 +132,7 @@ def test_attribute_cost_and_status_snapshot(active_facade: ManagedSessionMaker) 
     integration.attribute_cost("sess-1", cost_usd=-5.0, input_tokens=-3, output_tokens=0)
 
     snapshot = integration.status_snapshot()
-    accounts = {a["name"]: a for a in snapshot[0]["accounts"]}  # type: ignore[index]
+    accounts = {a["name"]: a for a in _accounts(snapshot)}
     assert accounts["c1"]["cost_today_usd"] == pytest.approx(1.25)  # unchanged by no-ops
     # Never observed (no probe/limit) → unknown, not available.
     assert accounts["c1"]["limit_status"] == "unknown"
@@ -140,5 +147,5 @@ def test_mark_available_clears_limit(active_facade: ManagedSessionMaker) -> None
 
     assert integration.mark_available(c1) is True
     snapshot = integration.status_snapshot()
-    accounts = {a["id"]: a for a in snapshot[0]["accounts"]}  # type: ignore[index]
+    accounts = {a["id"]: a for a in _accounts(snapshot)}
     assert accounts[c1]["limit_status"] == "available"

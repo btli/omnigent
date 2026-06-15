@@ -78,6 +78,28 @@ def test_limit_state_observe_reports_transition(
     assert was_available2 is False
 
 
+def test_observe_rejects_stale_write_under_lock(
+    seeded: ManagedSessionMaker, immediate_session_maker: ManagedSessionMaker
+) -> None:
+    # The locked observe() path must reject an older observation (exercising
+    # the row_exists short-circuit that skips the redundant guarded re-UPDATE)
+    # without clobbering the fresher stored row.
+    repo = SqlUsageLimitStateRepository(seeded, immediate_session_maker)
+    cid = account_id_for("claude-pool", "c1")
+
+    fresh = LimitState(
+        cid, is_limited=True, limited_until=9000, source="reactive", last_checked_at=2000
+    )
+    assert repo.observe(fresh) == (True, True)
+
+    stale = LimitState(cid, is_limited=False, source="poller", last_checked_at=1000)
+    wrote, was_available = repo.observe(stale)
+    assert wrote is False  # older observation rejected by the staleness guard
+    assert was_available is False  # prior was limited and not yet recovered
+    loaded = repo.find(cid)
+    assert loaded is not None and loaded.is_limited is True
+
+
 def test_limit_state_upsert_find_and_staleness(seeded: ManagedSessionMaker) -> None:
     repo = SqlUsageLimitStateRepository(seeded)
     cid = account_id_for("claude-pool", "c1")
@@ -102,12 +124,14 @@ def test_limit_state_upsert_find_and_staleness(seeded: ManagedSessionMaker) -> N
     # Stale write (older observation) is rejected.
     older = LimitState(credential_id=cid, is_limited=False, source="poller", last_checked_at=500)
     assert repo.upsert(older) is False
-    assert repo.find(cid).is_limited is True  # type: ignore[union-attr]
+    after_stale = repo.find(cid)
+    assert after_stale is not None and after_stale.is_limited is True
 
     # Manual override bypasses the staleness guard.
     manual = LimitState(credential_id=cid, is_limited=False, source="manual", last_checked_at=500)
     assert repo.upsert(manual, enforce_staleness=False) is True
-    assert repo.find(cid).is_limited is False  # type: ignore[union-attr]
+    after_manual = repo.find(cid)
+    assert after_manual is not None and after_manual.is_limited is False
 
 
 def test_staleness_same_second_source_precedence(seeded: ManagedSessionMaker) -> None:
@@ -126,10 +150,12 @@ def test_staleness_same_second_source_precedence(seeded: ManagedSessionMaker) ->
         repo.upsert(LimitState(cid, is_limited=False, source="poller", last_checked_at=1000))
         is False
     )
-    assert repo.find(cid).is_limited is True  # type: ignore[union-attr]
+    after_tie = repo.find(cid)
+    assert after_tie is not None and after_tie.is_limited is True
     # A strictly-later poller observation does win.
     assert repo.upsert(LimitState(cid, is_limited=False, source="poller", last_checked_at=2000))
-    assert repo.find(cid).is_limited is False  # type: ignore[union-attr]
+    after_later = repo.find(cid)
+    assert after_later is not None and after_later.is_limited is False
 
 
 def test_limit_state_find_many(seeded: ManagedSessionMaker) -> None:
@@ -153,8 +179,10 @@ def test_pool_repository_reconstructs_pool_and_accounts(seeded: ManagedSessionMa
     assert api.kind == "api_key"
     assert api.api_key_ref == "env:K"
 
-    assert repo.find_pool_for_family("openai").name == "codex-pool"  # type: ignore[union-attr]
-    assert repo.find_account(account_id_for("claude-pool", "c1")).name == "c1"  # type: ignore[union-attr]
+    openai_pool = repo.find_pool_for_family("openai")
+    assert openai_pool is not None and openai_pool.name == "codex-pool"
+    c1_account = repo.find_account(account_id_for("claude-pool", "c1"))
+    assert c1_account is not None and c1_account.name == "c1"
     assert repo.find_account("nope") is None
     assert {a.name for a in repo.accounts_for_family("anthropic")} == {"c1", "c2", "capi"}
 

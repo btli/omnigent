@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Any
+
 import pytest
 
 from omnigent.cswap.config.pool_config import (
@@ -96,8 +99,10 @@ def test_ids_are_deterministic() -> None:
 
 def test_get_pool_for_family_and_find_account() -> None:
     pools = load_pools(_valid_config())
-    assert get_pool_for_family(pools, "anthropic").name == "claude-pool"  # type: ignore[union-attr]
-    assert get_pool_for_family(pools, "openai").name == "codex-pool"  # type: ignore[union-attr]
+    anthropic_pool = get_pool_for_family(pools, "anthropic")
+    openai_pool = get_pool_for_family(pools, "openai")
+    assert anthropic_pool is not None and anthropic_pool.name == "claude-pool"
+    assert openai_pool is not None and openai_pool.name == "codex-pool"
 
     cid = account_id_for("codex-pool", "codex-1")
     found = find_account(pools, cid)
@@ -140,7 +145,10 @@ def test_get_pool_for_family_and_find_account() -> None:
         ),
     ],
 )
-def test_invalid_configs_raise(mutate, fragment) -> None:
+# ``mutate`` deliberately corrupts a nested, opaque config mapping in place, so
+# its input is typed ``Any`` (the project allows explicit Any in tests for such
+# JSON-shaped boundaries).
+def test_invalid_configs_raise(mutate: Callable[[Any], object], fragment: str) -> None:
     config = _valid_config()
     mutate(config)
     with pytest.raises(OmnigentError) as exc:

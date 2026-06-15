@@ -140,13 +140,26 @@ def _limit_state_from_row(row: SqlProviderAccountLimitState) -> LimitState:
     )
 
 
-def _upsert_limit_state(session: Session, state: LimitState, *, enforce_staleness: bool) -> bool:
+def _upsert_limit_state(
+    session: Session,
+    state: LimitState,
+    *,
+    enforce_staleness: bool,
+    row_exists: bool | None = None,
+) -> bool:
     """Guarded-UPSERT a limit-state row within *session*; return whether written.
 
     The staleness check lives in the ``UPDATE ... WHERE`` clause so it is
     atomic (concurrent writers cannot read-then-clobber a fresher row). A
     missing row is inserted via a SAVEPOINT, retrying the guarded UPDATE if a
     concurrent insert wins the PK race; a non-PK IntegrityError surfaces.
+
+    :param row_exists: Whether a row already exists, when the caller holds a
+        per-credential write lock (``observe``) so existence cannot change
+        underneath us. Lets the locked path skip the re-query and a provably
+        redundant second guarded UPDATE. Unlocked callers pass ``None`` and
+        re-check, since a concurrent insert could have added an older row that
+        still needs overwriting.
     """
     cls = SqlProviderAccountLimitState
     values = {
@@ -182,11 +195,18 @@ def _upsert_limit_state(session: Session, state: LimitState, *, enforce_stalenes
         )
     if rowcount(session.execute(guarded.values(**values))):
         return True
-    # No row updated. If one exists, re-run the guarded UPDATE so the staleness
-    # predicate (not a bare existence check) decides — a concurrently-inserted
-    # OLDER row must still be overwritten.
-    if session.get(cls, state.credential_id) is not None:
+    # No row updated: either none exists (insert) or one exists but the
+    # staleness guard rejected it. A locked caller (``row_exists`` supplied)
+    # already knows which, and no concurrent writer can change it — so a row
+    # that exists was simply staleness-rejected (return False), skipping the
+    # redundant re-query and re-UPDATE. An unlocked caller re-queries and, if a
+    # row now exists, re-runs the guarded UPDATE so the staleness predicate
+    # (not a bare existence check) decides — a concurrently-inserted OLDER row
+    # must still be overwritten.
+    if row_exists is None and session.get(cls, state.credential_id) is not None:
         return rowcount(session.execute(guarded.values(**values))) > 0
+    if row_exists:
+        return False
     try:
         with session.begin_nested():
             session.add(cls(credential_id=state.credential_id, **values))
@@ -257,7 +277,15 @@ class SqlUsageLimitStateRepository(UsageLimitStateRepository):
                 )
             prior = session.get(SqlProviderAccountLimitState, state.credential_id)
             was_available = prior is None or _limit_state_from_row(prior).is_available_now(now)
-            wrote = _upsert_limit_state(session, state, enforce_staleness=enforce_staleness)
+            # The lock (BEGIN IMMEDIATE / advisory) held since before this read
+            # means existence cannot change underneath the upsert, so pass it
+            # through to skip a redundant guarded re-UPDATE on staleness reject.
+            wrote = _upsert_limit_state(
+                session,
+                state,
+                enforce_staleness=enforce_staleness,
+                row_exists=prior is not None,
+            )
             return wrote, was_available
 
 

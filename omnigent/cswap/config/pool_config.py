@@ -15,6 +15,7 @@ into the DB — yields stable ids that match existing rows.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from typing import cast
 
 from omnigent.cswap.domain.entities.credential_pool import CredentialPool
@@ -192,7 +193,7 @@ def _parse_pool(name: str, raw: object) -> CredentialPool:
     )
 
 
-def load_pools(config: dict[str, object]) -> dict[str, CredentialPool]:
+def load_pools(config: Mapping[str, object]) -> dict[str, CredentialPool]:
     """Parse every pool in the config's ``pools:`` block.
 
     :param config: The full parsed config mapping (as returned by
