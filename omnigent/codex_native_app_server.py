@@ -1040,6 +1040,7 @@ def build_codex_native_server(
     extra_config_overrides: list[str] | None = None,
     config_source: Path | None = None,
     openai_api_key: str | None = None,
+    codex_access_token: str | None = None,
 ) -> CodexNativeAppServer:
     """
     Build a configured native Codex app-server process wrapper.
@@ -1071,6 +1072,10 @@ def build_codex_native_server(
     :param openai_api_key: A tier-fallback OpenAI api_key account's key. When
         set, it is exported as ``OPENAI_API_KEY`` and codex's built-in
         ``openai`` provider is forced (appended last so it wins over routing).
+    :param codex_access_token: A subscription account's headless Codex OAuth
+        token (``oauth_token_ref``) when it has no config dir to bridge. Exported
+        as ``CODEX_ACCESS_TOKEN`` so codex authenticates its ChatGPT
+        subscription; no provider override (it is not an api_key).
     :returns: Configured app-server process wrapper.
     :raises ImportError: If no Codex CLI is available.
     :raises OSError: If Databricks routing was requested but no
@@ -1108,6 +1113,11 @@ def build_codex_native_server(
         # OPENAI_API_KEY from the env by default.
         env["OPENAI_API_KEY"] = openai_api_key
         config_overrides.append('model_provider="openai"')
+    elif codex_access_token:
+        # A subscription account authenticated by a headless Codex OAuth token
+        # (oauth_token_ref) rather than a bridged config dir: codex reads its
+        # ChatGPT-subscription auth from CODEX_ACCESS_TOKEN. No provider override.
+        env["CODEX_ACCESS_TOKEN"] = codex_access_token
     return CodexNativeAppServer(
         codex_path=resolved_codex,
         socket_path=socket_path,
@@ -1539,7 +1549,10 @@ def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:
     return {
         key: value
         for key, value in {**app_server.env, "CODEX_HOME": str(app_server.codex_home)}.items()
-        if key in {"CODEX_HOME", "DATABRICKS_HOST", "DATABRICKS_CODEX_TOKEN"}
+        # CODEX_ACCESS_TOKEN: a subscription-token oauth account's headless Codex
+        # token — the TUI needs it too, or a fresh session hits the sign-in flow.
+        # (OPENAI_API_KEY rides the OPENAI_ prefix below.)
+        if key in {"CODEX_HOME", "CODEX_ACCESS_TOKEN", "DATABRICKS_HOST", "DATABRICKS_CODEX_TOKEN"}
         or key.startswith(("OPENAI_", "HTTP_", "HTTPS_", "NO_PROXY", "ALL_PROXY"))
     }
 

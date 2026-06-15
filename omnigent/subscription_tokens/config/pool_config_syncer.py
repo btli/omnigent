@@ -83,6 +83,7 @@ def sync_pools(session_maker: ManagedSessionMaker, pools: dict[str, CredentialPo
                     "claude_config_dir": member.claude_config_dir,
                     "codex_config_dir": member.codex_config_dir,
                     "api_key_ref": member.api_key_ref,
+                    "oauth_token_ref": member.oauth_token_ref,
                     "is_active": True,
                     "updated_at": now,
                 }

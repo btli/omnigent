@@ -419,3 +419,94 @@ def test_registry_sessions_for_credentials_live_filter_beats_the_cap(
         session.commit()
     result = registry.sessions_for_credentials([x1], only_session_ids={"live-old"}, limit_per=200)
     assert result == {x1: ["live-old"]}
+
+
+@pytest.fixture
+def active_oauth_facade(session_maker: ManagedSessionMaker) -> Iterator[ManagedSessionMaker]:
+    """Activate a claude pool whose subscriptions auth by a headless OAuth token."""
+    pools = load_pools(
+        {
+            "pools": {
+                "claude-pool": {
+                    "family": "anthropic",
+                    "failover": "auto",
+                    "members": [
+                        {
+                            "name": "sub-a",
+                            "kind": "subscription",
+                            "oauth_token_ref": "env:CLAUDE_OAUTH_A",
+                            "priority": 0,
+                        },
+                        {
+                            "name": "sub-b",
+                            "kind": "subscription",
+                            "oauth_token_ref": "env:CLAUDE_OAUTH_B",
+                            "priority": 1,
+                        },
+                    ],
+                }
+            }
+        }
+    )
+    sync_pools(session_maker, pools)
+    integration.activate(build_container(session_maker), pools)
+    try:
+        yield session_maker
+    finally:
+        integration.deactivate()
+
+
+def test_select_launch_env_injects_oauth_token_and_binds(
+    active_oauth_facade: ManagedSessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CLAUDE_OAUTH_A", "sk-ant-oat-aaa")
+    env = integration.select_launch_env_for_family("anthropic", session_id="sess-1")
+    assert env == {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-aaa"}  # priority-0 sub-a's token
+    bound = build_container(active_oauth_facade).registry.active_credential("sess-1")
+    assert bound == account_id_for("claude-pool", "sub-a")
+
+
+def test_select_launch_env_oauth_unresolved_does_not_bind(
+    active_oauth_facade: ManagedSessionMaker,
+) -> None:
+    # sub-a declares an oauth_token_ref but CLAUDE_OAUTH_A is unset → the token
+    # can't resolve → empty env AND no binding (the process falls back to ambient
+    # creds, so attributing sub-a would mis-route failover/cost).
+    env = integration.select_launch_env_for_family("anthropic", session_id="sess-2")
+    assert env == {}
+    assert build_container(active_oauth_facade).registry.active_credential("sess-2") is None
+
+
+def test_select_codex_launch_injects_access_token_and_binds(
+    session_maker: ManagedSessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CODEX_OAUTH_A", "codex-oat-aaa")
+    pools = load_pools(
+        {
+            "pools": {
+                "codex-pool": {
+                    "family": "openai",
+                    "failover": "auto",
+                    "members": [
+                        {
+                            "name": "cx-a",
+                            "kind": "subscription",
+                            "oauth_token_ref": "env:CODEX_OAUTH_A",
+                            "priority": 0,
+                        },
+                    ],
+                }
+            }
+        }
+    )
+    sync_pools(session_maker, pools)
+    integration.activate(build_container(session_maker), pools)
+    try:
+        selection = integration.select_codex_launch(session_id="sess-cx")
+        assert selection.access_token == "codex-oat-aaa"  # CODEX_ACCESS_TOKEN source
+        assert selection.config_source is None
+        assert selection.api_key is None
+        bound = build_container(session_maker).registry.active_credential("sess-cx")
+        assert bound == account_id_for("codex-pool", "cx-a")
+    finally:
+        integration.deactivate()

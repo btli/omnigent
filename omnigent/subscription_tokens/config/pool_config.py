@@ -143,10 +143,16 @@ def _parse_member(
     claude_dir = _opt_str(member.get("claude_config_dir"), "claude_config_dir", pool_name, name)
     codex_dir = _opt_str(member.get("codex_config_dir"), "codex_config_dir", pool_name, name)
     api_key_ref = _opt_str(member.get("api_key_ref"), "api_key_ref", pool_name, name)
+    oauth_token_ref = _opt_str(member.get("oauth_token_ref"), "oauth_token_ref", pool_name, name)
 
     if kind == "api_key" and not api_key_ref:
         raise _err(
             f"pool {pool_name!r} member {name!r}: an 'api_key' member requires 'api_key_ref'."
+        )
+    if kind == "api_key" and oauth_token_ref is not None:
+        raise _err(
+            f"pool {pool_name!r} member {name!r}: 'oauth_token_ref' is for a subscription "
+            f"member (a headless OAuth token); an 'api_key' member uses 'api_key_ref'."
         )
     if pool_family == "anthropic" and codex_dir is not None:
         raise _err(
@@ -157,6 +163,13 @@ def _parse_member(
         raise _err(
             f"pool {pool_name!r} member {name!r}: 'claude_config_dir' is invalid for an "
             f"openai pool (use 'codex_config_dir')."
+        )
+    family_dir = claude_dir if pool_family == "anthropic" else codex_dir
+    if oauth_token_ref is not None and family_dir is not None:
+        raise _err(
+            f"pool {pool_name!r} member {name!r}: a subscription authenticates by EITHER a "
+            f"config dir OR 'oauth_token_ref', not both (launch and the poller would "
+            f"otherwise auth as different accounts)."
         )
 
     return ProviderAccount(
@@ -169,6 +182,7 @@ def _parse_member(
         claude_config_dir=claude_dir,
         codex_config_dir=codex_dir,
         api_key_ref=api_key_ref,
+        oauth_token_ref=oauth_token_ref,
     )
 
 

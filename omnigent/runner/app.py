@@ -1305,6 +1305,7 @@ async def _auto_create_codex_terminal(
         ap_auth_headers=policy_headers,
         config_source=codex_config_source,
         openai_api_key=_codex_account.api_key,
+        codex_access_token=_codex_account.access_token,
     )
     app_server.listen_url = codex_ws_url
     await app_server.start()

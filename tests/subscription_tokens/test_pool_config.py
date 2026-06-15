@@ -79,6 +79,17 @@ def test_load_pools_parses_all_pools_and_members() -> None:
     assert api.priority == 10
 
 
+def test_parses_oauth_token_subscription_member() -> None:
+    config: Any = _valid_config()
+    config["pools"]["claude-pool"]["members"].append(
+        {"name": "claude-oauth", "kind": "subscription", "oauth_token_ref": "env:CLAUDE_OAUTH_1"}
+    )
+    member = load_pools(config)["claude-pool"].members[-1]
+    assert member.kind == "subscription"
+    assert member.oauth_token_ref == "env:CLAUDE_OAUTH_1"
+    assert member.config_dir() is None  # a token-ref subscription has no config dir
+
+
 def test_failover_defaults_to_notify() -> None:
     pools = load_pools(_valid_config())
     assert pools["codex-pool"].failover_mode == "notify"
@@ -142,6 +153,28 @@ def test_get_pool_for_family_and_find_account() -> None:
                 {"name": "wrongdir2", "claude_config_dir": "~/.c"}
             ),
             "claude_config_dir",
+        ),
+        (
+            lambda c: c["pools"]["claude-pool"]["members"].append(
+                {
+                    "name": "bad-oauth",
+                    "kind": "api_key",
+                    "api_key_ref": "env:K",
+                    "oauth_token_ref": "env:T",
+                }
+            ),
+            "oauth_token_ref",
+        ),
+        (
+            lambda c: c["pools"]["claude-pool"]["members"].append(
+                {
+                    "name": "both-auth",
+                    "kind": "subscription",
+                    "claude_config_dir": "~/.c",
+                    "oauth_token_ref": "env:T",
+                }
+            ),
+            "not both",
         ),
     ],
 )
