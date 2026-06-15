@@ -2826,6 +2826,14 @@ async def _post_external_conversation_item(
     :returns: None.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
+    # Multi-subscription (cswap) reactive detection: scan the item text for a
+    # Claude "usage limit reached" signal before posting, so a limited account
+    # is recorded and failed over even if this POST later fails. Parse-first
+    # and fully guarded — a no-op (cheap regex) when no pool is configured.
+    from omnigent.cswap import integration as _cswap
+
+    _cswap.record_reactive_text(str(item.data), family="anthropic", session_id=session_id)
+
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={
