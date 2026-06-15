@@ -110,19 +110,24 @@ def test_manifest_node_selector_pins_amd64_and_merges_operator_labels() -> None:
     }
 
 
-def test_manifest_node_selector_defaults_arch_amd64() -> None:
+def test_manifest_node_selector_arch_invariant_cannot_be_overridden() -> None:
     """
-    ``kubernetes.io/arch: amd64`` is the default node selector entry (the
-    host image is amd64-only). Operator-supplied labels merge on top per
-    the spec's ``{arch, **operator}`` ordering, so an operator running a
-    multi-arch image build CAN override arch deliberately — the default
-    just spares everyone else from having to set it.
+    ``kubernetes.io/arch: amd64`` is ALWAYS enforced and cannot be dropped
+    by an operator ``kubernetes.io/arch`` key (the host image is amd64-only,
+    so an override would only schedule a Pod that segfaults at exec). The
+    operator's other labels still merge.
+
+    Mutation guard: with the original ``{arch, **operator}`` merge order an
+    operator arm64 key would win and this assertion fails.
     """
     # No arch override: the default is present.
     assert _node_selector(_manifest())["kubernetes.io/arch"] == "amd64"
-    # Operator override wins (spread last), matching the spec.
-    override = _manifest(node_selector={"kubernetes.io/arch": "arm64"})
-    assert _node_selector(override)["kubernetes.io/arch"] == "arm64"
+    # An operator arch override is IGNORED — amd64 wins — and the operator's
+    # other labels survive.
+    override = _manifest(node_selector={"kubernetes.io/arch": "arm64", "disktype": "ssd"})
+    selector = _node_selector(override)
+    assert selector["kubernetes.io/arch"] == "amd64"
+    assert selector["disktype"] == "ssd"
 
 
 def test_manifest_pod_security_context_runs_as_uid_gid_1000() -> None:
@@ -369,10 +374,17 @@ class _ContainerState:
 
 @dataclass
 class _ContainerStatus:
-    """Stands in for ``V1ContainerStatus``."""
+    """
+    Stands in for ``V1ContainerStatus``.
+
+    ``name`` defaults to ``"host"`` (the launcher's ``_CONTAINER_NAME``)
+    so the common "host container ready" case is the default; sidecar
+    statuses pass an explicit name.
+    """
 
     ready: bool = False
     state: _ContainerState = field(default_factory=_ContainerState)
+    name: str = "host"
 
 
 @dataclass
@@ -903,6 +915,53 @@ def test_provision_waits_for_readiness_before_returning(
     assert pod_name.startswith("omnigent-managed-abc-")
 
 
+def test_provision_readiness_checks_host_container_not_sidecar(
+    fake_k8s: _FakeK8sState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    MEDIUM-1: on sidecar-injected clusters a ready sidecar must NOT count
+    as the Pod being ready — exec targets the ``host`` container, so the
+    wait must gate on the host container's readiness specifically. A Pod
+    whose sidecar is ready but whose host container is not stays not-ready
+    until the host flips ready.
+
+    Mutation guard: an ``any(cs.ready ...)`` readiness check would return
+    on the first (sidecar-ready) read and never poll for the host — this
+    asserts the wait kept polling until the host container was ready.
+    """
+    monkeypatch.setattr("omnigent.onboarding.sandboxes.kubernetes.time.sleep", lambda _s: None)
+    # Sidecar ready, host NOT ready — must be treated as not-ready.
+    sidecar_only = _Pod(
+        status=_PodStatus(
+            phase="Running",
+            container_statuses=[
+                _ContainerStatus(ready=True, name="istio-proxy"),
+                _ContainerStatus(ready=False, name="host"),
+            ],
+        )
+    )
+    # Then the host container flips ready (sidecar still ready).
+    both_ready = _Pod(
+        status=_PodStatus(
+            phase="Running",
+            container_statuses=[
+                _ContainerStatus(ready=True, name="istio-proxy"),
+                _ContainerStatus(ready=True, name="host"),
+            ],
+        )
+    )
+    fake_k8s.read_sequence = [sidecar_only, sidecar_only, both_ready]
+
+    pod_name = KubernetesSandboxLauncher().provision("managed-abc")
+
+    # The wait did NOT return on the sidecar-ready reads — it polled until
+    # the host container was ready (≥3 reads consumed).
+    assert fake_k8s.read_index >= 3
+    assert pod_name.startswith("omnigent-managed-abc-")
+    # Readiness succeeded → no cleanup delete.
+    assert fake_k8s.delete_calls == []
+
+
 def test_provision_fast_fails_on_image_pull_backoff(fake_k8s: _FakeK8sState) -> None:
     """
     A container stuck in ImagePullBackOff will never start — fail fast
@@ -931,6 +990,15 @@ def test_provision_fast_fails_on_image_pull_backoff(fake_k8s: _FakeK8sState) -> 
         KubernetesSandboxLauncher().provision("managed-abc")
     assert "ImagePullBackOff" in str(exc.value)
     assert "kubectl describe pod" in str(exc.value)
+    # HIGH-2: the just-created Pod is cleaned up so it can't orphan (the
+    # caller never gets an id to terminate()). grace_period 0, the created
+    # pod name.
+    [(deleted_name, grace)] = fake_k8s.delete_calls
+    assert grace == 0
+    [create] = fake_k8s.create_calls
+    metadata = create.manifest["metadata"]
+    assert isinstance(metadata, dict)
+    assert deleted_name == metadata["name"]
 
 
 def test_provision_fast_fails_on_unschedulable_and_surfaces_events(
@@ -964,6 +1032,8 @@ def test_provision_fast_fails_on_unschedulable_and_surfaces_events(
     message = str(exc.value)
     assert "cannot be scheduled" in message
     assert "FailedScheduling" in message
+    # HIGH-2: the unschedulable Pod is cleaned up rather than orphaned.
+    assert len(fake_k8s.delete_calls) == 1
 
 
 def test_provision_fast_fails_on_terminal_phase(fake_k8s: _FakeK8sState) -> None:
@@ -976,6 +1046,74 @@ def test_provision_fast_fails_on_terminal_phase(fake_k8s: _FakeK8sState) -> None
     with pytest.raises(click.ClickException) as exc:
         KubernetesSandboxLauncher().provision("managed-abc")
     assert "terminal phase 'Failed'" in str(exc.value)
+    # HIGH-2: the terminal Pod is cleaned up rather than orphaned.
+    assert len(fake_k8s.delete_calls) == 1
+
+
+def test_provision_cleans_up_pod_on_readiness_timeout(
+    fake_k8s: _FakeK8sState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    HIGH-2 path (c): when the readiness wait times out (Pod never ready,
+    no terminal/fast-fail signal), provision deletes the just-created Pod
+    before re-raising — otherwise it orphans (the caller gets no id).
+
+    Mutation guard: removing the provision() cleanup leaves delete_calls
+    empty and this fails.
+    """
+    # Make the deadline trip immediately: monotonic jumps past the budget,
+    # and sleep is a no-op so the loop spins fast.
+    monkeypatch.setattr("omnigent.onboarding.sandboxes.kubernetes.time.sleep", lambda _s: None)
+    ticks = iter([0.0, 10_000.0, 20_000.0, 30_000.0])
+    monkeypatch.setattr(
+        "omnigent.onboarding.sandboxes.kubernetes.time.monotonic",
+        lambda: next(ticks),
+    )
+
+    def _never_ready(name: str) -> _Pod:
+        # Running but the host container never reports ready, and no
+        # terminal / unschedulable / image-pull signal — only the timeout
+        # can end the wait.
+        return _Pod(
+            status=_PodStatus(phase="Running", container_statuses=[_ContainerStatus(ready=False)])
+        )
+
+    fake_k8s.pod_factory = _never_ready
+    with pytest.raises(click.ClickException) as exc:
+        KubernetesSandboxLauncher().provision("managed-abc")
+    assert "did not become ready" in str(exc.value)
+    # The orphan was reaped.
+    [(deleted_name, grace)] = fake_k8s.delete_calls
+    assert grace == 0
+    [create] = fake_k8s.create_calls
+    metadata = create.manifest["metadata"]
+    assert isinstance(metadata, dict)
+    assert deleted_name == metadata["name"]
+
+
+def test_provision_readiness_cleanup_swallows_delete_failure(
+    fake_k8s: _FakeK8sState,
+) -> None:
+    """
+    The best-effort cleanup must not mask the original readiness failure:
+    if the cleanup delete itself errors, provision still raises the
+    ORIGINAL error (not the delete error).
+    """
+
+    def _failed(name: str) -> _Pod:
+        return _Pod(status=_PodStatus(phase="Failed"))
+
+    fake_k8s.pod_factory = _failed
+    # The cleanup delete blows up — must be swallowed.
+    fake_k8s.delete_raises = [_FakeApiException(status=500, reason="ServerError")]
+
+    with pytest.raises(click.ClickException) as exc:
+        KubernetesSandboxLauncher().provision("managed-abc")
+    # Original readiness error surfaces, NOT the delete's ServerError.
+    assert "terminal phase 'Failed'" in str(exc.value)
+    assert "ServerError" not in str(exc.value)
+    # The cleanup was attempted.
+    assert len(fake_k8s.delete_calls) == 1
 
 
 def test_provision_image_resolution_order(
@@ -1135,7 +1273,8 @@ def test_provision_wraps_api_errors_with_reason_and_rbac_hint(
     message = str(exc.value)
     assert "Forbidden" in message
     assert "pods is forbidden" in message
-    assert "rbac.yaml" in message
+    # LOW-1: the remediation points at the real RBAC location.
+    assert "deploy/kubernetes/overlays/sandbox-runners/" in message
 
 
 # ── run ─────────────────────────────────────────────────────
@@ -1345,7 +1484,7 @@ def test_run_does_not_retry_permanent_exec_error(
         status=403, reason="Forbidden", body="pods/exec is forbidden"
     )
 
-    with pytest.raises(click.ClickException, match=r"rbac\.yaml"):
+    with pytest.raises(click.ClickException, match="sandbox-runners"):
         launcher.run(pod_name, "echo hi")
     # No backoff sleeps — a permanent error is not retried.
     assert sleeps == []

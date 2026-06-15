@@ -338,9 +338,12 @@ def build_pod_manifest(
     :param env_literals: Literal name → value env entries to add (the
         resolved server-env passthrough). Secret values should ride
         *harness_secret* instead, not this map.
-    :param node_selector: Extra node selector labels merged on top of
-        the mandatory ``kubernetes.io/arch: amd64`` constraint, or
-        ``None`` for none.
+    :param node_selector: Extra node selector labels, or ``None`` for
+        none. The mandatory ``kubernetes.io/arch: amd64`` constraint is
+        always enforced and CANNOT be overridden here — the official host
+        image is amd64-only, so an arch override would only schedule a Pod
+        that fails at exec. Any ``kubernetes.io/arch`` key supplied here
+        is ignored.
     :returns: The Pod manifest dict.
     """
     env: list[dict[str, str]] = [
@@ -379,7 +382,11 @@ def build_pod_manifest(
         "restartPolicy": "Never",
         "automountServiceAccountToken": False,
         "serviceAccountName": service_account,
-        "nodeSelector": {"kubernetes.io/arch": "amd64", **(node_selector or {})},
+        # arch is spread LAST so the amd64 invariant always wins — an
+        # operator key "kubernetes.io/arch" cannot drop it (the host image
+        # is amd64-only; an override would only schedule a Pod that segfaults
+        # on the first exec).
+        "nodeSelector": {**(node_selector or {}), "kubernetes.io/arch": "amd64"},
         "securityContext": {
             "runAsUser": _RUN_AS_UID,
             "runAsGroup": _RUN_AS_GID,
@@ -754,9 +761,42 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                     continue
                 raise click.ClickException(_format_api_error("create pod", pod_name, exc)) from exc
 
-        self._wait_for_pod_ready(namespace, pod_name)
+        # The Pod now exists. If readiness fails (Unschedulable,
+        # ImagePullBackOff, timeout, …) provision() returns no sandbox id,
+        # so the caller can never terminate() it — best-effort delete the
+        # orphan here and re-raise the original failure.
+        try:
+            self._wait_for_pod_ready(namespace, pod_name)
+        except BaseException:
+            self._best_effort_delete(namespace, pod_name)
+            raise
         click.echo(f"  → pod '{pod_name}' is ready")
         return pod_name
+
+    def _best_effort_delete(self, namespace: str, pod_name: str) -> None:
+        """
+        Delete a Pod, swallowing (and logging) any failure.
+
+        Used to reap a just-created Pod whose readiness wait failed: the
+        cleanup must not mask the original error, so a delete that itself
+        errors only warns. Mirrors :meth:`terminate`'s delete
+        (``grace_period_seconds=0``); a 404 means the Pod is already gone.
+
+        :param namespace: Namespace the Pod lives in.
+        :param pod_name: The Pod to delete.
+        """
+        from kubernetes.client.rest import ApiException
+
+        try:
+            self._load_core().delete_namespaced_pod(pod_name, namespace, grace_period_seconds=0)
+        except ApiException as exc:
+            if getattr(exc, "status", None) == 404:
+                return
+            click.echo(
+                f"  → warning: could not clean up pod '{pod_name}' after a "
+                f"failed readiness wait: {_format_api_error('delete pod', pod_name, exc)}",
+                err=True,
+            )
 
     def _wait_for_pod_ready(self, namespace: str, pod_name: str) -> None:
         """
@@ -1162,7 +1202,8 @@ def _format_api_error(action: str, pod: str, exc: k8s_client.ApiException) -> st
     if getattr(exc, "status", None) == 403:
         message += (
             " — the server ServiceAccount likely lacks the sandbox-manager "
-            "Role (pods, pods/exec); apply deploy/kubernetes/rbac.yaml."
+            "Role (pods, pods/exec); apply "
+            "`kubectl apply -k deploy/kubernetes/overlays/sandbox-runners/`."
         )
     return message
 
@@ -1180,19 +1221,24 @@ def _pod_phase(pod: object) -> str | None:
 
 def _container_ready(pod: object) -> bool:
     """
-    Report whether any container status is ``ready`` (codex S2).
+    Report whether the ``host`` container's status is ``ready`` (codex
+    S2).
 
-    The sandbox Pod has one container, so any ready container means the
-    host is execable.
+    Checks the status whose name is :data:`_CONTAINER_NAME` specifically,
+    NOT ``any()`` container — on sidecar-injected clusters (Istio,
+    Linkerd) a ready sidecar would otherwise be mistaken for a ready host,
+    and exec (which targets the ``host`` container) would race a container
+    that isn't up. A missing host status is treated as not-ready.
 
     :param pod: A ``V1Pod`` read from the API.
-    :returns: ``True`` when a container reports ``ready``.
+    :returns: ``True`` only when the ``host`` container reports ``ready``.
     """
     status = getattr(pod, "status", None)
     statuses = getattr(status, "container_statuses", None) if status is not None else None
-    if not statuses:
-        return False
-    return any(getattr(cs, "ready", False) for cs in statuses)
+    for cs in statuses or []:
+        if getattr(cs, "name", None) == _CONTAINER_NAME:
+            return bool(getattr(cs, "ready", False))
+    return False
 
 
 def _fatal_container_reason(pod: object) -> tuple[str, str] | None:

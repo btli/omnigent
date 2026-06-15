@@ -96,7 +96,10 @@ it, set `OMNIGENT_KUBERNETES_KUBECONFIG` to a kubeconfig path instead.
 - **`ImagePullBackOff`** — the runner image isn't pullable on the amd64 nodes
   (private registry needs an imagePullSecret; set `image` to a reachable ref).
 - **Agent auth failures inside the Pod** — a key is missing from
-  `omnigent-creds`; the provider rejects reserved names (`HOME`, `IS_SANDBOX`).
+  `omnigent-creds`. (Note: the reserved-name rejection of `HOME` /
+  `IS_SANDBOX` applies only to direct `sandbox.kubernetes.env` entries, which
+  the launcher sets itself; Secret keys mounted via `envFrom` are not
+  validated, so avoid putting `HOME`/`IS_SANDBOX` in `omnigent-creds`.)
 - **Agent turns crash with a Bun segfault (`embedder failed to suspend thread
   … panic: Segmentation fault`).** The Pod provisions and the host registers
   fine, but the first agent turn fails and the session goes to `failed` with that
