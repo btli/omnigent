@@ -81,6 +81,36 @@ def test_reactive_429_triggers_failover_rebind(active_facade: ManagedSessionMake
     assert c1_account["earliest_reset_at"] is not None
 
 
+def test_reactive_text_usage_limit_triggers_failover(active_facade: ManagedSessionMaker) -> None:
+    integration.select_launch_env_for_family("anthropic", session_id="sess-1")
+    c1 = account_id_for("claude-pool", "c1")
+    c2 = account_id_for("claude-pool", "c2")
+
+    # A Claude "usage limit reached" line in forwarded agent output.
+    integration.record_reactive_text(
+        "Claude AI usage limit reached. Resets later.",
+        family="anthropic",
+        session_id="sess-1",
+    )
+
+    # c1 limited → next selection avoids it; sess-1 auto-rebound to c2.
+    env = integration.select_launch_env_for_family("anthropic", session_id="sess-2")
+    assert env == {"CLAUDE_CONFIG_DIR": os.path.expanduser("~/.c2")}
+    assert build_container(active_facade).registry.active_credential("sess-1") == c2
+    assert c1  # referenced for clarity
+
+
+def test_reactive_text_non_limit_is_noop(active_facade: ManagedSessionMaker) -> None:
+    integration.select_launch_env_for_family("anthropic", session_id="sess-1")
+    # Ordinary output (no limit signal) leaves everything available.
+    integration.record_reactive_text(
+        "Here is the answer to your question.", family="anthropic", session_id="sess-1"
+    )
+    snapshot = integration.status_snapshot()
+    statuses = {a["id"]: a["limit_status"] for a in snapshot[0]["accounts"]}  # type: ignore[index]
+    assert all(s != "limited" for s in statuses.values())
+
+
 def test_attribute_cost_and_status_snapshot(active_facade: ManagedSessionMaker) -> None:
     integration.select_launch_env_for_family("anthropic", session_id="sess-1")
     integration.attribute_cost("sess-1", cost_usd=1.25, input_tokens=100, output_tokens=20)

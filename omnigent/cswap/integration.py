@@ -156,19 +156,28 @@ def select_launch_env_for_family(
 
 
 def record_reactive_text(text: str, *, family: Family, session_id: str) -> None:
-    """Scan agent *text* for a usage-limit signal and run track + failover."""
-    container = _ensure_container()
-    if container is None or not session_id:
+    """Scan agent *text* for a usage-limit signal and run track + failover.
+
+    Called per forwarded transcript item, so it parses **first** (a cheap
+    regex) and only touches the container / DB on a positive match — when
+    no pool is configured or the text shows no limit, this is regex-only.
+    """
+    if not session_id:
         return
     try:
         from omnigent.cswap.infrastructure.detection.reactive_output_detector import (
             ReactiveOutputDetector,
         )
 
+        parsed = ReactiveOutputDetector.parse(text)
+        if not parsed.is_limited:
+            return
+        container = _ensure_container()
+        if container is None:
+            return
         credential_id = container.registry.active_credential(session_id)
         if not credential_id:
             return
-        parsed = ReactiveOutputDetector.parse(text)
         now = int(time.time())
         detection = ReactiveOutputDetector.to_detection(credential_id, parsed, now)
         if detection is None:

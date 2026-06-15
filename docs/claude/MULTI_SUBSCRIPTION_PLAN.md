@@ -150,14 +150,16 @@ Wired into omnigent:
 - `cli.py` — points the facade at the server's DB via `OMNIGENT_DATABASE_URI`.
 - `server/routes/sessions.py` — per-account cost attribution in `_accumulate_session_usage`.
 - `server/routes/cswap.py` — `GET /v1/cswap/status`, `POST /v1/cswap/accounts/{id}/mark-available`.
+- `claude_native_forwarder.py` — **reactive in-stream detection**: every forwarded
+  transcript item is scanned (`integration.record_reactive_text`, parse-first so it's
+  regex-only when no pool is configured) for a Claude "usage limit reached" signal,
+  recording the limit + firing failover. `integration.record_rate_limited` is also
+  available for an explicit-429 caller.
 
-**Remaining hook (1 line each, facade ready):** reactive in-stream detection.
-`integration.record_reactive_text(text, family=..., session_id=...)` and
-`integration.record_rate_limited(family=..., session_id=...)` are implemented and tested;
-they need a call at the native forwarder's transcript-text site
-(`claude_native_forwarder.py`) and/or `inner/claude_sdk_executor.py`'s 429 `api_retry`
-branch. Left unwired to avoid touching those hot paths without live multi-account
-verification. Proactive polling + manual mark-available already cover limit detection.
-
-**Follow-on:** SDK-harness (`claude-sdk`/`codex`/`openai-agents`) launch selection via
-`runtime/workflow.py:_resolve_provider_for_build` (only the native CLI path is wired today).
+**Follow-ons:**
+- OpenAI/Codex **reactive** text patterns: `ReactiveOutputDetector` is Claude-anchored, so
+  the codex forwarder is intentionally not wired (OpenAI limits are covered by the proactive
+  poller + 429). Add OpenAI-specific phrasing to detect Codex limits reactively.
+- SDK-harness (`claude-sdk`/`codex`/`openai-agents`) launch selection via
+  `runtime/workflow.py:_resolve_provider_for_build` + a 429 hook in
+  `inner/claude_sdk_executor.py` (only the native CLI/runner path is wired today).
