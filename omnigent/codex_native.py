@@ -956,9 +956,7 @@ async def _prepare_codex_terminal(
         from omnigent.subscription_tokens import integration as _subtokens
 
         _codex_account = _subtokens.select_codex_launch(session_id)
-        codex_config_source = (
-            Path(_codex_account.config_source) if _codex_account.config_source else None
-        )
+        codex_config_source = _codex_account.config_source_path
         # Route across all offerings: a configured provider (configure
         # harness), the Databricks ucode profile, or Codex's own login —
         # so `omnigent codex` honors the provider selection like the

@@ -19,6 +19,7 @@ import logging
 import os
 import threading
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 from sqlalchemy import select
 
@@ -217,6 +218,11 @@ class CodexLaunchSelection:
 
     config_source: str | None = None
     api_key: str | None = None
+
+    @property
+    def config_source_path(self) -> Path | None:
+        """:attr:`config_source` as a :class:`Path` (the launch path's type)."""
+        return Path(self.config_source) if self.config_source else None
 
 
 def select_codex_launch(session_id: str | None = None) -> CodexLaunchSelection:
