@@ -33,10 +33,18 @@ logger = logging.getLogger(__name__)
 
 DATABASE_URI_ENV = "OMNIGENT_DATABASE_URI"
 
-# Default auto-recovery cooldown for a reactive limit with no known reset
-# time (Claude's rolling 5h window). Prevents a permanent lockout when the
-# proactive poller is disabled.
+# Auto-recovery cooldown for a limit with no known reset time, so an account
+# is never permanently locked out when polling is disabled. Family-specific:
+# Anthropic's subscription limit is its rolling 5h window; OpenAI/Codex limits
+# recover much faster, so a shorter default avoids over-benching the account.
 _DEFAULT_LIMIT_COOLDOWN_S = 5 * 3600
+_COOLDOWN_BY_FAMILY: dict[Family, int] = {"anthropic": 5 * 3600, "openai": 60 * 60}
+
+
+def _cooldown_for(family: Family) -> int:
+    """Return the auto-recovery cooldown (seconds) for *family*."""
+    return _COOLDOWN_BY_FAMILY.get(family, _DEFAULT_LIMIT_COOLDOWN_S)
+
 
 # Server-activated container (set by the lifespan). When None, the lazy
 # machine-global path is used instead.
@@ -52,8 +60,11 @@ _init_lock = threading.Lock()
 def activate(container: CswapContainer, pools: dict[str, CredentialPool]) -> None:
     """Install the server-built container + parsed pools as the active pair."""
     global _container, _pools
-    _container = container
+    # Assign pools BEFORE the container so a concurrent reader never observes
+    # a set container with empty pools (which _ensure_container treats as
+    # inactive) — it sees either the old pair or the fully-new pair.
     _pools = pools
+    _container = container
     logger.info("cswap activated with %d pool(s)", len(pools))
 
 
@@ -203,18 +214,19 @@ def record_reactive_text(text: str, *, family: Family, session_id: str) -> None:
         logger.exception("cswap reactive detection failed")
 
 
-def _with_recovery(detection: LimitDetectionResult) -> LimitDetectionResult:
+def _with_recovery(detection: LimitDetectionResult, cooldown_s: int) -> LimitDetectionResult:
     """Ensure a limited detection has a recovery time so it auto-recovers.
 
     A reactive limit often carries no reset (a 429 with no headers, or
     "usage limit reached" text without the header lines). Without a
     ``limited_until`` the account would stay limited until the poller probes
     it or it is manually cleared — a permanent lockout when polling is off.
-    Default a ``5h`` cooldown (Claude's rolling window).
+
+    :param cooldown_s: Family-specific fallback cooldown to apply.
     """
     if not detection.is_limited or detection.limited_until is not None:
         return detection
-    return replace(detection, limited_until=detection.observed_at + _DEFAULT_LIMIT_COOLDOWN_S)
+    return replace(detection, limited_until=detection.observed_at + cooldown_s)
 
 
 def _track_and_failover(
@@ -225,7 +237,7 @@ def _track_and_failover(
     family: Family,
 ) -> None:
     """Persist *detection*; fire one-shot failover when newly limited."""
-    detection = _with_recovery(detection)
+    detection = _with_recovery(detection, _cooldown_for(family))
     result = container.track_usage_limit.execute(detection)
     if result.was_newly_limited:
         container.failover_on_limit.execute(
@@ -262,7 +274,9 @@ async def run_poll_sweep_once() -> int:
             if detection is not None:
                 # Recovery default so a probe that only learns "limited" (e.g.
                 # 429 + retry-after, no window) still auto-recovers.
-                container.track_usage_limit.execute(_with_recovery(detection))
+                container.track_usage_limit.execute(
+                    _with_recovery(detection, _cooldown_for(account.family))
+                )
                 return 1
         except Exception:
             logger.exception("cswap probe/track failed for account %s", account)

@@ -2842,16 +2842,20 @@ async def _post_external_conversation_item(
     # positive-match DB write never blocks the forwarder's event loop. Fully
     # guarded / no-op when no pool is configured.
     if item.item_type == "message" and isinstance(item.data, dict):
-        role = item.data.get("role")
-        if role in ("assistant", "system"):
+        if item.data.get("role") in ("assistant", "system"):
             from omnigent.cswap import integration as _cswap
-
-            await asyncio.to_thread(
-                _cswap.record_reactive_text,
-                str(item.data),
-                family="anthropic",
-                session_id=cswap_session_id or session_id,
+            from omnigent.cswap.infrastructure.detection.reactive_output_detector import (
+                message_text,
             )
+
+            text = message_text(item.data)
+            if text:
+                await asyncio.to_thread(
+                    _cswap.record_reactive_text,
+                    text,
+                    family="anthropic",
+                    session_id=cswap_session_id or session_id,
+                )
 
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",

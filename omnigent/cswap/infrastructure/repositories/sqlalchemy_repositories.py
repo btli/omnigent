@@ -73,6 +73,15 @@ def _windows_to_json(windows: tuple[UsageWindow, ...]) -> str | None:
     )
 
 
+def _opt_int(value: object) -> int | None:
+    """Coerce a JSON number to ``int``, or ``None``.
+
+    JSON round-trips can surface a stored integer as a float; the
+    :class:`UsageWindow` contract is ``int | None``, so coerce explicitly.
+    """
+    return int(value) if isinstance(value, (int, float)) else None
+
+
 def _windows_from_json(raw: str | None) -> tuple[UsageWindow, ...]:
     """Parse a windows JSON array back into :class:`UsageWindow` objects."""
     if not raw:
@@ -86,8 +95,8 @@ def _windows_from_json(raw: str | None) -> tuple[UsageWindow, ...]:
     return tuple(
         UsageWindow(
             label=str(item.get("label", "")),
-            utilization_pct=item.get("utilization_pct"),
-            reset_at=item.get("reset_at"),
+            utilization_pct=_opt_int(item.get("utilization_pct")),
+            reset_at=_opt_int(item.get("reset_at")),
         )
         for item in items
         if isinstance(item, dict)
