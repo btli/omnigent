@@ -28,11 +28,14 @@ class SyncResult:
     :param accounts_upserted: Number of account rows inserted or updated.
     :param accounts_deactivated: Accounts present in the DB but absent from
         the config, marked inactive.
+    :param pools_deleted: Pool rows present in the DB but absent from the
+        config, deleted.
     """
 
     pools_upserted: int
     accounts_upserted: int
     accounts_deactivated: int
+    pools_deleted: int
 
 
 def sync_pools(session_maker: ManagedSessionMaker, pools: dict[str, CredentialPool]) -> SyncResult:
@@ -45,9 +48,11 @@ def sync_pools(session_maker: ManagedSessionMaker, pools: dict[str, CredentialPo
     """
     now = now_epoch()
     desired_account_ids: set[str] = set()
+    desired_pool_ids = {pool.id for pool in pools.values()}
     pools_upserted = 0
     accounts_upserted = 0
     accounts_deactivated = 0
+    pools_deleted = 0
 
     with session_maker() as session:
         for pool in pools.values():
@@ -114,8 +119,17 @@ def sync_pools(session_maker: ManagedSessionMaker, pools: dict[str, CredentialPo
                 row.updated_at = now
                 accounts_deactivated += 1
 
+        # Delete pool rows no longer in the config so a renamed/removed pool
+        # can't keep winning family selection with no active members
+        # (provider_accounts.pool_id is ON DELETE SET NULL).
+        for pool_row in session.execute(select(SqlCredentialPool)).scalars():
+            if pool_row.id not in desired_pool_ids:
+                session.delete(pool_row)
+                pools_deleted += 1
+
     return SyncResult(
         pools_upserted=pools_upserted,
         accounts_upserted=accounts_upserted,
         accounts_deactivated=accounts_deactivated,
+        pools_deleted=pools_deleted,
     )
