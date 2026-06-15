@@ -460,6 +460,12 @@ ignore_missing_imports = true
 module = "cwsandbox.*"
 ignore_missing_imports = true
 
+# kubernetes is an optional dep (the `kubernetes` extra); same lazy-import
+# posture as modal above.
+[[tool.mypy.overrides]]
+module = "kubernetes.*"
+ignore_missing_imports = true
+
 [[tool.mypy.overrides]]
 module = "prompt_toolkit.*"
 ignore_missing_imports = true
