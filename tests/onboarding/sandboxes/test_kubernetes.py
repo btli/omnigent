@@ -366,10 +366,19 @@ class _Waiting:
 
 
 @dataclass
+class _Terminated:
+    """Stands in for ``V1ContainerStateTerminated``."""
+
+    exit_code: int | None = None
+    reason: str | None = None
+
+
+@dataclass
 class _ContainerState:
-    """Stands in for ``V1ContainerState`` (only `waiting` is read)."""
+    """Stands in for ``V1ContainerState`` (``waiting`` / ``terminated``)."""
 
     waiting: _Waiting | None = None
+    terminated: _Terminated | None = None
 
 
 @dataclass
@@ -564,11 +573,16 @@ class _FakeCoreV1Api:
         """
         Resolve a registered Pod or raise the fake 404.
 
+        ``read_raises`` (popped front-first) lets a test inject transient
+        apiserver errors on the first N reads before a Pod is returned.
         When ``read_sequence`` is set, successive reads walk it (staying
         on the last element once exhausted) — used to model a Pod that
         becomes ready only after a few polls.
         """
         del namespace
+        self._state.read_count += 1
+        if self._state.read_raises:
+            raise self._state.read_raises.pop(0)
         if self._state.read_sequence:
             index = min(self._state.read_index, len(self._state.read_sequence) - 1)
             self._state.read_index += 1
@@ -639,7 +653,11 @@ class _FakeK8sState:
         calls walk this list (models a Pod that becomes ready after a few
         polls); empty falls back to the registered-pods lookup.
     :param read_index: Cursor into ``read_sequence``.
+    :param read_raises: Exceptions successive ``read_namespaced_pod`` calls
+        raise (popped front-first) before falling through to the normal
+        lookup — models transient apiserver errors during the ready wait.
     :param configurations: Every ``Configuration()`` constructed.
+    :param api_clients: Every ``ApiClient`` built (for the close assertion).
     """
 
     create_calls: list[_CreateCall] = field(default_factory=list)
@@ -660,9 +678,12 @@ class _FakeK8sState:
     incluster_calls: list[object] = field(default_factory=list)
     kubeconfig_calls: list[tuple[str | None, object]] = field(default_factory=list)
     configurations: list[object] = field(default_factory=list)
+    api_clients: list[_FakeApiClient] = field(default_factory=list)
     pod_factory: Callable[[str], _Pod] = _ready_pod
     read_sequence: list[_Pod] = field(default_factory=list)
     read_index: int = 0
+    read_count: int = 0
+    read_raises: list[Exception] = field(default_factory=list)
 
 
 class _FakeConfiguration:
@@ -670,10 +691,18 @@ class _FakeConfiguration:
 
 
 class _FakeApiClient:
-    """Stands in for ``client.ApiClient`` — records the config it wraps."""
+    """
+    Stands in for ``client.ApiClient`` — records the config it wraps and
+    how many times it was closed (for the connection-pool-leak assertion).
+    """
 
     def __init__(self, configuration: object) -> None:
         self.configuration = configuration
+        self.close_count = 0
+
+    def close(self) -> None:
+        """Record a pool close (the real ApiClient closes its PoolManager)."""
+        self.close_count += 1
 
 
 def _install_fake_kubernetes(
@@ -695,7 +724,9 @@ def _install_fake_kubernetes(
         return cfg
 
     def _make_api_client(configuration: object) -> _FakeApiClient:
-        return _FakeApiClient(configuration)
+        api_client = _FakeApiClient(configuration)
+        state.api_clients.append(api_client)
+        return api_client
 
     def _make_core(api_client: object) -> _FakeCoreV1Api:
         del api_client
@@ -962,11 +993,34 @@ def test_provision_readiness_checks_host_container_not_sidecar(
     assert fake_k8s.delete_calls == []
 
 
-def test_provision_fast_fails_on_image_pull_backoff(fake_k8s: _FakeK8sState) -> None:
+def _trip_deadline_after_polls(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    A container stuck in ImagePullBackOff will never start — fail fast
-    with the reason (and a describe hint), not after the full budget.
+    Patch the launcher clock so the readiness wait polls a few times and
+    then crosses the deadline (FIX-2: recoverable conditions poll until the
+    deadline rather than fast-failing). ``sleep`` is a no-op; ``monotonic``
+    starts at 0 then jumps past the 90s budget on the 3rd call.
     """
+    monkeypatch.setattr("omnigent.onboarding.sandboxes.kubernetes.time.sleep", lambda _s: None)
+    ticks = iter([0.0, 1.0, 2.0, 10_000.0, 20_000.0, 30_000.0])
+    monkeypatch.setattr(
+        "omnigent.onboarding.sandboxes.kubernetes.time.monotonic",
+        lambda: next(ticks),
+    )
+
+
+def test_provision_polls_through_image_pull_backoff_then_times_out(
+    fake_k8s: _FakeK8sState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    FIX-2: ImagePullBackOff is RECOVERABLE (the kubelet retries cold pulls
+    / registry+cred flaps), so the wait must NOT fast-fail on it — it polls
+    until the deadline, then times out surfacing the LATEST reason +
+    events, and the orphan Pod is still cleaned up.
+
+    Mutation guard: with ImagePullBackOff back in the fast-fail set this
+    would raise on the first read with no events / no timeout wording.
+    """
+    _trip_deadline_after_polls(monkeypatch)
 
     def _bad_image(name: str) -> _Pod:
         return _Pod(
@@ -986,13 +1040,19 @@ def test_provision_fast_fails_on_image_pull_backoff(fake_k8s: _FakeK8sState) -> 
         )
 
     fake_k8s.pod_factory = _bad_image
+    fake_k8s.events = [_Event(reason="Failed", message="Failed to pull image")]
     with pytest.raises(click.ClickException) as exc:
         KubernetesSandboxLauncher().provision("managed-abc")
-    assert "ImagePullBackOff" in str(exc.value)
-    assert "kubectl describe pod" in str(exc.value)
-    # HIGH-2: the just-created Pod is cleaned up so it can't orphan (the
-    # caller never gets an id to terminate()). grace_period 0, the created
-    # pod name.
+    message = str(exc.value)
+    # Timed out (not immediate fast-fail), surfacing the current reason…
+    assert "did not become ready" in message
+    assert "ImagePullBackOff" in message
+    # …and the latest kubelet events, plus a describe hint.
+    assert "Failed to pull image" in message
+    assert "kubectl describe pod" in message
+    # It actually polled (more than one read) before giving up.
+    assert fake_k8s.read_count > 1
+    # HIGH-2: the orphan Pod is still cleaned up on the timeout failure.
     [(deleted_name, grace)] = fake_k8s.delete_calls
     assert grace == 0
     [create] = fake_k8s.create_calls
@@ -1001,13 +1061,19 @@ def test_provision_fast_fails_on_image_pull_backoff(fake_k8s: _FakeK8sState) -> 
     assert deleted_name == metadata["name"]
 
 
-def test_provision_fast_fails_on_unschedulable_and_surfaces_events(
-    fake_k8s: _FakeK8sState,
+def test_provision_polls_through_unschedulable_then_times_out(
+    fake_k8s: _FakeK8sState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    An Unschedulable Pod fails fast, and the error surfaces the
-    scheduler's event (the operator-actionable reason).
+    FIX-2: Unschedulable is RECOVERABLE (autoscaler/Karpenter trigger
+    scale-up by leaving Pods Pending), so the wait polls until the deadline
+    rather than aborting; on timeout it surfaces the Unschedulable reason +
+    scheduler events, and the orphan Pod is cleaned up.
+
+    Mutation guard: with Unschedulable back in the fast-fail set this would
+    raise immediately with "cannot be scheduled" and no timeout wording.
     """
+    _trip_deadline_after_polls(monkeypatch)
 
     def _unschedulable(name: str) -> _Pod:
         return _Pod(
@@ -1030,9 +1096,116 @@ def test_provision_fast_fails_on_unschedulable_and_surfaces_events(
     with pytest.raises(click.ClickException) as exc:
         KubernetesSandboxLauncher().provision("managed-abc")
     message = str(exc.value)
-    assert "cannot be scheduled" in message
+    assert "did not become ready" in message
+    assert "Unschedulable" in message
     assert "FailedScheduling" in message
-    # HIGH-2: the unschedulable Pod is cleaned up rather than orphaned.
+    assert fake_k8s.read_count > 1
+    # HIGH-2: the orphan is cleaned up on the timeout failure.
+    assert len(fake_k8s.delete_calls) == 1
+
+
+def test_provision_polls_through_transient_read_error_then_succeeds(
+    fake_k8s: _FakeK8sState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    FIX-2: a transient apiserver error (5xx / connection) from
+    read_namespaced_pod must NOT abort the launch — it is logged and
+    retried until the Pod reads ready.
+
+    Mutation guard: re-raising on every ApiException makes this fail with
+    the 503.
+    """
+    monkeypatch.setattr("omnigent.onboarding.sandboxes.kubernetes.time.sleep", lambda _s: None)
+    # First two reads 503 (apiserver hiccup), then the Pod reads ready.
+    fake_k8s.read_raises = [
+        _FakeApiException(status=503, reason="Service Unavailable"),
+        _FakeApiException(status=0, reason="Connection refused"),
+    ]
+
+    pod_name = KubernetesSandboxLauncher().provision("managed-abc")
+
+    assert pod_name.startswith("omnigent-managed-abc-")
+    # No cleanup — the launch succeeded after the transient errors cleared.
+    assert fake_k8s.delete_calls == []
+
+
+def test_provision_fast_fails_on_definite_read_error(fake_k8s: _FakeK8sState) -> None:
+    """
+    FIX-2: a DEFINITE read error (e.g. 403 Forbidden — RBAC) is surfaced
+    immediately, not retried, and the orphan Pod is cleaned up.
+    """
+    fake_k8s.read_raises = [_FakeApiException(status=403, reason="Forbidden")]
+
+    with pytest.raises(click.ClickException) as exc:
+        KubernetesSandboxLauncher().provision("managed-abc")
+    assert "Forbidden" in str(exc.value)
+    # HIGH-2: orphan cleaned up.
+    assert len(fake_k8s.delete_calls) == 1
+
+
+def test_provision_fast_fails_on_terminal_config_error(fake_k8s: _FakeK8sState) -> None:
+    """
+    FIX-2: a non-self-healing config error (CreateContainerConfigError /
+    InvalidImageName / RunContainerError) IS terminal — fail fast rather
+    than poll, and clean up the orphan.
+    """
+
+    def _bad_config(name: str) -> _Pod:
+        return _Pod(
+            status=_PodStatus(
+                phase="Pending",
+                container_statuses=[
+                    _ContainerStatus(
+                        ready=False,
+                        state=_ContainerState(
+                            waiting=_Waiting(
+                                reason="CreateContainerConfigError",
+                                message="secret 'omnigent-creds' not found",
+                            )
+                        ),
+                    )
+                ],
+            )
+        )
+
+    fake_k8s.pod_factory = _bad_config
+    with pytest.raises(click.ClickException) as exc:
+        KubernetesSandboxLauncher().provision("managed-abc")
+    message = str(exc.value)
+    assert "CreateContainerConfigError" in message
+    assert "container cannot start" in message
+    assert len(fake_k8s.delete_calls) == 1
+
+
+def test_provision_fast_fails_on_early_host_container_exit(fake_k8s: _FakeK8sState) -> None:
+    """
+    FIX-2: a ``restartPolicy: Never`` Pod whose host container ran and
+    exited (state.terminated) will never become ready — fail fast on the
+    early exit (before the phase even flips to Failed), and clean up.
+
+    Mutation guard: dropping the terminated-state check makes this poll to
+    the deadline instead of fast-failing.
+    """
+
+    def _exited(name: str) -> _Pod:
+        return _Pod(
+            status=_PodStatus(
+                phase="Running",
+                container_statuses=[
+                    _ContainerStatus(
+                        ready=False,
+                        state=_ContainerState(terminated=_Terminated(exit_code=1, reason="Error")),
+                    )
+                ],
+            )
+        )
+
+    fake_k8s.pod_factory = _exited
+    with pytest.raises(click.ClickException) as exc:
+        KubernetesSandboxLauncher().provision("managed-abc")
+    message = str(exc.value)
+    assert "host container exited" in message
+    assert "exit 1" in message
     assert len(fake_k8s.delete_calls) == 1
 
 
@@ -1346,6 +1519,66 @@ def test_run_parses_nonzero_exit_and_raises_when_checked(fake_k8s: _FakeK8sState
         launcher.run(pod_name, "false")
 
 
+def test_run_nonzero_error_redacts_secret_env_in_command(fake_k8s: _FakeK8sState) -> None:
+    """
+    FIX-3: a non-zero exec whose command carries OMNIGENT_HOST_TOKEN=...
+    (how _start_host_in_sandbox launches the host) must NOT leak the token
+    value into the raised error (it becomes an HTTP 502 body + server log).
+    The key is kept (masked value) for diagnosability.
+
+    Mutation guard: dropping the redaction puts the raw secret in the error.
+    """
+    launcher, pod_name = _provisioned(fake_k8s)
+    fake_k8s.exec_channels = {
+        3: (
+            '{"metadata":{},"status":"Failure",'
+            '"details":{"causes":[{"reason":"ExitCode","message":"1"}]}}'
+        ),
+    }
+    secret = "oa_live_super_secret_token_value"
+    command = (
+        f"OMNIGENT_HOST_TOKEN={secret} ANTHROPIC_API_KEY=sk-ant-leakme "
+        "setsid nohup omnigent host --server https://srv > /tmp/log 2>&1"
+    )
+
+    with pytest.raises(click.ClickException) as exc:
+        launcher.run(pod_name, command)
+    message = str(exc.value)
+    # The secret VALUES are gone…
+    assert secret not in message
+    assert "sk-ant-leakme" not in message
+    # …replaced by the masked form, keys preserved for diagnosis.
+    assert "OMNIGENT_HOST_TOKEN=***" in message
+    assert "ANTHROPIC_API_KEY=***" in message
+    # Non-sensitive parts of the command survive.
+    assert "omnigent host --server https://srv" in message
+
+
+def test_run_stuck_error_redacts_secret_env_in_command(
+    fake_k8s: _FakeK8sState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    FIX-3: the wedged-exec (idle/overall) error path also redacts secrets
+    in the abandoned command.
+    """
+    # Trip the idle guard immediately via a fake clock + a stuck ws.
+    monkeypatch.setattr("omnigent.onboarding.sandboxes.kubernetes.time.sleep", lambda _s: None)
+    ticks = iter([0.0, 100_000.0, 200_000.0, 300_000.0])
+    monkeypatch.setattr(
+        "omnigent.onboarding.sandboxes.kubernetes.time.monotonic",
+        lambda: next(ticks),
+    )
+    launcher, pod_name = _provisioned(fake_k8s)
+    fake_k8s.exec_stuck = True
+    secret = "oa_live_wedged_token"
+
+    with pytest.raises(click.ClickException) as exc:
+        launcher.run(pod_name, f"OMNIGENT_HOST_TOKEN={secret} omnigent host")
+    message = str(exc.value)
+    assert secret not in message
+    assert "OMNIGENT_HOST_TOKEN=***" in message
+
+
 def test_run_nonzero_returns_when_unchecked(fake_k8s: _FakeK8sState) -> None:
     """check=False returns the failing result for the caller to inspect."""
     launcher, pod_name = _provisioned(fake_k8s)
@@ -1561,6 +1794,74 @@ def test_terminate_wraps_non_404_errors(fake_k8s: _FakeK8sState) -> None:
 
     with pytest.raises(click.ClickException, match="ServerError"):
         launcher.terminate("omnigent-x-1")
+
+
+def test_terminate_closes_api_client(fake_k8s: _FakeK8sState) -> None:
+    """
+    FIX-4: terminate() (the launcher's last op for a sandbox) closes the
+    ApiClient's connection pool so a fresh per-op launcher can't leak
+    sockets, and drops the cached handles.
+
+    Mutation guard: removing the close leaves close_count at 0.
+    """
+    launcher, pod_name = _provisioned(fake_k8s)
+    # provision built one ApiClient.
+    [api_client] = fake_k8s.api_clients
+
+    launcher.terminate(pod_name)
+
+    assert api_client.close_count == 1
+    # Cached handles dropped (a later op rebuilds lazily).
+    assert launcher._api_client is None
+    assert launcher._core is None
+
+
+def test_terminate_closes_api_client_even_when_delete_fails(fake_k8s: _FakeK8sState) -> None:
+    """
+    FIX-4: the pool is freed even when the delete raises (the close is in a
+    finally), and the close error never masks the delete error.
+    """
+    launcher, pod_name = _provisioned(fake_k8s)
+    [api_client] = fake_k8s.api_clients
+    fake_k8s.delete_raises = [_FakeApiException(status=500, reason="ServerError")]
+
+    with pytest.raises(click.ClickException, match="ServerError"):
+        launcher.terminate(pod_name)
+    assert api_client.close_count == 1
+
+
+def test_terminate_close_is_idempotent(fake_k8s: _FakeK8sState) -> None:
+    """
+    FIX-4: a double terminate (cleanup paths can race) is safe — the second
+    call rebuilds a client (lazy) and closes it again without error.
+    """
+    launcher, pod_name = _provisioned(fake_k8s)
+
+    launcher.terminate(pod_name)
+    launcher.terminate(pod_name)  # must not raise
+
+    # Each terminate built+closed its own ApiClient (lazy rebuild after the
+    # first close nulled the cache).
+    assert len(fake_k8s.api_clients) == 2
+    assert all(c.close_count == 1 for c in fake_k8s.api_clients)
+
+
+def test_provision_cleanup_closes_api_client_on_readiness_failure(
+    fake_k8s: _FakeK8sState,
+) -> None:
+    """
+    FIX-4: a failed launch (readiness fast-fail) is also the launcher's
+    last op for that sandbox, so _best_effort_delete closes the pool too.
+    """
+
+    def _failed(name: str) -> _Pod:
+        return _Pod(status=_PodStatus(phase="Failed"))
+
+    fake_k8s.pod_factory = _failed
+    with pytest.raises(click.ClickException):
+        KubernetesSandboxLauncher().provision("managed-abc")
+    [api_client] = fake_k8s.api_clients
+    assert api_client.close_count == 1
 
 
 # ── real-client contract ────────────────────────────────────

@@ -13,6 +13,8 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: omnigent-sandbox-config
+  # Mounted by the server Pod, so this ConfigMap lives in the SERVER namespace.
+  namespace: omnigent
   labels:
     app.kubernetes.io/name: omnigent
     app.kubernetes.io/component: server
@@ -26,10 +28,15 @@ data:
       # must reach the server through it.
       # In-cluster `service.namespace.svc.cluster.local` DNS form; the base
       # Service listens on port 80 (targetPort http=8000), so no port suffix.
+      # (The Service is in `omnigent`; runner Pods in `omnigent-sandboxes` reach
+      # it across namespaces via this fully-qualified cluster DNS name.)
       server_url: http://omnigent.omnigent.svc.cluster.local
       kubernetes:
-        # Namespace the runner Pods are created in (this namespace).
-        namespace: omnigent
+        # Namespace the runner Pods are created in — the DEDICATED runner
+        # namespace (separate from the server's `omnigent`), where the server SA
+        # holds its scoped pods + pods/exec rights. secret_name / service_account
+        # below resolve in THIS namespace.
+        namespace: omnigent-sandboxes
         # K8s Secret whose keys are projected into every runner Pod via envFrom
         # (the harness LLM/git credentials). See runner-credentials.yaml.
         secret_name: omnigent-creds

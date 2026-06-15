@@ -217,19 +217,25 @@ same managed launch-token model as the Modal/Daytona sandbox providers, but on
 your own cluster. This is the `kubernetes` sandbox provider.
 
 The [`overlays/sandbox-runners/`](overlays/sandbox-runners/README.md) overlay
-adds the RBAC (the server SA gets `pods` + `pods/exec`), the `sandbox: provider:
-kubernetes` config, and the harness-credentials Secret on top of the base
-deploy:
+adds, on top of the base deploy, the `sandbox: provider: kubernetes` config and a
+**two-namespace least-blast-radius** RBAC split: the runner Pods (and their
+harness-credentials Secret + powerless SA) live in a dedicated
+`omnigent-sandboxes` namespace, and the server SA's `pods` + `pods/exec` rights
+are scoped — via a cross-namespace RoleBinding — to that namespace only, so a
+compromised server can't touch the server/DB Pods or Secrets in `omnigent`.
 
 ```bash
-# edit overlays/sandbox-runners/{runner-credentials,sandbox-config}.yaml first
+# edit overlays/sandbox-runners/{runner-credentials,sandbox-config}.yaml and the
+# `images:` override in kustomization.yaml (REPLACE_ME) first
 kubectl kustomize deploy/kubernetes/overlays/sandbox-runners/ | kubectl apply -f -
 ```
 
-Needs amd64 nodes (the host image is amd64-only) and a server image built with
-the `kubernetes` extra. Supports `claude-sdk` + `codex` agents. See the
-[overlay README](overlays/sandbox-runners/README.md) for requirements, how it
-works, and troubleshooting.
+Requires amd64 nodes (the host image is amd64-only) and — importantly — a server
+image **built with the `kubernetes` extra** (`docker build --build-arg
+OMNIGENT_EXTRAS=kubernetes`; the base image lacks it and every launch would
+fail). Supports `claude-sdk` + `codex` agents. See the
+[overlay README](overlays/sandbox-runners/README.md) for requirements, the
+two-namespace design, how it works, and troubleshooting.
 
 ## Use your own IdP instead (OIDC) — optional
 

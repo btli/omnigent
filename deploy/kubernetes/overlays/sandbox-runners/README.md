@@ -10,30 +10,53 @@ sandbox.
 It layers on `../../base` (the server Deployment/Service/Ingress/PVC are
 unchanged) and adds only what the provider needs:
 
-- **`serviceaccount-server.yaml` / `serviceaccount-runner.yaml` / `role.yaml` /
-  `rolebinding.yaml`** — the `omnigent-server` ServiceAccount, bound by the
-  RoleBinding to a namespaced Role granting exactly what the launcher calls:
-  `pods` (create/get/delete), `pods/exec` (get+create), and `events` (list, for
-  surfacing scheduler/pull failures) — so the in-cluster launcher can create
-  runner Pods and exec `omnigent host` into them. Plus a deliberately powerless
-  `omnigent-runner` ServiceAccount for the runner Pods. (One resource per file,
-  per the repo's manifest convention.)
+- **`serviceaccount-server.yaml`** — the `omnigent-server` ServiceAccount (in the
+  server namespace `omnigent`); the deployment patch runs the server as it.
+- **`namespace-sandboxes.yaml` / `serviceaccount-runner.yaml` /
+  `runner-credentials.yaml` / `role.yaml` / `rolebinding.yaml`** — the dedicated
+  runner namespace `omnigent-sandboxes` and everything that lives in it: a
+  deliberately powerless `omnigent-runner` ServiceAccount for the runner Pods,
+  the `omnigent-creds` harness Secret, a namespaced Role granting exactly what
+  the launcher calls (`pods` create/get/delete, `pods/exec` get+create, `events`
+  list), and a **cross-namespace** RoleBinding granting that Role to the
+  `omnigent-server` SA over in `omnigent`. (One resource per file, per the repo's
+  manifest convention.)
 - **`sandbox-config.yaml`** — a `config.yaml` with the `sandbox: provider:
-  kubernetes` section, mounted at `/etc/omnigent` (the deployment patch sets
-  `OMNIGENT_CONFIG` to it). The server reads the managed-sandbox backend from
-  this file, not from env.
-- **`runner-credentials.yaml`** — the `omnigent-creds` Secret whose keys are
-  projected into every runner Pod via `envFrom` (the harness LLM/git creds).
+  kubernetes` section (in `omnigent`), mounted at `/etc/omnigent` (the deployment
+  patch sets `OMNIGENT_CONFIG` to it). The server reads the managed-sandbox
+  backend from this file, not from env; it points `sandbox.kubernetes.namespace`
+  at `omnigent-sandboxes`.
 - **`deployment-patch.yaml`** — runs the server as `omnigent-server` and mounts
   the config.
 
+## Two-namespace least-blast-radius design
+
+Runner Pods run in a **separate namespace** (`omnigent-sandboxes`) from the
+server, DB and Secrets (`omnigent`). The server SA's `pods` create/get/delete +
+`pods/exec` rights are scoped — via the Role + a cross-namespace RoleBinding — to
+`omnigent-sandboxes` **only**. So even a fully compromised server can manage
+runner Pods but **cannot** exec into or delete the server/DB Pods, and **cannot**
+create a Pod that mounts the server namespace's Secrets — the blast radius of the
+exec/create grant is contained to disposable runner Pods.
+
+The binding is cross-namespace because Kubernetes RBAC lets a RoleBinding in one
+namespace name a subject (the server SA) in another: `role.yaml` + the
+`rolebinding.yaml` live in `omnigent-sandboxes`, and the RoleBinding's subject is
+`ServiceAccount/omnigent-server` with `namespace: omnigent` set explicitly.
+Runner Pods reach the server's in-cluster Service across namespaces via its
+fully-qualified DNS name (`omnigent.omnigent.svc.cluster.local`).
+
 ## Requirements
 
-- **A server image built with the `kubernetes` extra.** The base image ships no
-  managed-sandbox extras, so build with `--build-arg OMNIGENT_EXTRAS=kubernetes`
+- **A server image BUILT WITH the `kubernetes` extra (required — the base image
+  will NOT work).** The base server image ships no managed-sandbox extras, so the
+  provider's `_ensure_sdk()` would fail on every launch. Build the server image
+  with `docker build --build-arg OMNIGENT_EXTRAS=kubernetes`
   (`deploy/docker/Dockerfile`) — or otherwise ensure `pip install
-  'omnigent[kubernetes]'` is present in the server image — so `_ensure_sdk()`
-  resolves the client at runtime.
+  'omnigent[kubernetes]'` is in the server image — then point this overlay at it:
+  the `images:` override in `kustomization.yaml` defaults to a
+  `ghcr.io/REPLACE_ME/omnigent-server:kubernetes` placeholder you MUST replace
+  with your built image (or `kubectl apply` will pull a nonexistent image).
 - **amd64 nodes.** The prebaked host image is amd64-only (`cel-expr-python` has
   no aarch64 wheel), so the launcher always sets `nodeSelector:
   kubernetes.io/arch: amd64` on runner Pods. Make sure the cluster has schedulable
@@ -67,8 +90,15 @@ A new chat that requests a managed sandbox triggers, server-side:
 1. `provision()` creates a runner Pod (`sleep infinity` under a tiny PID-1
    reaper, `runAsUser: 1000`, writable `HOME` on an emptyDir,
    `automountServiceAccountToken: false`, harness creds via `envFrom`,
-   `nodeSelector: kubernetes.io/arch: amd64`) and waits for it to be ready,
-   fast-failing on `Unschedulable` / `ImagePullBackOff`.
+   `nodeSelector: kubernetes.io/arch: amd64`) in `omnigent-sandboxes` and waits
+   for it to be ready. The wait is **patient on recoverable conditions** —
+   `Pending`/`Unschedulable` (so cluster-autoscaler/Karpenter scale-up works),
+   `ImagePullBackOff`/`ErrImagePull` (so kubelet pull retries / cold pulls
+   succeed) and transient apiserver errors are polled until the deadline — and
+   **fast-fails only on truly terminal states** (Pod `Failed`, the host
+   container exiting early, or non-self-healing config errors like
+   `CreateContainerConfigError`/`InvalidImageName`). On a deadline timeout it
+   surfaces the latest scheduler/kubelet events and the current reason.
 2. The server execs `omnigent host` into the Pod (`pods/exec`); the host dials
    back over the launch-token tunnel and registers.
 3. The agent runs in the Pod. On session end (or relaunch), `terminate()`
@@ -85,18 +115,26 @@ it, set `OMNIGENT_KUBERNETES_KUBECONFIG` to a kubeconfig path instead.
 
 ## Troubleshooting
 
-- **Session hangs / host never comes online.** Find the runner Pod
-  (`kubectl get pods -n omnigent -l omnigent.ai/role=sandbox-host`,
-  or watch `kubectl get pods -n omnigent -w` after starting a chat) and read the
-  host log: `kubectl exec -n omnigent <pod> -- cat /tmp/omnigent-host.log`.
-- **`pods "..." is forbidden`** — the server isn't running as `omnigent-server`
-  or the Role/RoleBinding wasn't applied. Confirm
-  `kubectl get rolebinding omnigent-sandbox-manager -n omnigent`.
-- **Pod stuck `Pending` / `Unschedulable`** — no schedulable amd64 node (check
-  taints / `kubectl get nodes -L kubernetes.io/arch`). The provider surfaces the
-  scheduler event in the session error.
+- **Session hangs / host never comes online.** Find the runner Pod — runner Pods
+  live in `omnigent-sandboxes`, not the server namespace
+  (`kubectl get pods -n omnigent-sandboxes -l omnigent.ai/role=sandbox-host`, or
+  watch `kubectl get pods -n omnigent-sandboxes -w` after starting a chat) — and
+  read the host log:
+  `kubectl exec -n omnigent-sandboxes <pod> -- cat /tmp/omnigent-host.log`.
+- **`pods "..." is forbidden`** — the server isn't running as `omnigent-server`,
+  the cross-namespace Role/RoleBinding wasn't applied, or it's in the wrong
+  namespace. Confirm
+  `kubectl get rolebinding omnigent-sandbox-manager -n omnigent-sandboxes -o yaml`
+  and check its subject is `omnigent-server` in `omnigent`.
+- **Pod stuck `Pending` / `Unschedulable`** — usually no schedulable amd64 node
+  (check taints / `kubectl get nodes -L kubernetes.io/arch`); the launcher waits
+  this out until its readiness deadline (autoscalers are meant to scale up while
+  the Pod is Pending) and, on timeout, surfaces the scheduler event in the
+  session error.
 - **`ImagePullBackOff`** — the runner image isn't pullable on the amd64 nodes
   (private registry needs an imagePullSecret; set `image` to a reachable ref).
+  The launcher retries the pull until its readiness deadline (cold pulls /
+  transient registry/cred flaps recover) before failing with the pull event.
 - **Agent auth failures inside the Pod** — a key is missing from
   `omnigent-creds`. (Note: the reserved-name rejection of `HOME` /
   `IS_SANDBOX` applies only to direct `sandbox.kubernetes.env` entries, which

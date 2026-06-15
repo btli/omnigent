@@ -174,15 +174,40 @@ _CONTAINER_NAME: str = "host"
 _POD_READY_TIMEOUT_S: int = 90
 _POD_READY_POLL_S: float = 2.0
 
-# Container ``waiting.reason`` values that will never resolve on their
-# own — fail the ready wait immediately rather than burning the budget.
+# Container ``waiting.reason`` values that are genuinely terminal — the
+# kubelet will NOT self-heal them, so the ready wait fast-fails rather
+# than burning the budget. Deliberately EXCLUDES ImagePull* / ErrImagePull
+# (kubelet retries cold pulls / registry+network flaps / delayed pull
+# creds — a transient ImagePullBackOff resolved itself in homelab testing)
+# and Unschedulable (autoscaler/Karpenter trigger scale-up by leaving Pods
+# Pending). Those are treated as recoverable and polled until the deadline.
 _FATAL_WAITING_REASONS: frozenset[str] = frozenset(
     {
-        "ErrImagePull",
-        "ImagePullBackOff",
         "InvalidImageName",
         "CreateContainerConfigError",
+        "RunContainerError",
     }
+)
+
+# HTTP status codes from ``read_namespaced_pod`` that are transient (the
+# apiserver is briefly unavailable / overloaded). Logged and retried until
+# the readiness deadline rather than aborting the launch. A 4xx other than
+# these (e.g. 403 Forbidden, 404 deleted) is surfaced immediately.
+_TRANSIENT_READ_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
+
+# Redaction for command strings before they enter error messages / logs
+# (tri-model FIX-3). _start_host_in_sandbox runs the host with
+# `OMNIGENT_HOST_TOKEN=<launch token>` (and harness creds may ride other
+# env assignments), so an exec timeout / non-zero must not leak the value
+# into the error detail (which becomes an HTTP 502 body + server log).
+# Matches a leading-word env assignment whose KEY contains a sensitive
+# substring (case-insensitive), capturing the key so only the VALUE is
+# masked. ``(?:^|\s)`` + a non-quote/non-space value keeps it a
+# conservative shell-token match.
+_SENSITIVE_ENV_RE: re.Pattern[str] = re.compile(
+    r"(?i)((?:^|\s)[A-Za-z_][A-Za-z0-9_]*"
+    r"(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)[A-Za-z0-9_]*=)"
+    r"[^\s]+"
 )
 
 # Reserved env names the Pod sets itself (writable-HOME contract + sandbox
@@ -609,6 +634,25 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         self._core = client.CoreV1Api(self._api_client)
         return self._core
 
+    def _close_clients(self) -> None:
+        """
+        Close the cached ``ApiClient`` (its urllib3 ``PoolManager``) and
+        drop the cached handles (tri-model FIX-4).
+
+        A fresh launcher is built per managed op (launch / relaunch /
+        teardown), so an unclosed pool leaks sockets — mirror the Islo
+        launcher closing its ``httpx.Client``. Idempotent (safe to call
+        twice) and best-effort: a close error is swallowed so it can never
+        mask the real operation's result. The next ``_load_core`` rebuilds
+        the client lazily.
+        """
+        api_client = self._api_client
+        self._api_client = None
+        self._core = None
+        if api_client is not None:
+            with contextlib.suppress(Exception):
+                api_client.close()
+
     # ── resolution helpers ──────────────────────────────────
 
     def _resolve_image(self) -> str:
@@ -790,27 +834,43 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         try:
             self._load_core().delete_namespaced_pod(pod_name, namespace, grace_period_seconds=0)
         except ApiException as exc:
-            if getattr(exc, "status", None) == 404:
-                return
-            click.echo(
-                f"  → warning: could not clean up pod '{pod_name}' after a "
-                f"failed readiness wait: {_format_api_error('delete pod', pod_name, exc)}",
-                err=True,
-            )
+            if getattr(exc, "status", None) != 404:
+                click.echo(
+                    f"  → warning: could not clean up pod '{pod_name}' after a "
+                    f"failed readiness wait: {_format_api_error('delete pod', pod_name, exc)}",
+                    err=True,
+                )
+        finally:
+            # A failed launch is the launcher's last op for this sandbox —
+            # release the connection pool too (in a finally so it happens
+            # even when the cleanup delete itself raised).
+            self._close_clients()
 
     def _wait_for_pod_ready(self, namespace: str, pod_name: str) -> None:
         """
-        Block until the Pod's container is ready, failing fast on
-        terminal states (codex S2 + fast-fail).
+        Block until the Pod's ``host`` container is ready, fast-failing
+        ONLY on genuinely terminal states (codex S2; tri-model FIX-2).
 
-        Readiness — not merely ``phase == Running`` — gates the first
-        exec: a container can be ``Running`` for a moment before its
-        process is up. The wait also fails immediately, rather than
-        burning the whole budget, on states that will never resolve: a
-        ``Failed``/``Succeeded`` phase, a container stuck in an image
-        pull / config error (see :data:`_FATAL_WAITING_REASONS`), or an
-        ``Unschedulable`` ``PodScheduled`` condition. Every failure
-        surfaces recent Pod events and a ``kubectl describe`` hint.
+        Readiness — not merely ``phase == Running`` — gates the first exec
+        (a container can be ``Running`` a beat before its process is up).
+        The wait is **patient on recoverable conditions** so it doesn't
+        abort what the cluster is busy resolving:
+
+        - ``Pending`` / ``Unschedulable`` — the autoscaler/Karpenter
+          trigger scale-up by leaving Pods Pending; poll until the deadline.
+        - ``ImagePullBackOff`` / ``ErrImagePull`` / registry backoff — the
+          kubelet retries cold pulls and registry/network/cred flaps; poll.
+        - a transient :class:`ApiException` from ``read_namespaced_pod``
+          (5xx / 429 / connection error) — log and keep polling.
+
+        It fast-fails immediately ONLY on unrecoverable states: Pod phase
+        ``Failed``, the ``host`` container terminated (a ``restartPolicy:
+        Never`` Pod whose entrypoint already exited never becomes ready),
+        and non-self-healing config errors (see
+        :data:`_FATAL_WAITING_REASONS`). On a deadline timeout it surfaces
+        the LATEST scheduler/kubelet events plus the current
+        waiting/unschedulable reason so a genuinely stuck Pod still gives a
+        clear diagnosis.
 
         :param namespace: Namespace the Pod lives in.
         :param pod_name: The Pod to wait on.
@@ -820,19 +880,53 @@ class KubernetesSandboxLauncher(SandboxLauncher):
 
         core = self._load_core()
         deadline = time.monotonic() + _POD_READY_TIMEOUT_S
+        last_reason: str | None = None
         while True:
             try:
                 pod = core.read_namespaced_pod(pod_name, namespace)
             except ApiException as exc:
+                # Transient apiserver hiccups must not abort the launch —
+                # log and retry until the deadline. A definite failure
+                # (403/404/…) surfaces immediately.
+                if _is_transient_read_error(exc):
+                    if time.monotonic() >= deadline:
+                        raise click.ClickException(
+                            self._pod_failure_message(
+                                namespace,
+                                pod_name,
+                                "pod readiness could not be read before the "
+                                f"{_POD_READY_TIMEOUT_S}s deadline "
+                                f"({getattr(exc, 'reason', None) or 'apiserver error'})",
+                            )
+                        ) from exc
+                    click.echo(
+                        f"  → transient error reading pod '{pod_name}' "
+                        f"({getattr(exc, 'reason', None) or 'apiserver error'}); retrying",
+                        err=True,
+                    )
+                    time.sleep(_POD_READY_POLL_S)
+                    continue
                 raise click.ClickException(_format_api_error("read pod", pod_name, exc)) from exc
 
             phase = _pod_phase(pod)
-            if phase in ("Failed", "Succeeded"):
+            # ── Terminal / unrecoverable: fast-fail ──
+            if phase == "Failed":
                 raise click.ClickException(
                     self._pod_failure_message(
                         namespace,
                         pod_name,
-                        f"pod entered terminal phase '{phase}' before becoming ready",
+                        "pod entered terminal phase 'Failed' before becoming ready",
+                    )
+                )
+            terminated = _terminal_container_exit(pod)
+            if terminated is not None:
+                exit_code, reason = terminated
+                raise click.ClickException(
+                    self._pod_failure_message(
+                        namespace,
+                        pod_name,
+                        f"host container exited before becoming ready "
+                        f"(exit {exit_code}, {reason})",
                     )
                 )
             fatal = _fatal_container_reason(pod)
@@ -844,22 +938,23 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                         namespace, pod_name, f"container cannot start ({detail})"
                     )
                 )
-            unschedulable = _unschedulable_message(pod)
-            if unschedulable is not None:
-                raise click.ClickException(
-                    self._pod_failure_message(
-                        namespace, pod_name, f"pod cannot be scheduled ({unschedulable})"
-                    )
-                )
+
+            # ── Ready: done ──
             if phase == "Running" and _container_ready(pod):
                 return
+
+            # ── Recoverable (Pending/Unschedulable/ImagePull*/…): keep
+            #    polling, remembering the latest reason for the timeout
+            #    diagnosis. ──
+            last_reason = _current_wait_reason(pod) or last_reason
             if time.monotonic() >= deadline:
+                detail = f"; last reason: {last_reason}" if last_reason else ""
                 raise click.ClickException(
                     self._pod_failure_message(
                         namespace,
                         pod_name,
                         f"pod did not become ready within {_POD_READY_TIMEOUT_S}s "
-                        f"(last phase '{phase or 'unknown'}')",
+                        f"(last phase '{phase or 'unknown'}'{detail})",
                     )
                 )
             time.sleep(_POD_READY_POLL_S)
@@ -1032,7 +1127,8 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         stderr = "".join(stderr_chunks)
         if check and returncode != 0:
             raise click.ClickException(
-                f"Remote command failed on pod '{sandbox_id}' (exit {returncode}): {command}"
+                f"Remote command failed on pod '{sandbox_id}' (exit {returncode}): "
+                f"{_redact_command(command)}"
             )
         return RemoteCommandResult(returncode=returncode, stdout=stdout, stderr=stderr)
 
@@ -1123,10 +1219,16 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         :param stderr_chunks: Captured stderr so far.
         :returns: The error message.
         """
-        message = f"Remote command on pod '{sandbox_id}' {summary} and was abandoned: {command}"
+        # Redact sensitive env-assignment values (the launch token rides
+        # OMNIGENT_HOST_TOKEN=...) before they enter the error / 502 body /
+        # log — both in the echoed command and in any output that echoed it.
+        message = (
+            f"Remote command on pod '{sandbox_id}' {summary} and was abandoned: "
+            f"{_redact_command(command)}"
+        )
         tail = ("".join(stdout_chunks) + "".join(stderr_chunks)).strip()
         if tail:
-            message += f" — output so far: {tail[-2000:]}"
+            message += f" — output so far: {_redact_command(tail[-2000:])}"
         return message
 
     def terminate(self, sandbox_id: str) -> None:
@@ -1153,9 +1255,54 @@ class KubernetesSandboxLauncher(SandboxLauncher):
             if exc.status == 404:
                 return
             raise click.ClickException(_format_api_error("delete pod", sandbox_id, exc)) from exc
+        finally:
+            # terminate() is the launcher's last op for a sandbox — release
+            # the connection pool (a fresh launcher is built per managed
+            # op). In a finally so the pool is freed even when the delete
+            # raised; _close_clients swallows its own errors.
+            self._close_clients()
 
 
 # ── module helpers ─────────────────────────────────────────
+
+
+def _redact_command(command: str) -> str:
+    """
+    Redact sensitive env-assignment VALUES in a shell command before it is
+    put into an error message or log (tri-model FIX-3).
+
+    Replaces ``FOO_TOKEN=abc`` with ``FOO_TOKEN=***`` for any key matching
+    (case-insensitive) ``TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL`` — so an
+    exec timeout / non-zero exit can't leak the launch token (the host is
+    started with ``OMNIGENT_HOST_TOKEN=<token>``) or harness creds into the
+    surfaced error / HTTP 502 body / server log. The key is preserved for
+    diagnosability; only the value is masked.
+
+    :param command: The shell command, possibly with env assignments.
+    :returns: The command with sensitive values masked.
+    """
+    return _SENSITIVE_ENV_RE.sub(r"\1***", command)
+
+
+def _is_transient_read_error(exc: k8s_client.ApiException) -> bool:
+    """
+    Report whether a ``read_namespaced_pod`` ``ApiException`` is transient
+    (the apiserver is briefly unavailable) rather than a definite failure
+    (tri-model FIX-2).
+
+    A status in :data:`_TRANSIENT_READ_STATUSES` (5xx / 429), or a missing
+    status (a connection/timeout error the client surfaces as an
+    ``ApiException`` with ``status == 0``/``None``), is treated as
+    retryable. A 4xx like 403 (RBAC) or 404 (Pod gone) is definite and
+    surfaced immediately.
+
+    :param exc: The raised ``ApiException``.
+    :returns: ``True`` when the read should be retried.
+    """
+    status = getattr(exc, "status", None)
+    if not status:  # 0 / None → connection/timeout, no HTTP response
+        return True
+    return status in _TRANSIENT_READ_STATUSES
 
 
 def _is_transient_exec_error(exc: k8s_client.ApiException) -> bool:
@@ -1243,26 +1390,97 @@ def _container_ready(pod: object) -> bool:
 
 def _fatal_container_reason(pod: object) -> tuple[str, str] | None:
     """
-    Return a ``(reason, message)`` for a container stuck in a
-    non-recoverable waiting state, or ``None`` (fast-fail).
+    Return a ``(reason, message)`` for a container in a genuinely terminal
+    waiting state, or ``None`` (fast-fail).
 
-    Matches a container ``state.waiting.reason`` against
-    :data:`_FATAL_WAITING_REASONS` — an unfixable image pull or config
-    error that the ready wait should surface immediately rather than
-    poll to its deadline.
+    Matches the ``host`` container's ``state.waiting.reason`` against
+    :data:`_FATAL_WAITING_REASONS` — a non-self-healing config error
+    (bad image name, bad config, runtime error) the ready wait surfaces
+    immediately. Recoverable waits (ImagePull*, ContainerCreating,
+    PodInitializing) are deliberately NOT here — the kubelet retries them,
+    so the loop polls until the deadline instead.
 
     :param pod: A ``V1Pod`` read from the API.
     :returns: The fatal ``(reason, message)``, or ``None``.
     """
+    waiting = _host_container_waiting(pod)
+    reason = getattr(waiting, "reason", None) if waiting is not None else None
+    if reason in _FATAL_WAITING_REASONS:
+        return reason, getattr(waiting, "message", None) or ""
+    return None
+
+
+def _terminal_container_exit(pod: object) -> tuple[int, str] | None:
+    """
+    Return ``(exit_code, reason)`` when the ``host`` container has
+    terminated, or ``None`` (fast-fail on early exit).
+
+    A ``restartPolicy: Never`` Pod whose host container ran and exited
+    (``state.terminated``) will never become ready — fail fast rather than
+    poll to the deadline. Catches the early-container-exit case (the
+    reaper/entrypoint died) before the Pod phase flips to ``Failed``.
+
+    :param pod: A ``V1Pod`` read from the API.
+    :returns: ``(exit_code, reason)``, or ``None`` when not terminated.
+    """
+    cs = _host_container_status(pod)
+    state = getattr(cs, "state", None) if cs is not None else None
+    terminated = getattr(state, "terminated", None) if state is not None else None
+    if terminated is None:
+        return None
+    exit_code = getattr(terminated, "exit_code", None)
+    reason = getattr(terminated, "reason", None) or "Terminated"
+    return (exit_code if isinstance(exit_code, int) else -1), reason
+
+
+def _current_wait_reason(pod: object) -> str | None:
+    """
+    Return the host container's current ``waiting.reason`` (e.g.
+    ``ImagePullBackOff``) or the Pod's ``Unschedulable`` reason — whichever
+    explains why the Pod is not yet ready — for the timeout diagnosis.
+
+    :param pod: A ``V1Pod`` read from the API.
+    :returns: A short reason string, or ``None`` when none applies.
+    """
+    waiting = _host_container_waiting(pod)
+    reason = getattr(waiting, "reason", None) if waiting is not None else None
+    if reason:
+        message = getattr(waiting, "message", None)
+        return f"{reason}: {message}" if message else str(reason)
+    unschedulable = _unschedulable_message(pod)
+    if unschedulable is not None:
+        return f"Unschedulable: {unschedulable}"
+    return None
+
+
+def _host_container_status(pod: object) -> object | None:
+    """
+    Return the ``host`` container's ``V1ContainerStatus``, or ``None``.
+
+    :param pod: A ``V1Pod`` read from the API.
+    :returns: The host container status, or ``None`` when absent.
+    """
     status = getattr(pod, "status", None)
     statuses = getattr(status, "container_statuses", None) if status is not None else None
     for cs in statuses or []:
-        state = getattr(cs, "state", None)
-        waiting = getattr(state, "waiting", None) if state is not None else None
-        reason = getattr(waiting, "reason", None) if waiting is not None else None
-        if reason in _FATAL_WAITING_REASONS:
-            return reason, getattr(waiting, "message", None) or ""
+        if getattr(cs, "name", None) == _CONTAINER_NAME:
+            host_status: object = cs
+            return host_status
     return None
+
+
+def _host_container_waiting(pod: object) -> object | None:
+    """
+    Return the ``host`` container's ``state.waiting`` object, or ``None``.
+
+    :param pod: A ``V1Pod`` read from the API.
+    :returns: The waiting state, or ``None`` when the host container is not
+        waiting.
+    """
+    cs = _host_container_status(pod)
+    state = getattr(cs, "state", None) if cs is not None else None
+    waiting: object | None = getattr(state, "waiting", None) if state is not None else None
+    return waiting
 
 
 def _unschedulable_message(pod: object) -> str | None:
