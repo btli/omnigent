@@ -298,9 +298,9 @@ HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
         "ANTHROPIC_AUTH_TOKEN",
         "ANTHROPIC_BASE_URL",
         "CLAUDE_CODE_OAUTH_TOKEN",
-        # Per-account config-dir isolation for multi-subscription (cswap)
+        # Per-account config-dir isolation for multi-subscription
         # rotation: a pool-selected Claude/Codex subscription points the
-        # launched CLI at its own login directory (see omnigent/cswap/).
+        # launched CLI at its own login directory (see omnigent/subscription_tokens/).
         "CLAUDE_CONFIG_DIR",
         "CODEX_HOME",
         "CODEX_ACCESS_TOKEN",

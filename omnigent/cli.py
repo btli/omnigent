@@ -2901,7 +2901,7 @@ def server(
     db_uri = database_uri or cfg.get("database_uri", _default_db_uri())
     art_loc = artifact_location or cfg.get("artifact_location", _default_artifact_location())
 
-    # Point the multi-subscription (cswap) facade at the server's DB so its
+    # Point the multi-subscription facade at the server's DB so its
     # account/limit/cost state lives alongside the rest of the server state
     # (it otherwise falls back to the machine-global chat.db). setdefault so
     # an explicit operator override still wins.

@@ -3862,13 +3862,14 @@ def _claude_terminal_request(
         "scrollback": _CLAUDE_TERMINAL_SCROLLBACK_LINES,
     }
     spec["env"] = build_native_claude_terminal_env(claude_config)
-    # Multi-subscription (cswap) rotation on the subscription / own-login path:
+    # Multi-subscription rotation on the subscription / own-login path:
     # point the CLI at the pool-selected account's CLAUDE_CONFIG_DIR (or inject
     # a tier-fallback key). No-op when no `pools:` block is configured.
     if claude_config is None:
-        from omnigent.cswap import integration as _cswap
+        from omnigent.subscription_tokens import integration as _subtokens
 
-        spec["env"].update(_cswap.select_launch_env_for_family("anthropic", session_id=session_id))
+        launch_env = _subtokens.select_launch_env_for_family("anthropic", session_id=session_id)
+        spec["env"].update(launch_env)
     if claude_config is not None:
         # The runner's terminal layer inherits the parent process env.
         # Remove provider/session variables that can override the
