@@ -1053,6 +1053,9 @@ async def _forward_available_subagents(
                     client,
                     session_id=entry.child_conversation_id,
                     item=item,
+                    # The child session has no account binding; attribute any
+                    # reactive limit signal to the parent's bound account.
+                    cswap_session_id=parent_session_id,
                 )
             except httpx.HTTPError as exc:
                 decision = item_retry_tracker.record_failure(retry_key, exc)
@@ -2816,6 +2819,7 @@ async def _post_external_conversation_item(
     *,
     session_id: str,
     item: ClaudeTranscriptItem,
+    cswap_session_id: str | None = None,
 ) -> None:
     """
     Post one mirrored transcript item to the Sessions API.
@@ -2823,16 +2827,31 @@ async def _post_external_conversation_item(
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
     :param item: Transcript-derived conversation item.
+    :param cswap_session_id: Session id that owns the account binding for
+        multi-subscription reactive detection. Defaults to *session_id*; the
+        sub-agent path passes the PARENT session id (the sub-agent's child id
+        carries no binding, and it shares the parent's account/quota).
     :returns: None.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
-    # Multi-subscription (cswap) reactive detection: scan the item text for a
-    # Claude "usage limit reached" signal before posting, so a limited account
-    # is recorded and failed over even if this POST later fails. Parse-first
-    # and fully guarded — a no-op (cheap regex) when no pool is configured.
-    from omnigent.cswap import integration as _cswap
+    # Multi-subscription (cswap) reactive detection: scan assistant/system
+    # message text for a Claude "usage limit reached" signal so a limited
+    # account is recorded + failed over. Restricted to assistant/system
+    # messages (NOT user/tool content) to avoid a user prompt that quotes the
+    # phrase triggering a bogus failover. Offloaded to a thread so the (rare)
+    # positive-match DB write never blocks the forwarder's event loop. Fully
+    # guarded / no-op when no pool is configured.
+    if item.item_type == "message" and isinstance(item.data, dict):
+        role = item.data.get("role")
+        if role in ("assistant", "system"):
+            from omnigent.cswap import integration as _cswap
 
-    _cswap.record_reactive_text(str(item.data), family="anthropic", session_id=session_id)
+            await asyncio.to_thread(
+                _cswap.record_reactive_text,
+                str(item.data),
+                family="anthropic",
+                session_id=cswap_session_id or session_id,
+            )
 
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",

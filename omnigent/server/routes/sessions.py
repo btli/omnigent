@@ -2747,8 +2747,11 @@ def _persist_native_cumulative_usage(
     current = dict(conv.session_usage) if conv and conv.session_usage else {}
     # Native usage is cumulative (SET semantics), so the per-turn delta
     # for the daily rollup is new_total - old_total. Capture the old
-    # cumulative cost before the fields below overwrite it.
+    # cumulative cost (and tokens, for per-account attribution) before the
+    # fields below overwrite them.
     old_cost = float(current.get("total_cost_usd", 0.0) or 0.0)
+    old_input = int(current.get("input_tokens", 0) or 0)
+    old_output = int(current.get("output_tokens", 0) or 0)
     if cin is not None:
         # The reported input total is INCLUSIVE of cached tokens (codex's
         # ``inputTokens`` counts cache reads). Split the cached portion into
@@ -2825,6 +2828,17 @@ def _persist_native_cumulative_usage(
     # daily report must reflect real spend, not the real-time gate estimate.
     new_cost = float(current.get("total_cost_usd", 0.0) or 0.0)
     _record_daily_cost(conv, new_cost - old_cost, conversation_store)
+    # Per-account rollup for multi-subscription (cswap). This is the NATIVE
+    # path cswap launches actually use; attribute the cumulative deltas to the
+    # account the session is bound to. No-op (safe) without a pool/binding.
+    from omnigent.cswap import integration as _cswap
+
+    _cswap.attribute_cost(
+        session_id,
+        cost_usd=new_cost - old_cost,
+        input_tokens=max(0, int(current.get("input_tokens", 0) or 0) - old_input),
+        output_tokens=max(0, int(current.get("output_tokens", 0) or 0) - old_output),
+    )
     return _priced_cost_for_display(current)
 
 

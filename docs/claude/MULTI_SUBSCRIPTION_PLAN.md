@@ -163,3 +163,27 @@ Wired into omnigent:
 - SDK-harness (`claude-sdk`/`codex`/`openai-agents`) launch selection via
   `runtime/workflow.py:_resolve_provider_for_build` + a 429 hook in
   `inner/claude_sdk_executor.py` (only the native CLI/runner path is wired today).
+
+## Adversarial review (Opus + Codex + Gemini) — round 2
+
+Ran three independent adversarial reviews. Fixed the confirmed issues:
+- **Native cost path**: per-account attribution was only on the relay path; added it to
+  `_persist_native_cumulative_usage` (the path cswap's native sessions actually use).
+- **CLI binding**: `_claude_terminal_request` now threads `session_id` so `omnigent claude`
+  sessions bind (failover/cost work, not just selection).
+- **Reactive false positives**: the forwarder scans only assistant/system **message** items
+  (not user/tool content), so a user prompt quoting the limit phrase can't trigger failover.
+- **Sub-agent attribution**: sub-agent items scan against the parent (account-bearing)
+  session via a new `cswap_session_id` param.
+- **Event loop**: the reactive hook is offloaded via `asyncio.to_thread`; lazy init is now
+  guarded by a `threading.Lock` (double-checked).
+- **Poller lockout**: poll-sweep detections run through `_with_recovery` so a 429/retry-after
+  with no window still auto-recovers; the sweep's track call is inside the try/except.
+- **Facade safety**: `status_snapshot` wrapped in try/except → `[]`; `select_launch_env_for_family`
+  binds the session only after a usable account-specific env is built.
+
+Deferred (low value / single-worker-safe): TOCTOU double-fire of failover and non-atomic cost
+increments matter only under multi-process uvicorn workers; RFC-1123 HTTP-date `Retry-After`
+parsing; cosmetic window-slot labelling in `status`; tie-break ordering. **Auto failover**
+rebinds the session for the *next* launch + notifies; it does not kill the in-flight process
+(matches remote-dev's "never kill a running session").
