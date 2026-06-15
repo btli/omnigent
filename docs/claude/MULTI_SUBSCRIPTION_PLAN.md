@@ -1,11 +1,11 @@
-# Multi-Subscription (cswap-style) Support for Omnigent
+# Subscription-Aware Token Management for Omnigent
 
 > Status: in progress. Owner: Claude Code session 2026-06-14.
 
 ## Goal
 
 Give omnigent native support for **multiple provider subscriptions/credentials per
-family**, modeled on [claude-swap (cswap)](https://github.com/realiti4/claude-swap)
+family**, modeled on [claude-swap](https://github.com/realiti4/claude-swap)
 and mirroring the feature already shipped in `remote-dev`.
 
 Confirmed requirements:
@@ -21,7 +21,7 @@ Confirmed requirements:
 5. **Auto-failover** with modes: `notify` / `auto` / `disabled`.
 6. **Per-account cost attribution**, extending the existing cost-tracking pipeline.
 
-Architecture: **Clean DDD** in a new `omnigent/cswap/` package. YAML config (`pools:`
+Architecture: **Clean DDD** in a new `omnigent/subscription_tokens/` package. YAML config (`pools:`
 block) is the source of truth; it is synced into DB tables at startup. Volatile state
 (limit windows, per-account cost, session→account bindings) lives in DB.
 
@@ -34,7 +34,7 @@ different concept. This feature uses `ProviderAccount` / `CredentialPool` /
 ## Package layout
 
 ```
-omnigent/cswap/
+omnigent/subscription_tokens/
   domain/
     value_objects/  account_kind, usage_window, limit_state, rate_limit_headers, rotation_policy
     entities/       provider_account, credential_pool, failover_mode
@@ -45,7 +45,7 @@ omnigent/cswap/
     repositories/   sqlalchemy_* + cost sink + session binding registry
     detection/      reactive_output_detector, anthropic_usage_probe, openai_usage_probe,
                     usage_endpoint_poller, composite_usage_limit_gateway
-    selection/      priority_credential_selection_policy (headroom + reset aware)
+    selection/      priority_selection_policy (headroom + reset aware)
     notification/   sse_failover_notifier
   config/           pool_config (load_pools), pool_config_syncer
   container.py      DI wiring
@@ -136,7 +136,7 @@ Among candidates for a family, ordered by configured priority then:
 
 ## Status (2026-06-14)
 
-**Complete & validated** — `omnigent/cswap/` package (domain, config, DB, repos,
+**Complete & validated** — `omnigent/subscription_tokens/` package (domain, config, DB, repos,
 detection, selection, use-cases, container, integration facade). 67 unit/integration
 tests, ruff clean, `mypy --strict` clean. Existing DB/onboarding/host suites still green;
 single Alembic head `n1a2b3c4d5e6`.
@@ -149,7 +149,7 @@ Wired into omnigent:
 - `server/app.py` lifespan — config→DB sync + proactive poll loop (flag-gated).
 - `cli.py` — points the facade at the server's DB via `OMNIGENT_DATABASE_URI`.
 - `server/routes/sessions.py` — per-account cost attribution in `_accumulate_session_usage`.
-- `server/routes/cswap.py` — `GET /v1/cswap/status`, `POST /v1/cswap/accounts/{id}/mark-available`.
+- `server/routes/subscription-tokens.py` — `GET /v1/subscription-tokens/status`, `POST /v1/subscription-tokens/accounts/{id}/mark-available`.
 - `claude_native_forwarder.py` — **reactive in-stream detection**: every forwarded
   transcript item is scanned (`integration.record_reactive_text`, parse-first so it's
   regex-only when no pool is configured) for a Claude "usage limit reached" signal,
@@ -168,13 +168,13 @@ Wired into omnigent:
 
 Ran three independent adversarial reviews. Fixed the confirmed issues:
 - **Native cost path**: per-account attribution was only on the relay path; added it to
-  `_persist_native_cumulative_usage` (the path cswap's native sessions actually use).
+  `_persist_native_cumulative_usage` (the path subscription-token's native sessions actually use).
 - **CLI binding**: `_claude_terminal_request` now threads `session_id` so `omnigent claude`
   sessions bind (failover/cost work, not just selection).
 - **Reactive false positives**: the forwarder scans only assistant/system **message** items
   (not user/tool content), so a user prompt quoting the limit phrase can't trigger failover.
 - **Sub-agent attribution**: sub-agent items scan against the parent (account-bearing)
-  session via a new `cswap_session_id` param.
+  session via a new `subtoken_session_id` param.
 - **Event loop**: the reactive hook is offloaded via `asyncio.to_thread`; lazy init is now
   guarded by a `threading.Lock` (double-checked).
 - **Poller lockout**: poll-sweep detections run through `_with_recovery` so a 429/retry-after

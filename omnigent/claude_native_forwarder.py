@@ -1261,7 +1261,7 @@ async def _forward_available_subagents(
                     item=item,
                     # The child session has no account binding; attribute any
                     # reactive limit signal to the parent's bound account.
-                    cswap_session_id=parent_session_id,
+                    subtoken_session_id=parent_session_id,
                 )
             except httpx.HTTPError as exc:
                 decision = item_retry_tracker.record_failure(retry_key, exc)
@@ -3028,7 +3028,7 @@ async def _post_external_conversation_item(
     *,
     session_id: str,
     item: ClaudeTranscriptItem,
-    cswap_session_id: str | None = None,
+    subtoken_session_id: str | None = None,
 ) -> None:
     """
     Post one mirrored transcript item to the Sessions API.
@@ -3036,14 +3036,14 @@ async def _post_external_conversation_item(
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
     :param item: Transcript-derived conversation item.
-    :param cswap_session_id: Session id that owns the account binding for
+    :param subtoken_session_id: Session id that owns the account binding for
         multi-subscription reactive detection. Defaults to *session_id*; the
         sub-agent path passes the PARENT session id (the sub-agent's child id
         carries no binding, and it shares the parent's account/quota).
     :returns: None.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
-    # Multi-subscription (cswap) reactive detection: scan assistant/system
+    # Multi-subscription reactive detection: scan assistant/system
     # message text for a Claude "usage limit reached" signal so a limited
     # account is recorded + failed over. Restricted to assistant/system
     # messages (NOT user/tool content) to avoid a user prompt that quotes the
@@ -3052,18 +3052,15 @@ async def _post_external_conversation_item(
     # guarded / no-op when no pool is configured.
     if item.item_type == "message" and isinstance(item.data, dict):
         if item.data.get("role") in ("assistant", "system"):
-            from omnigent.cswap import integration as _cswap
-            from omnigent.cswap.infrastructure.detection.reactive_output_detector import (
-                message_text,
-            )
+            from omnigent.subscription_tokens import integration as _subtokens
 
-            text = message_text(item.data)
+            text = _subtokens.extract_message_text(item.data)
             if text:
                 await asyncio.to_thread(
-                    _cswap.record_reactive_text,
+                    _subtokens.record_reactive_text,
                     text,
                     family="anthropic",
-                    session_id=cswap_session_id or session_id,
+                    session_id=subtoken_session_id or session_id,
                 )
 
     resp = await client.post(

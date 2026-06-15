@@ -789,15 +789,15 @@ class SqlUserDailyCost(Base):
     updated_at: Mapped[int] = mapped_column(Integer)
 
 
-# ── Multi-subscription (cswap) tables ──────────────────────
+# ── Multi-subscription tables ──────────────────────
 #
 # These power native rotation across multiple provider subscriptions /
-# credentials (see ``omnigent/cswap/``). ``~/.omnigent/config.yaml``'s
+# credentials (see ``omnigent/subscription_tokens/``). ``~/.omnigent/config.yaml``'s
 # ``pools:`` block is the source of truth; it is synced into
 # ``credential_pools`` / ``provider_accounts`` at startup. The remaining
 # tables hold volatile runtime state (observed usage limits, per-account
 # cost, the active credential per session). All are brand-new tables, so
-# deployments whose database lacks them are unaffected: the cswap code
+# deployments whose database lacks them are unaffected: the subscription-token code
 # paths only read/write them when a pool is configured.
 
 
