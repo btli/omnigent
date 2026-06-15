@@ -96,13 +96,16 @@ spec:
             # URL (behind your Ingress/LB), NOT the in-cluster Service address.
             - name: OMNIGENT_ACCOUNTS_BASE_URL
               value: "https://omnigent.example.com"
-            # Creates the first admin headlessly. Omnigent never auto-generates a
-            # password — without this (and with no TTY) first boot reports
-            # needs_setup and waits for the one-time web setup form. Set this to
-            # provision the admin non-interactively.
-            # - name: OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD
-            #   valueFrom:
-            #     secretKeyRef: { name: omnigent-secrets, key: accounts-admin-password }
+            # Creates the first admin headlessly when accounts-admin-password is
+            # present in the Secret (Omnigent never auto-generates a password).
+            # optional:true → if the key is absent the pod still boots and first
+            # boot reports needs_setup, waiting for the one-time web setup form.
+            - name: OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: omnigent-secrets
+                  key: accounts-admin-password
+                  optional: true
             # A connecting HOST authenticates with the session JWT from
             # `omnigent login`; the default 8h expiry breaks a long-lived host
             # on reconnect. Raise it for unattended hosts (720 = 30d).
