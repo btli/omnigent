@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterator
 
+import httpx
 import pytest
 
 from omnigent.db.utils import ManagedSessionMaker
@@ -138,6 +139,48 @@ def test_transfer_session_binding_carries_account_across_session_ids(
     # No-op when the source has no binding — never invents one.
     integration.transfer_session_binding("sess-unbound", "sess-target", family="openai")
     assert registry.active_credential("sess-target") is None
+
+
+async def test_codex_child_registration_copies_binding_to_child_session(
+    active_openai_facade: ManagedSessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Wiring test for the sub-agent path: when the forwarder registers a Codex
+    # child thread, it must copy the parent's launched OpenAI account onto the
+    # new child session id (so reactive detection on child events resolves it).
+    from omnigent import codex_native_forwarder as fwd
+
+    integration.select_codex_launch(session_id="conv-parent")
+    registry = build_container(active_openai_facade).registry
+    parent_cred = registry.active_credential("conv-parent")
+    assert parent_cred == account_id_for("codex-pool", "x1")
+
+    async def _fake_register(
+        client: httpx.AsyncClient,
+        *,
+        parent_session_id: str,
+        parent_thread_id: str | None,
+        child_thread_id: str,
+        item: dict[str, object],
+    ) -> str:
+        return "conv-child"
+
+    monkeypatch.setattr(fwd, "_register_child_session", _fake_register)
+    state = fwd._CodexForwarderState()
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json={})),
+        base_url="http://ap",
+    ) as client:
+        await fwd._ensure_child_session(
+            client,
+            parent_session_id="conv-parent",
+            parent_thread_id=None,
+            child_thread_id="thread-child",
+            item={},
+            forwarder_state=state,
+        )
+
+    assert registry.active_credential("conv-child") == parent_cred
 
 
 def test_select_launch_env_returns_config_dir_and_binds(
