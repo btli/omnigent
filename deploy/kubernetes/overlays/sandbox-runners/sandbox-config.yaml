@@ -1,0 +1,42 @@
+---
+# config.yaml for the server, supplying the `sandbox:` section that turns on the
+# kubernetes sandbox provider. The base deployment configures the server purely
+# through env vars (the omnigent-config ConfigMap); the managed-sandbox backend,
+# however, is read from the config FILE that `OMNIGENT_CONFIG` points at
+# (parse_sandbox_config(cfg.get("sandbox")) in omnigent/cli.py). This overlay's
+# deployment-patch.yaml mounts this ConfigMap at /etc/omnigent and sets
+# OMNIGENT_CONFIG=/etc/omnigent/config.yaml.
+#
+# Only the `sandbox:` section is needed here — auth and the rest stay in the
+# env-based omnigent-config ConfigMap (the two layers are independent).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: omnigent-sandbox-config
+  labels:
+    app.kubernetes.io/name: omnigent
+    app.kubernetes.io/component: server
+data:
+  config.yaml: |
+    sandbox:
+      provider: kubernetes
+      # Public/in-cluster URL the runner Pod's `omnigent host` dials back to.
+      # In-cluster service DNS is simplest (no ingress hop); http upgrades to ws
+      # for the tunnel. Use your external ingress URL instead if runner Pods
+      # must reach the server through it.
+      server_url: http://omnigent.omnigent.svc.cluster.local:8000
+      kubernetes:
+        # Namespace the runner Pods are created in (this namespace).
+        namespace: omnigent
+        # K8s Secret whose keys are projected into every runner Pod via envFrom
+        # (the harness LLM/git credentials). See runner-credentials.yaml.
+        secret_name: omnigent-creds
+        # ServiceAccount the runner Pods run as (deliberately powerless).
+        service_account: omnigent-runner
+        # Optional: override the runner image (defaults to the official prebaked
+        # host image ghcr.io/omnigent-ai/omnigent-host:latest — amd64-only).
+        # image: ghcr.io/your-org/omnigent-host:latest
+        # Optional: extra node selector labels, merged with the always-present
+        # kubernetes.io/arch: amd64 (the host image has no aarch64 wheel).
+        # node_selector:
+        #   node.kubernetes.io/instance-type: m5.xlarge

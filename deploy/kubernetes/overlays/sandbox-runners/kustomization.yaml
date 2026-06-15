@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# On-demand runner-Pod sandbox provider, layered on the base server deploy.
+# Adds the RBAC + config the kubernetes sandbox launcher needs; the base
+# Deployment/Service/Ingress/PVC are unchanged except for the patch below.
+namespace: omnigent
+
+resources:
+  - ../../base
+  - rbac.yaml
+  - sandbox-config.yaml
+  - runner-credentials.yaml
+
+patches:
+  - path: deployment-patch.yaml

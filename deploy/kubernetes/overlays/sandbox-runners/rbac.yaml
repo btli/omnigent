@@ -1,0 +1,93 @@
+---
+# RBAC for the kubernetes sandbox provider (on-demand runner Pods).
+#
+# Two ServiceAccounts with deliberately asymmetric rights, plus the namespaced
+# Role + RoleBinding that grants the server exactly what it needs to manage
+# on-demand runner Pods — nothing more.
+#
+#   omnigent-server  — the Omnigent server runs as this SA (this overlay's
+#                      deployment-patch.yaml sets serviceAccountName:
+#                      omnigent-server). The sandbox launcher uses its
+#                      in-cluster token to create/exec/delete runner Pods, so
+#                      this SA is bound to the Role below.
+#   omnigent-runner  — the sandbox runner Pods run as this SA. It has NO API
+#                      rights and no RoleBinding: the Pods never call the
+#                      Kubernetes API, and the launcher sets
+#                      automountServiceAccountToken: false on each Pod so even a
+#                      compromised agent can't reach the API with it. It exists
+#                      only so cluster policy (NetworkPolicy, PodSecurity, quotas)
+#                      can target runner Pods distinctly from the server.
+#
+# Scope is a namespaced Role (NOT a ClusterRole): the server only ever manages
+# Pods in its own namespace, so cluster-wide Pod rights would be needless blast
+# radius. If you run the server in a different namespace from the runner Pods,
+# move this Role + RoleBinding to the *runner* Pods' namespace and keep the
+# RoleBinding subject pointing at the server SA in the server's namespace.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: omnigent-server
+  labels:
+    app.kubernetes.io/name: omnigent
+    app.kubernetes.io/component: server
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: omnigent-runner
+  labels:
+    app.kubernetes.io/name: omnigent
+    app.kubernetes.io/component: runner
+# The runner SA is intentionally powerless — it is bound to no Role/ClusterRole.
+# Runner Pods set automountServiceAccountToken: false regardless, so its token
+# is never even mounted; this SA is a policy handle, not an access grant.
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: omnigent-sandbox-manager
+  labels:
+    app.kubernetes.io/name: omnigent
+    app.kubernetes.io/component: server
+rules:
+  # Manage the lifecycle of runner Pods: provision() creates them, the
+  # pod-ready wait gets/lists/watches them, and terminate() deletes them.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  # REQUIRED. The provider does not bake `omnigent host` into the Pod's
+  # entrypoint — the Pod just boots `sleep infinity`. Once the container is
+  # ready, the server execs `omnigent host` into it (pods/exec), which dials
+  # back over the managed launch-token tunnel. Without this verb the server can
+  # create Pods but never start a host in them, and every managed session hangs.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  # Read Pod logs — used when diagnosing a host that created its Pod but never
+  # came online (see the overlay README "host not coming online").
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  # Surface scheduler/kubelet events (FailedScheduling, Failed pull, …) in the
+  # provider's error messages when a Pod won't become ready.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: omnigent-sandbox-manager
+  labels:
+    app.kubernetes.io/name: omnigent
+    app.kubernetes.io/component: server
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: omnigent-sandbox-manager
+subjects:
+  # The server SA gets the Pod-management rights. The runner SA is deliberately
+  # absent — runner Pods need no API access.
+  - kind: ServiceAccount
+    name: omnigent-server
