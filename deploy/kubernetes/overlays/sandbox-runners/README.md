@@ -36,6 +36,11 @@ unchanged) and adds only what the provider needs:
   no aarch64 wheel), so the launcher always sets `nodeSelector:
   kubernetes.io/arch: amd64` on runner Pods. Make sure the cluster has schedulable
   amd64 nodes.
+- **A Bun-compatible kernel on those nodes.** The agent harness runs on Bun,
+  whose JSC garbage collector segfaults at startup on some newer Linux kernels
+  (see [Troubleshooting](#troubleshooting)). If your amd64 nodes span a mix of
+  kernels, label the known-good ones and pin runner Pods to them via
+  `sandbox.kubernetes.node_selector`.
 - A Postgres database for the server (as for the base deploy).
 
 ## Deploy
@@ -92,3 +97,16 @@ it, set `OMNIGENT_KUBERNETES_KUBECONFIG` to a kubeconfig path instead.
   (private registry needs an imagePullSecret; set `image` to a reachable ref).
 - **Agent auth failures inside the Pod** — a key is missing from
   `omnigent-creds`; the provider rejects reserved names (`HOME`, `IS_SANDBOX`).
+- **Agent turns crash with a Bun segfault (`embedder failed to suspend thread
+  … panic: Segmentation fault`).** The Pod provisions and the host registers
+  fine, but the first agent turn fails and the session goes to `failed` with that
+  error. This is an upstream Bun/JSC garbage-collector incompatibility with some
+  newer Linux kernels (reproduced on `7.0.0` / Ubuntu 26.04; works on `6.8` /
+  Ubuntu 24.04), and it is **independent of the seccomp profile** (confirmed with
+  both `RuntimeDefault` and `Unconfined`). Fix by pinning runner Pods to nodes on
+  a known-good kernel: label them
+  (`kubectl label node <node> omnigent.ai/runner-ready=true`) and set
+  `sandbox.kubernetes.node_selector: {omnigent.ai/runner-ready: "true"}` (see
+  `sandbox-config.yaml`). Inspect node kernels with `kubectl get nodes -o wide`.
+  Longer term, a host image built on a Bun version with the kernel fix removes the
+  constraint.
