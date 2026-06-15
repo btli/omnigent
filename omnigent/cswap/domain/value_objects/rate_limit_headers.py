@@ -23,6 +23,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 from omnigent.cswap.domain.value_objects.usage_window import UsageWindow
 
@@ -102,7 +103,10 @@ def _parse_duration_to_epoch(value: str | None, now: int) -> int | None:
 
 
 def _retry_after_at(raw: str | None, now: int) -> int | None:
-    """Parse a ``retry-after`` header (seconds or HTTP date) to epoch.
+    """Parse a ``retry-after`` header to epoch seconds.
+
+    Handles all three forms the spec allows: a delta in seconds, an RFC 3339
+    timestamp, and an RFC 7231 HTTP date (``Wed, 21 Oct 2015 07:28:00 GMT``).
 
     :returns: Absolute epoch seconds to retry after, or ``None``.
     """
@@ -111,7 +115,16 @@ def _retry_after_at(raw: str | None, now: int) -> int | None:
     secs = _to_int(raw)
     if secs is not None and "-" not in raw and ":" not in raw:
         return now + secs
-    return _parse_epoch_or_rfc3339(raw)
+    epoch = _parse_epoch_or_rfc3339(raw)
+    if epoch is not None:
+        return epoch
+    try:
+        http_date = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if http_date.tzinfo is None:
+        http_date = http_date.replace(tzinfo=timezone.utc)
+    return int(http_date.timestamp())
 
 
 @dataclass(frozen=True)

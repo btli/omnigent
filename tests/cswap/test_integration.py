@@ -119,10 +119,14 @@ def test_reactive_text_non_limit_is_noop(active_facade: ManagedSessionMaker) -> 
 def test_attribute_cost_and_status_snapshot(active_facade: ManagedSessionMaker) -> None:
     integration.select_launch_env_for_family("anthropic", session_id="sess-1")
     integration.attribute_cost("sess-1", cost_usd=1.25, input_tokens=100, output_tokens=20)
+    # No-op posts (zero spend, or a negative cumulative glitch) must not
+    # create a row or inflate the turn count.
+    integration.attribute_cost("sess-1", cost_usd=0.0, input_tokens=0, output_tokens=0)
+    integration.attribute_cost("sess-1", cost_usd=-5.0, input_tokens=-3, output_tokens=0)
 
     snapshot = integration.status_snapshot()
     accounts = {a["name"]: a for a in snapshot[0]["accounts"]}  # type: ignore[index]
-    assert accounts["c1"]["cost_today_usd"] == pytest.approx(1.25)
+    assert accounts["c1"]["cost_today_usd"] == pytest.approx(1.25)  # unchanged by no-ops
     # Never observed (no probe/limit) → unknown, not available.
     assert accounts["c1"]["limit_status"] == "unknown"
 

@@ -410,7 +410,17 @@ def attribute_cost(
     input_tokens: int,
     output_tokens: int,
 ) -> None:
-    """Attribute a turn's cost to the session's active account."""
+    """Attribute a turn's cost to the session's active account.
+
+    Clamps negative deltas to zero (cumulative totals only grow; a negative
+    is a glitch, not a refund) and skips no-op calls (e.g. a policy-only
+    usage post with no spend) so they don't inflate the turn count.
+    """
+    cost_usd = max(0.0, cost_usd)
+    input_tokens = max(0, input_tokens)
+    output_tokens = max(0, output_tokens)
+    if not (cost_usd or input_tokens or output_tokens):
+        return
     container = _ensure_container()
     if container is None or not session_id:
         return
