@@ -80,6 +80,7 @@ import {
   type TerminalInfo,
 } from "@/hooks/useTerminals";
 import type {
+  ActiveCredential,
   ContentBlock,
   ModelUsage,
   PendingInput,
@@ -310,6 +311,14 @@ export interface ChatState {
    * snapshot on bind; drives the composer pill's harness suffix.
    */
   sessionHarness: string | null;
+  /**
+   * The multi-subscription account the active session is bound to, or
+   * ``null`` when no credential pool is configured (single-account setups).
+   * Populated from the session snapshot on bind; drives the composer's
+   * credential chip. Stable for the session's lifetime (failover rebinds the
+   * next launch, not the running process).
+   */
+  sessionActiveCredential: ActiveCredential | null;
   /**
    * Context window size in tokens for the active session's model,
    * as looked up server-side. ``null`` before bind or when the
@@ -650,6 +659,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   flashItemId: null,
   llmModel: null,
   sessionHarness: null,
+  sessionActiveCredential: null,
   contextWindow: null,
   tokensUsed: null,
   sessionCostUsd: null,
@@ -1117,6 +1127,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         oldestItemId: null,
         llmModel: null,
         sessionHarness: null,
+        sessionActiveCredential: null,
         // ``selectedEffort`` / ``selectedModel`` are sticky user picks —
         // not reset here so a CLI-created new chat inherits them.
         // The cost switch IS session-scoped, so it resets with the session.
@@ -1485,6 +1496,7 @@ function sessionBindingPatch(
   | "boundAgentName"
   | "llmModel"
   | "sessionHarness"
+  | "sessionActiveCredential"
   | "costControlModeOverride"
   | "contextWindow"
   | "gitBranch"
@@ -1499,6 +1511,7 @@ function sessionBindingPatch(
     boundAgentName: session.agentName,
     llmModel: session.llmModel ?? null,
     sessionHarness: session.harness ?? null,
+    sessionActiveCredential: session.activeCredential ?? null,
     costControlModeOverride: session.costControlModeOverride ?? null,
     contextWindow: session.contextWindow ?? null,
     gitBranch: session.gitBranch ?? null,

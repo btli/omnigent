@@ -46,9 +46,12 @@ from omnigent.server.routes.session_policies import create_session_policies_rout
 from omnigent.server.routes.sessions import (
     SessionLiveness,
     create_sessions_router,
+    running_session_ids,
     set_server_runner_router,
 )
+from omnigent.server.routes.subscription_tokens import create_subscription_tokens_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
+from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
     ArtifactStore,
@@ -875,9 +878,27 @@ def create_app(
                 otel_publisher=server_metrics_otel,
             )
         )
+
+        # Multi-subscription: sync the config `pools:` block into the
+        # DB and start the proactive usage-limit poll loop. Best-effort — a
+        # failure here must never block server startup. Inert when no pool is
+        # configured; polling only runs when OMNIGENT_SUBSCRIPTION_TOKENS_POLL_ENABLED is set.
+        from omnigent.subscription_tokens import integration as subtokens_integration
+
+        try:
+            # Pre-warm off the event loop — the first build runs migrations +
+            # config→DB sync synchronously, which must not block startup.
+            await asyncio.to_thread(subtokens_integration.is_active)
+        except Exception:
+            _logger.exception("subscription-token startup sync failed; rotation disabled")
+        subtokens_poll_task = asyncio.create_task(subtokens_integration.poll_loop())
+
         try:
             yield
         finally:
+            subtokens_poll_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await subtokens_poll_task
             metrics_publish_task.cancel()
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task
@@ -925,6 +946,11 @@ def create_app(
     app.state.server_metrics = server_metrics
     app.state.server_metrics_otel = server_metrics_otel
     app.add_middleware(_WebSocketMetricsMiddleware, metrics=server_metrics)
+    # CSWSH guard: reject cross-origin WebSocket handshakes before any
+    # route accepts them. Added after the metrics middleware so it is the
+    # outermost WS middleware — a forbidden origin is closed without even
+    # reaching the metrics counter (which only counts on accept anyway).
+    app.add_middleware(WebSocketOriginMiddleware)
     # Give the tool-policy ASK gate (which forwards the native-terminal
     # approval popup from a parked-gate background task, off any
     # request/route closure) the runner router so it can reach the bound
@@ -1297,14 +1323,14 @@ def create_app(
         # managed_sandboxes_enabled gates the web UI's sandbox
         # option on the new-session screen: true only when a `sandbox:`
         # config is wired AND its provider can actually serve a managed
-        # launch (staged providers like daytona/lakebox parse but
-        # reject at launch — they must not advertise the option).
+        # launch (staged providers parse but reject at launch — they
+        # must not advertise the option).
         managed_sandboxes_enabled = (
             sandbox_config is not None and sandbox_config.managed_launch_supported
         )
         # sandbox_provider names the backing provider (e.g. "modal",
-        # "lakebox") so the web UI can label the option per provider
-        # ("Modal Sandbox" / "Databricks Sandbox") instead of the
+        # "islo") so the web UI can label the option per provider
+        # ("Modal Sandbox" / "Islo Sandbox") instead of the
         # generic "New Sandbox". Only surfaced when the option is
         # actually offered; None when no provider is named (embedding
         # configs may leave it unset) so the UI keeps the generic label.
@@ -1431,6 +1457,15 @@ def create_app(
         create_policy_registry_router(auth_provider=auth_provider),
         prefix="/v1",
         tags=["policy_registry"],
+    )
+    app.include_router(
+        create_subscription_tokens_router(
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+            running_session_ids=running_session_ids,
+        ),
+        prefix="/v1",
+        tags=["subscription-tokens"],
     )
 
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───

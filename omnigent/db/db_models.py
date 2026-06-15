@@ -780,3 +780,193 @@ class SqlUserDailyCost(Base):
     cost_usd: Mapped[float] = mapped_column(Float, nullable=False)
     ask_approved_usd: Mapped[float] = mapped_column(Float, nullable=False, server_default="0")
     updated_at: Mapped[int] = mapped_column(Integer)
+
+
+# ── Multi-subscription tables ──────────────────────
+#
+# These power native rotation across multiple provider subscriptions /
+# credentials (see ``omnigent/subscription_tokens/``). ``~/.omnigent/config.yaml``'s
+# ``pools:`` block is the source of truth; it is synced into
+# ``credential_pools`` / ``provider_accounts`` at startup. The remaining
+# tables hold volatile runtime state (observed usage limits, per-account
+# cost, the active credential per session). All are brand-new tables, so
+# deployments whose database lacks them are unaffected: the subscription-token code
+# paths only read/write them when a pool is configured.
+
+
+class SqlCredentialPool(Base):
+    """
+    SQLAlchemy model for the ``credential_pools`` table.
+
+    A named, family-scoped group of provider accounts the router rotates
+    through. Synced from the config ``pools:`` block by id (deterministic
+    SHA-1 of the pool name), so re-syncing is idempotent.
+
+    :param id: Deterministic pool id, ``"pool_<hex>"``.
+    :param name: Pool name from config, e.g. ``"claude-pool"``.
+    :param family: Provider family served, ``"anthropic"`` / ``"openai"``.
+    :param failover_mode: ``"notify"`` / ``"auto"`` / ``"disabled"``.
+    :param created_at: Unix epoch seconds the row was first synced.
+    :param updated_at: Unix epoch seconds of the last sync.
+    """
+
+    __tablename__ = "credential_pools"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    family: Mapped[str] = mapped_column(String(32), nullable=False)
+    failover_mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class SqlProviderAccount(Base):
+    """
+    SQLAlchemy model for the ``provider_accounts`` table.
+
+    One AI-provider credential participating in a pool. **Distinct from**
+    :class:`SqlUser` / the ``accounts`` concept (web-UI users): this is a
+    Claude/Codex subscription login or a provider API key. Never stores a
+    raw secret — subscriptions point at an isolated CLI config dir, API
+    keys point at a secret reference resolved at use time.
+
+    :param id: Deterministic account id, ``"pacct_<hex>"``.
+    :param pool_id: Owning pool id (FK), or ``None`` if ungrouped.
+    :param name: Account name, unique within its pool, e.g.
+        ``"claude-pro-1"``.
+    :param family: Provider family, ``"anthropic"`` / ``"openai"``.
+    :param kind: ``"subscription"`` or ``"api_key"``.
+    :param priority: Selection priority within the pool; lower preferred.
+    :param claude_config_dir: ``CLAUDE_CONFIG_DIR`` for an Anthropic
+        subscription, else ``None``.
+    :param codex_config_dir: ``CODEX_HOME`` for an OpenAI subscription,
+        else ``None``.
+    :param api_key_ref: Secret reference for an api_key account
+        (``env:VAR`` / ``keychain:NAME`` / ``$VAR``), else ``None``.
+    :param is_active: Soft-delete / disable flag.
+    :param created_at: Unix epoch seconds first synced.
+    :param updated_at: Unix epoch seconds of the last sync.
+    """
+
+    __tablename__ = "provider_accounts"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    pool_id: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey("credential_pools.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    family: Mapped[str] = mapped_column(String(32), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    claude_config_dir: Mapped[str | None] = mapped_column(Text, nullable=True)
+    codex_config_dir: Mapped[str | None] = mapped_column(Text, nullable=True)
+    api_key_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=true())
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        Index("ix_provider_accounts_family", "family"),
+        Index("ix_provider_accounts_pool_id", "pool_id"),
+    )
+
+
+class SqlProviderAccountLimitState(Base):
+    """
+    SQLAlchemy model for the ``provider_account_limit_states`` table.
+
+    The authoritative observed usage-limit state for one account, written
+    by reactive detection, the proactive poller, or a manual override. One
+    row per ``credential_id``. ``last_checked_at`` is the staleness guard:
+    a slower poll must not clobber a fresher reactive observation.
+
+    :param credential_id: The :class:`SqlProviderAccount` id (PK).
+    :param limit_status: ``"available"`` / ``"limited"`` / ``"unknown"``.
+    :param is_limited: Whether the account is currently rate-limited.
+    :param limited_until: Unix epoch seconds the limit lifts, or ``None``
+        (unknown). The authoritative recovery time selection reads.
+    :param windows_json: JSON array of ``{label, utilization_pct, reset_at}``
+        usage windows — informational (headroom ranking + display), arbitrary
+        labels and count. ``None`` / ``"[]"`` when none observed.
+    :param detection_source: ``"reactive"`` / ``"poller"`` / ``"manual"``.
+    :param last_checked_at: Unix epoch seconds of the observation.
+    :param updated_at: Unix epoch seconds of the last write.
+    """
+
+    __tablename__ = "provider_account_limit_states"
+
+    credential_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("provider_accounts.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    limit_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    is_limited: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    limited_until: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    windows_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    detection_source: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    last_checked_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class SqlProviderAccountCost(Base):
+    """
+    SQLAlchemy model for the ``provider_account_costs`` table.
+
+    Per-account, per-UTC-day rollup of LLM spend — the per-credential
+    analogue of :class:`SqlUserDailyCost`. Incremented (UPSERT) at each
+    turn boundary when the session is routed through a pool account.
+
+    :param credential_id: The :class:`SqlProviderAccount` id (PK part).
+    :param day_utc: UTC day ``"YYYY-MM-DD"`` (PK part).
+    :param cost_usd: Cumulative USD spend for this account on this day.
+    :param input_tokens: Cumulative input tokens.
+    :param output_tokens: Cumulative output tokens.
+    :param turn_count: Number of turns attributed.
+    :param updated_at: Unix epoch seconds of the last increment.
+    """
+
+    __tablename__ = "provider_account_costs"
+
+    credential_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("provider_accounts.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    day_utc: Mapped[str] = mapped_column(String(10), primary_key=True)
+    cost_usd: Mapped[float] = mapped_column(Float, nullable=False, server_default="0")
+    input_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    output_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    turn_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class SqlSessionCredentialBinding(Base):
+    """
+    SQLAlchemy model for the ``session_credential_bindings`` table.
+
+    Records which provider account is currently active for a session, so
+    auto-failover can rebind a session to a fresh account mid-run and so
+    per-account cost attribution knows where to charge each turn. One row
+    per session.
+
+    :param session_id: The owning conversation/session id (PK).
+    :param credential_id: The active :class:`SqlProviderAccount` id (FK).
+    :param family: The provider family the binding serves.
+    :param bound_at: Unix epoch seconds the (latest) binding was made.
+    """
+
+    __tablename__ = "session_credential_bindings"
+
+    session_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    credential_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("provider_accounts.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    family: Mapped[str] = mapped_column(String(32), nullable=False)
+    bound_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (Index("ix_session_credential_bindings_credential_id", "credential_id"),)

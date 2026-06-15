@@ -298,6 +298,11 @@ HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
         "ANTHROPIC_AUTH_TOKEN",
         "ANTHROPIC_BASE_URL",
         "CLAUDE_CODE_OAUTH_TOKEN",
+        # Per-account config-dir isolation for multi-subscription
+        # rotation: a pool-selected Claude/Codex subscription points the
+        # launched CLI at its own login directory (see omnigent/subscription_tokens/).
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
         "CODEX_ACCESS_TOKEN",
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
@@ -1283,8 +1288,14 @@ class HostProcess:
             managed-host token header or — only when a token could be
             minted — ``{"Authorization": "Bearer <token>"}``.
         """
-        headers: dict[str, str] = {}
         from omnigent.host.identity import HOST_TOKEN_ENV_VAR, MANAGED_HOST_TOKEN_HEADER
+        from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+
+        # Identify as a first-party client so the server's WebSocket origin
+        # guard (CSWSH protection) allows the handshake — the host process
+        # is not a browser. Seeded before either auth branch so it is sent
+        # on both the managed-token and Bearer paths.
+        headers: dict[str, str] = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
 
         managed_token = os.environ.get(HOST_TOKEN_ENV_VAR)
         if managed_token:

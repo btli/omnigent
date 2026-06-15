@@ -2901,6 +2901,12 @@ def server(
     db_uri = database_uri or cfg.get("database_uri", _default_db_uri())
     art_loc = artifact_location or cfg.get("artifact_location", _default_artifact_location())
 
+    # Point the multi-subscription facade at the server's DB so its
+    # account/limit/cost state lives alongside the rest of the server state
+    # (it otherwise falls back to the machine-global chat.db). setdefault so
+    # an explicit operator override still wins.
+    os.environ.setdefault("OMNIGENT_DATABASE_URI", db_uri)
+
     # Resolve relative artifact location against config file's directory
     # (only when the value came from the config file, not CLI).
     if config_path and artifact_location is None and not Path(art_loc).is_absolute():
@@ -4013,7 +4019,8 @@ def resume(
 
     run_resume(
         target=target,
-        server=server,
+        # A bare Databricks workspace URL means its /api/2.0/omnigent mount.
+        server=_workspace_api_server_url(server) if server else server,
     )
 
 
@@ -4532,7 +4539,8 @@ def _resolve_attach_server(server: str | None, configured_server: str | None) ->
     """
     chosen = server if server is not None else configured_server
     if chosen:
-        return chosen.rstrip("/")
+        # A bare Databricks workspace URL means its /api/2.0/omnigent mount.
+        return _workspace_api_server_url(chosen.rstrip("/"))
     local = local_server_url_if_healthy()
     return local.rstrip("/") if local else None
 
@@ -5069,7 +5077,8 @@ def _resolve_host_server(server: str | None) -> str | None:
     if server is None:
         configured = _load_effective_config().get("server")
         server = str(configured) if configured else None
-    return server.rstrip("/") if server else None
+    # A bare Databricks workspace URL means its /api/2.0/omnigent mount.
+    return _workspace_api_server_url(server.rstrip("/")) if server else None
 
 
 def _daemon_base_url(record: _HostDaemonRecord) -> str | None:
