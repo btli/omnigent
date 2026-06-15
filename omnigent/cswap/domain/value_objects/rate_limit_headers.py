@@ -114,7 +114,11 @@ def _retry_after_at(raw: str | None, now: int) -> int | None:
         return None
     secs = _to_int(raw)
     if secs is not None and "-" not in raw and ":" not in raw:
-        return now + secs
+        # A bare integer is a delta-seconds value per RFC 7231 — unless it is
+        # implausibly large for a delay (>~115 days), in which case a provider
+        # has put an absolute epoch here; treat it as such rather than as a
+        # ~decades-in-the-future delay.
+        return secs if secs >= 10**8 else now + secs
     epoch = _parse_epoch_or_rfc3339(raw)
     if epoch is not None:
         return epoch
