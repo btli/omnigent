@@ -291,3 +291,131 @@ def test_mark_available_clears_limit(active_facade: ManagedSessionMaker) -> None
     snapshot = integration.status_snapshot()
     accounts = {a["id"]: a for a in _accounts(snapshot)}
     assert accounts[c1]["limit_status"] == "available"
+
+
+def test_active_credential_for_session_returns_bound_account(
+    active_openai_facade: ManagedSessionMaker,
+) -> None:
+    integration.select_codex_launch(session_id="sess-x")  # binds priority-0 x1
+    assert integration.active_credential_for_session("sess-x") == {
+        "id": account_id_for("codex-pool", "x1"),
+        "name": "x1",
+        "kind": "subscription",
+        "family": "openai",
+        "limit_status": "unknown",  # never observed
+    }
+
+
+def test_active_credential_for_session_reflects_limit_state(
+    active_openai_facade: ManagedSessionMaker,
+) -> None:
+    integration.select_codex_launch(session_id="sess-x")
+    build_container(active_openai_facade).state_repo.upsert(
+        LimitState(
+            account_id_for("codex-pool", "x1"),
+            is_limited=True,
+            limited_until=10**12,
+            source="manual",
+            last_checked_at=1,
+        )
+    )
+    info = integration.active_credential_for_session("sess-x")
+    assert info is not None
+    assert info["limit_status"] == "limited"  # mid-session: stays on the limited account
+
+
+def test_active_credential_for_session_api_key_tier(
+    active_openai_facade: ManagedSessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OAI_TEST_KEY", "sk-oai-xyz")
+    repo = build_container(active_openai_facade).state_repo
+    for name in ("x1", "x2"):
+        repo.upsert(
+            LimitState(
+                account_id_for("codex-pool", name),
+                is_limited=True,
+                limited_until=10**12,
+                source="manual",
+                last_checked_at=1,
+            )
+        )
+    integration.select_codex_launch(session_id="sess-y")  # tier-falls to api_key xkey
+    info = integration.active_credential_for_session("sess-y")
+    assert info is not None
+    assert info["name"] == "xkey"
+    assert info["kind"] == "api_key"
+    assert info["family"] == "openai"
+
+
+def test_active_credential_for_session_unbound_is_none(
+    active_openai_facade: ManagedSessionMaker,
+) -> None:
+    # Never invents an account for a session the launch never bound.
+    assert integration.active_credential_for_session("never-launched") is None
+
+
+def test_active_credential_for_session_inactive_is_none() -> None:
+    integration.deactivate()
+    assert integration.active_credential_for_session("s") is None
+
+
+def test_sessions_for_credentials_returns_bound_sessions(
+    active_openai_facade: ManagedSessionMaker,
+) -> None:
+    integration.select_codex_launch(session_id="sess-a")
+    integration.select_codex_launch(session_id="sess-b")
+    x1 = account_id_for("codex-pool", "x1")
+    x2 = account_id_for("codex-pool", "x2")
+    result = integration.sessions_for_credentials([x1, x2])
+    assert set(result[x1]) == {"sess-a", "sess-b"}
+    assert result[x2] == []  # an account no session launched on → empty (key present)
+
+
+def test_sessions_for_credentials_inactive_is_empty() -> None:
+    integration.deactivate()
+    assert integration.sessions_for_credentials(["whatever"]) == {}
+
+
+def test_registry_sessions_for_credentials_orders_newest_first_and_caps(
+    active_openai_facade: ManagedSessionMaker,
+) -> None:
+    from omnigent.db.db_models import SqlSessionCredentialBinding
+
+    x1 = account_id_for("codex-pool", "x1")
+    registry = build_container(active_openai_facade).registry
+    with active_openai_facade() as session:
+        for i in range(5):
+            session.add(
+                SqlSessionCredentialBinding(
+                    session_id=f"c{i}", credential_id=x1, family="openai", bound_at=2000 + i
+                )
+            )
+        session.commit()
+    # Newest bound_at first, capped per credential at the requested limit.
+    assert registry.sessions_for_credentials([x1], limit_per=2) == {x1: ["c4", "c3"]}
+
+
+def test_registry_sessions_for_credentials_live_filter_beats_the_cap(
+    active_openai_facade: ManagedSessionMaker,
+) -> None:
+    # A long-running session must not be hidden behind newer dead bindings: the
+    # only_session_ids filter is applied in SQL *before* the per-credential cap.
+    from omnigent.db.db_models import SqlSessionCredentialBinding
+
+    x1 = account_id_for("codex-pool", "x1")
+    registry = build_container(active_openai_facade).registry
+    with active_openai_facade() as session:
+        for i in range(200):  # 200 newer, dead bindings
+            session.add(
+                SqlSessionCredentialBinding(
+                    session_id=f"dead{i}", credential_id=x1, family="openai", bound_at=5000 + i
+                )
+            )
+        session.add(  # one older, still-live binding
+            SqlSessionCredentialBinding(
+                session_id="live-old", credential_id=x1, family="openai", bound_at=1
+            )
+        )
+        session.commit()
+    result = registry.sessions_for_credentials([x1], only_session_ids={"live-old"}, limit_per=200)
+    assert result == {x1: ["live-old"]}

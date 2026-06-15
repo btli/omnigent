@@ -406,6 +406,38 @@ export interface Session {
    * sees the current stage.
    */
   sandboxStatus?: SandboxStatus | null;
+  /**
+   * The provider account this session's runner is bound to under
+   * multi-subscription routing — see {@link ActiveCredential}. `null`/absent
+   * when no credential pool is configured or the launch bound no account
+   * (single-account setups), so the indicator is hidden for those. Stable for
+   * the session's lifetime: failover rebinds the *next* launch, never the
+   * running process, so the snapshot value never goes stale mid-session.
+   */
+  activeCredential?: ActiveCredential | null;
+}
+
+/**
+ * The provider account a session is actively using under multi-subscription
+ * routing, surfaced on {@link Session.activeCredential} and rendered as the
+ * composer's credential chip.
+ */
+export interface ActiveCredential {
+  /** Stable credential id of the bound account, e.g. `"codex-pool/x1"`. */
+  id: string;
+  /** Human-readable pool member name, e.g. `"claude-pro-2"`. */
+  name: string;
+  /** `"subscription"` (an isolated CLI login) or `"api_key"` (tier fallback). */
+  kind: "subscription" | "api_key";
+  /** Provider family the account serves. */
+  family: "anthropic" | "openai";
+  /**
+   * The account's usage-limit state at snapshot time. A running session keeps
+   * using a `"limited"` account until its next launch, so this can read
+   * `"limited"` mid-session — the chip shows amber, signaling the next launch
+   * will rotate.
+   */
+  limitStatus: "available" | "limited" | "unknown";
 }
 
 /**

@@ -194,3 +194,39 @@ increments matter only under multi-process uvicorn workers; RFC-1123 HTTP-date `
 parsing; cosmetic window-slot labelling in `status`; tie-break ordering. **Auto failover**
 rebinds the session for the *next* launch + notifies; it does not kill the in-flight process
 (matches remote-dev's "never kill a running session").
+
+## Credential visibility (which account is a session using?)
+
+The binding registry already knew which account each session runs on
+(`session_credential_bindings`, `active_credential(session_id)`), but it was internal-only —
+no log, API, or UI surfaced it. This feature exposes it:
+
+- **Per-session indicator.** `SessionResponse.active_credential`
+  (`ActiveCredentialInfo`: id, name, kind, family, limit_status) is populated in
+  `_get_session_snapshot` via `integration.active_credential_for_session(root_id)` (resolved
+  on `root_conversation_id`, matching cost attribution; run concurrently with subtree-usage via
+  `asyncio.gather`). `None` without a `pools:` block, so single-account setups are unaffected.
+  Stable for the session's lifetime (failover rebinds the *next* launch, not the running
+  process), so no SSE event is needed — the normal snapshot refetch carries it.
+- **Launch log.** `select_launch_env_for_family` / `select_codex_launch` emit one INFO line
+  naming the chosen account, the cheap operator win.
+- **Operator reverse-view.** `GET /v1/subscription-tokens/status` attaches per-account
+  `active_sessions` — the registry's never-deleted bindings, batch-resolved
+  (`sessions_for_credentials(ids, only_session_ids=running)`) and **filtered in SQL to the live
+  `_session_status_cache` set** so a long-running session is never hidden behind newer dead
+  bindings. **Admin-gated**: session ids cross user boundaries, so non-admins get the base
+  snapshot without `active_sessions`.
+- **Web UI.** A self-hiding composer-footer `CredentialChip` (account name + kind icon +
+  limit-status dot, HoverCard detail) beside the agent/harness pill, plus an "Account" row in
+  the AgentInfo popover. Reads `chatStore.sessionActiveCredential`, seeded on bind exactly like
+  `sessionHarness`. No i18n (matches ap-web); oxlint/prettier/tsc clean.
+
+### Adversarial review (Opus + Codex + Gemini) — round 3
+
+All three converged on one HIGH: `active_sessions` leaked cross-user session ids on the
+auth-but-not-admin status endpoint → **admin-gated**. Codex caught the `LIMIT 200`-before-
+intersection bug (a live session hidden behind 200 dead bindings) → **fixed by filtering to the
+live set in SQL before the per-credential cap** (`sessions_for_credentials`, replacing the
+singular method + N-query loop). Opus's hot-path note → `asyncio.gather`. Docstrings clarified
+(launch-binding semantics; best-effort liveness cache). Tests cover the admin gate, the
+live-filter-beats-cap fix, the batched distribution, the mapper, and the chip.

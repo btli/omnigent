@@ -109,6 +109,7 @@ import {
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
+import { CredentialChip } from "@/components/CredentialChip";
 import {
   IntelligentModelControl,
   type CostRoutingVerdict,
@@ -3762,6 +3763,9 @@ export function Composer({
               disabled={isReadOnly}
               openNonce={pickerOpenNonce}
             />
+            {/* Which subscription / API key this session runs on. Self-hiding
+                when no credential pool is configured. */}
+            <CredentialChip />
             <Button
               type="submit"
               size="icon"

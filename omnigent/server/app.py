@@ -52,6 +52,7 @@ from omnigent.server.routes.session_policies import create_session_policies_rout
 from omnigent.server.routes.sessions import (
     SessionLiveness,
     create_sessions_router,
+    running_session_ids,
     set_server_runner_router,
 )
 from omnigent.server.routes.subscription_tokens import create_subscription_tokens_router
@@ -1557,6 +1558,7 @@ def create_app(
         create_subscription_tokens_router(
             auth_provider=auth_provider,
             permission_store=permission_store,
+            running_session_ids=running_session_ids,
         ),
         prefix="/v1",
         tags=["subscription-tokens"],

@@ -1380,6 +1380,39 @@ class ModelUsage(BaseModel):
     total_cost_usd: float | None = None
 
 
+class ActiveCredentialInfo(BaseModel):
+    """The provider account a session's runner is bound to (multi-subscription).
+
+    Present only when a ``pools:`` block is configured and the session's launch
+    selected and bound an account; ``None`` for single-account setups. Reflects
+    the account bound at the session root's launch. Because reactive failover
+    rebinds the *next* launch (never the running process), the account identity
+    does not change while the session runs — the Web UI renders it once per
+    session, refreshed by the normal snapshot refetch, with no live-update
+    channel. (``limit_status`` is the exception: it tracks the account's live
+    usage state, so a still-running session can read ``limited``.)
+
+    :param id: The bound account's stable credential id, e.g.
+        ``"codex-pool/codex-sub-1"``.
+    :param name: The account's human-readable pool member name, e.g.
+        ``"claude-pro-2"``.
+    :param kind: ``"subscription"`` (a Claude/Codex login isolated in its own
+        config dir) or ``"api_key"`` (a raw provider key — the tier fallback).
+    :param family: The provider family the account serves — ``"anthropic"`` or
+        ``"openai"``.
+    :param limit_status: The account's usage-limit state at snapshot time —
+        ``"available"``, ``"limited"``, or ``"unknown"`` (never observed). A
+        running session keeps using a ``"limited"`` account until its next
+        launch, so this can read ``"limited"`` mid-session.
+    """
+
+    id: str
+    name: str
+    kind: Literal["subscription", "api_key"]
+    family: Literal["anthropic", "openai"]
+    limit_status: Literal["available", "limited", "unknown"]
+
+
 class SessionResponse(BaseModel):
     """
     API representation of a session.
@@ -1588,6 +1621,11 @@ class SessionResponse(BaseModel):
         ``_session_sandbox_status_cache`` at snapshot build time, so
         a client opening the session mid-launch sees the current
         stage.
+    :param active_credential: The provider account this session's runner is
+        bound to under multi-subscription routing — see
+        :class:`ActiveCredentialInfo`. ``None`` when no ``pools:`` block is
+        configured or the session's launch bound no account (single-account
+        setups), so the field is invisible to clients that don't use pools.
     """
 
     id: str
@@ -1635,6 +1673,7 @@ class SessionResponse(BaseModel):
     model_options: list[dict[str, Any]] = Field(default_factory=list)
     terminal_pending: bool = False
     sandbox_status: SandboxStatus | None = None
+    active_credential: ActiveCredentialInfo | None = None
 
 
 class UpdateSessionRequest(BaseModel):

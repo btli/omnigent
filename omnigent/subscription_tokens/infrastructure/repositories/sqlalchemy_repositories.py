@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Collection, Sequence
 from typing import cast
 
 from sqlalchemy import and_, case, or_, select, text, update
@@ -373,6 +374,42 @@ class SqlSessionCredentialRegistry(SessionCredentialRegistry):
         with self._session() as session:
             row = session.get(SqlSessionCredentialBinding, session_id)
             return row.credential_id if row is not None else None
+
+    def sessions_for_credentials(
+        self,
+        credential_ids: Sequence[str],
+        *,
+        only_session_ids: Collection[str] | None = None,
+        limit_per: int = 200,
+    ) -> dict[str, list[str]]:
+        """Reverse-lookup bindings for several credentials in one query.
+
+        Best-effort operator reverse lookup. Bindings are never deleted, so
+        *only_session_ids* restricts the scan to a live set (filtered in SQL),
+        which keeps the per-credential *limit_per* cap counting live sessions
+        rather than being exhausted by dead bindings for a heavily-reused
+        account. Newest-bound first; one (possibly empty) list per requested id.
+        """
+        out: dict[str, list[str]] = {cid: [] for cid in credential_ids}
+        if not out:
+            return out
+        cls = SqlSessionCredentialBinding
+        stmt = (
+            select(cls.credential_id, cls.session_id)
+            .where(cls.credential_id.in_(list(credential_ids)))
+            .order_by(cls.bound_at.desc())
+        )
+        if only_session_ids is not None:
+            live = list(only_session_ids)
+            if not live:
+                return out
+            stmt = stmt.where(cls.session_id.in_(live))
+        with self._session() as session:
+            for credential_id, session_id in session.execute(stmt):
+                bucket = out[credential_id]
+                if len(bucket) < limit_per:
+                    bucket.append(session_id)
+        return out
 
 
 class SqlCostAttributionSink(CostAttributionSink):
