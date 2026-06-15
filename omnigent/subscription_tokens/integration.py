@@ -18,7 +18,7 @@ import asyncio
 import logging
 import os
 import threading
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from sqlalchemy import select
 
@@ -196,6 +196,66 @@ def select_launch_env_for_family(
     except Exception:
         logger.exception("subscription-token account selection failed for family %s", family)
         return {}
+
+
+@dataclass(frozen=True)
+class CodexLaunchSelection:
+    """How the Codex launch path should authenticate the selected account.
+
+    Codex isolates every session in a *private* ``CODEX_HOME`` and bridges
+    ``auth.json`` / ``config.toml`` in from a source home, so — unlike Claude's
+    flat ``CLAUDE_CONFIG_DIR`` override — the selected account is surfaced as a
+    config *source* (subscription) or an ``OPENAI_API_KEY`` (tier-fallback key),
+    which the codex launch path applies to the private home rather than merging
+    blindly into the process env.
+
+    :param config_source: A subscription account's ``CODEX_HOME`` to bridge
+        auth/config from, or ``None`` (a dir-less subscription / api_key /
+        inactive — bridge from the ambient default).
+    :param api_key: A tier-fallback account's ``OPENAI_API_KEY``, or ``None``.
+    """
+
+    config_source: str | None = None
+    api_key: str | None = None
+
+
+def select_codex_launch(session_id: str | None = None) -> CodexLaunchSelection:
+    """Select an OpenAI account and report how to launch Codex as it.
+
+    The OpenAI analogue of :func:`select_launch_env_for_family` for the native
+    Codex launch path, which needs config-source / api-key semantics rather
+    than a flat env dict (see :class:`CodexLaunchSelection`). Binds the session
+    to the chosen account so reactive failover and cost attribution can find
+    it. Always safe: returns an empty selection when no pool is configured or
+    on any error.
+    """
+    container = _ensure_container()
+    if container is None:
+        return CodexLaunchSelection()
+    try:
+        account = container.select_credential.execute("openai", now_epoch()).account
+        if account is None:
+            return CodexLaunchSelection()
+        config_source: str | None = None
+        api_key: str | None = None
+        if account.is_subscription:
+            config_dir = account.config_dir()
+            config_source = os.path.expanduser(config_dir) if config_dir else None
+        else:
+            from omnigent.subscription_tokens.infrastructure.detection.credentials import (
+                resolve_account_api_key,
+            )
+
+            api_key = resolve_account_api_key(account)
+        # Bind when the chosen account is the one the process will actually use:
+        # a subscription always (a dir-less one runs on the default codex login,
+        # which IS this account); an api_key only when its key resolved.
+        if session_id and (account.is_subscription or api_key):
+            container.registry.bind(session_id, account.id, "openai")
+        return CodexLaunchSelection(config_source=config_source, api_key=api_key)
+    except Exception:
+        logger.exception("subscription-token codex selection failed")
+        return CodexLaunchSelection()
 
 
 def extract_message_text(data: object) -> str:

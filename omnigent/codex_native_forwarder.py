@@ -4449,11 +4449,24 @@ async def _post_external_item(
     :param response_id: Response id for the mirrored Codex turn.
     :returns: None.
     """
-    # NOTE: Codex/OpenAI multi-subscription launch selection is not yet wired
-    # (Codex's per-session CODEX_HOME model differs from Claude's per-account
-    # CLAUDE_CONFIG_DIR), so reactive detection is intentionally NOT hooked
-    # here — without a binding it would no-op. The family-aware detector and
-    # record_reactive_text(family="openai") are ready for when that lands.
+    # Subscription-aware token management reactive detection: scan an
+    # assistant/system message for an OpenAI quota/limit signal (the detector
+    # requires a provider mention so a quoted error never triggers a bogus
+    # failover) and record + fail over the bound account. The launch path binds
+    # the openai account, so this resolves a credential; fully guarded / no-op
+    # when no pool is configured. Offloaded to a thread so the rare positive
+    # match's DB write never blocks the forwarder loop.
+    if item_type == "message" and item_data.get("role") in ("assistant", "system"):
+        from omnigent.subscription_tokens import integration as _subtokens
+
+        limit_text = _subtokens.extract_message_text(item_data)
+        if limit_text:
+            await asyncio.to_thread(
+                _subtokens.record_reactive_text,
+                limit_text,
+                family="openai",
+                session_id=session_id,
+            )
     response = await _post_session_event(
         client,
         session_id,

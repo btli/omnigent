@@ -1057,6 +1057,7 @@ async def _auto_create_codex_terminal(
         socket_path_for_bridge_dir,
     )
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.subscription_tokens import integration as _subtokens
 
     launch_config = await _codex_native_launch_config(
         session_id=session_id,
@@ -1067,6 +1068,14 @@ async def _auto_create_codex_terminal(
     bridge_dir = prepare_bridge_dir(session_id)
     socket_path = socket_path_for_bridge_dir(bridge_dir)
     codex_home = codex_home_for_bridge_dir(bridge_dir)
+    # Subscription-aware token management: select an OpenAI account for this
+    # session (binding it so reactive failover + cost attribution resolve) and
+    # thread its CODEX_HOME as the auth/config bridge source — or its api key.
+    # No-op (empty selection) when no `pools:` openai pool is configured.
+    _codex_account = _subtokens.select_codex_launch(session_id)
+    codex_config_source = (
+        Path(_codex_account.config_source) if _codex_account.config_source else None
+    )
     # Route across all offerings: a configured provider (omnigent setup),
     # a Databricks ucode profile from provider config, or Codex's own
     # login — parity with the in-process codex harness and the CLI path.
@@ -1074,7 +1083,9 @@ async def _auto_create_codex_terminal(
     # synthesis can stamp session_meta.model_provider with the provider
     # this launch actually routes through.
     default_model = launch_config.model_override or _codex_native_model_from_spec(agent_spec)
-    _codex_launch = resolve_native_codex_launch(model=default_model)
+    _codex_launch = resolve_native_codex_launch(
+        model=default_model, config_source=codex_config_source
+    )
     _session_meta_provider = codex_session_meta_model_provider(_codex_launch)
     from omnigent.inner.codex_executor import _find_codex_cli
 
@@ -1294,6 +1305,8 @@ async def _auto_create_codex_terminal(
         bridge_dir=bridge_dir,
         ap_server_url=launch_config.policy_server_url,
         ap_auth_headers=policy_headers,
+        config_source=codex_config_source,
+        openai_api_key=_codex_account.api_key,
     )
     app_server.listen_url = codex_ws_url
     await app_server.start()

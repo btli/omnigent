@@ -949,12 +949,22 @@ async def _prepare_codex_terminal(
         socket_path = socket_path_for_bridge_dir(bridge_dir)
         codex_home = codex_home_for_bridge_dir(bridge_dir)
         clear_bridge_state(bridge_dir)
+        # Subscription-aware token management: select an OpenAI account for this
+        # session (binding it so reactive failover + cost attribution resolve)
+        # and thread its CODEX_HOME as the auth/config bridge source — or its
+        # api key. No-op when no `pools:` openai pool is configured.
+        from omnigent.subscription_tokens import integration as _subtokens
+
+        _codex_account = _subtokens.select_codex_launch(session_id)
+        codex_config_source = (
+            Path(_codex_account.config_source) if _codex_account.config_source else None
+        )
         # Route across all offerings: a configured provider (configure
         # harness), the Databricks ucode profile, or Codex's own login —
         # so `omnigent codex` honors the provider selection like the
         # in-process codex harness. Resolved before any rollout synthesis
         # so session_meta can name the provider the launch routes through.
-        _codex_launch = resolve_native_codex_launch(model=model)
+        _codex_launch = resolve_native_codex_launch(model=model, config_source=codex_config_source)
         if thread_id is not None:
             await _ensure_local_codex_resume_rollout(
                 client,
@@ -985,6 +995,8 @@ async def _prepare_codex_terminal(
             bridge_dir=bridge_dir,
             ap_server_url=base_url,
             ap_auth_headers=headers,
+            config_source=codex_config_source,
+            openai_api_key=_codex_account.api_key,
         )
         app_server.listen_url = codex_ws_url
         event_client: CodexAppServerClient | None = None
