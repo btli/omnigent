@@ -113,6 +113,8 @@ def _retry_after_at(raw: str | None, now: int) -> int | None:
     if raw is None:
         return None
     secs = _to_int(raw)
+    if secs is not None and secs < 0:
+        return None  # a negative delay / epoch is malformed — ignore it
     if secs is not None and "-" not in raw and ":" not in raw:
         # A bare integer is a delta-seconds value per RFC 7231 — unless it is
         # implausibly large for a delay (>~115 days), in which case a provider

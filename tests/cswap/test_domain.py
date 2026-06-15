@@ -183,6 +183,8 @@ def test_retry_after_parses_seconds_rfc3339_and_http_date() -> None:
         {"retry-after": "Wed, 21 Oct 2015 07:28:00 GMT"}, now=1000
     ).retry_after_at
     assert http == 1445412480
+    # A negative (malformed) value is ignored, not treated as a past epoch.
+    assert RateLimitHeaders.parse_anthropic({"retry-after": "-5"}, now=1000).retry_after_at is None
 
 
 def test_recovery_at_waits_for_latest_exhausted_window() -> None:
