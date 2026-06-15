@@ -627,9 +627,7 @@ async def _auto_create_codex_terminal(
     # thread its CODEX_HOME as the auth/config bridge source — or its api key.
     # No-op (empty selection) when no `pools:` openai pool is configured.
     _codex_account = _subtokens.select_codex_launch(session_id)
-    codex_config_source = (
-        Path(_codex_account.config_source) if _codex_account.config_source else None
-    )
+    codex_config_source = _codex_account.config_source_path
     # Route across all offerings: a configured provider (omnigent setup),
     # a Databricks ucode profile from provider config, or Codex's own
     # login — parity with the in-process codex harness and the CLI path.
