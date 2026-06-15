@@ -152,9 +152,9 @@ def test_selection_prefers_headroom_then_tier_fallback() -> None:
 def test_selection_tier_fallback_when_all_subs_limited() -> None:
     repo = FakeStateRepo()
     pool_repo = FakePoolRepo(_pool())
-    limited = {"is_limited": True, "windows": (UsageWindow("5h", 100, 9999),), "source": "poller"}
-    repo.states["c1"] = LimitState("c1", **limited)  # type: ignore[arg-type]
-    repo.states["c2"] = LimitState("c2", **limited)  # type: ignore[arg-type]
+    exhausted = (UsageWindow("5h", 100, 9999),)
+    repo.states["c1"] = LimitState("c1", is_limited=True, windows=exhausted, source="poller")
+    repo.states["c2"] = LimitState("c2", is_limited=True, windows=exhausted, source="poller")
     policy = PriorityCredentialSelectionPolicy(pool_repo, repo)
     uc = SelectCredentialUseCase(policy)
 
@@ -188,9 +188,10 @@ def test_failover_disabled_is_noop() -> None:
 def test_failover_recommends_alternate_without_rebinding() -> None:
     # Failover does NOT rebind the running session (it keeps running on the
     # exhausted account); it recommends the account the next launch should use.
+    mode: FailoverMode
     for mode in ("auto", "notify"):
         repo = FakeStateRepo()
-        uc, notifier = _failover(mode, repo)  # type: ignore[arg-type]
+        uc, notifier = _failover(mode, repo)
         event = uc.execute(session_id="s", exhausted_credential_id="c1", family="anthropic", now=1)
         assert event is not None
         assert event.next_credential_id == "c2"  # next available subscription

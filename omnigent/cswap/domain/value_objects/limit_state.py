@@ -63,17 +63,34 @@ class LimitState:
         return self.limited_until is not None and now >= self.limited_until
 
     def earliest_reset_at(self) -> int | None:
-        """Return the soonest known reset, for best-effort ranking.
+        """Return the soonest known window reset, for display.
 
         Prefers the soonest window reset; falls back to
-        :attr:`limited_until` when no window declares one. Used only to
-        order fully-limited candidates (pick the one recovering soonest) —
-        availability uses :meth:`is_available_now`.
+        :attr:`limited_until` when no window declares one. This is
+        informational (the status snapshot's ``earliest_reset_at``); to
+        order limited candidates by when they actually become routable use
+        :meth:`recovery_eta`, and availability uses :meth:`is_available_now`.
         """
         resets = [w.reset_at for w in self.windows if w.reset_at is not None]
         if resets:
             return min(resets)
         return self.limited_until
+
+    def recovery_eta(self) -> int | None:
+        """Return the epoch at which this account becomes routable again.
+
+        The authoritative recovery time is :attr:`limited_until` — the value
+        :meth:`is_available_now` gates on. Only when no ``limited_until`` was
+        recorded does this fall back to the soonest known window reset. Used
+        to order fully-limited candidates for best-effort selection (route to
+        the one recovering soonest); ranking by the *earliest window* instead
+        could prefer an account whose longer window keeps it limited well past
+        another's authoritative recovery.
+        """
+        if self.limited_until is not None:
+            return self.limited_until
+        resets = [w.reset_at for w in self.windows if w.reset_at is not None]
+        return min(resets) if resets else None
 
     def remaining_headroom_pct(self) -> int | None:
         """Return the headroom of the most-constrained known window.

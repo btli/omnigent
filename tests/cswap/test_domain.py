@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from omnigent.cswap.domain.entities.credential_pool import CredentialPool
 from omnigent.cswap.domain.entities.provider_account import ProviderAccount
+from omnigent.cswap.domain.value_objects.enums import AccountKind
 from omnigent.cswap.domain.value_objects.limit_state import (
     LimitDetectionResult,
     LimitState,
@@ -83,6 +84,25 @@ def test_limit_state_headroom_is_minimum_across_windows() -> None:
     # 5h has 10% remaining, 7d has 60% — binding constraint is 10%.
     assert state.remaining_headroom_pct() == 10
     assert state.earliest_reset_at() == 2000
+
+
+def test_recovery_eta_prefers_limited_until_over_window() -> None:
+    # The authoritative recovery is ``limited_until`` (what is_available_now
+    # gates on), even when an earlier window reset exists.
+    state = LimitState(
+        "a", is_limited=True, limited_until=5000, windows=(UsageWindow("5h", 100, 2000),)
+    )
+    assert state.recovery_eta() == 5000
+    assert state.earliest_reset_at() == 2000  # the informational view differs
+    # No ``limited_until`` recorded → fall back to the soonest known window.
+    windowed = LimitState(
+        "a",
+        is_limited=True,
+        windows=(UsageWindow("5h", 100, 2000), UsageWindow("7d", 50, 9000)),
+    )
+    assert windowed.recovery_eta() == 2000
+    # Nothing known → ``None``.
+    assert LimitState("a", is_limited=True).recovery_eta() is None
 
 
 def test_limit_state_status_unknown_then_available_then_limited() -> None:
@@ -210,8 +230,8 @@ def test_recovery_at_waits_for_latest_exhausted_window() -> None:
 # ── RotationPolicy ─────────────────────────────────────────
 
 
-def _candidate(cid: str, priority: int, kind: str, state: LimitState) -> RotationCandidate:
-    return RotationCandidate(credential_id=cid, priority=priority, kind=kind, limit_state=state)  # type: ignore[arg-type]
+def _candidate(cid: str, priority: int, kind: AccountKind, state: LimitState) -> RotationCandidate:
+    return RotationCandidate(credential_id=cid, priority=priority, kind=kind, limit_state=state)
 
 
 def test_rotation_prefers_most_headroom_among_available() -> None:
@@ -258,6 +278,26 @@ def test_rotation_best_effort_picks_soonest_reset_when_none_available() -> None:
     )
     assert RotationPolicy.select([a, b], now=1000, best_effort=True) == "b"
     assert RotationPolicy.select([a, b], now=1000, best_effort=False) is None
+
+
+def test_rotation_best_effort_ranks_by_authoritative_recovery_not_earliest_window() -> None:
+    # ``a`` has a window resetting at 2000 but is actually limited_until 5000;
+    # ``b`` recovers at 3000. Best-effort must route to ``b`` (the genuinely
+    # sooner recovery) — ranking by the earliest *window* would wrongly pick
+    # ``a`` on its 2000 window while it stays limited until 5000.
+    a = _candidate(
+        "a",
+        0,
+        "subscription",
+        _state("a", is_limited=True, limited_until=5000, windows=(UsageWindow("5h", 100, 2000),)),
+    )
+    b = _candidate(
+        "b",
+        1,
+        "subscription",
+        _state("b", is_limited=True, limited_until=3000),
+    )
+    assert RotationPolicy.select([a, b], now=1000, best_effort=True) == "b"
 
 
 def test_rotation_excludes_current_account() -> None:

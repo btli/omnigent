@@ -121,7 +121,11 @@ class RotationPolicy:
             considered = [c for c in pool if c.kind != SUBSCRIPTION] or pool
 
         def sort_key(c: RotationCandidate) -> tuple[int, int, str]:
-            reset = c.limit_state.earliest_reset_at()
+            # Rank by the authoritative recovery time (``limited_until``), not
+            # the earliest window reset — an account can have a soon-resetting
+            # window yet stay limited until a later one, so the earliest window
+            # would mis-rank it as recovering first.
+            reset = c.limit_state.recovery_eta()
             # Unknown resets sort last (a huge sentinel), then by priority/id.
             return (reset if reset is not None else 1 << 62, c.priority, c.credential_id)
 
