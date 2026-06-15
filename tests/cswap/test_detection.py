@@ -12,6 +12,7 @@ from omnigent.cswap.infrastructure.detection.composite_usage_limit_gateway impor
 from omnigent.cswap.infrastructure.detection.probes import probe_anthropic, probe_openai
 from omnigent.cswap.infrastructure.detection.reactive_output_detector import (
     ReactiveOutputDetector,
+    message_text,
 )
 from omnigent.cswap.infrastructure.detection.usage_endpoint_poller import (
     POLL_ENABLED_ENV,
@@ -57,13 +58,28 @@ def test_reactive_to_detection_none_when_not_limited() -> None:
     assert ReactiveOutputDetector.to_detection("c", result, observed_at=1) is None
 
 
-def test_reactive_openai_detects_quota_codes() -> None:
-    # Provider-specific error codes match on their own.
-    assert ReactiveOutputDetector.parse("Error: insufficient_quota", family="openai").is_limited
-    assert ReactiveOutputDetector.parse("rate_limit_exceeded", family="openai").is_limited
-    # Generic phrasing needs an openai/gpt/codex mention.
-    assert not ReactiveOutputDetector.parse("rate limit reached", family="openai").is_limited
+def test_message_text_extracts_real_content_not_repr() -> None:
+    # Plain-string content.
+    assert message_text({"role": "assistant", "content": "Claude usage limit reached"}) == (
+        "Claude usage limit reached"
+    )
+    # Content blocks are concatenated by their text.
+    blocks = {"content": [{"type": "text", "text": "hit a"}, {"type": "text", "text": "limit"}]}
+    assert message_text(blocks) == "hit a limit"
+    # No content / non-dict → empty (nothing to scan, no repr noise).
+    assert message_text({"role": "user"}) == ""
+    assert message_text("not a dict") == ""
+
+
+def test_reactive_openai_requires_provider_mention() -> None:
+    # A quota signal fires only alongside a provider mention (openai/gpt/codex),
+    # so an assistant quoting an unrelated tool's error does not failover.
+    assert ReactiveOutputDetector.parse("openai: insufficient_quota", family="openai").is_limited
+    assert ReactiveOutputDetector.parse("codex rate_limit_exceeded", family="openai").is_limited
     assert ReactiveOutputDetector.parse("OpenAI: rate limit reached", family="openai").is_limited
+    # Without a provider mention, even an error-code token does not fire.
+    assert not ReactiveOutputDetector.parse("insufficient_quota", family="openai").is_limited
+    assert not ReactiveOutputDetector.parse("rate limit reached", family="openai").is_limited
     # A Claude limit must NOT match under the openai family.
     assert not ReactiveOutputDetector.parse(
         "claude usage limit reached", family="openai"
@@ -73,7 +89,7 @@ def test_reactive_openai_detects_quota_codes() -> None:
 def test_reactive_openai_detection_has_no_reset() -> None:
     # OpenAI surfaces no reset epoch in transcript text → limited_until None
     # (the facade applies a cooldown default).
-    parsed = ReactiveOutputDetector.parse("insufficient_quota", family="openai")
+    parsed = ReactiveOutputDetector.parse("openai insufficient_quota", family="openai")
     detection = ReactiveOutputDetector.to_detection("c", parsed, observed_at=100)
     assert detection is not None
     assert detection.limited_until is None

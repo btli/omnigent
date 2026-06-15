@@ -4457,13 +4457,18 @@ async def _post_external_item(
     if item_type == "message" and isinstance(item_data, dict):
         if item_data.get("role") in ("assistant", "system"):
             from omnigent.cswap import integration as _cswap
-
-            await asyncio.to_thread(
-                _cswap.record_reactive_text,
-                str(item_data),
-                family="openai",
-                session_id=session_id,
+            from omnigent.cswap.infrastructure.detection.reactive_output_detector import (
+                message_text,
             )
+
+            text = message_text(item_data)
+            if text:
+                await asyncio.to_thread(
+                    _cswap.record_reactive_text,
+                    text,
+                    family="openai",
+                    session_id=session_id,
+                )
 
     response = await _post_session_event(
         client,

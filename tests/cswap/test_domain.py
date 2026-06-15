@@ -165,6 +165,26 @@ def test_parse_empty_headers_yields_no_windows() -> None:
     assert parsed.is_limited(200) is False
 
 
+def test_recovery_at_waits_for_latest_exhausted_window() -> None:
+    # Both windows exhausted: recover only when the LATER one resets (avoids
+    # re-selecting while the 7d window is still at 100%).
+    headers = RateLimitHeaders(
+        windows=(UsageWindow("5h", 100, 2000), UsageWindow("7d", 100, 5000)),
+        retry_after_at=None,
+    )
+    assert headers.recovery_at() == 5000
+    # retry-after takes precedence when present.
+    headers2 = RateLimitHeaders(windows=(UsageWindow("5h", 100, 2000),), retry_after_at=9999)
+    assert headers2.recovery_at() == 9999
+    # No exhausted window → soonest reset (best guess); none → None.
+    headers3 = RateLimitHeaders(
+        windows=(UsageWindow("5h", 50, 2000), UsageWindow("7d", 30, 5000)),
+        retry_after_at=None,
+    )
+    assert headers3.recovery_at() == 2000
+    assert RateLimitHeaders(windows=(), retry_after_at=None).recovery_at() is None
+
+
 # ── RotationPolicy ─────────────────────────────────────────
 
 

@@ -23,6 +23,34 @@ from omnigent.cswap.domain.value_objects.enums import Family
 from omnigent.cswap.domain.value_objects.limit_state import LimitDetectionResult
 from omnigent.cswap.domain.value_objects.usage_window import UsageWindow
 
+
+def message_text(data: object) -> str:
+    """Extract the human-readable text from a transcript message item.
+
+    Both forwarders hand us the message's ``data`` dict; scanning its
+    ``str()`` would match Python ``repr`` punctuation/keys, not the actual
+    content. This pulls the ``content`` text (a plain string, or the
+    concatenated ``text`` of content blocks).
+
+    :param data: A message item's ``data`` (expected to be a mapping).
+    :returns: The message's text, or ``""`` when none can be extracted.
+    """
+    if not isinstance(data, dict):
+        return ""
+    content = data.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                parts.append(block["text"])
+            elif isinstance(block, str):
+                parts.append(block)
+        return " ".join(parts)
+    return ""
+
+
 # ── anthropic ──────────────────────────────────────────────
 _CLAUDE_LIMIT_RE = re.compile(r"claude\s+(?:ai\s+)?usage\s+limit\s+reached", re.IGNORECASE)
 _GENERIC_LIMIT_RE = re.compile(
@@ -34,11 +62,13 @@ _RESET_5H_RE = re.compile(r"anthropic-ratelimit-unified-5h-reset[:\s]+(\d{9,})",
 _RESET_7D_RE = re.compile(r"anthropic-ratelimit-unified-7d-reset[:\s]+(\d{9,})", re.IGNORECASE)
 
 # ── openai / codex ─────────────────────────────────────────
-# Provider-specific error codes are unambiguous on their own.
-_OPENAI_CODE_RE = re.compile(r"insufficient_quota|rate_limit_exceeded", re.IGNORECASE)
-# Generic phrasing only when the text also names openai/gpt/codex.
-_OPENAI_GENERIC_RE = re.compile(
-    r"rate\s+limit\s+reached|exceeded\s+your\s+current\s+quota", re.IGNORECASE
+# OpenAI quota/limit phrasing. All openai matching also requires a provider
+# mention (openai/gpt/codex) so an assistant *quoting* an unrelated tool's
+# "rate_limit_exceeded" error text does not trigger a bogus failover.
+_OPENAI_LIMIT_RE = re.compile(
+    r"insufficient_quota|rate_limit_exceeded|rate\s+limit\s+reached"
+    r"|exceeded\s+your\s+current\s+quota",
+    re.IGNORECASE,
 )
 _MENTIONS_OPENAI_RE = re.compile(r"openai|gpt|codex", re.IGNORECASE)
 
@@ -77,9 +107,7 @@ def _parse_anthropic(output: str) -> ReactiveParseResult:
 
 
 def _parse_openai(output: str) -> ReactiveParseResult:
-    is_limited = bool(_OPENAI_CODE_RE.search(output)) or (
-        bool(_MENTIONS_OPENAI_RE.search(output)) and bool(_OPENAI_GENERIC_RE.search(output))
-    )
+    is_limited = bool(_MENTIONS_OPENAI_RE.search(output)) and bool(_OPENAI_LIMIT_RE.search(output))
     return ReactiveParseResult(is_limited=is_limited)
 
 
