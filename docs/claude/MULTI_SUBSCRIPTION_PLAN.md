@@ -258,3 +258,66 @@ when an oauth-only sub's token is unset (mis-attribution); `codex_terminal_env` 
 `CODEX_ACCESS_TOKEN`; the config-dir+`oauth_token_ref` combo is a hard parse error; the poll
 sweep logs `account.id` not the secret-bearing dataclass; the resolvers catch the full
 best-effort tuple. **All three CLEAN on the final round.**
+
+## Policy governance: the credential as a label bridge
+
+**Why.** Omnigent leaves credential *selection* to deployment infra (the OS-sandbox doc:
+"credential selection and scoping remain the responsibility of the deployment infrastructure,
+not the Omnigent policy layer") — which is exactly what `pools:` + launch injection do, and
+correctly *outside* the session-scoped policy engine (you can't inject a process's env after it
+spawns). But Omnigent's **governance** model is label-driven policies, and the pool mechanism had
+no policy hook. So the aligned design is a **combination**: pools are the *mechanism* (which
+accounts exist + rotation/failover), and the bound account is projected into the policy engine as
+labels so policies *govern* on it and the UI reads the same source of truth.
+
+**The bridge** (`omnigent/subscription_tokens/labels.py`). On policy-engine build
+(`build_policy_engine`, after the declared-label seed) the session's bound account is projected
+into three **engine-owned** conversation labels:
+
+- `credential.kind` (`subscription` | `api_key`), `credential.family` (`anthropic` | `openai`),
+  `credential.account` (the pool-member id).
+- Resolved by the **root** conversation id — the binding lives on the session/spawn-tree top (the
+  same key the active-credential chip uses), so a sub-agent inherits its session's credential.
+- **Overwrite-on-change** (so a reactive failover to the api_key fallback is reflected next build)
+  but never blanks: a build that can't resolve the binding leaves existing values untouched.
+  No-op when no pool is configured (the facade returns `{}`, never raises).
+- **Reserved namespace**: `credential.*` is rejected in *all* client label writes (create + PATCH,
+  even from the bound runner — stricter than `cost_control.*`, which the runner may write), so a
+  caller can't forge `credential.kind=api_key` to dodge a governance policy.
+
+**Governance example** (no new policy-engine code — uses the `cel_policy` builtin):
+
+```yaml
+# Require approval before any tool call when the session runs on a personal
+# subscription account; api_key (and unbound) sessions proceed untouched.
+policies:
+  approve-tools-on-subscription:
+    function:
+      path: omnigent.policies.builtins.cel.cel_policy
+      arguments:
+        expression: >
+          event.type == "tool_call"
+          && "credential.kind" in event.context.labels
+          && event.context.labels["credential.kind"] == "subscription"
+          ? {"result": "ASK",
+             "reason": "Tool use on a personal subscription account requires approval."}
+          : {"result": "ALLOW"}
+```
+
+Combine with a data-classification label for the richer rule (`subscription` + `restricted` →
+`ASK`/`DENY`). The labels also make the active credential visible to the policy engine and any
+label-aware surface, consistent with the credential chip (both derive from the one binding).
+
+### Adversarial review (Opus + Codex + Gemini) — round 5
+
+Credential-label bridge (seed + reserved namespace + example governance policy).
+Opus **CLEAN** (verified the client-forgery spoof vector closed across every label-write
+path). Codex found 1 HIGH + 2 LOW, all fixed: a **policy** `set_labels` could still forge
+`credential.*` (engine `apply_label_writes` now drops the `credential.*` namespace before the
+store write + hot-cache update — the binding seed writes via the store directly, so it is
+unaffected); the facade now resolves the binding directly (skips the unused `limit_status` DB
+read on the per-build hot path) and self-guards (own `try/except` → `{}`). Gemini re-verified
+both HIGH + the MEDIUM resolved and added facade unit tests (DB-read-skip + error→`{}`); the
+policy-engine→subscription_tokens function-local import is kept by design (documented — no
+import-time coupling, mirrors the always-safe facade pattern). code-simplifier removed a dead
+`or conversation_id` fallback. **470 tests green, ruff + mypy --strict clean. All three CLEAN.**

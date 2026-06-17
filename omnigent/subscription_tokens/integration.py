@@ -37,6 +37,7 @@ from omnigent.subscription_tokens.infrastructure.detection.reactive_output_detec
     ReactiveOutputDetector,
     message_text,
 )
+from omnigent.subscription_tokens.labels import to_credential_labels
 
 logger = logging.getLogger(__name__)
 
@@ -374,6 +375,37 @@ def active_credential_for_session(session_id: str) -> dict[str, object] | None:
     except Exception:
         logger.exception("subscription-token active-credential lookup failed")
         return None
+
+
+def credential_labels_for_session(session_id: str) -> dict[str, str]:
+    """Project the session's bound account into engine label writes.
+
+    Drives the policy-engine seed step
+    (:func:`omnigent.runtime.policies.builder.build_policy_engine`), which calls
+    this on every build — so it resolves the binding directly (registry + pool
+    member) and skips the limit-state read :func:`active_credential_for_session`
+    does for the UI chip: the labels need only ``{credential.kind,
+    credential.family, credential.account}`` (see
+    :mod:`omnigent.subscription_tokens.labels`). Always safe — returns ``{}``
+    when no pool is configured, the session has no binding, the bound credential
+    is no longer a pool member, or on any error. Resolve with the
+    session/spawn-tree **root** id (the binding's key) so a sub-agent inherits
+    its session's credential.
+    """
+    container = _ensure_container()
+    if container is None:
+        return {}
+    try:
+        credential_id = container.registry.active_credential(session_id)
+        if not credential_id:
+            return {}
+        member, pool = _find_member(credential_id)
+        if member is None or pool is None:
+            return {}
+        return to_credential_labels({"id": member.id, "kind": member.kind, "family": pool.family})
+    except Exception:
+        logger.exception("subscription-token credential-labels lookup failed")
+        return {}
 
 
 def sessions_for_credentials(

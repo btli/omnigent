@@ -266,6 +266,10 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.subscription_tokens.labels import (
+    CREDENTIAL_LABEL_NAMESPACE,
+    reserved_credential_keys,
+)
 from omnigent.tools.client_specified import parse_client_side_tool_specs
 
 _logger = logging.getLogger(__name__)
@@ -10614,6 +10618,30 @@ def _reject_reserved_cost_control_label_seed(labels: dict[str, str]) -> None:
         )
 
 
+def _reject_reserved_credential_labels(labels: dict[str, str]) -> None:
+    """
+    Reject any client write to the engine-owned ``credential.*`` namespace.
+
+    Unlike ``cost_control.*`` (which the session's bound runner may write), the
+    ``credential.*`` labels are seeded *only* by the policy-engine build from
+    the session's account binding — no external caller, not even the runner,
+    has a legitimate write. Rejecting client seeds/writes (at both create and
+    update) stops a caller forging e.g. ``credential.kind=api_key`` to slip
+    restricted work past a credential-governance policy.
+
+    :param labels: The client-supplied labels, e.g. ``{"team": "ml"}``.
+    :raises OmnigentError: 400 when any ``credential.*`` key is present.
+    """
+    reserved = reserved_credential_keys(labels)
+    if reserved:
+        raise OmnigentError(
+            f"labels {', '.join(repr(key) for key in reserved)} "
+            f"are in the engine-owned {CREDENTIAL_LABEL_NAMESPACE}* "
+            "namespace and cannot be set via the API",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+
 def _require_cost_control_label_authority(
     *,
     reserved_keys: Sequence[str],
@@ -10704,6 +10732,7 @@ async def _create_session_from_existing_agent(
         fails authorization.
     """
     _reject_reserved_cost_control_label_seed(body.labels)
+    _reject_reserved_credential_labels(body.labels)
 
     agent = await asyncio.to_thread(agent_store.get, body.agent_id)
     if agent is None:
@@ -12539,6 +12568,7 @@ def create_sessions_router(
             raise HTTPException(status_code=422, detail=[_multipart_missing_detail("bundle")])
         parsed_metadata = _parse_session_create_metadata(metadata)
         _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
+        _reject_reserved_credential_labels(parsed_metadata.labels)
 
         inherited_runner_id: str | None = None
         if parsed_metadata.parent_session_id is not None:
@@ -13254,6 +13284,10 @@ def create_sessions_router(
                     code=ErrorCode.FORBIDDEN,
                 )
         if body.labels:
+            # Engine-owned credential.* labels have no external writer (not even
+            # the runner) — reject any client write outright before touching the
+            # store, so a forged credential.kind can't dodge a governance policy.
+            _reject_reserved_credential_labels(body.labels)
             # Advisor-owned cost_control.* labels are written only by the
             # session's bound runner; gate them on runner proof BEFORE any
             # store mutation so a rejected request leaves the session untouched.

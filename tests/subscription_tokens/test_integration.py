@@ -14,6 +14,11 @@ from omnigent.subscription_tokens.config.pool_config import account_id_for, load
 from omnigent.subscription_tokens.config.pool_config_syncer import sync_pools
 from omnigent.subscription_tokens.container import build_container
 from omnigent.subscription_tokens.domain.value_objects.limit_state import LimitState
+from omnigent.subscription_tokens.labels import (
+    CREDENTIAL_ACCOUNT_LABEL,
+    CREDENTIAL_FAMILY_LABEL,
+    CREDENTIAL_KIND_LABEL,
+)
 
 
 def _accounts(snapshot: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -357,6 +362,73 @@ def test_active_credential_for_session_unbound_is_none(
 def test_active_credential_for_session_inactive_is_none() -> None:
     integration.deactivate()
     assert integration.active_credential_for_session("s") is None
+
+
+def test_credential_labels_for_session_projects_bound_account(
+    active_openai_facade: ManagedSessionMaker,
+) -> None:
+    """The policy-engine seed facade projects the bound account to the three
+    engine-owned labels."""
+    integration.select_codex_launch(session_id="sess-x")  # binds priority-0 x1
+    assert integration.credential_labels_for_session("sess-x") == {
+        CREDENTIAL_KIND_LABEL: "subscription",
+        CREDENTIAL_FAMILY_LABEL: "openai",
+        CREDENTIAL_ACCOUNT_LABEL: account_id_for("codex-pool", "x1"),
+    }
+
+
+def test_credential_labels_for_session_unbound_is_empty(
+    active_openai_facade: ManagedSessionMaker,
+) -> None:
+    """A session the launch never bound projects to no labels."""
+    assert integration.credential_labels_for_session("never-launched") == {}
+
+
+def test_credential_labels_for_session_inactive_is_empty() -> None:
+    """No pool configured → no labels (and no container build)."""
+    integration.deactivate()
+    assert integration.credential_labels_for_session("s") == {}
+
+
+def test_credential_labels_for_session_skips_limit_state_read(
+    active_openai_facade: ManagedSessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The per-build label facade resolves the binding directly and does NOT
+    read limit state — keeping that DB read off the build_policy_engine hot
+    path. (The chip's active_credential_for_session DOES read it — the contrast
+    proves the skip is real, not just an unbound no-op.)"""
+    integration.select_codex_launch(session_id="sess-x")
+    container = integration._ensure_container()
+    assert container is not None
+    calls: list[object] = []
+    real_find_many = container.state_repo.find_many
+
+    def spy(ids: list[str]) -> object:
+        calls.append(ids)
+        return real_find_many(ids)
+
+    monkeypatch.setattr(container.state_repo, "find_many", spy)
+
+    labels = integration.credential_labels_for_session("sess-x")
+    assert labels[CREDENTIAL_KIND_LABEL] == "subscription"
+    assert calls == []  # the label path never touched limit state
+
+    integration.active_credential_for_session("sess-x")
+    assert calls  # contrast: the chip path does read it
+
+
+def test_credential_labels_for_session_swallows_errors(
+    active_openai_facade: ManagedSessionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Always-safe contract: a lookup failure returns ``{}`` (logged), so it can
+    never break a policy-engine build / a turn."""
+    integration.select_codex_launch(session_id="sess-x")
+
+    def boom(_credential_id: str) -> object:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(integration, "_find_member", boom)
+    assert integration.credential_labels_for_session("sess-x") == {}
 
 
 def test_sessions_for_credentials_returns_bound_sessions(
