@@ -1,7 +1,7 @@
 """add multi-subscription tables
 
-Revision ID: n1a2b3c4d5e6
-Revises: m1a2b3c4d5e6
+Revision ID: subtok_tables
+Revises: n1a2b3c4d5e6
 Create Date: 2026-06-14 00:00:00.000000
 
 Adds the five tables backing native multi-subscription rotation
@@ -26,8 +26,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "n1a2b3c4d5e6"
-down_revision: str | None = "m1a2b3c4d5e6"
+revision: str = "subtok_tables"
+down_revision: str | None = "n1a2b3c4d5e6"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

@@ -87,7 +87,7 @@ pools:
         priority: 5
 ```
 
-## DB tables (Alembic, down_revision = m1a2b3c4d5e6)
+## DB tables (Alembic: `subtok_tables` → `subtok_oauth_ref`, chained onto upstream's migration head)
 
 - `credential_pools` (id, name, family, failover_mode, timestamps)
 - `provider_accounts` (id, pool_id?, name, family, kind, priority, claude_config_dir?,
@@ -139,10 +139,10 @@ Among candidates for a family, ordered by configured priority then:
 **Complete & validated** — `omnigent/subscription_tokens/` package (domain, config, DB, repos,
 detection, selection, use-cases, container, integration facade). 67 unit/integration
 tests, ruff clean, `mypy --strict` clean. Existing DB/onboarding/host suites still green;
-single Alembic head `n1a2b3c4d5e6`.
+single Alembic head `subtok_tables` (re-chained onto upstream's head after the upstream rebase — see below).
 
 Wired into omnigent:
-- `db_models.py` + migration `n1a2b3c4d5e6` — 5 tables.
+- `db_models.py` + migration `subtok_tables` — 5 tables.
 - `claude_native.py` (CLI) + `runner/app.py` (server-spawned) — launch-time Claude account
   selection → `CLAUDE_CONFIG_DIR` / tier-fallback API key injection.
 - `codex_native.py` (CLI) + `runner/app.py` (server-spawned) — launch-time **OpenAI/Codex**
@@ -240,7 +240,7 @@ isolated config dir — the cleanest way to rotate between multiple Claude/Codex
 
 - New `ProviderAccount.oauth_token_ref` (reference only, e.g. `env:VAR` — never a raw
   token), a new nullable `provider_accounts.oauth_token_ref` column (additive migration
-  `o1a2b3c4d5e6`, `batch_alter_table` for SQLite), config parse + `resolve_account_oauth_token`.
+  `subtok_oauth_ref`, `batch_alter_table` for SQLite), config parse + `resolve_account_oauth_token`.
 - Launch injection: `select_launch_env_for_family` emits `CLAUDE_CODE_OAUTH_TOKEN`;
   `select_codex_launch` carries `access_token` → `CODEX_ACCESS_TOKEN` (also allowlisted into
   `codex_terminal_env` so the TUI inherits it). Config dir wins if both present — and the

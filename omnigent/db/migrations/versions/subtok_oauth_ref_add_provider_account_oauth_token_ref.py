@@ -1,7 +1,7 @@
 """add provider_accounts.oauth_token_ref
 
-Revision ID: o1a2b3c4d5e6
-Revises: n1a2b3c4d5e6
+Revision ID: subtok_oauth_ref
+Revises: subtok_tables
 Create Date: 2026-06-15 00:00:00.000000
 
 Adds ``provider_accounts.oauth_token_ref`` — the secret reference for a
@@ -18,8 +18,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "o1a2b3c4d5e6"
-down_revision: str | None = "n1a2b3c4d5e6"
+revision: str = "subtok_oauth_ref"
+down_revision: str | None = "subtok_tables"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
