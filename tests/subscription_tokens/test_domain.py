@@ -10,7 +10,11 @@ from __future__ import annotations
 
 from omnigent.subscription_tokens.domain.entities.credential_pool import CredentialPool
 from omnigent.subscription_tokens.domain.entities.provider_account import ProviderAccount
-from omnigent.subscription_tokens.domain.value_objects.enums import AccountKind
+from omnigent.subscription_tokens.domain.value_objects.enums import (
+    MAX_HEADROOM,
+    SOONEST_RESET,
+    AccountKind,
+)
 from omnigent.subscription_tokens.domain.value_objects.limit_state import (
     LimitDetectionResult,
     LimitState,
@@ -103,6 +107,22 @@ def test_recovery_eta_prefers_limited_until_over_window() -> None:
     assert windowed.recovery_eta() == 2000
     # Nothing known → ``None``.
     assert LimitState("a", is_limited=True).recovery_eta() is None
+
+
+def test_limit_state_renewal_reset_at_uses_weekly_window_only() -> None:
+    # Only the renewal (7d) window counts — a soon-resetting 5h window must not
+    # be mistaken for the weekly one that soonest_reset ranks on.
+    state = _state(
+        "a",
+        windows=(UsageWindow("5h", 30, 2000), UsageWindow("7d", 30, 9000)),
+    )
+    assert state.renewal_reset_at() == 9000
+    # No 7d window observed → unknown, even though a 5h reset exists.
+    assert _state("a", windows=(UsageWindow("5h", 30, 2000),)).renewal_reset_at() is None
+    # A 7d window with no reset epoch is still unknown.
+    assert _state("a", windows=(UsageWindow("7d", 30, None),)).renewal_reset_at() is None
+    # Never observed → unknown.
+    assert LimitState("a").renewal_reset_at() is None
 
 
 def test_limit_state_status_unknown_then_available_then_limited() -> None:
@@ -321,6 +341,117 @@ def test_rotation_best_effort_all_api_keys_no_tier_fallback_does_not_crash() -> 
     )
     chosen = RotationPolicy.select([a, b], now=1000, allow_tier_fallback=False, best_effort=True)
     assert chosen == "b"  # soonest reset
+
+
+# ── RotationPolicy: soonest_reset mode ─────────────────────
+#
+# These model the deployed claude-pool: three subscriptions whose *weekly* (7d)
+# windows reset on different days. soonest_reset spends the one lapsing first.
+# Utilization is None on purpose — the live unified headers expose the reset
+# epoch but not limit/remaining, so ranking must rely on the reset alone.
+
+
+def _weekly(
+    cid: str, priority: int, reset_7d: int | None, *, reset_5h: int = 9_999_999
+) -> RotationCandidate:
+    windows = (UsageWindow("5h", None, reset_5h),)
+    if reset_7d is not None:
+        windows = (*windows, UsageWindow("7d", None, reset_7d))
+    return _candidate(cid, priority, "subscription", _state(cid, windows=windows))
+
+
+def test_soonest_reset_ranks_by_weekly_reset_over_priority() -> None:
+    # The soonest-resetting account (asckv, Sun) is given the *worst* priority
+    # number so the two orderings diverge: soonest_reset must still pick it,
+    # whereas the priority-driven max_headroom default would pick gmail.
+    asckv = _weekly("asckv", 2, reset_7d=1_000)
+    joyful = _weekly("joyful", 1, reset_7d=2_000)
+    gmail = _weekly("gmail", 0, reset_7d=3_000)
+    pool = [gmail, joyful, asckv]  # any order in; ranked at selection
+    assert RotationPolicy.select(pool, now=10, mode=SOONEST_RESET) == "asckv"
+    assert RotationPolicy.select(pool, now=10, mode=MAX_HEADROOM) == "gmail"
+
+
+def test_soonest_reset_auto_advances_after_a_weekly_reset() -> None:
+    # Before: asckv's weekly resets soonest → it is spent first.
+    asckv_before = _weekly("asckv", 0, reset_7d=1_000)
+    joyful = _weekly("joyful", 1, reset_7d=2_000)
+    gmail = _weekly("gmail", 2, reset_7d=3_000)
+    assert (
+        RotationPolicy.select([asckv_before, joyful, gmail], now=10, mode=SOONEST_RESET) == "asckv"
+    )
+    # After asckv's window rolls over its 7d reset jumps a week out (now latest);
+    # joyful is now the soonest-resetting → selection flips to it automatically.
+    asckv_after = _weekly("asckv", 0, reset_7d=1_000 + 7 * 86_400)
+    assert (
+        RotationPolicy.select([asckv_after, joyful, gmail], now=10, mode=SOONEST_RESET) == "joyful"
+    )
+
+
+def test_soonest_reset_flips_to_next_when_5h_window_exhausted() -> None:
+    # asckv has the soonest weekly reset but its 5h window is maxed (limited
+    # until 1_200). At now=1_000 it is unavailable, so selection flips to the
+    # next-soonest-weekly account that *is* available (joyful).
+    asckv = _candidate(
+        "asckv",
+        0,
+        "subscription",
+        _state(
+            "asckv",
+            is_limited=True,
+            limited_until=1_200,
+            windows=(UsageWindow("5h", 100, 1_200), UsageWindow("7d", None, 1_000)),
+        ),
+    )
+    joyful = _weekly("joyful", 1, reset_7d=2_000)
+    gmail = _weekly("gmail", 2, reset_7d=3_000)
+    assert RotationPolicy.select([asckv, joyful, gmail], now=1_000, mode=SOONEST_RESET) == "joyful"
+    # Once asckv's 5h resets (now past limited_until) it is available again and,
+    # being the soonest weekly, reclaims selection.
+    assert RotationPolicy.select([asckv, joyful, gmail], now=1_200, mode=SOONEST_RESET) == "asckv"
+
+
+def test_soonest_reset_prefers_known_reset_over_unprobed() -> None:
+    # measured: has a weekly reset. unprobed: no windows yet. Even though
+    # unprobed has the lower priority number, the account with a known imminent
+    # weekly reset is spent first (we can't claim an unknown resets sooner).
+    measured = _weekly("measured", 5, reset_7d=1_000)
+    unprobed = _candidate("unprobed", 0, "subscription", _state("unprobed"))
+    assert RotationPolicy.select([measured, unprobed], now=10, mode=SOONEST_RESET) == "measured"
+
+
+def test_soonest_reset_falls_back_to_priority_when_all_unknown() -> None:
+    # No weekly resets known anywhere → ranking degrades to configured priority
+    # order (which the config sets to match the weekly cadence), then id.
+    a = _candidate("a", 2, "subscription", _state("a"))
+    b = _candidate("b", 0, "subscription", _state("b"))
+    c = _candidate("c", 1, "subscription", _state("c"))
+    assert RotationPolicy.select([a, b, c], now=10, mode=SOONEST_RESET) == "b"
+
+
+def test_soonest_reset_ties_break_by_priority_then_id() -> None:
+    # Identical weekly resets → lower priority wins; equal priority → lower id.
+    hi = _weekly("hi", 1, reset_7d=1_000)
+    lo = _weekly("lo", 0, reset_7d=1_000)
+    assert RotationPolicy.select([hi, lo], now=10, mode=SOONEST_RESET) == "lo"
+    a = _weekly("a", 0, reset_7d=1_000)
+    z = _weekly("z", 0, reset_7d=1_000)
+    assert RotationPolicy.select([z, a], now=10, mode=SOONEST_RESET) == "a"
+
+
+def test_default_mode_is_max_headroom() -> None:
+    # Omitting mode must preserve today's behaviour: most headroom wins even
+    # when its weekly resets later.
+    rich = _candidate(
+        "rich", 1, "subscription", _state("rich", windows=(UsageWindow("7d", 10, 9_000),))
+    )
+    poor = _candidate(
+        "poor", 0, "subscription", _state("poor", windows=(UsageWindow("7d", 90, 1_000),))
+    )
+    assert RotationPolicy.select([rich, poor], now=10) == "rich"
+    assert RotationPolicy.select([rich, poor], now=10, mode=MAX_HEADROOM) == "rich"
+    # The same inputs under soonest_reset pick the soonest-resetting instead.
+    assert RotationPolicy.select([rich, poor], now=10, mode=SOONEST_RESET) == "poor"
 
 
 # ── Entities ───────────────────────────────────────────────

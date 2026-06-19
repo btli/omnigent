@@ -6,8 +6,12 @@ exhaustively unit-tested:
 1. Prefer **available** accounts (not limited, or limited but past reset).
 2. Prefer the **subscription** tier; only fall through to **api_key**
    (tier fallback) when no subscription is available.
-3. Within the chosen tier, pick the account with the **most remaining
-   headroom**; break ties by lower configured priority, then id.
+3. Rank the available accounts of the chosen tier by the pool's
+   :data:`~omnigent.subscription_tokens.domain.value_objects.enums.RotationMode`:
+   ``max_headroom`` (default) picks the **most remaining headroom**;
+   ``soonest_reset`` picks the soonest-resetting **renewal (weekly) window**
+   so allowance is spent before it lapses. Both break ties by lower
+   configured priority, then id.
 4. When nothing is available, optionally best-effort to the account whose
    limit resets **soonest** so a launch is never blocked.
 """
@@ -16,12 +20,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from omnigent.subscription_tokens.domain.value_objects.enums import SUBSCRIPTION, AccountKind
+from omnigent.subscription_tokens.domain.value_objects.enums import (
+    MAX_HEADROOM,
+    SOONEST_RESET,
+    SUBSCRIPTION,
+    AccountKind,
+    RotationMode,
+)
 from omnigent.subscription_tokens.domain.value_objects.limit_state import LimitState
 
 # Headroom assumed for an account that has never been probed. Optimistic so
 # a freshly-added account is usable before the poller has measured it.
 _UNKNOWN_HEADROOM = 100
+
+# Sort sentinel for an unknown epoch (a missing renewal reset or recovery time):
+# orders such candidates last (after every real epoch) without special-casing
+# ``None`` in the sort key. Larger than any plausible Unix epoch.
+_UNKNOWN_EPOCH_SENTINEL = 1 << 62
 
 
 @dataclass(frozen=True)
@@ -44,6 +59,10 @@ class RotationCandidate:
         pct = self.limit_state.remaining_headroom_pct()
         return _UNKNOWN_HEADROOM if pct is None else pct
 
+    def renewal_reset_at(self) -> int | None:
+        """Epoch the renewal (weekly) window resets, or ``None`` if unknown."""
+        return self.limit_state.renewal_reset_at()
+
 
 class RotationPolicy:
     """Stateless selection strategy over :class:`RotationCandidate` lists."""
@@ -53,6 +72,7 @@ class RotationPolicy:
         candidates: list[RotationCandidate],
         now: int,
         *,
+        mode: RotationMode = MAX_HEADROOM,
         allow_tier_fallback: bool = True,
         best_effort: bool = True,
         exclude_credential_id: str | None = None,
@@ -61,6 +81,10 @@ class RotationPolicy:
 
         :param candidates: The accounts to choose among.
         :param now: Current Unix epoch seconds.
+        :param mode: How to rank the available accounts of the preferred
+            tier — ``max_headroom`` (default) or ``soonest_reset``. Only the
+            ranking among available accounts changes; availability and tier
+            fallback are identical for both.
         :param allow_tier_fallback: When ``True``, fall back to api_key
             accounts if no subscription is available.
         :param best_effort: When ``True`` and nothing is available, return
@@ -79,12 +103,31 @@ class RotationPolicy:
         available = [c for c in pool if c.limit_state.is_available_now(now)]
         tier = RotationPolicy._preferred_tier(available, allow_tier_fallback)
         if tier:
-            best = max(tier, key=lambda c: (c.headroom(), -c.priority, c.credential_id))
-            return best.credential_id
+            return RotationPolicy._rank_available(tier, mode).credential_id
 
         if not best_effort:
             return None
-        return RotationPolicy._soonest_reset(pool, allow_tier_fallback)
+        return RotationPolicy._best_effort_recovery(pool, allow_tier_fallback)
+
+    @staticmethod
+    def _rank_available(tier: list[RotationCandidate], mode: RotationMode) -> RotationCandidate:
+        """Pick the best of the available *tier* under the rotation *mode*."""
+        if mode == SOONEST_RESET:
+            return min(tier, key=RotationPolicy._soonest_renewal_key)
+        return max(tier, key=lambda c: (c.headroom(), -c.priority, c.credential_id))
+
+    @staticmethod
+    def _soonest_renewal_key(c: RotationCandidate) -> tuple[int, int, str]:
+        """Sort key for ``soonest_reset``: soonest renewal reset wins.
+
+        Accounts with a known renewal (weekly) reset rank ahead of those
+        without (so the freshly-added/unprobed account isn't picked over one
+        with a measured, imminent reset); among known resets the soonest wins.
+        Ties break by lower configured priority, then id.
+        """
+        reset = c.renewal_reset_at()
+        rank = reset if reset is not None else _UNKNOWN_EPOCH_SENTINEL
+        return (rank, c.priority, c.credential_id)
 
     @staticmethod
     def _preferred_tier(
@@ -103,11 +146,14 @@ class RotationPolicy:
         return [c for c in available if c.kind != SUBSCRIPTION]
 
     @staticmethod
-    def _soonest_reset(pool: list[RotationCandidate], allow_tier_fallback: bool) -> str:
-        """Best-effort pick when nothing is available: soonest reset.
+    def _best_effort_recovery(pool: list[RotationCandidate], allow_tier_fallback: bool) -> str:
+        """Best-effort pick when nothing is available: soonest recovery.
 
-        Honours the tier preference (subscriptions first) and falls back to
-        lowest priority when no reset times are known.
+        Distinct from the ``soonest_reset`` rotation mode (which ranks
+        *available* accounts by their weekly renewal): this ranks *limited*
+        accounts by when they become routable again (:meth:`recovery_eta`), so
+        a launch is never blocked. Honours the tier preference (subscriptions
+        first) and falls back to lowest priority when no reset times are known.
         """
         subscriptions = [c for c in pool if c.kind == SUBSCRIPTION]
         # Prefer the subscription tier; widen to the whole pool only when no
@@ -127,6 +173,10 @@ class RotationPolicy:
             # would mis-rank it as recovering first.
             reset = c.limit_state.recovery_eta()
             # Unknown resets sort last (a huge sentinel), then by priority/id.
-            return (reset if reset is not None else 1 << 62, c.priority, c.credential_id)
+            return (
+                reset if reset is not None else _UNKNOWN_EPOCH_SENTINEL,
+                c.priority,
+                c.credential_id,
+            )
 
         return min(considered, key=sort_key).credential_id

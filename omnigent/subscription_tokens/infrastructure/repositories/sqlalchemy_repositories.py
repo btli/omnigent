@@ -44,6 +44,7 @@ from omnigent.subscription_tokens.domain.value_objects.enums import (
     DetectionSource,
     FailoverMode,
     Family,
+    RotationMode,
 )
 from omnigent.subscription_tokens.domain.value_objects.limit_state import LimitState
 from omnigent.subscription_tokens.domain.value_objects.usage_window import UsageWindow
@@ -325,6 +326,7 @@ class SqlCredentialPoolRepository(CredentialPoolRepository):
                 family=cast("Family", pool_row.family),
                 failover_mode=cast("FailoverMode", pool_row.failover_mode),
                 members=members,
+                rotation_mode=cast("RotationMode", pool_row.rotation_mode),
             )
 
     def find_account(self, credential_id: str) -> ProviderAccount | None:

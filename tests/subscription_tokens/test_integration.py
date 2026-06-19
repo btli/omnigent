@@ -37,6 +37,26 @@ def _bound_family(session_maker: ManagedSessionMaker, session_id: str) -> str | 
         return row.family if row is not None else None
 
 
+def test_resolve_db_uri_prefers_explicit_then_database_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The facade shares the server/host DB: explicit override, else DATABASE_URL.
+
+    Both are normalised to the psycopg3 dialect so the resolved string matches
+    the server's engine cache key (one shared engine, one shared database).
+    """
+    monkeypatch.setenv(integration.DATABASE_URI_ENV, "postgresql://u:p@h:5432/explicit")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@h:5432/fallback")
+    # Explicit OMNIGENT_DATABASE_URI wins, normalised to +psycopg.
+    assert integration._resolve_db_uri() == "postgresql+psycopg://u:p@h:5432/explicit"
+    # Without it, DATABASE_URL (what the server entrypoint sets) is used.
+    monkeypatch.delenv(integration.DATABASE_URI_ENV, raising=False)
+    assert integration._resolve_db_uri() == "postgresql+psycopg://u:p@h:5432/fallback"
+    # Neither → the machine-global sqlite chat.db (laptop/dev path).
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    assert integration._resolve_db_uri().startswith("sqlite:///")
+
+
 @pytest.fixture
 def active_facade(session_maker: ManagedSessionMaker) -> Iterator[ManagedSessionMaker]:
     """Activate the facade over a seeded two-subscription claude pool."""
@@ -279,6 +299,8 @@ def test_attribute_cost_and_status_snapshot(active_facade: ManagedSessionMaker) 
     integration.attribute_cost("sess-1", cost_usd=-5.0, input_tokens=-3, output_tokens=0)
 
     snapshot = integration.status_snapshot()
+    # The pool surfaces its rotation mode (default here) for operator visibility.
+    assert snapshot[0]["rotation_mode"] == "max_headroom"
     accounts = {a["name"]: a for a in _accounts(snapshot)}
     assert accounts["c1"]["cost_today_usd"] == pytest.approx(1.25)  # unchanged by no-ops
     # Never observed (no probe/limit) → unknown, not available.

@@ -61,6 +61,7 @@ def sync_pools(session_maker: ManagedSessionMaker, pools: dict[str, CredentialPo
                 "name": pool.name,
                 "family": pool.family,
                 "failover_mode": pool.failover_mode,
+                "rotation_mode": pool.rotation_mode,
                 "updated_at": now,
             }
             atomic_upsert(

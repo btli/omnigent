@@ -9,6 +9,7 @@ from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
     OPENAI_FAMILY,
     PI_SURFACE,
+    _config_path,
     default_provider_for_harness,
     harness_family,
     load_providers,
@@ -18,6 +19,21 @@ from omnigent.onboarding.provider_config import (
     surface_default_model,
     surface_default_provider,
 )
+
+
+def test_config_path_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``OMNIGENT_CONFIG_HOME`` (dir) wins, then ``OMNIGENT_CONFIG`` (file)."""
+    # CONFIG_HOME (a directory) takes precedence — test isolation depends on it.
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", "/home/dir")
+    monkeypatch.setenv("OMNIGENT_CONFIG", "/etc/omnigent/config.yaml")
+    assert _config_path() == "/home/dir/config.yaml"
+    # With no CONFIG_HOME, the explicit server config FILE path is honoured so a
+    # hosted deploy can point both the server and this loader at one file.
+    monkeypatch.delenv("OMNIGENT_CONFIG_HOME", raising=False)
+    assert _config_path() == "/etc/omnigent/config.yaml"
+    # Neither set → the laptop default under ~/.omnigent.
+    monkeypatch.delenv("OMNIGENT_CONFIG", raising=False)
+    assert _config_path().endswith("/.omnigent/config.yaml")
 
 
 @pytest.mark.parametrize(

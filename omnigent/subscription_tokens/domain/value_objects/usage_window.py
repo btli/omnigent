@@ -13,6 +13,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+#: Labels of "renewal" windows — the long-horizon allowance that refreshes on
+#: a fixed cadence (Anthropic's weekly ``"7d"``). The ``soonest_reset`` rotation
+#: mode ranks accounts by when this window next resets, so unused subscription
+#: capacity is spent before it lapses. Labels are free-form (see
+#: :attr:`UsageWindow.label`), so this is a small known set, widened as other
+#: families expose comparable windows.
+RENEWAL_WINDOW_LABELS: frozenset[str] = frozenset({"7d"})
+
 
 @dataclass(frozen=True)
 class UsageWindow:

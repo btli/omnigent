@@ -87,10 +87,23 @@ def deactivate() -> None:
 
 
 def _resolve_db_uri() -> str:
-    """Resolve the omnigent DB URI (env override, else machine-global)."""
-    override = os.environ.get(DATABASE_URI_ENV)
+    """Resolve the omnigent DB URI — the *same* DB the server/host use.
+
+    Order: ``OMNIGENT_DATABASE_URI`` (explicit facade override) →
+    ``DATABASE_URL`` (what the server entrypoint and ``omnigent run`` read) →
+    the machine-global ``chat.db``. The first two are normalised to the
+    ``postgresql+psycopg://`` dialect SQLAlchemy needs, matching how the server
+    builds its engine. Whichever process resolves first wins the engine cache
+    key, so when the facade runs in-process with the server (the lifespan path)
+    they share one engine; a standalone process opens its own engine to the
+    *same* database (migrations are idempotent). Either way binds/limit-state
+    land in the one shared database.
+    """
+    from omnigent.db.utils import normalize_database_url
+
+    override = os.environ.get(DATABASE_URI_ENV) or os.environ.get("DATABASE_URL")
     if override:
-        return override
+        return normalize_database_url(override)
     from omnigent.host.local_server import _local_data_dir
 
     return f"sqlite:///{_local_data_dir() / 'chat.db'}"
@@ -586,10 +599,13 @@ def status_snapshot() -> list[dict[str, object]]:
 
     Shape (one entry per pool)::
 
-        {"name", "family", "failover_mode",
+        {"name", "family", "failover_mode", "rotation_mode",
          "accounts": [{"id", "name", "kind", "priority", "is_active",
                        "limit_status", "limited_until", "windows",
                        "earliest_reset_at", "cost_today_usd"}]}
+
+    ``rotation_mode`` + each account's ``earliest_reset_at`` let an operator
+    verify ``soonest_reset`` ordering at a glance.
 
     :returns: A list of pool dicts, or ``[]`` when no pool is configured.
     """
@@ -606,6 +622,7 @@ def status_snapshot() -> list[dict[str, object]]:
                 "name": pool.name,
                 "family": pool.family,
                 "failover_mode": pool.failover_mode,
+                "rotation_mode": pool.rotation_mode,
                 "accounts": [
                     _account_status(m, states.get(m.id), costs.get(m.id, 0.0), now)
                     for m in pool.members

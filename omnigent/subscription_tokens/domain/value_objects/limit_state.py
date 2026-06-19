@@ -23,7 +23,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from omnigent.subscription_tokens.domain.value_objects.enums import DetectionSource, LimitStatus
-from omnigent.subscription_tokens.domain.value_objects.usage_window import UsageWindow
+from omnigent.subscription_tokens.domain.value_objects.usage_window import (
+    RENEWAL_WINDOW_LABELS,
+    UsageWindow,
+)
 
 
 @dataclass(frozen=True)
@@ -90,6 +93,25 @@ class LimitState:
         if self.limited_until is not None:
             return self.limited_until
         resets = [w.reset_at for w in self.windows if w.reset_at is not None]
+        return min(resets) if resets else None
+
+    def renewal_reset_at(self) -> int | None:
+        """Return the soonest reset of a renewal (weekly) window, or ``None``.
+
+        The ``soonest_reset`` rotation mode ranks accounts by this so the
+        subscription whose weekly allowance lapses first is spent first. Looks
+        only at windows whose label is a known renewal label (see
+        :data:`RENEWAL_WINDOW_LABELS`) — never the short rolling window — so a
+        soon-resetting ``5h`` window can't be mistaken for the weekly one.
+
+        :returns: The soonest renewal-window ``reset_at``, or ``None`` when no
+            renewal window with a known reset has been observed.
+        """
+        resets = [
+            w.reset_at
+            for w in self.windows
+            if w.label in RENEWAL_WINDOW_LABELS and w.reset_at is not None
+        ]
         return min(resets) if resets else None
 
     def remaining_headroom_pct(self) -> int | None:

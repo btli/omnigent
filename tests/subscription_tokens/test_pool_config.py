@@ -95,6 +95,15 @@ def test_failover_defaults_to_notify() -> None:
     assert pools["codex-pool"].failover_mode == "notify"
 
 
+def test_rotation_parses_and_defaults_to_max_headroom() -> None:
+    config: Any = _valid_config()
+    config["pools"]["claude-pool"]["rotation"] = "soonest_reset"
+    pools = load_pools(config)
+    assert pools["claude-pool"].rotation_mode == "soonest_reset"
+    # codex-pool omits 'rotation' → backward-compatible default.
+    assert pools["codex-pool"].rotation_mode == "max_headroom"
+
+
 def test_missing_pools_block_returns_empty() -> None:
     assert load_pools({"providers": {}}) == {}
     assert load_pools({}) == {}
@@ -129,6 +138,7 @@ def test_get_pool_for_family_and_find_account() -> None:
     [
         (lambda c: c["pools"]["claude-pool"].__setitem__("family", "bogus"), "family"),
         (lambda c: c["pools"]["claude-pool"].__setitem__("failover", "sometimes"), "failover"),
+        (lambda c: c["pools"]["claude-pool"].__setitem__("rotation", "random"), "rotation"),
         (lambda c: c["pools"]["claude-pool"].__setitem__("members", []), "non-empty list"),
         (
             lambda c: c["pools"]["claude-pool"]["members"].append(

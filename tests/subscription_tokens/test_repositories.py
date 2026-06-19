@@ -25,6 +25,7 @@ def seeded(session_maker: ManagedSessionMaker) -> ManagedSessionMaker:
             "claude-pool": {
                 "family": "anthropic",
                 "failover": "auto",
+                "rotation": "soonest_reset",
                 "members": [
                     {
                         "name": "c1",
@@ -174,6 +175,7 @@ def test_pool_repository_reconstructs_pool_and_accounts(seeded: ManagedSessionMa
     assert pool is not None
     assert pool.name == "claude-pool"
     assert pool.failover_mode == "auto"
+    assert pool.rotation_mode == "soonest_reset"  # round-trips through the column
     assert [m.name for m in pool.members] == ["c1", "c2", "capi"]  # priority order
     api = next(m for m in pool.members if m.name == "capi")
     assert api.kind == "api_key"
@@ -181,6 +183,7 @@ def test_pool_repository_reconstructs_pool_and_accounts(seeded: ManagedSessionMa
 
     openai_pool = repo.find_pool_for_family("openai")
     assert openai_pool is not None and openai_pool.name == "codex-pool"
+    assert openai_pool.rotation_mode == "max_headroom"  # column default round-trips
     c1_account = repo.find_account(account_id_for("claude-pool", "c1"))
     assert c1_account is not None and c1_account.name == "c1"
     assert repo.find_account("nope") is None

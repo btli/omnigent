@@ -52,6 +52,7 @@ class PriorityCredentialSelectionPolicy(CredentialSelectionPolicy):
         chosen = RotationPolicy.select(
             candidates,
             now,
+            mode=pool.rotation_mode,
             allow_tier_fallback=True,
             best_effort=best_effort,
             exclude_credential_id=exclude_credential_id,

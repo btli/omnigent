@@ -813,6 +813,8 @@ class SqlCredentialPool(Base):
     :param name: Pool name from config, e.g. ``"claude-pool"``.
     :param family: Provider family served, ``"anthropic"`` / ``"openai"``.
     :param failover_mode: ``"notify"`` / ``"auto"`` / ``"disabled"``.
+    :param rotation_mode: How available members are ranked at selection,
+        ``"max_headroom"`` (default) / ``"soonest_reset"``.
     :param created_at: Unix epoch seconds the row was first synced.
     :param updated_at: Unix epoch seconds of the last sync.
     """
@@ -823,6 +825,9 @@ class SqlCredentialPool(Base):
     name: Mapped[str] = mapped_column(String(256), nullable=False)
     family: Mapped[str] = mapped_column(String(32), nullable=False)
     failover_mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    rotation_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default="max_headroom"
+    )
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
 

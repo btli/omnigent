@@ -12,7 +12,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from omnigent.subscription_tokens.domain.entities.provider_account import ProviderAccount
-from omnigent.subscription_tokens.domain.value_objects.enums import FailoverMode, Family
+from omnigent.subscription_tokens.domain.value_objects.enums import (
+    MAX_HEADROOM,
+    FailoverMode,
+    Family,
+    RotationMode,
+)
 from omnigent.subscription_tokens.domain.value_objects.limit_state import LimitState
 from omnigent.subscription_tokens.domain.value_objects.rotation_policy import RotationCandidate
 
@@ -26,6 +31,8 @@ class CredentialPool:
     :param family: The provider family this pool serves.
     :param failover_mode: How to react when the active account is limited.
     :param members: The pool's accounts (any order; ranked at selection).
+    :param rotation_mode: How available members are ranked at selection
+        (``max_headroom`` default, or ``soonest_reset``).
     """
 
     id: str
@@ -33,6 +40,7 @@ class CredentialPool:
     family: Family
     failover_mode: FailoverMode
     members: tuple[ProviderAccount, ...]
+    rotation_mode: RotationMode = MAX_HEADROOM
 
     def to_candidates(self, states: dict[str, LimitState]) -> list[RotationCandidate]:
         """Join active members with their limit states into candidates.

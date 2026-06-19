@@ -48,6 +48,30 @@ def test_sync_persists_oauth_token_ref(session_maker: ManagedSessionMaker) -> No
         assert acct.claude_config_dir is None
 
 
+def test_sync_persists_and_updates_rotation_mode(session_maker: ManagedSessionMaker) -> None:
+    # Default (omitted) syncs as max_headroom...
+    sync_pools(session_maker, load_pools(_config([{"name": "a", "claude_config_dir": "~/.a"}])))
+    with session_maker() as session:
+        pool = session.get(SqlCredentialPool, pool_id_for("claude-pool"))
+        assert pool is not None
+        assert pool.rotation_mode == "max_headroom"
+    # ...and a later config change to soonest_reset updates the row in place.
+    changed = {
+        "pools": {
+            "claude-pool": {
+                "family": "anthropic",
+                "rotation": "soonest_reset",
+                "members": [{"name": "a", "claude_config_dir": "~/.a"}],
+            }
+        }
+    }
+    sync_pools(session_maker, load_pools(changed))
+    with session_maker() as session:
+        pool = session.get(SqlCredentialPool, pool_id_for("claude-pool"))
+        assert pool is not None
+        assert pool.rotation_mode == "soonest_reset"
+
+
 def test_sync_is_idempotent_and_updates_fields(session_maker: ManagedSessionMaker) -> None:
     sync_pools(session_maker, load_pools(_config([{"name": "a", "claude_config_dir": "~/.a"}])))
     # Re-sync with a changed config dir → update in place, same row count.

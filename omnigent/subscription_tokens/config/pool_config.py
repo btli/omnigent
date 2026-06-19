@@ -22,13 +22,16 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.subscription_tokens.domain.entities.credential_pool import CredentialPool
 from omnigent.subscription_tokens.domain.entities.provider_account import ProviderAccount
 from omnigent.subscription_tokens.domain.value_objects.enums import (
+    MAX_HEADROOM,
     NOTIFY,
     VALID_ACCOUNT_KINDS,
     VALID_FAILOVER_MODES,
     VALID_FAMILIES,
+    VALID_ROTATION_MODES,
     AccountKind,
     FailoverMode,
     Family,
+    RotationMode,
 )
 
 POOLS_CONFIG_KEY = "pools"
@@ -82,6 +85,16 @@ def _parse_failover(raw: object, pool_name: str) -> FailoverMode:
         valid = ", ".join(VALID_FAILOVER_MODES)
         raise _err(f"pool {pool_name!r}: 'failover' must be one of {valid}; got {raw!r}.")
     return cast("FailoverMode", raw)
+
+
+def _parse_rotation(raw: object, pool_name: str) -> RotationMode:
+    """Validate and return a pool's ``rotation`` mode (default ``max_headroom``)."""
+    if raw is None:
+        return MAX_HEADROOM
+    if raw not in VALID_ROTATION_MODES:
+        valid = ", ".join(VALID_ROTATION_MODES)
+        raise _err(f"pool {pool_name!r}: 'rotation' must be one of {valid}; got {raw!r}.")
+    return cast("RotationMode", raw)
 
 
 def _parse_kind(raw: object, pool_name: str, member_name: str) -> AccountKind:
@@ -191,6 +204,7 @@ def _parse_pool(name: str, raw: object) -> CredentialPool:
     body = _require_mapping(raw, f"pool {name!r}")
     family = _parse_family(body.get("family"), name)
     failover = _parse_failover(body.get("failover"), name)
+    rotation = _parse_rotation(body.get("rotation"), name)
 
     members_raw = body.get("members")
     if not isinstance(members_raw, list) or not members_raw:
@@ -204,6 +218,7 @@ def _parse_pool(name: str, raw: object) -> CredentialPool:
         family=family,
         failover_mode=failover,
         members=members,
+        rotation_mode=rotation,
     )
 
 
