@@ -137,6 +137,13 @@ RUN test -f ./omnigent/server/static/web-ui/index.html \
 # [databricks] extra in pyproject — so add it explicitly here.
 RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} 'psycopg[binary]>=3.1,<4'
 
+# google-antigravity is the `antigravity` extra's SDK — the in-process,
+# Gemini-native harness (`harness: antigravity`) imports it lazily, so without
+# it the harness is registered but fails at launch. Not a baseline dep; bake it
+# so antigravity agents run out of the box. Installed in BOTH images (the host
+# stage adds it too) since agents run in host-spawned runners.
+RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} 'google-antigravity>=0.1,<1'
+
 # ── Node alias stage ─────────────────────────────────────
 # Pure alias so the host stage can COPY node out of a version-pinned
 # image; contributes no layers of its own.
@@ -235,6 +242,12 @@ COPY --from=builder /build /build
 # psycopg-free (it otherwise uses a local sqlite), so add the driver here. The
 # host stage has no `uv`, so install via the venv's pip (binary wheel, no build).
 RUN /opt/venv/bin/pip install --no-cache-dir 'psycopg[binary]>=3.1,<4'
+
+# google-antigravity: the `antigravity` extra's SDK for the in-process,
+# Gemini-native harness (`harness: antigravity`), which imports it lazily and
+# otherwise fails at launch. Optional extra (not baseline) — bake it so
+# antigravity agents run in host-spawned runners (mirrors the server-builder).
+RUN /opt/venv/bin/pip install --no-cache-dir 'google-antigravity>=0.1,<1'
 
 # Sandbox launchers exec commands through `bash -lc`, and Debian's
 # /etc/profile unconditionally resets PATH for login shells — the ENV
