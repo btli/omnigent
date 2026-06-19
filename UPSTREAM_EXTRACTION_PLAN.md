@@ -41,10 +41,15 @@ Carved, dependency-free (stdlib only, no infra/DB/server/UI). Verified on
 
 ## Staging the rest (draw final PR boundary with maintainer input)
 
-1. **Reactive on-429 detection** — `infrastructure/detection/reactive_output_detector.py`
-   (pure; scans agent output → `LimitDetectionResult`) + `application/ports/`
-   Protocols + `application/use_cases/track_usage_limit.py` + the minimal
-   `claude_native_forwarder` / `codex_native_forwarder` seam. Net-new, no #583
+1. **Reactive on-429 detection** — ✅ *drafted on this branch.*
+   `infrastructure/detection/reactive_output_detector.py` (pure; scans agent
+   output → `LimitDetectionResult`) + `application/ports/ports.py` (Protocols) +
+   `application/use_cases/track_usage_limit.py`, with extracted tests
+   (`test_reactive_detection.py` + `test_track_usage_limit.py`). Green: 11 added
+   tests, `ruff` + `mypy --strict` clean. **Remaining for the PR:** the
+   `claude_native_forwarder` / `codex_native_forwarder` seam that calls the
+   detector — deferred until cutting the PR, since it modifies upstream files
+   that have moved and is best adapted against current `main`. Net-new, no #583
    collision.
 2. **Proactive poller + header gateway** — `usage_endpoint_poller`,
    `composite_usage_limit_gateway`, `probes`, `detection/credentials.py` +
