@@ -228,6 +228,14 @@ RUN npm install -g --no-audit --no-fund \
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /build /build
 
+# psycopg[binary]: the multi-subscription pool feature has the host's RUNNER
+# read/write a SHARED Postgres (the server's poller writes usage-reset data
+# there; the runner reads it to rank accounts by soonest_reset and writes the
+# session→credential binding the server surfaces). The base host install is
+# psycopg-free (it otherwise uses a local sqlite), so add the driver here. The
+# host stage has no `uv`, so install via the venv's pip (binary wheel, no build).
+RUN /opt/venv/bin/pip install --no-cache-dir 'psycopg[binary]>=3.1,<4'
+
 # Sandbox launchers exec commands through `bash -lc`, and Debian's
 # /etc/profile unconditionally resets PATH for login shells — the ENV
 # PATH above would silently drop off and `omnigent` / `pip` would
