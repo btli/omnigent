@@ -1056,6 +1056,8 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         "AWS_SECRET_ACCESS_KEY": "aws-secret",
         "SOME_RANDOM_VAR": "x",
         "OMNIGENT_CLAUDE_SDK_NO_SANDBOX": "1",
+        "KUBECONFIG": "/home/alice/.kube/config",
+        "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1",
     }
 
     env = _build_runner_env(
@@ -1089,6 +1091,12 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     # must reach the runner without also forcing
     # ``OMNIGENT_RUNNER_ENV_PASSTHROUGH=OMNIGENT_CLAUDE_SDK_NO_SANDBOX``.
     assert env["OMNIGENT_CLAUDE_SDK_NO_SANDBOX"] == "1"
+    # KUBECONFIG is a filesystem path (not a secret) — kubectl, helm, k9s
+    # need it to resolve the user's cluster contexts and namespaces.
+    assert env["KUBECONFIG"] == "/home/alice/.kube/config"
+    # CLAUDE_CODE_SKIP_BEDROCK_AUTH disables AWS SigV4 auth for LiteLLM
+    # proxies — a non-secret boolean, same rationale as CLAUDE_CODE_USE_BEDROCK.
+    assert env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "1"
     # Non-harness secrets are stripped — the point of the allowlist.
     assert "DATABRICKS_TOKEN" not in env
     assert "AWS_SECRET_ACCESS_KEY" not in env
@@ -1121,6 +1129,8 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
         "OPENAI_API_KEY": "sk-o",
         "OPENAI_BASE_URL": "https://gateway.example.com/openai",
         "GEMINI_API_KEY": "g-key",
+        "AWS_BEARER_TOKEN_BEDROCK": "absk-fwd",
+        "ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock-runtime.us-east-1.amazonaws.com",
     }
 
     env = _build_runner_env(
@@ -1140,6 +1150,8 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "GEMINI_API_KEY",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "ANTHROPIC_BEDROCK_BASE_URL",
     ):
         # Pins each conventional name into the default set — dropping
         # one breaks that harness's credentials on managed sandboxes.
@@ -1802,6 +1814,31 @@ def _host(
     """
     identity = HostIdentity(host_id="host_test_connect", name="test-laptop")
     return HostProcess(identity, server_url)
+
+
+def test_build_connect_headers_adds_org_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A recorded ?o= selector rides the tunnel handshake.
+
+    The WS upgrade must name the workspace via ``X-Databricks-Org-Id`` or it
+    routes to the account. The header rides alongside the Origin sentinel,
+    independent of the bearer/managed-token branch.
+
+    :param monkeypatch: The pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import omnigent.runner._entry as entry_mod
+
+    # No managed token + no real Databricks creds: isolate the bearer
+    # branch so only the routing header is under test.
+    monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", lambda *, server_url=None: None)
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_databricks_org_id", lambda _url: "2850744067564480"
+    )
+
+    headers = _host("https://acme.databricks.com/api/2.0/omnigent")._build_connect_headers()
+
+    assert headers["X-Databricks-Org-Id"] == "2850744067564480"
 
 
 async def test_run_retries_on_login_redirect(

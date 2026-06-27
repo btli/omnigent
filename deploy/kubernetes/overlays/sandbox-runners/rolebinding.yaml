@@ -1,9 +1,9 @@
 ---
-# CROSS-NAMESPACE binding (tri-model FIX-1): this RoleBinding lives in the runner
-# namespace `omnigent-sandboxes` and grants the omnigent-sandbox-manager Role
-# (also in `omnigent-sandboxes`) to the omnigent-server SA, which lives in the
-# SEPARATE server namespace `omnigent`. A RoleBinding may reference a subject in
-# another namespace, so the server gets Pod-management rights in
+# CROSS-NAMESPACE binding: this RoleBinding lives in the runner namespace
+# `omnigent-sandboxes` and grants the omnigent-sandbox-manager Role (also in
+# `omnigent-sandboxes`) to the omnigent-server SA, which lives in the SEPARATE
+# server namespace `omnigent`. A RoleBinding may reference a subject in another
+# namespace, so the server gets runner-Pod management rights in
 # `omnigent-sandboxes` ONLY — never in its own namespace. The subject namespace
 # is set explicitly (NOT injected) so the binding is unambiguous. The runner SA
 # is deliberately absent — runner Pods need no API access.

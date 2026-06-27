@@ -4,11 +4,13 @@ import { Outlet, useParams, useSearchParams } from "@/lib/routing";
 import { useConversations } from "@/hooks/useConversations";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
+import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
+import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
-import { isMacElectronShell } from "@/lib/nativeBridge";
+import { isIOSShell, isMacElectronShell, onNativeSidebarDrag } from "@/lib/nativeBridge";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import {
   Dialog,
@@ -39,6 +41,7 @@ import {
 } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
 import { isNativeWrapper as isNativeWrapperLabel } from "@/lib/nativeCodingAgents";
+import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { useChatStore } from "@/store/chatStore";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
@@ -49,7 +52,7 @@ import { FileViewerContext } from "./FileViewerContext";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
-import { Sidebar } from "./Sidebar";
+import { isMobileViewport, Sidebar } from "./Sidebar";
 import { TitleBarServerPicker } from "./TitleBarServerPicker";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useRootSessionId, useSession } from "@/hooks/useSession";
@@ -60,8 +63,11 @@ import {
 import { TerminalsPanel } from "./TerminalsPanel";
 import { TodoPanel } from "./TodoPanel";
 import { PermissionsModal } from "@/components/PermissionsModal";
+import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
+import { Toaster } from "@/components/ui/toast";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
+import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { WorkspacePanel } from "./WorkspacePanel";
 import type { RightRailTab } from "./railTabs";
 
@@ -107,6 +113,11 @@ export function AppShell() {
   // here so it works on every chat route, regardless of where focus sits.
   useApproveHotkey();
 
+  // Lock the iOS shell to the visual viewport so the soft keyboard can't pan
+  // the whole document (which would hide the header and break the layout).
+  // No-op off the iOS shell. Scoped here so auth pages keep normal scrolling.
+  useIOSViewportLock();
+
   // Read early: the conversationId scopes the per-session workspace state
   // (rail open/width/tab/open files) used throughout this component.
   const { conversationId } = useParams<{ conversationId: string }>();
@@ -125,6 +136,27 @@ export function AppShell() {
     useResizableInlinePanel(conversationId ?? null, inlinePanelMinWidth);
   const [searchParams, setSearchParams] = useSearchParams();
   const [sidebarOpen, setSidebarOpen] = useState(initialSidebarOpen);
+  // Live open fraction (0→1) while the iOS edge-swipe drags the sidebar; null
+  // when not dragging. Drives the mobile overlay's finger-tracking transform.
+  const [sidebarDragProgress, setSidebarDragProgress] = useState<number | null>(null);
+  // The iOS shell repurposes the left-edge swipe (normally back-navigation) to
+  // drive the sidebar as an interactive drawer, streaming it over the native
+  // bridge. begin/move track the finger (mobile overlay only — the desktop
+  // width-based sidebar can't be partially slid, so it just settles); open/close
+  // are the settle decision on release. No-op outside the iOS shell.
+  useEffect(
+    () =>
+      onNativeSidebarDrag((phase, progress) => {
+        if (phase === "open" || phase === "close") {
+          setSidebarDragProgress(null);
+          setSidebarOpen(phase === "open");
+          return;
+        }
+        if (!isMobileViewport()) return;
+        setSidebarDragProgress(progress);
+      }),
+    [],
+  );
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(() =>
     conversationId ? (readSessionWorkspaceState(conversationId).selectedFilePath ?? null) : null,
   );
@@ -165,7 +197,9 @@ export function AppShell() {
   // Lifted so the Changes list order and the FileViewer prev/next order
   // share one source of truth (otherwise the "X/N" index won't match the
   // list position). Default "recent" mirrors the prior FilesPanel default.
-  const [filesPanelSort, setFilesPanelSort] = useState<ChangedSort>("recent");
+  const [filesPanelSort, setFilesPanelSort] = useState<ChangedSort>(
+    () => readFilesPanelPreferences().sort,
+  );
   const [panelInitialKey, setPanelInitialKeyState] = useState<string | null>(null);
   const [executionLogsKey, setExecutionLogsKey] = useState<string | null>(null);
   const [filesPanelOpen, setFilesPanelOpen] = useState(false);
@@ -173,6 +207,7 @@ export function AppShell() {
   // push panel of their own. On desktop these are tabs in the workspace rail;
   // on a phone they open as full-screen overlays from the session-menu FAB.
   const [subagentsPanelOpen, setSubagentsPanelOpen] = useState(false);
+  const [shellsPanelOpen, setShellsPanelOpen] = useState(false);
   const [todosPanelOpen, setTodosPanelOpen] = useState(false);
   // The right "Workspace" rail (WorkspacePanel) is open by default and
   // remembers its open/closed state per session — a brand-new session starts
@@ -295,6 +330,10 @@ export function AppShell() {
   // the server's parent-delegation path — so we hide the affordance.
   const canShare =
     !!conversationId && isKnownTopLevel && (permissionLevel === null || permissionLevel >= 3);
+  const shareDisabled = canShare && isCurrentServerLocal();
+  const shareDisabledReason = shareDisabled
+    ? "Sharing is unavailable from a local server."
+    : undefined;
   // Any viewer can fork a shared session; top-level only (the server
   // rejects forking a sub-agent). Surfaced as ForkDialogContext.canFork —
   // the per-message "Fork from here" action is the only fork entry point.
@@ -482,6 +521,7 @@ export function AppShell() {
     setExecutionLogsKey(null);
     setFilesPanelOpen(false);
     setSubagentsPanelOpen(false);
+    setShellsPanelOpen(false);
     setTodosPanelOpen(false);
     setFilesPanelShowHidden(false);
     if (!conversationId) {
@@ -601,7 +641,12 @@ export function AppShell() {
   const handleFilesFlatViewChange = useCallback((v: boolean) => {
     filesPanelScopePrefRef.current = v;
     setFilesPanelFlatView(v);
-    writeFilesPanelPreferences({ changedOnly: v });
+    writeFilesPanelPreferences({ ...readFilesPanelPreferences(), changedOnly: v });
+  }, []);
+
+  const handleFilesSortChange = useCallback((s: ChangedSort) => {
+    setFilesPanelSort(s);
+    writeFilesPanelPreferences({ ...readFilesPanelPreferences(), sort: s });
   }, []);
 
   const openFileViewer = useCallback(
@@ -670,6 +715,51 @@ export function AppShell() {
       { replace: true },
     );
   }, [setSearchParams]);
+
+  // Toggle the right (Workspace) sidebar — shared by the header's collapse
+  // button and the ⌘⌥]/Ctrl+Alt+] hotkey so they can't drift. Beyond flipping the
+  // open-state it persists the choice and keeps the deep-link URL in sync:
+  // re-add ?file= on reopen (the FileViewer diff-sync race makes an effect
+  // unsafe here), and strip file/diff/comment on collapse so the URL never
+  // advertises a panel that isn't shown.
+  const toggleRightPanel = () => {
+    const next = !rightPanelOpen;
+    if (conversationId) writeSessionWorkspaceState(conversationId, { open: next });
+    if (next) {
+      if (selectedFilePath) {
+        // Reopening lands back on the file remembered in per-session
+        // state, so re-add ?file= to keep the URL shareable — mirroring
+        // how the scope-sync effect re-adds ?view= on reopen. diff and
+        // comment are URL-only ephemerals (not remembered), so they
+        // intentionally don't rehydrate. Imperative (not an effect) to
+        // avoid the FileViewer diff-sync race documented in that effect.
+
+        setSearchParams(
+          (prev) => {
+            const params = new URLSearchParams(prev);
+            params.set("file", selectedFilePath);
+            return params;
+          },
+          { replace: true },
+        );
+      }
+    } else {
+      // Collapsing the rail hides the workspace, so strip the deep-
+      // link params that point into it (file/diff/comment) — otherwise
+      // the URL advertises a file that isn't shown and a reload would
+      // re-open the rail. (?view= is dropped by the scope-sync effect,
+      // which is gated on rightPanelOpen.)
+      clearFileViewerUrl();
+    }
+    setRightPanelOpen(next);
+  };
+
+  // ⌘⌥[ / ⌘⌥] (Ctrl+Alt on Win/Linux) toggle the left and right sidebars. Bound
+  // here where both panels' open-state lives.
+  useSidebarToggleHotkeys({
+    onToggleLeft: () => setSidebarOpen((prev) => !prev),
+    onToggleRight: toggleRightPanel,
+  });
 
   // Mobile back button: close the open file and return to the files/changes
   // list. On mobile the tab strip is hidden, so a "back" should fully drop the
@@ -762,6 +852,7 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
+    setShellsPanelOpen(false); // close mobile shells drawer
     setTodosPanelOpen(false); // close mobile tasks drawer
     setPanelInitialKey(key);
   }
@@ -772,6 +863,7 @@ export function AppShell() {
     setPanelInitialKey(null); // close terminals panel
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
+    setShellsPanelOpen(false); // close mobile shells drawer
     setTodosPanelOpen(false); // close mobile tasks drawer
     setExecutionLogsKey(key);
   }
@@ -785,6 +877,7 @@ export function AppShell() {
     setPanelInitialKey(null); // close terminals panel
     setExecutionLogsKey(null); // close execution-logs panel
     setSubagentsPanelOpen(false); // close mobile agents drawer
+    setShellsPanelOpen(false); // close mobile shells drawer
     setTodosPanelOpen(false); // close mobile tasks drawer
     setFilesPanelOpen(true);
   }
@@ -797,8 +890,23 @@ export function AppShell() {
     setPanelInitialKey(null); // close terminals panel
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
+    setShellsPanelOpen(false); // close mobile shells drawer
     setTodosPanelOpen(false); // close mobile tasks drawer
     setSubagentsPanelOpen(true);
+  }
+
+  // Mobile FAB → "Shells" opens the desktop rail's Shells tab content as a
+  // full-screen drawer. This preserves the "+ New shell" empty state on
+  // phones instead of requiring an existing shell before the entry works.
+  function openShellsPanel() {
+    setSelectedFilePath(null); // close file viewer
+    clearFileViewerUrl();
+    setPanelInitialKey(null); // close terminals panel / terminal-first view
+    setExecutionLogsKey(null); // close execution-logs panel
+    setFilesPanelOpen(false); // close files drawer
+    setSubagentsPanelOpen(false); // close mobile agents drawer
+    setTodosPanelOpen(false); // close mobile tasks drawer
+    setShellsPanelOpen(true);
   }
 
   // Mobile FAB → "Tasks" opens the todo list (the desktop rail's Tasks tab)
@@ -810,16 +918,8 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
+    setShellsPanelOpen(false); // close mobile shells drawer
     setTodosPanelOpen(true);
-  }
-
-  function openFirstTerminal() {
-    // Mobile FAB → "Terminals" routes to the first terminal so the
-    // single tap is equivalent to clicking the first row in the
-    // desktop rail's terminals card. Inventory view — the embedded
-    // REPL terminal is the pill's Terminal view, not a rail entry.
-    if (railTerminals.length === 0) return;
-    openTerminalsPanel(terminalTabKey(railTerminals[0]));
   }
 
   function openMainExecutionLog() {
@@ -945,6 +1045,7 @@ export function AppShell() {
           <div
             className="app-shell relative flex h-dvh bg-sidebar text-foreground"
             data-electron-mac={isMacElectronShell() ? "true" : undefined}
+            data-ios-native={isIOSShell() ? "true" : undefined}
           >
             {/* Frameless-window titlebar stand-in (macOS Electron only): the
           sidebar's electron top margin (see index.css) frees this strip of
@@ -957,7 +1058,11 @@ export function AppShell() {
             {isMacElectronShell() && (
               <TitleBarServerPicker threadTitle={activeSession?.title ?? activeConv?.title} />
             )}
-            <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
+            <Sidebar
+              open={sidebarOpen}
+              dragProgress={sidebarDragProgress}
+              onClose={() => setSidebarOpen(false)}
+            />
 
             {/* Content region (everything right of the sidebar): a relative
           flex row holding the chat+workspace group and the push panels
@@ -985,6 +1090,8 @@ export function AppShell() {
                   conversationId={conversationId}
                   boundAgent={boundAgent}
                   canShare={canShare}
+                  shareDisabled={shareDisabled}
+                  shareDisabledReason={shareDisabledReason}
                   onShare={() => setShareOpen(true)}
                   hasAgentInfo={hasAgentInfo}
                   onAgentInfo={() => setAgentInfoOpen(true)}
@@ -992,36 +1099,7 @@ export function AppShell() {
                   showFilesPanel={showFilesPanel}
                   hasRailContent={hasRailContent}
                   rightPanelOpen={rightPanelOpen}
-                  onToggleRightPanel={() => {
-                    const next = !rightPanelOpen;
-                    if (conversationId) writeSessionWorkspaceState(conversationId, { open: next });
-                    if (next) {
-                      // Reopening lands back on the file remembered in per-session
-                      // state, so re-add ?file= to keep the URL shareable — mirroring
-                      // how the scope-sync effect re-adds ?view= on reopen. diff and
-                      // comment are URL-only ephemerals (not remembered), so they
-                      // intentionally don't rehydrate. Imperative (not an effect) to
-                      // avoid the FileViewer diff-sync race documented in that effect.
-                      if (selectedFilePath) {
-                        setSearchParams(
-                          (prev) => {
-                            const params = new URLSearchParams(prev);
-                            params.set("file", selectedFilePath);
-                            return params;
-                          },
-                          { replace: true },
-                        );
-                      }
-                    } else {
-                      // Collapsing the rail hides the workspace, so strip the deep-
-                      // link params that point into it (file/diff/comment) — otherwise
-                      // the URL advertises a file that isn't shown and a reload would
-                      // re-open the rail. (?view= is dropped by the scope-sync effect,
-                      // which is gated on rightPanelOpen.)
-                      clearFileViewerUrl();
-                    }
-                    setRightPanelOpen(next);
-                  }}
+                  onToggleRightPanel={toggleRightPanel}
                   mobileMenu={{
                     fileViewerOpen,
                     panelOpen,
@@ -1029,8 +1107,10 @@ export function AppShell() {
                     executionLogsOpen,
                     filesPanelOpen,
                     subagentsPanelOpen,
+                    shellsPanelOpen,
                     todosPanelOpen,
                     hideTerminalsTab,
+                    showShellsTab: railTabsAvailable.terminals,
                     terminalsLength: railTerminals.length,
                     isClaudeNative,
                     todosCompleted,
@@ -1040,7 +1120,7 @@ export function AppShell() {
                     subagentsWorking,
                     agentCount,
                     onOpenFiles: openFilesPanel,
-                    onOpenFirstTerminal: openFirstTerminal,
+                    onOpenShells: openShellsPanel,
                     onOpenSubagents: openSubagentsPanel,
                     onOpenTodos: openTodosPanel,
                     onOpenMainExecutionLog: openMainExecutionLog,
@@ -1092,7 +1172,7 @@ export function AppShell() {
                       openTerminalsPanel={openTerminalsPanel}
                       permissionLevel={permissionLevel}
                       filesPanelSort={filesPanelSort}
-                      onSortChange={setFilesPanelSort}
+                      onSortChange={handleFilesSortChange}
                       filesPanelFlatView={filesPanelFlatView}
                       onFlatViewChange={handleFilesFlatViewChange}
                       filesPanelShowHidden={filesPanelShowHidden}
@@ -1136,7 +1216,7 @@ export function AppShell() {
                   showHidden={filesPanelShowHidden}
                   onShowHiddenChange={setFilesPanelShowHidden}
                   sort={filesPanelSort}
-                  onSortChange={setFilesPanelSort}
+                  onSortChange={handleFilesSortChange}
                 />
               )}
               {/* Mobile-only full-screen drawers for the rail tabs that have no
@@ -1151,6 +1231,19 @@ export function AppShell() {
                   testId="subagents-panel-drawer"
                 >
                   <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+                </MobilePanelDrawer>
+              )}
+              {conversationId && (
+                <MobilePanelDrawer
+                  open={shellsPanelOpen}
+                  title="Shells"
+                  onClose={() => setShellsPanelOpen(false)}
+                  testId="shells-panel-drawer"
+                >
+                  <InlineTerminalsSection
+                    conversationId={conversationId}
+                    onExpand={openTerminalsPanel}
+                  />
                 </MobilePanelDrawer>
               )}
               {conversationId && (
@@ -1217,10 +1310,20 @@ export function AppShell() {
                     Tools and policies configured for the active agent.
                   </DialogDescription>
                 </DialogHeader>
-                <AgentInfoContent agent={boundAgent} sessionId={conversationId} />
+                <AgentInfoContent
+                  agent={boundAgent}
+                  sessionId={conversationId}
+                  showIntelligentRouting
+                />
               </DialogContent>
             </Dialog>
           )}
+          {/* Keyboard-shortcuts reference. Self-contained (owns its open state +
+              ⌘/Ctrl+/ opener); ungated so it works on every route. */}
+          <KeyboardShortcutsDialog />
+          {/* Transient toasts (e.g. "session archived"). Mounted once here so
+              any surface can fire one via showToast(). */}
+          <Toaster />
         </ForkDialogContextProvider>
       </TerminalFirstContextProvider>
     </FileViewerContext.Provider>

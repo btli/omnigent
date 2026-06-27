@@ -1,162 +1,160 @@
-# On-demand runner Pods — kubernetes sandbox provider
+# Kubernetes sandbox runners (on-demand host Pods)
 
-This overlay turns the cluster itself into Omnigent's agent compute: instead of
-registering a long-lived external host, the server spawns a **runner Pod on
-demand** for each `host_type="managed"` session and deletes it when the session
-ends. It uses the same managed launch-token seam as the Modal and Daytona
-sandbox providers — no per-host browser login, credentials never enter the
-sandbox.
+This Kustomize overlay turns on the **`kubernetes`** managed-sandbox provider: a
+`host_type: managed` session spawns one **runner Pod** that runs `omnigent host`
+as its container entrypoint and dials back to the server over the existing
+launch-token tunnel. It layers the RBAC + config the provider needs onto the
+base server deployment.
 
-It layers on `../../base` (the server Deployment/Service/Ingress/PVC are
-unchanged) and adds only what the provider needs:
+## Launch model: entrypoint-as-host
 
-- **`serviceaccount-server.yaml`** — the `omnigent-server` ServiceAccount (in the
-  server namespace `omnigent`); the deployment patch runs the server as it.
-- **`namespace-sandboxes.yaml` / `serviceaccount-runner.yaml` /
-  `runner-credentials.yaml` / `role.yaml` / `rolebinding.yaml`** — the dedicated
-  runner namespace `omnigent-sandboxes` and everything that lives in it: a
-  deliberately powerless `omnigent-runner` ServiceAccount for the runner Pods,
-  the `omnigent-creds` harness Secret, a namespaced Role granting exactly what
-  the launcher calls (`pods` create/get/delete, `pods/exec` get+create, `events`
-  list), and a **cross-namespace** RoleBinding granting that Role to the
-  `omnigent-server` SA over in `omnigent`. (One resource per file, per the repo's
-  manifest convention.)
-- **`sandbox-config.yaml`** — a `config.yaml` with the `sandbox: provider:
-  kubernetes` section (in `omnigent`), mounted at `/etc/omnigent` (the deployment
-  patch sets `OMNIGENT_CONFIG` to it). The server reads the managed-sandbox
-  backend from this file, not from env; it points `sandbox.kubernetes.namespace`
-  at `omnigent-sandboxes`.
-- **`deployment-patch.yaml`** — runs the server as `omnigent-server` and mounts
-  the config.
+The runner Pod's container command **is** the host. An **init container**
+prepares the workspace (`mkdir` + optional `git clone`); the **main container**
+then runs `omnigent host` under a tiny PID-1 reaper. The host re-parents runner
+processes to PID 1, which the reaper reaps; SIGTERM is forwarded for graceful
+shutdown.
 
-## Two-namespace least-blast-radius design
+The launch token is delivered through a **per-Pod Kubernetes Secret** referenced
+by the Pod's `secretKeyRef` — it never enters the Pod spec, a command line, or
+an audit log. The launcher creates that Secret at provision and deletes it
+alongside the Pod at terminate.
 
-Runner Pods run in a **separate namespace** (`omnigent-sandboxes`) from the
-server, DB and Secrets (`omnigent`). The server SA's `pods` create/get/delete +
-`pods/exec` rights are scoped — via the Role + a cross-namespace RoleBinding — to
-`omnigent-sandboxes` **only**. So even a fully compromised server can manage
-runner Pods but **cannot** exec into or delete the server/DB Pods, and **cannot**
-create a Pod that mounts the server namespace's Secrets — the blast radius of the
-exec/create grant is contained to disposable runner Pods.
+Because the host is **never started by `exec`-ing into an already-running
+container**, this provider needs **no `pods/exec` grant** — and avoids the
+exec-into-running-container class of runtime issues entirely. The server SA's
+rights are the minimum the launcher calls: create/get/delete Pods, get
+`pods/log` (start-failure diagnostics only), create/delete Secrets (the per-Pod
+token), and list events.
 
-The binding is cross-namespace because Kubernetes RBAC lets a RoleBinding in one
-namespace name a subject (the server SA) in another: `role.yaml` + the
-`rolebinding.yaml` live in `omnigent-sandboxes`, and the RoleBinding's subject is
-`ServiceAccount/omnigent-server` with `namespace: omnigent` set explicitly.
-Runner Pods reach the server's in-cluster Service across namespaces via its
-fully-qualified DNS name (`omnigent.omnigent.svc.cluster.local`).
+## Two-namespace, least-blast-radius design
 
-## Requirements
+| Namespace | Holds |
+|---|---|
+| `omnigent` | the server, its DB/PVC, its Secrets, the `omnigent-server` SA |
+| `omnigent-sandboxes` | runner Pods, the per-Pod token Secrets, the harness-creds Secret, the powerless `omnigent-runner` SA, the scoped Role + RoleBinding |
 
-- **A server image BUILT WITH the `kubernetes` extra (required — the base image
-  will NOT work).** The base server image ships no managed-sandbox extras, so the
-  provider's `_ensure_sdk()` would fail on every launch. Build the server image
-  with `docker build --build-arg OMNIGENT_EXTRAS=kubernetes`
-  (`deploy/docker/Dockerfile`) — or otherwise ensure `pip install
-  'omnigent[kubernetes]'` is in the server image — then point this overlay at it:
-  the `images:` override in `kustomization.yaml` defaults to a
-  `ghcr.io/REPLACE_ME/omnigent-server:kubernetes` placeholder you MUST replace
-  with your built image (or `kubectl apply` will pull a nonexistent image).
-- **amd64 nodes.** The prebaked host image is amd64-only (`cel-expr-python` has
-  no aarch64 wheel), so the launcher always sets `nodeSelector:
-  kubernetes.io/arch: amd64` on runner Pods. Make sure the cluster has schedulable
-  amd64 nodes.
-- **A Bun-compatible kernel on those nodes.** The agent harness runs on Bun,
-  whose JSC garbage collector segfaults at startup on some newer Linux kernels
-  (see [Troubleshooting](#troubleshooting)). If your amd64 nodes span a mix of
-  kernels, label the known-good ones and pin runner Pods to them via
-  `sandbox.kubernetes.node_selector`.
-- A Postgres database for the server (as for the base deploy).
+The server SA's Pod/Secret rights are a **namespaced Role** bound (cross-namespace)
+to `omnigent-sandboxes` only — so a compromised server can manage runner Pods but
+**cannot** delete the server/DB Pods, read the server's Secrets, or execute
+commands inside any Pod. The runner namespace enforces Pod Security `restricted`;
+the generated runner Pod is already restricted-compliant (non-root uid 1000, drop
+`ALL` caps, `seccompProfile: RuntimeDefault`, no privilege escalation).
 
-## Deploy
+## Prerequisites
 
-1. Set `DATABASE_URL` + cookie secret in `base/secret.yaml` (see the
-   [base README](../../README.md#deploy-with-an-external-database)), or use the
-   `postgres` overlay's DB and reference it here.
-2. Edit **`runner-credentials.yaml`** — real harness credentials, drop the keys
-   you don't use. (Prefer a sealed-secret / external-secrets operator in prod.)
-3. Edit **`sandbox-config.yaml`** — set `server_url` (in-cluster service DNS is
-   the default and usually correct), and optionally `image` / `node_selector`.
-4. Apply:
+1. **A server image built with the `kubernetes` extra.** The base image omits
+   it, so `_ensure_sdk()` would fail every launch. Build with
+   `--build-arg OMNIGENT_EXTRAS=kubernetes` (see `deploy/docker`) and set the
+   image in `kustomization.yaml` (`images:` → `newName`/`newTag`).
+2. **Harness credentials.** The runners read their LLM / git credentials from a
+   Secret named by `secret_name` (default `omnigent-creds`); you create it out of
+   band after applying the overlay — see step 2 of **Apply**. It is deliberately
+   not checked in; for production prefer a sealed-secret / external-secrets Secret.
 
-   ```bash
-   kubectl kustomize deploy/kubernetes/overlays/sandbox-runners/ | kubectl apply -f -
-   ```
+## Apply
 
-## How it works
+```sh
+# 1. RBAC, the runner namespace, the server sandbox config, and the Deployment patch.
+kubectl apply -k deploy/kubernetes/overlays/sandbox-runners
 
-A new chat that requests a managed sandbox triggers, server-side:
+# 2. The harness-credentials Secret the runners read — created out of band, like
+#    the OIDC secret in ../../README.md. Add only the keys your agents use.
+kubectl create secret generic omnigent-creds -n omnigent-sandboxes \
+  --from-literal=ANTHROPIC_API_KEY=sk-ant-... \
+  --from-literal=OPENAI_API_KEY=sk-...
+```
 
-1. `provision()` creates a runner Pod (`sleep infinity` under a tiny PID-1
-   reaper, `runAsUser: 1000`, writable `HOME` on an emptyDir,
-   `automountServiceAccountToken: false`, harness creds via `envFrom`,
-   `nodeSelector: kubernetes.io/arch: amd64`) in `omnigent-sandboxes` and waits
-   for it to be ready. The wait is **patient on recoverable conditions** —
-   `Pending`/`Unschedulable` (so cluster-autoscaler/Karpenter scale-up works),
-   `ImagePullBackOff`/`ErrImagePull` (so kubelet pull retries / cold pulls
-   succeed) and transient apiserver errors are polled until the deadline — and
-   **fast-fails only on truly terminal states** (Pod `Failed`, the host
-   container exiting early, or non-self-healing config errors like
-   `CreateContainerConfigError`/`InvalidImageName`). On a deadline timeout it
-   surfaces the latest scheduler/kubelet events and the current reason.
-2. The server execs `omnigent host` into the Pod (`pods/exec`); the host dials
-   back over the launch-token tunnel and registers.
-3. The agent runs in the Pod. On session end (or relaunch), `terminate()`
-   deletes the Pod.
+Step 1 creates the runner namespace, both ServiceAccounts, the scoped Role +
+RoleBinding, and the server `sandbox:` config, and patches the server Deployment
+to run as `omnigent-server` with the config mounted. Step 2 supplies the model /
+git credentials — see [Model credentials](#model-credentials-llm-keys) and
+[Git credentials](#git-credentials-private-repositories) below for which keys to
+set (and a sealed-secret / external-secrets operator for production).
 
-**Supported agent classes:** `claude-sdk` and `codex` — parity with the Modal
-and Daytona providers. Terminal / native-ui agents are out of scope (they need a
-`bwrap` sandbox an unprivileged Pod can't provide).
+> **The `secret_name` Secret must exist before the first managed launch.** Its
+> `envFrom` is non-optional, so a runner Pod whose Secret is missing never starts
+> — it stalls in `CreateContainerConfigError` rather than launching without
+> credentials. Create it (step 2) right after the `kubectl apply -k` in step 1.
 
-**In-cluster vs out-of-cluster.** Running in-cluster (the default here), the
-launcher authenticates to the API with the `omnigent-server` ServiceAccount
-token — no kubeconfig needed. To drive a cluster from a server running outside
-it, set `OMNIGENT_KUBERNETES_KUBECONFIG` to a kubeconfig path instead.
+## Server auth (managed hosts)
+
+There are two kinds of credential here: the **server-connection** auth below, and
+the **model** keys in the next section — keep them separate.
+
+A managed sandbox opens two connections back to the server. The **host tunnel** is
+authenticated by the per-launch token directly — the per-Pod token Secret, always
+works. But each session's **runner tunnel**, opened by the runner the host spawns,
+authenticates with whatever *server* credential it can resolve — **not** the host
+token. So how you front the server matters:
+
+- **Header / OIDC-proxy auth, or single-user (no-auth) servers** — the runner
+  tunnel needs no extra identity; managed hosts work out of the box. (Verified
+  end-to-end on a header-auth server: a `host_type: managed` session launched a
+  runner Pod and ran a Claude turn on an injected `CLAUDE_CODE_OAUTH_TOKEN`.)
+- **The built-in `accounts` provider (`OMNIGENT_AUTH_ENABLED=1`)** — the runner
+  tunnel additionally requires a *user* identity, which the per-launch host token
+  does not carry, so the runner dial-back is refused (`403`) even though the host
+  tunnel connects. This is a framework-level managed-host interaction shared by
+  **all** sandbox providers (Modal / Daytona / Islo / …), not specific to Kubernetes.
+
+So front the server with **header or OIDC auth** — a reverse proxy / IdP injects
+the user identity on every request, including the runner WebSocket (see
+[`deploy/README.md`](../../../README.md#auth)) — or run it single-user.
+
+## Model credentials (LLM keys)
+
+A fresh runner Pod has no model keys. They ride the **`omnigent-creds` Secret**
+(`secret_name`, projected into every Pod via `envFrom`) created in [Apply](#apply);
+the in-sandbox host forwards the standard harness credential vars to its runners.
+Which variables to inject — first-party APIs, gateways (`*_BASE_URL`),
+subscriptions — is identical to Modal; see the [variable table and per-plan
+recipes](../../../modal/README.md#llm-credentials-for-managed-sandboxes). For a
+Claude **subscription**, run `claude setup-token` on your own machine (one-time
+browser auth) and inject the long-lived token as `CLAUDE_CODE_OAUTH_TOKEN`. For
+env vars beyond the standard harness set, also set
+`OMNIGENT_RUNNER_ENV_PASSTHROUGH=NAME1,NAME2`.
+
+## Git credentials (private repositories)
+
+Inject an HTTPS token as `GIT_TOKEN` (GitLab: add `GIT_USERNAME=oauth2`) into the
+`omnigent-creds` Secret. The host image's git credential helper answers HTTPS auth
+from it for both the launch-time clone and the agent's later `fetch` / `push`,
+writing nothing to disk — use HTTPS repository URLs. Details by provider match the
+[Modal git guide](../../../modal/README.md#git-credentials-private-repositories).
+
+## Configuration (`sandbox-config.yaml`)
+
+| Key | Meaning |
+|---|---|
+| `server_url` | URL the runner Pod's host dials back to (in-cluster service DNS by default). |
+| `namespace` | Runner-Pod namespace (defaults to `omnigent-sandboxes`). |
+| `secret_name` | Harness-creds Secret projected into every Pod via `envFrom`. |
+| `service_account` | ServiceAccount the runner Pods run as (powerless). |
+| `image` | Optional runner image override (defaults to the official amd64 host image). |
+| `env` | Optional list of SERVER env-var names to inject as literal Pod env (prefer `secret_name` for credentials). |
+| `node_selector` | Optional extra node labels, merged with the mandatory `kubernetes.io/arch: amd64`. |
+| `resources` | Optional `requests` / `limits` (`cpu` / `memory`) override. |
+| `in_cluster` | Optional cluster-config source: `true` (in-cluster SA only), `false` (kubeconfig only), omit (try in-cluster, then kubeconfig). |
+| `kubeconfig` | Optional kubeconfig path for the out-of-cluster fallback (env: `OMNIGENT_KUBERNETES_KUBECONFIG`). |
 
 ## Troubleshooting
 
-- **Session hangs / host never comes online.** Find the runner Pod — runner Pods
-  live in `omnigent-sandboxes`, not the server namespace
-  (`kubectl get pods -n omnigent-sandboxes -l omnigent.ai/role=sandbox-host`, or
-  watch `kubectl get pods -n omnigent-sandboxes -w` after starting a chat) — and
-  read the host log:
-  `kubectl exec -n omnigent-sandboxes <pod> -- cat /tmp/omnigent-host.log`.
-- **`pods "..." is forbidden`** — the server isn't running as `omnigent-server`,
-  the cross-namespace Role/RoleBinding wasn't applied, or it's in the wrong
-  namespace. Confirm
-  `kubectl get rolebinding omnigent-sandbox-manager -n omnigent-sandboxes -o yaml`
-  and check its subject is `omnigent-server` in `omnigent`.
-- **Pod stuck `Pending` / `Unschedulable`** — usually no schedulable amd64 node
-  (check taints / `kubectl get nodes -L kubernetes.io/arch`); the launcher waits
-  this out until its readiness deadline (autoscalers are meant to scale up while
-  the Pod is Pending) and, on timeout, surfaces the scheduler event in the
-  session error.
-- **`ImagePullBackOff`** — the runner image isn't pullable on the amd64 nodes
-  (private registry needs an imagePullSecret; set `image` to a reachable ref).
-  The launcher retries the pull until its readiness deadline (cold pulls /
-  transient registry/cred flaps recover) before failing with the pull event.
-- **Agent auth failures inside the Pod** — a key is missing from
-  `omnigent-creds`. (Note: the reserved-name rejection of `HOME` /
-  `IS_SANDBOX` applies only to direct `sandbox.kubernetes.env` entries, which
-  the launcher sets itself; Secret keys mounted via `envFrom` are not
-  validated, so avoid putting `HOME`/`IS_SANDBOX` in `omnigent-creds`.)
-- **Agent turns crash with a Bun segfault (`embedder failed to suspend thread
-  … panic: Segmentation fault`).** The Pod provisions and the host registers
-  fine, but the first agent turn fails and the session goes to `failed` with that
-  error. This is an upstream Bun/JSC garbage-collector incompatibility with some
-  newer Linux kernels (reproduced on `7.0.0` / Ubuntu 26.04; works on `6.8` /
-  Ubuntu 24.04), and it is **independent of the seccomp profile** (confirmed with
-  both `RuntimeDefault` and `Unconfined`). Fix by pinning runner Pods to nodes on
-  a known-good kernel: label them
-  (`kubectl label node <node> omnigent.ai/runner-ready=true`) and set
-  `sandbox.kubernetes.node_selector: {omnigent.ai/runner-ready: "true"}` (see
-  `sandbox-config.yaml`). Inspect node kernels with `kubectl get nodes -o wide`.
-  Root cause: [oven-sh/bun#31832](https://github.com/oven-sh/bun/issues/31832) — a
-  JSC thread-suspension regression (since Bun 1.3.11, still open) that fires *only*
-  when Bun is started by `exec`-ing into an already-running container — exactly
-  this provider's `kubectl exec` launch path (it does not occur when Bun is the
-  Pod's main process). 1.3.14 is the latest Bun, so there is no newer version to
-  upgrade to yet. Longer-term fixes: the upstream #31832 fix (rebuild the host
-  image on the fixed Bun), or a **PID-1 launch model** (run the host as the Pod's
-  main process instead of via exec) — see
-  `docs/claude/kubernetes-sandbox-homelab-e2e.md` for the analysis and trade-offs.
+- **Launch fails fast with a clear reason.** When a Pod can't schedule, pull its
+  image, or clone its repo, the launch error carries the diagnosis — recent Pod
+  events and a tail of the failed container's log (e.g. the `git clone` error
+  from the init container). No need to catch the Pod before it's reaped.
+- **Inspect a stuck launch:** `kubectl describe pod <pod> -n omnigent-sandboxes`
+  and `kubectl logs <pod> -n omnigent-sandboxes -c host` (or `-c workspace-prep`
+  for the clone step).
+- **403 on launch:** the server SA is missing the Role — re-apply this overlay
+  and confirm the cross-namespace RoleBinding subject namespace is `omnigent`.
+- **Runner Pod stuck in `CreateContainerConfigError`:** the `secret_name` Secret
+  (`omnigent-creds`) doesn't exist in the runner namespace — its `envFrom` is
+  non-optional, so the Pod can't start. Create it (see [Apply](#apply)).
+- **Host comes online but the session hangs / 403s on the first message:** the
+  server is using the built-in `accounts` provider, which doesn't support the
+  managed runner dial-back — see [Server auth](#server-auth-managed-hosts) (use
+  header/OIDC auth, or run single-user).
+- **401 / "could not load Kubernetes configuration":** out of cluster, the server
+  can't find a kubeconfig — set `kubeconfig` (or `OMNIGENT_KUBERNETES_KUBECONFIG`),
+  or unset `in_cluster: true` if it isn't actually running in the cluster.
