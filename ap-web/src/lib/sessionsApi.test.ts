@@ -101,6 +101,7 @@ describe("createSession", () => {
       codexModelOptions: [],
       terminalPending: false,
       sandboxStatus: null,
+      activeCredential: null,
       workspace: null,
       gitBranch: null,
     });
@@ -1002,5 +1003,45 @@ describe("approve", () => {
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_abc/elicitations/elic_xyz/resolve");
     expect(JSON.parse(init.body as string)).toEqual({ action: "decline" });
+  });
+});
+
+describe("active_credential mapping", () => {
+  it("lifts active_credential (snake) to activeCredential (camel)", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "ag",
+        status: "running",
+        created_at: 1,
+        active_credential: {
+          id: "codex-pool/x1",
+          name: "claude-pro-2",
+          kind: "subscription",
+          family: "anthropic",
+          limit_status: "available",
+        },
+      }),
+    );
+
+    const session = await getSession("conv_abc");
+
+    expect(session.activeCredential).toEqual({
+      id: "codex-pool/x1",
+      name: "claude-pro-2",
+      kind: "subscription",
+      family: "anthropic",
+      limitStatus: "available",
+    });
+  });
+
+  it("maps an absent active_credential to null (single-account setups)", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ id: "conv_abc", agent_id: "ag", status: "idle", created_at: 1 }),
+    );
+
+    const session = await getSession("conv_abc");
+
+    expect(session.activeCredential).toBeNull();
   });
 });

@@ -60,8 +60,10 @@ from omnigent.server.routes.session_policies import create_session_policies_rout
 from omnigent.server.routes.sessions import (
     SessionLiveness,
     create_sessions_router,
+    running_session_ids,
     set_server_runner_router,
 )
+from omnigent.server.routes.subscription_tokens import create_subscription_tokens_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
@@ -1221,9 +1223,27 @@ def create_app(
                 otel_publisher=server_metrics_otel,
             )
         )
+
+        # Multi-subscription: sync the config `pools:` block into the
+        # DB and start the proactive usage-limit poll loop. Best-effort — a
+        # failure here must never block server startup. Inert when no pool is
+        # configured; polling only runs when OMNIGENT_SUBSCRIPTION_TOKENS_POLL_ENABLED is set.
+        from omnigent.subscription_tokens import integration as subtokens_integration
+
+        try:
+            # Pre-warm off the event loop — the first build runs migrations +
+            # config→DB sync synchronously, which must not block startup.
+            await asyncio.to_thread(subtokens_integration.is_active)
+        except Exception:
+            _logger.exception("subscription-token startup sync failed; rotation disabled")
+        subtokens_poll_task = asyncio.create_task(subtokens_integration.poll_loop())
+
         try:
             yield
         finally:
+            subtokens_poll_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await subtokens_poll_task
             metrics_publish_task.cancel()
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task
@@ -1857,6 +1877,15 @@ def create_app(
         create_policy_registry_router(auth_provider=auth_provider),
         prefix="/v1",
         tags=["policy_registry"],
+    )
+    app.include_router(
+        create_subscription_tokens_router(
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+            running_session_ids=running_session_ids,
+        ),
+        prefix="/v1",
+        tags=["subscription-tokens"],
     )
 
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───

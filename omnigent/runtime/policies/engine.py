@@ -28,6 +28,7 @@ from omnigent.spec.types import (
     StateUpdateAction,
 )
 from omnigent.stores.conversation_store import ConversationStore
+from omnigent.subscription_tokens.labels import CREDENTIAL_LABEL_NAMESPACE
 
 # Number of recent conversation items the engine fetches from
 # the conversation store and threads onto :class:`EvaluationContext`
@@ -446,10 +447,25 @@ class PolicyEngine:
             No-op on empty dict. Writes update both the hot
             cache on this engine and the persistent row in
             ``conversation_labels`` in one UPSERT transaction.
+            Keys in the engine-owned ``credential.*`` namespace
+            are dropped — those are seeded only from the session's
+            account binding (see
+            :func:`omnigent.runtime.policies.builder.build_policy_engine`),
+            so a policy can never forge them to neuter a
+            credential-governance policy mid-turn.
         """
         if not set_labels:
             return
-        filtered = self._filter_schema_valid(set_labels)
+        # Drop engine-owned credential.* keys before persisting/caching: the
+        # binding seed writes them via the store directly (not this path), so
+        # this only blocks policy-originated writes. Gating here covers both the
+        # store write and the hot-cache update below.
+        writable = {
+            key: value
+            for key, value in set_labels.items()
+            if not key.startswith(CREDENTIAL_LABEL_NAMESPACE)
+        }
+        filtered = self._filter_schema_valid(writable)
         if not filtered:
             return
         self._store.set_labels(self._conversation_id, filtered)

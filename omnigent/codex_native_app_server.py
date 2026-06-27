@@ -563,6 +563,10 @@ class CodexNativeAppServer:
         session still starts and this reason is surfaced as a web-UI
         notice rather than blocking session creation. Not a constructor
         input — defaults ``None`` until ``start``.
+    :param config_source: Subscription-aware token management override for the
+        ``CODEX_HOME`` whose ``auth.json`` / ``config.toml`` are bridged into
+        this private home — the rotation-selected account's home. ``None``
+        falls back to the ambient :func:`_codex_home_config_source_from_env`.
     :param pinned_model: Session-pinned model id written into the
         per-session ``config.toml`` at start, or ``None``. Keeps the
         forwarder's config.toml model mirror (and the cost gate's hook
@@ -584,6 +588,7 @@ class CodexNativeAppServer:
     ap_server_url: str | None = None
     ap_auth_headers: dict[str, str] | None = None
     python_executable: str | None = None
+    config_source: Path | None = None
     listen_url: str | None = None
     proc: asyncio.subprocess.Process | None = None
     stderr_task: asyncio.Task[None] | None = None
@@ -607,7 +612,7 @@ class CodexNativeAppServer:
                 self.socket_path.unlink()
         _populate_codex_home_config(
             self.codex_home,
-            _codex_home_config_source_from_env(),
+            self.config_source or _codex_home_config_source_from_env(),
         )
         # Write the MCP server config into config.toml so the app-server
         # discovers it at config load. The -c overrides may not be honored
@@ -1180,6 +1185,9 @@ def build_codex_native_server(
     python_executable: str | None = None,
     codex_path: str | None = None,
     extra_config_overrides: list[str] | None = None,
+    config_source: Path | None = None,
+    openai_api_key: str | None = None,
+    codex_access_token: str | None = None,
     bypass_sandbox: bool = False,
 ) -> CodexNativeAppServer:
     """
@@ -1205,6 +1213,17 @@ def build_codex_native_server(
     :param extra_config_overrides: Additional ``-c`` config overrides
         appended after Databricks routing overrides, e.g. MCP server
         registration for the Omnigent tool relay.
+    :param config_source: Subscription-aware token management override for the
+        ``CODEX_HOME`` whose auth/config are bridged into the private home (the
+        rotation-selected subscription account). ``None`` uses the ambient
+        default.
+    :param openai_api_key: A tier-fallback OpenAI api_key account's key. When
+        set, it is exported as ``OPENAI_API_KEY`` and codex's built-in
+        ``openai`` provider is forced (appended last so it wins over routing).
+    :param codex_access_token: A subscription account's headless Codex OAuth
+        token (``oauth_token_ref``) when it has no config dir to bridge. Exported
+        as ``CODEX_ACCESS_TOKEN`` so codex authenticates its ChatGPT
+        subscription; no provider override (it is not an api_key).
     :param bypass_sandbox: When ``True``, append config overrides that put
         the app-server's threads into the full-bypass stance
         (``approval_policy="never"`` + ``sandbox_mode="danger-full-access"``)
@@ -1243,6 +1262,18 @@ def build_codex_native_server(
         env["DATABRICKS_HOST"] = host
     if extra_config_overrides:
         config_overrides.extend(extra_config_overrides)
+    if openai_api_key:
+        # A tier-fallback OpenAI api_key account: authenticate via the key and
+        # force codex's built-in ``openai`` provider, appended last so it wins
+        # over any routing-resolved provider. The ``openai`` provider reads
+        # OPENAI_API_KEY from the env by default.
+        env["OPENAI_API_KEY"] = openai_api_key
+        config_overrides.append('model_provider="openai"')
+    elif codex_access_token:
+        # A subscription account authenticated by a headless Codex OAuth token
+        # (oauth_token_ref) rather than a bridged config dir: codex reads its
+        # ChatGPT-subscription auth from CODEX_ACCESS_TOKEN. No provider override.
+        env["CODEX_ACCESS_TOKEN"] = codex_access_token
     if bypass_sandbox:
         # Mirror the --remote TUI's --dangerously-bypass-approvals-and-sandbox
         # on the app-server threads: never prompt for approval, and run
@@ -1265,6 +1296,7 @@ def build_codex_native_server(
         ap_server_url=ap_server_url,
         ap_auth_headers=ap_auth_headers,
         python_executable=python_executable,
+        config_source=config_source,
         pinned_model=model,
     )
 
@@ -1460,7 +1492,11 @@ def _first_routable_codex_provider(
 
 
 def _resolve_subscription_launch(
-    entry: ProviderEntry, model: str | None, explicit: dict[str, object]
+    entry: ProviderEntry,
+    model: str | None,
+    explicit: dict[str, object],
+    *,
+    config_source: Path | None = None,
 ) -> NativeCodexLaunch:
     """Resolve a native-Codex launch when the Codex default is a ``subscription``.
 
@@ -1478,6 +1514,10 @@ def _resolve_subscription_launch(
     :param explicit: The explicit parsed config mapping (``providers:`` block),
         used for the fall-through search over other configured/detected
         providers.
+    :param config_source: The rotation-selected account's ``CODEX_HOME`` to
+        read ``auth.json`` from for the "is Codex logged in?" check, so the
+        decision reflects the account this launch will actually bridge in.
+        ``None`` uses the ambient default.
     :returns: The resolved :class:`NativeCodexLaunch`.
     """
     from omnigent.onboarding.ambient import codex_auth_has_credential
@@ -1490,7 +1530,7 @@ def _resolve_subscription_launch(
     # Resolve against the same CODEX_HOME the native server bridges from
     # (``_populate_codex_home_config``) so this "is Codex logged in?" check reads
     # the exact auth.json the launched Codex process will use.
-    real_codex_home = _codex_home_config_source_from_env()
+    real_codex_home = config_source or _codex_home_config_source_from_env()
     if codex_auth_has_credential(real_codex_home / "auth.json"):
         _logger.info(
             "native-codex routing: Codex CLI login (subscription provider %r; Codex is logged in)",
@@ -1510,7 +1550,9 @@ def _resolve_subscription_launch(
     return NativeCodexLaunch(config_overrides=subscription_overrides, model=model, profile=None)
 
 
-def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
+def resolve_native_codex_launch(
+    *, model: str | None, config_source: Path | None = None
+) -> NativeCodexLaunch:
     """Resolve the native Codex launch config across all offerings.
 
     Mirrors the in-process codex harness routing precedence
@@ -1537,6 +1579,10 @@ def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
 
     :param model: An explicit/session model override that wins over the
         provider's default model, or ``None``.
+    :param config_source: The subscription-aware-token-management-selected
+        account's ``CODEX_HOME``, threaded to the ``subscription`` login check
+        so it reflects the account this launch will bridge in. ``None`` uses
+        the ambient default.
     :returns: The resolved :class:`NativeCodexLaunch`.
     """
     from omnigent.onboarding.detected import (
@@ -1579,7 +1625,7 @@ def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
         )
         return NativeCodexLaunch(config_overrides=no_provider_overrides, model=model, profile=None)
     if entry.kind == SUBSCRIPTION_KIND:
-        return _resolve_subscription_launch(entry, model, explicit)
+        return _resolve_subscription_launch(entry, model, explicit, config_source=config_source)
 
     launch = _codex_provider_launch(entry, model)
     if launch is not None:
@@ -1670,7 +1716,10 @@ def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:
     return {
         key: value
         for key, value in {**app_server.env, "CODEX_HOME": str(app_server.codex_home)}.items()
-        if key in {"CODEX_HOME", "DATABRICKS_HOST", "DATABRICKS_CODEX_TOKEN"}
+        # CODEX_ACCESS_TOKEN: a subscription-token oauth account's headless Codex
+        # token — the TUI needs it too, or a fresh session hits the sign-in flow.
+        # (OPENAI_API_KEY rides the OPENAI_ prefix below.)
+        if key in {"CODEX_HOME", "CODEX_ACCESS_TOKEN", "DATABRICKS_HOST", "DATABRICKS_CODEX_TOKEN"}
         or key.startswith(("OPENAI_", "HTTP_", "HTTPS_", "NO_PROXY", "ALL_PROXY"))
     }
 

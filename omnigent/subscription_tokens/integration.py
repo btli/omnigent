@@ -1,0 +1,731 @@
+"""Integration facade onto subscription-aware token management.
+
+The existing launch / detection / cost / server code calls a handful of
+small, **always-safe** functions here instead of touching the subscription-token
+internals directly. Every function:
+
+* is a no-op when no ``pools:`` block is configured (backward compatible);
+* never raises — any error is logged and swallowed so multi-subscription
+  problems can never break a launch, a turn, or the server;
+* lazily builds a :class:`SubscriptionTokenContainer` over the machine-global omnigent
+  DB (the same ``chat.db`` the server and ``omnigent run`` share), or uses
+  the container the server explicitly activates at startup.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import threading
+from collections.abc import Collection, Sequence
+from dataclasses import dataclass, replace
+from pathlib import Path
+
+from sqlalchemy import select
+
+from omnigent.db.utils import now_epoch, utc_day
+from omnigent.subscription_tokens.container import SubscriptionTokenContainer, build_container
+from omnigent.subscription_tokens.domain.entities.credential_pool import CredentialPool
+from omnigent.subscription_tokens.domain.entities.provider_account import ProviderAccount
+from omnigent.subscription_tokens.domain.value_objects.enums import Family
+from omnigent.subscription_tokens.domain.value_objects.limit_state import (
+    LimitDetectionResult,
+    LimitState,
+)
+from omnigent.subscription_tokens.infrastructure.detection.reactive_output_detector import (
+    ReactiveOutputDetector,
+    message_text,
+)
+from omnigent.subscription_tokens.labels import to_credential_labels
+
+logger = logging.getLogger(__name__)
+
+DATABASE_URI_ENV = "OMNIGENT_DATABASE_URI"
+
+# Auto-recovery cooldown for a limit with no known reset time, so an account
+# is never permanently locked out when polling is disabled. Family-specific:
+# Anthropic's subscription limit is its rolling 5h window; OpenAI/Codex limits
+# recover much faster, so a shorter default avoids over-benching the account.
+_DEFAULT_LIMIT_COOLDOWN_S = 5 * 3600
+_COOLDOWN_BY_FAMILY: dict[Family, int] = {"anthropic": 5 * 3600, "openai": 60 * 60}
+
+
+def _cooldown_for(family: Family) -> int:
+    """Return the auto-recovery cooldown (seconds) for *family*."""
+    return _COOLDOWN_BY_FAMILY.get(family, _DEFAULT_LIMIT_COOLDOWN_S)
+
+
+# Server-activated container (set by the lifespan). When None, the lazy
+# machine-global path is used instead.
+_container: SubscriptionTokenContainer | None = None
+_pools: dict[str, CredentialPool] = {}
+_lazy_attempted = False
+# Guards lazy init against concurrent first-callers (the reactive hook may
+# run in a worker thread via asyncio.to_thread; multiple session forwarders
+# can race the first build).
+_init_lock = threading.Lock()
+
+
+def activate(container: SubscriptionTokenContainer, pools: dict[str, CredentialPool]) -> None:
+    """Install the server-built container + parsed pools as the active pair."""
+    global _container, _pools
+    # Assign pools BEFORE the container so a concurrent reader never observes
+    # a set container with empty pools (which _ensure_container treats as
+    # inactive) — it sees either the old pair or the fully-new pair.
+    _pools = pools
+    _container = container
+    logger.info("subscription-token activated with %d pool(s)", len(pools))
+
+
+def deactivate() -> None:
+    """Clear the active container (for tests / shutdown)."""
+    global _container, _pools, _lazy_attempted
+    _container = None
+    _pools = {}
+    _lazy_attempted = False
+
+
+def _resolve_db_uri() -> str:
+    """Resolve the omnigent DB URI — the *same* DB the server/host use.
+
+    Order: ``OMNIGENT_DATABASE_URI`` (explicit facade override) →
+    ``DATABASE_URL`` (what the server entrypoint and ``omnigent run`` read) →
+    the machine-global ``chat.db``. The first two are normalised to the
+    ``postgresql+psycopg://`` dialect SQLAlchemy needs, matching how the server
+    builds its engine. Whichever process resolves first wins the engine cache
+    key, so when the facade runs in-process with the server (the lifespan path)
+    they share one engine; a standalone process opens its own engine to the
+    *same* database (migrations are idempotent). Either way binds/limit-state
+    land in the one shared database.
+    """
+    from omnigent.db.utils import normalize_database_url
+
+    override = os.environ.get(DATABASE_URI_ENV) or os.environ.get("DATABASE_URL")
+    if override:
+        return normalize_database_url(override)
+    from omnigent.host.local_server import _local_data_dir
+
+    return f"sqlite:///{_local_data_dir() / 'chat.db'}"
+
+
+def _ensure_container() -> SubscriptionTokenContainer | None:
+    """Return the active container, lazily building one if needed.
+
+    The lazy build is attempted at most once per process; failures (no DB,
+    no pools) leave the facade inert.
+    """
+    global _container, _pools, _lazy_attempted
+    if _container is not None:
+        return _container if _pools else None
+    if _lazy_attempted:
+        return None
+    # Double-checked locking: only one thread runs the (heavyweight, migration-
+    # running) build; others wait and see the result.
+    with _init_lock:
+        if _container is not None:
+            return _container if _pools else None
+        if _lazy_attempted:
+            return None
+        _lazy_attempted = True
+        try:
+            from omnigent.db.utils import get_or_create_engine, make_managed_session_maker
+            from omnigent.onboarding.provider_config import load_config
+            from omnigent.subscription_tokens.config.pool_config import load_pools
+            from omnigent.subscription_tokens.config.pool_config_syncer import sync_pools
+
+            pools = load_pools(load_config())
+            if not pools:
+                return None
+            engine = get_or_create_engine(_resolve_db_uri())
+            session_maker = make_managed_session_maker(engine)
+            sync_pools(session_maker, pools)
+            built = build_container(
+                session_maker,
+                immediate_session_maker=make_managed_session_maker(engine, immediate=True),
+            )
+            # Publish pools before the container so a concurrent reader never
+            # observes a set container with empty pools (treated as inactive).
+            _pools = pools
+            _container = built
+            logger.info("subscription-token lazily initialised with %d pool(s)", len(pools))
+            return _container
+        except Exception:
+            logger.exception(
+                "subscription-token lazy initialisation failed; multi-subscription disabled"
+            )
+            return None
+
+
+def is_active() -> bool:
+    """Whether multi-subscription routing is configured and available."""
+    return _ensure_container() is not None
+
+
+_CONFIG_DIR_ENV = {"anthropic": "CLAUDE_CONFIG_DIR", "openai": "CODEX_HOME"}
+_API_KEY_ENV = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
+# Headless OAuth token for a subscription without an isolated config dir
+# (``claude setup-token`` / Codex access token).
+_OAUTH_TOKEN_ENV = {"anthropic": "CLAUDE_CODE_OAUTH_TOKEN", "openai": "CODEX_ACCESS_TOKEN"}
+
+
+def select_launch_env_for_family(
+    family: Family, *, session_id: str | None = None
+) -> dict[str, str]:
+    """Select an account for *family* and return the env to launch it with.
+
+    For a subscription account this is its isolated config dir
+    (``CLAUDE_CONFIG_DIR`` / ``CODEX_HOME``), or — when the subscription
+    authenticates by a headless OAuth token (``oauth_token_ref``) instead of a
+    dir — that token (``CLAUDE_CODE_OAUTH_TOKEN`` / ``CODEX_ACCESS_TOKEN``); for
+    a tier-fallback api_key account it is the resolved key (``ANTHROPIC_API_KEY``
+    / ``OPENAI_API_KEY``). Binds the session to the chosen account when
+    *session_id* is given (so reactive failover and cost attribution can
+    find it).
+
+    :returns: Env vars to merge into the launched process, or ``{}`` when
+        no pool is configured or on any error.
+    """
+    container = _ensure_container()
+    if container is None:
+        return {}
+    try:
+        account = container.select_credential.execute(family, now_epoch()).account
+        if account is None:
+            return {}
+        env: dict[str, str] = {}
+        if account.is_subscription:
+            from omnigent.subscription_tokens.infrastructure.detection.credentials import (
+                resolve_account_oauth_token,
+            )
+
+            config_dir = account.config_dir()
+            if config_dir:
+                env = {_CONFIG_DIR_ENV[family]: os.path.expanduser(config_dir)}
+            else:
+                token = resolve_account_oauth_token(account)
+                if token:
+                    env = {_OAUTH_TOKEN_ENV[family]: token}
+        else:
+            from omnigent.subscription_tokens.infrastructure.detection.credentials import (
+                resolve_account_api_key,
+            )
+
+            key = resolve_account_api_key(account)
+            if key:
+                env = {_API_KEY_ENV[family]: key}
+        # Bind whenever the chosen account is the one the process will actually
+        # use: a config dir / resolved api_key / resolved oauth token all set
+        # `env`; a subscription with NEITHER a dir nor a token ref is a
+        # default-login account (the ambient login IS this account). A
+        # subscription whose dir or oauth_token_ref was set but did NOT resolve
+        # is not the running account, so it must not bind (else the process
+        # falls back to ambient creds and attributing this account mis-routes
+        # failover/cost).
+        default_login_sub = (
+            account.is_subscription and not account.config_dir() and not account.oauth_token_ref
+        )
+        if session_id and (env or default_login_sub):
+            container.registry.bind(session_id, account.id, family)
+        logger.info(
+            "subscription-token: session=%s %s launch on account %r (%s)",
+            session_id or "-",
+            family,
+            account.name,
+            account.kind,
+        )
+        return env
+    except Exception:
+        logger.exception("subscription-token account selection failed for family %s", family)
+        return {}
+
+
+@dataclass(frozen=True)
+class CodexLaunchSelection:
+    """How the Codex launch path should authenticate the selected account.
+
+    Codex isolates every session in a *private* ``CODEX_HOME`` and bridges
+    ``auth.json`` / ``config.toml`` in from a source home, so — unlike Claude's
+    flat ``CLAUDE_CONFIG_DIR`` override — the selected account is surfaced as a
+    config *source* (subscription) or an ``OPENAI_API_KEY`` (tier-fallback key),
+    which the codex launch path applies to the private home rather than merging
+    blindly into the process env.
+
+    :param config_source: A subscription account's ``CODEX_HOME`` to bridge
+        auth/config from, or ``None`` (a dir-less subscription / api_key /
+        inactive — bridge from the ambient default).
+    :param api_key: A tier-fallback account's ``OPENAI_API_KEY``, or ``None``.
+    :param access_token: A subscription account's headless Codex OAuth token
+        (``oauth_token_ref``), exported as ``CODEX_ACCESS_TOKEN`` when the
+        subscription has no config dir to bridge; ``None`` otherwise.
+    """
+
+    config_source: str | None = None
+    api_key: str | None = None
+    access_token: str | None = None
+
+    @property
+    def config_source_path(self) -> Path | None:
+        """:attr:`config_source` as a :class:`Path` (the launch path's type)."""
+        return Path(self.config_source) if self.config_source else None
+
+
+def select_codex_launch(session_id: str | None = None) -> CodexLaunchSelection:
+    """Select an OpenAI account and report how to launch Codex as it.
+
+    The OpenAI analogue of :func:`select_launch_env_for_family` for the native
+    Codex launch path, which needs config-source / api-key semantics rather
+    than a flat env dict (see :class:`CodexLaunchSelection`). Binds the session
+    to the chosen account so reactive failover and cost attribution can find
+    it. Always safe: returns an empty selection when no pool is configured or
+    on any error.
+    """
+    container = _ensure_container()
+    if container is None:
+        return CodexLaunchSelection()
+    try:
+        account = container.select_credential.execute("openai", now_epoch()).account
+        if account is None:
+            return CodexLaunchSelection()
+        config_source: str | None = None
+        api_key: str | None = None
+        access_token: str | None = None
+        if account.is_subscription:
+            from omnigent.subscription_tokens.infrastructure.detection.credentials import (
+                resolve_account_oauth_token,
+            )
+
+            config_dir = account.config_dir()
+            if config_dir:
+                config_source = os.path.expanduser(config_dir)
+            else:
+                access_token = resolve_account_oauth_token(account)
+        else:
+            from omnigent.subscription_tokens.infrastructure.detection.credentials import (
+                resolve_account_api_key,
+            )
+
+            api_key = resolve_account_api_key(account)
+        # Bind when the chosen account is the one the process will actually use:
+        # a bridged config source / resolved access token / resolved api_key all
+        # count; a subscription with neither a dir nor a token ref is a
+        # default-login codex account. A subscription whose dir/oauth_token_ref
+        # was set but did not resolve is not the running account → don't bind.
+        applied = bool(config_source or access_token or api_key)
+        default_login_sub = (
+            account.is_subscription and not account.config_dir() and not account.oauth_token_ref
+        )
+        if session_id and (applied or default_login_sub):
+            container.registry.bind(session_id, account.id, "openai")
+        logger.info(
+            "subscription-token: session=%s codex launch on account %r (%s)",
+            session_id or "-",
+            account.name,
+            account.kind,
+        )
+        return CodexLaunchSelection(
+            config_source=config_source, api_key=api_key, access_token=access_token
+        )
+    except Exception:
+        logger.exception("subscription-token codex selection failed")
+        return CodexLaunchSelection()
+
+
+def transfer_session_binding(old_session_id: str, new_session_id: str, *, family: Family) -> None:
+    """Copy *old_session_id*'s account binding onto *new_session_id*.
+
+    The launch binds the selected account to the launch session id, but the
+    native Codex forwarder reuses that one account across session ids that
+    change underneath it: a native ``/clear`` rotates the parent session, and
+    each sub-agent runs in its own child session. The binding is keyed by
+    session id, so without copying it those rotated / child sessions resolve no
+    credential and reactive failover + cost attribution silently stop. Copying
+    keeps the one launched account resolvable across the whole topology.
+
+    No-op when inactive or *old_session_id* has no binding (so a copy never
+    invents a binding the launch did not make).
+    """
+    container = _ensure_container()
+    if container is None:
+        return
+    try:
+        credential_id = container.registry.active_credential(old_session_id)
+        if credential_id:
+            container.registry.bind(new_session_id, credential_id, family)
+    except Exception:
+        logger.exception("subscription-token session-binding transfer failed")
+
+
+def active_credential_for_session(session_id: str) -> dict[str, object] | None:
+    """Return the account *session_id* is bound to, for display.
+
+    Resolves the binding made at launch to its pool member plus current
+    limit state::
+
+        {"id", "name", "kind", "family", "limit_status"}
+
+    Returns ``None`` when no pool is configured, the session has no binding,
+    or the bound credential is no longer a known pool member. Always safe.
+    """
+    container = _ensure_container()
+    if container is None:
+        return None
+    try:
+        credential_id = container.registry.active_credential(session_id)
+        if not credential_id:
+            return None
+        member, pool = _find_member(credential_id)
+        if member is None or pool is None:
+            return None
+        state = container.state_repo.find_many([credential_id]).get(credential_id)
+        return {
+            "id": member.id,
+            "name": member.name,
+            "kind": member.kind,
+            "family": pool.family,
+            "limit_status": state.to_status(now_epoch()) if state else "unknown",
+        }
+    except Exception:
+        logger.exception("subscription-token active-credential lookup failed")
+        return None
+
+
+def credential_labels_for_session(session_id: str) -> dict[str, str]:
+    """Project the session's bound account into engine label writes.
+
+    Drives the policy-engine seed step
+    (:func:`omnigent.runtime.policies.builder.build_policy_engine`), which calls
+    this on every build — so it resolves the binding directly (registry + pool
+    member) and skips the limit-state read :func:`active_credential_for_session`
+    does for the UI chip: the labels need only ``{credential.kind,
+    credential.family, credential.account}`` (see
+    :mod:`omnigent.subscription_tokens.labels`). Always safe — returns ``{}``
+    when no pool is configured, the session has no binding, the bound credential
+    is no longer a pool member, or on any error. Resolve with the
+    session/spawn-tree **root** id (the binding's key) so a sub-agent inherits
+    its session's credential.
+    """
+    container = _ensure_container()
+    if container is None:
+        return {}
+    try:
+        credential_id = container.registry.active_credential(session_id)
+        if not credential_id:
+            return {}
+        member, pool = _find_member(credential_id)
+        if member is None or pool is None:
+            return {}
+        return to_credential_labels({"id": member.id, "kind": member.kind, "family": pool.family})
+    except Exception:
+        logger.exception("subscription-token credential-labels lookup failed")
+        return {}
+
+
+def sessions_for_credentials(
+    credential_ids: Sequence[str], *, only_session_ids: Collection[str] | None = None
+) -> dict[str, list[str]]:
+    """Map each of *credential_ids* to the sessions bound to it (operator view).
+
+    Reverse of :func:`active_credential_for_session`. Pass *only_session_ids*
+    (the caller's live-session set) to restrict the result to currently-running
+    sessions — the filter runs in SQL, so a long-running session is never hidden
+    behind newer dead bindings. Returns ``{}`` when no pool is configured or on
+    any error (facade-safe).
+    """
+    container = _ensure_container()
+    if container is None:
+        return {}
+    try:
+        return container.registry.sessions_for_credentials(
+            credential_ids, only_session_ids=only_session_ids
+        )
+    except Exception:
+        logger.exception("subscription-token sessions-for-credentials lookup failed")
+        return {}
+
+
+def _find_member(
+    credential_id: str,
+) -> tuple[ProviderAccount | None, CredentialPool | None]:
+    """Resolve *credential_id* to its ``(member, pool)`` in the active pools.
+
+    :returns: ``(None, None)`` when the id matches no configured member.
+    """
+    for pool in _pools.values():
+        for member in pool.members:
+            if member.id == credential_id:
+                return member, pool
+    return None, None
+
+
+def extract_message_text(data: object) -> str:
+    """Extract a transcript message item's human-readable text (facade).
+
+    Lets the forwarder stay on this integration surface instead of reaching
+    into ``infrastructure.detection`` to pull the text it then feeds to
+    :func:`record_reactive_text`.
+    """
+    return message_text(data)
+
+
+def record_reactive_text(text: str, *, family: Family, session_id: str) -> None:
+    """Scan agent *text* for a usage-limit signal and run track + failover.
+
+    Called per forwarded transcript item, so it parses **first** (a cheap
+    regex) and only touches the container / DB on a positive match — when
+    no pool is configured or the text shows no limit, this is regex-only.
+    """
+    if not session_id:
+        return
+    try:
+        parsed = ReactiveOutputDetector.parse(text, family=family)
+        if not parsed.is_limited:
+            return
+        container = _ensure_container()
+        if container is None:
+            return
+        credential_id = container.registry.active_credential(session_id)
+        if not credential_id:
+            return
+        detection = ReactiveOutputDetector.to_detection(credential_id, parsed, now_epoch())
+        if detection is None:
+            return
+        _track_and_failover(container, detection, session_id=session_id, family=family)
+    except Exception:
+        logger.exception("subscription-token reactive detection failed")
+
+
+def _with_recovery(detection: LimitDetectionResult, cooldown_s: int) -> LimitDetectionResult:
+    """Ensure a limited detection has a recovery time so it auto-recovers.
+
+    A reactive limit often carries no reset (a 429 with no headers, or
+    "usage limit reached" text without the header lines). Without a
+    ``limited_until`` the account would stay limited until the poller probes
+    it or it is manually cleared — a permanent lockout when polling is off.
+
+    :param cooldown_s: Family-specific fallback cooldown to apply.
+    """
+    if not detection.is_limited or detection.limited_until is not None:
+        return detection
+    return replace(detection, limited_until=detection.observed_at + cooldown_s)
+
+
+def _track_and_failover(
+    container: SubscriptionTokenContainer,
+    detection: LimitDetectionResult,
+    *,
+    session_id: str,
+    family: Family,
+) -> None:
+    """Persist *detection*; fire one-shot failover when newly limited.
+
+    ``track_usage_limit`` detects the off→on transition atomically (its
+    repository ``observe`` serializes the read+write, even across processes),
+    so two concurrent detections for the same account can't both fire.
+    """
+    detection = _with_recovery(detection, _cooldown_for(family))
+    result = container.track_usage_limit.execute(detection)
+    if result.was_newly_limited:
+        container.failover_on_limit.execute(
+            session_id=session_id,
+            exhausted_credential_id=detection.credential_id,
+            family=family,
+            now=detection.observed_at,
+        )
+
+
+async def run_poll_sweep_once() -> int:
+    """Probe every active account once and persist the results.
+
+    Proactive only — does not trigger failover (no active session to fail
+    over); the refreshed state steers the next launch selection. No-op
+    unless ``OMNIGENT_SUBSCRIPTION_TOKENS_POLL_ENABLED`` is set.
+
+    :returns: The number of accounts whose state was refreshed.
+    """
+    container = _ensure_container()
+    if container is None:
+        return 0
+    from omnigent.subscription_tokens.infrastructure.detection.usage_endpoint_poller import (
+        is_poll_enabled,
+    )
+
+    if not is_poll_enabled():
+        return 0
+
+    accounts = [m for pool in _pools.values() for m in pool.members if m.is_active]
+
+    async def _probe_one(account: ProviderAccount) -> int:
+        """Probe one account and persist; never raises (per-account isolated)."""
+        try:
+            detection = await container.gateway.fetch_limit_state(account, now=now_epoch())
+            if detection is not None:
+                # Recovery default so a probe that only learns "limited" (e.g.
+                # 429 + retry-after, no window) still auto-recovers.
+                container.track_usage_limit.execute(
+                    _with_recovery(detection, _cooldown_for(account.family))
+                )
+                return 1
+        except Exception:
+            # Log the id only — never the account dataclass, whose repr would
+            # include api_key_ref / oauth_token_ref (a raw secret if an operator
+            # inlined a literal instead of an env:/keychain: reference).
+            logger.exception("subscription-token probe/track failed for account %s", account.id)
+        return 0
+
+    # Probe all accounts concurrently — independent network calls.
+    results = await asyncio.gather(*(_probe_one(a) for a in accounts))
+    return sum(results)
+
+
+async def poll_loop(*, interval_s: float = 1800.0) -> None:
+    """Background loop running :func:`run_poll_sweep_once` every *interval_s*.
+
+    Started from the server lifespan; cancel the task to stop it. Inert
+    when polling is disabled or no pool is configured.
+    """
+    while True:
+        try:
+            await run_poll_sweep_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("subscription-token poll sweep failed")
+        await asyncio.sleep(interval_s)
+
+
+def status_snapshot() -> list[dict[str, object]]:
+    """Return the current pools, accounts, limit states, and today's cost.
+
+    Shape (one entry per pool)::
+
+        {"name", "family", "failover_mode", "rotation_mode",
+         "accounts": [{"id", "name", "kind", "priority", "is_active",
+                       "limit_status", "limited_until", "windows",
+                       "earliest_reset_at", "cost_today_usd"}]}
+
+    ``rotation_mode`` + each account's ``earliest_reset_at`` let an operator
+    verify ``soonest_reset`` ordering at a glance.
+
+    :returns: A list of pool dicts, or ``[]`` when no pool is configured.
+    """
+    container = _ensure_container()
+    if container is None:
+        return []
+    try:
+        now = now_epoch()
+        all_ids = [m.id for pool in _pools.values() for m in pool.members]
+        states = container.state_repo.find_many(all_ids)
+        costs = _costs_today(container, all_ids, utc_day(now))
+        return [
+            {
+                "name": pool.name,
+                "family": pool.family,
+                "failover_mode": pool.failover_mode,
+                "rotation_mode": pool.rotation_mode,
+                "accounts": [
+                    _account_status(m, states.get(m.id), costs.get(m.id, 0.0), now)
+                    for m in pool.members
+                ],
+            }
+            for pool in _pools.values()
+        ]
+    except Exception:
+        logger.exception("subscription-token status_snapshot failed")
+        return []
+
+
+def _costs_today(
+    container: SubscriptionTokenContainer, credential_ids: list[str], day_utc: str
+) -> dict[str, float]:
+    """Batch-fetch today's per-account cost in a single query."""
+    from omnigent.db.db_models import SqlProviderAccountCost
+
+    if not credential_ids:
+        return {}
+    with container.session_maker() as session:
+        rows = session.execute(
+            select(SqlProviderAccountCost).where(
+                SqlProviderAccountCost.credential_id.in_(credential_ids),
+                SqlProviderAccountCost.day_utc == day_utc,
+            )
+        ).scalars()
+        return {row.credential_id: row.cost_usd for row in rows}
+
+
+def _account_status(
+    member: ProviderAccount, state: LimitState | None, cost_today: float, now: int
+) -> dict[str, object]:
+    """Build one account's status entry for :func:`status_snapshot`."""
+    windows = {w.label: w.utilization_pct for w in state.windows} if state else {}
+    return {
+        "id": member.id,
+        "name": member.name,
+        "kind": member.kind,
+        "priority": member.priority,
+        "is_active": member.is_active,
+        "limit_status": state.to_status(now) if state else "unknown",
+        "limited_until": state.limited_until if state and state.is_limited else None,
+        "windows": windows,
+        "earliest_reset_at": state.earliest_reset_at() if state else None,
+        "cost_today_usd": cost_today,
+    }
+
+
+def mark_available(credential_id: str) -> bool:
+    """Manually clear an account's limited state (bypasses staleness).
+
+    :returns: ``True`` when applied, ``False`` when subscription-token is inactive.
+    """
+    container = _ensure_container()
+    if container is None:
+        return False
+    try:
+        container.track_usage_limit.execute(
+            LimitDetectionResult(
+                credential_id=credential_id,
+                is_limited=False,
+                source="manual",
+                observed_at=now_epoch(),
+            )
+        )
+        return True
+    except Exception:
+        logger.exception("subscription-token mark_available failed for %s", credential_id)
+        return False
+
+
+def attribute_cost(
+    session_id: str,
+    *,
+    cost_usd: float,
+    input_tokens: int,
+    output_tokens: int,
+) -> None:
+    """Attribute a turn's cost to the session's active account.
+
+    Clamps negative deltas to zero (cumulative totals only grow; a negative
+    is a glitch, not a refund) and skips no-op calls (e.g. a policy-only
+    usage post with no spend) so they don't inflate the turn count.
+    """
+    cost_usd = max(0.0, cost_usd)
+    input_tokens = max(0, input_tokens)
+    output_tokens = max(0, output_tokens)
+    if not (cost_usd or input_tokens or output_tokens):
+        return
+    container = _ensure_container()
+    if container is None or not session_id:
+        return
+    try:
+        credential_id = container.registry.active_credential(session_id)
+        if not credential_id:
+            return
+        container.cost_sink.record_credential_cost(
+            credential_id,
+            utc_day(now_epoch()),
+            cost_usd=cost_usd,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+    except Exception:
+        logger.exception("subscription-token cost attribution failed")

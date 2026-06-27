@@ -80,6 +80,7 @@ import {
   type TerminalInfo,
 } from "@/hooks/useTerminals";
 import type {
+  ActiveCredential,
   ContentBlock,
   CodexModelOption,
   ModelUsage,
@@ -351,6 +352,14 @@ export interface ChatState {
    * snapshot on bind; drives the composer pill's harness suffix.
    */
   sessionHarness: string | null;
+  /**
+   * The multi-subscription account the active session is bound to, or
+   * ``null`` when no credential pool is configured (single-account setups).
+   * Populated from the session snapshot on bind; drives the composer's
+   * credential chip. Stable for the session's lifetime (failover rebinds the
+   * next launch, not the running process).
+   */
+  sessionActiveCredential: ActiveCredential | null;
   /**
    * The active session's sub-agent head name (e.g. `"gpt"`), or null for a
    * top-level session. Set from the snapshot on bind; lets a head sub-agent's
@@ -721,6 +730,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   flashItemId: null,
   llmModel: null,
   sessionHarness: null,
+  sessionActiveCredential: null,
   subAgentName: null,
   contextWindow: null,
   tokensUsed: null,
@@ -1195,6 +1205,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         oldestItemId: null,
         llmModel: null,
         sessionHarness: null,
+        sessionActiveCredential: null,
         // ``selectedEffort`` / ``selectedModel`` are sticky user picks —
         // not reset here so a CLI-created new chat inherits them.
         // ``sessionModelOverride`` and the cost switch ARE session-scoped,
@@ -1636,6 +1647,7 @@ function sessionBindingPatch(
   | "llmModel"
   | "sessionModelOverride"
   | "sessionHarness"
+  | "sessionActiveCredential"
   | "subAgentName"
   | "costControlModeOverride"
   | "codexPlanMode"
@@ -1659,6 +1671,7 @@ function sessionBindingPatch(
     llmModel: session.llmModel ?? null,
     sessionModelOverride: session.modelOverride ?? null,
     sessionHarness: session.harness ?? null,
+    sessionActiveCredential: session.activeCredential ?? null,
     subAgentName: session.subAgentName ?? null,
     costControlModeOverride: session.costControlModeOverride ?? null,
     codexPlanMode: codexPlanModeFromSession(session),

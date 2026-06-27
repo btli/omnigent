@@ -193,6 +193,7 @@ from omnigent.server.routes._content_type import (
 from omnigent.server.routes._host_worktree import CreatedWorktree
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.schemas import (
+    ActiveCredentialInfo,
     AgentObject,
     ChildSessionList,
     ChildSessionSummary,
@@ -273,6 +274,10 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.subscription_tokens.labels import (
+    CREDENTIAL_LABEL_NAMESPACE,
+    reserved_credential_keys,
+)
 from omnigent.tools.client_specified import parse_client_side_tool_specs
 
 _logger = logging.getLogger(__name__)
@@ -1836,6 +1841,22 @@ def _session_status_from_cache(conversation_id: str) -> Literal["idle", "running
     return "idle"
 
 
+def running_session_ids() -> set[str]:
+    """Return the ids of sessions currently executing a turn.
+
+    A session counts as running while its relay-fed status cache value is
+    ``"running"`` or ``"waiting"`` — the same signal
+    :func:`_session_status_from_cache` collapses to ``"running"``. The
+    subscription-token status route intersects an account's (never-deleted)
+    bindings with this set so ``active_sessions`` reflects the sessions
+    actually consuming the account's quota right now, not every session ever
+    bound to it.
+    """
+    return {
+        cid for cid, cached in _session_status_cache.items() if cached in ("running", "waiting")
+    }
+
+
 def _session_status_with_child_rollup(
     conversation_id: str,
     child_session_ids: list[str],
@@ -2260,6 +2281,7 @@ def _build_session_response(
     pending_elicitation_events: list[dict[str, Any]] | None = None,
     subtree_usage: dict[str, Any] | None = None,
     model_options: list[dict[str, Any]] | None = None,
+    active_credential: ActiveCredentialInfo | None = None,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -2322,6 +2344,10 @@ def _build_session_response(
     :param model_options: Raw Codex app-server ``model/list``
         options for this session, e.g. ``[{"id": "gpt-5.5"}]``.
         ``None`` is treated as ``[]``.
+    :param active_credential: The multi-subscription account the session is
+        bound to (see :class:`ActiveCredentialInfo`), resolved by the snapshot
+        caller from the session's launch binding. ``None`` for single-account
+        setups or callers that don't resolve it.
     :returns: The :class:`SessionResponse` for the API.
     :raises OmnigentError: If ``conv.agent_id`` is ``None``.
     """
@@ -2419,7 +2445,30 @@ def _build_session_response(
         # once the launch succeeds; a failed launch is retained with
         # its reason. Populated by _publish_sandbox_status.
         sandbox_status=_session_sandbox_status_cache.get(conv.id),
+        # The multi-subscription account this session is bound to, resolved by
+        # the snapshot caller from the launch binding. None for single-account
+        # setups; stable for the session's lifetime (failover rebinds the next
+        # launch, never the running process).
+        active_credential=active_credential,
     )
+
+
+def _active_credential_info(data: dict[str, object] | None) -> ActiveCredentialInfo | None:
+    """Lift the subscription-token facade's account dict into the API model.
+
+    :param data: The dict from ``integration.active_credential_for_session``
+        (``{"id", "name", "kind", "family", "limit_status"}``), or ``None``.
+    :returns: The validated :class:`ActiveCredentialInfo`, or ``None`` when
+        *data* is ``None`` or fails validation (best-effort — a malformed
+        account payload must never break a session snapshot).
+    """
+    if not data:
+        return None
+    try:
+        return ActiveCredentialInfo.model_validate(data)
+    except ValidationError:
+        _logger.warning("dropping malformed active-credential payload: %r", data)
+        return None
 
 
 def _publish_input_consumed(
@@ -2977,6 +3026,18 @@ def _accumulate_session_usage(
     conversation_store.set_session_usage(session_id, current)
     # Per-user daily rollup (policy-gated; this is the per-turn delta).
     _record_daily_cost(conv, cost_delta, conversation_store)
+    # Per-account rollup for multi-subscription: attribute this turn's
+    # cost to the account the ROOT session is bound to (sub-agents share the
+    # parent's account; only the root session carries the launch binding).
+    # No-op (safe) when no pool is configured or the root has no binding.
+    from omnigent.subscription_tokens import integration as _subtokens
+
+    _subtokens.attribute_cost(
+        conv.root_conversation_id if conv else session_id,
+        cost_usd=cost_delta,
+        input_tokens=int(input_tokens),
+        output_tokens=int(output_tokens),
+    )
     return _priced_cost_for_display(current)
 
 
@@ -3049,8 +3110,9 @@ def _persist_native_cumulative_usage(
     current = dict(conv.session_usage) if conv and conv.session_usage else {}
     # Native usage is cumulative (SET semantics), so the per-turn delta
     # for the daily rollup is new_total - old_total. Capture the old
-    # cumulative + enforcement costs before the fields below overwrite them.
-    # Both are clamped MONOTONIC below (a write may only raise them): the
+    # cumulative + enforcement costs (and tokens, for per-account
+    # attribution) before the fields below overwrite them. The costs are
+    # clamped MONOTONIC below (a write may only raise them): the
     # ``external_session_usage`` event is posted with the session owner's own
     # bearer token (the forwarder uses no privileged identity), so a client
     # could otherwise replay it with a falsified low cost to reset the gate's
@@ -3061,6 +3123,8 @@ def _persist_native_cumulative_usage(
     # label writes in ``cost_advisor`` — usage was the missing half.)
     old_cost = float(current.get("total_cost_usd", 0.0) or 0.0)
     old_policy_cost = float(current.get("policy_cost_usd", 0.0) or 0.0)
+    old_input = int(current.get("input_tokens", 0) or 0)
+    old_output = int(current.get("output_tokens", 0) or 0)
     if cin is not None:
         # The reported input total is INCLUSIVE of cached tokens (codex's
         # ``inputTokens`` counts cache reads). Split the cached portion into
@@ -3166,6 +3230,18 @@ def _persist_native_cumulative_usage(
     # Non-negative by the monotonic clamp above; ``max(0.0, ...)`` keeps the
     # daily rollup from ever being clawed back even if that invariant changes.
     _record_daily_cost(conv, max(0.0, new_cost - old_cost), conversation_store)
+    # Per-account rollup for multi-subscription. This is the NATIVE
+    # path subscription-token launches actually use; attribute the cumulative deltas to the
+    # account the ROOT session is bound to (sub-agents share the parent's
+    # account). No-op (safe) without a pool/binding.
+    from omnigent.subscription_tokens import integration as _subtokens
+
+    _subtokens.attribute_cost(
+        conv.root_conversation_id if conv else session_id,
+        cost_usd=max(0.0, new_cost - old_cost),
+        input_tokens=max(0, int(current.get("input_tokens", 0) or 0) - old_input),
+        output_tokens=max(0, int(current.get("output_tokens", 0) or 0) - old_output),
+    )
     return _priced_cost_for_display(current)
 
 
@@ -11543,6 +11619,30 @@ def _reject_reserved_cost_control_label_seed(labels: dict[str, str]) -> None:
         )
 
 
+def _reject_reserved_credential_labels(labels: dict[str, str]) -> None:
+    """
+    Reject any client write to the engine-owned ``credential.*`` namespace.
+
+    Unlike ``cost_control.*`` (which the session's bound runner may write), the
+    ``credential.*`` labels are seeded *only* by the policy-engine build from
+    the session's account binding — no external caller, not even the runner,
+    has a legitimate write. Rejecting client seeds/writes (at both create and
+    update) stops a caller forging e.g. ``credential.kind=api_key`` to slip
+    restricted work past a credential-governance policy.
+
+    :param labels: The client-supplied labels, e.g. ``{"team": "ml"}``.
+    :raises OmnigentError: 400 when any ``credential.*`` key is present.
+    """
+    reserved = reserved_credential_keys(labels)
+    if reserved:
+        raise OmnigentError(
+            f"labels {', '.join(repr(key) for key in reserved)} "
+            f"are in the engine-owned {CREDENTIAL_LABEL_NAMESPACE}* "
+            "namespace and cannot be set via the API",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+
 def _require_cost_control_label_authority(
     *,
     reserved_keys: Sequence[str],
@@ -11639,6 +11739,7 @@ async def _create_session_from_existing_agent(
         fails authorization.
     """
     _reject_reserved_cost_control_label_seed(body.labels)
+    _reject_reserved_credential_labels(body.labels)
 
     agent = await asyncio.to_thread(agent_store.get, body.agent_id)
     if agent is None:
@@ -13546,6 +13647,7 @@ def create_sessions_router(
             raise HTTPException(status_code=422, detail=[_multipart_missing_detail("bundle")])
         parsed_metadata = _parse_session_create_metadata(metadata)
         _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
+        _reject_reserved_credential_labels(parsed_metadata.labels)
 
         inherited_runner_id: str | None = None
         if parsed_metadata.parent_session_id is not None:
@@ -14312,6 +14414,10 @@ def create_sessions_router(
                     code=ErrorCode.FORBIDDEN,
                 )
         if body.labels:
+            # Engine-owned credential.* labels have no external writer (not even
+            # the runner) — reject any client write outright before touching the
+            # store, so a forged credential.kind can't dodge a governance policy.
+            _reject_reserved_credential_labels(body.labels)
             # Advisor-owned cost_control.* labels are written only by the
             # session's bound runner; gate them on runner proof BEFORE any
             # store mutation so a rejected request leaves the session untouched.
@@ -20006,12 +20112,24 @@ async def _get_session_snapshot(
         if result is not None:
             runner_online = result.runner_online
             host_online = result.host_online
-    # Subtree usage (this session + its sub-agent descendants) so the
-    # displayed cost includes sub-agents — a codex/claude sub-agent's spend
-    # is persisted on its own child conversation, not the parent's, so the
-    # parent's own session_usage would under-report. Off the event loop
-    # because it pages the conversation tree from the store.
-    subtree_usage = await asyncio.to_thread(load_session_usage, conv.id, conv_store)
+    # Two independent store reads, run concurrently off the event loop:
+    #  - subtree usage (this session + its sub-agent descendants) so the
+    #    displayed cost includes sub-agents — a codex/claude sub-agent's spend
+    #    is persisted on its own child conversation, so the parent's own
+    #    session_usage would under-report. It pages the conversation tree.
+    #  - the multi-subscription account this session is bound to (keyed on the
+    #    root conversation, matching cost attribution) for the Web UI's
+    #    per-session credential indicator; None without a pools: config, so
+    #    single-account setups are unaffected.
+    from omnigent.subscription_tokens import integration as _subtokens
+
+    subtree_usage, credential_payload = await asyncio.gather(
+        asyncio.to_thread(load_session_usage, conv.id, conv_store),
+        asyncio.to_thread(
+            _subtokens.active_credential_for_session, conv.root_conversation_id or conv.id
+        ),
+    )
+    active_credential = _active_credential_info(credential_payload)
     # Static signal telling the open view a host-bound, host-down session is a
     # resumable managed host it can wake by sending a message, vs a terminal
     # host_offline dead-end. Computed independently of liveness_lookup (the web
@@ -20044,4 +20162,5 @@ async def _get_session_snapshot(
             conv,
         ),
         subtree_usage=subtree_usage,
+        active_credential=active_credential,
     )

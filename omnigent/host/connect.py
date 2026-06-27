@@ -338,6 +338,11 @@ HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
         "ANTHROPIC_BEDROCK_BASE_URL",
         "AWS_BEARER_TOKEN_BEDROCK",
         "CLAUDE_CODE_OAUTH_TOKEN",
+        # Per-account config-dir isolation for multi-subscription
+        # rotation: a pool-selected Claude/Codex subscription points the
+        # launched CLI at its own login directory (see omnigent/subscription_tokens/).
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
         "CODEX_ACCESS_TOKEN",
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",

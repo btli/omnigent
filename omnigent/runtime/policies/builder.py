@@ -251,6 +251,17 @@ def build_policy_engine(
         label_defs=label_defs,
         conversation_store=conversation_store,
     )
+    # Project the session's bound provider account into engine-owned
+    # credential.* labels so guardrail policies can govern on it (and the
+    # active-credential UI reads the same binding). Keyed by the root
+    # conversation — the binding lives on the session/spawn-tree top — so a
+    # sub-agent inherits its session's credential.
+    _seed_credential_labels(
+        conversation_id=conversation_id,
+        root_conversation_id=root_conversation_id,
+        conversation_store=conversation_store,
+        initial_labels=initial_labels,
+    )
     initial_session_state = _load_session_state(conversation_id, conversation_store)
     # The cost-budget approval is per-SESSION: the whole spawn tree shares one
     # soft-threshold gate. A sub-agent runs as its own conversation, so seed its
@@ -517,6 +528,55 @@ def _seed_and_load_labels(
         # writes that landed concurrently from another workflow.
         existing = _load_existing_labels(conversation_id, conversation_store)
     return existing
+
+
+def _seed_credential_labels(
+    *,
+    conversation_id: str,
+    root_conversation_id: str,
+    conversation_store: ConversationStore,
+    initial_labels: dict[str, str],
+) -> None:
+    """
+    Seed the binding-derived ``credential.*`` labels for this conversation.
+
+    The launch path binds the *session* (the spawn-tree top) to one provider
+    account; this projects that binding into the conversation's label space so
+    guardrail policies can govern on which credential the session runs and the
+    engine hot cache exposes it (see
+    :mod:`omnigent.subscription_tokens.labels`).
+
+    Resolved by the **root** conversation id — the binding is keyed by the
+    session top (the same key the active-credential view uses), so a sub-agent
+    inherits its session's credential. Overwrites on change (so a reactive
+    failover to the fallback account is reflected) but never blanks a label: a
+    build where the binding can't be resolved (no pool configured, transient)
+    leaves any existing value untouched. No-op when multi-subscription is
+    inactive — the facade returns ``{}`` and never raises.
+
+    :param conversation_id: The conversation whose label rows are written (and
+        whose engine will read them).
+    :param root_conversation_id: The session/spawn-tree top the binding is
+        keyed by; equals *conversation_id* for a root conversation (the caller
+        resolves it via ``conv.root_conversation_id``).
+    :param conversation_store: Store for the label UPSERT.
+    :param initial_labels: The hot-cache snapshot; updated in place with any
+        write so the engine sees the seeded values without a re-read.
+    """
+    # Function-local import (deliberate): keeps the policy-engine core free of an
+    # import-time dependency on the optional subscription-token feature — the
+    # always-safe facade is loaded only when a build actually seeds, mirroring how
+    # integration.py is called from launch/cost/server code.
+    from omnigent.subscription_tokens.integration import credential_labels_for_session
+
+    cred_labels = credential_labels_for_session(root_conversation_id)
+    to_write = {
+        key: value for key, value in cred_labels.items() if initial_labels.get(key) != value
+    }
+    if not to_write:
+        return
+    conversation_store.set_labels(conversation_id, to_write)
+    initial_labels.update(to_write)
 
 
 def _load_existing_labels(

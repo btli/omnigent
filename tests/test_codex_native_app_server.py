@@ -19,6 +19,7 @@ from omnigent.codex_native_app_server import (
     CodexNativeAppServer,
     _codex_policy_hooks_settings,
     build_codex_native_server,
+    codex_terminal_env,
     trust_native_policy_hooks,
 )
 from omnigent.codex_native_hook import _EVALUATE_POLICY_TIMEOUT_S
@@ -224,6 +225,63 @@ def test_build_codex_native_server_uses_profile_host_without_static_token(
     overrides = "\n".join(app_server.config_overrides)
     assert "https://example.cloud.databricks.com/ai-gateway/codex/v1" in overrides
     assert 'databricks auth token --profile \\"oss\\"' in overrides
+
+
+def test_build_codex_native_server_threads_subscription_token_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Subscription-aware token management selection reaches the app server.
+
+    A subscription account surfaces as the ``config_source`` bridged into the
+    private home; a tier-fallback api_key surfaces as ``OPENAI_API_KEY`` plus a
+    forced ``openai`` provider appended last (so it wins over routing).
+    """
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server._find_codex_cli",
+        lambda: sys.executable,
+    )
+    account_home = tmp_path / "acct-home"
+    app_server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model=None,
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        config_source=account_home,
+        openai_api_key="sk-oai-test",
+    )
+    assert app_server.config_source == account_home
+    assert app_server.env["OPENAI_API_KEY"] == "sk-oai-test"
+    assert app_server.config_overrides[-1] == 'model_provider="openai"'
+
+
+def test_build_codex_native_server_threads_subscription_access_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A subscription authenticated by a headless Codex OAuth token surfaces as
+    ``CODEX_ACCESS_TOKEN`` — no forced provider override (it is not an api_key)."""
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server._find_codex_cli",
+        lambda: sys.executable,
+    )
+    app_server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model=None,
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        codex_access_token="codex-oat-test",
+    )
+    assert app_server.env["CODEX_ACCESS_TOKEN"] == "codex-oat-test"
+    assert "OPENAI_API_KEY" not in app_server.env
+    assert 'model_provider="openai"' not in app_server.config_overrides
+    # The token must also reach the spawned Codex TUI, or a fresh session hits
+    # the sign-in flow (the terminal env is an allowlist).
+    assert codex_terminal_env(app_server)["CODEX_ACCESS_TOKEN"] == "codex-oat-test"
 
 
 def test_build_codex_native_server_without_bypass_emits_no_bypass_config(

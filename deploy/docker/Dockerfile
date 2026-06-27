@@ -145,6 +145,13 @@ RUN test -f ./omnigent/server/static/web-ui/index.html \
 # [databricks] extra in pyproject — so add it explicitly here.
 RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} 'psycopg[binary]>=3.1,<4'
 
+# google-antigravity is the `antigravity` extra's SDK — the in-process,
+# Gemini-native harness (`harness: antigravity`) imports it lazily, so without
+# it the harness is registered but fails at launch. Not a baseline dep; bake it
+# so antigravity agents run out of the box. Installed in BOTH images (the host
+# stage adds it too) since agents run in host-spawned runners.
+RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} 'google-antigravity>=0.1,<1'
+
 # Optional managed-sandbox provider extras for the SERVER (the launcher imports
 # the provider SDK — e.g. the kubernetes client for `sandbox.provider:
 # kubernetes`). Off by default; the runner host image needs none of these. Build
@@ -294,6 +301,20 @@ RUN curl -fsSL https://antigravity.google/cli/install.sh | bash \
 # /app/ would break the import paths silently.
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /build /build
+
+# psycopg[binary]: the multi-subscription pool feature has the host's RUNNER
+# read/write a SHARED Postgres (the server's poller writes usage-reset data
+# there; the runner reads it to rank accounts by soonest_reset and writes the
+# session→credential binding the server surfaces). The base host install is
+# psycopg-free (it otherwise uses a local sqlite), so add the driver here. The
+# host stage has no `uv`, so install via the venv's pip (binary wheel, no build).
+RUN /opt/venv/bin/pip install --no-cache-dir 'psycopg[binary]>=3.1,<4'
+
+# google-antigravity: the `antigravity` extra's SDK for the in-process,
+# Gemini-native harness (`harness: antigravity`), which imports it lazily and
+# otherwise fails at launch. Optional extra (not baseline) — bake it so
+# antigravity agents run in host-spawned runners (mirrors the server-builder).
+RUN /opt/venv/bin/pip install --no-cache-dir 'google-antigravity>=0.1,<1'
 
 # Sandbox launchers exec commands through `bash -lc`, and Debian's
 # /etc/profile unconditionally resets PATH for login shells — the ENV

@@ -470,8 +470,16 @@ def resolve_secret(ref: str) -> str:
 def _config_path() -> str:
     """Return the path to the global omnigent config file.
 
-    Respects ``$OMNIGENT_CONFIG_HOME`` for test isolation (matching the
-    rest of the onboarding layer).
+    Resolution order:
+
+    1. ``$OMNIGENT_CONFIG_HOME`` (a *directory*) — test isolation and the
+       onboarding layer's home override; ``config.yaml`` within it.
+    2. ``$OMNIGENT_CONFIG`` (an explicit *file* path) — the same variable the
+       server entrypoint reads (see :func:`omnigent.server.server_config.resolve_config_path`).
+       Honouring it here lets a hosted deployment point both the server and
+       this provider/pool loader at one mounted config file (e.g.
+       ``/etc/omnigent/config.yaml``) without a second, redundant env var.
+    3. ``~/.omnigent/config.yaml`` (the laptop default).
 
     :returns: Path to ``config.yaml``, e.g.
         ``"/home/u/.omnigent/config.yaml"``.
@@ -479,6 +487,9 @@ def _config_path() -> str:
     config_home = os.environ.get("OMNIGENT_CONFIG_HOME")
     if config_home:
         return os.path.join(config_home, "config.yaml")
+    explicit = os.environ.get("OMNIGENT_CONFIG", "").strip()
+    if explicit:
+        return explicit
     return os.path.join(os.path.expanduser("~"), ".omnigent", "config.yaml")
 
 

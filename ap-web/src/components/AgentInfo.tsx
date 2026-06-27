@@ -53,6 +53,7 @@ import {
 } from "@/components/ui/dialog";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { credentialDotClass, credentialProviderLabel } from "@/components/CredentialChip";
 import { capitalizeAgentName } from "@/lib/agentLabels";
 import { coercePolicyParams } from "@/lib/policyParams";
 import { agentRootName } from "@/lib/forkHarness";
@@ -1192,6 +1193,10 @@ export function AgentInfoContent({
   // popover renders it directly — the frontend derives any aggregate view
   // from this map rather than receiving flat token fields.
   const usageByModel = useChatStore((s) => s.sessionUsageByModel);
+  // The multi-subscription account this session is bound to, live from the
+  // store (seeded on bind). ``null`` when no credential pool is configured —
+  // omit the row for single-account setups.
+  const activeCredential = useChatStore((s) => s.sessionActiveCredential);
   // Version footer: the server version (global, from the boot capabilities
   // probe) and the bound host's version (per-session, from the health poll).
   // Either may be absent — the footer renders whatever is known and hides
@@ -1305,6 +1310,19 @@ export function AgentInfoContent({
             data-testid="agent-info-session-cost"
           >
             {formatSessionCostUsd(sessionCostUsd)}
+          </span>
+        </div>
+      )}
+      {sessionId && activeCredential && (
+        <div className="flex flex-col gap-1.5" data-testid="agent-info-account">
+          <SectionLabel>Account</SectionLabel>
+          <span className="inline-flex items-center gap-1.5 text-sm text-muted-foreground">
+            <span
+              aria-hidden
+              className={`size-1.5 shrink-0 rounded-full ${credentialDotClass(activeCredential.limitStatus)}`}
+            />
+            <span className="truncate text-foreground">{activeCredential.name}</span>
+            <span className="text-xs">{credentialProviderLabel(activeCredential)}</span>
           </span>
         </div>
       )}
