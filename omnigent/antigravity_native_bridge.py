@@ -446,24 +446,47 @@ def write_mcp_config(
 
 
 def seed_isolated_agy_home(bridge_dir: Path) -> dict[str, str]:
-    """Seed the per-session isolated agy HOME and return the launch env override.
+    """Resolve the agy launch HOME and return the env override (platform-specific).
 
-    Copies the user's real agy OAuth token + onboarding/migration state (NEVER
-    moving or modifying the real files) into ``<bridge_dir>/agy-home/.gemini`` so
-    a launch under this isolated HOME does not re-demand OAuth or re-run the
-    onboarding wizard. The relay's ``mcp_config.json`` is written separately by
-    :func:`write_mcp_config` so it lands in this same isolated tree rather than
-    the user's real ``~/.gemini`` (the footgun this whole design avoids).
+    **Linux** — return ``{"HOME": <iso_home>}`` for a per-session ISOLATED HOME:
+    copy the user's real agy OAuth token + onboarding/migration state (NEVER moving
+    or modifying the real files) into ``<bridge_dir>/agy-home/.gemini`` so the
+    launch does not re-demand OAuth or re-run the wizard, and the relay's
+    ``mcp_config.json`` (:func:`write_mcp_config`) lands in this isolated tree
+    rather than clobbering the user's real ``~/.gemini``. Verified live (agy
+    1.0.12): the ``/mcp`` panel shows ``✓ omnigent`` with the ``sys_*`` tools.
 
-    Verified live (agy 1.0.12): under this isolated HOME agy logs in as the real
-    user from the seeded token and its ``/mcp`` panel shows ``✓ omnigent`` with the
-    ``sys_*`` tools discovered.
+    **macOS (darwin)** — return ``{"HOME": <real_home>}`` with NO isolation: agy
+    binds its OAuth credential to the real login HOME via the Keychain item
+    "Antigravity Safe Storage" (resolved against the real home PATH, not the
+    contents of ``$HOME/.gemini``), so any isolated HOME makes every agy turn hang
+    at the interactive OAuth prompt (#1477; verified — ``agy -p`` authenticates
+    under the real HOME but stalls under any isolated HOME, even one whose
+    ``.gemini`` is symlinked with ``oauth_creds.json`` present). Two deliberate
+    consequences on macOS: (1) the relay ``mcp_config.json`` :func:`write_mcp_config`
+    writes into the (unread) isolated tree is NOT seen by agy, so the ``sys_*`` /
+    relay tools are unavailable there (#1194 — logged at WARNING, not silent); (2)
+    concurrent agy-native sessions and the user's own interactive ``agy`` share the
+    real ``~/.gemini`` global state (Linux isolates this) — acceptable for a
+    single-session dev machine. Assumes ``Path.home()`` is the Keychain-bound login
+    user; a service account whose ``$HOME`` differs would not authenticate.
 
     :param bridge_dir: Native Antigravity bridge directory.
-    :returns: An env-override mapping (``{"HOME": <iso_home>}``) to layer onto the
-        agy launch environment.
+    :returns: An env-override mapping to layer onto the agy launch environment —
+        ``{"HOME": <iso_home>}`` on Linux, ``{"HOME": <real_home>}`` on macOS.
     """
     real_home = Path.home()
+    if sys.platform == "darwin":
+        # Real HOME for Keychain auth (#1477; see the docstring). The relay config
+        # write lands in the unread isolated tree, so sys_* / relay tools are absent
+        # on macOS (#1194) — surface it at WARNING (the server swallows DEBUG/INFO)
+        # rather than letting the tools silently disappear.
+        _logger.warning(
+            "agy-native on macOS runs under the real HOME for Keychain auth (#1477); "
+            "the Omnigent MCP relay / sys_* tools are unavailable and per-session HOME "
+            "isolation is disabled there (#1194)"
+        )
+        return {"HOME": str(real_home)}
     iso_home = agy_home_dir(bridge_dir)
     iso_gemini = iso_home / ".gemini"
     (iso_gemini / "antigravity-cli" / "cache").mkdir(mode=0o700, parents=True, exist_ok=True)

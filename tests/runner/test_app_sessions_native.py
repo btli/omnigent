@@ -3440,6 +3440,9 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
 
     session_id = "conv_agy_mcp"
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    # This asserts the Linux isolated-HOME relay wiring; on macOS agy runs under the
+    # real HOME (Keychain auth, #1477) so the relay isn't wired into the bridge tree.
+    monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
     (tmp_path / "workspace").mkdir(parents=True, exist_ok=True)

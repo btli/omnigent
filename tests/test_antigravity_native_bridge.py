@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1080,6 +1081,7 @@ def test_seed_isolated_agy_home_returns_home_override_and_seeds_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """seed_isolated_agy_home copies the OAuth token + markers and returns HOME."""
+    monkeypatch.setattr(sys, "platform", "linux")  # exercise the isolated-HOME path
     fake_home = tmp_path / "real-home"
     (fake_home / ".gemini" / "antigravity-cli").mkdir(parents=True)
     (fake_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token").write_text(
@@ -1113,6 +1115,7 @@ def test_seed_isolated_agy_home_tolerates_missing_credential(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A missing OAuth token only means agy re-auths — never a hard failure."""
+    monkeypatch.setattr(sys, "platform", "linux")  # exercise the isolated-HOME path
     fake_home = tmp_path / "real-home"
     fake_home.mkdir()
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
@@ -1126,6 +1129,36 @@ def test_seed_isolated_agy_home_tolerates_missing_credential(
     # No token copied (none existed), but the isolated HOME + markers still exist.
     assert not (iso / ".gemini" / "antigravity-cli" / "antigravity-oauth-token").exists()
     assert (iso / ".gemini" / "antigravity-cli" / "cache" / "onboarding.json").is_file()
+
+
+def test_seed_isolated_agy_home_darwin_returns_real_home_unisolated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On macOS agy must run under the REAL HOME (Keychain auth, #1477) — no isolation.
+
+    The isolated HOME breaks agy's Keychain-bound OAuth, so the darwin branch
+    returns the real home and seeds nothing into the bridge tree.
+    """
+    fake_home = tmp_path / "real-home"
+    (fake_home / ".gemini" / "antigravity-cli").mkdir(parents=True)
+    (fake_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token").write_text(
+        "real-token", encoding="utf-8"
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    env = seed_isolated_agy_home(bridge_dir)
+
+    # Returns the REAL home, not the per-session isolated bridge tree.
+    assert env == {"HOME": str(fake_home)}
+    # The isolated tree is NOT created or seeded on macOS.
+    assert not (agy_home_dir(bridge_dir) / ".gemini").exists()
+    # The real token is left untouched (never moved/modified).
+    assert (fake_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token").read_text(
+        encoding="utf-8"
+    ) == "real-token"
 
 
 def test_agy_home_dir_is_under_bridge_dir(tmp_path: Path) -> None:
