@@ -9,7 +9,6 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 
 /**
@@ -42,10 +41,13 @@ class ConnectActivity : ComponentActivity() {
 
     private fun connect(input: String) {
         val url = normalizeServerUrl(input)
+        val error = findViewById<TextView>(R.id.error_text)
         if (url == null) {
-            Toast.makeText(this, R.string.connect_invalid, Toast.LENGTH_SHORT).show()
+            error.setText(R.string.connect_invalid)
+            error.visibility = View.VISIBLE
             return
         }
+        error.visibility = View.GONE
         store.connect(url)
         startActivity(
             Intent(this, MainActivity::class.java).apply {
@@ -63,8 +65,7 @@ class ConnectActivity : ComponentActivity() {
 
         val inflater = LayoutInflater.from(this)
         for (url in recents) {
-            val row =
-                inflater.inflate(android.R.layout.simple_list_item_1, container, false) as TextView
+            val row = inflater.inflate(R.layout.item_recent, container, false) as TextView
             row.text = url
             row.setOnClickListener { connect(url) }
             container.addView(row)
