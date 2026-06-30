@@ -106,6 +106,8 @@ class MainActivity : ComponentActivity() {
         // Capture (don't replay yet) a notification tap that cold-started us.
         pendingNavigatePath = navigatePathOf(intent)
 
+        if (BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true) // chrome://inspect
+
         webView =
             WebView(this).apply {
                 settings.javaScriptEnabled = true
