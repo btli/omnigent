@@ -188,10 +188,15 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Bridge the session from the Custom Tab into the WebView: the polled JWT is
-     * exactly the session-cookie value, so set it as the cookie (the WebView's
-     * cookie store is isolated from the Custom Tab's), then reload authenticated
-     * and bring this activity back over the Custom Tab.
+     * Bridge the session from the browser into the WebView: the polled JWT is
+     * exactly the session-cookie value, so set it as the cookie (the browser's
+     * cookie store is isolated from the WebView's), reload authenticated, and get
+     * the user back to the app.
+     *
+     * Foregrounding ourselves from the background (the poll completes while the
+     * browser is in front) is blocked by Android's background-activity-launch
+     * rules, so we both attempt a reorder-to-front (works within the grace
+     * period) AND post a "tap to return" notification as the reliable path back.
      */
     private fun onSessionToken(token: String) {
         val origin = pinnedOrigin ?: return
@@ -205,13 +210,21 @@ class MainActivity : ComponentActivity() {
         }
         val cookies = CookieManager.getInstance()
         cookies.setAcceptCookie(true)
-        cookies.setCookie(origin, cookie) {
+        android.util.Log.i("OmnigentAuth", "onSessionToken: injecting $name (token len=${token.length}) at $origin")
+        cookies.setCookie(origin, cookie) { accepted ->
+            val present = cookies.getCookie(origin)?.contains(name) == true
+            android.util.Log.i("OmnigentAuth", "setCookie accepted=$accepted present=$present -> reloading")
             cookies.flush()
             webView.loadUrl(origin)
         }
         startActivity(
             Intent(this, MainActivity::class.java)
                 .addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+        )
+        notifications.notify(
+            title = getString(R.string.signed_in_title),
+            body = getString(R.string.signed_in_body),
+            navigatePath = "/",
         )
     }
 

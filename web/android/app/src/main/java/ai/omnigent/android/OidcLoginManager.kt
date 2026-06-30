@@ -1,10 +1,11 @@
 package ai.omnigent.android
 
 import android.app.Activity
+import android.content.Intent
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
-import androidx.browser.customtabs.CustomTabsIntent
+import android.util.Log
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -46,11 +47,14 @@ class OidcLoginManager {
             var token: String? = null
             try {
                 val ticket = requestTicket(origin)
+                Log.i(TAG, "cli-login -> ${if (ticket != null) "ticket ok" else "FAILED"}")
                 if (ticket != null) {
                     main.post { launchTab(activity, origin + ticket.loginUrl) }
                     token = pollForToken(origin, ticket.id)
+                    Log.i(TAG, "poll -> ${if (token != null) "token (len=${token.length})" else "no token (timeout/reject)"}")
                 }
-            } catch (_: Throwable) {
+            } catch (t: Throwable) {
+                Log.w(TAG, "login flow error: ${t.javaClass.simpleName}")
                 // Network/parse failure — login just doesn't complete; the user
                 // can retry. Never surface raw errors (may carry URLs/tokens).
             } finally {
@@ -84,10 +88,14 @@ class OidcLoginManager {
     }
 
     private fun launchTab(activity: Activity, url: String) {
-        CustomTabsIntent.Builder()
-            .setShowTitle(true)
-            .build()
-            .launchUrl(activity, Uri.parse(url))
+        // Use the full system browser (not a Custom Tab): the Authentik flow page
+        // renders blank in an in-app Custom Tab on some setups, but works in the
+        // browser. Still RFC 8252 compliant — the system browser is the canonical
+        // external user-agent (passkeys, Google, and password managers all work).
+        Log.i(TAG, "opening login in browser") // URL carries the one-time ticket — not logged
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).addCategory(Intent.CATEGORY_BROWSABLE)
+        runCatching { activity.startActivity(intent) }
+            .onFailure { Log.w(TAG, "no browser to open login: ${it.javaClass.simpleName}") }
     }
 
     private fun pollForToken(origin: String, ticket: String): String? {
@@ -118,6 +126,7 @@ class OidcLoginManager {
     }
 
     private companion object {
+        const val TAG = "OmnigentAuth"
         const val POLL_INTERVAL_MS = 2_000L
         const val POLL_TIMEOUT_MS = 5 * 60 * 1_000L // mirrors the CLI's 5-minute window
     }

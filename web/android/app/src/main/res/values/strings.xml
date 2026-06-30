@@ -2,6 +2,8 @@
 <resources>
     <string name="app_name">Omnigent</string>
     <string name="notification_channel_name">Sessions</string>
+    <string name="signed_in_title">Signed in to Omnigent</string>
+    <string name="signed_in_body">Tap to return to the app.</string>
     <plurals name="badge_text">
         <item quantity="one">%1$d pending</item>
         <item quantity="other">%1$d pending</item>
