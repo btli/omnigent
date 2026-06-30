@@ -86,8 +86,8 @@ class OidcLoginManager {
         // Bodyless POST — set Content-Length explicitly; some servers/WAFs reject
         // a POST without it (411 Length Required).
         conn.setRequestProperty("Content-Length", "0")
-        conn.connectTimeout = 10_000
-        conn.readTimeout = 10_000
+        conn.connectTimeout = HTTP_TIMEOUT_MS
+        conn.readTimeout = HTTP_TIMEOUT_MS
         return try {
             if (conn.responseCode != 200) return null
             val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
@@ -115,8 +115,8 @@ class OidcLoginManager {
             Thread.sleep(POLL_INTERVAL_MS) // throws InterruptedException on shutdownNow()
             val conn = (URL("$origin/auth/cli-poll?ticket=$encoded").openConnection() as HttpURLConnection)
             conn.requestMethod = "GET"
-            conn.connectTimeout = 10_000
-            conn.readTimeout = 10_000
+            conn.connectTimeout = HTTP_TIMEOUT_MS
+            conn.readTimeout = HTTP_TIMEOUT_MS
             try {
                 when (conn.responseCode) {
                     202 -> continue // still pending
@@ -139,5 +139,6 @@ class OidcLoginManager {
     private companion object {
         const val POLL_INTERVAL_MS = 2_000L
         const val POLL_TIMEOUT_MS = 5 * 60 * 1_000L // mirrors the CLI's 5-minute window
+        const val HTTP_TIMEOUT_MS = 10_000 // connect + read timeout for the login endpoints
     }
 }

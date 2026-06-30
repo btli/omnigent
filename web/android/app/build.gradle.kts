@@ -26,7 +26,7 @@ android {
     }
 
     buildFeatures {
-        buildConfig = true // for BuildConfig.DEBUG (gates WebView remote debugging)
+        buildConfig = true // for BuildConfig.DEBUG (gates authLog + WebView remote debugging)
     }
 
     compileOptions {

@@ -217,6 +217,15 @@ class MainActivity : ComponentActivity() {
         // The poll can land after the activity is gone (it ran on a background
         // thread up to 5 min) — never touch a destroyed WebView.
         if (isDestroyed || isFinishing || !::webView.isInitialized) return
+        // Defense-in-depth: the token is interpolated into the cookie string, so a
+        // value carrying ';' or whitespace could smuggle in cookie attributes
+        // (e.g. Domain=, defeating the __Host- prefix). A real session token is an
+        // HS256 JWT — three base64url segments — which never contains those, so
+        // this only ever rejects a malformed/hostile value, never a valid login.
+        if (!isJwtShaped(token)) {
+            authLog("onSessionToken: token not JWT-shaped — rejecting")
+            return
+        }
         val origin = pinnedOrigin ?: return
         val secure = origin.startsWith("https://")
         // Matches the server's session_cookie_name: __Host- prefix on HTTPS.
@@ -245,6 +254,23 @@ class MainActivity : ComponentActivity() {
             body = getString(R.string.signed_in_body),
             navigatePath = "/",
         )
+    }
+
+    /**
+     * True if [token] is shaped like a JWT — three non-empty base64url segments
+     * (`header.payload.signature`). base64url is `[A-Za-z0-9_-]`, so a JWT can
+     * never carry the `;`, whitespace, or control chars that would let a value
+     * break out of the cookie string and inject attributes.
+     */
+    private fun isJwtShaped(token: String): Boolean {
+        val parts = token.split('.')
+        if (parts.size != 3) return false
+        return parts.all { part ->
+            part.isNotEmpty() &&
+                part.all { c ->
+                    c in 'A'..'Z' || c in 'a'..'z' || c in '0'..'9' || c == '-' || c == '_'
+                }
+        }
     }
 
     override fun onDestroy() {
