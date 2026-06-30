@@ -42,7 +42,7 @@ class OmnigentWebViewClient(
         // load of the pinned server (e.g. it's offline), NOT an IdP redirect —
         // don't misread it as a bounce and pop the browser. Mirror the http(s)
         // gate in shouldOverrideUrlLoading.
-        if ((scheme == "http" || scheme == "https") && origin != pinnedOrigin()) {
+        if (isHttpScheme(scheme) && origin != pinnedOrigin()) {
             // Log origin only, never the full URL (carries OAuth state/PKCE).
             authLog("off-origin landing $origin -> login")
             view.stopLoading()
@@ -74,7 +74,7 @@ class OmnigentWebViewClient(
 
         // Non-http(s) schemes (mailto:, tel:, intent:, custom links) can't load in
         // the WebView — hand to the system, fail-closed if nothing handles them.
-        if (scheme != "http" && scheme != "https") {
+        if (!isHttpScheme(scheme)) {
             runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
             return true
         }
