@@ -35,7 +35,7 @@ class OmnigentWebViewClient(
         if (originOf(url) != pinnedOrigin()) {
             // Redirected to a foreign origin (the OIDC IdP) — run native login.
             // Log origin only, never the full URL (carries OAuth state/PKCE).
-            android.util.Log.i("OmnigentAuth", "off-origin landing ${originOf(url)} -> login")
+            authLog("off-origin landing ${originOf(url)} -> login")
             view.stopLoading()
             onLoginRequired()
             return
@@ -76,7 +76,7 @@ class OmnigentWebViewClient(
         // user gesture is an external link -> hand to the system browser. Either
         // way the foreign page never loads in this WebView (which holds the
         // native bridge).
-        android.util.Log.i("OmnigentAuth", "off-origin nav ${originOf(url.toString())} gesture=${request.hasGesture()}")
+        authLog("off-origin nav ${originOf(url.toString())} gesture=${request.hasGesture()}")
         if (request.hasGesture()) {
             runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
         } else {

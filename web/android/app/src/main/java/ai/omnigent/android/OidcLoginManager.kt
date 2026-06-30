@@ -5,7 +5,6 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
-import android.util.Log
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -13,16 +12,16 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Drives the RFC 8252 login flow for the shell: authenticate in a Chrome Custom
- * Tab — a real browser, so Google sign-in (which blocks embedded WebViews with
- * `disallowed_useragent`) and passkeys (which need Chrome / Google Password
- * Manager) both work — then bridge the resulting session into the WebView, whose
- * cookie store is isolated from the Custom Tab's.
+ * Drives the RFC 8252 login flow for the shell: authenticate in the system
+ * browser — a real browser, so Google sign-in (which blocks embedded WebViews
+ * with `disallowed_useragent`) and passkeys (which need the browser / a password
+ * manager) both work — then bridge the resulting session into the WebView, whose
+ * cookie store is isolated from the browser's.
  *
  * Reuses the server's existing browser-login endpoints (the same ones the
  * `omnigent login` CLI uses, no server change):
  *   1. `POST /auth/cli-login` -> `{ticket, login_url}`
- *   2. open `login_url` in the Custom Tab; the user authenticates; the OIDC
+ *   2. open `login_url` in the browser; the user authenticates; the OIDC
  *      callback fulfills the ticket server-side
  *   3. `GET /auth/cli-poll?ticket=...` -> `{token}` once fulfilled
  *
@@ -35,38 +34,48 @@ class OidcLoginManager {
     private val main = Handler(Looper.getMainLooper())
     private val inFlight = AtomicBoolean(false)
 
+    // Held only for the duration of a login; nulled by [shutdown] so a poll that
+    // finishes after the host is destroyed can neither invoke into a dead
+    // Activity nor pin it (and its View tree) for the poll's lifetime.
+    @Volatile private var sessionCallback: ((String) -> Unit)? = null
+
     /**
-     * Begin a login against [origin] (the pinned server). Opens a Custom Tab and
+     * Begin a login against [origin] (the pinned server). Opens the browser and
      * polls in the background; [onSession] is invoked on the main thread with the
      * session JWT once the browser flow completes. A second call while one is in
      * flight is ignored.
      */
     fun start(activity: Activity, origin: String, onSession: (String) -> Unit) {
         if (!inFlight.compareAndSet(false, true)) return
+        sessionCallback = onSession
         io.execute {
             var token: String? = null
             try {
                 val ticket = requestTicket(origin)
-                Log.i(TAG, "cli-login -> ${if (ticket != null) "ticket ok" else "FAILED"}")
+                authLog("cli-login -> ${if (ticket != null) "ticket ok" else "FAILED"}")
                 if (ticket != null) {
                     main.post { launchTab(activity, origin + ticket.loginUrl) }
                     token = pollForToken(origin, ticket.id)
-                    Log.i(TAG, "poll -> ${if (token != null) "token (len=${token.length})" else "no token (timeout/reject)"}")
+                    authLog("poll -> ${if (token != null) "token (len=${token.length})" else "no token"}")
                 }
+            } catch (_: InterruptedException) {
+                // shutdown() interrupted the poll — the host is going away; drop.
             } catch (t: Throwable) {
-                Log.w(TAG, "login flow error: ${t.javaClass.simpleName}")
-                // Network/parse failure — login just doesn't complete; the user
-                // can retry. Never surface raw errors (may carry URLs/tokens).
+                authLog("login flow error: ${t.javaClass.simpleName}")
             } finally {
                 inFlight.set(false)
             }
             val result = token
-            if (result != null) main.post { onSession(result) }
+            // sessionCallback is null once shutdown() ran — never invoke into a
+            // destroyed host.
+            if (result != null) main.post { sessionCallback?.invoke(result) }
         }
     }
 
+    /** Cancel an in-flight login and release the host. Call from onDestroy. */
     fun shutdown() {
-        io.shutdown()
+        sessionCallback = null
+        io.shutdownNow() // interrupts the polling sleep so the task exits promptly
     }
 
     private data class Ticket(val id: String, val loginUrl: String)
@@ -74,6 +83,9 @@ class OidcLoginManager {
     private fun requestTicket(origin: String): Ticket? {
         val conn = (URL("$origin/auth/cli-login").openConnection() as HttpURLConnection)
         conn.requestMethod = "POST"
+        // Bodyless POST — set Content-Length explicitly; some servers/WAFs reject
+        // a POST without it (411 Length Required).
+        conn.setRequestProperty("Content-Length", "0")
         conn.connectTimeout = 10_000
         conn.readTimeout = 10_000
         return try {
@@ -88,21 +100,19 @@ class OidcLoginManager {
     }
 
     private fun launchTab(activity: Activity, url: String) {
-        // Use the full system browser (not a Custom Tab): the Authentik flow page
-        // renders blank in an in-app Custom Tab on some setups, but works in the
-        // browser. Still RFC 8252 compliant — the system browser is the canonical
-        // external user-agent (passkeys, Google, and password managers all work).
-        Log.i(TAG, "opening login in browser") // URL carries the one-time ticket — not logged
+        // Full system browser (not a Custom Tab): the IdP flow page renders blank
+        // in an in-app Custom Tab on some setups but works in the browser. Still
+        // RFC 8252 — the system browser is the canonical external user-agent.
+        authLog("opening login in browser") // URL carries the one-time ticket — not logged
         val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).addCategory(Intent.CATEGORY_BROWSABLE)
         runCatching { activity.startActivity(intent) }
-            .onFailure { Log.w(TAG, "no browser to open login: ${it.javaClass.simpleName}") }
     }
 
     private fun pollForToken(origin: String, ticket: String): String? {
         val deadline = System.currentTimeMillis() + POLL_TIMEOUT_MS
         val encoded = Uri.encode(ticket)
         while (System.currentTimeMillis() < deadline) {
-            Thread.sleep(POLL_INTERVAL_MS)
+            Thread.sleep(POLL_INTERVAL_MS) // throws InterruptedException on shutdownNow()
             val conn = (URL("$origin/auth/cli-poll?ticket=$encoded").openConnection() as HttpURLConnection)
             conn.requestMethod = "GET"
             conn.connectTimeout = 10_000
@@ -117,6 +127,7 @@ class OidcLoginManager {
                     else -> return null // 410 expired/rejected, or other
                 }
             } catch (_: Throwable) {
+                if (Thread.currentThread().isInterrupted) return null // shutdown mid-request
                 continue // transient network error — keep polling until the deadline
             } finally {
                 conn.disconnect()
@@ -126,7 +137,6 @@ class OidcLoginManager {
     }
 
     private companion object {
-        const val TAG = "OmnigentAuth"
         const val POLL_INTERVAL_MS = 2_000L
         const val POLL_TIMEOUT_MS = 5 * 60 * 1_000L // mirrors the CLI's 5-minute window
     }

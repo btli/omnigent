@@ -47,6 +47,7 @@ class MainActivity : ComponentActivity() {
     private var pendingNavigatePath: String? = null
     private var lastInsets: Insets? = null
     private var pageLoaded = false
+    private var loginAttempts = 0 // capped browser-login retries; reset in onPageReady
 
     // WebChromeClient affordances that need Activity-scoped result launchers.
     // Transient by design: rotation is covered by configChanges (no recreation),
@@ -180,12 +181,24 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Run the RFC 8252 login flow: authenticate in a Custom Tab (Google/passkey
-     * work there, not in a WebView), then [onSessionToken] injects the session.
-     * Triggered by [OmnigentWebViewClient] when the server redirects to the IdP.
+     * Run the RFC 8252 login flow: authenticate in the system browser
+     * (Google/passkey work there, not in a WebView), then [onSessionToken]
+     * injects the session. Triggered by [OmnigentWebViewClient] when the server
+     * redirects to the IdP.
+     *
+     * Capped retries: if injecting the session still leaves us redirected to
+     * login (rejected cookie, expired token, clock skew), don't relaunch the
+     * browser forever — give up after [MAX_LOGIN_ATTEMPTS]. The counter resets in
+     * onPageReady once a pinned-origin page actually loads (i.e. we're past the
+     * login redirect).
      */
     private fun startLogin() {
         val origin = pinnedOrigin ?: return
+        if (loginAttempts >= MAX_LOGIN_ATTEMPTS) {
+            authLog("login attempts exhausted ($loginAttempts) — not retrying")
+            return
+        }
+        loginAttempts++
         loginManager.start(this, origin, ::onSessionToken)
     }
 
@@ -201,6 +214,9 @@ class MainActivity : ComponentActivity() {
      * period) AND post a "tap to return" notification as the reliable path back.
      */
     private fun onSessionToken(token: String) {
+        // The poll can land after the activity is gone (it ran on a background
+        // thread up to 5 min) — never touch a destroyed WebView.
+        if (isDestroyed || isFinishing || !::webView.isInitialized) return
         val origin = pinnedOrigin ?: return
         val secure = origin.startsWith("https://")
         // Matches the server's session_cookie_name: __Host- prefix on HTTPS.
@@ -212,10 +228,11 @@ class MainActivity : ComponentActivity() {
         }
         val cookies = CookieManager.getInstance()
         cookies.setAcceptCookie(true)
-        android.util.Log.i("OmnigentAuth", "onSessionToken: injecting $name (token len=${token.length}) at $origin")
+        authLog("onSessionToken: injecting $name (token len=${token.length})")
         cookies.setCookie(origin, cookie) { accepted ->
-            val present = cookies.getCookie(origin)?.contains(name) == true
-            android.util.Log.i("OmnigentAuth", "setCookie accepted=$accepted present=$present -> reloading")
+            // setCookie's callback is async — re-check the WebView is still alive.
+            if (isDestroyed || !::webView.isInitialized) return@setCookie
+            authLog("setCookie accepted=$accepted present=${cookies.getCookie(origin)?.contains(name) == true}")
             cookies.flush()
             webView.loadUrl(origin)
         }
@@ -258,6 +275,7 @@ class MainActivity : ComponentActivity() {
         // pendingNavigatePath or push insets into a page that can't consume them.
         if (originOf(url) != pinnedOrigin) return
         pageLoaded = true
+        loginAttempts = 0 // reached a pinned-origin page — we're past the login redirect
         flushPendingActivation()
         emitInsets()
     }
@@ -378,5 +396,9 @@ class MainActivity : ComponentActivity() {
                 )
             }
         getSystemService<DownloadManager>()?.enqueue(request)
+    }
+
+    private companion object {
+        const val MAX_LOGIN_ATTEMPTS = 3
     }
 }
