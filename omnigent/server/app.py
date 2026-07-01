@@ -182,6 +182,10 @@ def _register_web_mimetypes() -> None:
         (".map", "application/json"),
         (".wasm", "application/wasm"),
         (".svg", "image/svg+xml"),
+        # Python's mimetypes DB has no ``.webmanifest`` entry, so without this
+        # Starlette serves the PWA manifest as ``application/octet-stream`` and
+        # browsers silently refuse to install the app.
+        (".webmanifest", "application/manifest+json"),
     ):
         mimetypes.add_type(ctype, ext)
 
@@ -2112,6 +2116,26 @@ def create_app(
                 conversation_store,
             )
 
+    def _resolve_managed_runner_owner(runner_id: str) -> str | None:
+        """Owner for a server-managed sandbox runner, by its bound session.
+
+        Managed runners authenticate with a server-minted binding token,
+        not a user session, so the runner tunnel cannot resolve their
+        owner from the handshake. The server wrote ``runner_id`` onto the
+        session row at launch (``replace_runner_id``), so the bound
+        conversation's owner is authoritative — the runner-side analog of
+        the host tunnel's ``resolve_launch_token``.
+
+        :param runner_id: Token-bound runner id from the tunnel handshake.
+        :returns: The session owner's user id, or ``None`` when no session
+            is bound to this runner (the handshake is then refused).
+        """
+        for conv in conversation_store.list_conversations_by_runner_id(runner_id):
+            owner = conversation_store.get_session_owner(conv.id)
+            if owner is not None:
+                return owner
+        return None
+
     # WS tunnel endpoint for runners (RUNNER.md §2-3).
     app.include_router(
         create_runner_tunnel_router(
@@ -2121,6 +2145,7 @@ def create_app(
             on_runner_connect=_on_runner_connect,
             auth_provider=auth_provider,
             runner_exit_reports=runner_exit_reports,
+            resolve_managed_runner_owner=_resolve_managed_runner_owner,
         ),
         prefix="/v1",
         tags=["runners"],
@@ -2407,6 +2432,11 @@ def _apply_web_ui_cache_headers(response: Response, path: str) -> Response:
     media_type = content_type.partition(";")[0].lower() if content_type is not None else None
     if path.startswith("assets/"):
         response.headers["Cache-Control"] = _WEB_UI_ASSET_CACHE_CONTROL
+    elif path in {"sw.js", "version.json"}:
+        # The service worker and the version sentinel it precaches must
+        # revalidate on every load, or the HTTP cache could mask a deploy for up
+        # to an hour and defeat prompt-to-reload.
+        response.headers["Cache-Control"] = _WEB_UI_HTML_CACHE_CONTROL
     elif media_type == "text/html" or path in {"", ".", "index.html"}:
         response.headers["Cache-Control"] = _WEB_UI_HTML_CACHE_CONTROL
     else:
