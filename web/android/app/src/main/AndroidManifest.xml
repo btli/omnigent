@@ -9,8 +9,14 @@
 
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
 
+    <!--
+      allowBackup=false: the WebView cookie store holds the authenticated
+      __Host-ap_session cookie, so cloud Auto Backup and `adb backup` would
+      otherwise copy a live session (and the saved server list) off-device. A
+      server URL is trivially re-entered; a session is not worth exfiltrating.
+    -->
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:enableOnBackInvokedCallback="true"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
