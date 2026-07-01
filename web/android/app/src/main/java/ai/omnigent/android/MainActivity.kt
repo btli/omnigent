@@ -9,6 +9,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.MimeTypeMap
 import android.webkit.PermissionRequest
@@ -138,15 +139,35 @@ class MainActivity : ComponentActivity() {
         // properties — Android WebView can't rely on `env(safe-area-inset-*)`
         // alone (unreliable < API 30 and across OEM builds). Cached so the first
         // post-load emit (in onPageReady) isn't lost to the pre-load race.
-        ViewCompat.setOnApplyWindowInsetsListener(webView) { _, insets ->
+        ViewCompat.setOnApplyWindowInsetsListener(webView) { view, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
             val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
-            // When the soft keyboard is up it sits over the nav bar, so the bottom
-            // safe area must collapse to 0 — otherwise the composer (which
-            // adjustResize already keeps above the IME) floats a nav-bar height
-            // above the keyboard. Subtracting the IME inset does exactly that and
-            // is a no-op when the keyboard is hidden.
-            lastInsets = Insets.of(bars.left, bars.top, bars.right, maxOf(0, bars.bottom - ime.bottom))
+            // Edge-to-edge (setDecorFitsSystemWindows=false, above) neutralizes the
+            // manifest's adjustResize: the window no longer shrinks when the IME
+            // opens, so bottom-anchored web content (a chat composer, a terminal
+            // input) would sit BEHIND the keyboard. Resize the WebView ourselves —
+            // shrink its laid-out HEIGHT by the IME inset. It must be the view
+            // height (a bottom margin), not bottom padding: the CSS viewport
+            // (100vh / the visual viewport that fixed/sticky content anchors to)
+            // tracks the WebView's height, not its content box, so padding alone
+            // wouldn't reflow the composer above the keyboard. This is the
+            // adjustResize equivalent for an edge-to-edge window; the status/nav
+            // bars stay CSS safe-areas so content still draws behind them.
+            // Type.ime() is the real platform inset on API 30+; on 28-29 androidx
+            // backfills it from adjustResize's systemWindowInsets, so the resize
+            // still fires. If some pre-30 OEM reports none, the margin stays 0 and
+            // we simply degrade to the old (unresized) behavior — no regression.
+            (view.layoutParams as? ViewGroup.MarginLayoutParams)?.let { lp ->
+                if (lp.bottomMargin != ime.bottom) {
+                    lp.bottomMargin = ime.bottom
+                    view.layoutParams = lp
+                }
+            }
+            // Bottom safe-area: the nav bar when the keyboard is hidden; 0 while
+            // it's up (the resize already lifts content above the keyboard, and the
+            // keyboard covers the nav bar). Top/left/right are IME-independent.
+            val bottom = if (ime.bottom > 0) 0 else bars.bottom
+            lastInsets = Insets.of(bars.left, bars.top, bars.right, bottom)
             emitInsets()
             insets
         }
