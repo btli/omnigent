@@ -7,6 +7,7 @@ import {
   type RefObject,
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -99,6 +100,7 @@ import {
   useConversations,
   useMoveToProject,
   useDeleteProject,
+  useRenameProject,
   fetchProjectSessionIds,
   PROJECT_LABEL_KEY,
   usePinnedConversationBackfill,
@@ -246,6 +248,21 @@ export function computeShiftSelectRange(
 /** Fire the post-archive toast. Hoisted so it isn't a render-scoped closure. */
 function showArchivedToast() {
   showToast(<ArchivedToast />);
+}
+
+/**
+ * Toast shown when a project rename couldn't relabel every member (e.g. a
+ * shared session the viewer can't modify), which otherwise splits the project
+ * silently across the old and new names. Hoisted so the callback that fires it
+ * stays a plain handler rather than a render-scoped component.
+ */
+function showRenameFailedToast(projectName: string) {
+  showToast(
+    <span>
+      Couldn't rename <span className="font-medium">{projectName}</span> — some sessions couldn't be
+      moved (you may not own them).
+    </span>,
+  );
 }
 
 export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: SidebarProps) {
@@ -725,7 +742,9 @@ function ProjectFolder({
   selectedIds,
   onToggleSelected,
   onProjectAssigned,
+  onProjectRenamed,
   projectRenderedIdsRef,
+  siblingProjectNames,
 }: {
   name: string;
   expanded: boolean;
@@ -740,9 +759,19 @@ function ProjectFolder({
   selectedIds: Set<string>;
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
   onProjectAssigned?: (projectName: string) => void;
+  /** Carry expansion state from the old name to the new one after a rename. */
+  onProjectRenamed?: (from: string, to: string) => void;
   projectRenderedIdsRef?: RefObject<Map<string, string[]>>;
+  /** All project names, used to block renaming onto an existing project. */
+  siblingProjectNames: string[];
 }) {
   const query = useProjectSessions(name, expanded);
+  // Inline-rename edit state + the rename/delete mutations live here (not in the
+  // kebab) so both the kebab and the header's right-click context menu drive the
+  // same header override and delete dialog.
+  const [isEditing, setIsEditing] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const renameProject = useRenameProject();
   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
   const conversations = useMemo(() => {
     const loaded = query.data?.pages.flatMap((page) => page.data) ?? [];
@@ -776,6 +805,9 @@ function ProjectFolder({
     data: { type: "project", name },
   });
 
+  const startRename = useCallback(() => setIsEditing(true), []);
+  const startDelete = useCallback(() => setDeleteOpen(true), []);
+
   return (
     <div
       ref={setNodeRef}
@@ -808,7 +840,47 @@ function ProjectFolder({
         onProjectAssigned={onProjectAssigned}
         emptyMessage={loadingFirstPage ? undefined : "No chats"}
         indentRows
-        headerAction={<ProjectFolderActions projectName={name} onNavigate={onRowClick} />}
+        headerAction={
+          <ProjectFolderActions
+            projectName={name}
+            onNavigate={onRowClick}
+            onRename={startRename}
+            onDelete={startDelete}
+          />
+        }
+        headerOverride={
+          isEditing ? (
+            <ProjectEditRow
+              initialName={name}
+              existingNames={siblingProjectNames}
+              onCommit={(newName) => {
+                setIsEditing(false);
+                renameProject.mutate(
+                  { from: name, to: newName },
+                  {
+                    // Move the folder's expansion from the old name to the new
+                    // one so it stays open (and the old name doesn't linger).
+                    onSuccess: () => onProjectRenamed?.(name, newName),
+                    // Relabeling a member can fail (e.g. a shared session the
+                    // viewer can't modify), which would silently split the
+                    // project across both names — surface it instead.
+                    onError: () => showRenameFailedToast(name),
+                  },
+                );
+              }}
+              onCancel={() => setIsEditing(false)}
+            />
+          ) : undefined
+        }
+        headerContextMenuContent={
+          <ContextMenuContent className="min-w-40 [&_[role=menuitem]]:text-xs">
+            <ProjectMenuItems
+              components={contextBundle}
+              onRename={startRename}
+              onDelete={startDelete}
+            />
+          </ContextMenuContent>
+        }
         footer={
           loadingFirstPage ? (
             <p className="px-2 py-1 pl-7 text-muted-foreground text-xs">Loading…</p>
@@ -823,6 +895,7 @@ function ProjectFolder({
           )
         }
       />
+      <ProjectDeleteDialog projectName={name} open={deleteOpen} onOpenChange={setDeleteOpen} />
     </div>
   );
 }
@@ -1039,6 +1112,18 @@ function ConversationList({
       if (prev.includes(projectName)) return prev;
       setExpandedViaButton(false);
       const next = [...prev, projectName];
+      writeExpandedProjectSections(next);
+      return next;
+    });
+  }, []);
+  // Carry a renamed project's expansion forward: drop the old name (which no
+  // longer exists) and open the new one, so the folder stays expanded and a
+  // future project reusing the old name doesn't inherit its open state.
+  const renameExpandedProject = useCallback((from: string, to: string) => {
+    setExpandedProjects((prev) => {
+      const next = prev.filter((n) => n !== from);
+      if (!next.includes(to)) next.push(to);
+      setExpandedViaButton(false);
       writeExpandedProjectSections(next);
       return next;
     });
@@ -1402,7 +1487,9 @@ function ConversationList({
                     selectedIds={selectedIds}
                     onToggleSelected={onToggleSelected}
                     onProjectAssigned={expandProject}
+                    onProjectRenamed={renameExpandedProject}
                     projectRenderedIdsRef={projectRenderedIdsRef}
+                    siblingProjectNames={projectNames}
                   />
                 ))}
               </SectionGroup>
@@ -1740,6 +1827,8 @@ function ConversationSection({
   emptyMessage,
   indentRows,
   headerAction,
+  headerOverride,
+  headerContextMenuContent,
   footer,
   onProjectAssigned,
 }: {
@@ -1765,6 +1854,13 @@ function ConversationSection({
   /** Optional control overlaid at the header's right edge (e.g. a project's
       kebab). Hover/focus-revealed on desktop, always shown on mobile. */
   headerAction?: ReactNode;
+  /** Replaces the whole header (title + action) when set — used to swap the
+      project-folder header for its inline rename editor. Takes precedence over
+      the right-click context menu (no menu while editing). */
+  headerOverride?: ReactNode;
+  /** Optional <ContextMenuContent> that opens on right-click of the header,
+      giving the header the same actions as its kebab (e.g. a project folder). */
+  headerContextMenuContent?: ReactNode;
   /** Optional content rendered after the rows inside the expanded body (e.g. a
       project folder's own infinite-scroll sentinel / loading row). */
   footer?: ReactNode;
@@ -1774,28 +1870,43 @@ function ConversationSection({
 }) {
   // An untitled section is always open — there's no header to collapse it.
   const isCollapsed = title != null && collapsed;
-  return (
-    <section className="group/section relative">
-      {title && (
-        // Header + its hover-revealed kebab share a `group/header` scope so the
-        // kebab keys off hovering the header alone — NOT the whole section,
-        // which would also reveal it when hovering a child row.
-        <div className="group/header relative">
-          <SectionHeader
-            title={title}
-            icon={icon}
-            marker={marker}
-            hasAction={headerAction != null}
-            collapsed={isCollapsed}
-            onToggleCollapsed={onToggleCollapsed}
-          />
-          {headerAction && (
-            <div className="absolute top-0.5 right-1 flex items-center transition-opacity md:opacity-0 md:group-focus-within/header:opacity-100 md:group-hover/header:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100">
-              {headerAction}
-            </div>
-          )}
+  // Header + its hover-revealed kebab share a `group/header` scope so the kebab
+  // keys off hovering the header alone — NOT the whole section, which would also
+  // reveal it when hovering a child row.
+  const headerBlock = title != null && (
+    <div className="group/header relative">
+      <SectionHeader
+        title={title}
+        icon={icon}
+        marker={marker}
+        hasAction={headerAction != null}
+        collapsed={isCollapsed}
+        onToggleCollapsed={onToggleCollapsed}
+      />
+      {headerAction && (
+        <div className="absolute top-0.5 right-1 flex items-center transition-opacity md:opacity-0 md:group-focus-within/header:opacity-100 md:group-hover/header:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100">
+          {headerAction}
         </div>
       )}
+    </div>
+  );
+  // While editing, the override (inline rename) replaces the header entirely.
+  // Otherwise, an optional context menu wraps the header so right-click opens
+  // the same actions as the kebab.
+  let header: ReactNode = headerBlock;
+  if (headerOverride) {
+    header = headerOverride;
+  } else if (headerContextMenuContent && headerBlock) {
+    header = (
+      <ContextMenu>
+        <ContextMenuTrigger asChild>{headerBlock}</ContextMenuTrigger>
+        {headerContextMenuContent}
+      </ContextMenu>
+    );
+  }
+  return (
+    <section className="group/section relative">
+      {header}
       {!isCollapsed && (
         <>
           {conversations.length === 0 && emptyMessage ? (
@@ -2881,15 +2992,19 @@ function ArchivingRow({ label }: { label: string }) {
 function ProjectFolderActions({
   projectName,
   onNavigate,
+  onRename,
+  onDelete,
 }: {
   projectName: string;
   /** Plain-left-click nav handler — closes the mobile overlay so the
       pre-filed new-session page isn't left hidden behind the sidebar. */
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
+  onRename: () => void;
+  onDelete: () => void;
 }) {
   return (
     <div className="flex items-center">
-      <ProjectFolderMenu projectName={projectName} />
+      <ProjectFolderMenu projectName={projectName} onRename={onRename} onDelete={onDelete} />
       <Button
         asChild
         type="button"
@@ -2914,92 +3029,266 @@ function ProjectFolderActions({
   );
 }
 
+// ── ProjectMenuItems ──────────────────────────────────────────────────────────
+
+/**
+ * The project-folder action menu body — authored once and rendered under both
+ * the kebab {@link DropdownMenu} and the header's right-click {@link ContextMenu}
+ * via the {@link MenuComponents} bundle, so the two menus stay identical (mirrors
+ * {@link ConversationMenuItems}).
+ */
+function ProjectMenuItems({
+  components: C,
+  onRename,
+  onDelete,
+}: {
+  components: MenuComponents;
+  onRename: () => void;
+  onDelete: () => void;
+}) {
+  return (
+    <>
+      <C.Item data-testid="rename-project" onSelect={onRename}>
+        <PencilIcon className="size-3.5" />
+        Rename project
+      </C.Item>
+      <C.Separator />
+      <C.Item data-testid="delete-project" variant="destructive" onSelect={onDelete}>
+        <Trash2Icon className="size-3.5" />
+        Delete project
+      </C.Item>
+    </>
+  );
+}
+
 // ── ProjectFolderMenu ─────────────────────────────────────────────────────────
 
 /**
- * The kebab on a project-folder header. Currently just "Delete project", which
- * removes every session filed under the project (the implicit project then
- * disappears). Confirmation is required since it deletes sessions, not just the
- * grouping.
+ * The kebab on a project-folder header: "Rename project" (inline edit) and
+ * "Delete project". Both actions are owned by the parent {@link ProjectFolder}
+ * (which also surfaces them on the header's right-click menu), so this is just
+ * the dropdown surface.
  */
-function ProjectFolderMenu({ projectName }: { projectName: string }) {
-  const [menuOpen, setMenuOpen] = useState(false);
-  const [deleteOpen, setDeleteOpen] = useState(false);
-  const deleteProject = useDeleteProject();
-
+function ProjectFolderMenu({
+  projectName,
+  onRename,
+  onDelete,
+}: {
+  projectName: string;
+  onRename: () => void;
+  onDelete: () => void;
+}) {
   return (
-    <>
-      <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
-        <DropdownMenuTrigger asChild>
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-sm"
+          aria-label={`Project actions for ${projectName}`}
+          data-testid="project-actions"
+          // Sits on the folder header; keep its click off the collapse toggle.
+          onClick={(e) => e.stopPropagation()}
+        >
+          <MoreHorizontalIcon className="size-3.5" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="min-w-40 [&_[role=menuitem]]:text-xs">
+        <ProjectMenuItems components={dropdownBundle} onRename={onRename} onDelete={onDelete} />
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+// ── ProjectDeleteDialog ───────────────────────────────────────────────────────
+
+/**
+ * Confirmation dialog for "Delete project", which archives every session filed
+ * under the project (the implicit project then disappears). Confirmation is
+ * required since it archives sessions, not just the grouping.
+ */
+function ProjectDeleteDialog({
+  projectName,
+  open,
+  onOpenChange,
+}: {
+  projectName: string;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const deleteProject = useDeleteProject();
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent onClick={(e) => e.stopPropagation()}>
+        <DialogHeader>
+          <DialogTitle>Delete project?</DialogTitle>
+          <DialogDescription>
+            This archives the project{" "}
+            <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em] break-all">
+              {projectName}
+            </span>{" "}
+            and <span className="font-medium">all of its sessions</span>. Their history is kept. You
+            can find and restore them anytime from Settings.
+          </DialogDescription>
+        </DialogHeader>
+        {deleteProject.isError && (
+          <p className="text-sm text-destructive" role="alert">
+            Some sessions couldn't be archived (you may not own them); the rest were archived.
+          </p>
+        )}
+        <DialogFooter className="border-t-0 bg-transparent">
           <Button
             type="button"
             variant="ghost"
-            size="icon-sm"
-            aria-label={`Project actions for ${projectName}`}
-            data-testid="project-actions"
-            // Sits on the folder header; keep its click off the collapse toggle.
-            onClick={(e) => e.stopPropagation()}
+            onClick={() => onOpenChange(false)}
+            disabled={deleteProject.isPending}
           >
-            <MoreHorizontalIcon className="size-3.5" />
+            Cancel
           </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="min-w-40 [&_[role=menuitem]]:text-xs">
-          <DropdownMenuItem
-            data-testid="delete-project"
+          <Button
+            type="button"
             variant="destructive"
-            onSelect={() => setDeleteOpen(true)}
+            disabled={deleteProject.isPending}
+            onClick={() => {
+              deleteProject.mutate(projectName, {
+                onSuccess: () => onOpenChange(false),
+              });
+            }}
           >
-            <Trash2Icon className="size-3.5" />
-            Delete project
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
-      <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>
-        <DialogContent onClick={(e) => e.stopPropagation()}>
-          <DialogHeader>
-            <DialogTitle>Delete project?</DialogTitle>
-            <DialogDescription>
-              This archives the project{" "}
-              <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em] break-all">
-                {projectName}
-              </span>{" "}
-              and <span className="font-medium">all of its sessions</span>. Their history is kept.
-              You can find and restore them anytime from Settings.
-            </DialogDescription>
-          </DialogHeader>
-          {deleteProject.isError && (
-            <p className="text-sm text-destructive" role="alert">
-              Some sessions couldn't be archived (you may not own them); the rest were archived.
-            </p>
-          )}
-          <DialogFooter className="border-t-0 bg-transparent">
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => setDeleteOpen(false)}
-              disabled={deleteProject.isPending}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="button"
-              variant="destructive"
-              disabled={deleteProject.isPending}
-              onClick={() => {
-                deleteProject.mutate(projectName, {
-                  onSuccess: () => {
-                    setDeleteOpen(false);
-                    setMenuOpen(false);
-                  },
-                });
-              }}
-            >
-              {deleteProject.isPending ? "Deleting…" : "Delete project"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-    </>
+            {deleteProject.isPending ? "Deleting…" : "Delete project"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ── ProjectEditRow ────────────────────────────────────────────────────────────
+
+/**
+ * Inline-edit shell for a project-folder header — the rename affordance. Mirrors
+ * {@link ConversationEditRow} (auto-focus + select, Enter commits, Escape/blur
+ * cancels) but adds validation: an empty or unchanged name just exits, and a
+ * name that collides with an existing project is blocked with an inline error
+ * (rename never silently merges two projects).
+ */
+function ProjectEditRow({
+  initialName,
+  existingNames,
+  onCommit,
+  onCancel,
+}: {
+  initialName: string;
+  existingNames: string[];
+  onCommit: (name: string) => void;
+  onCancel: () => void;
+}) {
+  const [value, setValue] = useState(initialName);
+  const [error, setError] = useState<string | null>(null);
+  const errorId = useId();
+  const inputRef = useRef<HTMLInputElement>(null);
+  // Set when the user explicitly cancels (Escape or X); blur checks it so the
+  // unmount blur doesn't re-run the commit path.
+  const cancelledRef = useRef(false);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+    inputRef.current?.select();
+  }, []);
+
+  // `fromBlur` distinguishes an explicit commit (Enter / Save) from focus loss.
+  // On an explicit commit a collision surfaces an inline error and keeps
+  // editing; on blur it just cancels so focus isn't trapped on the field.
+  function commit(fromBlur: boolean) {
+    const trimmed = value.trim();
+    // No-op: empty or unchanged — leave edit mode without a rename.
+    if (!trimmed || trimmed === initialName) {
+      onCancel();
+      return;
+    }
+    // Best-effort guard against merging into an existing project. It only sees
+    // the loaded, non-archived project list, so a stale cache or an
+    // archived-only project of the same name could still slip through; the
+    // server treats the label as opaque and won't reject it.
+    if (existingNames.some((n) => n !== initialName && n === trimmed)) {
+      // Surface the collision and keep editing so the typed value isn't lost.
+      // On an explicit commit (Enter/Save) refocus the field; on blur don't —
+      // that would trap focus on a field the user is trying to leave.
+      setError("A project with this name already exists.");
+      if (!fromBlur) inputRef.current?.focus();
+      return;
+    }
+    onCommit(trimmed);
+  }
+
+  function handleKeyDown(e: KeyboardEvent<HTMLInputElement>) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      commit(false);
+      return;
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      cancelledRef.current = true;
+      onCancel();
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-1">
+      {/* pl-2 + folder icon line the input up with the folder header's title. */}
+      <div className="flex items-center gap-1 rounded-md bg-muted py-1 pr-1 pl-2">
+        <FolderOpenIcon className="size-4 shrink-0 text-muted-foreground" />
+        <input
+          ref={inputRef}
+          type="text"
+          value={value}
+          onChange={(e) => {
+            setValue(e.target.value);
+            if (error) setError(null);
+          }}
+          onKeyDown={handleKeyDown}
+          onBlur={() => {
+            if (cancelledRef.current) return;
+            commit(true);
+          }}
+          aria-label="Rename project"
+          aria-invalid={error != null}
+          aria-describedby={error ? errorId : undefined}
+          data-testid="rename-project-input"
+          className="min-w-0 flex-1 truncate rounded bg-transparent px-1 py-1 text-sm outline-none md:select-text"
+        />
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-sm"
+          aria-label="Save rename"
+          // Prevent the input's blur from firing before the commit.
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => commit(false)}
+        >
+          <CheckIcon className="size-3.5" />
+        </Button>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-sm"
+          aria-label="Cancel rename"
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => {
+            cancelledRef.current = true;
+            onCancel();
+          }}
+        >
+          <XIcon className="size-3.5" />
+        </Button>
+      </div>
+      {error && (
+        <p id={errorId} className="pl-2 text-destructive text-xs" role="alert">
+          {error}
+        </p>
+      )}
+    </div>
   );
 }
 

@@ -88,6 +88,7 @@ vi.mock("@/hooks/useConversations", () => ({
   },
   useMoveToProject: () => ({ mutate: vi.fn() }),
   useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: vi.fn(() => Promise.resolve([] as string[])),
   PROJECT_LABEL_KEY: "omni_project",
 }));

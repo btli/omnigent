@@ -838,3 +838,44 @@ export function useDeleteProject() {
     },
   });
 }
+
+/**
+ * Rename a whole project by re-labeling every session filed under it (archived
+ * included) with the new `omni_project` value. Projects are implicit — a project
+ * is just the set of sessions carrying its label — so renaming means relabeling
+ * the members; the old name's folder vanishes once its last member moves and the
+ * new name appears in the server's project list. Throws
+ * `{ failed, succeeded, total }` if any session failed (e.g. a shared session
+ * the user can't modify), leaving those members under the old name.
+ */
+export function useRenameProject() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ from, to }: { from: string; to: string }) => {
+      const ids = await fetchAllProjectSessionIds(from);
+      const results = await Promise.allSettled(ids.map((id) => moveConversationToProject(id, to)));
+      const succeeded: string[] = [];
+      const failed: string[] = [];
+      for (let i = 0; i < results.length; i++) {
+        if (results[i].status === "fulfilled") {
+          succeeded.push(ids[i]);
+          markConversationSeen(
+            ids[i],
+            (results[i] as PromiseFulfilledResult<Conversation>).value.updated_at,
+          );
+        } else {
+          failed.push(ids[i]);
+        }
+      }
+      if (failed.length > 0) throw { failed, succeeded, total: ids.length };
+      return { succeeded, failed };
+    },
+    onSettled: () => {
+      // Refresh regardless of partial failure so the sidebar reflects whatever
+      // was actually relabeled.
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+    },
+  });
+}
