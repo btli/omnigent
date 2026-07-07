@@ -10,6 +10,7 @@ import type { Session } from "@/lib/types";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import {
   deleteConversation,
+  fetchAllArchivedProjectNames,
   renameConversation,
   useArchiveConversation,
   useBulkArchiveConversations,
@@ -187,6 +188,70 @@ describe("useConversations project filter", () => {
     const url = fetchMock.mock.calls[0][0] as string;
     expect(url).toContain("include_archived=true");
     expect(url).not.toContain("project=");
+  });
+
+  it("forwards a project literally named __all__ as project=__all__", async () => {
+    renderWithProject("__all__");
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toContain("project=__all__");
+  });
+});
+
+describe("fetchAllArchivedProjectNames", () => {
+  it("pages through all archived sessions and returns distinct sorted project names", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          data: [
+            { id: "a", archived: true, labels: { omni_project: "Beta" } },
+            // Active row — include_archived returns it, but it's not filterable here.
+            { id: "b", archived: false, labels: { omni_project: "Zeta" } },
+            // Archived but unfiled — no project label to collect.
+            { id: "c", archived: true, labels: {} },
+          ],
+          first_id: "a",
+          last_id: "c",
+          has_more: true,
+        }),
+      )
+      .mockResolvedValueOnce(
+        mockResponse({
+          data: [
+            { id: "d", archived: true, labels: { omni_project: "Alpha" } },
+            // Duplicate project across pages collapses to one entry.
+            { id: "e", archived: true, labels: { omni_project: "Beta" } },
+          ],
+          first_id: "d",
+          last_id: "e",
+          has_more: false,
+        }),
+      );
+
+    const names = await fetchAllArchivedProjectNames();
+
+    // Distinct + sorted; active and unfiled rows contribute nothing.
+    expect(names).toEqual(["Alpha", "Beta"]);
+    // Page 1: archived, large page size, no project filter, no cursor.
+    const url1 = fetchMock.mock.calls[0][0] as string;
+    expect(url1).toContain("include_archived=true");
+    expect(url1).toContain("limit=100");
+    expect(url1).not.toContain("project=");
+    expect(url1).not.toContain("after=");
+    // Page 2 follows the previous page's last_id cursor.
+    expect(fetchMock.mock.calls[1][0]).toContain("after=c");
+  });
+
+  it("stops after one request when the first page has no more", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+    );
+
+    const names = await fetchAllArchivedProjectNames();
+
+    expect(names).toEqual([]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
 

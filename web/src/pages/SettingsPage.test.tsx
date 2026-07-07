@@ -23,6 +23,11 @@ const mocks = vi.hoisted(() => ({
   // the id, getCurrentIsAdmin the flag). null → unauthenticated.
   me: { id: "alice", is_admin: false } as { id: string; is_admin: boolean } | null,
   conversations: [] as Conversation[],
+  // Picker options come from useArchivedProjectNames (a dedicated scan), not
+  // from the loaded rows — so tests set them independently of `conversations`.
+  projectNames: [] as string[],
+  hasNextPage: false,
+  fetchNextPage: vi.fn(),
 }));
 
 vi.mock("next-themes", () => ({
@@ -45,9 +50,9 @@ vi.mock("@/lib/identity", () => ({
 }));
 vi.mock("@/hooks/useConversations", () => ({
   PROJECT_LABEL_KEY: "omni_project",
-  // The Archived view calls this twice: once unfiltered (drives the picker
-  // options) and once with the picked `project` (the list). Filter on the
-  // fourth arg so the mock mirrors the server-side ?project= scoping.
+  // The Archived view drives the visible list from this hook; filter on the
+  // fourth (`project`) arg so the mock mirrors the server-side ?project=
+  // scoping. Pagination fields back the "Load more" control.
   useConversations: (
     _searchQuery?: string,
     _includeArchived?: boolean,
@@ -64,7 +69,13 @@ vi.mock("@/hooks/useConversations", () => ({
       ],
     },
     isLoading: false,
+    hasNextPage: mocks.hasNextPage,
+    isFetchingNextPage: false,
+    fetchNextPage: mocks.fetchNextPage,
   }),
+  // Picker options are sourced from this dedicated scan, decoupled from the
+  // loaded rows so archived-only projects on later pages still appear.
+  useArchivedProjectNames: () => ({ data: mocks.projectNames }),
   useArchiveConversation: () => ({ mutate: mocks.archiveMutate, isPending: false }),
   useStopAndDeleteConversation: () => ({ mutate: mocks.deleteMutate, isPending: false }),
 }));
@@ -134,11 +145,14 @@ beforeEach(() => {
   mocks.setTheme.mockReset();
   mocks.archiveMutate.mockReset();
   mocks.deleteMutate.mockReset();
+  mocks.fetchNextPage.mockReset();
   mocks.theme = "system";
   mocks.accountsEnabled = true;
   mocks.loginUrl = "/login";
   mocks.me = { id: "alice", is_admin: false };
   mocks.conversations = [];
+  mocks.projectNames = [];
+  mocks.hasNextPage = false;
 });
 afterEach(() => {
   cleanup();
@@ -372,6 +386,7 @@ describe("SettingsPage", () => {
   });
 
   it("scopes the archived list to the project picked in the filter", () => {
+    mocks.projectNames = ["Alpha", "Beta"];
     mocks.conversations = [
       conv("conv_a", { archived: true, title: "Alpha chat", labels: { omni_project: "Alpha" } }),
       conv("conv_b", { archived: true, title: "Beta chat", labels: { omni_project: "Beta" } }),
@@ -382,20 +397,19 @@ describe("SettingsPage", () => {
     // "All projects" (default) lists every archived session.
     expect(screen.getAllByTestId("archived-row")).toHaveLength(2);
     const select = screen.getByTestId("archived-project-filter");
-    // Options come from the labels on the loaded archived sessions, not the
-    // project list endpoint (which omits all-archived projects).
     expect(within(select).getByRole("option", { name: "All projects" })).toBeInTheDocument();
     expect(within(select).getByRole("option", { name: "Alpha" })).toBeInTheDocument();
     expect(within(select).getByRole("option", { name: "Beta" })).toBeInTheDocument();
 
     // Picking a project narrows the list to that project's archived sessions.
-    fireEvent.change(select, { target: { value: "Alpha" } });
+    // Select values are discriminated (`project:<name>`), never the raw name.
+    fireEvent.change(select, { target: { value: "project:Alpha" } });
     const rows = screen.getAllByTestId("archived-row");
     expect(rows).toHaveLength(1);
     expect(within(rows[0]).getByText("Alpha chat")).toBeInTheDocument();
 
     // Back to "All projects" restores the full list.
-    fireEvent.change(select, { target: { value: "__all__" } });
+    fireEvent.change(select, { target: { value: "all" } });
     expect(screen.getAllByTestId("archived-row")).toHaveLength(2);
   });
 
@@ -416,8 +430,7 @@ describe("SettingsPage", () => {
   });
 
   it("shows a project-scoped empty state when the picked project has no rows", () => {
-    // Alpha is a valid option (its archived session provides the label), but a
-    // picked project can momentarily hold no visible rows.
+    mocks.projectNames = ["Alpha"];
     mocks.conversations = [
       conv("conv_a", { archived: true, title: "Alpha chat", labels: { omni_project: "Alpha" } }),
     ];
@@ -425,9 +438,48 @@ describe("SettingsPage", () => {
 
     const select = screen.getByTestId("archived-project-filter");
     // Drop Alpha's only session so the filtered fetch returns nothing, then
-    // re-pick Alpha (still an option because it's the current selection).
+    // pick Alpha (still an option because it's in the scanned name set).
     mocks.conversations = [];
-    fireEvent.change(select, { target: { value: "Alpha" } });
+    fireEvent.change(select, { target: { value: "project:Alpha" } });
     expect(screen.getByText("No archived sessions in this project.")).toBeInTheDocument();
+  });
+
+  it("offers archived-only projects whose sessions are beyond the first loaded page", () => {
+    // The visible list's first page has no Gamma row, but the option scan
+    // (useArchivedProjectNames, which pages through everything) found Gamma —
+    // this is the gotcha the feature exists for.
+    mocks.projectNames = ["Gamma"];
+    mocks.conversations = [conv("p1", { archived: true, title: "Page-one chat" })];
+    renderPage("/settings/archived");
+
+    const select = screen.getByTestId("archived-project-filter");
+    // Gamma is offered even though no Gamma row is in the loaded page.
+    expect(within(select).getByRole("option", { name: "Gamma" })).toBeInTheDocument();
+  });
+
+  it("treats a project literally named __all__ as a real project, not the clear-filter sentinel", () => {
+    mocks.projectNames = ["Other", "__all__"];
+    mocks.conversations = [
+      conv("x1", { archived: true, title: "Edge chat", labels: { omni_project: "__all__" } }),
+      conv("o1", { archived: true, title: "Other chat", labels: { omni_project: "Other" } }),
+    ];
+    renderPage("/settings/archived");
+
+    const select = screen.getByTestId("archived-project-filter");
+    // Picking the "__all__" project must FILTER to it (discriminated value
+    // `project:__all__`), not clear the filter.
+    fireEvent.change(select, { target: { value: "project:__all__" } });
+    const rows = screen.getAllByTestId("archived-row");
+    expect(rows).toHaveLength(1);
+    expect(within(rows[0]).getByText("Edge chat")).toBeInTheDocument();
+  });
+
+  it("loads the next page of archived sessions on demand", () => {
+    mocks.conversations = [conv("a1", { archived: true, title: "Old chat" })];
+    mocks.hasNextPage = true;
+    renderPage("/settings/archived");
+
+    fireEvent.click(screen.getByTestId("archived-load-more"));
+    expect(mocks.fetchNextPage).toHaveBeenCalled();
   });
 });

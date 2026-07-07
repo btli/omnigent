@@ -29,6 +29,7 @@ import { authenticatedFetch } from "@/lib/identity";
 import {
   filtersFromConversationQueryKey,
   mergeItemsIntoPages,
+  PROJECT_LABEL_KEY,
   removeIdsFromPages,
   type ConversationsInfiniteData,
   type SessionListWireItem,
@@ -674,13 +675,10 @@ export function usePinnedConversationBackfill(
 
 // ── Project hooks ─────────────────────────────────────────────────────────────
 
-/**
- * The reserved `conversation_labels` key that stores a session's project
- * membership. Namespaced (`omni_*`) so it never collides with the user-facing
- * "project" term or other reserved keys, and is filtered out of generic label
- * surfaces.
- */
-export const PROJECT_LABEL_KEY = "omni_project";
+// The reserved `conversation_labels` project key lives in the leaf cache
+// module (see sessionListCache) so the cache membership checks can read it
+// without a value import cycle; re-exported here for the existing consumers.
+export { PROJECT_LABEL_KEY };
 
 /** Fetch all project names from `GET /v1/sessions/projects`. */
 export function useProjects() {
@@ -691,6 +689,68 @@ export function useProjects() {
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
       return (await res.json()) as string[];
     },
+    staleTime: 30_000,
+  });
+}
+
+/**
+ * Fetch the names of every project that has at least one ARCHIVED session,
+ * paging through all archived sessions server-side.
+ *
+ * The Archived settings picker can't source options from `useProjects()`:
+ * `list_projects` (GET /v1/sessions/projects) omits projects whose every
+ * session is archived — exactly the population this page filters. And deriving
+ * options from only the archived list's loaded first page would miss
+ * archived-only projects whose sessions sit on later pages. So page through the
+ * whole archived set (a larger page size keeps the request count low) and
+ * collect the distinct `omni_project` labels present on archived rows.
+ *
+ * Exported for direct unit testing.
+ */
+export async function fetchAllArchivedProjectNames(): Promise<string[]> {
+  const names = new Set<string>();
+  let after: string | undefined;
+  for (;;) {
+    const params = new URLSearchParams({
+      order: "desc",
+      sort_by: "updated_at",
+      limit: "100",
+      include_archived: "true",
+    });
+    if (after) params.set("after", after);
+    // Sequential by necessity: each page's request needs the previous page's
+    // cursor (`after`), so these awaits can't be parallelized.
+    // eslint-disable-next-line no-await-in-loop
+    const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    // eslint-disable-next-line no-await-in-loop
+    const page = (await res.json()) as ConversationsPage;
+    for (const conv of page.data) {
+      // include_archived returns archived AND active rows; only archived ones
+      // are filterable on this page, so collect labels from those.
+      if (conv.archived !== true) continue;
+      const name = conv.labels?.[PROJECT_LABEL_KEY];
+      if (name) names.add(name);
+    }
+    if (!page.has_more || !page.last_id) break;
+    after = page.last_id;
+  }
+  return [...names].sort((a, b) => a.localeCompare(b));
+}
+
+/**
+ * Project names that have archived sessions — the option set for the Archived
+ * view's project filter.
+ *
+ * Keyed under the `["projects", …]` prefix so the archive / unarchive / move /
+ * delete mutations that already `invalidateQueries(["projects"])` refresh it
+ * for free (react-query prefix-matches), keeping the picker in sync as archived
+ * membership changes.
+ */
+export function useArchivedProjectNames() {
+  return useQuery<string[]>({
+    queryKey: ["projects", "archived-session-names"],
+    queryFn: fetchAllArchivedProjectNames,
     staleTime: 30_000,
   });
 }

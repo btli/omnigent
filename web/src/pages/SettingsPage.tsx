@@ -58,8 +58,8 @@ import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import {
   type Conversation,
-  PROJECT_LABEL_KEY,
   useArchiveConversation,
+  useArchivedProjectNames,
   useConversations,
   useStopAndDeleteConversation,
 } from "@/hooks/useConversations";
@@ -717,45 +717,48 @@ function AccountSection() {
   );
 }
 
-/** Select sentinel for the "no filter" option (Radix rejects an empty value). */
-const ALL_PROJECTS = "__all__";
+// Discriminated Select values so the "no filter" sentinel can never collide
+// with a real project name: the reset option is a fixed token that no project
+// value can equal, and every project is namespaced under a prefix (its name
+// URI-encoded) and decoded back on change. A project literally named "all" (or
+// "__all__") therefore still filters correctly instead of clearing the filter.
+const ALL_PROJECTS_VALUE = "all";
+const PROJECT_VALUE_PREFIX = "project:";
+
+function projectToSelectValue(project: string | undefined): string {
+  return project === undefined
+    ? ALL_PROJECTS_VALUE
+    : PROJECT_VALUE_PREFIX + encodeURIComponent(project);
+}
+
+function selectValueToProject(value: string): string | undefined {
+  if (value === ALL_PROJECTS_VALUE) return undefined;
+  return decodeURIComponent(value.slice(PROJECT_VALUE_PREFIX.length));
+}
 
 function ArchivedSection() {
   // `undefined` = all projects; a name scopes the list to that project.
   const [project, setProject] = useState<string | undefined>(undefined);
 
-  // Unfiltered archived set — always fetched — drives the picker options.
-  // `list_projects` (GET /v1/sessions/projects) omits projects whose every
-  // session is archived, which is exactly this page's population, so the
-  // options can't come from useProjects(). Derive them from the omni_project
-  // labels present on the loaded archived sessions instead.
-  const allQuery = useConversations("", true);
-  const projectOptions = useMemo(() => {
-    const names = new Set<string>();
-    for (const page of allQuery.data?.pages ?? []) {
-      for (const conv of page.data) {
-        if (conv.archived !== true) continue;
-        const name = conv.labels?.[PROJECT_LABEL_KEY];
-        if (name) names.add(name);
-      }
-    }
-    return [...names].sort((a, b) => a.localeCompare(b));
-  }, [allQuery.data]);
+  // Picker options: every project that has an archived session. Sourced from a
+  // dedicated hook that pages through ALL archived sessions server-side —
+  // `useProjects()` omits all-archived projects, and deriving options from only
+  // the visible list's loaded first page would hide archived-only projects
+  // whose sessions sit on later pages.
+  const { data: projectNames = [] } = useArchivedProjectNames();
 
-  // The list is filtered server-side via ?project= when one is picked.
-  // "All projects" (undefined) reuses allQuery's key, so react-query serves
-  // both from a single fetch.
+  // The visible list, filtered server-side via ?project= when one is picked.
   const listQuery = useConversations("", true, undefined, project);
   const archived = useMemo(
     () => (listQuery.data?.pages ?? []).flatMap((p) => p.data).filter((c) => c.archived === true),
     [listQuery.data],
   );
 
-  // A picked project can drop out of the options once its last archived
-  // session is unarchived; keep it listed so the trigger never shows a blank,
-  // orphaned value.
+  // Keep a picked project listed even if it drops out of the option set (its
+  // last archived session was just unarchived) so the trigger never shows a
+  // blank, orphaned value while the refetch settles.
   const items =
-    project && !projectOptions.includes(project) ? [project, ...projectOptions] : projectOptions;
+    project && !projectNames.includes(project) ? [project, ...projectNames] : projectNames;
 
   return (
     <Section
@@ -768,8 +771,8 @@ function ArchivedSection() {
             Project
           </label>
           <Select
-            value={project ?? ALL_PROJECTS}
-            onValueChange={(value) => setProject(value === ALL_PROJECTS ? undefined : value)}
+            value={projectToSelectValue(project)}
+            onValueChange={(value) => setProject(selectValueToProject(value))}
           >
             <SelectTrigger
               id="archived-project-filter"
@@ -780,9 +783,13 @@ function ArchivedSection() {
               <SelectValue />
             </SelectTrigger>
             <SelectContent position="popper" align="start">
-              <SelectItem value={ALL_PROJECTS}>All projects</SelectItem>
+              <SelectItem value={ALL_PROJECTS_VALUE}>All projects</SelectItem>
               {items.map((name) => (
-                <SelectItem key={name} value={name} data-testid={`archived-project-option-${name}`}>
+                <SelectItem
+                  key={name}
+                  value={projectToSelectValue(name)}
+                  data-testid={`archived-project-option-${name}`}
+                >
                   {name}
                 </SelectItem>
               ))}
@@ -798,11 +805,29 @@ function ArchivedSection() {
           {project ? "No archived sessions in this project." : "No archived sessions."}
         </p>
       ) : (
-        <ul className="flex flex-col gap-0.5">
-          {archived.map((conv) => (
-            <ArchivedRow key={conv.id} conversation={conv} />
-          ))}
-        </ul>
+        <>
+          <ul className="flex flex-col gap-0.5">
+            {archived.map((conv) => (
+              <ArchivedRow key={conv.id} conversation={conv} />
+            ))}
+          </ul>
+          {/* The list is paginated; without this it would silently cap at the
+              first page (~20 rows). */}
+          {listQuery.hasNextPage && (
+            <div className="mt-3">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                data-testid="archived-load-more"
+                disabled={listQuery.isFetchingNextPage}
+                onClick={() => void listQuery.fetchNextPage()}
+              >
+                {listQuery.isFetchingNextPage ? "Loading…" : "Load more"}
+              </Button>
+            </div>
+          )}
+        </>
       )}
     </Section>
   );
