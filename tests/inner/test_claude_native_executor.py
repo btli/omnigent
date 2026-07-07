@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from omnigent.claude_native_bridge import REQUEST_SESSION_ID_ENV_VAR
+from omnigent.claude_native_bridge import REQUEST_SESSION_ID_ENV_VAR, ClaudePromptReadyTimeout
 from omnigent.inner import claude_native_executor
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
 from omnigent.inner.executor import ExecutorError, TurnComplete
@@ -89,6 +89,152 @@ async def test_run_turn_injects_user_message_without_streaming_transcript(
     assert events == [TurnComplete(response=None)]
     assert not (bridge_dir / "transcript_forwarder.json").exists()
     assert not (bridge_dir / "transcript_forwarder.pause.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_run_turn_recovers_prompt_timeout_and_retries_message(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A Claude Code boot timeout is closed, relaunched, and retried once.
+
+    The first injection sees tmux but never sees Claude's input prompt,
+    which is the startup crash class this recovery handles. The executor
+    must close the poisoned terminal, use the native ensure path to
+    relaunch, then deliver the same pending message exactly once on the
+    retry.
+    """
+    monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "conv_boot")
+    bridge_dir = tmp_path / "bridge"
+    ops: list[str] = []
+
+    def fake_inject_user_message(
+        bridge_dir_arg: Path,
+        *,
+        content: str,
+        timeout_s: float = 30.0,
+    ) -> None:
+        del bridge_dir_arg, timeout_s
+        ops.append(f"inject:{content}")
+        if ops == ["inject:recover me"]:
+            raise ClaudePromptReadyTimeout(
+                "Claude Code terminal did not become ready within 0.1s "
+                "(input prompt never rendered). The message was not delivered."
+            )
+
+    async def fake_close(bridge_dir_arg: Path, session_id: str) -> None:
+        del bridge_dir_arg
+        ops.append(f"close:{session_id}")
+
+    async def fake_ensure(bridge_dir_arg: Path, session_id: str) -> None:
+        del bridge_dir_arg
+        ops.append(f"ensure:{session_id}")
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "_close_claude_terminal_for_recovery",
+        fake_close,
+    )
+    monkeypatch.setattr(
+        claude_native_executor,
+        "_ensure_claude_terminal_for_recovery",
+        fake_ensure,
+    )
+
+    executor = ClaudeNativeExecutor(bridge_dir)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "recover me"}],
+            tools=[],
+            system_prompt="ignored",
+        )
+    ]
+
+    assert events == [TurnComplete(response=None)]
+    assert ops == [
+        "inject:recover me",
+        "close:conv_boot",
+        "ensure:conv_boot",
+        "inject:recover me",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_double_prompt_timeout_is_retryable_and_closes_retry_pane(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    If the recovery launch also times out, the retry pane is closed.
+
+    The executor must not loop or emit multiple failures. It returns one
+    retryable error so the session can be resumed by a later message, and
+    it closes the second crashed pane so the next native ensure cannot
+    reuse it.
+    """
+    monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "conv_retry_fails")
+    bridge_dir = tmp_path / "bridge"
+    ops: list[str] = []
+
+    def fake_inject_user_message(
+        bridge_dir_arg: Path,
+        *,
+        content: str,
+        timeout_s: float = 30.0,
+    ) -> None:
+        del bridge_dir_arg, timeout_s
+        ops.append(f"inject:{content}")
+        raise ClaudePromptReadyTimeout(
+            "Claude Code terminal did not become ready within 0.1s "
+            "(input prompt never rendered). The message was not delivered."
+        )
+
+    async def fake_close(bridge_dir_arg: Path, session_id: str) -> None:
+        del bridge_dir_arg
+        ops.append(f"close:{session_id}")
+
+    async def fake_ensure(bridge_dir_arg: Path, session_id: str) -> None:
+        del bridge_dir_arg
+        ops.append(f"ensure:{session_id}")
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "_close_claude_terminal_for_recovery",
+        fake_close,
+    )
+    monkeypatch.setattr(
+        claude_native_executor,
+        "_ensure_claude_terminal_for_recovery",
+        fake_ensure,
+    )
+
+    executor = ClaudeNativeExecutor(bridge_dir)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "still recover"}],
+            tools=[],
+            system_prompt="ignored",
+        )
+    ]
+
+    assert len(events) == 1
+    error = events[0]
+    assert isinstance(error, ExecutorError)
+    assert error.retryable is True
+    assert error.code == "timeout"
+    assert "one automatic relaunch" in error.message
+    assert ops == [
+        "inject:still recover",
+        "close:conv_retry_fails",
+        "ensure:conv_retry_fails",
+        "inject:still recover",
+        "close:conv_retry_fails",
+    ]
 
 
 @pytest.mark.asyncio

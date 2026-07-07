@@ -108,6 +108,15 @@ _OBSERVED_TOOL_CALL_STATUS = "in_progress"
 #    ToolCallComplete — the dispatch's PATCH handler emits the
 #    paired output. Keeps the dedup story symmetric.
 _MCP_TOOL_NAME_PREFIX = "mcp__"
+_DEFAULT_RETRYABLE_EXECUTOR_ERROR_CODE = "server_error"
+
+
+class _RetryableExecutorError(RuntimeError):
+    """Runtime wrapper preserving ``ExecutorError.retryable`` semantics."""
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code or _DEFAULT_RETRYABLE_EXECUTOR_ERROR_CODE
 
 
 def _strip_mcp_tool_prefix(name: str) -> str:
@@ -457,7 +466,10 @@ class ExecutorAdapter(HarnessApp):
                                 error=event.message,
                             )
                             agent_span = None
-                        raise RuntimeError(f"inner executor error: {event.message}")
+                        error_message = f"inner executor error: {event.message}"
+                        if event.retryable:
+                            raise _RetryableExecutorError(error_message, code=event.code)
+                        raise RuntimeError(error_message)
         except ElicitationDeclinedError:
             # Fallback for executors that propagate the exception directly
             # (non-SDK / non-spawned-task paths). SDK-based executors use
@@ -1091,6 +1103,8 @@ class ExecutorAdapter(HarnessApp):
             # Project-internal structured errors already carry a
             # semantic code (e.g. ``RetryableLLMError(code="timeout")``).
             return ErrorDetail(code=exception.code, message=str(exception))
+        if isinstance(exception, _RetryableExecutorError):
+            return ErrorDetail(code=exception.code, message=str(exception))
 
         code = classify_inner_exception(exception)
         if code is not None:
@@ -1341,6 +1355,8 @@ def classify_inner_exception(exception: BaseException) -> str | None:
         ``"rate_limit_exceeded"``), or ``None`` when no
         classifier matched.
     """
+    if isinstance(exception, _RetryableExecutorError):
+        return exception.code
     for classifier in (
         _classify_openai_exception,
         _classify_anthropic_exception,

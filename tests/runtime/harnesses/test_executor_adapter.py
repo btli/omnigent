@@ -155,6 +155,12 @@ def use_error(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
+def use_retryable_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MockExecutor that yields a retryable ExecutorError."""
+    monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "retryable_error")
+
+
+@pytest.fixture
 def use_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
     """MockExecutor that yields a provider-side TurnCancelled."""
     monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "cancelled")
@@ -401,6 +407,33 @@ async def test_executor_error_terminates_with_response_failed(
     # via the RuntimeError wrap in the adapter; the scaffold
     # builds an ErrorDetail with the exception's str().
     assert "mock error" in error_detail["message"]
+
+
+async def test_retryable_executor_error_preserves_semantic_code(
+    use_retryable_error: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """
+    ``ExecutorError.retryable`` survives the adapter boundary.
+
+    A retryable inner error must not be demoted to a plain
+    ``RuntimeError`` code, otherwise AP's retry classifier treats a
+    recoverable harness failure as permanent.
+    """
+    conv_id = "conv_retryable_err"
+    client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    events: list[_ParsedSSEEvent] = []
+    async with client.stream(
+        "POST", f"/v1/sessions/{conv_id}/events", json=_start_turn_body()
+    ) as response:
+        async for event in _stream_iter(response):
+            events.append(event)
+
+    assert events[-1].event == "response.failed"
+    error_detail = events[-1].data["response"]["error"]
+    assert error_detail is not None
+    assert error_detail["code"] == "timeout"
+    assert "transient boot timeout" in error_detail["message"]
 
 
 async def test_turn_cancelled_terminates_with_response_cancelled(
