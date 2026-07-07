@@ -417,8 +417,7 @@ async def test_retryable_executor_error_preserves_semantic_code(
     ``ExecutorError.retryable`` survives the adapter boundary.
 
     A retryable inner error must not be demoted to a plain
-    ``RuntimeError`` code, otherwise AP's retry classifier treats a
-    recoverable harness failure as permanent.
+    ``RuntimeError`` code in the emitted ``response.failed`` detail.
     """
     conv_id = "conv_retryable_err"
     client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
@@ -474,10 +473,9 @@ def test_build_error_detail_uses_omnigent_error_code() -> None:
 
     What breaks if this fails: a ``RetryableLLMError(code="timeout")``
     raised by the inner executor would surface as
-    ``code="RetryableLLMError"``, AP's allowlist wouldn't
-    match, and the workflow's retry policy would treat the
-    timeout as permanent. The whole point of step 5j is the
-    structured ``code + retryable`` flowing through.
+    ``code="RetryableLLMError"`` instead of the semantic timeout code.
+    The whole point of the adapter override is the structured
+    ``code + retryable`` flowing through.
     """
     from omnigent.llms.errors import LLMErrorDetail, RetryableLLMError
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
@@ -491,10 +489,9 @@ def test_build_error_detail_uses_omnigent_error_code() -> None:
     )
     detail = adapter._build_error_detail(error)
 
-    # Code preserved verbatim — the Omnigent allowlist matches this and
-    # marks the failure retryable. Class-name fallback (which the
-    # base HarnessApp implementation would have used) gives
-    # ``"RetryableLLMError"`` instead, which Omnigent would NOT match.
+    # Code preserved verbatim. Class-name fallback (which the base
+    # HarnessApp implementation would have used) gives
+    # ``"RetryableLLMError"`` instead.
     assert detail.code == "rate_limit_exceeded"
     assert "rate-limited by gateway" in detail.message
     # Sanity: the base class fallback would NOT have produced this
@@ -544,7 +541,7 @@ def test_classify_openai_exception_maps_known_types() -> None:
         body=None,
     )
 
-    # Each known type maps onto AP's allowlist verbatim.
+    # Each known type maps onto a semantic error code verbatim.
     assert _classify_openai_exception(rate) == "rate_limit_exceeded"
     assert _classify_openai_exception(timeout) == "timeout"
     assert _classify_openai_exception(connect) == "connection_error"
@@ -712,9 +709,7 @@ def test_classify_anthropic_exception_maps_known_types(
     which can still surface raw :class:`anthropic.RateLimitError`
     upward when the SDK's framing layer fails. Without this
     classifier, those would render as ``[llm] RateLimitError``
-    and AP's retry allowlist (which uses semantic codes, not
-    class names) wouldn't match — silent demotion of retryable
-    failures to permanent.
+    instead of a semantic rate-limit code.
     """
     import sys
     import types

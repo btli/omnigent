@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import threading
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
-from omnigent.claude_native_bridge import REQUEST_SESSION_ID_ENV_VAR, ClaudePromptReadyTimeout
+from omnigent.claude_native_bridge import (
+    REQUEST_SESSION_ID_ENV_VAR,
+    ClaudePromptReadyTimeout,
+    build_hook_settings,
+)
 from omnigent.inner import claude_native_executor
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
 from omnigent.inner.executor import ExecutorError, TurnComplete
@@ -234,6 +240,185 @@ async def test_run_turn_double_prompt_timeout_is_retryable_and_closes_retry_pane
         "ensure:conv_retry_fails",
         "inject:still recover",
         "close:conv_retry_fails",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_status", [200, 404])
+async def test_boot_recovery_uses_terminal_resource_api_and_auth_headers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    close_status: int,
+) -> None:
+    """
+    Recovery tears down before ensure through the real HTTP request path.
+
+    The permission-hook config carries the same owner bearer and routing
+    headers that satisfy the server terminal routes' LEVEL_EDIT checks.
+    Recovery must replay them unchanged for both the normal close case
+    and the already-gone 404 close case.
+    """
+    root = tmp_path / "root"
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", root)
+    bridge_dir = root / "bridge"
+    build_hook_settings(
+        bridge_dir,
+        ap_server_url="http://ap",
+        ap_auth_headers={
+            "Authorization": "Bearer owner-token",
+            "X-Databricks-Org-Id": "123",
+        },
+    )
+    ops: list[str] = []
+    requests: list[tuple[str, str, dict[str, Any] | None]] = []
+
+    def fake_inject_user_message(
+        bridge_dir_arg: Path,
+        *,
+        content: str,
+        timeout_s: float = 30.0,
+    ) -> None:
+        del bridge_dir_arg, timeout_s
+        ops.append(f"inject:{content}")
+        if len(ops) == 1:
+            raise ClaudePromptReadyTimeout(
+                "Claude Code terminal did not become ready within 0.1s "
+                "(input prompt never rendered). The message was not delivered."
+            )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == "Bearer owner-token"
+        assert request.headers["x-databricks-org-id"] == "123"
+        body = json.loads(request.content.decode("utf-8")) if request.content else None
+        requests.append((request.method, request.url.path, body))
+        if request.method == "DELETE":
+            return httpx.Response(close_status, json={"id": "terminal_claude_main"})
+        if request.method == "POST":
+            return httpx.Response(200, json={"id": "terminal_claude_main"})
+        return httpx.Response(500)
+
+    transport = httpx.MockTransport(handler)
+
+    def recovery_http_client(base_url: str, headers: dict[str, str]) -> httpx.AsyncClient:
+        assert base_url == "http://ap"
+        assert headers == {
+            "Authorization": "Bearer owner-token",
+            "X-Databricks-Org-Id": "123",
+        }
+        return httpx.AsyncClient(
+            base_url=base_url,
+            headers=headers,
+            transport=transport,
+            timeout=30.0,
+        )
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
+    monkeypatch.setattr(claude_native_executor, "_recovery_http_client", recovery_http_client)
+
+    await claude_native_executor._inject_user_message_with_boot_recovery(
+        bridge_dir,
+        content="recover over http",
+        request_session_id="conv_boot",
+    )
+
+    assert ops == ["inject:recover over http", "inject:recover over http"]
+    assert requests == [
+        (
+            "DELETE",
+            "/v1/sessions/conv_boot/resources/terminals/terminal_claude_main",
+            None,
+        ),
+        (
+            "POST",
+            "/v1/sessions/conv_boot/resources/terminals",
+            {
+                "terminal": "claude",
+                "session_key": "main",
+                "ensure_native_terminal": True,
+            },
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ensure_failure", ["timeout", "status"])
+async def test_boot_recovery_http_failure_is_retryable_and_cleans_up_retry_pane(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    ensure_failure: str,
+) -> None:
+    """
+    Recovery HTTP failures become one retryable executor error.
+
+    A timeout or non-2xx ensure may have partially created a retry
+    pane, so the executor closes claude/main again before surfacing the
+    retryable outcome.
+    """
+    monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "conv_http_fail")
+    root = tmp_path / "root"
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", root)
+    bridge_dir = root / "bridge"
+    build_hook_settings(
+        bridge_dir,
+        ap_server_url="http://ap",
+        ap_auth_headers={"Authorization": "Bearer owner-token"},
+    )
+    requests: list[tuple[str, str]] = []
+
+    def fake_inject_user_message(
+        bridge_dir_arg: Path,
+        *,
+        content: str,
+        timeout_s: float = 30.0,
+    ) -> None:
+        del bridge_dir_arg, content, timeout_s
+        raise ClaudePromptReadyTimeout(
+            "Claude Code terminal did not become ready within 0.1s "
+            "(input prompt never rendered). The message was not delivered."
+        )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        if request.method == "DELETE":
+            return httpx.Response(200, json={"id": "terminal_claude_main"})
+        if ensure_failure == "timeout":
+            raise httpx.TimeoutException("ensure timed out", request=request)
+        return httpx.Response(503, json={"error": {"message": "busy"}})
+
+    transport = httpx.MockTransport(handler)
+
+    def recovery_http_client(base_url: str, headers: dict[str, str]) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            base_url=base_url,
+            headers=headers,
+            transport=transport,
+            timeout=30.0,
+        )
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
+    monkeypatch.setattr(claude_native_executor, "_recovery_http_client", recovery_http_client)
+
+    executor = ClaudeNativeExecutor(bridge_dir)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "recover me"}],
+            tools=[],
+            system_prompt="ignored",
+        )
+    ]
+
+    assert len(events) == 1
+    error = events[0]
+    assert isinstance(error, ExecutorError)
+    assert error.retryable is True
+    assert error.code == "timeout"
+    assert requests == [
+        ("DELETE", "/v1/sessions/conv_http_fail/resources/terminals/terminal_claude_main"),
+        ("POST", "/v1/sessions/conv_http_fail/resources/terminals"),
+        ("DELETE", "/v1/sessions/conv_http_fail/resources/terminals/terminal_claude_main"),
     ]
 
 

@@ -189,10 +189,15 @@ def is_claude_prompt_ready_timeout(exc: BaseException) -> bool:
     :param exc: Exception raised by :func:`inject_user_message`.
     :returns: ``True`` for the prompt-readiness timeout class/message.
     """
-    return isinstance(exc, ClaudePromptReadyTimeout) or (
-        isinstance(exc, RuntimeError)
-        and _CLAUDE_PROMPT_READY_TIMEOUT_PREFIX in str(exc)
-        and "input prompt never rendered" in str(exc)
+    if isinstance(exc, ClaudePromptReadyTimeout):
+        return True
+    # Compatibility for stale bridge/runtime pairs that still raise a
+    # plain RuntimeError with the historic prompt-timeout message.
+    if type(exc) is not RuntimeError:
+        return False
+    message = str(exc)
+    return message.startswith(_CLAUDE_PROMPT_READY_TIMEOUT_PREFIX) and (
+        "input prompt never rendered" in message
     )
 
 
