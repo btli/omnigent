@@ -126,13 +126,18 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("project folder kebab", () => {
-  it("offers Rename and Delete", () => {
+  it("offers New session, Rename and Delete", () => {
     renderSidebar();
 
     // Open the Alpha folder's kebab (Radix DropdownMenu opens on pointerdown).
     const kebab = within(projectSection("Alpha")).getByTestId("project-actions");
     fireEvent.pointerDown(kebab, { button: 0 });
 
+    // asChild renders the item as the <Link>'s anchor, carrying the testid.
+    const newSession = screen.getByTestId("project-new-session-item");
+    expect(newSession).toHaveTextContent("New session");
+    // New session pre-files the composer under this project.
+    expect(newSession).toHaveAttribute("href", "/?project=Alpha");
     expect(screen.getByTestId("rename-project")).toHaveTextContent("Rename project");
     expect(screen.getByTestId("delete-project")).toHaveTextContent("Delete project");
   });
@@ -148,6 +153,7 @@ describe("project folder right-click context menu", () => {
     fireEvent.contextMenu(screen.getByText("Alpha"));
 
     // Same testids as the kebab — proves both render from ProjectMenuItems.
+    expect(screen.getByTestId("project-new-session-item")).toBeInTheDocument();
     expect(screen.getByTestId("rename-project")).toBeInTheDocument();
     expect(screen.getByTestId("delete-project")).toBeInTheDocument();
   });

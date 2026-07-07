@@ -876,6 +876,8 @@ function ProjectFolder({
           <ContextMenuContent className="min-w-40 [&_[role=menuitem]]:text-xs">
             <ProjectMenuItems
               components={contextBundle}
+              projectName={name}
+              onNavigate={onRowClick}
               onRename={startRename}
               onDelete={startDelete}
             />
@@ -1950,6 +1952,9 @@ type MenuItemProps = {
   className?: string;
   disabled?: boolean;
   variant?: "default" | "destructive";
+  // Render the item's child element in place of the default (Radix `asChild`),
+  // e.g. so a menu item can be a react-router <Link>.
+  asChild?: boolean;
   // Radix's menu `onSelect` receives a native Event in both families.
   onSelect?: (event: Event) => void;
   "data-testid"?: string;
@@ -3004,7 +3009,12 @@ function ProjectFolderActions({
 }) {
   return (
     <div className="flex items-center">
-      <ProjectFolderMenu projectName={projectName} onRename={onRename} onDelete={onDelete} />
+      <ProjectFolderMenu
+        projectName={projectName}
+        onNavigate={onNavigate}
+        onRename={onRename}
+        onDelete={onDelete}
+      />
       <Button
         asChild
         type="button"
@@ -3039,15 +3049,29 @@ function ProjectFolderActions({
  */
 function ProjectMenuItems({
   components: C,
+  projectName,
+  onNavigate,
   onRename,
   onDelete,
 }: {
   components: MenuComponents;
+  projectName: string;
+  /** Nav handler shared with the header pencil — closes the mobile overlay. */
+  onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   onRename: () => void;
   onDelete: () => void;
 }) {
   return (
     <>
+      {/* New session pre-filed under this project — the menu counterpart of the
+          header's quick pencil, rendered as a Link so cmd/middle-click opens a
+          new tab and onNavigate still closes the mobile overlay. */}
+      <C.Item asChild data-testid="project-new-session-item">
+        <Link to={`/?project=${encodeURIComponent(projectName)}`} onClick={onNavigate}>
+          <SquarePenIcon className="size-3.5" />
+          New session
+        </Link>
+      </C.Item>
       <C.Item data-testid="rename-project" onSelect={onRename}>
         <PencilIcon className="size-3.5" />
         Rename project
@@ -3071,10 +3095,12 @@ function ProjectMenuItems({
  */
 function ProjectFolderMenu({
   projectName,
+  onNavigate,
   onRename,
   onDelete,
 }: {
   projectName: string;
+  onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   onRename: () => void;
   onDelete: () => void;
 }) {
@@ -3094,7 +3120,13 @@ function ProjectFolderMenu({
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="min-w-40 [&_[role=menuitem]]:text-xs">
-        <ProjectMenuItems components={dropdownBundle} onRename={onRename} onDelete={onDelete} />
+        <ProjectMenuItems
+          components={dropdownBundle}
+          projectName={projectName}
+          onNavigate={onNavigate}
+          onRename={onRename}
+          onDelete={onDelete}
+        />
       </DropdownMenuContent>
     </DropdownMenu>
   );
