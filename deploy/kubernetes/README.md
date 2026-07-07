@@ -249,13 +249,12 @@ The `overlays/sandbox-runners/` overlay turns on the **`kubernetes`** managed
 sandbox provider: a `host_type: managed` session spawns one runner Pod that runs
 `omnigent host` as its entrypoint and dials back over the launch-token tunnel. It
 adds a dedicated runner namespace, a least-privilege server SA (scoped Pod +
-Secret rights, **no `pods/exec`**), and the `sandbox:` server config. The server
-image must be built with the `kubernetes` extra
-(`--build-arg OMNIGENT_EXTRAS=kubernetes`). See
+Secret rights, **no `pods/exec`**), and the `sandbox:` server config. The
+official server image includes the `kubernetes` extra; self-builds overriding
+`OMNIGENT_EXTRAS` must keep it in the list. See
 `overlays/sandbox-runners/README.md` for the full guide.
 
 ```bash
-# set the server image in overlays/sandbox-runners/kustomization.yaml first
 kubectl apply -k deploy/kubernetes/overlays/sandbox-runners
 # then create the omnigent-creds harness Secret (see the overlay README)
 ```

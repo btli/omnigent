@@ -215,10 +215,10 @@ jobs:
           provenance: false
           sbom: true
 
-      # OpenShell server variant: the default server image plus the
-      # openshell SDK extra (OMNIGENT_EXTRAS=openshell). Used by the
-      # deploy/kubernetes/overlays/openshell kustomize overlay. Reuses
-      # the shared builder-stage layers from the gha cache.
+      # OpenShell server variant: the default server image plus the openshell
+      # SDK extra. Keeps the base image's kubernetes extra so the variant stays
+      # a superset of base. Used by the deploy/kubernetes/overlays/openshell
+      # kustomize overlay. Reuses the shared builder-stage layers from the cache.
       - name: Build and push openshell server image
         id: build-openshell
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
@@ -229,7 +229,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.tags.outputs.openshell_tags }}
           build-args: |
-            OMNIGENT_EXTRAS=openshell
+            OMNIGENT_EXTRAS=openshell,kubernetes
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
