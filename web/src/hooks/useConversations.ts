@@ -764,11 +764,12 @@ export async function fetchProjectSessionIds(project: string, limit = 2): Promis
 async function fetchProjectSessionsPage(
   project: string,
   after?: string,
+  limit = 20,
 ): Promise<ConversationsPage> {
   const params = new URLSearchParams({
     order: "desc",
     sort_by: "updated_at",
-    limit: "20",
+    limit: String(limit),
     project,
   });
   if (after) params.set("after", after);
@@ -795,6 +796,24 @@ export function useProjectSessions(project: string, enabled: boolean) {
     getNextPageParam: (lastPage) =>
       lastPage.has_more ? (lastPage.last_id ?? undefined) : undefined,
     enabled,
+  });
+}
+
+/**
+ * The newest (non-archived) session filed under a project, or `null` when
+ * the project has no session the caller can read. Powers the new-session
+ * landing screen's project prefill: starting another session in a project
+ * reuses its most recent session's host, repo, and agent.
+ */
+export function useNewestProjectSession(project: string | null) {
+  return useQuery({
+    queryKey: ["project-newest-session", project],
+    queryFn: async () => {
+      const page = await fetchProjectSessionsPage(project as string, undefined, 1);
+      return page.data[0] ?? null;
+    },
+    enabled: project !== null && project !== "",
+    staleTime: 30_000,
   });
 }
 
