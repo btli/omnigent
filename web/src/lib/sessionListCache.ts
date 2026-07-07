@@ -138,7 +138,10 @@ export function filtersFromConversationQueryKey(key: readonly unknown[]): Conver
  * - Project-filtered variants (the Archived picker's `["conversations","",true,
  *   name]` key) hold only rows whose `omni_project` label matches; a row
  *   relabeled out of that project — via a push-delta — is no longer a member.
- *   `project === ""` is the "unfiled" variant, which excludes any labeled row.
+ *   A falsy project (`undefined` or `""`) is the "all projects" list and
+ *   applies no project constraint — consistent with the request (which omits
+ *   `project=` for a falsy value) and the query key (which drops it). This list
+ *   never requests the server's "unfiled" (`project=`) slice.
  *
  * @param conv - Cached row after applying the incoming wire item.
  * @param filters - Canonical filters for the query being patched.
@@ -146,10 +149,7 @@ export function filtersFromConversationQueryKey(key: readonly unknown[]): Conver
  */
 function violatesKnownMembership(conv: Conversation, filters: ConversationListFilters): boolean {
   if (!filters.includeArchived && conv.archived === true) return true;
-  if (filters.project !== undefined) {
-    const label = conv.labels?.[PROJECT_LABEL_KEY];
-    if (filters.project === "" ? Boolean(label) : label !== filters.project) return true;
-  }
+  if (filters.project && conv.labels?.[PROJECT_LABEL_KEY] !== filters.project) return true;
   return false;
 }
 

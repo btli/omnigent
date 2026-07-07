@@ -202,9 +202,10 @@ async function fetchConversationsPage({
   // sidebar never pays to fetch them. The server excludes archived
   // sessions unless include_archived=true.
   if (includeArchived) params.set("include_archived", "true");
-  // Scope to one project's sessions server-side. Only a non-empty name is
-  // forwarded: an empty string would mean "unfiled sessions only" to the
-  // server, which is not what "all projects" (undefined) should do.
+  // Scope to one project's sessions server-side. A falsy project (`undefined`
+  // or `""`) is the "all projects" list, so no param is sent — matching the
+  // query key (which drops `project`) and the cache-membership check. This
+  // list never requests the server's "unfiled" (`project=`) slice.
   if (project) params.set("project", project);
   const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
@@ -245,11 +246,11 @@ export function useConversations(
   return useInfiniteQuery({
     // Keep the base three-element key for the unfiltered callers (byte-for-byte
     // unchanged, so the sidebar / rename / push-delta paths are untouched); only
-    // append `project` when a filter is active, yielding a distinct cache entry.
-    queryKey:
-      project === undefined
-        ? ["conversations", searchQuery, includeArchived]
-        : ["conversations", searchQuery, includeArchived, project],
+    // append `project` for a concrete name. A falsy project (`undefined` or `""`)
+    // is "all projects" and shares the base key — there is no distinct "" variant.
+    queryKey: project
+      ? ["conversations", searchQuery, includeArchived, project]
+      : ["conversations", searchQuery, includeArchived],
     queryFn: ({ pageParam }) =>
       fetchConversationsPage({
         after: pageParam as string | undefined,

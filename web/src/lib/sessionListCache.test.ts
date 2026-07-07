@@ -307,18 +307,19 @@ describe("mergeItemsIntoPages project-filtered membership", () => {
     expect(needsRefetch).toBe(false);
   });
 
-  it("evicts a labeled row from the unfiled ('') variant", () => {
-    const unfiled = filtersFromConversationQueryKey(["conversations", "", true, ""]);
+  it("treats an empty-string project as 'all projects' (no membership constraint)", () => {
+    // The contract: a falsy project is "all projects", not a distinct "unfiled"
+    // slice (this list never requests unfiled). So gaining a label does NOT
+    // evict the row — matching the request, which omits `project=` for "".
+    const allProjects = filtersFromConversationQueryKey(["conversations", "", true, ""]);
     const before = data([conv("a", { archived: true, labels: {} })]);
     const items = new Map<string, SessionListWireItem>([
       ["a", { id: "a", archived: true, labels: { omni_project: "Alpha" } }],
     ]);
 
-    const { data: after, needsRefetch } = mergeItemsIntoPages(before, items, unfiled, NO_ACTIVE);
+    const { data: after } = mergeItemsIntoPages(before, items, allProjects, NO_ACTIVE);
 
-    // Gaining a project label removes it from the "unfiled sessions" variant.
-    expect(after!.pages[0].data.map((c) => c.id)).toEqual([]);
-    expect(needsRefetch).toBe(true);
+    expect(after!.pages[0].data.map((c) => c.id)).toEqual(["a"]);
   });
 });
 

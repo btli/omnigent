@@ -159,6 +159,7 @@ describe("useConversations project filter", () => {
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
     renderHook(() => useConversations("", true, {}, project), { wrapper });
+    return queryClient;
   }
 
   it("sends project= alongside include_archived=true when a project is set", async () => {
@@ -188,6 +189,22 @@ describe("useConversations project filter", () => {
     const url = fetchMock.mock.calls[0][0] as string;
     expect(url).toContain("include_archived=true");
     expect(url).not.toContain("project=");
+  });
+
+  it("coalesces an empty-string project into 'all projects' (base key, no project= param)", async () => {
+    const queryClient = renderWithProject("");
+
+    // No distinct four-element "" variant: it shares the base three-element key,
+    // so key, request, and cache-membership all agree "all projects".
+    const keys = queryClient
+      .getQueryCache()
+      .getAll()
+      .map((q) => q.queryKey as unknown[]);
+    expect(keys).toContainEqual(["conversations", "", true]);
+    expect(keys.every((k) => k.length === 3)).toBe(true);
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    expect(fetchMock.mock.calls[0][0] as string).not.toContain("project=");
   });
 
   it("forwards a project literally named __all__ as project=__all__", async () => {
