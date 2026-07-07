@@ -262,8 +262,22 @@ describe("filtersFromConversationQueryKey", () => {
     });
   });
 
+  it("parses the project-filtered four-element key", () => {
+    // The Archived picker appends `project`; the parser must accept it so the
+    // rename overlay / push-delta merge don't throw when this variant is cached.
+    expect(filtersFromConversationQueryKey(["conversations", "", true, "Design"])).toEqual({
+      searchQuery: "",
+      includeArchived: true,
+      project: "Design",
+    });
+  });
+
   it("rejects non-canonical conversation query keys", () => {
     expect(() => filtersFromConversationQueryKey(["conversations", ""])).toThrow(
+      "Invalid conversations query key",
+    );
+    // A non-string project element is malformed and must fail loudly.
+    expect(() => filtersFromConversationQueryKey(["conversations", "", true, 5])).toThrow(
       "Invalid conversations query key",
     );
   });

@@ -3,6 +3,7 @@
 // Covers the Appearance theme picker, the auth-gated Account section, and the
 // Archived sessions list (which moved here out of the sidebar).
 
+import { type ReactNode } from "react";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -43,12 +44,56 @@ vi.mock("@/lib/identity", () => ({
   getCurrentIsAdmin: () => mocks.me?.is_admin ?? false,
 }));
 vi.mock("@/hooks/useConversations", () => ({
-  useConversations: () => ({
-    data: { pages: [{ data: mocks.conversations }] },
+  PROJECT_LABEL_KEY: "omni_project",
+  // The Archived view calls this twice: once unfiltered (drives the picker
+  // options) and once with the picked `project` (the list). Filter on the
+  // fourth arg so the mock mirrors the server-side ?project= scoping.
+  useConversations: (
+    _searchQuery?: string,
+    _includeArchived?: boolean,
+    _options?: unknown,
+    project?: string,
+  ) => ({
+    data: {
+      pages: [
+        {
+          data: project
+            ? mocks.conversations.filter((c) => c.labels?.["omni_project"] === project)
+            : mocks.conversations,
+        },
+      ],
+    },
     isLoading: false,
   }),
   useArchiveConversation: () => ({ mutate: mocks.archiveMutate, isPending: false }),
   useStopAndDeleteConversation: () => ({ mutate: mocks.deleteMutate, isPending: false }),
+}));
+// Radix Select uses a portal + pointer events jsdom can't drive; stub it to a
+// native <select> so tests can switch the archived project filter.
+vi.mock("@/components/ui/select", () => ({
+  Select: ({
+    value,
+    onValueChange,
+    children,
+  }: {
+    value: string;
+    onValueChange: (v: string) => void;
+    children: ReactNode;
+  }) => (
+    <select
+      data-testid="archived-project-filter"
+      value={value}
+      onChange={(e) => onValueChange(e.target.value)}
+    >
+      {children}
+    </select>
+  ),
+  SelectTrigger: ({ children }: { children: ReactNode }) => <>{children}</>,
+  SelectValue: () => null,
+  SelectContent: ({ children }: { children: ReactNode }) => <>{children}</>,
+  SelectItem: ({ value, children }: { value: string; children: ReactNode }) => (
+    <option value={value}>{children}</option>
+  ),
 }));
 // The admin management surfaces are lazy-loaded and own heavy data layers of
 // their own; stub them so these tests only assert SettingsPage's section
@@ -324,5 +369,65 @@ describe("SettingsPage", () => {
     fireEvent.click(screen.getByTestId("delete-archived"));
     fireEvent.click(screen.getByRole("button", { name: "Delete" }));
     expect(mocks.deleteMutate).toHaveBeenCalledWith({ id: "conv_archived" });
+  });
+
+  it("scopes the archived list to the project picked in the filter", () => {
+    mocks.conversations = [
+      conv("conv_a", { archived: true, title: "Alpha chat", labels: { omni_project: "Alpha" } }),
+      conv("conv_b", { archived: true, title: "Beta chat", labels: { omni_project: "Beta" } }),
+      conv("conv_active"),
+    ];
+    renderPage("/settings/archived");
+
+    // "All projects" (default) lists every archived session.
+    expect(screen.getAllByTestId("archived-row")).toHaveLength(2);
+    const select = screen.getByTestId("archived-project-filter");
+    // Options come from the labels on the loaded archived sessions, not the
+    // project list endpoint (which omits all-archived projects).
+    expect(within(select).getByRole("option", { name: "All projects" })).toBeInTheDocument();
+    expect(within(select).getByRole("option", { name: "Alpha" })).toBeInTheDocument();
+    expect(within(select).getByRole("option", { name: "Beta" })).toBeInTheDocument();
+
+    // Picking a project narrows the list to that project's archived sessions.
+    fireEvent.change(select, { target: { value: "Alpha" } });
+    const rows = screen.getAllByTestId("archived-row");
+    expect(rows).toHaveLength(1);
+    expect(within(rows[0]).getByText("Alpha chat")).toBeInTheDocument();
+
+    // Back to "All projects" restores the full list.
+    fireEvent.change(select, { target: { value: "__all__" } });
+    expect(screen.getAllByTestId("archived-row")).toHaveLength(2);
+  });
+
+  it("hides the project filter when no archived session belongs to a project", () => {
+    mocks.conversations = [conv("conv_archived", { archived: true, title: "Old chat" })];
+    renderPage("/settings/archived");
+
+    expect(screen.queryByTestId("archived-project-filter")).toBeNull();
+    expect(screen.getByTestId("archived-row")).toBeInTheDocument();
+  });
+
+  it("shows the empty state (and no filter) when there are no archived sessions", () => {
+    mocks.conversations = [conv("conv_active")];
+    renderPage("/settings/archived");
+
+    expect(screen.getByText("No archived sessions.")).toBeInTheDocument();
+    expect(screen.queryByTestId("archived-project-filter")).toBeNull();
+  });
+
+  it("shows a project-scoped empty state when the picked project has no rows", () => {
+    // Alpha is a valid option (its archived session provides the label), but a
+    // picked project can momentarily hold no visible rows.
+    mocks.conversations = [
+      conv("conv_a", { archived: true, title: "Alpha chat", labels: { omni_project: "Alpha" } }),
+    ];
+    renderPage("/settings/archived");
+
+    const select = screen.getByTestId("archived-project-filter");
+    // Drop Alpha's only session so the filtered fetch returns nothing, then
+    // re-pick Alpha (still an option because it's the current selection).
+    mocks.conversations = [];
+    fireEvent.change(select, { target: { value: "Alpha" } });
+    expect(screen.getByText("No archived sessions in this project.")).toBeInTheDocument();
   });
 });

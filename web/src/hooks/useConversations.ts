@@ -180,10 +180,12 @@ async function fetchConversationsPage({
   after,
   searchQuery,
   includeArchived,
+  project,
 }: {
   after?: string;
   searchQuery: string;
   includeArchived: boolean;
+  project?: string;
 }): Promise<ConversationsPage> {
   // `updated_at` matches the sidebar's sort, which keeps server
   // pagination consistent with the visible order as the user scrolls.
@@ -199,6 +201,10 @@ async function fetchConversationsPage({
   // sidebar never pays to fetch them. The server excludes archived
   // sessions unless include_archived=true.
   if (includeArchived) params.set("include_archived", "true");
+  // Scope to one project's sessions server-side. Only a non-empty name is
+  // forwarded: an empty string would mean "unfiled sessions only" to the
+  // server, which is not what "all projects" (undefined) should do.
+  if (project) params.set("project", project);
   const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as ConversationsPage;
@@ -213,11 +219,19 @@ async function fetchConversationsPage({
  * debounce the value before passing it. `includeArchived` controls
  * whether archived sessions are fetched — it's part of the query key
  * so toggling it triggers a refetch.
+ *
+ * `project` optionally scopes the list to one project's sessions
+ * (`?project=`, filtered server-side). It's only woven into the query key
+ * when set, so the default sidebar / search callers keep their existing
+ * three-element key and cache entry; a non-empty `project` produces a
+ * distinct four-element key that refetches when the picker changes. Used by
+ * the Archived settings view's project filter.
  */
 export function useConversations(
   searchQuery: string = "",
   includeArchived: boolean = false,
   options: UseConversationsOptions = {},
+  project?: string,
 ) {
   // Live updates arrive over the `WS /v1/sessions/updates` push stream
   // (SessionUpdatesProvider), which patches this cache in place as watched
@@ -228,12 +242,19 @@ export function useConversations(
   // If the socket is down, all consumers use a safety poll.
   const streamConnected = useSessionUpdatesConnected();
   return useInfiniteQuery({
-    queryKey: ["conversations", searchQuery, includeArchived],
+    // Keep the base three-element key for the unfiltered callers (byte-for-byte
+    // unchanged, so the sidebar / rename / push-delta paths are untouched); only
+    // append `project` when a filter is active, yielding a distinct cache entry.
+    queryKey:
+      project === undefined
+        ? ["conversations", searchQuery, includeArchived]
+        : ["conversations", searchQuery, includeArchived, project],
     queryFn: ({ pageParam }) =>
       fetchConversationsPage({
         after: pageParam as string | undefined,
         searchQuery,
         includeArchived,
+        project,
       }),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage) =>

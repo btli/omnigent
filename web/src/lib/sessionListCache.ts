@@ -17,6 +17,13 @@ export type ConversationsInfiniteData = InfiniteData<ConversationsPage, string |
 export interface ConversationListFilters {
   searchQuery: string;
   includeArchived: boolean;
+  /**
+   * Project (``omni_project`` label) the list is scoped to. Present only on
+   * the project-filtered variant (the Archived settings view's picker); the
+   * default sidebar / search queries omit it entirely. ``undefined`` means
+   * "all projects".
+   */
+  project?: string;
 }
 
 /**
@@ -83,25 +90,34 @@ function changedWireFields(conv: Conversation, wire: SessionListWireItem): Set<s
 /**
  * Decode the filter dimensions from a conversations query key.
  *
- * The canonical key is `["conversations", searchQuery, includeArchived]`.
- * Query membership decisions depend on both filter dimensions, so
- * malformed keys fail loudly instead of being guessed.
+ * The base key is `["conversations", searchQuery, includeArchived]`. The
+ * project-filtered variant appends a fourth element:
+ * `["conversations", searchQuery, includeArchived, project]` (the Archived
+ * settings picker is the only producer today). Both lengths are accepted so
+ * the rename overlay and push-delta merge — which iterate *every* cached
+ * `["conversations", ...]` query — never throw on the project variant. Query
+ * membership decisions depend on these dimensions, so malformed keys fail
+ * loudly instead of being guessed.
  *
  * @param key - TanStack Query key for a conversations query.
  * @returns Parsed list filters.
- * @throws Error if the key is not the canonical conversations list key.
+ * @throws Error if the key is not a conversations list key.
  */
 export function filtersFromConversationQueryKey(key: readonly unknown[]): ConversationListFilters {
-  if (key.length !== 3 || key[0] !== "conversations") {
+  if ((key.length !== 3 && key.length !== 4) || key[0] !== "conversations") {
     throw new Error("Invalid conversations query key");
   }
-  const [, searchQuery, includeArchived] = key;
+  const [, searchQuery, includeArchived, project] = key;
   if (typeof searchQuery !== "string" || typeof includeArchived !== "boolean") {
+    throw new Error("Invalid conversations query key");
+  }
+  if (project !== undefined && typeof project !== "string") {
     throw new Error("Invalid conversations query key");
   }
   return {
     searchQuery,
     includeArchived,
+    project,
   };
 }
 

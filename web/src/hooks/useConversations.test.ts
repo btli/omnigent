@@ -147,6 +147,49 @@ describe("useConversations refetch interval", () => {
   });
 });
 
+describe("useConversations project filter", () => {
+  function renderWithProject(project?: string) {
+    fetchMock.mockResolvedValue(
+      mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    renderHook(() => useConversations("", true, {}, project), { wrapper });
+  }
+
+  it("sends project= alongside include_archived=true when a project is set", async () => {
+    renderWithProject("Design");
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    // The archived list must scope server-side, so both params reach the request.
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toContain("include_archived=true");
+    expect(url).toContain("project=Design");
+  });
+
+  it("url-encodes a project name with spaces", async () => {
+    renderWithProject("My Project");
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toContain("project=My+Project");
+  });
+
+  it("omits project= when no project is set (all projects)", async () => {
+    renderWithProject(undefined);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    // "All projects" must not send an empty project= (the server would read
+    // that as "unfiled sessions only").
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toContain("include_archived=true");
+    expect(url).not.toContain("project=");
+  });
+});
+
 describe("deleteConversation", () => {
   it("DELETEs /v1/sessions/{id}", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse({ deleted: true }));

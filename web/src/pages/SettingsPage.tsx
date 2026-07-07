@@ -45,12 +45,20 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
 import { changePassword, logout } from "@/lib/accountsApi";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import {
   type Conversation,
+  PROJECT_LABEL_KEY,
   useArchiveConversation,
   useConversations,
   useStopAndDeleteConversation,
@@ -709,24 +717,86 @@ function AccountSection() {
   );
 }
 
+/** Select sentinel for the "no filter" option (Radix rejects an empty value). */
+const ALL_PROJECTS = "__all__";
+
 function ArchivedSection() {
-  // includeArchived:true is the only way to load archived rows; the
-  // default sidebar query no longer surfaces them.
-  const query = useConversations("", true);
+  // `undefined` = all projects; a name scopes the list to that project.
+  const [project, setProject] = useState<string | undefined>(undefined);
+
+  // Unfiltered archived set — always fetched — drives the picker options.
+  // `list_projects` (GET /v1/sessions/projects) omits projects whose every
+  // session is archived, which is exactly this page's population, so the
+  // options can't come from useProjects(). Derive them from the omni_project
+  // labels present on the loaded archived sessions instead.
+  const allQuery = useConversations("", true);
+  const projectOptions = useMemo(() => {
+    const names = new Set<string>();
+    for (const page of allQuery.data?.pages ?? []) {
+      for (const conv of page.data) {
+        if (conv.archived !== true) continue;
+        const name = conv.labels?.[PROJECT_LABEL_KEY];
+        if (name) names.add(name);
+      }
+    }
+    return [...names].sort((a, b) => a.localeCompare(b));
+  }, [allQuery.data]);
+
+  // The list is filtered server-side via ?project= when one is picked.
+  // "All projects" (undefined) reuses allQuery's key, so react-query serves
+  // both from a single fetch.
+  const listQuery = useConversations("", true, undefined, project);
   const archived = useMemo(
-    () => (query.data?.pages ?? []).flatMap((p) => p.data).filter((c) => c.archived === true),
-    [query.data],
+    () => (listQuery.data?.pages ?? []).flatMap((p) => p.data).filter((c) => c.archived === true),
+    [listQuery.data],
   );
+
+  // A picked project can drop out of the options once its last archived
+  // session is unarchived; keep it listed so the trigger never shows a blank,
+  // orphaned value.
+  const items =
+    project && !projectOptions.includes(project) ? [project, ...projectOptions] : projectOptions;
 
   return (
     <Section
       title="Archived sessions"
       description="Sessions you've archived. Restore one to the sidebar, or delete it for good."
     >
-      {query.isLoading ? (
+      {items.length > 0 && (
+        <div className="mb-4 flex items-center gap-2">
+          <label htmlFor="archived-project-filter" className="text-sm text-muted-foreground">
+            Project
+          </label>
+          <Select
+            value={project ?? ALL_PROJECTS}
+            onValueChange={(value) => setProject(value === ALL_PROJECTS ? undefined : value)}
+          >
+            <SelectTrigger
+              id="archived-project-filter"
+              aria-label="Filter archived sessions by project"
+              data-testid="archived-project-filter"
+              className="w-56"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent position="popper" align="start">
+              <SelectItem value={ALL_PROJECTS}>All projects</SelectItem>
+              {items.map((name) => (
+                <SelectItem key={name} value={name} data-testid={`archived-project-option-${name}`}>
+                  {name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      )}
+
+      {listQuery.isLoading ? (
         <p className="text-sm text-muted-foreground">Loading…</p>
       ) : archived.length === 0 ? (
-        <p className="text-sm text-muted-foreground">No archived sessions.</p>
+        <p className="text-sm text-muted-foreground">
+          {project ? "No archived sessions in this project." : "No archived sessions."}
+        </p>
       ) : (
         <ul className="flex flex-col gap-0.5">
           {archived.map((conv) => (
