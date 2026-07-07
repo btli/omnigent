@@ -13,6 +13,16 @@ import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 /** Cache value shape for a `useConversations` infinite query. */
 export type ConversationsInfiniteData = InfiniteData<ConversationsPage, string | undefined>;
 
+/**
+ * The reserved `conversation_labels` key that stores a session's project
+ * membership. Namespaced (`omni_*`) so it never collides with the user-facing
+ * "project" term or other reserved keys. Defined in this leaf cache module so
+ * membership checks can read it without importing back from the hooks layer
+ * (which would create a value import cycle); `useConversations` re-exports it
+ * for the existing consumers.
+ */
+export const PROJECT_LABEL_KEY = "omni_project";
+
 /** Filter dimensions encoded by a `["conversations", ...]` query key. */
 export interface ConversationListFilters {
   searchQuery: string;
@@ -124,7 +134,11 @@ export function filtersFromConversationQueryKey(key: readonly unknown[]): Conver
 /**
  * Check membership rules the client can decide exactly from a patched row.
  *
- * Archived rows never belong in default (non-includeArchived) queries.
+ * - Archived rows never belong in default (non-includeArchived) queries.
+ * - Project-filtered variants (the Archived picker's `["conversations","",true,
+ *   name]` key) hold only rows whose `omni_project` label matches; a row
+ *   relabeled out of that project — via a push-delta — is no longer a member.
+ *   `project === ""` is the "unfiled" variant, which excludes any labeled row.
  *
  * @param conv - Cached row after applying the incoming wire item.
  * @param filters - Canonical filters for the query being patched.
@@ -132,6 +146,10 @@ export function filtersFromConversationQueryKey(key: readonly unknown[]): Conver
  */
 function violatesKnownMembership(conv: Conversation, filters: ConversationListFilters): boolean {
   if (!filters.includeArchived && conv.archived === true) return true;
+  if (filters.project !== undefined) {
+    const label = conv.labels?.[PROJECT_LABEL_KEY];
+    if (filters.project === "" ? Boolean(label) : label !== filters.project) return true;
+  }
   return false;
 }
 
@@ -154,6 +172,14 @@ function violatesKnownMembership(conv: Conversation, filters: ConversationListFi
 function changedFieldsNeedRefetch(changed: Set<string>, isActiveRow: boolean): boolean {
   if (changed.has("archived")) return true;
   if (changed.has("title")) return true;
+  // A labels change can move a row between project-filtered variants and the
+  // project folders (["project-sessions", …]). A session relabeled INTO the
+  // selected project isn't in that filtered cache yet, so no local patch can
+  // place it; only a server reconcile can. The unfiltered variant where the
+  // row lives detects the label change here and flags the refetch, and the
+  // caller's invalidation is prefix-wide (["conversations"]), so it reconciles
+  // the filtered variants too.
+  if (changed.has("labels")) return true;
   // updated_at only affects the server's sort order. The active chat row is
   // pinned at its position by ActiveChatOverride regardless of that order, so
   // an updated_at bump on it — the common case while the user sends messages —
