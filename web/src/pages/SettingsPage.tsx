@@ -719,21 +719,19 @@ function AccountSection() {
 
 // Discriminated Select values so the "no filter" sentinel can never collide
 // with a real project name: the reset option is a fixed token that no project
-// value can equal, and every project is namespaced under a prefix (its name
-// URI-encoded) and decoded back on change. A project literally named "all" (or
-// "__all__") therefore still filters correctly instead of clearing the filter.
+// value can equal, and every project is namespaced under a prefix so its name
+// carries through verbatim. A project literally named "all" (or "__all__")
+// therefore still filters correctly instead of clearing the filter.
 const ALL_PROJECTS_VALUE = "all";
 const PROJECT_VALUE_PREFIX = "project:";
 
 function projectToSelectValue(project: string | undefined): string {
-  return project === undefined
-    ? ALL_PROJECTS_VALUE
-    : PROJECT_VALUE_PREFIX + encodeURIComponent(project);
+  return project === undefined ? ALL_PROJECTS_VALUE : PROJECT_VALUE_PREFIX + project;
 }
 
 function selectValueToProject(value: string): string | undefined {
   if (value === ALL_PROJECTS_VALUE) return undefined;
-  return decodeURIComponent(value.slice(PROJECT_VALUE_PREFIX.length));
+  return value.slice(PROJECT_VALUE_PREFIX.length);
 }
 
 function ArchivedSection() {
