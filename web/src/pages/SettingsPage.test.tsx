@@ -23,6 +23,9 @@ const mocks = vi.hoisted(() => ({
   // the id, getCurrentIsAdmin the flag). null → unauthenticated.
   me: { id: "alice", is_admin: false } as { id: string; is_admin: boolean } | null,
   conversations: [] as Conversation[],
+  // Optional multi-page dataset (array of per-page row arrays) for pagination
+  // tests. When unset the mock serves a single page of `conversations`.
+  pages: undefined as Conversation[][] | undefined,
   // Picker options come from useArchivedProjectNames (a dedicated scan), not
   // from the loaded rows — so tests set them independently of `conversations`.
   projectNames: [] as string[],
@@ -48,37 +51,47 @@ vi.mock("@/lib/identity", () => ({
   resolveIdentity: () => Promise.resolve(mocks.me?.id ?? null),
   getCurrentIsAdmin: () => mocks.me?.is_admin ?? false,
 }));
-vi.mock("@/hooks/useConversations", () => ({
-  PROJECT_LABEL_KEY: "omni_project",
-  // The Archived view drives the visible list from this hook; filter on the
-  // fourth (`project`) arg so the mock mirrors the server-side ?project=
-  // scoping. Pagination fields back the "Load more" control.
-  useConversations: (
-    _searchQuery?: string,
-    _includeArchived?: boolean,
-    _options?: unknown,
-    project?: string,
-  ) => ({
-    data: {
-      pages: [
-        {
-          data: project
-            ? mocks.conversations.filter((c) => c.labels?.["omni_project"] === project)
-            : mocks.conversations,
+vi.mock("@/hooks/useConversations", async () => {
+  // A stateful mock that emulates useInfiniteQuery pagination: it tracks how
+  // many pages are "loaded" and reveals the next on fetchNextPage, so a click
+  // on "Load more" re-renders with more rows (as the real hook would).
+  const { useState } = await import("react");
+  return {
+    PROJECT_LABEL_KEY: "omni_project",
+    // The Archived view drives the visible list from this hook; filter on the
+    // fourth (`project`) arg so the mock mirrors the server-side ?project=
+    // scoping.
+    useConversations: (
+      _searchQuery?: string,
+      _includeArchived?: boolean,
+      _options?: unknown,
+      project?: string,
+    ) => {
+      // `mocks.pages` (array of per-page row arrays) drives multi-page tests;
+      // otherwise serve a single page of `mocks.conversations`.
+      const source = mocks.pages ?? [mocks.conversations];
+      const [shown, setShown] = useState(1);
+      const pages = source.slice(0, shown).map((rows) => ({
+        data: project ? rows.filter((c) => c.labels?.["omni_project"] === project) : rows,
+      }));
+      return {
+        data: { pages },
+        isLoading: false,
+        hasNextPage: shown < source.length || mocks.hasNextPage,
+        isFetchingNextPage: false,
+        fetchNextPage: () => {
+          mocks.fetchNextPage();
+          setShown((n) => Math.min(n + 1, source.length));
         },
-      ],
+      };
     },
-    isLoading: false,
-    hasNextPage: mocks.hasNextPage,
-    isFetchingNextPage: false,
-    fetchNextPage: mocks.fetchNextPage,
-  }),
-  // Picker options are sourced from this dedicated scan, decoupled from the
-  // loaded rows so archived-only projects on later pages still appear.
-  useArchivedProjectNames: () => ({ data: mocks.projectNames }),
-  useArchiveConversation: () => ({ mutate: mocks.archiveMutate, isPending: false }),
-  useStopAndDeleteConversation: () => ({ mutate: mocks.deleteMutate, isPending: false }),
-}));
+    // Picker options are sourced from this dedicated scan, decoupled from the
+    // loaded rows so archived-only projects on later pages still appear.
+    useArchivedProjectNames: () => ({ data: mocks.projectNames }),
+    useArchiveConversation: () => ({ mutate: mocks.archiveMutate, isPending: false }),
+    useStopAndDeleteConversation: () => ({ mutate: mocks.deleteMutate, isPending: false }),
+  };
+});
 // Radix Select uses a portal + pointer events jsdom can't drive; stub it to a
 // native <select> so tests can switch the archived project filter.
 vi.mock("@/components/ui/select", () => ({
@@ -151,6 +164,7 @@ beforeEach(() => {
   mocks.loginUrl = "/login";
   mocks.me = { id: "alice", is_admin: false };
   mocks.conversations = [];
+  mocks.pages = undefined;
   mocks.projectNames = [];
   mocks.hasNextPage = false;
 });
@@ -481,5 +495,27 @@ describe("SettingsPage", () => {
 
     fireEvent.click(screen.getByTestId("archived-load-more"));
     expect(mocks.fetchNextPage).toHaveBeenCalled();
+  });
+
+  it("keeps Load more available when page 1 has only active rows, then pages to archived", () => {
+    // The first page holds only active sessions (archived ones sort onto a
+    // later page). This must NOT dead-end on the definitive empty state.
+    mocks.pages = [
+      [conv("act1", { title: "Active chat" })],
+      [conv("arch2", { archived: true, title: "Deep archive" })],
+    ];
+    renderPage("/settings/archived");
+
+    // No archived rows on page 1, but more pages exist → not the definitive
+    // empty state; a pager is offered instead.
+    expect(screen.queryByText("No archived sessions.")).toBeNull();
+    expect(screen.getByText("No archived sessions on this page.")).toBeInTheDocument();
+    expect(screen.getByTestId("archived-load-more")).toBeInTheDocument();
+
+    // Paging forward surfaces the archived row that lived on page 2.
+    fireEvent.click(screen.getByTestId("archived-load-more"));
+    expect(mocks.fetchNextPage).toHaveBeenCalled();
+    expect(screen.getByTestId("archived-row")).toBeInTheDocument();
+    expect(screen.getByText("Deep archive")).toBeInTheDocument();
   });
 });

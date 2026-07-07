@@ -800,19 +800,35 @@ function ArchivedSection() {
 
       {listQuery.isLoading ? (
         <p className="text-sm text-muted-foreground">Loading…</p>
-      ) : archived.length === 0 ? (
+      ) : archived.length === 0 && !listQuery.hasNextPage ? (
+        // Definitive empty only when there are no archived rows AND no further
+        // pages to fetch.
         <p className="text-sm text-muted-foreground">
           {project ? "No archived sessions in this project." : "No archived sessions."}
         </p>
       ) : (
         <>
-          <ul className="flex flex-col gap-0.5">
-            {archived.map((conv) => (
-              <ArchivedRow key={conv.id} conversation={conv} />
-            ))}
-          </ul>
-          {/* The list is paginated; without this it would silently cap at the
-              first page (~20 rows). */}
+          {archived.length > 0 && (
+            <ul className="flex flex-col gap-0.5">
+              {archived.map((conv) => (
+                <ArchivedRow key={conv.id} conversation={conv} />
+              ))}
+            </ul>
+          )}
+          {archived.length === 0 && (
+            // The list fetches a mixed page (active + archived rows) and filters
+            // to archived client-side; archived sessions are older and can sort
+            // onto later pages, so a page with none isn't the end. Offer to page
+            // forward instead of dead-ending on the definitive empty state.
+            <p className="text-sm text-muted-foreground">
+              {project
+                ? "No archived sessions in this project on this page."
+                : "No archived sessions on this page."}
+            </p>
+          )}
+          {/* Keep the pager visible whenever more pages exist, independent of the
+              current page's archived count — otherwise a first page of only
+              active rows would hide the archived rows on later pages. */}
           {listQuery.hasNextPage && (
             <div className="mt-3">
               <Button
