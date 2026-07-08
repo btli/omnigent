@@ -423,6 +423,195 @@ async def test_boot_recovery_http_failure_is_retryable_and_cleans_up_retry_pane(
 
 
 @pytest.mark.asyncio
+async def test_boot_recovery_closes_retry_pane_on_non_readiness_retry_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A non-readiness retry failure still closes the freshly-ensured pane.
+
+    When the post-recovery injection fails with a different RuntimeError
+    (tmux target missing, submit verification), the original error must
+    propagate — but the retry pane must be closed first, or the next
+    native ensure could reuse the dead pane.
+    """
+    monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "conv_sibling_err")
+    bridge_dir = tmp_path / "bridge"
+    ops: list[str] = []
+
+    def fake_inject_user_message(
+        bridge_dir_arg: Path,
+        *,
+        content: str,
+        timeout_s: float = 30.0,
+    ) -> None:
+        del bridge_dir_arg, timeout_s
+        ops.append(f"inject:{content}")
+        if len(ops) == 1:
+            raise ClaudePromptReadyTimeout(
+                "Claude Code terminal did not become ready within 0.1s "
+                "(input prompt never rendered). The message was not delivered."
+            )
+        raise RuntimeError("tmux send-keys target claude:main is not advertised yet")
+
+    async def fake_close(bridge_dir_arg: Path, session_id: str) -> None:
+        del bridge_dir_arg
+        ops.append(f"close:{session_id}")
+
+    async def fake_ensure(bridge_dir_arg: Path, session_id: str) -> None:
+        del bridge_dir_arg
+        ops.append(f"ensure:{session_id}")
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "_close_claude_terminal_for_recovery",
+        fake_close,
+    )
+    monkeypatch.setattr(
+        claude_native_executor,
+        "_ensure_claude_terminal_for_recovery",
+        fake_ensure,
+    )
+
+    executor = ClaudeNativeExecutor(bridge_dir)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "sibling failure"}],
+            tools=[],
+            system_prompt="ignored",
+        )
+    ]
+
+    assert len(events) == 1
+    error = events[0]
+    assert isinstance(error, ExecutorError)
+    assert error.retryable is False
+    assert "not advertised yet" in error.message
+    assert ops == [
+        "inject:sibling failure",
+        "close:conv_sibling_err",
+        "ensure:conv_sibling_err",
+        "inject:sibling failure",
+        "close:conv_sibling_err",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["session_id", "server_config"])
+async def test_boot_recovery_config_failures_stay_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    missing: str,
+) -> None:
+    """
+    Recovery pre-flight config failures surface as retryable errors.
+
+    An unresolvable session id or missing server routing metadata means
+    recovery could not run — the underlying boot timeout is still the
+    transient failure, so the executor must not downgrade it to a
+    permanent (non-retryable) error.
+    """
+    if missing == "session_id":
+        monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
+        monkeypatch.setattr(claude_native_executor, "read_active_session_id", lambda _: None)
+    else:
+        monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "conv_cfg")
+        monkeypatch.setattr(claude_native_executor, "read_permission_hook_config", lambda _: {})
+    bridge_dir = tmp_path / "bridge"
+
+    def fake_inject_user_message(
+        bridge_dir_arg: Path,
+        *,
+        content: str,
+        timeout_s: float = 30.0,
+    ) -> None:
+        del bridge_dir_arg, content, timeout_s
+        raise ClaudePromptReadyTimeout(
+            "Claude Code terminal did not become ready within 0.1s "
+            "(input prompt never rendered). The message was not delivered."
+        )
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
+
+    executor = ClaudeNativeExecutor(bridge_dir)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "recover me"}],
+            tools=[],
+            system_prompt="ignored",
+        )
+    ]
+
+    assert len(events) == 1
+    error = events[0]
+    assert isinstance(error, ExecutorError)
+    assert error.retryable is True
+    assert error.code == "timeout"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lapse_signal", ["401", "oidc_redirect"])
+async def test_boot_recovery_reauths_once_on_lapsed_bearer(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    lapse_signal: str,
+) -> None:
+    """
+    Recovery re-mints the bearer once when the snapshotted token lapsed.
+
+    The bridge's auth headers are snapshotted at launch; a long-idle
+    session's recovery close can hit a 401 or an OAuth-login redirect.
+    The request must retry exactly once with the freshly minted bearer.
+    """
+    root = tmp_path / "root"
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", root)
+    bridge_dir = root / "bridge"
+    build_hook_settings(
+        bridge_dir,
+        ap_server_url="http://ap",
+        ap_auth_headers={
+            "Authorization": "Bearer stale-token",
+            "X-Databricks-Org-Id": "123",
+        },
+    )
+    seen_auth: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_auth.append(request.headers["authorization"])
+        if request.headers["authorization"] == "Bearer stale-token":
+            if lapse_signal == "401":
+                return httpx.Response(401)
+            return httpx.Response(302, headers={"location": "http://ap/oidc/login"})
+        assert request.headers["x-databricks-org-id"] == "123"
+        return httpx.Response(200, json={"id": "terminal_claude_main"})
+
+    transport = httpx.MockTransport(handler)
+
+    def recovery_http_client(base_url: str, headers: dict[str, str]) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            base_url=base_url,
+            headers=headers,
+            transport=transport,
+            timeout=30.0,
+        )
+
+    def fake_policy_hook_reauth(base_url: str, headers: dict[str, str]) -> Any:
+        assert base_url == "http://ap"
+        return lambda: {**headers, "Authorization": "Bearer fresh-token"}
+
+    monkeypatch.setattr(claude_native_executor, "_recovery_http_client", recovery_http_client)
+    monkeypatch.setattr(claude_native_executor, "policy_hook_reauth", fake_policy_hook_reauth)
+
+    await claude_native_executor._close_claude_terminal_for_recovery(bridge_dir, "conv_auth")
+
+    assert seen_auth == ["Bearer stale-token", "Bearer fresh-token"]
+
+
+@pytest.mark.asyncio
 async def test_run_turn_does_not_advertise_active_omnigent_tools(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -32,6 +32,10 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.inner.native_attachments import materialize_attachment
+from omnigent.native_policy_hook import (
+    _is_login_redirect_or_unauthorized,
+    policy_hook_reauth,
+)
 
 _logger = logging.getLogger(__name__)
 _CLAUDE_TERMINAL_NAME = "claude"
@@ -227,9 +231,12 @@ async def _inject_user_message_with_boot_recovery(
             f"Retry injection error: {exc}"
         ) from exc
     except RuntimeError as exc:
+        # Any retry-injection failure (readiness timeout, tmux target
+        # missing, submit verification) leaves the freshly-ensured pane
+        # behind; close it so a later native ensure cannot reuse it.
+        await _best_effort_close_claude_terminal_for_recovery(bridge_dir, session_id)
         if not is_claude_prompt_ready_timeout(exc):
             raise
-        await _best_effort_close_claude_terminal_for_recovery(bridge_dir, session_id)
         raise ClaudeNativeBootRecoveryError(
             "Claude Code terminal did not become ready after one automatic "
             "relaunch. The crashed pane was closed; retry this message to "
@@ -277,7 +284,9 @@ def _recovery_session_id(bridge_dir: Path, request_session_id: str | None) -> st
     active_session_id = read_active_session_id(bridge_dir)
     if active_session_id:
         return active_session_id
-    raise RuntimeError("Claude native boot recovery cannot resolve the active session id.")
+    raise ClaudeNativeBootRecoveryError(
+        "Claude native boot recovery cannot resolve the active session id."
+    )
 
 
 def _recovery_server_config(bridge_dir: Path) -> tuple[str, dict[str, str]]:
@@ -291,7 +300,7 @@ def _recovery_server_config(bridge_dir: Path) -> tuple[str, dict[str, str]]:
     config = read_permission_hook_config(bridge_dir)
     raw_base_url = config.get("ap_server_url")
     if not isinstance(raw_base_url, str) or not raw_base_url.strip():
-        raise RuntimeError(
+        raise ClaudeNativeBootRecoveryError(
             "Claude native boot recovery cannot relaunch the terminal because "
             "the bridge is missing Omnigent server routing metadata."
         )
@@ -321,6 +330,45 @@ def _recovery_http_client(base_url: str, headers: dict[str, str]) -> httpx.Async
     )
 
 
+async def _recovery_request(
+    bridge_dir: Path,
+    method: str,
+    path: str,
+    *,
+    json_body: dict[str, Any] | None = None,
+) -> httpx.Response:
+    """
+    Send a recovery request, re-minting the bearer once on an auth lapse.
+
+    The bridge's ``ap_auth_headers`` are snapshotted at launch and expire
+    with the ~1h Databricks OAuth lifetime, so a long-idle session's
+    close/ensure calls can arrive with a dead bearer. On a 401 or an
+    OAuth-login redirect the token is re-minted through the same factory
+    the permission hook uses (``policy_hook_reauth``) and the request is
+    retried once, keeping routing headers so the retry still lands.
+
+    :param bridge_dir: Native bridge directory.
+    :param method: HTTP method, e.g. ``"DELETE"`` or ``"POST"``.
+    :param path: Server request path.
+    :param json_body: Optional JSON payload for the request.
+    :returns: The server response, after at most one re-auth retry.
+    :raises httpx.HTTPError: If the request transport fails.
+    """
+    base_url, headers = _recovery_server_config(bridge_dir)
+    reauth = policy_hook_reauth(base_url, headers)
+    reauthed = False
+    while True:
+        async with _recovery_http_client(base_url, headers) as client:
+            response = await client.request(method, path, json=json_body)
+        if not reauthed and _is_login_redirect_or_unauthorized(response):
+            refreshed = await asyncio.to_thread(reauth)
+            if refreshed:
+                headers = refreshed
+                reauthed = True
+                continue
+        return response
+
+
 async def _close_claude_terminal_for_recovery(bridge_dir: Path, session_id: str) -> None:
     """
     Close the claude/main terminal through the existing resource API.
@@ -330,15 +378,15 @@ async def _close_claude_terminal_for_recovery(bridge_dir: Path, session_id: str)
     :returns: None.
     :raises RuntimeError: If the server rejects the close.
     """
-    base_url, headers = _recovery_server_config(bridge_dir)
     terminal_id = terminal_resource_id(_CLAUDE_TERMINAL_NAME, _CLAUDE_TERMINAL_SESSION_KEY)
     quoted_session_id = urllib.parse.quote(session_id, safe="")
     quoted_terminal_id = urllib.parse.quote(terminal_id, safe="")
     try:
-        async with _recovery_http_client(base_url, headers) as client:
-            response = await client.delete(
-                f"/v1/sessions/{quoted_session_id}/resources/terminals/{quoted_terminal_id}"
-            )
+        response = await _recovery_request(
+            bridge_dir,
+            "DELETE",
+            f"/v1/sessions/{quoted_session_id}/resources/terminals/{quoted_terminal_id}",
+        )
     except httpx.HTTPError as exc:
         raise ClaudeNativeBootRecoveryError(
             "Claude native boot recovery could not close the crashed terminal "
@@ -361,18 +409,18 @@ async def _ensure_claude_terminal_for_recovery(bridge_dir: Path, session_id: str
     :returns: None when the runner accepted the relaunch.
     :raises RuntimeError: If the server rejects the relaunch.
     """
-    base_url, headers = _recovery_server_config(bridge_dir)
     quoted_session_id = urllib.parse.quote(session_id, safe="")
     try:
-        async with _recovery_http_client(base_url, headers) as client:
-            response = await client.post(
-                f"/v1/sessions/{quoted_session_id}/resources/terminals",
-                json={
-                    "terminal": _CLAUDE_TERMINAL_NAME,
-                    "session_key": _CLAUDE_TERMINAL_SESSION_KEY,
-                    "ensure_native_terminal": True,
-                },
-            )
+        response = await _recovery_request(
+            bridge_dir,
+            "POST",
+            f"/v1/sessions/{quoted_session_id}/resources/terminals",
+            json_body={
+                "terminal": _CLAUDE_TERMINAL_NAME,
+                "session_key": _CLAUDE_TERMINAL_SESSION_KEY,
+                "ensure_native_terminal": True,
+            },
+        )
     except httpx.HTTPError as exc:
         raise ClaudeNativeBootRecoveryError(
             "Claude native boot recovery could not relaunch the terminal "
