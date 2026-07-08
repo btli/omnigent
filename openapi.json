@@ -7318,6 +7318,19 @@
       "get": {
         "description": "Return all project names for the authenticated user, ordered\nalphabetically.\n\nProjects are implicit: they exist while at least one session\nhas a `conversation_labels` row with `key=\"omni_project\"`.\n\n**Returns:** List of project names.",
         "operationId": "list_session_projects_v1_sessions_projects_get",
+        "parameters": [
+          {
+            "description": "When true, also include projects whose every member is archived \u2014 the rename collision guard wants that superset so a rename can't silently merge into an archived project.",
+            "in": "query",
+            "name": "include_archived",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Archived",
+              "type": "boolean"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -7326,6 +7339,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "List Session Projects",
