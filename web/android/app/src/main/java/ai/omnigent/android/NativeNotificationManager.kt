@@ -94,9 +94,10 @@ class NativeNotificationManager(
                 .setSilent(true)
                 .setOngoing(false)
         if (navigatePath != null && navigatePath.startsWith("/")) {
-            // Tap opens the app and routes; auto-cancel so it clears on tap
-            // rather than lingering behind the screen it just opened.
-            builder.setAutoCancel(true)
+            // Tap opens the app and routes. Deliberately NOT setAutoCancel: this
+            // is an ambient count, not a one-off event — clearing it on tap would
+            // drop the only Android count surface while sessions are still
+            // pending, and a later poll with the same count won't repost it.
             builder.setContentIntent(activationIntent(navigatePath, BADGE_NOTIFICATION_ID))
         }
         post(BADGE_NOTIFICATION_ID, builder.build())

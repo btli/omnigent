@@ -123,13 +123,14 @@ export function useIdleNotifications(activeConversationId?: string): void {
   const { data } = useConversations();
   const prevStatus = useRef<Map<string, ConversationStatus>>(new Map());
   const prevElicitations = useRef<Map<string, number>>(new Map());
-  // Last badge state sent to the shell, as a `count|navigatePath` key. `null`
-  // (nothing sent yet) makes the FIRST computation send unconditionally —
+  // Last badge state sent to the shell, as a `count|navigatePath|title|body` key.
+  // `null` (nothing sent yet) makes the FIRST computation send unconditionally —
   // including 0 — so a badge left over in the Electron main process from before
   // a reload (it keeps a per-window count that survives in-window navigations)
-  // is corrected instead of sticking stale. Keying on the target too (not just
-  // the count) re-sends when the single unread session changes even if the
-  // count holds, so the Android badge notification's tap target stays current.
+  // is corrected instead of sticking stale. Keying on the full activation
+  // (target + title + body), not just the count, re-sends when the single unread
+  // session changes — or is renamed — even if the count holds, so the Android
+  // badge notification's tap target and text stay current.
   const lastSentBadge = useRef<string | null>(null);
   // Latest conversation list, so the focus listener (mounted once) can
   // recompute the badge without re-subscribing on data changes. `null` until
@@ -198,7 +199,7 @@ export function useIdleNotifications(activeConversationId?: string): void {
   const pushBadge = (ids: Set<string>, conversations: Conversation[]) => {
     const count = ids.size;
     const activation = badgeActivationFor(ids, conversations);
-    const key = `${count}|${activation?.navigatePath ?? ""}`;
+    const key = `${count}|${activation?.navigatePath ?? ""}|${activation?.title ?? ""}|${activation?.body ?? ""}`;
     if (key === lastSentBadge.current) return;
     lastSentBadge.current = key;
     // Omit the second arg when there's nothing unread, so shells expecting the
@@ -370,10 +371,14 @@ export function useIdleNotifications(activeConversationId?: string): void {
 
 /**
  * Build the badge notification's tap target + descriptive text from the set of
- * unread session ids. One unread session → open it, titled with its label;
- * several → open the inbox that lists everything awaiting the user.
- * `undefined` when nothing is unread — the badge clears and there's no
- * notification to make actionable.
+ * unread session ids. One unread session → open it; several → open the inbox
+ * when any awaits input, else the session list. `undefined` when nothing is
+ * unread — the badge clears and there's no notification to make actionable.
+ *
+ * The title is left unset (the shell falls back to the app name) so this ambient
+ * count summary stays visually distinct from the per-session event toast — which
+ * titles itself with the session label — instead of looking like a duplicate
+ * when both fire for the same finished session; the body carries the detail.
  *
  * Only the Android shell renders the badge as a tappable notification and reads
  * these fields; Electron/iOS paint a real icon badge and ignore them.
@@ -386,14 +391,18 @@ function badgeActivationFor(
   if (ids.size === 1) {
     const [id] = ids;
     const conversation = conversations.find((c) => c.id === id);
-    return {
-      navigatePath: `/c/${id}`,
-      title: conversation ? conversationDisplayLabel(conversation) : undefined,
-      body: "Needs your attention",
-    };
+    const label = conversation ? conversationDisplayLabel(conversation) : "A session";
+    return { navigatePath: `/c/${id}`, body: `${label} needs your attention` };
   }
+  // `/inbox` lists only sessions awaiting input, so route there only when at
+  // least one counted session actually has a pending prompt; a batch that just
+  // finished (unseen activity, no prompt) would otherwise land on an inbox that
+  // reads "Nothing waiting on you". Fall back to the session list.
+  const anyAwaiting = conversations.some(
+    (c) => ids.has(c.id) && (c.pending_elicitations_count ?? 0) > 0,
+  );
   return {
-    navigatePath: "/inbox",
+    navigatePath: anyAwaiting ? "/inbox" : "/",
     body: `${ids.size} sessions need your attention`,
   };
 }

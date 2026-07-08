@@ -626,10 +626,10 @@ describe("useIdleNotifications badge (native shell)", () => {
     setWindowFocused(false);
     setConversations([unseenConv("a"), unseenConv("b")]);
     renderHook(() => useIdleNotifications("a"));
-    // Both unread -> badge 2.
+    // Both unread (finished, none awaiting) -> badge 2, routed to the list.
     expect(setBadgeMock).toHaveBeenLastCalledWith(
       2,
-      expect.objectContaining({ navigatePath: "/inbox" }),
+      expect.objectContaining({ navigatePath: "/" }),
     );
     setBadgeMock.mockClear();
 
@@ -648,15 +648,29 @@ describe("useIdleNotifications badge (native shell)", () => {
     setConversations([unseenConv("a")]);
     renderHook(() => useIdleNotifications());
 
+    // Title stays unset (shell -> app name) so it doesn't clone the per-session
+    // toast; the body names the session.
     expect(setBadgeMock).toHaveBeenCalledWith(1, {
       navigatePath: "/c/a",
-      title: "a",
-      body: "Needs your attention",
+      body: "a needs your attention",
     });
   });
 
-  it("routes a multi-session badge to the inbox with a descriptive count", () => {
+  it("routes a multi-session badge to the session list when none await input", () => {
+    // Both merely finished (unseen activity, no pending prompt) -> the inbox
+    // would read "Nothing waiting on you", so route to the session list instead.
     setConversations([unseenConv("a"), unseenConv("b")]);
+    renderHook(() => useIdleNotifications());
+
+    expect(setBadgeMock).toHaveBeenCalledWith(2, {
+      navigatePath: "/",
+      body: "2 sessions need your attention",
+    });
+  });
+
+  it("routes a multi-session badge to the inbox when a session awaits input", () => {
+    // 'a' has a pending prompt, so /inbox will actually list something.
+    setConversations([conv("a", "running", 1), unseenConv("b")]);
     renderHook(() => useIdleNotifications());
 
     expect(setBadgeMock).toHaveBeenCalledWith(2, {
