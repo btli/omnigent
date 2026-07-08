@@ -43,6 +43,18 @@ import { markConversationSeen } from "./useUnseenConversations";
 export const CONNECTED_STREAM_REFETCH_INTERVAL_MS = 60_000;
 export const DISCONNECTED_STREAM_REFETCH_INTERVAL_MS = 45_000;
 
+/**
+ * Query key for the archived-project-names scan (see `useArchivedProjectNames`).
+ *
+ * Deliberately NOT under the `["projects"]` prefix: that scan pages the whole
+ * archived session list, so a shared prefix would re-run it on every
+ * `invalidateQueries(["projects"])` — including project moves/deletes of
+ * *non-archived* sessions that can't change the archived-project set. The
+ * mutations that actually change archived membership or a project label
+ * invalidate this key explicitly instead.
+ */
+const ARCHIVED_PROJECT_NAMES_KEY = ["archived-project-names"] as const;
+
 export interface UseConversationsOptions {
   reconcileWhileConnected?: boolean;
 }
@@ -397,6 +409,9 @@ export function useArchiveConversation() {
       // or drops it from that project folder's own paginated list.
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      // Archive membership just changed, so the archived-view picker's option
+      // set may have gained/lost a project.
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
     },
   });
 }
@@ -467,6 +482,8 @@ export function useStopAndDeleteConversation() {
       // list, /v1/sessions/projects reads the DB directly (no search-index
       // lag), so this can't resurrect the deleted row.
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      // Deleting an archived session may empty its project of archived members.
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
     },
   });
 }
@@ -527,6 +544,7 @@ export function useBulkArchiveConversations() {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
     },
   });
 }
@@ -581,6 +599,7 @@ export function useBulkDeleteConversations() {
       // Refresh the project list so a project emptied by these deletes drops
       // its now-empty folder (DB-direct read, no search-index lag).
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
     },
     onError: (err: any) => {
       if (err?.succeeded) {
@@ -598,6 +617,7 @@ export function useBulkDeleteConversations() {
           queryClient.removeQueries({ queryKey: ["session", id] });
         }
         void queryClient.invalidateQueries({ queryKey: ["projects"] });
+        void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
       }
     },
   });
@@ -743,16 +763,18 @@ export async function fetchAllArchivedProjectNames(): Promise<string[]> {
  * Project names that have archived sessions — the option set for the Archived
  * view's project filter.
  *
- * Keyed under the `["projects", …]` prefix so the archive / unarchive / move /
- * delete mutations that already `invalidateQueries(["projects"])` refresh it
- * for free (react-query prefix-matches), keeping the picker in sync as archived
- * membership changes.
+ * Keyed off the `["projects"]` prefix (see `ARCHIVED_PROJECT_NAMES_KEY`) so the
+ * expensive full-list scan isn't dragged along by unrelated
+ * `invalidateQueries(["projects"])` calls. The mutations that actually change
+ * archived membership or a project label invalidate this key explicitly to keep
+ * the picker in sync. Only fetched while the Archived settings view is mounted
+ * (its sole caller), so the scan never runs for users who don't open it.
  */
 export function useArchivedProjectNames() {
   return useQuery<string[]>({
-    queryKey: ["projects", "archived-session-names"],
+    queryKey: ARCHIVED_PROJECT_NAMES_KEY,
     queryFn: fetchAllArchivedProjectNames,
-    staleTime: 30_000,
+    staleTime: 60_000,
   });
 }
 
@@ -786,6 +808,9 @@ export function useMoveToProject() {
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       // Moving into/out of a project changes both folders' paginated lists.
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      // Moving an archived session relabels which project owns it, shifting the
+      // archived-view picker's option set.
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
     },
   });
 }
@@ -917,6 +942,8 @@ export function useDeleteProject() {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      // Deleting a project archives its members, growing the archived set.
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
     },
   });
 }
