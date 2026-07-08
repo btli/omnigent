@@ -63,25 +63,43 @@ class NativeNotificationManager(
     }
 
     /**
-     * Android has no universal numeric icon badge. We attach the count to a
-     * lightweight summary notification via `setNumber()` (surfaced by some
-     * launchers; AOSP shows only a dot). A count of 0 is a no-op: we never
-     * cancel notifications just to clear a badge.
+     * Android has no universal numeric icon badge, so the count is surfaced as a
+     * lightweight summary notification (its `setNumber()` is shown by some
+     * launchers; AOSP shows only a dot). Because that notification is often the
+     * ONLY thing the user sees, it must be actionable and descriptive: when the
+     * web layer supplies a [navigatePath] the tap opens the app and routes there
+     * (one waiting session → that session; several → the inbox), and [title] /
+     * [body] describe what's waiting instead of a bare "N pending". Older web
+     * builds omit these, so we fall back to the app name + "N pending" and no
+     * tap intent — the prior behavior.
+     *
+     * A count of 0 is a no-op: we never cancel notifications just to clear a
+     * badge.
      */
-    fun setBadgeCount(count: Int) {
+    fun setBadgeCount(
+        count: Int,
+        navigatePath: String? = null,
+        title: String? = null,
+        body: String? = null,
+    ) {
         if (count <= 0) return
-        val summary =
+        val builder =
             NotificationCompat
                 .Builder(context, CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_notification)
-                .setContentTitle(context.getString(R.string.app_name))
+                .setContentTitle(title ?: context.getString(R.string.app_name))
                 .setContentText(
-                    context.resources.getQuantityString(R.plurals.badge_text, count, count),
+                    body ?: context.resources.getQuantityString(R.plurals.badge_text, count, count),
                 ).setNumber(count)
                 .setSilent(true)
                 .setOngoing(false)
-                .build()
-        post(BADGE_NOTIFICATION_ID, summary)
+        if (navigatePath != null && navigatePath.startsWith("/")) {
+            // Tap opens the app and routes; auto-cancel so it clears on tap
+            // rather than lingering behind the screen it just opened.
+            builder.setAutoCancel(true)
+            builder.setContentIntent(activationIntent(navigatePath, BADGE_NOTIFICATION_ID))
+        }
+        post(BADGE_NOTIFICATION_ID, builder.build())
     }
 
     /**

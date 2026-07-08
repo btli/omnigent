@@ -42,7 +42,12 @@ class OmnigentBridgeListener(
 
         when (json.optString("method")) {
             "setBadgeCount" -> {
-                notifications.setBadgeCount(json.optInt("count", 0))
+                notifications.setBadgeCount(
+                    count = json.optInt("count", 0),
+                    navigatePath = json.optString("navigatePath").ifEmpty { null },
+                    title = json.optString("title").ifEmpty { null },
+                    body = json.optString("body").ifEmpty { null },
+                )
             }
 
             "notify" -> {
