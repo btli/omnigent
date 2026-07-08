@@ -292,4 +292,18 @@ describe("NewChatLandingScreen project prefill", () => {
     expect(body.host_id).toBe("host_1");
     expect(body.workspace).toBe(RECENT_WORKSPACE);
   });
+
+  it("falls back to the generic defaults when the session's host is offline", async () => {
+    // The host is still listed (the picker shows it disabled) but can't take
+    // a session — the prefill must not seed it or its workspace.
+    vi.mocked(useHosts).mockReturnValue({
+      data: [host(), host({ host_id: "host_off", name: "sleepy", status: "offline" })],
+    } as ReturnType<typeof useHosts>);
+    setNewestSession(conversation({ host_id: "host_off" }));
+    renderLanding();
+
+    const body = await submitAndReadBody();
+    expect(body.host_id).toBe("host_1");
+    expect(body.workspace).toBe(RECENT_WORKSPACE);
+  });
 });

@@ -2131,7 +2131,13 @@ export function NewChatLandingScreen() {
     if (agentHostSeededForRef.current === projectParam) return;
     agentHostSeededForRef.current = projectParam;
     const hostId = projectNewest?.host_id ?? null;
-    if (!sandboxSelected && hostId !== null && hosts.some((h) => h.host_id === hostId)) {
+    // Online only: the picker disables offline hosts, so seeding one would
+    // set up a create that can only fail instead of falling back.
+    if (
+      !sandboxSelected &&
+      hostId !== null &&
+      hosts.some((h) => h.host_id === hostId && h.status === "online")
+    ) {
       appliedPrefillRef.current.hostId = hostId;
       setSelectedHostId((cur) => cur ?? hostId);
     }
@@ -2171,10 +2177,12 @@ export function NewChatLandingScreen() {
       projectNewest == null ||
       hostId === null ||
       sourceWorkspace === null ||
-      !hosts.some((h) => h.host_id === hostId)
+      !hosts.some((h) => h.host_id === hostId && h.status === "online")
     ) {
       // Nothing seedable: empty project, sandbox-origin or host-less
-      // session, or the host is gone from the live list.
+      // session, or the host is gone or offline — fall back to the
+      // generic defaults rather than pairing a workspace with a host
+      // that can't take a session.
       settle();
       return;
     }

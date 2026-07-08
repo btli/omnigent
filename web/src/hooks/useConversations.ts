@@ -374,6 +374,10 @@ export function useArchiveConversation() {
       // or drops it from that project folder's own paginated list.
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      // Archiving can change (or empty) a project's newest member, which the
+      // composer prefill reuses — refresh it so prefill never anchors on a
+      // session that just left the active list.
+      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
     },
   });
 }
@@ -444,6 +448,9 @@ export function useStopAndDeleteConversation() {
       // list, /v1/sessions/projects reads the DB directly (no search-index
       // lag), so this can't resurrect the deleted row.
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      // The deleted session may have been a project's newest member, which
+      // the composer prefill anchors on — refresh it too.
+      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
     },
   });
 }
@@ -504,6 +511,7 @@ export function useBulkArchiveConversations() {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
     },
   });
 }
@@ -558,6 +566,7 @@ export function useBulkDeleteConversations() {
       // Refresh the project list so a project emptied by these deletes drops
       // its now-empty folder (DB-direct read, no search-index lag).
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
     },
     onError: (err: any) => {
       if (err?.succeeded) {
@@ -575,6 +584,7 @@ export function useBulkDeleteConversations() {
           queryClient.removeQueries({ queryKey: ["session", id] });
         }
         void queryClient.invalidateQueries({ queryKey: ["projects"] });
+        void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
       }
     },
   });
@@ -702,8 +712,10 @@ export function useMoveToProject() {
       markConversationSeen(updated.id, updated.updated_at);
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
-      // Moving into/out of a project changes both folders' paginated lists.
+      // Moving into/out of a project changes both folders' paginated lists,
+      // and can change either project's newest member the prefill anchors on.
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
     },
   });
 }
@@ -854,6 +866,7 @@ export function useDeleteProject() {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
     },
   });
 }
