@@ -97,6 +97,84 @@ def test_move_session_into_new_project(
     expect(_section(page, "Sessions").locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
 
 
+def _open_folder_context_menu(page: Page, project: str) -> None:
+    """Right-click a project folder header to open its actions context menu.
+
+    Parity with conversation rows: the folder header is wrapped in the same
+    Radix ``ContextMenu`` the rows use, so a right-click opens the shared
+    ``ProjectMenuItems`` body (New session / Rename project / Delete project).
+    """
+    page.get_by_role("button", name=project, exact=True).click(button="right")
+
+
+def test_project_folder_right_click_menu(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Right-clicking a project folder header opens its actions menu.
+
+    The menu carries the project-level actions — New session, Rename project,
+    Delete project — from the same body the kebab renders, so the two surfaces
+    stay in sync.
+    """
+    base_url, session_id = seeded_session
+    _set_title(base_url, session_id, f"e2e-proj-menu-{uuid.uuid4().hex[:8]}")
+    project = f"Project {uuid.uuid4().hex[:6]}"
+
+    page.goto(f"{base_url}/c/{session_id}")
+    row = _row(page, session_id)
+    expect(row).to_be_visible()
+    _move_to_new_project(page, row, project)
+    expect(page.get_by_role("button", name=project, exact=True)).to_be_visible()
+
+    _open_folder_context_menu(page, project)
+
+    # New session links to the pre-filed composer; rename + delete are actions.
+    new_session = page.get_by_test_id("project-new-session-item")
+    expect(new_session).to_be_visible()
+    expect(new_session).to_have_attribute("href", re.compile(r"[?&]project="))
+    expect(page.get_by_test_id("rename-project")).to_be_visible()
+    expect(page.get_by_test_id("delete-project")).to_be_visible()
+
+
+def test_rename_project_from_context_menu(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Renaming a project relabels its sessions and moves the folder.
+
+    Right-click → "Rename project" turns the header into an inline editor;
+    committing a new name relabels every member server-side, so the old folder
+    disappears and the new one holds the session (kept expanded).
+    """
+    base_url, session_id = seeded_session
+    _set_title(base_url, session_id, f"e2e-proj-rename-{uuid.uuid4().hex[:8]}")
+    project = f"Project {uuid.uuid4().hex[:6]}"
+    renamed = f"Renamed {uuid.uuid4().hex[:6]}"
+
+    page.goto(f"{base_url}/c/{session_id}")
+    row = _row(page, session_id)
+    expect(row).to_be_visible()
+    _move_to_new_project(page, row, project)
+    expect(_section(page, project).locator(f'a[href="/c/{session_id}"]')).to_be_visible()
+
+    _open_folder_context_menu(page, project)
+    page.get_by_test_id("rename-project").click()
+
+    editor = page.get_by_test_id("rename-project-input")
+    expect(editor).to_be_visible()
+    editor.fill(renamed)
+    editor.press("Enter")
+
+    # The renamed folder appears (expanded), still holding the session; the old
+    # name is gone.
+    header = page.get_by_role("button", name=renamed, exact=True)
+    expect(header).to_be_visible()
+    expect(header).to_have_attribute("aria-expanded", "true")
+    expect(_section(page, renamed).locator(f'a[href="/c/{session_id}"]')).to_be_visible()
+    expect(page.get_by_role("button", name=project, exact=True)).to_have_count(0)
+
+
 def test_remove_session_from_project(
     page: Page,
     seeded_session: tuple[str, str],
