@@ -49,6 +49,9 @@ vi.mock("@/hooks/useConversations", () => ({
   useStopSession: () => ({ mutate: vi.fn() }),
   // Two projects so a collision (rename Alpha → Beta) can be exercised.
   useProjects: () => ({ data: ["Alpha", "Beta"] }),
+  // Superset the rename collision guard reads: includes an archived-only
+  // project that useProjects (active-only) does not surface.
+  useAllProjectNames: () => ({ data: ["Alpha", "Beta", "Gamma"] }),
   useProjectSessions: () => ({
     data: undefined,
     isLoading: false,
@@ -189,6 +192,23 @@ describe("rename project", () => {
     fireEvent.keyDown(input, { key: "Enter" });
 
     // Collision surfaces an error and keeps editing — no rename fires.
+    expect(screen.getByRole("alert")).toHaveTextContent(/already exists/i);
+    expect(mocks.rename.mutate).not.toHaveBeenCalled();
+    expect(screen.getByTestId("rename-project-input")).toBeInTheDocument();
+  });
+
+  it("blocks renaming onto an archived-only project name", () => {
+    renderSidebar();
+
+    fireEvent.contextMenu(screen.getByText("Alpha"));
+    fireEvent.click(screen.getByTestId("rename-project"));
+
+    const input = screen.getByTestId("rename-project-input") as HTMLInputElement;
+    // "Gamma" only exists among archived sessions (absent from useProjects);
+    // renaming onto it would silently merge the two projects.
+    fireEvent.change(input, { target: { value: "Gamma" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
     expect(screen.getByRole("alert")).toHaveTextContent(/already exists/i);
     expect(mocks.rename.mutate).not.toHaveBeenCalled();
     expect(screen.getByTestId("rename-project-input")).toBeInTheDocument();

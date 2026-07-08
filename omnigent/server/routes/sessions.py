@@ -14284,6 +14284,7 @@ def create_sessions_router(
     )
     async def list_session_projects(
         request: Request,
+        include_archived: bool = Query(default=False),
     ) -> list[str]:
         """
         Return all project names for the authenticated user, ordered
@@ -14292,12 +14293,17 @@ def create_sessions_router(
         Projects are implicit: they exist while at least one session
         has a ``conversation_labels`` row with ``key="omni_project"``.
 
+        :param include_archived: When true, also include projects whose
+            every member is archived — the rename collision guard wants
+            that superset so a rename can't silently merge into an
+            archived project.
         :returns: List of project names.
         """
         user_id = _require_user(request, auth_provider)
         return await asyncio.to_thread(
             conversation_store.list_projects,
             accessible_by=user_id,
+            include_archived=include_archived,
         )
 
     # ── PUT /sessions/{session_id}/read-state ─────────────────────

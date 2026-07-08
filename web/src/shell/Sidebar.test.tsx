@@ -57,6 +57,7 @@ vi.mock("@/hooks/useConversations", () => ({
   // sections, and rows fire useMoveToProject from the kebab menu. Both must
   // be stubbed or the Sidebar throws on render.
   useProjects: () => ({ data: projectsMock }),
+  useAllProjectNames: () => ({ data: projectsMock }),
   // Each project folder fetches its own sessions (server-side ?project=). Derive
   // them from the global-list fixture by label so existing tests keep seeding
   // project sessions there. Single page, no pagination, in this mock.

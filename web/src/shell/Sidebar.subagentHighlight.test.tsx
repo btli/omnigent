@@ -34,6 +34,7 @@ vi.mock("@/hooks/useConversations", () => ({
   useRenameConversation: () => ({ mutate: vi.fn() }),
   useStopSession: () => ({ mutate: vi.fn() }),
   useProjects: () => ({ data: [] }),
+  useAllProjectNames: () => ({ data: [] }),
   useProjectSessions: () => ({ data: undefined, isLoading: false, isError: false, error: null }),
   useMoveToProject: () => ({ mutate: vi.fn() }),
   useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),

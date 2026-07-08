@@ -163,6 +163,26 @@ async def test_list_projects_returns_names_sorted(
     assert resp.json() == ["Customer X", "Sprint 42"]
 
 
+async def test_list_projects_include_archived_superset(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """``include_archived=true`` also returns archived-only projects — the
+    superset the rename collision guard checks."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    active = conv_store.create_conversation()
+    archived = conv_store.create_conversation()
+    conv_store.set_labels(active.id, {"omni_project": "Active"})
+    conv_store.set_labels(archived.id, {"omni_project": "Dormant"})
+    conv_store.update_conversation(archived.id, archived=True)
+
+    resp = await client.get("/v1/sessions/projects")
+    assert resp.json() == ["Active"]
+
+    resp = await client.get("/v1/sessions/projects?include_archived=true")
+    assert resp.json() == ["Active", "Dormant"]
+
+
 # ── GET /v1/sessions?project= (filter) ───────────────────────────────
 
 

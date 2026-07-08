@@ -4353,6 +4353,9 @@ def test_list_projects_excludes_all_archived_projects(
     conversation_store.update_conversation(mix_archived.id, archived=True)
 
     assert conversation_store.list_projects() == ["Mixed"]
+    # The superset view (rename collision guard) still sees the archived-only
+    # project, so a rename can't silently merge into it.
+    assert conversation_store.list_projects(include_archived=True) == ["Gone", "Mixed"]
 
     # Unarchiving the lone member brings its project back — the label was kept.
     conversation_store.update_conversation(solo.id, archived=False)

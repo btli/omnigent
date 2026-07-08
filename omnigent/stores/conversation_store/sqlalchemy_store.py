@@ -1514,6 +1514,7 @@ class SqlAlchemyConversationStore(ConversationStore):
     def list_projects(
         self,
         accessible_by: str | None = None,
+        include_archived: bool = False,
     ) -> list[str]:
         """
         Return all distinct project names, ordered alphabetically.
@@ -1532,24 +1533,28 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param accessible_by: When set, restrict to sessions that
             ``accessible_by`` has a permission row for (mirrors the
             ``list_conversations`` ACL filter).
+        :param include_archived: When ``True``, also return projects whose
+            every member is archived. The sidebar's folder list wants the
+            default (active-only) view; the rename collision guard wants this
+            superset so a rename can't silently merge into an archived project.
         :returns: List of project names ordered ascending.
         """
         with self._session() as session:
             # Join to the conversation so archived sessions don't keep an
-            # otherwise-empty project alive in the sidebar.
+            # otherwise-empty project alive in the sidebar (unless the caller
+            # explicitly asks for archived-only projects too).
             stmt = (
                 select(SqlConversationLabel.value)
                 .join(
                     SqlConversation,
                     SqlConversation.id == SqlConversationLabel.conversation_id,
                 )
-                .where(
-                    SqlConversationLabel.key == PROJECT_LABEL_KEY,
-                    SqlConversation.archived.is_(False),
-                )
+                .where(SqlConversationLabel.key == PROJECT_LABEL_KEY)
                 .distinct()
                 .order_by(SqlConversationLabel.value)
             )
+            if not include_archived:
+                stmt = stmt.where(SqlConversation.archived.is_(False))
             if accessible_by is not None:
                 accessible_ids = select(SqlSessionPermission.conversation_id).where(
                     SqlSessionPermission.user_id == accessible_by

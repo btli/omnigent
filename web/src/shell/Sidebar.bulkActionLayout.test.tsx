@@ -39,6 +39,7 @@ vi.mock("@/hooks/useConversations", () => ({
   // folder fetches its own sessions. No projects in this layout test, so the
   // folder query stays disabled/empty.
   useProjects: () => ({ data: [] }),
+  useAllProjectNames: () => ({ data: [] }),
   useProjectSessions: () => ({
     data: undefined,
     isLoading: false,

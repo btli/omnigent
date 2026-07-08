@@ -674,6 +674,25 @@ export function useProjects() {
   });
 }
 
+/**
+ * All project names *including* archived-only ones — the superset the rename
+ * collision guard checks so a rename can't silently merge into a project
+ * whose every member is archived. A cheap DB-direct DISTINCT; living under
+ * the `["projects", …]` prefix keeps it refreshed by the existing mutation
+ * invalidations for free.
+ */
+export function useAllProjectNames() {
+  return useQuery<string[]>({
+    queryKey: ["projects", "include-archived"],
+    queryFn: async () => {
+      const res = await authenticatedFetch("/v1/sessions/projects?include_archived=true");
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      return (await res.json()) as string[];
+    },
+    staleTime: 30_000,
+  });
+}
+
 async function moveConversationToProject(id: string, project: string): Promise<Conversation> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
     method: "PATCH",
@@ -840,6 +859,12 @@ export function useDeleteProject() {
 }
 
 /**
+ * Max relabel requests in flight at once while renaming a project. Caps the
+ * connection fan-out for large projects without serializing every request.
+ */
+const RENAME_RELABEL_BATCH_SIZE = 15;
+
+/**
  * Rename a whole project by re-labeling every session filed under it (archived
  * included) with the new `omni_project` value. Projects are implicit — a project
  * is just the set of sessions carrying its label — so renaming means relabeling
@@ -853,18 +878,27 @@ export function useRenameProject() {
   return useMutation({
     mutationFn: async ({ from, to }: { from: string; to: string }) => {
       const ids = await fetchAllProjectSessionIds(from);
-      const results = await Promise.allSettled(ids.map((id) => moveConversationToProject(id, to)));
       const succeeded: string[] = [];
       const failed: string[] = [];
-      for (let i = 0; i < results.length; i++) {
-        if (results[i].status === "fulfilled") {
-          succeeded.push(ids[i]);
-          markConversationSeen(
-            ids[i],
-            (results[i] as PromiseFulfilledResult<Conversation>).value.updated_at,
-          );
-        } else {
-          failed.push(ids[i]);
+      // Relabel in bounded batches rather than firing every request at once — a
+      // large project would otherwise open hundreds of parallel connections.
+      // Batches run sequentially; requests within a batch run in parallel.
+      for (let start = 0; start < ids.length; start += RENAME_RELABEL_BATCH_SIZE) {
+        const batch = ids.slice(start, start + RENAME_RELABEL_BATCH_SIZE);
+        // Sequential by design: each batch waits for the previous one so the
+        // fan-out stays bounded (same idiom as fetchAllProjectSessionIds).
+        // eslint-disable-next-line no-await-in-loop
+        const results = await Promise.allSettled(
+          batch.map((id) => moveConversationToProject(id, to)),
+        );
+        for (let i = 0; i < results.length; i++) {
+          const result = results[i];
+          if (result.status === "fulfilled") {
+            succeeded.push(batch[i]);
+            markConversationSeen(batch[i], result.value.updated_at);
+          } else {
+            failed.push(batch[i]);
+          }
         }
       }
       if (failed.length > 0) throw { failed, succeeded, total: ids.length };

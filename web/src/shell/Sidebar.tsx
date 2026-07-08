@@ -95,6 +95,7 @@ import {
   useArchiveConversation,
   useBulkArchiveConversations,
   useBulkDeleteConversations,
+  useAllProjectNames,
   useProjects,
   useProjectSessions,
   useConversations,
@@ -944,6 +945,13 @@ function ConversationList({
 
   // Project names for grouping sessions by their reserved project label.
   const { data: projectNames = [] } = useProjects();
+  // Superset with archived-only projects — the rename collision guard checks
+  // this so a rename can't silently merge into an all-archived project.
+  const { data: allProjectNames = [] } = useAllProjectNames();
+  const collisionProjectNames = useMemo(
+    () => [...new Set([...projectNames, ...allProjectNames])],
+    [projectNames, allProjectNames],
+  );
 
   // Each ProjectFolder registers its actually-rendered conversation IDs here
   // (synchronously during render) so shift-select ranges use the real rendered
@@ -1491,7 +1499,7 @@ function ConversationList({
                     onProjectAssigned={expandProject}
                     onProjectRenamed={renameExpandedProject}
                     projectRenderedIdsRef={projectRenderedIdsRef}
-                    siblingProjectNames={projectNames}
+                    siblingProjectNames={collisionProjectNames}
                   />
                 ))}
               </SectionGroup>
@@ -3238,10 +3246,10 @@ function ProjectEditRow({
       onCancel();
       return;
     }
-    // Best-effort guard against merging into an existing project. It only sees
-    // the loaded, non-archived project list, so a stale cache or an
-    // archived-only project of the same name could still slip through; the
-    // server treats the label as opaque and won't reject it.
+    // Best-effort guard against merging into an existing project (the caller
+    // passes the superset including archived-only names). A stale cache could
+    // still let one slip through; the server treats the label as opaque and
+    // won't reject it.
     if (existingNames.some((n) => n !== initialName && n === trimmed)) {
       // Surface the collision and keep editing so the typed value isn't lost.
       // On an explicit commit (Enter/Save) refocus the field; on blur don't —
@@ -3250,6 +3258,9 @@ function ProjectEditRow({
       if (!fromBlur) inputRef.current?.focus();
       return;
     }
+    // Mark committed before onCommit: unmounting the row fires a native blur,
+    // and without this the blur path would re-enter commit() and rename twice.
+    cancelledRef.current = true;
     onCommit(trimmed);
   }
 
@@ -3474,10 +3485,17 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
     inputRef.current?.select();
   }, []);
 
+  // Mark committed before onCommit: unmounting the row fires a native blur, and
+  // without this the blur path would re-enter commit() and rename twice.
+  function commit() {
+    cancelledRef.current = true;
+    onCommit(value);
+  }
+
   function handleKeyDown(e: KeyboardEvent<HTMLInputElement>) {
     if (e.key === "Enter") {
       e.preventDefault();
-      onCommit(value);
+      commit();
       return;
     }
     if (e.key === "Escape") {
@@ -3489,7 +3507,7 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
 
   function handleBlur() {
     if (cancelledRef.current) return;
-    onCommit(value);
+    commit();
   }
 
   return (
@@ -3515,7 +3533,7 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
           // Prevent the input's blur from firing before the commit.
           e.preventDefault();
         }}
-        onClick={() => onCommit(value)}
+        onClick={commit}
       >
         <CheckIcon className="size-3.5" />
       </Button>

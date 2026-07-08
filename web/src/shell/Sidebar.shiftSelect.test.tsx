@@ -63,6 +63,7 @@ vi.mock("@/hooks/useConversations", () => ({
   useRenameConversation: () => ({ mutate: vi.fn() }),
   useStopSession: () => ({ mutate: vi.fn() }),
   useProjects: () => ({ data: projectsMock }),
+  useAllProjectNames: () => ({ data: projectsMock }),
   useProjectSessions: (project: string, enabled: boolean) => {
     const override = projectSessionsMock.current[project];
     const rows = !enabled

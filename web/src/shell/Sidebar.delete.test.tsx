@@ -38,6 +38,7 @@ vi.mock("@/hooks/useConversations", () => ({
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useStopSession: () => ({ mutate: vi.fn() }),
   useProjects: () => ({ data: [] }),
+  useAllProjectNames: () => ({ data: [] }),
   useMoveToProject: () => ({ mutate: vi.fn() }),
   useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: () => Promise.resolve([]),
