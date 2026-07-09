@@ -21,6 +21,7 @@ came up. It needs ``kubectl`` on PATH with access to the runner namespace.
 from __future__ import annotations
 
 import argparse
+import shlex
 import subprocess
 import sys
 import time
@@ -98,7 +99,7 @@ def wait_host_online(base: str, conv_id: str, timeout_s: float) -> None:
 def newest_runner_pod(kubectl: str, namespace: str) -> str:
     out = subprocess.run(
         [
-            kubectl,
+            *shlex.split(kubectl),
             "get",
             "pods",
             "-n",
@@ -122,7 +123,7 @@ def assert_injected_config(kubectl: str, namespace: str, pod: str, expect: str) 
     log(f"[4/5] reading {POD_HOME}/.omnigent/config.yaml from {pod}")
     proc = subprocess.run(
         [
-            kubectl,
+            *shlex.split(kubectl),
             "exec",
             "-n",
             namespace,
@@ -160,7 +161,11 @@ def main() -> int:
         default="providers:",
         help="Substring the injected config.yaml must contain (default: 'providers:')",
     )
-    parser.add_argument("--kubectl", default="kubectl", help="kubectl binary")
+    parser.add_argument(
+        "--kubectl",
+        default="kubectl",
+        help="kubectl command, split shell-style (e.g. 'kubectl --context my-cluster')",
+    )
     parser.add_argument("--timeout", type=float, default=300.0, help="Host-online wait (s)")
     parser.add_argument("--keep", action="store_true", help="Skip session cleanup")
     args = parser.parse_args()
