@@ -59,6 +59,12 @@ import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { CliCommandBlock } from "./CliCommandBlock";
 import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
+import {
+  initialPrefillState,
+  prefillDone,
+  projectPrefillStep,
+  type ProjectPrefillState,
+} from "./projectPrefill";
 import { getCliServerUrl } from "@/lib/host";
 import { getOmnigentHostConfig } from "@/lib/host";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
@@ -2035,184 +2041,34 @@ export function NewChatLandingScreen() {
   // The hook serves the previous query's data as a placeholder while a new
   // fetch is in flight — that would be another repo's worktrees here.
   const projectSourceWorktrees = sourceWorktreesArePlaceholder ? undefined : sourceWorktreesData;
-  // Flips once the prefill has decided (seeded, or nothing to seed) for the
-  // current project. The generic host/workspace defaults below hold off
-  // until then so they can't win the race against the project's values.
-  const [prefillSettledFor, setPrefillSettledFor] = useState<string | null>(null);
-  const prefillSettled = projectParam === "" || prefillSettledFor === projectParam;
-  // What the prefill itself wrote, so switching to another project's pencil
-  // (same mount, only the param changes) can clear exactly those values and
-  // reseed. A value the user changed no longer matches and is kept.
-  const appliedPrefillRef = useRef<{
-    project: string;
-    hostId: string | null;
-    agentId: string | null;
-    workspace: string | null;
-    branch: string | null;
-  }>({ project: projectParam, hostId: null, agentId: null, workspace: null, branch: null });
-  // Seeding waits out the reset round-trip: cleared values land a render
-  // after the param change, so effects hold until this catches up.
-  const [prefillReadyFor, setPrefillReadyFor] = useState<string>(() => projectParam);
-  const agentHostSeededForRef = useRef<string | null>(null);
-  const branchSeededForRef = useRef<string | null>(null);
-  // What the generic defaults below auto-picked (sandbox / first host /
-  // recent workspace), so entering a project can release those slots for
-  // the project's own values. A user's explicit pick no longer matches.
-  const autoDefaultsRef = useRef<{
-    sandbox: boolean;
-    hostId: string | null;
-    workspace: string | null;
-    agentId: string | null;
-  }>({
-    sandbox: false,
-    hostId: null,
-    workspace: null,
-    // The initializer's last-used agent is itself an auto-default (absent
-    // a draft), so entering a project may replace it.
-    agentId: landingDraft?.pickedAgentId != null || projectParam !== "" ? null : readLastAgentId(),
-  });
+  // State machine driving the project prefill: a location track (host →
+  // workspace → branch → settled) plus an independent agent seed. The
+  // generic host/workspace defaults below hold off until the location
+  // track settles so they can't win the race against the project's values.
+  const [prefill, setPrefill] = useState<ProjectPrefillState>(() =>
+    initialPrefillState(projectParam),
+  );
+  // The generic defaults gate on the location track only — the agent seed
+  // waits on its own fetch and must not hold up the host/workspace fill.
+  const prefillSettled = prefill.phase === "settled";
+  // Host whose workspace was already seeded once, so a host re-pick doesn't
+  // clobber the field (used by the per-host seeding effect below).
   const seededHostRef = useRef<string | null>(null);
+
+  // The landing screen stays mounted while `?project=` changes (clicking
+  // another project's pencil), so re-create a fresh visit by hand: clear
+  // every seedable slot and restart the machine. Values the user set are
+  // reset too — a pencil click means "set me up for this project".
   useEffect(() => {
-    const applied = appliedPrefillRef.current;
-    if (applied.project === projectParam) return;
-    if (applied.hostId !== null) {
-      const { hostId } = applied;
-      setSelectedHostId((cur) => (cur === hostId ? null : cur));
-    }
-    if (applied.agentId !== null) {
-      const { agentId } = applied;
-      setPickedAgentId((cur) => (cur === agentId ? null : cur));
-    }
-    if (applied.workspace !== null) {
-      const { workspace: seeded } = applied;
-      setWorkspace((cur) => (cur === seeded ? "" : cur));
-    }
-    if (applied.branch !== null) {
-      const { branch } = applied;
-      setBranchName((cur) => (cur === branch ? "" : cur));
-    }
-    if (projectParam !== "") {
-      const auto = autoDefaultsRef.current;
-      if (auto.sandbox) setSandboxSelected(false);
-      if (auto.hostId !== null) {
-        const { hostId } = auto;
-        setSelectedHostId((cur) => (cur === hostId ? null : cur));
-      }
-      if (auto.workspace !== null) {
-        const { workspace: seeded } = auto;
-        setWorkspace((cur) => (cur === seeded ? "" : cur));
-        seededHostRef.current = null;
-      }
-      if (auto.agentId !== null) {
-        const { agentId } = auto;
-        setPickedAgentId((cur) => (cur === agentId ? null : cur));
-      }
-      autoDefaultsRef.current = { sandbox: false, hostId: null, workspace: null, agentId: null };
-    }
-    appliedPrefillRef.current = {
-      project: projectParam,
-      hostId: null,
-      agentId: null,
-      workspace: null,
-      branch: null,
-    };
-    agentHostSeededForRef.current = null;
-    branchSeededForRef.current = null;
-    setPrefillReadyFor(projectParam);
-  }, [projectParam]);
-  // Host + agent, once the newest-session lookup and the live host/agent
-  // lists have all loaded. Fills empty slots only; runs once per project.
-  useEffect(() => {
-    // A failed lookup seeds nothing project-specific but still lets the
-    // fallbacks below run, so the composer never sits without defaults.
-    if (projectParam === "" || (projectNewest === undefined && !projectNewestFailed)) return;
-    if (prefillReadyFor !== projectParam) return;
-    if (hosts === undefined || agents === undefined) return;
-    if (agentHostSeededForRef.current === projectParam) return;
-    agentHostSeededForRef.current = projectParam;
-    const hostId = projectNewest?.host_id ?? null;
-    // Online only: the picker disables offline hosts, so seeding one would
-    // set up a create that can only fail instead of falling back.
-    if (
-      !sandboxSelected &&
-      hostId !== null &&
-      hosts.some((h) => h.host_id === hostId && h.status === "online")
-    ) {
-      appliedPrefillRef.current.hostId = hostId;
-      setSelectedHostId((cur) => cur ?? hostId);
-    }
-    if (pickedAgentId === null) {
-      const agentId = projectNewest?.agent_id;
-      const inferred =
-        agentId != null && agentList.some((a) => a.id === agentId) ? agentId : readLastAgentId();
-      if (inferred) {
-        appliedPrefillRef.current.agentId = inferred;
-        setPickedAgentId(inferred);
-        setPickedHarness(readLastHarness(inferred));
-      }
-    }
-  }, [
-    projectParam,
-    projectNewest,
-    projectNewestFailed,
-    prefillReadyFor,
-    hosts,
-    agents,
-    sandboxSelected,
-    agentList,
-    pickedAgentId,
-  ]);
-  // Workspace: the newest session's repo, resolved to the main work tree
-  // when that session ran in a worktree. Every exit marks the prefill
-  // settled so the generic defaults can resume.
-  useEffect(() => {
-    if (projectParam === "" || (projectNewest === undefined && !projectNewestFailed)) return;
-    if (prefillReadyFor !== projectParam) return;
-    if (hosts === undefined) return;
-    if (prefillSettledFor === projectParam) return;
-    const settle = () => setPrefillSettledFor(projectParam);
-    const hostId = projectNewest?.host_id ?? null;
-    const sourceWorkspace = projectNewest?.workspace ?? null;
-    if (
-      projectNewest == null ||
-      hostId === null ||
-      sourceWorkspace === null ||
-      !hosts.some((h) => h.host_id === hostId && h.status === "online")
-    ) {
-      // Nothing seedable: empty project, sandbox-origin or host-less
-      // session, or the host is gone or offline — fall back to the
-      // generic defaults rather than pairing a workspace with a host
-      // that can't take a session.
-      settle();
-      return;
-    }
-    if (projectNewest.git_branch == null) {
-      appliedPrefillRef.current.workspace = sourceWorkspace;
-      setWorkspace((cur) => (cur === "" ? sourceWorkspace : cur));
-      settle();
-      return;
-    }
-    if (projectSourceWorktreesFailed) {
-      settle();
-      return;
-    }
-    if (projectSourceWorktrees === undefined) return; // still resolving
-    const main = projectSourceWorktrees.find((w) => w.is_main);
-    if (main) {
-      appliedPrefillRef.current.workspace = main.path;
-      setWorkspace((cur) => (cur === "" ? main.path : cur));
-    }
-    settle();
-  }, [
-    projectParam,
-    projectNewest,
-    projectNewestFailed,
-    prefillReadyFor,
-    hosts,
-    prefillSettledFor,
-    projectSourceWorktrees,
-    projectSourceWorktreesFailed,
-  ]);
+    if (prefill.project === projectParam) return;
+    setSandboxSelected(false);
+    setSelectedHostId(null);
+    setPickedAgentId(projectParam !== "" ? null : readLastAgentId());
+    setWorkspace("");
+    setBranchName("");
+    seededHostRef.current = null;
+    setPrefill(initialPrefillState(projectParam));
+  }, [projectParam, prefill.project]);
 
   // Auto-select the FIRST AVAILABLE option, mirroring the menu order, so
   // a session can be started without an explicit pick: the sandbox when
@@ -2224,13 +2080,11 @@ export function NewChatLandingScreen() {
     if (sandboxSelected) return;
     if (selectedHostId !== null) return;
     if (managedSandboxesEnabled) {
-      autoDefaultsRef.current.sandbox = true;
       setSandboxSelected(true);
       return;
     }
     const firstOnline = (hosts ?? []).find((h) => h.status === "online");
     if (firstOnline) {
-      autoDefaultsRef.current.hostId = firstOnline.host_id;
       setSelectedHostId(firstOnline.host_id);
     }
   }, [hosts, selectedHostId, sandboxSelected, managedSandboxesEnabled, prefillSettled]);
@@ -2265,7 +2119,6 @@ export function NewChatLandingScreen() {
     const candidate = recent[0] ?? derivedHome;
     if (!candidate) return;
     seededHostRef.current = selectedHostId;
-    autoDefaultsRef.current.workspace = candidate;
     setWorkspace((cur) => (cur === "" ? candidate : cur));
   }, [selectedHostId, recent, derivedHome, prefillSettled]);
 
@@ -2401,7 +2254,11 @@ export function NewChatLandingScreen() {
   // worktree picker. Skipped for sandbox sessions (server-managed) and
   // when no directory is picked. A non-git path resolves to [].
   const worktreesEnabled = !sandboxSelected && selectedHostId !== null && workspaceTrimmed !== "";
-  const { data: hostWorktrees, isPlaceholderData: hostWorktreesArePlaceholder } = useHostWorktrees(
+  const {
+    data: hostWorktrees,
+    isPlaceholderData: hostWorktreesArePlaceholder,
+    isError: hostWorktreesFailed,
+  } = useHostWorktrees(
     worktreesEnabled ? selectedHostId : null,
     worktreesEnabled ? workspaceTrimmed : null,
   );
@@ -2465,33 +2322,62 @@ export function NewChatLandingScreen() {
     const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
     setBranchName(`worktree-${suffix}`);
   }, []);
-  // A project-prefilled repo defaults to a fresh isolated worktree: once
-  // it proves to be a git repo, generate a branch name so a plain Enter
-  // starts there. Never touches a typed branch or a worktree prefill.
+  // Project prefill: advance the machine one step per render as its data
+  // arrives. It steps rather than loops in one pass because the "branch"
+  // phase needs `hostWorktrees` for the workspace the "workspace" phase
+  // just wrote, and that listing only reflects the seeded repo one render
+  // after the write applies.
   useEffect(() => {
-    if (projectParam === "" || !prefillSettled) return;
-    if (branchSeededForRef.current === projectParam) return;
-    if (workspaceTrimmed === "" || workspaceTrimmed !== appliedPrefillRef.current.workspace) {
-      branchSeededForRef.current = projectParam;
-      return;
+    if (prefill.project !== projectParam || prefillDone(prefill)) return;
+    const step = projectPrefillStep(prefill, {
+      newest: projectNewest,
+      newestFailed: projectNewestFailed,
+      hosts,
+      // The pickable list, not the raw one — a hidden agent's id would seed
+      // a pick that effectiveAgentId rejects. Raw undefined = still loading.
+      agents: agents === undefined ? undefined : agentList,
+      sandboxSelected,
+      lastAgentId: readLastAgentId(),
+      sourceWorktrees: projectSourceWorktrees,
+      sourceWorktreesFailed: projectSourceWorktreesFailed,
+      workspaceTrimmed,
+      branchName,
+      prefilledBranch,
+      hostWorktrees: hostWorktreesArePlaceholder ? undefined : hostWorktrees,
+      hostWorktreesFailed,
+    });
+    if (step === null) return;
+    const { writes } = step;
+    if (writes.hostId !== undefined) setSelectedHostId((cur) => cur ?? writes.hostId!);
+    if (writes.agentId !== undefined) {
+      setPickedAgentId((cur) => cur ?? writes.agentId!);
+      if (pickedAgentId === null) setPickedHarness(readLastHarness(writes.agentId));
     }
-    // Placeholder data is the previous directory's worktree list — wait
-    // for the seeded repo's own listing before judging git-ness.
-    if (hostWorktrees === undefined || hostWorktreesArePlaceholder) return;
-    branchSeededForRef.current = projectParam;
-    if (!hostWorktrees.some((w) => w.is_main)) return; // not a git repo
-    if (branchName !== "" || prefilledBranch !== "") return;
-    const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
-    appliedPrefillRef.current.branch = `worktree-${suffix}`;
-    setBranchName(`worktree-${suffix}`);
+    if (writes.workspace !== undefined) {
+      setWorkspace((cur) => (cur === "" ? writes.workspace! : cur));
+    }
+    if (writes.branch !== undefined && branchName === "" && prefilledBranch === "") {
+      setBranchName(writes.branch);
+    }
+    setPrefill(step.state);
   }, [
+    prefill,
     projectParam,
-    prefillSettled,
+    projectNewest,
+    projectNewestFailed,
+    hosts,
+    agents,
+    agentList,
+    sandboxSelected,
+    projectSourceWorktrees,
+    projectSourceWorktreesFailed,
     workspaceTrimmed,
-    hostWorktrees,
-    hostWorktreesArePlaceholder,
     branchName,
     prefilledBranch,
+    hostWorktrees,
+    hostWorktreesArePlaceholder,
+    hostWorktreesFailed,
+    pickedAgentId,
   ]);
 
   // Sandbox repo inputs are valid when blank (empty workspace), or when
