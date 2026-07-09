@@ -13,6 +13,7 @@ import subprocess
 from pathlib import Path
 from typing import ClassVar
 
+import pytest
 import yaml
 
 from omnigent.onboarding.sandboxes.base import (
@@ -194,6 +195,26 @@ def test_render_host_config_write_command_survives_hostile_yaml_content(tmp_path
     }
     written = _materialize(render_host_config_write_command(hostile), tmp_path)
     assert written == hostile
+
+
+def test_materialized_config_routes_pi_to_the_gateway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The point of the injection: a host booted with the materialized config
+    resolves the gateway as pi's provider through the REAL config loader and
+    harness-routing chain — before any ambient env credential is consulted.
+    """
+    _materialize(render_host_config_write_command(_GATEWAY_HOST_CONFIG), tmp_path)
+
+    from omnigent.onboarding.provider_config import default_provider_for_harness, load_config
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / ".omnigent"))
+    entry = default_provider_for_harness(load_config(), "pi")
+
+    assert entry is not None
+    assert entry.name == "litellm"
+    assert entry.kind == "gateway"
 
 
 def test_start_host_writes_host_config_before_launching_the_host() -> None:

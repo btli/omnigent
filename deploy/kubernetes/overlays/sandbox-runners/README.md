@@ -139,6 +139,11 @@ writing nothing to disk — use HTTPS repository URLs. Details by provider match
 | `in_cluster` | Optional cluster-config source: `true` (in-cluster SA only), `false` (kubeconfig only), omit (try in-cluster, then kubeconfig). |
 | `kubeconfig` | Optional kubeconfig path for the out-of-cluster fallback (env: `OMNIGENT_KUBERNETES_KUBECONFIG`). |
 
+To verify `host_config` end to end against a live cluster, run
+`python tests/e2e/integrations/deploy/kubernetes/e2e_managed_host_config.py
+--server <url>` — it creates a managed session and asserts the injected
+config inside the runner Pod.
+
 ## Troubleshooting
 
 - **Launch fails fast with a clear reason.** When a Pod can't schedule, pull its

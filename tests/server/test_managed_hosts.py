@@ -29,6 +29,7 @@ from omnigent.server.managed_hosts import (
     parse_repo_workspace,
     parse_sandbox_config,
     relaunch_managed_host,
+    resume_managed_host,
     terminate_managed_host,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -1090,6 +1091,53 @@ async def test_launch_materializes_host_config_before_host_start(db_uri: str) ->
 
     write_index = fake.commands.index(render_host_config_write_command(host_config))
     host_index = next(i for i, cmd in enumerate(fake.commands) if "omnigent host --server" in cmd)
+    assert write_index < host_index
+
+
+async def test_resume_rematerializes_host_config_before_host_restart(db_uri: str) -> None:
+    """
+    Waking a dormant sandbox re-runs the config write before re-execing the
+    host — resume_managed_host bypasses _arm_and_start_host, so this is a
+    distinct wiring point, and re-materializing is what lets an operator's
+    host_config change land on the next wake without a new sandbox.
+    """
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            owner=_OWNER,
+        )
+
+    class _ResumableFake(FakeSandboxLauncher):
+        """Fake with the stop/resume lifecycle the wake path requires."""
+
+        can_resume: ClassVar[bool] = True
+
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__(**kwargs)  # type: ignore[arg-type]
+            self.resumed: list[str] = []
+
+        def resume(self, sandbox_id: str) -> None:
+            self.resumed.append(sandbox_id)
+
+    fake = _ResumableFake(on_host_start=_register)
+    host_config: dict[str, object] = {"providers": {"litellm": {"kind": "gateway"}}}
+    config = _injected_config(fake, host_config=host_config)
+
+    result = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    host_store.set_offline(result.host_id)
+    commands_before = len(fake.commands)
+
+    await resume_managed_host(result.host_id, host_store, config)
+
+    assert fake.resumed == ["sb-fake-1"]
+    resumed_commands = fake.commands[commands_before:]
+    write_index = resumed_commands.index(render_host_config_write_command(host_config))
+    host_index = next(
+        i for i, cmd in enumerate(resumed_commands) if "omnigent host --server" in cmd
+    )
     assert write_index < host_index
 
 
