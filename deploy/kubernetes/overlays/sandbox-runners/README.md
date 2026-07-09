@@ -42,10 +42,11 @@ the generated runner Pod is already restricted-compliant (non-root uid 1000, dro
 
 ## Prerequisites
 
-1. **A server image built with the `kubernetes` extra.** The official
-   `omnigent-server` image includes it by default. If you self-build with a
-   custom `OMNIGENT_EXTRAS`, keep `kubernetes` in the list (see `deploy/docker`)
-   or `_ensure_sdk()` fails every launch.
+1. **A server image built with the `kubernetes` extra.** The overlay's
+   `images:` block already points at the official `omnigent-server-kubernetes`
+   variant, which includes it — nothing to build. If you self-build instead,
+   keep `kubernetes` in `OMNIGENT_EXTRAS` (see `deploy/docker`) or
+   `_ensure_sdk()` fails every launch, and point `images:` at your build.
 2. **Harness credentials.** The runners read their LLM / git credentials from a
    Secret named by `secret_name` (default `omnigent-creds`); you create it out of
    band after applying the overlay — see step 2 of **Apply**. It is deliberately
