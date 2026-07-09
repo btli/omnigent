@@ -14,6 +14,8 @@ App OAuth dance, host registration) lives in ``bootstrap``.
 
 from __future__ import annotations
 
+import base64
+import json
 import shlex
 from abc import ABC, abstractmethod
 from contextlib import AbstractContextManager
@@ -74,6 +76,62 @@ def host_image_wheel_install_command(remote_tgz_path: str) -> str:
         "pip install --quiet --force-reinstall --no-deps "
         "--no-warn-script-location oa-wheels/*.whl"
     )
+
+
+# In-sandbox merge-write of an injected host config, run via ``python3 -c``.
+# Self-contained on purpose (stdlib + yaml, both baked into any image that can
+# run ``omnigent host``): importing merge logic from the sandbox's installed
+# omnigent package would tie the feature to the IMAGE's package version, and
+# operator-supplied images may predate it. ``__PAYLOAD__`` is replaced with a
+# base64 Python literal — its alphabet has no quote or shell metacharacter, so
+# arbitrary YAML content can never break out of the script.
+_HOST_CONFIG_WRITE_SCRIPT: str = """\
+import base64, json, os, yaml
+
+path = os.path.expanduser("~/.omnigent/config.yaml")
+os.makedirs(os.path.dirname(path), exist_ok=True)
+existing = {}
+if os.path.exists(path):
+    loaded = yaml.safe_load(open(path))
+    if isinstance(loaded, dict):
+        existing = loaded
+injected = json.loads(base64.b64decode(__PAYLOAD__).decode())
+for key, value in injected.items():
+    current = existing.get(key)
+    if key == "providers" and isinstance(current, dict) and isinstance(value, dict):
+        existing[key] = {**current, **value}
+    else:
+        existing[key] = value
+yaml.safe_dump(existing, open(path, "w"), default_flow_style=False, sort_keys=True)
+"""
+
+
+def render_host_config_write_command(host_config: dict[str, object]) -> str:
+    """
+    Build the remote command that merges *host_config* into the
+    sandbox's ``~/.omnigent/config.yaml`` before ``omnigent host`` starts.
+
+    Mirrors ``omnigent.cli._save_global_config``'s
+    ``deep_merge_keys=("providers",)`` semantics: ``providers`` is merged
+    one level deep (existing entries survive, injected entries win); every
+    other top-level key replaces the existing value wholesale. Shared by
+    both launch seams — the exec-model :meth:`SandboxLauncher.start_host`
+    and the Kubernetes init container — so the merge behavior cannot
+    drift between providers.
+
+    The payload travels as base64-encoded JSON substituted into a fixed
+    Python script, and the whole script is ``shlex.quote``-wrapped —
+    operator-supplied YAML content (quotes, ``$``, newlines) never
+    reaches shell or Python quoting.
+
+    :param host_config: The validated ``sandbox.host_config`` mapping
+        (see :func:`omnigent.server.managed_hosts.parse_sandbox_config`).
+    :returns: A ``python3 -c '<script>'`` shell command, safe to pass to
+        :meth:`SandboxLauncher.run` or embed in a larger shell script.
+    """
+    payload = base64.b64encode(json.dumps(host_config).encode()).decode()
+    script = _HOST_CONFIG_WRITE_SCRIPT.replace("__PAYLOAD__", repr(payload))
+    return f"python3 -c {shlex.quote(script)}"
 
 
 class SandboxCapabilityError(click.ClickException):
@@ -238,13 +296,15 @@ class SandboxLauncher(ABC):
         repo_url: str | None = None,
         repo_branch: str | None = None,
         repo_name: str | None = None,
+        host_config: dict[str, object] | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> str:
         """
         Start ``omnigent host`` in the sandbox and return the workspace path.
 
         The default is the EXEC model: probe ``$HOME``, create
-        ``<HOME>/workspace``, optionally clone the repository into it, and start
+        ``<HOME>/workspace``, optionally clone the repository into it, merge any
+        *host_config* into ``~/.omnigent/config.yaml``, and start
         the host detached (``setsid``-backgrounded, identity + token in the
         process environment) — all driven through :meth:`run` /
         :meth:`run_background`. It is shared by every provider whose sandbox is a
@@ -267,6 +327,10 @@ class SandboxLauncher(ABC):
         :param repo_branch: Branch to clone, or ``None`` for the default branch.
         :param repo_name: Directory the clone lands in under the workspace, or
             ``None`` when *repo_url* is ``None``.
+        :param host_config: Deployment-supplied ``~/.omnigent/config.yaml``
+            content (the server's ``sandbox.host_config``) merged into the
+            sandbox's config BEFORE the host starts, or ``None`` — see
+            :func:`render_host_config_write_command`.
         :param on_stage: Progress observer invoked with ``"cloning"`` before the
             clone (when *repo_url* is set) and ``"starting"`` before the host
             launches. Runs on this (worker) thread, so it must be thread-safe.
@@ -313,6 +377,8 @@ class SandboxLauncher(ABC):
         # online poll resolves it.
         if on_stage is not None:
             on_stage("starting")
+        if host_config is not None:
+            self.run(sandbox_id, render_host_config_write_command(host_config))
         env_prefix = " ".join(
             f"{key}={shlex.quote(value)}"
             for key, value in (

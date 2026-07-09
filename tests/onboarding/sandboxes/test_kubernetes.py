@@ -23,7 +23,10 @@ from omnigent.host.identity import (
     HOST_NAME_ENV_VAR,
     HOST_TOKEN_ENV_VAR,
 )
-from omnigent.onboarding.sandboxes.base import SandboxCapabilityError
+from omnigent.onboarding.sandboxes.base import (
+    SandboxCapabilityError,
+    render_host_config_write_command,
+)
 from omnigent.onboarding.sandboxes.kubernetes import (
     KubernetesSandboxLauncher,
     build_pod_manifest,
@@ -89,6 +92,31 @@ def test_build_pod_manifest_without_repo_has_no_clone() -> None:
     script = manifest["spec"]["initContainers"][0]["command"][2]
     assert "mkdir -p /home/omnigent/workspace" in script
     assert "git clone" not in script
+
+
+def test_build_pod_manifest_host_config_is_written_by_init_container() -> None:
+    """host_config rides the init container script, after mkdir/clone, before the host."""
+    host_config: dict[str, object] = {"providers": {"litellm": {"kind": "gateway"}}}
+    manifest = build_pod_manifest(
+        **{**_MANIFEST_KW, "clone_dir": "/home/omnigent/workspace/repo"},
+        repo_url="https://github.com/org/repo.git",
+        host_config=host_config,
+    )
+    script = manifest["spec"]["initContainers"][0]["command"][2]
+    write_command = render_host_config_write_command(host_config)
+    assert write_command in script
+    # Ordering within the script: workspace prep and clone come first.
+    assert script.index("mkdir -p") < script.index("git clone") < script.index(write_command)
+    # The main container is untouched — the write happens before the host boots.
+    assert write_command not in manifest["spec"]["containers"][0]["command"][2]
+
+
+def test_build_pod_manifest_without_host_config_has_no_config_write() -> None:
+    """No host_config → the init container only preps the workspace."""
+    manifest = build_pod_manifest(**_MANIFEST_KW)
+    script = manifest["spec"]["initContainers"][0]["command"][2]
+    assert "config.yaml" not in script
+    assert "python3 -c" not in script
 
 
 def test_build_pod_manifest_token_rides_secret_ref_not_the_spec() -> None:

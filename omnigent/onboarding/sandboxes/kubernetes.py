@@ -65,6 +65,7 @@ from omnigent.onboarding.sandboxes.base import (
     DEFAULT_HOST_IMAGE,
     RemoteCommandResult,
     SandboxLauncher,
+    render_host_config_write_command,
 )
 
 if TYPE_CHECKING:
@@ -361,21 +362,26 @@ def _render_workspace_prep_command(
     clone_dir: str | None,
     repo_url: str | None,
     repo_branch: str | None,
+    host_config: dict[str, object] | None = None,
 ) -> list[str]:
     """
     Render the init container command that prepares the workspace.
 
-    Creates ``<workspace>`` and, when a repository is requested, clones it into
-    ``<clone_dir>`` BEFORE the host starts. Running in an init container means a
-    clone failure terminates the init container non-zero — surfaced fast by the
-    start wait with the git error as the container log tail — rather than
-    silently leaving the host without its workspace.
+    Creates ``<workspace>``, clones the repository into ``<clone_dir>`` when
+    requested, and merges *host_config* into ``~/.omnigent/config.yaml`` when
+    set — all BEFORE the host starts. Running in an init container means a
+    failure terminates the init container non-zero — surfaced fast by the
+    start wait with the error as the container log tail — rather than
+    silently leaving the host without its workspace or provider config.
 
     :param workspace: The workspace root to create, e.g. ``"/home/omnigent/workspace"``.
     :param clone_dir: Directory the clone lands in, or ``None`` for no clone.
     :param repo_url: Repository clone URL, or ``None`` for an empty workspace.
     :param repo_branch: Branch to clone (``--branch … --single-branch``), or
         ``None`` for the default branch.
+    :param host_config: Deployment-supplied ``~/.omnigent/config.yaml`` content
+        to merge in (lands on the HOME ``emptyDir`` shared with the host
+        container), or ``None``.
     :returns: The ``["bash", "-lc", script]`` command.
     """
     script = f"set -e\nmkdir -p {shlex.quote(workspace)}\n"
@@ -390,6 +396,8 @@ def _render_workspace_prep_command(
             else ""
         )
         script += f"git clone {branch}-- {shlex.quote(repo_url)} {shlex.quote(clone_dir)}\n"
+    if host_config is not None:
+        script += render_host_config_write_command(host_config) + "\n"
     return ["bash", "-lc", script]
 
 
@@ -461,6 +469,7 @@ def build_pod_manifest(
     clone_dir: str | None = None,
     repo_url: str | None = None,
     repo_branch: str | None = None,
+    host_config: dict[str, object] | None = None,
     resources: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """
@@ -510,6 +519,11 @@ def build_pod_manifest(
     :param clone_dir: Directory the clone lands in, or ``None`` for no clone.
     :param repo_url: Repository clone URL, or ``None`` for an empty workspace.
     :param repo_branch: Branch to clone, or ``None`` for the default branch.
+    :param host_config: Deployment-supplied ``~/.omnigent/config.yaml`` content
+        merged in by the init container, or ``None``. Non-secret by design:
+        credentials stay behind ``api_key_ref: env:`` indirection (resolved in
+        the sandbox against the ``envFrom`` harness Secret), so embedding the
+        content in the init container's command is as safe as the clone URL.
     :param resources: Configured resources block, or ``None`` for the defaults.
     :returns: The Pod manifest dict.
     """
@@ -524,7 +538,9 @@ def build_pod_manifest(
         "name": _INIT_CONTAINER_NAME,
         "image": image,
         "workingDir": _HOME_DIR,
-        "command": _render_workspace_prep_command(workspace, clone_dir, repo_url, repo_branch),
+        "command": _render_workspace_prep_command(
+            workspace, clone_dir, repo_url, repo_branch, host_config
+        ),
         "env": [{"name": "HOME", "value": _HOME_DIR}],
         "resources": pod_resources,
         "securityContext": container_security,
@@ -1021,6 +1037,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         repo_url: str | None = None,
         repo_branch: str | None = None,
         repo_name: str | None = None,
+        host_config: dict[str, object] | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> str:
         """
@@ -1045,6 +1062,9 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         :param repo_url: Repository clone URL, or ``None`` for an empty workspace.
         :param repo_branch: Branch to clone, or ``None`` for the default branch.
         :param repo_name: Directory the clone lands in, or ``None``.
+        :param host_config: Deployment-supplied ``~/.omnigent/config.yaml``
+            content the init container merges in before the host starts, or
+            ``None``.
         :param on_stage: Progress observer; invoked with ``"starting"``.
         :returns: The absolute in-sandbox workspace path (the cloned repository
             directory when *repo_url* is set).
@@ -1096,6 +1116,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                     clone_dir=clone_dir,
                     repo_url=repo_url,
                     repo_branch=repo_branch,
+                    host_config=host_config,
                     resources=self._resources,
                 )
                 core.create_namespaced_pod(

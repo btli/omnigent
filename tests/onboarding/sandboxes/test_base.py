@@ -8,10 +8,18 @@ minimal recording launcher rather than per provider.
 
 from __future__ import annotations
 
+import os
 import subprocess
+from pathlib import Path
 from typing import ClassVar
 
-from omnigent.onboarding.sandboxes.base import RemoteCommandResult, SandboxLauncher
+import yaml
+
+from omnigent.onboarding.sandboxes.base import (
+    RemoteCommandResult,
+    SandboxLauncher,
+    render_host_config_write_command,
+)
 
 
 class _RecordingLauncher(SandboxLauncher):
@@ -99,3 +107,127 @@ def test_start_host_env_prefix_is_honored_by_a_real_shell() -> None:
         ["sh", "-c", probe], capture_output=True, text=True, check=True
     ).stdout.strip()
     assert out == "tok-123:host_abc:managed-abc"
+
+
+# ── host_config materialization ────────────────────────────
+
+_GATEWAY_HOST_CONFIG: dict[str, object] = {
+    "providers": {
+        "litellm": {
+            "kind": "gateway",
+            "default": ["pi"],
+            "openai": {
+                "base_url": "http://litellm.litellm.svc.cluster.local/v1",
+                "api_key_ref": "env:LITELLM_API_KEY",
+                "wire_api": "chat",
+            },
+        }
+    }
+}
+
+
+def _materialize(command: str, home: Path) -> dict[str, object]:
+    """Run the rendered write command through a real shell + python3."""
+    subprocess.run(
+        ["sh", "-c", command],
+        env={**os.environ, "HOME": str(home)},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    with open(home / ".omnigent" / "config.yaml") as f:
+        return yaml.safe_load(f)
+
+
+def test_render_host_config_write_command_creates_config_from_scratch(tmp_path: Path) -> None:
+    """A fresh sandbox (no ~/.omnigent at all) gets the injected config verbatim."""
+    written = _materialize(render_host_config_write_command(_GATEWAY_HOST_CONFIG), tmp_path)
+    assert written == _GATEWAY_HOST_CONFIG
+
+
+def test_render_host_config_write_command_merges_providers_and_replaces_other_keys(
+    tmp_path: Path,
+) -> None:
+    """
+    The merge mirrors cli.py's ``deep_merge_keys=("providers",)``: sibling
+    provider entries survive, an injected entry of the same name wins
+    wholesale, other top-level keys replace, untouched keys persist.
+    """
+    (tmp_path / ".omnigent").mkdir()
+    (tmp_path / ".omnigent" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "providers": {
+                    "anthropic": {"kind": "key"},
+                    "litellm": {"kind": "gateway", "default": True},
+                },
+                "server": "https://old.example.com",
+                "host": {"name": "keep-me"},
+            }
+        )
+    )
+
+    injected = {**_GATEWAY_HOST_CONFIG, "server": "https://new.example.com"}
+    written = _materialize(render_host_config_write_command(injected), tmp_path)
+
+    providers = written["providers"]
+    assert providers["anthropic"] == {"kind": "key"}  # sibling survives
+    # Same-name entry replaced wholesale (no per-entry merge), injected wins.
+    assert providers["litellm"] == _GATEWAY_HOST_CONFIG["providers"]["litellm"]
+    assert written["server"] == "https://new.example.com"
+    assert written["host"] == {"name": "keep-me"}
+
+
+def test_render_host_config_write_command_survives_hostile_yaml_content(tmp_path: Path) -> None:
+    """
+    Quotes, ``$VAR``-looking strings, backticks, newlines, and unicode round-trip
+    byte-exact: the payload rides base64 through the shell/python layers, so no
+    operator YAML can break out of the quoting.
+    """
+    hostile: dict[str, object] = {
+        "providers": {
+            'we\'ird "name"': {
+                "kind": "gateway",
+                "note": "line1\nline2 `tick` $HOME 'single' — ünïcode ✓",
+            }
+        }
+    }
+    written = _materialize(render_host_config_write_command(hostile), tmp_path)
+    assert written == hostile
+
+
+def test_start_host_writes_host_config_before_launching_the_host() -> None:
+    """The config write runs via ``run`` strictly before the host is backgrounded."""
+    launcher = _RecordingLauncher()
+
+    launcher.start_host(
+        "sb-1",
+        token="tok-123",
+        host_id="host_abc",
+        host_name="managed-abc",
+        server_url="https://srv",
+        host_config=_GATEWAY_HOST_CONFIG,
+    )
+
+    write_index = launcher.commands.index(render_host_config_write_command(_GATEWAY_HOST_CONFIG))
+    # run_background funnels through run(), so the wrapped host launch is
+    # also in `commands` — the write must precede it.
+    host_index = next(
+        i for i, cmd in enumerate(launcher.commands) if "omnigent host --server" in cmd
+    )
+    assert write_index < host_index
+
+
+def test_start_host_without_host_config_writes_nothing() -> None:
+    """No host_config → no config-write command reaches the sandbox."""
+    launcher = _RecordingLauncher()
+
+    launcher.start_host(
+        "sb-1",
+        token="tok-123",
+        host_id="host_abc",
+        host_name="managed-abc",
+        server_url="https://srv",
+    )
+
+    assert not any(cmd.startswith("python3 -c") for cmd in launcher.commands)

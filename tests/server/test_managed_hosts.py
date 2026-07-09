@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 from pathlib import Path
 from typing import ClassVar
 
@@ -11,6 +12,7 @@ from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
 
 from omnigent.db.utils import now_epoch
+from omnigent.onboarding.sandboxes.base import render_host_config_write_command
 from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
@@ -56,6 +58,7 @@ def _injected_config(
     *,
     server_url: str = "https://srv.example.com",
     token_ttl_s: int = 3600,
+    host_config: dict[str, object] | None = None,
 ) -> ManagedSandboxConfig:
     """
     Build a config that injects *fake* through the launcher-factory seam
@@ -64,12 +67,14 @@ def _injected_config(
     :param fake: The launcher every launch should use.
     :param server_url: Server URL the sandbox host dials back to.
     :param token_ttl_s: Launch-token lifetime in seconds.
+    :param host_config: In-sandbox config.yaml content to forward, or ``None``.
     :returns: A ready :class:`ManagedSandboxConfig`.
     """
     return ManagedSandboxConfig(
         server_url=server_url,
         launcher_factory=lambda: fake,
         token_ttl_s=token_ttl_s,
+        host_config=host_config,
     )
 
 
@@ -528,6 +533,46 @@ def test_parse_kubernetes_without_section_defaults(monkeypatch: pytest.MonkeyPat
     assert fake.resources is None
 
 
+def test_parse_host_config_threads_verbatim_without_resolving_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A valid host_config lands on the parsed config verbatim, and its
+    ``api_key_ref: env:`` reference is NOT resolved at parse time — the
+    variable names sandbox environment, not server environment, so parsing
+    must succeed with the variable unset on the server.
+    """
+    monkeypatch.delenv("LITELLM_API_KEY", raising=False)
+    monkeypatch.delenv("OMNIGENT_LITELLM_API_KEY", raising=False)
+    host_config = {
+        "providers": {
+            "litellm": {
+                "kind": "gateway",
+                "default": ["pi"],
+                "openai": {
+                    "base_url": "http://litellm.litellm.svc.cluster.local/v1",
+                    "api_key_ref": "env:LITELLM_API_KEY",
+                    "wire_api": "chat",
+                },
+            }
+        }
+    }
+
+    cfg = parse_sandbox_config(
+        {"provider": "modal", "server_url": "https://s.example.com", "host_config": host_config}
+    )
+
+    assert cfg is not None
+    assert cfg.host_config == host_config
+
+
+def test_parse_absent_host_config_is_none() -> None:
+    """No host_config key → nothing forwarded, existing configs unchanged."""
+    cfg = parse_sandbox_config({"provider": "modal", "server_url": "https://s.example.com"})
+    assert cfg is not None
+    assert cfg.host_config is None
+
+
 @pytest.mark.parametrize(
     ("kubernetes_block", "expected_fragment"),
     [
@@ -737,6 +782,36 @@ def test_parse_kubernetes_invalid_block_fails_loud(
         (
             {"provider": "openshell", "server_url": "https://s", "openshell": {"cluster": "  "}},
             "sandbox.openshell.cluster",
+        ),
+        # host_config present but malformed (provider-agnostic top-level key).
+        (
+            {"provider": "modal", "server_url": "https://s", "host_config": "providers: {}"},
+            "sandbox.host_config",
+        ),
+        (
+            {"provider": "modal", "server_url": "https://s", "host_config": {"providers": "x"}},
+            "sandbox.host_config.providers",
+        ),
+        # An invalid provider entry (bad kind) is caught by the same parser
+        # omnigent itself uses — inside the sandbox this would degrade
+        # silently, so parse time is the only loud failure point.
+        (
+            {
+                "provider": "modal",
+                "server_url": "https://s",
+                "host_config": {"providers": {"litellm": {"kind": "bogus"}}},
+            },
+            "sandbox.host_config.providers",
+        ),
+        # yaml.safe_load turns an unquoted date into datetime.date, which the
+        # per-launch json.dumps cannot take — must fail startup, not launches.
+        (
+            {
+                "provider": "modal",
+                "server_url": "https://s",
+                "host_config": {"last_rotated": datetime.date(2024, 1, 1)},
+            },
+            "JSON-serializable",
         ),
     ],
 )
@@ -987,6 +1062,53 @@ async def test_launch_success_registers_host_and_returns_workspace(db_uri: str) 
     assert resolved.host_id == result.host_id
     # Nothing was torn down on the success path.
     assert fake.terminated == []
+
+
+async def test_launch_materializes_host_config_before_host_start(db_uri: str) -> None:
+    """
+    A configured host_config is written into the sandbox strictly BEFORE
+    ``omnigent host`` starts — the whole point of the injection is that the
+    host boots with its providers already on disk.
+    """
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            owner=_OWNER,
+        )
+
+    fake = FakeSandboxLauncher(on_host_start=_register)
+    host_config: dict[str, object] = {"providers": {"litellm": {"kind": "gateway"}}}
+
+    await launch_managed_host(
+        config=_injected_config(fake, host_config=host_config),
+        owner=_OWNER,
+        host_store=host_store,
+    )
+
+    write_index = fake.commands.index(render_host_config_write_command(host_config))
+    host_index = next(i for i, cmd in enumerate(fake.commands) if "omnigent host --server" in cmd)
+    assert write_index < host_index
+
+
+async def test_launch_without_host_config_writes_no_config(db_uri: str) -> None:
+    """No host_config → the launch issues no config-write command at all."""
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            owner=_OWNER,
+        )
+
+    fake = FakeSandboxLauncher(on_host_start=_register)
+
+    await launch_managed_host(config=_injected_config(fake), owner=_OWNER, host_store=host_store)
+
+    assert not any(cmd.startswith("python3 -c") for cmd in fake.commands)
 
 
 async def test_launch_with_injected_custom_launcher(db_uri: str) -> None:
@@ -1257,6 +1379,7 @@ class _EntrypointFakeLauncher(FakeSandboxLauncher):
         repo_url: str | None = None,
         repo_branch: str | None = None,
         repo_name: str | None = None,
+        host_config: dict[str, object] | None = None,
         on_stage=None,
     ) -> str:
         """Record the call, prove the token already resolves, and connect."""
