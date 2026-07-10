@@ -78,15 +78,24 @@ export function projectPrefillStep(
   let next = state;
 
   if (!state.agentSeeded) {
-    const { newest, newestFailed, agents, lastAgentId } = inputs;
-    if ((newest !== undefined || newestFailed) && agents !== undefined) {
+    const { newest, newestFailed, agents, hosts, lastAgentId } = inputs;
+    const lookupDone = newest !== undefined || newestFailed;
+    // A session on a gone/offline host is unusable as a template — every
+    // slot falls back to generic, the agent included. Judging that needs
+    // the host list, so wait for it (the location track does too).
+    const needsHosts = newest != null && newest.host_id != null;
+    if (lookupDone && agents !== undefined && (!needsHosts || hosts !== undefined)) {
       next = { ...next, agentSeeded: true };
+      const hostId = newest?.host_id;
+      const hostUsable =
+        hostId == null || (hosts ?? []).some((h) => h.host_id === hostId && h.status === "online");
       const agentId = newest?.agent_id;
-      if (agentId != null && agents.some((a) => a.id === agentId)) {
+      if (hostUsable && agentId != null && agents.some((a) => a.id === agentId)) {
         writes.agentId = agentId;
       } else if (lastAgentId) {
-        // A failed lookup, agent-less session, or retired agent still seeds
-        // the last-used agent so the composer never sits without one.
+        // A failed lookup, agent-less/unusable session, or retired agent
+        // still seeds the last-used agent so the composer never sits
+        // without one.
         writes.agentId = lastAgentId;
       }
     }
@@ -112,18 +121,11 @@ function locationStep(
   writes: ProjectPrefillWrites,
 ): ProjectPrefillState | null {
   if (state.phase === "host") {
-    const { newest, newestFailed, hosts, sandboxSelected } = inputs;
+    // Just the wait point: the workspace phase writes host and workspace
+    // TOGETHER once the source repo resolves, so a failed resolution can't
+    // leave a host seeded with a generic workspace (half a template).
+    const { newest, newestFailed, hosts } = inputs;
     if ((newest === undefined && !newestFailed) || hosts === undefined) return null;
-    // Online only: the picker disables offline hosts, so seeding one would
-    // set up a create that can only fail instead of falling back.
-    const hostId = newest?.host_id;
-    if (
-      !sandboxSelected &&
-      hostId != null &&
-      hosts.some((h) => h.host_id === hostId && h.status === "online")
-    ) {
-      writes.hostId = hostId;
-    }
     return { ...state, phase: "workspace" };
   }
 
@@ -139,6 +141,8 @@ function locationStep(
       // in flight — this workspace belongs to the newest session's host.
       inputs.sandboxSelected ||
       (selectedHostId !== null && selectedHostId !== hostId) ||
+      // Online only: the picker disables offline hosts, so seeding one would
+      // set up a create that can only fail instead of falling back.
       !(hosts ?? []).some((h) => h.host_id === hostId && h.status === "online")
     ) {
       // Nothing seedable: empty project, sandbox-origin or host-less
@@ -146,6 +150,7 @@ function locationStep(
       return settled(state);
     }
     if (newest.git_branch == null) {
+      writes.hostId = hostId;
       writes.workspace = sourceWorkspace;
       return { ...state, phase: "branch", seededWorkspace: sourceWorkspace };
     }
@@ -153,6 +158,7 @@ function locationStep(
     if (sourceWorktrees === undefined) return null; // still resolving
     const main = sourceWorktrees.find((w) => w.is_main);
     if (main === undefined) return settled(state);
+    writes.hostId = hostId;
     writes.workspace = main.path;
     return { ...state, phase: "branch", seededWorkspace: main.path };
   }

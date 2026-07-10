@@ -285,25 +285,29 @@ describe("NewChatLandingScreen project prefill", () => {
   });
 
   it("falls back to the generic defaults when the session's host is gone", async () => {
-    setNewestSession(conversation({ host_id: "host_gone" }));
+    // A distinct agent on the unusable session: the WHOLE template falls
+    // back, agent included — not just host and workspace.
+    setNewestSession(conversation({ host_id: "host_gone", agent_id: "ag_other" }));
     renderLanding();
 
     const body = await submitAndReadBody();
     expect(body.host_id).toBe("host_1");
     expect(body.workspace).toBe(RECENT_WORKSPACE);
+    expect(body.agent_id).toBe("ag_hello");
   });
 
   it("falls back to the generic defaults when the session's host is offline", async () => {
     // The host is still listed (the picker shows it disabled) but can't take
-    // a session — the prefill must not seed it or its workspace.
+    // a session — the prefill must not seed it, its workspace, or its agent.
     vi.mocked(useHosts).mockReturnValue({
       data: [host(), host({ host_id: "host_off", name: "sleepy", status: "offline" })],
     } as ReturnType<typeof useHosts>);
-    setNewestSession(conversation({ host_id: "host_off" }));
+    setNewestSession(conversation({ host_id: "host_off", agent_id: "ag_other" }));
     renderLanding();
 
     const body = await submitAndReadBody();
     expect(body.host_id).toBe("host_1");
     expect(body.workspace).toBe(RECENT_WORKSPACE);
+    expect(body.agent_id).toBe("ag_hello");
   });
 });

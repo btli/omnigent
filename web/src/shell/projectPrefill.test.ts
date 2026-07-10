@@ -79,7 +79,36 @@ describe("projectPrefill workspace phase vs live host pick", () => {
     const step = projectPrefillStep(state, inputs({ selectedHostId: "host_1" }));
     expect(step).not.toBeNull();
     expect(step!.state.phase).toBe("branch");
+    // Host and workspace land together — never one without the other.
+    expect(step!.writes.hostId).toBe("host_1");
     expect(step!.writes.workspace).toBe(REPO);
+  });
+
+  it("seeds neither host nor workspace when the source-repo resolution fails", () => {
+    // A worktree-born session needs its main repo resolved; if that lookup
+    // fails, seeding just the host would leave half a template (project
+    // host + generic workspace).
+    const worktreeBorn = inputs({
+      newest: newest({ git_branch: "feature-x" }),
+      sourceWorktreesFailed: true,
+    });
+    const state = stepTo("workspace", worktreeBorn);
+    const step = projectPrefillStep(state, worktreeBorn);
+    expect(step).not.toBeNull();
+    expect(step!.state.phase).toBe("settled");
+    expect(step!.writes.hostId).toBeUndefined();
+    expect(step!.writes.workspace).toBeUndefined();
+  });
+
+  it("falls back to the generic agent when the session's host is offline", () => {
+    const offline = inputs({
+      newest: newest({ host_id: "host_off", agent_id: "ag_special" }),
+      agents: [{ id: "ag_special" }, { id: "ag_generic" }],
+      lastAgentId: "ag_generic",
+    });
+    const step = projectPrefillStep(initialPrefillState("Alpha"), offline);
+    expect(step).not.toBeNull();
+    expect(step!.writes.agentId).toBe("ag_generic");
   });
 
   it("settles without a workspace write when the sandbox is selected", () => {
