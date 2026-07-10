@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+from collections.abc import Callable
 from pathlib import Path
 from typing import ClassVar
 
@@ -572,6 +573,23 @@ def test_parse_absent_host_config_is_none() -> None:
     cfg = parse_sandbox_config({"provider": "modal", "server_url": "https://s.example.com"})
     assert cfg is not None
     assert cfg.host_config is None
+
+
+def test_parse_host_config_null_providers_fails_loud() -> None:
+    """
+    An explicit ``providers: null`` fails parse. Left through, the sandbox
+    merge would write ``providers: null`` over any existing block and the
+    harness would silently fall back to its own login — the exact
+    degradation this parse exists to stop.
+    """
+    with pytest.raises(ValueError, match=r"sandbox\.host_config\.providers"):
+        parse_sandbox_config(
+            {
+                "provider": "modal",
+                "server_url": "https://s.example.com",
+                "host_config": {"providers": None},
+            }
+        )
 
 
 @pytest.mark.parametrize(
@@ -1157,6 +1175,60 @@ async def test_launch_without_host_config_writes_no_config(db_uri: str) -> None:
     await launch_managed_host(config=_injected_config(fake), owner=_OWNER, host_store=host_store)
 
     assert not any(cmd.startswith("python3 -c") for cmd in fake.commands)
+
+
+async def test_launch_without_host_config_supports_legacy_start_host_signature(
+    db_uri: str,
+) -> None:
+    """
+    A deployment-injected launcher whose ``start_host`` override predates the
+    ``host_config`` parameter keeps launching when no host_config is set —
+    the kwarg is omitted entirely rather than passed as ``None``.
+    """
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            owner=_OWNER,
+        )
+
+    class _LegacySignatureLauncher(FakeSandboxLauncher):
+        """Overrides start_host with the pre-host_config explicit signature."""
+
+        def start_host(
+            self,
+            sandbox_id: str,
+            *,
+            token: str,
+            host_id: str,
+            host_name: str,
+            server_url: str,
+            repo_url: str | None = None,
+            repo_branch: str | None = None,
+            repo_name: str | None = None,
+            on_stage: Callable[[str], None] | None = None,
+        ) -> str:
+            return super().start_host(
+                sandbox_id,
+                token=token,
+                host_id=host_id,
+                host_name=host_name,
+                server_url=server_url,
+                repo_url=repo_url,
+                repo_branch=repo_branch,
+                repo_name=repo_name,
+                on_stage=on_stage,
+            )
+
+    fake = _LegacySignatureLauncher(on_host_start=_register)
+
+    result = await launch_managed_host(
+        config=_injected_config(fake), owner=_OWNER, host_store=host_store
+    )
+
+    assert result.host_id.startswith("host_")
 
 
 async def test_launch_with_injected_custom_launcher(db_uri: str) -> None:

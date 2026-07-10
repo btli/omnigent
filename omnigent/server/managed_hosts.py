@@ -656,8 +656,12 @@ def _parse_host_config(raw: dict[str, object]) -> dict[str, object] | None:
             "in-sandbox ~/.omnigent/config.yaml content merged in before "
             "'omnigent host' starts"
         )
-    providers = host_config.get("providers")
-    if providers is not None:
+    # Key presence, not get(): an explicit `providers: null` would skip
+    # validation here yet still ride to the sandbox, where the merge writes
+    # `providers: null` over any existing block — the silent degradation this
+    # parse exists to prevent.
+    if "providers" in host_config:
+        providers = host_config["providers"]
         # load_providers silently ignores a non-mapping providers value, so
         # the mapping check must happen here to fail loud.
         if not isinstance(providers, dict):
@@ -2005,8 +2009,10 @@ async def _arm_and_start_host(
             repo_url=repo.url if repo is not None else None,
             repo_branch=repo.branch if repo is not None else None,
             repo_name=repo.repo_name if repo is not None else None,
-            host_config=config.host_config,
             on_stage=on_stage,
+            # Omitted entirely when unset: a deployment-injected launcher
+            # predating the host_config parameter must keep launching.
+            **({"host_config": config.host_config} if config.host_config is not None else {}),
         )
         await _wait_for_host_online(host_store, host_id)
     except Exception as exc:
@@ -2209,7 +2215,9 @@ async def resume_managed_host(
                 repo_url=None,  # the persistent volume already holds the workspace
                 # Re-materialized on every wake, so an operator's host_config
                 # change lands on the next resume without a new sandbox.
-                host_config=config.host_config,
+                # Omitted entirely when unset: a deployment-injected launcher
+                # predating the host_config parameter must keep resuming.
+                **({"host_config": config.host_config} if config.host_config is not None else {}),
             )
             await _wait_for_host_online(host_store, host.host_id)
         except Exception as exc:
