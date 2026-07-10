@@ -30,6 +30,19 @@ class NativeNotificationManager(
     // with the reserved badge-summary notification.
     private val nextId = AtomicInteger(BADGE_NOTIFICATION_ID + 1)
 
+    // Last badge state from the web layer, kept so a grant of the API 33+
+    // notification permission can replay a badge that was computed (and
+    // deduped web-side) while the permission dialog was still open.
+    private data class BadgeState(
+        val count: Int,
+        val navigatePath: String?,
+        val title: String?,
+        val body: String?,
+    )
+
+    @Volatile
+    private var lastBadge: BadgeState? = null
+
     init {
         val channel =
             NotificationChannel(
@@ -73,8 +86,9 @@ class NativeNotificationManager(
      * builds omit these, so we fall back to the app name + "N pending" and no
      * tap intent — the prior behavior.
      *
-     * A count of 0 is a no-op: we never cancel notifications just to clear a
-     * badge.
+     * A count of 0 withdraws the summary: the badge notification is the count
+     * surface, so once nothing is pending it must not linger as a stale,
+     * still-tappable "N sessions need your attention" routing to resolved work.
      */
     fun setBadgeCount(
         count: Int,
@@ -82,7 +96,11 @@ class NativeNotificationManager(
         title: String? = null,
         body: String? = null,
     ) {
-        if (count <= 0) return
+        lastBadge = BadgeState(count, navigatePath, title, body)
+        if (count <= 0) {
+            manager.cancel(BADGE_NOTIFICATION_ID)
+            return
+        }
         val builder =
             NotificationCompat
                 .Builder(context, CHANNEL_ID)
@@ -101,6 +119,16 @@ class NativeNotificationManager(
             builder.setContentIntent(activationIntent(navigatePath, BADGE_NOTIFICATION_ID))
         }
         post(BADGE_NOTIFICATION_ID, builder.build())
+    }
+
+    /**
+     * Re-post the last badge the web layer sent. Called when the user grants
+     * the notification permission: a badge posted before the grant was
+     * silently dropped, and the web side won't resend an unchanged state.
+     */
+    fun replayBadge() {
+        val badge = lastBadge ?: return
+        setBadgeCount(badge.count, badge.navigatePath, badge.title, badge.body)
     }
 
     /**

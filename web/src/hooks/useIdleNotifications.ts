@@ -397,12 +397,14 @@ function badgeActivationFor(
   // `/inbox` lists only sessions awaiting input, so route there only when at
   // least one counted session actually has a pending prompt; a batch that just
   // finished (unseen activity, no prompt) would otherwise land on an inbox that
-  // reads "Nothing waiting on you". Fall back to the session list.
+  // reads "Nothing waiting on you". Fall back to the session list —
+  // ?sidebar=open so phone-width shells (sidebar closed by default) actually
+  // show it instead of a bare composer (see AppShell).
   const anyAwaiting = conversations.some(
     (c) => ids.has(c.id) && (c.pending_elicitations_count ?? 0) > 0,
   );
   return {
-    navigatePath: anyAwaiting ? "/inbox" : "/",
+    navigatePath: anyAwaiting ? "/inbox" : "/?sidebar=open",
     body: `${ids.size} sessions need your attention`,
   };
 }

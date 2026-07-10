@@ -33,6 +33,11 @@ class OmnigentBridgeListener(
     ) {
         if (!isMainFrame) return // origin allowlist already gates; defense in depth.
         val data = message.data ?: return
+        handle(data)
+    }
+
+    /** Parse and dispatch one bridge message; malformed input is dropped. */
+    internal fun handle(data: String) {
         val json =
             try {
                 JSONObject(data)

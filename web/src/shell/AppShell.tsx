@@ -145,6 +145,17 @@ export function AppShell() {
     useResizableInlinePanel(conversationId ?? null, inlinePanelMinWidth);
   const [searchParams, setSearchParams] = useSearchParams();
   const [sidebarOpen, setSidebarOpen] = useState(initialSidebarOpen);
+  // ?sidebar=open surfaces the session list on phone-width shells where the
+  // sidebar is closed by default — the destination for a "N sessions need
+  // your attention" notification tap, which would otherwise land on a bare
+  // composer. One-shot: applied then stripped from the URL.
+  useEffect(() => {
+    if (searchParams.get("sidebar") !== "open") return;
+    setSidebarOpen(true);
+    const next = new URLSearchParams(searchParams);
+    next.delete("sidebar");
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams]);
   // Live open fraction (0→1) while the iOS edge-swipe drags the sidebar; null
   // when not dragging. Drives the mobile overlay's finger-tracking transform.
   const [sidebarDragProgress, setSidebarDragProgress] = useState<number | null>(null);

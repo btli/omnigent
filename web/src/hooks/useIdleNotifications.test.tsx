@@ -629,7 +629,7 @@ describe("useIdleNotifications badge (native shell)", () => {
     // Both unread (finished, none awaiting) -> badge 2, routed to the list.
     expect(setBadgeMock).toHaveBeenLastCalledWith(
       2,
-      expect.objectContaining({ navigatePath: "/" }),
+      expect.objectContaining({ navigatePath: "/?sidebar=open" }),
     );
     setBadgeMock.mockClear();
 
@@ -658,12 +658,13 @@ describe("useIdleNotifications badge (native shell)", () => {
 
   it("routes a multi-session badge to the session list when none await input", () => {
     // Both merely finished (unseen activity, no pending prompt) -> the inbox
-    // would read "Nothing waiting on you", so route to the session list instead.
+    // would read "Nothing waiting on you", so route to the session list;
+    // ?sidebar=open makes phone-width shells actually show it.
     setConversations([unseenConv("a"), unseenConv("b")]);
     renderHook(() => useIdleNotifications());
 
     expect(setBadgeMock).toHaveBeenCalledWith(2, {
-      navigatePath: "/",
+      navigatePath: "/?sidebar=open",
       body: "2 sessions need your attention",
     });
   });
