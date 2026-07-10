@@ -39,6 +39,9 @@ interface ProjectPrefillInputs {
   /** Pickable agents; undefined = still loading. */
   agents: { id: string }[] | undefined;
   sandboxSelected: boolean;
+  /** Live host pick; a mid-flight manual switch aborts the location seeding
+   *  so another host's workspace path can't land in the field. */
+  selectedHostId: string | null;
   /** Last-used agent id from localStorage (readLastAgentId()). */
   lastAgentId: string | null;
   /** Worktree set of the newest session's workspace (resolves a worktree-born
@@ -125,13 +128,17 @@ function locationStep(
   }
 
   if (state.phase === "workspace") {
-    const { newest, hosts, sourceWorktrees, sourceWorktreesFailed } = inputs;
+    const { newest, hosts, sourceWorktrees, sourceWorktreesFailed, selectedHostId } = inputs;
     const hostId = newest?.host_id ?? null;
     const sourceWorkspace = newest?.workspace ?? null;
     if (
       newest == null ||
       hostId === null ||
       sourceWorkspace === null ||
+      // The user picked the sandbox or a different host while the lookup was
+      // in flight — this workspace belongs to the newest session's host.
+      inputs.sandboxSelected ||
+      (selectedHostId !== null && selectedHostId !== hostId) ||
       !(hosts ?? []).some((h) => h.host_id === hostId && h.status === "online")
     ) {
       // Nothing seedable: empty project, sandbox-origin or host-less

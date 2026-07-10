@@ -2405,6 +2405,7 @@ export function NewChatLandingScreen() {
       // a pick that effectiveAgentId rejects. Raw undefined = still loading.
       agents: agents === undefined ? undefined : agentList,
       sandboxSelected,
+      selectedHostId,
       lastAgentId: readLastAgentId(),
       sourceWorktrees: projectSourceWorktrees,
       sourceWorktreesFailed: projectSourceWorktreesFailed,
@@ -2437,6 +2438,7 @@ export function NewChatLandingScreen() {
     agents,
     agentList,
     sandboxSelected,
+    selectedHostId,
     projectSourceWorktrees,
     projectSourceWorktreesFailed,
     workspaceTrimmed,
@@ -2857,6 +2859,9 @@ export function NewChatLandingScreen() {
           // session shows up immediately (the folder fetches via
           // useProjectSessions, separate from the global conversations list).
           void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+          // The just-created session is now the project's newest; without this
+          // a pencil click within staleTime prefills from the previous one.
+          void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
         } catch {
           // Leave the session unfiled; the user can file it from the sidebar.
         }
