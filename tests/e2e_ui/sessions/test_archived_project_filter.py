@@ -17,6 +17,7 @@ to other tests' sessions on the shared server.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import uuid
 
@@ -71,10 +72,8 @@ def _seed_archived_session(base_url: str, *, title: str, project: str | None) ->
 def _delete_sessions(base_url: str, session_ids: list[str]) -> None:
     """Best-effort cleanup so seeded sessions don't leak into other tests."""
     for session_id in session_ids:
-        try:
+        with contextlib.suppress(httpx.HTTPError):
             httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
-        except httpx.HTTPError:
-            pass
 
 
 def _pick_project(page: Page, option_name: str) -> None:

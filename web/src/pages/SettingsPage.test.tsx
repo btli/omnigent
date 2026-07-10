@@ -7,7 +7,6 @@ import { type ReactNode } from "react";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ReactNode } from "react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 
@@ -94,9 +93,13 @@ vi.mock("@/hooks/useConversations", async () => {
   };
 });
 // Radix Select uses a portal + pointer events jsdom can't drive; stub it to a
-// native <select> so tests can switch the archived project filter.
-vi.mock("@/components/ui/select", () => ({
-  Select: ({
+// native <select> so tests can drive both the color-theme dropdown and the
+// archived project filter. The real page puts data-testid on SelectTrigger,
+// so the stub lifts it from the trigger child onto the native <select>.
+vi.mock("@/components/ui/select", async () => {
+  const { Children, isValidElement } = await import("react");
+  const SelectTrigger = ({ children }: { children?: ReactNode }) => <>{children}</>;
+  const Select = ({
     value,
     onValueChange,
     children,
@@ -104,22 +107,33 @@ vi.mock("@/components/ui/select", () => ({
     value: string;
     onValueChange: (v: string) => void;
     children: ReactNode;
-  }) => (
-    <select
-      data-testid="archived-project-filter"
-      value={value}
-      onChange={(e) => onValueChange(e.target.value)}
-    >
-      {children}
-    </select>
-  ),
-  SelectTrigger: ({ children }: { children: ReactNode }) => <>{children}</>,
-  SelectValue: () => null,
-  SelectContent: ({ children }: { children: ReactNode }) => <>{children}</>,
-  SelectItem: ({ value, children }: { value: string; children: ReactNode }) => (
-    <option value={value}>{children}</option>
-  ),
-}));
+  }) => {
+    const kids = Children.toArray(children);
+    const trigger = kids.find((c) => isValidElement(c) && c.type === SelectTrigger);
+    const testId =
+      isValidElement(trigger) && trigger.props && typeof trigger.props === "object"
+        ? (trigger.props as Record<string, unknown>)["data-testid"]
+        : undefined;
+    return (
+      <select
+        data-testid={typeof testId === "string" ? testId : undefined}
+        value={value}
+        onChange={(e) => onValueChange(e.target.value)}
+      >
+        {kids.filter((c) => !(isValidElement(c) && c.type === SelectTrigger))}
+      </select>
+    );
+  };
+  return {
+    Select,
+    SelectTrigger,
+    SelectValue: () => null,
+    SelectContent: ({ children }: { children: ReactNode }) => <>{children}</>,
+    SelectItem: ({ value, children }: { value: string; children: ReactNode }) => (
+      <option value={value}>{children}</option>
+    ),
+  };
+});
 // The admin management surfaces are lazy-loaded and own heavy data layers of
 // their own; stub them so these tests only assert SettingsPage's section
 // routing (that /settings/members and /settings/policies render the right one).
@@ -128,33 +142,6 @@ vi.mock("@/pages/MembersPage", () => ({
 }));
 vi.mock("@/pages/PoliciesPage", () => ({
   PoliciesPage: () => <div>policies-page-stub</div>,
-}));
-// Radix Select uses a portal + pointer events jsdom can't drive, so stub it to
-// a native <select>; lets the color-theme dropdown be exercised via change.
-vi.mock("@/components/ui/select", () => ({
-  Select: ({
-    value,
-    onValueChange,
-    children,
-  }: {
-    value: string;
-    onValueChange: (v: string) => void;
-    children: ReactNode;
-  }) => (
-    <select
-      data-testid="color-theme-select"
-      value={value}
-      onChange={(e) => onValueChange(e.target.value)}
-    >
-      {children}
-    </select>
-  ),
-  SelectTrigger: ({ children }: { children: ReactNode }) => <>{children}</>,
-  SelectValue: () => null,
-  SelectContent: ({ children }: { children: ReactNode }) => <>{children}</>,
-  SelectItem: ({ value, children }: { value: string; children: ReactNode }) => (
-    <option value={value}>{children}</option>
-  ),
 }));
 
 import { SettingsPage } from "./SettingsPage";
