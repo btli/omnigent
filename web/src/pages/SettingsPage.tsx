@@ -1350,7 +1350,23 @@ function ArchivedSection() {
   // `useProjects()` omits all-archived projects, and deriving options from only
   // the visible list's loaded first page would hide archived-only projects
   // whose sessions sit on later pages.
-  const { data: projectNames = [] } = useArchivedProjectNames();
+  const namesQuery = useArchivedProjectNames();
+  const projectNames = useMemo(() => namesQuery.data ?? [], [namesQuery.data]);
+
+  // A picked project can vanish from the option set for good (its last
+  // archived session deleted or restored, possibly by another client). Once
+  // the scan settles without it, fall back to "All projects" rather than
+  // pinning a defunct filter with a project-scoped empty state.
+  useEffect(() => {
+    if (
+      project !== undefined &&
+      namesQuery.isSuccess &&
+      !namesQuery.isFetching &&
+      !projectNames.includes(project)
+    ) {
+      setProject(undefined);
+    }
+  }, [project, projectNames, namesQuery.isSuccess, namesQuery.isFetching]);
 
   // The visible list, filtered server-side via ?project= when one is picked.
   const listQuery = useConversations("", true, undefined, project);

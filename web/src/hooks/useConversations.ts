@@ -763,9 +763,9 @@ export async function fetchAllArchivedProjectNames(): Promise<string[]> {
  * Project names that have archived sessions — the option set for the Archived
  * view's project filter.
  *
- * Keyed off the `["projects"]` prefix (see `ARCHIVED_PROJECT_NAMES_KEY`) so the
- * expensive full-list scan isn't dragged along by unrelated
- * `invalidateQueries(["projects"])` calls. The mutations that actually change
+ * Deliberately a standalone key (`ARCHIVED_PROJECT_NAMES_KEY`), NOT under the
+ * `["projects"]` prefix, so the expensive full-list scan isn't dragged along
+ * by unrelated `invalidateQueries(["projects"])` calls. The mutations that actually change
  * archived membership or a project label invalidate this key explicitly to keep
  * the picker in sync. Only fetched while the Archived settings view is mounted
  * (its sole caller), so the scan never runs for users who don't open it.
