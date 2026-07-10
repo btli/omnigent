@@ -2425,8 +2425,10 @@ export function NewChatLandingScreen() {
     if (writes.workspace !== undefined) {
       setWorkspace((cur) => (cur === "" ? writes.workspace! : cur));
     }
-    if (writes.branch !== undefined && branchName === "" && prefilledBranch === "") {
-      setBranchName(writes.branch);
+    if (writes.branch !== undefined && prefilledBranch === "") {
+      // Functional fill-empty-only, like the other slots: a branch typed
+      // between the qualifying render and this effect must not be clobbered.
+      setBranchName((cur) => (cur === "" ? writes.branch! : cur));
     }
     setPrefill(step.state);
   }, [
