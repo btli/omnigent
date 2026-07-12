@@ -650,10 +650,16 @@ export function AppShell() {
   // since the scope is meaningless (and shouldn't deep-link the rail back open)
   // once the workspace is collapsed. Collapsing thus drops ?view= here.
   useEffect(() => {
+    // Skip when the URL already agrees: setSearchParams always navigates, and
+    // a no-op write replays this effect's stale params over whatever another
+    // same-commit effect just wrote (e.g. the one-shot ?sidebar=open strip).
+    const current = new URLSearchParams(window.location.search);
+    const wantChanged = rightPanelOpen && filesPanelFlatView;
+    if (wantChanged ? current.get("view") === "changed" : !current.has("view")) return;
     setSearchParams(
       (prev) => {
         const next = new URLSearchParams(prev);
-        if (rightPanelOpen && filesPanelFlatView) {
+        if (wantChanged) {
           next.set("view", "changed");
         } else {
           next.delete("view");
