@@ -10,6 +10,10 @@ foreground process open. Everything provider-specific (CLI bootstrap, SSH
 quirks, image contents, pip flags) lives behind a :class:`SandboxLauncher`
 implementation; everything provider-agnostic (wheel builds, the in-sandbox
 App OAuth dance, host registration) lives in ``bootstrap``.
+
+Injected host config uses the loader's ``OMNIGENT_CONFIG_HOME`` resolution,
+atomically replaces its config and ownership-marker files, and removes a
+previously injected value only while it remains unchanged by the user.
 """
 
 from __future__ import annotations
@@ -86,25 +90,26 @@ def host_image_wheel_install_command(remote_tgz_path: str) -> str:
 # base64 Python literal — its alphabet has no quote or shell metacharacter, so
 # arbitrary YAML content can never break out of the script.
 #
-# The server owns what it injects: a marker file records the previous payload,
-# and each run removes those entries before merging the current payload — so
-# a renamed gateway or a removed ``host_config`` block doesn't leave stale
-# providers behind on persistent sandboxes (two entries claiming the same
-# ``default`` scope is a load error). A missing or corrupt marker skips the
-# removal — never delete without evidence of what was injected.
+# A marker records the previous payload. Each run removes an entry only while
+# its current value still matches that payload, so user edits survive; a
+# missing or corrupt marker skips removal entirely.
 _HOST_CONFIG_WRITE_SCRIPT: str = """\
-import base64, json, os, yaml
+import base64, json, os, tempfile, yaml
 
-path = os.path.expanduser("~/.omnigent/config.yaml")
-marker = os.path.expanduser("~/.omnigent/.injected_host_config.json")
+config_home = os.environ.get("OMNIGENT_CONFIG_HOME")
+config_dir = config_home if config_home else os.path.join(os.path.expanduser("~"), ".omnigent")
+path = os.path.join(config_dir, "config.yaml")
+marker = os.path.join(config_dir, ".injected_host_config.json")
 existing = {}
 if os.path.exists(path):
-    loaded = yaml.safe_load(open(path))
+    with open(path) as f:
+        loaded = yaml.safe_load(f)
     if isinstance(loaded, dict):
         existing = loaded
 previous = {}
 try:
-    loaded = json.load(open(marker))
+    with open(marker) as f:
+        loaded = json.load(f)
     if isinstance(loaded, dict):
         previous = loaded
 except (OSError, ValueError):
@@ -113,12 +118,13 @@ for key, value in previous.items():
     if key == "providers" and isinstance(value, dict):
         current = existing.get(key)
         if isinstance(current, dict):
-            for name in value:
-                current.pop(name, None)
+            for name, injected_value in value.items():
+                if name in current and current[name] == injected_value:
+                    current.pop(name)
             if not current:
                 existing.pop(key, None)
-    else:
-        existing.pop(key, None)
+    elif key in existing and existing[key] == value:
+        existing.pop(key)
 injected = json.loads(base64.b64decode(__PAYLOAD__).decode())
 for key, value in injected.items():
     current = existing.get(key)
@@ -126,11 +132,32 @@ for key, value in injected.items():
         existing[key] = {**current, **value}
     else:
         existing[key] = value
+
+def atomic_write(path, dump):
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(path), delete=False) as f:
+            temp_path = f.name
+            dump(f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+    except BaseException:
+        if temp_path is not None:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        raise
+
 if injected or previous:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    yaml.safe_dump(existing, open(path, "w"), default_flow_style=False, sort_keys=True)
+    os.makedirs(config_dir, exist_ok=True)
+    atomic_write(
+        path,
+        lambda f: yaml.safe_dump(existing, f, default_flow_style=False, sort_keys=True),
+    )
 if injected:
-    json.dump(injected, open(marker, "w"))
+    atomic_write(marker, lambda f: json.dump(injected, f))
 elif previous:
     os.remove(marker)
 """
@@ -139,20 +166,27 @@ elif previous:
 def render_host_config_write_command(host_config: dict[str, object]) -> str:
     """
     Build the remote command that installs *host_config* into the
-    sandbox's ``~/.omnigent/config.yaml`` before ``omnigent host`` starts.
+    sandbox's config directory before ``omnigent host`` starts. The directory
+    is ``$OMNIGENT_CONFIG_HOME`` when truthy, otherwise ``~/.omnigent``, exactly
+    matching :func:`omnigent.onboarding.provider_config._config_path`.
 
     Server-managed replacement semantics: entries injected by a previous
-    run (recorded in ``~/.omnigent/.injected_host_config.json``) are
-    removed first, then the current payload merges in with
+    run (recorded alongside ``config.yaml``) are removed first only when their
+    current value still equals the recorded injected value. User-edited
+    provider entries and top-level values are therefore never removed during
+    replacement or cleanup. The current payload then merges in with
     ``omnigent.cli._save_global_config``'s
     ``deep_merge_keys=("providers",)`` semantics — ``providers`` one
-    level deep (user-created entries survive, injected entries win),
-    every other top-level key wholesale. The injected block therefore
-    always reflects the CURRENT server config across resumes; an empty
-    *host_config* renders a pure cleanup command. Shared by both launch
-    seams — the exec-model :meth:`SandboxLauncher.start_host` and the
-    Kubernetes init container — so the behavior cannot drift between
-    providers.
+    level deep and every other top-level key wholesale. Current injected names
+    still win, while untouched user-created provider entries survive. An empty
+    *host_config* renders a pure cleanup command. A missing or corrupt marker
+    skips removal rather than guessing ownership. Shared by both launch seams —
+    the exec-model :meth:`SandboxLauncher.start_host` and the Kubernetes init
+    container — so the behavior cannot drift between providers.
+
+    Both config and marker writes use a fully-written, fsynced temporary file
+    in the destination directory followed by :func:`os.replace`, so an
+    interrupted write cannot expose a truncated destination file.
 
     The payload travels as base64-encoded JSON substituted into a fixed
     Python script, and the whole script is ``shlex.quote``-wrapped —

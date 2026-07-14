@@ -675,14 +675,30 @@ def _parse_host_config(raw: dict[str, object]) -> dict[str, object] | None:
         # Lazy imports, matching the provider branches below: the parse path
         # must not pull the onboarding layer in at module import time.
         from omnigent.errors import OmnigentError
-        from omnigent.onboarding.provider_config import load_providers
+        from omnigent.onboarding.provider_config import get_default_provider, load_providers
 
         try:
-            load_providers(host_config)
+            parsed_providers = load_providers(host_config)
+            default_scopes = {
+                scope
+                for provider in parsed_providers.values()
+                for scope in provider.default_families
+            }
+            for scope in sorted(default_scopes):
+                get_default_provider(host_config, scope)
         except OmnigentError as exc:
             raise ValueError(
                 f"server config 'sandbox.host_config.providers' is invalid: {exc}"
             ) from exc
+        for provider in parsed_providers.values():
+            for family_name, family in provider.families.items():
+                if family.api_key is not None:
+                    raise ValueError(
+                        "server config "
+                        f"'sandbox.host_config.providers.{provider.name}."
+                        f"{family_name}.api_key' must not contain an inline API key — "
+                        "use api_key_ref: env:VAR instead"
+                    )
     # The block rides json.dumps to the sandbox on every launch, and
     # yaml.safe_load produces values json can't take (an unquoted date
     # becomes datetime.date) — round-trip now so that fails startup, not
@@ -690,12 +706,18 @@ def _parse_host_config(raw: dict[str, object]) -> dict[str, object] | None:
     import json
 
     try:
-        json.dumps(host_config)
+        serialized = json.dumps(host_config)
+        round_tripped = json.loads(serialized)
     except (TypeError, ValueError) as exc:
         raise ValueError(
             f"server config 'sandbox.host_config' must be JSON-serializable "
             f"(quote YAML scalars like dates): {exc}"
         ) from exc
+    if round_tripped != host_config:
+        raise ValueError(
+            "server config 'sandbox.host_config' must be JSON-serializable without loss "
+            "(mapping keys must be strings and values must preserve their JSON types)"
+        )
     return host_config
 
 

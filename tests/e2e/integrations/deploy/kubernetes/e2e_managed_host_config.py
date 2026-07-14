@@ -14,13 +14,13 @@ config landed at ``/home/omnigent/.omnigent/config.yaml`` before the host
 came up. It needs ``kubectl`` on PATH with access to the runner namespace.
 
     python tests/e2e/integrations/deploy/kubernetes/e2e_managed_host_config.py \
-        --server http://localhost:8080 \
-        --expect "kind: gateway"
+        --server http://localhost:8080
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import shlex
 import subprocess
 import sys
@@ -30,10 +30,15 @@ import httpx
 
 # Constants pinned by the kubernetes launcher (see
 # omnigent/onboarding/sandboxes/kubernetes.py): the Pod's fixed HOME, the
-# main container name, and the labels stamped on every runner Pod.
+# main container and host-id env names, and the labels stamped on every runner Pod.
 POD_HOME = "/home/omnigent"
 HOST_CONTAINER = "host"
+HOST_ID_ENV_VAR = "OMNIGENT_HOST_ID"
 POD_SELECTOR = "app.kubernetes.io/managed-by=omnigent,omnigent.ai/role=sandbox-host"
+DEFAULT_EXPECTED_CONFIG = (
+    "litellm:",
+    "base_url: http://litellm.litellm.svc.cluster.local/v1",
+)
 
 
 def log(msg: str) -> None:
@@ -81,14 +86,14 @@ def create_managed_session(base: str, agent_id: str) -> str:
     return conv_id
 
 
-def wait_host_online(base: str, conv_id: str, timeout_s: float) -> None:
+def wait_host_online(base: str, conv_id: str, timeout_s: float) -> str:
     log("[3/5] waiting for the runner Pod's host to register")
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         d = httpx.get(f"{base}/v1/sessions/{conv_id}", timeout=10.0).json()
         if d.get("host_id"):
             log(f"      ✓ host online: host_id={d['host_id']}")
-            return
+            return d["host_id"]
         status = d.get("sandbox_status") or {}
         if status.get("stage") == "failed":
             raise SystemExit(f"managed launch failed: {status.get('error')}")
@@ -96,7 +101,7 @@ def wait_host_online(base: str, conv_id: str, timeout_s: float) -> None:
     raise SystemExit(f"host did not come online within {timeout_s:.0f}s")
 
 
-def newest_runner_pod(kubectl: str, namespace: str) -> str:
+def runner_pod_for_host(kubectl: str, namespace: str, host_id: str) -> str:
     out = subprocess.run(
         [
             *shlex.split(kubectl),
@@ -106,20 +111,33 @@ def newest_runner_pod(kubectl: str, namespace: str) -> str:
             namespace,
             "-l",
             POD_SELECTOR,
-            "--sort-by=.metadata.creationTimestamp",
             "-o",
-            "name",
+            "json",
         ],
         capture_output=True,
         text=True,
         check=True,
-    ).stdout.split()
-    if not out:
-        raise SystemExit(f"no runner Pods matching '{POD_SELECTOR}' in namespace {namespace!r}")
-    return out[-1]
+    ).stdout
+    pods = json.loads(out).get("items", [])
+    matches = []
+    for pod in pods:
+        containers = pod.get("spec", {}).get("containers", [])
+        host = next((item for item in containers if item.get("name") == HOST_CONTAINER), None)
+        env = host.get("env", []) if host else []
+        if any(
+            item.get("name") == HOST_ID_ENV_VAR and item.get("value") == host_id for item in env
+        ):
+            matches.append(pod["metadata"]["name"])
+    if not matches:
+        raise SystemExit(f"no runner Pod matching host_id {host_id!r} in namespace {namespace!r}")
+    if len(matches) > 1:
+        raise SystemExit(f"multiple runner Pods match host_id {host_id!r}: {', '.join(matches)}")
+    return f"pod/{matches[0]}"
 
 
-def assert_injected_config(kubectl: str, namespace: str, pod: str, expect: str) -> str:
+def assert_injected_config(
+    kubectl: str, namespace: str, pod: str, expected: list[str] | tuple[str, ...]
+) -> str:
     log(f"[4/5] reading {POD_HOME}/.omnigent/config.yaml from {pod}")
     proc = subprocess.run(
         [
@@ -145,9 +163,10 @@ def assert_injected_config(kubectl: str, namespace: str, pod: str, expect: str) 
     content = proc.stdout
     log("      --- config.yaml ---")
     log(content.rstrip())
-    if expect not in content:
-        raise SystemExit(f"config.yaml does not contain the expected fragment {expect!r}")
-    log(f"      ✓ contains {expect!r}")
+    missing = [fragment for fragment in expected if fragment not in content]
+    if missing:
+        raise SystemExit(f"config.yaml does not contain expected fragment(s): {missing!r}")
+    log(f"      ✓ contains expected fragments: {expected!r}")
     return content
 
 
@@ -158,8 +177,12 @@ def main() -> int:
     parser.add_argument("--namespace", default="omnigent-sandboxes", help="Runner-Pod namespace")
     parser.add_argument(
         "--expect",
-        default="providers:",
-        help="Substring the injected config.yaml must contain (default: 'providers:')",
+        action="append",
+        default=None,
+        help=(
+            "Substring the injected config.yaml must contain; repeat for multiple fragments "
+            "(default: the documented litellm provider and base_url)"
+        ),
     )
     parser.add_argument(
         "--kubectl",
@@ -175,9 +198,14 @@ def main() -> int:
     agent_id = pick_agent(base, args.agent_id)
     conv_id = create_managed_session(base, agent_id)
     try:
-        wait_host_online(base, conv_id, args.timeout)
-        pod = newest_runner_pod(args.kubectl, args.namespace)
-        assert_injected_config(args.kubectl, args.namespace, pod, args.expect)
+        host_id = wait_host_online(base, conv_id, args.timeout)
+        pod = runner_pod_for_host(args.kubectl, args.namespace, host_id)
+        assert_injected_config(
+            args.kubectl,
+            args.namespace,
+            pod,
+            args.expect or DEFAULT_EXPECTED_CONFIG,
+        )
     finally:
         if args.keep:
             log(f"[5/5] --keep: leaving session {conv_id} (and its Pod) running")

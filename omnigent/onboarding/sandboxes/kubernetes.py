@@ -28,7 +28,9 @@ Platform notes that shape this launcher:
   the Pod runs as the image's non-root ``sandbox`` user (:data:`_RUN_AS_UID`)
   for least privilege, so ``$HOME`` would be unwritable. The Pod sets ``HOME``
   to :data:`_HOME_DIR`, mounts an ``emptyDir`` there shared by both containers,
-  and ``fsGroup`` makes it group-writable.
+  and ``fsGroup`` makes it group-writable. When the host receives a literal
+  ``OMNIGENT_CONFIG_HOME``, the init container receives the same value so its
+  config injection lands where the host loader reads it.
 - **PID-1 reaper.** The in-sandbox host re-parents orphaned runner processes to
   PID 1, so the container command is a tiny supervisor that spawns
   ``omnigent host``, reaps any children, and forwards SIGTERM for prompt,
@@ -368,20 +370,21 @@ def _render_workspace_prep_command(
     Render the init container command that prepares the workspace.
 
     Creates ``<workspace>``, clones the repository into ``<clone_dir>`` when
-    requested, and merges *host_config* into ``~/.omnigent/config.yaml`` when
-    set — all BEFORE the host starts. Running in an init container means a
-    failure terminates the init container non-zero — surfaced fast by the
-    start wait with the error as the container log tail — rather than
-    silently leaving the host without its workspace or provider config.
+    requested, and merges *host_config* into ``config.yaml`` under
+    ``$OMNIGENT_CONFIG_HOME`` or the default ``~/.omnigent`` when set — all
+    BEFORE the host starts. Running in an init container means a failure
+    terminates the init container non-zero — surfaced fast by the start wait
+    with the error as the container log tail — rather than silently leaving the
+    host without its workspace or provider config.
 
     :param workspace: The workspace root to create, e.g. ``"/home/omnigent/workspace"``.
     :param clone_dir: Directory the clone lands in, or ``None`` for no clone.
     :param repo_url: Repository clone URL, or ``None`` for an empty workspace.
     :param repo_branch: Branch to clone (``--branch … --single-branch``), or
         ``None`` for the default branch.
-    :param host_config: Deployment-supplied ``~/.omnigent/config.yaml`` content
-        to merge in (lands on the HOME ``emptyDir`` shared with the host
-        container), or ``None``.
+    :param host_config: Deployment-supplied config content to merge in (lands
+        under the same config directory seen by the host container), or
+        ``None``.
     :returns: The ``["bash", "-lc", script]`` command.
     """
     script = f"set -e\nmkdir -p {shlex.quote(workspace)}\n"
@@ -519,8 +522,9 @@ def build_pod_manifest(
     :param clone_dir: Directory the clone lands in, or ``None`` for no clone.
     :param repo_url: Repository clone URL, or ``None`` for an empty workspace.
     :param repo_branch: Branch to clone, or ``None`` for the default branch.
-    :param host_config: Deployment-supplied ``~/.omnigent/config.yaml`` content
-        merged in by the init container, or ``None``. Non-secret by design:
+    :param host_config: Deployment-supplied config content merged in by the
+        init container under the host's resolved config directory, or ``None``.
+        Non-secret by design:
         credentials stay behind ``api_key_ref: env:`` indirection (resolved in
         the sandbox against the ``envFrom`` harness Secret), so embedding the
         content in the init container's command is as safe as the clone URL.
@@ -534,6 +538,14 @@ def build_pod_manifest(
     }
     home_mount = [{"name": "home", "mountPath": _HOME_DIR}]
 
+    init_env = [{"name": "HOME", "value": _HOME_DIR}]
+    if "OMNIGENT_CONFIG_HOME" in env_literals:
+        init_env.append(
+            {
+                "name": "OMNIGENT_CONFIG_HOME",
+                "value": env_literals["OMNIGENT_CONFIG_HOME"],
+            }
+        )
     init_container: dict[str, object] = {
         "name": _INIT_CONTAINER_NAME,
         "image": image,
@@ -541,7 +553,7 @@ def build_pod_manifest(
         "command": _render_workspace_prep_command(
             workspace, clone_dir, repo_url, repo_branch, host_config
         ),
-        "env": [{"name": "HOME", "value": _HOME_DIR}],
+        "env": init_env,
         "resources": pod_resources,
         "securityContext": container_security,
         "volumeMounts": home_mount,
