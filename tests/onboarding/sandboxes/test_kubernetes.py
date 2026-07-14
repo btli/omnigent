@@ -49,6 +49,9 @@ _MANIFEST_KW = {
     "workspace": "/home/omnigent/workspace",
 }
 
+# Minimal valid host_config exercised by the injection tests below.
+_HOST_CONFIG: dict[str, object] = {"providers": {"litellm": {"kind": "gateway"}}}
+
 
 # ── pure manifest / rendering tests (no SDK) ────────────────
 
@@ -96,14 +99,13 @@ def test_build_pod_manifest_without_repo_has_no_clone() -> None:
 
 def test_build_pod_manifest_host_config_is_written_by_init_container() -> None:
     """host_config rides the init container script, after mkdir/clone, before the host."""
-    host_config: dict[str, object] = {"providers": {"litellm": {"kind": "gateway"}}}
     manifest = build_pod_manifest(
         **{**_MANIFEST_KW, "clone_dir": "/home/omnigent/workspace/repo"},
         repo_url="https://github.com/org/repo.git",
-        host_config=host_config,
+        host_config=_HOST_CONFIG,
     )
     script = manifest["spec"]["initContainers"][0]["command"][2]
-    write_command = render_host_config_write_command(host_config)
+    write_command = render_host_config_write_command(_HOST_CONFIG)
     assert write_command in script
     # Ordering within the script: workspace prep and clone come first.
     assert script.index("mkdir -p") < script.index("git clone") < script.index(write_command)
@@ -121,7 +123,7 @@ def test_build_pod_manifest_forwards_config_home_to_init_container() -> None:
                 "PLAIN_CONFIG": "host-only",
             },
         },
-        host_config={"providers": {"litellm": {"kind": "gateway"}}},
+        host_config=_HOST_CONFIG,
     )
 
     init_env = manifest["spec"]["initContainers"][0]["env"]
@@ -152,7 +154,7 @@ def test_build_pod_manifest_rejects_config_home_outside_home_dir(config_home: st
     with pytest.raises(ValueError, match=r"OMNIGENT_CONFIG_HOME.*must resolve under"):
         build_pod_manifest(
             **{**_MANIFEST_KW, "env_literals": {"OMNIGENT_CONFIG_HOME": config_home}},
-            host_config={"providers": {"litellm": {"kind": "gateway"}}},
+            host_config=_HOST_CONFIG,
         )
 
 
@@ -168,7 +170,7 @@ def test_build_pod_manifest_accepts_config_home_at_or_under_home_dir(config_home
     """
     manifest = build_pod_manifest(
         **{**_MANIFEST_KW, "env_literals": {"OMNIGENT_CONFIG_HOME": config_home}},
-        host_config={"providers": {"litellm": {"kind": "gateway"}}},
+        host_config=_HOST_CONFIG,
     )
     assert {"name": "OMNIGENT_CONFIG_HOME", "value": config_home} in manifest["spec"][
         "initContainers"
@@ -530,7 +532,7 @@ def test_launch_host_invalid_config_home_fails_before_creating_secret(
             host_id="host_x",
             host_name="managed-x",
             server_url="http://srv.example.com",
-            host_config={"providers": {"litellm": {"kind": "gateway"}}},
+            host_config=_HOST_CONFIG,
         )
     assert "create_secret" not in fake_core.calls
     assert fake_core.created_secrets == []

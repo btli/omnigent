@@ -49,6 +49,7 @@ import contextlib
 import importlib
 import logging
 import os
+import posixpath
 import re
 import shlex
 import time
@@ -552,8 +553,9 @@ def build_pod_manifest(
         # segment can't slip past the prefix check, then fail the launch loudly.
         # A runtime symlink under HOME pointing elsewhere can still defeat this
         # lexical check, so an operator must not aim OMNIGENT_CONFIG_HOME inside
-        # the cloned workspace.
-        resolved_home = os.path.normpath(os.path.join(_HOME_DIR, config_home))
+        # the cloned workspace. Use posixpath: the target is always a POSIX Pod,
+        # even when the server building this manifest runs on Windows.
+        resolved_home = posixpath.normpath(posixpath.join(_HOME_DIR, config_home))
         if (
             config_home
             and host_config is not None
