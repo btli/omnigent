@@ -6538,13 +6538,62 @@ class _ForwardBlockingHarnessClient(_BlockingHarnessClient):
         super().__init__(sse_frames, gate)
         self._fwd_gate = fwd_gate
         self.fwd_seen: asyncio.Event = asyncio.Event()
+        self.order: list[str] = []
+
+    def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
+        """Stream that records when the blocked turn is cancelled."""
+        del method, url, timeout
+        self.posted_bodies.append(json)
+        self.post_seen.set()
+        frames = self._sse_frames
+        gate = self._gate
+        order = self.order
+
+        class _ForwardBlockingCtx:
+            status_code = 200
+
+            async def __aenter__(self) -> _ForwardBlockingHarnessClient._ForwardBlockingHandle:
+                return _ForwardBlockingHarnessClient._ForwardBlockingHandle(frames, gate, order)
+
+            async def __aexit__(self, *_: Any) -> None:
+                return None
+
+        return _ForwardBlockingCtx()
 
     async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
         """Block an interrupt forward on ``fwd_gate``; pass other posts through."""
         if isinstance(json, dict) and json.get("type") == "interrupt":
+            self.order.append("forward")
             self.fwd_seen.set()
             await self._fwd_gate.wait()
         return await super().post(url, json=json, timeout=timeout)
+
+    class _ForwardBlockingHandle:
+        """Stream handle that records cancellation while paused on the gate."""
+
+        status_code = 200
+
+        def __init__(
+            self,
+            frames: list[str],
+            gate: asyncio.Event,
+            order: list[str],
+        ) -> None:
+            """Initialize with frames, gate, and shared order log."""
+            self._frames = frames
+            self._gate = gate
+            self._order = order
+
+        async def aiter_text(self) -> AsyncIterator[str]:
+            """Yield first frame, then record cancellation of the blocked turn."""
+            try:
+                for i, frame in enumerate(self._frames):
+                    if i == 1:
+                        await self._gate.wait()
+                    yield frame
+            except asyncio.CancelledError:
+                self._order.append("cancel")
+                raise
 
 
 def _build_fwd_blocking_app(
@@ -6630,11 +6679,13 @@ async def test_interrupt_forwards_to_harness_before_cancelling() -> None:
         # could race on loaded CI machines.
         await _hc.fwd_seen.wait()
         assert not int_task.done(), "interrupt must await the harness forward (forward-first)"
+        assert _hc.order == ["forward"]
 
         # Release the forward → the harness gets the interrupt, then the cancel runs.
         fwd_gate.set()
         int_resp = await int_task
         assert int_resp.status_code == 204, int_resp.text
+        assert _hc.order == ["forward", "cancel"]
         markers = _interrupt_markers(list(_session_histories_ref.get(conv_id, [])))
 
     assert len(markers) == 1, (
@@ -11039,31 +11090,26 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
         on_exit = callbacks.get("on_exit")
         assert callable(on_exit)
         on_exit()
-        # Terminal-exit cleanup fans out across two independent background
-        # tasks: one publishes the resource events, a second releases the
-        # harness subprocess. Their completion order is not guaranteed, so
-        # settle on BOTH the published ``deleted`` event and the subprocess
-        # release — accumulating drained events each tick — rather than using
-        # the release as a proxy for the publish (which raced: the release
-        # task could finish first, leaving the drain empty).
+        # Await terminal-exit cleanup deterministically instead of polling;
+        # then await any pending harness-release task so ``pm.released`` is set.
+        await resource_registry.wait_for_terminal_exit_cleanup()
+        release_task_name = f"required-terminal-release:{conv_id}"
+        pending_release = [
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == release_task_name and not task.done()
+        ]
+        if pending_release:
+            await asyncio.gather(*pending_release)
+
         deleted_event = {
             "type": "session.resource.deleted",
             "resource_id": "terminal_worker_main",
             "resource_type": "terminal",
             "session_id": conv_id,
         }
-        queued_events: list[dict[str, Any]] = []
-        parent_events: list[dict[str, Any]] = []
-        for _ in range(1000):
-            queued_events.extend(
-                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
-            )
-            parent_events.extend(
-                _drain_session_event_queue(_session_event_queues_ref.get(parent_id))
-            )
-            if pm.released and deleted_event in queued_events:
-                break
-            await asyncio.sleep(0)
+        queued_events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+        parent_events = _drain_session_event_queue(_session_event_queues_ref.get(parent_id))
     finally:
         _session_event_queues_ref.pop(conv_id, None)
         _session_event_queues_ref.pop(parent_id, None)
@@ -11230,20 +11276,25 @@ async def test_external_idle_status_makes_required_terminal_exit_clean(tmp_path:
         on_exit = callbacks.get("on_exit")
         assert callable(on_exit)
         on_exit()
+        # Await terminal-exit cleanup deterministically instead of polling;
+        # then await any pending harness-release task so ``pm.released`` is set.
+        await resource_registry.wait_for_terminal_exit_cleanup()
+        release_task_name = f"required-terminal-release:{conv_id}"
+        pending_release = [
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == release_task_name and not task.done()
+        ]
+        if pending_release:
+            await asyncio.gather(*pending_release)
+
         deleted_event = {
             "type": "session.resource.deleted",
             "resource_id": "terminal_kiro_main",
             "resource_type": "terminal",
             "session_id": conv_id,
         }
-        queued_events: list[dict[str, Any]] = []
-        for _ in range(1000):
-            queued_events.extend(
-                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
-            )
-            if pm.released and deleted_event in queued_events:
-                break
-            await asyncio.sleep(0)
+        queued_events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
     finally:
         _session_event_queues_ref.pop(conv_id, None)
 

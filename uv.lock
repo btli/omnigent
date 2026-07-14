@@ -2792,7 +2792,7 @@ wheels = [
 
 [[package]]
 name = "omnigent"
-version = "0.5.0.dev0"
+version = "0.6.0.dev0"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },
@@ -2819,6 +2819,7 @@ dependencies = [
     { name = "packaging" },
     { name = "pexpect", marker = "sys_platform != 'win32'" },
     { name = "prompt-toolkit" },
+    { name = "protobuf" },
     { name = "psutil" },
     { name = "pydantic" },
     { name = "pyjwt", extra = ["crypto"] },
@@ -2971,6 +2972,7 @@ requires-dist = [
     { name = "pexpect", marker = "sys_platform != 'win32'", specifier = ">=4.9,<5" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.5" },
     { name = "prompt-toolkit", specifier = ">=3.0,<4" },
+    { name = "protobuf", specifier = ">=6,<7" },
     { name = "psutil", specifier = ">=5.9,<8" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'databricks'", specifier = ">=3.1,<4" },
     { name = "pydantic", specifier = ">=2.0,<3" },
@@ -3004,7 +3006,7 @@ provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "verte
 
 [[package]]
 name = "omnigent-client"
-version = "0.5.0.dev0"
+version = "0.6.0.dev0"
 source = { editable = "sdks/python-client" }
 dependencies = [
     { name = "httpx" },
@@ -3021,7 +3023,7 @@ requires-dist = [
 
 [[package]]
 name = "omnigent-ui-sdk"
-version = "0.5.0.dev0"
+version = "0.6.0.dev0"
 source = { editable = "sdks/ui" }
 dependencies = [
     { name = "omnigent-client" },
@@ -3032,7 +3034,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "omnigent-client", specifier = "==0.5.0.dev0" },
+    { name = "omnigent-client", specifier = "==0.6.0.dev0" },
     { name = "prompt-toolkit", specifier = ">=3" },
     { name = "pyyaml", specifier = ">=6.0,<7" },
     { name = "rich", specifier = ">=13" },
