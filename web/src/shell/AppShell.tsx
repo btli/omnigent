@@ -868,18 +868,22 @@ export function AppShell() {
   // ``setSearchParams`` so it always closes over react-router's *current*
   // ``navigate`` — which is bound to the live ``locationPathname`` — rather
   // than a stale one captured at first mount (see ``showScopeView`` below).
-  const clearFileViewerUrl = useCallback(() => {
-    setSearchParams(
-      (prev) => {
-        const next = new URLSearchParams(prev);
-        next.delete("file");
-        next.delete("diff");
-        next.delete("comment");
-        return next;
-      },
-      { replace: true },
-    );
-  }, [setSearchParams]);
+  const clearFileViewerUrl = useCallback(
+    (includeView = false) => {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          next.delete("file");
+          next.delete("diff");
+          next.delete("comment");
+          if (includeView) next.delete("view");
+          return next;
+        },
+        { replace: true },
+      );
+    },
+    [setSearchParams],
+  );
 
   // Toggle the right (Workspace) sidebar — shared by the header's collapse
   // button and the ⌘⌥]/Ctrl+Alt+] hotkey so they can't drift. Beyond flipping the
@@ -910,11 +914,9 @@ export function AppShell() {
       }
     } else {
       // Collapsing the rail hides the workspace, so strip the deep-
-      // link params that point into it (file/diff/comment) — otherwise
-      // the URL advertises a file that isn't shown and a reload would
-      // re-open the rail. (?view= is dropped by the scope-sync effect,
-      // which is gated on rightPanelOpen.)
-      clearFileViewerUrl();
+      // link params that point into it; otherwise the URL advertises
+      // a workspace view a reload would re-open.
+      clearFileViewerUrl(true);
     }
     setRightPanelOpen(next);
   };
