@@ -694,6 +694,57 @@ def test_parse_host_config_secret_api_key_ref_succeeds(api_key_ref: str) -> None
     assert cfg.host_config == host_config
 
 
+@pytest.mark.parametrize("config_key", ["cursor", "antigravity"])
+def test_parse_host_config_top_level_inline_api_key_fails_loud(config_key: str) -> None:
+    """Literal top-level credentials cannot ride in the managed host config."""
+    with pytest.raises(
+        ValueError,
+        match=rf"sandbox\.host_config\.{config_key}\.api_key'",
+    ):
+        parse_sandbox_config(
+            {
+                "provider": "modal",
+                "server_url": "https://s.example.com",
+                "host_config": {config_key: {"api_key": "inline-secret"}},
+            }
+        )
+
+
+@pytest.mark.parametrize("config_key", ["cursor", "antigravity"])
+def test_parse_host_config_top_level_literal_api_key_ref_fails_loud(config_key: str) -> None:
+    """Literal top-level credential refs cannot ride in the managed host config."""
+    with pytest.raises(
+        ValueError,
+        match=rf"sandbox\.host_config\.{config_key}\.api_key_ref'",
+    ):
+        parse_sandbox_config(
+            {
+                "provider": "modal",
+                "server_url": "https://s.example.com",
+                "host_config": {config_key: {"api_key_ref": "prod-secret"}},
+            }
+        )
+
+
+@pytest.mark.parametrize("config_key", ["cursor", "antigravity"])
+@pytest.mark.parametrize(
+    "api_key_ref",
+    ["env:API_KEY", "keychain:api-key", "$API_KEY", "${API_KEY}"],
+)
+def test_parse_host_config_top_level_secret_api_key_ref_succeeds(
+    config_key: str, api_key_ref: str
+) -> None:
+    """Named top-level credential refs remain valid managed host config."""
+    host_config = {config_key: {"api_key_ref": api_key_ref}}
+
+    cfg = parse_sandbox_config(
+        {"provider": "modal", "server_url": "https://s.example.com", "host_config": host_config}
+    )
+
+    assert cfg is not None
+    assert cfg.host_config == host_config
+
+
 def test_parse_host_config_lossy_json_key_collision_fails_loud() -> None:
     """JSON key coercion cannot silently collapse distinct config entries."""
     with pytest.raises(ValueError, match=r"JSON-serializable"):

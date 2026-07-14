@@ -662,6 +662,10 @@ def _parse_host_config(raw: dict[str, object]) -> dict[str, object] | None:
             "in-sandbox ~/.omnigent/config.yaml content merged in before "
             "'omnigent host' starts"
         )
+    api_key_config_keys = ("cursor", "antigravity")
+    if "providers" in host_config or any(key in host_config for key in api_key_config_keys):
+        from omnigent.env_credentials import _ENV_REF_RE
+
     # Key presence, not get(): an explicit `providers: null` would skip
     # validation here yet still ride to the sandbox, where the merge writes
     # `providers: null` over any existing block — the silent degradation this
@@ -674,7 +678,6 @@ def _parse_host_config(raw: dict[str, object]) -> dict[str, object] | None:
             raise ValueError("server config 'sandbox.host_config.providers' must be a mapping")
         # Lazy imports, matching the provider branches below: the parse path
         # must not pull the onboarding layer in at module import time.
-        from omnigent.env_credentials import _ENV_REF_RE
         from omnigent.errors import OmnigentError
         from omnigent.onboarding.provider_config import get_default_provider, load_providers
 
@@ -712,6 +715,32 @@ def _parse_host_config(raw: dict[str, object]) -> dict[str, object] | None:
                         f"{family_name}.api_key_ref' must be a secret reference "
                         "(env:VAR, keychain:name, or $VAR) — got a literal value"
                     )
+    for config_key in api_key_config_keys:
+        if config_key not in host_config:
+            continue
+        config_block = host_config[config_key]
+        if not isinstance(config_block, dict):
+            continue
+        if config_block.get("api_key") is not None:
+            raise ValueError(
+                "server config "
+                f"'sandbox.host_config.{config_key}.api_key' must not contain an inline "
+                "API key — use api_key_ref: env:VAR instead"
+            )
+        api_key_ref = config_block.get("api_key_ref")
+        if api_key_ref is not None and not (
+            isinstance(api_key_ref, str)
+            and (
+                (api_key_ref.startswith("env:") and api_key_ref != "env:")
+                or (api_key_ref.startswith("keychain:") and api_key_ref != "keychain:")
+                or _ENV_REF_RE.fullmatch(api_key_ref) is not None
+            )
+        ):
+            raise ValueError(
+                "server config "
+                f"'sandbox.host_config.{config_key}.api_key_ref' must be a secret reference "
+                "(env:VAR, keychain:name, or $VAR) — got a literal value"
+            )
     # The block rides json.dumps to the sandbox on every launch, and
     # yaml.safe_load produces values json can't take (an unquoted date
     # becomes datetime.date) — round-trip now so that fails startup, not
