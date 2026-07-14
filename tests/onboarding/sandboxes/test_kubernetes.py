@@ -139,6 +139,27 @@ def test_build_pod_manifest_forwards_config_home_to_init_container() -> None:
     }
 
 
+def test_build_pod_manifest_rejects_config_home_outside_home_dir() -> None:
+    """
+    Init and host share only the HOME emptyDir, so a config dir outside it would
+    make the injected config invisible to the host. Fail the launch loudly.
+    """
+    with pytest.raises(ValueError, match=r"OMNIGENT_CONFIG_HOME.*must be under"):
+        build_pod_manifest(
+            **{**_MANIFEST_KW, "env_literals": {"OMNIGENT_CONFIG_HOME": "/tmp/elsewhere"}},
+            host_config={"providers": {"litellm": {"kind": "gateway"}}},
+        )
+
+
+def test_build_pod_manifest_config_home_outside_home_dir_ok_without_host_config() -> None:
+    """Without host_config the init container writes nothing, so the path is moot."""
+    manifest = build_pod_manifest(
+        **{**_MANIFEST_KW, "env_literals": {"OMNIGENT_CONFIG_HOME": "/tmp/elsewhere"}},
+    )
+    init_env = manifest["spec"]["initContainers"][0]["env"]
+    assert {"name": "OMNIGENT_CONFIG_HOME", "value": "/tmp/elsewhere"} in init_env
+
+
 def test_build_pod_manifest_without_host_config_has_no_config_write() -> None:
     """No host_config → the init container only preps the workspace."""
     manifest = build_pod_manifest(**_MANIFEST_KW)

@@ -358,10 +358,14 @@ def test_render_host_config_write_command_empty_payload_removes_injected_config(
     assert _read_marker(tmp_path) is None
 
 
-def test_render_host_config_write_command_preserves_user_edited_injected_values(
+def test_render_host_config_write_command_preserves_user_created_entries(
     tmp_path: Path,
 ) -> None:
-    """Cleanup leaves provider entries and top-level values the user changed."""
+    """
+    The server owns the names it injects; user-created config under OTHER names
+    always survives. A provider the user adds themselves is never in the marker,
+    so cleanup leaves it untouched while removing the injected entries by name.
+    """
     injected = {
         "providers": {"gateway": {"kind": "gateway", "default": ["pi"]}},
         "server": "https://injected.example.com",
@@ -369,16 +373,50 @@ def test_render_host_config_write_command_preserves_user_edited_injected_values(
     _materialize(render_host_config_write_command(injected), tmp_path)
     config_path = tmp_path / ".omnigent" / "config.yaml"
     with open(config_path) as f:
-        edited = yaml.safe_load(f)
-    edited["providers"]["gateway"] = {"kind": "key"}
-    edited["server"] = "https://user.example.com"
-    config_path.write_text(yaml.safe_dump(edited))
+        merged = yaml.safe_load(f)
+    merged["providers"]["mine"] = {"kind": "key"}  # user-created, never injected
+    merged["default_agent"] = "/user/agent.yaml"  # user-owned top-level key
+    config_path.write_text(yaml.safe_dump(merged))
 
     written = _materialize(render_host_config_write_command({}), tmp_path)
 
-    assert written["providers"]["gateway"] == {"kind": "key"}
-    assert written["server"] == "https://user.example.com"
+    assert written["providers"] == {"mine": {"kind": "key"}}  # user entry survives
+    assert "gateway" not in written["providers"]  # injected name removed
+    assert "server" not in written  # injected top-level key removed
+    assert written["default_agent"] == "/user/agent.yaml"  # user key untouched
     assert _read_marker(tmp_path) is None
+
+
+def test_render_host_config_write_command_rename_after_user_edit_leaves_no_stale_default(
+    tmp_path: Path,
+) -> None:
+    """
+    Renaming a gateway must not strand the old entry even when the user edited
+    it in place — two providers claiming the same ``default`` scope is a sandbox
+    load error. Removal is by name, so the old injected name goes regardless.
+    """
+    _materialize(
+        render_host_config_write_command(
+            {"providers": {"gateway_a": {"kind": "gateway", "default": ["pi"]}}}
+        ),
+        tmp_path,
+    )
+    config_path = tmp_path / ".omnigent" / "config.yaml"
+    with open(config_path) as f:
+        edited = yaml.safe_load(f)
+    edited["providers"]["gateway_a"]["base_url"] = "http://user-edited"  # user edit
+    config_path.write_text(yaml.safe_dump(edited))
+
+    written = _materialize(
+        render_host_config_write_command(
+            {"providers": {"gateway_b": {"kind": "gateway", "default": ["pi"]}}}
+        ),
+        tmp_path,
+    )
+
+    assert sorted(written["providers"]) == ["gateway_b"]
+    defaults = [n for n, v in written["providers"].items() if v.get("default") == ["pi"]]
+    assert defaults == ["gateway_b"]  # exactly one default, no collision
 
 
 @pytest.mark.parametrize(

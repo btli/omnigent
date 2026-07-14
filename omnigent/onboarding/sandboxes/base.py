@@ -90,9 +90,12 @@ def host_image_wheel_install_command(remote_tgz_path: str) -> str:
 # base64 Python literal — its alphabet has no quote or shell metacharacter, so
 # arbitrary YAML content can never break out of the script.
 #
-# A marker records the previous payload. Each run removes an entry only while
-# its current value still matches that payload, so user edits survive; a
-# missing or corrupt marker skips removal entirely.
+# A marker records the previous payload. Each run removes exactly the names it
+# injected last time — the server OWNS the names/keys it injects, so a renamed
+# gateway or a removed block never strands a stale entry that could collide on a
+# ``default`` scope. User-created entries under OTHER names are never in the
+# marker and so are never touched. A missing or corrupt marker skips removal
+# entirely — never delete without evidence of what was injected.
 _HOST_CONFIG_WRITE_SCRIPT: str = """\
 import base64, json, os, tempfile, yaml
 
@@ -118,13 +121,12 @@ for key, value in previous.items():
     if key == "providers" and isinstance(value, dict):
         current = existing.get(key)
         if isinstance(current, dict):
-            for name, injected_value in value.items():
-                if name in current and current[name] == injected_value:
-                    current.pop(name)
+            for name in value:
+                current.pop(name, None)
             if not current:
                 existing.pop(key, None)
-    elif key in existing and existing[key] == value:
-        existing.pop(key)
+    else:
+        existing.pop(key, None)
 injected = json.loads(base64.b64decode(__PAYLOAD__).decode())
 for key, value in injected.items():
     current = existing.get(key)
@@ -170,23 +172,29 @@ def render_host_config_write_command(host_config: dict[str, object]) -> str:
     is ``$OMNIGENT_CONFIG_HOME`` when truthy, otherwise ``~/.omnigent``, exactly
     matching :func:`omnigent.onboarding.provider_config._config_path`.
 
-    Server-managed replacement semantics: entries injected by a previous
-    run (recorded alongside ``config.yaml``) are removed first only when their
-    current value still equals the recorded injected value. User-edited
-    provider entries and top-level values are therefore never removed during
-    replacement or cleanup. The current payload then merges in with
+    Server-managed replacement semantics: the server OWNS the names/keys it
+    injects. Entries recorded in the previous marker are removed first BY NAME,
+    then the current payload merges in with
     ``omnigent.cli._save_global_config``'s
     ``deep_merge_keys=("providers",)`` semantics — ``providers`` one
-    level deep and every other top-level key wholesale. Current injected names
-    still win, while untouched user-created provider entries survive. An empty
-    *host_config* renders a pure cleanup command. A missing or corrupt marker
-    skips removal rather than guessing ownership. Shared by both launch seams —
-    the exec-model :meth:`SandboxLauncher.start_host` and the Kubernetes init
-    container — so the behavior cannot drift between providers.
+    level deep and every other top-level key wholesale. Removing by name (rather
+    than only when unchanged) is deliberate: a renamed gateway must not leave
+    its old entry behind, since two entries claiming the same ``default`` scope
+    is a sandbox load error. User-created config under names the server never
+    injects is never in the marker and so always survives; a name the server
+    injects is server-managed, and an in-sandbox edit to it does not persist
+    across the next replacement. An empty *host_config* renders a pure cleanup
+    command. A missing or corrupt marker skips removal rather than guessing
+    ownership. Shared by both launch seams — the exec-model
+    :meth:`SandboxLauncher.start_host` and the Kubernetes init container — so the
+    behavior cannot drift between providers.
 
     Both config and marker writes use a fully-written, fsynced temporary file
     in the destination directory followed by :func:`os.replace`, so an
-    interrupted write cannot expose a truncated destination file.
+    interrupted write cannot expose a truncated destination file. A pre-existing
+    ``config.yaml`` symlink is replaced by a real file — durability of the write
+    is favored over following the link, which an internal sandbox config never
+    relies on.
 
     The payload travels as base64-encoded JSON substituted into a fixed
     Python script, and the whole script is ``shlex.quote``-wrapped —

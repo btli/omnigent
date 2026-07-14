@@ -539,13 +539,22 @@ def build_pod_manifest(
     home_mount = [{"name": "home", "mountPath": _HOME_DIR}]
 
     init_env = [{"name": "HOME", "value": _HOME_DIR}]
-    if "OMNIGENT_CONFIG_HOME" in env_literals:
-        init_env.append(
-            {
-                "name": "OMNIGENT_CONFIG_HOME",
-                "value": env_literals["OMNIGENT_CONFIG_HOME"],
-            }
-        )
+    config_home = env_literals.get("OMNIGENT_CONFIG_HOME")
+    if config_home is not None:
+        # Init and host containers share ONLY the HOME emptyDir. The init
+        # container writes the injected config, the host reads it — so the
+        # config dir must live under HOME, or the write lands in the init
+        # container's private filesystem and the host never sees it. Fail the
+        # launch loudly rather than boot a host silently missing its providers.
+        if host_config is not None and not (
+            config_home == _HOME_DIR or config_home.startswith(_HOME_DIR + "/")
+        ):
+            raise ValueError(
+                f"OMNIGENT_CONFIG_HOME ({config_home!r}) must be under {_HOME_DIR!r} "
+                "when sandbox.host_config is set — the init container that writes the "
+                "injected config shares only the HOME volume with the host"
+            )
+        init_env.append({"name": "OMNIGENT_CONFIG_HOME", "value": config_home})
     init_container: dict[str, object] = {
         "name": _INIT_CONTAINER_NAME,
         "image": image,
