@@ -541,16 +541,26 @@ def build_pod_manifest(
     init_env = [{"name": "HOME", "value": _HOME_DIR}]
     config_home = env_literals.get("OMNIGENT_CONFIG_HOME")
     if config_home is not None:
-        # Init and host containers share ONLY the HOME emptyDir. The init
-        # container writes the injected config, the host reads it — so the
-        # config dir must live under HOME, or the write lands in the init
-        # container's private filesystem and the host never sees it. Fail the
-        # launch loudly rather than boot a host silently missing its providers.
-        if host_config is not None and not (
-            config_home == _HOME_DIR or config_home.startswith(_HOME_DIR + "/")
+        # Init and host containers share ONLY the HOME emptyDir, and both run
+        # with workingDir=_HOME_DIR. The injected config the init container
+        # writes is visible to the host only if its directory resolves under
+        # HOME — otherwise the write lands in the init container's private
+        # filesystem and the host silently boots without its providers. An empty
+        # value is falsy: the writer (and host loader) treat it as unset
+        # (~/.omnigent), so only a non-empty override is checked. Resolve
+        # relative to HOME (the shared workingDir) and normalize so a ``..``
+        # segment can't slip past the prefix check, then fail the launch loudly.
+        # A runtime symlink under HOME pointing elsewhere can still defeat this
+        # lexical check, so an operator must not aim OMNIGENT_CONFIG_HOME inside
+        # the cloned workspace.
+        resolved_home = os.path.normpath(os.path.join(_HOME_DIR, config_home))
+        if (
+            config_home
+            and host_config is not None
+            and not (resolved_home == _HOME_DIR or resolved_home.startswith(_HOME_DIR + "/"))
         ):
             raise ValueError(
-                f"OMNIGENT_CONFIG_HOME ({config_home!r}) must be under {_HOME_DIR!r} "
+                f"OMNIGENT_CONFIG_HOME ({config_home!r}) must resolve under {_HOME_DIR!r} "
                 "when sandbox.host_config is set — the init container that writes the "
                 "injected config shares only the HOME volume with the host"
             )
@@ -1110,17 +1120,9 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         )
         try:
             try:
-                # Secret first so the Pod's secretKeyRef resolves immediately —
-                # a Pod referencing a missing Secret would sit in
-                # CreateContainerConfigError (which the start wait treats as
-                # terminal).
-                core.create_namespaced_secret(
-                    namespace,
-                    build_token_secret_manifest(
-                        secret_name=secret_name, namespace=namespace, token=token
-                    ),
-                    _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
-                )
+                # Build the (side-effect-free) manifest first: it validates
+                # host_config placement and can raise, so nothing should have
+                # been created in the cluster yet when it does.
                 manifest = build_pod_manifest(
                     pod_name=sandbox_id,
                     namespace=namespace,
@@ -1139,6 +1141,17 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                     repo_branch=repo_branch,
                     host_config=host_config,
                     resources=self._resources,
+                )
+                # Secret before Pod so the Pod's secretKeyRef resolves
+                # immediately — a Pod referencing a missing Secret would sit in
+                # CreateContainerConfigError (which the start wait treats as
+                # terminal).
+                core.create_namespaced_secret(
+                    namespace,
+                    build_token_secret_manifest(
+                        secret_name=secret_name, namespace=namespace, token=token
+                    ),
+                    _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
                 )
                 core.create_namespaced_pod(
                     namespace, manifest, _request_timeout=_POD_READY_REQUEST_TIMEOUT_S

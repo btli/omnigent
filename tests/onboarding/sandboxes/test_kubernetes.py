@@ -139,16 +139,40 @@ def test_build_pod_manifest_forwards_config_home_to_init_container() -> None:
     }
 
 
-def test_build_pod_manifest_rejects_config_home_outside_home_dir() -> None:
+@pytest.mark.parametrize(
+    "config_home",
+    ["/tmp/elsewhere", "/home/omnigent-other", "/home/omnigent/../tmp", "../etc"],
+)
+def test_build_pod_manifest_rejects_config_home_outside_home_dir(config_home: str) -> None:
     """
-    Init and host share only the HOME emptyDir, so a config dir outside it would
-    make the injected config invisible to the host. Fail the launch loudly.
+    Init and host share only the HOME emptyDir, so a config dir that resolves
+    outside it would make the injected config invisible to the host. Fail the
+    launch loudly — including paths that only escape after normalizing ``..``.
     """
-    with pytest.raises(ValueError, match=r"OMNIGENT_CONFIG_HOME.*must be under"):
+    with pytest.raises(ValueError, match=r"OMNIGENT_CONFIG_HOME.*must resolve under"):
         build_pod_manifest(
-            **{**_MANIFEST_KW, "env_literals": {"OMNIGENT_CONFIG_HOME": "/tmp/elsewhere"}},
+            **{**_MANIFEST_KW, "env_literals": {"OMNIGENT_CONFIG_HOME": config_home}},
             host_config={"providers": {"litellm": {"kind": "gateway"}}},
         )
+
+
+@pytest.mark.parametrize(
+    "config_home",
+    ["/home/omnigent", "/home/omnigent/", "/home/omnigent/cfg", "cfg", "relative/dir", ".", ""],
+)
+def test_build_pod_manifest_accepts_config_home_at_or_under_home_dir(config_home: str) -> None:
+    """
+    A dir at or under HOME (absolute or relative to the shared workingDir) is on
+    the shared volume — allowed. An empty value is treated as unset by the
+    writer, so it is forwarded without validation. All are forwarded to init.
+    """
+    manifest = build_pod_manifest(
+        **{**_MANIFEST_KW, "env_literals": {"OMNIGENT_CONFIG_HOME": config_home}},
+        host_config={"providers": {"litellm": {"kind": "gateway"}}},
+    )
+    assert {"name": "OMNIGENT_CONFIG_HOME", "value": config_home} in manifest["spec"][
+        "initContainers"
+    ][0]["env"]
 
 
 def test_build_pod_manifest_config_home_outside_home_dir_ok_without_host_config() -> None:
@@ -483,6 +507,33 @@ def test_launch_host_cleans_up_on_create_failure(fake_core: _FakeCore) -> None:
         )
     assert "omnigent-pod-3-token" in fake_core.deleted_secrets
     assert "omnigent-pod-3" in fake_core.deleted_pods
+
+
+def test_launch_host_invalid_config_home_fails_before_creating_secret(
+    fake_core: _FakeCore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An out-of-HOME config dir must fail while the manifest is built — before the
+    token Secret is created — so no credential-bearing Secret is orphaned.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", "/tmp/outside")
+    launcher = KubernetesSandboxLauncher(
+        in_cluster=True,
+        namespace="omnigent-sandboxes",
+        secret_name="omnigent-creds",
+        env=["OMNIGENT_CONFIG_HOME"],
+    )
+    with pytest.raises(ValueError, match=r"OMNIGENT_CONFIG_HOME.*must resolve under"):
+        launcher.start_host(
+            "omnigent-pod-x",
+            token=_TOKEN,
+            host_id="host_x",
+            host_name="managed-x",
+            server_url="http://srv.example.com",
+            host_config={"providers": {"litellm": {"kind": "gateway"}}},
+        )
+    assert "create_secret" not in fake_core.calls
+    assert fake_core.created_secrets == []
 
 
 def test_launch_host_fast_fails_on_clone_failure_with_log_tail(
