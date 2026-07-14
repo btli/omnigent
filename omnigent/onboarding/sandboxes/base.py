@@ -12,8 +12,8 @@ implementation; everything provider-agnostic (wheel builds, the in-sandbox
 App OAuth dance, host registration) lives in ``bootstrap``.
 
 Injected host config uses the loader's ``OMNIGENT_CONFIG_HOME`` resolution,
-atomically replaces its config and ownership-marker files, and removes a
-previously injected value only while it remains unchanged by the user.
+atomically replaces its config and ownership-marker files, and removes
+previously injected entries by name — the server owns what it injects.
 """
 
 from __future__ import annotations
