@@ -10,7 +10,10 @@ import {
 } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import type { ServerInfo } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: vi.fn(),
@@ -303,11 +306,28 @@ function SessionNavButton({ to }: { to: string }) {
   );
 }
 
-function renderShell(path: string) {
+/** Full ServerInfo with permissive defaults; override per test. */
+function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
+  return {
+    accounts_enabled: false,
+    login_url: null,
+    needs_setup: false,
+    databricks_features: false,
+    managed_sandboxes_enabled: false,
+    sandbox_provider: null,
+    sharing_mode: "on",
+    public_sharing_enabled: true,
+    server_version: null,
+    smart_routing_enabled: false,
+    ...overrides,
+  };
+}
+
+function renderShell(path: string, info?: ServerInfo) {
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
-  return render(
+  const tree = (
     <QueryClientProvider client={qc}>
       <TooltipProvider>
         <MemoryRouter initialEntries={[path]}>
@@ -336,8 +356,11 @@ function renderShell(path: string) {
           </Routes>
         </MemoryRouter>
       </TooltipProvider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
+  // Without an explicit info the CapabilitiesContext default ("loading")
+  // applies, matching production first paint and every pre-existing test.
+  return render(info ? <CapabilitiesProvider info={info}>{tree}</CapabilitiesProvider> : tree);
 }
 
 function mockConversations(
@@ -1631,9 +1654,10 @@ describe("Right workspace card visibility", () => {
   });
 
   it("starts open for a fresh session (no stored open-state)", () => {
-    // A brand-new session has no persisted open-state, so the rail opens by
-    // default — the card is mounted and the header offers Collapse, not
-    // Expand.
+    // A brand-new session has no persisted open-state, so the Appearance
+    // Workspace panel default applies. With no preference stored that
+    // default is open — the card is mounted and the header offers Collapse,
+    // not Expand.
     useEnvironmentMock.mockReturnValue({
       data: { available: false, root: null, home: null },
       isLoading: false,
@@ -1645,6 +1669,38 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Expand right panel" })).toBeNull();
+  });
+
+  it("starts collapsed for a fresh session when Appearance default is collapsed", () => {
+    // The Appearance setting only seeds sessions with no saved open-state.
+    writeWorkspacePanelDefault("collapsed");
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_fresh_collapsed", permission_level: null }]);
+
+    renderShell("/c/conv_fresh_collapsed");
+
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
+  });
+
+  it("restores a saved open-state even when Appearance default is collapsed", () => {
+    // Per-chat persistence wins over the Appearance default once the user
+    // has toggled the rail in that session.
+    writeWorkspacePanelDefault("collapsed");
+    writeSessionWorkspaceState("conv_saved_open", { open: true });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_saved_open", permission_level: null }]);
+
+    renderShell("/c/conv_saved_open");
+
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
   });
 
   it("persists the open-state per session across remounts", () => {
@@ -2721,6 +2777,36 @@ describe("AppShell share action", () => {
         ),
       ).toBeInTheDocument();
       expect(shareButton).toHaveAttribute("title", "Sharing is unavailable from a local server.");
+    });
+  });
+
+  it("disables the Share button when the server reports sharing_mode off", () => {
+    // Non-local origin isolates the reason to the server policy (not the
+    // local-server path), so the tooltip must be the sharing-off message.
+    withWindowOrigin("https://app.example.com", () => {
+      mockConversations([{ id: "conv_top", permission_level: null }]);
+
+      renderShell("/c/conv_top", serverInfo({ sharing_mode: "off" }));
+
+      const shareButton = screen.getByRole("button", { name: /share session/i });
+      expect(shareButton).toBeDisabled();
+      expect(shareButton).toHaveAttribute(
+        "title",
+        "Sharing has been disabled for this Omnigent server.",
+      );
+    });
+  });
+
+  it("keeps the Share button enabled when sharing_mode is read_only", () => {
+    // read_only still permits (read) grants, so the affordance stays live —
+    // the modal caps the level, the button is not disabled.
+    withWindowOrigin("https://app.example.com", () => {
+      mockConversations([{ id: "conv_top", permission_level: null }]);
+
+      renderShell("/c/conv_top", serverInfo({ sharing_mode: "read_only" }));
+
+      const shareButton = screen.getByRole("button", { name: /share session/i });
+      expect(shareButton).toBeEnabled();
     });
   });
 

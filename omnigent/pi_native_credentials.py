@@ -22,7 +22,7 @@ import json
 import logging
 import os
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -62,6 +62,10 @@ _PI_PROVIDER_ID = "omnigent"
 # default the in-process Databricks executor pins. Used when the session
 # carries no explicit model override.
 _DATABRICKS_PI_DEFAULT_MODEL = "databricks-claude-sonnet-4-6"
+
+# Provider id for the secondary OpenAI Completions provider registered alongside
+# the primary Anthropic provider in Databricks gateway configs.
+_PI_OPENAI_PROVIDER_ID = "omnigent-openai"
 
 # Databricks AI Gateway Anthropic Messages surface. Pi speaks this protocol
 # natively (``api: anthropic-messages``); the gateway authenticates with a
@@ -145,18 +149,36 @@ class PiProviderConfig:
     model: str
     api_key: str
     auth_header: bool
+    # Full model list for providers that expose multiple models (e.g. the
+    # Databricks Anthropic gateway). Excluded from __hash__ so the frozen
+    # dataclass stays hashable even though list[dict] is not hashable.
+    extra_models: list[dict[str, Any]] = field(default_factory=list, hash=False)
+    # Extra providers to merge into models.json alongside the primary one (e.g.
+    # an OpenAI Completions provider for GPT models on the Databricks gateway).
+    # Keys are provider ids; values are complete Pi provider config dicts.
+    additional_providers: dict[str, Any] = field(default_factory=dict, hash=False)
 
     def to_models_config(self) -> dict[str, Any]:
         """Render this provider as a Pi ``models.json`` mapping."""
+        if self.extra_models:
+            # Include all known models, ensuring the selected model is present.
+            # The selected model may be a newer id not yet in the static list.
+            models: list[dict[str, Any]] = list(self.extra_models)
+            if not any(m.get("id") == self.model for m in models):
+                models.append({"id": self.model, "input": ["text", "image"]})
+        else:
+            models = [{"id": self.model}]
         provider: dict[str, Any] = {
             "baseUrl": self.base_url,
             "api": self.api,
             "apiKey": self.api_key,
-            "models": [{"id": self.model}],
+            "models": models,
         }
         if self.auth_header:
             provider["authHeader"] = True
-        return {"providers": {self.provider_id: provider}}
+        providers: dict[str, Any] = {self.provider_id: provider}
+        providers.update(self.additional_providers)
+        return {"providers": providers}
 
 
 def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiProviderConfig | None:
@@ -177,6 +199,22 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         return None
     host = host.rstrip("/")
     auth_command = _databricks_codex_auth_command(host, entry.profile)
+    api_key = f"!{auth_command}"
+    # Fetch the live model list from the workspace API so Pi's /model shows
+    # exactly the endpoints available on this workspace. Falls back to the
+    # bundled static lists when credentials can't be resolved or the API call
+    # fails (e.g. network blip, new workspace with no endpoints yet).
+    try:
+        from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
+
+        creds = resolve_databricks_workspace(entry.profile)
+        claude_models, openai_models = _fetch_pi_model_lists(creds.host, creds.token)
+    except Exception:  # noqa: BLE001 — credential/network failure must not break launch
+        _LOGGER.info(
+            "pi-native: falling back to single-model display (could not resolve credentials)"
+        )
+        claude_models = []
+        openai_models = []
     return PiProviderConfig(
         provider_id=_PI_PROVIDER_ID,
         base_url=f"{host}{_DATABRICKS_ANTHROPIC_GATEWAY_PATH}",
@@ -185,9 +223,184 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         # Pi resolves a "!command" apiKey at request time, so the gateway
         # bearer token is refreshed per request (the auth command itself
         # force-refreshes), matching codex-native's refresh semantics.
-        api_key=f"!{auth_command}",
+        api_key=api_key,
         auth_header=True,
+        extra_models=claude_models,
+        additional_providers=(
+            {
+                _PI_OPENAI_PROVIDER_ID: _databricks_openai_provider(
+                    api_key, f"{host}/serving-endpoints", openai_models
+                )
+            }
+            if openai_models
+            else {}
+        ),
     )
+
+
+def _gateway_workspace_url(gateway_base_url: str) -> str | None:
+    """Derive the Databricks workspace base URL from an AI Gateway URL.
+
+    The AI Gateway hostname carries an ``ai-gateway`` DNS label that the
+    workspace host does not (e.g. ``12345.ai-gateway.cloud.databricks.com`` →
+    ``12345.cloud.databricks.com``). The workspace URL is the root for both
+    ``/api/2.0/serving-endpoints`` (model catalog) and ``/serving-endpoints``
+    (OpenAI Completions base URL).
+
+    :param gateway_base_url: An AI Gateway base URL, e.g.
+        ``"https://<id>.ai-gateway.cloud.databricks.com/codex/v1"``.
+    :returns: ``https://<workspace>``, or ``None`` when the URL doesn't carry
+        the expected ``ai-gateway`` label.
+    """
+    parsed = urlparse(gateway_base_url)
+    if not parsed.hostname:
+        return None
+    labels = parsed.hostname.split(".")
+    if _DATABRICKS_AI_GATEWAY_LABEL not in labels:
+        return None
+    labels.remove(_DATABRICKS_AI_GATEWAY_LABEL)
+    return f"https://{'.'.join(labels)}"
+
+
+def _databricks_openai_provider(
+    api_key: str,
+    serving_endpoints_url: str,
+    models: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build a Pi OpenAI Completions provider config for the Databricks gateway.
+
+    GPT models on the Databricks workspace are served via the OpenAI
+    Completions API at ``/serving-endpoints``. The ``compat`` block disables
+    OpenAI-specific features the Databricks endpoint doesn't support.
+    """
+    return {
+        "baseUrl": serving_endpoints_url,
+        "apiKey": api_key,
+        "api": "openai-completions",
+        "compat": {
+            "supportsDeveloperRole": False,
+            "supportsStore": False,
+            "supportsStrictMode": False,
+            "supportsReasoningEffort": False,
+        },
+        "models": models,
+    }
+
+
+def _run_auth_command(auth_command: str, *, timeout: float = 15.0) -> str | None:
+    """Run *auth_command* and return its stdout as a bearer token.
+
+    Used to obtain a short-lived token at session-create time for the
+    one-shot model-catalog API call. Returns ``None`` on any failure so
+    callers can fall back gracefully.
+
+    :param auth_command: Shell command string, e.g.
+        ``"jq -r .access_token /path/token.json"``.
+    :param timeout: Maximum seconds to wait for the command.
+    :returns: Stripped stdout (the token), or ``None`` when the command
+        fails, times out, or produces empty output.
+    """
+    import shlex
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            shlex.split(auth_command),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip() or None
+    except Exception:  # noqa: BLE001 — any subprocess failure should just return None
+        return None
+
+
+def _fetch_pi_model_lists(
+    workspace_url: str,
+    token: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Fetch live model lists from the Databricks serving-endpoints API.
+
+    Calls ``GET <workspace>/api/2.0/serving-endpoints``, filters for READY LLM
+    endpoints, and splits them into two Pi model entry dict lists:
+
+    * Claude models → ``anthropic-messages`` provider.
+    * All other LLMs (GPT, GLM, Llama, Qwen, Kimi, …) → ``openai-completions``
+      provider. All non-Claude Databricks LLMs share the same serving-endpoints
+      URL and wire protocol, so a single provider covers them all.
+
+    Falls back to empty lists on any HTTP or auth failure so a network blip
+    never breaks Pi session launch.
+
+    :param workspace_url: Databricks workspace base URL, e.g.
+        ``"https://wkspc.example.com"`` — **no** trailing slash or path.
+    :param token: Bearer token for the workspace API.
+    :returns: ``(claude_models, openai_models)`` — Pi model entry dicts ready
+        to write into ``models.json``.
+    """
+    import httpx
+
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.get(
+                f"{workspace_url.rstrip('/')}/api/2.0/serving-endpoints",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+    except Exception:  # noqa: BLE001 — HTTP/network failure → empty
+        _LOGGER.warning(
+            "pi-native: could not fetch Databricks model list; "
+            "Pi will show only the selected model",
+            exc_info=True,
+        )
+        return [], []
+
+    endpoints = payload.get("endpoints") if isinstance(payload, dict) else None
+    claude: list[dict[str, Any]] = []
+    # All non-Claude LLM models (GPT, GLM, Llama, Qwen, Kimi, …) route to the
+    # same OpenAI Completions provider and serving-endpoints URL, so they share
+    # one list regardless of model family.
+    openai: list[dict[str, Any]] = []
+
+    for endpoint in endpoints if isinstance(endpoints, list) else []:
+        if not isinstance(endpoint, dict):
+            continue
+        name = endpoint.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        # Filter to chat/completion LLM endpoints (exclude embeddings/rerankers).
+        task = endpoint.get("task", "")
+        task_lower = task.lower() if isinstance(task, str) else ""
+        name_lower = name.lower()
+        if task_lower:
+            is_llm = any(t in task_lower for t in ("chat", "completion"))
+        else:
+            is_llm = any(
+                t in name_lower
+                for t in ("claude", "gpt", "codex", "gemini", "llama", "qwen", "kimi", "glm")
+            )
+        if not is_llm:
+            continue
+        state = endpoint.get("state")
+        ready = state.get("ready") if isinstance(state, dict) else None
+        if isinstance(ready, str) and ready and ready.upper() != "READY":
+            continue
+        entry: dict[str, Any] = {"id": name, "input": ["text", "image"]}
+        if "claude" in name_lower:
+            claude.append(entry)
+        else:
+            openai.append(entry)
+
+    if not claude and not openai:
+        _LOGGER.info(
+            "pi-native: Databricks serving-endpoints returned no LLM models; "
+            "Pi will show only the selected model"
+        )
+
+    return claude, openai
 
 
 def _gateway_anthropic_base_url(codex_base_url: str) -> str:
@@ -318,6 +531,28 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     transport = _cli_config_databricks_transport(entry)
     if transport is None:
         return None
+    api_key = f"!{transport.auth_command}"
+    # Derive the workspace base URL from the AI Gateway URL. Used for both the
+    # serving-endpoints OpenAI Completions base URL and the model-catalog API
+    # call. Falls back gracefully when the URL lacks the ai-gateway label.
+    workspace_url = _gateway_workspace_url(transport.base_url)
+    # Fetch the live model list. Run the auth command once to get the current
+    # token — Pi will refresh per request via the !command apiKey.
+    claude_models: list[dict[str, Any]] = []
+    openai_models: list[dict[str, Any]] = []
+    if workspace_url and transport.auth_command:
+        token = _run_auth_command(transport.auth_command)
+        if token:
+            claude_models, openai_models = _fetch_pi_model_lists(workspace_url, token)
+    additional: dict[str, Any] = (
+        {
+            _PI_OPENAI_PROVIDER_ID: _databricks_openai_provider(
+                api_key, f"{workspace_url}/serving-endpoints", openai_models
+            )
+        }
+        if workspace_url and openai_models
+        else {}
+    )
     return PiProviderConfig(
         provider_id=_PI_PROVIDER_ID,
         base_url=_gateway_anthropic_base_url(transport.base_url),
@@ -326,8 +561,10 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         # Pi resolves a "!command" apiKey at request time, so the gateway
         # bearer token (the codex auth command prints it) is refreshed per
         # request — matching codex-native's refresh semantics.
-        api_key=f"!{transport.auth_command}",
+        api_key=api_key,
         auth_header=True,
+        extra_models=claude_models,
+        additional_providers=additional,
     )
 
 

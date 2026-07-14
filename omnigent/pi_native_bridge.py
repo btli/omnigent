@@ -258,7 +258,7 @@ def write_extension_files(
 
 def refresh_config_auth_headers(bridge_dir: Path, auth_headers: dict[str, str]) -> bool:
     """
-    Rewrite only the ``authHeaders`` of an existing extension config.
+    Merge fresh headers into the ``authHeaders`` of an existing extension config.
 
     The bearer baked into ``config.json`` at launch dies with the ~1h
     Databricks OAuth lifetime. The resident extension re-reads the config on
@@ -268,12 +268,17 @@ def refresh_config_auth_headers(bridge_dir: Path, auth_headers: dict[str, str]) 
     Best-effort and behavior-preserving: it touches only ``authHeaders``,
     leaving ``serverUrl`` / ``tools`` / etc. intact.
 
+    Headers are **merged** (fresh values win on collision) rather than replaced,
+    so launch-written headers such as ``X-Omnigent-Runner-Tunnel-Token`` — set
+    when the binding token was available in the runner-main process env and
+    needed for guest-on-shared-host self-access — survive every bearer rotation.
+
     :param bridge_dir: Native Pi bridge directory.
-    :param auth_headers: Fresh outbound auth headers, e.g.
+    :param auth_headers: Fresh outbound auth headers to merge in, e.g.
         ``{"Authorization": "Bearer <token>"}``.
     :returns: ``True`` when the config was rewritten; ``False`` when
         *auth_headers* is empty (local/unauthenticated), the config is
-        missing/unreadable, or the headers already match.
+        missing/unreadable, or the merged result is unchanged.
     """
     if not auth_headers:
         return False
@@ -282,9 +287,13 @@ def refresh_config_auth_headers(bridge_dir: Path, auth_headers: dict[str, str]) 
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
-    if not isinstance(payload, dict) or payload.get("authHeaders") == auth_headers:
+    if not isinstance(payload, dict):
         return False
-    payload["authHeaders"] = auth_headers
+    existing = payload.get("authHeaders") or {}
+    merged = {**existing, **auth_headers}
+    if merged == existing:
+        return False
+    payload["authHeaders"] = merged
     _atomic_json(path, payload)
     return True
 

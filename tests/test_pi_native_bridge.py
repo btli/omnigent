@@ -273,3 +273,36 @@ def test_refresh_config_auth_headers_noops(tmp_path: Path) -> None:
         pi_native_bridge.refresh_config_auth_headers(bridge_dir, {"Authorization": "Bearer x"})
         is False
     )
+
+
+def test_refresh_config_auth_headers_preserves_launch_written_headers(tmp_path: Path) -> None:
+    """Bearer refresh merges over existing headers; launch-written extras survive.
+
+    On guest-on-shared-host runners the extension config is written at launch
+    with both the OAuth bearer and an ``X-Omnigent-Runner-Tunnel-Token`` header
+    needed for the extension's ``/events`` POSTs to be authorised as self-access.
+    The per-turn bearer refresh must not wipe that header — it only knows about
+    the fresh bearer, not the tunnel token.
+    """
+    bridge_dir = tmp_path / "bridge"
+    pi_native_bridge.write_extension_files(
+        bridge_dir,
+        session_id="conv_abc",
+        server_url="http://omnigent.test",
+        conversation_url="http://omnigent.test/c/conv_abc",
+        auth_headers={
+            "Authorization": "Bearer stale",
+            "X-Omnigent-Runner-Tunnel-Token": "tunnel-tok",
+        },
+    )
+
+    assert (
+        pi_native_bridge.refresh_config_auth_headers(bridge_dir, {"Authorization": "Bearer fresh"})
+        is True
+    )
+
+    payload = json.loads(pi_native_bridge.config_path(bridge_dir).read_text(encoding="utf-8"))
+    # Bearer is updated to the fresh value.
+    assert payload["authHeaders"]["Authorization"] == "Bearer fresh"
+    # Tunnel token written at launch is preserved across the bearer rotation.
+    assert payload["authHeaders"]["X-Omnigent-Runner-Tunnel-Token"] == "tunnel-tok"
