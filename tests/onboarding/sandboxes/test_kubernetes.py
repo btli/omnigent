@@ -111,6 +111,34 @@ def test_build_pod_manifest_host_config_is_written_by_init_container() -> None:
     assert write_command not in manifest["spec"]["containers"][0]["command"][2]
 
 
+def test_build_pod_manifest_forwards_config_home_to_init_container() -> None:
+    """Init and host resolve injected config under the same configured directory."""
+    manifest = build_pod_manifest(
+        **{
+            **_MANIFEST_KW,
+            "env_literals": {
+                "OMNIGENT_CONFIG_HOME": "/home/omnigent/custom-config",
+                "PLAIN_CONFIG": "host-only",
+            },
+        },
+        host_config={"providers": {"litellm": {"kind": "gateway"}}},
+    )
+
+    init_env = manifest["spec"]["initContainers"][0]["env"]
+    host_env = manifest["spec"]["containers"][0]["env"]
+    assert init_env == [
+        {"name": "HOME", "value": "/home/omnigent"},
+        {
+            "name": "OMNIGENT_CONFIG_HOME",
+            "value": "/home/omnigent/custom-config",
+        },
+    ]
+    assert {entry["name"] for entry in host_env} >= {
+        "OMNIGENT_CONFIG_HOME",
+        "PLAIN_CONFIG",
+    }
+
+
 def test_build_pod_manifest_without_host_config_has_no_config_write() -> None:
     """No host_config → the init container only preps the workspace."""
     manifest = build_pod_manifest(**_MANIFEST_KW)

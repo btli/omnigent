@@ -128,16 +128,37 @@ _GATEWAY_HOST_CONFIG: dict[str, object] = {
 }
 
 
-def _materialize(command: str, home: Path) -> dict[str, object]:
+def _run_write_command(
+    command: str,
+    home: Path,
+    *,
+    config_home: Path | None = None,
+    extra_env: dict[str, str] | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
     """Run the rendered write command through a real shell + python3."""
-    subprocess.run(
+    env = {**os.environ, "HOME": str(home)}
+    env.pop("OMNIGENT_CONFIG_HOME", None)
+    if config_home is not None:
+        env["OMNIGENT_CONFIG_HOME"] = str(config_home)
+    if extra_env is not None:
+        env.update(extra_env)
+    return subprocess.run(
         ["sh", "-c", command],
-        env={**os.environ, "HOME": str(home)},
+        env=env,
         capture_output=True,
         text=True,
-        check=True,
+        check=check,
     )
-    with open(home / ".omnigent" / "config.yaml") as f:
+
+
+def _materialize(
+    command: str, home: Path, *, config_home: Path | None = None
+) -> dict[str, object]:
+    """Run the command and return the config from its resolved directory."""
+    _run_write_command(command, home, config_home=config_home)
+    config_dir = config_home if config_home is not None else home / ".omnigent"
+    with open(config_dir / "config.yaml") as f:
         return yaml.safe_load(f)
 
 
@@ -145,6 +166,25 @@ def test_render_host_config_write_command_creates_config_from_scratch(tmp_path: 
     """A fresh sandbox (no ~/.omnigent at all) gets the injected config verbatim."""
     written = _materialize(render_host_config_write_command(_GATEWAY_HOST_CONFIG), tmp_path)
     assert written == _GATEWAY_HOST_CONFIG
+
+
+def test_render_host_config_write_command_honors_omnigent_config_home(
+    tmp_path: Path,
+) -> None:
+    """The writer uses OMNIGENT_CONFIG_HOME as the config directory itself."""
+    home = tmp_path / "home"
+    home.mkdir()
+    config_home = tmp_path / "custom-config"
+
+    written = _materialize(
+        render_host_config_write_command(_GATEWAY_HOST_CONFIG),
+        home,
+        config_home=config_home,
+    )
+
+    assert written == _GATEWAY_HOST_CONFIG
+    assert (config_home / ".injected_host_config.json").exists()
+    assert not (home / ".omnigent").exists()
 
 
 def test_render_host_config_write_command_merges_providers_and_replaces_other_keys(
@@ -318,17 +358,91 @@ def test_render_host_config_write_command_empty_payload_removes_injected_config(
     assert _read_marker(tmp_path) is None
 
 
+def test_render_host_config_write_command_preserves_user_edited_injected_values(
+    tmp_path: Path,
+) -> None:
+    """Cleanup leaves provider entries and top-level values the user changed."""
+    injected = {
+        "providers": {"gateway": {"kind": "gateway", "default": ["pi"]}},
+        "server": "https://injected.example.com",
+    }
+    _materialize(render_host_config_write_command(injected), tmp_path)
+    config_path = tmp_path / ".omnigent" / "config.yaml"
+    with open(config_path) as f:
+        edited = yaml.safe_load(f)
+    edited["providers"]["gateway"] = {"kind": "key"}
+    edited["server"] = "https://user.example.com"
+    config_path.write_text(yaml.safe_dump(edited))
+
+    written = _materialize(render_host_config_write_command({}), tmp_path)
+
+    assert written["providers"]["gateway"] == {"kind": "key"}
+    assert written["server"] == "https://user.example.com"
+    assert _read_marker(tmp_path) is None
+
+
+@pytest.mark.parametrize(
+    ("failure_mode", "target_name"),
+    [("config", "config.yaml"), ("marker", ".injected_host_config.json")],
+)
+def test_render_host_config_write_command_interrupted_write_keeps_complete_file(
+    tmp_path: Path,
+    failure_mode: str,
+    target_name: str,
+) -> None:
+    """A partial temp-file write never truncates either destination file."""
+    first = {"providers": {"gateway_a": {"kind": "gateway"}}}
+    second = {"providers": {"gateway_b": {"kind": "gateway"}}}
+    _materialize(render_host_config_write_command(first), tmp_path)
+    config_dir = tmp_path / ".omnigent"
+    target = config_dir / target_name
+    complete_contents = target.read_bytes()
+
+    hook_dir = tmp_path / "python-hooks"
+    hook_dir.mkdir()
+    (hook_dir / "sitecustomize.py").write_text(
+        """\
+import json
+import os
+import yaml
+
+failure = os.environ.get("FAIL_ATOMIC_WRITE")
+if failure == "config":
+    def fail_yaml(_data, stream, **_kwargs):
+        stream.write("partial")
+        raise OSError("simulated interrupted config write")
+    yaml.safe_dump = fail_yaml
+elif failure == "marker":
+    def fail_json(_data, stream, *_args, **_kwargs):
+        stream.write("{")
+        raise OSError("simulated interrupted marker write")
+    json.dump = fail_json
+"""
+    )
+
+    result = _run_write_command(
+        render_host_config_write_command(second),
+        tmp_path,
+        extra_env={
+            "FAIL_ATOMIC_WRITE": failure_mode,
+            "PYTHONPATH": str(hook_dir),
+        },
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert target.read_bytes() == complete_contents
+    assert set(config_dir.iterdir()) == {
+        config_dir / "config.yaml",
+        config_dir / ".injected_host_config.json",
+    }
+
+
 def test_render_host_config_write_command_empty_payload_without_marker_is_noop(
     tmp_path: Path,
 ) -> None:
     """The cleanup run on a sandbox that never saw an injection touches nothing."""
-    subprocess.run(
-        ["sh", "-c", render_host_config_write_command({})],
-        env={**os.environ, "HOME": str(tmp_path)},
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    _run_write_command(render_host_config_write_command({}), tmp_path)
 
     assert not (tmp_path / ".omnigent" / "config.yaml").exists()
     assert _read_marker(tmp_path) is None
