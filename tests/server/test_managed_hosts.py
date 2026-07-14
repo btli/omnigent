@@ -643,6 +643,57 @@ def test_parse_host_config_inline_api_key_fails_loud() -> None:
         )
 
 
+def test_parse_host_config_literal_api_key_ref_fails_loud() -> None:
+    """Literal provider credential refs cannot ride in the managed host config."""
+    with pytest.raises(
+        ValueError,
+        match=r"sandbox\.host_config\.providers\.openai\.openai\.api_key_ref",
+    ):
+        parse_sandbox_config(
+            {
+                "provider": "modal",
+                "server_url": "https://s.example.com",
+                "host_config": {
+                    "providers": {
+                        "openai": {
+                            "kind": "key",
+                            "openai": {
+                                "base_url": "https://api.openai.com/v1",
+                                "api_key_ref": "sk-prod-secret",
+                            },
+                        }
+                    }
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "api_key_ref",
+    ["env:LITELLM_API_KEY", "keychain:litellm", "$LITELLM_API_KEY", "${LITELLM_API_KEY}"],
+)
+def test_parse_host_config_secret_api_key_ref_succeeds(api_key_ref: str) -> None:
+    """Named provider credential refs remain valid managed host config."""
+    host_config = {
+        "providers": {
+            "litellm": {
+                "kind": "gateway",
+                "openai": {
+                    "base_url": "https://litellm.example.com/v1",
+                    "api_key_ref": api_key_ref,
+                },
+            }
+        }
+    }
+
+    cfg = parse_sandbox_config(
+        {"provider": "modal", "server_url": "https://s.example.com", "host_config": host_config}
+    )
+
+    assert cfg is not None
+    assert cfg.host_config == host_config
+
+
 def test_parse_host_config_lossy_json_key_collision_fails_loud() -> None:
     """JSON key coercion cannot silently collapse distinct config entries."""
     with pytest.raises(ValueError, match=r"JSON-serializable"):

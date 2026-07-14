@@ -674,6 +674,7 @@ def _parse_host_config(raw: dict[str, object]) -> dict[str, object] | None:
             raise ValueError("server config 'sandbox.host_config.providers' must be a mapping")
         # Lazy imports, matching the provider branches below: the parse path
         # must not pull the onboarding layer in at module import time.
+        from omnigent.env_credentials import _ENV_REF_RE
         from omnigent.errors import OmnigentError
         from omnigent.onboarding.provider_config import get_default_provider, load_providers
 
@@ -698,6 +699,18 @@ def _parse_host_config(raw: dict[str, object]) -> dict[str, object] | None:
                         f"'sandbox.host_config.providers.{provider.name}."
                         f"{family_name}.api_key' must not contain an inline API key — "
                         "use api_key_ref: env:VAR instead"
+                    )
+                api_key_ref = family.api_key_ref
+                if api_key_ref is not None and not (
+                    (api_key_ref.startswith("env:") and api_key_ref != "env:")
+                    or (api_key_ref.startswith("keychain:") and api_key_ref != "keychain:")
+                    or _ENV_REF_RE.fullmatch(api_key_ref) is not None
+                ):
+                    raise ValueError(
+                        "server config "
+                        f"'sandbox.host_config.providers.{provider.name}."
+                        f"{family_name}.api_key_ref' must be a secret reference "
+                        "(env:VAR, keychain:name, or $VAR) — got a literal value"
                     )
     # The block rides json.dumps to the sandbox on every launch, and
     # yaml.safe_load produces values json can't take (an unquoted date
