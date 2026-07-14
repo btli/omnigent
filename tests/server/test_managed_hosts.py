@@ -592,6 +592,69 @@ def test_parse_host_config_null_providers_fails_loud() -> None:
         )
 
 
+def test_parse_host_config_duplicate_default_fails_loud() -> None:
+    """Duplicate defaults fail at server startup, before sandbox launch."""
+    provider = {
+        "kind": "gateway",
+        "default": ["pi"],
+        "openai": {
+            "base_url": "https://gateway.example.com/v1",
+            "api_key_ref": "env:GATEWAY_API_KEY",
+        },
+    }
+
+    with pytest.raises(
+        ValueError,
+        match=r"sandbox\.host_config\.providers.*multiple providers.*'pi' family",
+    ):
+        parse_sandbox_config(
+            {
+                "provider": "modal",
+                "server_url": "https://s.example.com",
+                "host_config": {
+                    "providers": {
+                        "first": provider,
+                        "second": provider,
+                    }
+                },
+            }
+        )
+
+
+def test_parse_host_config_inline_api_key_fails_loud() -> None:
+    """Literal provider credentials cannot ride in the managed host config."""
+    with pytest.raises(ValueError, match=r"api_key_ref: env:VAR"):
+        parse_sandbox_config(
+            {
+                "provider": "modal",
+                "server_url": "https://s.example.com",
+                "host_config": {
+                    "providers": {
+                        "openai": {
+                            "kind": "key",
+                            "openai": {
+                                "base_url": "https://api.openai.com/v1",
+                                "api_key": "sk-inline-secret",
+                            },
+                        }
+                    }
+                },
+            }
+        )
+
+
+def test_parse_host_config_lossy_json_key_collision_fails_loud() -> None:
+    """JSON key coercion cannot silently collapse distinct config entries."""
+    with pytest.raises(ValueError, match=r"JSON-serializable"):
+        parse_sandbox_config(
+            {
+                "provider": "modal",
+                "server_url": "https://s.example.com",
+                "host_config": {"metadata": {1: "integer", "1": "string"}},
+            }
+        )
+
+
 @pytest.mark.parametrize(
     ("kubernetes_block", "expected_fragment"),
     [
