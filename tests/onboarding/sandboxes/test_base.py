@@ -8,6 +8,7 @@ minimal recording launcher rather than per provider.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -240,7 +241,12 @@ def test_start_host_writes_host_config_before_launching_the_host() -> None:
 
 
 def test_start_host_without_host_config_writes_nothing() -> None:
-    """No host_config → no config-write command reaches the sandbox."""
+    """No host_config on a fresh-sandbox launcher → no config command at all.
+
+    Non-resumable sandboxes can't carry a stale injection marker, so the
+    cleanup run would be dead weight (and a python3+yaml image requirement
+    for operators who never use the feature).
+    """
     launcher = _RecordingLauncher()
 
     launcher.start_host(
@@ -252,3 +258,126 @@ def test_start_host_without_host_config_writes_nothing() -> None:
     )
 
     assert not any(cmd.startswith("python3 -c") for cmd in launcher.commands)
+
+
+# ── server-managed replacement semantics ────────────────────
+
+
+def _read_marker(home: Path) -> dict[str, object] | None:
+    marker = home / ".omnigent" / ".injected_host_config.json"
+    if not marker.exists():
+        return None
+    return json.loads(marker.read_text())
+
+
+def test_render_host_config_write_command_replaces_previously_injected_entries(
+    tmp_path: Path,
+) -> None:
+    """
+    Renaming a gateway in ``sandbox.host_config`` must not leave the old
+    entry behind: two providers claiming the same ``default`` scope is a
+    load error inside the sandbox. Previously injected providers and
+    top-level keys are removed before the current payload merges in;
+    user-created entries survive.
+    """
+    (tmp_path / ".omnigent").mkdir()
+    (tmp_path / ".omnigent" / "config.yaml").write_text(
+        yaml.safe_dump({"providers": {"mine": {"kind": "key"}}})
+    )
+    first = {
+        "providers": {"gateway_a": {"kind": "gateway", "default": ["pi"]}},
+        "server": "https://old.example.com",
+    }
+    second = {"providers": {"gateway_b": {"kind": "gateway", "default": ["pi"]}}}
+
+    _materialize(render_host_config_write_command(first), tmp_path)
+    written = _materialize(render_host_config_write_command(second), tmp_path)
+
+    assert written["providers"] == {
+        "mine": {"kind": "key"},
+        "gateway_b": {"kind": "gateway", "default": ["pi"]},
+    }
+    # The previously injected non-providers key is gone, not just replaced.
+    assert "server" not in written
+    assert _read_marker(tmp_path) == second
+
+
+def test_render_host_config_write_command_empty_payload_removes_injected_config(
+    tmp_path: Path,
+) -> None:
+    """Removing ``host_config`` from server config cleans up on the next run."""
+    (tmp_path / ".omnigent").mkdir()
+    (tmp_path / ".omnigent" / "config.yaml").write_text(
+        yaml.safe_dump({"host": {"name": "keep-me"}})
+    )
+
+    _materialize(render_host_config_write_command(_GATEWAY_HOST_CONFIG), tmp_path)
+    written = _materialize(render_host_config_write_command({}), tmp_path)
+
+    assert written == {"host": {"name": "keep-me"}}
+    assert _read_marker(tmp_path) is None
+
+
+def test_render_host_config_write_command_empty_payload_without_marker_is_noop(
+    tmp_path: Path,
+) -> None:
+    """The cleanup run on a sandbox that never saw an injection touches nothing."""
+    subprocess.run(
+        ["sh", "-c", render_host_config_write_command({})],
+        env={**os.environ, "HOME": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert not (tmp_path / ".omnigent" / "config.yaml").exists()
+    assert _read_marker(tmp_path) is None
+
+
+def test_render_host_config_write_command_corrupt_marker_degrades_to_additive(
+    tmp_path: Path,
+) -> None:
+    """
+    Never delete without evidence: an unreadable marker skips the removal
+    (today's additive behavior) rather than guessing what the server owns,
+    and the run repairs the marker for the next cycle.
+    """
+    (tmp_path / ".omnigent").mkdir()
+    (tmp_path / ".omnigent" / "config.yaml").write_text(
+        yaml.safe_dump({"providers": {"gateway_a": {"kind": "gateway"}}})
+    )
+    (tmp_path / ".omnigent" / ".injected_host_config.json").write_text("{not json")
+
+    written = _materialize(render_host_config_write_command(_GATEWAY_HOST_CONFIG), tmp_path)
+
+    providers = written["providers"]
+    assert providers["gateway_a"] == {"kind": "gateway"}  # not removed
+    assert "litellm" in providers
+    assert _read_marker(tmp_path) == _GATEWAY_HOST_CONFIG
+
+
+def test_start_host_without_host_config_runs_cleanup_on_resumable_launcher() -> None:
+    """
+    A resumable sandbox keeps its filesystem across wakes, so the cleanup
+    must run even with no host_config — otherwise entries injected by a
+    since-removed block outlive it forever.
+    """
+
+    class _ResumableLauncher(_RecordingLauncher):
+        can_resume: ClassVar[bool] = True
+
+    launcher = _ResumableLauncher()
+
+    launcher.start_host(
+        "sb-1",
+        token="tok-123",
+        host_id="host_abc",
+        host_name="managed-abc",
+        server_url="https://srv",
+    )
+
+    cleanup_index = launcher.commands.index(render_host_config_write_command({}))
+    host_index = next(
+        i for i, cmd in enumerate(launcher.commands) if "omnigent host --server" in cmd
+    )
+    assert cleanup_index < host_index

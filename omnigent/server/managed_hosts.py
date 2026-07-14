@@ -36,11 +36,15 @@ stores into ``create_app``):
          server_url: https://omnigent.example.com
          host_config:             # optional; provider-agnostic. Verbatim
                                   # in-sandbox ~/.omnigent/config.yaml content,
-                                  # merged in before `omnigent host` starts
+                                  # installed before `omnigent host` starts
                                   # (e.g. route the `pi` harness through a
-                                  # self-hosted gateway). Keep secrets out via
-                                  # api_key_ref: env: — resolved in the SANDBOX
-                                  # env (harness Secret / provider env lane).
+                                  # self-hosted gateway). Server-managed:
+                                  # entries injected earlier are replaced or
+                                  # removed on the next launch/resume; user
+                                  # config in the sandbox survives. Keep
+                                  # secrets out via api_key_ref: env: —
+                                  # resolved in the SANDBOX env (harness
+                                  # Secret / provider env lane).
            providers:
              litellm:
                kind: gateway
@@ -383,8 +387,10 @@ class ManagedSandboxConfig:
         ``GET /v1/info`` as ``sandbox_provider``.
     :param host_config: Verbatim in-sandbox ``~/.omnigent/config.yaml``
         content (e.g. a ``providers:`` block routing a harness through
-        a self-hosted gateway) merged into the sandbox's config before
-        ``omnigent host`` starts, or ``None``. Provider-agnostic:
+        a self-hosted gateway) installed into the sandbox's config before
+        ``omnigent host`` starts, or ``None``. Server-managed: previously
+        injected entries are replaced or removed on each launch/resume so
+        the sandbox always reflects the current block. Provider-agnostic:
         forwarded to every launcher's ``start_host`` — see
         :func:`omnigent.onboarding.sandboxes.base.render_host_config_write_command`.
         Non-secret by design: credentials stay behind
@@ -2217,6 +2223,8 @@ async def resume_managed_host(
                 # change lands on the next resume without a new sandbox.
                 # Omitted entirely when unset: a deployment-injected launcher
                 # predating the host_config parameter must keep resuming.
+                # (Base start_host still cleans up previously injected entries
+                # on resumable launchers when the block is removed.)
                 **({"host_config": config.host_config} if config.host_config is not None else {}),
             )
             await _wait_for_host_online(host_store, host.host_id)

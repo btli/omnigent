@@ -78,23 +78,47 @@ def host_image_wheel_install_command(remote_tgz_path: str) -> str:
     )
 
 
-# In-sandbox merge-write of an injected host config, run via ``python3 -c``.
+# In-sandbox write of an injected host config, run via ``python3 -c``.
 # Self-contained on purpose (stdlib + yaml, both baked into any image that can
 # run ``omnigent host``): importing merge logic from the sandbox's installed
 # omnigent package would tie the feature to the IMAGE's package version, and
 # operator-supplied images may predate it. ``__PAYLOAD__`` is replaced with a
 # base64 Python literal — its alphabet has no quote or shell metacharacter, so
 # arbitrary YAML content can never break out of the script.
+#
+# The server owns what it injects: a marker file records the previous payload,
+# and each run removes those entries before merging the current payload — so
+# a renamed gateway or a removed ``host_config`` block doesn't leave stale
+# providers behind on persistent sandboxes (two entries claiming the same
+# ``default`` scope is a load error). A missing or corrupt marker skips the
+# removal — never delete without evidence of what was injected.
 _HOST_CONFIG_WRITE_SCRIPT: str = """\
 import base64, json, os, yaml
 
 path = os.path.expanduser("~/.omnigent/config.yaml")
-os.makedirs(os.path.dirname(path), exist_ok=True)
+marker = os.path.expanduser("~/.omnigent/.injected_host_config.json")
 existing = {}
 if os.path.exists(path):
     loaded = yaml.safe_load(open(path))
     if isinstance(loaded, dict):
         existing = loaded
+previous = {}
+try:
+    loaded = json.load(open(marker))
+    if isinstance(loaded, dict):
+        previous = loaded
+except (OSError, ValueError):
+    pass
+for key, value in previous.items():
+    if key == "providers" and isinstance(value, dict):
+        current = existing.get(key)
+        if isinstance(current, dict):
+            for name in value:
+                current.pop(name, None)
+            if not current:
+                existing.pop(key, None)
+    else:
+        existing.pop(key, None)
 injected = json.loads(base64.b64decode(__PAYLOAD__).decode())
 for key, value in injected.items():
     current = existing.get(key)
@@ -102,22 +126,33 @@ for key, value in injected.items():
         existing[key] = {**current, **value}
     else:
         existing[key] = value
-yaml.safe_dump(existing, open(path, "w"), default_flow_style=False, sort_keys=True)
+if injected or previous:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    yaml.safe_dump(existing, open(path, "w"), default_flow_style=False, sort_keys=True)
+if injected:
+    json.dump(injected, open(marker, "w"))
+elif previous:
+    os.remove(marker)
 """
 
 
 def render_host_config_write_command(host_config: dict[str, object]) -> str:
     """
-    Build the remote command that merges *host_config* into the
+    Build the remote command that installs *host_config* into the
     sandbox's ``~/.omnigent/config.yaml`` before ``omnigent host`` starts.
 
-    Mirrors ``omnigent.cli._save_global_config``'s
-    ``deep_merge_keys=("providers",)`` semantics: ``providers`` is merged
-    one level deep (existing entries survive, injected entries win); every
-    other top-level key replaces the existing value wholesale. Shared by
-    both launch seams — the exec-model :meth:`SandboxLauncher.start_host`
-    and the Kubernetes init container — so the merge behavior cannot
-    drift between providers.
+    Server-managed replacement semantics: entries injected by a previous
+    run (recorded in ``~/.omnigent/.injected_host_config.json``) are
+    removed first, then the current payload merges in with
+    ``omnigent.cli._save_global_config``'s
+    ``deep_merge_keys=("providers",)`` semantics — ``providers`` one
+    level deep (user-created entries survive, injected entries win),
+    every other top-level key wholesale. The injected block therefore
+    always reflects the CURRENT server config across resumes; an empty
+    *host_config* renders a pure cleanup command. Shared by both launch
+    seams — the exec-model :meth:`SandboxLauncher.start_host` and the
+    Kubernetes init container — so the behavior cannot drift between
+    providers.
 
     The payload travels as base64-encoded JSON substituted into a fixed
     Python script, and the whole script is ``shlex.quote``-wrapped —
@@ -125,7 +160,8 @@ def render_host_config_write_command(host_config: dict[str, object]) -> str:
     reaches shell or Python quoting.
 
     :param host_config: The validated ``sandbox.host_config`` mapping
-        (see :func:`omnigent.server.managed_hosts.parse_sandbox_config`).
+        (see :func:`omnigent.server.managed_hosts.parse_sandbox_config`),
+        or ``{}`` to only remove previously injected entries.
     :returns: A ``python3 -c '<script>'`` shell command, safe to pass to
         :meth:`SandboxLauncher.run` or embed in a larger shell script.
     """
@@ -328,8 +364,10 @@ class SandboxLauncher(ABC):
         :param repo_name: Directory the clone lands in under the workspace, or
             ``None`` when *repo_url* is ``None``.
         :param host_config: Deployment-supplied ``~/.omnigent/config.yaml``
-            content (the server's ``sandbox.host_config``) merged into the
-            sandbox's config BEFORE the host starts, or ``None`` — see
+            content (the server's ``sandbox.host_config``) installed into the
+            sandbox's config BEFORE the host starts, or ``None``. On resumable
+            launchers ``None`` still runs the cleanup so entries injected by a
+            since-removed block don't outlive it — see
             :func:`render_host_config_write_command`.
         :param on_stage: Progress observer invoked with ``"cloning"`` before the
             clone (when *repo_url* is set) and ``"starting"`` before the host
@@ -377,8 +415,12 @@ class SandboxLauncher(ABC):
         # online poll resolves it.
         if on_stage is not None:
             on_stage("starting")
-        if host_config is not None:
-            self.run(sandbox_id, render_host_config_write_command(host_config))
+        # Resumable sandboxes keep their filesystem, so even with no
+        # host_config the cleanup must run: an operator who removed the block
+        # expects previously injected entries gone on the next wake. Fresh
+        # sandboxes can't carry a stale marker — skip the extra exec there.
+        if host_config is not None or self.can_resume:
+            self.run(sandbox_id, render_host_config_write_command(host_config or {}))
         env_prefix = " ".join(
             f"{key}={shlex.quote(value)}"
             for key, value in (
