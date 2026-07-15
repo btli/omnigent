@@ -62,6 +62,7 @@ from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
+from omnigent.server.routes.projects import create_projects_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
 from omnigent.server.routes.session_policies import create_session_policies_router
@@ -78,6 +79,7 @@ from omnigent.stores import (
     ArtifactStore,
     ConversationStore,
     FileStore,
+    ProjectStore,
 )
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import SessionConnectivity
@@ -86,6 +88,35 @@ from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 
 _logger = logging.getLogger(__name__)
+
+
+def add_workspace_scope_middleware(app: FastAPI) -> None:
+    """Bind the trusted Databricks workspace identity for every HTTP request."""
+    from omnigent.db.db_models import DEFAULT_WORKSPACE_ID, workspace_scope
+
+    @app.middleware("http")
+    async def _scope_request_workspace(
+        request: Request,
+        call_next: "_FastAPICallNext",
+    ) -> Response:
+        raw_workspace_id = request.headers.get("X-Databricks-Org-Id")
+        if raw_workspace_id is None:
+            workspace_id = DEFAULT_WORKSPACE_ID
+        else:
+            try:
+                workspace_id = int(raw_workspace_id)
+            except ValueError as error:
+                raise OmnigentError(
+                    "X-Databricks-Org-Id must be an integer",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from error
+            if workspace_id < 0:
+                raise OmnigentError(
+                    "X-Databricks-Org-Id must be non-negative",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+        with workspace_scope(workspace_id):
+            return await call_next(request)
 
 
 def _server_version() -> str:
@@ -1070,6 +1101,7 @@ def create_app(
     comment_store: CommentStore | None = None,
     policy_store: PolicyStore | None = None,
     permission_store: PermissionStore | None = None,
+    project_store: ProjectStore | None = None,
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
     account_store: Any | None = None,  # SqlAlchemyAccountStore — accounts mode only
@@ -1109,6 +1141,8 @@ def create_app(
         CRUD endpoints.
     :param permission_store: Store for session-level access grants.
         ``None`` disables permission checks (all access allowed).
+    :param project_store: Store for flat owner-scoped projects. ``None``
+        leaves the Projects API unmounted.
     :param auth_provider: Pre-constructed auth provider for
         identity resolution. ``None`` disables auth (anonymous
         access). **Required** when ``permission_store`` is
@@ -1381,6 +1415,7 @@ def create_app(
             await _mcp_pool.shutdown_all()
 
     app = FastAPI(title="Omnigent Server", lifespan=_lifespan)
+    add_workspace_scope_middleware(app)
     from omnigent.runtime import telemetry
 
     telemetry.instrument_fastapi_app(app)
@@ -2006,6 +2041,12 @@ def create_app(
         )
         return {"user_id": user_id, "is_admin": is_admin}
 
+    if project_store is not None:
+        app.include_router(
+            create_projects_router(project_store, auth_provider=auth_provider),
+            prefix="/v1",
+            tags=["projects"],
+        )
     app.include_router(
         create_sessions_router(
             conversation_store,

@@ -53,6 +53,7 @@ class ErrorCode:
     INVALID_INPUT = "invalid_input"
     ALREADY_EXISTS = "already_exists"
     CONFLICT = "conflict"
+    PRECONDITION_FAILED = "precondition_failed"
     INTERNAL_ERROR = "internal_error"
     HARNESS_PROTOCOL_VIOLATION = "harness_protocol_violation"
     RUNNER_UNAVAILABLE = "runner_unavailable"
@@ -70,6 +71,7 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     ErrorCode.INVALID_INPUT: 400,
     ErrorCode.ALREADY_EXISTS: 409,
     ErrorCode.CONFLICT: 409,
+    ErrorCode.PRECONDITION_FAILED: 412,
     ErrorCode.INTERNAL_ERROR: 500,
     # Harness protocol violations are server-side bugs in the
     # harness implementation — surface as 500 (no client action

@@ -405,6 +405,7 @@ class SqlConversationMetadata(OmnigentBase):
     # Required when host_id is set; enforced by check constraint below.
     workspace: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     git_branch: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    project_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     archived: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=false()
     )
@@ -419,6 +420,119 @@ class SqlConversationMetadata(OmnigentBase):
         Index("ix_conversation_metadata_kind", "workspace_id", "kind", "id"),
         # Supports list_conversations_by_runner_id and get_runner_ids.
         Index("ix_conversation_metadata_runner_id", "workspace_id", "runner_id", "id"),
+        Index("ix_conversation_metadata_project_id", "workspace_id", "project_id", "id"),
+    )
+
+
+class SqlProject(OmnigentBase):
+    """A tenant- and owner-scoped flat project."""
+
+    __tablename__ = "projects"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    owner_principal_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    normalized_name: Mapped[str] = mapped_column(String(256), nullable=False)
+    normalized_name_checksum: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
+    storage_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    defaults_json: Mapped[str] = mapped_column(Text, nullable=False)
+    defaults_schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    row_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    archived_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "storage_key",
+            name="uq_projects_storage_key",
+        ),
+        UniqueConstraint(
+            "workspace_id",
+            "owner_principal_id",
+            "normalized_name_checksum",
+            name="uq_projects_owner_name_checksum",
+        ),
+        Index("ix_projects_owner_id", "workspace_id", "owner_principal_id", "id"),
+    )
+
+
+class SqlSessionProjectSnapshot(OmnigentBase):
+    """Immutable create-time project defaults provenance for a session."""
+
+    __tablename__ = "session_project_snapshots"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    session_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    project_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    snapshot_origin: Mapped[str] = mapped_column(String(16), nullable=False)
+    project_row_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    defaults_schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    defaults_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "snapshot_origin IN ('live', 'backfill')",
+            name="ck_session_project_snapshots_origin",
+        ),
+        Index(
+            "ix_session_project_snapshots_project_id",
+            "workspace_id",
+            "project_id",
+            "session_id",
+        ),
+    )
+
+
+class SqlProjectMigrationLedger(OmnigentBase):
+    """Idempotence ledger for the legacy project-label migration."""
+
+    __tablename__ = "project_migration_ledger"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    owner_principal_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    normalized_name: Mapped[str] = mapped_column(String(256), nullable=False)
+    normalized_name_checksum: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
+    project_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_fingerprint: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "owner_principal_id",
+            "normalized_name_checksum",
+            name="uq_project_migration_ledger_owner_name_checksum",
+        ),
+        Index(
+            "ix_project_migration_ledger_project_id",
+            "workspace_id",
+            "project_id",
+            "id",
+        ),
     )
 
 

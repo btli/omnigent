@@ -36,6 +36,7 @@ from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlPolicy,
     SqlSessionPermission,
+    SqlSessionProjectSnapshot,
     SqlUserDailyCost,
     current_workspace_id,
 )
@@ -66,6 +67,7 @@ from omnigent.db.utils import (
 from omnigent.entities import (
     Conversation,
     ConversationItem,
+    LegacyProjectLabel,
     NewConversationItem,
     PagedList,
     parse_item_data,
@@ -1908,6 +1910,54 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             return [row[0] for row in ap_sess.execute(stmt).all()]
 
+    def list_project_label_assignments(self) -> list[LegacyProjectLabel]:
+        """Return legacy project labels paired with owner-level grantees."""
+        from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_PUBLIC
+
+        with self._conv_session() as ap_session:
+            labels = ap_session.execute(
+                select(
+                    SqlConversationLabel.conversation_id,
+                    SqlConversationLabel.value,
+                )
+                .where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.key == PROJECT_LABEL_KEY,
+                )
+                .order_by(SqlConversationLabel.conversation_id)
+            ).all()
+        session_ids = [row.conversation_id for row in labels]
+        owners: dict[str, str] = {}
+        if session_ids:
+            with self._session() as session:
+                owner_rows = session.execute(
+                    select(
+                        SqlSessionPermission.conversation_id,
+                        SqlSessionPermission.user_id,
+                    ).where(
+                        SqlSessionPermission.workspace_id == current_workspace_id(),
+                        SqlSessionPermission.conversation_id.in_(session_ids),
+                        SqlSessionPermission.level >= LEVEL_OWNER,
+                        SqlSessionPermission.user_id != RESERVED_USER_PUBLIC,
+                    )
+                ).all()
+            owner_candidates: dict[str, set[str]] = {}
+            for conversation_id, user_id in owner_rows:
+                owner_candidates.setdefault(conversation_id, set()).add(user_id)
+            owners = {
+                conversation_id: next(iter(candidates))
+                for conversation_id, candidates in owner_candidates.items()
+                if len(candidates) == 1
+            }
+        return [
+            LegacyProjectLabel(
+                session_id=row.conversation_id,
+                label=row.value,
+                owner_principal_id=owners.get(row.conversation_id),
+            )
+            for row in labels
+        ]
+
     def delete_label(
         self,
         conversation_id: str,
@@ -3389,6 +3439,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             ap_sess.delete(row)
 
         with self._session() as session:
+            session.execute(
+                delete(SqlSessionProjectSnapshot).where(
+                    SqlSessionProjectSnapshot.workspace_id == current_workspace_id(),
+                    SqlSessionProjectSnapshot.session_id.in_(subtree_ids),
+                )
+            )
             session.execute(
                 delete(SqlComment).where(
                     SqlComment.workspace_id == current_workspace_id(),

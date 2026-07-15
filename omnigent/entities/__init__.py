@@ -27,6 +27,13 @@ from omnigent.entities.file import StoredFile
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.permission import ResolvedAccess, SessionPermission
 from omnigent.entities.policy import Policy
+from omnigent.entities.project import (
+    LegacyProjectLabel,
+    Project,
+    ProjectBackfillResult,
+    ProjectMigrationIssue,
+    ProjectMigrationMapping,
+)
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     SessionResourceView,
@@ -50,12 +57,17 @@ __all__ = [
     "FunctionCallData",
     "FunctionCallOutputData",
     "ItemData",
+    "LegacyProjectLabel",
     "LoadedAgent",
     "MessageData",
     "NativeToolData",
     "NewConversationItem",
     "PagedList",
     "Policy",
+    "Project",
+    "ProjectBackfillResult",
+    "ProjectMigrationIssue",
+    "ProjectMigrationMapping",
     "ReasoningData",
     "ResolvedAccess",
     "ResourceEventData",

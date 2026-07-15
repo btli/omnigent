@@ -51,6 +51,7 @@ def test_omnigent_error_with_harness_violation_code_returns_500() -> None:
         (ErrorCode.INVALID_INPUT, 400),
         (ErrorCode.ALREADY_EXISTS, 409),
         (ErrorCode.CONFLICT, 409),
+        (ErrorCode.PRECONDITION_FAILED, 412),
         (ErrorCode.INTERNAL_ERROR, 500),
         (ErrorCode.HARNESS_PROTOCOL_VIOLATION, 500),
     ],

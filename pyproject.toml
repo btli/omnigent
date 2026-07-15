@@ -390,6 +390,9 @@ extend-exclude = [
     # Protobuf-generated code (DO NOT EDIT); not ours to restyle.
     "omnigent/api/**/*_pb2.py",
     "omnigent/api/**/*_pb2.pyi",
+    # Parser fixtures include an intentionally malformed notebook and must
+    # remain byte-stable rather than being normalized as source notebooks.
+    "web/src/shell/__fixtures__/*.ipynb",
 ]
 
 [tool.ruff.lint]
