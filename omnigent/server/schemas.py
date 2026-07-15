@@ -1205,6 +1205,8 @@ class SessionCreateRequest(BaseModel):
 
     :param agent_id: Durable identifier of the agent to bind,
         e.g. ``"ag_abc123"``. Must match a registered agent.
+    :param project_id: Optional owner-scoped project whose resolved defaults
+        initialize this top-level session. Ignored for child sessions.
     :param initial_items: Initial queued events/inputs, typically a
         single user ``"message"``.
     :param title: Optional human-readable title for the session,
@@ -1306,6 +1308,7 @@ class SessionCreateRequest(BaseModel):
     """
 
     agent_id: str
+    project_id: str | None = None
     initial_items: list[SessionEventInput] = Field(default_factory=list)
     title: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)

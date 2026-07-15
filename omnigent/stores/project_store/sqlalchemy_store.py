@@ -29,22 +29,9 @@ from omnigent.entities import (
     ProjectMigrationMapping,
 )
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.projects.defaults import DEFAULTS_SCHEMA_VERSION, validate_defaults_bundle
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.project_store import UNSET, ProjectInputError, ProjectStore, _Unset
-
-DEFAULTS_SCHEMA_VERSION = 1
-_DEFAULT_FIELDS = frozenset(
-    {
-        "repo_url",
-        "default_branch",
-        "host_type",
-        "host_id",
-        "workspace",
-        "harness",
-        "model",
-        "reasoning_effort",
-    }
-)
 
 
 def normalize_project_name(name: str) -> tuple[str, str, bytes]:
@@ -57,30 +44,6 @@ def normalize_project_name(name: str) -> tuple[str, str, bytes]:
         raise ProjectInputError("Project name must be at most 256 characters")
     checksum = hashlib.sha256(normalized_name.encode("utf-8")).digest()
     return display_name, normalized_name, checksum
-
-
-def validate_defaults_bundle(
-    defaults_json: dict[str, Any] | None,
-    defaults_schema_version: int = DEFAULTS_SCHEMA_VERSION,
-) -> dict[str, Any]:
-    """Validate and copy the version-one flat defaults bundle."""
-    if defaults_schema_version != DEFAULTS_SCHEMA_VERSION:
-        raise ProjectInputError(f"Unsupported defaults_schema_version: {defaults_schema_version}")
-    bundle = dict(defaults_json or {})
-    unknown = sorted(set(bundle) - _DEFAULT_FIELDS)
-    if unknown:
-        raise ProjectInputError(f"Unknown project default fields: {', '.join(unknown)}")
-    for key, value in bundle.items():
-        if value is not None and not isinstance(value, str):
-            raise ProjectInputError(f"Project default {key!r} must be a string or null")
-    host_type = bundle.get("host_type")
-    if host_type not in (None, "managed", "external"):
-        raise ProjectInputError(
-            "Project default 'host_type' must be 'managed', 'external', or null"
-        )
-    if host_type == "managed" and bundle.get("host_id") is not None:
-        raise ProjectInputError("Managed project defaults prohibit host_id")
-    return bundle
 
 
 def _to_entity(row: SqlProject) -> Project:
@@ -147,7 +110,9 @@ class SqlAlchemyProjectStore(ProjectStore):
             normalized_name=normalized_name,
             normalized_name_checksum=checksum,
             storage_key=_storage_key(resolved_id),
-            defaults_json=json.dumps(bundle, sort_keys=True, separators=(",", ":")),
+            defaults_json=json.dumps(
+                bundle.model_dump(exclude_unset=True), sort_keys=True, separators=(",", ":")
+            ),
             defaults_schema_version=defaults_schema_version,
             row_version=1,
             created_at=now,
@@ -292,7 +257,9 @@ class SqlAlchemyProjectStore(ProjectStore):
             if not isinstance(defaults_json, (dict, type(None))):
                 raise ProjectInputError("defaults_json must be an object or null")
             bundle = validate_defaults_bundle(defaults_json)
-            values["defaults_json"] = json.dumps(bundle, sort_keys=True, separators=(",", ":"))
+            values["defaults_json"] = json.dumps(
+                bundle.model_dump(exclude_unset=True), sort_keys=True, separators=(",", ":")
+            )
         if not values:
             raise ProjectInputError("At least one mutable field is required")
         return self._mutate(

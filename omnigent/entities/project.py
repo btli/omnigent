@@ -26,6 +26,16 @@ class Project:
 
 
 @dataclass(frozen=True)
+class LiveProjectSnapshot:
+    """Resolved project provenance written with session metadata."""
+
+    project_id: str
+    project_row_version: int
+    defaults_schema_version: int
+    defaults_json: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class LegacyProjectLabel:
     """A legacy project-label assignment with its inferred session owner."""
 

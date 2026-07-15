@@ -29,6 +29,7 @@ from omnigent.entities.permission import ResolvedAccess, SessionPermission
 from omnigent.entities.policy import Policy
 from omnigent.entities.project import (
     LegacyProjectLabel,
+    LiveProjectSnapshot,
     Project,
     ProjectBackfillResult,
     ProjectMigrationIssue,
@@ -58,6 +59,7 @@ __all__ = [
     "FunctionCallOutputData",
     "ItemData",
     "LegacyProjectLabel",
+    "LiveProjectSnapshot",
     "LoadedAgent",
     "MessageData",
     "NativeToolData",

@@ -70,6 +70,7 @@ from omnigent.entities import (
     Conversation,
     ConversationItem,
     ErrorData,
+    LiveProjectSnapshot,
     MessageData,
     NewConversationItem,
     SlashCommandData,
@@ -109,6 +110,8 @@ from omnigent.policies.types import (
     PolicyAction,
     PolicyResult,
 )
+from omnigent.projects.defaults import ProjectDefaultsBundle
+from omnigent.projects.resolver import resolve_project_defaults
 from omnigent.reasoning_effort import (
     EFFORT_CLEAR_VALUES,
     EFFORT_VALUES,
@@ -153,6 +156,7 @@ from omnigent.server.auth import (
     LEVEL_MANAGE,
     LEVEL_OWNER,
     LEVEL_READ,
+    RESERVED_USER_LOCAL,
     RESERVED_USER_PUBLIC,
     AuthProvider,
     SharingMode,
@@ -288,6 +292,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.project_store import ProjectInputError, ProjectStore
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.events import SessionCreatedEvent as _TelSessionCreatedEvent
 from omnigent.telemetry.events import SessionDeletedEvent as _TelSessionDeletedEvent
@@ -12384,6 +12389,7 @@ async def _create_session_from_existing_agent(
     runner_router: RunnerRouter | None,
     body: SessionCreateRequest,
     request: Request,
+    project_store: ProjectStore | None = None,
     agent_cache: AgentCache | None = None,
     user_id: str | None = None,
     permission_store: PermissionStore | None = None,
@@ -12425,6 +12431,58 @@ async def _create_session_from_existing_agent(
         fails authorization.
     """
     _reject_reserved_cost_control_label_seed(body.labels)
+
+    project_snapshot: LiveProjectSnapshot | None = None
+    if body.project_id is not None and body.parent_session_id is None:
+        if project_store is None:
+            raise OmnigentError(
+                "Project storage is not configured",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
+        owner_principal_id = user_id or RESERVED_USER_LOCAL
+        project = await asyncio.to_thread(
+            project_store.get_for_use,
+            body.project_id,
+            owner_principal_id,
+        )
+        if project is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+
+        override_values: dict[str, Any] = {}
+        direct_fields = ("host_type", "host_id", "workspace", "reasoning_effort")
+        for field_name in direct_fields:
+            if field_name in body.model_fields_set:
+                override_values[field_name] = getattr(body, field_name)
+        if "model_override" in body.model_fields_set:
+            override_values["model"] = body.model_override
+        if "harness_override" in body.model_fields_set:
+            override_values["harness"] = body.harness_override
+
+        resolved = resolve_project_defaults(
+            server_defaults=ProjectDefaultsBundle(host_type="external"),
+            project_defaults=project.defaults_json,
+            defaults_schema_version=project.defaults_schema_version,
+            session_overrides=ProjectDefaultsBundle.model_validate(override_values),
+            session_git=body.git,
+            session_git_is_set="git" in body.model_fields_set,
+        )
+        resolved_values = resolved.model_dump()
+        try:
+            body = SessionCreateRequest.model_validate(
+                {
+                    **body.model_dump(),
+                    **resolved_values,
+                }
+            )
+        except ValidationError as error:
+            message = "; ".join(item["msg"] for item in error.errors(include_context=False))
+            raise ProjectInputError(f"Invalid resolved project defaults: {message}") from error
+        project_snapshot = LiveProjectSnapshot(
+            project_id=project.id,
+            project_row_version=project.row_version,
+            defaults_schema_version=project.defaults_schema_version,
+            defaults_json=resolved.model_dump(mode="json"),
+        )
 
     agent = await asyncio.to_thread(agent_store.get, body.agent_id)
     if agent is None:
@@ -12621,17 +12679,22 @@ async def _create_session_from_existing_agent(
             ) from exc
 
     try:
+        create_values: dict[str, Any] = {
+            "agent_id": agent.id,
+            "title": body.title,
+            "parent_conversation_id": body.parent_session_id,
+            "runner_id": inherited_runner_id,
+            "kind": "sub_agent" if body.parent_session_id else "default",
+            "sub_agent_name": body.sub_agent_name,
+            "host_id": body.host_id,
+            "workspace": canonical_workspace,
+            "git_branch": git_branch,
+            "terminal_launch_args": validated_launch_args,
+        }
+        if project_snapshot is not None:
+            create_values["project_snapshot"] = project_snapshot
         conv = conversation_store.create_conversation(
-            agent_id=agent.id,
-            title=body.title,
-            parent_conversation_id=body.parent_session_id,
-            runner_id=inherited_runner_id,
-            kind="sub_agent" if body.parent_session_id else "default",
-            sub_agent_name=body.sub_agent_name,
-            host_id=body.host_id,
-            workspace=canonical_workspace,
-            git_branch=git_branch,
-            terminal_launch_args=validated_launch_args,
+            **create_values,
         )
     except Exception:
         # Broad catch is intentional: ANY create_conversation failure
@@ -14190,6 +14253,7 @@ def create_sessions_router(
     comment_store: CommentStore | None = None,
     runner_tunnel_tokens: frozenset[str] | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
+    project_store: ProjectStore | None = None,
 ) -> APIRouter:
     """
     Factory that builds the sessions router.
@@ -14333,6 +14397,7 @@ def create_sessions_router(
             runner_router,
             body,
             request,
+            project_store=project_store,
             agent_cache=agent_cache,
             user_id=user_id,
             permission_store=permission_store,
