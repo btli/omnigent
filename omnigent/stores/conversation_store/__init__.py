@@ -8,6 +8,7 @@ from omnigent.entities import (
     Agent,
     Conversation,
     ConversationItem,
+    LegacyProjectLabel,
     NewConversationItem,
     PagedList,
 )
@@ -775,6 +776,14 @@ class ConversationStore(ABC):
         :returns: List of project names ordered alphabetically.
         """
         ...
+
+    def list_project_label_assignments(self) -> list[LegacyProjectLabel]:
+        """Return every legacy project label with its unambiguous session owner.
+
+        This is the read side of the staged Projects migration. Labels remain
+        in place after the caller imports them.
+        """
+        raise NotImplementedError
 
     @abstractmethod
     def set_session_state(
