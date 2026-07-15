@@ -63,7 +63,7 @@ def resolve_project_defaults(
         if session_git_is_set and session_git is not None:
             raise ProjectInputError("Managed project defaults prohibit git worktree options")
         repo_url = merged.get("repo_url")
-        if "workspace" not in session_overrides.model_fields_set and repo_url is not None:
+        if workspace is None and repo_url is not None:
             default_branch = merged.get("default_branch")
             workspace = f"{repo_url}#{default_branch}" if default_branch is not None else repo_url
         git = None

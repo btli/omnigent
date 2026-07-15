@@ -12467,16 +12467,18 @@ async def _create_session_from_existing_agent(
             session_git_is_set="git" in body.model_fields_set,
         )
         resolved_values = resolved.model_dump()
+        resolved_updates = {
+            key: value
+            for key, value in resolved_values.items()
+            if key in SessionCreateRequest.model_fields
+        }
+        resolved_body = body.model_copy(update=resolved_updates)
         try:
-            body = SessionCreateRequest.model_validate(
-                {
-                    **body.model_dump(),
-                    **resolved_values,
-                }
-            )
+            SessionCreateRequest.model_validate(resolved_body.model_dump())
         except ValidationError as error:
             message = "; ".join(item["msg"] for item in error.errors(include_context=False))
             raise ProjectInputError(f"Invalid resolved project defaults: {message}") from error
+        body = resolved_body
         project_snapshot = LiveProjectSnapshot(
             project_id=project.id,
             project_row_version=project.row_version,
