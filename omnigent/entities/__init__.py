@@ -32,6 +32,7 @@ from omnigent.entities.project import (
     LiveProjectSnapshot,
     Project,
     ProjectBackfillResult,
+    ProjectIdentity,
     ProjectMigrationIssue,
     ProjectMigrationMapping,
 )
@@ -68,6 +69,7 @@ __all__ = [
     "Policy",
     "Project",
     "ProjectBackfillResult",
+    "ProjectIdentity",
     "ProjectMigrationIssue",
     "ProjectMigrationMapping",
     "ReasoningData",

@@ -467,7 +467,7 @@ class SqlProject(OmnigentBase):
 
 
 class SqlSessionProjectSnapshot(OmnigentBase):
-    """Immutable create-time project defaults provenance for a session."""
+    """Project membership provenance and any create-time resolved defaults."""
 
     __tablename__ = "session_project_snapshots"
 
@@ -488,7 +488,7 @@ class SqlSessionProjectSnapshot(OmnigentBase):
 
     __table_args__ = (
         CheckConstraint(
-            "snapshot_origin IN ('live', 'backfill')",
+            "snapshot_origin IN ('live', 'backfill', 'moved')",
             name="ck_session_project_snapshots_origin",
         ),
         Index(

@@ -15,11 +15,21 @@ writes still land atomically.
 
 from __future__ import annotations
 
+import logging
+
+import pytest
+from sqlalchemy.orm import Session
+
+from omnigent.db.db_models import SqlConversationMetadata, SqlSessionProjectSnapshot
+from omnigent.db.utils import get_or_create_engine
 from omnigent.runtime.policies.engine import PolicyEngine
+from omnigent.server.auth import LEVEL_OWNER
 from omnigent.spec.types import LabelDef
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 
 # ── Engine-level filtering ────────────────────────────
 
@@ -121,3 +131,44 @@ def test_apply_label_writes_values_only_free_transitions(
     # Out-of-enum still rejected.
     engine.apply_label_writes({"role": "root"})
     assert engine.labels["role"] == "guest"
+
+
+def test_policy_project_label_write_forwards_membership_once(
+    db_uri: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conversation = store.create_conversation()
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("alice")
+    permissions.grant("alice", conversation.id, LEVEL_OWNER)
+    engine = PolicyEngine(
+        policies=[],
+        label_defs={"omni_project": LabelDef(values=["Different project"])},
+        ask_timeout=30,
+        conversation_id=conversation.id,
+        initial_labels={},
+        conversation_store=store,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        engine.apply_label_writes({"omni_project": "Policy forwarded", "other": "kept"})
+
+    project = SqlAlchemyProjectStore(db_uri).get_by_name("Policy forwarded", "alice")
+    assert project is not None
+    persisted = store.get_conversation(conversation.id)
+    assert persisted is not None
+    assert persisted.labels == {"other": "kept"}
+    with Session(get_or_create_engine(db_uri)) as session:
+        metadata = session.get(SqlConversationMetadata, (0, conversation.id))
+        snapshot = session.get(SqlSessionProjectSnapshot, (0, conversation.id))
+    assert metadata is not None and metadata.project_id == project.id
+    assert snapshot is not None and snapshot.project_id == project.id
+    assert snapshot.snapshot_origin == "moved"
+    assert (
+        caplog.messages.count(
+            "omni_project label is deprecated; forwarded to project_id — "
+            "migrate to the project_id API."
+        )
+        == 1
+    )

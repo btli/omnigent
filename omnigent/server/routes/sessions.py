@@ -285,6 +285,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import (
+    PROJECT_LABEL_DEPRECATION_WARNING,
     PROJECT_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
@@ -12383,6 +12384,49 @@ def _require_cost_control_label_authority(
     )
 
 
+def _warn_deprecated_project_label(write_path: str) -> None:
+    _logger.warning(
+        PROJECT_LABEL_DEPRECATION_WARNING,
+        extra={"event": "deprecated_project_label_write", "write_path": write_path},
+    )
+
+
+async def _resolve_legacy_project_label(
+    labels: dict[str, str],
+    owner_principal_id: str,
+    project_store: ProjectStore | None,
+    *,
+    write_path: str,
+) -> tuple[dict[str, str], str | None, bool]:
+    """Consume a legacy project label and resolve its authoritative project id."""
+    if PROJECT_LABEL_KEY not in labels:
+        return labels, None, False
+    _warn_deprecated_project_label(write_path)
+    clean_labels = {key: value for key, value in labels.items() if key != PROJECT_LABEL_KEY}
+    project_name = labels[PROJECT_LABEL_KEY]
+    if not project_name:
+        return clean_labels, None, True
+    if project_store is None:
+        raise OmnigentError(
+            "Project storage is not configured",
+            code=ErrorCode.INTERNAL_ERROR,
+        )
+    project = await asyncio.to_thread(
+        project_store.get_by_name,
+        project_name,
+        owner_principal_id,
+    )
+    if project is None:
+        project = await asyncio.to_thread(
+            project_store.create,
+            owner_principal_id,
+            project_name,
+        )
+    if project.archived_at is not None:
+        raise OmnigentError("Project is archived", code=ErrorCode.CONFLICT)
+    return clean_labels, project.id, True
+
+
 async def _create_session_from_existing_agent(
     conversation_store: ConversationStore,
     agent_store: AgentStore,
@@ -12432,6 +12476,30 @@ async def _create_session_from_existing_agent(
     """
     _reject_reserved_cost_control_label_seed(body.labels)
 
+    owner_principal_id = user_id or RESERVED_USER_LOCAL
+    explicit_project_requested = "project_id" in body.model_fields_set
+    (
+        clean_labels,
+        legacy_project_id,
+        legacy_project_requested,
+    ) = await _resolve_legacy_project_label(
+        body.labels,
+        owner_principal_id,
+        project_store,
+        write_path="json_create",
+    )
+    if (
+        explicit_project_requested
+        and legacy_project_requested
+        and (body.project_id or None) != legacy_project_id
+    ):
+        raise OmnigentError(
+            "project_id and omni_project label refer to different projects",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    body = body.model_copy(update={"labels": clean_labels})
+    forward_legacy_membership = legacy_project_requested and not explicit_project_requested
+
     project_snapshot: LiveProjectSnapshot | None = None
     if body.project_id is not None and body.parent_session_id is None:
         if project_store is None:
@@ -12439,7 +12507,6 @@ async def _create_session_from_existing_agent(
                 "Project storage is not configured",
                 code=ErrorCode.INTERNAL_ERROR,
             )
-        owner_principal_id = user_id or RESERVED_USER_LOCAL
         project = await asyncio.to_thread(
             project_store.get_for_use,
             body.project_id,
@@ -12720,6 +12787,15 @@ async def _create_session_from_existing_agent(
                 reason="create-rollback",
             )
         raise
+
+    if forward_legacy_membership:
+        membership_updated = await asyncio.to_thread(
+            conversation_store.set_project_membership,
+            conv.id,
+            legacy_project_id,
+        )
+        if not membership_updated:
+            raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
 
     # The create request has no conv id in its URL, so the path-based
     # FastAPI hook can't tag it — stamp the minted id so the create span
@@ -14672,6 +14748,18 @@ def create_sessions_router(
             raise HTTPException(status_code=422, detail=[_multipart_missing_detail("bundle")])
         parsed_metadata = _parse_session_create_metadata(metadata)
         _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
+        owner_principal_id = user_id or RESERVED_USER_LOCAL
+        (
+            clean_labels,
+            legacy_project_id,
+            legacy_project_requested,
+        ) = await _resolve_legacy_project_label(
+            parsed_metadata.labels,
+            owner_principal_id,
+            project_store,
+            write_path="multipart_create",
+        )
+        parsed_metadata = parsed_metadata.model_copy(update={"labels": clean_labels})
 
         inherited_runner_id: str | None = None
         if parsed_metadata.parent_session_id is not None:
@@ -14692,6 +14780,14 @@ def create_sessions_router(
             bundle_bytes,
             inherited_runner_id,
         )
+        if legacy_project_requested:
+            membership_updated = await asyncio.to_thread(
+                conversation_store.set_project_membership,
+                result.session_id,
+                legacy_project_id,
+            )
+            if not membership_updated:
+                raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
         # Top-level creates (no inherited runner) skip the notify —
         # their runner registers itself later.
         if inherited_runner_id is not None:
@@ -14715,25 +14811,22 @@ def create_sessions_router(
     )
     async def list_session_projects(
         request: Request,
-    ) -> list[str]:
+        archived: bool = Query(default=False),
+    ) -> list[dict[str, str]]:
         """
-        Return all project names for the authenticated user, ordered
-        alphabetically.
+        Return owned project identities with live or archived members.
 
-        Projects are implicit: they exist while at least one session
-        has a ``conversation_labels`` row with ``key="omni_project"``.
-
-        :returns: List of project names.
+        :param archived: When true, select projects having archived members.
+        :returns: Project identities ordered by normalized name.
         """
         user_id = _require_user(request, auth_provider)
-        # Filing into a project is owner-only, so the sidebar renders project
-        # folders only on "My sessions". Scope to owned sessions so a project
-        # owned by someone else (with a session shared to this user) doesn't
-        # surface as one of their own folders.
-        return await asyncio.to_thread(
+        owner_principal_id = user_id or RESERVED_USER_LOCAL
+        projects = await asyncio.to_thread(
             conversation_store.list_projects,
-            owned_by=user_id,
+            owner_principal_id,
+            archived=archived,
         )
+        return [{"id": project.id, "name": project.name} for project in projects]
 
     # ── PUT /sessions/{session_id}/read-state ─────────────────────
     #
@@ -14905,6 +14998,7 @@ def create_sessions_router(
         search_query: str | None = Query(default=None),
         include_archived: bool = Query(default=False),
         kind: str = Query(default="default", pattern="^(default|sub_agent|any)$"),
+        project_id: str | None = Query(default=None),
         project: str | None = Query(default=None),
     ) -> PaginatedList:
         """
@@ -14970,7 +15064,9 @@ def create_sessions_router(
         # like-named project belongs on "Shared with me", not in this folder.
         # The flat list (project=None) and Unfiled (project="") stay unscoped so
         # shared sessions still surface for the "Shared with me" tab.
-        owned_by = user_id if project else None
+        project_filter = project_id or project
+        owned_by = user_id if permission_store is not None and project_filter else None
+        project_owner = (user_id or RESERVED_USER_LOCAL) if project else None
         page = await asyncio.to_thread(
             conversation_store.list_conversations,
             limit=limit,
@@ -14989,7 +15085,9 @@ def create_sessions_router(
             sort_by=sort_by,
             search_query=normalized_query,
             include_archived=include_archived,
+            project_id=project_id,
             project=project,
+            project_owner=project_owner,
         )
         # list_conversations may return rows with agent_id=None for
         # legacy conversations; skip them before building the batch IDs.
@@ -15497,7 +15595,14 @@ def create_sessions_router(
         # endpoint needs only edit. Owner implies edit, so a single check at
         # the level the request actually requires gates both — no redundant
         # second permission-store read for archive/unarchive.
-        required_level = LEVEL_OWNER if body.archived is not None else LEVEL_EDIT
+        project_membership_requested = (
+            "project_id" in body.model_fields_set or PROJECT_LABEL_KEY in (body.labels or {})
+        )
+        required_level = (
+            LEVEL_OWNER
+            if body.archived is not None or project_membership_requested
+            else LEVEL_EDIT
+        )
         await _require_access(
             user_id, session_id, required_level, permission_store, conversation_store
         )
@@ -15563,7 +15668,9 @@ def create_sessions_router(
                     code=ErrorCode.INVALID_INPUT,
                 )
             requested_codex_collaboration_mode = body.collaboration_mode
-        labels_to_set = dict(body.labels or {})
+        labels_to_set = {
+            key: value for key, value in (body.labels or {}).items() if key != PROJECT_LABEL_KEY
+        }
         if requested_codex_collaboration_mode is not None:
             labels_to_set[_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY] = (
                 requested_codex_collaboration_mode
@@ -15634,6 +15741,47 @@ def create_sessions_router(
                 f"invalid terminal_launch_args: {exc}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
+
+        resolved_project_id: str | None = None
+        if project_membership_requested:
+            if project_store is None:
+                raise OmnigentError(
+                    "Project storage is not configured",
+                    code=ErrorCode.INTERNAL_ERROR,
+                )
+            owner_principal_id = user_id or RESERVED_USER_LOCAL
+            explicit_project_requested = "project_id" in body.model_fields_set
+            explicit_project_id = body.project_id or None
+            if explicit_project_id is not None:
+                explicit_project = await asyncio.to_thread(
+                    project_store.get_for_use,
+                    explicit_project_id,
+                    owner_principal_id,
+                )
+                if explicit_project is None:
+                    raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+
+            legacy_project_requested = PROJECT_LABEL_KEY in (body.labels or {})
+            legacy_project_id: str | None = None
+            if legacy_project_requested:
+                _, legacy_project_id, _ = await _resolve_legacy_project_label(
+                    body.labels or {},
+                    owner_principal_id,
+                    project_store,
+                    write_path="patch",
+                )
+            if (
+                explicit_project_requested
+                and legacy_project_requested
+                and explicit_project_id != legacy_project_id
+            ):
+                raise OmnigentError(
+                    "project_id and omni_project label refer to different projects",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            resolved_project_id = (
+                legacy_project_id if legacy_project_requested else explicit_project_id
+            )
 
         if body.runner_id is not None:
             # Empty string is the clear sentinel (None = leave unchanged);
@@ -15740,6 +15888,14 @@ def create_sessions_router(
                 "Session not found",
                 code=ErrorCode.NOT_FOUND,
             )
+        if project_membership_requested:
+            membership_updated = await asyncio.to_thread(
+                conversation_store.set_project_membership,
+                session_id,
+                resolved_project_id,
+            )
+            if not membership_updated:
+                raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
         # Archiving hides the session from the default view (and its unread
         # dot), so drop its per-user read-state to bound in-memory growth.
         # Only on archive→true; unarchiving leaves it pruned (reads as seen).
@@ -15799,12 +15955,6 @@ def create_sessions_router(
                 _codex_plan_enabled,
                 _runner_result,
             )
-        # The project label is special: an empty-string value means "remove
-        # from project" (delete the label row) rather than upsert an empty value.
-        # Split it out before the bulk upsert so other labels are unaffected.
-        if labels_to_set and labels_to_set.get(PROJECT_LABEL_KEY) == "":
-            labels_to_set = {k: v for k, v in labels_to_set.items() if k != PROJECT_LABEL_KEY}
-            await asyncio.to_thread(conversation_store.delete_label, session_id, PROJECT_LABEL_KEY)
         if labels_to_set:
             await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_set)
         if requested_codex_collaboration_mode is not None:

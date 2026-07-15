@@ -36,6 +36,7 @@ from omnigent.db.db_models import (
     SqlConversationLabel,
     SqlConversationMetadata,
     SqlPolicy,
+    SqlProject,
     SqlSessionPermission,
     SqlSessionProjectSnapshot,
     SqlUserDailyCost,
@@ -72,8 +73,10 @@ from omnigent.entities import (
     LiveProjectSnapshot,
     NewConversationItem,
     PagedList,
+    ProjectIdentity,
     parse_item_data,
 )
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.stores.conversation_store import (
     _INSTANCE_SCOPED_LABEL_KEYS,
     FORK_CARRY_HISTORY_LABEL_KEY,
@@ -96,6 +99,12 @@ def _chunked_ids(ids: list[str]) -> Iterator[list[str]]:
     """Yield ID batches that stay below common SQL bind-variable limits."""
     for start in range(0, len(ids), _SQL_IN_CHUNK_SIZE):
         yield ids[start : start + _SQL_IN_CHUNK_SIZE]
+
+
+def _chunked_in(column: QueryableAttribute[str], ids: list[str]) -> ColumnElement[bool]:
+    """Build a bounded ``IN`` predicate for a potentially large id list."""
+    chunks = [column.in_(chunk) for chunk in _chunked_ids(ids)]
+    return or_(*chunks) if chunks else column.in_([])
 
 
 def _to_conversation(
@@ -1875,72 +1884,130 @@ class SqlAlchemyConversationStore(ConversationStore):
 
     def list_projects(
         self,
-        accessible_by: str | None = None,
-        owned_by: str | None = None,
-    ) -> list[str]:
-        """
-        Return all distinct project names, ordered alphabetically.
-
-        Projects are implicit: they exist as long as at least one
-        *non-archived* ``conversation_labels`` row with ``key="omni_project"``
-        references them. Archived sessions keep their project label (so
-        unarchiving restores a session to its original project), but a project
-        whose every member is archived drops out of this list — that is what
-        makes "Delete project" (which archives all members) remove the folder
-        while leaving the sessions recoverable. The label key is namespaced
-        (``omni_*``) to keep this internal storage key distinct from the
-        user-facing "project" term and from any future reserved keys; it is
-        never surfaced as a label in the UI.
-
-        :param accessible_by: When set, restrict to sessions that
-            ``accessible_by`` has a permission row for (mirrors the
-            ``list_conversations`` ACL filter).
-        :param owned_by: When set, restrict to projects that contain at
-            least one session ``owned_by`` owns (an ``owner``-level grant).
-            Filing into a project is owner-only, so the sidebar renders
-            folders only on "My sessions"; scoping by ownership keeps a
-            project shared *with* the user (but owned by someone else) from
-            surfacing as one of their own folders.
-        :returns: List of project names ordered ascending.
-        """
-        from omnigent.server.auth import LEVEL_OWNER
-
-        # Get non-archived IDs from Omnigent, then filter labels in AP.
-        with self._session() as meta_sess:
-            non_archived_q = select(SqlConversationMetadata.id).where(
-                SqlConversationMetadata.workspace_id == current_workspace_id(),
-                SqlConversationMetadata.archived.is_(False),
+        owner_principal_id: str,
+        *,
+        archived: bool = False,
+    ) -> list[ProjectIdentity]:
+        """Return owned projects having at least one member in the requested state."""
+        statement = (
+            select(SqlProject.id, SqlProject.name)
+            .join(
+                SqlConversationMetadata,
+                and_(
+                    SqlConversationMetadata.workspace_id == SqlProject.workspace_id,
+                    SqlConversationMetadata.project_id == SqlProject.id,
+                ),
             )
-            if accessible_by is not None:
-                accessible_ids = select(SqlSessionPermission.conversation_id).where(
-                    SqlSessionPermission.workspace_id == current_workspace_id(),
-                    SqlSessionPermission.user_id == accessible_by,
+            .where(
+                SqlProject.workspace_id == current_workspace_id(),
+                SqlProject.owner_principal_id == owner_principal_id,
+                SqlProject.archived_at.is_(None),
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.archived.is_(archived),
+            )
+            .group_by(SqlProject.id, SqlProject.name, SqlProject.normalized_name)
+            .order_by(SqlProject.normalized_name, SqlProject.id)
+        )
+        with self._session() as session:
+            return [
+                ProjectIdentity(id=row.id, name=row.name)
+                for row in session.execute(statement).all()
+            ]
+
+    def set_project_membership(
+        self,
+        conversation_id: str,
+        project_id: str | None,
+    ) -> bool:
+        """Atomically move/unfile metadata and its membership snapshot."""
+        with self._session() as session:
+            metadata = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+            )
+            if metadata is None:
+                return False
+            snapshot = session.get(
+                SqlSessionProjectSnapshot,
+                (current_workspace_id(), conversation_id),
+            )
+            if project_id is None:
+                metadata.project_id = None
+                if snapshot is not None:
+                    session.delete(snapshot)
+                return True
+            project = session.execute(
+                select(SqlProject)
+                .where(
+                    SqlProject.workspace_id == current_workspace_id(),
+                    SqlProject.id == project_id,
                 )
-                non_archived_q = non_archived_q.where(
-                    SqlConversationMetadata.id.in_(accessible_ids)
-                )
-            if owned_by is not None:
-                owned_ids = select(SqlSessionPermission.conversation_id).where(
-                    SqlSessionPermission.workspace_id == current_workspace_id(),
-                    SqlSessionPermission.user_id == owned_by,
-                    SqlSessionPermission.level >= LEVEL_OWNER,
-                )
-                non_archived_q = non_archived_q.where(SqlConversationMetadata.id.in_(owned_ids))
-            non_archived_ids = list(meta_sess.execute(non_archived_q).scalars().all())
-        with self._conv_session() as ap_sess:
-            project_names: set[str] = set()
-            for id_chunk in _chunked_ids(non_archived_ids):
-                stmt = (
-                    select(SqlConversationLabel.value)
-                    .where(
-                        SqlConversationLabel.workspace_id == current_workspace_id(),
-                        SqlConversationLabel.key == PROJECT_LABEL_KEY,
-                        SqlConversationLabel.conversation_id.in_(id_chunk),
+                .with_for_update()
+            ).scalar_one_or_none()
+            if project is None:
+                raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+            if project.archived_at is not None:
+                raise OmnigentError("Project is archived", code=ErrorCode.CONFLICT)
+            if (
+                metadata.project_id == project_id
+                and snapshot is not None
+                and snapshot.project_id == project_id
+            ):
+                return True
+            metadata.project_id = project_id
+            if snapshot is None:
+                session.add(
+                    SqlSessionProjectSnapshot(
+                        session_id=conversation_id,
+                        project_id=project_id,
+                        snapshot_origin="moved",
+                        project_row_version=None,
+                        defaults_schema_version=1,
+                        defaults_json="{}",
+                        created_at=now_epoch(),
                     )
-                    .distinct()
                 )
-                project_names.update(ap_sess.execute(stmt).scalars().all())
-            return sorted(project_names)
+            else:
+                snapshot.project_id = project_id
+                snapshot.snapshot_origin = "moved"
+                snapshot.project_row_version = None
+                snapshot.defaults_schema_version = 1
+                snapshot.defaults_json = "{}"
+                snapshot.created_at = now_epoch()
+            return True
+
+    def forward_legacy_project_label(
+        self,
+        conversation_id: str,
+        project_name: str,
+    ) -> bool:
+        """Forward a deprecated project label into authoritative membership."""
+        from omnigent.server.auth import RESERVED_USER_LOCAL
+        from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+
+        project_id: str | None = None
+        if project_name:
+            owner_principal_id = self.get_session_owner(conversation_id) or RESERVED_USER_LOCAL
+            projects = SqlAlchemyProjectStore(self.storage_location)
+            project = projects.get_by_name(project_name, owner_principal_id)
+            if project is None:
+                project = projects.create(owner_principal_id, project_name)
+            if project.archived_at is not None:
+                raise OmnigentError("Project is archived", code=ErrorCode.CONFLICT)
+            project_id = project.id
+        return self.set_project_membership(conversation_id, project_id)
+
+    def list_project_label_workspace_ids(self) -> list[int]:
+        """Return only workspaces that have deprecated project-label rows."""
+        with self._conv_session() as session:
+            return list(
+                session.execute(
+                    select(SqlConversationLabel.workspace_id)
+                    .where(SqlConversationLabel.key == PROJECT_LABEL_KEY)
+                    .distinct()
+                    .order_by(SqlConversationLabel.workspace_id)
+                ).scalars()
+            )
 
     def list_project_label_assignments(self) -> list[LegacyProjectLabel]:
         """Return legacy project labels paired with owner-level grantees."""
@@ -2030,7 +2097,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         accessible_by: str | None = None,
         owned_by: str | None = None,
         include_archived: bool = False,
+        project_id: str | None = None,
         project: str | None = None,
+        project_owner: str | None = None,
         title: str | None = None,
     ) -> PagedList[Conversation]:
         """
@@ -2076,12 +2145,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param include_archived: When ``False`` (default), exclude
             rows where ``archived`` is true. When ``True``, include
             archived rows alongside non-archived ones.
-        :param project: When set to a non-empty string, only return
-            sessions that have a ``conversation_labels`` row with
-            ``key="omni_project"`` and ``value=project``. When set to an
-            empty string ``""``, only return sessions with NO project
-            label (i.e., unfiled sessions). ``None`` disables the
-            filter.
+        :param project_id: Authoritative metadata project filter. Empty
+            string matches unfiled sessions; ``None`` disables it.
+        :param project: Legacy owner-scoped project-name alias.
+        :param project_owner: Owner principal for resolving ``project``.
         :param owned_by: When set, restrict to sessions the user owns
             (an ``owner``-level grant) — stricter than ``accessible_by``,
             which also matches sessions merely shared with them. Powers
@@ -2101,6 +2168,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             or (not include_archived)
             or (accessible_by is not None)
             or (owned_by is not None)
+            or (project_id is not None)
+            or (project is not None)
         )
 
         qualifying_ids: list[str] | None = None
@@ -2129,6 +2198,33 @@ class SqlAlchemyConversationStore(ConversationStore):
                         SqlSessionPermission.level >= LEVEL_OWNER,
                     )
                     meta_q = meta_q.where(SqlConversationMetadata.id.in_(owned_ids))
+                resolved_project_id = project_id
+                if resolved_project_id is None and project is not None:
+                    if project == "":
+                        resolved_project_id = ""
+                    elif project_owner is None:
+                        meta_q = meta_q.where(literal_column("0 = 1"))
+                    else:
+                        from omnigent.stores.project_store.sqlalchemy_store import (
+                            normalize_project_name,
+                        )
+
+                        _, _, checksum = normalize_project_name(project)
+                        resolved_project_id = meta_sess.execute(
+                            select(SqlProject.id).where(
+                                SqlProject.workspace_id == current_workspace_id(),
+                                SqlProject.owner_principal_id == project_owner,
+                                SqlProject.normalized_name_checksum == checksum,
+                            )
+                        ).scalar_one_or_none()
+                        if resolved_project_id is None:
+                            meta_q = meta_q.where(literal_column("0 = 1"))
+                if resolved_project_id == "":
+                    meta_q = meta_q.where(SqlConversationMetadata.project_id.is_(None))
+                elif resolved_project_id is not None:
+                    meta_q = meta_q.where(
+                        SqlConversationMetadata.project_id == resolved_project_id
+                    )
                 qualifying_ids = list(meta_sess.execute(meta_q).scalars().all())
 
         with self._conv_session() as session:
@@ -2137,7 +2233,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
 
             if qualifying_ids is not None:
-                stmt = stmt.where(SqlConversation.id.in_(qualifying_ids))
+                stmt = stmt.where(_chunked_in(SqlConversation.id, qualifying_ids))
 
             if parent_conversation_id is not None:
                 stmt = stmt.where(
@@ -2204,28 +2300,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .distinct()
                 )
                 stmt = stmt.where(or_(title_match, content_match))
-            if project is not None:
-                if project == "":
-                    # Unfiled: sessions with no project label at all.
-                    stmt = stmt.where(
-                        SqlConversation.id.not_in(
-                            select(SqlConversationLabel.conversation_id).where(
-                                SqlConversationLabel.workspace_id == current_workspace_id(),
-                                SqlConversationLabel.key == PROJECT_LABEL_KEY,
-                            )
-                        )
-                    )
-                else:
-                    # Specific project: session must have this project label.
-                    stmt = stmt.where(
-                        SqlConversation.id.in_(
-                            select(SqlConversationLabel.conversation_id).where(
-                                SqlConversationLabel.workspace_id == current_workspace_id(),
-                                SqlConversationLabel.key == PROJECT_LABEL_KEY,
-                                SqlConversationLabel.value == project,
-                            )
-                        )
-                    )
             if after:
                 stmt = self._apply_cursor(
                     stmt,

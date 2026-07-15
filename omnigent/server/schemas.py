@@ -1860,6 +1860,9 @@ class UpdateSessionRequest(BaseModel):
         ``None`` leaves unchanged.
     :param labels: Guardrails labels to upsert. Merges with existing
         labels; keys not present are left untouched.
+    :param project_id: First-class project membership. A non-empty id
+        moves the session; an empty string or explicit null unfiles it.
+        Omission leaves membership unchanged.
     :param reasoning_effort: Per-session reasoning-effort hint.
         Accepted metadata values are ``"none"``, ``"minimal"``,
         ``"low"``, ``"medium"``, ``"high"``, ``"xhigh"``, and
@@ -1914,6 +1917,7 @@ class UpdateSessionRequest(BaseModel):
     runner_id: str | None = None
     title: str | None = None
     labels: dict[str, str] | None = None
+    project_id: str | None = None
     reasoning_effort: str | None = None
     model_override: str | None = None
     collaboration_mode: str | None = None

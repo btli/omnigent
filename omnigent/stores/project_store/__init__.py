@@ -59,6 +59,11 @@ class ProjectStore(ABC):
         ...
 
     @abstractmethod
+    def get_by_name(self, name: str, owner_principal_id: str) -> Project | None:
+        """Get an owned project by normalized name, including archived rows."""
+        ...
+
+    @abstractmethod
     def list(self, owner_principal_id: str, *, include_archived: bool = False) -> list[Project]:
         """List projects owned by one principal."""
         ...

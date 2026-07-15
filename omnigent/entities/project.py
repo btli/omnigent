@@ -26,6 +26,14 @@ class Project:
 
 
 @dataclass(frozen=True)
+class ProjectIdentity:
+    """Project identity returned by session membership surfaces."""
+
+    id: str
+    name: str
+
+
+@dataclass(frozen=True)
 class LiveProjectSnapshot:
     """Resolved project provenance written with session metadata."""
 

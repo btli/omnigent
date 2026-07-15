@@ -13,6 +13,7 @@ The orchestration here handles composition.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from typing import Any
 
@@ -27,7 +28,11 @@ from omnigent.spec.types import (
     StateUpdate,
     StateUpdateAction,
 )
-from omnigent.stores.conversation_store import ConversationStore
+from omnigent.stores.conversation_store import (
+    PROJECT_LABEL_DEPRECATION_WARNING,
+    PROJECT_LABEL_KEY,
+    ConversationStore,
+)
 
 # Number of recent conversation items the engine fetches from
 # the conversation store and threads onto :class:`EvaluationContext`
@@ -38,6 +43,7 @@ from omnigent.stores.conversation_store import ConversationStore
 # here so it surfaces in grep across the engine + prompt layers.
 # See designs/LIVE_POLICIES.md §4.1.
 _TRAJECTORY_WINDOW = 10
+_logger = logging.getLogger(__name__)
 
 
 class PolicyEngine:
@@ -508,11 +514,22 @@ class PolicyEngine:
         """
         if not set_labels:
             return
+        legacy_project_requested = PROJECT_LABEL_KEY in set_labels
+        legacy_project_name = set_labels.get(PROJECT_LABEL_KEY)
         filtered = self._filter_schema_valid(set_labels)
-        if not filtered:
-            return
-        self._store.set_labels(self._conversation_id, filtered)
-        self._labels.update(filtered)
+        filtered.pop(PROJECT_LABEL_KEY, None)
+        if legacy_project_requested and legacy_project_name is not None:
+            _logger.warning(
+                PROJECT_LABEL_DEPRECATION_WARNING,
+                extra={"event": "deprecated_project_label_write", "write_path": "policy"},
+            )
+            self._store.forward_legacy_project_label(
+                self._conversation_id,
+                legacy_project_name,
+            )
+        if filtered:
+            self._store.set_labels(self._conversation_id, filtered)
+            self._labels.update(filtered)
 
     def apply_state_updates(self, updates: list[StateUpdate]) -> None:
         """
