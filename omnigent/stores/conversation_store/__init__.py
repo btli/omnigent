@@ -9,6 +9,7 @@ from omnigent.entities import (
     Conversation,
     ConversationItem,
     LegacyProjectLabel,
+    LiveProjectSnapshot,
     NewConversationItem,
     PagedList,
 )
@@ -239,6 +240,7 @@ class ConversationStore(ABC):
         workspace: str | None = None,
         git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
+        project_snapshot: LiveProjectSnapshot | None = None,
     ) -> Conversation:
         """
         Create a new conversation. Generates a unique

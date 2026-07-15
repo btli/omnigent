@@ -69,6 +69,7 @@ from omnigent.entities import (
     Conversation,
     ConversationItem,
     LegacyProjectLabel,
+    LiveProjectSnapshot,
     NewConversationItem,
     PagedList,
     parse_item_data,
@@ -813,6 +814,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         workspace: str | None = None,
         git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
+        project_snapshot: LiveProjectSnapshot | None = None,
     ) -> Conversation:
         """
         Create a new conversation in the database.
@@ -875,6 +877,8 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         now = now_epoch()
         new_id = generate_conversation_id()
+        if parent_conversation_id is not None and project_snapshot is not None:
+            raise ValueError("project snapshots are top-level-only")
         try:
             # Get parent's root from AP, then write AP row and Omnigent meta separately.
             root_id = new_id
@@ -917,6 +921,23 @@ class SqlAlchemyConversationStore(ConversationStore):
                 archived=False,
             )
             with self._session() as meta_sess:
+                if project_snapshot is not None:
+                    meta.project_id = project_snapshot.project_id
+                    meta_sess.add(
+                        SqlSessionProjectSnapshot(
+                            session_id=new_id,
+                            project_id=project_snapshot.project_id,
+                            snapshot_origin="live",
+                            project_row_version=project_snapshot.project_row_version,
+                            defaults_schema_version=project_snapshot.defaults_schema_version,
+                            defaults_json=json.dumps(
+                                project_snapshot.defaults_json,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                            created_at=now,
+                        )
+                    )
                 meta_sess.add(meta)
             return _to_conversation(row, meta, agent_config=agent_config)
         except IntegrityError as exc:

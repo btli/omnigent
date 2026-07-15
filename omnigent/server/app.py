@@ -2076,6 +2076,7 @@ def create_app(
             # (host.runner_exited) as last_task_error so a reload still
             # renders the error banner after the live push is gone.
             runner_exit_reports=runner_exit_reports,
+            project_store=project_store,
         ),
         prefix="/v1",
         tags=["sessions"],
