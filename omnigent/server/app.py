@@ -91,8 +91,18 @@ _logger = logging.getLogger(__name__)
 
 
 def add_workspace_scope_middleware(app: FastAPI) -> None:
-    """Bind the trusted Databricks workspace identity for every HTTP request."""
+    """Bind the trusted Databricks workspace identity for every HTTP request.
+
+    ``X-Databricks-Org-Id`` is trusted infra metadata: the edge proxy MUST set/strip it;
+    owner scoping still gates every row.
+    """
     from omnigent.db.db_models import DEFAULT_WORKSPACE_ID, workspace_scope
+
+    def _invalid_workspace_id(message: str) -> JSONResponse:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"code": ErrorCode.INVALID_INPUT, "message": message}},
+        )
 
     @app.middleware("http")
     async def _scope_request_workspace(
@@ -105,16 +115,10 @@ def add_workspace_scope_middleware(app: FastAPI) -> None:
         else:
             try:
                 workspace_id = int(raw_workspace_id)
-            except ValueError as error:
-                raise OmnigentError(
-                    "X-Databricks-Org-Id must be an integer",
-                    code=ErrorCode.INVALID_INPUT,
-                ) from error
+            except ValueError:
+                return _invalid_workspace_id("X-Databricks-Org-Id must be an integer")
             if workspace_id < 0:
-                raise OmnigentError(
-                    "X-Databricks-Org-Id must be non-negative",
-                    code=ErrorCode.INVALID_INPUT,
-                )
+                return _invalid_workspace_id("X-Databricks-Org-Id must be non-negative")
         with workspace_scope(workspace_id):
             return await call_next(request)
 

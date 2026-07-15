@@ -67,8 +67,8 @@ def test_owner_and_workspace_scoping_hide_projects(
 
     with workspace_scope(11):
         assert store.get(project.id, "alice") is None
-        same_id = store.create("alice", "Private", project_id=project.id)
-        assert same_id.id == project.id
+        other_workspace_project = store.create("alice", "Private")
+        assert other_workspace_project.id != project.id
 
 
 def test_all_mutations_require_matching_version_and_increment_atomically(
@@ -103,6 +103,85 @@ def test_all_mutations_require_matching_version_and_increment_atomically(
         with pytest.raises(OmnigentError) as stale:
             operation(version - 1)
         assert stale.value.code == ErrorCode.PRECONDITION_FAILED
+
+
+def test_rename_to_existing_name_is_conflict_and_preserves_source(
+    store: SqlAlchemyProjectStore,
+) -> None:
+    source = store.create("alice", "Source")
+    store.create("alice", "Existing")
+
+    with pytest.raises(OmnigentError) as exc_info:
+        store.rename(
+            source.id,
+            "alice",
+            "Existing",
+            expected_row_version=source.row_version,
+        )
+
+    assert exc_info.value.code == ErrorCode.CONFLICT
+    unchanged = store.get(source.id, "alice")
+    assert unchanged is not None
+    assert unchanged.name == "Source"
+    assert unchanged.row_version == source.row_version
+
+
+def test_archive_and_restore_reject_already_satisfied_state(
+    store: SqlAlchemyProjectStore,
+) -> None:
+    live = store.create("alice", "Lifecycle")
+
+    with pytest.raises(OmnigentError) as restore_error:
+        store.restore(
+            live.id,
+            "alice",
+            expected_row_version=live.row_version,
+        )
+    assert restore_error.value.code == ErrorCode.CONFLICT
+
+    archived = store.archive(
+        live.id,
+        "alice",
+        expected_row_version=live.row_version,
+    )
+    assert archived is not None
+    with pytest.raises(OmnigentError) as archive_error:
+        store.archive(
+            live.id,
+            "alice",
+            expected_row_version=archived.row_version,
+        )
+    assert archive_error.value.code == ErrorCode.CONFLICT
+
+
+def test_stale_etag_write_is_not_applied_and_version_advances_once(
+    store: SqlAlchemyProjectStore,
+) -> None:
+    project = store.create("alice", "Concurrent")
+    first_etag = project.row_version
+
+    winner = store.update(
+        project.id,
+        "alice",
+        expected_row_version=first_etag,
+        description="winner",
+    )
+    assert winner is not None
+    assert winner.row_version == first_etag + 1
+
+    with pytest.raises(OmnigentError) as stale_error:
+        store.update(
+            project.id,
+            "alice",
+            expected_row_version=first_etag,
+            description="loser",
+        )
+    assert stale_error.value.code == ErrorCode.PRECONDITION_FAILED
+
+    persisted = store.get(project.id, "alice")
+    assert persisted is not None
+    assert persisted.description == "winner"
+    assert persisted.row_version == first_etag + 1
 
 
 def test_archive_hides_by_default_and_keeps_name_reserved(

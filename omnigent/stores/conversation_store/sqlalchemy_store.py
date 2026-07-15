@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Iterator
 from typing import Any
 
 from sqlalchemy import (
@@ -86,6 +87,14 @@ from omnigent.stores.conversation_store import (
 )
 
 _logger = logging.getLogger(__name__)
+
+_SQL_IN_CHUNK_SIZE = 900
+
+
+def _chunked_ids(ids: list[str]) -> Iterator[list[str]]:
+    """Yield ID batches that stay below common SQL bind-variable limits."""
+    for start in range(0, len(ids), _SQL_IN_CHUNK_SIZE):
+        yield ids[start : start + _SQL_IN_CHUNK_SIZE]
 
 
 def _to_conversation(
@@ -1898,17 +1907,19 @@ class SqlAlchemyConversationStore(ConversationStore):
                 non_archived_q = non_archived_q.where(SqlConversationMetadata.id.in_(owned_ids))
             non_archived_ids = list(meta_sess.execute(non_archived_q).scalars().all())
         with self._conv_session() as ap_sess:
-            stmt = (
-                select(SqlConversationLabel.value)
-                .where(
-                    SqlConversationLabel.workspace_id == current_workspace_id(),
-                    SqlConversationLabel.key == PROJECT_LABEL_KEY,
-                    SqlConversationLabel.conversation_id.in_(non_archived_ids),
+            project_names: set[str] = set()
+            for id_chunk in _chunked_ids(non_archived_ids):
+                stmt = (
+                    select(SqlConversationLabel.value)
+                    .where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.key == PROJECT_LABEL_KEY,
+                        SqlConversationLabel.conversation_id.in_(id_chunk),
+                    )
+                    .distinct()
                 )
-                .distinct()
-                .order_by(SqlConversationLabel.value)
-            )
-            return [row[0] for row in ap_sess.execute(stmt).all()]
+                project_names.update(ap_sess.execute(stmt).scalars().all())
+            return sorted(project_names)
 
     def list_project_label_assignments(self) -> list[LegacyProjectLabel]:
         """Return legacy project labels paired with owner-level grantees."""
@@ -1929,21 +1940,22 @@ class SqlAlchemyConversationStore(ConversationStore):
         session_ids = [row.conversation_id for row in labels]
         owners: dict[str, str] = {}
         if session_ids:
-            with self._session() as session:
-                owner_rows = session.execute(
-                    select(
-                        SqlSessionPermission.conversation_id,
-                        SqlSessionPermission.user_id,
-                    ).where(
-                        SqlSessionPermission.workspace_id == current_workspace_id(),
-                        SqlSessionPermission.conversation_id.in_(session_ids),
-                        SqlSessionPermission.level >= LEVEL_OWNER,
-                        SqlSessionPermission.user_id != RESERVED_USER_PUBLIC,
-                    )
-                ).all()
             owner_candidates: dict[str, set[str]] = {}
-            for conversation_id, user_id in owner_rows:
-                owner_candidates.setdefault(conversation_id, set()).add(user_id)
+            with self._session() as session:
+                for id_chunk in _chunked_ids(session_ids):
+                    owner_rows = session.execute(
+                        select(
+                            SqlSessionPermission.conversation_id,
+                            SqlSessionPermission.user_id,
+                        ).where(
+                            SqlSessionPermission.workspace_id == current_workspace_id(),
+                            SqlSessionPermission.conversation_id.in_(id_chunk),
+                            SqlSessionPermission.level >= LEVEL_OWNER,
+                            SqlSessionPermission.user_id != RESERVED_USER_PUBLIC,
+                        )
+                    ).all()
+                    for conversation_id, user_id in owner_rows:
+                        owner_candidates.setdefault(conversation_id, set()).add(user_id)
             owners = {
                 conversation_id: next(iter(candidates))
                 for conversation_id, candidates in owner_candidates.items()

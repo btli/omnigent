@@ -16,7 +16,6 @@ class _Unset(Enum):
 
 
 UNSET = _Unset.VALUE
-ProjectField = str | dict[str, Any] | None | _Unset
 
 
 class ProjectInputError(OmnigentError):
@@ -45,15 +44,12 @@ class ProjectStore(ABC):
         description: str | None = None,
         defaults_json: dict[str, Any] | None = None,
         defaults_schema_version: int = 1,
-        project_id: str | None = None,
     ) -> Project:
         """Create a project. Name collisions raise ``OmnigentError``."""
         ...
 
     @abstractmethod
-    def get(
-        self, project_id: str, owner_principal_id: str, *, include_archived: bool = True
-    ) -> Project | None:
+    def get(self, project_id: str, owner_principal_id: str) -> Project | None:
         """Get an owned project, hiding other owners and workspaces."""
         ...
 

@@ -134,11 +134,10 @@ class SqlAlchemyProjectStore(ProjectStore):
         description: str | None = None,
         defaults_json: dict[str, Any] | None = None,
         defaults_schema_version: int = DEFAULTS_SCHEMA_VERSION,
-        project_id: str | None = None,
     ) -> Project:
         display_name, normalized_name, checksum = normalize_project_name(name)
         bundle = validate_defaults_bundle(defaults_json, defaults_schema_version)
-        resolved_id = project_id or _project_id()
+        resolved_id = _project_id()
         now = now_epoch()
         row = SqlProject(
             id=resolved_id,
@@ -158,7 +157,12 @@ class SqlAlchemyProjectStore(ProjectStore):
         try:
             with self._session() as session:
                 if session.get(SqlUser, (current_workspace_id(), owner_principal_id)) is None:
-                    session.add(SqlUser(id=owner_principal_id, is_admin=False))
+                    try:
+                        with session.begin_nested():
+                            session.add(SqlUser(id=owner_principal_id, is_admin=False))
+                            session.flush()
+                    except IntegrityError:
+                        pass
                 session.add(row)
                 session.flush()
                 return _to_entity(row)
@@ -168,14 +172,10 @@ class SqlAlchemyProjectStore(ProjectStore):
                 code=ErrorCode.CONFLICT,
             ) from error
 
-    def get(
-        self, project_id: str, owner_principal_id: str, *, include_archived: bool = True
-    ) -> Project | None:
+    def get(self, project_id: str, owner_principal_id: str) -> Project | None:
         with self._session() as session:
             row = session.get(SqlProject, (current_workspace_id(), project_id))
             if row is None or row.owner_principal_id != owner_principal_id:
-                return None
-            if not include_archived and row.archived_at is not None:
                 return None
             return _to_entity(row)
 
