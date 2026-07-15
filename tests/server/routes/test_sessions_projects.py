@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI, Request
@@ -21,11 +23,12 @@ from omnigent.db.utils import get_or_create_conversation_engine, get_or_create_e
 from omnigent.errors import OmnigentError
 from omnigent.server import managed_hosts
 from omnigent.server.app import add_workspace_scope_middleware
-from omnigent.server.auth import UnifiedAuthProvider
+from omnigent.server.auth import LEVEL_EDIT, UnifiedAuthProvider
 from omnigent.server.routes import sessions
 from omnigent.server.routes.sessions import create_sessions_router
 from omnigent.server.schemas import SessionCreateMetadata
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -51,6 +54,7 @@ def _app(
     *,
     conversation_store: SqlAlchemyConversationStore | None = None,
     managed: bool = False,
+    artifact_store: LocalArtifactStore | None = None,
 ) -> FastAPI:
     app = FastAPI()
 
@@ -70,6 +74,7 @@ def _app(
             auth_provider=UnifiedAuthProvider(source="header"),
             permission_store=SqlAlchemyPermissionStore(db_uri),
             project_store=SqlAlchemyProjectStore(db_uri),
+            artifact_store=artifact_store,
         ),
         prefix="/v1",
     )
@@ -394,3 +399,386 @@ def test_projectless_create_and_multipart_schema_remain_unscoped(
     assert isinstance(config, SqlAgentConfiguration)
     assert config.model_override == "gpt-5"
     assert "project_id" not in SessionCreateMetadata.model_fields
+
+
+def test_session_projects_list_uses_membership_and_archived_variant(
+    project_setup: tuple[SqlAlchemyProjectStore, TestClient],
+) -> None:
+    projects, client = project_setup
+    live_only = projects.create(ALICE, "Live only")
+    archived_only = projects.create(ALICE, "Archived only")
+    mixed = projects.create(ALICE, "Mixed")
+    empty = projects.create(ALICE, "Empty")
+    bob = projects.create(BOB, "Bob")
+
+    def create(project_id: str, *, archived: bool = False, user: str = ALICE) -> str:
+        response = client.post(
+            "/v1/sessions",
+            headers=_headers(user),
+            json={"agent_id": "ag_test", "project_id": project_id},
+        )
+        assert response.status_code == 201, response.text
+        session_id = response.json()["id"]
+        if archived:
+            archived_response = client.patch(
+                f"/v1/sessions/{session_id}",
+                headers=_headers(user),
+                json={"archived": True},
+            )
+            assert archived_response.status_code == 200, archived_response.text
+        return session_id
+
+    create(live_only.id)
+    create(archived_only.id, archived=True)
+    create(mixed.id)
+    create(mixed.id, archived=True)
+    create(bob.id, user=BOB)
+
+    live_response = client.get("/v1/sessions/projects", headers=_headers(ALICE))
+    archived_response = client.get("/v1/sessions/projects?archived=true", headers=_headers(ALICE))
+
+    assert live_response.status_code == 200
+    assert live_response.json() == [
+        {"id": live_only.id, "name": "Live only"},
+        {"id": mixed.id, "name": "Mixed"},
+    ]
+    assert archived_response.status_code == 200
+    assert archived_response.json() == [
+        {"id": archived_only.id, "name": "Archived only"},
+        {"id": mixed.id, "name": "Mixed"},
+    ]
+    assert empty.id not in {item["id"] for item in live_response.json()}
+
+
+def test_session_list_filters_by_project_id_and_legacy_name_alias(
+    project_setup: tuple[SqlAlchemyProjectStore, TestClient],
+) -> None:
+    projects, client = project_setup
+    project = projects.create(ALICE, "Widgets")
+    filed = client.post(
+        "/v1/sessions",
+        headers=_headers(ALICE),
+        json={"agent_id": "ag_test", "project_id": project.id},
+    )
+    unfiled = client.post(
+        "/v1/sessions",
+        headers=_headers(ALICE),
+        json={"agent_id": "ag_test"},
+    )
+    assert filed.status_code == unfiled.status_code == 201
+
+    by_id = client.get(f"/v1/sessions?project_id={project.id}", headers=_headers(ALICE))
+    by_name = client.get("/v1/sessions?project=Widgets", headers=_headers(ALICE))
+    without_project = client.get("/v1/sessions?project_id=", headers=_headers(ALICE))
+
+    assert [item["id"] for item in by_id.json()["data"]] == [filed.json()["id"]]
+    assert [item["id"] for item in by_name.json()["data"]] == [filed.json()["id"]]
+    assert unfiled.json()["id"] in {item["id"] for item in without_project.json()["data"]}
+    assert filed.json()["id"] not in {item["id"] for item in without_project.json()["data"]}
+
+
+def test_patch_project_id_moves_and_unfiles_with_snapshot(
+    db_uri: str,
+    project_setup: tuple[SqlAlchemyProjectStore, TestClient],
+) -> None:
+    projects, client = project_setup
+    project = projects.create(ALICE, "Moved")
+    created = client.post(
+        "/v1/sessions",
+        headers=_headers(ALICE),
+        json={"agent_id": "ag_test"},
+    )
+    session_id = created.json()["id"]
+
+    moved = client.patch(
+        f"/v1/sessions/{session_id}",
+        headers=_headers(ALICE),
+        json={"project_id": project.id},
+    )
+
+    assert moved.status_code == 200, moved.text
+    metadata, snapshot, _ = _rows(db_uri, session_id)
+    assert isinstance(metadata, SqlConversationMetadata)
+    assert metadata.project_id == project.id
+    assert isinstance(snapshot, SqlSessionProjectSnapshot)
+    assert snapshot.project_id == project.id
+    assert snapshot.snapshot_origin == "moved"
+    assert snapshot.project_row_version is None
+    assert snapshot.defaults_schema_version == 1
+    assert json.loads(snapshot.defaults_json) == {}
+
+    unfiled = client.patch(
+        f"/v1/sessions/{session_id}",
+        headers=_headers(ALICE),
+        json={"project_id": None},
+    )
+    assert unfiled.status_code == 200, unfiled.text
+    metadata, snapshot, _ = _rows(db_uri, session_id)
+    assert isinstance(metadata, SqlConversationMetadata)
+    assert metadata.project_id is None
+    assert snapshot is None
+
+
+def test_patch_project_id_hides_wrong_owner_and_rejects_archived(
+    project_setup: tuple[SqlAlchemyProjectStore, TestClient],
+) -> None:
+    projects, client = project_setup
+    mine = projects.create(ALICE, "Mine")
+    archived = projects.create(ALICE, "Archived")
+    projects.archive(archived.id, ALICE, expected_row_version=1)
+    created = client.post(
+        "/v1/sessions",
+        headers=_headers(BOB),
+        json={"agent_id": "ag_test"},
+    )
+    session_id = created.json()["id"]
+
+    wrong_owner = client.patch(
+        f"/v1/sessions/{session_id}",
+        headers=_headers(BOB),
+        json={"project_id": mine.id},
+    )
+    assert wrong_owner.status_code == 404
+
+    alice_session = client.post(
+        "/v1/sessions",
+        headers=_headers(ALICE),
+        json={"agent_id": "ag_test"},
+    ).json()["id"]
+    archived_response = client.patch(
+        f"/v1/sessions/{alice_session}",
+        headers=_headers(ALICE),
+        json={"project_id": archived.id},
+    )
+    assert archived_response.status_code == 409
+
+
+def test_patch_project_membership_is_session_owner_only(
+    db_uri: str,
+    project_setup: tuple[SqlAlchemyProjectStore, TestClient],
+) -> None:
+    projects, client = project_setup
+    bob_project = projects.create(BOB, "Bob project")
+    created = client.post(
+        "/v1/sessions",
+        headers=_headers(ALICE),
+        json={"agent_id": "ag_test"},
+    )
+    session_id = created.json()["id"]
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user(BOB)
+    permissions.grant(BOB, session_id, LEVEL_EDIT)
+
+    response = client.patch(
+        f"/v1/sessions/{session_id}",
+        headers=_headers(BOB),
+        json={"project_id": bob_project.id},
+    )
+
+    assert response.status_code == 403
+
+
+def test_legacy_project_label_write_forwards_membership_without_persisting_label(
+    db_uri: str,
+    project_setup: tuple[SqlAlchemyProjectStore, TestClient],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    projects, client = project_setup
+    created = client.post(
+        "/v1/sessions",
+        headers=_headers(ALICE),
+        json={"agent_id": "ag_test"},
+    )
+    session_id = created.json()["id"]
+
+    with caplog.at_level(logging.WARNING):
+        response = client.patch(
+            f"/v1/sessions/{session_id}",
+            headers=_headers(ALICE),
+            json={"labels": {"omni_project": "Legacy bridge"}},
+        )
+
+    assert response.status_code == 200, response.text
+    project = next(item for item in projects.list(ALICE) if item.name == "Legacy bridge")
+    metadata, snapshot, _ = _rows(db_uri, session_id)
+    assert isinstance(metadata, SqlConversationMetadata)
+    assert metadata.project_id == project.id
+    assert isinstance(snapshot, SqlSessionProjectSnapshot)
+    assert snapshot.project_id == project.id
+    assert snapshot.snapshot_origin == "moved"
+    persisted = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert persisted is not None and "omni_project" not in persisted.labels
+    assert (
+        caplog.messages.count(
+            "omni_project label is deprecated; forwarded to project_id — "
+            "migrate to the project_id API."
+        )
+        == 1
+    )
+
+    cleared = client.patch(
+        f"/v1/sessions/{session_id}",
+        headers=_headers(ALICE),
+        json={"labels": {"omni_project": ""}},
+    )
+    assert cleared.status_code == 200, cleared.text
+    metadata, snapshot, _ = _rows(db_uri, session_id)
+    assert isinstance(metadata, SqlConversationMetadata)
+    assert metadata.project_id is None
+    assert snapshot is None
+
+
+def test_json_create_forwards_legacy_project_label_and_validates_explicit_id(
+    db_uri: str,
+    project_setup: tuple[SqlAlchemyProjectStore, TestClient],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    projects, client = project_setup
+    with caplog.at_level(logging.WARNING):
+        forwarded = client.post(
+            "/v1/sessions",
+            headers=_headers(ALICE),
+            json={"agent_id": "ag_test", "labels": {"omni_project": "Forwarded"}},
+        )
+
+    assert forwarded.status_code == 201, forwarded.text
+    project = next(item for item in projects.list(ALICE) if item.name == "Forwarded")
+    metadata, snapshot, _ = _rows(db_uri, forwarded.json()["id"])
+    assert isinstance(metadata, SqlConversationMetadata) and metadata.project_id == project.id
+    assert isinstance(snapshot, SqlSessionProjectSnapshot)
+    assert snapshot.project_id == project.id and snapshot.snapshot_origin == "moved"
+    persisted = SqlAlchemyConversationStore(db_uri).get_conversation(forwarded.json()["id"])
+    assert persisted is not None and "omni_project" not in persisted.labels
+    assert (
+        caplog.messages.count(
+            "omni_project label is deprecated; forwarded to project_id — "
+            "migrate to the project_id API."
+        )
+        == 1
+    )
+
+    agreed = client.post(
+        "/v1/sessions",
+        headers=_headers(ALICE),
+        json={
+            "agent_id": "ag_test",
+            "project_id": project.id,
+            "labels": {"omni_project": "Forwarded"},
+        },
+    )
+    assert agreed.status_code == 201, agreed.text
+    _, agreed_snapshot, _ = _rows(db_uri, agreed.json()["id"])
+    assert isinstance(agreed_snapshot, SqlSessionProjectSnapshot)
+    assert agreed_snapshot.snapshot_origin == "live"
+
+    other = projects.create(ALICE, "Other")
+    disagreed = client.post(
+        "/v1/sessions",
+        headers=_headers(ALICE),
+        json={
+            "agent_id": "ag_test",
+            "project_id": other.id,
+            "labels": {"omni_project": "Forwarded"},
+        },
+    )
+    assert disagreed.status_code == 400
+
+
+def test_multipart_create_forwards_legacy_project_label(
+    db_uri: str,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from tests.server.helpers import build_agent_bundle
+
+    projects = SqlAlchemyProjectStore(db_uri)
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    bundle = build_agent_bundle(name="multipart-project-agent")
+    with TestClient(_app(db_uri, artifact_store=artifact_store)) as client:
+        with caplog.at_level(logging.WARNING):
+            response = client.post(
+                "/v1/sessions",
+                headers=_headers(ALICE),
+                data={"metadata": json.dumps({"labels": {"omni_project": "Multipart forwarded"}})},
+                files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+            )
+
+    assert response.status_code == 201, response.text
+    project = next(item for item in projects.list(ALICE) if item.name == "Multipart forwarded")
+    session_id = response.json()["session_id"]
+    metadata, snapshot, _ = _rows(db_uri, session_id)
+    assert isinstance(metadata, SqlConversationMetadata) and metadata.project_id == project.id
+    assert isinstance(snapshot, SqlSessionProjectSnapshot)
+    assert snapshot.project_id == project.id and snapshot.snapshot_origin == "moved"
+    persisted = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert persisted is not None and "omni_project" not in persisted.labels
+    assert (
+        caplog.messages.count(
+            "omni_project label is deprecated; forwarded to project_id — "
+            "migrate to the project_id API."
+        )
+        == 1
+    )
+
+
+def test_patch_project_label_agreement_and_disagreement(
+    project_setup: tuple[SqlAlchemyProjectStore, TestClient],
+) -> None:
+    projects, client = project_setup
+    project = projects.create(ALICE, "Same")
+    other = projects.create(ALICE, "Different")
+    session_id = client.post(
+        "/v1/sessions",
+        headers=_headers(ALICE),
+        json={"agent_id": "ag_test"},
+    ).json()["id"]
+
+    agreed = client.patch(
+        f"/v1/sessions/{session_id}",
+        headers=_headers(ALICE),
+        json={"project_id": project.id, "labels": {"omni_project": "Same"}},
+    )
+    assert agreed.status_code == 200, agreed.text
+
+    disagreed = client.patch(
+        f"/v1/sessions/{session_id}",
+        headers=_headers(ALICE),
+        json={"project_id": other.id, "labels": {"omni_project": "Same"}},
+    )
+    assert disagreed.status_code == 400
+
+
+class ArchiveBeforeMembershipStore(SqlAlchemyConversationStore):
+    def __init__(self, db_uri: str, projects: SqlAlchemyProjectStore, project_id: str) -> None:
+        super().__init__(db_uri)
+        self._projects = projects
+        self._project_id = project_id
+
+    def set_project_membership(self, conversation_id: str, project_id: str | None) -> bool:
+        if project_id == self._project_id:
+            self._projects.archive(project_id, ALICE, expected_row_version=1)
+        return super().set_project_membership(conversation_id, project_id)
+
+
+def test_patch_rechecks_archived_project_at_membership_write(db_uri: str) -> None:
+    agents = SqlAlchemyAgentStore(db_uri)
+    agents.create(agent_id="ag_test", name="test-agent", bundle_location="ag_test/bundle")
+    projects = SqlAlchemyProjectStore(db_uri)
+    project = projects.create(ALICE, "Race")
+    store = ArchiveBeforeMembershipStore(db_uri, projects, project.id)
+    with TestClient(_app(db_uri, conversation_store=store)) as client:
+        session_id = client.post(
+            "/v1/sessions",
+            headers=_headers(ALICE),
+            json={"agent_id": "ag_test"},
+        ).json()["id"]
+        response = client.patch(
+            f"/v1/sessions/{session_id}",
+            headers=_headers(ALICE),
+            json={"project_id": project.id},
+        )
+
+    assert response.status_code == 409
+    metadata, snapshot, _ = _rows(db_uri, session_id)
+    assert isinstance(metadata, SqlConversationMetadata) and metadata.project_id is None
+    assert snapshot is None

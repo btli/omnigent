@@ -88,6 +88,67 @@ from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 
 _logger = logging.getLogger(__name__)
+_STARTUP_BACKFILL_EXCEPTIONS = (Exception,)
+
+
+def _backfill_legacy_project_labels_on_startup(
+    conversation_store: ConversationStore | None,
+    project_store: ProjectStore | None,
+) -> tuple[int, int]:
+    """Best-effort migration of deprecated project labels in every workspace."""
+    if conversation_store is None or project_store is None:
+        _logger.info("project label startup backfill skipped: stores not configured")
+        return (0, 0)
+
+    try:
+        workspace_ids = conversation_store.list_project_label_workspace_ids()
+    except _STARTUP_BACKFILL_EXCEPTIONS:
+        _logger.warning(
+            "project label startup backfill workspace scan failed",
+            exc_info=True,
+        )
+        return (0, 0)
+
+    from omnigent.db.db_models import workspace_scope
+
+    migrated = 0
+    requires_mapping = 0
+    for workspace_id in workspace_ids:
+        try:
+            with workspace_scope(workspace_id):
+                result = project_store.backfill_legacy_labels(conversation_store)
+            migrated += len(result.mappings)
+            if result.requires_mapping:
+                requires_mapping += len(result.issues)
+                mapping_plan = [
+                    {
+                        "owner": list(issue.candidate_owners),
+                        "normalized_name": issue.normalized_name,
+                        "reason": issue.reason,
+                        "session_ids": list(issue.session_ids),
+                    }
+                    for issue in result.issues
+                ]
+                _logger.warning(
+                    "project label mapping required",
+                    extra={
+                        "event": "deprecated_project_label_mapping_required",
+                        "workspace_id": workspace_id,
+                        "mapping_plan": mapping_plan,
+                    },
+                )
+        except _STARTUP_BACKFILL_EXCEPTIONS:
+            _logger.warning(
+                "project label startup backfill failed",
+                extra={"workspace_id": workspace_id},
+                exc_info=True,
+            )
+
+    _logger.info(
+        "project label startup backfill complete",
+        extra={"migrated": migrated, "requires_mapping": requires_mapping},
+    )
+    return (migrated, requires_mapping)
 
 
 def add_workspace_scope_middleware(app: FastAPI) -> None:
@@ -1308,6 +1369,12 @@ def create_app(
 
         _log_level_name = _os.environ.get("OMNIGENT_LOG_LEVEL", "INFO").upper()
         logging.getLogger("omnigent").setLevel(getattr(logging, _log_level_name, logging.INFO))
+
+        await asyncio.to_thread(
+            _backfill_legacy_project_labels_on_startup,
+            conversation_store,
+            project_store,
+        )
 
         harness_pm = HarnessProcessManager()
         await harness_pm.start()

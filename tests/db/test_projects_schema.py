@@ -61,6 +61,8 @@ def test_projects_schema_has_portable_keys_constraints_and_indexes(db_uri: str) 
             inspector.get_foreign_keys("project_migration_ledger"),
         )
     )
+    snapshot_checks = inspector.get_check_constraints("session_project_snapshots")
+    assert any("moved" in str(check["sqltext"]) for check in snapshot_checks)
 
 
 def test_project_id_index_includes_workspace_project_and_session_id(db_uri: str) -> None:

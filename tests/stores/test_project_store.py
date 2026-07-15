@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 
 import pytest
 from sqlalchemy import select
@@ -16,6 +17,7 @@ from omnigent.db.db_models import (
 )
 from omnigent.db.utils import get_or_create_engine
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.server.app import _backfill_legacy_project_labels_on_startup
 from omnigent.server.auth import LEVEL_OWNER
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -260,7 +262,8 @@ def test_label_backfill_is_idempotent_and_writes_atomic_backfill_snapshot(
 
     assert first.requires_mapping is False
     assert len(first.mappings) == 1
-    assert second == first
+    assert second.mappings == ()
+    assert second.issues == ()
     project_id = first.mappings[0].project_id
     engine = get_or_create_engine(db_uri)
     with Session(engine) as session:
@@ -279,7 +282,11 @@ def test_label_backfill_is_idempotent_and_writes_atomic_backfill_snapshot(
     assert snapshot.project_row_version is None
     assert snapshot.defaults_json == "{}"
     assert len(ledgers) == 1
-    assert conversations.list_projects() == ["Omnigent"]
+    assert [project.name for project in conversations.list_projects("alice")] == ["Omnigent"]
+    assert {
+        conversation.id
+        for conversation in conversations.list_conversations(project_id=project_id).data
+    } == {session_id}
 
 
 def test_backfill_keeps_same_name_distinct_per_workspace(
@@ -299,6 +306,63 @@ def test_backfill_keeps_same_name_distinct_per_workspace(
             assert [project.name for project in store.list("alice")] == ["omnigent"]
 
     assert project_ids[0] != project_ids[1]
+
+
+def test_startup_backfill_runs_all_labeled_workspaces_and_is_non_blocking(
+    db_uri: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    conversations = SqlAlchemyConversationStore(db_uri)
+    projects = SqlAlchemyProjectStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    migrated_sessions: dict[int, str] = {}
+    for workspace_id in (100, 200):
+        with workspace_scope(workspace_id):
+            migrated_sessions[workspace_id] = _legacy_session(
+                db_uri,
+                conversations,
+                permissions,
+                owner="alice",
+                label=f"Project {workspace_id}",
+            )
+    with workspace_scope(300):
+        _legacy_session(
+            db_uri,
+            conversations,
+            permissions,
+            owner=None,
+            label="Needs mapping",
+        )
+
+    with caplog.at_level(logging.INFO):
+        first = _backfill_legacy_project_labels_on_startup(conversations, projects)
+        second = _backfill_legacy_project_labels_on_startup(conversations, projects)
+
+    assert first == (2, 1)
+    assert second == (0, 1)
+    for workspace_id, session_id in migrated_sessions.items():
+        with workspace_scope(workspace_id):
+            with Session(get_or_create_engine(db_uri)) as session:
+                metadata = session.get(SqlConversationMetadata, (workspace_id, session_id))
+                snapshot = session.get(SqlSessionProjectSnapshot, (workspace_id, session_id))
+            assert metadata is not None and metadata.project_id is not None
+            assert snapshot is not None and snapshot.project_id == metadata.project_id
+    mapping_logs = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "project label mapping required"
+    ]
+    assert len(mapping_logs) == 2
+    assert all(record.workspace_id == 300 for record in mapping_logs)
+    assert all(
+        record.mapping_plan[0]["normalized_name"] == "needs mapping" for record in mapping_logs
+    )
+    assert any(
+        record.getMessage() == "project label startup backfill complete"
+        and record.migrated == 2
+        and record.requires_mapping == 1
+        for record in caplog.records
+    )
 
 
 @pytest.mark.parametrize("owners", [(), ("alice", "bob")])

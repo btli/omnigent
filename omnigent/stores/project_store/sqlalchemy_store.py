@@ -150,6 +150,17 @@ class SqlAlchemyProjectStore(ProjectStore):
             raise OmnigentError("Project is archived", code=ErrorCode.CONFLICT)
         return project
 
+    def get_by_name(self, name: str, owner_principal_id: str) -> Project | None:
+        _, _, checksum = normalize_project_name(name)
+        statement = select(SqlProject).where(
+            SqlProject.workspace_id == current_workspace_id(),
+            SqlProject.owner_principal_id == owner_principal_id,
+            SqlProject.normalized_name_checksum == checksum,
+        )
+        with self._session() as session:
+            row = session.execute(statement).scalar_one_or_none()
+            return _to_entity(row) if row is not None else None
+
     def list(self, owner_principal_id: str, *, include_archived: bool = False) -> list[Project]:
         statement = select(SqlProject).where(
             SqlProject.workspace_id == current_workspace_id(),
@@ -336,7 +347,7 @@ class SqlAlchemyProjectStore(ProjectStore):
 
         issues: list[ProjectMigrationIssue] = []
         proposed: list[
-            tuple[str, str, bytes, list[LegacyProjectLabel], str, SqlProject | None]
+            tuple[str, str, bytes, list[LegacyProjectLabel], str, SqlProject | None, bool]
         ] = []
         with self._session() as session:
             for normalized_name in sorted(grouped):
@@ -394,9 +405,32 @@ class SqlAlchemyProjectStore(ProjectStore):
                     resolved_id = _project_id()
                 if ledger is not None and (mine is None or mine.id != ledger.project_id):
                     issues.append(self._issue(normalized_name, group, "ledger_project_mismatch"))
-                proposed.append((owner, normalized_name, checksum, group, resolved_id, mine))
+                proposed.append(
+                    (
+                        owner,
+                        normalized_name,
+                        checksum,
+                        group,
+                        resolved_id,
+                        mine,
+                        ledger is not None,
+                    )
+                )
 
-            for _owner, normalized_name, _checksum, group, resolved_id, _mine in proposed:
+            pending: list[
+                tuple[str, str, bytes, list[LegacyProjectLabel], str, SqlProject | None, bool]
+            ] = []
+            for proposal in proposed:
+                (
+                    _owner,
+                    normalized_name,
+                    _checksum,
+                    group,
+                    resolved_id,
+                    _mine,
+                    has_ledger,
+                ) = proposal
+                already_migrated = has_ledger
                 for assignment in group:
                     metadata = session.get(
                         SqlConversationMetadata,
@@ -407,20 +441,27 @@ class SqlAlchemyProjectStore(ProjectStore):
                         (current_workspace_id(), assignment.session_id),
                     )
                     if metadata is None:
+                        already_migrated = False
                         issues.append(
                             self._issue(normalized_name, group, "missing_session_metadata")
                         )
                         break
                     if metadata.project_id not in (None, resolved_id):
+                        already_migrated = False
                         issues.append(
                             self._issue(normalized_name, group, "existing_project_binding")
                         )
                         break
                     if snapshot is not None and snapshot.project_id != resolved_id:
+                        already_migrated = False
                         issues.append(
                             self._issue(normalized_name, group, "existing_snapshot_binding")
                         )
                         break
+                    if metadata.project_id != resolved_id or snapshot is None:
+                        already_migrated = False
+                if not already_migrated:
+                    pending.append(proposal)
             if issues:
                 return ProjectBackfillResult(
                     issues=tuple(
@@ -430,10 +471,19 @@ class SqlAlchemyProjectStore(ProjectStore):
                         )
                     )
                 )
+            proposed = pending
 
             now = now_epoch()
             mappings: list[ProjectMigrationMapping] = []
-            for owner, normalized_name, checksum, group, resolved_id, mine in proposed:
+            for (
+                owner,
+                normalized_name,
+                checksum,
+                group,
+                resolved_id,
+                mine,
+                _has_ledger,
+            ) in proposed:
                 display_name = unicodedata.normalize("NFKC", group[0].label).strip()
                 if mine is None:
                     session.add(

@@ -12,6 +12,7 @@ from omnigent.entities import (
     LiveProjectSnapshot,
     NewConversationItem,
     PagedList,
+    ProjectIdentity,
 )
 
 # Label set on a fork of a session that had a working directory. Its
@@ -83,6 +84,9 @@ CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 # is the store layer; the SQLAlchemy store and the server route both import it,
 # and the web client mirrors the literal as ``PROJECT_LABEL_KEY``.
 PROJECT_LABEL_KEY = "omni_project"
+PROJECT_LABEL_DEPRECATION_WARNING = (
+    "omni_project label is deprecated; forwarded to project_id — migrate to the project_id API."
+)
 
 # Labels that must NOT cross into a new session context — deliberately
 # dropped both when forking (not copied to the clone) and on an in-place
@@ -492,7 +496,9 @@ class ConversationStore(ABC):
         accessible_by: str | None = None,
         owned_by: str | None = None,
         include_archived: bool = False,
+        project_id: str | None = None,
         project: str | None = None,
+        project_owner: str | None = None,
         title: str | None = None,
     ) -> PagedList[Conversation]:
         """
@@ -583,12 +589,14 @@ class ConversationStore(ABC):
             conversations are excluded. When ``True``, archived and
             non-archived conversations are both returned (the caller
             groups them). Powers the sidebar's "Show archived" toggle.
-        :param project: When set to a non-empty string, only return
-            sessions that have a ``conversation_labels`` row with
-            ``key="omni_project"`` and ``value=project`` (the sidebar's
-            per-project folder fetch). When set to an empty string
-            ``""``, only return sessions with NO project label (unfiled
-            sessions). ``None`` disables the filter.
+        :param project_id: Authoritative project membership filter. A
+            non-empty id matches ``metadata.project_id``; an empty string
+            matches unfiled sessions. ``None`` disables this filter.
+        :param project: Legacy project-name alias. Resolves through the
+            caller's owner-scoped project row, then applies the same
+            ``metadata.project_id`` filter as ``project_id``.
+        :param project_owner: Owner principal used only to resolve the
+            legacy project-name alias.
         :param title: When set, only return conversations whose
             ``title`` matches exactly. ``None`` disables the filter.
             Powers the ``(agent, title)`` child-session lookup in
@@ -752,31 +760,40 @@ class ConversationStore(ABC):
     @abstractmethod
     def list_projects(
         self,
-        accessible_by: str | None = None,
-        owned_by: str | None = None,
-    ) -> list[str]:
+        owner_principal_id: str,
+        *,
+        archived: bool = False,
+    ) -> list[ProjectIdentity]:
         """
-        Return all distinct sidebar "project" names, ordered ascending.
+        Return owned project identities having a member in the requested state.
 
-        Projects are implicit: a project exists while at least one
-        *non-archived* conversation carries a
-        ``conversation_labels`` row with ``key="omni_project"``
-        naming it. Archived sessions keep their project label, but a
-        project whose every member is archived drops out of this list
-        (so "Delete project" — which archives all members — removes the
-        folder, while unarchiving a member restores it).
-
-        :param accessible_by: When set, restrict to projects on
-            sessions the user has a permission row for (mirrors the
-            ``list_conversations`` ACL filter). ``None`` returns
-            projects across all sessions.
-        :param owned_by: When set, restrict to projects that contain at
-            least one session the user owns (an ``owner``-level grant).
-            Projects are a "My sessions"-only surface, so this keeps a
-            project owned by someone else — but with a session shared to
-            the user — from appearing as one of the user's own folders.
-        :returns: List of project names ordered alphabetically.
+        :param owner_principal_id: Project owner whose rows may be returned.
+        :param archived: Match archived members instead of live members.
+        :returns: Project identities ordered by normalized name.
         """
+        ...
+
+    @abstractmethod
+    def set_project_membership(
+        self,
+        conversation_id: str,
+        project_id: str | None,
+    ) -> bool:
+        """Atomically move/unfile metadata and its membership snapshot."""
+        ...
+
+    @abstractmethod
+    def forward_legacy_project_label(
+        self,
+        conversation_id: str,
+        project_name: str,
+    ) -> bool:
+        """Resolve a deprecated project label and write authoritative membership."""
+        ...
+
+    @abstractmethod
+    def list_project_label_workspace_ids(self) -> list[int]:
+        """Return workspace ids that still contain deprecated project labels."""
         ...
 
     def list_project_label_assignments(self) -> list[LegacyProjectLabel]:

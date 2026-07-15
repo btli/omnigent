@@ -7,7 +7,7 @@ of their own project folders under "My sessions".
 
 The sidebar builds project folders from two owner-scoped server surfaces:
 
-- ``GET /v1/sessions/projects`` — the folder *names*, and
+- ``GET /v1/sessions/projects`` — folder identities, and
 - ``GET /v1/sessions?project=<name>`` — the sessions *inside* a folder.
 
 Both must filter by ownership (an ``owner``-level grant), not mere access, or
@@ -31,6 +31,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 from omnigent.stores.permission_store.sqlalchemy_store import (
     SqlAlchemyPermissionStore,
 )
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 
 ALICE = "alice@example.com"
 BOB = "bob@example.com"
@@ -55,39 +56,42 @@ def _multi_user_app(db_uri: str) -> FastAPI:
             agent_store=SqlAlchemyAgentStore(db_uri),
             auth_provider=UnifiedAuthProvider(source="header"),
             permission_store=SqlAlchemyPermissionStore(db_uri),
+            project_store=SqlAlchemyProjectStore(db_uri),
         ),
         prefix="/v1",
     )
     return app
 
 
-def _seed_shared_project_session(db_uri: str) -> str:
+def _seed_shared_project_session(db_uri: str) -> tuple[str, str]:
     """Seed a session owned by Bob, filed under a project, and read-shared to
     Alice. Returns the session id."""
     agent_store = SqlAlchemyAgentStore(db_uri)
     conv_store = SqlAlchemyConversationStore(db_uri)
     perms = SqlAlchemyPermissionStore(db_uri)
+    project = SqlAlchemyProjectStore(db_uri).create(BOB, "Bob Project")
     if agent_store.get("ag_test") is None:
         agent_store.create(agent_id="ag_test", name="test-agent", bundle_location="ag_test/bundle")
     conv = conv_store.create_conversation(title="Bob's session", agent_id="ag_test")
+    conv_store.set_project_membership(conv.id, project.id)
     conv_store.set_labels(conv.id, {PROJECT_LABEL_KEY: "Bob Project"})
     for user in (ALICE, BOB):
         perms.ensure_user(user)
     perms.grant(BOB, conv.id, LEVEL_OWNER)
     perms.grant(ALICE, conv.id, LEVEL_READ)
-    return conv.id
+    return conv.id, project.id
 
 
 def test_shared_project_not_listed_as_recipients_own_project(db_uri: str) -> None:
     """A project whose only member is a session shared TO Alice (owned by Bob)
     must not appear in Alice's project list — folders are her own sessions."""
-    _seed_shared_project_session(db_uri)
+    _, project_id = _seed_shared_project_session(db_uri)
     app = _multi_user_app(db_uri)
 
     # Bob owns it, so it's his project.
     bob = TestClient(app).get("/v1/sessions/projects", headers={"X-Forwarded-Email": BOB})
     assert bob.status_code == 200
-    assert bob.json() == ["Bob Project"]
+    assert bob.json() == [{"id": project_id, "name": "Bob Project"}]
 
     # Alice can access the session, but doesn't own it — no folder for her.
     alice = TestClient(app).get("/v1/sessions/projects", headers={"X-Forwarded-Email": ALICE})
@@ -98,7 +102,7 @@ def test_shared_project_not_listed_as_recipients_own_project(db_uri: str) -> Non
 def test_shared_session_excluded_from_recipients_project_folder(db_uri: str) -> None:
     """Fetching a project folder's sessions (``?project=``) as Alice excludes a
     session merely shared with her — it belongs on "Shared with me"."""
-    conv_id = _seed_shared_project_session(db_uri)
+    conv_id, _ = _seed_shared_project_session(db_uri)
     app = _multi_user_app(db_uri)
 
     # Bob's folder holds the session.
@@ -120,7 +124,7 @@ def test_shared_session_still_visible_in_flat_list(db_uri: str) -> None:
     """The fix is scoped to project surfaces: the shared session still shows up
     in Alice's unfiltered session list, where the "Shared with me" tab reads it
     (the frontend splits owned vs. shared by permission_level there)."""
-    conv_id = _seed_shared_project_session(db_uri)
+    conv_id, _ = _seed_shared_project_session(db_uri)
     app = _multi_user_app(db_uri)
 
     resp = TestClient(app).get("/v1/sessions", headers={"X-Forwarded-Email": ALICE})

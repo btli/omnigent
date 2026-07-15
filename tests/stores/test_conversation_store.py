@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import select, text
+from sqlalchemy.orm import Session
 
+from omnigent.db.db_models import SqlSessionProjectSnapshot
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import (
     ErrorData,
     FunctionCallData,
     FunctionCallOutputData,
+    LiveProjectSnapshot,
     MessageData,
     NewConversationItem,
     ReasoningData,
@@ -20,6 +23,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 
 # ── CRUD ──────────────────────────────────────────────
 
@@ -4374,89 +4378,85 @@ def test_append_many_batches_stay_contiguous(
     assert len(listed.data) == total
 
 
-# ── Projects (conversation_labels key="omni_project") ───────
+# ── Projects (metadata.project_id) ───────────────────────────
 
 
 def test_list_projects_returns_distinct_names_sorted(
     conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
 ) -> None:
-    """``list_projects`` returns each distinct project name once, ordered
-    alphabetically. Sessions with no project label don't create phantom
-    projects, and a project shared by two sessions appears a single time."""
+    """Project rows with live members are returned once in name order."""
+    projects = SqlAlchemyProjectStore(db_uri)
+    sprint = projects.create("alice", "Sprint 42")
+    customer = projects.create("alice", "Customer X")
+    projects.create("alice", "Empty")
+    foreign = projects.create("bob", "Foreign")
     a1 = conversation_store.create_conversation()
     a2 = conversation_store.create_conversation()
     b1 = conversation_store.create_conversation()
-    conversation_store.create_conversation()  # unfiled — must not appear
+    other = conversation_store.create_conversation()
 
-    conversation_store.set_labels(a1.id, {"omni_project": "Sprint 42"})
-    conversation_store.set_labels(a2.id, {"omni_project": "Sprint 42"})
-    conversation_store.set_labels(b1.id, {"omni_project": "Customer X"})
+    conversation_store.set_project_membership(a1.id, sprint.id)
+    conversation_store.set_project_membership(a2.id, sprint.id)
+    conversation_store.set_project_membership(b1.id, customer.id)
+    conversation_store.set_project_membership(other.id, foreign.id)
 
-    # Alphabetical, de-duplicated. A missing DISTINCT would list "Sprint 42"
-    # twice.
-    assert conversation_store.list_projects() == ["Customer X", "Sprint 42"]
+    assert [(item.id, item.name) for item in conversation_store.list_projects("alice")] == [
+        (customer.id, "Customer X"),
+        (sprint.id, "Sprint 42"),
+    ]
 
 
 def test_list_projects_empty_when_no_project_labels(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """Non-project labels (e.g. guardrail keys) never surface as projects."""
+    """Legacy and non-project labels are not project read authorities."""
     conv = conversation_store.create_conversation()
-    conversation_store.set_labels(conv.id, {"integrity": "1", "sensitivity": "public"})
-    assert conversation_store.list_projects() == []
+    conversation_store.set_labels(conv.id, {"omni_project": "Legacy", "integrity": "1"})
+    assert conversation_store.list_projects("alice") == []
 
 
 def test_list_projects_excludes_all_archived_projects(
     conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
 ) -> None:
-    """A project whose every member is archived drops out of the list (this is
-    what makes "Delete project" — which archives all members — remove the
-    folder), while the label is preserved so unarchiving restores it.
-
-    A project with a mix of archived and active members still appears."""
+    """Live and archived variants select by member state, including mixed."""
+    projects = SqlAlchemyProjectStore(db_uri)
+    gone = projects.create("alice", "Gone")
+    mixed = projects.create("alice", "Mixed")
     solo = conversation_store.create_conversation()
     mix_archived = conversation_store.create_conversation()
     mix_active = conversation_store.create_conversation()
 
-    conversation_store.set_labels(solo.id, {"omni_project": "Gone"})
-    conversation_store.set_labels(mix_archived.id, {"omni_project": "Mixed"})
-    conversation_store.set_labels(mix_active.id, {"omni_project": "Mixed"})
-
-    # "Gone" has one member; archiving it empties the project. "Mixed" keeps a
-    # live member, so it stays.
+    conversation_store.set_project_membership(solo.id, gone.id)
+    conversation_store.set_project_membership(mix_archived.id, mixed.id)
+    conversation_store.set_project_membership(mix_active.id, mixed.id)
     conversation_store.update_conversation(solo.id, archived=True)
     conversation_store.update_conversation(mix_archived.id, archived=True)
 
-    assert conversation_store.list_projects() == ["Mixed"]
+    assert [item.name for item in conversation_store.list_projects("alice")] == ["Mixed"]
+    assert [item.name for item in conversation_store.list_projects("alice", archived=True)] == [
+        "Gone",
+        "Mixed",
+    ]
 
-    # Unarchiving the lone member brings its project back — the label was kept.
-    conversation_store.update_conversation(solo.id, archived=False)
-    assert conversation_store.list_projects() == ["Gone", "Mixed"]
 
-
-def test_list_projects_scoped_by_accessible_by(
+def test_list_projects_is_owner_scoped(
     conversation_store: SqlAlchemyConversationStore,
     db_uri: str,
 ) -> None:
-    """When ``accessible_by`` is set, only projects on sessions the user has a
-    permission row for are returned — mirroring the list_conversations ACL."""
-    from omnigent.stores.permission_store.sqlalchemy_store import (
-        SqlAlchemyPermissionStore,
-    )
-
+    """A member in another owner's project never leaks into the result."""
+    projects = SqlAlchemyProjectStore(db_uri)
+    mine_project = projects.create("alice@example.com", "Mine")
+    theirs_project = projects.create("bob@example.com", "Theirs")
     mine = conversation_store.create_conversation()
     theirs = conversation_store.create_conversation()
-    conversation_store.set_labels(mine.id, {"omni_project": "Mine"})
-    conversation_store.set_labels(theirs.id, {"omni_project": "Theirs"})
+    conversation_store.set_project_membership(mine.id, mine_project.id)
+    conversation_store.set_project_membership(theirs.id, theirs_project.id)
 
-    perms = SqlAlchemyPermissionStore(db_uri)
-    for user in ("alice@example.com", "bob@example.com"):
-        perms.ensure_user(user)
-    perms.grant("alice@example.com", mine.id, 4)
-    perms.grant("bob@example.com", theirs.id, 4)
-
-    # Alice only sees her project; Theirs is invisible to her.
-    assert conversation_store.list_projects(accessible_by="alice@example.com") == ["Mine"]
+    assert [item.name for item in conversation_store.list_projects("alice@example.com")] == [
+        "Mine"
+    ]
 
 
 def test_delete_label_removes_only_target_key(
@@ -4487,28 +4487,45 @@ def test_delete_label_is_noop_when_absent(
 
 def test_list_conversations_filters_by_project(
     conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
 ) -> None:
-    """``project="X"`` returns only sessions carrying that exact project label."""
+    """Project ids and the owner-scoped legacy name alias match the same row."""
+    projects = SqlAlchemyProjectStore(db_uri)
+    project = projects.create("alice", "X")
     filed = conversation_store.create_conversation()
-    other = conversation_store.create_conversation()
     conversation_store.create_conversation()  # unfiled
+    conversation_store.set_project_membership(filed.id, project.id)
 
-    conversation_store.set_labels(filed.id, {"omni_project": "X"})
-    conversation_store.set_labels(other.id, {"omni_project": "Y"})
+    by_id = conversation_store.list_conversations(project_id=project.id).data
+    by_name = conversation_store.list_conversations(project="X", project_owner="alice").data
+    assert {item.id for item in by_id} == {filed.id}
+    assert {item.id for item in by_name} == {filed.id}
 
-    ids = {c.id for c in conversation_store.list_conversations(project="X").data}
-    assert ids == {filed.id}
+
+def test_list_conversations_unresolved_project_alias_is_empty(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conversation_store.create_conversation()
+    assert (
+        conversation_store.list_conversations(
+            project="missing",
+            project_owner="alice",
+        ).data
+        == []
+    )
 
 
 def test_list_conversations_empty_project_returns_unfiled(
     conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
 ) -> None:
-    """``project=""`` returns only sessions with NO project label (Unfiled)."""
+    """An empty project id returns only metadata rows without membership."""
+    project = SqlAlchemyProjectStore(db_uri).create("alice", "X")
     filed = conversation_store.create_conversation()
     unfiled = conversation_store.create_conversation()
-    conversation_store.set_labels(filed.id, {"omni_project": "X"})
+    conversation_store.set_project_membership(filed.id, project.id)
 
-    ids = {c.id for c in conversation_store.list_conversations(project="").data}
+    ids = {c.id for c in conversation_store.list_conversations(project_id="").data}
     assert unfiled.id in ids
     assert filed.id not in ids
 
@@ -4525,37 +4542,55 @@ def test_list_conversations_project_none_disables_filter(
     assert ids >= {filed.id, unfiled.id}
 
 
-def test_list_projects_owned_by_excludes_shared_only_projects(
+def test_re_move_updates_single_snapshot_and_changes_live_origin(
     conversation_store: SqlAlchemyConversationStore,
     db_uri: str,
 ) -> None:
-    """``owned_by`` restricts to projects the user OWNS, not ones merely shared
-    with them — so a project whose sessions are only shared to the user (owned
-    by someone else) does not surface as one of their own sidebar folders."""
-    from omnigent.stores.permission_store.sqlalchemy_store import (
-        SqlAlchemyPermissionStore,
+    projects = SqlAlchemyProjectStore(db_uri)
+    first = projects.create("alice", "First")
+    second = projects.create("alice", "Second")
+    conversation = conversation_store.create_conversation(
+        project_snapshot=LiveProjectSnapshot(
+            project_id=first.id,
+            project_row_version=first.row_version,
+            defaults_schema_version=1,
+            defaults_json={},
+        )
     )
 
-    mine = conversation_store.create_conversation()
+    assert conversation_store.set_project_membership(conversation.id, second.id)
+    assert conversation_store.set_project_membership(conversation.id, first.id)
+
+    with Session(get_or_create_engine(db_uri)) as session:
+        snapshots = (
+            session.execute(
+                select(SqlSessionProjectSnapshot).where(
+                    SqlSessionProjectSnapshot.session_id == conversation.id
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(snapshots) == 1
+    assert snapshots[0].project_id == first.id
+    assert snapshots[0].snapshot_origin == "moved"
+    assert snapshots[0].project_row_version is None
+
+
+def test_list_projects_owner_scope_excludes_shared_only_projects(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """Project ownership, not session access, controls folder visibility."""
+    projects = SqlAlchemyProjectStore(db_uri)
+    bob_project = projects.create("bob@example.com", "Shared")
     shared = conversation_store.create_conversation()
-    conversation_store.set_labels(mine.id, {"omni_project": "Mine"})
-    conversation_store.set_labels(shared.id, {"omni_project": "Shared"})
+    conversation_store.set_project_membership(shared.id, bob_project.id)
 
-    perms = SqlAlchemyPermissionStore(db_uri)
-    for user in ("alice@example.com", "bob@example.com"):
-        perms.ensure_user(user)
-    # Bob owns both; Alice only gets a read (level 1) grant on the shared one.
-    perms.grant("bob@example.com", mine.id, 4)
-    perms.grant("alice@example.com", mine.id, 4)
-    perms.grant("bob@example.com", shared.id, 4)
-    perms.grant("alice@example.com", shared.id, 1)
-
-    # accessible_by would leak "Shared" — Alice can access it. owned_by must not.
-    assert conversation_store.list_projects(accessible_by="alice@example.com") == [
-        "Mine",
-        "Shared",
+    assert conversation_store.list_projects("alice@example.com") == []
+    assert [item.name for item in conversation_store.list_projects("bob@example.com")] == [
+        "Shared"
     ]
-    assert conversation_store.list_projects(owned_by="alice@example.com") == ["Mine"]
 
 
 def test_list_conversations_owned_by_excludes_shared_sessions(
@@ -4569,10 +4604,11 @@ def test_list_conversations_owned_by_excludes_shared_sessions(
         SqlAlchemyPermissionStore,
     )
 
+    project = SqlAlchemyProjectStore(db_uri).create("alice@example.com", "X")
     mine = conversation_store.create_conversation()
     shared = conversation_store.create_conversation()
-    conversation_store.set_labels(mine.id, {"omni_project": "X"})
-    conversation_store.set_labels(shared.id, {"omni_project": "X"})
+    conversation_store.set_project_membership(mine.id, project.id)
+    conversation_store.set_project_membership(shared.id, project.id)
 
     perms = SqlAlchemyPermissionStore(db_uri)
     for user in ("alice@example.com", "bob@example.com"):
@@ -4584,7 +4620,9 @@ def test_list_conversations_owned_by_excludes_shared_sessions(
     ids = {
         c.id
         for c in conversation_store.list_conversations(
-            project="X", owned_by="alice@example.com"
+            project="X",
+            project_owner="alice@example.com",
+            owned_by="alice@example.com",
         ).data
     }
     assert ids == {mine.id}
