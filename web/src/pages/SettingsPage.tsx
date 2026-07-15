@@ -9,8 +9,8 @@
  *
  * Sections:
  *
- * - **Appearance** — theme mode (System / Light / Dark). This is the new
- *   home of the theme control that used to sit in the sidebar header.
+ * - **Appearance** — theme mode (System / Light / Dark), terminal theme,
+ *   Workspace panel default for new chats, and UI/code font controls.
  * - **Git** — Git behavior, e.g. the default base branch pre-filled when
  *   naming a new worktree branch in the composer.
  * - **Keyboard shortcuts** — the full shortcuts reference, shown inline.
@@ -39,19 +39,19 @@ import {
 } from "react";
 import {
   ArchiveRestoreIcon,
-  KeyRoundIcon,
-  LogOutIcon,
-  Trash2Icon,
-  UserCogIcon,
-} from "lucide-react";
-import {
   CheckIcon,
+  KeyRoundIcon,
   LaptopMinimalIcon,
+  LogOutIcon,
   MinusIcon,
   MonitorIcon,
   MoonIcon,
+  PanelRightCloseIcon,
+  PanelRightIcon,
   PlusIcon,
   SunIcon,
+  Trash2Icon,
+  UserCogIcon,
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
@@ -79,6 +79,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import {
   type Conversation,
   useArchiveConversation,
+  useArchivedProjectNames,
   useConversations,
   useStopAndDeleteConversation,
 } from "@/hooks/useConversations";
@@ -119,6 +120,11 @@ import {
   writeTerminalThemeMode,
   type TerminalThemeMode,
 } from "@/lib/terminalThemePreferences";
+import {
+  readWorkspacePanelDefault,
+  writeWorkspacePanelDefault,
+  type WorkspacePanelDefault,
+} from "@/lib/workspacePanelPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import {
   applyThemePalette,
@@ -142,6 +148,9 @@ const MembersPage = lazy(() =>
 const PoliciesPage = lazy(() =>
   import("@/pages/PoliciesPage").then((m) => ({ default: m.PoliciesPage })),
 );
+const SharingPage = lazy(() =>
+  import("@/pages/SharingPage").then((m) => ({ default: m.SharingPage })),
+);
 
 /**
  * Settings content panel. The section nav lives in the sidebar card
@@ -164,10 +173,16 @@ export function SettingsPage() {
   // Rendered in ANY multi-user mode (accounts AND OIDC), not gated on
   // `accountsEnabled` — the nav + pages handle admin gating, and Members runs
   // read-only under OIDC (no password actions).
-  if (section === "members" || section === "policies") {
+  if (section === "members" || section === "policies" || section === "sharing") {
     return (
       <Suspense fallback={null}>
-        {section === "members" ? <MembersPage /> : <PoliciesPage />}
+        {section === "members" ? (
+          <MembersPage />
+        ) : section === "policies" ? (
+          <PoliciesPage />
+        ) : (
+          <SharingPage />
+        )}
       </Suspense>
     );
   }
@@ -213,6 +228,15 @@ const terminalThemeCards: { mode: TerminalThemeMode; label: string; icon: typeof
   { mode: "auto", label: "Match app", icon: MonitorIcon },
   { mode: "light", label: "Light", icon: SunIcon },
   { mode: "dark", label: "Dark", icon: MoonIcon },
+];
+
+const workspacePanelCards: {
+  value: WorkspacePanelDefault;
+  label: string;
+  icon: typeof PanelRightIcon;
+}[] = [
+  { value: "open", label: "Open", icon: PanelRightIcon },
+  { value: "collapsed", label: "Collapsed", icon: PanelRightCloseIcon },
 ];
 
 /**
@@ -469,6 +493,40 @@ function TerminalThemeControl() {
 }
 
 /**
+ * Default open/collapsed state for the right Workspace rail on brand-new chats.
+ * Only applies when a session has no saved per-chat open state — existing
+ * sessions keep restoring whatever the user last left them as.
+ */
+function WorkspacePanelDefaultControl() {
+  const [value, setValue] = useState(() => readWorkspacePanelDefault());
+  const labelId = useId();
+  const choose = useCallback((next: WorkspacePanelDefault) => {
+    setValue(next);
+    writeWorkspacePanelDefault(next);
+  }, []);
+  return (
+    <ThemeSubsection
+      labelId={labelId}
+      title="Workspace panel"
+      helper="Whether new chats open with the Files / Agents / Shells panel visible. Existing chats keep their last layout."
+    >
+      <CardRadioGroup<WorkspacePanelDefault>
+        labelledBy={labelId}
+        value={value}
+        onSelect={choose}
+        className="grid grid-cols-2 gap-3"
+        cardClassName="items-center gap-2 p-4"
+        items={workspacePanelCards.map((card) => ({
+          value: card.value,
+          testId: `workspace-panel-default-${card.value}`,
+          body: iconCardBody(card.icon, card.label),
+        }))}
+      />
+    </ThemeSubsection>
+  );
+}
+
+/**
  * Color-theme (palette) picker — a dropdown (à la Codex). Each option shows a
  * swatch chip + name and the trigger mirrors the current selection. Choosing
  * one applies it live to <html> via `data-theme`, persists it, and composes on
@@ -593,6 +651,8 @@ function AppearanceSection() {
         )}
 
         <TerminalThemeControl />
+
+        <WorkspacePanelDefaultControl />
 
         <UiFontSizeControl />
 
@@ -1323,30 +1383,147 @@ function AccountSection() {
   );
 }
 
+// Discriminated Select values so the "no filter" sentinel can never collide
+// with a real project name: the reset option is a fixed token that no project
+// value can equal, and every project is namespaced under a prefix so its name
+// carries through verbatim. A project literally named "all" (or "__all__")
+// therefore still filters correctly instead of clearing the filter.
+const ALL_PROJECTS_VALUE = "all";
+const PROJECT_VALUE_PREFIX = "project:";
+
+function projectToSelectValue(project: string | undefined): string {
+  return project === undefined ? ALL_PROJECTS_VALUE : PROJECT_VALUE_PREFIX + project;
+}
+
+function selectValueToProject(value: string): string | undefined {
+  if (value === ALL_PROJECTS_VALUE) return undefined;
+  return value.slice(PROJECT_VALUE_PREFIX.length);
+}
+
 function ArchivedSection() {
-  // includeArchived:true is the only way to load archived rows; the
-  // default sidebar query no longer surfaces them.
-  const query = useConversations("", true);
+  // `undefined` = all projects; a name scopes the list to that project.
+  const [project, setProject] = useState<string | undefined>(undefined);
+
+  // Picker options: every project that has an archived session. Sourced from a
+  // dedicated hook that pages through ALL archived sessions server-side —
+  // `useProjects()` omits all-archived projects, and deriving options from only
+  // the visible list's loaded first page would hide archived-only projects
+  // whose sessions sit on later pages.
+  const namesQuery = useArchivedProjectNames();
+  const projectNames = useMemo(() => namesQuery.data ?? [], [namesQuery.data]);
+
+  // A picked project can vanish from the option set for good (its last
+  // archived session deleted or restored, possibly by another client). Once
+  // the scan settles without it, fall back to "All projects" rather than
+  // pinning a defunct filter with a project-scoped empty state.
+  useEffect(() => {
+    if (
+      project !== undefined &&
+      namesQuery.isSuccess &&
+      !namesQuery.isFetching &&
+      !projectNames.includes(project)
+    ) {
+      setProject(undefined);
+    }
+  }, [project, projectNames, namesQuery.isSuccess, namesQuery.isFetching]);
+
+  // The visible list, filtered server-side via ?project= when one is picked.
+  const listQuery = useConversations("", true, undefined, project);
   const archived = useMemo(
-    () => (query.data?.pages ?? []).flatMap((p) => p.data).filter((c) => c.archived === true),
-    [query.data],
+    () => (listQuery.data?.pages ?? []).flatMap((p) => p.data).filter((c) => c.archived === true),
+    [listQuery.data],
   );
+
+  // Keep a picked project listed even if it drops out of the option set (its
+  // last archived session was just unarchived) so the trigger never shows a
+  // blank, orphaned value while the refetch settles.
+  const items =
+    project && !projectNames.includes(project) ? [project, ...projectNames] : projectNames;
 
   return (
     <Section
       title="Archived sessions"
       description="Sessions you've archived. Restore one to the sidebar, or delete it for good."
     >
-      {query.isLoading ? (
+      {items.length > 0 && (
+        <div className="mb-4 flex items-center gap-2">
+          <label htmlFor="archived-project-filter" className="text-sm text-muted-foreground">
+            Project
+          </label>
+          <Select
+            value={projectToSelectValue(project)}
+            onValueChange={(value) => setProject(selectValueToProject(value))}
+          >
+            <SelectTrigger
+              id="archived-project-filter"
+              aria-label="Filter archived sessions by project"
+              data-testid="archived-project-filter"
+              className="w-56"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent position="popper" align="start">
+              <SelectItem value={ALL_PROJECTS_VALUE}>All projects</SelectItem>
+              {items.map((name) => (
+                <SelectItem
+                  key={name}
+                  value={projectToSelectValue(name)}
+                  data-testid={`archived-project-option-${name}`}
+                >
+                  {name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      )}
+
+      {listQuery.isLoading ? (
         <p className="text-sm text-muted-foreground">Loading…</p>
-      ) : archived.length === 0 ? (
-        <p className="text-sm text-muted-foreground">No archived sessions.</p>
+      ) : archived.length === 0 && !listQuery.hasNextPage ? (
+        // Definitive empty only when there are no archived rows AND no further
+        // pages to fetch.
+        <p className="text-sm text-muted-foreground">
+          {project ? "No archived sessions in this project." : "No archived sessions."}
+        </p>
       ) : (
-        <ul className="flex flex-col gap-0.5">
-          {archived.map((conv) => (
-            <ArchivedRow key={conv.id} conversation={conv} />
-          ))}
-        </ul>
+        <>
+          {archived.length > 0 && (
+            <ul className="flex flex-col gap-0.5">
+              {archived.map((conv) => (
+                <ArchivedRow key={conv.id} conversation={conv} />
+              ))}
+            </ul>
+          )}
+          {archived.length === 0 && (
+            // The list fetches a mixed page (active + archived rows) and filters
+            // to archived client-side; archived sessions are older and can sort
+            // onto later pages, so a page with none isn't the end. Offer to page
+            // forward instead of dead-ending on the definitive empty state.
+            <p className="text-sm text-muted-foreground">
+              {project
+                ? "No archived sessions in this project on this page."
+                : "No archived sessions on this page."}
+            </p>
+          )}
+          {/* Keep the pager visible whenever more pages exist, independent of the
+              current page's archived count — otherwise a first page of only
+              active rows would hide the archived rows on later pages. */}
+          {listQuery.hasNextPage && (
+            <div className="mt-3">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                data-testid="archived-load-more"
+                disabled={listQuery.isFetchingNextPage}
+                onClick={() => void listQuery.fetchNextPage()}
+              >
+                {listQuery.isFetchingNextPage ? "Loading…" : "Load more"}
+              </Button>
+            </div>
+          )}
+        </>
       )}
     </Section>
   );

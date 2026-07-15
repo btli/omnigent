@@ -17,7 +17,7 @@ import shutil
 import sys
 import threading
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -6538,13 +6538,62 @@ class _ForwardBlockingHarnessClient(_BlockingHarnessClient):
         super().__init__(sse_frames, gate)
         self._fwd_gate = fwd_gate
         self.fwd_seen: asyncio.Event = asyncio.Event()
+        self.order: list[str] = []
+
+    def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
+        """Stream that records when the blocked turn is cancelled."""
+        del method, url, timeout
+        self.posted_bodies.append(json)
+        self.post_seen.set()
+        frames = self._sse_frames
+        gate = self._gate
+        order = self.order
+
+        class _ForwardBlockingCtx:
+            status_code = 200
+
+            async def __aenter__(self) -> _ForwardBlockingHarnessClient._ForwardBlockingHandle:
+                return _ForwardBlockingHarnessClient._ForwardBlockingHandle(frames, gate, order)
+
+            async def __aexit__(self, *_: Any) -> None:
+                return None
+
+        return _ForwardBlockingCtx()
 
     async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
         """Block an interrupt forward on ``fwd_gate``; pass other posts through."""
         if isinstance(json, dict) and json.get("type") == "interrupt":
+            self.order.append("forward")
             self.fwd_seen.set()
             await self._fwd_gate.wait()
         return await super().post(url, json=json, timeout=timeout)
+
+    class _ForwardBlockingHandle:
+        """Stream handle that records cancellation while paused on the gate."""
+
+        status_code = 200
+
+        def __init__(
+            self,
+            frames: list[str],
+            gate: asyncio.Event,
+            order: list[str],
+        ) -> None:
+            """Initialize with frames, gate, and shared order log."""
+            self._frames = frames
+            self._gate = gate
+            self._order = order
+
+        async def aiter_text(self) -> AsyncIterator[str]:
+            """Yield first frame, then record cancellation of the blocked turn."""
+            try:
+                for i, frame in enumerate(self._frames):
+                    if i == 1:
+                        await self._gate.wait()
+                    yield frame
+            except asyncio.CancelledError:
+                self._order.append("cancel")
+                raise
 
 
 def _build_fwd_blocking_app(
@@ -6630,11 +6679,13 @@ async def test_interrupt_forwards_to_harness_before_cancelling() -> None:
         # could race on loaded CI machines.
         await _hc.fwd_seen.wait()
         assert not int_task.done(), "interrupt must await the harness forward (forward-first)"
+        assert _hc.order == ["forward"]
 
         # Release the forward → the harness gets the interrupt, then the cancel runs.
         fwd_gate.set()
         int_resp = await int_task
         assert int_resp.status_code == 204, int_resp.text
+        assert _hc.order == ["forward", "cancel"]
         markers = _interrupt_markers(list(_session_histories_ref.get(conv_id, [])))
 
     assert len(markers) == 1, (
@@ -9231,6 +9282,72 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
 
 
 @pytest.mark.asyncio
+async def test_opencode_native_model_options_uses_cli_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from omnigent import opencode_native_app_server, opencode_native_bridge
+    from omnigent.opencode_native_bridge import OpenCodeNativeBridgeState
+    from omnigent.spec.types import ExecutorSpec
+
+    conv_id = "conv_opencode_native_model_options"
+    monkeypatch.setattr(opencode_native_bridge, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr(
+        opencode_native_bridge,
+        "read_bridge_state",
+        lambda _dir: OpenCodeNativeBridgeState(
+            session_id=conv_id,
+            server_base_url="http://127.0.0.1:49231",
+            opencode_session_id="ses_1",
+        ),
+    )
+    captured_envs: list[Mapping[str, str] | None] = []
+
+    def _fake_list_options(*, env: Mapping[str, str] | None = None) -> list[dict[str, object]]:
+        captured_envs.append(env)
+        return [{"id": "opencode-go/glm-5.2", "displayName": "opencode-go/glm-5.2"}]
+
+    monkeypatch.setattr(
+        opencode_native_app_server,
+        "list_opencode_cli_model_options",
+        _fake_list_options,
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        response = await client.get(f"/v1/sessions/{conv_id}/codex-model-options")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "models": [{"id": "opencode-go/glm-5.2", "displayName": "opencode-go/glm-5.2"}]
+    }
+    assert len(captured_envs) == 1
+    cli_env = captured_envs[0]
+    assert cli_env is not None
+    bridge_dir = opencode_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    assert cli_env["XDG_DATA_HOME"] == str(bridge_dir / "xdg-data")
+    assert cli_env["XDG_CONFIG_HOME"] == str(bridge_dir / "xdg-config")
+
+
+@pytest.mark.asyncio
 async def test_codex_native_model_options_returns_503_until_bridge_state_exists(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -10274,6 +10391,84 @@ async def test_events_interrupt_and_stop_on_pi_native_enqueue_bridge_interrupt(
     ), f"no interrupt marker should enter _session_histories; got {captured_history!r}"
 
 
+@pytest.mark.asyncio
+async def test_events_model_change_on_pi_native_enqueues_bridge_model_change(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    POST ``/events`` ``model_change`` on a pi-native session queues a
+    ``model_change`` payload to the Pi extension inbox.
+
+    A pi-native turn runs inside the resident Pi TUI process, and the
+    ``--model`` launch flag is baked in at spawn. The dispatch must route to
+    ``_handle_pi_native_model_change``, which drops a ``model_change`` payload
+    the extension applies live via Pi's ``setModel``.
+
+    Regression guard: the ``model_change`` branch originally enumerated only
+    claude/codex/cursor/opencode/kiro, so pi-native fell through to the no-op
+    and a web-picked model never reached the running Pi process.
+
+    Pins:
+    1. 204 returned.
+    2. A ``model_change_*`` payload carrying the model id is written to the
+       session's bridge inbox.
+    """
+    import json as _json
+
+    import omnigent.pi_native_bridge as pi_native_bridge
+    from omnigent.spec.types import ExecutorSpec
+
+    conv_id = "conv_pi_native_model_change"
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+
+    pi_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return pi_native_spec
+
+    server_client = _EventRecordingServerClient()
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "model_change", "model": "databricks-claude-opus-4-1"},
+        )
+
+    assert resp.status_code == 204, (
+        f"pi-native model_change must return 204; got {resp.status_code}: {resp.text}"
+    )
+
+    inbox = pi_native_bridge.bridge_dir_for_session_id(conv_id) / "inbox"
+    payloads = [
+        _json.loads(p.read_text(encoding="utf-8"))
+        for p in (inbox.glob("*.json") if inbox.exists() else [])
+    ]
+    model_changes = [p for p in payloads if p.get("type") == "model_change"]
+    assert len(model_changes) == 1, (
+        f"pi-native model_change must enqueue exactly one payload; got {payloads!r}."
+    )
+    assert model_changes[0]["model"] == "databricks-claude-opus-4-1"
+    assert model_changes[0]["id"].startswith("model_change_")
+
+
 def test_interrupted_sessions_isolated_per_app_instance() -> None:
     """
     Each ``create_runner_app()`` gets its own ``_interrupted_sessions`` set.
@@ -11039,31 +11234,26 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
         on_exit = callbacks.get("on_exit")
         assert callable(on_exit)
         on_exit()
-        # Terminal-exit cleanup fans out across two independent background
-        # tasks: one publishes the resource events, a second releases the
-        # harness subprocess. Their completion order is not guaranteed, so
-        # settle on BOTH the published ``deleted`` event and the subprocess
-        # release — accumulating drained events each tick — rather than using
-        # the release as a proxy for the publish (which raced: the release
-        # task could finish first, leaving the drain empty).
+        # Await terminal-exit cleanup deterministically instead of polling;
+        # then await any pending harness-release task so ``pm.released`` is set.
+        await resource_registry.wait_for_terminal_exit_cleanup()
+        release_task_name = f"required-terminal-release:{conv_id}"
+        pending_release = [
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == release_task_name and not task.done()
+        ]
+        if pending_release:
+            await asyncio.gather(*pending_release)
+
         deleted_event = {
             "type": "session.resource.deleted",
             "resource_id": "terminal_worker_main",
             "resource_type": "terminal",
             "session_id": conv_id,
         }
-        queued_events: list[dict[str, Any]] = []
-        parent_events: list[dict[str, Any]] = []
-        for _ in range(1000):
-            queued_events.extend(
-                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
-            )
-            parent_events.extend(
-                _drain_session_event_queue(_session_event_queues_ref.get(parent_id))
-            )
-            if pm.released and deleted_event in queued_events:
-                break
-            await asyncio.sleep(0)
+        queued_events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+        parent_events = _drain_session_event_queue(_session_event_queues_ref.get(parent_id))
     finally:
         _session_event_queues_ref.pop(conv_id, None)
         _session_event_queues_ref.pop(parent_id, None)
@@ -11230,20 +11420,25 @@ async def test_external_idle_status_makes_required_terminal_exit_clean(tmp_path:
         on_exit = callbacks.get("on_exit")
         assert callable(on_exit)
         on_exit()
+        # Await terminal-exit cleanup deterministically instead of polling;
+        # then await any pending harness-release task so ``pm.released`` is set.
+        await resource_registry.wait_for_terminal_exit_cleanup()
+        release_task_name = f"required-terminal-release:{conv_id}"
+        pending_release = [
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == release_task_name and not task.done()
+        ]
+        if pending_release:
+            await asyncio.gather(*pending_release)
+
         deleted_event = {
             "type": "session.resource.deleted",
             "resource_id": "terminal_kiro_main",
             "resource_type": "terminal",
             "session_id": conv_id,
         }
-        queued_events: list[dict[str, Any]] = []
-        for _ in range(1000):
-            queued_events.extend(
-                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
-            )
-            if pm.released and deleted_event in queued_events:
-                break
-            await asyncio.sleep(0)
+        queued_events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
     finally:
         _session_event_queues_ref.pop(conv_id, None)
 

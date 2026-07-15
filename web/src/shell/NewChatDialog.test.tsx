@@ -42,7 +42,10 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
   authenticatedFetch: vi.fn(),
 }));
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
-vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
+vi.mock("@/hooks/useAvailableAgents", () => ({
+  useAvailableAgents: vi.fn(),
+  prefetchAvailableAgentDetails: vi.fn(),
+}));
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
   // WorkspacePicker (rendered by the file browser) reads this on mount;
@@ -629,11 +632,14 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
   });
   const info: ServerInfo = {
     accounts_enabled: false,
+    single_user: false,
     login_url: null,
     needs_setup: false,
     databricks_features: false,
     managed_sandboxes_enabled: false,
     sandbox_provider: null,
+    sharing_mode: "on",
+    public_sharing_enabled: true,
     server_version: null,
     smart_routing_enabled: false,
     ...infoOverrides,

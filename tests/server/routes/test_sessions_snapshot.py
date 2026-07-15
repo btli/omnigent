@@ -557,8 +557,17 @@ async def test_session_snapshot_includes_skills_from_runner(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("session_id", "wrapper_attr"),
+    [
+        ("conv_codex_options", "_CODEX_NATIVE_WRAPPER_LABEL_VALUE"),
+        ("conv_opencode_options", "_OPENCODE_NATIVE_WRAPPER_LABEL_VALUE"),
+    ],
+)
 async def test_session_snapshot_includes_model_options_from_runner(
     monkeypatch: pytest.MonkeyPatch,
+    session_id: str,
+    wrapper_attr: str,
 ) -> None:
     """
     Codex-native model and effort controls use Codex's live ``model/list``.
@@ -620,32 +629,32 @@ async def test_session_snapshot_includes_model_options_from_runner(
     monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
 
     conv = Conversation(
-        id="conv_codex_options",
+        id=session_id,
         created_at=1,
         updated_at=1,
-        root_conversation_id="conv_codex_options",
+        root_conversation_id=session_id,
         agent_id="ag_test",
         labels={
-            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: getattr(_mod, wrapper_attr),
         },
     )
     conv_store = _ConversationStore(
         [_message_item("item_1", "hi")],
-        conversations={"conv_codex_options": conv},
+        conversations={session_id: conv},
     )
 
     first = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
-        "conv_codex_options",
+        session_id,
     )
     assert first.model_options == []
-    await _drain_model_options("conv_codex_options")
+    await _drain_model_options(session_id)
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
-        "conv_codex_options",
+        session_id,
     )
 
-    assert "/v1/sessions/conv_codex_options/codex-model-options" in fake_client.get_calls
+    assert f"/v1/sessions/{session_id}/codex-model-options" in fake_client.get_calls
     assert [m["id"] for m in snapshot.model_options] == ["gpt-5.5"]
     assert snapshot.model_options[0]["displayName"] == "GPT-5.5"
     assert snapshot.model_options[0]["supportedReasoningEfforts"] == [
@@ -654,6 +663,104 @@ async def test_session_snapshot_includes_model_options_from_runner(
         {"reasoningEffort": "high", "description": "High"},
         {"reasoningEffort": "xhigh", "description": "Extra high"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_serves_pi_model_options_from_extension_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Pi-native model options come from the extension-PUSHED cache, not a fetch.
+
+    Pi's picker catalog is reported by the resident extension (its live
+    ``ctx.modelRegistry``) via ``external_model_options``, landing in
+    ``_pushed_model_options_cache``. The snapshot serves that directly — no
+    runner round-trip — so the picker populates regardless of how pi
+    authenticated (Omnigent provider OR pi's own ``/login``). Before any push,
+    the snapshot returns ``[]`` and hides the picker.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    _mod._session_status_cache.clear()
+    _mod._runner_skills_cache.clear()
+    _mod._runner_skills_inflight.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+    _mod._pushed_model_options_cache.clear()
+
+    class _FakeResponse:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.status_code = 200
+            self._payload = payload
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    class _FakeRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
+            self.get_calls.append(url)
+            if url.endswith("/skills"):
+                return _FakeResponse({"skills": []})
+            return _FakeResponse({"status": "idle"})
+
+    fake_client = _FakeRunnerClient()
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: fake_client)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    conv = Conversation(
+        id="conv_pi_options",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_pi_options",
+        agent_id="ag_test",
+        labels={
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._PI_NATIVE_WRAPPER_LABEL_VALUE,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={"conv_pi_options": conv},
+    )
+
+    # Before the extension pushes its catalog, the picker has nothing.
+    before = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_pi_options",
+    )
+    assert before.model_options == []
+
+    # The ``external_model_options`` handler lands the catalog here.
+    from omnigent.server.schemas import SessionEventInput
+
+    _mod._persist_external_model_options(
+        "conv_pi_options",
+        conv,
+        SessionEventInput(
+            type="external_model_options",
+            data={
+                "models": [
+                    {"id": "databricks-claude-sonnet-4-6", "displayName": "Sonnet 4.6"},
+                    {"id": "anthropic-claude-opus-4-1", "displayName": "Opus 4.1"},
+                ]
+            },
+        ),
+    )
+
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_pi_options",
+    )
+
+    # Served straight from the pushed cache — no runner model-options fetch.
+    assert not any("model-options" in url for url in fake_client.get_calls)
+    assert [m["id"] for m in snapshot.model_options] == [
+        "databricks-claude-sonnet-4-6",
+        "anthropic-claude-opus-4-1",
+    ]
+    assert snapshot.model_options[0]["displayName"] == "Sonnet 4.6"
 
 
 @pytest.mark.asyncio

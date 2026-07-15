@@ -6,6 +6,10 @@
   "private": true,
   "main": "src/main.js",
   "homepage": "https://omnigent.ai",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/omnigent-ai/omnigent.git"
+  },
   "author": {
     "name": "Databricks, Inc.",
     "email": "support@omnigent.ai"
@@ -30,6 +34,21 @@
     "directories": {
       "output": "dist"
     },
+    "protocols": [
+      {
+        "name": "Omnigent session link",
+        "schemes": [
+          "omnigent"
+        ]
+      }
+    ],
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "omnigent-ai",
+        "repo": "omnigent"
+      }
+    ],
     "afterPack": "build/afterPack.js",
     "files": [
       "src/**/*",

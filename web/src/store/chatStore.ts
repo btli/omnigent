@@ -53,7 +53,9 @@ import type {
   UserMessageBlock,
 } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
+import { isSystemUserContent } from "@/lib/systemMessage";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
+import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import {
   ApiError,
   approve as approveElicitation,
@@ -645,6 +647,14 @@ export interface ChatState {
    * or there is no active conversation / oldest-item cursor yet.
    */
   loadMoreHistory: () => Promise<void>;
+  /**
+   * Page older history back-to-back until at least `minUserMessages` user
+   * prompts are loaded (or history runs out), committing all pages in ONE
+   * update. Used by the turn rail so it lands with its initial run of ticks
+   * in a single render instead of growing page-by-page. No-op if the target
+   * is already met or a fetch is already in flight.
+   */
+  loadHistoryUntilUserMessages: (minUserMessages: number) => Promise<void>;
   /** Flash a bubble briefly; rapid calls reschedule so the latest target wins. */
   flashUserMessage: (itemId: string) => void;
   /** Queue an "@"-mention chip into the active composer from outside it. */
@@ -732,6 +742,12 @@ const WORKSPACE_INVALIDATION_DEBOUNCE_MS = 750;
 // instantly.
 const STREAM_RECONNECT_BASE_MS = 250;
 const STREAM_RECONNECT_MAX_MS = 5_000;
+// A reverse proxy serves 404 for the stream route for the ~10-60s a backend
+// container takes to restart (upgrade, config change, re-seed bounce), so a
+// 404 mid-restart must not be treated as permanent. Bound the retries instead
+// of trusting them forever, so a truly deleted/invalid conversation still
+// gives up rather than polling it forever.
+const MAX_TRANSIENT_404_RETRIES = 10;
 
 // Sticky picker prefs — persisted so a new chat inherits the user's
 // last pick across reloads and across sessions.
@@ -1332,7 +1348,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             // instead of being left on a silent, empty composer.
             set((s) => ({ blocks: [...s.blocks, makeClientErrorBlock(message, code)] }));
           }
-          set({ status: "idle" });
+          set({ status: "idle", sessionStatus: "idle", backgroundTaskCount: 0 });
         }
       }
     } finally {
@@ -1840,6 +1856,100 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // Disable further fetches on error — a persistent server failure
       // would otherwise re-trigger the scroll listener on every scroll event.
       set({ loadingMoreHistory: false, hasMoreHistory: false });
+    }
+  },
+
+  loadHistoryUntilUserMessages: async (minUserMessages) => {
+    const start = get();
+    if (start.loadingMoreHistory) return;
+    // Count only REAL user turns, not `[System: …]` marker blocks (task/timer/
+    // sub-agent notices arrive as user-role). The rail derives its ticks from
+    // the same non-system predicate, so counting markers here would let the
+    // loader hit the target while the rail has too few ticks — and, since the
+    // early-return leaves hasMoreHistory set, wedge the rail permanently hidden.
+    const countUsers = (blocks: AnyBlock[]): number =>
+      blocks.reduce(
+        (n, b) => n + (b.type === "user_message" && !isSystemUserContent(b.content) ? 1 : 0),
+        0,
+      );
+    // Users already in state count toward the target: we only need to fetch
+    // enough MORE to top up to minUserMessages, else we overshoot by whatever
+    // state already holds and blow past the "≤20 ticks initially" intent.
+    const existingUsers = countUsers(start.blocks);
+    if (existingUsers >= minUserMessages) return;
+
+    const { conversationId, historyGeneration } = start;
+    if (!conversationId) return;
+    const stale = (): boolean =>
+      get().conversationId !== conversationId || get().historyGeneration !== historyGeneration;
+
+    // Page older windows into a local buffer, then commit ONCE so the rail
+    // (and transcript) jump straight to the initial run of turns rather than
+    // growing one page per render. Large per-page limit because turns can span
+    // many items (tool calls, reasoning) — a turn here averages well over the
+    // default 20-item page, so small pages would need a dozen+ round-trips to
+    // reach the target. Bounded page count is a backstop against a pathological
+    // single turn.
+    const EAGER_PAGE_LIMIT = 200;
+    const MAX_EAGER_PAGES = 10;
+    set({ loadingMoreHistory: true });
+    let cursor = start.oldestItemId;
+    let hasMore = start.hasMoreHistory;
+    const older: AnyBlock[] = [];
+    const seenNew = new Set<string>();
+    // Commit whatever pages we gathered, even on a mid-loop error — discarding
+    // the buffer would lose progress AND leave turns.length unchanged, so the
+    // rail's eager-load effect (keyed on it) would never re-fire and the rail
+    // would wedge at a partial, unscrollable set of ticks.
+    const commit = () => {
+      set((state) => {
+        const seen = new Set(
+          state.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
+        );
+        const unique = older.filter((b) => !b.ctx.itemId || !seen.has(b.ctx.itemId));
+        return {
+          blocks: [...unique, ...state.blocks],
+          hasMoreHistory: hasMore,
+          oldestItemId: cursor ?? state.oldestItemId,
+          loadingMoreHistory: false,
+        };
+      });
+    };
+    try {
+      for (let pages = 0; pages < MAX_EAGER_PAGES && hasMore && cursor; pages++) {
+        const page = await fetchSessionItemsPage(conversationId, {
+          olderThan: cursor,
+          limit: EAGER_PAGE_LIMIT,
+        });
+        if (stale()) return;
+        hasMore = page.hasMore;
+        cursor = page.items[0]?.id ?? cursor;
+        // Each page is chronological (oldest→newest) and older than the last.
+        // Collect this page's new blocks in order, then prepend the whole page
+        // as a group — prepending item-by-item would reverse each page's
+        // internal order, scrambling the transcript.
+        const pageBlocks: AnyBlock[] = [];
+        for (const b of itemsToBlocks(page.items)) {
+          const iid = b.ctx.itemId;
+          if (iid && seenNew.has(iid)) continue;
+          if (iid) seenNew.add(iid);
+          pageBlocks.push(b);
+        }
+        older.unshift(...pageBlocks);
+        if (existingUsers + countUsers(older) >= minUserMessages) break;
+        if (!page.items[0]?.id) break;
+      }
+      commit();
+    } catch {
+      if (stale()) return;
+      // Commit progress, but disable further history fetches. This function is
+      // auto-fired by the rail's eager-load effect (no user gesture), so a
+      // persistent failure that left hasMoreHistory true would re-arm the
+      // effect on the very next render — a tight retry loop hammering the
+      // failing endpoint. Matching loadMoreHistory's policy stops the loop
+      // (and lets the rail's `revealed` latch instead of staying hidden).
+      hasMore = false;
+      commit();
     }
   },
 }));
@@ -2950,6 +3060,10 @@ export async function startStreamPump(
   get: Getter,
 ): Promise<void> {
   let failedOpens = 0;
+  // Consecutive 404s only — reset on any non-404 outcome (success or a
+  // different-status failure), so a 404 has to persist across attempts to
+  // count toward the cap below.
+  let consecutive404s = 0;
   // True once we've had at least one SUCCESSFUL open. Drives reconnect-only
   // behavior (drop in-flight + reconcile), which must NOT run on the first
   // established stream — failed opens leave it false so a recovered first
@@ -2999,13 +3113,33 @@ export async function startStreamPump(
           // Release the unconsumed error-response body so the underlying fetch
           // connection is freed promptly rather than lingering across retries.
           void streamRes.body?.cancel().catch(() => {});
-          // 401/403/404 won't fix themselves by retrying — give up and mark
-          // the session failed so the user isn't left on a silent spinner.
-          if (streamRes.status === 401 || streamRes.status === 403 || streamRes.status === 404) {
+          // 401/403 won't fix themselves by retrying — give up and mark the
+          // session failed so the user isn't left on a silent spinner.
+          if (streamRes.status === 401 || streamRes.status === 403) {
             console.warn(`Session ${id}: stream unavailable (${streamRes.status}), giving up`);
             finalizeActive(set, "failed", `stream unavailable (${streamRes.status})`, null);
             set({ sessionStatus: "failed", status: "idle" });
             break;
+          }
+          // A reverse proxy routinely serves 404 for the stream route while
+          // the backend container restarts, so treat it like a transient
+          // failure up to a cap — only a 404 that outlives that window (a
+          // truly deleted/invalid conversation) gives up.
+          if (streamRes.status === 404) {
+            consecutive404s += 1;
+            if (consecutive404s > MAX_TRANSIENT_404_RETRIES) {
+              console.warn(
+                `Session ${id}: stream unavailable (404) after ${consecutive404s} attempts, giving up`,
+              );
+              finalizeActive(set, "failed", "stream unavailable (404)", null);
+              set({ sessionStatus: "failed", status: "idle" });
+              break;
+            }
+            console.warn(
+              `Session ${id}: stream open failed (404, attempt ${consecutive404s}/${MAX_TRANSIENT_404_RETRIES}), will retry`,
+            );
+            failedOpens += 1;
+            continue;
           }
           console.warn(`Session ${id}: stream open failed (${streamRes.status}), will retry`);
           failedOpens += 1;
@@ -3015,6 +3149,7 @@ export async function startStreamPump(
         const reconnecting = hasConnected;
         hasConnected = true;
         failedOpens = 0;
+        consecutive404s = 0;
         presenceIdle.noteReported(idle);
         if (reconnecting) {
           dropEphemeralInFlightBlocks(id, set);
@@ -3504,10 +3639,23 @@ export async function pumpStreamEvents(
         // Force-flush buffer + marker before the terminal side effects so
         // the bubble's final content commits with its lifecycle transition.
         flush(block);
+        // Ignore a terminal for a response that is NOT the currently-active
+        // one. A native-terminal harness (e.g. hermes-native) can emit an
+        // empty runner wrapper response that completes AFTER the forwarder's
+        // per-turn id has already taken over `activeResponse`; applying this
+        // stale terminal would downgrade the live turn to "completed" (its
+        // tool cards stop streaming), flip the session to idle, and prune the
+        // in-flight preview — the first-turn "no spinner" bug. On a matching
+        // (or absent) active response this is the normal terminal path.
+        const active = get().activeResponse;
+        const endedId = block.response?.id ?? block.ctx?.responseId ?? "";
+        if (active !== null && active.responseId !== endedId) {
+          continue;
+        }
         // If the active response was already marked cancelled by an
         // earlier `session.interrupted`, keep that. Session events
         // are the authoritative source for user-initiated terminals.
-        if (get().activeResponse?.state !== "cancelled") {
+        if (active?.state !== "cancelled") {
           const errorMsg = block.response?.error?.message ?? null;
           finalizeActive(set, block.status as ActiveResponse["state"], errorMsg);
         }
@@ -3995,6 +4143,11 @@ export function handleSessionEvent(event: StreamEvent): void {
       useChatStore.setState({
         pendingUserMessages: [],
       });
+      return;
+    case "browser_action_request":
+      // Embedded-browser action: fan out to the relay hook (which claims,
+      // executes, posts the result). No store state; no-op without a relay.
+      emitBrowserActionRequest(event);
       return;
     case "session_status": {
       // Captured BEFORE the patch below adopts event.responseId, so a

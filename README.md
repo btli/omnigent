@@ -173,6 +173,41 @@ mirrors work out of the box; override with `OMNIGENT_INDEX_URL` if needed.
 
 </details>
 
+<details>
+<summary>Uninstalling Omnigent</summary>
+
+Preview the CLI/profile cleanup that would run by default:
+
+```bash
+omnigent uninstall
+```
+
+Remove the CLI and installer-managed PATH entries while keeping your local
+history, credentials, and projects:
+
+```bash
+omnigent uninstall --yes
+```
+
+To also remove Omnigent state under `~/.omnigent`, pass `--purge`; Omnigent
+backs it up outside the target before deletion. Your `~/omnigent` workspace is
+kept unless you explicitly add `--purge-workspace`.
+
+```bash
+omnigent uninstall --purge --yes
+```
+
+If the installed wheel is broken or `omnigent` is not on `PATH`, run the
+standalone script instead:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/uninstall_oss.sh | sh
+```
+
+Add `--yes` to the standalone script to perform the previewed CLI cleanup.
+
+</details>
+
 ### 2. Start your first agent
 
 `omnigent` picks a model with you and starts a session in your terminal. It
@@ -451,6 +486,10 @@ Polly at [`examples/polly/`](https://github.com/omnigent-ai/omnigent/tree/main/e
 
 Contributions are welcome. See [CONTRIBUTING.md](https://github.com/omnigent-ai/omnigent/blob/main/CONTRIBUTING.md) for how to set up your environment, run the checks, and open a pull request.
 
+Adding or changing support for a harness (Claude, Codex, Cursor, OpenCode,
+Hermes, Pi, ...)? Run the [harness test bench](https://github.com/omnigent-ai/omnigent/tree/main/tests/harness_bench)
+to check its capability matrix against observed behavior.
+
 
 ### Contributors
 
@@ -459,4 +498,3 @@ Thanks to all of our amazing contributors!
 <a href="https://github.com/omnigent-ai/omnigent/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=omnigent-ai/omnigent" />
 </a>
-

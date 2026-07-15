@@ -56,11 +56,12 @@ import { ElicitationCard } from "@/components/blocks/ApprovalCard";
 import { BlockRenderer, FilePathAwareMessageResponse } from "@/components/blocks/BlockRenderer";
 import { CompactionMarker, RoutingDecisionCard } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
-import { parseSystemMessage } from "@/lib/systemMessage";
+import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { cn } from "@/lib/utils";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
+import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { validateAttachments } from "@/lib/attachments";
 import { useSurfaceFrontmost } from "@/hooks/useNativeServerSwitcher";
 import {
@@ -598,8 +599,8 @@ export function ChatPage() {
     isLoading: agentsLoading,
     error: agentsError,
     refetch: refetchAgents,
-  } = useAgents();
-  const { data: conversationsData } = useConversations();
+  } = useAgents({ enabled: !!urlConvId });
+  const { data: conversationsData } = useConversations("", true);
   const conversations = useMemo(
     () => conversationsData?.pages.flatMap((p) => p.data),
     [conversationsData],
@@ -1176,6 +1177,10 @@ interface SessionLayoutProps {
  * Inside a conversation: wraps the chat surface. The terminals panel
  * and right rail are managed by AppShell and rendered outside this
  * component as flex siblings.
+ *
+ * The embedded browser pane is NOT here — it lives as the "Browser"
+ * tab inside the right Workspace rail (WorkspacePanel), so it never floats as a
+ * mid-page column.
  */
 function SessionLayout({ mainAgent }: SessionLayoutProps) {
   return (
@@ -1422,6 +1427,11 @@ function MainAgentSurface({
   subAgentLabel,
 }: MainAgentSurfaceProps) {
   const terminalFirst = useTerminalFirst();
+  // The turn rail is a hover minimap with no mobile affordance (CSS-hidden
+  // under `md`). Gate its MOUNT — not just its visibility — on the viewport so
+  // mobile never runs its eager history backfill (up to 2000 items/open) for a
+  // rail the user can't see.
+  const isMobileViewport = useIsMobileViewport();
   // Mirrors ChatPage's `sandboxLaunching`: while the managed-sandbox
   // launch runs, the composer must stay sendable — the server parks
   // the message on the launch rendezvous — even though liveness reads
@@ -1457,6 +1467,40 @@ function MainAgentSurface({
     [bubbles],
   );
   const nav = useUserMessageNav(userMessageIds);
+
+  // One rail tick per real user turn, paired with a preview of the reply that
+  // followed. Walk bubbles in order: each non-system user bubble opens a turn,
+  // and the first assistant text after it (before the next user bubble) is the
+  // preview. Same first-page window as the transcript, so a fresh load shows
+  // ≤20 ticks and older ones page in on scroll-up.
+  const turns = useMemo<Turn[]>(() => {
+    const out: Turn[] = [];
+    for (let i = 0; i < bubbles.length; i++) {
+      const b = bubbles[i];
+      if (b.kind !== "user" || isSystemBubble(b)) continue;
+      let preview = "";
+      for (let j = i + 1; j < bubbles.length; j++) {
+        const next = bubbles[j];
+        // Stop at the next REAL user turn only. A system-marker user bubble
+        // isn't a tick of its own, so breaking on it would strand this turn
+        // with a blank preview even though its reply follows the marker.
+        if (next.kind === "user" && !isSystemBubble(next)) break;
+        if (next.kind === "assistant") {
+          const textItem = next.items.find((it) => it.kind === "text" && it.text.trim());
+          if (textItem && textItem.kind === "text") {
+            preview = textItem.text.trim();
+            break;
+          }
+        }
+      }
+      out.push({
+        itemId: b.itemId,
+        userText: extractUserText(b.content),
+        responsePreview: preview.slice(0, 240),
+      });
+    }
+    return out;
+  }, [bubbles]);
 
   // Pending elicitation cards float to the bottom of the chat: rendered as the
   // last items in the scroll flow and removed from their inline position so
@@ -1632,10 +1676,13 @@ function MainAgentSurface({
             content dissolves into the canvas before reaching the
             ChatHeader overlay's controls (geometry in index.css). */}
         <Conversation className="chat-scroll-fade flex-1">
-          {/* gap-4 overrides ConversationContent's default gap-8 so consecutive agent turns read as one thread. */}
+          {/* gap-4 overrides ConversationContent's default gap-8 so consecutive agent turns read as one thread.
+              md:pl-12 opens a gap between the left-edge TurnRail (24px wide) and
+              the message column so the ticks don't butt against the text; the
+              rail is hidden on mobile, so the extra left padding is md-only. */}
           <ConversationContent
             className={cn(
-              "chat-conversation-content mx-auto w-full gap-4 pt-20 pb-6",
+              "chat-conversation-content mx-auto w-full gap-4 pt-20 pb-6 md:pl-12",
               CHAT_COLUMN_WIDTH,
             )}
           >
@@ -1742,6 +1789,19 @@ function MainAgentSurface({
           scroller={scroller}
           hasMoreHistory={hasMoreHistory}
         />
+        {/* Left-edge minimap: one tick per turn, scrolls independently, pages
+            in older history on scroll-up. Sibling of Conversation for the same
+            reason as JumpToTopButton — it escapes the chat-scroll-fade mask.
+            Desktop-only: not mounted on mobile so its eager backfill never
+            runs where the rail is hidden. */}
+        {!isMobileViewport && (
+          <TurnRail
+            turns={turns}
+            scroller={scroller}
+            hasMoreHistory={hasMoreHistory}
+            loadingMoreHistory={loadingMoreHistory}
+          />
+        )}
       </div>
       {/* Floating reply button — scoped to the conversation container. */}
       <SelectionPopup
@@ -1848,7 +1908,15 @@ function ConversationLoadError({
 function UserMessageNavConnected(props: React.ComponentProps<typeof UserMessageNav>) {
   const { isAtBottom } = useStickToBottomContext();
   return (
-    <UserMessageNav {...props} className={cn(props.className, isAtBottom && "max-md:hidden")} />
+    <UserMessageNav
+      {...props}
+      // Mobile-only: the TurnRail (a hover minimap) replaces these buttons on
+      // desktop, but mobile has no hover, so the ↑↓ nav stays there. Hidden at
+      // the bottom on mobile too — nothing above to page up to matters less
+      // than keeping the composer area clear. Keyboard ⌘⌥↑↓ still works on all
+      // sizes regardless of the buttons.
+      className={cn(props.className, "md:hidden", isAtBottom && "max-md:hidden")}
+    />
   );
 }
 
@@ -2877,11 +2945,7 @@ function ConnectedTerminalFirstPill({
  */
 function isSystemBubble(bubble: Bubble): boolean {
   if (bubble.kind !== "user") return false;
-  const hasAttachments = bubble.content.some(
-    (c) => c.type === "input_image" || c.type === "input_file",
-  );
-  if (hasAttachments) return false;
-  return parseSystemMessage(extractUserText(bubble.content)) !== null;
+  return isSystemUserContent(bubble.content);
 }
 
 function CompactionLoadingIndicator() {
@@ -4303,13 +4367,15 @@ export function Composer({
       // the user choose there. "/model <name>" takes the builtin route below to
       // setModel — the same write the picker makes.
       //
-      // opencode is excluded: it surfaces showModels (the pill mirrors its live
-      // TUI model) but ships no web model options, so intercepting bare "/model"
-      // would pop an empty dropdown and swallow the command. Fall through to the
-      // builtin "/model" handler below, which surfaces the current model as a
-      // read-only hint. ("/model <name>" still routes to setModel there —
-      // opencode reads model_override on the next web-injected turn.)
-      if (cmd === "/model" && !arg && showModels && modelPickerKind !== "opencode") {
+      // opencode-native now surfaces server-backed model options too, so bare
+      // "/model" opens the picker when options are loaded. When the options are
+      // still empty (e.g. the runner catalog hasn't arrived yet), fall through
+      // to the builtin "/model" handler, which surfaces the current model as a
+      // read-only hint instead of popping an empty dropdown. ("/model <name>"
+      // still routes to setModel there — opencode reads model_override on the
+      // next web-injected turn.)
+      const canOpenModelPicker = modelPickerKind !== "opencode" || codexModelOptions.length > 0;
+      if (cmd === "/model" && !arg && showModels && canOpenModelPicker) {
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
@@ -4942,8 +5008,12 @@ export function computeIsWorking(sessionStatus: SessionStatus): boolean {
  * @param options.hasPendingElicitation - ``true`` when an elicitation prompt
  *   owns the in-progress slot and should suppress the shimmer/pinned pill.
  * @param options.runnerOnline - Runner liveness: ``true`` online, ``false``
- *   known offline, ``undefined`` before the health poll resolves. Only known
- *   offline suppresses the indicator.
+ *   known offline, ``undefined`` before the health poll resolves. A known-offline
+ *   runner suppresses the indicator ONLY when the session is otherwise idle: a
+ *   session actively reporting ``running``/``waiting`` cannot have an offline
+ *   runner, so its live status wins over the ``/health`` poll — which polls at a
+ *   10s cadence and reads stale-offline during the runner's connect window on a
+ *   fresh session's first turn (it would otherwise hide "Working…" for seconds).
  * @param options.backgroundTaskCount - Background shells still running after
  *   the turn ended. A claude-native turn settles to ``idle`` (the PTY-activity
  *   watcher's edge) even while shells run, so the bare status alone would hide
@@ -4959,9 +5029,14 @@ export function computeShowsWorking(
     backgroundTaskCount?: number;
   },
 ): boolean {
-  if (options.runnerOnline === false) return false;
   if (options.hasPendingElicitation) return false;
-  return computeIsWorking(sessionStatus) || (options.backgroundTaskCount ?? 0) > 0;
+  const isWorking = computeIsWorking(sessionStatus);
+  // A running/waiting session is proof the runner is up, so a stale
+  // poll-derived ``runnerOnline === false`` must not suppress it. Only gate on
+  // known-offline for the not-actively-working case (e.g. a background-shell
+  // tally on an idle session).
+  if (options.runnerOnline === false && !isWorking) return false;
+  return isWorking || (options.backgroundTaskCount ?? 0) > 0;
 }
 
 /**
@@ -5096,7 +5171,7 @@ const EFFORT_LEVELS = ["low", "medium", "high"] as const;
 /** Anthropic-side efforts for claude-native sessions (matches ANTHROPIC_EFFORTS in reasoning_effort.py). */
 const CLAUDE_NATIVE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
-type NativeModelPickerKind = "claude" | "codex" | "cursor" | "kiro" | "opencode";
+type NativeModelPickerKind = "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
 
@@ -5170,6 +5245,12 @@ export function modelPickerKindForConv(
       // model into the session ``model_override`` (the forwarder's terminal→web
       // mirror), so the picker surfaces that as the live model.
       return "opencode";
+    case "pi-native-ui":
+      // Like cursor: the runner types a model switch into the live Pi process
+      // (via the bridge inbox → Pi's ``setModel``) and Pi mirrors its own
+      // ``/model`` picks back to ``model_override`` via the extension's
+      // model_select handler, so the picker surfaces that as the live model.
+      return "pi";
     default:
       return null;
   }
@@ -5291,11 +5372,15 @@ function AgentPicker({
   const sessionModelOverride = useChatStore((s) => s.sessionModelOverride);
   const llmModel = useChatStore((s) => s.llmModel);
 
-  // Codex and cursor both populate the picker from the server-provided
-  // ``codexModelOptions`` channel (the snapshot's ``model_options`` field);
-  // claude uses the static local catalog.
+  // Codex, cursor, kiro, pi, and opencode all populate the picker from the
+  // server-provided ``codexModelOptions`` channel (the snapshot's
+  // ``model_options`` field); claude uses the static local catalog.
   const usesServerModelOptions =
-    modelPickerKind === "codex" || modelPickerKind === "cursor" || modelPickerKind === "kiro";
+    modelPickerKind === "codex" ||
+    modelPickerKind === "cursor" ||
+    modelPickerKind === "kiro" ||
+    modelPickerKind === "pi" ||
+    modelPickerKind === "opencode";
   const modelOptions: ReadonlyArray<{ id: string; label?: string; displayName?: string }> =
     modelPickerKind === "claude"
       ? CLAUDE_NATIVE_MODELS
@@ -5332,10 +5417,17 @@ function AgentPicker({
   // There is no terminal→web mirror, so the picker reflects the web-side
   // ``sessionModelOverride`` (which stays correct since a web pick sets it), like
   // cursor/opencode surface theirs.
+  // pi mirrors both ways into ``model_override`` (a web pick persists it before
+  // the live ``setModel``; a TUI ``/model`` pick posts external_model_change),
+  // so like cursor/kiro/opencode the live model is the session override, never
+  // the cross-session sticky ``selectedModel``.
   const pickerSelectedModel =
-    modelPickerKind === "cursor" || modelPickerKind === "kiro" || modelPickerKind === "opencode"
+    modelPickerKind === "cursor" ||
+    modelPickerKind === "kiro" ||
+    modelPickerKind === "opencode" ||
+    modelPickerKind === "pi"
       ? sessionModelOverride
-      : selectedModel;
+      : (sessionModelOverride ?? selectedModel);
   // SDK/bundle agents (no native picker) never have the cross-session sticky
   // applied to them, so their live model is the session's own — the applied
   // override or the bound default — never `selectedModel` (a pick carried over
@@ -5343,17 +5435,20 @@ function AgentPicker({
   // on a Claude-SDK agent like Polly). claude-/codex-native keep `selectedModel`:
   // there the sticky IS the applied model.
   const nonNativeModel =
-    modelPickerKind === null ? (sessionModelOverride ?? llmModel) : (selectedModel ?? llmModel);
+    modelPickerKind === null
+      ? (sessionModelOverride ?? llmModel)
+      : (sessionModelOverride ?? selectedModel ?? llmModel);
   const effectiveModel = nativeVendorOwnsModel
     ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
       ? // cursor mirrors its live TUI model into ``model_override``; kiro sets it
         // on a web pick (which also drives a live ``/model`` switch). Either way
         // the Omnigent-visible model is ``model_override``.
         sessionModelOverride
-      : modelPickerKind === "opencode"
-        ? // opencode mirrors its live TUI model into ``model_override`` (set at
-          // launch and updated by the forwarder on a TUI switch); show that,
-          // falling back to the launch-resolved model before any switch.
+      : modelPickerKind === "opencode" || modelPickerKind === "pi"
+        ? // opencode/pi mirror their live TUI model into ``model_override``
+          // (set on a web pick, updated by the extension's model_select
+          // handler on a TUI switch); show that, falling back to the
+          // launch-resolved model before any switch.
           (sessionModelOverride ?? llmModel)
         : null
     : nonNativeModel;
@@ -5364,14 +5459,16 @@ function AgentPicker({
       : null;
   const hasPickerActions = showAgents || modelOptions.length > 0 || showEffort;
 
-  // Until kiro mirrors its live model (its first session ``.json`` write), there
-  // is no resolved model to show; fall back to the catalog default (e.g. "Auto")
-  // so the trigger reads as a model rather than the harness name ("Kiro").
-  const kiroDefaultOption =
-    modelPickerKind === "kiro"
+  // Before kiro/pi resolve a live model, there is no model to show: kiro until
+  // its first session ``.json`` write, pi until its snapshot fills llmModel (or
+  // the workspace model-list fetch failed, leaving only the launch model). Fall
+  // back to the catalog default (e.g. "Auto") / first option so the trigger
+  // reads as a model rather than the harness name ("Kiro" / "Pi").
+  const launchFallbackOption =
+    modelPickerKind === "kiro" || modelPickerKind === "pi"
       ? (codexModelOptions.find((m) => m.isDefault) ?? codexModelOptions[0])
       : undefined;
-  const kiroLaunchFallbackLabel = kiroDefaultOption?.displayName ?? kiroDefaultOption?.id;
+  const launchFallbackLabel = launchFallbackOption?.displayName ?? launchFallbackOption?.id;
 
   // Model in foreground (black), effort in muted (grey). Static fallbacks
   // first; the final `else` returns null so a session with nothing to show
@@ -5402,10 +5499,10 @@ function AgentPicker({
     // spec may carry no executor model and no sticky/override is set), but the
     // dropdown still has model rows to switch. Keep the trigger rendered — and
     // the model dropdown + bare-`/model` open path reachable — with a stable
-    // identity fallback rather than hiding the picker entirely. For kiro, prefer
-    // the catalog default (e.g. "Auto") over the agent name so the launch-window
-    // label reads as a model.
-    triggerContent = kiroLaunchFallbackLabel ?? agentDisplayName ?? "Model";
+    // identity fallback rather than hiding the picker entirely. For kiro/pi,
+    // prefer the catalog default (e.g. "Auto") over the agent name so the
+    // launch-window label reads as a model.
+    triggerContent = launchFallbackLabel ?? agentDisplayName ?? "Model";
   } else {
     return null;
   }
