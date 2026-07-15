@@ -29,6 +29,18 @@ class ProjectDefaultsBundle(BaseModel):
     def _check_explicit_managed_host(self) -> ProjectDefaultsBundle:
         if self.host_type == "managed" and self.host_id is not None:
             raise ValueError("managed project defaults prohibit host_id")
+        if self.host_type == "managed" and self.repo_url is not None:
+            from omnigent.server.managed_hosts import parse_repo_workspace
+
+            workspace = (
+                f"{self.repo_url}#{self.default_branch}"
+                if self.default_branch is not None
+                else self.repo_url
+            )
+            try:
+                parse_repo_workspace(workspace)
+            except ValueError as exc:
+                raise ValueError(f"invalid managed repository defaults: {exc}") from exc
         return self
 
 

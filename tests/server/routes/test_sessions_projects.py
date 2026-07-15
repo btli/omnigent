@@ -19,8 +19,10 @@ from omnigent.db.db_models import (
 )
 from omnigent.db.utils import get_or_create_conversation_engine, get_or_create_engine
 from omnigent.errors import OmnigentError
+from omnigent.server import managed_hosts
 from omnigent.server.app import add_workspace_scope_middleware
 from omnigent.server.auth import UnifiedAuthProvider
+from omnigent.server.routes import sessions
 from omnigent.server.routes.sessions import create_sessions_router
 from omnigent.server.schemas import SessionCreateMetadata
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -48,6 +50,7 @@ def _app(
     db_uri: str,
     *,
     conversation_store: SqlAlchemyConversationStore | None = None,
+    managed: bool = False,
 ) -> FastAPI:
     app = FastAPI()
 
@@ -70,6 +73,10 @@ def _app(
         ),
         prefix="/v1",
     )
+    if managed:
+        app.state.sandbox_config = object()
+        app.state.host_store = object()
+        app.state.managed_launches = managed_hosts.ManagedLaunchTracker()
     return app
 
 
@@ -135,6 +142,106 @@ def test_project_create_writes_snapshot_and_seeds_agent_configuration(
     assert config.reasoning_effort == "high"
 
 
+def test_managed_project_create_maps_repo_branch_without_git_or_host(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _skip_managed_launch(**_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(sessions, "_run_managed_launch", _skip_managed_launch)
+    agents = SqlAlchemyAgentStore(db_uri)
+    agents.create(agent_id="ag_test", name="test-agent", bundle_location="ag_test/bundle")
+    projects = SqlAlchemyProjectStore(db_uri)
+    project = projects.create(
+        ALICE,
+        "Managed widgets",
+        defaults_json={
+            "host_type": "managed",
+            "repo_url": "https://github.com/acme/widgets.git",
+            "default_branch": "release",
+        },
+    )
+
+    with TestClient(_app(db_uri, managed=True)) as client:
+        response = client.post(
+            "/v1/sessions",
+            headers=_headers(ALICE),
+            json={"agent_id": "ag_test", "project_id": project.id},
+        )
+
+    assert response.status_code == 201, response.text
+    _, snapshot, _ = _rows(db_uri, response.json()["id"])
+    assert isinstance(snapshot, SqlSessionProjectSnapshot)
+    assert json.loads(snapshot.defaults_json) == {
+        "git": None,
+        "harness_override": None,
+        "host_id": None,
+        "host_type": "managed",
+        "model_override": None,
+        "reasoning_effort": None,
+        "workspace": "https://github.com/acme/widgets.git#release",
+    }
+
+
+def test_session_overrides_win_alongside_project_id(
+    db_uri: str,
+    project_setup: tuple[SqlAlchemyProjectStore, TestClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sessions, "_validated_harness_override", lambda value, _agent: value)
+    projects, client = project_setup
+    project = projects.create(
+        ALICE,
+        "Overrides",
+        defaults_json={"model": "project-model", "harness": "project-harness"},
+    )
+
+    response = client.post(
+        "/v1/sessions",
+        headers=_headers(ALICE),
+        json={
+            "agent_id": "ag_test",
+            "project_id": project.id,
+            "model_override": "session-model",
+            "harness_override": "session-harness",
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    _, snapshot, config = _rows(db_uri, response.json()["id"])
+    assert isinstance(snapshot, SqlSessionProjectSnapshot)
+    snapshot_defaults = json.loads(snapshot.defaults_json)
+    assert snapshot_defaults["model_override"] == "session-model"
+    assert snapshot_defaults["harness_override"] == "session-harness"
+    assert isinstance(config, SqlAgentConfiguration)
+    assert config.model_override == "session-model"
+    assert config.harness_override == "session-harness"
+
+
+def test_invalid_resolved_project_defaults_return_422(
+    project_setup: tuple[SqlAlchemyProjectStore, TestClient],
+) -> None:
+    projects, client = project_setup
+    project = projects.create(
+        ALICE,
+        "Invalid resolved values",
+        defaults_json={
+            "host_type": "external",
+            "workspace": "https://github.com/acme/widgets.git",
+        },
+    )
+
+    response = client.post(
+        "/v1/sessions",
+        headers=_headers(ALICE),
+        json={"agent_id": "ag_test", "project_id": project.id},
+    )
+
+    assert response.status_code == 422
+    assert "Invalid resolved project defaults" in response.json()["error"]["message"]
+
+
 def test_snapshot_survives_config_seed_failure_and_project_edit(
     db_uri: str,
 ) -> None:
@@ -170,6 +277,44 @@ def test_snapshot_survives_config_seed_failure_and_project_edit(
     with Session(get_or_create_engine(db_uri)) as session:
         persisted = session.get(SqlSessionProjectSnapshot, (0, snapshot.session_id))
         assert persisted is not None and persisted.defaults_json == before
+
+
+def test_new_session_picks_up_project_edit_without_changing_first_snapshot(
+    db_uri: str,
+    project_setup: tuple[SqlAlchemyProjectStore, TestClient],
+) -> None:
+    projects, client = project_setup
+    project = projects.create(ALICE, "Editable", defaults_json={"model": "first-model"})
+    first = client.post(
+        "/v1/sessions",
+        headers=_headers(ALICE),
+        json={"agent_id": "ag_test", "project_id": project.id},
+    )
+    assert first.status_code == 201, first.text
+
+    projects.update(
+        project.id,
+        ALICE,
+        expected_row_version=project.row_version,
+        defaults_json={"model": "second-model"},
+    )
+    second = client.post(
+        "/v1/sessions",
+        headers=_headers(ALICE),
+        json={"agent_id": "ag_test", "project_id": project.id},
+    )
+
+    assert second.status_code == 201, second.text
+    _, first_snapshot, first_config = _rows(db_uri, first.json()["id"])
+    _, second_snapshot, second_config = _rows(db_uri, second.json()["id"])
+    assert isinstance(first_snapshot, SqlSessionProjectSnapshot)
+    assert isinstance(second_snapshot, SqlSessionProjectSnapshot)
+    assert json.loads(first_snapshot.defaults_json)["model_override"] == "first-model"
+    assert json.loads(second_snapshot.defaults_json)["model_override"] == "second-model"
+    assert isinstance(first_config, SqlAgentConfiguration)
+    assert isinstance(second_config, SqlAgentConfiguration)
+    assert first_config.model_override == "first-model"
+    assert second_config.model_override == "second-model"
 
 
 def test_project_attach_hides_wrong_owner_and_rejects_archived(

@@ -202,3 +202,27 @@ async def test_invalid_defaults_returns_422(project_client: httpx.AsyncClient) -
         json={"name": "Bad", "defaults_json": {"unknown": "value"}},
     )
     assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "defaults_json",
+    [
+        {"host_type": "managed", "repo_url": "github.com/acme/widgets"},
+        {
+            "host_type": "managed",
+            "repo_url": "https://github.com/acme/widgets.git",
+            "default_branch": "a" * 40,
+        },
+    ],
+)
+async def test_invalid_managed_repo_defaults_return_422_at_save(
+    project_client: httpx.AsyncClient,
+    defaults_json: dict[str, str],
+) -> None:
+    response = await project_client.post(
+        "/v1/projects",
+        headers=_headers("alice"),
+        json={"name": "Bad managed", "defaults_json": defaults_json},
+    )
+
+    assert response.status_code == 422
