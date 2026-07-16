@@ -61,6 +61,43 @@ def _find_row(session: Session, credential_id: str) -> SqlGitCredential | None:
         raise
 
 
+def _find_owned_row(
+    session: Session,
+    *,
+    owner_user_id: str,
+    host_id: str,
+    credential_id: str,
+) -> SqlGitCredential | None:
+    """Look up a credential row scoped to its authorized owner and host.
+
+    Unlike :func:`_find_row` (workspace-only), this filters the full
+    authorization tuple ``(workspace, owner_user_id, host_id, id)``, so a
+    caller who merely knows an id cannot address a row they do not own or a
+    row bound to a different host. A malformed ``credential_id`` (not a
+    32-char hex uuid) addresses no row and returns ``None`` — same tolerance
+    as :func:`_find_row`.
+
+    :param session: The active SQLAlchemy session.
+    :param owner_user_id: The authenticated owner the row must belong to.
+    :param host_id: The operator host id the row must be bound to.
+    :param credential_id: Opaque credential slot id to look up.
+    :returns: The matching row, or ``None`` if absent, malformed, or not owned.
+    """
+    try:
+        return session.execute(
+            select(SqlGitCredential).where(
+                SqlGitCredential.workspace_id == current_workspace_id(),
+                SqlGitCredential.owner_user_id == owner_user_id,
+                SqlGitCredential.host_id == host_id,
+                SqlGitCredential.id == credential_id,
+            )
+        ).scalar_one_or_none()
+    except StatementError as exc:
+        if isinstance(exc.orig, InvalidUuidError):
+            return None
+        raise
+
+
 def _row_to_entity(row: SqlGitCredential) -> GitCredential:
     return GitCredential(
         id=row.id,
@@ -172,11 +209,23 @@ class GitCredentialStore:
             return [_row_to_entity(r) for r in rows]
 
     def get(self, credential_id: str) -> GitCredential | None:
+        """Fetch a credential's metadata by id, workspace-scoped only.
+
+        Not an authorization boundary: ownership is enforced by the route
+        layer. A handoff needing an owned, host-bound slot must use
+        :meth:`resolve_token`.
+        """
         with self._session() as session:
             row = _find_row(session, credential_id)
             return _row_to_entity(row) if row is not None else None
 
     def delete(self, credential_id: str) -> None:
+        """Delete a credential by id, workspace-scoped only.
+
+        Not an authorization boundary: the route layer verifies the caller
+        owns the credential before calling this. Tolerates a malformed id
+        (matches no row).
+        """
         with self._session() as session:
             try:
                 session.execute(
@@ -190,25 +239,40 @@ class GitCredentialStore:
                 if not isinstance(exc.orig, InvalidUuidError):
                     raise
 
-    def resolve_token(self, credential_id: str) -> str | None:
-        """Decrypt and return the token for the slot *credential_id*, or ``None``.
+    def resolve_token(
+        self,
+        *,
+        owner_user_id: str,
+        host_id: str,
+        credential_id: str,
+    ) -> str | None:
+        """Decrypt the token for a credential slot, or ``None`` if not authorized.
 
-        Resolution is by opaque id (not ``(owner, host)``, which is ambiguous with
-        multiple labeled identities). The only method that returns plaintext; call
-        server-side only.
+        The slot is resolved against the full authorization tuple
+        ``(workspace, owner_user_id, host_id, credential_id)`` and decrypted
+        **only** when all four match. A caller supplying another user's id, a
+        mismatched host, a foreign workspace (ambient, via
+        :func:`current_workspace_id`), or a malformed id gets ``None`` — never
+        plaintext. ``credential_id`` is an identifier, not a capability:
+        ownership is proven by the query, not by possession of the id.
 
-        .. warning::
-           ``credential_id`` is an *identifier*, not an authorization token —
-           this method performs no ownership or host check. A caller who
-           merely knows or guesses an id (e.g. from another user's session)
-           gets that id's plaintext back. A handoff (P1c-2) MUST first
-           resolve the id against the authenticated ``(workspace, owner,
-           expected host, id)`` tuple — e.g. via :meth:`list_for_owner_host`
-           or an equivalent ownership-checked lookup — before ever calling
-           this method with a caller-supplied id.
+        This is the only method that returns plaintext; call server-side only.
+        The caller (the fetch/push handoff) is responsible for the remaining
+        checks the store cannot make — re-deriving the provider from the live
+        operator host config and refusing an unconfigured host.
+
+        :param owner_user_id: The authenticated owner the slot must belong to.
+        :param host_id: The operator host id the slot must be bound to.
+        :param credential_id: The opaque slot id to resolve.
+        :returns: The decrypted token, or ``None`` if no owned row matches.
         """
         with self._session() as session:
-            row = _find_row(session, credential_id)
+            row = _find_owned_row(
+                session,
+                owner_user_id=owner_user_id,
+                host_id=host_id,
+                credential_id=credential_id,
+            )
             if row is None:
                 return None
             return self._cipher.decrypt(row.token_ciphertext)
