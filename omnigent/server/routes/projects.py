@@ -12,7 +12,8 @@ from pydantic import BaseModel, ConfigDict
 
 from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.projects.defaults import DEFAULTS_SCHEMA_VERSION
+from omnigent.projects.defaults import DEFAULTS_SCHEMA_VERSION, ProjectDefaultsBundle
+from omnigent.projects.resolver import resolve_project_defaults
 from omnigent.server.auth import AuthProvider, resolve_owner_principal
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.stores.conversation_store import ConversationStore
@@ -146,6 +147,26 @@ def create_projects_router(
             _owner(request, auth_provider),
         )
         return _serialized(_require_project(project), response)
+
+    @router.get("/projects/{project_id}/defaults/resolved")
+    async def get_resolved_project_defaults(
+        request: Request,
+        project_id: str,
+    ) -> dict[str, Any]:
+        project = _require_project(
+            await asyncio.to_thread(
+                store.get_for_use,
+                project_id,
+                _owner(request, auth_provider),
+            )
+        )
+        resolved = resolve_project_defaults(
+            server_defaults=ProjectDefaultsBundle(host_type="external"),
+            project_defaults=project.defaults_json,
+            defaults_schema_version=project.defaults_schema_version,
+            session_overrides=ProjectDefaultsBundle(),
+        )
+        return {**resolved.model_dump(mode="json"), "row_version": project.row_version}
 
     @router.post("/projects/{project_id}/transfer")
     async def transfer_project(

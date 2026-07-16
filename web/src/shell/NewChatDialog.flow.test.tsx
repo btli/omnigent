@@ -79,6 +79,7 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   useProjects: () => ({ data: [] }),
   useCreateProject: () => ({ mutate: vi.fn(), isPending: false }),
   useNewestProjectSession: () => ({ data: undefined, isError: false }),
+  useResolvedProjectDefaults: () => ({ data: undefined, isError: false }),
 }));
 // Dynamic harness-label fetching is covered separately. Keep it synchronous
 // here so exact create-POST call-count assertions only observe the POST.

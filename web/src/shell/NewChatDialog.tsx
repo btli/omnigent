@@ -108,6 +108,7 @@ import {
   moveConversationToProject,
   useNewestProjectSession,
   useProjects,
+  useResolvedProjectDefaults,
 } from "@/hooks/useConversations";
 import { invalidateProjectQueries } from "@/hooks/projectQueries";
 import { useProjectPickerState } from "@/hooks/useProjectPickerState";
@@ -670,6 +671,15 @@ export function composeSandboxWorkspace(url: string, branch: string): string | u
   if (u === "") return undefined;
   const b = branch.trim();
   return b === "" ? u : `${u}#${b}`;
+}
+
+function splitSandboxWorkspace(workspace: string): { url: string; branch: string } {
+  const separator = workspace.lastIndexOf("#");
+  if (separator === -1) return { url: workspace, branch: "" };
+  return {
+    url: workspace.slice(0, separator),
+    branch: workspace.slice(separator + 1),
+  };
 }
 
 /**
@@ -1870,6 +1880,13 @@ export function NewChatLandingScreen() {
   // Project to file the new session under. Empty = unfiled. Pre-filled from
   // `?project_id=` so the sidebar's pencil lands with the project selected.
   const [selectedProjectId, setSelectedProjectId] = useState<string>(() => projectIdParam);
+  const prefillEditsRef = useRef({
+    host: landingDraft !== null,
+    workspace: landingDraft !== null,
+    harness: landingDraft !== null,
+    model: landingDraft !== null,
+    effort: landingDraft !== null,
+  });
   // The landing screen stays mounted while the `?project_id=` param changes (e.g.
   // clicking a different project's pencil), so the lazy initializer above won't
   // re-run — sync the selection to the param whenever it changes.
@@ -1930,6 +1947,7 @@ export function NewChatLandingScreen() {
     if (model) _setCostControlMode(null);
   }, []);
   const setCostControlMode = useCallback((mode: CostControlMode) => {
+    prefillEditsRef.current.model = true;
     _setCostControlMode(mode);
     if (mode === "on") _setPickedModel("");
   }, []);
@@ -2010,6 +2028,9 @@ export function NewChatLandingScreen() {
   const { data: projectNewest, isError: projectNewestFailed } = useNewestProjectSession(
     projectIdParam || null,
   );
+  const { data: projectDefaults, isError: projectDefaultsFailed } = useResolvedProjectDefaults(
+    projectIdParam || null,
+  );
   const needsSourceRepoResolve =
     projectNewest != null &&
     projectNewest.git_branch != null &&
@@ -2032,6 +2053,13 @@ export function NewChatLandingScreen() {
 
   useEffect(() => {
     if (prefill.projectId === projectIdParam) return;
+    prefillEditsRef.current = {
+      host: false,
+      workspace: false,
+      harness: false,
+      model: false,
+      effort: false,
+    };
     setSandboxSelected(false);
     setSelectedHostId(null);
     setPickedAgentId(projectIdParam ? null : readLastAgentId());
@@ -2209,10 +2237,34 @@ export function NewChatLandingScreen() {
     } else if (supportsCursorMode) {
       setCursorExecMode(resolve(CURSOR_NATIVE_EXEC_MODES, CURSOR_NATIVE_DEFAULT_EXEC_MODE));
     }
-    // Reseed only on harness change; capability flags are derived from the
-    // same harness so they don't need to be deps.
+    // Reseed on a harness or project change; capability flags are derived
+    // from the same harness so they don't need to be deps.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedNativeHarness]);
+  }, [selectedNativeHarness, projectIdParam]);
+
+  useEffect(() => {
+    if (!projectIdParam || projectDefaults === undefined) return;
+    if (!prefillEditsRef.current.harness && projectDefaults.harness_override !== null) {
+      setPickedHarness(projectDefaults.harness_override);
+    }
+    if (!prefillEditsRef.current.model && projectDefaults.model_override !== null) {
+      setPickedModel(projectDefaults.model_override);
+    }
+    if (!prefillEditsRef.current.effort) {
+      if (projectDefaults.reasoning_effort !== null) {
+        setPickedEffort(projectDefaults.reasoning_effort);
+      } else if (projectNewest?.reasoning_effort != null) {
+        setPickedEffort(projectNewest.reasoning_effort);
+      }
+    }
+  }, [
+    effectiveAgentId,
+    projectDefaults,
+    projectIdParam,
+    projectNewest?.reasoning_effort,
+    selectedNativeHarness,
+    setPickedModel,
+  ]);
   // Native-terminal agents interpret slash commands inside their own CLI
   // (the runner injects the text verbatim), so the landing composer must
   // not intercept them — no skills menu, no slash_command routing.
@@ -2352,6 +2404,8 @@ export function NewChatLandingScreen() {
     const step = projectPrefillStep(prefill, {
       newest: projectNewest,
       newestFailed: projectNewestFailed,
+      defaults: projectDefaults,
+      defaultsFailed: projectDefaultsFailed,
       hosts,
       agents: agents === undefined ? undefined : agentList,
       sandboxSelected,
@@ -2364,9 +2418,20 @@ export function NewChatLandingScreen() {
       prefilledBranch,
       hostWorktrees: hostWorktreesArePlaceholder ? undefined : hostWorktrees,
       hostWorktreesFailed,
+      hostEdited: prefillEditsRef.current.host,
+      workspaceEdited: prefillEditsRef.current.workspace,
     });
     if (step === null) return;
     const { writes } = step;
+    if (writes.sandboxSelected) {
+      setSandboxSelected(true);
+      setSelectedHostId(null);
+    }
+    if (writes.sandboxWorkspace !== undefined) {
+      const sandbox = splitSandboxWorkspace(writes.sandboxWorkspace);
+      setSandboxRepoUrl(sandbox.url);
+      setSandboxRepoBranch(sandbox.branch);
+    }
     if (writes.hostId !== undefined) setSelectedHostId((current) => current ?? writes.hostId!);
     if (writes.agentId !== undefined) {
       setPickedAgentId((current) => current ?? writes.agentId!);
@@ -2384,6 +2449,8 @@ export function NewChatLandingScreen() {
     projectIdParam,
     projectNewest,
     projectNewestFailed,
+    projectDefaults,
+    projectDefaultsFailed,
     hosts,
     agents,
     agentList,
@@ -2603,18 +2670,33 @@ export function NewChatLandingScreen() {
   // applied yet).
   const handleSetPickedHarness = useCallback(
     (harness: string | null, agentId?: string) => {
+      prefillEditsRef.current.harness = true;
       setPickedHarness(harness);
       writeLastHarness(agentId ?? effectiveAgentId, harness);
     },
     [effectiveAgentId],
   );
+  const handleSetPickedModel = useCallback(
+    (model: string) => {
+      prefillEditsRef.current.model = true;
+      setPickedModel(model);
+    },
+    [setPickedModel],
+  );
+  const handleSetPickedEffort = useCallback((effort: string) => {
+    prefillEditsRef.current.effort = true;
+    setPickedEffort(effort);
+  }, []);
 
   // Select an agent/harness from the picker. Switching agents seeds the
   // harness override from the user's last pick for that agent (so a
   // returning user lands on the harness they used last); explicit picks
   // persist via localStorage.
   const handleSelectAgent = (agent: AvailableAgent) => {
-    if (agent.id !== effectiveAgentId) setPickedHarness(readLastHarness(agent.id));
+    if (agent.id !== effectiveAgentId) {
+      prefillEditsRef.current.harness = true;
+      setPickedHarness(readLastHarness(agent.id));
+    }
     setPickedAgentId(agent.id);
     writeLastAgentId(agent.id);
   };
@@ -2624,6 +2706,7 @@ export function NewChatLandingScreen() {
   };
 
   function selectHost(hostId: string) {
+    prefillEditsRef.current.host = true;
     // Persist the explicit pick even when it matches the current selection, so
     // clicking the auto-selected host still records it as the sticky default
     // for the next visit.
@@ -2644,6 +2727,7 @@ export function NewChatLandingScreen() {
   }
 
   function selectSandbox() {
+    prefillEditsRef.current.host = true;
     // Persist the explicit sandbox pick (as the reserved sentinel) even when
     // it's already selected, mirroring selectHost — so the sandbox becomes the
     // sticky default for the next visit.
@@ -3181,8 +3265,8 @@ export function NewChatLandingScreen() {
                   setApprovalMode={setApprovalMode}
                   setCursorExecMode={setCursorExecMode}
                   setBypassSandbox={setBypassSandbox}
-                  setPickedModel={setPickedModel}
-                  setPickedEffort={setPickedEffort}
+                  setPickedModel={handleSetPickedModel}
+                  setPickedEffort={handleSetPickedEffort}
                   setPickedHarness={handleSetPickedHarness}
                 />
                 {smartRoutingEnabled &&
@@ -3448,7 +3532,10 @@ export function NewChatLandingScreen() {
                         id="landing-repo-url"
                         type="text"
                         value={sandboxRepoUrl}
-                        onChange={(e) => setSandboxRepoUrl(e.target.value)}
+                        onChange={(e) => {
+                          prefillEditsRef.current.workspace = true;
+                          setSandboxRepoUrl(e.target.value);
+                        }}
                         placeholder="https://github.com/org/repo"
                         className="rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
                         data-testid="new-chat-landing-repo-input"
@@ -3456,7 +3543,10 @@ export function NewChatLandingScreen() {
                       <input
                         type="text"
                         value={sandboxRepoBranch}
-                        onChange={(e) => setSandboxRepoBranch(e.target.value)}
+                        onChange={(e) => {
+                          prefillEditsRef.current.workspace = true;
+                          setSandboxRepoBranch(e.target.value);
+                        }}
                         placeholder="Branch (defaults to the repo's default)"
                         aria-label="Repository branch"
                         className="rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
@@ -3490,7 +3580,10 @@ export function NewChatLandingScreen() {
                         initialPath={
                           isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined
                         }
-                        onNavigate={setWorkspace}
+                        onNavigate={(path) => {
+                          prefillEditsRef.current.workspace = true;
+                          setWorkspace(path);
+                        }}
                         // Warn when browsing into a directory other live agents
                         // occupy. Suppressed only when a NEW isolated worktree
                         // will be created (no shared-dir conflict then). When
@@ -3624,6 +3717,7 @@ export function NewChatLandingScreen() {
                                       // though blur is about to hide the list.
                                       onMouseDown={(e) => {
                                         e.preventDefault();
+                                        prefillEditsRef.current.workspace = true;
                                         setWorkspace(w.path);
                                         setBranchInputFocused(false);
                                         setWorktreePopoverOpen(false);

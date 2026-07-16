@@ -41,9 +41,11 @@ import {
   ARCHIVED_PROJECTS_KEY,
   invalidateProjectQueries,
   PROJECT_NEWEST_KEY,
+  PROJECT_RESOLVED_DEFAULTS_KEY,
   PROJECT_SESSIONS_KEY,
   PROJECTS_KEY,
   removeSessionsFromListCaches,
+  type ResolvedProjectDefaults,
 } from "./projectQueries";
 
 export const CONNECTED_STREAM_REFETCH_INTERVAL_MS = 60_000;
@@ -108,6 +110,8 @@ export interface Conversation {
    * "delete local branch" checkbox. See designs/SESSION_GIT_WORKTREE.md.
    */
   git_branch?: string | null;
+  /** Per-session reasoning effort, used by project composer mimicry. */
+  reasoning_effort?: string | null;
   /**
    * Whether the session is archived. Archived sessions are hidden from
    * the sidebar's default view and surface in the "Archived" section
@@ -888,6 +892,22 @@ export function useNewestProjectSession(projectId: string | null) {
     queryFn: async () => {
       const page = await fetchProjectSessionsPage(projectId as string, undefined, 1);
       return page.data[0] ?? null;
+    },
+    enabled: projectId !== null && projectId !== "",
+    staleTime: 30_000,
+  });
+}
+
+/** Fetch a project's server-resolved create defaults for composer prefill. */
+export function useResolvedProjectDefaults(projectId: string | null) {
+  return useQuery<ResolvedProjectDefaults>({
+    queryKey: [...PROJECT_RESOLVED_DEFAULTS_KEY, projectId],
+    queryFn: async () => {
+      const res = await authenticatedFetch(
+        `/v1/projects/${encodeURIComponent(projectId as string)}/defaults/resolved`,
+      );
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      return (await res.json()) as ResolvedProjectDefaults;
     },
     enabled: projectId !== null && projectId !== "",
     staleTime: 30_000,

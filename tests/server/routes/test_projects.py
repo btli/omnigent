@@ -72,6 +72,71 @@ async def test_create_list_get_are_owner_only_and_owner_is_server_derived(
     assert (await project_client.get("/v1/projects", headers=_headers("bob"))).json() == []
 
 
+async def test_resolved_defaults_preview_uses_bundle_and_includes_row_version(
+    project_client: httpx.AsyncClient,
+) -> None:
+    created = await project_client.post(
+        "/v1/projects",
+        headers=_headers("alice"),
+        json={
+            "name": "Configured",
+            "defaults_json": {
+                "host_type": "external",
+                "host_id": "host_123",
+                "workspace": "/work/widgets",
+                "harness": "claude",
+                "model": "claude-opus-4-6",
+                "reasoning_effort": "high",
+            },
+        },
+    )
+
+    response = await project_client.get(
+        f"/v1/projects/{created.json()['id']}/defaults/resolved",
+        headers=_headers("alice"),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "host_type": "external",
+        "host_id": "host_123",
+        "workspace": "/work/widgets",
+        "git": None,
+        "harness_override": "claude",
+        "model_override": "claude-opus-4-6",
+        "reasoning_effort": "high",
+        "row_version": 1,
+    }
+
+
+async def test_resolved_defaults_preview_is_owner_scoped_and_rejects_archived_projects(
+    project_client: httpx.AsyncClient,
+) -> None:
+    created = await project_client.post(
+        "/v1/projects",
+        headers=_headers("alice"),
+        json={"name": "Private", "defaults_json": {}},
+    )
+    project_id = created.json()["id"]
+
+    wrong_owner = await project_client.get(
+        f"/v1/projects/{project_id}/defaults/resolved",
+        headers=_headers("bob"),
+    )
+    archived = await project_client.post(
+        f"/v1/projects/{project_id}/archive",
+        headers=_headers("alice", **{"If-Match": '"1"'}),
+    )
+    archived_preview = await project_client.get(
+        f"/v1/projects/{project_id}/defaults/resolved",
+        headers=_headers("alice"),
+    )
+
+    assert wrong_owner.status_code == 404
+    assert archived.status_code == 200
+    assert archived_preview.status_code == 409
+
+
 async def test_name_collision_and_every_mutation_uses_if_match(
     project_client: httpx.AsyncClient,
 ) -> None:

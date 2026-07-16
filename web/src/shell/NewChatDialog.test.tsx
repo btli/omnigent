@@ -70,6 +70,19 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/hooks/useConversations")>()),
   useProjects: () => ({ data: projectOptions }),
   useNewestProjectSession: () => ({ data: null, isError: false }),
+  useResolvedProjectDefaults: () => ({
+    data: {
+      host_type: "external",
+      host_id: null,
+      workspace: null,
+      git: null,
+      harness_override: null,
+      model_override: null,
+      reasoning_effort: null,
+      row_version: 1,
+    },
+    isError: false,
+  }),
 }));
 // The harness-label catalog is not under test here. Keep it synchronous so
 // create-session fetch assertions only observe the POST/PATCH calls they own.

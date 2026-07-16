@@ -4,7 +4,23 @@ import { removeIdsFromPages, type ConversationsInfiniteData } from "@/lib/sessio
 export const PROJECTS_KEY = ["projects"] as const;
 export const PROJECT_SESSIONS_KEY = ["project-sessions"] as const;
 export const PROJECT_NEWEST_KEY = ["project-newest-session"] as const;
+export const PROJECT_RESOLVED_DEFAULTS_KEY = ["project-resolved-defaults"] as const;
 export const ARCHIVED_PROJECTS_KEY = ["archived-projects"] as const;
+
+export interface ResolvedProjectDefaults {
+  host_type: "managed" | "external";
+  host_id: string | null;
+  workspace: string | null;
+  git: {
+    branch_name: string;
+    base_branch?: string | null;
+    existing_worktree?: boolean;
+  } | null;
+  harness_override: string | null;
+  model_override: string | null;
+  reasoning_effort: string | null;
+  row_version: number;
+}
 
 /**
  * Refresh project identities and session-derived project state.
@@ -19,6 +35,7 @@ export function invalidateProjectQueries(
   void queryClient.invalidateQueries({ queryKey: PROJECTS_KEY });
   if (sessions) void queryClient.invalidateQueries({ queryKey: PROJECT_SESSIONS_KEY });
   void queryClient.invalidateQueries({ queryKey: PROJECT_NEWEST_KEY });
+  void queryClient.invalidateQueries({ queryKey: PROJECT_RESOLVED_DEFAULTS_KEY });
   void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECTS_KEY });
 }
 

@@ -1,138 +1,268 @@
-"""Browser e2e for the sidebar's session projects.
-
-Projects group conversations under named, collapsible folders inside a
-"Projects" sidebar group. Membership is stored server-side as the session's
-first-class ``metadata.project_id``. The web UI moves a session via the row
-kebab's **"Change project"** submenu (``data-testid="move-to-project"``), which
-calls ``PATCH /v1/sessions/{id}`` with ``project_id`` (an empty value removes
-the membership).
-
-The web UI move submenu is labelled "Add to project" (unfiled) or
-"Move session" (already filed); both share ``data-testid="move-to-project"``.
-
-These drive the real chain the ``Sidebar`` unit tests mock out: the kebab
-submenu → the PATCH → the refreshed ``GET /v1/projects`` and
-``GET /v1/sessions`` lists → the row landing under (or leaving) a project
-folder. Project folders render collapsed by default, so the tests expand the
-folder to assert membership.
-"""
+"""Browser e2e coverage for first-class sidebar projects."""
 
 from __future__ import annotations
 
-import re
 import uuid
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from typing import Any
 
 import httpx
+import pytest
 from playwright.sync_api import Locator, Page, expect
 
 
-def _set_title(base_url: str, session_id: str, title: str) -> None:
-    """Give a session a unique title via ``PATCH /v1/sessions/{id}`` so its row
-    is easy to spot among other tests' sessions in the shared server."""
-    resp = httpx.patch(
-        f"{base_url}/v1/sessions/{session_id}",
-        json={"title": title},
+@dataclass
+class ProjectApi:
+    """Seed projects and sessions through their public REST APIs."""
+
+    base_url: str
+    agent_id: str
+    session_ids: list[str] = field(default_factory=list)
+
+    def create_project(self, name: str) -> dict[str, Any]:
+        response = httpx.post(
+            f"{self.base_url}/v1/projects",
+            json={"name": name},
+            timeout=10.0,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def create_session(self, project_id: str, title: str) -> str:
+        response = httpx.post(
+            f"{self.base_url}/v1/sessions",
+            json={
+                "agent_id": self.agent_id,
+                "project_id": project_id,
+                "title": title,
+            },
+            timeout=10.0,
+        )
+        response.raise_for_status()
+        session_id = response.json()["id"]
+        self.session_ids.append(session_id)
+        return session_id
+
+
+@pytest.fixture
+def project_api(seeded_session: tuple[str, str]) -> Iterator[ProjectApi]:
+    """Reuse the seeded session's agent for project-bound JSON creates."""
+    base_url, source_session_id = seeded_session
+    response = httpx.get(
+        f"{base_url}/v1/sessions/{source_session_id}/agent",
         timeout=10.0,
     )
-    resp.raise_for_status()
+    response.raise_for_status()
+    api = ProjectApi(base_url=base_url, agent_id=response.json()["id"])
+    try:
+        yield api
+    finally:
+        for session_id in reversed(api.session_ids):
+            httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
 
 
-def _section(page: Page, title: str) -> Locator:
-    """Locate the sidebar ``<section>`` whose collapse-header button reads
-    *title* (e.g. "Sessions" or a project name). Section headers carry no count
-    or icon, so the header's accessible name is the bare title."""
-    return page.locator("section").filter(has=page.get_by_role("button", name=title, exact=True))
+def _unique(prefix: str) -> str:
+    return f"{prefix} {uuid.uuid4().hex[:8]}"
 
 
-def _row(page: Page, session_id: str) -> Locator:
-    """Locate the sidebar row (``<li>``) for *session_id* by its href."""
-    return page.locator("li").filter(has=page.locator(f'a[href="/c/{session_id}"]'))
+def _section(page: Page, project_name: str) -> Locator:
+    return page.locator("section").filter(
+        has=page.get_by_role("button", name=project_name, exact=True)
+    ).last
 
 
-def _move_to_new_project(page: Page, row: Locator, name: str) -> None:
-    """Drive the row kebab → "Add to project" → "Create new project" flow,
-    typing *name* and committing with Enter."""
+def _row(page: Page, section: Locator, session_id: str) -> Locator:
+    return section.locator("li").filter(has=page.locator(f'a[href="/c/{session_id}"]'))
+
+
+def _open_project_kebab(page: Page, project_name: str) -> None:
+    section = _section(page, project_name)
+    section.hover()
+    page.get_by_role("button", name=f"Project actions for {project_name}").click()
+
+
+def _expect_project_menu(page: Page, project_id: str) -> None:
+    new_session = page.get_by_role("menuitem", name="New session", exact=True)
+    expect(new_session).to_be_visible()
+    expect(new_session).to_have_attribute("href", f"/?project_id={project_id}")
+    for name in ("Project settings", "Rename project", "Delete project"):
+        expect(page.get_by_role("menuitem", name=name, exact=True)).to_be_visible()
+
+
+def test_api_seeded_project_shows_sessions_and_new_session_link(
+    page: Page,
+    project_api: ProjectApi,
+) -> None:
+    project_name = _unique("Project folder")
+    title = _unique("Filed session")
+    project = project_api.create_project(project_name)
+    session_id = project_api.create_session(project["id"], title)
+
+    page.goto(f"{project_api.base_url}/c/{session_id}")
+
+    header = page.get_by_role("button", name=project_name, exact=True)
+    expect(header).to_be_visible()
+    expect(header).to_have_attribute("aria-expanded", "true")
+    expect(_section(page, project_name).locator(f'a[href="/c/{session_id}"]')).to_contain_text(
+        title
+    )
+
+    _section(page, project_name).hover()
+    new_session = page.get_by_role("link", name=f"New session in {project_name}")
+    expect(new_session).to_be_visible()
+    expect(new_session).to_have_attribute("href", f"/?project_id={project['id']}")
+
+
+def test_project_right_click_and_kebab_offer_the_same_actions(
+    page: Page,
+    project_api: ProjectApi,
+) -> None:
+    project_name = _unique("Project actions")
+    project = project_api.create_project(project_name)
+    session_id = project_api.create_session(project["id"], _unique("Action session"))
+    page.goto(f"{project_api.base_url}/c/{session_id}")
+
+    page.get_by_role("button", name=project_name, exact=True).click(button="right")
+    _expect_project_menu(page, project["id"])
+    page.keyboard.press("Escape")
+
+    _open_project_kebab(page, project_name)
+    _expect_project_menu(page, project["id"])
+
+
+def test_inline_rename_commits_and_keeps_collision_in_edit(
+    page: Page,
+    project_api: ProjectApi,
+) -> None:
+    original_name = _unique("Rename source")
+    existing_name = _unique("Rename collision")
+    renamed_name = _unique("Rename committed")
+    project = project_api.create_project(original_name)
+    project_api.create_project(existing_name)
+    session_id = project_api.create_session(project["id"], _unique("Rename session"))
+    page.goto(f"{project_api.base_url}/c/{session_id}")
+
+    page.get_by_role("button", name=original_name, exact=True).click(button="right")
+    page.get_by_role("menuitem", name="Rename project", exact=True).click()
+    rename_input = page.get_by_role("textbox", name="Rename project")
+    expect(rename_input).to_be_visible()
+    rename_input.fill(renamed_name)
+    rename_input.press("Enter")
+
+    renamed_header = page.get_by_role("button", name=renamed_name, exact=True)
+    expect(renamed_header).to_be_visible()
+    expect(renamed_header).to_have_attribute("aria-expanded", "true")
+
+    renamed_header.click(button="right")
+    page.get_by_role("menuitem", name="Rename project", exact=True).click()
+    rename_input = page.get_by_role("textbox", name="Rename project")
+    rename_input.fill(existing_name)
+    rename_input.press("Enter")
+
+    alert = page.get_by_role("alert")
+    expect(alert).to_contain_text("already exists")
+    expect(rename_input).to_be_visible()
+    expect(rename_input).to_have_value(existing_name)
+    expect(rename_input).to_have_attribute("aria-invalid", "true")
+    editing_section = page.locator("section").filter(has=rename_input)
+    expect(editing_section.locator(f'a[href="/c/{session_id}"]')).to_be_visible()
+
+
+def test_move_session_between_projects_from_row_kebab(
+    page: Page,
+    project_api: ProjectApi,
+) -> None:
+    source_name = _unique("Move source")
+    target_name = _unique("Move target")
+    source = project_api.create_project(source_name)
+    project_api.create_project(target_name)
+    session_id = project_api.create_session(source["id"], _unique("Moved session"))
+    page.goto(f"{project_api.base_url}/c/{session_id}")
+
+    source_row = _row(page, _section(page, source_name), session_id)
+    expect(source_row).to_be_visible()
+    source_row.hover()
+    source_row.get_by_test_id("conversation-actions").click()
+    page.get_by_test_id("move-to-project").click()
+    page.get_by_role("menuitem", name=target_name, exact=True).click()
+
+    expect(_section(page, source_name).locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
+    target_header = page.get_by_role("button", name=target_name, exact=True)
+    expect(target_header).to_have_attribute("aria-expanded", "true")
+    expect(_section(page, target_name).locator(f'a[href="/c/{session_id}"]')).to_be_visible()
+
+
+def test_archived_filter_lists_and_filters_by_project(
+    page: Page,
+    project_api: ProjectApi,
+) -> None:
+    project_name = _unique("Archived project")
+    title = _unique("Archived filed session")
+    project = project_api.create_project(project_name)
+    session_id = project_api.create_session(project["id"], title)
+    page.goto(f"{project_api.base_url}/c/{session_id}")
+
+    row = _row(page, _section(page, project_name), session_id)
     row.hover()
     row.get_by_test_id("conversation-actions").click()
-    # Open the submenu flyout, then start the inline new-project input.
-    page.get_by_test_id("move-to-project").click()
-    page.get_by_role("menuitem", name="Create new project").click()
-    new_input = page.get_by_placeholder("Project name…")
-    new_input.fill(name)
-    new_input.press("Enter")
+    with page.expect_response(
+        lambda response: (
+            response.url.endswith(f"/v1/sessions/{session_id}")
+            and response.request.method == "PATCH"
+        )
+    ) as archive_response:
+        page.get_by_test_id("archive-conversation").click()
+    assert archive_response.value.ok
+
+    page.get_by_test_id("settings-button").click()
+    page.get_by_test_id("settings-nav-archived").click()
+    expect(page.get_by_role("heading", name="Archived sessions", exact=True)).to_be_visible()
+
+    project_filter = page.get_by_role("combobox", name="Filter archived sessions by project")
+    expect(project_filter).to_be_visible()
+    project_filter.click()
+    options = page.get_by_role("option")
+    expect(options).to_have_text(["All projects", project_name])
+    page.get_by_role("option", name=project_name, exact=True).click()
+
+    archived_rows = page.get_by_test_id("archived-row")
+    expect(archived_rows).to_have_count(1)
+    expect(archived_rows).to_contain_text(title)
 
 
-def test_move_session_into_new_project(
+def test_delete_project_archives_sessions_and_removes_folder(
     page: Page,
-    seeded_session: tuple[str, str],
+    project_api: ProjectApi,
 ) -> None:
-    """Creating a project from the kebab moves the row into it.
+    project_name = _unique("Delete project")
+    project = project_api.create_project(project_name)
+    session_id = project_api.create_session(project["id"], _unique("Delete project session"))
+    page.goto(f"{project_api.base_url}/c/{session_id}")
 
-    The session starts under "Sessions"; after "Add to project → Create new
-    project", a project folder with that name appears under the "Projects" group and the
-    row lives under it (once expanded) and no longer under "Sessions".
-    """
-    base_url, session_id = seeded_session
-    title = f"e2e-proj-{uuid.uuid4().hex[:8]}"
-    _set_title(base_url, session_id, title)
-    project = f"Project {uuid.uuid4().hex[:6]}"
+    _open_project_kebab(page, project_name)
+    page.get_by_role("menuitem", name="Delete project", exact=True).click()
+    dialog = page.get_by_role("dialog")
+    expect(dialog).to_contain_text("all of its sessions")
+    with page.expect_response(
+        lambda response: (
+            response.url.endswith(f"/v1/projects/{project['id']}/archive?include_sessions=true")
+            and response.request.method == "POST"
+        )
+    ) as delete_response:
+        dialog.get_by_role("button", name="Delete project", exact=True).click()
+    assert delete_response.value.ok
 
-    page.goto(f"{base_url}/c/{session_id}")
-
-    row = _row(page, session_id)
-    expect(row).to_be_visible()
-    expect(_section(page, "Sessions").locator(f'a[href="/c/{session_id}"]')).to_be_visible()
-
-    _move_to_new_project(page, row, project)
-
-    # The project folder appears and auto-expands on the move (so the session
-    # you just filed is revealed without a manual click).
-    header = page.get_by_role("button", name=project, exact=True)
-    expect(header).to_be_visible()
-    expect(header).to_have_attribute("aria-expanded", "true")
-
-    expect(_section(page, project).locator(f'a[href="/c/{session_id}"]')).to_be_visible()
-    expect(_section(page, "Sessions").locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
-
-
-def test_remove_session_from_project(
-    page: Page,
-    seeded_session: tuple[str, str],
-) -> None:
-    """Removing a session from its project drops it back under "Sessions".
-
-    Moves the row into a fresh project first, then uses the kebab's
-    "Remove from <project>" item and asserts the row returns to "Sessions".
-    """
-    base_url, session_id = seeded_session
-    title = f"e2e-proj-rm-{uuid.uuid4().hex[:8]}"
-    _set_title(base_url, session_id, title)
-    project = f"Project {uuid.uuid4().hex[:6]}"
-
-    page.goto(f"{base_url}/c/{session_id}")
-
-    row = _row(page, session_id)
-    expect(row).to_be_visible()
-    _move_to_new_project(page, row, project)
-
-    # The folder auto-expands on the move, so its row is already visible.
-    header = page.get_by_role("button", name=project, exact=True)
-    expect(header).to_be_visible()
-    expect(header).to_have_attribute("aria-expanded", "true")
-
-    # Remove via the kebab's "Remove from <project>" item (only shown when the
-    # session is in a project).
-    project_row = (
-        _section(page, project)
-        .locator("li")
-        .filter(has=page.locator(f'a[href="/c/{session_id}"]'))
+    expect(page.get_by_role("button", name=project_name, exact=True)).to_have_count(0)
+    session_response = httpx.get(
+        f"{project_api.base_url}/v1/sessions/{session_id}",
+        timeout=10.0,
     )
-    project_row.hover()
-    project_row.get_by_test_id("conversation-actions").click()
-    page.get_by_test_id("move-to-project").click()
-    # The kebab item names the project it removes from ("Remove from <name>").
-    page.get_by_role("menuitem", name=re.compile(rf"Remove from {re.escape(project)}")).click()
-
-    # Back under "Sessions"; the now-empty first-class project persists.
-    expect(_section(page, "Sessions").locator(f'a[href="/c/{session_id}"]')).to_be_visible()
-    expect(page.get_by_role("button", name=project, exact=True)).to_be_visible()
+    session_response.raise_for_status()
+    assert session_response.json()["archived"] is True
+    project_response = httpx.get(
+        f"{project_api.base_url}/v1/projects/{project['id']}",
+        timeout=10.0,
+    )
+    project_response.raise_for_status()
+    assert project_response.json()["archived_at"] is not None

@@ -1,6 +1,7 @@
 import type { Host } from "@/hooks/useHosts";
 import type { Conversation } from "@/hooks/useConversations";
 import type { HostWorktree } from "@/hooks/useHostWorktrees";
+import type { ResolvedProjectDefaults } from "@/hooks/projectQueries";
 
 type ProjectPrefillPhase = "host" | "workspace" | "branch" | "settled";
 
@@ -26,9 +27,26 @@ export function prefillDone(state: ProjectPrefillState): boolean {
   return state.phase === "settled" && state.agentSeeded;
 }
 
+export function resolvePrefillValue<T>({
+  bundle,
+  fallback,
+  manual,
+  edited,
+}: {
+  bundle: T | undefined;
+  fallback: T | undefined;
+  manual?: T;
+  edited: boolean;
+}): T | undefined {
+  if (edited) return manual;
+  return bundle !== undefined ? bundle : fallback;
+}
+
 interface ProjectPrefillInputs {
   newest: Conversation | null | undefined;
   newestFailed: boolean;
+  defaults: ResolvedProjectDefaults | undefined;
+  defaultsFailed: boolean;
   hosts: Host[] | undefined;
   agents: { id: string }[] | undefined;
   sandboxSelected: boolean;
@@ -41,10 +59,14 @@ interface ProjectPrefillInputs {
   prefilledBranch: string;
   hostWorktrees: HostWorktree[] | undefined;
   hostWorktreesFailed: boolean;
+  hostEdited: boolean;
+  workspaceEdited: boolean;
 }
 
 interface ProjectPrefillWrites {
   hostId?: string;
+  sandboxSelected?: boolean;
+  sandboxWorkspace?: string;
   agentId?: string;
   workspace?: string;
   branch?: string;
@@ -92,29 +114,66 @@ function locationStep(
   writes: ProjectPrefillWrites,
 ): ProjectPrefillState | null {
   if (state.phase === "host") {
-    const { newest, newestFailed, hosts } = inputs;
-    if ((newest === undefined && !newestFailed) || hosts === undefined) return null;
+    const { newest, newestFailed, defaults, defaultsFailed, hosts } = inputs;
+    if (
+      (newest === undefined && !newestFailed) ||
+      (defaults === undefined && !defaultsFailed) ||
+      hosts === undefined
+    ) {
+      return null;
+    }
+    if (defaults?.host_type === "managed" && !inputs.hostEdited && !inputs.workspaceEdited) {
+      writes.sandboxSelected = true;
+    }
     return { ...state, phase: "workspace" };
   }
 
   if (state.phase === "workspace") {
-    const { newest, hosts, sourceWorktrees, sourceWorktreesFailed, selectedHostId } = inputs;
-    const hostId = newest?.host_id ?? null;
-    const sourceWorkspace = newest?.workspace ?? null;
+    const { newest, defaults, hosts, sourceWorktrees, sourceWorktreesFailed, selectedHostId } =
+      inputs;
+    if (defaults?.host_type === "managed" && !inputs.hostEdited && !inputs.workspaceEdited) {
+      if (!inputs.hostEdited && !inputs.workspaceEdited && defaults.workspace !== null) {
+        writes.sandboxWorkspace = defaults.workspace;
+      }
+      return settled(state);
+    }
+    const hostId = resolvePrefillValue({
+      bundle: defaults?.host_id ?? undefined,
+      fallback: newest?.host_id ?? undefined,
+      manual: selectedHostId ?? undefined,
+      edited: inputs.hostEdited,
+    });
+    const sourceWorkspace = resolvePrefillValue({
+      bundle: defaults?.workspace ?? undefined,
+      fallback: newest?.workspace ?? undefined,
+      manual: inputs.workspaceTrimmed || undefined,
+      edited: inputs.workspaceEdited,
+    });
+    const newestLocationSelected =
+      defaults?.workspace == null &&
+      newest?.host_id === hostId &&
+      newest?.workspace === sourceWorkspace;
     if (
-      newest == null ||
-      hostId === null ||
-      sourceWorkspace === null ||
+      sourceWorkspace == null ||
       inputs.sandboxSelected ||
-      (selectedHostId !== null && selectedHostId !== hostId) ||
-      !(hosts ?? []).some((host) => host.host_id === hostId && host.status === "online")
+      inputs.workspaceEdited ||
+      (inputs.hostEdited && selectedHostId !== hostId)
     ) {
       return settled(state);
     }
-    if (newest.git_branch == null) {
+    if (hostId === undefined) {
+      writes.workspace = sourceWorkspace;
+      return settled(state);
+    }
+    if (!(hosts ?? []).some((host) => host.host_id === hostId && host.status === "online")) {
+      return settled(state);
+    }
+    if (!newestLocationSelected || newest?.git_branch == null) {
       writes.hostId = hostId;
       writes.workspace = sourceWorkspace;
-      return { ...state, phase: "branch", seededWorkspace: sourceWorkspace };
+      return newestLocationSelected
+        ? { ...state, phase: "branch", seededWorkspace: sourceWorkspace }
+        : settled(state);
     }
     if (sourceWorktreesFailed) return settled(state);
     if (sourceWorktrees === undefined) return null;
