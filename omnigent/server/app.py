@@ -25,6 +25,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from omnigent._platform import resolve_repo_symlink
 from omnigent.db.db_models import InvalidUuidError
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.git_hosts.base import HostConfig
 from omnigent.harness_plugins import (
     ANTIGRAVITY_NATIVE_CODING_AGENT,
     CLAUDE_NATIVE_CODING_AGENT,
@@ -1082,6 +1083,7 @@ def create_app(
     admins: list[str] | None = None,
     allowed_domains: list[str] | None = None,
     sandbox_config: ManagedSandboxConfig | None = None,
+    git_hosts: tuple[HostConfig, ...] = (),
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
@@ -1142,6 +1144,9 @@ def create_app(
         ``host_type="managed"`` create fails with a clear error).
         Managed-host credentials live on the ``hosts`` table, so no
         extra store is wired.
+    :param git_hosts: Operator-configured custom git hosts, parsed by
+        :func:`omnigent.git_hosts.config.load_git_hosts`; empty when
+        none are configured.
     :param sharing_mode: Server policy for creating new session
         permission grants (see :class:`SharingMode`): ``ON`` allows
         grants at any level plus public/workspace read, ``READ_ONLY``
@@ -1396,6 +1401,7 @@ def create_app(
     app.state.host_registry = host_registry
     app.state.host_store = host_store
     app.state.sandbox_config = sandbox_config
+    app.state.git_hosts = git_hosts
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
     # admin-gated auth routes AND ``/v1/me``'s is_admin computation consult the
