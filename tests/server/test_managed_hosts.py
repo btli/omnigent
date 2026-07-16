@@ -24,6 +24,7 @@ from omnigent.server.managed_hosts import (
     OPENSHELL_MANAGED_TOKEN_TTL_S,
     ManagedSandboxConfig,
     RepoWorkspace,
+    _build_clone_env,
     host_resume_supported,
     launch_managed_host,
     parse_repo_workspace,
@@ -901,6 +902,39 @@ def test_resolve_repo_workspace_unknown_host_raises() -> None:
         resolve_repo_workspace("https://git.unknown.com/x/y", _GH_HOSTS)
 
 
+def test_build_clone_env_none_without_credential_source() -> None:
+    assert _build_clone_env(None) is None
+    repo = RepoWorkspace(url="https://github.com/o/r", branch=None, repo_name="r")
+    assert _build_clone_env(repo) is None
+
+
+def test_build_clone_env_resolves_operator_credential(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ACME_TOKEN", "s3cret")
+    repo = RepoWorkspace(
+        url="https://git.acme.com/t/p",
+        branch=None,
+        repo_name="p",
+        canonical_host="git.acme.com",
+        provider="forgejo",
+        credential_source="env:ACME_TOKEN",
+        clone_username="oauth2",
+    )
+    assert _build_clone_env(repo) == {"GIT_TOKEN": "s3cret", "GIT_USERNAME": "oauth2"}
+
+
+def test_build_clone_env_missing_secret_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ACME_TOKEN", raising=False)
+    repo = RepoWorkspace(
+        url="https://git.acme.com/t/p",
+        branch=None,
+        repo_name="p",
+        credential_source="env:ACME_TOKEN",
+        clone_username="oauth2",
+    )
+    with pytest.raises(ValueError):
+        _build_clone_env(repo)
+
+
 # ── GET /v1/info: managed_sandboxes_enabled ─────────────────
 
 
@@ -1331,6 +1365,7 @@ class _EntrypointFakeLauncher(FakeSandboxLauncher):
         repo_url: str | None = None,
         repo_branch: str | None = None,
         repo_name: str | None = None,
+        clone_env: dict[str, str] | None = None,
         on_stage=None,
     ) -> str:
         """Record the call, prove the token already resolves, and connect."""
@@ -1342,6 +1377,7 @@ class _EntrypointFakeLauncher(FakeSandboxLauncher):
                 "server_url": server_url,
                 "repo_url": repo_url,
                 "repo_name": repo_name,
+                "clone_env": clone_env,
             }
         )
         # The token was registered before start_host, so it resolves now.

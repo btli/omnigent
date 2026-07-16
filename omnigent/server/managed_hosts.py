@@ -105,6 +105,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import secrets
 import time
@@ -118,6 +119,7 @@ from fastapi import HTTPException
 
 from omnigent.db.utils import now_epoch
 from omnigent.git_hosts.base import HostConfig
+from omnigent.git_hosts.credentials import resolve_credential
 from omnigent.git_hosts.resolver import resolve_clone_plan
 from omnigent.stores.host_store import Host, HostStore
 
@@ -590,6 +592,25 @@ def resolve_repo_workspace(workspace: str, hosts: Sequence[HostConfig]) -> RepoW
         credential_source=plan.credential_source,
         clone_username=plan.auth.username,
     )
+
+
+def _build_clone_env(repo: RepoWorkspace | None) -> dict[str, str] | None:
+    """Resolve a repo's operator credential into per-clone env, or ``None``.
+
+    Resolution happens in the trusted server process at launch time; only the
+    resolved value rides the single prefixed clone command (launch-scoped —
+    see the ``clone_env`` launcher contract). The github.com default carries
+    no ``credential_source`` and keeps today's ambient-``GIT_TOKEN`` behavior.
+
+    :param repo: The enriched workspace, or ``None`` for no-repo launches.
+    :returns: ``{"GIT_TOKEN": ..., "GIT_USERNAME": ...}`` or ``None``.
+    :raises ValueError: When the configured source cannot be resolved —
+        provisioning must fail loudly rather than clone unauthenticated.
+    """
+    if repo is None or repo.credential_source is None:
+        return None
+    token = resolve_credential(repo.credential_source, parent_env=os.environ.copy())
+    return {"GIT_TOKEN": token, "GIT_USERNAME": repo.clone_username or "x-access-token"}
 
 
 def _modal_launcher_factory(
@@ -1975,6 +1996,7 @@ async def _arm_and_start_host(
         # a token that already resolves. The exec-model default execs in; the
         # entrypoint model (k8s) creates the Pod that boots the host. *repo* is
         # unpacked into primitives — the launcher API takes no RepoWorkspace.
+        clone_env = _build_clone_env(repo)
         workspace = await asyncio.to_thread(
             launcher.start_host,
             sandbox_id,
@@ -1985,6 +2007,7 @@ async def _arm_and_start_host(
             repo_url=repo.url if repo is not None else None,
             repo_branch=repo.branch if repo is not None else None,
             repo_name=repo.repo_name if repo is not None else None,
+            clone_env=clone_env,
             on_stage=on_stage,
         )
         await _wait_for_host_online(host_store, host_id)
