@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from omnigent.entities import LiveProjectSnapshot
+from omnigent.entities import LiveProjectSnapshot, Project
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.projects.defaults import ProjectDefaultsBundle
 from omnigent.projects.resolver import resolve_project_defaults
@@ -19,17 +19,59 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.project_store import ProjectInputError, ProjectStore
 
 
+def _require_project_store(project_store: ProjectStore | None) -> ProjectStore:
+    if project_store is None:
+        raise OmnigentError(
+            "Project storage is not configured",
+            code=ErrorCode.INTERNAL_ERROR,
+        )
+    return project_store
+
+
+async def _get_project_for_use(
+    project_store: ProjectStore,
+    project_id: str,
+    owner_principal_id: str,
+) -> Project:
+    project = await asyncio.to_thread(
+        project_store.get_for_use,
+        project_id,
+        owner_principal_id,
+    )
+    if project is None:
+        raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+    return project
+
+
+def _moved_project_snapshot(
+    project_id: str | None,
+    *,
+    legacy_project_requested: bool,
+    explicit_project_requested: bool,
+    parent_session_id: str | None,
+) -> LiveProjectSnapshot | None:
+    if (
+        legacy_project_requested
+        and not explicit_project_requested
+        and project_id is not None
+        and parent_session_id is None
+    ):
+        return LiveProjectSnapshot.moved(project_id)
+    return None
+
+
 async def resolve_legacy_project_label(
     labels: dict[str, str],
     owner_principal_id: str,
     project_store: ProjectStore | None,
     *,
     write_path: str,
+    legacy_project_requested: bool,
     explicit_project_requested: bool = False,
     explicit_project_id: str | None = None,
 ) -> tuple[dict[str, str], str | None, bool]:
     """Consume a legacy project label and resolve its authoritative id."""
-    if PROJECT_LABEL_KEY not in labels:
+    if not legacy_project_requested:
         return labels, None, False
     warn_deprecated_project_label(write_path)
     clean_labels = {key: value for key, value in labels.items() if key != PROJECT_LABEL_KEY}
@@ -41,11 +83,7 @@ async def resolve_legacy_project_label(
                 code=ErrorCode.INVALID_INPUT,
             )
         return clean_labels, None, True
-    if project_store is None:
-        raise OmnigentError(
-            "Project storage is not configured",
-            code=ErrorCode.INTERNAL_ERROR,
-        )
+    project_store = _require_project_store(project_store)
 
     if explicit_project_requested:
         project = await asyncio.to_thread(
@@ -76,29 +114,24 @@ async def prepare_json_session_project(
 ) -> tuple[SessionCreateRequest, LiveProjectSnapshot | None]:
     """Resolve JSON-create project compatibility, defaults, and snapshot."""
     explicit_project_requested = "project_id" in body.model_fields_set
+    legacy_project_requested = PROJECT_LABEL_KEY in body.labels
     clean_labels, legacy_project_id, legacy_project_requested = await resolve_legacy_project_label(
         body.labels,
         owner_principal_id,
         project_store,
         write_path="json_create",
+        legacy_project_requested=legacy_project_requested,
         explicit_project_requested=explicit_project_requested,
         explicit_project_id=body.project_id or None,
     )
     body = body.model_copy(update={"labels": clean_labels})
 
     if body.project_id is not None and body.parent_session_id is None:
-        if project_store is None:
-            raise OmnigentError(
-                "Project storage is not configured",
-                code=ErrorCode.INTERNAL_ERROR,
-            )
-        project = await asyncio.to_thread(
-            project_store.get_for_use,
+        project = await _get_project_for_use(
+            _require_project_store(project_store),
             body.project_id,
             owner_principal_id,
         )
-        if project is None:
-            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
 
         override_values: dict[str, Any] = {}
         for field_name in ("host_type", "host_id", "workspace", "reasoning_effort"):
@@ -135,14 +168,12 @@ async def prepare_json_session_project(
             defaults_json=resolved.model_dump(mode="json"),
         )
 
-    if (
-        legacy_project_requested
-        and not explicit_project_requested
-        and legacy_project_id is not None
-        and body.parent_session_id is None
-    ):
-        return body, LiveProjectSnapshot.moved(legacy_project_id)
-    return body, None
+    return body, _moved_project_snapshot(
+        legacy_project_id,
+        legacy_project_requested=legacy_project_requested,
+        explicit_project_requested=explicit_project_requested,
+        parent_session_id=body.parent_session_id,
+    )
 
 
 async def prepare_multipart_session_project(
@@ -151,19 +182,20 @@ async def prepare_multipart_session_project(
     project_store: ProjectStore | None,
 ) -> tuple[SessionCreateMetadata, LiveProjectSnapshot | None]:
     """Resolve multipart-create legacy membership and snapshot."""
+    legacy_project_requested = PROJECT_LABEL_KEY in metadata.labels
     clean_labels, legacy_project_id, legacy_project_requested = await resolve_legacy_project_label(
         metadata.labels,
         owner_principal_id,
         project_store,
         write_path="multipart_create",
+        legacy_project_requested=legacy_project_requested,
     )
     metadata = metadata.model_copy(update={"labels": clean_labels})
-    snapshot = (
-        LiveProjectSnapshot.moved(legacy_project_id)
-        if legacy_project_requested
-        and legacy_project_id is not None
-        and metadata.parent_session_id is None
-        else None
+    snapshot = _moved_project_snapshot(
+        legacy_project_id,
+        legacy_project_requested=legacy_project_requested,
+        explicit_project_requested=False,
+        parent_session_id=metadata.parent_session_id,
     )
     return metadata, snapshot
 
@@ -178,19 +210,13 @@ async def resolve_patch_project_membership(
     project_store: ProjectStore | None,
 ) -> str | None:
     """Validate and resolve a PATCH membership request."""
-    if project_store is None:
-        raise OmnigentError(
-            "Project storage is not configured",
-            code=ErrorCode.INTERNAL_ERROR,
-        )
+    project_store = _require_project_store(project_store)
     if explicit_project_id is not None:
-        explicit_project = await asyncio.to_thread(
-            project_store.get_for_use,
+        await _get_project_for_use(
+            project_store,
             explicit_project_id,
             owner_principal_id,
         )
-        if explicit_project is None:
-            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
 
     if not legacy_project_requested:
         return explicit_project_id
@@ -199,6 +225,7 @@ async def resolve_patch_project_membership(
         owner_principal_id,
         project_store,
         write_path="patch",
+        legacy_project_requested=legacy_project_requested,
         explicit_project_requested=explicit_project_requested,
         explicit_project_id=explicit_project_id,
     )

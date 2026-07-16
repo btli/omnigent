@@ -130,6 +130,7 @@ import { AgentRowTooltip } from "@/components/AgentHoverCard";
 import { CreateAgentDialog } from "./CreateAgentDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
 import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
+import { ProjectCreateRow } from "./ProjectCreateRow";
 
 // Hidden from the new-session picker only. `nessie` is superseded by polly.
 // `kimi` / `kimi-code` are the headless SDK harness (kept for sub-agent / `run
@@ -823,26 +824,15 @@ function LandingProjectPicker({
         <div className="border-t pt-1">
           {picker.creatingNew ? (
             <div className="px-2 py-1">
-              <input
-                ref={picker.newInputRef}
-                className="w-full bg-transparent text-xs outline-none"
-                placeholder="Project name…"
+              <ProjectCreateRow
+                inputRef={picker.newInputRef}
                 value={picker.newProjectName}
-                onChange={(e) => picker.setNewProjectName(e.target.value)}
+                onChange={picker.setNewProjectName}
                 onKeyDown={picker.handleNewProjectKeyDown}
                 disabled={picker.isCreatingProject}
-                aria-invalid={picker.createError ? true : undefined}
-                aria-describedby={picker.createError ? "landing-project-create-error" : undefined}
+                error={picker.createError}
+                errorId="landing-project-create-error"
               />
-              {picker.createError && (
-                <p
-                  id="landing-project-create-error"
-                  className="pt-1 text-destructive text-xs"
-                  role="alert"
-                >
-                  {picker.createError}
-                </p>
-              )}
             </div>
           ) : (
             <button type="button" className={itemClass} onClick={picker.beginCreatingProject}>

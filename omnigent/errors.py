@@ -117,6 +117,17 @@ class OmnigentError(Exception):
         return _CODE_TO_HTTP_STATUS.get(self.code, 500)
 
 
+class ProjectInputError(OmnigentError):
+    """Project input validation error rendered as HTTP 422 by the API."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, code=ErrorCode.INVALID_INPUT)
+
+    @property
+    def http_status(self) -> int:
+        return 422
+
+
 class ElicitationDeclinedError(Exception):
     """Raised when a user explicitly declines an elicitation (action == "decline").
 

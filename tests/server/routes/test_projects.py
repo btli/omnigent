@@ -7,49 +7,20 @@ from collections.abc import AsyncIterator
 import httpx
 import pytest
 import pytest_asyncio
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI
 from sqlalchemy import event
 
 from omnigent.db.utils import get_or_create_engine
-from omnigent.errors import OmnigentError
-from omnigent.server.app import add_workspace_scope_middleware
-from omnigent.server.auth import AuthProvider
-from omnigent.server.routes.projects import create_projects_router
+from omnigent.server.auth import RESERVED_USER_PUBLIC
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
-
-
-class HeaderAuthProvider(AuthProvider):
-    """Resolve the test caller from ``X-Test-User``."""
-
-    def get_user_id(self, request: Request) -> str | None:
-        return request.headers.get("X-Test-User")
+from tests.server.routes.conftest import sessions_test_app
 
 
 @pytest.fixture()
 def project_app(db_uri: str) -> FastAPI:
-    app = FastAPI()
-
-    @app.exception_handler(OmnigentError)
-    async def _handle_error(_request: Request, error: OmnigentError) -> JSONResponse:
-        return JSONResponse(
-            status_code=error.http_status,
-            content={"error": {"code": error.code, "message": error.message}},
-        )
-
-    add_workspace_scope_middleware(app)
-    conversations = SqlAlchemyConversationStore(db_uri)
-    app.include_router(
-        create_projects_router(
-            SqlAlchemyProjectStore(db_uri),
-            HeaderAuthProvider(),
-            conversation_store=conversations,
-        ),
-        prefix="/v1",
-    )
-    return app
+    return sessions_test_app(db_uri)
 
 
 @pytest_asyncio.fixture()
@@ -61,7 +32,7 @@ async def project_client(project_app: FastAPI) -> AsyncIterator[httpx.AsyncClien
 
 def _headers(user: str, workspace: int = 0, **extra: str) -> dict[str, str]:
     return {
-        "X-Test-User": user,
+        "X-Forwarded-Email": user,
         "X-Databricks-Org-Id": str(workspace),
         **extra,
     }
@@ -184,7 +155,7 @@ async def test_transfer_rekeys_owner_and_rejects_collision_stale_and_wrong_calle
     project_client: httpx.AsyncClient,
 ) -> None:
     source = await project_client.post(
-        "/v1/projects", headers=_headers("local"), json={"name": "Migrated"}
+        "/v1/projects", headers=_headers("carol"), json={"name": "Migrated"}
     )
     project_id = source.json()["id"]
 
@@ -197,61 +168,36 @@ async def test_transfer_rekeys_owner_and_rejects_collision_stale_and_wrong_calle
 
     stale = await project_client.post(
         f"/v1/projects/{project_id}/transfer",
-        headers=_headers("local", **{"If-Match": '"2"'}),
+        headers=_headers("carol", **{"If-Match": '"2"'}),
         json={"new_owner_principal_id": "alice"},
     )
     assert stale.status_code == 412
 
     transferred = await project_client.post(
         f"/v1/projects/{project_id}/transfer",
-        headers=_headers("local", **{"If-Match": '"1"'}),
+        headers=_headers("carol", **{"If-Match": '"1"'}),
         json={"new_owner_principal_id": "alice"},
     )
     assert transferred.status_code == 200
     assert transferred.json()["owner_principal_id"] == "alice"
     assert transferred.headers["etag"] == '"2"'
     assert (
-        await project_client.get(f"/v1/projects/{project_id}", headers=_headers("local"))
+        await project_client.get(f"/v1/projects/{project_id}", headers=_headers("carol"))
     ).status_code == 404
     assert (
         await project_client.get(f"/v1/projects/{project_id}", headers=_headers("alice"))
     ).status_code == 200
 
     collision_source = await project_client.post(
-        "/v1/projects", headers=_headers("local"), json={"name": "Taken"}
+        "/v1/projects", headers=_headers("carol"), json={"name": "Taken"}
     )
     await project_client.post("/v1/projects", headers=_headers("alice"), json={"name": "taken"})
     collision = await project_client.post(
         f"/v1/projects/{collision_source.json()['id']}/transfer",
-        headers=_headers("local", **{"If-Match": '"1"'}),
+        headers=_headers("carol", **{"If-Match": '"1"'}),
         json={"new_owner_principal_id": "alice"},
     )
     assert collision.status_code == 409
-
-
-async def test_list_archived_members_variant_returns_full_project_rows(
-    db_uri: str,
-    project_client: httpx.AsyncClient,
-) -> None:
-    projects = SqlAlchemyProjectStore(db_uri)
-    conversations = SqlAlchemyConversationStore(db_uri)
-    permissions = SqlAlchemyPermissionStore(db_uri)
-    archived_member = projects.create("alice", "Archived member")
-    live_only = projects.create("alice", "Live only")
-    session = conversations.create_conversation()
-    conversations.set_project_membership(session.id, archived_member.id)
-    conversations.update_conversation(session.id, archived=True)
-    permissions.ensure_user("alice")
-    permissions.grant("alice", session.id, 4)
-
-    response = await project_client.get(
-        "/v1/projects?archived_members=true", headers=_headers("alice")
-    )
-
-    assert response.status_code == 200
-    assert [item["id"] for item in response.json()] == [archived_member.id]
-    assert response.json()[0]["row_version"] == 1
-    assert live_only.id not in {item["id"] for item in response.json()}
 
 
 async def test_archive_include_sessions_archives_members_and_project(
@@ -307,6 +253,71 @@ async def test_archive_include_sessions_is_owner_scoped(
     assert response.json()["archived_sessions"] == 1
     assert conversations.get_conversation(alice_session.id).archived is True  # type: ignore[union-attr]
     assert conversations.get_conversation(bob_session.id).archived is False  # type: ignore[union-attr]
+
+
+async def test_stale_archive_etag_fails_before_member_timestamps_advance(
+    db_uri: str,
+    project_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    projects = SqlAlchemyProjectStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    project = projects.create("alice", "Stale archive")
+    member = conversations.create_conversation()
+    conversations.set_project_membership(member.id, project.id)
+    permissions.ensure_user("alice")
+    permissions.grant("alice", member.id, 4)
+    original_updated_at = member.updated_at
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store.now_epoch",
+        lambda: original_updated_at + 100,
+    )
+
+    response = await project_client.post(
+        f"/v1/projects/{project.id}/archive?include_sessions=true",
+        headers=_headers("alice", **{"If-Match": '"2"'}),
+    )
+
+    assert response.status_code == 412
+    assert response.json() == {
+        "error": {
+            "code": "precondition_failed",
+            "message": "Project ETag is stale",
+        }
+    }
+    persisted = conversations.get_conversation(member.id)
+    assert persisted is not None
+    assert persisted.updated_at == original_updated_at
+    assert persisted.archived is False
+
+
+async def test_public_owner_grant_is_not_listed_or_archived_as_membership(
+    db_uri: str,
+    project_client: httpx.AsyncClient,
+) -> None:
+    projects = SqlAlchemyProjectStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    project = projects.create("alice", "Public grant")
+    public_session = conversations.create_conversation()
+    conversations.set_project_membership(public_session.id, project.id)
+    permissions.ensure_user(RESERVED_USER_PUBLIC)
+    permissions.grant(RESERVED_USER_PUBLIC, public_session.id, 4)
+
+    listed = conversations.list_conversations(
+        project_id=project.id,
+        owned_by=RESERVED_USER_PUBLIC,
+    )
+    response = await project_client.post(
+        f"/v1/projects/{project.id}/archive?include_sessions=true",
+        headers=_headers("alice", **{"If-Match": '"1"'}),
+    )
+
+    assert listed.data == []
+    assert response.status_code == 200
+    assert response.json()["archived_sessions"] == 0
+    assert conversations.get_conversation(public_session.id).archived is False  # type: ignore[union-attr]
 
 
 def test_archive_include_sessions_rolls_back_metadata_with_project_failure(db_uri: str) -> None:

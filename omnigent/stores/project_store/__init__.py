@@ -7,7 +7,8 @@ from enum import Enum
 from typing import Any
 
 from omnigent.entities import Project, ProjectBackfillResult
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ProjectInputError as ProjectInputError
+from omnigent.projects.defaults import DEFAULTS_SCHEMA_VERSION
 from omnigent.stores.conversation_store import ConversationStore
 
 
@@ -16,17 +17,6 @@ class _Unset(Enum):
 
 
 UNSET = _Unset.VALUE
-
-
-class ProjectInputError(OmnigentError):
-    """Project input validation error rendered as HTTP 422 by the API."""
-
-    def __init__(self, message: str) -> None:
-        super().__init__(message, code=ErrorCode.INVALID_INPUT)
-
-    @property
-    def http_status(self) -> int:
-        return 422
 
 
 class ProjectStore(ABC):
@@ -43,7 +33,7 @@ class ProjectStore(ABC):
         *,
         description: str | None = None,
         defaults_json: dict[str, Any] | None = None,
-        defaults_schema_version: int = 1,
+        defaults_schema_version: int = DEFAULTS_SCHEMA_VERSION,
     ) -> Project:
         """Create a project. Name collisions raise ``OmnigentError``."""
         ...

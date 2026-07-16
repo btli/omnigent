@@ -303,6 +303,89 @@ def test_update_stamps_current_defaults_schema_version(
     assert updated.defaults_schema_version == DEFAULTS_SCHEMA_VERSION
 
 
+def test_list_projects_returns_distinct_names_sorted(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """Every live owned project row is returned once in name order."""
+    projects = SqlAlchemyProjectStore(db_uri)
+    sprint = projects.create("alice", "Sprint 42")
+    customer = projects.create("alice", "Customer X")
+    empty = projects.create("alice", "Empty")
+    archived_row = projects.create("alice", "Archived row")
+    projects.archive(archived_row.id, "alice", expected_row_version=1)
+    foreign = projects.create("bob", "Foreign")
+    a1 = conversation_store.create_conversation()
+    a2 = conversation_store.create_conversation()
+    b1 = conversation_store.create_conversation()
+    other = conversation_store.create_conversation()
+
+    conversation_store.set_project_membership(a1.id, sprint.id)
+    conversation_store.set_project_membership(a2.id, sprint.id)
+    conversation_store.set_project_membership(b1.id, customer.id)
+    conversation_store.set_project_membership(other.id, foreign.id)
+
+    assert [(item.id, item.name) for item in projects.list("alice")] == [
+        (customer.id, "Customer X"),
+        (empty.id, "Empty"),
+        (sprint.id, "Sprint 42"),
+    ]
+
+
+def test_list_projects_empty_when_no_project_labels(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """Legacy and non-project labels are not project read authorities."""
+    conversation = conversation_store.create_conversation()
+    conversation_store.set_labels(
+        conversation.id,
+        {"omni_project": "Legacy", "integrity": "1"},
+    )
+    assert SqlAlchemyProjectStore(db_uri).list("alice") == []
+
+
+def test_list_projects_includes_projects_with_only_archived_members(
+    db_uri: str,
+) -> None:
+    """The live variant lists rows; the archived variant still requires members."""
+    projects = SqlAlchemyProjectStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    gone = projects.create("alice", "Gone")
+    mixed = projects.create("alice", "Mixed")
+    solo = conversations.create_conversation()
+    mix_archived = conversations.create_conversation()
+    mix_active = conversations.create_conversation()
+
+    conversations.set_project_membership(solo.id, gone.id)
+    conversations.set_project_membership(mix_archived.id, mixed.id)
+    conversations.set_project_membership(mix_active.id, mixed.id)
+    conversations.update_conversation(solo.id, archived=True)
+    conversations.update_conversation(mix_archived.id, archived=True)
+
+    assert [item.name for item in projects.list("alice")] == ["Gone", "Mixed"]
+    assert [item.name for item in projects.list("alice", archived_members=True)] == [
+        "Gone",
+        "Mixed",
+    ]
+
+
+def test_list_projects_is_owner_scoped(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """A member in another owner's project never leaks into the result."""
+    projects = SqlAlchemyProjectStore(db_uri)
+    mine_project = projects.create("alice@example.com", "Mine")
+    theirs_project = projects.create("bob@example.com", "Theirs")
+    mine = conversation_store.create_conversation()
+    theirs = conversation_store.create_conversation()
+    conversation_store.set_project_membership(mine.id, mine_project.id)
+    conversation_store.set_project_membership(theirs.id, theirs_project.id)
+
+    assert [item.name for item in projects.list("alice@example.com")] == ["Mine"]
+
+
 def _legacy_session(
     db_uri: str,
     conversation_store: SqlAlchemyConversationStore,

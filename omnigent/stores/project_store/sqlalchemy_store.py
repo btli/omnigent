@@ -7,11 +7,13 @@ import json
 import unicodedata
 import uuid
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import (
     SqlConversationMetadata,
@@ -29,6 +31,7 @@ from omnigent.entities import (
     ProjectBackfillResult,
     ProjectMigrationIssue,
     ProjectMigrationMapping,
+    project_snapshot_values,
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.projects.defaults import DEFAULTS_SCHEMA_VERSION, validate_defaults_bundle
@@ -64,6 +67,80 @@ def _to_entity(row: SqlProject) -> Project:
         updated_at=row.updated_at,
         archived_at=row.archived_at,
     )
+
+
+def _ensure_user_row(session: Session, user_id: str) -> None:
+    """Provision a user row without racing concurrent creators."""
+    if session.get(SqlUser, (current_workspace_id(), user_id)) is not None:
+        return
+    try:
+        with session.begin_nested():
+            session.add(SqlUser(id=user_id, is_admin=False))
+            session.flush()
+    except IntegrityError:
+        pass
+
+
+def mutate_project_row(
+    session: Session,
+    project_id: str,
+    owner_principal_id: str,
+    expected_row_version: int | None,
+    values: dict[str, Any],
+    *,
+    require_archived: bool | None = None,
+    prepare: Callable[[Session, SqlProject], None] | None = None,
+    updated_at: int | None = None,
+) -> Project | None:
+    """Apply the canonical project compare-and-set mutation."""
+    if expected_row_version is None:
+        raise OmnigentError(
+            "If-Match is required for project mutations",
+            code=ErrorCode.PRECONDITION_FAILED,
+        )
+    row = session.get(SqlProject, (current_workspace_id(), project_id))
+    if row is None or row.owner_principal_id != owner_principal_id:
+        return None
+    if row.row_version != expected_row_version:
+        raise OmnigentError(
+            "Project ETag is stale",
+            code=ErrorCode.PRECONDITION_FAILED,
+        )
+    if require_archived is True and row.archived_at is None:
+        raise OmnigentError("Project is not archived", code=ErrorCode.CONFLICT)
+    if require_archived is False and row.archived_at is not None:
+        raise OmnigentError("Project is already archived", code=ErrorCode.CONFLICT)
+    if prepare is not None:
+        prepare(session, row)
+
+    conditions = [
+        SqlProject.workspace_id == current_workspace_id(),
+        SqlProject.id == project_id,
+        SqlProject.owner_principal_id == owner_principal_id,
+        SqlProject.row_version == expected_row_version,
+    ]
+    if require_archived is True:
+        conditions.append(SqlProject.archived_at.is_not(None))
+    elif require_archived is False:
+        conditions.append(SqlProject.archived_at.is_(None))
+    result = session.execute(
+        update(SqlProject)
+        .where(*conditions)
+        .values(
+            **values,
+            updated_at=now_epoch() if updated_at is None else updated_at,
+            row_version=SqlProject.row_version + 1,
+        )
+    )
+    if result.rowcount != 1:
+        raise OmnigentError(
+            "Project ETag is stale",
+            code=ErrorCode.PRECONDITION_FAILED,
+        )
+    session.flush()
+    session.expire_all()
+    updated_row = session.get(SqlProject, (current_workspace_id(), project_id))
+    return _to_entity(updated_row) if updated_row is not None else None
 
 
 def _project_id() -> str:
@@ -134,13 +211,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         )
         try:
             with self._session() as session:
-                if session.get(SqlUser, (current_workspace_id(), owner_principal_id)) is None:
-                    try:
-                        with session.begin_nested():
-                            session.add(SqlUser(id=owner_principal_id, is_admin=False))
-                            session.flush()
-                    except IntegrityError:
-                        pass
+                _ensure_user_row(session, owner_principal_id)
                 session.add(row)
                 session.flush()
                 return _to_entity(row)
@@ -216,56 +287,16 @@ class SqlAlchemyProjectStore(ProjectStore):
         *,
         expected_row_version: int | None,
     ) -> Project | None:
-        if expected_row_version is None:
-            raise OmnigentError(
-                "If-Match is required for project mutations",
-                code=ErrorCode.PRECONDITION_FAILED,
-            )
-        try:
-            with self._session() as session:
-                row = session.get(SqlProject, (current_workspace_id(), project_id))
-                if row is None or row.owner_principal_id != current_owner:
-                    return None
-                if row.row_version != expected_row_version:
-                    raise OmnigentError(
-                        "Project ETag is stale",
-                        code=ErrorCode.PRECONDITION_FAILED,
-                    )
-                if session.get(SqlUser, (current_workspace_id(), new_owner)) is None:
-                    try:
-                        with session.begin_nested():
-                            session.add(SqlUser(id=new_owner, is_admin=False))
-                            session.flush()
-                    except IntegrityError:
-                        pass
-                result = session.execute(
-                    update(SqlProject)
-                    .where(
-                        SqlProject.workspace_id == current_workspace_id(),
-                        SqlProject.id == project_id,
-                        SqlProject.owner_principal_id == current_owner,
-                        SqlProject.row_version == expected_row_version,
-                    )
-                    .values(
-                        owner_principal_id=new_owner,
-                        updated_at=now_epoch(),
-                        row_version=SqlProject.row_version + 1,
-                    )
-                )
-                if result.rowcount != 1:
-                    raise OmnigentError(
-                        "Project ETag is stale",
-                        code=ErrorCode.PRECONDITION_FAILED,
-                    )
-                session.flush()
-                session.expire_all()
-                updated_row = session.get(SqlProject, (current_workspace_id(), project_id))
-                return _to_entity(updated_row) if updated_row is not None else None
-        except IntegrityError as error:
-            raise OmnigentError(
-                "A project with that name already exists",
-                code=ErrorCode.CONFLICT,
-            ) from error
+        def prepare(session: Session, _row: SqlProject) -> None:
+            _ensure_user_row(session, new_owner)
+
+        return self._mutate(
+            project_id,
+            current_owner,
+            expected_row_version,
+            {"owner_principal_id": new_owner},
+            prepare=prepare,
+        )
 
     def _mutate(
         self,
@@ -275,52 +306,19 @@ class SqlAlchemyProjectStore(ProjectStore):
         values: dict[str, Any],
         *,
         require_archived: bool | None = None,
+        prepare: Callable[[Session, SqlProject], None] | None = None,
     ) -> Project | None:
-        if expected_row_version is None:
-            raise OmnigentError(
-                "If-Match is required for project mutations",
-                code=ErrorCode.PRECONDITION_FAILED,
-            )
         try:
             with self._session() as session:
-                row = session.get(SqlProject, (current_workspace_id(), project_id))
-                if row is None or row.owner_principal_id != owner_principal_id:
-                    return None
-                if row.row_version != expected_row_version:
-                    raise OmnigentError(
-                        "Project ETag is stale",
-                        code=ErrorCode.PRECONDITION_FAILED,
-                    )
-                if require_archived is True and row.archived_at is None:
-                    raise OmnigentError("Project is not archived", code=ErrorCode.CONFLICT)
-                if require_archived is False and row.archived_at is not None:
-                    raise OmnigentError("Project is already archived", code=ErrorCode.CONFLICT)
-                statement = (
-                    update(SqlProject)
-                    .where(
-                        SqlProject.workspace_id == current_workspace_id(),
-                        SqlProject.id == project_id,
-                        SqlProject.owner_principal_id == owner_principal_id,
-                        SqlProject.row_version == expected_row_version,
-                    )
-                    .values(
-                        **values,
-                        updated_at=now_epoch(),
-                        row_version=SqlProject.row_version + 1,
-                    )
+                return mutate_project_row(
+                    session,
+                    project_id,
+                    owner_principal_id,
+                    expected_row_version,
+                    values,
+                    require_archived=require_archived,
+                    prepare=prepare,
                 )
-                result = session.execute(statement)
-                if result.rowcount != 1:
-                    raise OmnigentError(
-                        "Project ETag is stale",
-                        code=ErrorCode.PRECONDITION_FAILED,
-                    )
-                session.flush()
-                session.expire_all()
-                updated_row = session.get(SqlProject, (current_workspace_id(), project_id))
-                if updated_row is None:
-                    return None
-                return _to_entity(updated_row)
         except IntegrityError as error:
             raise OmnigentError(
                 "A project with that name already exists",
@@ -624,16 +622,7 @@ class SqlAlchemyProjectStore(ProjectStore):
                         session.add(
                             SqlSessionProjectSnapshot(
                                 session_id=assignment.session_id,
-                                project_id=project_snapshot.project_id,
-                                snapshot_origin=project_snapshot.snapshot_origin,
-                                project_row_version=project_snapshot.project_row_version,
-                                defaults_schema_version=project_snapshot.defaults_schema_version,
-                                defaults_json=json.dumps(
-                                    project_snapshot.defaults_json,
-                                    sort_keys=True,
-                                    separators=(",", ":"),
-                                ),
-                                created_at=now,
+                                **project_snapshot_values(project_snapshot, now),
                             )
                         )
                 mappings.append(

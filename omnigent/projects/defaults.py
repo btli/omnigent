@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
-from omnigent.stores.project_store import ProjectInputError
+from omnigent.errors import ProjectInputError
 
 DEFAULTS_SCHEMA_VERSION = 1
 

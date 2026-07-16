@@ -704,15 +704,17 @@ export async function mutateProjectWithIfMatch(
   return result;
 }
 
+async function fetchProjects(query = ""): Promise<Project[]> {
+  const res = await authenticatedFetch(`/v1/projects${query}`);
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return (await res.json()) as Project[];
+}
+
 /** Fetch every non-archived project owned by the viewer. */
 export function useProjects() {
   return useQuery<Project[]>({
     queryKey: PROJECTS_KEY,
-    queryFn: async () => {
-      const res = await authenticatedFetch("/v1/projects");
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      return (await res.json()) as Project[];
-    },
+    queryFn: () => fetchProjects(),
     staleTime: 30_000,
   });
 }
@@ -721,11 +723,7 @@ export function useProjects() {
 export function useArchivedProjects() {
   return useQuery<Project[]>({
     queryKey: ARCHIVED_PROJECTS_KEY,
-    queryFn: async () => {
-      const res = await authenticatedFetch("/v1/projects?archived_members=true");
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      return (await res.json()) as Project[];
-    },
+    queryFn: () => fetchProjects("?archived_members=true"),
     staleTime: 60_000,
   });
 }

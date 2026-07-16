@@ -8,9 +8,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
+from omnigent.errors import ProjectInputError
 from omnigent.projects.defaults import ProjectDefaultsBundle, validate_defaults_bundle
 from omnigent.server.schemas import SessionGitOptions
-from omnigent.stores.project_store import ProjectInputError
 
 
 class ResolvedProjectDefaults(BaseModel):
