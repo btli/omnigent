@@ -20,10 +20,17 @@ class ProjectApi:
     agent_id: str
     session_ids: list[str] = field(default_factory=list)
 
-    def create_project(self, name: str) -> dict[str, Any]:
+    def create_project(
+        self,
+        name: str,
+        defaults: dict[str, str | None] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"name": name}
+        if defaults is not None:
+            payload["defaults_json"] = defaults
         response = httpx.post(
             f"{self.base_url}/v1/projects",
-            json={"name": name},
+            json=payload,
             timeout=10.0,
         )
         response.raise_for_status()
@@ -98,6 +105,14 @@ def _expect_project_menu(page: Page, project_id: str) -> None:
     expect(new_session).to_have_attribute("href", f"/?project_id={project_id}")
     for name in ("Project settings", "Rename project", "Delete project"):
         expect(page.get_by_role("menuitem", name=name, exact=True)).to_be_visible()
+
+
+def _open_project_settings(page: Page, project_name: str) -> Locator:
+    _open_project_kebab(page, project_name)
+    page.get_by_role("menuitem", name="Project settings", exact=True).click()
+    dialog = page.get_by_role("dialog", name="Project settings")
+    expect(dialog).to_be_visible()
+    return dialog
 
 
 def test_api_seeded_project_shows_sessions_and_new_session_link(
@@ -237,6 +252,126 @@ def test_archived_filter_lists_and_filters_by_project(
     archived_rows = page.get_by_test_id("archived-row")
     expect(archived_rows).to_have_count(1)
     expect(archived_rows).to_contain_text(title)
+
+
+def test_project_settings_resolved_defaults_save_and_reset(
+    page: Page,
+    project_api: ProjectApi,
+) -> None:
+    project_name = _unique("Defaults editor")
+    project = project_api.create_project(project_name, defaults={"model": None})
+    session_id = project_api.create_session(project["id"], _unique("Defaults session"))
+    page.goto(f"{project_api.base_url}/c/{session_id}")
+
+    dialog = _open_project_settings(page, project_name)
+    host_type = dialog.get_by_test_id("project-default-host_type-control")
+    expect(host_type).to_have_value("external")
+    expect(dialog.get_by_test_id("project-default-host_type-provenance")).to_have_attribute(
+        "data-provenance", "inherited"
+    )
+    expect(dialog.get_by_test_id("project-default-host_id-field")).to_be_visible()
+
+    host_type.select_option("managed")
+    expect(dialog.get_by_test_id("project-default-host_type-provenance")).to_have_attribute(
+        "data-provenance", "overridden"
+    )
+    expect(dialog.get_by_test_id("project-default-host_id-field")).to_have_count(0)
+    repo = dialog.get_by_test_id("project-default-repo_url-control")
+    branch = dialog.get_by_test_id("project-default-default_branch-control")
+    expect(repo).to_be_visible()
+    expect(branch).to_be_visible()
+
+    repo_url = "https://github.com/example/project-defaults.git"
+    repo.fill(repo_url)
+    branch.fill("main")
+    with page.expect_response(
+        lambda response: (
+            response.url.endswith(f"/v1/projects/{project['id']}")
+            and response.request.method == "PATCH"
+        )
+    ) as save_response:
+        dialog.get_by_role("button", name="Save settings", exact=True).click()
+    assert save_response.value.ok
+    expect(dialog).to_have_count(0)
+
+    project_response = httpx.get(
+        f"{project_api.base_url}/v1/projects/{project['id']}",
+        timeout=10.0,
+    )
+    project_response.raise_for_status()
+    assert project_response.json()["defaults_json"] == {
+        "host_type": "managed",
+        "repo_url": repo_url,
+        "default_branch": "main",
+    }
+
+    dialog = _open_project_settings(page, project_name)
+    expect(dialog.get_by_test_id("project-default-host_type-control")).to_have_value("managed")
+    expect(dialog.get_by_test_id("project-default-repo_url-provenance")).to_have_attribute(
+        "data-provenance", "overridden"
+    )
+    expect(dialog.get_by_test_id("project-default-default_branch-provenance")).to_have_attribute(
+        "data-provenance", "overridden"
+    )
+    dialog.get_by_test_id("project-default-default_branch-reset").click()
+    with page.expect_response(
+        lambda response: (
+            response.url.endswith(f"/v1/projects/{project['id']}")
+            and response.request.method == "PATCH"
+        )
+    ) as reset_response:
+        dialog.get_by_role("button", name="Save settings", exact=True).click()
+    assert reset_response.value.ok
+
+    project_response = httpx.get(
+        f"{project_api.base_url}/v1/projects/{project['id']}",
+        timeout=10.0,
+    )
+    project_response.raise_for_status()
+    assert project_response.json()["defaults_json"] == {
+        "host_type": "managed",
+        "repo_url": repo_url,
+    }
+
+
+def test_project_settings_remains_usable_at_360px(
+    page: Page,
+    project_api: ProjectApi,
+) -> None:
+    page.set_viewport_size({"width": 360, "height": 780})
+    project_name = _unique("Narrow defaults")
+    project = project_api.create_project(project_name, defaults={})
+    session_id = project_api.create_session(project["id"], _unique("Narrow session"))
+    page.goto(f"{project_api.base_url}/c/{session_id}")
+
+    dialog = _open_project_settings(page, project_name)
+    dialog_box = dialog.bounding_box()
+    assert dialog_box is not None
+    assert dialog_box["x"] >= 0
+    assert dialog_box["y"] >= 0
+    assert dialog_box["x"] + dialog_box["width"] <= 360
+    assert dialog_box["y"] + dialog_box["height"] <= 780
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+    host_field = dialog.get_by_test_id("project-default-host_type-field")
+    header = host_field.locator(":scope > div").first
+    assert header.evaluate("element => getComputedStyle(element).flexWrap") == "wrap"
+
+    harness_trigger = dialog.get_by_test_id("project-default-harness-control")
+    harness_trigger.click()
+    menu = page.get_by_test_id("project-default-harness-options")
+    expect(menu).to_be_visible()
+    menu_box = menu.bounding_box()
+    assert menu_box is not None
+    assert menu_box["x"] >= 0
+    assert menu_box["x"] + menu_box["width"] <= 360
+    page.keyboard.press("Escape")
+
+    save = dialog.get_by_role("button", name="Save settings", exact=True)
+    expect(save).to_be_visible()
+    save_box = save.bounding_box()
+    assert save_box is not None
+    assert save_box["y"] + save_box["height"] <= 780
 
 
 def test_delete_project_archives_sessions_and_removes_folder(

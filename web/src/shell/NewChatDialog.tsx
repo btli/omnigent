@@ -81,6 +81,7 @@ import { readDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readHarnessOptions, writeHarnessOption } from "@/lib/modePreferences";
 import { useBrainHarnessLabels } from "@/lib/agentLabels";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
+import { CLAUDE_NATIVE_EFFORTS } from "@/lib/harnessCatalog";
 import { sortAgentsForDisplay } from "@/lib/agentGrouping";
 import { cn } from "@/lib/utils";
 import {
@@ -120,6 +121,7 @@ import {
 import { invalidateProjectQueries } from "@/hooks/projectQueries";
 import { useProjectPickerState } from "@/hooks/useProjectPickerState";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
+import { HostOption } from "@/components/HostOption";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import {
   buildMentionPreamble,
@@ -191,22 +193,6 @@ const CLAUDE_NATIVE_PERMISSION_MODES: { value: string; label: string; descriptio
     label: "Bypass permissions",
     description: "Runs everything; no prompts or safety checks",
   },
-];
-
-// Claude-native reasoning-effort options for the new-session model/effort
-// picker. There is deliberately no hardcoded model/effort default: a fresh
-// session leaves both unselected and omits `model_override` / `reasoning_effort`
-// from the create, so Claude Code falls back to its own configured model — the
-// same "no override" semantics the in-session picker's `null` state and the
-// `/model default` / `/effort default` commands use. Effort levels mirror
-// CLAUDE_NATIVE_EFFORT_LEVELS in ChatPage's in-session picker (ANTHROPIC_EFFORTS
-// server-side).
-const CLAUDE_NATIVE_EFFORTS: { value: string; label: string }[] = [
-  { value: "low", label: "Low" },
-  { value: "medium", label: "Medium" },
-  { value: "high", label: "High" },
-  { value: "xhigh", label: "xHigh" },
-  { value: "max", label: "Max" },
 ];
 
 // Cursor execution modes. "default" sends no flags; other values map to CLI
@@ -297,35 +283,6 @@ const CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sand
 // A typed confirmation makes the dangerous mode impossible to enable by an
 // accidental click; the toggle stays off until this is entered verbatim.
 const CODEX_NATIVE_BYPASS_SANDBOX_CONFIRM_PHRASE = "bypass sandbox";
-
-function HostOption({ host, subtitle }: { host: Host; subtitle?: string }) {
-  const isOnline = host.status === "online";
-  return (
-    <span className="flex min-w-0 items-center gap-2">
-      {host.name.toLowerCase().includes("cloud") ? (
-        <MonitorCloudIcon className="size-4 shrink-0 text-muted-foreground" />
-      ) : (
-        <MonitorIcon className="size-4 shrink-0 text-muted-foreground" />
-      )}
-      <span className="flex min-w-0 flex-col">
-        <span className="flex items-center gap-2">
-          <span className="truncate text-xs">{host.name}</span>
-          <span
-            className={`inline-flex shrink-0 items-center gap-1 text-[10px] font-semibold uppercase tracking-wider ${isOnline ? "text-green-600" : "text-muted-foreground"}`}
-          >
-            <span
-              className={`inline-block size-1.5 rounded-full ${isOnline ? "bg-green-500" : "bg-muted-foreground"}`}
-            />
-            {host.status}
-          </span>
-        </span>
-        {subtitle && (
-          <span className="text-[10px] leading-tight text-muted-foreground">{subtitle}</span>
-        )}
-      </span>
-    </span>
-  );
-}
 
 export function ConnectHostInstructions({
   serverUrl,
