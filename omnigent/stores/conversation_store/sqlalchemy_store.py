@@ -811,6 +811,44 @@ class SqlAlchemyConversationStore(ConversationStore):
                 {"id": conversation_id},
             )
 
+    def _write_project_snapshot(
+        self,
+        session: Session,
+        metadata: SqlConversationMetadata,
+        conversation_id: str,
+        project_snapshot: LiveProjectSnapshot,
+        created_at: int,
+    ) -> None:
+        """Lock the project, recheck archival, and stage membership provenance."""
+        project = session.execute(
+            select(SqlProject)
+            .where(
+                SqlProject.workspace_id == current_workspace_id(),
+                SqlProject.id == project_snapshot.project_id,
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
+        if project is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        if project.archived_at is not None:
+            raise OmnigentError("Project is archived", code=ErrorCode.CONFLICT)
+        metadata.project_id = project_snapshot.project_id
+        session.add(
+            SqlSessionProjectSnapshot(
+                session_id=conversation_id,
+                project_id=project_snapshot.project_id,
+                snapshot_origin=project_snapshot.snapshot_origin,
+                project_row_version=project_snapshot.project_row_version,
+                defaults_schema_version=project_snapshot.defaults_schema_version,
+                defaults_json=json.dumps(
+                    project_snapshot.defaults_json,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                created_at=created_at,
+            )
+        )
+
     def create_conversation(
         self,
         kind: str = "default",
@@ -870,6 +908,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             the column NULL; a list (including ``[]``) is JSON-encoded
             so the runner applies it when it auto-launches the
             terminal.
+        :param project_snapshot: Optional project membership provenance
+            to insert atomically with the session.
         :returns: The newly created :class:`Conversation`.
         :raises NameAlreadyExistsError: If
             ``parent_conversation_id`` is set and a sibling row
@@ -889,8 +929,63 @@ class SqlAlchemyConversationStore(ConversationStore):
         if parent_conversation_id is not None and project_snapshot is not None:
             raise ValueError("project snapshots are top-level-only")
         try:
-            # Get parent's root from AP, then write AP row and Omnigent meta separately.
+            # In the normal single-DB deployment, create every session row and
+            # project snapshot in one transaction.
             root_id = new_id
+            if self._engine is self._conv_engine:
+                session_factory = (
+                    self._session_immediate if project_snapshot is not None else self._session
+                )
+                with session_factory() as session:
+                    if parent_conversation_id is not None:
+                        parent_row = session.get(
+                            SqlConversation,
+                            (current_workspace_id(), parent_conversation_id),
+                        )
+                        if parent_row is None:
+                            raise ConversationNotFoundError(
+                                f"parent conversation {parent_conversation_id!r} does not exist"
+                            )
+                        root_id = parent_row.root_conversation_id
+                    if parent_conversation_id is not None and not title:
+                        title = f"untitled:{new_id}"
+                    row = SqlConversation(
+                        id=new_id,
+                        created_at=now,
+                        updated_at=now,
+                        title=title or "",
+                        parent_conversation_id=parent_conversation_id,
+                        root_conversation_id=root_id,
+                    )
+                    agent_config = _new_agent_configuration_row(new_id, agent_id=agent_id)
+                    meta = SqlConversationMetadata(
+                        id=new_id,
+                        kind=encode_conversation_kind(kind),
+                        runner_id=runner_id,
+                        host_id=host_id,
+                        sub_agent_name=sub_agent_name,
+                        workspace=workspace,
+                        git_branch=git_branch,
+                        terminal_launch_args=(
+                            json.dumps(terminal_launch_args)
+                            if terminal_launch_args is not None
+                            else None
+                        ),
+                        archived=False,
+                    )
+                    session.add_all((row, agent_config, meta))
+                    if project_snapshot is not None:
+                        self._write_project_snapshot(
+                            session,
+                            meta,
+                            new_id,
+                            project_snapshot,
+                            now,
+                        )
+                return _to_conversation(row, meta, agent_config=agent_config)
+
+            # Split databases cannot share a SQLAlchemy transaction. Preserve
+            # the existing write ordering while keeping metadata + snapshot atomic.
             if parent_conversation_id is not None:
                 with self._conv_session() as ap_sess:
                     parent_row = ap_sess.get(
@@ -929,23 +1024,17 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ),
                 archived=False,
             )
-            with self._session() as meta_sess:
+            meta_session_factory = (
+                self._session_immediate if project_snapshot is not None else self._session
+            )
+            with meta_session_factory() as meta_sess:
                 if project_snapshot is not None:
-                    meta.project_id = project_snapshot.project_id
-                    meta_sess.add(
-                        SqlSessionProjectSnapshot(
-                            session_id=new_id,
-                            project_id=project_snapshot.project_id,
-                            snapshot_origin="live",
-                            project_row_version=project_snapshot.project_row_version,
-                            defaults_schema_version=project_snapshot.defaults_schema_version,
-                            defaults_json=json.dumps(
-                                project_snapshot.defaults_json,
-                                sort_keys=True,
-                                separators=(",", ":"),
-                            ),
-                            created_at=now,
-                        )
+                    self._write_project_snapshot(
+                        meta_sess,
+                        meta,
+                        new_id,
+                        project_snapshot,
+                        now,
                     )
                 meta_sess.add(meta)
             return _to_conversation(row, meta, agent_config=agent_config)
@@ -1995,7 +2084,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             if project.archived_at is not None:
                 raise OmnigentError("Project is archived", code=ErrorCode.CONFLICT)
             project_id = project.id
-        return self.set_project_membership(conversation_id, project_id)
+        updated = self.set_project_membership(conversation_id, project_id)
+        if updated:
+            self.delete_label(conversation_id, PROJECT_LABEL_KEY)
+        return updated
 
     def list_project_label_workspace_ids(self) -> list[int]:
         """Return only workspaces that have deprecated project-label rows."""
@@ -2883,6 +2975,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
+        project_snapshot: LiveProjectSnapshot | None = None,
     ) -> CreatedSession:
         """
         Atomically insert a conversation row and session-scoped agent.
@@ -2931,6 +3024,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             creation time, e.g. ``"runner_abc123"``. Child sessions
             inherit the parent's binding through this field so
             runner dispatch remains explicit in store state.
+        :param project_snapshot: Optional project membership provenance
+            to insert atomically with the top-level session.
         :returns: A :class:`CreatedSession` with both entities.
         :raises ConversationNotFoundError: If
             ``parent_conversation_id`` is set but no such
@@ -2940,6 +3035,70 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         now = now_epoch()
         conversation_id = generate_conversation_id()
+        if parent_conversation_id is not None and project_snapshot is not None:
+            raise ValueError("project snapshots are top-level-only")
+
+        if self._engine is self._conv_engine:
+            session_factory = (
+                self._session_immediate if project_snapshot is not None else self._session
+            )
+            with session_factory() as session:
+                parent_root_id: str | None = None
+                if parent_conversation_id is not None:
+                    parent_row = session.get(
+                        SqlConversation,
+                        (current_workspace_id(), parent_conversation_id),
+                    )
+                    if parent_row is None:
+                        raise ConversationNotFoundError(
+                            f"parent conversation {parent_conversation_id!r} does not exist"
+                        )
+                    parent_root_id = parent_row.root_conversation_id
+                conversation_row = _new_session_conversation_row(
+                    conversation_id,
+                    now,
+                    title,
+                    parent_conversation_id=parent_conversation_id,
+                    root_conversation_id=parent_root_id,
+                )
+                agent_config_row = _new_agent_configuration_row(
+                    conversation_id,
+                    agent_id=agent_id,
+                    reasoning_effort=reasoning_effort,
+                )
+                agent_row = _new_session_agent_row(
+                    agent_id=agent_id,
+                    agent_name=agent_name,
+                    agent_bundle_location=agent_bundle_location,
+                    agent_description=agent_description,
+                    now=now,
+                )
+                meta_row = _new_session_metadata_row(
+                    conversation_id,
+                    parent_conversation_id=parent_conversation_id,
+                    runner_id=runner_id,
+                    workspace=workspace,
+                    terminal_launch_args=terminal_launch_args,
+                )
+                session.add_all((conversation_row, agent_config_row, agent_row, meta_row))
+                if labels:
+                    _upsert_labels(session, conversation_id, labels, now)
+                if project_snapshot is not None:
+                    self._write_project_snapshot(
+                        session,
+                        meta_row,
+                        conversation_id,
+                        project_snapshot,
+                        now,
+                    )
+                session.flush()
+            return _created_session_from_rows(
+                conversation_row,
+                meta_row,
+                agent_config_row,
+                agent_row,
+                labels,
+            )
 
         # Conversation + labels go to AP; agent + metadata go to Omnigent.
         # Get parent root_id from AP first.
@@ -2987,9 +3146,20 @@ class SqlAlchemyConversationStore(ConversationStore):
             workspace=workspace,
             terminal_launch_args=terminal_launch_args,
         )
-        with self._session() as session:
+        session_factory = (
+            self._session_immediate if project_snapshot is not None else self._session
+        )
+        with session_factory() as session:
             session.add(agent_row)
             session.add(meta_row)
+            if project_snapshot is not None:
+                self._write_project_snapshot(
+                    session,
+                    meta_row,
+                    conversation_id,
+                    project_snapshot,
+                    now,
+                )
             session.flush()
 
         return _created_session_from_rows(

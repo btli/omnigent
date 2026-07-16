@@ -6,20 +6,23 @@ import json
 import logging
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import event, select
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import (
     SqlAgentConfiguration,
+    SqlConversation,
     SqlConversationMetadata,
     SqlSessionProjectSnapshot,
 )
 from omnigent.db.utils import get_or_create_conversation_engine, get_or_create_engine
+from omnigent.entities import Conversation, LiveProjectSnapshot
 from omnigent.errors import OmnigentError
 from omnigent.server import managed_hosts
 from omnigent.server.app import add_workspace_scope_middleware
@@ -590,6 +593,10 @@ def test_legacy_project_label_write_forwards_membership_without_persisting_label
         json={"agent_id": "ag_test"},
     )
     session_id = created.json()["id"]
+    SqlAlchemyConversationStore(db_uri).set_labels(
+        session_id,
+        {"omni_project": "Stale legacy value"},
+    )
 
     with caplog.at_level(logging.WARNING):
         response = client.patch(
@@ -683,6 +690,71 @@ def test_json_create_forwards_legacy_project_label_and_validates_explicit_id(
     )
     assert disagreed.status_code == 400
 
+    orphan_name = "Must not be created"
+    rejected_new_label = client.post(
+        "/v1/sessions",
+        headers=_headers(ALICE),
+        json={
+            "agent_id": "ag_test",
+            "project_id": other.id,
+            "labels": {"omni_project": orphan_name},
+        },
+    )
+    assert rejected_new_label.status_code == 400
+    assert projects.get_by_name(orphan_name, ALICE) is None
+
+    rejected_explicit_unfile = client.post(
+        "/v1/sessions",
+        headers=_headers(ALICE),
+        json={
+            "agent_id": "ag_test",
+            "project_id": None,
+            "labels": {"omni_project": orphan_name},
+        },
+    )
+    assert rejected_explicit_unfile.status_code == 400
+    assert projects.get_by_name(orphan_name, ALICE) is None
+
+
+def test_json_forwarded_snapshot_failure_rolls_back_session(
+    db_uri: str,
+) -> None:
+    agents = SqlAlchemyAgentStore(db_uri)
+    agents.create(agent_id="ag_test", name="test-agent", bundle_location="ag_test/bundle")
+
+    def _fail_snapshot_write(
+        session: Session,
+        flush_context: object,
+        instances: object,
+    ) -> None:
+        del flush_context, instances
+        if any(isinstance(row, SqlSessionProjectSnapshot) for row in session.new):
+            raise RuntimeError("simulated snapshot write failure")
+
+    event.listen(Session, "before_flush", _fail_snapshot_write)
+    try:
+        with TestClient(_app(db_uri), raise_server_exceptions=False) as client:
+            response = client.post(
+                "/v1/sessions",
+                headers=_headers(ALICE),
+                json={
+                    "agent_id": "ag_test",
+                    "title": "atomic-json-forward",
+                    "labels": {"omni_project": "Atomic JSON"},
+                },
+            )
+    finally:
+        event.remove(Session, "before_flush", _fail_snapshot_write)
+
+    assert response.status_code == 500
+    with Session(get_or_create_conversation_engine(db_uri)) as session:
+        assert (
+            session.execute(
+                select(SqlConversation).where(SqlConversation.title == "atomic-json-forward")
+            ).scalar_one_or_none()
+            is None
+        )
+
 
 def test_multipart_create_forwards_legacy_project_label(
     db_uri: str,
@@ -721,6 +793,56 @@ def test_multipart_create_forwards_legacy_project_label(
     )
 
 
+def test_multipart_forwarded_snapshot_failure_rolls_back_session(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    from tests.server.helpers import build_agent_bundle
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "atomic-artifacts"))
+    bundle = build_agent_bundle(name="atomic-multipart-agent")
+
+    def _fail_snapshot_write(
+        session: Session,
+        flush_context: object,
+        instances: object,
+    ) -> None:
+        del flush_context, instances
+        if any(isinstance(row, SqlSessionProjectSnapshot) for row in session.new):
+            raise RuntimeError("simulated snapshot write failure")
+
+    event.listen(Session, "before_flush", _fail_snapshot_write)
+    try:
+        with TestClient(
+            _app(db_uri, artifact_store=artifact_store),
+            raise_server_exceptions=False,
+        ) as client:
+            response = client.post(
+                "/v1/sessions",
+                headers=_headers(ALICE),
+                data={
+                    "metadata": json.dumps(
+                        {
+                            "title": "atomic-multipart-forward",
+                            "labels": {"omni_project": "Atomic multipart"},
+                        }
+                    )
+                },
+                files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+            )
+    finally:
+        event.remove(Session, "before_flush", _fail_snapshot_write)
+
+    assert response.status_code == 500
+    with Session(get_or_create_conversation_engine(db_uri)) as session:
+        assert (
+            session.execute(
+                select(SqlConversation).where(SqlConversation.title == "atomic-multipart-forward")
+            ).scalar_one_or_none()
+            is None
+        )
+
+
 def test_patch_project_label_agreement_and_disagreement(
     project_setup: tuple[SqlAlchemyProjectStore, TestClient],
 ) -> None:
@@ -747,6 +869,18 @@ def test_patch_project_label_agreement_and_disagreement(
     )
     assert disagreed.status_code == 400
 
+    orphan_name = "Rejected patch project"
+    rejected_new_label = client.patch(
+        f"/v1/sessions/{session_id}",
+        headers=_headers(ALICE),
+        json={
+            "project_id": other.id,
+            "labels": {"omni_project": orphan_name},
+        },
+    )
+    assert rejected_new_label.status_code == 400
+    assert projects.get_by_name(orphan_name, ALICE) is None
+
 
 class ArchiveBeforeMembershipStore(SqlAlchemyConversationStore):
     def __init__(self, db_uri: str, projects: SqlAlchemyProjectStore, project_id: str) -> None:
@@ -758,6 +892,22 @@ class ArchiveBeforeMembershipStore(SqlAlchemyConversationStore):
         if project_id == self._project_id:
             self._projects.archive(project_id, ALICE, expected_row_version=1)
         return super().set_project_membership(conversation_id, project_id)
+
+
+class ArchiveBeforeCreateStore(SqlAlchemyConversationStore):
+    def __init__(self, db_uri: str, projects: SqlAlchemyProjectStore, project_id: str) -> None:
+        super().__init__(db_uri)
+        self._projects = projects
+        self._project_id = project_id
+
+    def create_conversation(self, *args: Any, **kwargs: Any) -> Conversation:
+        project_snapshot = kwargs.get("project_snapshot")
+        if (
+            isinstance(project_snapshot, LiveProjectSnapshot)
+            and project_snapshot.project_id == self._project_id
+        ):
+            self._projects.archive(self._project_id, ALICE, expected_row_version=1)
+        return super().create_conversation(*args, **kwargs)
 
 
 def test_patch_rechecks_archived_project_at_membership_write(db_uri: str) -> None:
@@ -782,3 +932,24 @@ def test_patch_rechecks_archived_project_at_membership_write(db_uri: str) -> Non
     metadata, snapshot, _ = _rows(db_uri, session_id)
     assert isinstance(metadata, SqlConversationMetadata) and metadata.project_id is None
     assert snapshot is None
+
+
+def test_create_rechecks_archived_project_before_snapshot_write(db_uri: str) -> None:
+    agents = SqlAlchemyAgentStore(db_uri)
+    agents.create(agent_id="ag_test", name="test-agent", bundle_location="ag_test/bundle")
+    projects = SqlAlchemyProjectStore(db_uri)
+    project = projects.create(ALICE, "Create race")
+    store = ArchiveBeforeCreateStore(db_uri, projects, project.id)
+    with TestClient(_app(db_uri, conversation_store=store)) as client:
+        response = client.post(
+            "/v1/sessions",
+            headers=_headers(ALICE),
+            json={"agent_id": "ag_test", "project_id": project.id},
+        )
+
+    assert response.status_code == 409
+    with Session(get_or_create_conversation_engine(db_uri)) as session:
+        assert session.execute(select(SqlConversation)).scalars().all() == []
+    with Session(get_or_create_engine(db_uri)) as session:
+        assert session.execute(select(SqlConversationMetadata)).scalars().all() == []
+        assert session.execute(select(SqlSessionProjectSnapshot)).scalars().all() == []

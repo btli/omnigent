@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
+import threading
 
 import pytest
 from sqlalchemy import select
@@ -13,11 +15,15 @@ from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlProjectMigrationLedger,
     SqlSessionProjectSnapshot,
+    current_workspace_id,
     workspace_scope,
 )
 from omnigent.db.utils import get_or_create_engine
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.app import _backfill_legacy_project_labels_on_startup
+from omnigent.server.app import (
+    _backfill_legacy_project_labels_on_startup,
+    _schedule_legacy_project_label_backfill,
+)
 from omnigent.server.auth import LEVEL_OWNER
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -282,6 +288,9 @@ def test_label_backfill_is_idempotent_and_writes_atomic_backfill_snapshot(
     assert snapshot.project_row_version is None
     assert snapshot.defaults_json == "{}"
     assert len(ledgers) == 1
+    persisted = conversations.get_conversation(session_id)
+    assert persisted is not None and "omni_project" not in persisted.labels
+    assert conversations.list_project_label_workspace_ids() == []
     assert [project.name for project in conversations.list_projects("alice")] == ["Omnigent"]
     assert {
         conversation.id
@@ -347,6 +356,9 @@ def test_startup_backfill_runs_all_labeled_workspaces_and_is_non_blocking(
                 snapshot = session.get(SqlSessionProjectSnapshot, (workspace_id, session_id))
             assert metadata is not None and metadata.project_id is not None
             assert snapshot is not None and snapshot.project_id == metadata.project_id
+            persisted = conversations.get_conversation(session_id)
+            assert persisted is not None and "omni_project" not in persisted.labels
+    assert conversations.list_project_label_workspace_ids() == [300]
     mapping_logs = [
         record
         for record in caplog.records
@@ -363,6 +375,98 @@ def test_startup_backfill_runs_all_labeled_workspaces_and_is_non_blocking(
         and record.requires_mapping == 1
         for record in caplog.records
     )
+
+
+def test_startup_backfill_continues_after_one_workspace_fails(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    conversations = SqlAlchemyConversationStore(db_uri)
+    projects = SqlAlchemyProjectStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    sessions: dict[int, str] = {}
+    for workspace_id in (100, 200):
+        with workspace_scope(workspace_id):
+            sessions[workspace_id] = _legacy_session(
+                db_uri,
+                conversations,
+                permissions,
+                owner="alice",
+                label=f"Project {workspace_id}",
+            )
+
+    real_backfill = projects.backfill_legacy_labels
+
+    def _fail_one_workspace(conversation_store: SqlAlchemyConversationStore):
+        if current_workspace_id() == 100:
+            raise RuntimeError("simulated workspace failure")
+        return real_backfill(conversation_store)
+
+    monkeypatch.setattr(projects, "backfill_legacy_labels", _fail_one_workspace)
+    with caplog.at_level(logging.WARNING):
+        result = _backfill_legacy_project_labels_on_startup(conversations, projects)
+
+    assert result == (1, 0)
+    with workspace_scope(100):
+        with Session(get_or_create_engine(db_uri)) as session:
+            metadata = session.get(SqlConversationMetadata, (100, sessions[100]))
+        assert metadata is not None and metadata.project_id is None
+    with workspace_scope(200):
+        with Session(get_or_create_engine(db_uri)) as session:
+            metadata = session.get(SqlConversationMetadata, (200, sessions[200]))
+        assert metadata is not None and metadata.project_id is not None
+    assert any(
+        record.getMessage() == "project label startup backfill failed"
+        and record.workspace_id == 100
+        for record in caplog.records
+    )
+
+
+def test_startup_backfill_unconfigured_or_scan_failure_is_non_blocking(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conversations = SqlAlchemyConversationStore(db_uri)
+    projects = SqlAlchemyProjectStore(db_uri)
+
+    assert _backfill_legacy_project_labels_on_startup(None, projects) == (0, 0)
+    assert _backfill_legacy_project_labels_on_startup(conversations, None) == (0, 0)
+
+    def _fail_scan() -> list[int]:
+        raise RuntimeError("simulated workspace scan failure")
+
+    monkeypatch.setattr(conversations, "list_project_label_workspace_ids", _fail_scan)
+    assert _backfill_legacy_project_labels_on_startup(conversations, projects) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_startup_backfill_schedule_does_not_gate_boot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def _slow_backfill(
+        conversation_store: object,
+        project_store: object,
+    ) -> tuple[int, int]:
+        del conversation_store, project_store
+        started.set()
+        release.wait(timeout=5)
+        return (0, 0)
+
+    monkeypatch.setattr(
+        "omnigent.server.app._backfill_legacy_project_labels_on_startup",
+        _slow_backfill,
+    )
+    task = _schedule_legacy_project_label_backfill(None, None)
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        assert task.done() is False
+    finally:
+        release.set()
+        assert await task == (0, 0)
 
 
 @pytest.mark.parametrize("owners", [(), ("alice", "bob")])

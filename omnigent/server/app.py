@@ -151,6 +151,20 @@ def _backfill_legacy_project_labels_on_startup(
     return (migrated, requires_mapping)
 
 
+def _schedule_legacy_project_label_backfill(
+    conversation_store: ConversationStore | None,
+    project_store: ProjectStore | None,
+) -> asyncio.Task[tuple[int, int]]:
+    """Run the best-effort legacy-label backfill without delaying startup."""
+    return asyncio.create_task(
+        asyncio.to_thread(
+            _backfill_legacy_project_labels_on_startup,
+            conversation_store,
+            project_store,
+        )
+    )
+
+
 def add_workspace_scope_middleware(app: FastAPI) -> None:
     """Bind the trusted Databricks workspace identity for every HTTP request.
 
@@ -1370,8 +1384,7 @@ def create_app(
         _log_level_name = _os.environ.get("OMNIGENT_LOG_LEVEL", "INFO").upper()
         logging.getLogger("omnigent").setLevel(getattr(logging, _log_level_name, logging.INFO))
 
-        await asyncio.to_thread(
-            _backfill_legacy_project_labels_on_startup,
+        _schedule_legacy_project_label_backfill(
             conversation_store,
             project_store,
         )
