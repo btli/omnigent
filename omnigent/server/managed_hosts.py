@@ -109,7 +109,7 @@ import re
 import secrets
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -117,6 +117,8 @@ import click
 from fastapi import HTTPException
 
 from omnigent.db.utils import now_epoch
+from omnigent.git_hosts.base import HostConfig
+from omnigent.git_hosts.resolver import resolve_clone_plan
 from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
@@ -413,11 +415,24 @@ class RepoWorkspace:
     :param repo_name: Directory name the clone lands in under the
         sandbox workspace, derived from the URL's last path segment
         with ``.git`` stripped, e.g. ``"repo"``.
+    :param canonical_host: Resolution metadata from the operator
+        git-host config; ``None`` when unresolved.
+    :param provider: Resolution metadata from the operator git-host
+        config; ``None`` when unresolved.
+    :param credential_source: Resolution metadata from the operator
+        git-host config; ``None`` when unresolved or for the built-in
+        github.com default's credential fields.
+    :param clone_username: Resolution metadata from the operator
+        git-host config; ``None`` when unresolved.
     """
 
     url: str
     branch: str | None
     repo_name: str
+    canonical_host: str | None = None
+    provider: str | None = None
+    credential_source: str | None = None
+    clone_username: str | None = None
 
 
 # A full 40-hex object id — rejected as a clone fragment: cloning a
@@ -547,6 +562,34 @@ def parse_repo_workspace(workspace: str) -> RepoWorkspace:
         )
     branch = _validate_clone_branch(fragment) if sep else None
     return RepoWorkspace(url=url, branch=branch, repo_name=_derive_repo_name(url))
+
+
+def resolve_repo_workspace(workspace: str, hosts: Sequence[HostConfig]) -> RepoWorkspace:
+    """Parse *workspace* and resolve it against the operator git-host config.
+
+    Combines :func:`parse_repo_workspace` (shape validation) with
+    :func:`resolve_clone_plan` (host resolution): the returned workspace
+    carries the canonical host, provider name, and the host's non-secret
+    ``credential_source`` reference for launch-time credential injection.
+
+    :param workspace: The raw repository-URL workspace, e.g.
+        ``"https://git.acme.com/team/proj#main"``.
+    :param hosts: Operator-configured hosts (``app.state.git_hosts``).
+    :returns: The enriched, validated :class:`RepoWorkspace`.
+    :raises ValueError: When the URL is malformed or its host is neither
+        configured nor github.com.
+    """
+    parsed = parse_repo_workspace(workspace)
+    plan = resolve_clone_plan(workspace, hosts)
+    return RepoWorkspace(
+        url=parsed.url,
+        branch=parsed.branch,
+        repo_name=parsed.repo_name,
+        canonical_host=plan.canonical_host,
+        provider=plan.provider,
+        credential_source=plan.credential_source,
+        clone_username=plan.auth.username,
+    )
 
 
 def _modal_launcher_factory(
