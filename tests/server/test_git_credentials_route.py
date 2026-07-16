@@ -21,14 +21,67 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from omnigent.errors import OmnigentError
+from omnigent.git_hosts.base import HostConfig
 from omnigent.git_hosts.config import load_git_hosts
 from omnigent.git_hosts.crypto import GitCredentialCipher
 from omnigent.server.app import sanitized_validation_error_handler
+from omnigent.server.auth import AuthProvider
 from omnigent.server.routes.git_credentials import create_git_credentials_router
 from omnigent.stores.git_credential_store import GitCredentialStore
 
 _HOST_ID = "acme-forgejo"
 _SECRET_TOKEN = "ghp_super_secret_value_do_not_leak"
+
+
+class _HeaderAuthProvider:
+    """Test auth: the X-Test-User header is the authenticated user (absent -> 401)."""
+
+    def get_user_id(self, request: Request) -> str | None:
+        """Return the caller identity from the ``X-Test-User`` header.
+
+        :param request: The incoming request.
+        :returns: The header value, or ``None`` if absent (unauthenticated).
+        """
+        return request.headers.get("X-Test-User")
+
+
+def _build_app(
+    git_hosts: tuple[HostConfig, ...],
+    store: GitCredentialStore,
+    *,
+    auth_provider: AuthProvider | None = None,
+) -> FastAPI:
+    """Build a minimal app mounting the git-credentials router.
+
+    Registers the same two handlers ``create_app`` does for this router:
+    the ``OmnigentError`` handler (for 401/404/403/409) and the sanitized
+    ``RequestValidationError`` handler (for 422s that must not echo a
+    submitted token).
+
+    :param git_hosts: Operator-configured hosts to pass to the router.
+    :param store: The backing :class:`GitCredentialStore`.
+    :param auth_provider: Auth provider, or ``None`` for single-user mode.
+    :returns: A configured :class:`FastAPI` app.
+    """
+    app = FastAPI()
+
+    @app.exception_handler(OmnigentError)
+    async def _handle_omnigent_error(request: Request, exc: OmnigentError) -> JSONResponse:
+        del request
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
+    # Mirror create_app: strip echoed input from 422s so a malformed body
+    # never reflects the submitted token.
+    app.add_exception_handler(RequestValidationError, sanitized_validation_error_handler)
+
+    app.include_router(
+        create_git_credentials_router(store, git_hosts, auth_provider=auth_provider),
+        prefix="/v1",
+    )
+    return app
 
 
 @pytest.fixture()
@@ -47,24 +100,29 @@ def route_client(tmp_path: Path) -> Iterator[TestClient]:
         ]
     )
 
-    app = FastAPI()
+    app = _build_app(git_hosts, store)
 
-    @app.exception_handler(OmnigentError)
-    async def _handle_omnigent_error(request: Request, exc: OmnigentError) -> JSONResponse:
-        del request
-        return JSONResponse(
-            status_code=exc.http_status,
-            content={"error": {"code": exc.code, "message": exc.message}},
-        )
+    with TestClient(app) as client:
+        yield client
 
-    # Mirror create_app: strip echoed input from 422s so a malformed body
-    # never reflects the submitted token.
-    app.add_exception_handler(RequestValidationError, sanitized_validation_error_handler)
 
-    app.include_router(
-        create_git_credentials_router(store, git_hosts),
-        prefix="/v1",
+@pytest.fixture()
+def multi_user_route_client(tmp_path: Path) -> Iterator[TestClient]:
+    """The same router, but mounted with a real ``auth_provider`` — the security boundary."""
+    cipher = GitCredentialCipher([Fernet.generate_key().decode()])
+    store = GitCredentialStore(f"sqlite:///{tmp_path}/creds_multi_user.db", cipher)
+    git_hosts = load_git_hosts(
+        [
+            {
+                "id": _HOST_ID,
+                "provider": "forgejo",
+                "web_host": "git.acme.com",
+                "credential_source": "env:ACME_TOKEN",
+            }
+        ]
     )
+
+    app = _build_app(git_hosts, store, auth_provider=_HeaderAuthProvider())
 
     with TestClient(app) as client:
         yield client
@@ -180,3 +238,85 @@ def test_delete_removes_credential(route_client: TestClient) -> None:
     remaining = route_client.get("/v1/git-credentials").json()["data"]
     assert len(remaining) == 1
     assert remaining[0]["id"] == other["id"]
+
+
+def test_create_oversized_token_rejected(route_client: TestClient) -> None:
+    oversized = "x" * 9000
+    resp = route_client.post(
+        "/v1/git-credentials",
+        json={"host_id": _HOST_ID, "label": "work", "token": oversized},
+    )
+    assert resp.status_code == 422
+    assert oversized not in resp.text
+
+
+def test_create_empty_label_rejected(route_client: TestClient) -> None:
+    resp = route_client.post(
+        "/v1/git-credentials",
+        json={"host_id": _HOST_ID, "label": "", "token": _SECRET_TOKEN},
+    )
+    assert resp.status_code == 422
+    assert _SECRET_TOKEN not in resp.text
+
+
+# ── Multi-user authorization boundary ──────────────────────────────────
+
+
+def test_missing_auth_header_401s_on_every_verb(multi_user_route_client: TestClient) -> None:
+    client = multi_user_route_client
+    post_resp = client.post(
+        "/v1/git-credentials",
+        json={"host_id": _HOST_ID, "label": "work", "token": _SECRET_TOKEN},
+    )
+    assert post_resp.status_code == 401
+
+    get_resp = client.get("/v1/git-credentials")
+    assert get_resp.status_code == 401
+
+    del_resp = client.delete("/v1/git-credentials/some-id")
+    assert del_resp.status_code == 401
+
+
+def test_cross_user_isolation_and_foreign_delete_denied(
+    multi_user_route_client: TestClient,
+) -> None:
+    client = multi_user_route_client
+    alice_headers = {"X-Test-User": "alice"}
+    bob_headers = {"X-Test-User": "bob"}
+
+    created = client.post(
+        "/v1/git-credentials",
+        json={"host_id": _HOST_ID, "label": "work", "token": _SECRET_TOKEN},
+        headers=alice_headers,
+    )
+    assert created.status_code in (200, 201)
+    alice_cred_id = created.json()["id"]
+
+    # Bob's list must not include Alice's credential.
+    bob_list = client.get("/v1/git-credentials", headers=bob_headers)
+    assert bob_list.status_code == 200
+    assert bob_list.json()["data"] == []
+
+    # Bob deleting Alice's credential must not succeed and must not delete it.
+    bob_delete = client.delete(f"/v1/git-credentials/{alice_cred_id}", headers=bob_headers)
+    assert bob_delete.status_code in (403, 404)
+
+    # Alice can still resolve/list her own credential afterward.
+    alice_list = client.get("/v1/git-credentials", headers=alice_headers)
+    assert alice_list.status_code == 200
+    alice_ids = {item["id"] for item in alice_list.json()["data"]}
+    assert alice_cred_id in alice_ids
+
+
+def test_client_supplied_owner_field_rejected(multi_user_route_client: TestClient) -> None:
+    resp = multi_user_route_client.post(
+        "/v1/git-credentials",
+        json={
+            "host_id": _HOST_ID,
+            "label": "work",
+            "token": _SECRET_TOKEN,
+            "owner_user_id": "someone-else",
+        },
+        headers={"X-Test-User": "alice"},
+    )
+    assert resp.status_code == 422

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 
 from omnigent.git_hosts.base import HostConfig
 from omnigent.git_hosts.config import load_git_hosts
@@ -89,3 +90,11 @@ def test_git_credential_router_mounted_when_store_present(app_factory, tmp_path:
     app = app_factory(git_credential_store=store)
     assert app.state.git_credential_store is store
     assert any(r.path == "/v1/git-credentials" for r in app.routes)
+
+
+def test_create_app_registers_request_validation_error_handler(app_factory) -> None:
+    # Guards the sanitized-422 handler registration: without it, a malformed
+    # git-credentials body (or any other route's body) would echo submitted
+    # field values — including secrets — back in the 422 response.
+    app = app_factory()
+    assert RequestValidationError in app.exception_handlers

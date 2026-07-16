@@ -14,7 +14,7 @@ import asyncio
 from typing import Any
 
 from fastapi import APIRouter, Request
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.git_hosts.base import HostConfig
@@ -39,10 +39,10 @@ class CreateGitCredentialRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    host_id: str
-    label: str
-    token: str
-    username: str | None = None
+    host_id: str = Field(min_length=1, max_length=256)
+    label: str = Field(min_length=1, max_length=128)
+    token: str = Field(min_length=1, max_length=8192)
+    username: str | None = Field(default=None, max_length=256)
 
 
 def _find_host(git_hosts: tuple[HostConfig, ...], host_id: str) -> HostConfig | None:

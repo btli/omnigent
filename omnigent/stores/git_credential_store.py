@@ -96,6 +96,9 @@ class GitCredentialStore:
 
         :raises ValueError: When this owner already has a credential labeled
             *label* for *host_id*.
+        :raises RuntimeError: On any other database failure while inserting
+            the row. The original error is not chained — its message can
+            carry the INSERT parameters, including ``token_ciphertext``.
         """
         now = now_epoch()
         row = SqlGitCredential(
@@ -138,6 +141,12 @@ class GitCredentialStore:
                     f"a git credential labeled {label!r} for host {host_id!r} "
                     "already exists for this user"
                 ) from None
+            except StatementError:
+                # Any other statement error (e.g. an oversized value on MySQL)
+                # carries the INSERT parameters — including token_ciphertext — in
+                # its message. Drop it from the chain so the ciphertext can never
+                # reach the 500 traceback log.
+                raise RuntimeError("failed to store the git credential") from None
             return _row_to_entity(row)
 
     def list_for_owner(self, owner_user_id: str) -> list[GitCredential]:
@@ -187,6 +196,16 @@ class GitCredentialStore:
         Resolution is by opaque id (not ``(owner, host)``, which is ambiguous with
         multiple labeled identities). The only method that returns plaintext; call
         server-side only.
+
+        .. warning::
+           ``credential_id`` is an *identifier*, not an authorization token —
+           this method performs no ownership or host check. A caller who
+           merely knows or guesses an id (e.g. from another user's session)
+           gets that id's plaintext back. A handoff (P1c-2) MUST first
+           resolve the id against the authenticated ``(workspace, owner,
+           expected host, id)`` tuple — e.g. via :meth:`list_for_owner_host`
+           or an equivalent ownership-checked lookup — before ever calling
+           this method with a caller-supplied id.
         """
         with self._session() as session:
             row = _find_row(session, credential_id)

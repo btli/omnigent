@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import traceback
+
 import pytest
 from cryptography.fernet import Fernet
+from sqlalchemy.exc import StatementError
+from sqlalchemy.orm import Session
 
 from omnigent.git_hosts.crypto import GitCredentialCipher
 from omnigent.stores.git_credential_store import GitCredential, GitCredentialStore
@@ -113,6 +117,49 @@ def test_duplicate_owner_host_label_rejected(tmp_path) -> None:
             username=None,
             token="b",
         )
+
+
+def test_create_non_integrity_statement_error_drops_ciphertext(tmp_path, monkeypatch) -> None:
+    # A DB failure on INSERT that isn't a unique-constraint violation (e.g. a
+    # DataError/OperationalError on a real backend) must not let the
+    # ciphertext-bearing SQLAlchemy error message reach the caller or a
+    # traceback log.
+    store = _store(tmp_path)
+    secret_marker = "very-secret-ciphertext-blob"
+
+    def _boom(self: Session, *args: object, **kwargs: object) -> None:
+        # The pre-check duplicate-label SELECT also triggers autoflush; only
+        # the explicit flush() after session.add(row) has a pending insert.
+        if not self.new:
+            return
+        message = (
+            f"(driver.Error) value too long "
+            f"[parameters: {{'token_ciphertext': {secret_marker!r}}}]"
+        )
+        raise StatementError(
+            message,
+            statement="INSERT INTO git_credentials ...",
+            params={"token_ciphertext": secret_marker},
+            orig=Exception("driver-level failure"),
+        )
+
+    monkeypatch.setattr(Session, "flush", _boom)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        store.create(
+            owner_user_id="alice",
+            host_id="h",
+            provider="forgejo",
+            label="work",
+            username=None,
+            token="tok",
+        )
+
+    assert secret_marker not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    exc = exc_info.value
+    formatted = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    assert secret_marker not in formatted
 
 
 def test_delete_then_absent(tmp_path) -> None:
