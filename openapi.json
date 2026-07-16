@@ -1109,6 +1109,49 @@
         "title": "CreateDirectoryRequest",
         "type": "object"
       },
+      "CreateProjectRequest": {
+        "additionalProperties": false,
+        "description": "Fields accepted when creating a project.",
+        "properties": {
+          "defaults_json": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Defaults Json"
+          },
+          "defaults_schema_version": {
+            "default": 1,
+            "title": "Defaults Schema Version",
+            "type": "integer"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "CreateProjectRequest",
+        "type": "object"
+      },
       "CreateSessionPolicyRequest": {
         "description": "Request body for `POST /v1/sessions/{session_id}/policies`.",
         "properties": {
@@ -2577,6 +2620,21 @@
         "title": "ReasoningTextDeltaEvent",
         "type": "object"
       },
+      "RenameProjectRequest": {
+        "additionalProperties": false,
+        "description": "Project rename payload.",
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "RenameProjectRequest",
+        "type": "object"
+      },
       "ResourceEventData": {
         "description": "Data payload for a persisted resource lifecycle event.\n\nThese items are written to the conversation store when a\nsession resource is created or deleted, so reconnecting\nclients can discover resource history without replaying the\nlive SSE stream.  The agent loop filters them out of the\nLLM's message context (they are metadata, not conversation\ncontent).",
         "properties": {
@@ -3920,6 +3978,17 @@
             "description": "The requesting user's numeric permission level on this session: `1` = read, `2` = edit, `3` = manage. `None` when permissions are disabled.",
             "title": "Permission Level"
           },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
+          },
           "reasoning_effort": {
             "anyOf": [
               {
@@ -4717,6 +4786,17 @@
             ],
             "description": "The requesting user's numeric permission level on this session: `1` = read, `2` = edit, `3` = manage. `None` when permissions are disabled (single-user mode without a permission store).",
             "title": "Permission Level"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
           },
           "reasoning_effort": {
             "anyOf": [
@@ -5554,6 +5634,21 @@
         "title": "TerminalCommandData",
         "type": "object"
       },
+      "TransferProjectRequest": {
+        "additionalProperties": false,
+        "description": "Destination principal for an ownership transfer.",
+        "properties": {
+          "new_owner_principal_id": {
+            "title": "New Owner Principal Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "new_owner_principal_id"
+        ],
+        "title": "TransferProjectRequest",
+        "type": "object"
+      },
       "TurnCancelledEvent": {
         "description": "Emitted when a turn is interrupted by the user or system.",
         "properties": {
@@ -5791,6 +5886,37 @@
         "title": "UpdateDefaultPolicyRequest",
         "type": "object"
       },
+      "UpdateProjectRequest": {
+        "additionalProperties": false,
+        "description": "Mutable project settings payload.",
+        "properties": {
+          "defaults_json": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Defaults Json"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          }
+        },
+        "title": "UpdateProjectRequest",
+        "type": "object"
+      },
       "UpdateSessionPolicyRequest": {
         "additionalProperties": false,
         "description": "Request body for `PATCH /v1/sessions/{session_id}/policies/{policy_id}`.\n\nAll fields are optional; `None` fields are left unchanged.\nUnknown fields (including `type`, which is immutable) are\nrejected with `422`.",
@@ -5913,6 +6039,18 @@
             ],
             "description": "Per-session LLM model override, e.g. `\"claude-opus-4-7\"`. The value is forwarded as-is to the executor at turn start; the server does not enumerate valid models. Clear aliases such as `\"default\"`, `\"off\"`, or `\"reset\"` remove the override (matching the REPL's `/model` semantics). `None` leaves unchanged.",
             "title": "Model Override"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "First-class project membership. A non-empty id moves the session; an empty string or explicit null unfiles it. Omission leaves membership unchanged.",
+            "title": "Project Id"
           },
           "reasoning_effort": {
             "anyOf": [
@@ -7147,6 +7285,487 @@
         ]
       }
     },
+    "/v1/projects": {
+      "get": {
+        "operationId": "list_projects_v1_projects_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "include_archived",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Archived",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "archived_members",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Archived Members",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "title": "Response List Projects V1 Projects Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Projects",
+        "tags": [
+          "projects"
+        ]
+      },
+      "post": {
+        "operationId": "create_project_v1_projects_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateProjectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Project V1 Projects Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Project",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}": {
+      "get": {
+        "operationId": "get_project_v1_projects__project_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Project V1 Projects  Project Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Project",
+        "tags": [
+          "projects"
+        ]
+      },
+      "patch": {
+        "operationId": "update_project_v1_projects__project_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "If-Match"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateProjectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Project V1 Projects  Project Id  Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Project",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/archive": {
+      "post": {
+        "operationId": "archive_project_v1_projects__project_id__archive_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_sessions",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Sessions",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "If-Match"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Archive Project V1 Projects  Project Id  Archive Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Archive Project",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/rename": {
+      "post": {
+        "operationId": "rename_project_v1_projects__project_id__rename_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "If-Match"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RenameProjectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Rename Project V1 Projects  Project Id  Rename Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rename Project",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/restore": {
+      "post": {
+        "operationId": "restore_project_v1_projects__project_id__restore_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "If-Match"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Restore Project V1 Projects  Project Id  Restore Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Restore Project",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/transfer": {
+      "post": {
+        "operationId": "transfer_project_v1_projects__project_id__transfer_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "If-Match"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TransferProjectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Transfer Project V1 Projects  Project Id  Transfer Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Transfer Project",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
     "/v1/runners": {
       "get": {
         "description": "Return currently online runners owned by the requesting user.\n\nWhen auth is active, only runners whose tunnel was\nestablished by the same user are returned. Without auth,\nall online runners are listed (single-user / dev mode).\n\n**Returns:** A `{\"data\": [...]}` list with runner ids and advertised harnesses.",
@@ -7439,7 +8058,7 @@
           },
           {
             "in": "query",
-            "name": "project",
+            "name": "project_id",
             "required": false,
             "schema": {
               "anyOf": [
@@ -7450,7 +8069,7 @@
                   "type": "null"
                 }
               ],
-              "title": "Project"
+              "title": "Project Id"
             }
           }
         ],
@@ -7495,26 +8114,6 @@
           }
         },
         "summary": "Create Session",
-        "tags": [
-          "sessions"
-        ]
-      }
-    },
-    "/v1/sessions/projects": {
-      "get": {
-        "description": "Return all project names for the authenticated user, ordered\nalphabetically.\n\nProjects are implicit: they exist while at least one session\nhas a `conversation_labels` row with `key=\"omni_project\"`.\n\n**Returns:** List of project names.",
-        "operationId": "list_session_projects_v1_sessions_projects_get",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          }
-        },
-        "summary": "List Session Projects",
         "tags": [
           "sessions"
         ]

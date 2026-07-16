@@ -76,7 +76,7 @@ from omnigent.entities import (
     LiveProjectSnapshot,
     NewConversationItem,
     PagedList,
-    ProjectIdentity,
+    Project,
     parse_item_data,
 )
 from omnigent.errors import ErrorCode, OmnigentError
@@ -833,6 +833,27 @@ class SqlAlchemyConversationStore(ConversationStore):
             ),
             "created_at": created_at,
         }
+
+    @staticmethod
+    def _set_metadata_archive_state(
+        session: Session,
+        conversation_ids: list[str],
+        archived: bool,
+    ) -> int:
+        """Apply the canonical metadata archival flag update in bounded chunks."""
+        changed = 0
+        for id_chunk in _chunked_ids(conversation_ids):
+            result = session.execute(
+                update(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id.in_(id_chunk),
+                    SqlConversationMetadata.archived.is_not(archived),
+                )
+                .values(archived=archived)
+            )
+            changed += result.rowcount
+        return changed
 
     @staticmethod
     def _lock_active_project(session: Session, project_id: str) -> SqlProject:
@@ -1991,39 +2012,6 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         return persisted
 
-    def list_projects(
-        self,
-        owner_principal_id: str,
-        *,
-        archived: bool = False,
-    ) -> list[ProjectIdentity]:
-        """Return live owned projects, or those having an archived member."""
-        statement = select(SqlProject.id, SqlProject.name).where(
-            SqlProject.workspace_id == current_workspace_id(),
-            SqlProject.owner_principal_id == owner_principal_id,
-            SqlProject.archived_at.is_(None),
-        )
-        if archived:
-            statement = statement.join(
-                SqlConversationMetadata,
-                and_(
-                    SqlConversationMetadata.workspace_id == SqlProject.workspace_id,
-                    SqlConversationMetadata.project_id == SqlProject.id,
-                ),
-            ).where(
-                SqlProject.workspace_id == current_workspace_id(),
-                SqlConversationMetadata.workspace_id == current_workspace_id(),
-                SqlConversationMetadata.archived.is_(True),
-            )
-        statement = statement.group_by(
-            SqlProject.id, SqlProject.name, SqlProject.normalized_name
-        ).order_by(SqlProject.normalized_name, SqlProject.id)
-        with self._session() as session:
-            return [
-                ProjectIdentity(id=row.id, name=row.name)
-                for row in session.execute(statement).all()
-            ]
-
     def set_project_membership(
         self,
         conversation_id: str,
@@ -2054,11 +2042,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             ):
                 return True
             metadata.project_id = project_id
-            snapshot_values = self._project_snapshot_values(
-                LiveProjectSnapshot.moved(project_id),
-                now_epoch(),
-            )
             if snapshot is None:
+                snapshot_values = self._project_snapshot_values(
+                    LiveProjectSnapshot.moved(project_id),
+                    now_epoch(),
+                )
                 session.add(
                     SqlSessionProjectSnapshot(
                         session_id=conversation_id,
@@ -2066,9 +2054,121 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                 )
             else:
-                for key, value in snapshot_values.items():
-                    setattr(snapshot, key, value)
+                snapshot.project_id = project_id
+                snapshot.snapshot_origin = "moved"
             return True
+
+    def archive_project_with_sessions(
+        self,
+        project_id: str,
+        owner_principal_id: str,
+        *,
+        expected_row_version: int | None,
+    ) -> tuple[Project | None, int]:
+        """Archive member sessions and their project with per-database atomicity.
+
+        The Agent Platform ``updated_at`` writes commit first. The Omnigent
+        metadata flags and project row then commit together, so a second-phase
+        failure can leave newer timestamps but never a partially archived set.
+        """
+        from omnigent.server.auth import LEVEL_OWNER
+        from omnigent.stores.project_store.sqlalchemy_store import _to_entity
+
+        if expected_row_version is None:
+            raise OmnigentError(
+                "If-Match is required for project mutations",
+                code=ErrorCode.PRECONDITION_FAILED,
+            )
+
+        def member_ids(session: Session) -> list[str]:
+            return list(
+                session.execute(
+                    select(SqlConversationMetadata.id)
+                    .join(
+                        SqlSessionPermission,
+                        and_(
+                            SqlSessionPermission.workspace_id
+                            == SqlConversationMetadata.workspace_id,
+                            SqlSessionPermission.conversation_id == SqlConversationMetadata.id,
+                        ),
+                    )
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.project_id == project_id,
+                        SqlConversationMetadata.archived.is_(False),
+                        SqlSessionPermission.user_id == owner_principal_id,
+                        SqlSessionPermission.level >= LEVEL_OWNER,
+                    )
+                    .distinct()
+                ).scalars()
+            )
+
+        with self._session() as session:
+            project = session.get(SqlProject, (current_workspace_id(), project_id))
+            if project is None or project.owner_principal_id != owner_principal_id:
+                return None, 0
+            if project.row_version != expected_row_version:
+                raise OmnigentError(
+                    "Project ETag is stale",
+                    code=ErrorCode.PRECONDITION_FAILED,
+                )
+            if project.archived_at is not None:
+                raise OmnigentError("Project is already archived", code=ErrorCode.CONFLICT)
+            pending_ids = member_ids(session)
+
+        now = now_epoch()
+        if pending_ids:
+            with self._conv_session() as session:
+                for id_chunk in _chunked_ids(pending_ids):
+                    session.execute(
+                        update(SqlConversation)
+                        .where(
+                            SqlConversation.workspace_id == current_workspace_id(),
+                            SqlConversation.id.in_(id_chunk),
+                        )
+                        .values(updated_at=now)
+                    )
+
+        with self._session_immediate() as session:
+            project = session.get(SqlProject, (current_workspace_id(), project_id))
+            if project is None or project.owner_principal_id != owner_principal_id:
+                return None, 0
+            if project.row_version != expected_row_version:
+                raise OmnigentError(
+                    "Project ETag is stale",
+                    code=ErrorCode.PRECONDITION_FAILED,
+                )
+            if project.archived_at is not None:
+                raise OmnigentError("Project is already archived", code=ErrorCode.CONFLICT)
+            pending_ids = member_ids(session)
+            archived_sessions = self._set_metadata_archive_state(session, pending_ids, True)
+            result = session.execute(
+                update(SqlProject)
+                .where(
+                    SqlProject.workspace_id == current_workspace_id(),
+                    SqlProject.id == project_id,
+                    SqlProject.owner_principal_id == owner_principal_id,
+                    SqlProject.row_version == expected_row_version,
+                    SqlProject.archived_at.is_(None),
+                )
+                .values(
+                    archived_at=now,
+                    updated_at=now,
+                    row_version=SqlProject.row_version + 1,
+                )
+            )
+            if result.rowcount != 1:
+                raise OmnigentError(
+                    "Project ETag is stale",
+                    code=ErrorCode.PRECONDITION_FAILED,
+                )
+            session.flush()
+            session.expire_all()
+            updated_project = session.get(SqlProject, (current_workspace_id(), project_id))
+            return (
+                _to_entity(updated_project) if updated_project is not None else None,
+                archived_sessions,
+            )
 
     def forward_legacy_project_label(
         self,
@@ -2622,7 +2722,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 meta = meta_sess.get(
                     SqlConversationMetadata, (current_workspace_id(), conversation_id)
                 )
-                if meta is None:
+                metadata_was_missing = meta is None
+                if metadata_was_missing:
                     # Orphaned conversation (a crash between the AP and
                     # metadata transactions during creation left no metadata
                     # row). Recreate it rather than silently dropping the
@@ -2638,7 +2739,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                     meta_sess.add(meta)
                 if archived is not None:
-                    meta.archived = archived
+                    if metadata_was_missing:
+                        meta.archived = archived
+                    else:
+                        self._set_metadata_archive_state(meta_sess, [conversation_id], archived)
                 if terminal_launch_args is not None:
                     meta.terminal_launch_args = json.dumps(terminal_launch_args)
         return self.get_conversation(conversation_id)

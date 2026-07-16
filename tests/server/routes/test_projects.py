@@ -9,11 +9,15 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from sqlalchemy import event
 
+from omnigent.db.utils import get_or_create_engine
 from omnigent.errors import OmnigentError
 from omnigent.server.app import add_workspace_scope_middleware
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes.projects import create_projects_router
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 
 
@@ -36,8 +40,13 @@ def project_app(db_uri: str) -> FastAPI:
         )
 
     add_workspace_scope_middleware(app)
+    conversations = SqlAlchemyConversationStore(db_uri)
     app.include_router(
-        create_projects_router(SqlAlchemyProjectStore(db_uri), HeaderAuthProvider()),
+        create_projects_router(
+            SqlAlchemyProjectStore(db_uri),
+            HeaderAuthProvider(),
+            conversation_store=conversations,
+        ),
         prefix="/v1",
     )
     return app
@@ -169,6 +178,195 @@ async def test_wrong_owner_mutation_is_404_even_with_matching_etag(
     )
 
     assert response.status_code == 404
+
+
+async def test_transfer_rekeys_owner_and_rejects_collision_stale_and_wrong_caller(
+    project_client: httpx.AsyncClient,
+) -> None:
+    source = await project_client.post(
+        "/v1/projects", headers=_headers("local"), json={"name": "Migrated"}
+    )
+    project_id = source.json()["id"]
+
+    wrong = await project_client.post(
+        f"/v1/projects/{project_id}/transfer",
+        headers=_headers("mallory", **{"If-Match": '"1"'}),
+        json={"new_owner_principal_id": "alice"},
+    )
+    assert wrong.status_code == 404
+
+    stale = await project_client.post(
+        f"/v1/projects/{project_id}/transfer",
+        headers=_headers("local", **{"If-Match": '"2"'}),
+        json={"new_owner_principal_id": "alice"},
+    )
+    assert stale.status_code == 412
+
+    transferred = await project_client.post(
+        f"/v1/projects/{project_id}/transfer",
+        headers=_headers("local", **{"If-Match": '"1"'}),
+        json={"new_owner_principal_id": "alice"},
+    )
+    assert transferred.status_code == 200
+    assert transferred.json()["owner_principal_id"] == "alice"
+    assert transferred.headers["etag"] == '"2"'
+    assert (
+        await project_client.get(f"/v1/projects/{project_id}", headers=_headers("local"))
+    ).status_code == 404
+    assert (
+        await project_client.get(f"/v1/projects/{project_id}", headers=_headers("alice"))
+    ).status_code == 200
+
+    collision_source = await project_client.post(
+        "/v1/projects", headers=_headers("local"), json={"name": "Taken"}
+    )
+    await project_client.post("/v1/projects", headers=_headers("alice"), json={"name": "taken"})
+    collision = await project_client.post(
+        f"/v1/projects/{collision_source.json()['id']}/transfer",
+        headers=_headers("local", **{"If-Match": '"1"'}),
+        json={"new_owner_principal_id": "alice"},
+    )
+    assert collision.status_code == 409
+
+
+async def test_list_archived_members_variant_returns_full_project_rows(
+    db_uri: str,
+    project_client: httpx.AsyncClient,
+) -> None:
+    projects = SqlAlchemyProjectStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    archived_member = projects.create("alice", "Archived member")
+    live_only = projects.create("alice", "Live only")
+    session = conversations.create_conversation()
+    conversations.set_project_membership(session.id, archived_member.id)
+    conversations.update_conversation(session.id, archived=True)
+    permissions.ensure_user("alice")
+    permissions.grant("alice", session.id, 4)
+
+    response = await project_client.get(
+        "/v1/projects?archived_members=true", headers=_headers("alice")
+    )
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()] == [archived_member.id]
+    assert response.json()[0]["row_version"] == 1
+    assert live_only.id not in {item["id"] for item in response.json()}
+
+
+async def test_archive_include_sessions_archives_members_and_project(
+    db_uri: str,
+    project_client: httpx.AsyncClient,
+) -> None:
+    projects = SqlAlchemyProjectStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    project = projects.create("alice", "Delete me")
+    member_ids = []
+    for _ in range(2):
+        session = conversations.create_conversation()
+        conversations.set_project_membership(session.id, project.id)
+        permissions.ensure_user("alice")
+        permissions.grant("alice", session.id, 4)
+        member_ids.append(session.id)
+
+    response = await project_client.post(
+        f"/v1/projects/{project.id}/archive?include_sessions=true",
+        headers=_headers("alice", **{"If-Match": '"1"'}),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["archived_sessions"] == 2
+    assert response.json()["archived_at"] is not None
+    assert projects.get(project.id, "alice").archived_at is not None  # type: ignore[union-attr]
+    assert all(conversations.get_conversation(item).archived for item in member_ids)  # type: ignore[union-attr]
+
+
+async def test_archive_include_sessions_is_owner_scoped(
+    db_uri: str,
+    project_client: httpx.AsyncClient,
+) -> None:
+    projects = SqlAlchemyProjectStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    project = projects.create("alice", "Owner scoped")
+    alice_session = conversations.create_conversation()
+    bob_session = conversations.create_conversation()
+    for session in (alice_session, bob_session):
+        conversations.set_project_membership(session.id, project.id)
+    for owner, session in (("alice", alice_session), ("bob", bob_session)):
+        permissions.ensure_user(owner)
+        permissions.grant(owner, session.id, 4)
+
+    response = await project_client.post(
+        f"/v1/projects/{project.id}/archive?include_sessions=true",
+        headers=_headers("alice", **{"If-Match": '"1"'}),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["archived_sessions"] == 1
+    assert conversations.get_conversation(alice_session.id).archived is True  # type: ignore[union-attr]
+    assert conversations.get_conversation(bob_session.id).archived is False  # type: ignore[union-attr]
+
+
+def test_archive_include_sessions_rolls_back_metadata_with_project_failure(db_uri: str) -> None:
+    projects = SqlAlchemyProjectStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    project = projects.create("alice", "Atomic")
+    member = conversations.create_conversation()
+    conversations.set_project_membership(member.id, project.id)
+    permissions.ensure_user("alice")
+    permissions.grant("alice", member.id, 4)
+
+    def fail_project_archive(
+        _conn: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        if statement.startswith("UPDATE projects SET") and "archived_at" in statement:
+            raise RuntimeError("simulated project archive failure")
+
+    engine = get_or_create_engine(db_uri)
+    event.listen(engine, "before_cursor_execute", fail_project_archive)
+    try:
+        with pytest.raises(RuntimeError, match="simulated project archive failure"):
+            conversations.archive_project_with_sessions(
+                project.id,
+                "alice",
+                expected_row_version=project.row_version,
+            )
+    finally:
+        event.remove(engine, "before_cursor_execute", fail_project_archive)
+
+    assert projects.get(project.id, "alice").archived_at is None  # type: ignore[union-attr]
+    assert conversations.get_conversation(member.id).archived is False  # type: ignore[union-attr]
+
+
+async def test_archive_without_include_sessions_leaves_members_live(
+    db_uri: str,
+    project_client: httpx.AsyncClient,
+) -> None:
+    projects = SqlAlchemyProjectStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    project = projects.create("alice", "Archive row only")
+    session = conversations.create_conversation()
+    conversations.set_project_membership(session.id, project.id)
+    permissions.ensure_user("alice")
+    permissions.grant("alice", session.id, 4)
+
+    response = await project_client.post(
+        f"/v1/projects/{project.id}/archive",
+        headers=_headers("alice", **{"If-Match": '"1"'}),
+    )
+
+    assert response.status_code == 200
+    assert "archived_sessions" not in response.json()
+    assert conversations.get_conversation(session.id).archived is False  # type: ignore[union-attr]
 
 
 async def test_workspace_middleware_keeps_tenants_distinct(

@@ -14700,36 +14700,6 @@ def create_sessions_router(
             )
         return result
 
-    # ── GET /sessions/projects ────────────────────────────────────
-    #
-    # MUST be registered before ``GET /sessions/{session_id}``: FastAPI
-    # matches routes in registration order, so a literal ``/sessions/projects``
-    # would otherwise be captured by the ``{session_id}`` path param and 404
-    # as a missing conversation.
-
-    @router.get(
-        "/sessions/projects",
-        response_model=None,
-    )
-    async def list_session_projects(
-        request: Request,
-        archived: bool = Query(default=False),
-    ) -> list[dict[str, str]]:
-        """
-        Return owned project identities with live or archived members.
-
-        :param archived: When true, select projects having archived members.
-        :returns: Project identities ordered by normalized name.
-        """
-        user_id = _require_user(request, auth_provider)
-        owner_principal_id = resolve_owner_principal(user_id)
-        projects = await asyncio.to_thread(
-            conversation_store.list_projects,
-            owner_principal_id,
-            archived=archived,
-        )
-        return [{"id": project.id, "name": project.name} for project in projects]
-
     # ── PUT /sessions/{session_id}/read-state ─────────────────────
     #
     # The per-user read-state *write* path. The *read* path is the

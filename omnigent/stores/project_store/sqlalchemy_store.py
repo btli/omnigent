@@ -182,16 +182,90 @@ class SqlAlchemyProjectStore(ProjectStore):
             raise OmnigentError("Project is archived", code=ErrorCode.CONFLICT)
         return project
 
-    def list(self, owner_principal_id: str, *, include_archived: bool = False) -> list[Project]:
+    def list(
+        self,
+        owner_principal_id: str,
+        *,
+        include_archived: bool = False,
+        archived_members: bool = False,
+    ) -> list[Project]:
         statement = select(SqlProject).where(
             SqlProject.workspace_id == current_workspace_id(),
             SqlProject.owner_principal_id == owner_principal_id,
         )
-        if not include_archived:
+        if archived_members:
+            statement = statement.join(
+                SqlConversationMetadata,
+                (SqlConversationMetadata.workspace_id == SqlProject.workspace_id)
+                & (SqlConversationMetadata.project_id == SqlProject.id),
+            ).where(
+                SqlProject.archived_at.is_(None),
+                SqlConversationMetadata.archived.is_(True),
+            )
+        elif not include_archived:
             statement = statement.where(SqlProject.archived_at.is_(None))
-        statement = statement.order_by(SqlProject.normalized_name, SqlProject.id)
+        statement = statement.order_by(SqlProject.normalized_name, SqlProject.id).distinct()
         with self._session() as session:
             return [_to_entity(row) for row in session.execute(statement).scalars().all()]
+
+    def transfer(
+        self,
+        project_id: str,
+        current_owner: str,
+        new_owner: str,
+        *,
+        expected_row_version: int | None,
+    ) -> Project | None:
+        if expected_row_version is None:
+            raise OmnigentError(
+                "If-Match is required for project mutations",
+                code=ErrorCode.PRECONDITION_FAILED,
+            )
+        try:
+            with self._session() as session:
+                row = session.get(SqlProject, (current_workspace_id(), project_id))
+                if row is None or row.owner_principal_id != current_owner:
+                    return None
+                if row.row_version != expected_row_version:
+                    raise OmnigentError(
+                        "Project ETag is stale",
+                        code=ErrorCode.PRECONDITION_FAILED,
+                    )
+                if session.get(SqlUser, (current_workspace_id(), new_owner)) is None:
+                    try:
+                        with session.begin_nested():
+                            session.add(SqlUser(id=new_owner, is_admin=False))
+                            session.flush()
+                    except IntegrityError:
+                        pass
+                result = session.execute(
+                    update(SqlProject)
+                    .where(
+                        SqlProject.workspace_id == current_workspace_id(),
+                        SqlProject.id == project_id,
+                        SqlProject.owner_principal_id == current_owner,
+                        SqlProject.row_version == expected_row_version,
+                    )
+                    .values(
+                        owner_principal_id=new_owner,
+                        updated_at=now_epoch(),
+                        row_version=SqlProject.row_version + 1,
+                    )
+                )
+                if result.rowcount != 1:
+                    raise OmnigentError(
+                        "Project ETag is stale",
+                        code=ErrorCode.PRECONDITION_FAILED,
+                    )
+                session.flush()
+                session.expire_all()
+                updated_row = session.get(SqlProject, (current_workspace_id(), project_id))
+                return _to_entity(updated_row) if updated_row is not None else None
+        except IntegrityError as error:
+            raise OmnigentError(
+                "A project with that name already exists",
+                code=ErrorCode.CONFLICT,
+            ) from error
 
     def _mutate(
         self,

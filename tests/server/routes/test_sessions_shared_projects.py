@@ -7,7 +7,7 @@ of their own project folders under "My sessions".
 
 The sidebar builds project folders from two owner-scoped server surfaces:
 
-- ``GET /v1/sessions/projects`` — folder identities, and
+- ``GET /v1/projects`` — folder identities, and
 - ``GET /v1/sessions?project_id=<id>`` — the sessions *inside* a folder.
 
 Both must filter by ownership (an ``owner``-level grant), not mere access, or
@@ -61,12 +61,14 @@ def test_shared_project_not_listed_as_recipients_own_project(db_uri: str) -> Non
     app = sessions_test_app(db_uri)
 
     # Bob owns it, so it's his project.
-    bob = TestClient(app).get("/v1/sessions/projects", headers={"X-Forwarded-Email": BOB})
+    bob = TestClient(app).get("/v1/projects", headers={"X-Forwarded-Email": BOB})
     assert bob.status_code == 200
-    assert bob.json() == [{"id": project_id, "name": "Bob Project"}]
+    assert [{"id": item["id"], "name": item["name"]} for item in bob.json()] == [
+        {"id": project_id, "name": "Bob Project"}
+    ]
 
     # Alice can access the session, but doesn't own it — no folder for her.
-    alice = TestClient(app).get("/v1/sessions/projects", headers={"X-Forwarded-Email": ALICE})
+    alice = TestClient(app).get("/v1/projects", headers={"X-Forwarded-Email": ALICE})
     assert alice.status_code == 200
     assert alice.json() == []
 
