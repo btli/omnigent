@@ -193,8 +193,7 @@ export type SidebarDropTarget =
   | null;
 
 /** The action a drop resolves to. `move` files the session into a project;
-    `ungroup` removes it from its current project (the caller still confirms
-    when it's the project's last member); `pin` pins it (pin-precedence then
+    `ungroup` removes it from its current project; `pin` pins it (pin-precedence then
     floats it into the Pinned section); `unpin` just unpins it (so it leaves
     Pinned and falls back to its project / the flat list); `none` is a no-op.
 

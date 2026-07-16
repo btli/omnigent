@@ -765,10 +765,11 @@ class ConversationStore(ABC):
         archived: bool = False,
     ) -> list[ProjectIdentity]:
         """
-        Return owned project identities having a member in the requested state.
+        Return live owned projects, or projects having an archived member.
 
         :param owner_principal_id: Project owner whose rows may be returned.
-        :param archived: Match archived members instead of live members.
+        :param archived: Require at least one archived member. When false,
+            return every non-archived project row regardless of membership.
         :returns: Project identities ordered by normalized name.
         """
         ...

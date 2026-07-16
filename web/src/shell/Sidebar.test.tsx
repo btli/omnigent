@@ -6,7 +6,7 @@
 // are no longer listed here — they live on the Settings page.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -19,16 +19,13 @@ const {
   projectsMock,
   moveToProjectSpy,
   deleteProjectSpy,
-  fetchProjectSessionIdsMock,
   conversationsRef,
   projectSessionsMock,
+  dndContextProps,
 } = vi.hoisted(() => ({
   projectsMock: [] as { id: string; name: string }[],
   moveToProjectSpy: vi.fn(),
   deleteProjectSpy: vi.fn(),
-  // Server-side "ids in this project" check that gates the remove
-  // confirmation. Defaults to "no other sessions"; tests override per case.
-  fetchProjectSessionIdsMock: vi.fn(() => Promise.resolve([] as string[])),
   // Latest conversations handed to the global-list mock. The useProjectSessions
   // mock derives each folder's rows from this by label, mirroring the server's
   // ?project_id= filter — so tests that seed project sessions via the global list
@@ -40,7 +37,20 @@ const {
   // serves exactly those rows instead of deriving from the global list — used to
   // prove a folder fetches its members independently of the global window.
   projectSessionsMock: { current: {} as Record<string, unknown[]> },
+  dndContextProps: { current: null as any },
 }));
+
+vi.mock("@dnd-kit/core", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@dnd-kit/core")>();
+  const { createElement } = await import("react");
+  return {
+    ...actual,
+    DndContext: (props: any) => {
+      dndContextProps.current = props;
+      return createElement(actual.DndContext, props);
+    },
+  };
+});
 
 // Mutation hooks are only invoked on row actions; stub them. useConversations
 // is the data source under test, so it's a controllable mock.
@@ -89,7 +99,6 @@ vi.mock("@/hooks/useConversations", () => ({
   },
   useMoveToProject: () => ({ mutate: moveToProjectSpy }),
   useDeleteProject: () => ({ mutate: deleteProjectSpy, isPending: false, isError: false }),
-  fetchProjectSessionIds: fetchProjectSessionIdsMock,
 }));
 // Header / dialog children that pull their own context — stub to keep the
 // test scoped to the conversation list + funnel.
@@ -194,8 +203,7 @@ beforeEach(() => {
   projectsMock.length = 0;
   moveToProjectSpy.mockReset();
   deleteProjectSpy.mockReset();
-  fetchProjectSessionIdsMock.mockReset();
-  fetchProjectSessionIdsMock.mockResolvedValue([]);
+  dndContextProps.current = null;
   projectSessionsMock.current = {};
   // Default to a multi-user server so the tab-based tests see the tabs.
   isServerLocalMock.mockReturnValue(false);
@@ -1100,13 +1108,11 @@ describe("Sidebar move-to-project action", () => {
     });
   });
 
-  it("confirms removal only when it's the project's last session", async () => {
+  it("removes a project's last session without confirmation and keeps the project listed", async () => {
     addProjects("Sprint 42");
     mockConversations([
       conv("conv_filed", "Claude Code", { metadata: { project_id: projectId("Sprint 42") } }),
     ]);
-    // Server reports this is the only session in the project.
-    fetchProjectSessionIdsMock.mockResolvedValue(["conv_filed"]);
     renderSidebar();
 
     // Expand the project folder, open the filed row's kebab → Change project.
@@ -1118,44 +1124,44 @@ describe("Sidebar move-to-project action", () => {
     });
     fireEvent.click(await screen.findByTestId("move-to-project"));
 
-    // Last session → "Remove from <project>" opens a confirmation that says the
-    // project will be removed too; it does NOT remove immediately.
+    // Emptying a first-class project is non-destructive, so removal is immediate.
     fireEvent.click(await screen.findByRole("menuitem", { name: /Remove from Sprint 42/ }));
-    expect(await screen.findByText(/the project will be removed as well/i)).toBeInTheDocument();
-    expect(moveToProjectSpy).not.toHaveBeenCalled();
-
-    // Confirming fires the removal with an empty project (server deletes the
-    // label; the implicit project vanishes with its last session).
-    fireEvent.click(screen.getByRole("button", { name: "Remove from project" }));
-    expect(moveToProjectSpy).toHaveBeenCalledWith(
-      { id: "conv_filed", projectId: "" },
-      expect.anything(),
-    );
+    expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_filed", projectId: "" });
+    expect(screen.queryByText(/the project will be removed as well/i)).toBeNull();
+    expect(screen.getByRole("button", { name: "Sprint 42" })).toBeInTheDocument();
   });
 
-  it("removes without confirmation when other sessions remain in the project", async () => {
+  it("moves the last session out by drag without confirmation and keeps the project listed", () => {
     addProjects("Sprint 42");
     mockConversations([
       conv("conv_filed", "Claude Code", { metadata: { project_id: projectId("Sprint 42") } }),
     ]);
-    // Server reports another session is still in the project.
-    fetchProjectSessionIdsMock.mockResolvedValue(["conv_filed", "conv_other"]);
     renderSidebar();
 
-    fireEvent.click(screen.getByRole("button", { name: "Sprint 42" }));
-    const row = screen.getByRole("link", { name: /conv_filed/ }).closest("li")!;
-    fireEvent.pointerDown(within(row).getByRole("button", { name: "Conversation actions" }), {
-      button: 0,
-      ctrlKey: false,
+    act(() => {
+      dndContextProps.current.onDragStart({
+        active: {
+          id: "conv_filed",
+          data: {
+            current: {
+              label: "conv_filed",
+              project: projectId("Sprint 42"),
+              isPinned: false,
+            },
+          },
+        },
+      });
     });
-    fireEvent.click(await screen.findByTestId("move-to-project"));
-    fireEvent.click(await screen.findByRole("menuitem", { name: /Remove from Sprint 42/ }));
+    act(() => {
+      dndContextProps.current.onDragEnd({
+        active: { id: "conv_filed" },
+        over: { data: { current: { type: "ungroup" } } },
+      });
+    });
 
-    // Not the last session → removes straight away, no confirmation dialog.
-    await waitFor(() =>
-      expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_filed", projectId: "" }),
-    );
+    expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_filed", projectId: "" });
     expect(screen.queryByText(/the project will be removed as well/i)).toBeNull();
+    expect(screen.getByRole("button", { name: "Sprint 42" })).toBeInTheDocument();
   });
 });
 

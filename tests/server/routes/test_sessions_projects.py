@@ -442,6 +442,8 @@ def test_session_projects_list_uses_membership_and_archived_variant(
 
     assert live_response.status_code == 200
     assert live_response.json() == [
+        {"id": archived_only.id, "name": "Archived only"},
+        {"id": empty.id, "name": "Empty"},
         {"id": live_only.id, "name": "Live only"},
         {"id": mixed.id, "name": "Mixed"},
     ]
@@ -450,7 +452,7 @@ def test_session_projects_list_uses_membership_and_archived_variant(
         {"id": archived_only.id, "name": "Archived only"},
         {"id": mixed.id, "name": "Mixed"},
     ]
-    assert empty.id not in {item["id"] for item in live_response.json()}
+    assert empty.id in {item["id"] for item in live_response.json()}
 
 
 def test_session_list_filters_by_project_id_and_legacy_name_alias(
