@@ -51,7 +51,11 @@ class FailingOverrideConversationStore(SqlAlchemyConversationStore):
 @pytest.fixture()
 def project_setup(db_uri: str) -> Iterator[tuple[SqlAlchemyProjectStore, TestClient]]:
     agents = SqlAlchemyAgentStore(db_uri)
-    agents.create(agent_id="ag_test", name="test-agent", bundle_location="ag_test/bundle")
+    agents.create(
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        name="test-agent",
+        bundle_location="087b7cb7ac30abf4debfaa578d052ec6/bundle",
+    )
     app = sessions_test_app(db_uri)
     with TestClient(app) as client:
         yield SqlAlchemyProjectStore(db_uri), client
@@ -84,7 +88,7 @@ def test_project_create_writes_snapshot_and_seeds_agent_configuration(
     response = client.post(
         "/v1/sessions",
         headers=_headers(ALICE),
-        json={"agent_id": "ag_test", "project_id": project.id},
+        json={"agent_id": "087b7cb7ac30abf4debfaa578d052ec6", "project_id": project.id},
     )
 
     assert response.status_code == 201, response.text
@@ -119,7 +123,11 @@ def test_managed_project_create_maps_repo_branch_without_git_or_host(
 
     monkeypatch.setattr(sessions, "_run_managed_launch", _skip_managed_launch)
     agents = SqlAlchemyAgentStore(db_uri)
-    agents.create(agent_id="ag_test", name="test-agent", bundle_location="ag_test/bundle")
+    agents.create(
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        name="test-agent",
+        bundle_location="087b7cb7ac30abf4debfaa578d052ec6/bundle",
+    )
     projects = SqlAlchemyProjectStore(db_uri)
     project = projects.create(
         ALICE,
@@ -135,7 +143,7 @@ def test_managed_project_create_maps_repo_branch_without_git_or_host(
         response = client.post(
             "/v1/sessions",
             headers=_headers(ALICE),
-            json={"agent_id": "ag_test", "project_id": project.id},
+            json={"agent_id": "087b7cb7ac30abf4debfaa578d052ec6", "project_id": project.id},
         )
 
     assert response.status_code == 201, response.text
@@ -169,7 +177,7 @@ def test_session_overrides_win_alongside_project_id(
         "/v1/sessions",
         headers=_headers(ALICE),
         json={
-            "agent_id": "ag_test",
+            "agent_id": "087b7cb7ac30abf4debfaa578d052ec6",
             "project_id": project.id,
             "model_override": "session-model",
             "harness_override": "session-harness",
@@ -203,7 +211,7 @@ def test_invalid_resolved_project_defaults_return_422(
     response = client.post(
         "/v1/sessions",
         headers=_headers(ALICE),
-        json={"agent_id": "ag_test", "project_id": project.id},
+        json={"agent_id": "087b7cb7ac30abf4debfaa578d052ec6", "project_id": project.id},
     )
 
     assert response.status_code == 422
@@ -214,7 +222,11 @@ def test_snapshot_survives_config_seed_failure_and_project_edit(
     db_uri: str,
 ) -> None:
     agents = SqlAlchemyAgentStore(db_uri)
-    agents.create(agent_id="ag_test", name="test-agent", bundle_location="ag_test/bundle")
+    agents.create(
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        name="test-agent",
+        bundle_location="087b7cb7ac30abf4debfaa578d052ec6/bundle",
+    )
     projects = SqlAlchemyProjectStore(db_uri)
     project = projects.create(ALICE, "Durable", defaults_json={"model": "gpt-5"})
     failing_store = FailingOverrideConversationStore(db_uri)
@@ -227,7 +239,7 @@ def test_snapshot_survives_config_seed_failure_and_project_edit(
         client.post(
             "/v1/sessions",
             headers=_headers(ALICE),
-            json={"agent_id": "ag_test", "project_id": project.id},
+            json={"agent_id": "087b7cb7ac30abf4debfaa578d052ec6", "project_id": project.id},
         )
 
     with Session(get_or_create_engine(db_uri)) as session:
@@ -256,7 +268,7 @@ def test_new_session_picks_up_project_edit_without_changing_first_snapshot(
     first = client.post(
         "/v1/sessions",
         headers=_headers(ALICE),
-        json={"agent_id": "ag_test", "project_id": project.id},
+        json={"agent_id": "087b7cb7ac30abf4debfaa578d052ec6", "project_id": project.id},
     )
     assert first.status_code == 201, first.text
 
@@ -269,7 +281,7 @@ def test_new_session_picks_up_project_edit_without_changing_first_snapshot(
     second = client.post(
         "/v1/sessions",
         headers=_headers(ALICE),
-        json={"agent_id": "ag_test", "project_id": project.id},
+        json={"agent_id": "087b7cb7ac30abf4debfaa578d052ec6", "project_id": project.id},
     )
 
     assert second.status_code == 201, second.text
@@ -294,7 +306,7 @@ def test_project_attach_hides_wrong_owner_and_rejects_archived(
     hidden = client.post(
         "/v1/sessions",
         headers=_headers(BOB),
-        json={"agent_id": "ag_test", "project_id": project.id},
+        json={"agent_id": "087b7cb7ac30abf4debfaa578d052ec6", "project_id": project.id},
     )
     assert hidden.status_code == 404
 
@@ -302,7 +314,7 @@ def test_project_attach_hides_wrong_owner_and_rejects_archived(
     archived = client.post(
         "/v1/sessions",
         headers=_headers(ALICE),
-        json={"agent_id": "ag_test", "project_id": project.id},
+        json={"agent_id": "087b7cb7ac30abf4debfaa578d052ec6", "project_id": project.id},
     )
     assert archived.status_code == 409
 
@@ -316,7 +328,7 @@ def test_project_id_is_top_level_only_for_children_and_forks(
     parent = client.post(
         "/v1/sessions",
         headers=_headers(ALICE),
-        json={"agent_id": "ag_test", "project_id": project.id},
+        json={"agent_id": "087b7cb7ac30abf4debfaa578d052ec6", "project_id": project.id},
     )
     assert parent.status_code == 201
 
@@ -324,7 +336,7 @@ def test_project_id_is_top_level_only_for_children_and_forks(
         "/v1/sessions",
         headers=_headers(ALICE),
         json={
-            "agent_id": "ag_test",
+            "agent_id": "087b7cb7ac30abf4debfaa578d052ec6",
             "parent_session_id": parent.json()["id"],
             "sub_agent_name": "helper",
             "project_id": project.id,
@@ -351,7 +363,7 @@ def test_projectless_create_and_multipart_schema_remain_unscoped(
     response = client.post(
         "/v1/sessions",
         headers=_headers(ALICE),
-        json={"agent_id": "ag_test", "model_override": "gpt-5"},
+        json={"agent_id": "087b7cb7ac30abf4debfaa578d052ec6", "model_override": "gpt-5"},
     )
 
     assert response.status_code == 201
@@ -378,7 +390,7 @@ def test_session_projects_list_uses_membership_and_archived_variant(
         response = client.post(
             "/v1/sessions",
             headers=_headers(user),
-            json={"agent_id": "ag_test", "project_id": project_id},
+            json={"agent_id": "087b7cb7ac30abf4debfaa578d052ec6", "project_id": project_id},
         )
         assert response.status_code == 201, response.text
         session_id = response.json()["id"]
@@ -423,12 +435,12 @@ def test_session_list_filters_by_project_id(
     filed = client.post(
         "/v1/sessions",
         headers=_headers(ALICE),
-        json={"agent_id": "ag_test", "project_id": project.id},
+        json={"agent_id": "087b7cb7ac30abf4debfaa578d052ec6", "project_id": project.id},
     )
     unfiled = client.post(
         "/v1/sessions",
         headers=_headers(ALICE),
-        json={"agent_id": "ag_test"},
+        json={"agent_id": "087b7cb7ac30abf4debfaa578d052ec6"},
     )
     assert filed.status_code == unfiled.status_code == 201
 
@@ -448,7 +460,7 @@ def test_project_membership_is_emitted_by_list_and_detail(
     created = client.post(
         "/v1/sessions",
         headers=_headers(ALICE),
-        json={"agent_id": "ag_test", "project_id": project.id},
+        json={"agent_id": "087b7cb7ac30abf4debfaa578d052ec6", "project_id": project.id},
     )
     session_id = created.json()["id"]
 
@@ -473,7 +485,7 @@ def test_patch_project_id_moves_and_unfiles_with_snapshot(
     created = client.post(
         "/v1/sessions",
         headers=_headers(ALICE),
-        json={"agent_id": "ag_test"},
+        json={"agent_id": "087b7cb7ac30abf4debfaa578d052ec6"},
     )
     session_id = created.json()["id"]
 
@@ -516,7 +528,7 @@ def test_patch_project_id_hides_wrong_owner_and_rejects_archived(
     created = client.post(
         "/v1/sessions",
         headers=_headers(BOB),
-        json={"agent_id": "ag_test"},
+        json={"agent_id": "087b7cb7ac30abf4debfaa578d052ec6"},
     )
     session_id = created.json()["id"]
 
@@ -530,7 +542,7 @@ def test_patch_project_id_hides_wrong_owner_and_rejects_archived(
     alice_session = client.post(
         "/v1/sessions",
         headers=_headers(ALICE),
-        json={"agent_id": "ag_test"},
+        json={"agent_id": "087b7cb7ac30abf4debfaa578d052ec6"},
     ).json()["id"]
     archived_response = client.patch(
         f"/v1/sessions/{alice_session}",
@@ -549,7 +561,7 @@ def test_patch_project_membership_is_session_owner_only(
     created = client.post(
         "/v1/sessions",
         headers=_headers(ALICE),
-        json={"agent_id": "ag_test"},
+        json={"agent_id": "087b7cb7ac30abf4debfaa578d052ec6"},
     )
     session_id = created.json()["id"]
     permissions = SqlAlchemyPermissionStore(db_uri)
@@ -574,7 +586,7 @@ def test_legacy_project_label_write_forwards_membership_without_persisting_label
     created = client.post(
         "/v1/sessions",
         headers=_headers(ALICE),
-        json={"agent_id": "ag_test"},
+        json={"agent_id": "087b7cb7ac30abf4debfaa578d052ec6"},
     )
     session_id = created.json()["id"]
     SqlAlchemyConversationStore(db_uri).set_labels(
@@ -629,7 +641,10 @@ def test_json_create_forwards_legacy_project_label_and_validates_explicit_id(
         forwarded = client.post(
             "/v1/sessions",
             headers=_headers(ALICE),
-            json={"agent_id": "ag_test", "labels": {PROJECT_LABEL_KEY: "Forwarded"}},
+            json={
+                "agent_id": "087b7cb7ac30abf4debfaa578d052ec6",
+                "labels": {PROJECT_LABEL_KEY: "Forwarded"},
+            },
         )
 
     assert forwarded.status_code == 201, forwarded.text
@@ -652,7 +667,7 @@ def test_json_create_forwards_legacy_project_label_and_validates_explicit_id(
         "/v1/sessions",
         headers=_headers(ALICE),
         json={
-            "agent_id": "ag_test",
+            "agent_id": "087b7cb7ac30abf4debfaa578d052ec6",
             "project_id": project.id,
             "labels": {PROJECT_LABEL_KEY: "Forwarded"},
         },
@@ -667,7 +682,7 @@ def test_json_create_forwards_legacy_project_label_and_validates_explicit_id(
         "/v1/sessions",
         headers=_headers(ALICE),
         json={
-            "agent_id": "ag_test",
+            "agent_id": "087b7cb7ac30abf4debfaa578d052ec6",
             "project_id": other.id,
             "labels": {PROJECT_LABEL_KEY: "Forwarded"},
         },
@@ -679,7 +694,7 @@ def test_json_create_forwards_legacy_project_label_and_validates_explicit_id(
         "/v1/sessions",
         headers=_headers(ALICE),
         json={
-            "agent_id": "ag_test",
+            "agent_id": "087b7cb7ac30abf4debfaa578d052ec6",
             "project_id": other.id,
             "labels": {PROJECT_LABEL_KEY: orphan_name},
         },
@@ -691,7 +706,7 @@ def test_json_create_forwards_legacy_project_label_and_validates_explicit_id(
         "/v1/sessions",
         headers=_headers(ALICE),
         json={
-            "agent_id": "ag_test",
+            "agent_id": "087b7cb7ac30abf4debfaa578d052ec6",
             "project_id": None,
             "labels": {PROJECT_LABEL_KEY: orphan_name},
         },
@@ -704,7 +719,11 @@ def test_json_forwarded_snapshot_failure_rolls_back_session(
     db_uri: str,
 ) -> None:
     agents = SqlAlchemyAgentStore(db_uri)
-    agents.create(agent_id="ag_test", name="test-agent", bundle_location="ag_test/bundle")
+    agents.create(
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        name="test-agent",
+        bundle_location="087b7cb7ac30abf4debfaa578d052ec6/bundle",
+    )
 
     def _fail_snapshot_write(
         session: Session,
@@ -722,7 +741,7 @@ def test_json_forwarded_snapshot_failure_rolls_back_session(
                 "/v1/sessions",
                 headers=_headers(ALICE),
                 json={
-                    "agent_id": "ag_test",
+                    "agent_id": "087b7cb7ac30abf4debfaa578d052ec6",
                     "title": "atomic-json-forward",
                     "labels": {PROJECT_LABEL_KEY: "Atomic JSON"},
                 },
@@ -838,7 +857,7 @@ def test_patch_project_label_agreement_and_disagreement(
     session_id = client.post(
         "/v1/sessions",
         headers=_headers(ALICE),
-        json={"agent_id": "ag_test"},
+        json={"agent_id": "087b7cb7ac30abf4debfaa578d052ec6"},
     ).json()["id"]
 
     agreed = client.patch(
@@ -898,7 +917,11 @@ class ArchiveBeforeCreateStore(SqlAlchemyConversationStore):
 
 def test_patch_rechecks_archived_project_at_membership_write(db_uri: str) -> None:
     agents = SqlAlchemyAgentStore(db_uri)
-    agents.create(agent_id="ag_test", name="test-agent", bundle_location="ag_test/bundle")
+    agents.create(
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        name="test-agent",
+        bundle_location="087b7cb7ac30abf4debfaa578d052ec6/bundle",
+    )
     projects = SqlAlchemyProjectStore(db_uri)
     project = projects.create(ALICE, "Race")
     store = ArchiveBeforeMembershipStore(db_uri, projects, project.id)
@@ -906,7 +929,7 @@ def test_patch_rechecks_archived_project_at_membership_write(db_uri: str) -> Non
         session_id = client.post(
             "/v1/sessions",
             headers=_headers(ALICE),
-            json={"agent_id": "ag_test"},
+            json={"agent_id": "087b7cb7ac30abf4debfaa578d052ec6"},
         ).json()["id"]
         response = client.patch(
             f"/v1/sessions/{session_id}",
@@ -922,7 +945,11 @@ def test_patch_rechecks_archived_project_at_membership_write(db_uri: str) -> Non
 
 def test_create_rechecks_archived_project_before_snapshot_write(db_uri: str) -> None:
     agents = SqlAlchemyAgentStore(db_uri)
-    agents.create(agent_id="ag_test", name="test-agent", bundle_location="ag_test/bundle")
+    agents.create(
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        name="test-agent",
+        bundle_location="087b7cb7ac30abf4debfaa578d052ec6/bundle",
+    )
     projects = SqlAlchemyProjectStore(db_uri)
     project = projects.create(ALICE, "Create race")
     store = ArchiveBeforeCreateStore(db_uri, projects, project.id)
@@ -930,7 +957,7 @@ def test_create_rechecks_archived_project_before_snapshot_write(db_uri: str) -> 
         response = client.post(
             "/v1/sessions",
             headers=_headers(ALICE),
-            json={"agent_id": "ag_test", "project_id": project.id},
+            json={"agent_id": "087b7cb7ac30abf4debfaa578d052ec6", "project_id": project.id},
         )
 
     assert response.status_code == 409

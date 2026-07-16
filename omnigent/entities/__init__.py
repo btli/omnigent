@@ -36,6 +36,7 @@ from omnigent.entities.project import (
     ProjectMigrationMapping,
     project_snapshot_values,
 )
+from omnigent.entities.scheduled_task import ScheduledTask, ScheduledTaskRun
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     SessionResourceView,
@@ -75,6 +76,8 @@ __all__ = [
     "ResolvedAccess",
     "ResourceEventData",
     "RoutingDecisionData",
+    "ScheduledTask",
+    "ScheduledTaskRun",
     "SessionPermission",
     "SessionResourceView",
     "SlashCommandData",

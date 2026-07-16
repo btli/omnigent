@@ -74,6 +74,7 @@ import {
   SANDBOX_HOST_CHOICE,
 } from "@/lib/hostPreferences";
 import { readLastHarness, writeLastHarness } from "@/lib/harnessPreferences";
+import { readHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
 import { readDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readHarnessOptions, writeHarnessOption } from "@/lib/modePreferences";
 import { useBrainHarnessLabels } from "@/lib/agentLabels";
@@ -94,7 +95,11 @@ import {
   onHostStatusChanged,
   type HostIdentity,
 } from "@/lib/nativeBridge";
-import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
+import {
+  useAvailableAgents,
+  prefetchAvailableAgentDetails,
+  type AvailableAgent,
+} from "@/hooks/useAvailableAgents";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
@@ -1106,19 +1111,27 @@ function BrainHarnessOptions({
   onValueChange,
   host,
   labels,
+  hideUnconfigured,
 }: {
   value: string;
   onValueChange: (harness: string) => void;
   host: Host | undefined | null;
   labels: Record<string, string>;
+  hideUnconfigured: boolean;
 }) {
+  // With "hide unconfigured harnesses" on, drop brain options that can't launch
+  // on the host — except the current selection, which stays so the radio group
+  // still reflects the active pick.
+  const entries = Object.entries(labels).filter(
+    ([id]) => id === value || !hideUnconfigured || !harnessUnconfiguredOnHost(id, host),
+  );
   return (
     <>
       <div className="px-2 pt-1.5 pb-0.5 text-[11px] font-medium text-muted-foreground">
         Agent Harness
       </div>
       <DropdownMenuRadioGroup value={value} onValueChange={onValueChange}>
-        {Object.entries(labels).map(([id, label]) => (
+        {entries.map(([id, label]) => (
           <DropdownMenuRadioItem
             key={id}
             value={id}
@@ -1288,6 +1301,7 @@ function AgentHarnessPicker({
   // Controlled so clicking a knobbed row can commit the pick and close the
   // menu (see the sub-trigger onClick below) without diving into the submenu.
   const [open, setOpen] = useState(false);
+  const queryClient = useQueryClient();
 
   // Touch devices can't hover, so the desktop knob flyout (a Radix sub-menu
   // that opens on hover) is unreachable there. On mobile we instead swap the
@@ -1476,6 +1490,7 @@ function AgentHarnessPicker({
           }}
           host={host}
           labels={brainHarnessLabels}
+          hideUnconfigured={hideUnconfigured}
         />
       );
     }
@@ -1553,6 +1568,19 @@ function AgentHarnessPicker({
     );
   };
 
+  // Opt-in "hide unconfigured harnesses" filter (Settings › Appearance). When
+  // on, drop harness rows that can't launch on the selected host. Fails open:
+  // harnessUnconfiguredOnHost returns false with no host / no readiness map, so
+  // nothing is hidden in those cases, and unrecognized harnesses stay visible.
+  const hideUnconfigured = useMemo(() => readHideUnconfiguredHarnesses(), []);
+  const visibleHarnessEntries = useMemo(
+    () =>
+      hideUnconfigured
+        ? harnessEntries.filter((a) => !harnessUnconfiguredOnHost(a.harness, host))
+        : harnessEntries,
+    [hideUnconfigured, harnessEntries, host],
+  );
+
   return (
     <DropdownMenu
       open={open}
@@ -1563,6 +1591,11 @@ function AgentHarnessPicker({
           // tall list, so the later drill-in (shorter page) can't flip it.
           const rect = triggerRef.current?.getBoundingClientRect();
           if (rect) setMobileSide(window.innerHeight - rect.bottom >= rect.top ? "bottom" : "top");
+          // Prefetch harness/description/skills for all session-discovered
+          // agents so hasKnobs is stable before the user reads the list.
+          for (const agent of [...harnessEntries, ...agentEntries]) {
+            void prefetchAvailableAgentDetails(agent, queryClient);
+          }
         } else {
           // Closing resets the in-place page so the menu always reopens on the
           // agent list, never a stale knobs page.
@@ -1626,10 +1659,10 @@ function AgentHarnessPicker({
           <>
             {/* Harnesses group first — the native terminal CLIs (Claude Code is
             the default), so the most-used picks lead. */}
-            {harnessEntries.length > 0 && (
+            {visibleHarnessEntries.length > 0 && (
               <>
                 <PickerSectionHeader>Harnesses</PickerSectionHeader>
-                {harnessEntries.map(renderEntry)}
+                {visibleHarnessEntries.map(renderEntry)}
                 <DropdownMenuSeparator />
               </>
             )}
@@ -1708,9 +1741,6 @@ export function NewChatLandingScreen() {
   const { data: agents } = useAvailableAgents();
   const brainHarnessLabels = useBrainHarnessLabels();
   const { data: hosts, isLoading: hostsLoading } = useHosts();
-  // Sessions the caller can access, to warn when a new session would share a
-  // working directory with a live one (see the conflict tooltip below).
-  const { data: directorySessions } = useDirectorySessions(true);
 
   const agentList = useMemo(
     () =>
@@ -1814,16 +1844,20 @@ export function NewChatLandingScreen() {
   const showDisabledSandboxWithDocs = !managedSandboxesEnabled && !!newSandboxTooltipContent;
 
   const projectIdParam = searchParams.get("project_id") ?? "";
-
   // Seeded from the persisted last pick so a returning user starts on the
   // agent they used last; validated against the live list in
-  // effectiveAgentId below (a stale id falls back to the default).
+  // effectiveAgentId below (a stale id falls back to the default). A
+  // project-driven visit defers to the project-prefill effect instead
+  // (which falls back to the same last pick).
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(
     () => landingDraft?.pickedAgentId ?? (projectIdParam ? null : readLastAgentId()),
   );
   const [selectedHostId, setSelectedHostId] = useState<string | null>(
     () => landingDraft?.selectedHostId ?? null,
   );
+  // Sessions on the selected host — fetched only when a host is selected,
+  // to avoid registering hundreds of sessions into the health poll at idle.
+  const { data: directorySessions } = useDirectorySessions(selectedHostId !== null);
   // True when the user picked the sandbox option instead of a connected
   // host — the server provisions a sandbox host at create time
   // (host_type: "managed"), so no host_id or workspace is sent.
@@ -2010,6 +2044,9 @@ export function NewChatLandingScreen() {
   const { data: projectNewest, isError: projectNewestFailed } = useNewestProjectSession(
     projectIdParam || null,
   );
+  // That session may have run in a linked worktree (git_branch set), where
+  // its workspace is the worktree dir, not the repo. Listing that path's
+  // worktrees returns the whole set, including the `is_main` source repo.
   const needsSourceRepoResolve =
     projectNewest != null &&
     projectNewest.git_branch != null &&
@@ -2047,7 +2084,7 @@ export function NewChatLandingScreen() {
   // sandbox when the server supports it (it's pinned first in the picker),
   // else the first online host. Only fills an empty slot; an explicit choice
   // already in state (or restored from the in-memory draft) is never
-  // overridden.
+  // overridden. Holds off while a project prefill is deciding.
   useEffect(() => {
     if (!prefillSettled) return;
     if (sandboxSelected) return;
@@ -2236,9 +2273,10 @@ export function NewChatLandingScreen() {
   const isCloudHost =
     sandboxSelected || (selectedHost?.name?.toLowerCase().includes("cloud") ?? false);
 
-  // Sessions on the selected host that have a workspace — candidates for a
-  // directory conflict, fed to the runner-health poll so only *connected*
-  // agents count (same /health signal as the sidebar dots).
+  // Sessions on the selected host that have a workspace — the narrow set
+  // the health poll needs to check for live directory conflicts. Much
+  // smaller than all 200 directorySessions (only host-matched + workspace
+  // rows), so registering them into the /health poll is cheap.
   const conflictCandidates = useMemo(
     () =>
       (directorySessions ?? []).filter((s) => s.host_id === selectedHostId && s.workspace != null),
@@ -2346,7 +2384,11 @@ export function NewChatLandingScreen() {
     const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
     setBranchName(`worktree-${suffix}`);
   }, []);
-
+  // Project prefill: advance the machine one step per render as its data
+  // arrives. It steps rather than loops in one pass because the "branch"
+  // phase needs `hostWorktrees` for the workspace the "workspace" phase
+  // just wrote, and that listing only reflects the seeded repo one render
+  // after the write applies.
   useEffect(() => {
     if (prefill.projectId !== projectIdParam || prefillDone(prefill)) return;
     const step = projectPrefillStep(prefill, {
