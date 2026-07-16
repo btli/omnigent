@@ -305,10 +305,10 @@ def test_update_stamps_current_defaults_schema_version(
 
 def test_list_projects_returns_distinct_names_sorted(
     conversation_store: SqlAlchemyConversationStore,
-    db_uri: str,
+    store: SqlAlchemyProjectStore,
 ) -> None:
     """Every live owned project row is returned once in name order."""
-    projects = SqlAlchemyProjectStore(db_uri)
+    projects = store
     sprint = projects.create("alice", "Sprint 42")
     customer = projects.create("alice", "Customer X")
     empty = projects.create("alice", "Empty")
@@ -334,7 +334,7 @@ def test_list_projects_returns_distinct_names_sorted(
 
 def test_list_projects_empty_when_no_project_labels(
     conversation_store: SqlAlchemyConversationStore,
-    db_uri: str,
+    store: SqlAlchemyProjectStore,
 ) -> None:
     """Legacy and non-project labels are not project read authorities."""
     conversation = conversation_store.create_conversation()
@@ -342,15 +342,16 @@ def test_list_projects_empty_when_no_project_labels(
         conversation.id,
         {"omni_project": "Legacy", "integrity": "1"},
     )
-    assert SqlAlchemyProjectStore(db_uri).list("alice") == []
+    assert store.list("alice") == []
 
 
 def test_list_projects_includes_projects_with_only_archived_members(
-    db_uri: str,
+    conversation_store: SqlAlchemyConversationStore,
+    store: SqlAlchemyProjectStore,
 ) -> None:
     """The live variant lists rows; the archived variant still requires members."""
-    projects = SqlAlchemyProjectStore(db_uri)
-    conversations = SqlAlchemyConversationStore(db_uri)
+    projects = store
+    conversations = conversation_store
     gone = projects.create("alice", "Gone")
     mixed = projects.create("alice", "Mixed")
     solo = conversations.create_conversation()
@@ -372,10 +373,10 @@ def test_list_projects_includes_projects_with_only_archived_members(
 
 def test_list_projects_is_owner_scoped(
     conversation_store: SqlAlchemyConversationStore,
-    db_uri: str,
+    store: SqlAlchemyProjectStore,
 ) -> None:
     """A member in another owner's project never leaks into the result."""
-    projects = SqlAlchemyProjectStore(db_uri)
+    projects = store
     mine_project = projects.create("alice@example.com", "Mine")
     theirs_project = projects.create("bob@example.com", "Theirs")
     mine = conversation_store.create_conversation()

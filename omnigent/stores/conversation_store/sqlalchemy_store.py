@@ -2071,26 +2071,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         metadata flags and project row then commit together, so a second-phase
         failure can leave newer timestamps but never a partially archived set.
         """
-        from omnigent.stores.project_store.sqlalchemy_store import mutate_project_row
-
-        if expected_row_version is None:
-            raise OmnigentError(
-                "If-Match is required for project mutations",
-                code=ErrorCode.PRECONDITION_FAILED,
-            )
-
-        def project_precondition(session: Session) -> SqlProject | None:
-            project = session.get(SqlProject, (current_workspace_id(), project_id))
-            if project is None or project.owner_principal_id != owner_principal_id:
-                return None
-            if project.row_version != expected_row_version:
-                raise OmnigentError(
-                    "Project ETag is stale",
-                    code=ErrorCode.PRECONDITION_FAILED,
-                )
-            if project.archived_at is not None:
-                raise OmnigentError("Project is already archived", code=ErrorCode.CONFLICT)
-            return project
+        from omnigent.stores.project_store.sqlalchemy_store import (
+            check_project_cas,
+            mutate_project_row,
+        )
 
         def member_ids(session: Session) -> list[str]:
             return list(
@@ -2115,7 +2099,16 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
 
         with self._session() as session:
-            if project_precondition(session) is None:
+            if (
+                check_project_cas(
+                    session,
+                    project_id,
+                    owner_principal_id,
+                    expected_row_version,
+                    require_archived=False,
+                )
+                is None
+            ):
                 return None, 0
             pending_ids = member_ids(session)
 
@@ -2133,7 +2126,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
 
         with self._session_immediate() as session:
-            if project_precondition(session) is None:
+            if (
+                check_project_cas(
+                    session,
+                    project_id,
+                    owner_principal_id,
+                    expected_row_version,
+                    require_archived=False,
+                )
+                is None
+            ):
                 return None, 0
             pending_ids = member_ids(session)
             archived_sessions = self._set_metadata_archive_state(session, pending_ids, True)

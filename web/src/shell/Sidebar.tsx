@@ -3349,7 +3349,6 @@ function ProjectPickerMenu({
               onKeyDown={picker.handleNewProjectKeyDown}
               disabled={picker.isCreatingProject}
               error={picker.createError}
-              errorId="sidebar-project-create-error"
             />
           </div>
         ) : (

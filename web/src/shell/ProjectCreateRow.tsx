@@ -1,4 +1,4 @@
-import type { KeyboardEventHandler, RefObject } from "react";
+import { useId, type KeyboardEventHandler, type RefObject } from "react";
 
 interface ProjectCreateRowProps {
   inputRef: RefObject<HTMLInputElement | null>;
@@ -7,7 +7,6 @@ interface ProjectCreateRowProps {
   onKeyDown: KeyboardEventHandler<HTMLInputElement>;
   disabled: boolean;
   error: string | null;
-  errorId: string;
 }
 
 /** Shared project-name input and inline creation error. */
@@ -18,8 +17,9 @@ export function ProjectCreateRow({
   onKeyDown,
   disabled,
   error,
-  errorId,
 }: ProjectCreateRowProps) {
+  const errorId = useId();
+
   return (
     <>
       <input

@@ -33,10 +33,10 @@ from omnigent.entities import (
     ProjectMigrationMapping,
     project_snapshot_values,
 )
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, ProjectInputError
 from omnigent.projects.defaults import DEFAULTS_SCHEMA_VERSION, validate_defaults_bundle
 from omnigent.stores.conversation_store import PROJECT_LABEL_KEY, ConversationStore
-from omnigent.stores.project_store import UNSET, ProjectInputError, ProjectStore, _Unset
+from omnigent.stores.project_store import UNSET, ProjectStore, _Unset
 
 
 def normalize_project_name(name: str) -> tuple[str, str, bytes]:
@@ -81,25 +81,22 @@ def _ensure_user_row(session: Session, user_id: str) -> None:
         pass
 
 
-def mutate_project_row(
+def check_project_cas(
     session: Session,
     project_id: str,
-    owner_principal_id: str,
+    owner: str,
     expected_row_version: int | None,
-    values: dict[str, Any],
     *,
-    require_archived: bool | None = None,
-    prepare: Callable[[Session, SqlProject], None] | None = None,
-    updated_at: int | None = None,
-) -> Project | None:
-    """Apply the canonical project compare-and-set mutation."""
+    require_archived: bool | None,
+) -> SqlProject | None:
+    """Check the canonical project compare-and-set preconditions."""
     if expected_row_version is None:
         raise OmnigentError(
             "If-Match is required for project mutations",
             code=ErrorCode.PRECONDITION_FAILED,
         )
     row = session.get(SqlProject, (current_workspace_id(), project_id))
-    if row is None or row.owner_principal_id != owner_principal_id:
+    if row is None or row.owner_principal_id != owner:
         return None
     if row.row_version != expected_row_version:
         raise OmnigentError(
@@ -110,8 +107,32 @@ def mutate_project_row(
         raise OmnigentError("Project is not archived", code=ErrorCode.CONFLICT)
     if require_archived is False and row.archived_at is not None:
         raise OmnigentError("Project is already archived", code=ErrorCode.CONFLICT)
+    return row
+
+
+def mutate_project_row(
+    session: Session,
+    project_id: str,
+    owner_principal_id: str,
+    expected_row_version: int | None,
+    values: dict[str, Any],
+    *,
+    require_archived: bool | None = None,
+    prepare: Callable[[Session], None] | None = None,
+    updated_at: int | None = None,
+) -> Project | None:
+    """Apply the canonical project compare-and-set mutation."""
+    row = check_project_cas(
+        session,
+        project_id,
+        owner_principal_id,
+        expected_row_version,
+        require_archived=require_archived,
+    )
+    if row is None:
+        return None
     if prepare is not None:
-        prepare(session, row)
+        prepare(session)
 
     conditions = [
         SqlProject.workspace_id == current_workspace_id(),
@@ -287,7 +308,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         *,
         expected_row_version: int | None,
     ) -> Project | None:
-        def prepare(session: Session, _row: SqlProject) -> None:
+        def prepare(session: Session) -> None:
             _ensure_user_row(session, new_owner)
 
         return self._mutate(
@@ -306,7 +327,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         values: dict[str, Any],
         *,
         require_archived: bool | None = None,
-        prepare: Callable[[Session, SqlProject], None] | None = None,
+        prepare: Callable[[Session], None] | None = None,
     ) -> Project | None:
         try:
             with self._session() as session:
