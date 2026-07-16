@@ -11,7 +11,9 @@ import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import {
   deleteConversation,
   renameConversation,
+  createProject,
   useArchiveConversation,
+  useArchivedProjects,
   useBulkArchiveConversations,
   useBulkDeleteConversations,
   useBulkStopSessions,
@@ -144,6 +146,28 @@ describe("useConversations refetch interval", () => {
 
     // The disconnected path keeps the prior safety-poll cadence.
     expect(interval).toBe(45_000);
+  });
+});
+
+describe("useConversations project filtering", () => {
+  it("uses project_id in the request and query key", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+
+    const { result } = renderHook(
+      () => useConversations("", true, {}, "proj_sprint_42"),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(fetchMock.mock.calls[0][0]).toContain("project_id=proj_sprint_42");
+    expect(
+      queryClient.getQueryState(["conversations", "", true, "proj_sprint_42"]),
+    ).toBeDefined();
   });
 });
 
@@ -682,7 +706,10 @@ describe("useBulkStopSessions", () => {
 
 describe("useProjects", () => {
   it("GETs /v1/sessions/projects and returns the project list", async () => {
-    const projects = ["Customer X", "Sprint 42"];
+    const projects = [
+      { id: "proj_customer_x", name: "Customer X" },
+      { id: "proj_sprint_42", name: "Sprint 42" },
+    ];
     fetchMock.mockResolvedValueOnce(mockResponse(projects));
 
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -706,12 +733,39 @@ describe("useProjects", () => {
   });
 });
 
+describe("first-class project APIs", () => {
+  it("fetches archived project identities from the server endpoint", async () => {
+    const projects = [{ id: "proj_docs", name: "Docs" }];
+    fetchMock.mockResolvedValueOnce(mockResponse(projects));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+
+    const { result } = renderHook(() => useArchivedProjects(), { wrapper });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/projects?archived=true");
+    expect(result.current.data).toEqual(projects);
+  });
+
+  it("creates a project through POST /v1/projects", async () => {
+    const project = { id: "proj_docs", name: "Docs" };
+    fetchMock.mockResolvedValueOnce(mockResponse(project));
+
+    await expect(createProject("Docs")).resolves.toEqual(project);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/projects");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body as string)).toEqual({ name: "Docs" });
+  });
+});
+
 describe("useProjectSessions", () => {
   it("does not fetch while disabled (collapsed folder)", () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
-    renderHook(() => useProjectSessions("Sprint 42", false), { wrapper });
+    renderHook(() => useProjectSessions("proj_sprint_42", false), { wrapper });
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -727,12 +781,12 @@ describe("useProjectSessions", () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
-    const { result } = renderHook(() => useProjectSessions("Sprint 42", true), { wrapper });
+    const { result } = renderHook(() => useProjectSessions("proj_sprint_42", true), { wrapper });
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     const url = fetchMock.mock.calls[0][0] as string;
     expect(url).toContain("/v1/sessions?");
-    expect(url).toContain("project=Sprint+42");
+    expect(url).toContain("project_id=proj_sprint_42");
     expect(url).toContain("order=desc");
     expect(url).toContain("sort_by=updated_at");
     expect(url).toContain("limit=20");
@@ -743,7 +797,7 @@ describe("useProjectSessions", () => {
 });
 
 describe("useMoveToProject", () => {
-  it("PATCHes /v1/sessions/{id} with the project label", async () => {
+  it("PATCHes /v1/sessions/{id} with the project id", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse({
         id: "conv_move",
@@ -751,7 +805,8 @@ describe("useMoveToProject", () => {
         title: "t",
         created_at: 0,
         updated_at: 1,
-        labels: { omni_project: "Sprint 42" },
+        labels: {},
+        metadata: { project_id: "proj_sprint_42" },
       }),
     );
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -759,13 +814,13 @@ describe("useMoveToProject", () => {
       createElement(QueryClientProvider, { client: queryClient }, children);
     const { result } = renderHook(() => useMoveToProject(), { wrapper });
 
-    result.current.mutate({ id: "conv_move", project: "Sprint 42" });
+    result.current.mutate({ id: "conv_move", projectId: "proj_sprint_42" });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_move");
     expect(init.method).toBe("PATCH");
-    expect(JSON.parse(init.body as string)).toEqual({ labels: { omni_project: "Sprint 42" } });
+    expect(JSON.parse(init.body as string)).toEqual({ project_id: "proj_sprint_42" });
   });
 
   it("invalidates both the conversations and projects queries on success", async () => {
@@ -785,7 +840,7 @@ describe("useMoveToProject", () => {
       createElement(QueryClientProvider, { client: queryClient }, children);
     const { result } = renderHook(() => useMoveToProject(), { wrapper });
 
-    result.current.mutate({ id: "conv_move", project: "" });
+    result.current.mutate({ id: "conv_move", projectId: "" });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
     // Both keys must refresh: conversations so the row re-groups into its new
@@ -804,7 +859,8 @@ describe("useArchiveConversation", () => {
         title: "A",
         created_at: 0,
         updated_at: 10,
-        labels: { omni_project: "Sprint 42" },
+        labels: {},
+        metadata: { project_id: "proj_sprint_42" },
       }),
     );
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
@@ -836,11 +892,12 @@ describe("useDeleteProject", () => {
       created_at: 0,
       updated_at: 10,
       archived: true,
-      labels: { omni_project: "Sprint 42" },
+      labels: {},
+      metadata: { project_id: "proj_sprint_42" },
     });
   }
 
-  it("archives every session in the project (keeping the label) and refreshes the lists", async () => {
+  it("archives every session in the project (keeping membership) and refreshes the lists", async () => {
     // 1st call: page of project members. Then one PATCH archive per member.
     fetchMock
       .mockResolvedValueOnce(
@@ -863,15 +920,15 @@ describe("useDeleteProject", () => {
       createElement(QueryClientProvider, { client: queryClient }, children);
     const { result } = renderHook(() => useDeleteProject(), { wrapper });
 
-    result.current.mutate("Sprint 42");
+    result.current.mutate("proj_sprint_42");
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
     // The list fetch is filtered by project and includes archived members.
     const listUrl = fetchMock.mock.calls[0][0] as string;
-    expect(listUrl).toContain("project=Sprint+42");
+    expect(listUrl).toContain("project_id=proj_sprint_42");
     expect(listUrl).toContain("include_archived=true");
 
-    // Each member is archived via PATCH — NOT deleted, and the project label is
+    // Each member is archived via PATCH — NOT deleted, and project membership is
     // left intact so unarchiving restores the session to its project.
     const patches = (fetchMock.mock.calls.slice(1) as [string, RequestInit][]).map(
       ([url, init]) => ({ url, init }),
@@ -910,7 +967,7 @@ describe("useDeleteProject", () => {
       createElement(QueryClientProvider, { client: queryClient }, children);
     const { result } = renderHook(() => useDeleteProject(), { wrapper });
 
-    result.current.mutate("Sprint 42");
+    result.current.mutate("proj_sprint_42");
     await waitFor(() => expect(result.current.isError).toBe(true));
 
     const err = result.current.error as unknown as {

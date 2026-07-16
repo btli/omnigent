@@ -79,6 +79,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import {
   type Conversation,
   useArchiveConversation,
+  useArchivedProjects,
   useConversations,
   useStopAndDeleteConversation,
 } from "@/hooks/useConversations";
@@ -1383,9 +1384,22 @@ function AccountSection() {
 }
 
 function ArchivedSection() {
-  // includeArchived:true is the only way to load archived rows; the
-  // default sidebar query no longer surfaces them.
-  const query = useConversations("", true);
+  const [projectId, setProjectId] = useState("");
+  const projectsQuery = useArchivedProjects();
+  const projects = useMemo(() => projectsQuery.data ?? [], [projectsQuery.data]);
+
+  useEffect(() => {
+    if (
+      projectId &&
+      projectsQuery.isSuccess &&
+      !projectsQuery.isFetching &&
+      !projects.some((project) => project.id === projectId)
+    ) {
+      setProjectId("");
+    }
+  }, [projectId, projects, projectsQuery.isSuccess, projectsQuery.isFetching]);
+
+  const query = useConversations("", true, undefined, projectId || undefined);
   const archived = useMemo(
     () => (query.data?.pages ?? []).flatMap((p) => p.data).filter((c) => c.archived === true),
     [query.data],
@@ -1396,16 +1410,76 @@ function ArchivedSection() {
       title="Archived sessions"
       description="Sessions you've archived. Restore one to the sidebar, or delete it for good."
     >
+      {projects.length > 0 && (
+        <div className="mb-4 flex items-center gap-2">
+          <label htmlFor="archived-project-filter" className="text-sm text-muted-foreground">
+            Project
+          </label>
+          <Select
+            value={projectId || "all"}
+            onValueChange={(value) => setProjectId(value === "all" ? "" : value)}
+          >
+            <SelectTrigger
+              id="archived-project-filter"
+              aria-label="Filter archived sessions by project"
+              data-testid="archived-project-filter"
+              className="w-56"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent position="popper" align="start">
+              <SelectItem value="all">All projects</SelectItem>
+              {projects.map((project) => (
+                <SelectItem
+                  key={project.id}
+                  value={project.id}
+                  data-testid={`archived-project-option-${project.id}`}
+                >
+                  {project.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      )}
+
       {query.isLoading ? (
         <p className="text-sm text-muted-foreground">Loading…</p>
-      ) : archived.length === 0 ? (
-        <p className="text-sm text-muted-foreground">No archived sessions.</p>
+      ) : archived.length === 0 && !query.hasNextPage ? (
+        <p className="text-sm text-muted-foreground">
+          {projectId ? "No archived sessions in this project." : "No archived sessions."}
+        </p>
       ) : (
-        <ul className="flex flex-col gap-0.5">
-          {archived.map((conv) => (
-            <ArchivedRow key={conv.id} conversation={conv} />
-          ))}
-        </ul>
+        <>
+          {archived.length > 0 && (
+            <ul className="flex flex-col gap-0.5">
+              {archived.map((conv) => (
+                <ArchivedRow key={conv.id} conversation={conv} />
+              ))}
+            </ul>
+          )}
+          {archived.length === 0 && (
+            <p className="text-sm text-muted-foreground">
+              {projectId
+                ? "No archived sessions in this project on this page."
+                : "No archived sessions on this page."}
+            </p>
+          )}
+          {query.hasNextPage && (
+            <div className="mt-3">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                data-testid="archived-load-more"
+                disabled={query.isFetchingNextPage}
+                onClick={() => void query.fetchNextPage()}
+              >
+                {query.isFetchingNextPage ? "Loading…" : "Load more"}
+              </Button>
+            </div>
+          )}
+        </>
       )}
     </Section>
   );

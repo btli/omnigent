@@ -17,6 +17,8 @@ export type ConversationsInfiniteData = InfiniteData<ConversationsPage, string |
 export interface ConversationListFilters {
   searchQuery: string;
   includeArchived: boolean;
+  /** Stable project id for a server-filtered list variant. */
+  projectId?: string;
 }
 
 /**
@@ -71,7 +73,7 @@ function changedWireFields(conv: Conversation, wire: SessionListWireItem): Set<s
   const row = conv as unknown as Record<string, unknown>;
   for (const [key, value] of Object.entries(wire)) {
     const current = row[key];
-    if (key === "labels") {
+    if (key === "labels" || key === "metadata") {
       if (JSON.stringify(current) !== JSON.stringify(value)) changed.add(key);
     } else if (current !== value) {
       changed.add(key);
@@ -83,25 +85,28 @@ function changedWireFields(conv: Conversation, wire: SessionListWireItem): Set<s
 /**
  * Decode the filter dimensions from a conversations query key.
  *
- * The canonical key is `["conversations", searchQuery, includeArchived]`.
- * Query membership decisions depend on both filter dimensions, so
- * malformed keys fail loudly instead of being guessed.
+ * The base key is `["conversations", searchQuery, includeArchived]`.
+ * Project-filtered variants append a stable project id.
  *
  * @param key - TanStack Query key for a conversations query.
  * @returns Parsed list filters.
  * @throws Error if the key is not the canonical conversations list key.
  */
 export function filtersFromConversationQueryKey(key: readonly unknown[]): ConversationListFilters {
-  if (key.length !== 3 || key[0] !== "conversations") {
+  if ((key.length !== 3 && key.length !== 4) || key[0] !== "conversations") {
     throw new Error("Invalid conversations query key");
   }
-  const [, searchQuery, includeArchived] = key;
+  const [, searchQuery, includeArchived, projectId] = key;
   if (typeof searchQuery !== "string" || typeof includeArchived !== "boolean") {
+    throw new Error("Invalid conversations query key");
+  }
+  if (projectId !== undefined && typeof projectId !== "string") {
     throw new Error("Invalid conversations query key");
   }
   return {
     searchQuery,
     includeArchived,
+    ...(projectId === undefined ? {} : { projectId }),
   };
 }
 
@@ -116,6 +121,7 @@ export function filtersFromConversationQueryKey(key: readonly unknown[]): Conver
  */
 function violatesKnownMembership(conv: Conversation, filters: ConversationListFilters): boolean {
   if (!filters.includeArchived && conv.archived === true) return true;
+  if (filters.projectId && conv.metadata?.project_id !== filters.projectId) return true;
   return false;
 }
 
@@ -138,6 +144,7 @@ function violatesKnownMembership(conv: Conversation, filters: ConversationListFi
 function changedFieldsNeedRefetch(changed: Set<string>, isActiveRow: boolean): boolean {
   if (changed.has("archived")) return true;
   if (changed.has("title")) return true;
+  if (changed.has("metadata")) return true;
   // updated_at only affects the server's sort order. The active chat row is
   // pinned at its position by ActiveChatOverride regardless of that order, so
   // an updated_at bump on it — the common case while the user sends messages —

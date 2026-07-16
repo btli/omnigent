@@ -39,6 +39,7 @@ vi.mock("@/hooks/useConversations", () => ({
   // folder fetches its own sessions. No projects in this layout test, so the
   // folder query stays disabled/empty.
   useProjects: () => ({ data: [] }),
+  useCreateProject: () => ({ mutate: vi.fn(), isPending: false }),
   useProjectSessions: () => ({
     data: undefined,
     isLoading: false,
@@ -49,7 +50,6 @@ vi.mock("@/hooks/useConversations", () => ({
   useMoveToProject: () => ({ mutate: vi.fn() }),
   useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: () => Promise.resolve([]),
-  PROJECT_LABEL_KEY: "omni_project",
 }));
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));

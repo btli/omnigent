@@ -37,7 +37,7 @@ const SEEDED_WORKSPACE = "/Users/corey/universe/src/foo";
 // flow's navigate() lands on our spy regardless of router/provider setup.
 vi.mock("@/lib/routing", () => ({
   useNavigate: () => navigateMock,
-  // The landing screen reads `?project=` to pre-fill the project chip; this
+  // The landing screen reads `?project_id=` to pre-fill the project chip; this
   // flow suite never sets one, so an empty params object is enough.
   useSearchParams: () => [new URLSearchParams(), vi.fn()],
 }));
@@ -77,6 +77,8 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/hooks/useConversations")>()),
   useProjects: () => ({ data: [] }),
+  useCreateProject: () => ({ mutate: vi.fn(), isPending: false }),
+  useNewestProjectSession: () => ({ data: undefined, isError: false }),
 }));
 // Dynamic harness-label fetching is covered separately. Keep it synchronous
 // here so exact create-POST call-count assertions only observe the POST.

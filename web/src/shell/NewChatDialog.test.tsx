@@ -35,6 +35,11 @@ import { setOmnigentHostConfig } from "@/lib/host";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
+const projectOptions = vi.hoisted(() => [
+  { id: "proj_docs", name: "docs" },
+  { id: "proj_sprint_42", name: "Sprint 42" },
+]);
+
 // Only authenticatedFetch is stubbed (the create POST under test);
 // the module's other exports stay real for any other consumer in the tree.
 vi.mock("@/lib/identity", async (importOriginal) => ({
@@ -63,7 +68,8 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 // the create-POST call-count / call-order assertions below).
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/hooks/useConversations")>()),
-  useProjects: () => ({ data: [] }),
+  useProjects: () => ({ data: projectOptions }),
+  useNewestProjectSession: () => ({ data: null, isError: false }),
 }));
 // The harness-label catalog is not under test here. Keep it synchronous so
 // create-session fetch assertions only observe the POST/PATCH calls they own.
@@ -1017,9 +1023,9 @@ describe("NewChatLandingScreen", () => {
   });
 
   it("caps each footer chip label with truncate so a long label can't wrap the row", async () => {
-    // Land with `?project=` so the (otherwise-hidden) project chip renders and
+    // Land with `?project_id=` so the (otherwise-hidden) project chip renders and
     // its truncate cap can be asserted alongside the other chips.
-    renderLanding({}, "/?project=docs");
+    renderLanding({}, "/?project_id=proj_docs");
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
     );
@@ -1448,7 +1454,7 @@ describe("NewChatLandingScreen", () => {
   });
 
   it("hides the project chip in the normal new-session flow (no project pre-selected)", async () => {
-    // Without a `?project=` param the session is unfiled, so the chip is
+    // Without a `?project_id=` param the session is unfiled, so the chip is
     // hidden entirely — the fresh new-session flow stays project-free.
     renderLanding();
 
@@ -1464,8 +1470,8 @@ describe("NewChatLandingScreen", () => {
     } as unknown as Response);
     const invalidateSpy = vi.spyOn(QueryClient.prototype, "invalidateQueries");
     // The chip only renders when a project is pre-selected (e.g. via the
-    // sidebar's per-project pencil), so land with `?project=`.
-    renderLanding({}, "/?project=docs");
+    // sidebar's per-project pencil), so land with `?project_id=`.
+    renderLanding({}, "/?project_id=proj_docs");
 
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-project-chip").textContent).toContain("docs"),
@@ -1476,7 +1482,7 @@ describe("NewChatLandingScreen", () => {
     });
     fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
 
-    // Create POST first, then a PATCH that sets the omni_project label on the
+    // Create POST first, then a PATCH that sets first-class project membership on the
     // freshly-created session id.
     await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(2));
     const [createUrl] = authenticatedFetchMock.mock.calls[0];
@@ -1485,9 +1491,9 @@ describe("NewChatLandingScreen", () => {
     expect(patchUrl).toBe("/v1/sessions/conv_new");
     expect((patchInit as RequestInit).method).toBe("PATCH");
     const patchBody = JSON.parse((patchInit as RequestInit).body as string) as {
-      labels: Record<string, string>;
+      project_id: string;
     };
-    expect(patchBody.labels).toEqual({ omni_project: "docs" });
+    expect(patchBody.project_id).toBe("proj_docs");
 
     // The target folder fetches its own paginated list (useProjectSessions),
     // so filing the new session must invalidate it — otherwise the row only
@@ -1502,7 +1508,7 @@ describe("NewChatLandingScreen", () => {
     // When shown, the picker still lets the user clear the selection; doing so
     // empties `selectedProject` and the chip disappears (consistent with the
     // "only show when selected" rule).
-    renderLanding({}, "/?project=docs");
+    renderLanding({}, "/?project_id=proj_docs");
 
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-project-chip").textContent).toContain("docs"),
@@ -1514,14 +1520,48 @@ describe("NewChatLandingScreen", () => {
     await waitFor(() => expect(screen.queryByTestId("new-chat-landing-project-chip")).toBeNull());
   });
 
-  it("pre-fills the project chip from the ?project= query param", async () => {
+  it("creates a first-class project before selecting a new project", async () => {
+    authenticatedFetchMock
+      .mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as unknown as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ id: "proj_new_docs", name: "New docs" }),
+      } as unknown as Response);
+    renderLanding({}, "/?project_id=proj_docs");
+
+    fireEvent.click(await screen.findByTestId("new-chat-landing-project-chip"));
+    fireEvent.click(screen.getByText("New project…"));
+    const input = screen.getByPlaceholderText("Project name…");
+    fireEvent.change(input, { target: { value: "New docs" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [url, init] = authenticatedFetchMock.mock.calls[0];
+    expect(url).toBe("/v1/projects");
+    expect(JSON.parse((init as RequestInit).body as string)).toEqual({ name: "New docs" });
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "start the new project" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(3));
+    const [, patchInit] = authenticatedFetchMock.mock.calls[2];
+    expect(JSON.parse((patchInit as RequestInit).body as string)).toEqual({
+      project_id: "proj_new_docs",
+    });
+  });
+
+  it("pre-fills the project chip from the ?project_id= query param", async () => {
     // The sidebar's per-project "new session" pencil lands here with the
     // project pre-selected — the chip reflects it with no interaction.
     authenticatedFetchMock.mockResolvedValue({
       ok: true,
       json: async () => ({ id: "conv_new" }),
     } as unknown as Response);
-    renderLanding({}, "/?project=Sprint%2042");
+    renderLanding({}, "/?project_id=proj_sprint_42");
 
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-project-chip").textContent).toContain(
@@ -1539,9 +1579,9 @@ describe("NewChatLandingScreen", () => {
     const [patchUrl, patchInit] = authenticatedFetchMock.mock.calls[1];
     expect(patchUrl).toBe("/v1/sessions/conv_new");
     const patchBody = JSON.parse((patchInit as RequestInit).body as string) as {
-      labels: Record<string, string>;
+      project_id: string;
     };
-    expect(patchBody.labels).toEqual({ omni_project: "Sprint 42" });
+    expect(patchBody.project_id).toBe("proj_sprint_42");
   });
 
   it.each([
