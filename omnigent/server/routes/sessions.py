@@ -110,8 +110,11 @@ from omnigent.policies.types import (
     PolicyAction,
     PolicyResult,
 )
-from omnigent.projects.defaults import ProjectDefaultsBundle
-from omnigent.projects.resolver import resolve_project_defaults
+from omnigent.projects.session_integration import (
+    prepare_json_session_project,
+    prepare_multipart_session_project,
+    resolve_patch_project_membership,
+)
 from omnigent.reasoning_effort import (
     EFFORT_CLEAR_VALUES,
     EFFORT_VALUES,
@@ -156,11 +159,11 @@ from omnigent.server.auth import (
     LEVEL_MANAGE,
     LEVEL_OWNER,
     LEVEL_READ,
-    RESERVED_USER_LOCAL,
     RESERVED_USER_PUBLIC,
     AuthProvider,
     SharingMode,
     local_single_user_enabled,
+    resolve_owner_principal,
     workspace_sharing_blocked,
 )
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
@@ -285,7 +288,6 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import (
-    PROJECT_LABEL_DEPRECATION_WARNING,
     PROJECT_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
@@ -293,7 +295,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore
 from omnigent.stores.permission_store import PermissionStore
-from omnigent.stores.project_store import ProjectInputError, ProjectStore
+from omnigent.stores.project_store import ProjectStore
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.events import SessionCreatedEvent as _TelSessionCreatedEvent
 from omnigent.telemetry.events import SessionDeletedEvent as _TelSessionDeletedEvent
@@ -2230,6 +2232,7 @@ def _build_session_list_item(
     return SessionListItem(
         id=conv.id,
         agent_id=conv.agent_id,
+        project_id=conv.project_id,
         agent_name=agent_names_by_id.get(conv.agent_id),
         status=_session_status_with_child_rollup(conv.id, child_session_ids),
         created_at=conv.created_at,
@@ -2616,6 +2619,7 @@ def _build_session_response(
     return SessionResponse(
         id=conv.id,
         agent_id=conv.agent_id,
+        project_id=conv.project_id,
         agent_name=agent_name,
         status=status,
         background_task_count=background_task_count,
@@ -10794,6 +10798,7 @@ def _build_policy_engine_from_spec(
     spec: AgentSpec,
     session_id: str,
     conversation_store: ConversationStore,
+    project_store: ProjectStore | None = None,
 ) -> PolicyEngine:
     caps = get_caps()
     host_connection = (
@@ -10803,6 +10808,7 @@ def _build_policy_engine_from_spec(
         spec=spec,
         conversation_id=session_id,
         conversation_store=conversation_store,
+        project_store=project_store,
         default_policies=caps.default_policies,
         policy_store=get_policy_store(),
         server_llm=caps.llm,
@@ -10816,6 +10822,8 @@ async def _apply_pending_policy_ask_writes(
     conversation_store: ConversationStore,
     agent_store: AgentStore,
     data: dict[str, Any],
+    *,
+    project_store: ProjectStore | None = None,
 ) -> None:
     """
     Apply (or drop) policy writes stashed for a relay tool-call ASK.
@@ -10866,7 +10874,11 @@ async def _apply_pending_policy_ask_writes(
     if spec is None:
         return
     engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store
+        _build_policy_engine_from_spec,
+        spec,
+        session_id,
+        conversation_store,
+        project_store,
     )
     # The label/state writes hit the DB synchronously too — keep them
     # off the loop.
@@ -11002,6 +11014,7 @@ async def _evaluate_tool_call_policy(
     agent_store: AgentStore,
     _runner_router: RunnerRouter | None,
     *,
+    project_store: ProjectStore | None = None,
     actor: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
     """
@@ -11040,7 +11053,11 @@ async def _evaluate_tool_call_policy(
     if spec is None:
         return None
     engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store
+        _build_policy_engine_from_spec,
+        spec,
+        session_id,
+        conversation_store,
+        project_store,
     )
 
     try:
@@ -11264,6 +11281,7 @@ async def _evaluate_input_policy(
     agent_store: AgentStore,
     _runner_router: RunnerRouter | None,
     *,
+    project_store: ProjectStore | None = None,
     actor: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
     """
@@ -11317,7 +11335,11 @@ async def _evaluate_input_policy(
         return None
 
     engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store
+        _build_policy_engine_from_spec,
+        spec,
+        session_id,
+        conversation_store,
+        project_store,
     )
     ctx = EvaluationContext(
         phase=Phase.REQUEST,
@@ -11439,6 +11461,7 @@ async def _evaluate_output_policy(
     agent_store: AgentStore,
     _runner_router: RunnerRouter | None,
     *,
+    project_store: ProjectStore | None = None,
     actor: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
     """
@@ -11479,7 +11502,11 @@ async def _evaluate_output_policy(
         return None
 
     engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store
+        _build_policy_engine_from_spec,
+        spec,
+        session_id,
+        conversation_store,
+        project_store,
     )
     ctx = EvaluationContext(
         phase=Phase.RESPONSE,
@@ -12384,64 +12411,6 @@ def _require_cost_control_label_authority(
     )
 
 
-def _warn_deprecated_project_label(write_path: str) -> None:
-    _logger.warning(
-        PROJECT_LABEL_DEPRECATION_WARNING,
-        extra={"event": "deprecated_project_label_write", "write_path": write_path},
-    )
-
-
-async def _resolve_legacy_project_label(
-    labels: dict[str, str],
-    owner_principal_id: str,
-    project_store: ProjectStore | None,
-    *,
-    write_path: str,
-    explicit_project_requested: bool = False,
-    explicit_project_id: str | None = None,
-) -> tuple[dict[str, str], str | None, bool]:
-    """Consume a legacy project label and resolve its authoritative project id."""
-    if PROJECT_LABEL_KEY not in labels:
-        return labels, None, False
-    _warn_deprecated_project_label(write_path)
-    clean_labels = {key: value for key, value in labels.items() if key != PROJECT_LABEL_KEY}
-    project_name = labels[PROJECT_LABEL_KEY]
-    if not project_name:
-        if explicit_project_requested and explicit_project_id is not None:
-            raise OmnigentError(
-                "project_id and omni_project label refer to different projects",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        return clean_labels, None, True
-    if project_store is None:
-        raise OmnigentError(
-            "Project storage is not configured",
-            code=ErrorCode.INTERNAL_ERROR,
-        )
-    project = await asyncio.to_thread(
-        project_store.get_by_name,
-        project_name,
-        owner_principal_id,
-    )
-    resolved_project_id = project.id if project is not None else None
-    if explicit_project_requested and (
-        project is None or explicit_project_id != resolved_project_id
-    ):
-        raise OmnigentError(
-            "project_id and omni_project label refer to different projects",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    if project is None:
-        project = await asyncio.to_thread(
-            project_store.create,
-            owner_principal_id,
-            project_name,
-        )
-    if project.archived_at is not None:
-        raise OmnigentError("Project is archived", code=ErrorCode.CONFLICT)
-    return clean_labels, project.id, True
-
-
 async def _create_session_from_existing_agent(
     conversation_store: ConversationStore,
     agent_store: AgentStore,
@@ -12491,87 +12460,11 @@ async def _create_session_from_existing_agent(
     """
     _reject_reserved_cost_control_label_seed(body.labels)
 
-    owner_principal_id = user_id or RESERVED_USER_LOCAL
-    explicit_project_requested = "project_id" in body.model_fields_set
-    (
-        clean_labels,
-        legacy_project_id,
-        legacy_project_requested,
-    ) = await _resolve_legacy_project_label(
-        body.labels,
-        owner_principal_id,
+    body, project_snapshot = await prepare_json_session_project(
+        body,
+        resolve_owner_principal(user_id),
         project_store,
-        write_path="json_create",
-        explicit_project_requested=explicit_project_requested,
-        explicit_project_id=body.project_id or None,
     )
-    body = body.model_copy(update={"labels": clean_labels})
-
-    project_snapshot: LiveProjectSnapshot | None = None
-    if body.project_id is not None and body.parent_session_id is None:
-        if project_store is None:
-            raise OmnigentError(
-                "Project storage is not configured",
-                code=ErrorCode.INTERNAL_ERROR,
-            )
-        project = await asyncio.to_thread(
-            project_store.get_for_use,
-            body.project_id,
-            owner_principal_id,
-        )
-        if project is None:
-            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
-
-        override_values: dict[str, Any] = {}
-        direct_fields = ("host_type", "host_id", "workspace", "reasoning_effort")
-        for field_name in direct_fields:
-            if field_name in body.model_fields_set:
-                override_values[field_name] = getattr(body, field_name)
-        if "model_override" in body.model_fields_set:
-            override_values["model"] = body.model_override
-        if "harness_override" in body.model_fields_set:
-            override_values["harness"] = body.harness_override
-
-        resolved = resolve_project_defaults(
-            server_defaults=ProjectDefaultsBundle(host_type="external"),
-            project_defaults=project.defaults_json,
-            defaults_schema_version=project.defaults_schema_version,
-            session_overrides=ProjectDefaultsBundle.model_validate(override_values),
-            session_git=body.git,
-            session_git_is_set="git" in body.model_fields_set,
-        )
-        resolved_values = resolved.model_dump()
-        resolved_updates = {
-            key: value
-            for key, value in resolved_values.items()
-            if key in SessionCreateRequest.model_fields
-        }
-        resolved_body = body.model_copy(update=resolved_updates)
-        try:
-            SessionCreateRequest.model_validate(resolved_body.model_dump())
-        except ValidationError as error:
-            message = "; ".join(item["msg"] for item in error.errors(include_context=False))
-            raise ProjectInputError(f"Invalid resolved project defaults: {message}") from error
-        body = resolved_body
-        project_snapshot = LiveProjectSnapshot(
-            project_id=project.id,
-            project_row_version=project.row_version,
-            defaults_schema_version=project.defaults_schema_version,
-            defaults_json=resolved.model_dump(mode="json"),
-        )
-    elif (
-        legacy_project_requested
-        and not explicit_project_requested
-        and legacy_project_id is not None
-        and body.parent_session_id is None
-    ):
-        project_snapshot = LiveProjectSnapshot(
-            project_id=legacy_project_id,
-            project_row_version=None,
-            defaults_schema_version=1,
-            defaults_json={},
-            snapshot_origin="moved",
-        )
 
     agent = await asyncio.to_thread(agent_store.get, body.agent_id)
     if agent is None:
@@ -13876,6 +13769,7 @@ async def _handle_mcp_tools_call(
     agent_store: AgentStore,
     runner_router: RunnerRouter | None,
     *,
+    project_store: ProjectStore | None = None,
     actor: dict[str, str] | None = None,
     request: Request | None = None,
 ) -> Response:
@@ -13958,7 +13852,11 @@ async def _handle_mcp_tools_call(
     # only) and TOOL_RESULT (both paths). Engine construction reads
     # session-policy specs and labels from the DB, so keep it off-loop too.
     engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store
+        _build_policy_engine_from_spec,
+        spec,
+        session_id,
+        conversation_store,
+        project_store,
     )
 
     if is_retry:
@@ -14580,7 +14478,6 @@ def create_sessions_router(
                     "'sandbox:' section to the server config",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            from omnigent.server.auth import RESERVED_USER_LOCAL
             from omnigent.server.managed_hosts import (
                 MANAGED_REPO_LABEL_KEY,
                 parse_repo_workspace,
@@ -14613,7 +14510,7 @@ def create_sessions_router(
                     # On auth-disabled servers user_id is None; the
                     # sandbox host registers under the reserved local
                     # owner, same as a directly-connected host would.
-                    owner=user_id if user_id is not None else RESERVED_USER_LOCAL,
+                    owner=resolve_owner_principal(user_id),
                     sandbox_config=sandbox_config,
                     repo=repo,
                     tracker=managed_launches,
@@ -14767,30 +14664,10 @@ def create_sessions_router(
             raise HTTPException(status_code=422, detail=[_multipart_missing_detail("bundle")])
         parsed_metadata = _parse_session_create_metadata(metadata)
         _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
-        owner_principal_id = user_id or RESERVED_USER_LOCAL
-        (
-            clean_labels,
-            legacy_project_id,
-            legacy_project_requested,
-        ) = await _resolve_legacy_project_label(
-            parsed_metadata.labels,
-            owner_principal_id,
+        parsed_metadata, project_snapshot = await prepare_multipart_session_project(
+            parsed_metadata,
+            resolve_owner_principal(user_id),
             project_store,
-            write_path="multipart_create",
-        )
-        parsed_metadata = parsed_metadata.model_copy(update={"labels": clean_labels})
-        project_snapshot = (
-            LiveProjectSnapshot(
-                project_id=legacy_project_id,
-                project_row_version=None,
-                defaults_schema_version=1,
-                defaults_json={},
-                snapshot_origin="moved",
-            )
-            if legacy_project_requested
-            and legacy_project_id is not None
-            and parsed_metadata.parent_session_id is None
-            else None
         )
 
         inherited_runner_id: str | None = None
@@ -14845,7 +14722,7 @@ def create_sessions_router(
         :returns: Project identities ordered by normalized name.
         """
         user_id = _require_user(request, auth_provider)
-        owner_principal_id = user_id or RESERVED_USER_LOCAL
+        owner_principal_id = resolve_owner_principal(user_id)
         projects = await asyncio.to_thread(
             conversation_store.list_projects,
             owner_principal_id,
@@ -15024,7 +14901,6 @@ def create_sessions_router(
         include_archived: bool = Query(default=False),
         kind: str = Query(default="default", pattern="^(default|sub_agent|any)$"),
         project_id: str | None = Query(default=None),
-        project: str | None = Query(default=None),
     ) -> PaginatedList:
         """
         List sessions with cursor-based pagination.
@@ -15087,11 +14963,9 @@ def create_sessions_router(
         # A specific project folder ("My sessions"-only) must show only the
         # viewer's own sessions — a session shared with them but filed under a
         # like-named project belongs on "Shared with me", not in this folder.
-        # The flat list (project=None) and Unfiled (project="") stay unscoped so
+        # The flat list and Unfiled (project_id="") stay unscoped so
         # shared sessions still surface for the "Shared with me" tab.
-        project_filter = project_id or project
-        owned_by = user_id if permission_store is not None and project_filter else None
-        project_owner = (user_id or RESERVED_USER_LOCAL) if project else None
+        owned_by = user_id if permission_store is not None and project_id else None
         page = await asyncio.to_thread(
             conversation_store.list_conversations,
             limit=limit,
@@ -15111,8 +14985,6 @@ def create_sessions_router(
             search_query=normalized_query,
             include_archived=include_archived,
             project_id=project_id,
-            project=project,
-            project_owner=project_owner,
         )
         # list_conversations may return rows with agent_id=None for
         # legacy conversations; skip them before building the batch IDs.
@@ -15620,8 +15492,9 @@ def create_sessions_router(
         # endpoint needs only edit. Owner implies edit, so a single check at
         # the level the request actually requires gates both — no redundant
         # second permission-store read for archive/unarchive.
+        legacy_project_requested = PROJECT_LABEL_KEY in (body.labels or {})
         project_membership_requested = (
-            "project_id" in body.model_fields_set or PROJECT_LABEL_KEY in (body.labels or {})
+            "project_id" in body.model_fields_set or legacy_project_requested
         )
         required_level = (
             LEVEL_OWNER
@@ -15769,36 +15642,15 @@ def create_sessions_router(
 
         resolved_project_id: str | None = None
         if project_membership_requested:
-            if project_store is None:
-                raise OmnigentError(
-                    "Project storage is not configured",
-                    code=ErrorCode.INTERNAL_ERROR,
-                )
-            owner_principal_id = user_id or RESERVED_USER_LOCAL
             explicit_project_requested = "project_id" in body.model_fields_set
             explicit_project_id = body.project_id or None
-            if explicit_project_id is not None:
-                explicit_project = await asyncio.to_thread(
-                    project_store.get_for_use,
-                    explicit_project_id,
-                    owner_principal_id,
-                )
-                if explicit_project is None:
-                    raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
-
-            legacy_project_requested = PROJECT_LABEL_KEY in (body.labels or {})
-            legacy_project_id: str | None = None
-            if legacy_project_requested:
-                _, legacy_project_id, _ = await _resolve_legacy_project_label(
-                    body.labels or {},
-                    owner_principal_id,
-                    project_store,
-                    write_path="patch",
-                    explicit_project_requested=explicit_project_requested,
-                    explicit_project_id=explicit_project_id,
-                )
-            resolved_project_id = (
-                legacy_project_id if legacy_project_requested else explicit_project_id
+            resolved_project_id = await resolve_patch_project_membership(
+                labels=body.labels or {},
+                explicit_project_requested=explicit_project_requested,
+                explicit_project_id=explicit_project_id,
+                legacy_project_requested=legacy_project_requested,
+                owner_principal_id=resolve_owner_principal(user_id),
+                project_store=project_store,
             )
 
         if body.runner_id is not None:
@@ -16913,6 +16765,7 @@ def create_sessions_router(
                 spec=loaded.spec,
                 conversation_id=session_id,
                 conversation_store=conversation_store,
+                project_store=project_store,
                 default_policies=_caps.default_policies,
                 policy_store=get_policy_store(),
                 server_llm=_caps.llm,
@@ -19300,7 +19153,12 @@ def create_sessions_router(
         # Apply any policy writes deferred by the relay tool-call ASK gate
         # (e.g. a cost-budget checkpoint) now that the verdict is in.
         await _apply_pending_policy_ask_writes(
-            session_id, conv, conversation_store, agent_store, _resolve_data
+            session_id,
+            conv,
+            conversation_store,
+            agent_store,
+            _resolve_data,
+            project_store=project_store,
         )
         return {"queued": False}
 
@@ -19556,6 +19414,7 @@ def create_sessions_router(
                     conversation_store,
                     agent_store,
                     runner_router,
+                    project_store=project_store,
                     actor=_actor,
                 )
             except Exception as _policy_exc:  # noqa: BLE001 — fail-safe for misconfigured policies
@@ -19606,6 +19465,7 @@ def create_sessions_router(
                 conversation_store,
                 agent_store,
                 runner_router,
+                project_store=project_store,
             )
             if _input_verdict is not None:
                 reason = _input_verdict.get("reason", "Denied by policy")
@@ -19634,6 +19494,7 @@ def create_sessions_router(
                 conversation_store,
                 agent_store,
                 runner_router,
+                project_store=project_store,
                 actor=_actor,
             )
             if _output_verdict is not None:
@@ -19655,6 +19516,7 @@ def create_sessions_router(
                 conversation_store,
                 agent_store,
                 runner_router,
+                project_store=project_store,
                 actor=_actor,
             )
             if _tool_verdict is not None:
@@ -19774,7 +19636,12 @@ def create_sessions_router(
             # Apply any policy writes deferred by the relay tool-call ASK gate
             # (e.g. a cost-budget checkpoint) now that the verdict is in.
             await _apply_pending_policy_ask_writes(
-                session_id, conv, conversation_store, agent_store, body.data
+                session_id,
+                conv,
+                conversation_store,
+                agent_store,
+                body.data,
+                project_store=project_store,
             )
             return {"queued": False}
         if body.type == _MCP_ELICITATION_TYPE:
@@ -21499,6 +21366,7 @@ def create_sessions_router(
                 conversation_store,
                 agent_store,
                 runner_router,
+                project_store=project_store,
                 actor=_build_actor(user_id),
                 request=request,
             )

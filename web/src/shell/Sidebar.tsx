@@ -95,7 +95,6 @@ import {
   useArchiveConversation,
   useBulkArchiveConversations,
   useBulkDeleteConversations,
-  useCreateProject,
   useProjects,
   useProjectSessions,
   useConversations,
@@ -107,6 +106,7 @@ import {
   useStopAndDeleteConversation,
   useStopSession,
 } from "@/hooks/useConversations";
+import { useProjectPickerState } from "@/hooks/useProjectPickerState";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -163,6 +163,40 @@ const TIME_MARKER_SLOT_CLASS =
 // gentler gray in light mode (a gentler glow in dark mode) and reads as "active
 // area" without the heavy fill. Pair with `transition-colors` so it eases in.
 const DROP_TARGET_HIGHLIGHT = "bg-primary/5";
+
+interface VisibleProjectGroup {
+  id: string;
+}
+
+/** Build the visible sidebar row universe for navigation and range selection. */
+function visibleProjectConversations<T, G extends VisibleProjectGroup>({
+  pinned,
+  chats,
+  projectGroups,
+  collapsedSections,
+  expandedProjects,
+  projectItems,
+}: {
+  pinned: readonly T[];
+  chats: readonly T[];
+  projectGroups: readonly G[];
+  collapsedSections: readonly string[];
+  expandedProjects: readonly string[];
+  projectItems: (project: G) => readonly T[];
+}): T[] {
+  const visible = (title: string, items: readonly T[]) =>
+    collapsedSections.includes(title) ? [] : [...items];
+  const projectsCollapsed = collapsedSections.includes("Projects");
+  return [
+    ...visible("Pinned", pinned),
+    ...(projectsCollapsed
+      ? []
+      : projectGroups.flatMap((project) =>
+          expandedProjects.includes(project.id) ? [...projectItems(project)] : [],
+        )),
+    ...visible("Chats", chats),
+  ];
+}
 
 /**
  * Which session tab the sidebar is showing. ``"mine"`` is the viewer's own
@@ -1070,8 +1104,7 @@ function ConversationList({
         : projects.map((project) => {
             const inProject = tabScoped.filter(
               (conversation) =>
-                conversation.metadata?.project_id === project.id &&
-                !pinnedIdSet.has(conversation.id),
+                conversation.project_id === project.id && !pinnedIdSet.has(conversation.id),
             );
             inProject.forEach((c) => filedIds.add(c.id));
             return {
@@ -1300,7 +1333,7 @@ function ConversationList({
   const activeProjectId = useMemo(() => {
     if (!activeId) return null;
     const active = allConversations.find((c) => c.id === activeId);
-    return active?.metadata?.project_id ?? null;
+    return active?.project_id ?? null;
   }, [activeId, allConversations]);
   // Auto-expand the project folder holding the selected session, so navigating
   // to a filed session reveals it instead of leaving it hidden in a collapsed
@@ -1311,55 +1344,44 @@ function ConversationList({
 
   // Visible rows in render order (collapsed sections excluded) for the Cmd+↑/↓
   // session hotkey. Titles must match the <ConversationSection> props below.
-  const orderedConversationIds = useMemo(() => {
-    const visible = (title: string, list: readonly Conversation[]) =>
-      effectiveCollapsedSections.includes(title) ? [] : list;
-    // A project's chats are navigable only when the "Projects" group is
-    // expanded AND that individual project folder is expanded (folders are
-    // collapsed unless explicitly opened — inverse of the fixed sections).
-    const projectsCollapsed = effectiveCollapsedSections.includes("Projects");
-    const projectVisible = (id: string, list: readonly Conversation[]) =>
-      !projectsCollapsed && expandedProjects.includes(id) ? list : [];
-    // `sections` is already scoped to the active tab, so the same Pinned /
-    // Projects / Sessions walk covers both tabs (Projects is empty on shared).
-    return [
-      ...visible("Pinned", sections.pinned),
-      ...sections.projectGroups.flatMap((g) => projectVisible(g.id, g.conversations)),
-      ...visible("Chats", sections.sessions),
-    ].map((c) => c.id);
-  }, [sections, effectiveCollapsedSections, expandedProjects]);
+  const orderedConversationIds = useMemo(
+    () =>
+      visibleProjectConversations({
+        pinned: sections.pinned,
+        chats: sections.sessions,
+        projectGroups: sections.projectGroups,
+        collapsedSections: effectiveCollapsedSections,
+        expandedProjects,
+        projectItems: (project) => project.conversations,
+      }).map((conversation) => conversation.id),
+    [sections, effectiveCollapsedSections, expandedProjects],
+  );
   useEffect(() => {
     onVisibleCountChange(orderedConversationIds.length);
   }, [orderedConversationIds.length, onVisibleCountChange]);
-  getVisibleConversationsRef.current = () => {
-    const visible = (title: string, list: readonly Conversation[]) =>
-      effectiveCollapsedSections.includes(title) ? [] : [...list];
-    const projectsCollapsed = effectiveCollapsedSections.includes("Projects");
-    const projectVisible = (id: string, list: readonly Conversation[]) =>
-      !projectsCollapsed && expandedProjects.includes(id) ? [...list] : [];
-    return [
-      ...visible("Pinned", sections.pinned),
-      ...sections.projectGroups.flatMap((g) => projectVisible(g.id, g.conversations)),
-      ...visible("Chats", sections.sessions),
-    ];
-  };
+  getVisibleConversationsRef.current = () =>
+    visibleProjectConversations({
+      pinned: sections.pinned,
+      chats: sections.sessions,
+      projectGroups: sections.projectGroups,
+      collapsedSections: effectiveCollapsedSections,
+      expandedProjects,
+      projectItems: (project) => project.conversations,
+    });
   // Getter that builds the shift-select visible order on demand (at click
   // time). Reading projectRenderedIdsRef lazily — rather than snapshotting it
   // during render — guarantees the project segment is always fresh even when a
   // ProjectFolder re-renders independently (async query resolve, session
   // re-sort) without triggering a parent re-render.
-  getVisibleIdsRef.current = () => {
-    const vis = (title: string, list: readonly Conversation[]) =>
-      effectiveCollapsedSections.includes(title) ? [] : list.map((c) => c.id);
-    const projCollapsed = effectiveCollapsedSections.includes("Projects");
-    return [
-      ...vis("Pinned", sections.pinned),
-      ...(projCollapsed
-        ? []
-        : sections.projectGroups.flatMap((g) => projectRenderedIdsRef.current.get(g.id) ?? [])),
-      ...vis("Chats", sections.sessions),
-    ];
-  };
+  getVisibleIdsRef.current = () =>
+    visibleProjectConversations({
+      pinned: sections.pinned.map((conversation) => conversation.id),
+      chats: sections.sessions.map((conversation) => conversation.id),
+      projectGroups: sections.projectGroups,
+      collapsedSections: effectiveCollapsedSections,
+      expandedProjects,
+      projectItems: (project) => projectRenderedIdsRef.current.get(project.id) ?? [],
+    });
   useSessionSwitchHotkey(orderedConversationIds, activeId);
 
   // Cmd/Ctrl+1..9/0 jumps to the first ten pinned sessions (desktop only;
@@ -2361,7 +2383,7 @@ function ConversationRow({
 
   // The session's current first-class project id, or null when unfiled —
   // drives the kebab submenu label ("Add to project" vs "Change project").
-  const currentProject = conversation.metadata?.project_id ?? null;
+  const currentProject = conversation.project_id ?? null;
 
   const label = conversationDisplayLabel(conversation);
   // Recompute unseen state the moment the last-seen map changes (e.g. the
@@ -3278,34 +3300,8 @@ function ProjectPickerMenu({
   onSelect: (project: string) => void;
 }) {
   const { data: projects = [] } = useProjects();
-  const createProject = useCreateProject();
-  const [search, setSearch] = useState("");
-  const [creatingNew, setCreatingNew] = useState(false);
-  const [newProjectName, setNewProjectName] = useState("");
-  const newInputRef = useRef<HTMLInputElement>(null);
-
-  useEffect(() => {
-    if (creatingNew) {
-      newInputRef.current?.focus();
-    }
-  }, [creatingNew]);
-
-  const filtered = search
-    ? projects.filter((project) => project.name.toLowerCase().includes(search.toLowerCase()))
-    : projects;
+  const picker = useProjectPickerState(projects, onSelect);
   const currentProjectName = projects.find((project) => project.id === currentProject)?.name;
-
-  function handleNewProjectCommit() {
-    const name = newProjectName.trim();
-    if (!name) return;
-    createProject.mutate(name, {
-      onSuccess: (project) => {
-        setCreatingNew(false);
-        setNewProjectName("");
-        onSelect(project.id);
-      },
-    });
-  }
 
   // Keep keystrokes inside the inputs from reaching the menu's typeahead /
   // navigation handlers (which would otherwise steal letters and arrows).
@@ -3320,45 +3316,51 @@ function ProjectPickerMenu({
         <input
           className="w-full bg-transparent text-xs outline-none placeholder:text-muted-foreground"
           placeholder="Search projects"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
+          value={picker.search}
+          onChange={(e) => picker.setSearch(e.target.value)}
           onKeyDown={swallowKeys}
         />
       </div>
       <div className="max-h-48 overflow-y-auto">
-        {filtered.map((project) => (
-          <C.Item key={project.id} className="px-2 py-1" onSelect={() => onSelect(project.id)}>
+        {picker.filteredProjects.map((project) => (
+          <C.Item
+            key={project.id}
+            className="px-2 py-1"
+            onSelect={() => picker.selectProject(project.id)}
+          >
             <span className="flex-1 truncate text-left">{project.name}</span>
             {currentProject === project.id && (
               <CheckMarkIcon className="size-3.5 shrink-0 text-primary" />
             )}
           </C.Item>
         ))}
-        {filtered.length === 0 && !creatingNew && (
+        {picker.filteredProjects.length === 0 && !picker.creatingNew && (
           <p className="px-2 py-1.5 text-xs text-muted-foreground">No projects yet.</p>
         )}
       </div>
       <div className="border-t pt-1">
-        {creatingNew ? (
-          <div className="flex items-center gap-1 px-2 py-1">
+        {picker.creatingNew ? (
+          <div className="px-2 py-1">
             <input
-              ref={newInputRef}
-              className="flex-1 bg-transparent text-xs outline-none"
+              ref={picker.newInputRef}
+              className="w-full bg-transparent text-xs outline-none"
               placeholder="Project name…"
-              value={newProjectName}
-              onChange={(e) => setNewProjectName(e.target.value)}
-              onKeyDown={(e) => {
-                e.stopPropagation();
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  handleNewProjectCommit();
-                }
-                if (e.key === "Escape") {
-                  setCreatingNew(false);
-                  setNewProjectName("");
-                }
-              }}
+              value={picker.newProjectName}
+              onChange={(e) => picker.setNewProjectName(e.target.value)}
+              onKeyDown={picker.handleNewProjectKeyDown}
+              disabled={picker.isCreatingProject}
+              aria-invalid={picker.createError ? true : undefined}
+              aria-describedby={picker.createError ? "sidebar-project-create-error" : undefined}
             />
+            {picker.createError && (
+              <p
+                id="sidebar-project-create-error"
+                className="pt-1 text-destructive text-xs"
+                role="alert"
+              >
+                {picker.createError}
+              </p>
+            )}
           </div>
         ) : (
           <C.Item
@@ -3366,7 +3368,7 @@ function ProjectPickerMenu({
             // Keep the menu open so the inline input can take over in place.
             onSelect={(e) => {
               e.preventDefault();
-              setCreatingNew(true);
+              picker.beginCreatingProject();
             }}
           >
             <PlusIcon className="size-3.5 shrink-0" />
@@ -3374,7 +3376,7 @@ function ProjectPickerMenu({
           </C.Item>
         )}
         {currentProject && (
-          <C.Item className="px-2 py-1" onSelect={() => onSelect("")}>
+          <C.Item className="px-2 py-1" onSelect={() => picker.selectProject("")}>
             Remove from{" "}
             <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
               {currentProjectName ?? currentProject}

@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import logging
-import threading
 
 import pytest
 from sqlalchemy import select
@@ -20,11 +18,10 @@ from omnigent.db.db_models import (
 )
 from omnigent.db.utils import get_or_create_engine
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.app import (
-    _backfill_legacy_project_labels_on_startup,
-    _schedule_legacy_project_label_backfill,
-)
+from omnigent.projects.defaults import DEFAULTS_SCHEMA_VERSION
+from omnigent.server.app import _backfill_legacy_project_labels_on_startup
 from omnigent.server.auth import LEVEL_OWNER
+from omnigent.stores.conversation_store import PROJECT_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -237,6 +234,22 @@ def test_defaults_bundle_validation_and_update(
     assert managed_host.value.code == ErrorCode.INVALID_INPUT
 
 
+def test_update_stamps_current_defaults_schema_version(
+    store: SqlAlchemyProjectStore,
+) -> None:
+    project = store.create("alice", "Versioned defaults")
+
+    updated = store.update(
+        project.id,
+        "alice",
+        expected_row_version=project.row_version,
+        defaults_json={"model": "gpt-5"},
+    )
+
+    assert updated is not None
+    assert updated.defaults_schema_version == DEFAULTS_SCHEMA_VERSION
+
+
 def _legacy_session(
     db_uri: str,
     conversation_store: SqlAlchemyConversationStore,
@@ -246,7 +259,7 @@ def _legacy_session(
     label: str,
 ) -> str:
     conversation = conversation_store.create_conversation()
-    conversation_store.set_labels(conversation.id, {"omni_project": label})
+    conversation_store.set_labels(conversation.id, {PROJECT_LABEL_KEY: label})
     if owner is not None:
         permissions.ensure_user(owner)
         permissions.grant(owner, conversation.id, LEVEL_OWNER)
@@ -289,7 +302,7 @@ def test_label_backfill_is_idempotent_and_writes_atomic_backfill_snapshot(
     assert snapshot.defaults_json == "{}"
     assert len(ledgers) == 1
     persisted = conversations.get_conversation(session_id)
-    assert persisted is not None and "omni_project" not in persisted.labels
+    assert persisted is not None and PROJECT_LABEL_KEY not in persisted.labels
     assert conversations.list_project_label_workspace_ids() == []
     assert [project.name for project in conversations.list_projects("alice")] == ["Omnigent"]
     assert {
@@ -357,7 +370,7 @@ def test_startup_backfill_runs_all_labeled_workspaces_and_is_non_blocking(
             assert metadata is not None and metadata.project_id is not None
             assert snapshot is not None and snapshot.project_id == metadata.project_id
             persisted = conversations.get_conversation(session_id)
-            assert persisted is not None and "omni_project" not in persisted.labels
+            assert persisted is not None and PROJECT_LABEL_KEY not in persisted.labels
     assert conversations.list_project_label_workspace_ids() == [300]
     mapping_logs = [
         record
@@ -440,35 +453,6 @@ def test_startup_backfill_unconfigured_or_scan_failure_is_non_blocking(
     assert _backfill_legacy_project_labels_on_startup(conversations, projects) == (0, 0)
 
 
-@pytest.mark.asyncio
-async def test_startup_backfill_schedule_does_not_gate_boot(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    started = threading.Event()
-    release = threading.Event()
-
-    def _slow_backfill(
-        conversation_store: object,
-        project_store: object,
-    ) -> tuple[int, int]:
-        del conversation_store, project_store
-        started.set()
-        release.wait(timeout=5)
-        return (0, 0)
-
-    monkeypatch.setattr(
-        "omnigent.server.app._backfill_legacy_project_labels_on_startup",
-        _slow_backfill,
-    )
-    task = _schedule_legacy_project_label_backfill(None, None)
-    try:
-        assert await asyncio.to_thread(started.wait, 2)
-        assert task.done() is False
-    finally:
-        release.set()
-        assert await task == (0, 0)
-
-
 @pytest.mark.parametrize("owners", [(), ("alice", "bob")])
 def test_backfill_zero_or_multiple_owners_stops_with_mapping_plan(
     db_uri: str,
@@ -519,6 +503,66 @@ def test_backfill_alias_or_preexisting_other_owner_collision_is_non_mutating(
         ledger_count = len(connection.execute(select(SqlProjectMigrationLedger)).scalars().all())
     assert project_id is None
     assert ledger_count == 0
+
+
+def test_backfill_applies_clean_group_and_reports_ambiguous_group(
+    db_uri: str,
+    store: SqlAlchemyProjectStore,
+) -> None:
+    conversations = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    clean_session = _legacy_session(
+        db_uri,
+        conversations,
+        permissions,
+        owner="alice",
+        label="Clean",
+    )
+    ambiguous_session = _legacy_session(
+        db_uri,
+        conversations,
+        permissions,
+        owner=None,
+        label="Ambiguous",
+    )
+
+    result = store.backfill_legacy_labels(conversations)
+
+    assert len(result.mappings) == 1
+    assert result.mappings[0].normalized_name == "clean"
+    assert [issue.normalized_name for issue in result.issues] == ["ambiguous"]
+    clean = conversations.get_conversation(clean_session)
+    ambiguous = conversations.get_conversation(ambiguous_session)
+    assert clean is not None and clean.project_id == result.mappings[0].project_id
+    assert PROJECT_LABEL_KEY not in clean.labels
+    assert ambiguous is not None and ambiguous.project_id is None
+    assert ambiguous.labels[PROJECT_LABEL_KEY] == "Ambiguous"
+
+
+def test_startup_backfill_kill_switch_skips(
+    db_uri: str,
+    store: SqlAlchemyProjectStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    conversations = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    session_id = _legacy_session(
+        db_uri,
+        conversations,
+        permissions,
+        owner="alice",
+        label="Disabled",
+    )
+    monkeypatch.setenv("OMNIGENT_DISABLE_LABEL_BACKFILL", "1")
+
+    with caplog.at_level(logging.INFO):
+        result = _backfill_legacy_project_labels_on_startup(conversations, store)
+
+    assert result == (0, 0)
+    persisted = conversations.get_conversation(session_id)
+    assert persisted is not None and persisted.project_id is None
+    assert any("disabled by environment" in message for message in caplog.messages)
 
 
 def test_backfill_reuses_project_owned_by_candidate(

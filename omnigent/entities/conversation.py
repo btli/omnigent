@@ -198,6 +198,7 @@ class Conversation:
     agent_id: str | None = None
     runner_id: str | None = None
     host_id: str | None = None
+    project_id: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
     session_state: dict[str, Any] = field(default_factory=dict)
     session_usage: dict[str, Any] = field(default_factory=dict)

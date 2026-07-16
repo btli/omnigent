@@ -17,6 +17,7 @@ import type { Conversation } from "@/hooks/useConversations";
 // sections; moveToProjectSpy captures kebab-menu "Change project" calls.
 const {
   projectsMock,
+  createProjectMock,
   moveToProjectSpy,
   deleteProjectSpy,
   conversationsRef,
@@ -24,14 +25,15 @@ const {
   dndContextProps,
 } = vi.hoisted(() => ({
   projectsMock: [] as { id: string; name: string }[],
+  createProjectMock: { mutate: vi.fn(), isPending: false },
   moveToProjectSpy: vi.fn(),
   deleteProjectSpy: vi.fn(),
   // Latest conversations handed to the global-list mock. The useProjectSessions
-  // mock derives each folder's rows from this by label, mirroring the server's
+  // mock derives each folder's rows from this by project_id, mirroring the server's
   // ?project_id= filter — so tests that seed project sessions via the global list
   // keep working without a separate per-project fixture.
   conversationsRef: {
-    current: [] as { id: string; metadata?: { project_id?: string | null } }[],
+    current: [] as { id: string; project_id?: string | null }[],
   },
   // Per-project override: when a test sets projectSessionsMock[name], the folder
   // serves exactly those rows instead of deriving from the global list — used to
@@ -69,10 +71,10 @@ vi.mock("@/hooks/useConversations", () => ({
   // sections, and rows fire useMoveToProject from the kebab menu. Both must
   // be stubbed or the Sidebar throws on render.
   useProjects: () => ({ data: projectsMock }),
-  useCreateProject: () => ({ mutate: vi.fn(), isPending: false }),
+  useCreateProject: () => createProjectMock,
   useRenameProject: () => ({ mutate: vi.fn(), isPending: false }),
   // Each project folder fetches its own sessions (server-side ?project_id=). Derive
-  // them from the global-list fixture by metadata so existing tests keep seeding
+  // them from the global-list fixture by project_id so existing tests keep seeding
   // project sessions there. Single page, no pagination, in this mock.
   useProjectSessions: (project: string, enabled: boolean) => {
     const override = projectSessionsMock.current[project];
@@ -80,7 +82,7 @@ vi.mock("@/hooks/useConversations", () => ({
       ? []
       : (override ??
         conversationsRef.current.filter(
-          (c) => c.metadata?.project_id === project && (c as any).archived !== true,
+          (c) => c.project_id === project && (c as any).archived !== true,
         ));
     return {
       data: enabled
@@ -202,6 +204,7 @@ beforeEach(() => {
   localStorage.clear();
   projectsMock.length = 0;
   moveToProjectSpy.mockReset();
+  createProjectMock.mutate.mockReset();
   deleteProjectSpy.mockReset();
   dndContextProps.current = null;
   projectSessionsMock.current = {};
@@ -486,11 +489,11 @@ describe("Sidebar tabs", () => {
 
   it("does not render project folders on the Shared tab (projects are owner-only)", () => {
     // Filing into a project is owner-only, so the Shared tab shows no Projects
-    // group; a shared session that carries a project label just lands in the
+    // group; a shared session that carries a project_id just lands in the
     // flat Sessions list there.
     addProjects("Alpha");
     mockConversations([
-      conv("conv_mine", "Claude Code", { metadata: { project_id: projectId("Alpha") } }),
+      conv("conv_mine", "Claude Code", { project_id: projectId("Alpha") }),
       conv("conv_shared", "Claude Code", { permission_level: 2 }),
     ]);
     renderSidebar();
@@ -664,15 +667,15 @@ describe("Sidebar load-more vs collapsed Sessions", () => {
   });
 });
 
-// Project feature: sessions carrying a project label are peeled out of the
+// Project feature: sessions carrying a project_id are peeled out of the
 // "Sessions" list into a folder under the "Projects" group (rendered between
 // Pinned and Sessions). The project list comes from useProjects() (mocked here).
 describe("Sidebar project sections", () => {
-  it("groups sessions by their project label, separate from Sessions", () => {
+  it("groups sessions by project_id, separate from Sessions", () => {
     addProjects("Customer X");
     mockConversations([
       conv("conv_unfiled", "Claude Code"),
-      conv("conv_filed", "Claude Code", { metadata: { project_id: projectId("Customer X") } }),
+      conv("conv_filed", "Claude Code", { project_id: projectId("Customer X") }),
     ]);
     renderSidebar();
 
@@ -697,8 +700,8 @@ describe("Sidebar project sections", () => {
     // until you scrolled). The folder fetches them itself via useProjectSessions.
     mockConversations([conv("conv_unfiled", "Claude Code")]);
     projectSessionsMock.current[projectId("Customer X")] = [
-      conv("conv_far_1", "Claude Code", { metadata: { project_id: projectId("Customer X") } }),
-      conv("conv_far_2", "Claude Code", { metadata: { project_id: projectId("Customer X") } }),
+      conv("conv_far_1", "Claude Code", { project_id: projectId("Customer X") }),
+      conv("conv_far_2", "Claude Code", { project_id: projectId("Customer X") }),
     ];
     renderSidebar();
 
@@ -715,9 +718,7 @@ describe("Sidebar project sections", () => {
 
   it("offers a pencil that starts a new session pre-filed under the project", () => {
     addProjects("Customer X");
-    mockConversations([
-      conv("conv_filed", "Claude Code", { metadata: { project_id: projectId("Customer X") } }),
-    ]);
+    mockConversations([conv("conv_filed", "Claude Code", { project_id: projectId("Customer X") })]);
     renderSidebar();
 
     // The pencil links to the landing composer with the project pre-selected
@@ -732,9 +733,7 @@ describe("Sidebar project sections", () => {
     // true: a plain pencil tap must close the full-screen sidebar overlay,
     // otherwise the pre-filed new-session page is left hidden behind it.
     addProjects("Customer X");
-    mockConversations([
-      conv("conv_filed", "Claude Code", { metadata: { project_id: projectId("Customer X") } }),
-    ]);
+    mockConversations([conv("conv_filed", "Claude Code", { project_id: projectId("Customer X") })]);
     const onClose = vi.fn();
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
@@ -753,9 +752,7 @@ describe("Sidebar project sections", () => {
 
   it("starts a project folder collapsed with its rows hidden", () => {
     addProjects("Customer X");
-    mockConversations([
-      conv("conv_filed", "Claude Code", { metadata: { project_id: projectId("Customer X") } }),
-    ]);
+    mockConversations([conv("conv_filed", "Claude Code", { project_id: projectId("Customer X") })]);
     renderSidebar();
 
     // The folder header is present under the (default-expanded) Projects group,
@@ -768,9 +765,7 @@ describe("Sidebar project sections", () => {
 
   it("auto-expands the project folder holding the selected session", () => {
     addProjects("Customer X");
-    mockConversations([
-      conv("conv_filed", "Claude Code", { metadata: { project_id: projectId("Customer X") } }),
-    ]);
+    mockConversations([conv("conv_filed", "Claude Code", { project_id: projectId("Customer X") })]);
     // Render with the filed session active (a matched /c/:conversationId route
     // so useParams resolves), instead of the default renderSidebar() which
     // mounts at "/".
@@ -798,8 +793,8 @@ describe("Sidebar project sections", () => {
   it("moves a pinned project session out into the global Pinned section", () => {
     addProjects("Customer X");
     mockConversations([
-      conv("conv_plain", "Claude Code", { metadata: { project_id: projectId("Customer X") } }),
-      conv("conv_pinned", "Claude Code", { metadata: { project_id: projectId("Customer X") } }),
+      conv("conv_plain", "Claude Code", { project_id: projectId("Customer X") }),
+      conv("conv_pinned", "Claude Code", { project_id: projectId("Customer X") }),
     ]);
     // Pin one of the filed sessions via localStorage (client-side pins).
     localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_pinned"]));
@@ -818,11 +813,9 @@ describe("Sidebar project sections", () => {
   });
 
   it("does not render a project section when useProjects returns nothing", () => {
-    // A session with a stale project label but no matching project entry stays
+    // A session with a stale project_id but no matching project entry stays
     // in Sessions — projects are driven by the project list, not the labels alone.
-    mockConversations([
-      conv("conv_filed", "Claude Code", { metadata: { project_id: projectId("Ghost") } }),
-    ]);
+    mockConversations([conv("conv_filed", "Claude Code", { project_id: projectId("Ghost") })]);
     renderSidebar();
 
     expect(screen.queryByText("Ghost")).toBeNull();
@@ -833,8 +826,8 @@ describe("Sidebar project sections", () => {
   it("expands all project folders at once and reverts to the previously-open set", () => {
     addProjects("Alpha", "Beta");
     mockConversations([
-      conv("conv_a", "Claude Code", { metadata: { project_id: projectId("Alpha") } }),
-      conv("conv_b", "Claude Code", { metadata: { project_id: projectId("Beta") } }),
+      conv("conv_a", "Claude Code", { project_id: projectId("Alpha") }),
+      conv("conv_b", "Claude Code", { project_id: projectId("Beta") }),
     ]);
     renderSidebar();
 
@@ -866,8 +859,8 @@ describe("Sidebar project sections", () => {
     // state), reverting collapses everything rather than restoring a stale set.
     addProjects("Alpha", "Beta");
     mockConversations([
-      conv("conv_a", "Claude Code", { metadata: { project_id: projectId("Alpha") } }),
-      conv("conv_b", "Claude Code", { metadata: { project_id: projectId("Beta") } }),
+      conv("conv_a", "Claude Code", { project_id: projectId("Alpha") }),
+      conv("conv_b", "Claude Code", { project_id: projectId("Beta") }),
     ]);
     renderSidebar();
 
@@ -905,8 +898,8 @@ describe("Sidebar project sections", () => {
     // expand-all / revert would be a no-op — the control must not show.
     addProjects("Alpha", "Beta");
     mockConversations([
-      conv("conv_a", "Claude Code", { metadata: { project_id: projectId("Alpha") } }),
-      conv("conv_b", "Claude Code", { metadata: { project_id: projectId("Beta") } }),
+      conv("conv_a", "Claude Code", { project_id: projectId("Alpha") }),
+      conv("conv_b", "Claude Code", { project_id: projectId("Beta") }),
     ]);
     renderSidebar();
 
@@ -925,9 +918,7 @@ describe("Sidebar project sections", () => {
 
   it("deletes a project (and all its sessions) from the folder kebab after confirming", async () => {
     addProjects("Customer X");
-    mockConversations([
-      conv("conv_filed", "Claude Code", { metadata: { project_id: projectId("Customer X") } }),
-    ]);
+    mockConversations([conv("conv_filed", "Claude Code", { project_id: projectId("Customer X") })]);
     renderSidebar();
 
     // Open the project folder's kebab → "Delete project".
@@ -952,7 +943,7 @@ describe("Sidebar collapsed project marker", () => {
     addProjects("Customer X");
     mockConversations([
       conv("conv_awaiting", "Claude Code", {
-        metadata: { project_id: projectId("Customer X") },
+        project_id: projectId("Customer X"),
         pending_elicitations_count: 1,
       }),
     ]);
@@ -969,7 +960,7 @@ describe("Sidebar collapsed project marker", () => {
     addProjects("Customer X");
     mockConversations([
       conv("conv_awaiting", "Claude Code", {
-        metadata: { project_id: projectId("Customer X") },
+        project_id: projectId("Customer X"),
         pending_elicitations_count: 1,
       }),
     ]);
@@ -984,9 +975,7 @@ describe("Sidebar collapsed project marker", () => {
 
   it("shows no header marker when no filed row has one", () => {
     addProjects("Customer X");
-    mockConversations([
-      conv("conv_plain", "Claude Code", { metadata: { project_id: projectId("Customer X") } }),
-    ]);
+    mockConversations([conv("conv_plain", "Claude Code", { project_id: projectId("Customer X") })]);
     renderSidebar();
 
     const header = screen.getByRole("button", { name: /^Customer X/ });
@@ -1108,11 +1097,30 @@ describe("Sidebar move-to-project action", () => {
     });
   });
 
+  it("shows an inline error when project creation fails", async () => {
+    createProjectMock.mutate.mockImplementation((_name, options) => {
+      options.onError(new Error("500 Internal Server Error"));
+    });
+    mockConversations([conv("conv_move", "Claude Code")]);
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByTestId("move-to-project"));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Create new project" }));
+    const input = screen.getByPlaceholderText("Project name…");
+    fireEvent.change(input, { target: { value: "Broken project" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't create project");
+    expect(screen.getByPlaceholderText("Project name…")).toBeInTheDocument();
+  });
+
   it("removes a project's last session without confirmation and keeps the project listed", async () => {
     addProjects("Sprint 42");
-    mockConversations([
-      conv("conv_filed", "Claude Code", { metadata: { project_id: projectId("Sprint 42") } }),
-    ]);
+    mockConversations([conv("conv_filed", "Claude Code", { project_id: projectId("Sprint 42") })]);
     renderSidebar();
 
     // Expand the project folder, open the filed row's kebab → Change project.
@@ -1133,9 +1141,7 @@ describe("Sidebar move-to-project action", () => {
 
   it("moves the last session out by drag without confirmation and keeps the project listed", () => {
     addProjects("Sprint 42");
-    mockConversations([
-      conv("conv_filed", "Claude Code", { metadata: { project_id: projectId("Sprint 42") } }),
-    ]);
+    mockConversations([conv("conv_filed", "Claude Code", { project_id: projectId("Sprint 42") })]);
     renderSidebar();
 
     act(() => {

@@ -105,10 +105,12 @@ import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSw
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
 import {
-  useCreateProject,
+  moveConversationToProject,
   useNewestProjectSession,
   useProjects,
 } from "@/hooks/useConversations";
+import { invalidateProjectQueries } from "@/hooks/projectQueries";
+import { useProjectPickerState } from "@/hooks/useProjectPickerState";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import {
@@ -742,7 +744,7 @@ export function deriveHomeDir(entries: HostFilesystemEntry[]): string | null {
  * first-class project. Mirrors the sidebar kebab's project picker: a search
  * box, the existing projects, a "No project" reset,
  * and an inline "New project…" input. Selection is local state on the landing
- * composer; membership is applied right after the session is created.
+ * composer and is included in the session-create request.
  */
 function LandingProjectPicker({
   value,
@@ -752,37 +754,12 @@ function LandingProjectPicker({
   onChange: (project: string) => void;
 }) {
   const { data: projects = [] } = useProjects();
-  const createProject = useCreateProject();
   const [open, setOpen] = useState(false);
-  const [search, setSearch] = useState("");
-  const [creatingNew, setCreatingNew] = useState(false);
-  const [newName, setNewName] = useState("");
-  const newRef = useRef<HTMLInputElement>(null);
-
-  useEffect(() => {
-    if (creatingNew) newRef.current?.focus();
-  }, [creatingNew]);
-
-  const filtered = search
-    ? projects.filter((project) => project.name.toLowerCase().includes(search.toLowerCase()))
-    : projects;
-  const selected = projects.find((project) => project.id === value);
-
-  function pick(project: string) {
-    onChange(project);
+  const picker = useProjectPickerState(projects, (projectId) => {
+    onChange(projectId);
     setOpen(false);
-    setSearch("");
-    setCreatingNew(false);
-    setNewName("");
-  }
-
-  function commitNew() {
-    const name = newName.trim();
-    if (!name) return;
-    createProject.mutate(name, {
-      onSuccess: (project) => pick(project.id),
-    });
-  }
+  });
+  const selected = projects.find((project) => project.id === value);
 
   const itemClass =
     "flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground";
@@ -819,53 +796,56 @@ function LandingProjectPicker({
           <input
             className="w-full bg-transparent text-xs outline-none placeholder:text-muted-foreground"
             placeholder="Search projects"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
+            value={picker.search}
+            onChange={(e) => picker.setSearch(e.target.value)}
           />
         </div>
         <div className="max-h-48 overflow-y-auto">
-          <button type="button" className={itemClass} onClick={() => pick("")}>
+          <button type="button" className={itemClass} onClick={() => picker.selectProject("")}>
             <span className="flex-1 truncate">No project</span>
             {value === "" && <CheckIcon className="size-3.5 shrink-0 text-primary" />}
           </button>
-          {filtered.map((project) => (
+          {picker.filteredProjects.map((project) => (
             <button
               key={project.id}
               type="button"
               className={itemClass}
-              onClick={() => pick(project.id)}
+              onClick={() => picker.selectProject(project.id)}
             >
               <span className="flex-1 truncate">{project.name}</span>
               {value === project.id && <CheckIcon className="size-3.5 shrink-0 text-primary" />}
             </button>
           ))}
-          {filtered.length === 0 && !creatingNew && (
+          {picker.filteredProjects.length === 0 && !picker.creatingNew && (
             <p className="px-2 py-1.5 text-xs text-muted-foreground">No projects yet.</p>
           )}
         </div>
         <div className="border-t pt-1">
-          {creatingNew ? (
-            <div className="flex items-center gap-1 px-2 py-1">
+          {picker.creatingNew ? (
+            <div className="px-2 py-1">
               <input
-                ref={newRef}
-                className="flex-1 bg-transparent text-xs outline-none"
+                ref={picker.newInputRef}
+                className="w-full bg-transparent text-xs outline-none"
                 placeholder="Project name…"
-                value={newName}
-                onChange={(e) => setNewName(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    commitNew();
-                  }
-                  if (e.key === "Escape") {
-                    setCreatingNew(false);
-                    setNewName("");
-                  }
-                }}
+                value={picker.newProjectName}
+                onChange={(e) => picker.setNewProjectName(e.target.value)}
+                onKeyDown={picker.handleNewProjectKeyDown}
+                disabled={picker.isCreatingProject}
+                aria-invalid={picker.createError ? true : undefined}
+                aria-describedby={picker.createError ? "landing-project-create-error" : undefined}
               />
+              {picker.createError && (
+                <p
+                  id="landing-project-create-error"
+                  className="pt-1 text-destructive text-xs"
+                  role="alert"
+                >
+                  {picker.createError}
+                </p>
+              )}
             </div>
           ) : (
-            <button type="button" className={itemClass} onClick={() => setCreatingNew(true)}>
+            <button type="button" className={itemClass} onClick={picker.beginCreatingProject}>
               <PlusIcon className="size-3.5 shrink-0" />
               New project…
             </button>
@@ -2742,6 +2722,10 @@ export function NewChatLandingScreen() {
           bundle,
           metadata as Parameters<typeof createBundledSession>[1],
         );
+        // The multipart create schema has no project_id (bundle sessions are
+        // excluded from create-time inheritance), so file the session into the
+        // project with the canonical membership PATCH afterwards.
+        if (selectedProjectId) await moveConversationToProject(data.id, selectedProjectId);
         // Launch the runner on the selected host. The multipart create
         // only stores DB rows — launchRunner binds + starts the runner.
         if (!sandboxSelected && selectedHostId && workspaceTrimmed) {
@@ -2764,6 +2748,7 @@ export function NewChatLandingScreen() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             agent_id: effectiveAgentId,
+            project_id: selectedProjectId || undefined,
             ...(sandboxSelected
               ? {
                   host_type: "managed",
@@ -2824,24 +2809,10 @@ export function NewChatLandingScreen() {
         }
         data = (await res.json()) as { id: string };
       }
-      // File the new session under the chosen project. Awaited so the next
-      // conversations refetch sees the membership; failure leaves it unfiled.
+      // The create request files the session atomically. Refresh project-derived
+      // lists so an already-open folder shows the new member immediately.
       if (selectedProjectId) {
-        try {
-          await authenticatedFetch(`/v1/sessions/${data.id}`, {
-            method: "PATCH",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ project_id: selectedProjectId }),
-          });
-          void queryClient.invalidateQueries({ queryKey: ["projects"] });
-          // Refetch the target project folder's own paginated list so the new
-          // session shows up immediately (the folder fetches via
-          // useProjectSessions, separate from the global conversations list).
-          void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
-          void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
-        } catch {
-          // Leave the session unfiled; the user can file it from the sidebar.
-        }
+        invalidateProjectQueries(queryClient, { sessions: true });
       }
       // Sandbox creates have no user-picked workspace to remember.
       if (!sandboxSelected) addRecent(workspaceTrimmed);

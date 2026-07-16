@@ -1788,6 +1788,7 @@ class SessionResponse(BaseModel):
 
     id: str
     agent_id: str
+    project_id: str | None = None
     agent_name: str | None = None
     status: Literal["idle", "running", "waiting", "failed"]
     background_task_count: int | None = None
@@ -2203,6 +2204,7 @@ class SessionListItem(BaseModel):
 
     id: str
     agent_id: str
+    project_id: str | None = None
     agent_name: str | None = None
     status: Literal["idle", "running", "waiting", "failed"]
     created_at: int

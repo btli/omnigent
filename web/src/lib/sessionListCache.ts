@@ -73,7 +73,7 @@ function changedWireFields(conv: Conversation, wire: SessionListWireItem): Set<s
   const row = conv as unknown as Record<string, unknown>;
   for (const [key, value] of Object.entries(wire)) {
     const current = row[key];
-    if (key === "labels" || key === "metadata") {
+    if (key === "labels") {
       if (JSON.stringify(current) !== JSON.stringify(value)) changed.add(key);
     } else if (current !== value) {
       changed.add(key);
@@ -121,7 +121,7 @@ export function filtersFromConversationQueryKey(key: readonly unknown[]): Conver
  */
 function violatesKnownMembership(conv: Conversation, filters: ConversationListFilters): boolean {
   if (!filters.includeArchived && conv.archived === true) return true;
-  if (filters.projectId && conv.metadata?.project_id !== filters.projectId) return true;
+  if (filters.projectId && conv.project_id !== filters.projectId) return true;
   return false;
 }
 
@@ -144,7 +144,7 @@ function violatesKnownMembership(conv: Conversation, filters: ConversationListFi
 function changedFieldsNeedRefetch(changed: Set<string>, isActiveRow: boolean): boolean {
   if (changed.has("archived")) return true;
   if (changed.has("title")) return true;
-  if (changed.has("metadata")) return true;
+  if (changed.has("project_id")) return true;
   // updated_at only affects the server's sort order. The active chat row is
   // pinned at its position by ActiveChatOverride regardless of that order, so
   // an updated_at bump on it — the common case while the user sends messages —

@@ -209,7 +209,7 @@ async def test_forged_retry_with_deny_policy_is_rejected(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: deny_engine,
+        lambda spec, session_id, conversation_store, project_store=None: deny_engine,
     )
 
     response = await _handle_mcp_tools_call(
@@ -266,7 +266,7 @@ async def test_forged_retry_with_ask_policy_rejects_unknown_elicitation(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: ask_engine,
+        lambda spec, session_id, conversation_store, project_store=None: ask_engine,
     )
 
     forged_eid = "elicit_FORGED_never_issued"
@@ -318,7 +318,7 @@ async def test_retry_with_allow_policy_falls_through(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: allow_engine,
+        lambda spec, session_id, conversation_store, project_store=None: allow_engine,
     )
 
     response = await _handle_mcp_tools_call(
@@ -374,7 +374,7 @@ async def test_retry_session_mismatch_still_rejected(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: deny_engine,
+        lambda spec, session_id, conversation_store, project_store=None: deny_engine,
     )
 
     params = _forged_retry_params()
@@ -432,7 +432,7 @@ async def test_legitimate_retry_with_pending_entry_proceeds(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: ask_engine,
+        lambda spec, session_id, conversation_store, project_store=None: ask_engine,
     )
 
     eid = "elicit_LEGITIMATE_server_issued"
@@ -533,7 +533,7 @@ async def test_non_mcp_entry_popped_by_events_handler_on_accept(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: _FixedPolicyEngine(
+        lambda spec, session_id, conversation_store, project_store=None: _FixedPolicyEngine(
             result=PolicyResult(action=PolicyAction.ALLOW, reason=None)
         ),
     )

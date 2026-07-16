@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
-
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -22,7 +20,7 @@ def test_projectless_create_flow_is_unchanged(db_uri: str) -> None:
 
     conversation = store.create_conversation()
 
-    assert "project_id" not in asdict(conversation)
+    assert conversation.project_id is None
     engine = get_or_create_engine(db_uri)
     with Session(engine) as session:
         metadata = session.get(SqlConversationMetadata, (0, conversation.id))

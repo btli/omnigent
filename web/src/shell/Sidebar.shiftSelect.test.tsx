@@ -48,7 +48,7 @@ describe("computeShiftSelectRange", () => {
 const { projectsMock, conversationsRef, projectSessionsMock } = vi.hoisted(() => ({
   projectsMock: [] as { id: string; name: string }[],
   conversationsRef: {
-    current: [] as { id: string; metadata?: { project_id?: string | null } }[],
+    current: [] as { id: string; project_id?: string | null }[],
   },
   projectSessionsMock: { current: {} as Record<string, unknown[]> },
 }));
@@ -73,7 +73,7 @@ vi.mock("@/hooks/useConversations", () => ({
       ? []
       : (override ??
         conversationsRef.current.filter(
-          (c) => c.metadata?.project_id === project && (c as any).archived !== true,
+          (c) => c.project_id === project && (c as any).archived !== true,
         ));
     return {
       data: enabled
@@ -198,8 +198,8 @@ describe("Sidebar shift-click selection", () => {
     // Set up project "Alpha" with 2 sessions, plus 3 unfiled chat sessions
     addProjects("Alpha");
     const sessions = [
-      conv("p1", { metadata: { project_id: projectId("Alpha") } }),
-      conv("p2", { metadata: { project_id: projectId("Alpha") } }),
+      conv("p1", { project_id: projectId("Alpha") }),
+      conv("p2", { project_id: projectId("Alpha") }),
       conv("c1"),
       conv("c2"),
       conv("c3"),
@@ -261,17 +261,17 @@ describe("Sidebar shift-click selection", () => {
     // the global list has p1,p2 but the folder's own query returns p1,p2,p3.
     addProjects("Alpha");
     const sessions = [
-      conv("p1", { metadata: { project_id: projectId("Alpha") } }),
-      conv("p2", { metadata: { project_id: projectId("Alpha") } }),
+      conv("p1", { project_id: projectId("Alpha") }),
+      conv("p2", { project_id: projectId("Alpha") }),
       conv("c1"),
     ];
     mockConversations(sessions);
     // The folder's useProjectSessions returns an extra session (p3)
     // that isn't in the global paginated window.
     projectSessionsMock.current[projectId("Alpha")] = [
-      conv("p1", { metadata: { project_id: projectId("Alpha") } }),
-      conv("p2", { metadata: { project_id: projectId("Alpha") } }),
-      conv("p3", { metadata: { project_id: projectId("Alpha") } }),
+      conv("p1", { project_id: projectId("Alpha") }),
+      conv("p2", { project_id: projectId("Alpha") }),
+      conv("p3", { project_id: projectId("Alpha") }),
     ];
     localStorage.setItem(
       "omnigent:expanded-project-sections",

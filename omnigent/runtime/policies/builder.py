@@ -46,6 +46,7 @@ from omnigent.spec.types import (
 )
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.policy_store import PolicyStore
+from omnigent.stores.project_store import ProjectStore
 
 _logger = logging.getLogger(__name__)
 
@@ -238,6 +239,7 @@ def build_policy_engine(
     spec: AgentSpec,
     conversation_id: str,
     conversation_store: ConversationStore,
+    project_store: ProjectStore | None = None,
     connection_override: dict[str, str] | None = None,
     default_policies: list[PolicySpec] | None = None,
     policy_store: PolicyStore | None = None,
@@ -413,6 +415,7 @@ def build_policy_engine(
         token_pricing=token_pricing,
         initial_model=initial_model,
         conversation_store=conversation_store,
+        project_store=project_store,
         root_conversation_id=root_conversation_id,
         llm_client=llm_client,
     )

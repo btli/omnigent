@@ -88,6 +88,7 @@ from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 
 _logger = logging.getLogger(__name__)
+# Ruff rejects broad exception names here; startup backfill is intentionally best-effort.
 _STARTUP_BACKFILL_EXCEPTIONS = (Exception,)
 
 
@@ -96,6 +97,9 @@ def _backfill_legacy_project_labels_on_startup(
     project_store: ProjectStore | None,
 ) -> tuple[int, int]:
     """Best-effort migration of deprecated project labels in every workspace."""
+    if os.environ.get("OMNIGENT_DISABLE_LABEL_BACKFILL") == "1":
+        _logger.info("project label startup backfill disabled by environment")
+        return (0, 0)
     if conversation_store is None or project_store is None:
         _logger.info("project label startup backfill skipped: stores not configured")
         return (0, 0)
@@ -149,20 +153,6 @@ def _backfill_legacy_project_labels_on_startup(
         extra={"migrated": migrated, "requires_mapping": requires_mapping},
     )
     return (migrated, requires_mapping)
-
-
-def _schedule_legacy_project_label_backfill(
-    conversation_store: ConversationStore | None,
-    project_store: ProjectStore | None,
-) -> asyncio.Task[tuple[int, int]]:
-    """Run the best-effort legacy-label backfill without delaying startup."""
-    return asyncio.create_task(
-        asyncio.to_thread(
-            _backfill_legacy_project_labels_on_startup,
-            conversation_store,
-            project_store,
-        )
-    )
 
 
 def add_workspace_scope_middleware(app: FastAPI) -> None:
@@ -1384,10 +1374,24 @@ def create_app(
         _log_level_name = _os.environ.get("OMNIGENT_LOG_LEVEL", "INFO").upper()
         logging.getLogger("omnigent").setLevel(getattr(logging, _log_level_name, logging.INFO))
 
-        _schedule_legacy_project_label_backfill(
-            conversation_store,
-            project_store,
+        project_label_backfill_task = asyncio.create_task(
+            asyncio.to_thread(
+                _backfill_legacy_project_labels_on_startup,
+                conversation_store,
+                project_store,
+            )
         )
+        app_inst.state.project_label_backfill_task = project_label_backfill_task
+
+        def _observe_project_label_backfill(task: asyncio.Task[tuple[int, int]]) -> None:
+            if task.cancelled():
+                return
+            try:
+                task.result()
+            except Exception:
+                _logger.exception("project label startup backfill task failed")
+
+        project_label_backfill_task.add_done_callback(_observe_project_label_backfill)
 
         harness_pm = HarnessProcessManager()
         await harness_pm.start()
@@ -1474,6 +1478,9 @@ def create_app(
         try:
             yield
         finally:
+            project_label_backfill_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await project_label_backfill_task
             metrics_publish_task.cancel()
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task

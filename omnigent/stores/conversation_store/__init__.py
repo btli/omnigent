@@ -1,8 +1,14 @@
 """Conversation store — manages conversations and their items."""
 
+from __future__ import annotations
+
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from omnigent.stores.project_store import ProjectStore
 
 from omnigent.entities import (
     Agent,
@@ -87,6 +93,16 @@ PROJECT_LABEL_KEY = "omni_project"
 PROJECT_LABEL_DEPRECATION_WARNING = (
     "omni_project label is deprecated; forwarded to project_id — migrate to the project_id API."
 )
+_logger = logging.getLogger(__name__)
+
+
+def warn_deprecated_project_label(write_path: str) -> None:
+    """Emit the canonical structured warning for a legacy label write."""
+    _logger.warning(
+        PROJECT_LABEL_DEPRECATION_WARNING,
+        extra={"event": "deprecated_project_label_write", "write_path": write_path},
+    )
+
 
 # Labels that must NOT cross into a new session context — deliberately
 # dropped both when forking (not copied to the clone) and on an in-place
@@ -497,8 +513,6 @@ class ConversationStore(ABC):
         owned_by: str | None = None,
         include_archived: bool = False,
         project_id: str | None = None,
-        project: str | None = None,
-        project_owner: str | None = None,
         title: str | None = None,
     ) -> PagedList[Conversation]:
         """
@@ -592,11 +606,6 @@ class ConversationStore(ABC):
         :param project_id: Authoritative project membership filter. A
             non-empty id matches ``metadata.project_id``; an empty string
             matches unfiled sessions. ``None`` disables this filter.
-        :param project: Legacy project-name alias. Resolves through the
-            caller's owner-scoped project row, then applies the same
-            ``metadata.project_id`` filter as ``project_id``.
-        :param project_owner: Owner principal used only to resolve the
-            legacy project-name alias.
         :param title: When set, only return conversations whose
             ``title`` matches exactly. ``None`` disables the filter.
             Powers the ``(agent, title)`` child-session lookup in
@@ -788,6 +797,7 @@ class ConversationStore(ABC):
         self,
         conversation_id: str,
         project_name: str,
+        project_store: ProjectStore,
     ) -> bool:
         """Resolve a deprecated project label and write authoritative membership."""
         ...

@@ -64,6 +64,11 @@ class ProjectStore(ABC):
         ...
 
     @abstractmethod
+    def get_or_create_by_name(self, owner_principal_id: str, name: str) -> Project:
+        """Return a named project, creating it unless an archived row exists."""
+        ...
+
+    @abstractmethod
     def list(self, owner_principal_id: str, *, include_archived: bool = False) -> list[Project]:
         """List projects owned by one principal."""
         ...

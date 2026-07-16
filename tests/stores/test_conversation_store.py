@@ -4492,7 +4492,7 @@ def test_list_conversations_filters_by_project(
     conversation_store: SqlAlchemyConversationStore,
     db_uri: str,
 ) -> None:
-    """Project ids and the owner-scoped legacy name alias match the same row."""
+    """Project ids select the matching membership row."""
     projects = SqlAlchemyProjectStore(db_uri)
     project = projects.create("alice", "X")
     filed = conversation_store.create_conversation()
@@ -4500,22 +4500,7 @@ def test_list_conversations_filters_by_project(
     conversation_store.set_project_membership(filed.id, project.id)
 
     by_id = conversation_store.list_conversations(project_id=project.id).data
-    by_name = conversation_store.list_conversations(project="X", project_owner="alice").data
     assert {item.id for item in by_id} == {filed.id}
-    assert {item.id for item in by_name} == {filed.id}
-
-
-def test_list_conversations_unresolved_project_alias_is_empty(
-    conversation_store: SqlAlchemyConversationStore,
-) -> None:
-    conversation_store.create_conversation()
-    assert (
-        conversation_store.list_conversations(
-            project="missing",
-            project_owner="alice",
-        ).data
-        == []
-    )
 
 
 def test_list_conversations_empty_project_returns_unfiled(
@@ -4536,7 +4521,7 @@ def test_list_conversations_empty_project_returns_unfiled(
 def test_list_conversations_project_none_disables_filter(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """``project=None`` (the default) returns filed and unfiled alike."""
+    """``project_id=None`` (the default) returns filed and unfiled alike."""
     filed = conversation_store.create_conversation()
     unfiled = conversation_store.create_conversation()
     conversation_store.set_labels(filed.id, {"omni_project": "X"})
@@ -4623,8 +4608,7 @@ def test_list_conversations_owned_by_excludes_shared_sessions(
     ids = {
         c.id
         for c in conversation_store.list_conversations(
-            project="X",
-            project_owner="alice@example.com",
+            project_id=project.id,
             owned_by="alice@example.com",
         ).data
     }
