@@ -7,6 +7,7 @@ import {
   type RefObject,
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -103,6 +104,7 @@ import {
   fetchProjectSessionIds,
   usePinnedConversationBackfill,
   useRenameConversation,
+  useRenameProject,
   useStopAndDeleteConversation,
   useStopSession,
 } from "@/hooks/useConversations";
@@ -760,6 +762,11 @@ function InfiniteScrollSentinel({
   );
 }
 
+function getHttpErrorStatus(error: unknown): number | null {
+  if (typeof error !== "object" || error === null || !("status" in error)) return null;
+  return typeof error.status === "number" ? error.status : null;
+}
+
 /**
  * One project folder. Fetches its own sessions server-side (`?project_id=`) so it
  * shows ALL its members regardless of how far the global sidebar list has been
@@ -802,6 +809,10 @@ function ProjectFolder({
   projectRenderedIdsRef?: RefObject<Map<string, string[]>>;
 }) {
   const query = useProjectSessions(id, expanded);
+  const [isEditing, setIsEditing] = useState(false);
+  const [renameError, setRenameError] = useState<string | null>(null);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const renameProject = useRenameProject();
   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
   const conversations = useMemo(() => {
     const loaded = query.data?.pages.flatMap((page) => page.data) ?? [];
@@ -834,6 +845,15 @@ function ProjectFolder({
     id: `project:${id}`,
     data: { type: "project", name: id },
   });
+
+  const startRename = useCallback(() => {
+    setRenameError(null);
+    setIsEditing(true);
+  }, []);
+  const cancelRename = useCallback(() => {
+    setRenameError(null);
+    setIsEditing(false);
+  }, []);
 
   return (
     <div
@@ -868,7 +888,56 @@ function ProjectFolder({
         emptyMessage={loadingFirstPage ? undefined : "No chats"}
         indentRows
         headerAction={
-          <ProjectFolderActions projectId={id} projectName={name} onNavigate={onRowClick} />
+          <ProjectFolderActions
+            projectId={id}
+            projectName={name}
+            onNavigate={onRowClick}
+            onRename={startRename}
+            onDelete={() => setDeleteOpen(true)}
+          />
+        }
+        headerOverride={
+          isEditing ? (
+            <ProjectEditRow
+              initialName={name}
+              error={renameError}
+              isPending={renameProject.isPending}
+              onChange={() => setRenameError(null)}
+              onCommit={(newName) => {
+                renameProject.mutate(
+                  { id, name: newName },
+                  {
+                    onSuccess: () => cancelRename(),
+                    onError: (error) => {
+                      const status = getHttpErrorStatus(error);
+                      if (status === 409) {
+                        setRenameError("A project with this name already exists.");
+                        return;
+                      }
+                      cancelRename();
+                      showToast(
+                        status === 412
+                          ? "This project changed elsewhere. Projects have been refreshed."
+                          : "Couldn't rename project. Try again.",
+                      );
+                    },
+                  },
+                );
+              }}
+              onCancel={cancelRename}
+            />
+          ) : undefined
+        }
+        headerContextMenuContent={
+          <ContextMenuContent className="min-w-40 [&_[role=menuitem]]:text-xs">
+            <ProjectMenuItems
+              components={contextBundle}
+              projectId={id}
+              onNavigate={onRowClick}
+              onRename={startRename}
+              onDelete={() => setDeleteOpen(true)}
+            />
+          </ContextMenuContent>
         }
         footer={
           loadingFirstPage ? (
@@ -883,6 +952,12 @@ function ProjectFolder({
             />
           )
         }
+      />
+      <ProjectDeleteDialog
+        projectId={id}
+        projectName={name}
+        open={deleteOpen}
+        onOpenChange={setDeleteOpen}
       />
     </div>
   );
@@ -1091,9 +1166,8 @@ function ConversationList({
       }
     : toggleSectionCollapsed;
 
-  // Project folders default to COLLAPSED, so we track the inverse — names the
-  // user has expanded — persisted across reloads. A project shows its rows only
-  // while its name is in this set.
+  // Project folders default to COLLAPSED, so persist the stable project ids the
+  // user has expanded. Renaming a project cannot change this state.
   const [expandedProjects, setExpandedProjects] = useState<string[]>(readExpandedProjectSections);
   // True only while the open set was produced by "Expand all" and hasn't been
   // touched since. This — not "do all folders happen to be open" — is what gates
@@ -1101,12 +1175,12 @@ function ConversationList({
   // a single project) never sees a "Revert to last state" button backed by an
   // empty snapshot that would destructively collapse everything.
   const [expandedViaButton, setExpandedViaButton] = useState(false);
-  const toggleProjectExpanded = useCallback((projectName: string) => {
+  const toggleProjectExpanded = useCallback((projectId: string) => {
     setExpandedViaButton(false);
     setExpandedProjects((prev) => {
-      const next = prev.includes(projectName)
-        ? prev.filter((n) => n !== projectName)
-        : [...prev, projectName];
+      const next = prev.includes(projectId)
+        ? prev.filter((id) => id !== projectId)
+        : [...prev, projectId];
       writeExpandedProjectSections(next);
       return next;
     });
@@ -1114,11 +1188,11 @@ function ConversationList({
   // Expand a project (idempotent). Called right after a session is filed into
   // one, so the freshly populated folder — especially a brand-new project —
   // opens to reveal the session instead of appearing collapsed.
-  const expandProject = useCallback((projectName: string) => {
+  const expandProject = useCallback((projectId: string) => {
     setExpandedProjects((prev) => {
-      if (prev.includes(projectName)) return prev;
+      if (prev.includes(projectId)) return prev;
       setExpandedViaButton(false);
-      const next = [...prev, projectName];
+      const next = [...prev, projectId];
       writeExpandedProjectSections(next);
       return next;
     });
@@ -1271,8 +1345,8 @@ function ConversationList({
     // expanded AND that individual project folder is expanded (folders are
     // collapsed unless explicitly opened — inverse of the fixed sections).
     const projectsCollapsed = effectiveCollapsedSections.includes("Projects");
-    const projectVisible = (name: string, list: readonly Conversation[]) =>
-      !projectsCollapsed && expandedProjects.includes(name) ? list : [];
+    const projectVisible = (id: string, list: readonly Conversation[]) =>
+      !projectsCollapsed && expandedProjects.includes(id) ? list : [];
     // `sections` is already scoped to the active tab, so the same Pinned /
     // Projects / Sessions walk covers both tabs (Projects is empty on shared).
     return [
@@ -1288,8 +1362,8 @@ function ConversationList({
     const visible = (title: string, list: readonly Conversation[]) =>
       effectiveCollapsedSections.includes(title) ? [] : [...list];
     const projectsCollapsed = effectiveCollapsedSections.includes("Projects");
-    const projectVisible = (name: string, list: readonly Conversation[]) =>
-      !projectsCollapsed && expandedProjects.includes(name) ? [...list] : [];
+    const projectVisible = (id: string, list: readonly Conversation[]) =>
+      !projectsCollapsed && expandedProjects.includes(id) ? [...list] : [];
     return [
       ...visible("Pinned", sections.pinned),
       ...sections.projectGroups.flatMap((g) => projectVisible(g.id, g.conversations)),
@@ -1375,6 +1449,51 @@ function ConversationList({
     sections.projectGroups.length +
     sections.projectGroups.reduce((sum, g) => sum + g.conversations.length, 0);
 
+  let projectGroupAction: ReactNode = null;
+  if (!effectiveCollapsedSections.includes("Projects")) {
+    const allIds = sections.projectGroups.map((group) => group.id);
+    const allExpanded = allIds.every((id) => expandedProjects.includes(id));
+    projectGroupAction = allExpanded ? (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            aria-label="Collapse to previous"
+            data-testid="revert-projects"
+            onClick={(e) => {
+              e.stopPropagation();
+              revertProjects();
+            }}
+          >
+            <Minimize2Icon className="size-3.5" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">Collapse to previous</TooltipContent>
+      </Tooltip>
+    ) : (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            aria-label="Expand all"
+            data-testid="expand-all-projects"
+            onClick={(e) => {
+              e.stopPropagation();
+              expandAllProjects(allIds);
+            }}
+          >
+            <Maximize2Icon className="size-3.5" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">Expand all</TooltipContent>
+      </Tooltip>
+    );
+  }
+
   // Section structure comes from the muted micro-headers + whitespace
   // alone (Linear-style) — no icons or counts in the headers, no divider
   // rules between groups.
@@ -1446,60 +1565,7 @@ function ConversationList({
                 title="Projects"
                 collapsed={effectiveCollapsedSections.includes("Projects")}
                 onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
-                headerAction={(() => {
-                  // The "Projects" group itself is collapsed: its folders aren't
-                  // rendered, so expand-all / revert would be a no-op — show no
-                  // control at all.
-                  if (effectiveCollapsedSections.includes("Projects")) return null;
-                  const allIds = sections.projectGroups.map((g) => g.id);
-                  // Once every folder is open the only useful move is to undo it,
-                  // so the control flips to "revert" — which restores the set open
-                  // before "Expand all", or collapses everything when there's no
-                  // real last state (folders opened by hand). Otherwise it expands.
-                  const allExpanded = allIds.every((id) => expandedProjects.includes(id));
-                  if (allExpanded) {
-                    return (
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="icon-sm"
-                            aria-label="Collapse to previous"
-                            data-testid="revert-projects"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              revertProjects();
-                            }}
-                          >
-                            <Minimize2Icon className="size-3.5" />
-                          </Button>
-                        </TooltipTrigger>
-                        <TooltipContent side="bottom">Collapse to previous</TooltipContent>
-                      </Tooltip>
-                    );
-                  }
-                  return (
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon-sm"
-                          aria-label="Expand all"
-                          data-testid="expand-all-projects"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            expandAllProjects(allIds);
-                          }}
-                        >
-                          <Maximize2Icon className="size-3.5" />
-                        </Button>
-                      </TooltipTrigger>
-                      <TooltipContent side="bottom">Expand all</TooltipContent>
-                    </Tooltip>
-                  );
-                })()}
+                headerAction={projectGroupAction}
               >
                 {sections.projectGroups.map((group) => (
                   <ProjectFolder
@@ -1846,6 +1912,8 @@ function ConversationSection({
   emptyMessage,
   indentRows,
   headerAction,
+  headerOverride,
+  headerContextMenuContent,
   footer,
   onProjectAssigned,
 }: {
@@ -1871,6 +1939,10 @@ function ConversationSection({
   /** Optional control overlaid at the header's right edge (e.g. a project's
       kebab). Hover/focus-revealed on desktop, always shown on mobile. */
   headerAction?: ReactNode;
+  /** Replaces the header while a project name is being edited. */
+  headerOverride?: ReactNode;
+  /** Optional context-menu content opened by right-clicking the header. */
+  headerContextMenuContent?: ReactNode;
   /** Optional content rendered after the rows inside the expanded body (e.g. a
       project folder's own infinite-scroll sentinel / loading row). */
   footer?: ReactNode;
@@ -1880,28 +1952,37 @@ function ConversationSection({
 }) {
   // An untitled section is always open — there's no header to collapse it.
   const isCollapsed = title != null && collapsed;
-  return (
-    <section className="group/section relative">
-      {title && (
-        // Header + its hover-revealed kebab share a `group/header` scope so the
-        // kebab keys off hovering the header alone — NOT the whole section,
-        // which would also reveal it when hovering a child row.
-        <div className="group/header relative">
-          <SectionHeader
-            title={title}
-            icon={icon}
-            marker={marker}
-            hasAction={headerAction != null}
-            collapsed={isCollapsed}
-            onToggleCollapsed={onToggleCollapsed}
-          />
-          {headerAction && (
-            <div className="absolute top-0.5 right-1 flex items-center transition-opacity md:opacity-0 md:group-focus-within/header:opacity-100 md:group-hover/header:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100">
-              {headerAction}
-            </div>
-          )}
+  const headerBlock = title != null && (
+    <div className="group/header relative">
+      <SectionHeader
+        title={title}
+        icon={icon}
+        marker={marker}
+        hasAction={headerAction != null}
+        collapsed={isCollapsed}
+        onToggleCollapsed={onToggleCollapsed}
+      />
+      {headerAction && (
+        <div className="absolute top-0.5 right-1 flex items-center transition-opacity md:opacity-0 md:group-focus-within/header:opacity-100 md:group-hover/header:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100">
+          {headerAction}
         </div>
       )}
+    </div>
+  );
+  let header: ReactNode = headerBlock;
+  if (headerOverride) {
+    header = headerOverride;
+  } else if (headerContextMenuContent && headerBlock) {
+    header = (
+      <ContextMenu>
+        <ContextMenuTrigger asChild>{headerBlock}</ContextMenuTrigger>
+        {headerContextMenuContent}
+      </ContextMenu>
+    );
+  }
+  return (
+    <section className="group/section relative">
+      {header}
       {!isCollapsed && (
         <>
           {conversations.length === 0 && emptyMessage ? (
@@ -1945,6 +2026,7 @@ type MenuItemProps = {
   className?: string;
   disabled?: boolean;
   variant?: "default" | "destructive";
+  asChild?: boolean;
   // Radix's menu `onSelect` receives a native Event in both families.
   onSelect?: (event: Event) => void;
   "data-testid"?: string;
@@ -3021,16 +3103,26 @@ function ProjectFolderActions({
   projectId,
   projectName,
   onNavigate,
+  onRename,
+  onDelete,
 }: {
   projectId: string;
   projectName: string;
   /** Plain-left-click nav handler — closes the mobile overlay so the
       pre-filed new-session page isn't left hidden behind the sidebar. */
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
+  onRename: () => void;
+  onDelete: () => void;
 }) {
   return (
     <div className="flex items-center">
-      <ProjectFolderMenu projectId={projectId} projectName={projectName} />
+      <ProjectFolderMenu
+        projectId={projectId}
+        projectName={projectName}
+        onNavigate={onNavigate}
+        onRename={onRename}
+        onDelete={onDelete}
+      />
       <Button
         asChild
         type="button"
@@ -3055,92 +3147,253 @@ function ProjectFolderActions({
   );
 }
 
-// ── ProjectFolderMenu ─────────────────────────────────────────────────────────
+// ── ProjectMenuItems ──────────────────────────────────────────────────────────
 
-/**
- * The kebab on a project-folder header. Currently just "Delete project", which
- * removes every session filed under the project (the implicit project then
- * disappears). Confirmation is required since it deletes sessions, not just the
- * grouping.
- */
-function ProjectFolderMenu({ projectId, projectName }: { projectId: string; projectName: string }) {
-  const [menuOpen, setMenuOpen] = useState(false);
-  const [deleteOpen, setDeleteOpen] = useState(false);
-  const deleteProject = useDeleteProject();
-
+/** Shared project-folder actions for the kebab and right-click menu. */
+function ProjectMenuItems({
+  components: C,
+  projectId,
+  onNavigate,
+  onRename,
+  onDelete,
+}: {
+  components: MenuComponents;
+  projectId: string;
+  onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
+  onRename: () => void;
+  onDelete: () => void;
+}) {
   return (
     <>
-      <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
-        <DropdownMenuTrigger asChild>
+      <C.Item asChild data-testid="project-new-session-item">
+        <Link to={`/?project_id=${encodeURIComponent(projectId)}`} onClick={onNavigate}>
+          <SquarePenIcon className="size-3.5" />
+          New session
+        </Link>
+      </C.Item>
+      <C.Item data-testid="rename-project" onSelect={onRename}>
+        <PencilIcon className="size-3.5" />
+        Rename project
+      </C.Item>
+      <C.Separator />
+      <C.Item data-testid="delete-project" variant="destructive" onSelect={onDelete}>
+        <Trash2Icon className="size-3.5" />
+        Delete project
+      </C.Item>
+    </>
+  );
+}
+
+// ── ProjectFolderMenu ─────────────────────────────────────────────────────────
+
+/** The dropdown surface for the shared project-folder actions. */
+function ProjectFolderMenu({
+  projectId,
+  projectName,
+  onNavigate,
+  onRename,
+  onDelete,
+}: {
+  projectId: string;
+  projectName: string;
+  onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
+  onRename: () => void;
+  onDelete: () => void;
+}) {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-sm"
+          aria-label={`Project actions for ${projectName}`}
+          data-testid="project-actions"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <MoreHorizontalIcon className="size-3.5" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="min-w-40 [&_[role=menuitem]]:text-xs">
+        <ProjectMenuItems
+          components={dropdownBundle}
+          projectId={projectId}
+          onNavigate={onNavigate}
+          onRename={onRename}
+          onDelete={onDelete}
+        />
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+// ── ProjectDeleteDialog ───────────────────────────────────────────────────────
+
+function ProjectDeleteDialog({
+  projectId,
+  projectName,
+  open,
+  onOpenChange,
+}: {
+  projectId: string;
+  projectName: string;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const deleteProject = useDeleteProject();
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent onClick={(e) => e.stopPropagation()}>
+        <DialogHeader>
+          <DialogTitle>Delete project?</DialogTitle>
+          <DialogDescription>
+            This archives the project{" "}
+            <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em] break-all">
+              {projectName}
+            </span>{" "}
+            and <span className="font-medium">all of its sessions</span>. Their history is kept. You
+            can find and restore them anytime from Settings.
+          </DialogDescription>
+        </DialogHeader>
+        {deleteProject.isError && (
+          <p className="text-sm text-destructive" role="alert">
+            Some sessions couldn't be archived (you may not own them); the rest were archived.
+          </p>
+        )}
+        <DialogFooter className="border-t-0 bg-transparent">
           <Button
             type="button"
             variant="ghost"
-            size="icon-sm"
-            aria-label={`Project actions for ${projectName}`}
-            data-testid="project-actions"
-            // Sits on the folder header; keep its click off the collapse toggle.
-            onClick={(e) => e.stopPropagation()}
+            onClick={() => onOpenChange(false)}
+            disabled={deleteProject.isPending}
           >
-            <MoreHorizontalIcon className="size-3.5" />
+            Cancel
           </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="min-w-40 [&_[role=menuitem]]:text-xs">
-          <DropdownMenuItem
-            data-testid="delete-project"
+          <Button
+            type="button"
             variant="destructive"
-            onSelect={() => setDeleteOpen(true)}
+            disabled={deleteProject.isPending}
+            onClick={() => {
+              deleteProject.mutate(projectId, {
+                onSuccess: () => onOpenChange(false),
+              });
+            }}
           >
-            <Trash2Icon className="size-3.5" />
-            Delete project
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
-      <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>
-        <DialogContent onClick={(e) => e.stopPropagation()}>
-          <DialogHeader>
-            <DialogTitle>Delete project?</DialogTitle>
-            <DialogDescription>
-              This archives the project{" "}
-              <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em] break-all">
-                {projectName}
-              </span>{" "}
-              and <span className="font-medium">all of its sessions</span>. Their history is kept.
-              You can find and restore them anytime from Settings.
-            </DialogDescription>
-          </DialogHeader>
-          {deleteProject.isError && (
-            <p className="text-sm text-destructive" role="alert">
-              Some sessions couldn't be archived (you may not own them); the rest were archived.
-            </p>
-          )}
-          <DialogFooter className="border-t-0 bg-transparent">
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => setDeleteOpen(false)}
-              disabled={deleteProject.isPending}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="button"
-              variant="destructive"
-              disabled={deleteProject.isPending}
-              onClick={() => {
-                deleteProject.mutate(projectId, {
-                  onSuccess: () => {
-                    setDeleteOpen(false);
-                    setMenuOpen(false);
-                  },
-                });
-              }}
-            >
-              {deleteProject.isPending ? "Deleting…" : "Delete project"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-    </>
+            {deleteProject.isPending ? "Deleting…" : "Delete project"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ── ProjectEditRow ────────────────────────────────────────────────────────────
+
+function ProjectEditRow({
+  initialName,
+  error,
+  isPending,
+  onChange,
+  onCommit,
+  onCancel,
+}: {
+  initialName: string;
+  error: string | null;
+  isPending: boolean;
+  onChange: () => void;
+  onCommit: (name: string) => void;
+  onCancel: () => void;
+}) {
+  const [value, setValue] = useState(initialName);
+  const errorId = useId();
+  const inputRef = useRef<HTMLInputElement>(null);
+  const cancelledRef = useRef(false);
+  const submittedRef = useRef(false);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+    inputRef.current?.select();
+  }, []);
+
+  useEffect(() => {
+    if (error) submittedRef.current = false;
+  }, [error]);
+
+  function commit() {
+    if (cancelledRef.current || submittedRef.current || isPending) return;
+    const trimmed = value.trim();
+    if (!trimmed || trimmed === initialName) {
+      onCancel();
+      return;
+    }
+    submittedRef.current = true;
+    onCommit(trimmed);
+  }
+
+  function handleKeyDown(e: KeyboardEvent<HTMLInputElement>) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      commit();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      cancelledRef.current = true;
+      onCancel();
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center gap-1 rounded-md bg-muted py-1 pr-1 pl-2">
+        <FolderOpenIcon className="size-4 shrink-0 text-muted-foreground" />
+        <input
+          ref={inputRef}
+          type="text"
+          value={value}
+          onChange={(e) => {
+            setValue(e.target.value);
+            submittedRef.current = false;
+            if (error) onChange();
+          }}
+          onKeyDown={handleKeyDown}
+          onBlur={commit}
+          aria-label="Rename project"
+          aria-invalid={error != null}
+          aria-describedby={error ? errorId : undefined}
+          data-testid="rename-project-input"
+          className="min-w-0 flex-1 truncate rounded bg-transparent px-1 py-1 text-sm outline-none md:select-text"
+        />
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-sm"
+          aria-label="Save rename"
+          disabled={isPending}
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={commit}
+        >
+          <CheckIcon className="size-3.5" />
+        </Button>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-sm"
+          aria-label="Cancel rename"
+          disabled={isPending}
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => {
+            cancelledRef.current = true;
+            onCancel();
+          }}
+        >
+          <XIcon className="size-3.5" />
+        </Button>
+      </div>
+      {error && (
+        <p id={errorId} className="pl-2 text-destructive text-xs" role="alert">
+          {error}
+        </p>
+      )}
+    </div>
   );
 }
 
@@ -3213,11 +3466,7 @@ function ProjectPickerMenu({
       </div>
       <div className="max-h-48 overflow-y-auto">
         {filtered.map((project) => (
-          <C.Item
-            key={project.id}
-            className="px-2 py-1"
-            onSelect={() => onSelect(project.id)}
-          >
+          <C.Item key={project.id} className="px-2 py-1" onSelect={() => onSelect(project.id)}>
             <span className="flex-1 truncate text-left">{project.name}</span>
             {currentProject === project.id && (
               <CheckMarkIcon className="size-3.5 shrink-0 text-primary" />
@@ -3670,8 +3919,8 @@ function writeCollapsedSidebarSections(titles: string[]) {
   }
 }
 
-// Project folders default to collapsed, so the persisted set is the EXPANDED
-// names (empty by default = every project starts collapsed).
+// Project folders default to collapsed, so persist the EXPANDED project ids.
+// Legacy name entries do not match any id and are dropped as state is rewritten.
 function readExpandedProjectSections(): string[] {
   if (typeof window === "undefined") return [];
   try {
@@ -3685,10 +3934,10 @@ function readExpandedProjectSections(): string[] {
   }
 }
 
-function writeExpandedProjectSections(names: string[]) {
+function writeExpandedProjectSections(projectIds: string[]) {
   if (typeof window === "undefined") return;
   try {
-    window.localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(names));
+    window.localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(projectIds));
   } catch {
     // Same as collapse state — a lost local preference is harmless.
   }

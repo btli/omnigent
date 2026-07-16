@@ -60,6 +60,7 @@ vi.mock("@/hooks/useConversations", () => ({
   // be stubbed or the Sidebar throws on render.
   useProjects: () => ({ data: projectsMock }),
   useCreateProject: () => ({ mutate: vi.fn(), isPending: false }),
+  useRenameProject: () => ({ mutate: vi.fn(), isPending: false }),
   // Each project folder fetches its own sessions (server-side ?project_id=). Derive
   // them from the global-list fixture by metadata so existing tests keep seeding
   // project sessions there. Single page, no pagination, in this mock.
@@ -811,7 +812,9 @@ describe("Sidebar project sections", () => {
   it("does not render a project section when useProjects returns nothing", () => {
     // A session with a stale project label but no matching project entry stays
     // in Sessions — projects are driven by the project list, not the labels alone.
-    mockConversations([conv("conv_filed", "Claude Code", { metadata: { project_id: projectId("Ghost") } })]);
+    mockConversations([
+      conv("conv_filed", "Claude Code", { metadata: { project_id: projectId("Ghost") } }),
+    ]);
     renderSidebar();
 
     expect(screen.queryByText("Ghost")).toBeNull();

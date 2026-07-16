@@ -689,6 +689,22 @@ export interface Project {
   name: string;
 }
 
+/** HTTP failure from the conditional first-class project rename flow. */
+export class ProjectRenameError extends Error {
+  readonly status: number;
+
+  constructor(status: number, statusText: string) {
+    super(`${status} ${statusText}`);
+    this.name = "ProjectRenameError";
+    this.status = status;
+  }
+}
+
+function projectRenameStatus(error: unknown): number | null {
+  if (typeof error !== "object" || error === null || !("status" in error)) return null;
+  return typeof error.status === "number" ? error.status : null;
+}
+
 /** Fetch projects with at least one active session. */
 export function useProjects() {
   return useQuery<Project[]>({
@@ -734,6 +750,47 @@ export function useCreateProject() {
       queryClient.setQueryData<Project[]>(["projects"], (current = []) =>
         current.some((item) => item.id === project.id) ? current : [...current, project],
       );
+    },
+  });
+}
+
+/** Rename a first-class project using its latest row version. */
+export async function renameProject(projectId: string, name: string): Promise<Project> {
+  const projectUrl = `/v1/projects/${encodeURIComponent(projectId)}`;
+  const current = await authenticatedFetch(projectUrl);
+  if (!current.ok) throw new ProjectRenameError(current.status, current.statusText);
+
+  const etag = current.headers.get("ETag");
+  if (!etag) throw new Error("Project response did not include an ETag");
+
+  const renamed = await authenticatedFetch(`${projectUrl}/rename`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "If-Match": etag,
+    },
+    body: JSON.stringify({ name }),
+  });
+  if (!renamed.ok) throw new ProjectRenameError(renamed.status, renamed.statusText);
+  return (await renamed.json()) as Project;
+}
+
+export function useRenameProject() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, name }: { id: string; name: string }) => renameProject(id, name),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECTS_KEY });
+    },
+    onError: (error) => {
+      // A conflict is handled inline with the editor. Other failures may mean
+      // our project identity/name data is stale, so refresh both project lists.
+      if (projectRenameStatus(error) === 409) return;
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECTS_KEY });
     },
   });
 }

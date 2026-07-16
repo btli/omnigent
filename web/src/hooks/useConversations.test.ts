@@ -11,6 +11,7 @@ import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import {
   deleteConversation,
   renameConversation,
+  renameProject,
   createProject,
   useArchiveConversation,
   useArchivedProjects,
@@ -23,6 +24,7 @@ import {
   useProjectSessions,
   useMoveToProject,
   useRenameConversation,
+  useRenameProject,
   useStopAndDeleteConversation,
   useStopSession,
   type Conversation,
@@ -30,11 +32,15 @@ import {
 
 vi.mock("./useSessionUpdatesConnected", () => ({ useSessionUpdatesConnected: vi.fn() }));
 
-function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {
+function mockResponse(
+  body: unknown,
+  init?: { ok?: boolean; status?: number; headers?: HeadersInit },
+): Response {
   return {
     ok: init?.ok ?? true,
     status: init?.status ?? 200,
     statusText: "OK",
+    headers: new Headers(init?.headers),
     json: async () => body,
   } as unknown as Response;
 }
@@ -158,16 +164,13 @@ describe("useConversations project filtering", () => {
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
 
-    const { result } = renderHook(
-      () => useConversations("", true, {}, "proj_sprint_42"),
-      { wrapper },
-    );
+    const { result } = renderHook(() => useConversations("", true, {}, "proj_sprint_42"), {
+      wrapper,
+    });
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(fetchMock.mock.calls[0][0]).toContain("project_id=proj_sprint_42");
-    expect(
-      queryClient.getQueryState(["conversations", "", true, "proj_sprint_42"]),
-    ).toBeDefined();
+    expect(queryClient.getQueryState(["conversations", "", true, "proj_sprint_42"])).toBeDefined();
   });
 });
 
@@ -757,6 +760,57 @@ describe("first-class project APIs", () => {
     expect(url).toBe("/v1/projects");
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body as string)).toEqual({ name: "Docs" });
+  });
+
+  it("renames a project with the ETag from a fresh GET", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({ id: "proj_docs", name: "Docs" }, { headers: { ETag: '"7"' } }),
+      )
+      .mockResolvedValueOnce(mockResponse({ id: "proj_docs", name: "Documentation" }));
+
+    await expect(renameProject("proj_docs", "Documentation")).resolves.toEqual({
+      id: "proj_docs",
+      name: "Documentation",
+    });
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/projects/proj_docs");
+    const [url, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(url).toBe("/v1/projects/proj_docs/rename");
+    expect(init.method).toBe("POST");
+    expect(new Headers(init.headers).get("If-Match")).toBe('"7"');
+    expect(JSON.parse(init.body as string)).toEqual({ name: "Documentation" });
+  });
+
+  it("preserves the rename response status for conflict handling", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({ id: "proj_docs", name: "Docs" }, { headers: { ETag: '"7"' } }),
+      )
+      .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 409 }));
+
+    await expect(renameProject("proj_docs", "Existing")).rejects.toMatchObject({ status: 409 });
+  });
+
+  it("invalidates project-name caches after a rename", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({ id: "proj_docs", name: "Docs" }, { headers: { ETag: '"3"' } }),
+      )
+      .mockResolvedValueOnce(mockResponse({ id: "proj_docs", name: "Documentation" }));
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useRenameProject(), { wrapper });
+
+    result.current.mutate({ id: "proj_docs", name: "Documentation" });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["project-sessions"] });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["project-newest-session"] });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["archived-projects"] });
   });
 });
 
