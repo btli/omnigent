@@ -1150,6 +1150,47 @@ class SqlHost(OmnigentBase):
     )
 
 
+class SqlGitCredential(OmnigentBase):
+    """A per-user, per-host git credential, encrypted at rest.
+
+    The ``id`` is an opaque server-minted slot; ``owner_user_id`` and
+    ``workspace_id`` come from the authenticated request, and ``provider`` is a
+    validated snapshot of the operator host config. ``label`` distinguishes
+    multiple identities a user holds on the same host (0..n). ``token_ciphertext``
+    is a Fernet token (see :mod:`omnigent.git_hosts.crypto`) — the plaintext is
+    never stored. No foreign key (Rule R032); uniqueness is application-declared.
+    """
+
+    __tablename__ = "git_credentials"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    owner_user_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    host_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    label: Mapped[str] = mapped_column(String(128), nullable=False)
+    username: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    token_ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[int] = mapped_column(Integer)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "owner_user_id",
+            "host_id",
+            "label",
+            name="uq_git_credentials_workspace_owner_host_label",
+        ),
+    )
+
+
 class SqlUserDailyCost(OmnigentBase):
     """
     SQLAlchemy model for the ``user_daily_cost`` table.
