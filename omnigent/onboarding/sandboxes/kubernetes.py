@@ -64,6 +64,7 @@ from omnigent.host.identity import (
 from omnigent.onboarding.sandboxes.base import (
     DEFAULT_HOST_IMAGE,
     RemoteCommandResult,
+    SandboxCapabilityError,
     SandboxLauncher,
 )
 
@@ -1021,6 +1022,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         repo_url: str | None = None,
         repo_branch: str | None = None,
         repo_name: str | None = None,
+        clone_env: dict[str, str] | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> str:
         """
@@ -1045,12 +1047,22 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         :param repo_url: Repository clone URL, or ``None`` for an empty workspace.
         :param repo_branch: Branch to clone, or ``None`` for the default branch.
         :param repo_name: Directory the clone lands in, or ``None``.
+        :param clone_env: Per-clone credential env. Not yet supported by this
+            provider — the init container clone has no path to consume it, so
+            a request fails closed rather than silently cloning without the
+            credential.
         :param on_stage: Progress observer; invoked with ``"starting"``.
         :returns: The absolute in-sandbox workspace path (the cloned repository
             directory when *repo_url* is set).
         :raises click.ClickException: When creation fails or the host does not
             start in time.
+        :raises SandboxCapabilityError: When *clone_env* is set — per-host
+            clone credentials are not yet supported by this provider.
         """
+        if clone_env:
+            raise SandboxCapabilityError(
+                "the kubernetes provider does not support per-host clone credentials yet"
+            )
         _ensure_sdk()
         from kubernetes.client.rest import ApiException
         from urllib3.exceptions import HTTPError

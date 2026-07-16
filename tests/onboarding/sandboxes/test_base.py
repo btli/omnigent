@@ -146,10 +146,12 @@ def test_materialize_workspace_override_resolves_local_checkout_without_cloning(
             repo_url: str,
             repo_branch,
             repo_name,
+            clone_env=None,
             on_stage=None,
         ) -> str:
             # Resolve the repo identity to a pre-provisioned local checkout;
-            # fetch the branch into it rather than cloning the URL.
+            # fetch the branch into it rather than cloning the URL. No clone
+            # command runs here, so clone_env has nothing to attach to.
             local = f"/checkouts/{repo_name}"
             if repo_branch is not None:
                 self.run(sandbox_id, f"git -C {local} checkout {repo_branch}")

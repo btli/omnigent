@@ -647,6 +647,35 @@ def test_start_host_stops_preserved_daemon_before_launch(monkeypatch: pytest.Mon
     assert "tok-new" in commands[launch_index]
 
 
+def test_start_host_forwards_clone_env_to_the_clone_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``clone_env`` passed to Islo's ``start_host`` override reaches the base
+    exec-model clone via ``super().start_host`` — proving the pass-through,
+    not just the signature.
+    """
+    fake = _FakeIsloAPI()
+    launcher = IsloSandboxLauncher()
+    monkeypatch.setattr(launcher, "_islo", lambda: fake)
+
+    workspace = launcher.start_host(
+        "sb-1",
+        token="tok-new",
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="https://omnigent.example.com",
+        repo_url="https://git.acme.com/t/p",
+        repo_name="p",
+        clone_env={"GIT_TOKEN": "s3cret"},
+    )
+
+    assert workspace == "/root/workspace/p"
+    commands = [call.command[-1] for call in fake.exec_calls]
+    [clone_cmd] = [cmd for cmd in commands if cmd.startswith("GIT_TOKEN=")]
+    assert clone_cmd.startswith("GIT_TOKEN=s3cret git clone -- ")
+
+
 def test_terminate_deletes_sandbox_and_closes_client(monkeypatch: pytest.MonkeyPatch) -> None:
     """``terminate`` deletes the sandbox and clears the cached client."""
     fake = _FakeIsloAPI()
