@@ -4737,3 +4737,23 @@ def test_list_conversations_owned_by_excludes_shared_sessions(
         ).data
     }
     assert ids == {mine.id}
+
+
+# ── Launch generation (anti-replay counter) ───────────
+
+
+def test_increment_launch_generation_is_monotonic(conversation_store) -> None:
+    conv = conversation_store.create_conversation()
+    assert conversation_store.get_conversation(conv.id).launch_generation == 0
+    assert conversation_store.increment_launch_generation(conv.id) == 1
+    assert conversation_store.increment_launch_generation(conv.id) == 2
+    assert conversation_store.get_conversation(conv.id).launch_generation == 2
+
+
+def test_increment_launch_generation_missing_raises(conversation_store) -> None:
+    import pytest
+
+    from omnigent.stores.conversation_store import ConversationNotFoundError
+
+    with pytest.raises(ConversationNotFoundError):
+        conversation_store.increment_launch_generation("f" * 32)

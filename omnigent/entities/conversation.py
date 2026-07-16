@@ -180,6 +180,10 @@ class Conversation:
         listing (and the sidebar), surfacing only when the caller
         passes ``include_archived=True``. ``False`` for normal
         sessions; toggled via ``PATCH /v1/sessions/{id}``.
+    :param launch_generation: Monotonic per-session launch counter — 0 before
+        the first launch, incremented on the create launch and each managed
+        relaunch (not on wake). The anti-replay anchor the credential-delivery
+        handoff binds to.
     :param search_snippet: Transient, list-only excerpt of the chat
         content that matched a ``search_query`` — set by
         ``list_conversations`` whenever the query hit an item's body (even
@@ -211,6 +215,7 @@ class Conversation:
     workspace: str | None = None
     git_branch: str | None = None
     archived: bool = False
+    launch_generation: int = 0
     # Transient: populated only by list_conversations on a content search;
     # never read from or written to the DB.
     search_snippet: str | None = None

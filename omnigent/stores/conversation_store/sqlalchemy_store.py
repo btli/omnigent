@@ -159,6 +159,7 @@ def _to_conversation(
         workspace=meta.workspace if meta else None,
         git_branch=meta.git_branch if meta else None,
         archived=row.archived,
+        launch_generation=row.launch_generation,
     )
 
 
@@ -1306,6 +1307,27 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .values(session_usage=json.dumps(current))
             )
             return current
+
+    def increment_launch_generation(self, conversation_id: str) -> int:
+        """Atomically bump and return a session's launch generation.
+
+        Serialises concurrent bumps the same way as the ``next_position``
+        allocator on this AP table: ``SELECT … FOR UPDATE`` on
+        PostgreSQL/MySQL, and ``BEGIN IMMEDIATE`` (``_conv_session_immediate``)
+        on SQLite so the write lock is taken before the read.
+        """
+        with self._conv_session_immediate() as session:
+            q = select(SqlConversation).where(
+                SqlConversation.workspace_id == current_workspace_id(),
+                SqlConversation.id == conversation_id,
+            )
+            if self._supports_for_update:
+                q = q.with_for_update()
+            row = session.scalars(q).first()
+            if row is None:
+                raise ConversationNotFoundError(conversation_id)
+            row.launch_generation = (row.launch_generation or 0) + 1
+            return row.launch_generation
 
     def add_daily_cost(self, user_id: str, day_utc: str, delta_usd: float) -> None:
         """

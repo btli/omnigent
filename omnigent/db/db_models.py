@@ -660,6 +660,14 @@ class SqlConversation(ConversationBase):
     )
     # Monotonic allocator for the next item position in this conversation.
     next_position: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
+    # Monotonic per-session launch counter. Advances on the create launch and
+    # on every managed RELAUNCH (a fresh sandbox generation), NOT on a wake
+    # (which reattaches the same volume). The P1c-4 credential-delivery frame
+    # binds to it as its anti-replay anchor (runner_id alone recurs across
+    # relaunches). Starts at 0; the first launch bumps it to 1.
+    launch_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", default=0
+    )
     # Whether the session is archived (hidden from the default sidebar). Lives
     # here on the AP table so list_conversations can filter it inline alongside
     # the created_at/updated_at sort keys, instead of pre-fetching ids from the

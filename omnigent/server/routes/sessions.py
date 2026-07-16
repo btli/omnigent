@@ -6555,6 +6555,14 @@ async def _run_managed_launch(
         sandbox generation for, or ``None`` for a first launch (a
         fresh host identity is minted).
     """
+    # Advance the anti-replay launch generation for this launch/relaunch. Both
+    # the create launch and every managed relaunch funnel through here; a wake
+    # uses _run_managed_wake and deliberately does NOT bump (same volume). A
+    # row deleted mid-flight is caught downstream at the bind step, so a bump
+    # failure must not abort the launch.
+    with contextlib.suppress(ConversationNotFoundError):
+        await asyncio.to_thread(conversation_store.increment_launch_generation, session_id)
+
     managed = await _provision_managed_sandbox(
         session_id=session_id,
         owner=owner,

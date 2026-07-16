@@ -1099,6 +1099,22 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def increment_launch_generation(self, conversation_id: str) -> int:
+        """Atomically increment and return a session's launch generation.
+
+        The launch generation is a monotonic per-session counter that advances
+        on the create launch and on every managed sandbox RELAUNCH (a fresh
+        generation), but NOT on a wake (which reattaches the same volume). It
+        anchors the P1c-4 credential-delivery frame against replay of a stale
+        generation's delivery.
+
+        :param conversation_id: The session to bump.
+        :returns: The new launch generation (1 on the first launch).
+        :raises ConversationNotFoundError: When the session row is absent.
+        """
+        ...
+
+    @abstractmethod
     def set_external_session_id(
         self,
         conversation_id: str,
