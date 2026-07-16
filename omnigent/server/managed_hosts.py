@@ -893,7 +893,17 @@ def _build_clone_env(
     if repo is None:
         return None
     username = repo.clone_username or "x-access-token"
-    if repo.credential_slot_id is not None and owner is not None and credential_store is not None:
+    if repo.credential_slot_id is not None:
+        # A bound session MUST clone with its owner's slot: fail closed if the
+        # dependencies to resolve it are absent, rather than silently falling
+        # through to the operator credential or an unauthenticated clone. In the
+        # live call graph both are always threaded for a bound session (create
+        # requires the store to select a slot; relaunch refuses upstream when it
+        # is gone), so this is a local defense-in-depth backstop.
+        if owner is None or credential_store is None:
+            raise ValueError(
+                "the git credential bound to this session cannot be resolved at launch"
+            )
         # resolve_lease scopes by current_workspace_id() ambiently (see
         # GitCredentialStore). The single-tenant default (workspace 0)
         # resolves correctly with no scope wrapper here; a multi-tenant

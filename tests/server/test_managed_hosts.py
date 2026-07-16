@@ -1108,6 +1108,34 @@ def test_build_clone_env_fails_closed_when_slot_revoked(tmp_path) -> None:
     assert "SLOT_TOKEN" not in str(exc.value)  # fail-closed message names no token
 
 
+def test_build_clone_env_bound_slot_without_deps_fails_closed(tmp_path) -> None:
+    # A bound session (credential_slot_id set) MUST NOT silently fall through to
+    # the operator credential or an unauthenticated clone when the store/owner
+    # needed to resolve its slot is absent — it fails closed locally.
+    store = _cred_store(tmp_path)
+    store.create(
+        owner_user_id="alice",
+        host_id="acme",
+        provider="forgejo",
+        label="work",
+        username=None,
+        token="SLOT_TOKEN",
+    )
+    repo = resolve_repo_workspace(
+        "https://git.acme.com/team/proj",
+        _GH_HOSTS,
+        owner_user_id="alice",
+        credential_store=store,
+    )
+    assert repo.credential_slot_id is not None  # the session is bound
+    # Store gone at launch (e.g. feature disabled since create): raise, not fall through.
+    with pytest.raises(ValueError):
+        _build_clone_env(repo, owner="alice", credential_store=None)
+    # Owner not threaded: same fail-closed backstop.
+    with pytest.raises(ValueError):
+        _build_clone_env(repo, owner=None, credential_store=store)
+
+
 def test_build_clone_env_operator_source_when_no_slot(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("ACME_TOKEN", "OPERATOR_TOKEN")
     repo = resolve_repo_workspace("https://git.acme.com/team/proj", _GH_HOSTS)
