@@ -2382,3 +2382,158 @@ def test_run_host_process_announces_session_log_dir_on_start(
     out = capsys.readouterr().out
     assert "Session logs: ~/.omnigent/logs/runner/" in out
     assert "This host's log: ~/.omnigent/logs/host/host-" in out
+
+
+# ── host.deliver_credential / host.invalidate_credential ───
+
+
+def _managed_deliver_frame(
+    kp_public_b64: str, *, runner_id: str, generation: int, token: str = "ghp_tok"
+):
+    """Build a ``host.deliver_credential`` frame sealed to *kp_public_b64*.
+
+    :param kp_public_b64: Recipient public key the token is sealed to.
+    :param runner_id: Runner the credential binds to.
+    :param generation: Launch generation the credential binds to.
+    :param token: Plaintext token to seal, e.g. ``"ghp_tok"``.
+    :returns: A frame ready to hand to ``_handle_deliver_credential``.
+    """
+    from omnigent.host.frames import (
+        HostDeliverCredentialFrame,
+        build_credential_delivery_aad,
+    )
+    from omnigent.host.sealing import seal
+
+    fields = {
+        "runner_id": runner_id,
+        "launch_generation": generation,
+        "session_id": "conv_1",
+        "host_id": "host_9",
+        "credential_slot": "slot_1",
+        "canonical_host": "git.acme.com",
+        "repo_path": "/team/proj",
+        "credential_kind": "http-token",
+        "auth_scheme": "basic",
+        "username": "x-access-token",
+    }
+    aad = build_credential_delivery_aad(**fields)
+    return HostDeliverCredentialFrame(
+        request_id="req_cred_1",
+        sealed_credential=seal(token, recipient_public_key_b64=kp_public_b64, aad=aad),
+        **fields,
+    )
+
+
+def test_deliver_credential_unseals_caches_and_acks() -> None:
+    """A validly sealed delivery unseals, caches, and ACKs 'installed'."""
+    from omnigent.host.sealing import generate_sealing_keypair
+
+    proc = _make_host_process()
+    proc._sealing_keypair = generate_sealing_keypair()
+    frame = _managed_deliver_frame(
+        proc._sealing_keypair.public_key_b64, runner_id="runner_abc", generation=1
+    )
+    result = proc._handle_deliver_credential(frame)
+    assert result.status == "installed"
+    cached = proc._pending_credentials["runner_abc"]
+    assert cached.token == "ghp_tok"
+    assert cached.canonical_host == "git.acme.com"
+    assert cached.repo_path == "/team/proj"
+    assert cached.launch_generation == 1
+
+
+def test_deliver_credential_rejects_unknown_kind_without_token() -> None:
+    """A reserved (not-yet-implemented) credential_kind is NACKed, uncached.
+
+    The rejection reason must not leak the token even though it never got
+    as far as unsealing it.
+    """
+    from omnigent.host.sealing import generate_sealing_keypair
+
+    proc = _make_host_process()
+    proc._sealing_keypair = generate_sealing_keypair()
+    frame = _managed_deliver_frame(
+        proc._sealing_keypair.public_key_b64, runner_id="runner_abc", generation=1
+    )
+    frame.credential_kind = "ssh-key"  # reserved, not implemented
+    result = proc._handle_deliver_credential(frame)
+    assert result.status == "rejected"
+    assert "runner_abc" not in proc._pending_credentials
+    assert "ghp_tok" not in (result.error or "")
+
+
+def test_deliver_credential_rejects_bad_seal_without_token() -> None:
+    """A blob sealed to a different key fails the AEAD tag and is NACKed."""
+    from omnigent.host.sealing import generate_sealing_keypair
+
+    proc = _make_host_process()
+    proc._sealing_keypair = generate_sealing_keypair()
+    other = generate_sealing_keypair()
+    # Sealed to a DIFFERENT key than the host holds.
+    frame = _managed_deliver_frame(other.public_key_b64, runner_id="runner_abc", generation=1)
+    result = proc._handle_deliver_credential(frame)
+    assert result.status == "rejected"
+    assert "runner_abc" not in proc._pending_credentials
+    assert "ghp_tok" not in (result.error or "")
+
+
+def test_deliver_credential_rejects_generation_conflict() -> None:
+    """A second delivery for a runner under a different generation is a replay."""
+    from omnigent.host.sealing import generate_sealing_keypair
+
+    proc = _make_host_process()
+    proc._sealing_keypair = generate_sealing_keypair()
+    pub = proc._sealing_keypair.public_key_b64
+    assert (
+        proc._handle_deliver_credential(
+            _managed_deliver_frame(pub, runner_id="runner_abc", generation=1)
+        ).status
+        == "installed"
+    )
+    # A second delivery for the same runner with a different generation is a replay/conflict.
+    result = proc._handle_deliver_credential(
+        _managed_deliver_frame(pub, runner_id="runner_abc", generation=2)
+    )
+    assert result.status == "rejected"
+    assert proc._pending_credentials["runner_abc"].launch_generation == 1
+
+
+def test_invalidate_credential_discards_cache() -> None:
+    """host.invalidate_credential drops the cached credential for the runner."""
+    from omnigent.host.frames import HostInvalidateCredentialFrame
+    from omnigent.host.sealing import generate_sealing_keypair
+
+    proc = _make_host_process()
+    proc._sealing_keypair = generate_sealing_keypair()
+    proc._handle_deliver_credential(
+        _managed_deliver_frame(proc._sealing_keypair.public_key_b64, runner_id="r1", generation=1)
+    )
+    proc._handle_invalidate_credential(
+        HostInvalidateCredentialFrame(runner_id="r1", launch_generation=1)
+    )
+    assert "r1" not in proc._pending_credentials
+
+
+def test_handle_stop_discards_cached_credential() -> None:
+    """Stopping a runner discards any credential cached for it."""
+    from omnigent.host.sealing import generate_sealing_keypair
+
+    proc = _make_host_process()
+    proc._sealing_keypair = generate_sealing_keypair()
+    proc._handle_deliver_credential(
+        _managed_deliver_frame(proc._sealing_keypair.public_key_b64, runner_id="r1", generation=1)
+    )
+    proc._handle_stop(HostStopRunnerFrame(request_id="req", runner_id="r1"))
+    assert "r1" not in proc._pending_credentials
+
+
+def test_deliver_credential_repr_hides_token() -> None:
+    """The cached credential's repr never exposes the unsealed token."""
+    from omnigent.host.sealing import generate_sealing_keypair
+
+    proc = _make_host_process()
+    proc._sealing_keypair = generate_sealing_keypair()
+    proc._handle_deliver_credential(
+        _managed_deliver_frame(proc._sealing_keypair.public_key_b64, runner_id="r1", generation=1)
+    )
+    assert "ghp_tok" not in repr(proc._pending_credentials["r1"])

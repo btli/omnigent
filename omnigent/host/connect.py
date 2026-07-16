@@ -30,7 +30,10 @@ from omnigent.host.frames import (
     HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
     HostCreateWorktreeResultFrame,
+    HostDeliverCredentialFrame,
+    HostDeliverCredentialResultFrame,
     HostHelloFrame,
+    HostInvalidateCredentialFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
     HostListDirEntry,
@@ -45,6 +48,7 @@ from omnigent.host.frames import (
     HostStatResultFrame,
     HostStopRunnerFrame,
     HostStopRunnerResultFrame,
+    build_credential_delivery_aad,
     decode_host_frame,
     encode_host_frame,
 )
@@ -55,6 +59,12 @@ from omnigent.host.git_worktree import (
     remove_worktree,
 )
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
+from omnigent.host.sealing import (
+    SealError,
+    SealingKeypair,
+    generate_sealing_keypair,
+    unseal,
+)
 from omnigent.onboarding.harness_install import harness_setup_hint
 from omnigent.onboarding.harness_readiness import (
     configured_harness_map,
@@ -623,6 +633,41 @@ class _RunnerHandle:
     log_path: Path
 
 
+@dataclass
+class _DeliveredCredential:
+    """A git credential delivered for a pending/live runner (host-side cache).
+
+    Held from ``host.deliver_credential`` receipt until the runner exits;
+    discarded on every runner-exit path. The token is the real secret — kept
+    out of every repr/log.
+
+    :param token: The unsealed upstream git token (the real secret).
+    :param launch_generation: Generation this delivery is bound to.
+    :param session_id: Session the runner serves.
+    :param credential_slot: Server-side slot id the token came from.
+    :param canonical_host: Host the swap binds to, e.g. ``"git.acme.com"``.
+    :param repo_path: Repo path prefix the egress rule scopes to.
+    :param auth_scheme: Upstream ``Authorization`` scheme.
+    :param username: Basic-auth username, or ``None``.
+    """
+
+    token: str
+    launch_generation: int
+    session_id: str
+    credential_slot: str
+    canonical_host: str
+    repo_path: str
+    auth_scheme: str
+    username: str | None
+
+    def __repr__(self) -> str:
+        return (
+            "_DeliveredCredential(token=<redacted>, "
+            f"canonical_host={self.canonical_host!r}, "
+            f"launch_generation={self.launch_generation})"
+        )
+
+
 class HostProcess:
     """Manages the host daemon lifecycle.
 
@@ -647,6 +692,15 @@ class HostProcess:
         self._identity = identity
         self._server_url = server_url.rstrip("/")
         self._runners: dict[str, _RunnerHandle] = {}
+        # Git credentials delivered per pending/live runner, keyed by
+        # runner_id. Populated by host.deliver_credential (pre-spawn),
+        # consumed at _handle_launch, discarded on every runner-exit path.
+        # Kept across a transient tunnel reconnect (this process survives it);
+        # re-delivery happens only on relaunch (a fresh runner_id).
+        self._pending_credentials: dict[str, _DeliveredCredential] = {}
+        # X25519 keypair advertised on host.hello so the server can seal
+        # delivered credentials to it. Regenerated on every (re)connect.
+        self._sealing_keypair: SealingKeypair | None = None
         # Set on the first accepted WS upgrade. Distinguishes a host that
         # never authenticated (login redirects turn fatal after
         # _LOGIN_REDIRECT_FATAL_ATTEMPTS) from a live host hit by a server
@@ -1166,6 +1220,7 @@ class HostProcess:
         :returns: Result frame with status.
         """
         handle = self._runners.pop(frame.runner_id, None)
+        self._pending_credentials.pop(frame.runner_id, None)
         if handle is None:
             return HostStopRunnerResultFrame(
                 request_id=frame.request_id,
@@ -1187,6 +1242,118 @@ class HostProcess:
         return HostStopRunnerResultFrame(
             request_id=frame.request_id,
             status="stopped",
+        )
+
+    def _handle_deliver_credential(
+        self,
+        frame: HostDeliverCredentialFrame,
+    ) -> HostDeliverCredentialResultFrame:
+        """Unseal, validate, and cache a delivered git credential.
+
+        Sent (and ACKed) before ``host.launch_runner`` so the credential is
+        cached before the runner spawns. The unsealed token is threaded into
+        the runner at spawn (see :meth:`_handle_launch`) and never leaves the
+        trusted parent. Rejects (NACKs) without ever naming a token.
+
+        :param frame: The delivery frame.
+        :returns: ``"installed"`` on success, else ``"rejected"`` with a
+            token-free reason.
+        """
+        if self._sealing_keypair is None:  # pragma: no cover — hello sets it
+            return HostDeliverCredentialResultFrame(
+                request_id=frame.request_id,
+                status="rejected",
+                error="host connection has no sealing key",
+            )
+        # Only HTTPS-token swaps are implemented; ssh-key / oauth are reserved
+        # envelope values that slot in later without a frame redesign.
+        if frame.credential_kind != "http-token":
+            return HostDeliverCredentialResultFrame(
+                request_id=frame.request_id,
+                status="rejected",
+                error=f"unsupported credential kind: {frame.credential_kind!r}",
+            )
+        # Binding validation (anti-replay): delivery must be pre-spawn, and a
+        # runner must not be re-bound to a different generation.
+        if frame.runner_id in self._runners:
+            return HostDeliverCredentialResultFrame(
+                request_id=frame.request_id,
+                status="rejected",
+                error="runner already launched",
+            )
+        existing = self._pending_credentials.get(frame.runner_id)
+        if existing is not None and existing.launch_generation != frame.launch_generation:
+            return HostDeliverCredentialResultFrame(
+                request_id=frame.request_id,
+                status="rejected",
+                error="credential generation conflict",
+            )
+        # Rebuild the AAD from the RECEIVED frame's binding fields: if any was
+        # tampered, or the blob is replayed under a different identity, the tag
+        # check fails and we reject without ever exposing a token.
+        aad = build_credential_delivery_aad(
+            runner_id=frame.runner_id,
+            launch_generation=frame.launch_generation,
+            session_id=frame.session_id,
+            host_id=frame.host_id,
+            credential_slot=frame.credential_slot,
+            canonical_host=frame.canonical_host,
+            repo_path=frame.repo_path,
+            credential_kind=frame.credential_kind,
+            auth_scheme=frame.auth_scheme,
+            username=frame.username,
+        )
+        try:
+            token = unseal(
+                frame.sealed_credential,
+                private_key=self._sealing_keypair.private_key,
+                aad=aad,
+            )
+        except SealError:
+            return HostDeliverCredentialResultFrame(
+                request_id=frame.request_id,
+                status="rejected",
+                error="could not unseal delivered credential",
+            )
+        self._pending_credentials[frame.runner_id] = _DeliveredCredential(
+            token=token,
+            launch_generation=frame.launch_generation,
+            session_id=frame.session_id,
+            credential_slot=frame.credential_slot,
+            canonical_host=frame.canonical_host,
+            repo_path=frame.repo_path,
+            auth_scheme=frame.auth_scheme,
+            username=frame.username,
+        )
+        _logger.info(
+            "Cached delivered credential for runner %s (host %s, generation %d)",
+            frame.runner_id,
+            frame.canonical_host,
+            frame.launch_generation,
+        )
+        return HostDeliverCredentialResultFrame(
+            request_id=frame.request_id,
+            status="installed",
+        )
+
+    def _handle_invalidate_credential(
+        self,
+        frame: HostInvalidateCredentialFrame,
+    ) -> None:
+        """Discard a cached credential (one-way; contract-only in P1).
+
+        The live runner still holds the credential in its own egress-proxy
+        heap (there is no post-spawn rotate channel); operational revocation
+        is kill+relaunch. This only drops the host's cached copy.
+
+        :param frame: The invalidate frame.
+        :returns: None.
+        """
+        self._pending_credentials.pop(frame.runner_id, None)
+        _logger.info(
+            "Discarded cached credential for runner %s (generation %d)",
+            frame.runner_id,
+            frame.launch_generation,
         )
 
     async def _watch_runner(self, runner_id: str) -> None:
@@ -1215,6 +1382,7 @@ class HostProcess:
             # _handle_stop (or _cleanup_runners) removed it first —
             # an intentional termination, not a crash to report.
             return
+        self._pending_credentials.pop(runner_id, None)
         error = _runner_exit_error(handle.proc.returncode, handle.log_path)
         _logger.warning("Runner %s died unexpectedly: %s", runner_id, error)
         await self._report_runner_exit(runner_id, error)
@@ -1722,6 +1890,7 @@ class HostProcess:
             except subprocess.TimeoutExpired:
                 handle.proc.kill()
         self._runners.clear()
+        self._pending_credentials.clear()
 
     async def _connect_and_serve(self) -> None:
         """Single connection attempt: connect, hello, serve.
@@ -1844,6 +2013,7 @@ class HostProcess:
             _tel_opt_out = _tel_disabled()
         except Exception:  # noqa: BLE001 — telemetry errors must not abort hello
             pass
+        self._sealing_keypair = generate_sealing_keypair()
         hello = HostHelloFrame(
             version=VERSION,
             frame_protocol_version=1,
@@ -1855,6 +2025,7 @@ class HostProcess:
             # launch-time check above stays the authoritative gate.
             configured_harnesses=await asyncio.to_thread(configured_harness_map),
             telemetry_opt_out=_tel_opt_out,
+            sealing_public_key=self._sealing_keypair.public_key_b64,
         )
         await ws.send(encode_host_frame(hello))
         self._ws = ws
@@ -1955,6 +2126,10 @@ class HostProcess:
             await ws.send(encode_host_frame(await self._handle_remove_worktree(frame)))
         elif isinstance(frame, HostListWorktreesFrame):
             await ws.send(encode_host_frame(await self._handle_list_worktrees(frame)))
+        elif isinstance(frame, HostDeliverCredentialFrame):
+            await ws.send(encode_host_frame(self._handle_deliver_credential(frame)))
+        elif isinstance(frame, HostInvalidateCredentialFrame):
+            self._handle_invalidate_credential(frame)
 
 
 def run_host_process(
