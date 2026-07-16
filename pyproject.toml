@@ -104,6 +104,7 @@ dependencies = [
     # (omnigent/api/routing/v1/routing.proto).
     # Previously only a transitive dep; declared directly now that we ship a proto.
     "protobuf>=6,<7",
+    "cryptography>=43",
 ]
 
 [project.optional-dependencies]
