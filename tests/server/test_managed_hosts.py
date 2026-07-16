@@ -1066,6 +1066,64 @@ def test_build_clone_env_missing_secret_raises(monkeypatch: pytest.MonkeyPatch) 
         _build_clone_env(repo)
 
 
+def test_build_clone_env_uses_owner_slot_lease(tmp_path) -> None:
+    store = _cred_store(tmp_path)
+    store.create(
+        owner_user_id="alice",
+        host_id="acme",
+        provider="forgejo",
+        label="work",
+        username=None,
+        token="SLOT_TOKEN",
+    )
+    repo = resolve_repo_workspace(
+        "https://git.acme.com/team/proj",
+        _GH_HOSTS,
+        owner_user_id="alice",
+        credential_store=store,
+    )
+    env = _build_clone_env(repo, owner="alice", credential_store=store)
+    assert env == {"GIT_TOKEN": "SLOT_TOKEN", "GIT_USERNAME": "oauth2"}
+
+
+def test_build_clone_env_fails_closed_when_slot_revoked(tmp_path) -> None:
+    store = _cred_store(tmp_path)
+    slot = store.create(
+        owner_user_id="alice",
+        host_id="acme",
+        provider="forgejo",
+        label="work",
+        username=None,
+        token="SLOT_TOKEN",
+    )
+    repo = resolve_repo_workspace(
+        "https://git.acme.com/team/proj",
+        _GH_HOSTS,
+        owner_user_id="alice",
+        credential_store=store,
+    )
+    store.delete(slot.id)  # owner lost the slot between create and launch
+    with pytest.raises(ValueError) as exc:
+        _build_clone_env(repo, owner="alice", credential_store=store)
+    assert "SLOT_TOKEN" not in str(exc.value)  # fail-closed message names no token
+
+
+def test_build_clone_env_operator_source_when_no_slot(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("ACME_TOKEN", "OPERATOR_TOKEN")
+    repo = resolve_repo_workspace("https://git.acme.com/team/proj", _GH_HOSTS)
+    env = _build_clone_env(repo, owner="alice", credential_store=None)
+    assert env == {"GIT_TOKEN": "OPERATOR_TOKEN", "GIT_USERNAME": "oauth2"}
+
+
+def test_build_clone_env_github_default_unchanged() -> None:
+    # Backward compat: github.com default -> no credential_source, no slot ->
+    # None (the ambient GIT_TOKEN path is preserved).
+    repo = resolve_repo_workspace("https://github.com/org/repo", _GH_HOSTS)
+    assert _build_clone_env(repo, owner="alice", credential_store=None) is None
+    # And the legacy no-arg / no-repo forms still work unchanged.
+    assert _build_clone_env(None) is None
+
+
 # ── relaunch binding: persistence + re-authorization ────────
 
 

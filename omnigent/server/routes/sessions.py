@@ -290,6 +290,7 @@ from omnigent.stores.conversation_store import (
     NameAlreadyExistsError,
 )
 from omnigent.stores.file_store import FileStore
+from omnigent.stores.git_credential_store import GitCredentialStore
 from omnigent.stores.host_store import Host, HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.telemetry import emit as _tel_emit
@@ -6506,6 +6507,7 @@ async def _run_managed_launch(
     host_registry: HostRegistry | None,
     tunnel_registry: TunnelRegistry | None,
     relaunch_host: Host | None = None,
+    credential_store: GitCredentialStore | None = None,
 ) -> None:
     """
     Provision a managed sandbox for a session in the background.
@@ -6554,6 +6556,9 @@ async def _run_managed_launch(
     :param relaunch_host: Existing managed host row to relaunch a new
         sandbox generation for, or ``None`` for a first launch (a
         fresh host identity is minted).
+    :param credential_store: Per-user git credential store used to
+        resolve the owner's selected slot at launch, or ``None`` when
+        the feature is not configured.
     """
     # Advance the anti-replay launch generation for this launch/relaunch. Both
     # the create launch and every managed relaunch funnel through here; a wake
@@ -6571,6 +6576,7 @@ async def _run_managed_launch(
         tracker=tracker,
         host_store=host_store,
         relaunch_host=relaunch_host,
+        credential_store=credential_store,
     )
     if managed is None:
         return
@@ -6595,6 +6601,7 @@ async def _provision_managed_sandbox(
     tracker: ManagedLaunchTracker,
     host_store: HostStore,
     relaunch_host: Host | None,
+    credential_store: GitCredentialStore | None = None,
 ) -> ManagedHostLaunch | None:
     """
     Run the provision phase of a background managed launch.
@@ -6612,6 +6619,9 @@ async def _provision_managed_sandbox(
     :param host_store: Persistent host registrations.
     :param relaunch_host: Existing host row for a relaunch, or
         ``None`` for a first launch.
+    :param credential_store: Per-user git credential store used to
+        resolve the owner's selected slot at launch, or ``None`` when
+        the feature is not configured.
     :returns: The launch result, or ``None`` when the launch failed
         (the tracker entry is already settled with the reason).
     """
@@ -6636,6 +6646,7 @@ async def _provision_managed_sandbox(
                 host=relaunch_host,
                 host_store=host_store,
                 repo=repo,
+                credential_store=credential_store,
                 on_stage=_on_stage,
             )
         return await launch_managed_host(
@@ -6643,6 +6654,7 @@ async def _provision_managed_sandbox(
             owner=owner,
             host_store=host_store,
             repo=repo,
+            credential_store=credential_store,
             on_stage=_on_stage,
         )
     except HTTPException as exc:
@@ -7120,6 +7132,7 @@ def _kick_managed_relaunch(
             host_registry=getattr(app_state, "host_registry", None),
             tunnel_registry=getattr(app_state, "tunnel_registry", None),
             relaunch_host=host,
+            credential_store=getattr(app_state, "git_credential_store", None),
         )
     )
     _managed_launch_tasks.add(relaunch_task)
@@ -14728,6 +14741,7 @@ def create_sessions_router(
                     host_store=host_store_for_managed,
                     host_registry=getattr(request.app.state, "host_registry", None),
                     tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+                    credential_store=getattr(request.app.state, "git_credential_store", None),
                 )
             )
             _managed_launch_tasks.add(launch_task)

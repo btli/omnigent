@@ -863,23 +863,61 @@ def reauthorize_relaunch_binding(
     return repo
 
 
-def _build_clone_env(repo: RepoWorkspace | None) -> dict[str, str] | None:
-    """Resolve a repo's operator credential into per-clone env, or ``None``.
+def _build_clone_env(
+    repo: RepoWorkspace | None,
+    *,
+    owner: str | None = None,
+    credential_store: GitCredentialStore | None = None,
+) -> dict[str, str] | None:
+    """Resolve a repo's credential into per-clone env, or ``None``.
 
-    Resolution happens in the trusted server process at launch time; only the
-    resolved value rides the single prefixed clone command (launch-scoped —
-    see the ``clone_env`` launcher contract). The github.com default carries
-    no ``credential_source`` and keeps today's ambient-``GIT_TOKEN`` behavior.
+    Precedence (design §12.3): the session *owner's* selected credential slot
+    for the resolved host (decrypted here, in the trusted server process), else
+    the operator host ``credential_source``, else ``None`` (the github.com
+    default keeps today's ambient-``GIT_TOKEN`` behavior). The resolved value
+    rides only the single prefixed clone command (launch-scoped) and never
+    enters ``RepoWorkspace``.
+
+    ``repo.host_id`` is the operator GIT-host id the credential is keyed by —
+    NOT the sandbox host id.
 
     :param repo: The enriched workspace, or ``None`` for no-repo launches.
+    :param owner: The session owner the credential slot must belong to.
+    :param credential_store: The per-user credential store, or ``None`` when
+        the feature is not configured (opt-in).
     :returns: ``{"GIT_TOKEN": ..., "GIT_USERNAME": ...}`` or ``None``.
-    :raises ValueError: When the configured source cannot be resolved —
-        provisioning must fail loudly rather than clone unauthenticated.
+    :raises ValueError: When a bound slot cannot be resolved for *owner* at
+        launch (fail closed — never clone unauthenticated), or when the
+        operator source cannot be resolved. The token is never in the message.
     """
-    if repo is None or repo.credential_source is None:
+    if repo is None:
+        return None
+    username = repo.clone_username or "x-access-token"
+    if repo.credential_slot_id is not None and owner is not None and credential_store is not None:
+        # resolve_lease scopes by current_workspace_id() ambiently (see
+        # GitCredentialStore). The single-tenant default (workspace 0)
+        # resolves correctly with no scope wrapper here; a multi-tenant
+        # deployment must run this launch inside the session's
+        # workspace_scope so the lookup lands in the right workspace —
+        # threading that scope through the background launch task is a
+        # follow-up, not covered by this resolution seam.
+        lease = credential_store.resolve_lease(
+            owner_user_id=owner,
+            host_id=repo.host_id or "",
+            credential_id=repo.credential_slot_id,
+        )
+        if lease is None:
+            # The owner lost access or the slot was deleted between create and
+            # launch. Fail closed rather than clone unauthenticated. No token
+            # is named in this message.
+            raise ValueError(
+                "the git credential bound to this session is no longer available to its owner"
+            )
+        return {"GIT_TOKEN": lease.token, "GIT_USERNAME": username}
+    if repo.credential_source is None:
         return None
     token = resolve_credential(repo.credential_source, parent_env=os.environ.copy())
-    return {"GIT_TOKEN": token, "GIT_USERNAME": repo.clone_username or "x-access-token"}
+    return {"GIT_TOKEN": token, "GIT_USERNAME": username}
 
 
 def _modal_launcher_factory(
@@ -2056,6 +2094,7 @@ async def launch_managed_host(
     owner: str,
     host_store: HostStore,
     repo: RepoWorkspace | None = None,
+    credential_store: GitCredentialStore | None = None,
     on_stage: Callable[[str], None] | None = None,
 ) -> ManagedHostLaunch:
     """
@@ -2084,6 +2123,9 @@ async def launch_managed_host(
         host image's git credential helper when the sandbox env
         carries ``GIT_TOKEN`` (injected through Modal secrets — see
         deploy/modal/README.md "Git credentials").
+    :param credential_store: Per-user git credential store used to
+        resolve the owner's selected slot at launch, or ``None`` when
+        the feature is not configured.
     :param on_stage: Progress observer invoked as the launch pipeline
         advances, with the stage just entered: ``"cloning"`` (when
         *repo* is set) then ``"starting"``. May be called from a
@@ -2119,6 +2161,7 @@ async def launch_managed_host(
         owner=owner,
         sandbox_id=sandbox_id,
         repo=repo,
+        credential_store=credential_store,
         on_stage=on_stage,
     )
     return ManagedHostLaunch(host_id=host_id, workspace=workspace)
@@ -2130,6 +2173,7 @@ async def relaunch_managed_host(
     host: Host,
     host_store: HostStore,
     repo: RepoWorkspace | None = None,
+    credential_store: GitCredentialStore | None = None,
     on_stage: Callable[[str], None] | None = None,
 ) -> ManagedHostLaunch:
     """
@@ -2157,6 +2201,9 @@ async def relaunch_managed_host(
     :param host_store: Persistent host registrations.
     :param repo: Repository to re-clone as the workspace, or ``None``
         for an empty workspace.
+    :param credential_store: Per-user git credential store used to
+        resolve the owner's selected slot at launch, or ``None`` when
+        the feature is not configured.
     :param on_stage: Progress observer forwarded to
         :func:`_arm_and_start_host`; see :func:`launch_managed_host`.
         ``None`` disables progress reporting.
@@ -2195,6 +2242,7 @@ async def relaunch_managed_host(
         owner=host.owner,
         sandbox_id=sandbox_id,
         repo=repo,
+        credential_store=credential_store,
         on_stage=on_stage,
         keep_host_on_failure=True,
     )
@@ -2213,6 +2261,7 @@ async def _arm_and_start_host(
     repo: RepoWorkspace | None = None,
     on_stage: Callable[[str], None] | None = None,
     keep_host_on_failure: bool = False,
+    credential_store: GitCredentialStore | None = None,
 ) -> str:
     """
     Arm the credential, start the in-sandbox host, and await its
@@ -2244,6 +2293,9 @@ async def _arm_and_start_host(
     :param keep_host_on_failure: ``True`` on a relaunch — failure
         cleanup terminates the new sandbox and revokes the token but
         keeps the host row. ``False`` (first launch) deletes the row.
+    :param credential_store: Per-user git credential store used to
+        resolve the owner's selected slot at launch, or ``None`` when
+        the feature is not configured.
     :returns: The absolute in-sandbox workspace path.
     :raises HTTPException: 502 when cloning, host startup, or
         registration fails.
@@ -2265,7 +2317,7 @@ async def _arm_and_start_host(
         # a token that already resolves. The exec-model default execs in; the
         # entrypoint model (k8s) creates the Pod that boots the host. *repo* is
         # unpacked into primitives — the launcher API takes no RepoWorkspace.
-        clone_env = _build_clone_env(repo)
+        clone_env = _build_clone_env(repo, owner=owner, credential_store=credential_store)
         workspace = await asyncio.to_thread(
             launcher.start_host,
             sandbox_id,
