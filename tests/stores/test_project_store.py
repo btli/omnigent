@@ -63,6 +63,59 @@ def test_name_uniqueness_is_normalized_and_per_owner(
     assert bob.owner_principal_id == "bob"
 
 
+def test_transfer_rekeys_owner_and_provisions_destination_user(
+    store: SqlAlchemyProjectStore,
+) -> None:
+    project = store.create("local", "Migrated")
+
+    transferred = store.transfer(
+        project.id,
+        "local",
+        "alice",
+        expected_row_version=project.row_version,
+    )
+
+    assert transferred is not None
+    assert transferred.owner_principal_id == "alice"
+    assert transferred.row_version == project.row_version + 1
+    assert store.get(project.id, "local") is None
+    assert store.get(project.id, "alice") == transferred
+
+
+def test_transfer_enforces_destination_name_uniqueness_and_if_match(
+    store: SqlAlchemyProjectStore,
+) -> None:
+    source = store.create("local", "Existing")
+    store.create("alice", "existing")
+
+    with pytest.raises(OmnigentError) as collision:
+        store.transfer(
+            source.id,
+            "local",
+            "alice",
+            expected_row_version=source.row_version,
+        )
+    assert collision.value.code == ErrorCode.CONFLICT
+
+    with pytest.raises(OmnigentError) as stale:
+        store.transfer(
+            source.id,
+            "local",
+            "bob",
+            expected_row_version=source.row_version + 1,
+        )
+    assert stale.value.code == ErrorCode.PRECONDITION_FAILED
+    assert (
+        store.transfer(
+            source.id,
+            "mallory",
+            "bob",
+            expected_row_version=source.row_version,
+        )
+        is None
+    )
+
+
 def test_owner_and_workspace_scoping_hide_projects(
     store: SqlAlchemyProjectStore,
 ) -> None:
@@ -304,7 +357,7 @@ def test_label_backfill_is_idempotent_and_writes_atomic_backfill_snapshot(
     persisted = conversations.get_conversation(session_id)
     assert persisted is not None and PROJECT_LABEL_KEY not in persisted.labels
     assert conversations.list_project_label_workspace_ids() == []
-    assert [project.name for project in conversations.list_projects("alice")] == ["Omnigent"]
+    assert [project.name for project in store.list("alice")] == ["Omnigent"]
     assert {
         conversation.id
         for conversation in conversations.list_conversations(project_id=project_id).data

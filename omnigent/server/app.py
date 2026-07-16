@@ -2134,7 +2134,11 @@ def create_app(
 
     if project_store is not None:
         app.include_router(
-            create_projects_router(project_store, auth_provider=auth_provider),
+            create_projects_router(
+                project_store,
+                auth_provider=auth_provider,
+                conversation_store=conversation_store,
+            ),
             prefix="/v1",
             tags=["projects"],
         )

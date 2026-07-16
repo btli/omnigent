@@ -69,8 +69,26 @@ class ProjectStore(ABC):
         ...
 
     @abstractmethod
-    def list(self, owner_principal_id: str, *, include_archived: bool = False) -> list[Project]:
+    def list(
+        self,
+        owner_principal_id: str,
+        *,
+        include_archived: bool = False,
+        archived_members: bool = False,
+    ) -> list[Project]:
         """List projects owned by one principal."""
+        ...
+
+    @abstractmethod
+    def transfer(
+        self,
+        project_id: str,
+        current_owner: str,
+        new_owner: str,
+        *,
+        expected_row_version: int | None,
+    ) -> Project | None:
+        """Compare-and-set a project's owner principal."""
         ...
 
     @abstractmethod

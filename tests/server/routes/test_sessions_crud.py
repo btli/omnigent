@@ -175,12 +175,12 @@ async def test_patch_session_not_found(client: httpx.AsyncClient) -> None:
     assert resp.status_code == 404
 
 
-# ── GET /v1/sessions/projects ────────────────────────────────────────
+# ── GET /v1/projects ─────────────────────────────────────────────────
 
 
 async def test_list_projects_empty(client: httpx.AsyncClient) -> None:
     """No project rows anywhere means an empty project list."""
-    resp = await client.get("/v1/sessions/projects")
+    resp = await client.get("/v1/projects")
     assert resp.status_code == 200
     assert resp.json() == []
 
@@ -199,9 +199,9 @@ async def test_list_projects_returns_names_sorted(
     conv_store.set_project_membership(a.id, sprint.id)
     conv_store.set_project_membership(b.id, customer.id)
 
-    resp = await client.get("/v1/sessions/projects")
+    resp = await client.get("/v1/projects")
     assert resp.status_code == 200
-    assert resp.json() == [
+    assert [{"id": item["id"], "name": item["name"]} for item in resp.json()] == [
         {"id": customer.id, "name": "Customer X"},
         {"id": sprint.id, "name": "Sprint 42"},
     ]
@@ -214,10 +214,17 @@ async def test_list_projects_includes_memberless_project(
     """A first-class project persists in the live list without sessions."""
     project = SqlAlchemyProjectStore(db_uri).create(RESERVED_USER_LOCAL, "Empty")
 
-    resp = await client.get("/v1/sessions/projects")
+    resp = await client.get("/v1/projects")
 
     assert resp.status_code == 200
-    assert resp.json() == [{"id": project.id, "name": "Empty"}]
+    assert [{"id": item["id"], "name": item["name"]} for item in resp.json()] == [
+        {"id": project.id, "name": "Empty"}
+    ]
+
+
+async def test_legacy_session_projects_route_is_removed(client: httpx.AsyncClient) -> None:
+    resp = await client.get("/v1/sessions/projects")
+    assert resp.status_code == 404
 
 
 # ── GET /v1/sessions?project_id= (filter) ────────────────────────────

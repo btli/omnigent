@@ -11,7 +11,7 @@ The web UI move submenu is labelled "Add to project" (unfiled) or
 "Move session" (already filed); both share ``data-testid="move-to-project"``.
 
 These drive the real chain the ``Sidebar`` unit tests mock out: the kebab
-submenu → the PATCH → the refreshed ``GET /v1/sessions/projects`` and
+submenu → the PATCH → the refreshed ``GET /v1/projects`` and
 ``GET /v1/sessions`` lists → the row landing under (or leaving) a project
 folder. Project folders render collapsed by default, so the tests expand the
 folder to assert membership.

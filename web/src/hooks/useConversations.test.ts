@@ -707,7 +707,7 @@ describe("useBulkStopSessions", () => {
 });
 
 describe("useProjects", () => {
-  it("GETs /v1/sessions/projects and returns the project list", async () => {
+  it("GETs /v1/projects and returns the project list", async () => {
     const projects = [
       { id: "proj_customer_x", name: "Customer X" },
       { id: "proj_sprint_42", name: "Sprint 42" },
@@ -720,7 +720,7 @@ describe("useProjects", () => {
     const { result } = renderHook(() => useProjects(), { wrapper });
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/projects");
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/projects");
     expect(result.current.data).toEqual(projects);
   });
 
@@ -746,7 +746,7 @@ describe("first-class project APIs", () => {
     const { result } = renderHook(() => useArchivedProjects(), { wrapper });
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/projects?archived=true");
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/projects?archived_members=true");
     expect(result.current.data).toEqual(projects);
   });
 
@@ -936,44 +936,15 @@ describe("useArchiveConversation", () => {
 });
 
 describe("useDeleteProject", () => {
-  function archivedConv(id: string) {
-    return mockResponse({
-      id,
-      object: "conversation",
-      title: id,
-      created_at: 0,
-      updated_at: 10,
-      archived: true,
-      labels: {},
-      project_id: "proj_sprint_42",
-    });
-  }
-
-  it("archives every member and then archives the project row with its ETag", async () => {
-    // List members, archive each one, read the project ETag, then archive the row.
+  it("archives members and the project with one server mutation", async () => {
     fetchMock
-      .mockResolvedValueOnce(
-        mockResponse({
-          data: [
-            { id: "conv_a", object: "conversation", title: "A", created_at: 0, updated_at: 1 },
-            { id: "conv_b", object: "conversation", title: "B", created_at: 0, updated_at: 2 },
-          ],
-          first_id: "conv_a",
-          last_id: "conv_b",
-          has_more: false,
-        }),
-      )
-      .mockResolvedValueOnce(archivedConv("conv_a"))
-      .mockResolvedValueOnce(archivedConv("conv_b"))
       .mockResolvedValueOnce(
         mockResponse(
           { id: "proj_sprint_42", name: "Sprint 42", row_version: 7 },
           { headers: { ETag: '"7"' } },
         ),
       )
-      .mockResolvedValueOnce(
-        mockResponse({ id: "proj_sprint_42", name: "Sprint 42", row_version: 8 }),
-      );
+      .mockResolvedValueOnce(mockResponse({ archived_sessions: 2 }));
 
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
     const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
@@ -984,28 +955,9 @@ describe("useDeleteProject", () => {
     result.current.mutate("proj_sprint_42");
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
-    // The list fetch is filtered by project and includes archived members.
-    const listUrl = fetchMock.mock.calls[0][0] as string;
-    expect(listUrl).toContain("project_id=proj_sprint_42");
-    expect(listUrl).toContain("include_archived=true");
-
-    // Each member is archived via PATCH — NOT deleted, and project membership is
-    // left intact so unarchiving restores the session to its project.
-    const patches = (fetchMock.mock.calls.slice(1, 3) as [string, RequestInit][]).map(
-      ([url, init]) => ({ url, init }),
-    );
-    expect(patches.map((p) => p.url).sort()).toEqual([
-      "/v1/sessions/conv_a",
-      "/v1/sessions/conv_b",
-    ]);
-    for (const { init } of patches) {
-      expect(init.method).toBe("PATCH");
-      expect(JSON.parse(init.body as string)).toEqual({ archived: true });
-    }
-
-    expect(fetchMock.mock.calls[3][0]).toBe("/v1/projects/proj_sprint_42");
-    const [archiveUrl, archiveInit] = fetchMock.mock.calls[4] as [string, RequestInit];
-    expect(archiveUrl).toBe("/v1/projects/proj_sprint_42/archive");
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/projects/proj_sprint_42");
+    const [archiveUrl, archiveInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(archiveUrl).toBe("/v1/projects/proj_sprint_42/archive?include_sessions=true");
     expect(archiveInit.method).toBe("POST");
     expect(new Headers(archiveInit.headers).get("If-Match")).toBe('"7"');
 
@@ -1013,50 +965,8 @@ describe("useDeleteProject", () => {
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });
   });
 
-  it("throws with succeeded/failed split when some archives fail", async () => {
-    fetchMock
-      .mockResolvedValueOnce(
-        mockResponse({
-          data: [
-            { id: "conv_a", object: "conversation", title: "A", created_at: 0, updated_at: 1 },
-            { id: "conv_b", object: "conversation", title: "B", created_at: 0, updated_at: 2 },
-          ],
-          first_id: "conv_a",
-          last_id: "conv_b",
-          has_more: false,
-        }),
-      )
-      .mockResolvedValueOnce(archivedConv("conv_a"))
-      .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 403 }));
-
-    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
-    const wrapper = ({ children }: { children: ReactNode }) =>
-      createElement(QueryClientProvider, { client: queryClient }, children);
-    const { result } = renderHook(() => useDeleteProject(), { wrapper });
-
-    result.current.mutate("proj_sprint_42");
-    await waitFor(() => expect(result.current.isError).toBe(true));
-
-    const err = result.current.error as unknown as {
-      failed: string[];
-      succeeded: string[];
-      total: number;
-    };
-    expect(err.failed).toEqual(["conv_b"]);
-    expect(err.succeeded).toEqual(["conv_a"]);
-    expect(err.total).toBe(2);
-  });
-
   it("preserves the project archive response status", async () => {
     fetchMock
-      .mockResolvedValueOnce(
-        mockResponse({
-          data: [],
-          first_id: null,
-          last_id: null,
-          has_more: false,
-        }),
-      )
       .mockResolvedValueOnce(
         mockResponse({ id: "proj_sprint_42", name: "Sprint 42" }, { headers: { ETag: '"7"' } }),
       )

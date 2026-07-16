@@ -397,18 +397,18 @@ def test_session_projects_list_uses_membership_and_archived_variant(
     create(mixed.id, archived=True)
     create(bob.id, user=BOB)
 
-    live_response = client.get("/v1/sessions/projects", headers=_headers(ALICE))
-    archived_response = client.get("/v1/sessions/projects?archived=true", headers=_headers(ALICE))
+    live_response = client.get("/v1/projects", headers=_headers(ALICE))
+    archived_response = client.get("/v1/projects?archived_members=true", headers=_headers(ALICE))
 
     assert live_response.status_code == 200
-    assert live_response.json() == [
+    assert [{"id": item["id"], "name": item["name"]} for item in live_response.json()] == [
         {"id": archived_only.id, "name": "Archived only"},
         {"id": empty.id, "name": "Empty"},
         {"id": live_only.id, "name": "Live only"},
         {"id": mixed.id, "name": "Mixed"},
     ]
     assert archived_response.status_code == 200
-    assert archived_response.json() == [
+    assert [{"id": item["id"], "name": item["name"]} for item in archived_response.json()] == [
         {"id": archived_only.id, "name": "Archived only"},
         {"id": mixed.id, "name": "Mixed"},
     ]

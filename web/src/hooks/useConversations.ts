@@ -709,7 +709,7 @@ export function useProjects() {
   return useQuery<Project[]>({
     queryKey: PROJECTS_KEY,
     queryFn: async () => {
-      const res = await authenticatedFetch("/v1/sessions/projects");
+      const res = await authenticatedFetch("/v1/projects");
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
       return (await res.json()) as Project[];
     },
@@ -722,7 +722,7 @@ export function useArchivedProjects() {
   return useQuery<Project[]>({
     queryKey: ARCHIVED_PROJECTS_KEY,
     queryFn: async () => {
-      const res = await authenticatedFetch("/v1/sessions/projects?archived=true");
+      const res = await authenticatedFetch("/v1/projects?archived_members=true");
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
       return (await res.json()) as Project[];
     },
@@ -820,35 +820,6 @@ export function useMoveToProject() {
   });
 }
 
-/**
- * Collect every session id filed under a project, paging through the
- * server-side `?project_id=` filter (archived included). Used by "Delete project"
- * so it removes ALL members, not just those in the loaded sidebar window.
- */
-async function fetchAllProjectSessionIds(projectId: string): Promise<string[]> {
-  const ids: string[] = [];
-  let after: string | undefined;
-  for (;;) {
-    const params = buildSessionListParams({
-      after,
-      includeArchived: true,
-      projectId,
-      limit: 100,
-    });
-    // Sequential by necessity: each page's request needs the previous page's
-    // cursor (`after`), so these awaits can't be parallelized.
-    // eslint-disable-next-line no-await-in-loop
-    const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
-    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-    // eslint-disable-next-line no-await-in-loop
-    const page = (await res.json()) as ConversationsPage;
-    for (const conv of page.data) ids.push(conv.id);
-    if (!page.has_more || !page.last_id) break;
-    after = page.last_id;
-  }
-  return ids;
-}
-
 /** One page of a project's (non-archived) sessions, newest-first. */
 async function fetchProjectSessionsPage(
   projectId: string,
@@ -896,43 +867,21 @@ export function useNewestProjectSession(projectId: string | null) {
   });
 }
 
-/**
- * Delete a whole project by archiving every member session and then the
- * first-class project row. Sessions keep their membership and history. Throws
- * `{ failed, succeeded, total }` if any session failed (e.g. a shared session
- * the user can't modify), leaving those sessions in place.
- */
+/** Archive a project and all of its member sessions in one server operation. */
 export function useDeleteProject() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async (projectId: string) => {
-      const ids = await fetchAllProjectSessionIds(projectId);
-      const results = await Promise.allSettled(ids.map((id) => archiveConversation(id, true)));
-      const succeeded: string[] = [];
-      const failed: string[] = [];
-      for (let i = 0; i < results.length; i++) {
-        if (results[i].status === "fulfilled") {
-          succeeded.push(ids[i]);
-          markConversationSeen(
-            ids[i],
-            (results[i] as PromiseFulfilledResult<Conversation>).value.updated_at,
-          );
-        } else {
-          failed.push(ids[i]);
-        }
-      }
-      if (failed.length > 0) throw { failed, succeeded, total: ids.length };
-      await mutateProjectWithIfMatch(projectId, (projectUrl, etag) =>
-        authenticatedFetch(`${projectUrl}/archive`, {
+      const archived = await mutateProjectWithIfMatch(projectId, (projectUrl, etag) =>
+        authenticatedFetch(`${projectUrl}/archive?include_sessions=true`, {
           method: "POST",
           headers: { "If-Match": etag },
         }),
       );
-      return { succeeded, failed };
+      return (await archived.json()) as { archived_sessions: number };
     },
     onSettled: () => {
-      // Refresh regardless of partial failure so the sidebar reflects whatever
-      // was actually archived.
+      // Refresh after success or a two-phase failure so cached state is authoritative.
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       invalidateProjectQueries(queryClient, { sessions: true });
     },

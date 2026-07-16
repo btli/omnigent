@@ -18,7 +18,7 @@ from omnigent.entities import (
     LiveProjectSnapshot,
     NewConversationItem,
     PagedList,
-    ProjectIdentity,
+    Project,
 )
 
 # Label set on a fork of a session that had a working directory. Its
@@ -767,29 +767,23 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def list_projects(
-        self,
-        owner_principal_id: str,
-        *,
-        archived: bool = False,
-    ) -> list[ProjectIdentity]:
-        """
-        Return live owned projects, or projects having an archived member.
-
-        :param owner_principal_id: Project owner whose rows may be returned.
-        :param archived: Require at least one archived member. When false,
-            return every non-archived project row regardless of membership.
-        :returns: Project identities ordered by normalized name.
-        """
-        ...
-
-    @abstractmethod
     def set_project_membership(
         self,
         conversation_id: str,
         project_id: str | None,
     ) -> bool:
         """Atomically move/unfile metadata and its membership snapshot."""
+        ...
+
+    @abstractmethod
+    def archive_project_with_sessions(
+        self,
+        project_id: str,
+        owner_principal_id: str,
+        *,
+        expected_row_version: int | None,
+    ) -> tuple[Project | None, int]:
+        """Archive owned member sessions and their project."""
         ...
 
     @abstractmethod

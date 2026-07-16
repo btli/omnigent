@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
@@ -4403,7 +4405,7 @@ def test_list_projects_returns_distinct_names_sorted(
     conversation_store.set_project_membership(b1.id, customer.id)
     conversation_store.set_project_membership(other.id, foreign.id)
 
-    assert [(item.id, item.name) for item in conversation_store.list_projects("alice")] == [
+    assert [(item.id, item.name) for item in projects.list("alice")] == [
         (customer.id, "Customer X"),
         (empty.id, "Empty"),
         (sprint.id, "Sprint 42"),
@@ -4412,11 +4414,12 @@ def test_list_projects_returns_distinct_names_sorted(
 
 def test_list_projects_empty_when_no_project_labels(
     conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
 ) -> None:
     """Legacy and non-project labels are not project read authorities."""
     conv = conversation_store.create_conversation()
     conversation_store.set_labels(conv.id, {"omni_project": "Legacy", "integrity": "1"})
-    assert conversation_store.list_projects("alice") == []
+    assert SqlAlchemyProjectStore(db_uri).list("alice") == []
 
 
 def test_list_projects_includes_projects_with_only_archived_members(
@@ -4437,8 +4440,8 @@ def test_list_projects_includes_projects_with_only_archived_members(
     conversation_store.update_conversation(solo.id, archived=True)
     conversation_store.update_conversation(mix_archived.id, archived=True)
 
-    assert [item.name for item in conversation_store.list_projects("alice")] == ["Gone", "Mixed"]
-    assert [item.name for item in conversation_store.list_projects("alice", archived=True)] == [
+    assert [item.name for item in projects.list("alice")] == ["Gone", "Mixed"]
+    assert [item.name for item in projects.list("alice", archived_members=True)] == [
         "Gone",
         "Mixed",
     ]
@@ -4457,9 +4460,7 @@ def test_list_projects_is_owner_scoped(
     conversation_store.set_project_membership(mine.id, mine_project.id)
     conversation_store.set_project_membership(theirs.id, theirs_project.id)
 
-    assert [item.name for item in conversation_store.list_projects("alice@example.com")] == [
-        "Mine"
-    ]
+    assert [item.name for item in projects.list("alice@example.com")] == ["Mine"]
 
 
 def test_delete_label_removes_only_target_key(
@@ -4542,9 +4543,14 @@ def test_re_move_updates_single_snapshot_and_changes_live_origin(
             project_id=first.id,
             project_row_version=first.row_version,
             defaults_schema_version=1,
-            defaults_json={},
+            defaults_json={"model_override": "gpt-5"},
         )
     )
+
+    with Session(get_or_create_engine(db_uri)) as session:
+        original = session.get(SqlSessionProjectSnapshot, (0, conversation.id))
+        assert original is not None
+        original_created_at = original.created_at
 
     assert conversation_store.set_project_membership(conversation.id, second.id)
     assert conversation_store.set_project_membership(conversation.id, first.id)
@@ -4562,7 +4568,10 @@ def test_re_move_updates_single_snapshot_and_changes_live_origin(
     assert len(snapshots) == 1
     assert snapshots[0].project_id == first.id
     assert snapshots[0].snapshot_origin == "moved"
-    assert snapshots[0].project_row_version is None
+    assert snapshots[0].project_row_version == first.row_version
+    assert snapshots[0].defaults_schema_version == 1
+    assert json.loads(snapshots[0].defaults_json) == {"model_override": "gpt-5"}
+    assert snapshots[0].created_at == original_created_at
 
 
 def test_list_projects_owner_scope_excludes_shared_only_projects(
@@ -4575,10 +4584,8 @@ def test_list_projects_owner_scope_excludes_shared_only_projects(
     shared = conversation_store.create_conversation()
     conversation_store.set_project_membership(shared.id, bob_project.id)
 
-    assert conversation_store.list_projects("alice@example.com") == []
-    assert [item.name for item in conversation_store.list_projects("bob@example.com")] == [
-        "Shared"
-    ]
+    assert projects.list("alice@example.com") == []
+    assert [item.name for item in projects.list("bob@example.com")] == ["Shared"]
 
 
 def test_list_conversations_owned_by_excludes_shared_sessions(
