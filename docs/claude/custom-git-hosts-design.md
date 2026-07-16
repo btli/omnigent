@@ -151,12 +151,21 @@ trusted parent. `command` is operator-only.
 trusted parent; never in `SandboxPolicy`). A user/operator supplies only an opaque token bound to an
 operator host — never a command or URL.
 
-### 8.3 Authorization
+### 8.3 Authorization & cardinality
 The server-minted row **`id` is the opaque credential slot**. Routes **derive** owner, workspace,
-canonical host, and provider from the authenticated identity + the typed operator host record and
-**reject** any client-supplied values. Uniqueness `(workspace_id, owner, host_id)`. Enforcement at
-**write and launch**; on launch the operator host must still exist and match before decrypt. No
-user-authored `CredentialSourceSpec` ever reaches the `command` branch
+and provider from the authenticated identity + the typed operator host record and **reject** any
+client-supplied authority values.
+
+**Cardinality (0..n user → identity):** any number of users each hold their own credentials; a user
+may hold **multiple labeled identities on the same host** (e.g. a personal and a work account on
+`git.acme.com`). A user-supplied **`label`** disambiguates them, so uniqueness is
+`(workspace_id, owner_user_id, host_id, label)`. The row `id` remains the opaque selector the
+handoff resolves by. **Selection policy** — which of a user's labeled identities a given
+session/repo uses — is a **P1c-2 concern** (the handoff records the chosen slot per session);
+P1c-1 only provides disambiguated storage + resolution-by-id + per-(owner,host) enumeration.
+
+Enforcement at **write and launch**; on launch the operator host must still exist and match before
+decrypt. No user-authored `CredentialSourceSpec` ever reaches the `command` branch
 (`omnigent/inner/credential_proxy.py:184-208`).
 
 ### 8.4 Managed-clone secret delivery
@@ -292,9 +301,12 @@ app-enforced schema.
 
 ### 12.2 `SqlGitCredential(OmnigentBase)`
 Mirrors `SqlHost` (`omnigent/db/db_models.py:1063-1150`): composite PK `(workspace_id, id)` where
-**`id` is the opaque credential slot** (`Uuid16`); `owner: String(256)`; `host_id`;
-`provider: SmallInteger` via a stable `enum_codecs` map + `CheckConstraint`; `token_ciphertext: Text`
-(Fernet); timestamps. `UniqueConstraint(workspace_id, owner, host_id)` — not a partial index.
+**`id` is the opaque credential slot** (`Uuid16`); `owner_user_id: String(256)`; `host_id: String(256)`
+(the operator host config id); `provider: String(32)` (validated denormalized snapshot, mirroring
+`SqlHost.sandbox_provider`); `label: String(128)` (user-chosen, distinguishes multiple identities on
+one host); `username: String(256) | None`; `token_ciphertext: Text` (Fernet); timestamps.
+`UniqueConstraint(workspace_id, owner_user_id, host_id, label)` — not a partial index. Multiple
+labeled rows per `(owner, host)` are the 0..n-identity model (§8.3).
 `canonical_host`/`provider` are **validated denormalized snapshots** of operator topology, re-checked
 at launch (topology can drift). **No FK**; app-cascade (`omnigent/stores/host_store.py:736-763`) **plus
 a reconciliation sweeper** that also scrubs credentials orphaned by **operator-host removal from YAML**

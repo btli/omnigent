@@ -15,6 +15,7 @@
 - **Style:** `from __future__ import annotations` first; frozen dataclasses for value types where the codebase does (note: existing store entities like `Host` are plain `@dataclass`, not frozen — match the neighbor you mirror); Sphinx `:param:` docstrings; comments describe the scenario, not the change.
 - **Security invariants (design §8.2, §8.3 — enforce, don't just document):**
   - The row **`id` is the opaque credential slot**. `owner_user_id` and `workspace_id` come from the authenticated request; `provider` is derived from the operator host config for `host_id`. The route **rejects** any client-supplied owner/workspace/provider.
+  - **0..n identities per (user, host):** a user may register multiple labeled identities on the same host (e.g. personal + work on `git.acme.com`). A required user-supplied **`label`** disambiguates; uniqueness is `(workspace_id, owner_user_id, host_id, label)`. The row `id` is the selector the future handoff resolves by; **selection policy (which label a session uses) is P1c-2**, out of scope here.
   - `host_id` **must** reference a host in `app.state.git_hosts`; attaching a credential to an unknown host is a 4xx.
   - The token is **encrypted immediately** on write and **decrypted only** in `GitCredentialStore.resolve_token()` (called server-side by the future handoff). `create`/`list`/`get` responses and the `GitCredential` entity **never** contain the token or ciphertext.
   - Fernet **key list** from `OMNIGENT_GIT_CREDENTIAL_KEYS` (comma-separated; the **first** key encrypts, **all** keys decrypt → rotation). Unset → the credential store is disabled (router not mounted), mirroring how `host_store` is optional.
@@ -220,7 +221,7 @@ git commit -m "feat(git-hosts): rotatable Fernet cipher for credential-at-rest"
 - Test: `tests/db/test_git_credentials_schema.py`
 
 **Interfaces:**
-- Produces: `SqlGitCredential(OmnigentBase)`, `__tablename__ = "git_credentials"`, PK `(workspace_id, id)`, columns: `owner_user_id: String(256)`, `host_id: String(256)`, `provider: String(32)`, `username: String(256) | None`, `token_ciphertext: Text`, `created_at`/`updated_at: Integer`; `UniqueConstraint("workspace_id","owner_user_id","host_id", name="uq_git_credentials_workspace_owner_host")`; no FK. Migration `revision="z8a2b3c4d5e6"`, `down_revision="z7a2b3c4d5e6"`.
+- Produces: `SqlGitCredential(OmnigentBase)`, `__tablename__ = "git_credentials"`, PK `(workspace_id, id)`, columns: `owner_user_id: String(256)`, `host_id: String(256)`, `provider: String(32)`, `label: String(128)`, `username: String(256) | None`, `token_ciphertext: Text`, `created_at`/`updated_at: Integer`; `UniqueConstraint("workspace_id","owner_user_id","host_id","label", name="uq_git_credentials_workspace_owner_host_label")`; no FK. Migration `revision="z8a2b3c4d5e6"`, `down_revision="z7a2b3c4d5e6"`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -241,25 +242,28 @@ def test_git_credentials_table_roundtrips(tmp_path) -> None:
     engine = get_or_create_engine(f"sqlite:///{tmp_path}/t.db")
     session_maker = make_managed_session_maker(engine)
     with session_maker() as session:
-        session.add(
-            SqlGitCredential(
-                id="0123456789abcdef0123456789abcdef",
-                owner_user_id="alice@example.com",
-                host_id="acme-forgejo",
-                provider="forgejo",
-                username="alice",
-                token_ciphertext="gAAAA-fake-ciphertext",
-                created_at=now_epoch(),
-                updated_at=now_epoch(),
+        # Two labeled identities for the same (owner, host) coexist (0..n).
+        for label in ("personal", "work"):
+            session.add(
+                SqlGitCredential(
+                    id=f"{label:0<32}"[:32],
+                    owner_user_id="alice@example.com",
+                    host_id="acme-forgejo",
+                    provider="forgejo",
+                    label=label,
+                    username="alice",
+                    token_ciphertext=f"gAAAA-fake-{label}",
+                    created_at=now_epoch(),
+                    updated_at=now_epoch(),
+                )
             )
-        )
     with session_maker() as session:
-        row = session.execute(
+        rows = session.execute(
             select(SqlGitCredential).where(SqlGitCredential.host_id == "acme-forgejo")
-        ).scalar_one()
-        assert row.owner_user_id == "alice@example.com"
-        assert row.token_ciphertext == "gAAAA-fake-ciphertext"
-        assert row.workspace_id == 0  # single-tenant default
+        ).scalars().all()
+        assert {r.label for r in rows} == {"personal", "work"}
+        assert all(r.owner_user_id == "alice@example.com" for r in rows)
+        assert all(r.workspace_id == 0 for r in rows)  # single-tenant default
 ```
 
 - [ ] **Step 2: Run to verify failure**
@@ -275,9 +279,10 @@ class SqlGitCredential(OmnigentBase):
 
     The ``id`` is an opaque server-minted slot; ``owner_user_id`` and
     ``workspace_id`` come from the authenticated request, and ``provider`` is a
-    validated snapshot of the operator host config. ``token_ciphertext`` is a
-    Fernet token (see :mod:`omnigent.git_hosts.crypto`) — the plaintext is never
-    stored. No foreign key (Rule R032); uniqueness is application-declared.
+    validated snapshot of the operator host config. ``label`` distinguishes
+    multiple identities a user holds on the same host (0..n). ``token_ciphertext``
+    is a Fernet token (see :mod:`omnigent.git_hosts.crypto`) — the plaintext is
+    never stored. No foreign key (Rule R032); uniqueness is application-declared.
     """
 
     __tablename__ = "git_credentials"
@@ -293,6 +298,7 @@ class SqlGitCredential(OmnigentBase):
     owner_user_id: Mapped[str] = mapped_column(String(256), nullable=False)
     host_id: Mapped[str] = mapped_column(String(256), nullable=False)
     provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    label: Mapped[str] = mapped_column(String(128), nullable=False)
     username: Mapped[str | None] = mapped_column(String(256), nullable=True)
     token_ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[int] = mapped_column(Integer)
@@ -303,7 +309,8 @@ class SqlGitCredential(OmnigentBase):
             "workspace_id",
             "owner_user_id",
             "host_id",
-            name="uq_git_credentials_workspace_owner_host",
+            "label",
+            name="uq_git_credentials_workspace_owner_host_label",
         ),
     )
 ```
@@ -343,6 +350,7 @@ def upgrade() -> None:
         sa.Column("owner_user_id", sa.String(length=256), nullable=False),
         sa.Column("host_id", sa.String(length=256), nullable=False),
         sa.Column("provider", sa.String(length=32), nullable=False),
+        sa.Column("label", sa.String(length=128), nullable=False),
         sa.Column("username", sa.String(length=256), nullable=True),
         sa.Column("token_ciphertext", sa.Text(), nullable=False),
         sa.Column("created_at", sa.Integer(), nullable=True),
@@ -352,7 +360,8 @@ def upgrade() -> None:
             "workspace_id",
             "owner_user_id",
             "host_id",
-            name="uq_git_credentials_workspace_owner_host",
+            "label",
+            name="uq_git_credentials_workspace_owner_host_label",
         ),
     )
 
@@ -387,7 +396,7 @@ git commit -m "feat(git-hosts): SqlGitCredential table + migration (encrypted-at
 
 **Interfaces:**
 - Consumes: `SqlGitCredential` (Task 2); `GitCredentialCipher` (Task 1); `get_or_create_engine`, `make_managed_session_maker`, `now_epoch` (`omnigent.db.utils`); `current_workspace_id` (`omnigent.db.db_models`).
-- Produces: `GitCredential` dataclass (`id`, `owner_user_id`, `host_id`, `provider`, `username`, `created_at`, `updated_at` — **no token/ciphertext field**); `GitCredentialStore(storage_location: str, cipher: GitCredentialCipher)` with `create(*, owner_user_id, host_id, provider, username, token) -> GitCredential` (raises `ValueError` on duplicate `(owner_user_id, host_id)`), `list_for_owner(owner_user_id) -> list[GitCredential]`, `get(credential_id) -> GitCredential | None`, `delete(credential_id) -> None`, `resolve_token(*, owner_user_id, host_id) -> str | None` (decrypts; the only method that returns plaintext).
+- Produces: `GitCredential` dataclass (`id`, `owner_user_id`, `host_id`, `provider`, `label`, `username`, `created_at`, `updated_at` — **no token/ciphertext field**); `GitCredentialStore(storage_location: str, cipher: GitCredentialCipher)` with `create(*, owner_user_id, host_id, provider, label, username, token) -> GitCredential` (raises `ValueError` on duplicate `(owner_user_id, host_id, label)`), `list_for_owner(owner_user_id) -> list[GitCredential]`, `list_for_owner_host(owner_user_id, host_id) -> list[GitCredential]` (the candidate set a future selector picks from), `get(credential_id) -> GitCredential | None`, `delete(credential_id) -> None`, `resolve_token(credential_id) -> str | None` (decrypts the specific slot; the only method that returns plaintext — resolution is by opaque id because `(owner, host)` is now ambiguous).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -414,45 +423,61 @@ def test_create_returns_entity_without_secret(tmp_path) -> None:
     store = _store(tmp_path)
     cred = store.create(
         owner_user_id="alice", host_id="acme-forgejo", provider="forgejo",
-        username="alice", token="ghp_secret",
+        label="work", username="alice", token="ghp_secret",
     )
     assert isinstance(cred, GitCredential)
     assert cred.host_id == "acme-forgejo"
     assert cred.provider == "forgejo"
+    assert cred.label == "work"
     # The entity must not expose the secret in any field.
     assert "ghp_secret" not in repr(cred)
     assert not hasattr(cred, "token")
     assert not hasattr(cred, "token_ciphertext")
 
 
-def test_resolve_token_roundtrips(tmp_path) -> None:
+def test_resolve_token_by_id_roundtrips(tmp_path) -> None:
     store = _store(tmp_path)
-    store.create(owner_user_id="alice", host_id="h", provider="forgejo", username=None, token="tok")
-    assert store.resolve_token(owner_user_id="alice", host_id="h") == "tok"
-    assert store.resolve_token(owner_user_id="bob", host_id="h") is None
+    cred = store.create(
+        owner_user_id="alice", host_id="h", provider="forgejo", label="default",
+        username=None, token="tok",
+    )
+    assert store.resolve_token(cred.id) == "tok"
+    assert store.resolve_token("nonexistent-id") is None
+
+
+def test_multiple_identities_per_host_coexist(tmp_path) -> None:
+    store = _store(tmp_path)
+    work = store.create(owner_user_id="alice", host_id="h", provider="forgejo",
+                        label="work", username="alice-w", token="wtok")
+    personal = store.create(owner_user_id="alice", host_id="h", provider="forgejo",
+                            label="personal", username="alice-p", token="ptok")
+    candidates = store.list_for_owner_host("alice", "h")
+    assert {c.label for c in candidates} == {"work", "personal"}
+    assert store.resolve_token(work.id) == "wtok"
+    assert store.resolve_token(personal.id) == "ptok"
 
 
 def test_list_is_owner_scoped(tmp_path) -> None:
     store = _store(tmp_path)
-    store.create(owner_user_id="alice", host_id="h1", provider="forgejo", username=None, token="a")
-    store.create(owner_user_id="bob", host_id="h2", provider="gitea", username=None, token="b")
+    store.create(owner_user_id="alice", host_id="h1", provider="forgejo", label="default", username=None, token="a")
+    store.create(owner_user_id="bob", host_id="h2", provider="gitea", label="default", username=None, token="b")
     alice = store.list_for_owner("alice")
     assert [c.host_id for c in alice] == ["h1"]
 
 
-def test_duplicate_owner_host_rejected(tmp_path) -> None:
+def test_duplicate_owner_host_label_rejected(tmp_path) -> None:
     store = _store(tmp_path)
-    store.create(owner_user_id="alice", host_id="h", provider="forgejo", username=None, token="a")
+    store.create(owner_user_id="alice", host_id="h", provider="forgejo", label="work", username=None, token="a")
     with pytest.raises(ValueError, match="already"):
-        store.create(owner_user_id="alice", host_id="h", provider="forgejo", username=None, token="b")
+        store.create(owner_user_id="alice", host_id="h", provider="forgejo", label="work", username=None, token="b")
 
 
 def test_delete_then_absent(tmp_path) -> None:
     store = _store(tmp_path)
-    cred = store.create(owner_user_id="alice", host_id="h", provider="forgejo", username=None, token="a")
+    cred = store.create(owner_user_id="alice", host_id="h", provider="forgejo", label="default", username=None, token="a")
     store.delete(cred.id)
     assert store.get(cred.id) is None
-    assert store.resolve_token(owner_user_id="alice", host_id="h") is None
+    assert store.resolve_token(cred.id) is None
 ```
 
 - [ ] **Step 2: Run to verify failure**
@@ -491,6 +516,7 @@ class GitCredential:
     owner_user_id: str
     host_id: str
     provider: str
+    label: str
     username: str | None
     created_at: int
     updated_at: int
@@ -502,6 +528,7 @@ def _row_to_entity(row: SqlGitCredential) -> GitCredential:
         owner_user_id=row.owner_user_id,
         host_id=row.host_id,
         provider=row.provider,
+        label=row.label,
         username=row.username,
         created_at=row.created_at,
         updated_at=row.updated_at,
@@ -522,12 +549,14 @@ class GitCredentialStore:
         owner_user_id: str,
         host_id: str,
         provider: str,
+        label: str,
         username: str | None,
         token: str,
     ) -> GitCredential:
         """Encrypt *token* and store a new credential.
 
-        :raises ValueError: When this owner already has a credential for *host_id*.
+        :raises ValueError: When this owner already has a credential labeled
+            *label* for *host_id*.
         """
         now = now_epoch()
         row = SqlGitCredential(
@@ -535,24 +564,27 @@ class GitCredentialStore:
             owner_user_id=owner_user_id,
             host_id=host_id,
             provider=provider,
+            label=label,
             username=username,
             token_ciphertext=self._cipher.encrypt(token),
             created_at=now,
             updated_at=now,
         )
         with self._session() as session:
-            # (workspace_id, owner_user_id, host_id) is unique; MySQL has no
-            # partial index, so the store checks before insert.
+            # (workspace_id, owner_user_id, host_id, label) is unique; MySQL has
+            # no partial index, so the store checks before insert.
             existing = session.execute(
                 select(SqlGitCredential.id).where(
                     SqlGitCredential.workspace_id == current_workspace_id(),
                     SqlGitCredential.owner_user_id == owner_user_id,
                     SqlGitCredential.host_id == host_id,
+                    SqlGitCredential.label == label,
                 )
             ).first()
             if existing is not None:
                 raise ValueError(
-                    f"a git credential for host {host_id!r} already exists for this user"
+                    f"a git credential labeled {label!r} for host {host_id!r} "
+                    "already exists for this user"
                 )
             session.add(row)
             return _row_to_entity(row)
@@ -563,6 +595,18 @@ class GitCredentialStore:
                 select(SqlGitCredential).where(
                     SqlGitCredential.workspace_id == current_workspace_id(),
                     SqlGitCredential.owner_user_id == owner_user_id,
+                )
+            ).scalars()
+            return [_row_to_entity(r) for r in rows]
+
+    def list_for_owner_host(self, owner_user_id: str, host_id: str) -> list[GitCredential]:
+        """The owner's candidate identities on *host_id* (a future selector picks one)."""
+        with self._session() as session:
+            rows = session.execute(
+                select(SqlGitCredential).where(
+                    SqlGitCredential.workspace_id == current_workspace_id(),
+                    SqlGitCredential.owner_user_id == owner_user_id,
+                    SqlGitCredential.host_id == host_id,
                 )
             ).scalars()
             return [_row_to_entity(r) for r in rows]
@@ -586,17 +630,18 @@ class GitCredentialStore:
                 )
             )
 
-    def resolve_token(self, *, owner_user_id: str, host_id: str) -> str | None:
-        """Decrypt and return the token for (owner, host), or ``None`` if absent.
+    def resolve_token(self, credential_id: str) -> str | None:
+        """Decrypt and return the token for the slot *credential_id*, or ``None``.
 
-        The only method that returns plaintext; call server-side only.
+        Resolution is by opaque id (not ``(owner, host)``, which is ambiguous with
+        multiple labeled identities). The only method that returns plaintext; call
+        server-side only.
         """
         with self._session() as session:
             row = session.execute(
                 select(SqlGitCredential).where(
                     SqlGitCredential.workspace_id == current_workspace_id(),
-                    SqlGitCredential.owner_user_id == owner_user_id,
-                    SqlGitCredential.host_id == host_id,
+                    SqlGitCredential.id == credential_id,
                 )
             ).scalar_one_or_none()
             if row is None:
@@ -628,9 +673,9 @@ git commit -m "feat(git-hosts): GitCredentialStore — encrypt on write, decrypt
 
 **Interfaces:**
 - Consumes: `GitCredentialStore` (Task 3); `app.state.git_hosts` (from P1b — a `tuple[HostConfig, ...]`); the auth helper the other routes use (`require_user` / `_require_user`); `OmnigentError`/`ErrorCode` or `HTTPException` per the neighboring route's convention.
-- Produces: `create_git_credentials_router(git_credential_store, git_hosts, *, auth_provider=None) -> APIRouter` mounting `POST /v1/git-credentials`, `GET /v1/git-credentials`, `DELETE /v1/git-credentials/{credential_id}`. Request model carries only `host_id` + `token` (+ optional `username`); the response model has **no** token field. `provider` is derived from the matching `HostConfig`; an unknown `host_id` → 4xx; the token is encrypted via the store immediately; ownership is enforced on delete.
+- Produces: `create_git_credentials_router(git_credential_store, git_hosts, *, auth_provider=None) -> APIRouter` mounting `POST /v1/git-credentials`, `GET /v1/git-credentials`, `DELETE /v1/git-credentials/{credential_id}`. Request model carries `host_id` + `label` + `token` (+ optional `username`); the response model has **no** token field but **does** include `label`. `provider` is derived from the matching `HostConfig`; an unknown `host_id` → 4xx; a duplicate `(owner, host_id, label)` → CONFLICT; the token is encrypted via the store immediately; ownership is enforced on delete.
 
-- [ ] **Step 1: Write the failing test** — read `omnigent/server/routes/default_policies.py` (POST/DELETE shape, error codes) and `tests/server/test_app_git_hosts.py` (how to build a real `create_app` with stores) first. Mount the router on a minimal app with a `GitCredentialStore` and a one-host `git_hosts`. Assert: POST with a configured `host_id` returns 200/201 with the credential metadata and **no** token; POST with an unknown `host_id` returns 4xx; the created credential appears in GET; a second POST for the same host returns a conflict; DELETE removes it. Also assert the response body never contains the submitted token string.
+- [ ] **Step 1: Write the failing test** — read `omnigent/server/routes/default_policies.py` (POST/DELETE shape, error codes) and `tests/server/test_app_git_hosts.py` (how to build a real `create_app` with stores) first. Mount the router on a minimal app with a `GitCredentialStore` and a one-host `git_hosts`. Assert: POST with a configured `host_id` + a `label` returns 200/201 with the credential metadata (incl. `label`, provider derived from the host) and **no** token; POST with an unknown `host_id` returns 4xx; a **second POST for the same host with a *different* `label`** succeeds (0..n identities); a second POST with the **same `(host_id, label)`** returns a conflict; the created credentials appear in GET; DELETE by id removes one. Also assert the response body never contains the submitted token string.
 
 (Write the concrete test using the real fixtures — model the app construction on `tests/server/test_app_git_hosts.py`'s `app_factory`, extended to also pass a `git_credential_store` and mount `create_git_credentials_router`.)
 
@@ -639,7 +684,7 @@ git commit -m "feat(git-hosts): GitCredentialStore — encrypt on write, decrypt
 Run: `uv run pytest tests/server/test_git_credentials_route.py -v`
 Expected: FAIL — no module / router.
 
-- [ ] **Step 3: Implement** — mirror `default_policies.py`'s router factory, request/response Pydantic models (define them in this module or `schemas.py` following the neighbor), the `IntegrityError`/`ValueError` → `CONFLICT` mapping, and the ownership 404/403 idiom from `hosts.py:385-391`. Derive `provider` by finding the `HostConfig` in `git_hosts` whose `id == body.host_id`; if none, raise the validation error. Encrypt happens in `store.create`. Off-thread store calls via `asyncio.to_thread` as the neighbors do. The response model exposes `id, host_id, provider, username, created_at` — never the token.
+- [ ] **Step 3: Implement** — mirror `default_policies.py`'s router factory, request/response Pydantic models (define them in this module or `schemas.py` following the neighbor), the `IntegrityError`/`ValueError` → `CONFLICT` mapping, and the ownership 404/403 idiom from `hosts.py:385-391`. Request model: `host_id: str`, `label: str`, `token: str`, `username: str | None = None`. Derive `provider` by finding the `HostConfig` in `git_hosts` whose `id == body.host_id`; if none, raise the validation error. Pass `label=body.label` into `store.create`; a duplicate `(owner, host_id, label)` `ValueError` maps to CONFLICT. Encrypt happens in `store.create`. Off-thread store calls via `asyncio.to_thread` as the neighbors do. The response model exposes `id, host_id, provider, label, username, created_at` — never the token.
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -734,4 +779,5 @@ git commit -m "feat(git-hosts): wire git_credential_store + router at startup (o
 
 - **Spec coverage:** §8.2 encrypted-at-rest user creds (Fernet key list) → Tasks 1-3; §8.3 opaque-slot id + server-derived authority + host-must-exist → Tasks 3-4; portability (no FK, real UniqueConstraint, Uuid16, workspace-scoped, migration) → Task 2; opt-in/backward-compat (unset key → disabled) → Tasks 1,5. The token-decrypt-only-on-resolve and never-returned invariants are enforced in Task 3 (entity omits secret) and Task 4 (response omits token) and gated in Task 6 Step 5.
 - **Placeholder scan:** Tasks 4's test/impl and Task 5's fixture say "mirror the neighbor" for app-construction boilerplate that is repo-specific — every novel unit (crypto, model, migration, store) ships complete code. No TBDs.
-- **Type consistency:** `GitCredentialCipher.encrypt/decrypt: str->str` used by the store (Task 3); `GitCredentialStore(storage_location, cipher)` signature identical in Tasks 3/5; `create(*, owner_user_id, host_id, provider, username, token)` identical in Task 3 impl and Task 4 route; `SqlGitCredential` column names identical across model (Task 2), migration (Task 2), and store (Task 3).
+- **Type consistency:** `GitCredentialCipher.encrypt/decrypt: str->str` used by the store (Task 3); `GitCredentialStore(storage_location, cipher)` signature identical in Tasks 3/5; `create(*, owner_user_id, host_id, provider, label, username, token)` identical in Task 3 impl and Task 4 route; `resolve_token(credential_id)` (by opaque id) consistent Task 3 impl + tests; `label` threads through the model + migration (Task 2), entity + store (Task 3), and request/response (Task 4); `SqlGitCredential` column names + `uq_git_credentials_workspace_owner_host_label` identical across model (Task 2) and migration (Task 2).
+- **Cardinality (§8.3):** 0..n identities per (user, host) via `label`; selection policy is P1c-2. Tasks 2-4 tests each assert multiple labeled identities coexist and same-`(host,label)` conflicts.
