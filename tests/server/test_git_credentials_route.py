@@ -292,31 +292,48 @@ def test_cross_user_isolation_and_foreign_delete_denied(
     assert created.status_code in (200, 201)
     alice_cred_id = created.json()["id"]
 
-    # Bob's list must not include Alice's credential.
-    bob_list = client.get("/v1/git-credentials", headers=bob_headers)
-    assert bob_list.status_code == 200
-    assert bob_list.json()["data"] == []
+    # Bob has his own credential on the same host; isolation is bilateral.
+    bob_created = client.post(
+        "/v1/git-credentials",
+        json={"host_id": _HOST_ID, "label": "work", "token": "bob-token"},
+        headers=bob_headers,
+    )
+    assert bob_created.status_code in (200, 201)
+    bob_cred_id = bob_created.json()["id"]
+
+    # Bob's list has only his; Alice's list has only hers.
+    def _list_ids(headers: dict[str, str]) -> set[str]:
+        data = client.get("/v1/git-credentials", headers=headers).json()["data"]
+        return {item["id"] for item in data}
+
+    assert _list_ids(bob_headers) == {bob_cred_id}
+    assert _list_ids(alice_headers) == {alice_cred_id}
 
     # Bob deleting Alice's credential must not succeed and must not delete it.
     bob_delete = client.delete(f"/v1/git-credentials/{alice_cred_id}", headers=bob_headers)
     assert bob_delete.status_code in (403, 404)
 
-    # Alice can still resolve/list her own credential afterward.
+    # Alice can still list her own credential afterward.
     alice_list = client.get("/v1/git-credentials", headers=alice_headers)
     assert alice_list.status_code == 200
-    alice_ids = {item["id"] for item in alice_list.json()["data"]}
-    assert alice_cred_id in alice_ids
+    assert {item["id"] for item in alice_list.json()["data"]} == {alice_cred_id}
 
 
-def test_client_supplied_owner_field_rejected(multi_user_route_client: TestClient) -> None:
+@pytest.mark.parametrize("field", ["owner_user_id", "provider", "workspace_id"])
+def test_client_supplied_authority_field_rejected(
+    multi_user_route_client: TestClient, field: str
+) -> None:
+    # None of the server-derived authority fields may be supplied by the client
+    # (the request model forbids extras).
     resp = multi_user_route_client.post(
         "/v1/git-credentials",
         json={
             "host_id": _HOST_ID,
             "label": "work",
             "token": _SECRET_TOKEN,
-            "owner_user_id": "someone-else",
+            field: "attacker-controlled",
         },
         headers={"X-Test-User": "alice"},
     )
     assert resp.status_code == 422
+    assert _SECRET_TOKEN not in resp.text
