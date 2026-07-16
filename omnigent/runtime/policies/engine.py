@@ -29,10 +29,11 @@ from omnigent.spec.types import (
     StateUpdateAction,
 )
 from omnigent.stores.conversation_store import (
-    PROJECT_LABEL_DEPRECATION_WARNING,
     PROJECT_LABEL_KEY,
     ConversationStore,
+    warn_deprecated_project_label,
 )
+from omnigent.stores.project_store import ProjectStore
 
 # Number of recent conversation items the engine fetches from
 # the conversation store and threads onto :class:`EvaluationContext`
@@ -123,6 +124,7 @@ class PolicyEngine:
         token_pricing: ModelPricing | None = None,
         initial_model: str | None = None,
         conversation_store: ConversationStore,
+        project_store: ProjectStore | None = None,
         root_conversation_id: str | None = None,
         llm_client: Any = None,
     ) -> None:
@@ -168,6 +170,7 @@ class PolicyEngine:
         self._token_pricing = token_pricing
         self._model = initial_model
         self._store = conversation_store
+        self._project_store = project_store
         self._llm_client = llm_client
 
     @property
@@ -519,13 +522,13 @@ class PolicyEngine:
         filtered = self._filter_schema_valid(set_labels)
         filtered.pop(PROJECT_LABEL_KEY, None)
         if legacy_project_requested and legacy_project_name is not None:
-            _logger.warning(
-                PROJECT_LABEL_DEPRECATION_WARNING,
-                extra={"event": "deprecated_project_label_write", "write_path": "policy"},
-            )
+            if self._project_store is None:
+                raise RuntimeError("project store is required for legacy project label writes")
+            warn_deprecated_project_label("policy")
             self._store.forward_legacy_project_label(
                 self._conversation_id,
                 legacy_project_name,
+                self._project_store,
             )
             self._labels.pop(PROJECT_LABEL_KEY, None)
         if filtered:

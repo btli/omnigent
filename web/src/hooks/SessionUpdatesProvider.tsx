@@ -25,16 +25,21 @@ import {
   filtersFromConversationQueryKey,
   mergeItemsIntoPages,
   nullsToUndefined,
-  removeIdsFromPages,
 } from "@/lib/sessionListCache";
 import { type SessionUpdatesFrame, sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
+import {
+  ARCHIVED_PROJECTS_KEY,
+  PROJECT_NEWEST_KEY,
+  PROJECT_SESSIONS_KEY,
+  removeSessionsFromListCaches,
+} from "./projectQueries";
 
 // Coalesce bursts of structural changes / watch-set recomputes into one
 // action. 250 ms is short enough to feel live, long enough to batch the
 // flurry of cache writes a single frame can trigger.
 const DEBOUNCE_MS = 250;
 
-// A project folder's ["project-sessions", <name>] query is always the
+// A project folder's ["project-sessions", <project-id>] query is always the
 // non-archived, unsearched slice of that project (see useProjectSessions).
 // Live frames overlay those caches with these fixed filters so archived rows
 // drop out the same way they do from the default sidebar list.
@@ -77,10 +82,10 @@ function applyItemsToCache(
   // streamed field updates (pending_elicitations_count → "Needs response",
   // status, runner_online, …) must overlay those caches too — otherwise a
   // filed session's row stays frozen at fetch time. Folders are non-archived,
-  // unsearched lists; an archived/label-changed row converges via the
+  // unsearched lists; an archived/membership-changed row converges via the
   // debounced ["project-sessions"] invalidation the caller schedules.
   const projectEntries = queryClient.getQueriesData<ConversationsInfiniteData>({
-    queryKey: ["project-sessions"],
+    queryKey: PROJECT_SESSIONS_KEY,
   });
   for (const [key, data] of projectEntries) {
     const {
@@ -96,30 +101,6 @@ function applyItemsToCache(
     missingIds: [...itemsById.keys()].filter((id) => !foundAnywhere.has(id)),
     needsRefetch,
   };
-}
-
-/**
- * Remove ids from every cached `["conversations", ...]` variant.
- *
- * @param queryClient - The app QueryClient.
- * @param ids - Conversation ids to evict.
- * @returns `true` when at least one cached page changed.
- */
-function removeIdsFromCache(queryClient: QueryClient, ids: string[]): boolean {
-  const idSet = new Set(ids);
-  let removedAny = false;
-  // Both the global lists and each project folder's own list (same page shape).
-  for (const queryKey of [["conversations"], ["project-sessions"]]) {
-    const entries = queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey });
-    for (const [key, data] of entries) {
-      const { data: next, removed } = removeIdsFromPages(data, idSet);
-      if (removed) {
-        queryClient.setQueryData(key, next);
-        removedAny = true;
-      }
-    }
-  }
-  return removedAny;
 }
 
 /**
@@ -164,7 +145,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     // ids so the server streams liveness (e.g. pending-elicitation "Needs
     // response") for filed sessions that aren't in the global loaded window.
     const projectEntries = queryClient.getQueriesData<ConversationsInfiniteData>({
-      queryKey: ["project-sessions"],
+      queryKey: PROJECT_SESSIONS_KEY,
     });
     const ids = collectConversationIds([...entries, ...projectEntries].map(([, data]) => data));
     // Union in the open session. A directly-opened child / sub-agent
@@ -197,9 +178,9 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
         void queryClient.invalidateQueries({ queryKey: ["conversations"] });
         // Converge each project folder's own list too (new/archived/relabeled
         // members the local field-patch can't place).
-        void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
-        void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
-        void queryClient.invalidateQueries({ queryKey: ["archived-projects"] });
+        void queryClient.invalidateQueries({ queryKey: PROJECT_SESSIONS_KEY });
+        void queryClient.invalidateQueries({ queryKey: PROJECT_NEWEST_KEY });
+        void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECTS_KEY });
       }, DEBOUNCE_MS);
     };
 
@@ -224,7 +205,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           return;
         case "removed":
           for (const id of frame.ids) commentsFingerprintsRef.current.delete(id);
-          if (removeIdsFromCache(queryClient, frame.ids)) scheduleInvalidate();
+          if (removeSessionsFromListCaches(queryClient, frame.ids)) scheduleInvalidate();
           return;
         case "snapshot":
         case "changed": {

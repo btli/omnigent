@@ -7,6 +7,7 @@ import json
 import unicodedata
 import uuid
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import select, update
@@ -23,6 +24,7 @@ from omnigent.db.db_models import (
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker, now_epoch
 from omnigent.entities import (
     LegacyProjectLabel,
+    LiveProjectSnapshot,
     Project,
     ProjectBackfillResult,
     ProjectMigrationIssue,
@@ -79,6 +81,17 @@ def _source_fingerprint(assignments: list[LegacyProjectLabel]) -> bytes:
         for assignment in sorted(assignments, key=lambda item: (item.session_id, item.label))
     )
     return hashlib.sha256(source.encode("utf-8")).digest()
+
+
+@dataclass(frozen=True)
+class _BackfillProposal:
+    owner: str
+    normalized_name: str
+    checksum: bytes
+    assignments: list[LegacyProjectLabel]
+    project_id: str
+    existing_project: SqlProject | None
+    has_ledger: bool
 
 
 class SqlAlchemyProjectStore(ProjectStore):
@@ -160,6 +173,14 @@ class SqlAlchemyProjectStore(ProjectStore):
         with self._session() as session:
             row = session.execute(statement).scalar_one_or_none()
             return _to_entity(row) if row is not None else None
+
+    def get_or_create_by_name(self, owner_principal_id: str, name: str) -> Project:
+        project = self.get_by_name(name, owner_principal_id)
+        if project is None:
+            return self.create(owner_principal_id, name)
+        if project.archived_at is not None:
+            raise OmnigentError("Project is archived", code=ErrorCode.CONFLICT)
+        return project
 
     def list(self, owner_principal_id: str, *, include_archived: bool = False) -> list[Project]:
         statement = select(SqlProject).where(
@@ -271,6 +292,7 @@ class SqlAlchemyProjectStore(ProjectStore):
             values["defaults_json"] = json.dumps(
                 bundle.model_dump(exclude_unset=True), sort_keys=True, separators=(",", ":")
             )
+            values["defaults_schema_version"] = DEFAULTS_SCHEMA_VERSION
         if not values:
             raise ProjectInputError("At least one mutable field is required")
         return self._mutate(
@@ -346,9 +368,13 @@ class SqlAlchemyProjectStore(ProjectStore):
             return ProjectBackfillResult()
 
         issues: list[ProjectMigrationIssue] = []
-        proposed: list[
-            tuple[str, str, bytes, list[LegacyProjectLabel], str, SqlProject | None, bool]
-        ] = []
+        issue_groups: set[str] = set()
+
+        def add_issue(issue: ProjectMigrationIssue) -> None:
+            issues.append(issue)
+            issue_groups.add(issue.normalized_name)
+
+        proposed: list[_BackfillProposal] = []
         with self._session() as session:
             for normalized_name in sorted(grouped):
                 group = grouped[normalized_name]
@@ -356,10 +382,10 @@ class SqlAlchemyProjectStore(ProjectStore):
                     unicodedata.normalize("NFKC", assignment.label).strip() for assignment in group
                 }
                 if len(display_labels) > 1:
-                    issues.append(self._issue(normalized_name, group, "normalized_name_alias"))
+                    add_issue(self._issue(normalized_name, group, "normalized_name_alias"))
                 owners = {assignment.owner_principal_id for assignment in group}
                 if None in owners or len(owners) != 1:
-                    issues.append(self._issue(normalized_name, group, "ambiguous_owner"))
+                    add_issue(self._issue(normalized_name, group, "ambiguous_owner"))
                     continue
                 owner = next(iter(owners))
                 if owner is None:
@@ -379,7 +405,7 @@ class SqlAlchemyProjectStore(ProjectStore):
                     project for project in existing_projects if project.owner_principal_id != owner
                 ]
                 if foreign_projects:
-                    issues.append(self._issue(normalized_name, group, "owned_name_collision"))
+                    add_issue(self._issue(normalized_name, group, "owned_name_collision"))
                 mine = next(
                     (
                         project
@@ -389,7 +415,7 @@ class SqlAlchemyProjectStore(ProjectStore):
                     None,
                 )
                 if mine is not None and mine.archived_at is not None:
-                    issues.append(self._issue(normalized_name, group, "archived_project"))
+                    add_issue(self._issue(normalized_name, group, "archived_project"))
                 ledger = session.execute(
                     select(SqlProjectMigrationLedger).where(
                         SqlProjectMigrationLedger.workspace_id == current_workspace_id(),
@@ -404,34 +430,23 @@ class SqlAlchemyProjectStore(ProjectStore):
                 else:
                     resolved_id = _project_id()
                 if ledger is not None and (mine is None or mine.id != ledger.project_id):
-                    issues.append(self._issue(normalized_name, group, "ledger_project_mismatch"))
+                    add_issue(self._issue(normalized_name, group, "ledger_project_mismatch"))
                 proposed.append(
-                    (
-                        owner,
-                        normalized_name,
-                        checksum,
-                        group,
-                        resolved_id,
-                        mine,
-                        ledger is not None,
+                    _BackfillProposal(
+                        owner=owner,
+                        normalized_name=normalized_name,
+                        checksum=checksum,
+                        assignments=group,
+                        project_id=resolved_id,
+                        existing_project=mine,
+                        has_ledger=ledger is not None,
                     )
                 )
 
-            pending: list[
-                tuple[str, str, bytes, list[LegacyProjectLabel], str, SqlProject | None, bool]
-            ] = []
+            pending: list[_BackfillProposal] = []
             for proposal in proposed:
-                (
-                    _owner,
-                    normalized_name,
-                    _checksum,
-                    group,
-                    resolved_id,
-                    _mine,
-                    has_ledger,
-                ) = proposal
-                already_migrated = has_ledger
-                for assignment in group:
+                already_migrated = proposal.has_ledger
+                for assignment in proposal.assignments:
                     metadata = session.get(
                         SqlConversationMetadata,
                         (current_workspace_id(), assignment.session_id),
@@ -442,48 +457,51 @@ class SqlAlchemyProjectStore(ProjectStore):
                     )
                     if metadata is None:
                         already_migrated = False
-                        issues.append(
-                            self._issue(normalized_name, group, "missing_session_metadata")
+                        add_issue(
+                            self._issue(
+                                proposal.normalized_name,
+                                proposal.assignments,
+                                "missing_session_metadata",
+                            )
                         )
                         break
-                    if metadata.project_id not in (None, resolved_id):
+                    if metadata.project_id not in (None, proposal.project_id):
                         already_migrated = False
-                        issues.append(
-                            self._issue(normalized_name, group, "existing_project_binding")
+                        add_issue(
+                            self._issue(
+                                proposal.normalized_name,
+                                proposal.assignments,
+                                "existing_project_binding",
+                            )
                         )
                         break
-                    if snapshot is not None and snapshot.project_id != resolved_id:
+                    if snapshot is not None and snapshot.project_id != proposal.project_id:
                         already_migrated = False
-                        issues.append(
-                            self._issue(normalized_name, group, "existing_snapshot_binding")
+                        add_issue(
+                            self._issue(
+                                proposal.normalized_name,
+                                proposal.assignments,
+                                "existing_snapshot_binding",
+                            )
                         )
                         break
-                    if metadata.project_id != resolved_id or snapshot is None:
+                    if metadata.project_id != proposal.project_id or snapshot is None:
                         already_migrated = False
                 if not already_migrated:
                     pending.append(proposal)
-            if issues:
-                return ProjectBackfillResult(
-                    issues=tuple(
-                        sorted(
-                            issues,
-                            key=lambda issue: (issue.normalized_name, issue.reason),
-                        )
-                    )
-                )
-            proposed = pending
+            proposed = [
+                proposal for proposal in pending if proposal.normalized_name not in issue_groups
+            ]
 
             now = now_epoch()
             mappings: list[ProjectMigrationMapping] = []
-            for (
-                owner,
-                normalized_name,
-                checksum,
-                group,
-                resolved_id,
-                mine,
-                _has_ledger,
-            ) in proposed:
+            for proposal in proposed:
+                owner = proposal.owner
+                normalized_name = proposal.normalized_name
+                checksum = proposal.checksum
+                group = proposal.assignments
+                resolved_id = proposal.project_id
+                mine = proposal.existing_project
                 display_name = unicodedata.normalize("NFKC", group[0].label).strip()
                 if mine is None:
                     session.add(
@@ -503,14 +521,7 @@ class SqlAlchemyProjectStore(ProjectStore):
                             archived_at=None,
                         )
                     )
-                ledger = session.execute(
-                    select(SqlProjectMigrationLedger).where(
-                        SqlProjectMigrationLedger.workspace_id == current_workspace_id(),
-                        SqlProjectMigrationLedger.owner_principal_id == owner,
-                        SqlProjectMigrationLedger.normalized_name_checksum == checksum,
-                    )
-                ).scalar_one_or_none()
-                if ledger is None:
+                if not proposal.has_ledger:
                     session.add(
                         SqlProjectMigrationLedger(
                             id=f"pmig_{uuid.uuid4().hex}",
@@ -535,14 +546,19 @@ class SqlAlchemyProjectStore(ProjectStore):
                         (current_workspace_id(), assignment.session_id),
                     )
                     if snapshot is None:
+                        project_snapshot = LiveProjectSnapshot.backfill(resolved_id)
                         session.add(
                             SqlSessionProjectSnapshot(
                                 session_id=assignment.session_id,
-                                project_id=resolved_id,
-                                snapshot_origin="backfill",
-                                project_row_version=None,
-                                defaults_schema_version=DEFAULTS_SCHEMA_VERSION,
-                                defaults_json="{}",
+                                project_id=project_snapshot.project_id,
+                                snapshot_origin=project_snapshot.snapshot_origin,
+                                project_row_version=project_snapshot.project_row_version,
+                                defaults_schema_version=project_snapshot.defaults_schema_version,
+                                defaults_json=json.dumps(
+                                    project_snapshot.defaults_json,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                ),
                                 created_at=now,
                             )
                         )
@@ -555,7 +571,18 @@ class SqlAlchemyProjectStore(ProjectStore):
                     )
                 )
             session.flush()
-            result = ProjectBackfillResult(mappings=tuple(mappings))
+            result = ProjectBackfillResult(
+                mappings=tuple(mappings),
+                issues=tuple(
+                    sorted(
+                        issues,
+                        key=lambda issue: (issue.normalized_name, issue.reason),
+                    )
+                ),
+            )
+        clean_groups = set(grouped) - issue_groups
         for assignment in assignments:
-            conversation_store.delete_label(assignment.session_id, PROJECT_LABEL_KEY)
+            _, normalized_name, _ = normalize_project_name(assignment.label)
+            if normalized_name in clean_groups:
+                conversation_store.delete_label(assignment.session_id, PROJECT_LABEL_KEY)
         return result

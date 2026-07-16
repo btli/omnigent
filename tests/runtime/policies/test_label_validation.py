@@ -150,6 +150,7 @@ def test_policy_project_label_write_forwards_membership_once(
         conversation_id=conversation.id,
         initial_labels={"omni_project": "Stale project"},
         conversation_store=store,
+        project_store=SqlAlchemyProjectStore(db_uri),
     )
 
     with caplog.at_level(logging.WARNING):

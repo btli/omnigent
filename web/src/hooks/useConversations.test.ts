@@ -859,7 +859,7 @@ describe("useMoveToProject", () => {
         created_at: 0,
         updated_at: 1,
         labels: {},
-        metadata: { project_id: "proj_sprint_42" },
+        project_id: "proj_sprint_42",
       }),
     );
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -913,7 +913,7 @@ describe("useArchiveConversation", () => {
         created_at: 0,
         updated_at: 10,
         labels: {},
-        metadata: { project_id: "proj_sprint_42" },
+        project_id: "proj_sprint_42",
       }),
     );
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
@@ -945,7 +945,7 @@ describe("useDeleteProject", () => {
       updated_at: 10,
       archived: true,
       labels: {},
-      metadata: { project_id: "proj_sprint_42" },
+      project_id: "proj_sprint_42",
     });
   }
 
@@ -1045,5 +1045,31 @@ describe("useDeleteProject", () => {
     expect(err.failed).toEqual(["conv_b"]);
     expect(err.succeeded).toEqual(["conv_a"]);
     expect(err.total).toBe(2);
+  });
+
+  it("preserves the project archive response status", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          data: [],
+          first_id: null,
+          last_id: null,
+          has_more: false,
+        }),
+      )
+      .mockResolvedValueOnce(
+        mockResponse({ id: "proj_sprint_42", name: "Sprint 42" }, { headers: { ETag: '"7"' } }),
+      )
+      .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 412 }));
+
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useDeleteProject(), { wrapper });
+
+    result.current.mutate("proj_sprint_42");
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    expect(result.current.error).toMatchObject({ status: 412 });
   });
 });

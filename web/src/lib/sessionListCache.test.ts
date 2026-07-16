@@ -162,10 +162,8 @@ describe("mergeItemsIntoPages", () => {
   });
 
   it("removes rows moved out of a project-filtered query", () => {
-    const before = data([conv("a", { metadata: { project_id: "proj_a" } })]);
-    const items = new Map<string, SessionListWireItem>([
-      ["a", { id: "a", metadata: { project_id: "proj_b" } }],
-    ]);
+    const before = data([conv("a", { project_id: "proj_a" })]);
+    const items = new Map<string, SessionListWireItem>([["a", { id: "a", project_id: "proj_b" }]]);
 
     const { data: after, needsRefetch } = mergeItemsIntoPages(
       before,
@@ -295,9 +293,7 @@ describe("filtersFromConversationQueryKey", () => {
   });
 
   it("parses project-filtered conversation query keys", () => {
-    expect(
-      filtersFromConversationQueryKey(["conversations", "", true, "proj_sprint_42"]),
-    ).toEqual({
+    expect(filtersFromConversationQueryKey(["conversations", "", true, "proj_sprint_42"])).toEqual({
       searchQuery: "",
       includeArchived: true,
       projectId: "proj_sprint_42",

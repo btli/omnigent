@@ -8,7 +8,7 @@ of their own project folders under "My sessions".
 The sidebar builds project folders from two owner-scoped server surfaces:
 
 - ``GET /v1/sessions/projects`` — folder identities, and
-- ``GET /v1/sessions?project=<name>`` — the sessions *inside* a folder.
+- ``GET /v1/sessions?project_id=<id>`` — the sessions *inside* a folder.
 
 Both must filter by ownership (an ``owner``-level grant), not mere access, or
 a shared session leaks into the recipient's "My sessions" project view. These
@@ -17,14 +17,11 @@ tests drive the real routes against file-backed SQLite stores with header auth.
 
 from __future__ import annotations
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
-from omnigent.errors import OmnigentError
-from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, UnifiedAuthProvider
-from omnigent.server.routes.sessions import create_sessions_router
+from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.conversation_store import PROJECT_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -32,35 +29,10 @@ from omnigent.stores.permission_store.sqlalchemy_store import (
     SqlAlchemyPermissionStore,
 )
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+from tests.server.routes.conftest import sessions_test_app
 
 ALICE = "alice@example.com"
 BOB = "bob@example.com"
-PROJECT_LABEL_KEY = "omni_project"
-
-
-def _multi_user_app(db_uri: str) -> FastAPI:
-    """Build a header-auth app mounting the sessions router at ``/v1``."""
-    app = FastAPI()
-
-    @app.exception_handler(OmnigentError)
-    async def _handle(request: Request, exc: OmnigentError) -> JSONResponse:
-        del request
-        return JSONResponse(
-            status_code=exc.http_status,
-            content={"error": {"code": exc.code, "message": exc.message}},
-        )
-
-    app.include_router(
-        create_sessions_router(
-            conversation_store=SqlAlchemyConversationStore(db_uri),
-            agent_store=SqlAlchemyAgentStore(db_uri),
-            auth_provider=UnifiedAuthProvider(source="header"),
-            permission_store=SqlAlchemyPermissionStore(db_uri),
-            project_store=SqlAlchemyProjectStore(db_uri),
-        ),
-        prefix="/v1",
-    )
-    return app
 
 
 def _seed_shared_project_session(db_uri: str) -> tuple[str, str]:
@@ -86,7 +58,7 @@ def test_shared_project_not_listed_as_recipients_own_project(db_uri: str) -> Non
     """A project whose only member is a session shared TO Alice (owned by Bob)
     must not appear in Alice's project list — folders are her own sessions."""
     _, project_id = _seed_shared_project_session(db_uri)
-    app = _multi_user_app(db_uri)
+    app = sessions_test_app(db_uri)
 
     # Bob owns it, so it's his project.
     bob = TestClient(app).get("/v1/sessions/projects", headers={"X-Forwarded-Email": BOB})
@@ -100,21 +72,21 @@ def test_shared_project_not_listed_as_recipients_own_project(db_uri: str) -> Non
 
 
 def test_shared_session_excluded_from_recipients_project_folder(db_uri: str) -> None:
-    """Fetching a project folder's sessions (``?project=``) as Alice excludes a
+    """Fetching a project folder's sessions as Alice excludes a
     session merely shared with her — it belongs on "Shared with me"."""
-    conv_id, _ = _seed_shared_project_session(db_uri)
-    app = _multi_user_app(db_uri)
+    conv_id, project_id = _seed_shared_project_session(db_uri)
+    app = sessions_test_app(db_uri)
 
     # Bob's folder holds the session.
     bob = TestClient(app).get(
-        "/v1/sessions?project=Bob%20Project", headers={"X-Forwarded-Email": BOB}
+        f"/v1/sessions?project_id={project_id}", headers={"X-Forwarded-Email": BOB}
     )
     assert bob.status_code == 200
     assert [s["id"] for s in bob.json()["data"]] == [conv_id]
 
     # Alice's same-named folder is empty — the shared session isn't hers to file.
     alice = TestClient(app).get(
-        "/v1/sessions?project=Bob%20Project", headers={"X-Forwarded-Email": ALICE}
+        f"/v1/sessions?project_id={project_id}", headers={"X-Forwarded-Email": ALICE}
     )
     assert alice.status_code == 200
     assert alice.json()["data"] == []
@@ -125,7 +97,7 @@ def test_shared_session_still_visible_in_flat_list(db_uri: str) -> None:
     in Alice's unfiltered session list, where the "Shared with me" tab reads it
     (the frontend splits owned vs. shared by permission_level there)."""
     conv_id, _ = _seed_shared_project_session(db_uri)
-    app = _multi_user_app(db_uri)
+    app = sessions_test_app(db_uri)
 
     resp = TestClient(app).get("/v1/sessions", headers={"X-Forwarded-Email": ALICE})
     assert resp.status_code == 200

@@ -45,7 +45,32 @@ class LiveProjectSnapshot:
     project_row_version: int | None
     defaults_schema_version: int
     defaults_json: dict[str, Any]
-    snapshot_origin: Literal["live", "moved"] = "live"
+    snapshot_origin: Literal["live", "moved", "backfill"] = "live"
+
+    @classmethod
+    def moved(cls, project_id: str) -> LiveProjectSnapshot:
+        """Build the canonical snapshot for a moved session."""
+        from omnigent.projects.defaults import DEFAULTS_SCHEMA_VERSION
+
+        return cls(
+            project_id=project_id,
+            project_row_version=None,
+            defaults_schema_version=DEFAULTS_SCHEMA_VERSION,
+            defaults_json={},
+            snapshot_origin="moved",
+        )
+
+    @classmethod
+    def backfill(cls, project_id: str) -> LiveProjectSnapshot:
+        """Build the canonical snapshot for a legacy-label backfill."""
+        snapshot = cls.moved(project_id)
+        return cls(
+            project_id=snapshot.project_id,
+            project_row_version=snapshot.project_row_version,
+            defaults_schema_version=snapshot.defaults_schema_version,
+            defaults_json=snapshot.defaults_json,
+            snapshot_origin="backfill",
+        )
 
 
 @dataclass(frozen=True)

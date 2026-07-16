@@ -48,6 +48,12 @@ RESERVED_USER_PUBLIC = "__public__"
 _RESERVED_USERS = frozenset({RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC})
 _TRUTHY_STRINGS = ("1", "true", "yes")
 
+
+def resolve_owner_principal(user_id: str | None) -> str:
+    """Resolve the project owner used by authenticated and local flows."""
+    return user_id or RESERVED_USER_LOCAL
+
+
 # Explicit single-user marker. Set by the managed local-server spawn
 # paths (`omnigent run` in chat.py, the daemon's
 # host/local_server.py) and by the canonical bare loopback

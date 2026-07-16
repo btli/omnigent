@@ -1462,8 +1462,7 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-project-chip")).toBeNull();
   });
 
-  it("files a pre-filled project chip's selection, and invalidates project sessions", async () => {
-    // Both the create POST and the follow-up label PATCH read .ok / .json.
+  it("creates with a pre-filled project selection, and invalidates project sessions", async () => {
     authenticatedFetchMock.mockResolvedValue({
       ok: true,
       json: async () => ({ id: "conv_new" }),
@@ -1482,18 +1481,14 @@ describe("NewChatLandingScreen", () => {
     });
     fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
 
-    // Create POST first, then a PATCH that sets first-class project membership on the
-    // freshly-created session id.
-    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(2));
-    const [createUrl] = authenticatedFetchMock.mock.calls[0];
+    // First-class membership is part of the create body, with no follow-up PATCH.
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [createUrl, createInit] = authenticatedFetchMock.mock.calls[0];
     expect(createUrl).toBe("/v1/sessions");
-    const [patchUrl, patchInit] = authenticatedFetchMock.mock.calls[1];
-    expect(patchUrl).toBe("/v1/sessions/conv_new");
-    expect((patchInit as RequestInit).method).toBe("PATCH");
-    const patchBody = JSON.parse((patchInit as RequestInit).body as string) as {
+    const createBody = JSON.parse((createInit as RequestInit).body as string) as {
       project_id: string;
     };
-    expect(patchBody.project_id).toBe("proj_docs");
+    expect(createBody.project_id).toBe("proj_docs");
 
     // The target folder fetches its own paginated list (useProjectSessions),
     // so filing the new session must invalidate it — otherwise the row only
@@ -1547,11 +1542,30 @@ describe("NewChatLandingScreen", () => {
       target: { value: "start the new project" },
     });
     fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
-    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(3));
-    const [, patchInit] = authenticatedFetchMock.mock.calls[2];
-    expect(JSON.parse((patchInit as RequestInit).body as string)).toEqual({
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(2));
+    const [createUrl, createInit] = authenticatedFetchMock.mock.calls[1];
+    expect(createUrl).toBe("/v1/sessions");
+    expect(JSON.parse((createInit as RequestInit).body as string)).toMatchObject({
       project_id: "proj_new_docs",
     });
+  });
+
+  it("shows an inline error when project creation fails", async () => {
+    authenticatedFetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      statusText: "Internal Server Error",
+    } as unknown as Response);
+    renderLanding({}, "/?project_id=proj_docs");
+
+    fireEvent.click(await screen.findByTestId("new-chat-landing-project-chip"));
+    fireEvent.click(screen.getByText("New project…"));
+    const input = screen.getByPlaceholderText("Project name…");
+    fireEvent.change(input, { target: { value: "Broken project" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't create project");
+    expect(screen.getByPlaceholderText("Project name…")).toBeInTheDocument();
   });
 
   it("pre-fills the project chip from the ?project_id= query param", async () => {
@@ -1575,13 +1589,13 @@ describe("NewChatLandingScreen", () => {
     });
     fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
 
-    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(2));
-    const [patchUrl, patchInit] = authenticatedFetchMock.mock.calls[1];
-    expect(patchUrl).toBe("/v1/sessions/conv_new");
-    const patchBody = JSON.parse((patchInit as RequestInit).body as string) as {
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [createUrl, createInit] = authenticatedFetchMock.mock.calls[0];
+    expect(createUrl).toBe("/v1/sessions");
+    const createBody = JSON.parse((createInit as RequestInit).body as string) as {
       project_id: string;
     };
-    expect(patchBody.project_id).toBe("proj_sprint_42");
+    expect(createBody.project_id).toBe("proj_sprint_42");
   });
 
   it.each([

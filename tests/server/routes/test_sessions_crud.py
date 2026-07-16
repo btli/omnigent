@@ -220,14 +220,14 @@ async def test_list_projects_includes_memberless_project(
     assert resp.json() == [{"id": project.id, "name": "Empty"}]
 
 
-# ── GET /v1/sessions?project= (filter) ───────────────────────────────
+# ── GET /v1/sessions?project_id= (filter) ────────────────────────────
 
 
 async def test_list_sessions_filtered_by_project(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    """``?project=X`` returns only sessions in that project."""
+    """``?project_id=X`` returns only sessions in that project."""
     agent_store = SqlAlchemyAgentStore(db_uri)
     conv_store = SqlAlchemyConversationStore(db_uri)
     project = SqlAlchemyProjectStore(db_uri).create(RESERVED_USER_LOCAL, "X")
@@ -239,7 +239,7 @@ async def test_list_sessions_filtered_by_project(
     conv_store.create_conversation(agent_id=agent_id)  # unfiled
     conv_store.set_project_membership(filed.id, project.id)
 
-    resp = await client.get("/v1/sessions?project=X")
+    resp = await client.get(f"/v1/sessions?project_id={project.id}")
     assert resp.status_code == 200
     ids = [s["id"] for s in resp.json()["data"]]
     assert ids == [filed.id]
@@ -249,7 +249,7 @@ async def test_list_sessions_empty_project_returns_unfiled(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    """``?project=`` (empty) returns only sessions with no project label."""
+    """An empty project id returns only unfiled sessions."""
     agent_store = SqlAlchemyAgentStore(db_uri)
     conv_store = SqlAlchemyConversationStore(db_uri)
     project = SqlAlchemyProjectStore(db_uri).create(RESERVED_USER_LOCAL, "X")

@@ -29,7 +29,6 @@ import { authenticatedFetch } from "@/lib/identity";
 import {
   filtersFromConversationQueryKey,
   mergeItemsIntoPages,
-  removeIdsFromPages,
   type ConversationsInfiniteData,
   type SessionListWireItem,
 } from "@/lib/sessionListCache";
@@ -38,10 +37,17 @@ import { useChatStore } from "@/store/chatStore";
 import type { Session } from "@/lib/types";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import { markConversationSeen } from "./useUnseenConversations";
+import {
+  ARCHIVED_PROJECTS_KEY,
+  invalidateProjectQueries,
+  PROJECT_NEWEST_KEY,
+  PROJECT_SESSIONS_KEY,
+  PROJECTS_KEY,
+  removeSessionsFromListCaches,
+} from "./projectQueries";
 
 export const CONNECTED_STREAM_REFETCH_INTERVAL_MS = 60_000;
 export const DISCONNECTED_STREAM_REFETCH_INTERVAL_MS = 45_000;
-const ARCHIVED_PROJECTS_KEY = ["archived-projects"] as const;
 
 export interface UseConversationsOptions {
   reconcileWhileConnected?: boolean;
@@ -55,10 +61,8 @@ export interface Conversation {
   created_at: number;
   updated_at: number;
   labels: Record<string, string>;
-  /** First-class session metadata used for stable project membership. */
-  metadata?: {
-    project_id?: string | null;
-  };
+  /** Stable first-class project membership from the session payload. */
+  project_id?: string | null;
   permission_level: number | null;
   owner?: string | null;
   runner_id?: string | null;
@@ -173,7 +177,7 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     created_at: wire.created_at,
     updated_at: wire.updated_at ?? wire.created_at,
     labels: wire.labels ?? {},
-    metadata: wire.metadata,
+    project_id: wire.project_id ?? null,
     permission_level: wire.permission_level ?? null,
     owner: wire.owner ?? null,
     runner_id: wire.runner_id ?? null,
@@ -190,6 +194,34 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
   };
 }
 
+interface SessionListParams {
+  after?: string;
+  searchQuery?: string;
+  includeArchived?: boolean;
+  projectId?: string;
+  limit?: number;
+}
+
+/** Build the common newest-first query parameters for session-list endpoints. */
+function buildSessionListParams({
+  after,
+  searchQuery,
+  includeArchived,
+  projectId,
+  limit = 20,
+}: SessionListParams): URLSearchParams {
+  const params = new URLSearchParams({
+    order: "desc",
+    sort_by: "updated_at",
+    limit: String(limit),
+  });
+  if (after) params.set("after", after);
+  if (searchQuery) params.set("search_query", searchQuery);
+  if (includeArchived) params.set("include_archived", "true");
+  if (projectId) params.set("project_id", projectId);
+  return params;
+}
+
 async function fetchConversationsPage({
   after,
   searchQuery,
@@ -204,18 +236,7 @@ async function fetchConversationsPage({
   // `updated_at` matches the sidebar's sort, which keeps server
   // pagination consistent with the visible order as the user scrolls.
   // See sidebarNav.ts.
-  const params = new URLSearchParams({
-    order: "desc",
-    sort_by: "updated_at",
-    limit: "20",
-  });
-  if (after) params.set("after", after);
-  if (searchQuery) params.set("search_query", searchQuery);
-  // Only request archived rows when the toggle is on, so the default
-  // sidebar never pays to fetch them. The server excludes archived
-  // sessions unless include_archived=true.
-  if (includeArchived) params.set("include_archived", "true");
-  if (projectId) params.set("project_id", projectId);
+  const params = buildSessionListParams({ after, searchQuery, includeArchived, projectId });
   const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as ConversationsPage;
@@ -392,10 +413,7 @@ export function useArchiveConversation() {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       // Archiving changes the folder's paginated sessions and whether the
       // project appears in the archived-session filter.
-      void queryClient.invalidateQueries({ queryKey: ["projects"] });
-      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
-      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
-      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECTS_KEY });
+      invalidateProjectQueries(queryClient, { sessions: true });
     },
   });
 }
@@ -445,27 +463,17 @@ export function useStopAndDeleteConversation() {
       await deleteConversation(id, deleteBranch);
     },
     onSuccess: (_data, { id }) => {
-      const ids = new Set([id]);
       // Drop the row from the global list AND every project folder's own
-      // paginated list (["project-sessions", <name>]) — both share the same
+      // paginated list (["project-sessions", <project-id>]) — both share the same
       // page shape. Patched in place rather than invalidated for the same
       // reason as the global list: an immediate refetch races the server's
       // async search reindex and can resurrect the just-deleted row.
-      for (const queryKey of [["conversations"], ["project-sessions"]]) {
-        for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-          queryKey,
-        })) {
-          const { data: next, removed } = removeIdsFromPages(data, ids);
-          if (removed) queryClient.setQueryData(key, next);
-        }
-      }
+      removeSessionsFromListCaches(queryClient, [id]);
       queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
       queryClient.removeQueries({ queryKey: ["session", id] });
       // Keep project identities and their derived session state fresh. This
       // endpoint reads the DB directly, so it has no search-index race.
-      void queryClient.invalidateQueries({ queryKey: ["projects"] });
-      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
-      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECTS_KEY });
+      invalidateProjectQueries(queryClient, { sessions: false });
     },
   });
 }
@@ -524,10 +532,7 @@ export function useBulkArchiveConversations() {
     },
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
-      void queryClient.invalidateQueries({ queryKey: ["projects"] });
-      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
-      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
-      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECTS_KEY });
+      invalidateProjectQueries(queryClient, { sessions: true });
     },
   });
 }
@@ -563,46 +568,26 @@ export function useBulkDeleteConversations() {
       return { succeeded, failed };
     },
     onSuccess: (_data, ids) => {
-      const idSet = new Set(ids);
       // Splice deleted rows out of the global list AND every project folder's
       // own paginated list (same page shape) so filed sessions leave their
       // folder without a refresh.
-      for (const queryKey of [["conversations"], ["project-sessions"]]) {
-        for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-          queryKey,
-        })) {
-          const { data: next, removed } = removeIdsFromPages(data, idSet);
-          if (removed) queryClient.setQueryData(key, next);
-        }
-      }
+      removeSessionsFromListCaches(queryClient, ids);
       for (const id of ids) {
         queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
         queryClient.removeQueries({ queryKey: ["session", id] });
       }
       // Refresh project identities and derived session state (DB-direct read,
       // with no search-index lag).
-      void queryClient.invalidateQueries({ queryKey: ["projects"] });
-      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
-      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECTS_KEY });
+      invalidateProjectQueries(queryClient, { sessions: false });
     },
     onError: (err: any) => {
       if (err?.succeeded) {
-        const idSet = new Set(err.succeeded as string[]);
-        for (const queryKey of [["conversations"], ["project-sessions"]]) {
-          for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-            queryKey,
-          })) {
-            const { data: next, removed } = removeIdsFromPages(data, idSet);
-            if (removed) queryClient.setQueryData(key, next);
-          }
-        }
+        removeSessionsFromListCaches(queryClient, err.succeeded as string[]);
         for (const id of err.succeeded) {
           queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
           queryClient.removeQueries({ queryKey: ["session", id] });
         }
-        void queryClient.invalidateQueries({ queryKey: ["projects"] });
-        void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
-        void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECTS_KEY });
+        invalidateProjectQueries(queryClient, { sessions: false });
       }
     },
   });
@@ -686,26 +671,43 @@ export interface Project {
   name: string;
 }
 
-/** HTTP failure from the conditional first-class project rename flow. */
-export class ProjectRenameError extends Error {
+/** HTTP failure from a conditional first-class project mutation. */
+export class ProjectMutationError extends Error {
   readonly status: number;
 
   constructor(status: number, statusText: string) {
     super(`${status} ${statusText}`);
-    this.name = "ProjectRenameError";
+    this.name = "ProjectMutationError";
     this.status = status;
   }
 }
 
-function projectRenameStatus(error: unknown): number | null {
+function projectMutationStatus(error: unknown): number | null {
   if (typeof error !== "object" || error === null || !("status" in error)) return null;
   return typeof error.status === "number" ? error.status : null;
+}
+
+/** Run a project action against the latest ETag and preserve HTTP status errors. */
+export async function mutateProjectWithIfMatch(
+  projectId: string,
+  action: (projectUrl: string, etag: string) => Promise<Response>,
+): Promise<Response> {
+  const projectUrl = `/v1/projects/${encodeURIComponent(projectId)}`;
+  const current = await authenticatedFetch(projectUrl);
+  if (!current.ok) throw new ProjectMutationError(current.status, current.statusText);
+
+  const etag = current.headers.get("ETag");
+  if (!etag) throw new Error("Project response did not include an ETag");
+
+  const result = await action(projectUrl, etag);
+  if (!result.ok) throw new ProjectMutationError(result.status, result.statusText);
+  return result;
 }
 
 /** Fetch every non-archived project owned by the viewer. */
 export function useProjects() {
   return useQuery<Project[]>({
-    queryKey: ["projects"],
+    queryKey: PROJECTS_KEY,
     queryFn: async () => {
       const res = await authenticatedFetch("/v1/sessions/projects");
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
@@ -744,7 +746,7 @@ export function useCreateProject() {
   return useMutation({
     mutationFn: createProject,
     onSuccess: (project) => {
-      queryClient.setQueryData<Project[]>(["projects"], (current = []) =>
+      queryClient.setQueryData<Project[]>(PROJECTS_KEY, (current = []) =>
         current.some((item) => item.id === project.id) ? current : [...current, project],
       );
     },
@@ -753,22 +755,16 @@ export function useCreateProject() {
 
 /** Rename a first-class project using its latest row version. */
 export async function renameProject(projectId: string, name: string): Promise<Project> {
-  const projectUrl = `/v1/projects/${encodeURIComponent(projectId)}`;
-  const current = await authenticatedFetch(projectUrl);
-  if (!current.ok) throw new ProjectRenameError(current.status, current.statusText);
-
-  const etag = current.headers.get("ETag");
-  if (!etag) throw new Error("Project response did not include an ETag");
-
-  const renamed = await authenticatedFetch(`${projectUrl}/rename`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "If-Match": etag,
-    },
-    body: JSON.stringify({ name }),
-  });
-  if (!renamed.ok) throw new ProjectRenameError(renamed.status, renamed.statusText);
+  const renamed = await mutateProjectWithIfMatch(projectId, (projectUrl, etag) =>
+    authenticatedFetch(`${projectUrl}/rename`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "If-Match": etag,
+      },
+      body: JSON.stringify({ name }),
+    }),
+  );
   return (await renamed.json()) as Project;
 }
 
@@ -777,22 +773,22 @@ export function useRenameProject() {
   return useMutation({
     mutationFn: ({ id, name }: { id: string; name: string }) => renameProject(id, name),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["projects"] });
-      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
-      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
-      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECTS_KEY });
+      invalidateProjectQueries(queryClient, { sessions: true });
     },
     onError: (error) => {
       // A conflict is handled inline with the editor. Other failures may mean
       // our project identity/name data is stale, so refresh both project lists.
-      if (projectRenameStatus(error) === 409) return;
-      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      if (projectMutationStatus(error) === 409) return;
+      void queryClient.invalidateQueries({ queryKey: PROJECTS_KEY });
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECTS_KEY });
     },
   });
 }
 
-async function moveConversationToProject(id: string, projectId: string): Promise<Conversation> {
+export async function moveConversationToProject(
+  id: string,
+  projectId: string,
+): Promise<Conversation> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
@@ -818,11 +814,8 @@ export function useMoveToProject() {
     onSuccess: (updated) => {
       markConversationSeen(updated.id, updated.updated_at);
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
-      void queryClient.invalidateQueries({ queryKey: ["projects"] });
       // Moving into/out of a project changes both folders' paginated lists.
-      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
-      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
-      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECTS_KEY });
+      invalidateProjectQueries(queryClient, { sessions: true });
     },
   });
 }
@@ -836,14 +829,12 @@ async function fetchAllProjectSessionIds(projectId: string): Promise<string[]> {
   const ids: string[] = [];
   let after: string | undefined;
   for (;;) {
-    const params = new URLSearchParams({
-      order: "desc",
-      sort_by: "updated_at",
-      limit: "100",
-      include_archived: "true",
-      project_id: projectId,
+    const params = buildSessionListParams({
+      after,
+      includeArchived: true,
+      projectId,
+      limit: 100,
     });
-    if (after) params.set("after", after);
     // Sequential by necessity: each page's request needs the previous page's
     // cursor (`after`), so these awaits can't be parallelized.
     // eslint-disable-next-line no-await-in-loop
@@ -864,13 +855,7 @@ async function fetchProjectSessionsPage(
   after?: string,
   limit = 20,
 ): Promise<ConversationsPage> {
-  const params = new URLSearchParams({
-    order: "desc",
-    sort_by: "updated_at",
-    limit: String(limit),
-    project_id: projectId,
-  });
-  if (after) params.set("after", after);
+  const params = buildSessionListParams({ after, projectId, limit });
   const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as ConversationsPage;
@@ -888,7 +873,7 @@ async function fetchProjectSessionsPage(
  */
 export function useProjectSessions(projectId: string, enabled: boolean) {
   return useInfiniteQuery({
-    queryKey: ["project-sessions", projectId],
+    queryKey: [...PROJECT_SESSIONS_KEY, projectId],
     queryFn: ({ pageParam }) =>
       fetchProjectSessionsPage(projectId, pageParam as string | undefined),
     initialPageParam: undefined as string | undefined,
@@ -901,7 +886,7 @@ export function useProjectSessions(projectId: string, enabled: boolean) {
 /** The newest active session in a project, used by composer prefill. */
 export function useNewestProjectSession(projectId: string | null) {
   return useQuery({
-    queryKey: ["project-newest-session", projectId],
+    queryKey: [...PROJECT_NEWEST_KEY, projectId],
     queryFn: async () => {
       const page = await fetchProjectSessionsPage(projectId as string, undefined, 1);
       return page.data[0] ?? null;
@@ -937,26 +922,19 @@ export function useDeleteProject() {
         }
       }
       if (failed.length > 0) throw { failed, succeeded, total: ids.length };
-      const projectUrl = `/v1/projects/${encodeURIComponent(projectId)}`;
-      const current = await authenticatedFetch(projectUrl);
-      if (!current.ok) throw new Error(`${current.status} ${current.statusText}`);
-      const etag = current.headers.get("ETag");
-      if (!etag) throw new Error("Project response did not include an ETag");
-      const archived = await authenticatedFetch(`${projectUrl}/archive`, {
-        method: "POST",
-        headers: { "If-Match": etag },
-      });
-      if (!archived.ok) throw new Error(`${archived.status} ${archived.statusText}`);
+      await mutateProjectWithIfMatch(projectId, (projectUrl, etag) =>
+        authenticatedFetch(`${projectUrl}/archive`, {
+          method: "POST",
+          headers: { "If-Match": etag },
+        }),
+      );
       return { succeeded, failed };
     },
     onSettled: () => {
       // Refresh regardless of partial failure so the sidebar reflects whatever
       // was actually archived.
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
-      void queryClient.invalidateQueries({ queryKey: ["projects"] });
-      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
-      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
-      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECTS_KEY });
+      invalidateProjectQueries(queryClient, { sessions: true });
     },
   });
 }

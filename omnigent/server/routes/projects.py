@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict
 
 from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.auth import AuthProvider, resolve_owner_principal
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.stores.project_store import UNSET, ProjectStore
 
@@ -45,7 +45,7 @@ class UpdateProjectRequest(BaseModel):
 
 
 def _owner(request: Request, auth_provider: AuthProvider | None) -> str:
-    return require_user(request, auth_provider) or RESERVED_USER_LOCAL
+    return resolve_owner_principal(require_user(request, auth_provider))
 
 
 def _expected_version(if_match: str | None) -> int | None:

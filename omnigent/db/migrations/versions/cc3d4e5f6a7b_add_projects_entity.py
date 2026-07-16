@@ -64,7 +64,7 @@ def upgrade() -> None:
         sa.Column("defaults_json", sa.Text(), nullable=False),
         sa.Column("created_at", sa.Integer(), nullable=False),
         sa.CheckConstraint(
-            "snapshot_origin IN ('live', 'backfill')",
+            "snapshot_origin IN ('live', 'backfill', 'moved')",
             name="ck_session_project_snapshots_origin",
         ),
         sa.PrimaryKeyConstraint("workspace_id", "session_id"),
