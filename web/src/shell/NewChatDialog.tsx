@@ -60,9 +60,11 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { CliCommandBlock } from "./CliCommandBlock";
 import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
 import {
+  freshPrefillEdits,
   initialPrefillState,
   prefillDone,
   projectPrefillStep,
+  resolvePrefillValue,
   type ProjectPrefillState,
 } from "./projectPrefill";
 import { getCliServerUrl } from "@/lib/host";
@@ -1880,13 +1882,7 @@ export function NewChatLandingScreen() {
   // Project to file the new session under. Empty = unfiled. Pre-filled from
   // `?project_id=` so the sidebar's pencil lands with the project selected.
   const [selectedProjectId, setSelectedProjectId] = useState<string>(() => projectIdParam);
-  const prefillEditsRef = useRef({
-    host: landingDraft !== null,
-    workspace: landingDraft !== null,
-    harness: landingDraft !== null,
-    model: landingDraft !== null,
-    effort: landingDraft !== null,
-  });
+  const prefillEditsRef = useRef(freshPrefillEdits(landingDraft !== null));
   // The landing screen stays mounted while the `?project_id=` param changes (e.g.
   // clicking a different project's pencil), so the lazy initializer above won't
   // re-run — sync the selection to the param whenever it changes.
@@ -2053,13 +2049,7 @@ export function NewChatLandingScreen() {
 
   useEffect(() => {
     if (prefill.projectId === projectIdParam) return;
-    prefillEditsRef.current = {
-      host: false,
-      workspace: false,
-      harness: false,
-      model: false,
-      effort: false,
-    };
+    prefillEditsRef.current = freshPrefillEdits(false);
     setSandboxSelected(false);
     setSelectedHostId(null);
     setPickedAgentId(projectIdParam ? null : readLastAgentId());
@@ -2244,19 +2234,25 @@ export function NewChatLandingScreen() {
 
   useEffect(() => {
     if (!projectIdParam || projectDefaults === undefined) return;
-    if (!prefillEditsRef.current.harness && projectDefaults.harness_override !== null) {
-      setPickedHarness(projectDefaults.harness_override);
-    }
-    if (!prefillEditsRef.current.model && projectDefaults.model_override !== null) {
-      setPickedModel(projectDefaults.model_override);
-    }
-    if (!prefillEditsRef.current.effort) {
-      if (projectDefaults.reasoning_effort !== null) {
-        setPickedEffort(projectDefaults.reasoning_effort);
-      } else if (projectNewest?.reasoning_effort != null) {
-        setPickedEffort(projectNewest.reasoning_effort);
-      }
-    }
+    const edits = prefillEditsRef.current;
+    const harness = resolvePrefillValue({
+      bundle: projectDefaults.harness_override ?? undefined,
+      fallback: undefined,
+      edited: edits.harness,
+    });
+    if (harness !== undefined) setPickedHarness(harness);
+    const model = resolvePrefillValue({
+      bundle: projectDefaults.model_override ?? undefined,
+      fallback: undefined,
+      edited: edits.model,
+    });
+    if (model !== undefined) setPickedModel(model);
+    const effort = resolvePrefillValue({
+      bundle: projectDefaults.reasoning_effort ?? undefined,
+      fallback: projectNewest?.reasoning_effort ?? undefined,
+      edited: edits.effort,
+    });
+    if (effort !== undefined) setPickedEffort(effort);
   }, [
     effectiveAgentId,
     projectDefaults,

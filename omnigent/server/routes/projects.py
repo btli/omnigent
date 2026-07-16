@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict
 from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.projects.defaults import DEFAULTS_SCHEMA_VERSION, ProjectDefaultsBundle
-from omnigent.projects.resolver import resolve_project_defaults
+from omnigent.projects.resolver import default_server_defaults, resolve_project_defaults
 from omnigent.server.auth import AuthProvider, resolve_owner_principal
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.stores.conversation_store import ConversationStore
@@ -161,7 +161,7 @@ def create_projects_router(
             )
         )
         resolved = resolve_project_defaults(
-            server_defaults=ProjectDefaultsBundle(host_type="external"),
+            server_defaults=default_server_defaults(),
             project_defaults=project.defaults_json,
             defaults_schema_version=project.defaults_schema_version,
             session_overrides=ProjectDefaultsBundle(),

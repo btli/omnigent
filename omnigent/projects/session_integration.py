@@ -10,7 +10,7 @@ from pydantic import ValidationError
 from omnigent.entities import LiveProjectSnapshot, Project
 from omnigent.errors import ErrorCode, OmnigentError, ProjectInputError
 from omnigent.projects.defaults import ProjectDefaultsBundle
-from omnigent.projects.resolver import resolve_project_defaults
+from omnigent.projects.resolver import default_server_defaults, resolve_project_defaults
 from omnigent.server.schemas import SessionCreateMetadata, SessionCreateRequest
 from omnigent.stores.conversation_store import (
     PROJECT_LABEL_KEY,
@@ -143,7 +143,7 @@ async def prepare_json_session_project(
             override_values["harness"] = body.harness_override
 
         resolved = resolve_project_defaults(
-            server_defaults=ProjectDefaultsBundle(host_type="external"),
+            server_defaults=default_server_defaults(),
             project_defaults=project.defaults_json,
             defaults_schema_version=project.defaults_schema_version,
             session_overrides=ProjectDefaultsBundle.model_validate(override_values),

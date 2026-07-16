@@ -58,6 +58,7 @@ from omnigent.onboarding.ucode_setup import (
     model_gateway_workspace_urls,
 )
 from omnigent.process_logging import LOG_LEVEL_ENV_VAR, LOG_TO_STDERR_ENV_VAR
+from omnigent.projects.defaults import ProjectDefaultsBundle
 
 if TYPE_CHECKING:
     import httpx
@@ -5774,22 +5775,9 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
       omnigent session export --id conv_abc123 --output my_session.jsonl
       omnigent session export --id conv_abc123 --server https://myserver.com
     """
-    import httpx
-
-    from omnigent.chat import _remote_headers
-
-    cfg = _load_effective_config()
-    base_url = _resolve_attach_server(server, cfg.get("server"))
-    if base_url is None:
-        startup = ensure_local_omnigent_server()
-        base_url = startup.url
-
-    base_url = base_url.rstrip("/")
     out_path = Path(output) if output else Path(f"{session_id}.jsonl")
 
-    with httpx.Client(
-        base_url=base_url, headers=_remote_headers(server_url=base_url), timeout=30.0
-    ) as client:
+    with _server_client(server) as client:
         # Fetch session metadata (items fetched separately via pagination).
         resp = client.get(
             f"/v1/sessions/{session_id}",
@@ -5826,18 +5814,7 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
     click.echo(f"Exported {n_items} item(s) from {session_id} to {out_path}")
 
 
-_PROJECT_DEFAULT_KEYS: frozenset[str] = frozenset(
-    {
-        "default_branch",
-        "harness",
-        "host_id",
-        "host_type",
-        "model",
-        "reasoning_effort",
-        "repo_url",
-        "workspace",
-    }
-)
+_PROJECT_DEFAULT_KEYS: frozenset[str] = frozenset(ProjectDefaultsBundle.model_fields)
 
 
 def _parse_project_default_settings(settings: tuple[str, ...]) -> dict[str, str]:
@@ -5870,8 +5847,8 @@ def _validate_project_default_keys(keys: tuple[str, ...]) -> tuple[str, ...]:
 
 
 @contextlib.contextmanager
-def _project_client(server: str | None) -> collections.abc.Iterator[httpx.Client]:
-    """Yield an authenticated client for project management requests."""
+def _server_client(server: str | None) -> collections.abc.Iterator[httpx.Client]:
+    """Yield an authenticated client for the configured (or local) server."""
     import httpx
 
     from omnigent.chat import _remote_headers
@@ -5961,8 +5938,8 @@ def _get_project_with_etag(
     return body, etag
 
 
-def _project_table(title: str) -> Table:
-    """Build a project CLI table with the shared management style."""
+def _management_table(title: str) -> Table:
+    """Build a management CLI table (projects, hosts) with the shared style."""
     return Table(
         title=title,
         box=box.SIMPLE_HEAVY,
@@ -6012,7 +5989,7 @@ def project_list(archived_members: bool, json_output: bool, server: str | None) 
       omnigent project list --archived-members
       omnigent project list --json --server https://myserver.com
     """
-    with _project_client(server) as client:
+    with _server_client(server) as client:
         response = client.get(
             "/v1/projects",
             params={"archived_members": archived_members},
@@ -6022,7 +5999,7 @@ def project_list(archived_members: bool, json_output: bool, server: str | None) 
     if json_output:
         click.echo(json.dumps(projects, indent=2, sort_keys=True))
         return
-    table = _project_table("Projects")
+    table = _management_table("Projects")
     table.add_column("ID")
     table.add_column("NAME")
     table.add_column("UPDATED")
@@ -6066,7 +6043,7 @@ def project_create(
         payload["description"] = description
     if defaults:
         payload["defaults_json"] = defaults
-    with _project_client(server) as client:
+    with _server_client(server) as client:
         response = client.post("/v1/projects", json=payload)
         _check_project_response(response)
         created = response.json()
@@ -6086,14 +6063,14 @@ def project_show(project_id: str, json_output: bool, server: str | None) -> None
       omnigent project show proj_abc123 --json
       omnigent project show proj_abc123 --server https://myserver.com
     """
-    with _project_client(server) as client:
+    with _server_client(server) as client:
         response = client.get(f"/v1/projects/{project_id}")
         _check_project_response(response, project_id=project_id)
         item = response.json()
     if json_output:
         click.echo(json.dumps(item, indent=2, sort_keys=True))
         return
-    table = _project_table(f"Project {project_id}")
+    table = _management_table(f"Project {project_id}")
     table.add_column("FIELD")
     table.add_column("VALUE")
     for key, value in item.items():
@@ -6118,7 +6095,7 @@ def project_rename(project_id: str, new_name: str, server: str | None) -> None:
       omnigent project rename proj_abc123 "New name"
       omnigent project rename proj_abc123 "New name" --server https://myserver.com
     """
-    with _project_client(server) as client:
+    with _server_client(server) as client:
         _, etag = _get_project_with_etag(client, project_id)
         response = client.post(
             f"/v1/projects/{project_id}/rename",
@@ -6167,7 +6144,7 @@ def project_update(
     """
     parsed = _parse_project_default_settings(settings)
     validated_unsets = _validate_project_default_keys(unset_keys)
-    with _project_client(server) as client:
+    with _server_client(server) as client:
         current, etag = _get_project_with_etag(client, project_id)
         defaults = dict(current.get("defaults_json") or {})
         defaults.update(parsed)
@@ -6205,7 +6182,7 @@ def project_archive(
       omnigent project archive proj_abc123 --include-sessions
       omnigent project archive proj_abc123 --server https://myserver.com
     """
-    with _project_client(server) as client:
+    with _server_client(server) as client:
         _, etag = _get_project_with_etag(client, project_id)
         response = client.post(
             f"/v1/projects/{project_id}/archive",
@@ -6231,7 +6208,7 @@ def project_restore(project_id: str, server: str | None) -> None:
       omnigent project restore proj_abc123
       omnigent project restore proj_abc123 --server https://myserver.com
     """
-    with _project_client(server) as client:
+    with _server_client(server) as client:
         _, etag = _get_project_with_etag(client, project_id)
         response = client.post(
             f"/v1/projects/{project_id}/restore",
@@ -6253,7 +6230,7 @@ def project_transfer(project_id: str, new_owner: str, server: str | None) -> Non
       omnigent project transfer proj_abc123 user@example.com
       omnigent project transfer proj_abc123 user@example.com --server https://myserver.com
     """
-    with _project_client(server) as client:
+    with _server_client(server) as client:
         _, etag = _get_project_with_etag(client, project_id)
         response = client.post(
             f"/v1/projects/{project_id}/transfer",
@@ -8012,22 +7989,6 @@ def _host_console() -> Console:
     return Console(highlight=False)
 
 
-def _host_table(title: str) -> Table:
-    """
-    Build a host CLI table with the shared style.
-
-    :param title: Table title, e.g. ``"Host daemons"``.
-    :returns: A :class:`rich.table.Table` ready for columns and rows.
-    """
-    return Table(
-        title=title,
-        box=box.SIMPLE_HEAVY,
-        border_style="dim",
-        header_style="bold cyan",
-        show_edge=False,
-    )
-
-
 def _host_display_value(value: _HostJsonValue, *, missing: str = "-") -> str:
     """
     Convert optional payload values into display text.
@@ -8187,7 +8148,7 @@ def _add_host_payload_sessions_table(console: Console, payload: _HostPayload) ->
     if not sessions:
         console.print("  [dim]No owned sessions found.[/dim]")
         return
-    table = _host_table("Sessions")
+    table = _management_table("Sessions")
     widths = _host_sessions_table_widths(console_width=console.width, sessions=sessions)
     table.add_column(
         "Session ID",

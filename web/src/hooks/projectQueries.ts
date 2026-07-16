@@ -7,6 +7,8 @@ export const PROJECT_NEWEST_KEY = ["project-newest-session"] as const;
 export const PROJECT_RESOLVED_DEFAULTS_KEY = ["project-resolved-defaults"] as const;
 export const ARCHIVED_PROJECTS_KEY = ["archived-projects"] as const;
 
+// Hand-kept mirror of ResolvedProjectDefaults (omnigent/projects/resolver.py),
+// plus the row_version the preview endpoint appends.
 export interface ResolvedProjectDefaults {
   host_type: "managed" | "external";
   host_id: string | null;

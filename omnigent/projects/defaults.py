@@ -12,7 +12,12 @@ DEFAULTS_SCHEMA_VERSION = 1
 
 
 class ProjectDefaultsBundle(BaseModel):
-    """Version-one flat defaults with absent/null/value field semantics."""
+    """Version-one flat defaults with absent/null/value field semantics.
+
+    Field names are mirrored by hand in the web settings dialog
+    (web/src/shell/ProjectSettingsDialog.tsx DEFAULT_FIELDS); the CLI
+    ``--set`` allowlist derives from ``model_fields`` automatically.
+    """
 
     model_config = ConfigDict(extra="forbid")
 

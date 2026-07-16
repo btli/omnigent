@@ -27,6 +27,19 @@ export function prefillDone(state: ProjectPrefillState): boolean {
   return state.phase === "settled" && state.agentSeeded;
 }
 
+export interface ProjectPrefillEdits {
+  host: boolean;
+  workspace: boolean;
+  harness: boolean;
+  model: boolean;
+  effort: boolean;
+}
+
+/** Per-field "user already touched this" flags that block prefill writes. */
+export function freshPrefillEdits(edited: boolean): ProjectPrefillEdits {
+  return { host: edited, workspace: edited, harness: edited, model: edited, effort: edited };
+}
+
 export function resolvePrefillValue<T>({
   bundle,
   fallback,
@@ -61,6 +74,11 @@ interface ProjectPrefillInputs {
   hostWorktreesFailed: boolean;
   hostEdited: boolean;
   workspaceEdited: boolean;
+}
+
+/** Project pins a managed sandbox and the user hasn't overridden location. */
+function managedSandboxPrefill(inputs: ProjectPrefillInputs): boolean {
+  return inputs.defaults?.host_type === "managed" && !inputs.hostEdited && !inputs.workspaceEdited;
 }
 
 interface ProjectPrefillWrites {
@@ -122,7 +140,7 @@ function locationStep(
     ) {
       return null;
     }
-    if (defaults?.host_type === "managed" && !inputs.hostEdited && !inputs.workspaceEdited) {
+    if (managedSandboxPrefill(inputs)) {
       writes.sandboxSelected = true;
     }
     return { ...state, phase: "workspace" };
@@ -131,9 +149,10 @@ function locationStep(
   if (state.phase === "workspace") {
     const { newest, defaults, hosts, sourceWorktrees, sourceWorktreesFailed, selectedHostId } =
       inputs;
-    if (defaults?.host_type === "managed" && !inputs.hostEdited && !inputs.workspaceEdited) {
-      if (!inputs.hostEdited && !inputs.workspaceEdited && defaults.workspace !== null) {
-        writes.sandboxWorkspace = defaults.workspace;
+    if (managedSandboxPrefill(inputs)) {
+      const managedWorkspace = defaults?.workspace;
+      if (managedWorkspace != null) {
+        writes.sandboxWorkspace = managedWorkspace;
       }
       return settled(state);
     }

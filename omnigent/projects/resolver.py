@@ -14,7 +14,10 @@ from omnigent.server.schemas import SessionGitOptions
 
 
 class ResolvedProjectDefaults(BaseModel):
-    """Fully resolved values mapped onto JSON session-create fields."""
+    """Fully resolved values mapped onto JSON session-create fields.
+
+    Mirrored by hand in web/src/hooks/projectQueries.ts (ResolvedProjectDefaults).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -29,6 +32,12 @@ class ResolvedProjectDefaults(BaseModel):
 
 def _mint_branch_name() -> str:
     return f"omnigent/{uuid.uuid4().hex}"
+
+
+def default_server_defaults() -> ProjectDefaultsBundle:
+    """Server-level bundle every resolution starts from; the resolved-defaults
+    preview endpoint must use the same base as session create."""
+    return ProjectDefaultsBundle(host_type="external")
 
 
 def _values(bundle: ProjectDefaultsBundle) -> dict[str, Any]:

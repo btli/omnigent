@@ -72,8 +72,16 @@ def _section(page: Page, project_name: str) -> Locator:
     ).last
 
 
+def _session_href(session_id: str) -> str:
+    return f'a[href="/c/{session_id}"]'
+
+
+def _session_link(section: Locator, session_id: str) -> Locator:
+    return section.locator(_session_href(session_id))
+
+
 def _row(page: Page, section: Locator, session_id: str) -> Locator:
-    return section.locator("li").filter(has=page.locator(f'a[href="/c/{session_id}"]'))
+    return section.locator("li").filter(has=page.locator(_session_href(session_id)))
 
 
 def _open_project_kebab(page: Page, project_name: str) -> None:
@@ -104,9 +112,7 @@ def test_api_seeded_project_shows_sessions_and_new_session_link(
     header = page.get_by_role("button", name=project_name, exact=True)
     expect(header).to_be_visible()
     expect(header).to_have_attribute("aria-expanded", "true")
-    expect(_section(page, project_name).locator(f'a[href="/c/{session_id}"]')).to_contain_text(
-        title
-    )
+    expect(_session_link(_section(page, project_name), session_id)).to_contain_text(title)
 
     _section(page, project_name).hover()
     new_session = page.get_by_role("link", name=f"New session in {project_name}")
@@ -166,7 +172,7 @@ def test_inline_rename_commits_and_keeps_collision_in_edit(
     expect(rename_input).to_have_value(existing_name)
     expect(rename_input).to_have_attribute("aria-invalid", "true")
     editing_section = page.locator("section").filter(has=rename_input)
-    expect(editing_section.locator(f'a[href="/c/{session_id}"]')).to_be_visible()
+    expect(_session_link(editing_section, session_id)).to_be_visible()
 
 
 def test_move_session_between_projects_from_row_kebab(
@@ -187,10 +193,10 @@ def test_move_session_between_projects_from_row_kebab(
     page.get_by_test_id("move-to-project").click()
     page.get_by_role("menuitem", name=target_name, exact=True).click()
 
-    expect(_section(page, source_name).locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
+    expect(_session_link(_section(page, source_name), session_id)).to_have_count(0)
     target_header = page.get_by_role("button", name=target_name, exact=True)
     expect(target_header).to_have_attribute("aria-expanded", "true")
-    expect(_section(page, target_name).locator(f'a[href="/c/{session_id}"]')).to_be_visible()
+    expect(_session_link(_section(page, target_name), session_id)).to_be_visible()
 
 
 def test_archived_filter_lists_and_filters_by_project(

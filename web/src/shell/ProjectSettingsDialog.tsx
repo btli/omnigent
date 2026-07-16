@@ -11,11 +11,17 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { mutateProjectWithIfMatch, type ProjectMutationError } from "@/hooks/useConversations";
+import {
+  fetchProjectWithEtag,
+  mutateProjectWithIfMatch,
+  projectMutationStatus,
+  ProjectMutationError,
+} from "@/hooks/useConversations";
 import { invalidateProjectQueries } from "@/hooks/projectQueries";
 import { authenticatedFetch } from "@/lib/identity";
 import { cn } from "@/lib/utils";
 
+// Hand-kept mirror of ProjectDefaultsBundle (omnigent/projects/defaults.py).
 const DEFAULT_FIELDS = [
   "host_type",
   "repo_url",
@@ -89,15 +95,10 @@ function stateLabel(state: FieldState): string {
   return "State: value";
 }
 
-function statusOf(error: unknown): number | null {
-  if (typeof error !== "object" || error === null || !("status" in error)) return null;
-  const status = (error as ProjectMutationError).status;
-  return typeof status === "number" ? status : null;
-}
-
 function serverMessage(error: unknown): string {
-  if (!(error instanceof Error)) return "Couldn't save project settings. Try again.";
-  return error.message.replace(/^\d+\s*/, "") || "Couldn't save project settings. Try again.";
+  const fallback = "Couldn't save project settings. Try again.";
+  if (error instanceof ProjectMutationError) return error.serverMessage || fallback;
+  return error instanceof Error && error.message ? error.message : fallback;
 }
 
 function formatTimestamp(value: number): string {
@@ -207,10 +208,7 @@ export function ProjectSettingsDialog({
         setNameError(null);
       }
       try {
-        const response = await authenticatedFetch(`/v1/projects/${encodeURIComponent(projectId)}`);
-        if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-        const nextEtag = response.headers.get("ETag");
-        if (!nextEtag) throw new Error("Project response did not include an ETag");
+        const { response, etag: nextEtag } = await fetchProjectWithEtag(projectId);
         const nextProject = (await response.json()) as ProjectDetails;
         if (sequence !== loadSequence.current) return;
         setProject(nextProject);
@@ -312,15 +310,13 @@ export function ProjectSettingsDialog({
       invalidateProjectQueries(queryClient, { sessions: true });
       onOpenChange(false);
     } catch (error) {
-      const status = statusOf(error);
+      const status = projectMutationStatus(error);
       if (phase === "rename" && status === 409) {
         setNameError("A project with this name already exists.");
         invalidateProjectQueries(queryClient, { sessions: true });
       } else if (status === 412) {
         setSaveError("This project changed elsewhere. Latest settings have been loaded.");
         await loadProject(true);
-      } else if (status === 422) {
-        setSaveError(serverMessage(error));
       } else {
         setSaveError(serverMessage(error));
       }
