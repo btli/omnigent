@@ -128,3 +128,37 @@ def test_delete_then_absent(tmp_path) -> None:
     store.delete(cred.id)
     assert store.get(cred.id) is None
     assert store.resolve_token(cred.id) is None
+
+
+def test_unknown_well_formed_id_returns_none(tmp_path) -> None:
+    import uuid
+
+    store = _store(tmp_path)
+    absent = uuid.uuid4().hex  # valid Uuid16, but no such row
+    assert store.get(absent) is None
+    assert store.resolve_token(absent) is None
+    store.delete(absent)  # no-op, does not raise
+
+
+def test_credentials_are_workspace_isolated(tmp_path) -> None:
+    from omnigent.db.db_models import workspace_scope
+
+    store = _store(tmp_path)
+    with workspace_scope(1):
+        cred = store.create(
+            owner_user_id="alice",
+            host_id="h",
+            provider="forgejo",
+            label="work",
+            username=None,
+            token="secret-w1",
+        )
+    # A different workspace must not see, resolve, or list workspace 1's credential.
+    with workspace_scope(2):
+        assert store.get(cred.id) is None
+        assert store.resolve_token(cred.id) is None
+        assert store.list_for_owner("alice") == []
+        assert store.list_for_owner_host("alice", "h") == []
+    # Back in its own workspace it resolves normally.
+    with workspace_scope(1):
+        assert store.resolve_token(cred.id) == "secret-w1"

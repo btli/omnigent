@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import select
-from sqlalchemy.exc import StatementError
+from sqlalchemy.exc import IntegrityError, StatementError
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import InvalidUuidError, SqlGitCredential, current_workspace_id
@@ -111,7 +111,9 @@ class GitCredentialStore:
         )
         with self._session() as session:
             # (workspace_id, owner_user_id, host_id, label) is unique; MySQL has
-            # no partial index, so the store checks before insert.
+            # no partial index. The pre-check gives a friendly error in the common
+            # case; flush() makes the DB unique constraint the authoritative,
+            # race-free guard for a concurrent insert.
             existing = session.execute(
                 select(SqlGitCredential.id).where(
                     SqlGitCredential.workspace_id == current_workspace_id(),
@@ -126,6 +128,16 @@ class GitCredentialStore:
                     "already exists for this user"
                 )
             session.add(row)
+            try:
+                session.flush()
+            except IntegrityError:
+                # A concurrent insert won the unique-constraint race. Translate to
+                # the documented ValueError and drop the DB error from the chain —
+                # its ``[parameters: …]`` carry the ciphertext.
+                raise ValueError(
+                    f"a git credential labeled {label!r} for host {host_id!r} "
+                    "already exists for this user"
+                ) from None
             return _row_to_entity(row)
 
     def list_for_owner(self, owner_user_id: str) -> list[GitCredential]:
