@@ -1338,6 +1338,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "pane-split",
         "pi",
         "polly",
+        "project",
         "qwen",
         "resume",
         "run",
@@ -5823,6 +5824,444 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
                 after = page.get("last_id")
 
     click.echo(f"Exported {n_items} item(s) from {session_id} to {out_path}")
+
+
+_PROJECT_DEFAULT_KEYS: frozenset[str] = frozenset(
+    {
+        "default_branch",
+        "harness",
+        "host_id",
+        "host_type",
+        "model",
+        "reasoning_effort",
+        "repo_url",
+        "workspace",
+    }
+)
+
+
+def _parse_project_default_settings(settings: tuple[str, ...]) -> dict[str, str]:
+    """Parse and validate project ``--set KEY=VALUE`` options."""
+    parsed: dict[str, str] = {}
+    supported = ", ".join(sorted(_PROJECT_DEFAULT_KEYS))
+    for item in settings:
+        if "=" not in item:
+            raise click.ClickException(
+                f"Expected KEY=VALUE, got {item!r}. Supported keys: {supported}"
+            )
+        key, _, value = item.partition("=")
+        if key not in _PROJECT_DEFAULT_KEYS:
+            raise click.ClickException(
+                f"Unknown project default key {key!r}. Supported keys: {supported}"
+            )
+        parsed[key] = value
+    return parsed
+
+
+def _validate_project_default_keys(keys: tuple[str, ...]) -> tuple[str, ...]:
+    """Validate project ``--unset KEY`` options."""
+    supported = ", ".join(sorted(_PROJECT_DEFAULT_KEYS))
+    for key in keys:
+        if key not in _PROJECT_DEFAULT_KEYS:
+            raise click.ClickException(
+                f"Unknown project default key {key!r}. Supported keys: {supported}"
+            )
+    return keys
+
+
+@contextlib.contextmanager
+def _project_client(server: str | None) -> collections.abc.Iterator[httpx.Client]:
+    """Yield an authenticated client for project management requests."""
+    import httpx
+
+    from omnigent.chat import _remote_headers
+
+    cfg = _load_effective_config()
+    base_url = _resolve_attach_server(server, cfg.get("server"))
+    if base_url is None:
+        startup = ensure_local_omnigent_server()
+        base_url = startup.url
+
+    base_url = base_url.rstrip("/")
+    with httpx.Client(
+        base_url=base_url,
+        headers=_remote_headers(server_url=base_url),
+        timeout=30.0,
+    ) as client:
+        yield client
+
+
+def _project_response_message(response: httpx.Response) -> str:
+    """Extract a concise message from a project API error response."""
+    try:
+        body = response.json()
+    except ValueError:
+        return response.text[:400] or f"HTTP {response.status_code}"
+    if not isinstance(body, dict):
+        return str(body)[:400]
+    error = body.get("error")
+    if isinstance(error, dict) and isinstance(error.get("message"), str):
+        return error["message"]
+    detail = body.get("detail")
+    if isinstance(detail, str):
+        return detail
+    if isinstance(detail, list):
+        rendered: list[str] = []
+        for item in detail:
+            if not isinstance(item, dict):
+                rendered.append(str(item))
+                continue
+            location = item.get("loc", [])
+            if isinstance(location, list):
+                fields = [str(part) for part in location if part not in {"body", "defaults_json"}]
+            else:
+                fields = []
+            message = str(item.get("msg", "Invalid value"))
+            rendered.append(f"{'.'.join(fields)}: {message}" if fields else message)
+        if rendered:
+            return "; ".join(rendered)
+    return json.dumps(body, sort_keys=True)[:400]
+
+
+def _check_project_response(
+    response: httpx.Response,
+    *,
+    project_id: str | None = None,
+) -> None:
+    """Map expected project API failures to concise CLI errors."""
+    if response.status_code < 400:
+        return
+    if response.status_code == 412:
+        raise click.ClickException("project changed on the server — retry")
+    message = _project_response_message(response)
+    if response.status_code == 404:
+        if project_id is not None:
+            raise click.ClickException(f"Project {project_id!r} not found.")
+        raise click.ClickException(message)
+    if response.status_code == 409:
+        raise click.ClickException(f"Project conflict: {message}")
+    if response.status_code == 422:
+        raise click.ClickException(message)
+    response.raise_for_status()
+
+
+def _get_project_with_etag(
+    client: httpx.Client,
+    project_id: str,
+) -> tuple[dict[str, Any], str]:
+    """Fetch a project and return its body with the current ETag."""
+    response = client.get(f"/v1/projects/{project_id}")
+    _check_project_response(response, project_id=project_id)
+    etag = response.headers.get("ETag")
+    if etag is None:
+        raise click.ClickException("Project response did not include an ETag.")
+    body = response.json()
+    if not isinstance(body, dict):
+        raise click.ClickException("Project response was not an object.")
+    return body, etag
+
+
+def _project_table(title: str) -> Table:
+    """Build a project CLI table with the shared management style."""
+    return Table(
+        title=title,
+        box=box.SIMPLE_HEAVY,
+        border_style="dim",
+        header_style="bold cyan",
+        show_edge=False,
+    )
+
+
+def _project_updated(value: Any) -> str:
+    """Format an epoch timestamp for project table output."""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(value)))
+    except (TypeError, ValueError, OverflowError):
+        return str(value)
+
+
+@cli.group("project", invoke_without_command=True)
+@click.pass_context
+def project(ctx: click.Context) -> None:
+    """Manage Omnigent projects.
+
+    \b
+    Examples:
+      omnigent project list
+      omnigent project create "My project" --set model=gpt-5
+      omnigent project show proj_abc123
+    """
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
+
+
+@project.command("list")
+@click.option(
+    "--archived-members",
+    is_flag=True,
+    help="Include projects whose only session members are archived.",
+)
+@click.option("--json", "json_output", is_flag=True, help="Emit raw JSON.")
+@click.option("--server", default=None, help="Omnigent server URL.")
+def project_list(archived_members: bool, json_output: bool, server: str | None) -> None:
+    """List projects owned by the current user.
+
+    \b
+    Examples:
+      omnigent project list
+      omnigent project list --archived-members
+      omnigent project list --json --server https://myserver.com
+    """
+    with _project_client(server) as client:
+        response = client.get(
+            "/v1/projects",
+            params={"archived_members": archived_members},
+        )
+        _check_project_response(response)
+        projects = response.json()
+    if json_output:
+        click.echo(json.dumps(projects, indent=2, sort_keys=True))
+        return
+    table = _project_table("Projects")
+    table.add_column("ID")
+    table.add_column("NAME")
+    table.add_column("UPDATED")
+    for item in projects:
+        table.add_row(
+            str(item.get("id", "")),
+            str(item.get("name", "")),
+            _project_updated(item.get("updated_at")),
+        )
+    Console(highlight=False).print(table)
+
+
+@project.command("create")
+@click.argument("name")
+@click.option("--description", default=None, help="Project description.")
+@click.option(
+    "--set",
+    "settings",
+    multiple=True,
+    metavar="KEY=VALUE",
+    help="Set a project default; repeat for multiple values.",
+)
+@click.option("--server", default=None, help="Omnigent server URL.")
+def project_create(
+    name: str,
+    description: str | None,
+    settings: tuple[str, ...],
+    server: str | None,
+) -> None:
+    """Create a project named NAME.
+
+    \b
+    Examples:
+      omnigent project create "My project"
+      omnigent project create "My project" --description "Agent work"
+      omnigent project create "My project" --set model=gpt-5 --set harness=claude
+    """
+    defaults = _parse_project_default_settings(settings)
+    payload: dict[str, Any] = {"name": name}
+    if description is not None:
+        payload["description"] = description
+    if defaults:
+        payload["defaults_json"] = defaults
+    with _project_client(server) as client:
+        response = client.post("/v1/projects", json=payload)
+        _check_project_response(response)
+        created = response.json()
+    click.echo(f"Created project {created['id']} ({created['name']}).")
+
+
+@project.command("show")
+@click.argument("project_id")
+@click.option("--json", "json_output", is_flag=True, help="Emit raw JSON.")
+@click.option("--server", default=None, help="Omnigent server URL.")
+def project_show(project_id: str, json_output: bool, server: str | None) -> None:
+    """Show PROJECT_ID and its defaults.
+
+    \b
+    Examples:
+      omnigent project show proj_abc123
+      omnigent project show proj_abc123 --json
+      omnigent project show proj_abc123 --server https://myserver.com
+    """
+    with _project_client(server) as client:
+        response = client.get(f"/v1/projects/{project_id}")
+        _check_project_response(response, project_id=project_id)
+        item = response.json()
+    if json_output:
+        click.echo(json.dumps(item, indent=2, sort_keys=True))
+        return
+    table = _project_table(f"Project {project_id}")
+    table.add_column("FIELD")
+    table.add_column("VALUE")
+    for key, value in item.items():
+        rendered = (
+            json.dumps(value, indent=2, sort_keys=True)
+            if isinstance(value, (dict, list))
+            else str(value)
+        )
+        table.add_row(str(key), rendered)
+    Console(highlight=False).print(table)
+
+
+@project.command("rename")
+@click.argument("project_id")
+@click.argument("new_name")
+@click.option("--server", default=None, help="Omnigent server URL.")
+def project_rename(project_id: str, new_name: str, server: str | None) -> None:
+    """Rename PROJECT_ID to NEW_NAME.
+
+    \b
+    Examples:
+      omnigent project rename proj_abc123 "New name"
+      omnigent project rename proj_abc123 "New name" --server https://myserver.com
+    """
+    with _project_client(server) as client:
+        _, etag = _get_project_with_etag(client, project_id)
+        response = client.post(
+            f"/v1/projects/{project_id}/rename",
+            headers={"If-Match": etag},
+            json={"name": new_name},
+        )
+        _check_project_response(response, project_id=project_id)
+    click.echo(f"Renamed project {project_id} to {new_name}.")
+
+
+@project.command("update")
+@click.argument("project_id")
+@click.option("--description", default=None, help="Replace the project description.")
+@click.option(
+    "--set",
+    "settings",
+    multiple=True,
+    metavar="KEY=VALUE",
+    help="Set a project default; repeat for multiple values.",
+)
+@click.option(
+    "--unset",
+    "unset_keys",
+    multiple=True,
+    metavar="KEY",
+    help="Set a project default to null; repeat for multiple values.",
+)
+@click.option("--server", default=None, help="Omnigent server URL.")
+def project_update(
+    project_id: str,
+    description: str | None,
+    settings: tuple[str, ...],
+    unset_keys: tuple[str, ...],
+    server: str | None,
+) -> None:
+    """Update PROJECT_ID settings.
+
+    Existing defaults are preserved. ``--set`` replaces selected values,
+    while ``--unset`` stores null for selected values.
+
+    \b
+    Examples:
+      omnigent project update proj_abc123 --description "Updated"
+      omnigent project update proj_abc123 --set model=gpt-5 --unset workspace
+      omnigent project update proj_abc123 --server https://myserver.com --set harness=claude
+    """
+    parsed = _parse_project_default_settings(settings)
+    validated_unsets = _validate_project_default_keys(unset_keys)
+    with _project_client(server) as client:
+        current, etag = _get_project_with_etag(client, project_id)
+        defaults = dict(current.get("defaults_json") or {})
+        defaults.update(parsed)
+        defaults.update(dict.fromkeys(validated_unsets))
+        payload: dict[str, Any] = {"defaults_json": defaults}
+        if description is not None:
+            payload["description"] = description
+        response = client.patch(
+            f"/v1/projects/{project_id}",
+            headers={"If-Match": etag},
+            json=payload,
+        )
+        _check_project_response(response, project_id=project_id)
+    click.echo(f"Updated project {project_id}.")
+
+
+@project.command("archive")
+@click.argument("project_id")
+@click.option(
+    "--include-sessions",
+    is_flag=True,
+    help="Archive sessions belonging to the project too.",
+)
+@click.option("--server", default=None, help="Omnigent server URL.")
+def project_archive(
+    project_id: str,
+    include_sessions: bool,
+    server: str | None,
+) -> None:
+    """Archive PROJECT_ID.
+
+    \b
+    Examples:
+      omnigent project archive proj_abc123
+      omnigent project archive proj_abc123 --include-sessions
+      omnigent project archive proj_abc123 --server https://myserver.com
+    """
+    with _project_client(server) as client:
+        _, etag = _get_project_with_etag(client, project_id)
+        response = client.post(
+            f"/v1/projects/{project_id}/archive",
+            headers={"If-Match": etag},
+            params={"include_sessions": include_sessions},
+        )
+        _check_project_response(response, project_id=project_id)
+        archived = response.json()
+    message = f"Archived project {project_id}."
+    if include_sessions:
+        message += f" Archived {archived.get('archived_sessions', 0)} session(s)."
+    click.echo(message)
+
+
+@project.command("restore")
+@click.argument("project_id")
+@click.option("--server", default=None, help="Omnigent server URL.")
+def project_restore(project_id: str, server: str | None) -> None:
+    """Restore archived PROJECT_ID.
+
+    \b
+    Examples:
+      omnigent project restore proj_abc123
+      omnigent project restore proj_abc123 --server https://myserver.com
+    """
+    with _project_client(server) as client:
+        _, etag = _get_project_with_etag(client, project_id)
+        response = client.post(
+            f"/v1/projects/{project_id}/restore",
+            headers={"If-Match": etag},
+        )
+        _check_project_response(response, project_id=project_id)
+    click.echo(f"Restored project {project_id}.")
+
+
+@project.command("transfer")
+@click.argument("project_id")
+@click.argument("new_owner")
+@click.option("--server", default=None, help="Omnigent server URL.")
+def project_transfer(project_id: str, new_owner: str, server: str | None) -> None:
+    """Transfer PROJECT_ID to NEW_OWNER.
+
+    \b
+    Examples:
+      omnigent project transfer proj_abc123 user@example.com
+      omnigent project transfer proj_abc123 user@example.com --server https://myserver.com
+    """
+    with _project_client(server) as client:
+        _, etag = _get_project_with_etag(client, project_id)
+        response = client.post(
+            f"/v1/projects/{project_id}/transfer",
+            headers={"If-Match": etag},
+            json={"new_owner_principal_id": new_owner},
+        )
+        _check_project_response(response, project_id=project_id)
+    click.echo(f"Transferred project {project_id} to {new_owner}.")
 
 
 # Shared option help for ``run`` and the harness commands. These are the same

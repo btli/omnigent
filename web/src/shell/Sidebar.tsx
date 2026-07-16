@@ -108,6 +108,7 @@ import {
 } from "@/hooks/useConversations";
 import { useProjectPickerState } from "@/hooks/useProjectPickerState";
 import { ProjectCreateRow } from "./ProjectCreateRow";
+import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -846,6 +847,7 @@ function ProjectFolder({
   const [isEditing, setIsEditing] = useState(false);
   const [renameError, setRenameError] = useState<string | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const renameProject = useRenameProject();
   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
   const conversations = useMemo(() => {
@@ -926,6 +928,7 @@ function ProjectFolder({
             projectId={id}
             projectName={name}
             onNavigate={onRowClick}
+            onSettings={() => setSettingsOpen(true)}
             onRename={startRename}
             onDelete={() => setDeleteOpen(true)}
           />
@@ -968,6 +971,7 @@ function ProjectFolder({
               components={contextBundle}
               projectId={id}
               onNavigate={onRowClick}
+              onSettings={() => setSettingsOpen(true)}
               onRename={startRename}
               onDelete={() => setDeleteOpen(true)}
             />
@@ -993,6 +997,7 @@ function ProjectFolder({
         open={deleteOpen}
         onOpenChange={setDeleteOpen}
       />
+      <ProjectSettingsDialog projectId={id} open={settingsOpen} onOpenChange={setSettingsOpen} />
     </div>
   );
 }
@@ -2987,6 +2992,7 @@ function ProjectFolderActions({
   projectId,
   projectName,
   onNavigate,
+  onSettings,
   onRename,
   onDelete,
 }: {
@@ -2995,6 +3001,7 @@ function ProjectFolderActions({
   /** Plain-left-click nav handler — closes the mobile overlay so the
       pre-filed new-session page isn't left hidden behind the sidebar. */
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
+  onSettings: () => void;
   onRename: () => void;
   onDelete: () => void;
 }) {
@@ -3004,6 +3011,7 @@ function ProjectFolderActions({
         projectId={projectId}
         projectName={projectName}
         onNavigate={onNavigate}
+        onSettings={onSettings}
         onRename={onRename}
         onDelete={onDelete}
       />
@@ -3038,12 +3046,14 @@ function ProjectMenuItems({
   components: C,
   projectId,
   onNavigate,
+  onSettings,
   onRename,
   onDelete,
 }: {
   components: MenuComponents;
   projectId: string;
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
+  onSettings: () => void;
   onRename: () => void;
   onDelete: () => void;
 }) {
@@ -3054,6 +3064,10 @@ function ProjectMenuItems({
           <SquarePenIcon className="size-3.5" />
           New session
         </Link>
+      </C.Item>
+      <C.Item data-testid="project-settings" onSelect={onSettings}>
+        <SettingsIcon className="size-3.5" />
+        Project settings
       </C.Item>
       <C.Item data-testid="rename-project" onSelect={onRename}>
         <PencilIcon className="size-3.5" />
@@ -3075,12 +3089,14 @@ function ProjectFolderMenu({
   projectId,
   projectName,
   onNavigate,
+  onSettings,
   onRename,
   onDelete,
 }: {
   projectId: string;
   projectName: string;
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
+  onSettings: () => void;
   onRename: () => void;
   onDelete: () => void;
 }) {
@@ -3103,6 +3119,7 @@ function ProjectFolderMenu({
           components={dropdownBundle}
           projectId={projectId}
           onNavigate={onNavigate}
+          onSettings={onSettings}
           onRename={onRename}
           onDelete={onDelete}
         />

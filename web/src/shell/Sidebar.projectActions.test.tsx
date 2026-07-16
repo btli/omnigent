@@ -128,6 +128,7 @@ describe("project folder actions", () => {
     const newSession = screen.getByTestId("project-new-session-item");
     expect(newSession).toHaveTextContent("New session");
     expect(newSession).toHaveAttribute("href", "/?project_id=proj_alpha");
+    expect(screen.getByTestId("project-settings")).toHaveTextContent("Project settings");
     expect(screen.getByTestId("rename-project")).toHaveTextContent("Rename project");
     expect(screen.getByTestId("delete-project")).toHaveTextContent("Delete project");
   });
@@ -142,6 +143,7 @@ describe("project folder actions", () => {
       "href",
       "/?project_id=proj_alpha",
     );
+    expect(screen.getByTestId("project-settings")).toBeInTheDocument();
     expect(screen.getByTestId("rename-project")).toBeInTheDocument();
     expect(screen.getByTestId("delete-project")).toBeInTheDocument();
   });

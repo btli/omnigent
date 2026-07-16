@@ -675,11 +675,37 @@ export interface Project {
 export class ProjectMutationError extends Error {
   readonly status: number;
 
-  constructor(status: number, statusText: string) {
-    super(`${status} ${statusText}`);
+  constructor(status: number, message: string) {
+    super(message ? `${status} ${message}` : `${status}`);
     this.name = "ProjectMutationError";
     this.status = status;
   }
+}
+
+async function projectErrorMessage(response: Response): Promise<string> {
+  try {
+    const body: unknown = await response.json();
+    if (body && typeof body === "object") {
+      const record = body as Record<string, unknown>;
+      if (typeof record.detail === "string") return record.detail;
+      if (typeof record.message === "string") return record.message;
+      const error = record.error;
+      if (
+        error &&
+        typeof error === "object" &&
+        typeof (error as Record<string, unknown>).message === "string"
+      ) {
+        return (error as Record<string, unknown>).message as string;
+      }
+    }
+  } catch {
+    // Fall back to the HTTP status text when the response is not JSON.
+  }
+  return response.statusText;
+}
+
+async function projectMutationError(response: Response): Promise<ProjectMutationError> {
+  return new ProjectMutationError(response.status, await projectErrorMessage(response));
 }
 
 function projectMutationStatus(error: unknown): number | null {
@@ -687,20 +713,23 @@ function projectMutationStatus(error: unknown): number | null {
   return typeof error.status === "number" ? error.status : null;
 }
 
-/** Run a project action against the latest ETag and preserve HTTP status errors. */
+/** Run a project action against a captured or freshly fetched ETag. */
 export async function mutateProjectWithIfMatch(
   projectId: string,
   action: (projectUrl: string, etag: string) => Promise<Response>,
+  knownEtag?: string,
 ): Promise<Response> {
   const projectUrl = `/v1/projects/${encodeURIComponent(projectId)}`;
-  const current = await authenticatedFetch(projectUrl);
-  if (!current.ok) throw new ProjectMutationError(current.status, current.statusText);
-
-  const etag = current.headers.get("ETag");
-  if (!etag) throw new Error("Project response did not include an ETag");
+  let etag = knownEtag;
+  if (!etag) {
+    const current = await authenticatedFetch(projectUrl);
+    if (!current.ok) throw await projectMutationError(current);
+    etag = current.headers.get("ETag") ?? undefined;
+    if (!etag) throw new Error("Project response did not include an ETag");
+  }
 
   const result = await action(projectUrl, etag);
-  if (!result.ok) throw new ProjectMutationError(result.status, result.statusText);
+  if (!result.ok) throw await projectMutationError(result);
   return result;
 }
 
