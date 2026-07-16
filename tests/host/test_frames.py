@@ -1016,6 +1016,29 @@ def test_deliver_credential_frame_roundtrips() -> None:
     assert decoded == frame
 
 
+def test_deliver_credential_frame_repr_hides_sealed_blob() -> None:
+    from omnigent.host.frames import HostDeliverCredentialFrame
+
+    frame = HostDeliverCredentialFrame(
+        request_id="req1",
+        runner_id="runner_abc",
+        launch_generation=3,
+        session_id="conv_1",
+        credential_slot="slot_1",
+        canonical_host="git.acme.com",
+        repo_path="/team/proj",
+        credential_kind="http-token",
+        auth_scheme="basic",
+        username="x-access-token",
+        sealed_credential="SEALEDBLOBSHOULDNOTAPPEAR",
+        host_id="host_9",
+    )
+    # The sealed blob must not reach a log/exception via repr; other fields do.
+    text = repr(frame)
+    assert "SEALEDBLOBSHOULDNOTAPPEAR" not in text
+    assert "host_9" in text
+
+
 def test_deliver_credential_result_roundtrips() -> None:
     from omnigent.host.frames import (
         HostDeliverCredentialResultFrame,

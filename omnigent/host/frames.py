@@ -560,7 +560,8 @@ class HostDeliverCredentialFrame:
         ``bearer`` / ``token``.
     :param sealed_credential: The token sealed to the host's
         ``sealing_public_key`` (see :mod:`omnigent.host.sealing`). Never the
-        plaintext token; the field name triggers telemetry redaction.
+        plaintext token; excluded from ``repr`` (so the blob can't reach a log
+        or exception message) and the field name triggers telemetry redaction.
     :param host_id: The operator git-host id (part of the binding tuple).
     """
 
@@ -574,7 +575,7 @@ class HostDeliverCredentialFrame:
     credential_kind: str
     auth_scheme: str
     username: str | None
-    sealed_credential: str
+    sealed_credential: str = field(repr=False)
     host_id: str
 
 
