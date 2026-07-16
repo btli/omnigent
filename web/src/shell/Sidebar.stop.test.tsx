@@ -37,10 +37,10 @@ vi.mock("@/hooks/useConversations", () => ({
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useStopSession: () => mocks.stop,
   useProjects: () => ({ data: [] }),
+  useCreateProject: () => ({ mutate: vi.fn(), isPending: false }),
   useMoveToProject: () => ({ mutate: vi.fn() }),
   useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: () => Promise.resolve([]),
-  PROJECT_LABEL_KEY: "omni_project",
 }));
 
 vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({

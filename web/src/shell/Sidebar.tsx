@@ -94,13 +94,13 @@ import {
   useArchiveConversation,
   useBulkArchiveConversations,
   useBulkDeleteConversations,
+  useCreateProject,
   useProjects,
   useProjectSessions,
   useConversations,
   useMoveToProject,
   useDeleteProject,
   fetchProjectSessionIds,
-  PROJECT_LABEL_KEY,
   usePinnedConversationBackfill,
   useRenameConversation,
   useStopAndDeleteConversation,
@@ -761,7 +761,7 @@ function InfiniteScrollSentinel({
 }
 
 /**
- * One project folder. Fetches its own sessions server-side (`?project=`) so it
+ * One project folder. Fetches its own sessions server-side (`?project_id=`) so it
  * shows ALL its members regardless of how far the global sidebar list has been
  * scrolled, paginated with its own infinite-scroll sentinel. Lazy: the fetch is
  * gated on `expanded`, so a collapsed folder costs nothing. The collapsed
@@ -769,6 +769,7 @@ function InfiniteScrollSentinel({
  * window) since a collapsed folder hasn't fetched yet.
  */
 function ProjectFolder({
+  id,
   name,
   expanded,
   marker,
@@ -784,6 +785,7 @@ function ProjectFolder({
   onProjectAssigned,
   projectRenderedIdsRef,
 }: {
+  id: string;
   name: string;
   expanded: boolean;
   marker: SessionState | null;
@@ -796,10 +798,10 @@ function ProjectFolder({
   selectionMode: boolean;
   selectedIds: Set<string>;
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
-  onProjectAssigned?: (projectName: string) => void;
+  onProjectAssigned?: (projectId: string) => void;
   projectRenderedIdsRef?: RefObject<Map<string, string[]>>;
 }) {
-  const query = useProjectSessions(name, expanded);
+  const query = useProjectSessions(id, expanded);
   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
   const conversations = useMemo(() => {
     const loaded = query.data?.pages.flatMap((page) => page.data) ?? [];
@@ -817,7 +819,7 @@ function ProjectFolder({
     [expanded, conversations],
   );
   if (projectRenderedIdsRef) {
-    projectRenderedIdsRef.current.set(name, renderedIds);
+    projectRenderedIdsRef.current.set(id, renderedIds);
   }
 
   // While the first page loads, show a "Loading…" footer instead of the "No
@@ -829,8 +831,8 @@ function ProjectFolder({
   // `project:` prefix keeps the droppable id clear of conversation ids (the
   // draggable ids) and the ungroup sentinel.
   const { setNodeRef, isOver } = useDroppable({
-    id: `project:${name}`,
-    data: { type: "project", name },
+    id: `project:${id}`,
+    data: { type: "project", name: id },
   });
 
   return (
@@ -865,7 +867,9 @@ function ProjectFolder({
         onProjectAssigned={onProjectAssigned}
         emptyMessage={loadingFirstPage ? undefined : "No chats"}
         indentRows
-        headerAction={<ProjectFolderActions projectName={name} onNavigate={onRowClick} />}
+        headerAction={
+          <ProjectFolderActions projectId={id} projectName={name} onNavigate={onRowClick} />
+        }
         footer={
           loadingFirstPage ? (
             <p className="px-2 py-1 pl-7 text-muted-foreground text-xs">Loading…</p>
@@ -930,8 +934,7 @@ function ConversationList({
     [conversationsQuery.data],
   );
 
-  // Project names for grouping sessions by their reserved project label.
-  const { data: projectNames = [] } = useProjects();
+  const { data: projects = [] } = useProjects();
 
   // Each ProjectFolder registers its actually-rendered conversation IDs here
   // (synchronously during render) so shift-select ranges use the real rendered
@@ -987,15 +990,20 @@ function ConversationList({
     // (it lives under Pinned), so pinning a project's last session leaves the
     // folder showing "No chats".
     const filedIds = new Set<string>();
-    const projectGroups: { name: string; conversations: Conversation[] }[] =
+    const projectGroups: { id: string; name: string; conversations: Conversation[] }[] =
       activeTab === "shared"
         ? []
-        : projectNames.map((name) => {
+        : projects.map((project) => {
             const inProject = tabScoped.filter(
-              (c) => c.labels?.[PROJECT_LABEL_KEY] === name && !pinnedIdSet.has(c.id),
+              (conversation) =>
+                conversation.metadata?.project_id === project.id &&
+                !pinnedIdSet.has(conversation.id),
             );
             inProject.forEach((c) => filedIds.add(c.id));
-            return { name, conversations: sortByUpdatedAtDesc(inProject, activeOverride) };
+            return {
+              ...project,
+              conversations: sortByUpdatedAtDesc(inProject, activeOverride),
+            };
           });
     // NOTE: empty projects are intentionally NOT filtered out. A project comes
     // from the server project list (useProjects), so it can have zero *loaded*
@@ -1019,7 +1027,7 @@ function ConversationList({
     pinnedSet,
     pinnedConversationIds,
     activeOverride,
-    projectNames,
+    projects,
     activeTab,
   ]);
 
@@ -1172,7 +1180,7 @@ function ConversationList({
         target,
       );
       if (action.kind === "move") {
-        moveToProject.mutate({ id: dragged.id, project: action.project });
+        moveToProject.mutate({ id: dragged.id, projectId: action.project });
         // Unpin a pinned session so it actually drops into the folder instead of
         // staying floated up in Pinned (pin outranks project membership).
         if (action.unpin) onTogglePinned(dragged.id);
@@ -1203,7 +1211,7 @@ function ConversationList({
           if (isLastSession) {
             setPendingUngroup({ id: dragged.id, project: action.project, unpin });
           } else {
-            moveToProject.mutate({ id: dragged.id, project: "" });
+            moveToProject.mutate({ id: dragged.id, projectId: "" });
             if (unpin) onTogglePinned(dragged.id);
           }
         })();
@@ -1242,17 +1250,17 @@ function ConversationList({
   // as a primitive so the auto-expand effect below only fires when the
   // selection (or its project) changes — not on every background list refetch,
   // which would re-open a folder the user just collapsed.
-  const activeProjectName = useMemo(() => {
+  const activeProjectId = useMemo(() => {
     if (!activeId) return null;
     const active = allConversations.find((c) => c.id === activeId);
-    return active?.labels?.[PROJECT_LABEL_KEY] ?? null;
+    return active?.metadata?.project_id ?? null;
   }, [activeId, allConversations]);
   // Auto-expand the project folder holding the selected session, so navigating
   // to a filed session reveals it instead of leaving it hidden in a collapsed
   // folder. Fires on selection only; the user can still collapse it afterward.
   useEffect(() => {
-    if (activeProjectName) expandProject(activeProjectName);
-  }, [activeProjectName, expandProject]);
+    if (activeProjectId) expandProject(activeProjectId);
+  }, [activeProjectId, expandProject]);
 
   // Visible rows in render order (collapsed sections excluded) for the Cmd+↑/↓
   // session hotkey. Titles must match the <ConversationSection> props below.
@@ -1269,7 +1277,7 @@ function ConversationList({
     // Projects / Sessions walk covers both tabs (Projects is empty on shared).
     return [
       ...visible("Pinned", sections.pinned),
-      ...sections.projectGroups.flatMap((g) => projectVisible(g.name, g.conversations)),
+      ...sections.projectGroups.flatMap((g) => projectVisible(g.id, g.conversations)),
       ...visible("Chats", sections.sessions),
     ].map((c) => c.id);
   }, [sections, effectiveCollapsedSections, expandedProjects]);
@@ -1284,7 +1292,7 @@ function ConversationList({
       !projectsCollapsed && expandedProjects.includes(name) ? [...list] : [];
     return [
       ...visible("Pinned", sections.pinned),
-      ...sections.projectGroups.flatMap((g) => projectVisible(g.name, g.conversations)),
+      ...sections.projectGroups.flatMap((g) => projectVisible(g.id, g.conversations)),
       ...visible("Chats", sections.sessions),
     ];
   };
@@ -1301,7 +1309,7 @@ function ConversationList({
       ...vis("Pinned", sections.pinned),
       ...(projCollapsed
         ? []
-        : sections.projectGroups.flatMap((g) => projectRenderedIdsRef.current.get(g.name) ?? [])),
+        : sections.projectGroups.flatMap((g) => projectRenderedIdsRef.current.get(g.id) ?? [])),
       ...vis("Chats", sections.sessions),
     ];
   };
@@ -1443,12 +1451,12 @@ function ConversationList({
                   // rendered, so expand-all / revert would be a no-op — show no
                   // control at all.
                   if (effectiveCollapsedSections.includes("Projects")) return null;
-                  const allNames = sections.projectGroups.map((g) => g.name);
+                  const allIds = sections.projectGroups.map((g) => g.id);
                   // Once every folder is open the only useful move is to undo it,
                   // so the control flips to "revert" — which restores the set open
                   // before "Expand all", or collapses everything when there's no
                   // real last state (folders opened by hand). Otherwise it expands.
-                  const allExpanded = allNames.every((n) => expandedProjects.includes(n));
+                  const allExpanded = allIds.every((id) => expandedProjects.includes(id));
                   if (allExpanded) {
                     return (
                       <Tooltip>
@@ -1482,7 +1490,7 @@ function ConversationList({
                           data-testid="expand-all-projects"
                           onClick={(e) => {
                             e.stopPropagation();
-                            expandAllProjects(allNames);
+                            expandAllProjects(allIds);
                           }}
                         >
                           <Maximize2Icon className="size-3.5" />
@@ -1495,13 +1503,14 @@ function ConversationList({
               >
                 {sections.projectGroups.map((group) => (
                   <ProjectFolder
-                    key={group.name}
+                    key={group.id}
+                    id={group.id}
                     name={group.name}
-                    expanded={expandedProjects.includes(group.name)}
+                    expanded={expandedProjects.includes(group.id)}
                     // Best-effort marker from the globally-loaded window: a
                     // collapsed folder hasn't fetched its own sessions yet.
                     marker={projectMarkerState(group.conversations)}
-                    onToggleCollapsed={() => toggleProjectExpanded(group.name)}
+                    onToggleCollapsed={() => toggleProjectExpanded(group.id)}
                     pinnedConversationIds={pinnedConversationIds}
                     activeOverride={activeOverride}
                     scrollRoot={scrollContainerRef}
@@ -1601,7 +1610,7 @@ function ConversationList({
               onClick={() => {
                 if (!pendingUngroup) return;
                 moveToProject.mutate(
-                  { id: pendingUngroup.id, project: "" },
+                  { id: pendingUngroup.id, projectId: "" },
                   { onSuccess: () => setPendingUngroup(null) },
                 );
                 // A pinned session must also be unpinned to leave Pinned and
@@ -1865,9 +1874,9 @@ function ConversationSection({
   /** Optional content rendered after the rows inside the expanded body (e.g. a
       project folder's own infinite-scroll sentinel / loading row). */
   footer?: ReactNode;
-  /** Called with the project name when a row is filed into one, so the sidebar
+  /** Called with the project id when a row is filed into one, so the sidebar
       can expand that (possibly brand-new) project folder. */
-  onProjectAssigned?: (projectName: string) => void;
+  onProjectAssigned?: (projectId: string) => void;
 }) {
   // An untitled section is always open — there's no header to collapse it.
   const isCollapsed = title != null && collapsed;
@@ -2026,7 +2035,7 @@ function ConversationMenuItems({
   currentProject: string | null;
   onTogglePinned: (conversationId: string) => void;
   onMarkUnread: () => void;
-  onProjectAssigned?: (projectName: string) => void;
+  onProjectAssigned?: (projectId: string) => void;
   moveToProject: ReturnType<typeof useMoveToProject>;
   stopSession: ReturnType<typeof useStopSession>;
   setShareOpen: (open: boolean) => void;
@@ -2138,7 +2147,7 @@ function ConversationMenuItems({
                 // and expand that (possibly new) project so the session
                 // is visible in it rather than hidden in a collapsed folder.
                 if (project !== "") {
-                  moveToProject.mutate({ id: conversation.id, project });
+                  moveToProject.mutate({ id: conversation.id, projectId: project });
                   onProjectAssigned?.(project);
                   return;
                 }
@@ -2160,7 +2169,7 @@ function ConversationMenuItems({
                   if (isLastSession) {
                     setRemoveProjectOpen(true);
                   } else {
-                    moveToProject.mutate({ id: conversation.id, project: "" });
+                    moveToProject.mutate({ id: conversation.id, projectId: "" });
                   }
                 })();
               }}
@@ -2280,7 +2289,7 @@ function ConversationRow({
   selectionMode: boolean;
   isSelected: boolean;
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
-  onProjectAssigned?: (projectName: string) => void;
+  onProjectAssigned?: (projectId: string) => void;
 }) {
   // `useParams` reads from the active matched route. On `/`, the param is
   // undefined; on `/c/:conversationId`, it carries the active id.
@@ -2367,9 +2376,12 @@ function ConversationRow({
       runnerId: conversation.runner_id,
     }) && runnerOnline !== false;
 
-  // The session's current project (reserved label), or null when unfiled —
+  // The session's current first-class project id, or null when unfiled —
   // drives the kebab submenu label ("Add to project" vs "Change project").
-  const currentProject = conversation.labels?.[PROJECT_LABEL_KEY] ?? null;
+  const currentProject = conversation.metadata?.project_id ?? null;
+  const { data: projects = [] } = useProjects();
+  const currentProjectName =
+    projects.find((project) => project.id === currentProject)?.name ?? currentProject;
 
   const label = conversationDisplayLabel(conversation);
   // Recompute unseen state the moment the last-seen map changes (e.g. the
@@ -2877,7 +2889,7 @@ function ConversationRow({
             <DialogTitle>Remove from project?</DialogTitle>
             <DialogDescription>
               This is the only session in{" "}
-              <span className="break-all font-medium">{currentProject}</span>, so{" "}
+              <span className="break-all font-medium">{currentProjectName}</span>, so{" "}
               <span className="font-medium">the project will be removed as well</span>. The session
               itself is kept.
             </DialogDescription>
@@ -2897,7 +2909,7 @@ function ConversationRow({
               disabled={moveToProject.isPending}
               onClick={() =>
                 moveToProject.mutate(
-                  { id: conversation.id, project: "" },
+                  { id: conversation.id, projectId: "" },
                   { onSuccess: () => setRemoveProjectOpen(false) },
                 )
               }
@@ -3002,13 +3014,15 @@ function ArchivingRow({ label }: { label: string }) {
 /**
  * The hover-revealed controls on a project-folder header: a kebab menu and a
  * pencil that starts a new session pre-filed under this project. The pencil
- * links to the landing composer with `?project=<name>` so its project chip
+ * links to the landing composer with `?project_id=<id>` so its project chip
  * lands already selected.
  */
 function ProjectFolderActions({
+  projectId,
   projectName,
   onNavigate,
 }: {
+  projectId: string;
   projectName: string;
   /** Plain-left-click nav handler — closes the mobile overlay so the
       pre-filed new-session page isn't left hidden behind the sidebar. */
@@ -3016,7 +3030,7 @@ function ProjectFolderActions({
 }) {
   return (
     <div className="flex items-center">
-      <ProjectFolderMenu projectName={projectName} />
+      <ProjectFolderMenu projectId={projectId} projectName={projectName} />
       <Button
         asChild
         type="button"
@@ -3026,7 +3040,7 @@ function ProjectFolderActions({
         data-testid="project-new-session"
       >
         <Link
-          to={`/?project=${encodeURIComponent(projectName)}`}
+          to={`/?project_id=${encodeURIComponent(projectId)}`}
           onClick={(e) => {
             // Keep the click off the folder's collapse toggle, then run the
             // shared nav handler (closes the sidebar overlay on mobile).
@@ -3049,7 +3063,7 @@ function ProjectFolderActions({
  * disappears). Confirmation is required since it deletes sessions, not just the
  * grouping.
  */
-function ProjectFolderMenu({ projectName }: { projectName: string }) {
+function ProjectFolderMenu({ projectId, projectName }: { projectId: string; projectName: string }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const deleteProject = useDeleteProject();
@@ -3113,7 +3127,7 @@ function ProjectFolderMenu({ projectName }: { projectName: string }) {
               variant="destructive"
               disabled={deleteProject.isPending}
               onClick={() => {
-                deleteProject.mutate(projectName, {
+                deleteProject.mutate(projectId, {
                   onSuccess: () => {
                     setDeleteOpen(false);
                     setMenuOpen(false);
@@ -3150,6 +3164,7 @@ function ProjectPickerMenu({
   onSelect: (project: string) => void;
 }) {
   const { data: projects = [] } = useProjects();
+  const createProject = useCreateProject();
   const [search, setSearch] = useState("");
   const [creatingNew, setCreatingNew] = useState(false);
   const [newProjectName, setNewProjectName] = useState("");
@@ -3162,14 +3177,20 @@ function ProjectPickerMenu({
   }, [creatingNew]);
 
   const filtered = search
-    ? projects.filter((name) => name.toLowerCase().includes(search.toLowerCase()))
+    ? projects.filter((project) => project.name.toLowerCase().includes(search.toLowerCase()))
     : projects;
+  const currentProjectName = projects.find((project) => project.id === currentProject)?.name;
 
   function handleNewProjectCommit() {
     const name = newProjectName.trim();
-    setCreatingNew(false);
-    setNewProjectName("");
-    if (name) onSelect(name);
+    if (!name) return;
+    createProject.mutate(name, {
+      onSuccess: (project) => {
+        setCreatingNew(false);
+        setNewProjectName("");
+        onSelect(project.id);
+      },
+    });
   }
 
   // Keep keystrokes inside the inputs from reaching the menu's typeahead /
@@ -3191,10 +3212,14 @@ function ProjectPickerMenu({
         />
       </div>
       <div className="max-h-48 overflow-y-auto">
-        {filtered.map((name) => (
-          <C.Item key={name} className="px-2 py-1" onSelect={() => onSelect(name)}>
-            <span className="flex-1 truncate text-left">{name}</span>
-            {currentProject === name && (
+        {filtered.map((project) => (
+          <C.Item
+            key={project.id}
+            className="px-2 py-1"
+            onSelect={() => onSelect(project.id)}
+          >
+            <span className="flex-1 truncate text-left">{project.name}</span>
+            {currentProject === project.id && (
               <CheckMarkIcon className="size-3.5 shrink-0 text-primary" />
             )}
           </C.Item>
@@ -3242,7 +3267,7 @@ function ProjectPickerMenu({
           <C.Item className="px-2 py-1" onSelect={() => onSelect("")}>
             Remove from{" "}
             <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
-              {currentProject}
+              {currentProjectName ?? currentProject}
             </span>
           </C.Item>
         )}

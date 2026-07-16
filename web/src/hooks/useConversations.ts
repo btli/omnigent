@@ -41,6 +41,7 @@ import { markConversationSeen } from "./useUnseenConversations";
 
 export const CONNECTED_STREAM_REFETCH_INTERVAL_MS = 60_000;
 export const DISCONNECTED_STREAM_REFETCH_INTERVAL_MS = 45_000;
+const ARCHIVED_PROJECTS_KEY = ["archived-projects"] as const;
 
 export interface UseConversationsOptions {
   reconcileWhileConnected?: boolean;
@@ -54,6 +55,10 @@ export interface Conversation {
   created_at: number;
   updated_at: number;
   labels: Record<string, string>;
+  /** First-class session metadata used for stable project membership. */
+  metadata?: {
+    project_id?: string | null;
+  };
   permission_level: number | null;
   owner?: string | null;
   runner_id?: string | null;
@@ -168,6 +173,7 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     created_at: wire.created_at,
     updated_at: wire.updated_at ?? wire.created_at,
     labels: wire.labels ?? {},
+    metadata: wire.metadata,
     permission_level: wire.permission_level ?? null,
     owner: wire.owner ?? null,
     runner_id: wire.runner_id ?? null,
@@ -188,10 +194,12 @@ async function fetchConversationsPage({
   after,
   searchQuery,
   includeArchived,
+  projectId,
 }: {
   after?: string;
   searchQuery: string;
   includeArchived: boolean;
+  projectId?: string;
 }): Promise<ConversationsPage> {
   // `updated_at` matches the sidebar's sort, which keeps server
   // pagination consistent with the visible order as the user scrolls.
@@ -207,6 +215,7 @@ async function fetchConversationsPage({
   // sidebar never pays to fetch them. The server excludes archived
   // sessions unless include_archived=true.
   if (includeArchived) params.set("include_archived", "true");
+  if (projectId) params.set("project_id", projectId);
   const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as ConversationsPage;
@@ -226,6 +235,7 @@ export function useConversations(
   searchQuery: string = "",
   includeArchived: boolean = false,
   options: UseConversationsOptions = {},
+  projectId?: string,
 ) {
   // Live updates arrive over the `WS /v1/sessions/updates` push stream
   // (SessionUpdatesProvider), which patches this cache in place as watched
@@ -236,12 +246,15 @@ export function useConversations(
   // If the socket is down, all consumers use a safety poll.
   const streamConnected = useSessionUpdatesConnected();
   return useInfiniteQuery({
-    queryKey: ["conversations", searchQuery, includeArchived],
+    queryKey: projectId
+      ? ["conversations", searchQuery, includeArchived, projectId]
+      : ["conversations", searchQuery, includeArchived],
     queryFn: ({ pageParam }) =>
       fetchConversationsPage({
         after: pageParam as string | undefined,
         searchQuery,
         includeArchived,
+        projectId,
       }),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage) =>
@@ -382,6 +395,8 @@ export function useArchiveConversation() {
       // or drops it from that project folder's own paginated list.
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECTS_KEY });
     },
   });
 }
@@ -452,6 +467,8 @@ export function useStopAndDeleteConversation() {
       // list, /v1/sessions/projects reads the DB directly (no search-index
       // lag), so this can't resurrect the deleted row.
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECTS_KEY });
     },
   });
 }
@@ -512,6 +529,8 @@ export function useBulkArchiveConversations() {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECTS_KEY });
     },
   });
 }
@@ -566,6 +585,8 @@ export function useBulkDeleteConversations() {
       // Refresh the project list so a project emptied by these deletes drops
       // its now-empty folder (DB-direct read, no search-index lag).
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECTS_KEY });
     },
     onError: (err: any) => {
       if (err?.succeeded) {
@@ -583,6 +604,8 @@ export function useBulkDeleteConversations() {
           queryClient.removeQueries({ queryKey: ["session", id] });
         }
         void queryClient.invalidateQueries({ queryKey: ["projects"] });
+        void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
+        void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECTS_KEY });
       }
     },
   });
@@ -661,40 +684,72 @@ export function usePinnedConversationBackfill(
 
 // ── Project hooks ─────────────────────────────────────────────────────────────
 
-/**
- * The reserved `conversation_labels` key that stores a session's project
- * membership. Namespaced (`omni_*`) so it never collides with the user-facing
- * "project" term or other reserved keys, and is filtered out of generic label
- * surfaces.
- */
-export const PROJECT_LABEL_KEY = "omni_project";
+export interface Project {
+  id: string;
+  name: string;
+}
 
-/** Fetch all project names from `GET /v1/sessions/projects`. */
+/** Fetch projects with at least one active session. */
 export function useProjects() {
-  return useQuery<string[]>({
+  return useQuery<Project[]>({
     queryKey: ["projects"],
     queryFn: async () => {
       const res = await authenticatedFetch("/v1/sessions/projects");
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      return (await res.json()) as string[];
+      return (await res.json()) as Project[];
     },
     staleTime: 30_000,
   });
 }
 
-async function moveConversationToProject(id: string, project: string): Promise<Conversation> {
+/** Fetch projects with at least one archived session. */
+export function useArchivedProjects() {
+  return useQuery<Project[]>({
+    queryKey: ARCHIVED_PROJECTS_KEY,
+    queryFn: async () => {
+      const res = await authenticatedFetch("/v1/sessions/projects?archived=true");
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      return (await res.json()) as Project[];
+    },
+    staleTime: 60_000,
+  });
+}
+
+/** Create a first-class project and return its stable identity. */
+export async function createProject(name: string): Promise<Project> {
+  const res = await authenticatedFetch("/v1/projects", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return (await res.json()) as Project;
+}
+
+export function useCreateProject() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: createProject,
+    onSuccess: (project) => {
+      queryClient.setQueryData<Project[]>(["projects"], (current = []) =>
+        current.some((item) => item.id === project.id) ? current : [...current, project],
+      );
+    },
+  });
+}
+
+async function moveConversationToProject(id: string, projectId: string): Promise<Conversation> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    // Empty string signals "remove from project" (server deletes the label row).
-    body: JSON.stringify({ labels: { [PROJECT_LABEL_KEY]: project } }),
+    body: JSON.stringify({ project_id: projectId }),
   });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as Conversation;
 }
 
 /**
- * Move a session to a project (or remove it from all projects when `project=""`).
+ * Move a session to a project (or remove it from all projects when `projectId=""`).
  *
  * Invalidates both the conversations list (so sidebar sections re-group) and
  * the projects list (so counts update). Patch-in-place is skipped here — project
@@ -704,24 +759,26 @@ async function moveConversationToProject(id: string, project: string): Promise<C
 export function useMoveToProject() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, project }: { id: string; project: string }) =>
-      moveConversationToProject(id, project),
+    mutationFn: ({ id, projectId }: { id: string; projectId: string }) =>
+      moveConversationToProject(id, projectId),
     onSuccess: (updated) => {
       markConversationSeen(updated.id, updated.updated_at);
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       // Moving into/out of a project changes both folders' paginated lists.
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECTS_KEY });
     },
   });
 }
 
 /**
  * Collect every session id filed under a project, paging through the
- * server-side `?project=` filter (archived included). Used by "Delete project"
+ * server-side `?project_id=` filter (archived included). Used by "Delete project"
  * so it removes ALL members, not just those in the loaded sidebar window.
  */
-async function fetchAllProjectSessionIds(project: string): Promise<string[]> {
+async function fetchAllProjectSessionIds(projectId: string): Promise<string[]> {
   const ids: string[] = [];
   let after: string | undefined;
   for (;;) {
@@ -730,7 +787,7 @@ async function fetchAllProjectSessionIds(project: string): Promise<string[]> {
       sort_by: "updated_at",
       limit: "100",
       include_archived: "true",
-      project,
+      project_id: projectId,
     });
     if (after) params.set("after", after);
     // Sequential by necessity: each page's request needs the previous page's
@@ -749,18 +806,18 @@ async function fetchAllProjectSessionIds(project: string): Promise<string[]> {
 
 /**
  * Fetch up to `limit` session ids filed under a project (archived included),
- * server-side via the `?project=` filter. A single page — enough to answer
+ * server-side via the `?project_id=` filter. A single page — enough to answer
  * "is this session the project's last member?" reliably (unaffected by the
  * sidebar's loaded window or pin-precedence placement). Default `limit=2` is
  * the minimum that distinguishes "only this one" from "more than one".
  */
-export async function fetchProjectSessionIds(project: string, limit = 2): Promise<string[]> {
+export async function fetchProjectSessionIds(projectId: string, limit = 2): Promise<string[]> {
   const params = new URLSearchParams({
     order: "desc",
     sort_by: "updated_at",
     limit: String(limit),
     include_archived: "true",
-    project,
+    project_id: projectId,
   });
   const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
@@ -770,14 +827,15 @@ export async function fetchProjectSessionIds(project: string, limit = 2): Promis
 
 /** One page of a project's (non-archived) sessions, newest-first. */
 async function fetchProjectSessionsPage(
-  project: string,
+  projectId: string,
   after?: string,
+  limit = 20,
 ): Promise<ConversationsPage> {
   const params = new URLSearchParams({
     order: "desc",
     sort_by: "updated_at",
-    limit: "20",
-    project,
+    limit: String(limit),
+    project_id: projectId,
   });
   if (after) params.set("after", after);
   const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
@@ -787,7 +845,7 @@ async function fetchProjectSessionsPage(
 
 /**
  * Cursor-paginated list of the sessions filed under one project, fetched
- * server-side via `?project=` so a folder shows ALL its members regardless of
+ * server-side via `?project_id=` so a folder shows ALL its members regardless of
  * how far the global sidebar list has been scrolled. Archived sessions are
  * excluded (they leave the active sidebar). `enabled` gates the fetch so a
  * collapsed folder costs nothing — pass the folder's expanded state.
@@ -795,10 +853,11 @@ async function fetchProjectSessionsPage(
  * Same page size (20) and sort (`updated_at desc`) as the global list, so a
  * folder paginates independently with its own infinite-scroll sentinel.
  */
-export function useProjectSessions(project: string, enabled: boolean) {
+export function useProjectSessions(projectId: string, enabled: boolean) {
   return useInfiniteQuery({
-    queryKey: ["project-sessions", project],
-    queryFn: ({ pageParam }) => fetchProjectSessionsPage(project, pageParam as string | undefined),
+    queryKey: ["project-sessions", projectId],
+    queryFn: ({ pageParam }) =>
+      fetchProjectSessionsPage(projectId, pageParam as string | undefined),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage) =>
       lastPage.has_more ? (lastPage.last_id ?? undefined) : undefined,
@@ -806,20 +865,33 @@ export function useProjectSessions(project: string, enabled: boolean) {
   });
 }
 
+/** The newest active session in a project, used by composer prefill. */
+export function useNewestProjectSession(projectId: string | null) {
+  return useQuery({
+    queryKey: ["project-newest-session", projectId],
+    queryFn: async () => {
+      const page = await fetchProjectSessionsPage(projectId as string, undefined, 1);
+      return page.data[0] ?? null;
+    },
+    enabled: projectId !== null && projectId !== "",
+    staleTime: 30_000,
+  });
+}
+
 /**
  * Delete a whole project by ARCHIVING every session filed under it. The
- * sessions keep their `omni_project` label (so unarchiving restores them to
+ * Sessions keep their first-class membership (so unarchiving restores them to
  * this project) and their history; they only leave the active sidebar. The
- * project is implicit and the server's project list excludes all-archived
- * projects, so the folder disappears once its last member is archived. Throws
+ * server's active-project list excludes all-archived projects, so the folder
+ * disappears once its last member is archived. Throws
  * `{ failed, succeeded, total }` if any session failed (e.g. a shared session
  * the user can't modify), leaving those sessions in place.
  */
 export function useDeleteProject() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (project: string) => {
-      const ids = await fetchAllProjectSessionIds(project);
+    mutationFn: async (projectId: string) => {
+      const ids = await fetchAllProjectSessionIds(projectId);
       const results = await Promise.allSettled(ids.map((id) => archiveConversation(id, true)));
       const succeeded: string[] = [];
       const failed: string[] = [];
@@ -843,6 +915,8 @@ export function useDeleteProject() {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECTS_KEY });
     },
   });
 }

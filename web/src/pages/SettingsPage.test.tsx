@@ -51,7 +51,9 @@ vi.mock("@/hooks/useConversations", () => ({
   useConversations: () => ({
     data: { pages: [{ data: mocks.conversations }] },
     isLoading: false,
+    hasNextPage: false,
   }),
+  useArchivedProjects: () => ({ data: [], isSuccess: true, isFetching: false }),
   useArchiveConversation: () => ({ mutate: mocks.archiveMutate, isPending: false }),
   useStopAndDeleteConversation: () => ({ mutate: mocks.deleteMutate, isPending: false }),
 }));

@@ -198,6 +198,8 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
         // Converge each project folder's own list too (new/archived/relabeled
         // members the local field-patch can't place).
         void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+        void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
+        void queryClient.invalidateQueries({ queryKey: ["archived-projects"] });
       }, DEBOUNCE_MS);
     };
 

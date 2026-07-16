@@ -59,6 +59,12 @@ import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { CliCommandBlock } from "./CliCommandBlock";
 import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
+import {
+  initialPrefillState,
+  prefillDone,
+  projectPrefillStep,
+  type ProjectPrefillState,
+} from "./projectPrefill";
 import { getCliServerUrl } from "@/lib/host";
 import { getOmnigentHostConfig } from "@/lib/host";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
@@ -98,7 +104,11 @@ import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSwitcher";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
-import { useProjects, PROJECT_LABEL_KEY } from "@/hooks/useConversations";
+import {
+  useCreateProject,
+  useNewestProjectSession,
+  useProjects,
+} from "@/hooks/useConversations";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import {
@@ -729,11 +739,10 @@ export function deriveHomeDir(entries: HostFilesystemEntry[]): string | null {
 
 /**
  * The composer's "Project" chip — files the to-be-created session under a
- * named project (an implicit collection stored as a ``conversation_labels``
- * row with the reserved key ``omni_project``). Mirrors the sidebar kebab's
- * project picker: a search box, the existing projects, a "No project" reset,
+ * first-class project. Mirrors the sidebar kebab's project picker: a search
+ * box, the existing projects, a "No project" reset,
  * and an inline "New project…" input. Selection is local state on the landing
- * composer; the label is applied right after the session is created.
+ * composer; membership is applied right after the session is created.
  */
 function LandingProjectPicker({
   value,
@@ -743,6 +752,7 @@ function LandingProjectPicker({
   onChange: (project: string) => void;
 }) {
   const { data: projects = [] } = useProjects();
+  const createProject = useCreateProject();
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [creatingNew, setCreatingNew] = useState(false);
@@ -754,8 +764,9 @@ function LandingProjectPicker({
   }, [creatingNew]);
 
   const filtered = search
-    ? projects.filter((name) => name.toLowerCase().includes(search.toLowerCase()))
+    ? projects.filter((project) => project.name.toLowerCase().includes(search.toLowerCase()))
     : projects;
+  const selected = projects.find((project) => project.id === value);
 
   function pick(project: string) {
     onChange(project);
@@ -767,7 +778,10 @@ function LandingProjectPicker({
 
   function commitNew() {
     const name = newName.trim();
-    if (name) pick(name);
+    if (!name) return;
+    createProject.mutate(name, {
+      onSuccess: (project) => pick(project.id),
+    });
   }
 
   const itemClass =
@@ -785,7 +799,7 @@ function LandingProjectPicker({
           {/* Label collapses to icon-only on narrow viewports (mobile),
               matching the host/workspace/worktree chips. */}
           <span className={`hidden max-w-32 truncate sm:block ${value ? "text-foreground" : ""}`}>
-            {value || "No project"}
+            {selected?.name ?? "No project"}
           </span>
           <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
         </button>
@@ -814,10 +828,15 @@ function LandingProjectPicker({
             <span className="flex-1 truncate">No project</span>
             {value === "" && <CheckIcon className="size-3.5 shrink-0 text-primary" />}
           </button>
-          {filtered.map((name) => (
-            <button key={name} type="button" className={itemClass} onClick={() => pick(name)}>
-              <span className="flex-1 truncate">{name}</span>
-              {value === name && <CheckIcon className="size-3.5 shrink-0 text-primary" />}
+          {filtered.map((project) => (
+            <button
+              key={project.id}
+              type="button"
+              className={itemClass}
+              onClick={() => pick(project.id)}
+            >
+              <span className="flex-1 truncate">{project.name}</span>
+              {value === project.id && <CheckIcon className="size-3.5 shrink-0 text-primary" />}
             </button>
           ))}
           {filtered.length === 0 && !creatingNew && (
@@ -1825,11 +1844,13 @@ export function NewChatLandingScreen() {
   const databricksGitCredentialsTooltipContent = docsLinks?.databricksGitCredentials;
   const showDisabledSandboxWithDocs = !managedSandboxesEnabled && !!newSandboxTooltipContent;
 
+  const projectIdParam = searchParams.get("project_id") ?? "";
+
   // Seeded from the persisted last pick so a returning user starts on the
   // agent they used last; validated against the live list in
   // effectiveAgentId below (a stale id falls back to the default).
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(
-    () => landingDraft?.pickedAgentId ?? readLastAgentId(),
+    () => landingDraft?.pickedAgentId ?? (projectIdParam ? null : readLastAgentId()),
   );
   const [selectedHostId, setSelectedHostId] = useState<string | null>(
     () => landingDraft?.selectedHostId ?? null,
@@ -1877,18 +1898,15 @@ export function NewChatLandingScreen() {
   const [prefilledBranch, setPrefilledBranch] = useState<string>(
     () => landingDraft?.prefilledBranch ?? "",
   );
-  // Project to file the new session under (an implicit collection stored as a
-  // conversation_labels row). Empty = unfiled. Applied right after create.
-  // Pre-filled from a `?project=` query param so the sidebar's per-project
-  // "new session" pencil can land here with the project already selected.
-  const projectParam = searchParams.get("project") ?? "";
-  const [selectedProject, setSelectedProject] = useState<string>(() => projectParam);
-  // The landing screen stays mounted while the `?project=` param changes (e.g.
+  // Project to file the new session under. Empty = unfiled. Pre-filled from
+  // `?project_id=` so the sidebar's pencil lands with the project selected.
+  const [selectedProjectId, setSelectedProjectId] = useState<string>(() => projectIdParam);
+  // The landing screen stays mounted while the `?project_id=` param changes (e.g.
   // clicking a different project's pencil), so the lazy initializer above won't
   // re-run — sync the selection to the param whenever it changes.
   useEffect(() => {
-    setSelectedProject(projectParam);
-  }, [projectParam]);
+    setSelectedProjectId(projectIdParam);
+  }, [projectIdParam]);
   // Permission mode for Claude Code (claude --permission-mode). Only
   // meaningful for the claude-native wrapper; ignored otherwise. Lives in
   // the footer tray's Advanced settings menu.
@@ -2020,6 +2038,40 @@ export function NewChatLandingScreen() {
     };
   }, []);
 
+  const { data: projectNewest, isError: projectNewestFailed } = useNewestProjectSession(
+    projectIdParam || null,
+  );
+  const needsSourceRepoResolve =
+    projectNewest != null &&
+    projectNewest.git_branch != null &&
+    projectNewest.workspace != null &&
+    projectNewest.host_id != null;
+  const {
+    data: sourceWorktreesData,
+    isError: projectSourceWorktreesFailed,
+    isPlaceholderData: sourceWorktreesArePlaceholder,
+  } = useHostWorktrees(
+    needsSourceRepoResolve ? (projectNewest.host_id ?? null) : null,
+    needsSourceRepoResolve ? (projectNewest.workspace ?? null) : null,
+  );
+  const projectSourceWorktrees = sourceWorktreesArePlaceholder ? undefined : sourceWorktreesData;
+  const [prefill, setPrefill] = useState<ProjectPrefillState>(() =>
+    initialPrefillState(projectIdParam),
+  );
+  const prefillSettled = prefill.phase === "settled";
+  const seededHostRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (prefill.projectId === projectIdParam) return;
+    setSandboxSelected(false);
+    setSelectedHostId(null);
+    setPickedAgentId(projectIdParam ? null : readLastAgentId());
+    setWorkspace("");
+    setBranchName("");
+    seededHostRef.current = null;
+    setPrefill(initialPrefillState(projectIdParam));
+  }, [projectIdParam, prefill.projectId]);
+
   // Auto-select an option so a session can be started without an explicit
   // pick. Prefer the user's last explicit choice (persisted across visits);
   // otherwise fall back to the FIRST AVAILABLE option in menu order — the
@@ -2028,6 +2080,7 @@ export function NewChatLandingScreen() {
   // already in state (or restored from the in-memory draft) is never
   // overridden.
   useEffect(() => {
+    if (!prefillSettled) return;
     if (sandboxSelected) return;
     if (selectedHostId !== null) return;
 
@@ -2066,7 +2119,15 @@ export function NewChatLandingScreen() {
     }
     const firstOnline = (hosts ?? []).find((h) => h.status === "online");
     if (firstOnline) setSelectedHostId(firstOnline.host_id);
-  }, [hosts, hostsLoading, selectedHostId, sandboxSelected, managedSandboxesEnabled, info]);
+  }, [
+    hosts,
+    hostsLoading,
+    selectedHostId,
+    sandboxSelected,
+    managedSandboxesEnabled,
+    info,
+    prefillSettled,
+  ]);
 
   // Fall back to the host's home directory when it has no recorded recents, so
   // the working-directory field is pre-filled and the user can send in one
@@ -2090,15 +2151,15 @@ export function NewChatLandingScreen() {
   // Seed the working directory once per host, into an empty field only, so an
   // explicit pick isn't clobbered. Prefer the most-recent path; else the
   // derived home (which can arrive a render later, hence the dep).
-  const seededHostRef = useRef<string | null>(null);
   useEffect(() => {
+    if (!prefillSettled) return;
     if (selectedHostId === null) return;
     if (seededHostRef.current === selectedHostId) return;
     const candidate = recent[0] ?? derivedHome;
     if (!candidate) return;
     seededHostRef.current = selectedHostId;
     setWorkspace((cur) => (cur === "" ? candidate : cur));
-  }, [selectedHostId, recent, derivedHome]);
+  }, [selectedHostId, recent, derivedHome, prefillSettled]);
 
   // A pick only wins while it exists in the list — a persisted id whose
   // agent has since been unregistered (or hidden) falls back to the default.
@@ -2232,7 +2293,11 @@ export function NewChatLandingScreen() {
   // worktree picker. Skipped for sandbox sessions (server-managed) and
   // when no directory is picked. A non-git path resolves to [].
   const worktreesEnabled = !sandboxSelected && selectedHostId !== null && workspaceTrimmed !== "";
-  const { data: hostWorktrees } = useHostWorktrees(
+  const {
+    data: hostWorktrees,
+    isPlaceholderData: hostWorktreesArePlaceholder,
+    isError: hostWorktreesFailed,
+  } = useHostWorktrees(
     worktreesEnabled ? selectedHostId : null,
     worktreesEnabled ? workspaceTrimmed : null,
   );
@@ -2312,6 +2377,59 @@ export function NewChatLandingScreen() {
     const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
     setBranchName(`worktree-${suffix}`);
   }, []);
+
+  useEffect(() => {
+    if (prefill.projectId !== projectIdParam || prefillDone(prefill)) return;
+    const step = projectPrefillStep(prefill, {
+      newest: projectNewest,
+      newestFailed: projectNewestFailed,
+      hosts,
+      agents: agents === undefined ? undefined : agentList,
+      sandboxSelected,
+      selectedHostId,
+      lastAgentId: readLastAgentId(),
+      sourceWorktrees: projectSourceWorktrees,
+      sourceWorktreesFailed: projectSourceWorktreesFailed,
+      workspaceTrimmed,
+      branchName,
+      prefilledBranch,
+      hostWorktrees: hostWorktreesArePlaceholder ? undefined : hostWorktrees,
+      hostWorktreesFailed,
+    });
+    if (step === null) return;
+    const { writes } = step;
+    if (writes.hostId !== undefined) setSelectedHostId((current) => current ?? writes.hostId!);
+    if (writes.agentId !== undefined) {
+      setPickedAgentId((current) => current ?? writes.agentId!);
+      if (pickedAgentId === null) setPickedHarness(readLastHarness(writes.agentId));
+    }
+    if (writes.workspace !== undefined) {
+      setWorkspace((current) => (current === "" ? writes.workspace! : current));
+    }
+    if (writes.branch !== undefined && prefilledBranch === "") {
+      setBranchName((current) => (current === "" ? writes.branch! : current));
+    }
+    setPrefill(step.state);
+  }, [
+    prefill,
+    projectIdParam,
+    projectNewest,
+    projectNewestFailed,
+    hosts,
+    agents,
+    agentList,
+    sandboxSelected,
+    selectedHostId,
+    pickedAgentId,
+    projectSourceWorktrees,
+    projectSourceWorktreesFailed,
+    workspaceTrimmed,
+    branchName,
+    prefilledBranch,
+    hostWorktrees,
+    hostWorktreesArePlaceholder,
+    hostWorktreesFailed,
+  ]);
 
   // Sandbox repo inputs are valid when blank (empty workspace), or when
   // the URL passes the shape check; a branch without a URL is dangling.
@@ -2706,22 +2824,21 @@ export function NewChatLandingScreen() {
         }
         data = (await res.json()) as { id: string };
       }
-      // File the new session under the chosen project (an implicit collection
-      // stored as a conversation_labels row). Awaited so the conversations
-      // refetch below already sees the label; non-fatal if it fails — the
-      // session is created either way, just unfiled.
-      if (selectedProject) {
+      // File the new session under the chosen project. Awaited so the next
+      // conversations refetch sees the membership; failure leaves it unfiled.
+      if (selectedProjectId) {
         try {
           await authenticatedFetch(`/v1/sessions/${data.id}`, {
             method: "PATCH",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ labels: { [PROJECT_LABEL_KEY]: selectedProject } }),
+            body: JSON.stringify({ project_id: selectedProjectId }),
           });
           void queryClient.invalidateQueries({ queryKey: ["projects"] });
           // Refetch the target project folder's own paginated list so the new
           // session shows up immediately (the folder fetches via
           // useProjectSessions, separate from the global conversations list).
           void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+          void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
         } catch {
           // Leave the session unfiled; the user can file it from the sidebar.
         }
@@ -3606,10 +3723,10 @@ export function NewChatLandingScreen() {
               {/* Project chip — files the session under a named project on
                 create. Sits after the worktree chip. Only shown when a project
                 is already selected (e.g. quick-starting from an existing
-                project's "new session" pencil, which passes `?project=`);
+                project's "new session" pencil, which passes `?project_id=`);
                 otherwise the new-session flow stays unfiled. */}
-              {selectedProject && (
-                <LandingProjectPicker value={selectedProject} onChange={setSelectedProject} />
+              {selectedProjectId && (
+                <LandingProjectPicker value={selectedProjectId} onChange={setSelectedProjectId} />
               )}
             </div>
             {/* The agent / harness picker moved out of the tray and into the

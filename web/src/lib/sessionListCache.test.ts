@@ -161,6 +161,23 @@ describe("mergeItemsIntoPages", () => {
     expect(needsRefetch).toBe(true);
   });
 
+  it("removes rows moved out of a project-filtered query", () => {
+    const before = data([conv("a", { metadata: { project_id: "proj_a" } })]);
+    const items = new Map<string, SessionListWireItem>([
+      ["a", { id: "a", metadata: { project_id: "proj_b" } }],
+    ]);
+
+    const { data: after, needsRefetch } = mergeItemsIntoPages(
+      before,
+      items,
+      { includeArchived: true, searchQuery: "", projectId: "proj_a" },
+      NO_ACTIVE,
+    );
+
+    expect(after!.pages[0].data).toEqual([]);
+    expect(needsRefetch).toBe(true);
+  });
+
   it("does not refetch on a runner_online-only push delta", () => {
     // runner_online is no longer a list membership / sort dimension — the
     // sidebar fetches one undifferentiated session list, so a liveness
@@ -274,6 +291,16 @@ describe("filtersFromConversationQueryKey", () => {
     expect(filtersFromConversationQueryKey(["conversations", "needle", true])).toEqual({
       searchQuery: "needle",
       includeArchived: true,
+    });
+  });
+
+  it("parses project-filtered conversation query keys", () => {
+    expect(
+      filtersFromConversationQueryKey(["conversations", "", true, "proj_sprint_42"]),
+    ).toEqual({
+      searchQuery: "",
+      includeArchived: true,
+      projectId: "proj_sprint_42",
     });
   });
 

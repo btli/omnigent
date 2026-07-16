@@ -46,8 +46,10 @@ describe("computeShiftSelectRange", () => {
 // ── Integration tests ───────────────────────────────────────────────────────
 
 const { projectsMock, conversationsRef, projectSessionsMock } = vi.hoisted(() => ({
-  projectsMock: [] as string[],
-  conversationsRef: { current: [] as { id: string; labels?: Record<string, string> }[] },
+  projectsMock: [] as { id: string; name: string }[],
+  conversationsRef: {
+    current: [] as { id: string; metadata?: { project_id?: string | null } }[],
+  },
   projectSessionsMock: { current: {} as Record<string, unknown[]> },
 }));
 
@@ -63,13 +65,14 @@ vi.mock("@/hooks/useConversations", () => ({
   useRenameConversation: () => ({ mutate: vi.fn() }),
   useStopSession: () => ({ mutate: vi.fn() }),
   useProjects: () => ({ data: projectsMock }),
+  useCreateProject: () => ({ mutate: vi.fn(), isPending: false }),
   useProjectSessions: (project: string, enabled: boolean) => {
     const override = projectSessionsMock.current[project];
     const rows = !enabled
       ? []
       : (override ??
         conversationsRef.current.filter(
-          (c) => (c.labels?.omni_project ?? null) === project && (c as any).archived !== true,
+          (c) => c.metadata?.project_id === project && (c as any).archived !== true,
         ));
     return {
       data: enabled
@@ -89,7 +92,6 @@ vi.mock("@/hooks/useConversations", () => ({
   useMoveToProject: () => ({ mutate: vi.fn() }),
   useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: vi.fn(() => Promise.resolve([] as string[])),
-  PROJECT_LABEL_KEY: "omni_project",
 }));
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
@@ -111,6 +113,14 @@ function conv(id: string, partial: Partial<Conversation> = {}): Conversation {
     agent_name: "Claude Code",
     ...partial,
   };
+}
+
+function projectId(name: string): string {
+  return `proj_${name.toLowerCase().replace(/[^a-z0-9]+/g, "_")}`;
+}
+
+function addProjects(...names: string[]): void {
+  projectsMock.push(...names.map((name) => ({ id: projectId(name), name })));
 }
 
 function mockConversations(convs: Conversation[]) {
@@ -186,10 +196,10 @@ describe("Sidebar shift-click selection", () => {
 
   it("shift-click does not select project sessions when selecting within Sessions", async () => {
     // Set up project "Alpha" with 2 sessions, plus 3 unfiled chat sessions
-    projectsMock.push("Alpha");
+    addProjects("Alpha");
     const sessions = [
-      conv("p1", { labels: { omni_project: "Alpha" } }),
-      conv("p2", { labels: { omni_project: "Alpha" } }),
+      conv("p1", { metadata: { project_id: projectId("Alpha") } }),
+      conv("p2", { metadata: { project_id: projectId("Alpha") } }),
       conv("c1"),
       conv("c2"),
       conv("c3"),
@@ -197,7 +207,10 @@ describe("Sidebar shift-click selection", () => {
     mockConversations(sessions);
 
     // Expand the Alpha project so its sessions are visible
-    localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha"]));
+    localStorage.setItem(
+      "omnigent:expanded-project-sections",
+      JSON.stringify([projectId("Alpha")]),
+    );
 
     renderSidebar();
 
@@ -246,21 +259,24 @@ describe("Sidebar shift-click selection", () => {
   it("shift-select within a project uses the folder's own rendered IDs, not the global list", async () => {
     // Seed a project with sessions that differ from the global list:
     // the global list has p1,p2 but the folder's own query returns p1,p2,p3.
-    projectsMock.push("Alpha");
+    addProjects("Alpha");
     const sessions = [
-      conv("p1", { labels: { omni_project: "Alpha" } }),
-      conv("p2", { labels: { omni_project: "Alpha" } }),
+      conv("p1", { metadata: { project_id: projectId("Alpha") } }),
+      conv("p2", { metadata: { project_id: projectId("Alpha") } }),
       conv("c1"),
     ];
     mockConversations(sessions);
     // The folder's useProjectSessions returns an extra session (p3)
     // that isn't in the global paginated window.
-    projectSessionsMock.current["Alpha"] = [
-      conv("p1", { labels: { omni_project: "Alpha" } }),
-      conv("p2", { labels: { omni_project: "Alpha" } }),
-      conv("p3", { labels: { omni_project: "Alpha" } }),
+    projectSessionsMock.current[projectId("Alpha")] = [
+      conv("p1", { metadata: { project_id: projectId("Alpha") } }),
+      conv("p2", { metadata: { project_id: projectId("Alpha") } }),
+      conv("p3", { metadata: { project_id: projectId("Alpha") } }),
     ];
-    localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha"]));
+    localStorage.setItem(
+      "omnigent:expanded-project-sections",
+      JSON.stringify([projectId("Alpha")]),
+    );
 
     renderSidebar();
 
