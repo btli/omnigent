@@ -5,9 +5,10 @@ isolation, ssh-agent, exact-repo binding, warn-and-allow shared push)
 **Date:** 2026-07-15
 **Branch:** `feat/custom-git-hosts` (worktree off `upstream/main` @ `0f6e82fb`)
 **Anchor issue:** omnigent-ai#2125. **Related:** #1937, #1421, #236.
-**Research:** `custom-git-hosts-codex.md`, `custom-git-hosts-research.md`.
-**Reviews:** `custom-git-hosts-codex-review.md`, `custom-git-hosts-agy-review.md`,
-`custom-git-hosts-codex-rereview.md`.
+
+> This spec was developed through several rounds of multi-engine adversarial review; the
+> phased plan (P1a/P1b landed here, P1c/P1d to follow) and review history live in the PR
+> discussion rather than in-tree.
 
 ## 0. What changed in v3
 
