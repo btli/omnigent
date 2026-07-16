@@ -22,6 +22,7 @@ from omnigent.server.managed_hosts import (
     KUBERNETES_MANAGED_TOKEN_TTL_S,
     MODAL_MANAGED_TOKEN_TTL_S,
     OPENSHELL_MANAGED_TOKEN_TTL_S,
+    CredentialSelectionError,
     ManagedSandboxConfig,
     RepoWorkspace,
     _build_clone_env,
@@ -917,6 +918,110 @@ def test_resolve_repo_workspace_github_default_has_no_credential_source() -> Non
 def test_resolve_repo_workspace_unknown_host_raises() -> None:
     with pytest.raises(ValueError, match="no configured git host"):
         resolve_repo_workspace("https://git.unknown.com/x/y", _GH_HOSTS)
+
+
+def _cred_store(tmp_path):
+    from cryptography.fernet import Fernet
+
+    from omnigent.git_hosts.crypto import GitCredentialCipher
+    from omnigent.stores.git_credential_store import GitCredentialStore
+
+    return GitCredentialStore(
+        f"sqlite:///{tmp_path}/creds.db",
+        GitCredentialCipher([Fernet.generate_key().decode()]),
+    )
+
+
+def test_resolve_repo_workspace_selects_single_slot(tmp_path) -> None:
+    store = _cred_store(tmp_path)
+    slot = store.create(
+        owner_user_id="alice",
+        host_id="acme",
+        provider="forgejo",
+        label="work",
+        username=None,
+        token="t",
+    )
+    repo = resolve_repo_workspace(
+        "https://git.acme.com/team/proj",
+        _GH_HOSTS,
+        owner_user_id="alice",
+        credential_store=store,
+    )
+    assert repo.credential_slot_id == slot.id
+
+
+def test_resolve_repo_workspace_multiple_slots_requires_label(tmp_path) -> None:
+    store = _cred_store(tmp_path)
+    store.create(
+        owner_user_id="alice",
+        host_id="acme",
+        provider="forgejo",
+        label="work",
+        username=None,
+        token="t1",
+    )
+    personal = store.create(
+        owner_user_id="alice",
+        host_id="acme",
+        provider="forgejo",
+        label="personal",
+        username=None,
+        token="t2",
+    )
+    with pytest.raises(CredentialSelectionError, match="multiple git credentials"):
+        resolve_repo_workspace(
+            "https://git.acme.com/team/proj",
+            _GH_HOSTS,
+            owner_user_id="alice",
+            credential_store=store,
+        )
+    repo = resolve_repo_workspace(
+        "https://git.acme.com/team/proj",
+        _GH_HOSTS,
+        owner_user_id="alice",
+        credential_store=store,
+        label="personal",
+    )
+    assert repo.credential_slot_id == personal.id
+
+
+def test_resolve_repo_workspace_unknown_label_lists_available(tmp_path) -> None:
+    store = _cred_store(tmp_path)
+    store.create(
+        owner_user_id="alice",
+        host_id="acme",
+        provider="forgejo",
+        label="work",
+        username=None,
+        token="t",
+    )
+    with pytest.raises(CredentialSelectionError, match="work"):
+        resolve_repo_workspace(
+            "https://git.acme.com/team/proj",
+            _GH_HOSTS,
+            owner_user_id="alice",
+            credential_store=store,
+            label="nope",
+        )
+
+
+def test_resolve_repo_workspace_zero_slots_falls_back(tmp_path) -> None:
+    store = _cred_store(tmp_path)
+    repo = resolve_repo_workspace(
+        "https://git.acme.com/team/proj",
+        _GH_HOSTS,
+        owner_user_id="alice",
+        credential_store=store,
+    )
+    assert repo.credential_slot_id is None
+    assert repo.credential_source == "env:ACME_TOKEN"
+
+
+def test_resolve_repo_workspace_no_store_no_selection() -> None:
+    # Backward compat: no store -> no owner-aware selection (today's behavior).
+    repo = resolve_repo_workspace("https://git.acme.com/team/proj", _GH_HOSTS)
+    assert repo.credential_slot_id is None
 
 
 def test_build_clone_env_none_without_credential_source() -> None:

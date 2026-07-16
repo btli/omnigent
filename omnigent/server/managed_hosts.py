@@ -118,13 +118,14 @@ import click
 from fastapi import HTTPException
 
 from omnigent.db.utils import now_epoch
-from omnigent.git_hosts.base import HostConfig
+from omnigent.git_hosts.base import ClonePlan, HostConfig
 from omnigent.git_hosts.credentials import resolve_credential
 from omnigent.git_hosts.resolver import resolve_clone_plan
 from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
     from omnigent.onboarding.sandboxes import SandboxLauncher
+    from omnigent.stores.git_credential_store import GitCredentialStore
 
 _logger = logging.getLogger(__name__)
 
@@ -398,6 +399,16 @@ class ManagedHostLaunch:
     workspace: str
 
 
+class CredentialSelectionError(ValueError):
+    """A managed session's git-credential slot cannot be chosen unambiguously.
+
+    Raised when the owner holds multiple labeled identities on the resolved
+    host and the request did not name one (or named one that does not exist).
+    A ``ValueError`` subclass so the create route's existing ``except
+    ValueError`` renders it as a 422 — never a silent pick (design §12.3).
+    """
+
+
 @dataclass
 class RepoWorkspace:
     """
@@ -424,6 +435,10 @@ class RepoWorkspace:
     :param credential_source: Resolution metadata from the operator
         git-host config; ``None`` when unresolved or for the built-in
         github.com default's credential fields.
+    :param credential_slot_id: The owner's selected credential slot id for the
+        resolved host (design §8.3/§12.3), or ``None`` when the owner has no
+        slot (fall back to the operator ``credential_source``) or owner-aware
+        selection was not requested.
     :param clone_username: Resolution metadata from the operator
         git-host config; ``None`` when unresolved.
     :param host_id: Operator git-host id the repo resolved to (``"github"``
@@ -444,6 +459,7 @@ class RepoWorkspace:
     provider: str | None = None
     api_base: str | None = None
     credential_source: str | None = None
+    credential_slot_id: str | None = None
     clone_username: str | None = None
     auth_scheme: str | None = None
     ca_bundle: str | None = None
@@ -580,7 +596,56 @@ def parse_repo_workspace(workspace: str) -> RepoWorkspace:
     return RepoWorkspace(url=url, branch=branch, repo_name=_derive_repo_name(url))
 
 
-def resolve_repo_workspace(workspace: str, hosts: Sequence[HostConfig]) -> RepoWorkspace:
+def _select_credential_slot(
+    *,
+    plan: ClonePlan,
+    owner_user_id: str | None,
+    credential_store: GitCredentialStore | None,
+    label: str | None,
+) -> str | None:
+    """Pick the owner's credential slot for the resolved host (design §12.3).
+
+    Precedence: the owner's slot for this host (model A) → else ``None`` so the
+    caller falls back to the operator ``credential_source`` → else legacy
+    ambient ``GIT_TOKEN``. A given *label* must match exactly one slot; without
+    a label, exactly-one auto-selects and multiple is a hard error (never a
+    silent pick).
+
+    :returns: The selected slot id, or ``None`` when the owner has no slot or
+        owner-aware selection was not requested (no store / no owner — today's
+        behavior).
+    :raises CredentialSelectionError: On an ambiguous or unmatched selection.
+    """
+    if credential_store is None or owner_user_id is None:
+        return None
+    slots = credential_store.list_for_owner_host(owner_user_id, plan.host_id)
+    if not slots:
+        return None
+    available = ", ".join(sorted(s.label for s in slots))
+    if label is not None:
+        for slot in slots:
+            if slot.label == label:
+                return slot.id
+        raise CredentialSelectionError(
+            f"no git credential labeled {label!r} for host {plan.host_id!r}; "
+            f"available: {available}"
+        )
+    if len(slots) == 1:
+        return slots[0].id
+    raise CredentialSelectionError(
+        f"host {plan.host_id!r} has multiple git credentials for this user "
+        f"({available}); set 'git_credential_label' to choose one"
+    )
+
+
+def resolve_repo_workspace(
+    workspace: str,
+    hosts: Sequence[HostConfig],
+    *,
+    owner_user_id: str | None = None,
+    credential_store: GitCredentialStore | None = None,
+    label: str | None = None,
+) -> RepoWorkspace:
     """Parse *workspace* and resolve it against the operator git-host config.
 
     Combines :func:`parse_repo_workspace` (shape validation) with
@@ -592,12 +657,29 @@ def resolve_repo_workspace(workspace: str, hosts: Sequence[HostConfig]) -> RepoW
     :param workspace: The raw repository-URL workspace, e.g.
         ``"https://git.acme.com/team/proj#main"``.
     :param hosts: Operator-configured hosts (``app.state.git_hosts``).
+    :param owner_user_id: The session creator's user id, for owner-aware
+        credential-slot selection (design §12.3). ``None`` skips selection
+        (``credential_slot_id`` stays ``None`` — today's behavior).
+    :param credential_store: The store to look up the owner's credential
+        slots in. ``None`` skips selection the same as an absent
+        *owner_user_id* — both must be given to select a slot.
+    :param label: The request's chosen credential label, or ``None`` to
+        auto-select when the owner has exactly one slot on the resolved host.
     :returns: The enriched, validated :class:`RepoWorkspace`.
     :raises ValueError: When the URL is malformed or its host is neither
         configured nor github.com.
+    :raises CredentialSelectionError: When owner-aware selection is active
+        and the owner's slots for the resolved host are ambiguous or the
+        given *label* matches none of them.
     """
     parsed = parse_repo_workspace(workspace)
     plan = resolve_clone_plan(workspace, hosts)
+    credential_slot_id = _select_credential_slot(
+        plan=plan,
+        owner_user_id=owner_user_id,
+        credential_store=credential_store,
+        label=label,
+    )
     return RepoWorkspace(
         url=parsed.url,
         branch=parsed.branch,
@@ -607,6 +689,7 @@ def resolve_repo_workspace(workspace: str, hosts: Sequence[HostConfig]) -> RepoW
         provider=plan.provider,
         api_base=plan.api_base,
         credential_source=plan.credential_source,
+        credential_slot_id=credential_slot_id,
         clone_username=plan.auth.username,
         auth_scheme=plan.auth.scheme,
         ca_bundle=plan.ca_bundle,

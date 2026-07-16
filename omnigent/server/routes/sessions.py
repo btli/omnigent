@@ -163,6 +163,7 @@ from omnigent.server.auth import (
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
+    CredentialSelectionError,
     ManagedHostLaunch,
     ManagedLaunch,
     ManagedLaunchTracker,
@@ -14500,11 +14501,29 @@ def create_sessions_router(
         if body.host_type == "managed" and body.workspace is not None:
             try:
                 managed_repo = resolve_repo_workspace(
-                    body.workspace, getattr(request.app.state, "git_hosts", ())
+                    body.workspace,
+                    getattr(request.app.state, "git_hosts", ()),
+                    owner_user_id=user_id,
+                    credential_store=getattr(request.app.state, "git_credential_store", None),
+                    label=body.git_credential_label,
                 )
+            except CredentialSelectionError as exc:
+                # Ambiguous/unmatched credential label — point the 422 at the
+                # label field, listing the choices (str(exc)); never a silent pick.
+                raise HTTPException(
+                    status_code=422,
+                    detail=[
+                        {
+                            "type": "value_error",
+                            "loc": ["body", "git_credential_label"],
+                            "msg": str(exc),
+                            "input": body.git_credential_label,
+                        },
+                    ],
+                ) from exc
             except ValueError as exc:
-                # Same list-of-errors 422 shape as the schema
-                # validators (describeCreateError renders detail[0].msg).
+                # Same list-of-errors 422 shape as the schema validators
+                # (describeCreateError renders detail[0].msg).
                 raise HTTPException(
                     status_code=422,
                     detail=[

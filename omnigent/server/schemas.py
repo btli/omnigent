@@ -1303,6 +1303,12 @@ class SessionCreateRequest(BaseModel):
         the spec's declared harness. Create-time only — there is no
         PATCH path, since the harness process spawns on the first
         turn.
+    :param git_credential_label: For a ``host_type: "managed"`` session whose
+        repository resolves to an operator git host on which the creator holds
+        MULTIPLE labeled credentials, the label choosing which one the session
+        uses (design §12.3). Ignored when the creator holds zero or one
+        credential on the host. ``None`` (the default) auto-selects the single
+        credential or falls back to the operator credential source.
     """
 
     agent_id: str
@@ -1320,6 +1326,7 @@ class SessionCreateRequest(BaseModel):
     reasoning_effort: str | None = None
     cost_control_mode_override: str | None = None
     harness_override: str | None = None
+    git_credential_label: str | None = None
 
     @model_validator(mode="after")
     def _check_git_requires_host(self) -> SessionCreateRequest:
