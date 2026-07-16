@@ -7,7 +7,6 @@ from enum import Enum
 from typing import Any
 
 from omnigent.entities import Project, ProjectBackfillResult
-from omnigent.errors import ProjectInputError as ProjectInputError
 from omnigent.projects.defaults import DEFAULTS_SCHEMA_VERSION
 from omnigent.stores.conversation_store import ConversationStore
 

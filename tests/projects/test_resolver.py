@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 
+from omnigent.errors import ProjectInputError
 from omnigent.projects.defaults import ProjectDefaultsBundle
 from omnigent.projects.resolver import resolve_project_defaults
-from omnigent.stores.project_store import ProjectInputError
 
 
 def test_resolver_applies_field_precedence_and_explicit_null_clears() -> None:

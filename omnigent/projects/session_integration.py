@@ -8,7 +8,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from omnigent.entities import LiveProjectSnapshot, Project
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, ProjectInputError
 from omnigent.projects.defaults import ProjectDefaultsBundle
 from omnigent.projects.resolver import resolve_project_defaults
 from omnigent.server.schemas import SessionCreateMetadata, SessionCreateRequest
@@ -16,7 +16,7 @@ from omnigent.stores.conversation_store import (
     PROJECT_LABEL_KEY,
     warn_deprecated_project_label,
 )
-from omnigent.stores.project_store import ProjectInputError, ProjectStore
+from omnigent.stores.project_store import ProjectStore
 
 
 def _require_project_store(project_store: ProjectStore | None) -> ProjectStore:
@@ -69,10 +69,10 @@ async def resolve_legacy_project_label(
     legacy_project_requested: bool,
     explicit_project_requested: bool = False,
     explicit_project_id: str | None = None,
-) -> tuple[dict[str, str], str | None, bool]:
+) -> tuple[dict[str, str], str | None]:
     """Consume a legacy project label and resolve its authoritative id."""
     if not legacy_project_requested:
-        return labels, None, False
+        return labels, None
     warn_deprecated_project_label(write_path)
     clean_labels = {key: value for key, value in labels.items() if key != PROJECT_LABEL_KEY}
     project_name = labels[PROJECT_LABEL_KEY]
@@ -82,7 +82,7 @@ async def resolve_legacy_project_label(
                 "project_id and omni_project label refer to different projects",
                 code=ErrorCode.INVALID_INPUT,
             )
-        return clean_labels, None, True
+        return clean_labels, None
     project_store = _require_project_store(project_store)
 
     if explicit_project_requested:
@@ -104,7 +104,7 @@ async def resolve_legacy_project_label(
             owner_principal_id,
             project_name,
         )
-    return clean_labels, project.id, True
+    return clean_labels, project.id
 
 
 async def prepare_json_session_project(
@@ -115,7 +115,7 @@ async def prepare_json_session_project(
     """Resolve JSON-create project compatibility, defaults, and snapshot."""
     explicit_project_requested = "project_id" in body.model_fields_set
     legacy_project_requested = PROJECT_LABEL_KEY in body.labels
-    clean_labels, legacy_project_id, legacy_project_requested = await resolve_legacy_project_label(
+    clean_labels, legacy_project_id = await resolve_legacy_project_label(
         body.labels,
         owner_principal_id,
         project_store,
@@ -183,7 +183,7 @@ async def prepare_multipart_session_project(
 ) -> tuple[SessionCreateMetadata, LiveProjectSnapshot | None]:
     """Resolve multipart-create legacy membership and snapshot."""
     legacy_project_requested = PROJECT_LABEL_KEY in metadata.labels
-    clean_labels, legacy_project_id, legacy_project_requested = await resolve_legacy_project_label(
+    clean_labels, legacy_project_id = await resolve_legacy_project_label(
         metadata.labels,
         owner_principal_id,
         project_store,
@@ -220,7 +220,7 @@ async def resolve_patch_project_membership(
 
     if not legacy_project_requested:
         return explicit_project_id
-    _, legacy_project_id, _ = await resolve_legacy_project_label(
+    _, legacy_project_id = await resolve_legacy_project_label(
         labels,
         owner_principal_id,
         project_store,

@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import dataclasses
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 
@@ -57,7 +56,7 @@ class LiveProjectSnapshot:
     @classmethod
     def backfill(cls, project_id: str) -> LiveProjectSnapshot:
         """Build the canonical snapshot for a legacy-label backfill."""
-        return dataclasses.replace(cls.moved(project_id), snapshot_origin="backfill")
+        return replace(cls.moved(project_id), snapshot_origin="backfill")
 
 
 def project_snapshot_values(

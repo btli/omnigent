@@ -831,7 +831,6 @@ function LandingProjectPicker({
                 onKeyDown={picker.handleNewProjectKeyDown}
                 disabled={picker.isCreatingProject}
                 error={picker.createError}
-                errorId="landing-project-create-error"
               />
             </div>
           ) : (
