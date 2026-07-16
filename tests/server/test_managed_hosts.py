@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
 
 from omnigent.db.utils import now_epoch
+from omnigent.git_hosts.config import load_git_hosts
 from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
@@ -28,6 +29,7 @@ from omnigent.server.managed_hosts import (
     parse_repo_workspace,
     parse_sandbox_config,
     relaunch_managed_host,
+    resolve_repo_workspace,
     resume_managed_host,
     terminate_managed_host,
 )
@@ -861,6 +863,42 @@ def test_parse_repo_workspace_rejects_malformed(workspace: str, expected_fragmen
     with pytest.raises(ValueError, match="") as exc:
         parse_repo_workspace(workspace)
     assert expected_fragment in str(exc.value)
+
+
+# ── resolve_repo_workspace ────────────────────────────────────
+
+_GH_HOSTS = load_git_hosts(
+    [
+        {
+            "id": "acme",
+            "provider": "forgejo",
+            "web_host": "git.acme.com",
+            "credential_source": "env:ACME_TOKEN",
+        }
+    ]
+)
+
+
+def test_resolve_repo_workspace_enriches_configured_host() -> None:
+    repo = resolve_repo_workspace("https://git.acme.com/team/proj#main", _GH_HOSTS)
+    assert repo.url == "https://git.acme.com/team/proj"
+    assert repo.branch == "main"
+    assert repo.repo_name == "proj"
+    assert repo.canonical_host == "git.acme.com"
+    assert repo.provider == "forgejo"
+    assert repo.credential_source == "env:ACME_TOKEN"
+    assert repo.clone_username == "oauth2"
+
+
+def test_resolve_repo_workspace_github_default_has_no_credential_source() -> None:
+    repo = resolve_repo_workspace("https://github.com/org/repo", _GH_HOSTS)
+    assert repo.provider == "github"
+    assert repo.credential_source is None
+
+
+def test_resolve_repo_workspace_unknown_host_raises() -> None:
+    with pytest.raises(ValueError, match="no configured git host"):
+        resolve_repo_workspace("https://git.unknown.com/x/y", _GH_HOSTS)
 
 
 # ── GET /v1/info: managed_sandboxes_enabled ─────────────────
