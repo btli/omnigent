@@ -146,7 +146,7 @@ from omnigent.runtime.policies.approval import (
 from omnigent.runtime.policies.builder import build_policy_engine, load_session_usage
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.tool_output import cap_tool_output
-from omnigent.server import presence
+from omnigent.server import presence, session_live_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -2059,21 +2059,30 @@ def _owner_from_grants(grants: list[SessionPermission]) -> str | None:
     return next((g.user_id for g in grants if g.level >= LEVEL_OWNER), None)
 
 
-def _session_status_from_cache(conversation_id: str) -> Literal["idle", "running", "failed"]:
+def _session_status_from_cache(
+    conversation_id: str,
+    db_status: str | None = None,
+) -> Literal["idle", "running", "failed"]:
     """
     Map the relay-fed status cache value to a list-item status.
 
     The cache stores the fine-grained relay status (``"running"``,
     ``"waiting"``, ``"failed"``, ``"idle"``); the list-item shape
     collapses ``"running"``/``"waiting"`` to ``"running"``. A cache
-    miss means no relay has reported on this session, which presents
-    as ``"idle"``.
+    miss falls back to *db_status* — the row value the tunnel-holding
+    replica persisted (``omnigent_conversation_metadata.live_status``) — so a replica
+    that does NOT hold this session's runner tunnel still serves the
+    real status. No cache entry and no row value presents as ``"idle"``.
 
     :param conversation_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
+    :param db_status: ``Conversation.live_status`` when the caller has
+        the row, else ``None``.
     :returns: One of ``"idle"``, ``"running"``, ``"failed"``.
     """
     cached = _session_status_cache.get(conversation_id)
+    if cached is None:
+        cached = db_status
     if cached in ("running", "waiting"):
         return "running"
     if cached == "failed":
@@ -2084,6 +2093,7 @@ def _session_status_from_cache(conversation_id: str) -> Literal["idle", "running
 def _session_status_with_child_rollup(
     conversation_id: str,
     child_session_ids: list[str],
+    db_status: str | None = None,
 ) -> Literal["idle", "running", "failed"]:
     """
     Map a session's cached status plus direct child activity to list status.
@@ -2097,10 +2107,14 @@ def _session_status_with_child_rollup(
         e.g. ``"conv_parent123"``.
     :param child_session_ids: Direct sub-agent child conversation ids,
         e.g. ``["conv_child1", "conv_child2"]``.
+    :param db_status: The row's persisted ``live_status``, used when the
+        local cache has no entry (this replica doesn't hold the runner
+        tunnel). The child rollup below stays cache-only — a wrong-pod
+        miss there just skips the parent's roll-up spinner, best-effort.
     :returns: One of ``"idle"``, ``"running"``, ``"failed"`` for the
         session-list row.
     """
-    own_status = _session_status_from_cache(conversation_id)
+    own_status = _session_status_from_cache(conversation_id, db_status)
     if own_status == "running":
         return "running"
     # A claude-native session can settle to ``idle`` while background shells
@@ -2264,7 +2278,7 @@ def _build_session_list_item(
         agent_id=conv.agent_id,
         project_id=conv.project_id,
         agent_name=agent_names_by_id.get(conv.agent_id),
-        status=_session_status_with_child_rollup(conv.id, child_session_ids),
+        status=_session_status_with_child_rollup(conv.id, child_session_ids, conv.live_status),
         created_at=conv.created_at,
         updated_at=conv.updated_at,
         title=title_without_closed_marker(conv.title),
@@ -2275,7 +2289,21 @@ def _build_session_list_item(
         permission_level=level,
         owner=owner,
         external_session_id=conv.external_session_id,
-        pending_elicitations_count=pending_count,
+        # The persisted row count is a CROSS-REPLICA mirror: the replica
+        # holding the runner's tunnel writes it, and a replica that doesn't
+        # hold it falls back to the row (max() prefers "shows the parked
+        # approval" whichever side lags). That fallback only makes sense for
+        # a runner-bound session — an unbound session (no runner_id) has no
+        # tunnel on any replica, so the local in-memory index is
+        # authoritative and the row (an async mirror that lags a resolve's
+        # decrement) must not override it. Gating on runner_id keeps the
+        # cross-replica fallback where it's needed while making the unbound
+        # path index-only and free of the persist-lag race.
+        pending_elicitations_count=(
+            max(pending_count, conv.pending_elicitation_count or 0)
+            if conv.runner_id is not None
+            else pending_count
+        ),
         workspace=conv.workspace,
         git_branch=conv.git_branch,
         archived=conv.archived,
@@ -2320,6 +2348,14 @@ async def _apply_liveness_to_items(
         result = liveness[item.id]
         item.runner_online = result.runner_online
         item.host_online = result.host_online
+        # A dead runner's parked prompts died with it, but the persisted
+        # pending count has no crash-time writer (a runner/host/replica that
+        # dies without a graceful resolve never decrements the row) — so an
+        # offline runner reads as zero pending rather than lighting a phantom
+        # inbox badge over an empty prompt list. Reconciled durably when the
+        # runner reconnects (see ``_on_runner_connect``'s pending resync).
+        if not result.runner_online:
+            item.pending_elicitations_count = 0
 
 
 def _targeted_elicitation_event(
@@ -5711,6 +5747,10 @@ def _publish_status(
         _session_active_response_cache.pop(session_id, None)
         return
     _session_status_cache[session_id] = status
+    # Mirror the transition onto the conversation row (best-effort,
+    # deduplicated, off-loop) so replicas that don't hold this session's
+    # runner tunnel serve the same sidebar status.
+    session_live_state.persist_live_status(session_id, status)
     # Track the in-flight response id for snapshot-based reconnect (see
     # _session_active_response_cache). A running/waiting edge that names a
     # turn opens it; any idle/failed edge closes it.
@@ -5888,6 +5928,7 @@ async def _publish_runner_recovered_status(
         if last_error is None or last_error.get("code") != "runner_disconnected":
             return
     _session_status_cache[session_id] = "idle"
+    session_live_state.persist_live_status(session_id, "idle")
     event = SessionStatusEvent(
         type="session.status",
         conversation_id=session_id,
@@ -22308,6 +22349,8 @@ async def _get_session_snapshot(
                 if resp.status_code == 200:
                     raw = resp.json().get("status", "idle")
                     _session_status_cache[session_id] = raw
+                    if raw in ("idle", "running", "waiting", "failed"):
+                        session_live_state.persist_live_status(session_id, raw)
                     status = _session_status_from_cache(session_id)
             except (httpx.HTTPError, ConnectionError):
                 _logger.debug(
