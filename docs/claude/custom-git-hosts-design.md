@@ -167,6 +167,12 @@ args/logs, or `SandboxPolicy`.
 - **Exec:** a launcher primitive delivers the credential via a transient askpass/helper file or
   secret-env channel the provider supports — not via the `self.run` command string
   (`omnigent/onboarding/sandboxes/base.py:425-438`); removed immediately after clone.
+- **Interim exec mechanism (P1b, recorded deviation):** until the secret-delivery launcher
+  capability lands, the exec model delivers the credential as a shlex-quoted env prefix on the
+  single clone command, with **mandatory redaction** of the values from any failure message
+  before it reaches logs/SSE/error bodies. Residual: the token rides the provider exec API and
+  the sandbox process table during the clone. The §8.4-conformant channel (askpass/secret-env
+  primitive) is a named P1c task alongside the k8s init-container Secret.
 - **Kubernetes:** a **distinct clone-only Secret** projected to the init container
   (`omnigent/onboarding/sandboxes/kubernetes.py:359-393,447-591`). The init container **must drop the
   shared `harness_secret` `envFrom`** (else it still sees every credential) and receive **only** the

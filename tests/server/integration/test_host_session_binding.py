@@ -1313,8 +1313,16 @@ async def test_relaunch_soft_fails_when_host_no_longer_configured(
         conv = await _wait_for_managed_binding(env, session_id)
         first_tunnel = await host_futures[0]
         commands_before_relaunch = list(fake.commands)
-        assert any("git clone" in cmd for cmd in commands_before_relaunch), (
+        clone_commands = [cmd for cmd in commands_before_relaunch if "git clone" in cmd]
+        assert clone_commands, (
             "create-time clone against the configured host did not run — fixture regressed"
+        )
+        # Proves end-to-end credential delivery: the operator credential
+        # resolved for "acme" rides the create-time clone command as the
+        # per-clone env prefix, not the ambient/baked GIT_TOKEN.
+        assert clone_commands[0].startswith("GIT_TOKEN="), (
+            f"create-time clone did not carry the resolved operator credential: "
+            f"{clone_commands[0]!r}"
         )
 
         tracker = env.app.state.managed_launches

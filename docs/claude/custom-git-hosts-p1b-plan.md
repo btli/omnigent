@@ -14,7 +14,7 @@
 - **No linter suppressions:** never add `# noqa` / `# type: ignore`. Fix root causes (underscore-prefix genuinely-unused args).
 - **Style:** `from __future__ import annotations` first; frozen dataclasses for value types; Sphinx `:param:` docstrings; comments describe the scenario, never the PR/change history.
 - **Security invariants:** no secret value in `RepoWorkspace`, labels, app.state, or any persisted/logged object — only the `credential_source` *reference*. The resolved token exists transiently in `_arm_and_start_host` (server side) and the single prefixed clone command. Unknown non-github.com hosts are rejected (422 at create; soft-fail skip at relaunch).
-- **Backward compatibility:** with no `git_hosts:` config, behavior is byte-identical to today (github.com + ambient `GIT_TOKEN`; no new env prefix on the clone command when there is no per-host credential).
+- **Backward compatibility:** with no `git_hosts:` config, github.com workspaces behave byte-identically to today. **Behavior change (intended, design §7):** non-github.com repo URLs — which previously cloned without validation (e.g. public gitlab.com repos) — are now rejected 422 at create unless operator-configured; pre-existing non-github sessions relaunch into an empty workspace with a warning. Must be called out in the upstream PR as a breaking-change note.
 - **Scope boundary (state in code comments where relevant):** per-host credentials cover the **launch-time clone**. In-runner fetch/push still uses the ambient deployment credential; multi-host runner credentials arrive with the P1c handoff (design §8.5).
 - **Commit discipline:** one commit per task; run `pre-commit run --files <changed>` before each commit.
 

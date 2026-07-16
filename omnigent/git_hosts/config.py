@@ -11,6 +11,7 @@ from typing import Any
 
 from omnigent.git_hosts import available_providers, get_git_host
 from omnigent.git_hosts.base import HostConfig
+from omnigent.git_hosts.credentials import parse_credential_source
 
 _REQUIRED = ("id", "provider", "web_host", "credential_source")
 _ALLOWED_KEYS = frozenset(
@@ -90,6 +91,11 @@ def load_git_hosts(raw: object) -> tuple[HostConfig, ...]:
         ca_bundle_raw = entry.get("ca_bundle")
         if ca_bundle_raw is not None and (not isinstance(ca_bundle_raw, str) or not ca_bundle_raw):
             raise ValueError(f"git_hosts[{index}].ca_bundle must be a non-empty string when set")
+
+        try:
+            parse_credential_source(entry["credential_source"])
+        except ValueError as exc:
+            raise ValueError(f"git_hosts[{index}].credential_source: {exc}") from exc
 
         hosts.append(
             HostConfig(
