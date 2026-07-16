@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import dataclasses
+
+import pytest
+
 from omnigent.git_hosts.base import (
     CloneAuthBinding,
     ClonePlan,
@@ -50,3 +54,7 @@ def test_host_config_and_clone_plan_are_frozen_value_types() -> None:
     )
     assert plan.credential_source == "env:ACME_TOKEN"
     assert plan.ssh_host is None
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        cfg.id = "x"
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        plan.provider = "x"
