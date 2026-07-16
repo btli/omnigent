@@ -104,13 +104,14 @@ stores into ``create_app``):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
 import secrets
 import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -233,6 +234,17 @@ MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S = MANAGED_HOST_ONLINE_TIMEOUT_S + 120
 # path at bind time, so this label is what a sandbox RELAUNCH parses
 # to re-clone the repository into the fresh generation's workspace.
 MANAGED_REPO_LABEL_KEY = "omnigent.sandbox.repo"
+# Server-owned relaunch-binding labels (design §9). Persisted at create so a
+# relaunch can detect operator topology drift and re-authorize the same
+# credential slot deterministically, instead of silently re-resolving the raw
+# URL against whatever git_hosts is live. These are HINTS re-validated at every
+# launch — tampering can only cause a refusal, never a silent rebind or a
+# privilege escalation (the slot is re-authorized against the live
+# owner/host-scoped store on every relaunch).
+MANAGED_GIT_HOST_ID_LABEL_KEY = "omnigent.sandbox.git_host_id"
+MANAGED_GIT_HOST_HASH_LABEL_KEY = "omnigent.sandbox.git_host_hash"
+MANAGED_GIT_CANONICAL_URL_LABEL_KEY = "omnigent.sandbox.git_canonical_url"
+MANAGED_GIT_CREDENTIAL_SLOT_LABEL_KEY = "omnigent.sandbox.git_credential_slot"
 
 
 @dataclass
@@ -406,6 +418,21 @@ class CredentialSelectionError(ValueError):
     host and the request did not name one (or named one that does not exist).
     A ``ValueError`` subclass so the create route's existing ``except
     ValueError`` renders it as a 422 — never a silent pick (design §12.3).
+    """
+
+
+class RelaunchBindingError(RuntimeError):
+    """A session's persisted git-host binding no longer holds at relaunch.
+
+    Raised when the bound host no longer resolves the session's repository
+    (removed), the URL now resolves to a DIFFERENT host than the one bound
+    (semantic rebind), or the owner lost the bound credential slot. Same-host
+    configuration drift does NOT raise — it deliberately takes effect on
+    relaunch (design §9). The relaunch refuses rather than silently rebinding
+    to a different host/credential or degrading to an empty workspace.
+    Persisted binding labels are hints re-validated every launch; tampering
+    with one can only cause this refusal (never escalation), because the slot
+    is re-authorized against the live owner/host-scoped store.
     """
 
 
@@ -696,6 +723,144 @@ def resolve_repo_workspace(
         ssh_host=plan.ssh_host,
         ssh_port=plan.ssh_port,
     )
+
+
+def host_config_hash(cfg: HostConfig) -> str:
+    """Return a deterministic hash of a host's non-secret topology.
+
+    Covers the host's identity and non-secret topology: id, provider,
+    canonical host, API base, the credential-source *reference*
+    (``"env:NAME"`` — not a secret), and the SSH/CA overrides. The hash is a
+    drift-detection/audit signal (and the future §8.7 re-resolution notice
+    hook), NOT a gate: same-host changes deliberately take effect on relaunch
+    (design §9) and refresh the persisted binding. Refusal is reserved for the
+    separately-checked rebind / lost-slot cases.
+    """
+    parts = (
+        cfg.id,
+        cfg.provider,
+        cfg.web_host,
+        cfg.api_base,
+        cfg.credential_source,
+        cfg.ssh_host or "",
+        "" if cfg.ssh_port is None else str(cfg.ssh_port),
+        cfg.ca_bundle or "",
+    )
+    return hashlib.sha256("\x00".join(parts).encode()).hexdigest()
+
+
+def build_relaunch_binding_labels(
+    repo: RepoWorkspace, hosts: Sequence[HostConfig]
+) -> dict[str, str]:
+    """Server-owned labels pinning a session's git-host binding for relaunch.
+
+    Empty for the github.com built-in default (host id ``"github"`` has no
+    ``HostConfig`` and no user credentials — nothing to drift). For an operator
+    host: the host id, its topology hash, the canonical clone URL, and the
+    selected credential slot id (only when a slot was chosen).
+    """
+    cfg = next((h for h in hosts if h.id == repo.host_id), None)
+    if cfg is None:
+        return {}
+    labels = {
+        MANAGED_GIT_HOST_ID_LABEL_KEY: cfg.id,
+        MANAGED_GIT_HOST_HASH_LABEL_KEY: host_config_hash(cfg),
+        MANAGED_GIT_CANONICAL_URL_LABEL_KEY: repo.url,
+    }
+    if repo.credential_slot_id is not None:
+        labels[MANAGED_GIT_CREDENTIAL_SLOT_LABEL_KEY] = repo.credential_slot_id
+    return labels
+
+
+def reauthorize_relaunch_binding(
+    *,
+    raw_repo: str,
+    labels: Mapping[str, str],
+    owner: str,
+    hosts: Sequence[HostConfig],
+    credential_store: GitCredentialStore | None,
+) -> RepoWorkspace:
+    """Re-resolve and re-authorize a session's repo binding for a relaunch.
+
+    Re-resolves *raw_repo* against the LIVE operator hosts and enforces the
+    binding's SECURITY invariants — refusing (raising
+    :class:`RelaunchBindingError`) only when one is violated:
+
+    - the bound host id no longer resolves the URL (operator removed the host);
+    - the URL now resolves to a DIFFERENT host id (a semantic rebind — because a
+      fixed URL matches the same host id only if that host's ``web_host`` is
+      unchanged, "same host id" already guarantees the canonical DESTINATION is
+      invariant, so this is the destination-integrity gate);
+    - a bound credential slot no longer resolves for *owner* (revoked/lost — the
+      ownership gate).
+
+    A ``host_config_hash`` mismatch under the SAME host id is NOT a gate.
+    Design §9 is explicit: "Topology/credential changes deliberately take effect
+    on relaunch." A ``ca_bundle``/``api_base``/``credential_source``-ref/SSH/
+    provider change keeps the same destination and the same (re-authorized)
+    owner slot, so the relaunch proceeds with the LIVE config; the mismatch is
+    logged (host id only — never config values or secrets) as a drift/audit
+    signal (and the future §8.7 re-resolution notice hook), and the CALLER
+    refreshes the persisted binding labels so later relaunches compare against
+    current config instead of logging forever.
+
+    A session with NO persisted binding (pre-P1c-3, or the github default) is
+    left to the caller's existing behavior: topology resolution succeeds
+    normally, and an unresolvable URL raises a plain ``ValueError``
+    (degrade-to-empty).
+
+    :returns: The re-resolved :class:`RepoWorkspace` carrying the
+        re-authorized ``credential_slot_id`` (``None`` when unbound). The caller
+        re-persists ``build_relaunch_binding_labels(returned_repo, hosts)`` on
+        success to refresh a drifted hash/URL.
+    """
+    bound_host_id = labels.get(MANAGED_GIT_HOST_ID_LABEL_KEY)
+    try:
+        repo = resolve_repo_workspace(raw_repo, hosts)
+    except ValueError:
+        if bound_host_id is not None:
+            # The bound host no longer resolves the URL — operator removed it.
+            raise RelaunchBindingError(
+                f"the git host {bound_host_id!r} this session was created "
+                "against no longer resolves its repository; refusing to relaunch"
+            ) from None
+        raise  # no binding persisted -> caller keeps the degrade-to-empty path
+    if bound_host_id is None:
+        return repo
+    cfg = next((h for h in hosts if h.id == bound_host_id), None)
+    if cfg is None or repo.host_id != bound_host_id:
+        # Destination-integrity gate: the URL rebound to a different host id
+        # (or the host is gone). Never send the credential to a new host.
+        raise RelaunchBindingError(
+            f"the git host {bound_host_id!r} this session was created against "
+            "is no longer configured; refusing to relaunch with a different host"
+        )
+    if labels.get(MANAGED_GIT_HOST_HASH_LABEL_KEY) != host_config_hash(cfg):
+        # Topology/credential changes deliberately take effect on relaunch
+        # (design §9) — NOT a gate. Same host id => same destination; the slot
+        # is still re-authorized below. Proceed with the live config; log the
+        # drift (host id only, no config values/secrets) as an audit signal and
+        # the future §8.7 notice hook. The caller refreshes the persisted binding.
+        _logger.warning(
+            "git host %r configuration changed since session create; "
+            "relaunching with the live config",
+            bound_host_id,
+        )
+    bound_slot = labels.get(MANAGED_GIT_CREDENTIAL_SLOT_LABEL_KEY)
+    if bound_slot is None:
+        return repo  # operator-credential-source binding; no per-owner slot
+    owned = (
+        {c.id for c in credential_store.list_for_owner_host(owner, bound_host_id)}
+        if credential_store is not None
+        else set()
+    )
+    if bound_slot not in owned:
+        raise RelaunchBindingError(
+            "the git credential this session was created with is no longer "
+            "available to its owner; refusing to relaunch"
+        )
+    repo.credential_slot_id = bound_slot
+    return repo
 
 
 def _build_clone_env(repo: RepoWorkspace | None) -> dict[str, str] | None:

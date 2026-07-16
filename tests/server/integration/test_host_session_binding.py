@@ -1209,7 +1209,7 @@ async def test_relaunch_resolves_repo_workspace_for_github_default(
     del first_tunnel, second_tunnel
 
 
-async def test_relaunch_soft_fails_when_host_no_longer_configured(
+async def test_relaunch_refuses_when_bound_host_no_longer_configured(
     runtime_init: None,
     db_uri: str,
     tmp_path: Path,
@@ -1217,17 +1217,19 @@ async def test_relaunch_soft_fails_when_host_no_longer_configured(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
-    A relaunch whose repo label points at a host the operator has since
-    removed from ``git_hosts`` soft-fails: it proceeds with an empty
-    workspace and logs a warning, rather than dying outright.
+    A relaunch whose PERSISTED git-host binding names a host the operator
+    has since removed from ``git_hosts`` REFUSES outright rather than
+    silently degrading to an empty workspace (design §9's destination-
+    integrity gate — a BOUND session never loses its repository quietly).
 
     The session is created against a CONFIGURED custom host (so the
-    create-time clone succeeds and the label is set), then
+    create-time clone succeeds and the binding labels are persisted), then
     ``app.state.git_hosts`` is cleared before the relaunch — the
     cheapest way to simulate "the operator removed the host since
     create" without rebuilding the app. Mirrors
     ``test_message_relaunches_dead_managed_sandbox``'s dead-sandbox ->
-    message -> relaunch flow.
+    message -> relaunch flow, but no generation-2 sandbox is ever
+    provisioned: the refusal happens before the relaunch pipeline starts.
     """
     monkeypatch.setenv("ACME_TOKEN", "t0k")
 
@@ -1366,20 +1368,19 @@ async def test_relaunch_soft_fails_when_host_no_longer_configured(
                 timeout=30.0,
             )
         assert message_resp.status_code == 503, message_resp.text
+        assert "no longer resolves its repository" in message_resp.text
 
-        # The relaunch still proceeded (generation 2 provisioned) but
-        # WITHOUT the repo — resolve_repo_workspace raised ValueError
-        # against the now-empty git_hosts and the soft-fail path took
-        # over instead of the relaunch dying outright.
-        assert len(fake.provisioned_names) == 2
-        new_commands = fake.commands[len(commands_before_relaunch) :]
-        assert not any("git clone" in cmd for cmd in new_commands), (
-            f"relaunch should not have re-cloned once the host was unconfigured: {new_commands}"
-        )
-        assert "relaunching with an empty workspace" in caplog.text
+        # The relaunch refused BEFORE the pipeline started: no generation-2
+        # sandbox was provisioned, nothing was terminated, and no new
+        # commands ran — the dead generation-1 clone is still the last one.
+        assert len(fake.provisioned_names) == 1
+        assert fake.terminated == []
+        assert fake.commands == commands_before_relaunch
+        assert "Refusing relaunch of session" in caplog.text
+        assert "acme" in caplog.text
+        assert "no longer resolves its repository" in caplog.text
 
-        second_tunnel = await host_futures[1]
-        del first_tunnel, second_tunnel
+        del first_tunnel
 
 
 async def test_resumable_managed_wake_ignores_stale_db_liveness(

@@ -7025,25 +7025,62 @@ def _kick_managed_relaunch(
     :param host_store: Persistent host registrations.
     :param app_state: ``request.app.state`` — supplies the registries.
     """
-    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
+    from omnigent.server.managed_hosts import (
+        MANAGED_REPO_LABEL_KEY,
+        RelaunchBindingError,
+        build_relaunch_binding_labels,
+        reauthorize_relaunch_binding,
+    )
 
-    # Re-clone the repository the session was created with so the
-    # fresh generation's workspace matches the create-time state.
-    # A resolve failure (tampered label, or a git host the operator
-    # removed since create) proceeds with an empty workspace rather
-    # than dying.
+    # Re-clone the repository the session was created with so the fresh
+    # generation's workspace matches the create-time state, re-authorizing
+    # any persisted git-host binding against the LIVE operator config. A
+    # bound session whose host was removed/rebound, or whose credential
+    # slot was revoked, REFUSES the relaunch outright (design §9) rather
+    # than silently dropping the repo or rebinding to a different host. A
+    # session with no persisted binding (pre-P1c-3, or the github default)
+    # keeps the historical degrade-to-empty-workspace behavior.
     repo = None
     raw_repo = conv.labels.get(MANAGED_REPO_LABEL_KEY)
     if raw_repo is not None:
         try:
-            repo = resolve_repo_workspace(raw_repo, getattr(app_state, "git_hosts", ()))
+            repo = reauthorize_relaunch_binding(
+                raw_repo=raw_repo,
+                labels=conv.labels,
+                owner=host.owner,
+                hosts=getattr(app_state, "git_hosts", ()),
+                credential_store=getattr(app_state, "git_credential_store", None),
+            )
+        except RelaunchBindingError as exc:
+            # Rebind / lost slot: the bound host is gone (or the URL now
+            # resolves to a different host), or the owner lost the credential
+            # slot. Refuse rather than silently rebinding or degrading to an
+            # empty workspace (design §9). Settle the tracker so a waiting
+            # message POST reports the reason.
+            _logger.warning("Refusing relaunch of session %s: %s", session_id, exc)
+            tracker.begin(session_id)
+            tracker.fail(session_id, str(exc))
+            _publish_sandbox_status(session_id, "failed", str(exc))
+            return
         except ValueError:
+            # No persisted binding and an unparseable/unknown raw label
+            # (pre-P1c-3 session or corrupt label): keep the historical
+            # degrade-to-empty-workspace behavior.
             _logger.warning(
                 "Session %s has an unparseable %s label (%r); relaunching with an empty workspace",
                 session_id,
                 MANAGED_REPO_LABEL_KEY,
                 raw_repo,
             )
+        else:
+            # Successful re-auth: refresh the persisted binding so later
+            # relaunches compare against the config that actually took effect
+            # (same-host drift deliberately takes effect, design §9).
+            refreshed = build_relaunch_binding_labels(repo, getattr(app_state, "git_hosts", ()))
+            if refreshed:
+                conversation_store.set_labels(
+                    session_id, {MANAGED_REPO_LABEL_KEY: raw_repo, **refreshed}
+                )
     _logger.info(
         "Managed sandbox for session %s (host %s) is gone; relaunching a new generation",
         session_id,
@@ -14628,22 +14665,31 @@ def create_sessions_router(
                     code=ErrorCode.INVALID_INPUT,
                 )
             from omnigent.server.auth import RESERVED_USER_LOCAL
-            from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
+            from omnigent.server.managed_hosts import (
+                MANAGED_REPO_LABEL_KEY,
+                build_relaunch_binding_labels,
+            )
 
             # The pre-create gate already parsed and host-resolved the
             # repository workspace; reuse that single resolution so the
             # launch clones exactly what the gate validated.
             repo = managed_repo
             if body.workspace is not None:
-                # The session row's workspace is overwritten with the
-                # CLONED path at bind time; record the raw request
-                # value so a sandbox relaunch can re-clone the same
-                # repository into the new generation.
-                await asyncio.to_thread(
-                    conversation_store.set_labels,
-                    resp.id,
-                    {MANAGED_REPO_LABEL_KEY: body.workspace},
-                )
+                # The session row's workspace is overwritten with the CLONED
+                # path at bind time; record the raw request value so a sandbox
+                # relaunch can re-clone the same repository, PLUS the resolved
+                # binding (host-config id + topology hash + canonical URL +
+                # credential slot id) so relaunch re-authorizes deterministically
+                # instead of silently re-resolving against whatever git_hosts is
+                # live. Empty for the github.com default.
+                _repo_labels = {MANAGED_REPO_LABEL_KEY: body.workspace}
+                if repo is not None:
+                    _repo_labels.update(
+                        build_relaunch_binding_labels(
+                            repo, getattr(request.app.state, "git_hosts", ())
+                        )
+                    )
+                await asyncio.to_thread(conversation_store.set_labels, resp.id, _repo_labels)
             managed_launches.begin(resp.id)
             # Seed the launch-progress indicator before the background
             # task starts, so the first GET snapshot (the Web UI

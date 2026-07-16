@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import ClassVar
 
@@ -20,16 +21,24 @@ from omnigent.server.managed_hosts import (
     DAYTONA_MANAGED_TOKEN_TTL_S,
     ISLO_MANAGED_TOKEN_TTL_S,
     KUBERNETES_MANAGED_TOKEN_TTL_S,
+    MANAGED_GIT_CREDENTIAL_SLOT_LABEL_KEY,
+    MANAGED_GIT_HOST_HASH_LABEL_KEY,
+    MANAGED_GIT_HOST_ID_LABEL_KEY,
+    MANAGED_REPO_LABEL_KEY,
     MODAL_MANAGED_TOKEN_TTL_S,
     OPENSHELL_MANAGED_TOKEN_TTL_S,
     CredentialSelectionError,
     ManagedSandboxConfig,
+    RelaunchBindingError,
     RepoWorkspace,
     _build_clone_env,
+    build_relaunch_binding_labels,
+    host_config_hash,
     host_resume_supported,
     launch_managed_host,
     parse_repo_workspace,
     parse_sandbox_config,
+    reauthorize_relaunch_binding,
     relaunch_managed_host,
     resolve_repo_workspace,
     resume_managed_host,
@@ -1055,6 +1064,196 @@ def test_build_clone_env_missing_secret_raises(monkeypatch: pytest.MonkeyPatch) 
     )
     with pytest.raises(ValueError):
         _build_clone_env(repo)
+
+
+# ── relaunch binding: persistence + re-authorization ────────
+
+
+def _bound_labels(repo, store, tmp_path):
+    return {
+        MANAGED_REPO_LABEL_KEY: "https://git.acme.com/team/proj",
+        **build_relaunch_binding_labels(repo, _GH_HOSTS),
+    }
+
+
+def test_build_relaunch_binding_labels_for_operator_host(tmp_path) -> None:
+    store = _cred_store(tmp_path)
+    slot = store.create(
+        owner_user_id="alice",
+        host_id="acme",
+        provider="forgejo",
+        label="work",
+        username=None,
+        token="t",
+    )
+    repo = resolve_repo_workspace(
+        "https://git.acme.com/team/proj",
+        _GH_HOSTS,
+        owner_user_id="alice",
+        credential_store=store,
+    )
+    labels = build_relaunch_binding_labels(repo, _GH_HOSTS)
+    assert labels[MANAGED_GIT_HOST_ID_LABEL_KEY] == "acme"
+    assert labels[MANAGED_GIT_HOST_HASH_LABEL_KEY] == host_config_hash(_GH_HOSTS[0])
+    assert labels[MANAGED_GIT_CREDENTIAL_SLOT_LABEL_KEY] == slot.id
+
+
+def test_build_relaunch_binding_labels_empty_for_github() -> None:
+    repo = resolve_repo_workspace("https://github.com/org/repo", _GH_HOSTS)
+    assert build_relaunch_binding_labels(repo, _GH_HOSTS) == {}
+
+
+def test_reauthorize_relaunch_binding_happy_path(tmp_path) -> None:
+    store = _cred_store(tmp_path)
+    slot = store.create(
+        owner_user_id="alice",
+        host_id="acme",
+        provider="forgejo",
+        label="work",
+        username=None,
+        token="t",
+    )
+    repo = resolve_repo_workspace(
+        "https://git.acme.com/team/proj",
+        _GH_HOSTS,
+        owner_user_id="alice",
+        credential_store=store,
+    )
+    labels = _bound_labels(repo, store, tmp_path)
+    out = reauthorize_relaunch_binding(
+        raw_repo="https://git.acme.com/team/proj",
+        labels=labels,
+        owner="alice",
+        hosts=_GH_HOSTS,
+        credential_store=store,
+    )
+    assert out.credential_slot_id == slot.id
+
+
+def test_reauthorize_refuses_when_host_removed(tmp_path) -> None:
+    store = _cred_store(tmp_path)
+    store.create(
+        owner_user_id="alice",
+        host_id="acme",
+        provider="forgejo",
+        label="work",
+        username=None,
+        token="t",
+    )
+    repo = resolve_repo_workspace(
+        "https://git.acme.com/team/proj",
+        _GH_HOSTS,
+        owner_user_id="alice",
+        credential_store=store,
+    )
+    labels = _bound_labels(repo, store, tmp_path)
+    with pytest.raises(RelaunchBindingError):
+        reauthorize_relaunch_binding(
+            raw_repo="https://git.acme.com/team/proj",
+            labels=labels,
+            owner="alice",
+            hosts=(),
+            credential_store=store,
+        )
+
+
+def test_reauthorize_same_host_config_drift_takes_effect(tmp_path, caplog) -> None:
+    # Same host id, changed config: operator changes deliberately take effect
+    # on relaunch (design §9) — no refusal; the drift is logged and the
+    # refreshed binding labels carry the NEW hash.
+    store = _cred_store(tmp_path)
+    slot = store.create(
+        owner_user_id="alice",
+        host_id="acme",
+        provider="forgejo",
+        label="work",
+        username=None,
+        token="t",
+    )
+    repo = resolve_repo_workspace(
+        "https://git.acme.com/team/proj",
+        _GH_HOSTS,
+        owner_user_id="alice",
+        credential_store=store,
+    )
+    labels = _bound_labels(repo, store, tmp_path)
+    changed = load_git_hosts(
+        [
+            {
+                "id": "acme",
+                "provider": "forgejo",
+                "web_host": "git.acme.com",
+                "credential_source": "env:DIFFERENT_TOKEN",
+            }
+        ]
+    )
+    # _cred_store()'s first migration ran Alembic's env.py, which calls
+    # fileConfig() and replaces the root logger's handlers — silently
+    # detaching pytest's caplog handler. Re-attach it (idempotent) so the
+    # drift warning below is actually captured.
+    logging.getLogger().addHandler(caplog.handler)
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.managed_hosts"):
+        out = reauthorize_relaunch_binding(
+            raw_repo="https://git.acme.com/team/proj",
+            labels=labels,
+            owner="alice",
+            hosts=changed,
+            credential_store=store,
+        )
+    # The live config took effect and the slot survived re-authorization.
+    assert out.credential_source == "env:DIFFERENT_TOKEN"
+    assert out.credential_slot_id == slot.id
+    # The drift was logged (host id only — never config values).
+    assert any(
+        "acme" in r.message and "configuration changed" in r.message for r in caplog.records
+    )
+    assert not any("DIFFERENT_TOKEN" in r.message for r in caplog.records)
+    # Rebuilding the binding from the re-authorized workspace yields the NEW hash.
+    refreshed = build_relaunch_binding_labels(out, changed)
+    assert refreshed[MANAGED_GIT_HOST_HASH_LABEL_KEY] == host_config_hash(changed[0])
+    assert refreshed[MANAGED_GIT_HOST_HASH_LABEL_KEY] != labels[MANAGED_GIT_HOST_HASH_LABEL_KEY]
+
+
+def test_reauthorize_refuses_when_slot_revoked(tmp_path) -> None:
+    store = _cred_store(tmp_path)
+    slot = store.create(
+        owner_user_id="alice",
+        host_id="acme",
+        provider="forgejo",
+        label="work",
+        username=None,
+        token="t",
+    )
+    repo = resolve_repo_workspace(
+        "https://git.acme.com/team/proj",
+        _GH_HOSTS,
+        owner_user_id="alice",
+        credential_store=store,
+    )
+    labels = _bound_labels(repo, store, tmp_path)
+    store.delete(slot.id)  # owner lost the slot between create and relaunch
+    with pytest.raises(RelaunchBindingError, match="no longer available"):
+        reauthorize_relaunch_binding(
+            raw_repo="https://git.acme.com/team/proj",
+            labels=labels,
+            owner="alice",
+            hosts=_GH_HOSTS,
+            credential_store=store,
+        )
+
+
+def test_reauthorize_no_binding_preserves_degrade() -> None:
+    # A pre-P1c-3 session (only the raw repo label, no binding labels) whose
+    # host the operator later removed still raises a plain ValueError, so the
+    # relaunch caller keeps the degrade-to-empty-workspace behavior.
+    with pytest.raises(ValueError):
+        reauthorize_relaunch_binding(
+            raw_repo="https://git.gone.com/x/y",
+            labels={MANAGED_REPO_LABEL_KEY: "https://git.gone.com/x/y"},
+            owner="alice",
+            hosts=(),
+            credential_store=None,
+        )
 
 
 # ── GET /v1/info: managed_sandboxes_enabled ─────────────────
