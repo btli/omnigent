@@ -3274,10 +3274,12 @@ def server(
     # Managed sandbox hosts (host_type="managed" sessions): parse the
     # config's `sandbox:` section up front so an operator typo stops
     # startup instead of 502-ing the first managed session.
+    from omnigent.git_hosts.config import load_git_hosts
     from omnigent.server.managed_hosts import parse_sandbox_config
 
     try:
         sandbox_config = parse_sandbox_config(cfg.get("sandbox"))
+        git_hosts = load_git_hosts(cfg.get("git_hosts"))
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -3345,6 +3347,7 @@ def server(
         admins=config_str_list(cfg.get("admins")),
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
         sandbox_config=sandbox_config,
+        git_hosts=git_hosts,
         server_config=cfg,
     )
 
