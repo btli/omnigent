@@ -1,7 +1,7 @@
 # Custom git-host provider abstraction — design spec (v3)
 
-**Status:** Draft for review (v3 — incorporates codex + agy review, re-review, and the credential/
-identity discussion)
+**Status:** Draft for review (v3.1 — + round-3 focused re-review locks: handoff protocol, k8s Secret
+isolation, ssh-agent, exact-repo binding, warn-and-allow shared push)
 **Date:** 2026-07-15
 **Branch:** `feat/custom-git-hosts` (worktree off `upstream/main` @ `0f6e82fb`)
 **Anchor issue:** omnigent-ai#2125. **Related:** #1937, #1421, #236.
@@ -28,6 +28,11 @@ identity discussion)
 - **Resolver runs before durable session creation**; relaunch semantics are locked (persist non-secret
   host-config id/version + canonical URL + slot id; re-authorize for `host.owner`).
 - **Egress effective-spec merge point named**; **Fernet key *list*** for rotation.
+- **Round-3 locks (v3.1):** the fetch/push handoff is a concrete confidential, fully-bound, single-use
+  protocol (+ ssh-agent for SSH keys); the k8s clone Secret is isolated (drops the shared `envFrom`,
+  `OwnerReference` + reconciler); the push credential is bound to the **exact repo**; and shared-session
+  push is **warn-and-allow** — owner authority + a non-blocking notice, so the agent is never left
+  unable to commit. Stricter teams use model B (a scoped bot).
 
 ## 1. Summary
 
@@ -62,7 +67,8 @@ protocols beyond HTTPS/SSH; a full in-process REST client per forge (native adap
 | Login/SSO | In scope |
 | Shared-session push identity | Owner (A, default) or service bot (B, optional); per-user deferred |
 | Shared-session commit author | **The session starter** (consistent) |
-| Session sharing | Warn on git-credential exposure (grant + late-attach) |
+| Shared-session push authority | Warn-and-allow (owner authority; non-blocking notice); exact-repo binding; model B for stricter isolation |
+| Session sharing | Non-blocking notice on git-credential exposure (grant + late-attach) |
 
 ## 4. Current state (grounded, verified)
 
@@ -155,60 +161,84 @@ user-authored `CredentialSourceSpec` ever reaches the `command` branch
 ### 8.4 Managed-clone secret delivery
 Secret delivery is an **explicit launcher capability** (e.g. `stage_clone_credential` /
 `run_with_secret_env`), separate from the non-secret `ClonePlan`, guaranteeing non-logging, host
-binding, and cleanup (incl. failure paths). The secret value never enters `RepoWorkspace`, `ClonePlan`,
-shell strings, provider args/logs, or `SandboxPolicy`.
+binding, and cleanup (incl. failure paths); providers **fail closed** when the capability is
+unavailable. The secret value never enters `RepoWorkspace`, `ClonePlan`, shell strings, provider
+args/logs, or `SandboxPolicy`.
 - **Exec:** a launcher primitive delivers the credential via a transient askpass/helper file or
   secret-env channel the provider supports — not via the `self.run` command string
   (`omnigent/onboarding/sandboxes/base.py:425-438`); removed immediately after clone.
 - **Kubernetes:** a **distinct clone-only Secret** projected to the init container
-  (`omnigent/onboarding/sandboxes/kubernetes.py:359-393,447-591`), **deleted as soon as init
-  succeeds** (and on every failure path) — not carried to teardown.
+  (`omnigent/onboarding/sandboxes/kubernetes.py:359-393,447-591`). The init container **must drop the
+  shared `harness_secret` `envFrom`** (else it still sees every credential) and receive **only** the
+  per-clone Secret; the main container never receives it. Created with an **`OwnerReference` to the
+  Pod** (GC reaps it if the server crashes) plus a label-based reconciler, and **deleted as soon as
+  init succeeds** (and on every failure path) — not carried to teardown.
 - **Framing:** unless a provider actually mints/exchanges a token, this is **launch-scoped delivery of
   the existing credential**, not a "short-lived token" (a copied PAT stays long-lived).
 
 ### 8.5 Fetch/push handoff (built in P1) & long-lived hosts
 The transient clone secret is gone after clone, so later fetch/push needs its own path.
-- **Managed hosts:** a **second authenticated server→runner-parent credential handoff** delivers the
-  resolved secret as an **in-memory handle over the existing authenticated host tunnel**
-  (`omnigent/server/routes/host_tunnel.py`), consumed only by the trusted runner parent, which mints
-  the credential-proxy placeholders/rewrite rules (`inject_env`) — **without** converting a user PAT
-  into env/file/command policy or a real `GIT_TOKEN`. Specify TTL, reconnect/relaunch re-fetch,
-  best-effort zeroization, and the trusted-boundary process.
+- **Managed hosts:** a **second authenticated server→runner-parent credential handoff** over the
+  existing host tunnel (`omnigent/server/routes/host_tunnel.py`), consumed only by the trusted runner
+  parent (the `omni host` daemon that spawns the runner), which mints the credential-proxy
+  placeholders/rewrite rules (`inject_env`) — **without** converting a user PAT into env/file/command
+  policy or a real `GIT_TOKEN`.
+  **Locked P1 protocol:** versioned and **confidential** (`wss`/TLS with cert validation — never
+  plaintext `ws`); each delivery is **single-use**, bound to `{host_id, runner_id, session_id,
+  launch_generation, credential_slot, canonical_host, repo_path}`, carries a short **TTL +
+  acknowledgement**, is **discarded on runner exit/stop/timeout/tunnel loss**, and requires **fresh
+  authorization + re-fetch after reconnect/relaunch**. Secret-bearing frame bodies never enter
+  logs/errors; zeroization is best-effort.
+  **SSH-key credentials** cannot ride the HTTP rewrite proxy — expose an **ephemeral `ssh-agent`
+  socket** to the sandbox for the operation, torn down after.
 - **Runner:** placeholder path only; do **not** add real provider tokens to
   `_BASE_HARNESS_CREDENTIAL_ENV_VARS` (`omnigent/host/connect.py:435-451`).
 - **Long-lived `omni host`:** the server env is not the external host's env. External hosts use a
-  **host-local per-git-host credential config** keyed to the server-provided canonical host identity;
-  only **non-secret** provider/topology + CA/known-hosts data crosses the launch frame. `/v1/git-
-  credentials` does **not** configure `omni host` (documented), unless an explicit opt-in secret-
-  transfer is later added.
+  **host-local per-git-host credential config** keyed to the server-provided canonical host identity
+  (name the schema + lookup-failure behavior); only **non-secret** provider/topology + CA/known-hosts
+  data crosses the launch frame. `/v1/git-credentials` does **not** configure `omni host`.
 
 ### 8.6 Identity model (shared sessions)
 - **Push / write permission:** the **session owner's** credential (model A, default) or an optional
-  per-workspace **service "bot"** credential (model B). Per-user push is **deferred** (fights the
-  agent execution model and needs per-turn credential switching).
-- **Commit authorship:** `user.name`/`user.email` set to the **session starter** (the owner) —
-  consistent across the session — since omnigent does not manage commit identity today. omnigent sets
-  it in the runner git environment (e.g. `GIT_AUTHOR_*`/`GIT_COMMITTER_*` or `git config`).
+  per-workspace **service "bot"** credential (model B). Per-user push is **deferred**. An EDIT grantee
+  driving the agent pushes **with that identity's full forge authority** (accepted — see the risk note).
+  The push credential is **bound to the exact resolved repository** (never host-wide), so a shared
+  session cannot reach other repos on the same forge.
+- **Commit authorship:** `user.name`/`user.email` set to the **session starter** — consistent across
+  the session (omnigent does not manage commit identity today). Set runner-scoped `GIT_AUTHOR_*` **and**
+  `GIT_COMMITTER_*` (not persistent repo config on a long-lived host); snapshot the starter's validated
+  name/email at session create with a deterministic no-email fallback. This is a **best-effort metadata
+  default** (workspace code can override `--author`); the authoritative record of who drove each turn is
+  the server's `created_by`/grant **audit trail**, not git metadata.
 - **Enforcement (two-layer):** omnigent's session grant (`LEVEL_EDIT`+) gates *who can drive the
-  agent*; the forge scopes / branch protection of the push identity (owner or bot) bound *what git
-  actions are possible*. omnigent never re-implements forge ACLs.
+  agent*; the forge scopes / branch protection of the push identity bound *what git actions are
+  possible*. omnigent never re-implements forge ACLs.
+- **Accepted risk — owner-authority delegation:** in a shared session an EDIT grantee can direct the
+  agent to push as the owner/bot, including bypassing protected branches if that identity can. This is
+  **accepted deliberately**: a hard delegation gate would leave the agent unable to commit/push,
+  breaking the workflow. Mitigations: the §8.7 warning, forge-side scopes/branch protection, exact-repo
+  credential binding, and the audit trail. Teams needing stricter isolation choose model **B** (a
+  least-privilege bot that cannot bypass protection) or disable push.
 - **Model B provisioning:** the bot credential is an operator reference-source (or encrypted) token
-  bound to a workspace; attribution reads "authored by \<owner\>, pushed by \<bot\>."
+  bound to a workspace; attribution reads "authored by \<starter\>, pushed by \<bot\>."
 
-### 8.7 Session-sharing warning
+### 8.7 Session-sharing warning (non-blocking notice)
+Per the accepted-risk decision (§8.6), this is an **informational warning, not a blocking gate** — it
+must never leave the agent unable to commit.
 - Persist the **credential host IDs in scope** for the session (per launch generation) — do not
   compute from the owner's current global credential rows.
-- **Warn/confirm** both when an edit/manage grant is created or upgraded (choke point `PUT /sessions/
-  {id}/permissions`, `omnigent/server/routes/sessions.py:20782-20882`) **and** whenever credentials
-  are newly attached or re-resolved for a session that already has such grants (closes the timing
-  bypass).
-- **Consent semantics:** define that exposing an owner's credential requires the credential owner's
-  confirmation (a manager creating a grant is not the owner's consent) — e.g. only `LEVEL_OWNER`
-  approves, or the owner's original attach explicitly authorizes manager re-sharing.
-- **Headless/API/CLI:** an explicit `confirm_git_credential_sharing` field (not a synchronous UI
-  assumption) so automation doesn't break or silently expose credentials.
-- **Optional hardening:** under `RESTRICTED_READ_ONLY`, block credential propagation into shared
-  sessions or require the grantee's own credential.
+- **Notify the credential owner** both when an edit/manage grant is created or upgraded (choke point
+  `PUT /sessions/{id}/permissions`, `omnigent/server/routes/sessions.py:20782-20882`) **and** whenever
+  credentials are newly attached or re-resolved for a session that already has such grants (closes the
+  timing bypass). Surface an **exposure fingerprint** — push identity (owner/bot), canonical host +
+  repo, grantee set, grant level — so the owner sees exactly what is exposed.
+- **Non-blocking + acknowledgement:** the notice is surfaced to the owner and one-time-acknowledgeable;
+  it does not hard-block execution. A manager creating a grant triggers the notice **to the credential
+  owner** (a manager is not the owner).
+- **Headless/API/CLI:** a `git_credential_sharing_notice` in the response + an optional `ack` field, so
+  automation is informed rather than broken.
+- **Stricter opt-in:** teams wanting a hard gate use model **B**, or under `RESTRICTED_READ_ONLY` block
+  credential propagation into shared sessions / require the grantee's own credential.
 
 ## 9. Clone / transport & resolver
 
