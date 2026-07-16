@@ -638,15 +638,31 @@ def _select_credential_slot(
     a label, exactly-one auto-selects and multiple is a hard error (never a
     silent pick).
 
-    :returns: The selected slot id, or ``None`` when the owner has no slot or
-        owner-aware selection was not requested (no store / no owner — today's
-        behavior).
-    :raises CredentialSelectionError: On an ambiguous or unmatched selection.
+    :returns: The selected slot id, or ``None`` when no *label* was requested
+        and the owner has no slot / owner-aware selection is off (no store / no
+        owner — today's operator-credential fallback).
+    :raises CredentialSelectionError: On an ambiguous selection, an unmatched
+        label, or an explicit *label* that cannot be honored (no store / no
+        owner / no stored slots) — an explicit request is never silently
+        ignored in favor of a different credential.
     """
     if credential_store is None or owner_user_id is None:
+        # An explicit label must not be silently dropped: if per-user
+        # credentials aren't configured for this session, say so rather than
+        # falling back to the operator credential the user didn't ask for.
+        if label is not None:
+            raise CredentialSelectionError(
+                f"a git credential labeled {label!r} was requested, but per-user "
+                "git credentials are not configured for this session"
+            )
         return None
     slots = credential_store.list_for_owner_host(owner_user_id, plan.host_id)
     if not slots:
+        if label is not None:
+            raise CredentialSelectionError(
+                f"no git credential labeled {label!r} for host {plan.host_id!r}: "
+                "you have no stored credentials for this host"
+            )
         return None
     available = ", ".join(sorted(s.label for s in slots))
     if label is not None:

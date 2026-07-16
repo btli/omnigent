@@ -1027,6 +1027,33 @@ def test_resolve_repo_workspace_zero_slots_falls_back(tmp_path) -> None:
     assert repo.credential_source == "env:ACME_TOKEN"
 
 
+def test_resolve_repo_workspace_explicit_label_zero_slots_raises(tmp_path) -> None:
+    # An explicit label the owner cannot have (0 slots on the host) must NOT
+    # silently fall back to the operator credential — it errors.
+    store = _cred_store(tmp_path)
+    with pytest.raises(CredentialSelectionError, match="no git credential labeled"):
+        resolve_repo_workspace(
+            "https://git.acme.com/team/proj",
+            _GH_HOSTS,
+            owner_user_id="alice",
+            credential_store=store,
+            label="work",
+        )
+
+
+def test_resolve_repo_workspace_explicit_label_without_store_raises() -> None:
+    # A label requested while per-user credentials are unconfigured (no store)
+    # must error rather than being silently ignored.
+    with pytest.raises(CredentialSelectionError, match="not configured"):
+        resolve_repo_workspace(
+            "https://git.acme.com/team/proj",
+            _GH_HOSTS,
+            owner_user_id="alice",
+            credential_store=None,
+            label="work",
+        )
+
+
 def test_resolve_repo_workspace_no_store_no_selection() -> None:
     # Backward compat: no store -> no owner-aware selection (today's behavior).
     repo = resolve_repo_workspace("https://git.acme.com/team/proj", _GH_HOSTS)
