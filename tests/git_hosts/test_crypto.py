@@ -55,3 +55,18 @@ def test_load_cipher_from_env_parses_key_list() -> None:
 def test_load_cipher_from_env_malformed_key_raises() -> None:
     with pytest.raises(RuntimeError, match="OMNIGENT_GIT_CREDENTIAL_KEYS"):
         load_cipher_from_env({"OMNIGENT_GIT_CREDENTIAL_KEYS": "not-a-valid-fernet-key"})
+
+
+def test_malformed_key_value_never_appears_in_error() -> None:
+    # A misconfigured key must not be echoed into the exception (it might be a
+    # mistakenly-pasted secret); the message and its cause chain stay key-free.
+    bad = "s3cret-looking-bad-key-value"
+    with pytest.raises(RuntimeError) as exc_info:
+        load_cipher_from_env({"OMNIGENT_GIT_CREDENTIAL_KEYS": bad})
+    chain: list[BaseException] = []
+    err: BaseException | None = exc_info.value
+    while err is not None:
+        chain.append(err)
+        err = err.__cause__ or err.__context__
+    assert all(bad not in str(link) for link in chain)
+    assert all(bad not in repr(link) for link in chain)
