@@ -52,8 +52,8 @@ Controller note: line numbers are anchors from commit `cb4e7615` — implementer
 
 - [ ] **Step 1: Add the dependency**
 
-Run: `uv add 'cryptography>=49'`
-Then confirm it landed in `[project] dependencies` in `pyproject.toml` (match the existing pin style there; if the repo uses bare names, `cryptography>=49` is fine). Rationale to note in the report: `cryptography` was only a latent transitive dep (imported unguarded in `omnigent/inner/egress/ca.py`); this makes it explicit for the at-rest cipher. Latest stable at authoring time is 49.0.0.
+Run: `uv add 'cryptography>=43'`
+Then confirm it landed in `[project] dependencies` in `pyproject.toml` (match the existing pin style there). **Rationale (document in the report):** `cryptography` was only a latent transitive dep (imported unguarded in `omnigent/inner/egress/ca.py`); this makes it explicit for the at-rest cipher. Latest stable is 49.0.0, but the `databricks` extra pulls `mlflow`, which caps `cryptography<49` — a documented compatibility ceiling — so the floor is `>=43` (mlflow's own floor; Fernet predates it by years; the lock already resolves 48.0.1). Do **not** use `>=49` (it has no overlap with the mlflow cap and fails resolution).
 
 - [ ] **Step 2: Write the failing test**
 
