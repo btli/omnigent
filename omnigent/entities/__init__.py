@@ -32,9 +32,9 @@ from omnigent.entities.project import (
     LiveProjectSnapshot,
     Project,
     ProjectBackfillResult,
-    ProjectIdentity,
     ProjectMigrationIssue,
     ProjectMigrationMapping,
+    project_snapshot_values,
 )
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
@@ -69,7 +69,6 @@ __all__ = [
     "Policy",
     "Project",
     "ProjectBackfillResult",
-    "ProjectIdentity",
     "ProjectMigrationIssue",
     "ProjectMigrationMapping",
     "ReasoningData",
@@ -84,6 +83,7 @@ __all__ = [
     "filter_resources_by_type",
     "get_resource_by_id",
     "parse_item_data",
+    "project_snapshot_values",
     "resolve_terminal_entry_by_resource_id",
     "synthesize_conversation_title",
 ]

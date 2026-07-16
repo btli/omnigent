@@ -107,6 +107,7 @@ import {
   useStopSession,
 } from "@/hooks/useConversations";
 import { useProjectPickerState } from "@/hooks/useProjectPickerState";
+import { ProjectCreateRow } from "./ProjectCreateRow";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -3341,26 +3342,15 @@ function ProjectPickerMenu({
       <div className="border-t pt-1">
         {picker.creatingNew ? (
           <div className="px-2 py-1">
-            <input
-              ref={picker.newInputRef}
-              className="w-full bg-transparent text-xs outline-none"
-              placeholder="Project name…"
+            <ProjectCreateRow
+              inputRef={picker.newInputRef}
               value={picker.newProjectName}
-              onChange={(e) => picker.setNewProjectName(e.target.value)}
+              onChange={picker.setNewProjectName}
               onKeyDown={picker.handleNewProjectKeyDown}
               disabled={picker.isCreatingProject}
-              aria-invalid={picker.createError ? true : undefined}
-              aria-describedby={picker.createError ? "sidebar-project-create-error" : undefined}
+              error={picker.createError}
+              errorId="sidebar-project-create-error"
             />
-            {picker.createError && (
-              <p
-                id="sidebar-project-create-error"
-                className="pt-1 text-destructive text-xs"
-                role="alert"
-              >
-                {picker.createError}
-              </p>
-            )}
           </div>
         ) : (
           <C.Item

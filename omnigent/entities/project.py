@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import dataclasses
+import json
+from dataclasses import dataclass
 from typing import Any, Literal
 
 
@@ -23,14 +25,6 @@ class Project:
     created_at: int
     updated_at: int
     archived_at: int | None
-
-
-@dataclass(frozen=True)
-class ProjectIdentity:
-    """Project identity returned by session membership surfaces."""
-
-    id: str
-    name: str
 
 
 @dataclass(frozen=True)
@@ -63,14 +57,26 @@ class LiveProjectSnapshot:
     @classmethod
     def backfill(cls, project_id: str) -> LiveProjectSnapshot:
         """Build the canonical snapshot for a legacy-label backfill."""
-        snapshot = cls.moved(project_id)
-        return cls(
-            project_id=snapshot.project_id,
-            project_row_version=snapshot.project_row_version,
-            defaults_schema_version=snapshot.defaults_schema_version,
-            defaults_json=snapshot.defaults_json,
-            snapshot_origin="backfill",
-        )
+        return dataclasses.replace(cls.moved(project_id), snapshot_origin="backfill")
+
+
+def project_snapshot_values(
+    project_snapshot: LiveProjectSnapshot,
+    created_at: int,
+) -> dict[str, Any]:
+    """Build persistence values for a project snapshot."""
+    return {
+        "project_id": project_snapshot.project_id,
+        "snapshot_origin": project_snapshot.snapshot_origin,
+        "project_row_version": project_snapshot.project_row_version,
+        "defaults_schema_version": project_snapshot.defaults_schema_version,
+        "defaults_json": json.dumps(
+            project_snapshot.defaults_json,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        "created_at": created_at,
+    }
 
 
 @dataclass(frozen=True)
@@ -108,7 +114,7 @@ class ProjectBackfillResult:
     """Applied mappings or a non-mutating operator mapping plan."""
 
     mappings: tuple[ProjectMigrationMapping, ...] = ()
-    issues: tuple[ProjectMigrationIssue, ...] = field(default_factory=tuple)
+    issues: tuple[ProjectMigrationIssue, ...] = ()
 
     @property
     def requires_mapping(self) -> bool:

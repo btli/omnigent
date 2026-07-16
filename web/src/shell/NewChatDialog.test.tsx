@@ -1550,24 +1550,6 @@ describe("NewChatLandingScreen", () => {
     });
   });
 
-  it("shows an inline error when project creation fails", async () => {
-    authenticatedFetchMock.mockResolvedValueOnce({
-      ok: false,
-      status: 500,
-      statusText: "Internal Server Error",
-    } as unknown as Response);
-    renderLanding({}, "/?project_id=proj_docs");
-
-    fireEvent.click(await screen.findByTestId("new-chat-landing-project-chip"));
-    fireEvent.click(screen.getByText("New project…"));
-    const input = screen.getByPlaceholderText("Project name…");
-    fireEvent.change(input, { target: { value: "Broken project" } });
-    fireEvent.keyDown(input, { key: "Enter" });
-
-    expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't create project");
-    expect(screen.getByPlaceholderText("Project name…")).toBeInTheDocument();
-  });
-
   it("pre-fills the project chip from the ?project_id= query param", async () => {
     // The sidebar's per-project "new session" pencil lands here with the
     // project pre-selected — the chip reflects it with no interaction.

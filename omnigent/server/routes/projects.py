@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict
 
 from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.projects.defaults import DEFAULTS_SCHEMA_VERSION
 from omnigent.server.auth import AuthProvider, resolve_owner_principal
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.stores.conversation_store import ConversationStore
@@ -28,7 +29,7 @@ class CreateProjectRequest(BaseModel):
     name: str
     description: str | None = None
     defaults_json: dict[str, Any] | None = None
-    defaults_schema_version: int = 1
+    defaults_schema_version: int = DEFAULTS_SCHEMA_VERSION
 
 
 class RenameProjectRequest(BaseModel):
