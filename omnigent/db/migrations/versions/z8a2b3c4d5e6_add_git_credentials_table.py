@@ -36,8 +36,8 @@ def upgrade() -> None:
         sa.Column("label", sa.String(length=128), nullable=False),
         sa.Column("username", sa.String(length=256), nullable=True),
         sa.Column("token_ciphertext", sa.Text(), nullable=False),
-        sa.Column("created_at", sa.Integer(), nullable=True),
-        sa.Column("updated_at", sa.Integer(), nullable=True),
+        sa.Column("created_at", sa.Integer(), nullable=False),
+        sa.Column("updated_at", sa.Integer(), nullable=False),
         sa.PrimaryKeyConstraint("workspace_id", "id"),
         sa.UniqueConstraint(
             "workspace_id",
