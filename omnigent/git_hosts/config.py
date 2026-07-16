@@ -13,6 +13,18 @@ from omnigent.git_hosts import available_providers, get_git_host
 from omnigent.git_hosts.base import HostConfig
 
 _REQUIRED = ("id", "provider", "web_host", "credential_source")
+_ALLOWED_KEYS = frozenset(
+    {
+        "id",
+        "provider",
+        "web_host",
+        "credential_source",
+        "api_base",
+        "ssh_host",
+        "ssh_port",
+        "ca_bundle",
+    }
+)
 
 
 def _require_str(entry: dict[str, Any], key: str, index: int) -> str:
@@ -39,6 +51,9 @@ def load_git_hosts(raw: object) -> tuple[HostConfig, ...]:
     for index, entry in enumerate(raw):
         if not isinstance(entry, dict):
             raise ValueError(f"git_hosts[{index}] must be a mapping")
+        unknown = set(entry) - _ALLOWED_KEYS
+        if unknown:
+            raise ValueError(f"git_hosts[{index}] has unknown keys: {sorted(unknown)}")
         for key in _REQUIRED:
             _require_str(entry, key, index)
         provider = entry["provider"]
@@ -48,6 +63,11 @@ def load_git_hosts(raw: object) -> tuple[HostConfig, ...]:
                 f"known: {available_providers()}"
             )
         web_host = _require_str(entry, "web_host", index).lower()
+        if any(c in web_host for c in ":/@") or any(c.isspace() for c in web_host):
+            raise ValueError(
+                f"git_hosts[{index}].web_host must be a bare hostname (no port, path, or "
+                "userinfo); custom ports are not supported yet"
+            )
         if web_host in seen:
             raise ValueError(f"git_hosts[{index}].web_host: duplicate host {web_host!r}")
         seen.add(web_host)

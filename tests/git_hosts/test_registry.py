@@ -18,6 +18,9 @@ def test_get_git_host_returns_provider_instance() -> None:
     # Forgejo and Gitea share the Gitea API implementation.
     assert isinstance(get_git_host("forgejo"), GiteaProvider)
     assert isinstance(get_git_host("gitea"), GiteaProvider)
+    # ...but each keeps its own provider identity for config/API selection.
+    assert get_git_host("forgejo").provider == "forgejo"
+    assert get_git_host("gitea").provider == "gitea"
 
 
 def test_get_git_host_unknown_name_raises() -> None:

@@ -119,6 +119,51 @@ def test_explicit_api_base_and_optional_fields_are_kept() -> None:
             ],
             "ca_bundle",
         ),
+        (
+            [
+                {
+                    "id": "a",
+                    "provider": "forgejo",
+                    "web_host": "git.acme.com:8443",
+                    "credential_source": "env:X",
+                }
+            ],
+            "web_host",
+        ),
+        (
+            [
+                {
+                    "id": "a",
+                    "provider": "forgejo",
+                    "web_host": "git.acme.com/evil",
+                    "credential_source": "env:X",
+                }
+            ],
+            "web_host",
+        ),
+        (
+            [
+                {
+                    "id": "a",
+                    "provider": "forgejo",
+                    "web_host": "u@git.acme.com",
+                    "credential_source": "env:X",
+                }
+            ],
+            "web_host",
+        ),
+        (
+            [
+                {
+                    "id": "a",
+                    "provider": "forgejo",
+                    "web_host": "git.acme.com",
+                    "credential_source": "env:X",
+                    "ssh-port": 2222,
+                }
+            ],
+            "unknown keys",
+        ),
     ],
 )
 def test_fail_closed_on_malformed_config(raw: object, match: str) -> None:

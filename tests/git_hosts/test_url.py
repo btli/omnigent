@@ -14,7 +14,6 @@ from omnigent.git_hosts.url import split_host
         ("https://GitHub.com/org/repo.git", "github.com"),
         ("https://git.acme.com/team/proj#main", "git.acme.com"),
         ("git@git.acme.com:team/proj.git", "git.acme.com"),
-        ("https://git.acme.com:8443/team/proj", "git.acme.com"),
     ],
 )
 def test_split_host_extracts_canonical_lowercase_host(url: str, expected: str) -> None:
@@ -31,6 +30,8 @@ def test_split_host_extracts_canonical_lowercase_host(url: str, expected: str) -
         "https:///team/proj",
         "git@user@evil.com:team/proj.git",
         "git@user:pass@evil.com:team/proj.git",
+        "https://git.acme.com:8443/team/proj",
+        "https://[::1]:8443/team/proj",
     ],
 )
 def test_split_host_rejects_unsupported_or_userinfo(url: str) -> None:

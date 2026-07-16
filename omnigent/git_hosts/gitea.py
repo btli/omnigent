@@ -20,3 +20,9 @@ class GiteaProvider(GitHostProvider):
 
     def default_api_base(self, web_host: str) -> str:
         return f"https://{web_host}/api/v1"
+
+
+class ForgejoProvider(GiteaProvider):
+    """Forgejo — identical Gitea API; distinct provider identity."""
+
+    provider = "forgejo"

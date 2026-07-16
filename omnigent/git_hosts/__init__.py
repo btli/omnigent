@@ -17,7 +17,7 @@ _GIT_HOSTS: dict[str, str] = {
     "github": "omnigent.git_hosts.github:GitHubProvider",
     "ghe": "omnigent.git_hosts.github:GitHubEnterpriseProvider",
     "gitea": "omnigent.git_hosts.gitea:GiteaProvider",
-    "forgejo": "omnigent.git_hosts.gitea:GiteaProvider",
+    "forgejo": "omnigent.git_hosts.gitea:ForgejoProvider",
 }
 
 
@@ -36,10 +36,8 @@ def get_git_host(provider: str) -> GitHostProvider:
         ) from None
     module_path, _, class_name = target.partition(":")
     module = importlib.import_module(module_path)
-    provider_cls = getattr(module, class_name)
-    instance = provider_cls()
-    assert isinstance(instance, GitHostProvider)
-    return instance
+    provider_cls: type[GitHostProvider] = getattr(module, class_name)
+    return provider_cls()
 
 
 def available_providers() -> list[str]:
