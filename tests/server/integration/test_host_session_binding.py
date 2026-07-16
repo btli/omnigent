@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from omnigent.entities import Conversation
+from omnigent.git_hosts.config import load_git_hosts
 from omnigent.host.frames import (
     HostHelloFrame,
     HostLaunchRunnerFrame,
@@ -584,6 +586,38 @@ async def test_managed_session_create_validator_errors_serialize_as_422(
     assert "takes a git repository URL" in detail[0]["msg"]
 
 
+async def test_managed_create_rejects_unconfigured_host_before_creation(
+    managed_session_env: ManagedSessionEnv,
+) -> None:
+    """
+    A managed create whose repository workspace points at a host that
+    is neither github.com nor operator-configured fails synchronously
+    as a 422 — and the gate fires BEFORE the durable create, so no
+    session row is left behind for a launch that could never clone.
+    """
+    env = managed_session_env
+    agent = await create_test_agent(env.client, name="managed-unknown-host-agent")
+    resp = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_type": "managed",
+            "workspace": "https://git.unknown.com/team/proj",
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    assert "no configured git host" in resp.text
+    # Same list-of-errors shape as the schema-validator 422s, so the
+    # web UI's describeCreateError renders the message unchanged.
+    detail = resp.json()["detail"]
+    assert isinstance(detail, list) and "no configured git host" in detail[0]["msg"]
+    # No session row was created: the only session in the per-test DB
+    # is the agent-owning one from the multipart agent upload.
+    listing = await env.client.get("/v1/sessions")
+    assert listing.status_code == 200, listing.text
+    assert [s["id"] for s in listing.json()["data"]] == [agent["_session_id"]]
+
+
 async def test_managed_session_create_without_config_fails_clearly(
     runtime_init: None,
     db_uri: str,
@@ -1054,6 +1088,290 @@ async def test_message_relaunches_dead_managed_sandbox(
     # communicator) only after the assertions.
     second_tunnel = await host_futures[1]
     del first_tunnel, second_tunnel
+
+
+async def test_relaunch_resolves_repo_workspace_for_github_default(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A relaunch of a session created with a github.com repo workspace
+    re-resolves the ``omnigent.sandbox.repo`` label through
+    ``resolve_repo_workspace`` and re-clones it into generation 2.
+
+    Same dead-sandbox -> message -> relaunch flow as
+    ``test_message_relaunches_dead_managed_sandbox``, but the session is
+    created with a repository workspace so the relaunch has a label to
+    resolve. The github.com host needs no operator ``git_hosts`` config,
+    so ``managed_session_env``'s default (empty) config is enough.
+    Regression guard for the ``resolve_repo_workspace`` call inside
+    ``_kick_managed_relaunch``: without it, generation 2 would provision
+    an empty workspace even though the session was created with a repo.
+    """
+    env = managed_session_env
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setattr(
+        env.app.state.tunnel_registry,
+        "wait_for_runner",
+        lambda _runner_id, *, timeout_s: asyncio.sleep(0, result=object()),
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2
+    )
+    monkeypatch.setattr("omnigent.server.routes.sessions._HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.1)
+    loop = asyncio.get_running_loop()
+    host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
+
+    def _start_fake_sandbox_host(invocation: HostStartInvocation) -> None:
+        """Spawn the fake sandbox host when the launcher 'starts' it."""
+        future = asyncio.run_coroutine_threadsafe(
+            _fake_sandbox_host(
+                env.app, invocation.host_id, invocation.host_name, invocation.token
+            ),
+            loop,
+        )
+        host_futures.append(asyncio.wrap_future(future, loop=loop))
+
+    fake = FakeSandboxLauncher(on_host_start=_start_fake_sandbox_host)
+    install_fake_modal_launcher(monkeypatch, fake)
+
+    agent = await create_test_agent(env.client, name="managed-relaunch-repo-agent")
+    resp = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_type": "managed",
+            "workspace": "https://github.com/org/myrepo.git#main",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["id"]
+    conv = await _wait_for_managed_binding(env, session_id)
+    first_tunnel = await host_futures[0]
+
+    clone_command = (
+        "git clone --branch main --single-branch "
+        "-- https://github.com/org/myrepo.git /root/workspace/myrepo"
+    )
+    assert fake.commands.count(clone_command) == 1, (
+        "create-time clone did not run as expected — fixture regressed"
+    )
+
+    # Wait for the CREATE launch to fully settle before killing the
+    # tunnel, same rationale as the sibling relaunch test.
+    tracker = env.app.state.managed_launches
+    deadline = loop.time() + 10.0
+    while loop.time() < deadline and tracker.get(session_id) is not None:
+        await asyncio.sleep(0.05)
+    assert tracker.get(session_id) is None, "create launch never settled"
+
+    monkeypatch.setattr(
+        env.app.state.tunnel_registry,
+        "wait_for_runner",
+        lambda _runner_id, *, timeout_s: asyncio.sleep(0, result=None),
+    )
+
+    # Kill generation 1 the same way the sibling relaunch test does.
+    await first_tunnel.send_input({"type": "websocket.disconnect", "code": 1000})
+    host_registry = env.app.state.host_registry
+    deadline = loop.time() + 10.0
+    while loop.time() < deadline and (
+        host_registry.get(conv.host_id) is not None or env.host_store.is_online(conv.host_id)
+    ):
+        await asyncio.sleep(0.05)
+    assert host_registry.get(conv.host_id) is None
+    assert env.host_store.is_online(conv.host_id) is False
+
+    message_resp = await env.client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "wake up"}],
+            },
+        },
+        timeout=30.0,
+    )
+    assert message_resp.status_code == 503, message_resp.text
+
+    # Generation 2 was provisioned and re-cloned the SAME repository —
+    # proof the relaunch path re-resolved the label through
+    # resolve_repo_workspace instead of skipping it.
+    assert len(fake.provisioned_names) == 2
+    assert fake.commands.count(clone_command) == 2, (
+        f"expected a second clone for the relaunched generation, got commands: {fake.commands}"
+    )
+    host = env.host_store.get_host(conv.host_id)
+    assert host is not None
+    assert host.sandbox_id == "sb-fake-2"
+    second_tunnel = await host_futures[1]
+    del first_tunnel, second_tunnel
+
+
+async def test_relaunch_soft_fails_when_host_no_longer_configured(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A relaunch whose repo label points at a host the operator has since
+    removed from ``git_hosts`` soft-fails: it proceeds with an empty
+    workspace and logs a warning, rather than dying outright.
+
+    The session is created against a CONFIGURED custom host (so the
+    create-time clone succeeds and the label is set), then
+    ``app.state.git_hosts`` is cleared before the relaunch — the
+    cheapest way to simulate "the operator removed the host since
+    create" without rebuilding the app. Mirrors
+    ``test_message_relaunches_dead_managed_sandbox``'s dead-sandbox ->
+    message -> relaunch flow.
+    """
+    monkeypatch.setenv("ACME_TOKEN", "t0k")
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    host_store = HostStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=conv_store,
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(
+            artifact_store=artifact_store,
+            cache_dir=tmp_path / "cache",
+        ),
+        comment_store=SqlAlchemyCommentStore(db_uri),
+        host_store=host_store,
+        sandbox_config=parse_sandbox_config(
+            {
+                "provider": "modal",
+                "server_url": "https://managed-test.example.com",
+                "modal": {"image": "docker.io/test/omnigent-host:latest"},
+            }
+        ),
+        git_hosts=load_git_hosts(
+            [
+                {
+                    "id": "acme",
+                    "provider": "forgejo",
+                    "web_host": "git.acme.com",
+                    "credential_source": "env:ACME_TOKEN",
+                }
+            ]
+        ),
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        env = ManagedSessionEnv(
+            app=app, client=client, host_store=host_store, conv_store=conv_store
+        )
+
+        monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+        monkeypatch.setattr(
+            env.app.state.tunnel_registry,
+            "wait_for_runner",
+            lambda _runner_id, *, timeout_s: asyncio.sleep(0, result=object()),
+        )
+        monkeypatch.setattr(
+            "omnigent.server.routes.sessions._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2
+        )
+        monkeypatch.setattr(
+            "omnigent.server.routes.sessions._HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.1
+        )
+        loop = asyncio.get_running_loop()
+        host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
+
+        def _start_fake_sandbox_host(invocation: HostStartInvocation) -> None:
+            """Spawn the fake sandbox host when the launcher 'starts' it."""
+            future = asyncio.run_coroutine_threadsafe(
+                _fake_sandbox_host(
+                    env.app, invocation.host_id, invocation.host_name, invocation.token
+                ),
+                loop,
+            )
+            host_futures.append(asyncio.wrap_future(future, loop=loop))
+
+        fake = FakeSandboxLauncher(on_host_start=_start_fake_sandbox_host)
+        install_fake_modal_launcher(monkeypatch, fake)
+
+        agent = await create_test_agent(env.client, name="managed-relaunch-unconfigured-agent")
+        resp = await env.client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "host_type": "managed",
+                "workspace": "https://git.acme.com/team/proj#main",
+            },
+        )
+        assert resp.status_code == 201, resp.text
+        session_id = resp.json()["id"]
+        conv = await _wait_for_managed_binding(env, session_id)
+        first_tunnel = await host_futures[0]
+        commands_before_relaunch = list(fake.commands)
+        assert any("git clone" in cmd for cmd in commands_before_relaunch), (
+            "create-time clone against the configured host did not run — fixture regressed"
+        )
+
+        tracker = env.app.state.managed_launches
+        deadline = loop.time() + 10.0
+        while loop.time() < deadline and tracker.get(session_id) is not None:
+            await asyncio.sleep(0.05)
+        assert tracker.get(session_id) is None, "create launch never settled"
+
+        monkeypatch.setattr(
+            env.app.state.tunnel_registry,
+            "wait_for_runner",
+            lambda _runner_id, *, timeout_s: asyncio.sleep(0, result=None),
+        )
+
+        await first_tunnel.send_input({"type": "websocket.disconnect", "code": 1000})
+        host_registry = env.app.state.host_registry
+        deadline = loop.time() + 10.0
+        while loop.time() < deadline and (
+            host_registry.get(conv.host_id) is not None or env.host_store.is_online(conv.host_id)
+        ):
+            await asyncio.sleep(0.05)
+        assert host_registry.get(conv.host_id) is None
+        assert env.host_store.is_online(conv.host_id) is False
+
+        # The operator removed the custom host from config before the
+        # relaunch — app.state.git_hosts is read fresh on every request,
+        # so clearing it here is equivalent to a config reload that
+        # dropped the "acme" entry.
+        env.app.state.git_hosts = ()
+
+        with caplog.at_level(logging.WARNING, logger="omnigent.server.routes.sessions"):
+            message_resp = await env.client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "wake up"}],
+                    },
+                },
+                timeout=30.0,
+            )
+        assert message_resp.status_code == 503, message_resp.text
+
+        # The relaunch still proceeded (generation 2 provisioned) but
+        # WITHOUT the repo — resolve_repo_workspace raised ValueError
+        # against the now-empty git_hosts and the soft-fail path took
+        # over instead of the relaunch dying outright.
+        assert len(fake.provisioned_names) == 2
+        new_commands = fake.commands[len(commands_before_relaunch) :]
+        assert not any("git clone" in cmd for cmd in new_commands), (
+            f"relaunch should not have re-cloned once the host was unconfigured: {new_commands}"
+        )
+        assert "relaunching with an empty workspace" in caplog.text
+
+        second_tunnel = await host_futures[1]
+        del first_tunnel, second_tunnel
 
 
 async def test_resumable_managed_wake_ignores_stale_db_liveness(
