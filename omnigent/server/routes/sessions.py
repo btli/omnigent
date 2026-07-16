@@ -170,6 +170,7 @@ from omnigent.server.managed_hosts import (
     RepoWorkspace,
     host_resume_supported,
     host_sandbox_is_running,
+    resolve_repo_workspace,
 )
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.permissions import check_session_access
@@ -7023,19 +7024,18 @@ def _kick_managed_relaunch(
     :param host_store: Persistent host registrations.
     :param app_state: ``request.app.state`` — supplies the registries.
     """
-    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY, parse_repo_workspace
+    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
 
     # Re-clone the repository the session was created with so the
     # fresh generation's workspace matches the create-time state.
-    # The label holds the raw create-time value, already validated
-    # by the create's parse — a parse failure here means the label
-    # was tampered with, and the relaunch proceeds with an empty
-    # workspace rather than dying.
+    # A resolve failure (tampered label, or a git host the operator
+    # removed since create) proceeds with an empty workspace rather
+    # than dying.
     repo = None
     raw_repo = conv.labels.get(MANAGED_REPO_LABEL_KEY)
     if raw_repo is not None:
         try:
-            repo = parse_repo_workspace(raw_repo)
+            repo = resolve_repo_workspace(raw_repo, getattr(app_state, "git_hosts", ()))
         except ValueError:
             _logger.warning(
                 "Session %s has an unparseable %s label (%r); relaunching with an empty workspace",
@@ -14492,6 +14492,31 @@ def create_sessions_router(
             # message survives in each entry's `msg`.
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
+        # Pre-create git-host gate: resolve a managed repository
+        # workspace against the operator git-host config BEFORE the
+        # durable create — an unconfigured host 422s with no session
+        # row left behind. Provisioning below reuses this resolution.
+        managed_repo: RepoWorkspace | None = None
+        if body.host_type == "managed" and body.workspace is not None:
+            try:
+                managed_repo = resolve_repo_workspace(
+                    body.workspace, getattr(request.app.state, "git_hosts", ())
+                )
+            except ValueError as exc:
+                # Same list-of-errors 422 shape as the schema
+                # validators (describeCreateError renders detail[0].msg).
+                raise HTTPException(
+                    status_code=422,
+                    detail=[
+                        {
+                            "type": "value_error",
+                            "loc": ["body", "workspace"],
+                            "msg": str(exc),
+                            "input": body.workspace,
+                        },
+                    ],
+                ) from exc
+
         resp = await _create_session_from_existing_agent(
             conversation_store,
             agent_store,
@@ -14584,16 +14609,12 @@ def create_sessions_router(
                     code=ErrorCode.INVALID_INPUT,
                 )
             from omnigent.server.auth import RESERVED_USER_LOCAL
-            from omnigent.server.managed_hosts import (
-                MANAGED_REPO_LABEL_KEY,
-                parse_repo_workspace,
-            )
+            from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
 
-            # A managed workspace is a repository URL (schema-
-            # validated) the launch clones inside the sandbox; parse
-            # it now so a malformed URL is a synchronous 4xx, not a
-            # background failure.
-            repo = parse_repo_workspace(body.workspace) if body.workspace is not None else None
+            # The pre-create gate already parsed and host-resolved the
+            # repository workspace; reuse that single resolution so the
+            # launch clones exactly what the gate validated.
+            repo = managed_repo
             if body.workspace is not None:
                 # The session row's workspace is overwritten with the
                 # CLONED path at bind time; record the raw request
