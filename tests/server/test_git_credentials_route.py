@@ -16,12 +16,14 @@ from pathlib import Path
 import pytest
 from cryptography.fernet import Fernet
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from omnigent.errors import OmnigentError
 from omnigent.git_hosts.config import load_git_hosts
 from omnigent.git_hosts.crypto import GitCredentialCipher
+from omnigent.server.app import sanitized_validation_error_handler
 from omnigent.server.routes.git_credentials import create_git_credentials_router
 from omnigent.stores.git_credential_store import GitCredentialStore
 
@@ -55,6 +57,10 @@ def route_client(tmp_path: Path) -> Iterator[TestClient]:
             content={"error": {"code": exc.code, "message": exc.message}},
         )
 
+    # Mirror create_app: strip echoed input from 422s so a malformed body
+    # never reflects the submitted token.
+    app.add_exception_handler(RequestValidationError, sanitized_validation_error_handler)
+
     app.include_router(
         create_git_credentials_router(store, git_hosts),
         prefix="/v1",
@@ -79,6 +85,20 @@ def test_create_returns_metadata_without_token(route_client: TestClient) -> None
     assert "created_at" in body
     assert "token" not in body
     assert _SECRET_TOKEN not in resp.text
+
+
+def test_malformed_body_422_does_not_echo_token(route_client: TestClient) -> None:
+    # A body missing a required field triggers request validation *before* the
+    # handler runs; the 422 must not reflect the submitted token.
+    resp = route_client.post(
+        "/v1/git-credentials",
+        json={"host_id": _HOST_ID, "token": _SECRET_TOKEN},  # 'label' missing
+    )
+    assert resp.status_code == 422
+    assert _SECRET_TOKEN not in resp.text
+    # The structural error info is still present.
+    detail = resp.json()["detail"]
+    assert any("label" in err.get("loc", []) for err in detail)
 
 
 def test_create_unknown_host_returns_4xx(route_client: TestClient) -> None:

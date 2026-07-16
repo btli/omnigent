@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from fastapi import FastAPI, Query, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import StatementError
@@ -90,6 +92,33 @@ from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 
 _logger = logging.getLogger(__name__)
+
+
+async def sanitized_validation_error_handler(
+    request: Request,
+    exc: RequestValidationError,
+) -> JSONResponse:
+    """Return a 422 for a malformed request body with echoed values stripped.
+
+    FastAPI's default validation response includes each error's ``input`` (the
+    rejected value) and ``ctx``, which can reflect a secret the client sent —
+    e.g. a token in a body that failed on a *different* field. Keep the
+    structural fields (``type``/``loc``/``msg``) and drop the value-bearing ones
+    so a bad body never echoes a submitted secret back to the caller or into
+    logs. Registered app-wide by :func:`create_app`.
+
+    :param request: The incoming request — used only for a debug log line.
+    :param exc: The validation error raised before the route handler ran.
+    :returns: A 422 JSON response whose ``detail`` entries carry no input values.
+    """
+    sanitized = [
+        {key: value for key, value in error.items() if key not in ("input", "ctx")}
+        for error in exc.errors()
+    ]
+    _logger.debug(
+        "Request validation failed on %s (%d error(s))", request.url.path, len(sanitized)
+    )
+    return JSONResponse(status_code=422, content=jsonable_encoder({"detail": sanitized}))
 
 
 def _server_version() -> str:
@@ -1555,6 +1584,10 @@ def create_app(
                 route=route,
                 status_code=metrics_status_code,
             )
+
+    # Malformed request bodies must not echo submitted values (e.g. a token) in
+    # the 422; see :func:`sanitized_validation_error_handler`.
+    app.add_exception_handler(RequestValidationError, sanitized_validation_error_handler)
 
     @app.exception_handler(OmnigentError)
     async def _handle_omnigent_error(
