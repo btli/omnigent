@@ -84,6 +84,7 @@ from omnigent.stores import (
 )
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import SessionConnectivity
+from omnigent.stores.git_credential_store import GitCredentialStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
@@ -1084,6 +1085,7 @@ def create_app(
     allowed_domains: list[str] | None = None,
     sandbox_config: ManagedSandboxConfig | None = None,
     git_hosts: tuple[HostConfig, ...] = (),
+    git_credential_store: GitCredentialStore | None = None,
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
@@ -1147,6 +1149,9 @@ def create_app(
     :param git_hosts: Operator-configured custom git hosts, parsed by
         :func:`omnigent.git_hosts.config.load_git_hosts`; empty when
         none are configured.
+    :param git_credential_store: Store for per-user git credentials on
+        custom hosts. ``None`` disables the git-credential CRUD endpoints
+        (opt-in via ``OMNIGENT_GIT_CREDENTIAL_KEYS``).
     :param sharing_mode: Server policy for creating new session
         permission grants (see :class:`SharingMode`): ``ON`` allows
         grants at any level plus public/workspace read, ``READ_ONLY``
@@ -1402,6 +1407,7 @@ def create_app(
     app.state.host_store = host_store
     app.state.sandbox_config = sandbox_config
     app.state.git_hosts = git_hosts
+    app.state.git_credential_store = git_credential_store
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
     # admin-gated auth routes AND ``/v1/me``'s is_admin computation consult the
@@ -2430,6 +2436,24 @@ def create_app(
             ),
             prefix="/v1",
             tags=["hosts"],
+        )
+
+    # Git-credential CRUD endpoints (DAEMON_API.md's custom-git-hosts
+    # follow-up). Mounted only when a git_credential_store is configured
+    # (opt-in via OMNIGENT_GIT_CREDENTIAL_KEYS) — same rationale as the
+    # host_store gate above: mounting with no store would fail every
+    # request instead of the feature simply being absent (404).
+    if git_credential_store is not None:
+        from omnigent.server.routes.git_credentials import create_git_credentials_router
+
+        app.include_router(
+            create_git_credentials_router(
+                git_credential_store,
+                git_hosts,
+                auth_provider=auth_provider,
+            ),
+            prefix="/v1",
+            tags=["git-credentials"],
         )
 
     # Mount the auth router that matches the active provider. OIDC and

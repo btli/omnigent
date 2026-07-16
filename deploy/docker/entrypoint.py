@@ -273,6 +273,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     # ── Stores ───────────────────────────────────────────────
 
     from omnigent.git_hosts.config import load_git_hosts
+    from omnigent.git_hosts.crypto import load_cipher_from_env
     from omnigent.runtime import init as init_runtime
     from omnigent.runtime import telemetry
     from omnigent.runtime.agent_cache import AgentCache
@@ -286,6 +287,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         SqlAlchemyConversationStore,
     )
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.git_credential_store import GitCredentialStore
     from omnigent.stores.host_store import HostStore
     from omnigent.stores.permission_store.sqlalchemy_store import (
         SqlAlchemyPermissionStore,
@@ -304,6 +306,15 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     # session); the startup catch-all below logs it.
     sandbox_config = parse_sandbox_config(cfg.get("sandbox"))
     git_hosts = load_git_hosts(cfg.get("git_hosts"))
+    # Git-credential store (custom git hosts): opt-in via
+    # OMNIGENT_GIT_CREDENTIAL_KEYS. Absent that env var, the cipher — and
+    # therefore the store and its CRUD endpoints — stay disabled.
+    _git_credential_cipher = load_cipher_from_env()
+    git_credential_store = (
+        GitCredentialStore(database_url, _git_credential_cipher)
+        if _git_credential_cipher is not None
+        else None
+    )
     artifact_store = _select_artifact_store(resolved_config)
 
     agent_cache = AgentCache(
@@ -355,6 +366,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
         sandbox_config=sandbox_config,
         git_hosts=git_hosts,
+        git_credential_store=git_credential_store,
     )
 
     return _BuiltApp(app=app, host=resolved_config.host, port=resolved_config.port)

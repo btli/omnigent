@@ -3283,6 +3283,19 @@ def server(
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
+    # Git-credential store (custom git hosts): opt-in via
+    # OMNIGENT_GIT_CREDENTIAL_KEYS. Absent that env var, the cipher — and
+    # therefore the store and its CRUD endpoints — stay disabled.
+    from omnigent.git_hosts.crypto import load_cipher_from_env
+    from omnigent.stores.git_credential_store import GitCredentialStore
+
+    _git_credential_cipher = load_cipher_from_env()
+    git_credential_store = (
+        GitCredentialStore(db_uri, _git_credential_cipher)
+        if _git_credential_cipher is not None
+        else None
+    )
+
     # Accounts mode ergonomics: when accounts mode is selected
     # (OMNIGENT_AUTH_ENABLED=1 without OIDC config, or an explicit
     # OMNIGENT_AUTH_PROVIDER=accounts), supply sensible defaults
@@ -3348,6 +3361,7 @@ def server(
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
         sandbox_config=sandbox_config,
         git_hosts=git_hosts,
+        git_credential_store=git_credential_store,
         server_config=cfg,
     )
 
