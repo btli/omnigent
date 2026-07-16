@@ -7075,12 +7075,22 @@ def _kick_managed_relaunch(
         else:
             # Successful re-auth: refresh the persisted binding so later
             # relaunches compare against the config that actually took effect
-            # (same-host drift deliberately takes effect, design §9).
+            # (same-host drift deliberately takes effect, design §9). This runs
+            # on the event loop (it schedules the relaunch task below), so the
+            # store write is offloaded to a thread rather than blocking it — a
+            # best-effort self-heal (a lost write only re-logs the drift next
+            # relaunch), so it rides its own tracked task like the launch below.
             refreshed = build_relaunch_binding_labels(repo, getattr(app_state, "git_hosts", ()))
             if refreshed:
-                conversation_store.set_labels(
-                    session_id, {MANAGED_REPO_LABEL_KEY: raw_repo, **refreshed}
+                refresh_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        conversation_store.set_labels,
+                        session_id,
+                        {MANAGED_REPO_LABEL_KEY: raw_repo, **refreshed},
+                    )
                 )
+                _managed_launch_tasks.add(refresh_task)
+                refresh_task.add_done_callback(_managed_launch_tasks.discard)
     _logger.info(
         "Managed sandbox for session %s (host %s) is gone; relaunching a new generation",
         session_id,
