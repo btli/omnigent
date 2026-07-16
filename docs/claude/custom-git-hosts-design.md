@@ -1,8 +1,9 @@
-# Custom git-host provider abstraction — design spec (v3)
+# Custom git-host provider abstraction — design spec (v4)
 
-**Status:** Draft for review (v3.1 — + round-3 focused re-review locks: handoff protocol, k8s Secret
-isolation, ssh-agent, exact-repo binding, warn-and-allow shared push)
-**Date:** 2026-07-15
+**Status:** Draft for review (v4 — P1c handoff architecture resolved: launch-scoped secretless swap
+[architecture A]; sealed, ACKed, type-tagged `deliver_credential` frame; repo-path-scoped rule +
+kill/relaunch revocation; PAT-first with a `kind` discriminator, OAuth deferred to P3)
+**Date:** 2026-07-16
 **Branch:** `feat/custom-git-hosts` (worktree off `upstream/main` @ `0f6e82fb`)
 **Anchor issue:** omnigent-ai#2125. **Related:** #1937, #1421, #236.
 
@@ -10,7 +11,49 @@ isolation, ssh-agent, exact-repo binding, warn-and-allow shared push)
 > phased plan (P1a/P1b landed here, P1c/P1d to follow) and review history live in the PR
 > discussion rather than in-tree.
 
-## 0. What changed in v3
+## 0. What changed in v4 (P1c handoff architecture resolved)
+
+The fetch/push handoff (§8.5) was grounded against the code (a 6-subsystem recon) and re-decided
+through a diverse-lens + multi-engine review. The locked v3.1 "single-use, per-operation, TTL"
+protocol did not match how the runtime actually works, and is **amended**:
+
+- **Delivery is architecture A — a launch/runner-scoped secretless swap, not a per-operation handoff.**
+  The real secret already has a home: the trusted runner-parent's in-process **egress-proxy**, which
+  swaps the credential onto the git-over-HTTPS **upstream** leg (the sandbox child is a separate OS
+  process and never holds it). There is **no per-git-operation interception point** and **no post-spawn
+  rotation channel** in the code; the swap is spawn-time. Per-op single-use (B) would require building
+  an egress→server callback that does not exist, for **no blast-radius gain** against the real threats
+  (a compromised *runner* is itself the per-op requester, so per-op does not contain it). §8.5's
+  "single-use/TTL/re-fetch/discard-on-tunnel-loss" is **reconciled to launch/runner granularity**:
+  single-delivery-per-launch, discard on runner exit, re-authorize on relaunch, kept across a
+  *transient* tunnel reconnect. Clone/fetch/push all ride the one swap. (A is also a net improvement
+  over today's ambient `GIT_TOKEN` env.)
+- **The credential rides a dedicated `deliver_credential` frame** (§8.5) — separate from the launch
+  frame, **ACKed** (git is gated until the rule is installed, closing the spawn-race), **type-tagged**
+  `{http-token | ssh-key | oauth}` and keyed by `{credential_slot, canonical_host}` (multi-host = N
+  rules), bound to `runner_id` **plus a new monotonic `launch_generation`** as the anti-replay anchor.
+  A paired **`invalidate_credential`** frame is defined in the contract now (push revocation ships
+  later).
+- **The frame is sealed** — the credential field is encrypted to a runner-held key established at
+  launch, so confidentiality does **not** depend on deployment TLS (the tunnel can be `ws://` on
+  loopback). Sealing is **pluggable** so `binding_token` can adopt it later.
+- **PAT-first with a `kind: pat | oauth` discriminator** (§8.2, §12.2). The resolver returns a uniform
+  **credential lease** (bearer token + optional `expires_at`); the egress-proxy never branches on
+  `kind`. **OAuth is deferred to P3** as an extension of the SSO/OIDC work (access token minted at
+  helper spawn + pre-expiry helper restart; no rotation channel) — a user-pasted PAT is
+  zero-operator-setup and long-lived, so it sidesteps rotation entirely.
+- **P1-achievable hardenings applied now:** the rewrite rule is **scoped to the repo-path prefix**
+  (limits the host-scoped confused-deputy surface — hooks/submodule/LFS/terminal) and revocation is
+  **kill+relaunch**. The residual is **accepted and documented**: a user PAT sits in trusted runner
+  memory for the launch (a user PAT cannot be narrowed server-side; reduced later by OAuth-minted
+  short-lived tokens).
+- **Handoff decomposed** (§14): P1c-2 `resolve_token` owner/host-scoping *(done)* → P1c-3 resolver
+  widening + relaunch binding persistence + **add `launch_generation`** → P1c-4 the sealed
+  `deliver_credential` frame + host-parent swap + repo-scoped rule → P1c-5 k8s in-Pod proxy + SSH
+  ssh-agent → P1c-6 commit identity + sharing notice. **k8s, the init-container clone, the tmux
+  terminal, and SSH keys are explicitly separate coverage items**, not folded into P1c-4.
+
+## 0.1 What changed in v3
 
 - **Shared-session identity model settled.** Push auth = session **owner** (default, model A) or an
   optional per-workspace **service "bot"** (model B); per-user push is deferred. **Commit authorship
@@ -149,7 +192,12 @@ trusted parent. `command` is operator-only.
 ### 8.2 User / bot credentials — encrypted at rest
 `SqlGitCredential` (§12.2) holds `token_ciphertext` (Fernet; **key list** in env; decrypt-only in the
 trusted parent; never in `SandboxPolicy`). A user/operator supplies only an opaque token bound to an
-operator host — never a command or URL.
+operator host — never a command or URL. A **`kind: pat | oauth`** discriminator (default `pat`) records
+the credential type; the resolver normalizes both into a uniform **credential lease** (bearer token +
+optional `expires_at`) so the egress-proxy never branches on `kind`. **P1 ships `pat` only** (zero
+operator setup, long-lived → no rotation needed); **`oauth` is a P3 extension** of the SSO/OIDC work
+(refresh-token grant → access token minted at helper spawn + pre-expiry helper restart; no rotation
+channel).
 
 ### 8.3 Authorization & cardinality
 The server-minted row **`id` is the opaque credential slot**. Routes **derive** owner, workspace,
@@ -193,22 +241,60 @@ args/logs, or `SandboxPolicy`.
   the existing credential**, not a "short-lived token" (a copied PAT stays long-lived).
 
 ### 8.5 Fetch/push handoff (built in P1) & long-lived hosts
-The transient clone secret is gone after clone, so later fetch/push needs its own path.
-- **Managed hosts:** a **second authenticated server→runner-parent credential handoff** over the
-  existing host tunnel (`omnigent/server/routes/host_tunnel.py`), consumed only by the trusted runner
-  parent (the `omni host` daemon that spawns the runner), which mints the credential-proxy
-  placeholders/rewrite rules (`inject_env`) — **without** converting a user PAT into env/file/command
-  policy or a real `GIT_TOKEN`.
-  **Locked P1 protocol:** versioned and **confidential** (`wss`/TLS with cert validation — never
-  plaintext `ws`); each delivery is **single-use**, bound to `{host_id, runner_id, session_id,
-  launch_generation, credential_slot, canonical_host, repo_path}`, carries a short **TTL +
-  acknowledgement**, is **discarded on runner exit/stop/timeout/tunnel loss**, and requires **fresh
-  authorization + re-fetch after reconnect/relaunch**. Secret-bearing frame bodies never enter
-  logs/errors; zeroization is best-effort.
-  **SSH-key credentials** cannot ride the HTTP rewrite proxy — expose an **ephemeral `ssh-agent`
-  socket** to the sandbox for the operation, torn down after.
+The transient clone secret is gone after clone, so later fetch/push needs its own path. **Grounded
+resolution (v4, architecture A):** the credential is delivered **once per runner launch** into the
+trusted runner-parent's in-process **egress-proxy**, which swaps it onto the git-over-HTTPS **upstream**
+leg. The sandbox child is a separate OS process that only ever emits **tokenless** traffic through the
+proxy — it never holds the secret. Clone/fetch/push all ride this one swap. There is no
+per-git-operation hook and no post-spawn rotation channel in the runtime; the earlier "single-use,
+per-operation, TTL" framing is **reconciled to launch/runner granularity** (see §0 v4).
+
+- **Managed hosts — the `deliver_credential` protocol (locked, v4):** a **dedicated versioned frame**
+  over the existing host tunnel (`omnigent/server/routes/host_tunnel.py`), consumed only by the trusted
+  runner parent, which installs a **repo-path-scoped** credential-rewrite rule in its egress-proxy
+  (minting the proxy placeholder/rewrite) — **without** converting a user PAT into env/file/command
+  policy or a real `GIT_TOKEN`. The frame is:
+  - **Separate from the launch frame** — re-deliverable on relaunch/host-rescope without re-launching,
+    and keeps the higher-value PAT off the launch frame's logging/replay surface;
+  - **ACKed RPC, not fire-and-forget** — the runner confirms the rule is installed **before git is
+    permitted**, closing the spawn-time race where a git op precedes the rule; the ACK drives
+    single-delivery accounting;
+  - **type-tagged** `{http-token | ssh-key | oauth}` and **keyed by `{credential_slot,
+    canonical_host}`** so multiple/mixed-type credentials coexist (multi-host = N rules) and SSH/OAuth
+    slot in without a frame redesign;
+  - **bound to `{host_id, runner_id, launch_generation, session_id, credential_slot, canonical_host,
+    repo_path}`** — `launch_generation` (added in P1c-3) is the monotonic **anti-replay anchor**;
+    `runner_id` alone is insufficient (it can recur across relaunches / span OAuth helper-restart
+    incarnations);
+  - **sealed** — the credential field is encrypted to a **runner-held key established at launch**, so
+    confidentiality does not depend on the tunnel's (deployment-provided, possibly `ws://` loopback)
+    TLS; sealing is **pluggable** so `binding_token` can adopt it later. Secret-bearing frame bodies
+    never enter logs/telemetry; zeroization is best-effort;
+  - **launch-scoped lifecycle:** single-delivery-per-launch; **kept across a transient tunnel
+    reconnect** (wiping would break in-flight git); **re-authorized + re-delivered on relaunch**;
+    discarded on runner exit/stop/timeout. A paired **`invalidate_credential`** frame is defined in the
+    contract now for server-driven revocation (push-revoke ships later); until then **revocation is
+    kill+relaunch**.
+- **Repo-path scoping (v4):** the rewrite rule matches the **specific repo-path prefix**, not the whole
+  host, limiting the confused-deputy surface (malicious git hooks, submodule/LFS fetches, poisoned
+  build steps, the interactive terminal) a host-wide swap would authenticate.
+- **Accepted residual:** a user-pasted PAT is long-lived and cannot be narrowed server-side, so it sits
+  in trusted runner-parent memory for the launch (core-dump/swap/ptrace exposure under trusted-parent
+  compromise). Documented and accepted for P1; reduced in P3 when OAuth/App tokens allow a short-TTL,
+  server-minted, repo-scoped credential to sit at rest instead.
+- **SSH-key credentials** cannot ride the HTTP rewrite proxy — a **separate coverage item (P1c-5)**: an
+  **ephemeral `ssh-agent`** in the runner parent with `SSH_AUTH_SOCK` exposed to the sandbox for the
+  operation (never the real key; torn down after). The type-tagged envelope already carries `ssh-key`.
 - **Runner:** placeholder path only; do **not** add real provider tokens to
   `_BASE_HARNESS_CREDENTIAL_ENV_VARS` (`omnigent/host/connect.py:435-451`).
+- **Egress coupling:** the swap is a **no-op without an egress rule** for the canonical host; launching
+  a managed-git session must **auto-merge that host's egress rule** at the §11 merge point, or
+  push/fetch silently goes out tokenless.
+- **Coverage explicitly deferred to separate slices (not folded into P1c-4):** **k8s** (no parent-side
+  proxy — the same runner→helper→bwrap tree runs in-Pod, so the swap layer must run in the Pod) and the
+  **init-container clone** (the *first* git op, predating the runner — a projected Secret / short-lived
+  clone token, §8.4); the **tmux terminal** swap (a new auth surface — deliberate decision required);
+  and **SSH** as above.
 - **Long-lived `omni host`:** the server env is not the external host's env. External hosts use a
   **host-local per-git-host credential config** keyed to the server-provided canonical host identity
   (name the schema + lookup-failure behavior); only **non-secret** provider/topology + CA/known-hosts
@@ -304,9 +390,11 @@ Mirrors `SqlHost` (`omnigent/db/db_models.py:1063-1150`): composite PK `(workspa
 **`id` is the opaque credential slot** (`Uuid16`); `owner_user_id: String(256)`; `host_id: String(256)`
 (the operator host config id); `provider: String(32)` (validated denormalized snapshot, mirroring
 `SqlHost.sandbox_provider`); `label: String(128)` (user-chosen, distinguishes multiple identities on
-one host); `username: String(256) | None`; `token_ciphertext: Text` (Fernet); timestamps.
-`UniqueConstraint(workspace_id, owner_user_id, host_id, label)` — not a partial index. Multiple
-labeled rows per `(owner, host)` are the 0..n-identity model (§8.3).
+one host); `username: String(256) | None`; `token_ciphertext: Text` (Fernet);
+`kind: SmallInteger` (enum `pat`|`oauth` via the codec, default `pat`, `CheckConstraint`; §8.2);
+timestamps. `UniqueConstraint(workspace_id, owner_user_id, host_id, label)` — not a partial index.
+Multiple labeled rows per `(owner, host)` are the 0..n-identity model (§8.3). (`kind` lands with the
+P1c-3 resolver work; P1c-1 shipped without it and defaults existing rows to `pat`.)
 `canonical_host`/`provider` are **validated denormalized snapshots** of operator topology, re-checked
 at launch (topology can drift). **No FK**; app-cascade (`omnigent/stores/host_store.py:736-763`) **plus
 a reconciliation sweeper** that also scrubs credentials orphaned by **operator-host removal from YAML**
@@ -317,7 +405,9 @@ a reconciliation sweeper** that also scrubs credentials orphaned by **operator-h
 ### 12.3 Resolution & precedence
 Topology: operator-only → github.com default. Credential for a resolved host: in a session, the
 **owner's** slot for that host (model A) or the workspace **bot** slot (model B), else the operator
-host credential source, else legacy `GIT_TOKEN` (github.com). No user topology override.
+host credential source, else legacy `GIT_TOKEN` (github.com). No user topology override. Resolution is
+owner/host-scoped (§8.3, P1c-2) and returns a **credential lease** — bearer token + optional
+`expires_at`, uniform across `kind` (§8.2) — never the raw row.
 
 ## 13. Provider matrix
 
@@ -342,6 +432,15 @@ Fernet key-list.
 **Acceptance:** github.com + self-hosted Forgejo + GitLab clone/**fetch/push** simultaneously on exec
 **and** Kubernetes managed sandboxes and omni host; shared session warns and attributes commits to the
 starter. Live Forgejo/Gitea containers; sharing/handoff integration tests.
+
+**P1 credential/handoff slices (P1c), grounded + sequenced (v4):**
+- **P1a/P1b** *(done)* — provider ABC/registry/resolver + operator-credential clone wiring (PR #2708).
+- **P1c-1** *(done)* — encrypted-at-rest user credentials (`SqlGitCredential` + store + `/v1/git-credentials`), 0..n labeled identities per `(user, host)`.
+- **P1c-2** *(done)* — owner/host-scoped `resolve_token` (opaque id ≠ authorization).
+- **P1c-3** — owner-aware resolver + `RepoWorkspace`/`ClonePlan` field-widening + relaunch **binding persistence** (host-config id/version + canonical URL + slot id) + **add `launch_generation`** (the anti-replay anchor P1c-4 needs) + the `kind` column.
+- **P1c-4** — the sealed, ACKed, type-tagged **`deliver_credential`** frame (§8.5) + host-parent egress-proxy install with a **repo-path-scoped** rule, on **exec (bwrap/seatbelt)** sandboxes; `invalidate_credential` in the contract; kill/relaunch revocation. HTTPS-token only.
+- **P1c-5** — **k8s** in-Pod swap layer + init-container clone credential; **SSH** ssh-agent path; the **tmux terminal** swap decision.
+- **P1c-6** — commit identity (session starter, §8.6) + the session-sharing notice (§8.7).
 
 ### P2 — PR/issue + tools
 Per-provider MCP + policy peers + CLI; **GHE same-host multi-mode binding**; generalize `gh_basic`
