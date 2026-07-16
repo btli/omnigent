@@ -891,6 +891,23 @@ def test_resolve_repo_workspace_enriches_configured_host() -> None:
     assert repo.clone_username == "oauth2"
 
 
+def test_resolve_repo_workspace_carries_widened_plan_fields() -> None:
+    repo = resolve_repo_workspace("https://git.acme.com/team/proj#main", _GH_HOSTS)
+    # The fields resolve_repo_workspace used to drop from the ClonePlan.
+    assert repo.host_id == "acme"
+    assert repo.auth_scheme == "basic"
+    assert repo.api_base == _GH_HOSTS[0].api_base
+    assert repo.ca_bundle is None
+    assert repo.ssh_host is None
+    assert repo.ssh_port is None
+
+
+def test_resolve_repo_workspace_github_default_host_id() -> None:
+    repo = resolve_repo_workspace("https://github.com/org/repo", _GH_HOSTS)
+    assert repo.host_id == "github"
+    assert repo.auth_scheme == "basic"
+
+
 def test_resolve_repo_workspace_github_default_has_no_credential_source() -> None:
     repo = resolve_repo_workspace("https://github.com/org/repo", _GH_HOSTS)
     assert repo.provider == "github"

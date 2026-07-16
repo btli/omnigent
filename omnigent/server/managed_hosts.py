@@ -426,15 +426,29 @@ class RepoWorkspace:
         github.com default's credential fields.
     :param clone_username: Resolution metadata from the operator
         git-host config; ``None`` when unresolved.
+    :param host_id: Operator git-host id the repo resolved to (``"github"``
+        for the built-in default); ``None`` when unresolved.
+    :param api_base: API base URL for the resolved host; ``None`` when unresolved.
+    :param auth_scheme: HTTPS auth scheme (``"basic"``/``"token"``) from the
+        provider clone binding; ``None`` when unresolved.
+    :param ca_bundle: Path to the host's CA bundle for a private forge, or ``None``.
+    :param ssh_host: SSH host override for the resolved host, or ``None``.
+    :param ssh_port: SSH port override for the resolved host, or ``None``.
     """
 
     url: str
     branch: str | None
     repo_name: str
+    host_id: str | None = None
     canonical_host: str | None = None
     provider: str | None = None
+    api_base: str | None = None
     credential_source: str | None = None
     clone_username: str | None = None
+    auth_scheme: str | None = None
+    ca_bundle: str | None = None
+    ssh_host: str | None = None
+    ssh_port: int | None = None
 
 
 # A full 40-hex object id — rejected as a clone fragment: cloning a
@@ -571,8 +585,9 @@ def resolve_repo_workspace(workspace: str, hosts: Sequence[HostConfig]) -> RepoW
 
     Combines :func:`parse_repo_workspace` (shape validation) with
     :func:`resolve_clone_plan` (host resolution): the returned workspace
-    carries the canonical host, provider name, and the host's non-secret
-    ``credential_source`` reference for launch-time credential injection.
+    carries the full non-secret plan — host id, canonical host, provider
+    name, API base, the host's ``credential_source`` reference, and the
+    auth/SSH/CA details — for launch-time credential injection and handoff.
 
     :param workspace: The raw repository-URL workspace, e.g.
         ``"https://git.acme.com/team/proj#main"``.
@@ -587,10 +602,16 @@ def resolve_repo_workspace(workspace: str, hosts: Sequence[HostConfig]) -> RepoW
         url=parsed.url,
         branch=parsed.branch,
         repo_name=parsed.repo_name,
+        host_id=plan.host_id,
         canonical_host=plan.canonical_host,
         provider=plan.provider,
+        api_base=plan.api_base,
         credential_source=plan.credential_source,
         clone_username=plan.auth.username,
+        auth_scheme=plan.auth.scheme,
+        ca_bundle=plan.ca_bundle,
+        ssh_host=plan.ssh_host,
+        ssh_port=plan.ssh_port,
     )
 
 
