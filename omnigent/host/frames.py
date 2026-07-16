@@ -55,6 +55,9 @@ class HostFrameKind(str, Enum):
     LIST_WORKTREES_RESULT = "host.list_worktrees_result"
     CREATE_DIR = "host.create_dir"
     CREATE_DIR_RESULT = "host.create_dir_result"
+    DELIVER_CREDENTIAL = "host.deliver_credential"
+    DELIVER_CREDENTIAL_RESULT = "host.deliver_credential_result"
+    INVALIDATE_CREDENTIAL = "host.invalidate_credential"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -79,6 +82,11 @@ class HostHelloFrame:
         unknown (an older host that doesn't report it) — never
         treat ``None`` as "nothing is configured". Recomputed on
         each (re)connect; the launch-time check is authoritative.
+    :param sealing_public_key: base64 X25519 public key this connection
+        advertises so the server can seal a delivered credential to it
+        (see :mod:`omnigent.host.sealing`). Regenerated per tunnel
+        connection; ``None`` from an older host that cannot receive
+        sealed credentials.
     """
 
     version: str
@@ -87,6 +95,7 @@ class HostHelloFrame:
     runners: list[str] = field(default_factory=list)
     configured_harnesses: dict[str, HarnessAvailability] | None = None
     telemetry_opt_out: bool = False
+    sealing_public_key: str | None = None
 
 
 @dataclass
@@ -519,6 +528,92 @@ class HostCreateDirResultFrame:
     error: str | None = None
 
 
+@dataclass
+class HostDeliverCredentialFrame:
+    """Server → host: deliver a sealed git credential for a pending runner.
+
+    Sent (and ACKed) BEFORE ``host.launch_runner`` so the host caches the
+    credential and can thread it into the runner at spawn — before any git
+    op can run. Consumed only by the trusted runner parent.
+
+    :param request_id: Correlates the result, e.g. ``"req_cred_1"``.
+    :param runner_id: The runner this credential is bound to (derived
+        server-side from the launch binding token via
+        ``token_bound_runner_id``), e.g. ``"runner_abc..."``.
+    :param launch_generation: Monotonic per-session launch counter — the
+        anti-replay anchor. A credential for a generation the host does not
+        expect for this runner is rejected.
+    :param session_id: Conversation/session id, e.g. ``"conv_abc"``.
+    :param credential_slot: The opaque server-side credential slot id the
+        token was resolved from (bookkeeping / audit).
+    :param canonical_host: Exact host the swap binds to, e.g.
+        ``"git.acme.com"``.
+    :param repo_path: Repo path prefix the egress rule scopes to (leading
+        slash, no ``.git``, no trailing slash), e.g. ``"/team/proj"``.
+    :param credential_kind: Envelope type tag: ``"http-token"`` (the only
+        kind implemented). ``"ssh-key"`` / ``"oauth"`` are reserved so the
+        frame never needs a redesign; the host rejects them for now.
+    :param auth_scheme: Upstream ``Authorization`` scheme, one of
+        ``"basic"`` / ``"bearer"`` / ``"token"``.
+    :param username: Basic-auth username emitted upstream when
+        ``auth_scheme="basic"``, e.g. ``"x-access-token"``; ``None`` for
+        ``bearer`` / ``token``.
+    :param sealed_credential: The token sealed to the host's
+        ``sealing_public_key`` (see :mod:`omnigent.host.sealing`). Never the
+        plaintext token; the field name triggers telemetry redaction.
+    :param host_id: The operator git-host id (part of the binding tuple).
+    """
+
+    request_id: str
+    runner_id: str
+    launch_generation: int
+    session_id: str
+    credential_slot: str
+    canonical_host: str
+    repo_path: str
+    credential_kind: str
+    auth_scheme: str
+    username: str | None
+    sealed_credential: str
+    host_id: str
+
+
+@dataclass
+class HostDeliverCredentialResultFrame:
+    """Host → server: outcome of a credential delivery.
+
+    :param request_id: Correlates to the
+        :class:`HostDeliverCredentialFrame`, e.g. ``"req_cred_1"``.
+    :param status: ``"installed"`` (cached, will thread at spawn) or
+        ``"rejected"``.
+    :param error: Reason when ``status`` is ``"rejected"`` (never names a
+        token), e.g. ``"unknown credential kind"``. ``None`` on success.
+    """
+
+    request_id: str
+    status: str
+    error: str | None = None
+
+
+@dataclass
+class HostInvalidateCredentialFrame:
+    """Server → host: discard a cached credential (one-way; contract-only).
+
+    Defined now so server-driven revocation can ship without a contract
+    change. In P1 the operational revocation story is kill+relaunch; the
+    host handler simply drops the cached credential for the runner. No
+    result frame.
+
+    :param runner_id: The runner whose cached credential to discard.
+    :param launch_generation: The generation the discard targets.
+    :param reason: Optional human-readable reason (audit only).
+    """
+
+    runner_id: str
+    launch_generation: int
+    reason: str | None = None
+
+
 HostFrame = (
     HostHelloFrame
     | HostLaunchRunnerFrame
@@ -538,6 +633,9 @@ HostFrame = (
     | HostListWorktreesResultFrame
     | HostCreateDirFrame
     | HostCreateDirResultFrame
+    | HostDeliverCredentialFrame
+    | HostDeliverCredentialResultFrame
+    | HostInvalidateCredentialFrame
 )
 
 
@@ -585,6 +683,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "runners": list(frame.runners),
                 "configured_harnesses": frame.configured_harnesses,
                 "telemetry_opt_out": frame.telemetry_opt_out,
+                "sealing_public_key": frame.sealing_public_key,
             }
         )
     if isinstance(frame, HostLaunchRunnerFrame):
@@ -761,6 +860,42 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error": frame.error,
             }
         )
+    if isinstance(frame, HostDeliverCredentialFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.DELIVER_CREDENTIAL.value,
+                "request_id": frame.request_id,
+                "runner_id": frame.runner_id,
+                "launch_generation": frame.launch_generation,
+                "session_id": frame.session_id,
+                "credential_slot": frame.credential_slot,
+                "canonical_host": frame.canonical_host,
+                "repo_path": frame.repo_path,
+                "credential_kind": frame.credential_kind,
+                "auth_scheme": frame.auth_scheme,
+                "username": frame.username,
+                "sealed_credential": frame.sealed_credential,
+                "host_id": frame.host_id,
+            }
+        )
+    if isinstance(frame, HostDeliverCredentialResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.DELIVER_CREDENTIAL_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostInvalidateCredentialFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.INVALIDATE_CREDENTIAL.value,
+                "runner_id": frame.runner_id,
+                "launch_generation": frame.launch_generation,
+                "reason": frame.reason,
+            }
+        )
     raise TypeError(f"unknown host frame type: {type(frame).__name__}")
 
 
@@ -857,6 +992,12 @@ def _decode_known_host_frame(
             return _decode_create_dir(msg)
         case HostFrameKind.CREATE_DIR_RESULT:
             return _decode_create_dir_result(msg)
+        case HostFrameKind.DELIVER_CREDENTIAL:
+            return _decode_deliver_credential(msg)
+        case HostFrameKind.DELIVER_CREDENTIAL_RESULT:
+            return _decode_deliver_credential_result(msg)
+        case HostFrameKind.INVALIDATE_CREDENTIAL:
+            return _decode_invalidate_credential(msg)
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
 
 
@@ -873,6 +1014,7 @@ def _decode_host_hello(msg: dict[str, Any]) -> HostHelloFrame:
         runners=_optional_str_list(msg, "runners"),
         configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
+        sealing_public_key=_optional_nullable_str(msg, "sealing_public_key"),
     )
 
 
@@ -1164,6 +1306,101 @@ def _decode_create_dir_result(msg: dict[str, Any]) -> HostCreateDirResultFrame:
         path=_optional_nullable_str(msg, "path"),
         error=_optional_nullable_str(msg, "error"),
     )
+
+
+def _decode_deliver_credential(msg: dict[str, Any]) -> HostDeliverCredentialFrame:
+    """Decode a host.deliver_credential frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.deliver_credential frame.
+    """
+    return HostDeliverCredentialFrame(
+        request_id=_required_str(msg, "request_id"),
+        runner_id=_required_str(msg, "runner_id"),
+        launch_generation=_required_int(msg, "launch_generation"),
+        session_id=_required_str(msg, "session_id"),
+        credential_slot=_required_str(msg, "credential_slot"),
+        canonical_host=_required_str(msg, "canonical_host"),
+        repo_path=_required_str(msg, "repo_path"),
+        credential_kind=_required_str(msg, "credential_kind"),
+        auth_scheme=_required_str(msg, "auth_scheme"),
+        username=_optional_nullable_str(msg, "username"),
+        sealed_credential=_required_str(msg, "sealed_credential"),
+        host_id=_required_str(msg, "host_id"),
+    )
+
+
+def _decode_deliver_credential_result(
+    msg: dict[str, Any],
+) -> HostDeliverCredentialResultFrame:
+    """Decode a host.deliver_credential_result frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.deliver_credential_result frame.
+    """
+    return HostDeliverCredentialResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_invalidate_credential(
+    msg: dict[str, Any],
+) -> HostInvalidateCredentialFrame:
+    """Decode a host.invalidate_credential frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.invalidate_credential frame.
+    """
+    return HostInvalidateCredentialFrame(
+        runner_id=_required_str(msg, "runner_id"),
+        launch_generation=_required_int(msg, "launch_generation"),
+        reason=_optional_nullable_str(msg, "reason"),
+    )
+
+
+def build_credential_delivery_aad(
+    *,
+    runner_id: str,
+    launch_generation: int,
+    session_id: str,
+    host_id: str,
+    credential_slot: str,
+    canonical_host: str,
+    repo_path: str,
+    credential_kind: str,
+    auth_scheme: str,
+    username: str | None,
+) -> bytes:
+    """Canonical AEAD associated-data binding a sealed credential to its frame.
+
+    The server builds this from the values it puts on the
+    :class:`HostDeliverCredentialFrame` and passes it to
+    :func:`omnigent.host.sealing.seal`; the host rebuilds it from the RECEIVED
+    frame's fields and passes it to :func:`~omnigent.host.sealing.unseal`. Any
+    tampering with a bound field — or replaying a sealed blob under a
+    different runner / generation / host / repo — changes the AAD, so the
+    ChaCha20-Poly1305 tag check fails and the delivery is rejected. This
+    cryptographically binds the sealed token to its exact frame identity (the
+    plaintext binding fields are then tamper-evident, not merely advisory).
+
+    :returns: The associated-data bytes (unit-separator-joined; the fields are
+        ASCII ids / paths that cannot contain ``0x1f``).
+    """
+    parts = [
+        runner_id,
+        str(launch_generation),
+        session_id,
+        host_id,
+        credential_slot,
+        canonical_host,
+        repo_path,
+        credential_kind,
+        auth_scheme,
+        username if username is not None else "",
+    ]
+    return "\x1f".join(parts).encode("utf-8")
 
 
 # ── Field validators ─────────────────────────────────────

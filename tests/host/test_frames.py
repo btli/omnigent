@@ -986,3 +986,125 @@ def test_create_dir_result_error_round_trip() -> None:
     assert decoded.status == "ok"
     assert decoded.path is None
     assert decoded.error == "directory already exists"
+
+
+# ── host.deliver_credential frames ──────────────────────
+
+
+def test_deliver_credential_frame_roundtrips() -> None:
+    from omnigent.host.frames import (
+        HostDeliverCredentialFrame,
+        decode_host_frame,
+        encode_host_frame,
+    )
+
+    frame = HostDeliverCredentialFrame(
+        request_id="req1",
+        runner_id="runner_abc",
+        launch_generation=3,
+        session_id="conv_1",
+        credential_slot="slot_1",
+        canonical_host="git.acme.com",
+        repo_path="/team/proj",
+        credential_kind="http-token",
+        auth_scheme="basic",
+        username="x-access-token",
+        sealed_credential="U0VBTEVE",
+        host_id="host_9",
+    )
+    decoded = decode_host_frame(encode_host_frame(frame))
+    assert decoded == frame
+
+
+def test_deliver_credential_result_roundtrips() -> None:
+    from omnigent.host.frames import (
+        HostDeliverCredentialResultFrame,
+        decode_host_frame,
+        encode_host_frame,
+    )
+
+    for result in (
+        HostDeliverCredentialResultFrame(request_id="req1", status="installed"),
+        HostDeliverCredentialResultFrame(
+            request_id="req1", status="rejected", error="unknown credential kind"
+        ),
+    ):
+        assert decode_host_frame(encode_host_frame(result)) == result
+
+
+def test_invalidate_credential_roundtrips() -> None:
+    from omnigent.host.frames import (
+        HostInvalidateCredentialFrame,
+        decode_host_frame,
+        encode_host_frame,
+    )
+
+    frame = HostInvalidateCredentialFrame(
+        runner_id="runner_abc", launch_generation=3, reason="revoked"
+    )
+    assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+def test_hello_carries_sealing_public_key() -> None:
+    from omnigent.host.frames import HostHelloFrame, decode_host_frame, encode_host_frame
+
+    hello = HostHelloFrame(
+        version="0.1.0",
+        frame_protocol_version=1,
+        name="corey-laptop",
+        sealing_public_key="cHVia2V5",
+    )
+    assert decode_host_frame(encode_host_frame(hello)).sealing_public_key == "cHVia2V5"
+
+
+def test_hello_sealing_public_key_defaults_none_for_older_host() -> None:
+    from omnigent.host.frames import decode_host_frame
+
+    # An older host omits the field entirely; decode must tolerate it.
+    text = '{"kind": "host.hello", "version": "0.1.0", "frame_protocol_version": 1, "name": "old"}'
+    assert decode_host_frame(text).sealing_public_key is None
+
+
+def test_sealed_credential_is_redacted_on_telemetry() -> None:
+    from omnigent.runtime.telemetry import _redact_payload
+
+    redacted = _redact_payload(
+        {"kind": "host.deliver_credential", "sealed_credential": "SEALEDBLOB", "host_id": "h"}
+    )
+    assert redacted["sealed_credential"] == "[redacted]"
+    assert redacted["host_id"] == "h"
+
+
+def test_unknown_frame_kind_still_raises_valueerror() -> None:
+    # Version-skew contract: an unknown kind must raise ValueError so the
+    # receive loops drop it (fail-safe), not crash.
+    import pytest
+
+    from omnigent.host.frames import decode_host_frame
+
+    with pytest.raises(ValueError):
+        decode_host_frame('{"kind": "host.does_not_exist", "request_id": "x"}')
+
+
+def test_credential_delivery_aad_is_deterministic_and_identity_bound() -> None:
+    from omnigent.host.frames import build_credential_delivery_aad
+
+    kwargs = {
+        "runner_id": "runner_abc",
+        "launch_generation": 3,
+        "session_id": "conv_1",
+        "host_id": "host_9",
+        "credential_slot": "slot_1",
+        "canonical_host": "git.acme.com",
+        "repo_path": "/team/proj",
+        "credential_kind": "http-token",
+        "auth_scheme": "basic",
+        "username": "x-access-token",
+    }
+    aad = build_credential_delivery_aad(**kwargs)
+    assert isinstance(aad, bytes)
+    # Deterministic for the same identity...
+    assert build_credential_delivery_aad(**kwargs) == aad
+    # ...and different when ANY bound field changes (here: the generation).
+    assert build_credential_delivery_aad(**{**kwargs, "launch_generation": 4}) != aad
+    assert build_credential_delivery_aad(**{**kwargs, "runner_id": "runner_xyz"}) != aad
