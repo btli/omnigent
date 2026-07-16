@@ -378,6 +378,26 @@ def test_launch_host_creates_secret_then_pod_and_returns_workspace(
     assert fake_core.deleted_pods == []
 
 
+def test_start_host_rejects_clone_env(fake_core: _FakeCore) -> None:
+    """
+    A per-host clone credential fails closed before any API call — the init
+    container clone has no path to consume it yet.
+    """
+    with pytest.raises(SandboxCapabilityError, match="does not support per-host clone"):
+        _launcher().start_host(
+            "omnigent-pod-x",
+            token=_TOKEN,
+            host_id="host_x",
+            host_name="managed-x",
+            server_url="http://srv.example.com",
+            repo_url="https://github.com/org/repo.git",
+            repo_name="repo",
+            clone_env={"GIT_TOKEN": "abc123"},
+        )
+    # Fails before any Secret/Pod create call is made.
+    assert fake_core.calls == []
+
+
 def test_launch_host_with_repo_returns_clone_dir(fake_core: _FakeCore) -> None:
     """With a repo, the returned workspace is the cloned directory under the workspace."""
     fake_core.read_queue = [_pod(phase="Running")]

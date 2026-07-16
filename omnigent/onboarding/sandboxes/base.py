@@ -238,6 +238,7 @@ class SandboxLauncher(ABC):
         repo_url: str | None = None,
         repo_branch: str | None = None,
         repo_name: str | None = None,
+        clone_env: dict[str, str] | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> str:
         """
@@ -271,6 +272,11 @@ class SandboxLauncher(ABC):
         :param repo_branch: Branch to clone, or ``None`` for the default branch.
         :param repo_name: Directory the clone lands in under the workspace, or
             ``None`` when *repo_url* is ``None``.
+        :param clone_env: Per-clone credential env (e.g. ``GIT_TOKEN``/
+            ``GIT_USERNAME`` for the image's git credential helper), prefixed
+            onto the clone command only — never the sandbox's ambient env.
+            Launch-scoped: the value appears in this one command. ``None``
+            leaves the command unchanged.
         :param on_stage: Progress observer invoked with ``"cloning"`` before the
             clone (when *repo_url* is set) and ``"starting"`` before the host
             launches. Runs on this (worker) thread, so it must be thread-safe.
@@ -297,6 +303,7 @@ class SandboxLauncher(ABC):
                 repo_url=repo_url,
                 repo_branch=repo_branch,
                 repo_name=repo_name,
+                clone_env=clone_env,
                 on_stage=on_stage,
             )
         # "starting" covers from here through host registration — the caller's
@@ -325,6 +332,7 @@ class SandboxLauncher(ABC):
         repo_url: str,
         repo_branch: str | None,
         repo_name: str | None,
+        clone_env: dict[str, str] | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> str:
         """
@@ -357,6 +365,11 @@ class SandboxLauncher(ABC):
             branch.
         :param repo_name: Directory the checkout lands in under *workspace*, or
             ``None``.
+        :param clone_env: Per-clone credential env (e.g. ``GIT_TOKEN``/
+            ``GIT_USERNAME`` for the image's git credential helper), prefixed
+            onto the clone command only — never the sandbox's ambient env.
+            Launch-scoped: the value appears in this one command. ``None``
+            leaves the command unchanged.
         :param on_stage: Progress observer; the default invokes it with
             ``"cloning"`` before the clone. Runs on this (worker) thread, so it
             must be thread-safe. ``None`` disables progress reporting.
@@ -373,10 +386,16 @@ class SandboxLauncher(ABC):
             if repo_branch is not None
             else ""
         )
+        env_prefix = (
+            " ".join(f"{key}={shlex.quote(value)}" for key, value in clone_env.items()) + " "
+            if clone_env
+            else ""
+        )
         try:
             self.run(
                 sandbox_id,
-                f"git clone {branch_args}-- {shlex.quote(repo_url)} {shlex.quote(clone_dir)}",
+                f"{env_prefix}git clone {branch_args}-- "
+                f"{shlex.quote(repo_url)} {shlex.quote(clone_dir)}",
             )
         except click.ClickException as exc:
             # Provider boundary: re-raise with the repository named so the
