@@ -26,6 +26,12 @@ def test_rejects_malformed_refs(ref: str) -> None:
         parse_credential_source(ref)
 
 
+def test_malformed_ref_error_never_echoes_the_raw_value() -> None:
+    with pytest.raises(ValueError) as exc:
+        parse_credential_source("my-secret-value")
+    assert "my-secret-value" not in str(exc.value)
+
+
 def test_resolve_credential_env_roundtrip() -> None:
     assert resolve_credential("env:ACME_TOKEN", parent_env={"ACME_TOKEN": "s3cret"}) == "s3cret"
 

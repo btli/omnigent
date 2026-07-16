@@ -164,6 +164,17 @@ def test_explicit_api_base_and_optional_fields_are_kept() -> None:
             ],
             "unknown keys",
         ),
+        (
+            [
+                {
+                    "id": "a",
+                    "provider": "forgejo",
+                    "web_host": "git.acme.com",
+                    "credential_source": "bogus",
+                }
+            ],
+            "credential_source",
+        ),
     ],
 )
 def test_fail_closed_on_malformed_config(raw: object, match: str) -> None:

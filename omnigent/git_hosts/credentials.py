@@ -23,8 +23,7 @@ def parse_credential_source(ref: str) -> CredentialSourceSpec:
     kind, sep, value = ref.partition(":")
     if not sep or not value:
         raise ValueError(
-            f"credential_source {ref!r} must be '<kind>:<value>' with kind one of "
-            "env, file, command"
+            "credential_source must be '<kind>:<value>' with kind one of env, file, command"
         )
     if kind == "env":
         return CredentialSourceSpec(kind="env", env=value)

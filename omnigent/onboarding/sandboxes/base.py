@@ -386,6 +386,12 @@ class SandboxLauncher(ABC):
             if repo_branch is not None
             else ""
         )
+        if clone_env:
+            for key in clone_env:
+                if not key.isidentifier():
+                    raise click.ClickException(
+                        f"clone_env key {key!r} is not a valid environment variable name"
+                    )
         env_prefix = (
             " ".join(f"{key}={shlex.quote(value)}" for key, value in clone_env.items()) + " "
             if clone_env
@@ -398,12 +404,20 @@ class SandboxLauncher(ABC):
                 f"{shlex.quote(repo_url)} {shlex.quote(clone_dir)}",
             )
         except click.ClickException as exc:
+            message = exc.message
+            if clone_env:
+                # A failed clone's message embeds the full command, env prefix
+                # included — scrub the secret values before the message travels
+                # to logs, SSE status events, and HTTP error bodies.
+                for value in clone_env.values():
+                    for needle in (shlex.quote(value), value):
+                        message = message.replace(needle, "***")
             # Provider boundary: re-raise with the repository named so the
             # create-session 502 says WHAT failed to clone, not just that a
             # sandbox command exited non-zero.
             raise click.ClickException(
                 f"failed to clone repository '{repo_url}'"
-                f"{f' (branch {repo_branch!r})' if repo_branch else ''}: {exc.message}"
+                f"{f' (branch {repo_branch!r})' if repo_branch else ''}: {message}"
             ) from exc
         return clone_dir
 
