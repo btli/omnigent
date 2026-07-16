@@ -4385,11 +4385,13 @@ def test_list_projects_returns_distinct_names_sorted(
     conversation_store: SqlAlchemyConversationStore,
     db_uri: str,
 ) -> None:
-    """Project rows with live members are returned once in name order."""
+    """Every live owned project row is returned once in name order."""
     projects = SqlAlchemyProjectStore(db_uri)
     sprint = projects.create("alice", "Sprint 42")
     customer = projects.create("alice", "Customer X")
-    projects.create("alice", "Empty")
+    empty = projects.create("alice", "Empty")
+    archived_row = projects.create("alice", "Archived row")
+    projects.archive(archived_row.id, "alice", expected_row_version=1)
     foreign = projects.create("bob", "Foreign")
     a1 = conversation_store.create_conversation()
     a2 = conversation_store.create_conversation()
@@ -4403,6 +4405,7 @@ def test_list_projects_returns_distinct_names_sorted(
 
     assert [(item.id, item.name) for item in conversation_store.list_projects("alice")] == [
         (customer.id, "Customer X"),
+        (empty.id, "Empty"),
         (sprint.id, "Sprint 42"),
     ]
 
@@ -4416,11 +4419,11 @@ def test_list_projects_empty_when_no_project_labels(
     assert conversation_store.list_projects("alice") == []
 
 
-def test_list_projects_excludes_all_archived_projects(
+def test_list_projects_includes_projects_with_only_archived_members(
     conversation_store: SqlAlchemyConversationStore,
     db_uri: str,
 ) -> None:
-    """Live and archived variants select by member state, including mixed."""
+    """The live variant lists rows; the archived variant still requires members."""
     projects = SqlAlchemyProjectStore(db_uri)
     gone = projects.create("alice", "Gone")
     mixed = projects.create("alice", "Mixed")
@@ -4434,7 +4437,7 @@ def test_list_projects_excludes_all_archived_projects(
     conversation_store.update_conversation(solo.id, archived=True)
     conversation_store.update_conversation(mix_archived.id, archived=True)
 
-    assert [item.name for item in conversation_store.list_projects("alice")] == ["Mixed"]
+    assert [item.name for item in conversation_store.list_projects("alice")] == ["Gone", "Mixed"]
     assert [item.name for item in conversation_store.list_projects("alice", archived=True)] == [
         "Gone",
         "Mixed",

@@ -1,13 +1,11 @@
 """Browser e2e for the sidebar's session projects.
 
 Projects group conversations under named, collapsible folders inside a
-"Projects" sidebar group. Membership is stored server-side as a
-``conversation_labels`` row with the reserved key ``"omni_project"`` (no new
-table — see ``sqlalchemy_store.list_projects`` / the ``project`` filter on
-``list_conversations``). The web UI moves a session via the row kebab's
-**"Change project"** submenu (``data-testid="move-to-project"``), which calls
-``PATCH /v1/sessions/{id}`` with ``{labels:{omni_project}}`` (an empty value
-removes the label).
+"Projects" sidebar group. Membership is stored server-side as the session's
+first-class ``metadata.project_id``. The web UI moves a session via the row
+kebab's **"Change project"** submenu (``data-testid="move-to-project"``), which
+calls ``PATCH /v1/sessions/{id}`` with ``project_id`` (an empty value removes
+the membership).
 
 The web UI move submenu is labelled "Add to project" (unfiled) or
 "Move session" (already filed); both share ``data-testid="move-to-project"``.
@@ -134,9 +132,7 @@ def test_remove_session_from_project(
     page.get_by_test_id("move-to-project").click()
     # The kebab item names the project it removes from ("Remove from <name>").
     page.get_by_role("menuitem", name=re.compile(rf"Remove from {re.escape(project)}")).click()
-    # Removal is confirmed (it may delete the implicit project) — accept it.
-    page.get_by_role("button", name="Remove from project", exact=True).click()
 
-    # Back under "Sessions", and the now-empty project folder is gone.
+    # Back under "Sessions"; the now-empty first-class project persists.
     expect(_section(page, "Sessions").locator(f'a[href="/c/{session_id}"]')).to_be_visible()
-    expect(page.get_by_role("button", name=project, exact=True)).to_have_count(0)
+    expect(page.get_by_role("button", name=project, exact=True)).to_be_visible()

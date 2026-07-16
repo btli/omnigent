@@ -390,9 +390,8 @@ export function useArchiveConversation() {
     onSuccess: (updated) => {
       markConversationSeen(updated.id, updated.updated_at);
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
-      // Archiving/unarchiving the last (or first) non-archived member of a
-      // project removes/restores it from the server's project list, and adds
-      // or drops it from that project folder's own paginated list.
+      // Archiving changes the folder's paginated sessions and whether the
+      // project appears in the archived-session filter.
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
       void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
@@ -462,10 +461,8 @@ export function useStopAndDeleteConversation() {
       }
       queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
       queryClient.removeQueries({ queryKey: ["session", id] });
-      // Deleting the last member of a project empties it, so refresh the
-      // project list to drop the now-empty folder. Unlike the conversations
-      // list, /v1/sessions/projects reads the DB directly (no search-index
-      // lag), so this can't resurrect the deleted row.
+      // Keep project identities and their derived session state fresh. This
+      // endpoint reads the DB directly, so it has no search-index race.
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECTS_KEY });
@@ -582,8 +579,8 @@ export function useBulkDeleteConversations() {
         queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
         queryClient.removeQueries({ queryKey: ["session", id] });
       }
-      // Refresh the project list so a project emptied by these deletes drops
-      // its now-empty folder (DB-direct read, no search-index lag).
+      // Refresh project identities and derived session state (DB-direct read,
+      // with no search-index lag).
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECTS_KEY });
@@ -705,7 +702,7 @@ function projectRenameStatus(error: unknown): number | null {
   return typeof error.status === "number" ? error.status : null;
 }
 
-/** Fetch projects with at least one active session. */
+/** Fetch every non-archived project owned by the viewer. */
 export function useProjects() {
   return useQuery<Project[]>({
     queryKey: ["projects"],
@@ -861,27 +858,6 @@ async function fetchAllProjectSessionIds(projectId: string): Promise<string[]> {
   return ids;
 }
 
-/**
- * Fetch up to `limit` session ids filed under a project (archived included),
- * server-side via the `?project_id=` filter. A single page — enough to answer
- * "is this session the project's last member?" reliably (unaffected by the
- * sidebar's loaded window or pin-precedence placement). Default `limit=2` is
- * the minimum that distinguishes "only this one" from "more than one".
- */
-export async function fetchProjectSessionIds(projectId: string, limit = 2): Promise<string[]> {
-  const params = new URLSearchParams({
-    order: "desc",
-    sort_by: "updated_at",
-    limit: String(limit),
-    include_archived: "true",
-    project_id: projectId,
-  });
-  const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const page = (await res.json()) as ConversationsPage;
-  return page.data.map((conv) => conv.id);
-}
-
 /** One page of a project's (non-archived) sessions, newest-first. */
 async function fetchProjectSessionsPage(
   projectId: string,
@@ -936,11 +912,8 @@ export function useNewestProjectSession(projectId: string | null) {
 }
 
 /**
- * Delete a whole project by ARCHIVING every session filed under it. The
- * Sessions keep their first-class membership (so unarchiving restores them to
- * this project) and their history; they only leave the active sidebar. The
- * server's active-project list excludes all-archived projects, so the folder
- * disappears once its last member is archived. Throws
+ * Delete a whole project by archiving every member session and then the
+ * first-class project row. Sessions keep their membership and history. Throws
  * `{ failed, succeeded, total }` if any session failed (e.g. a shared session
  * the user can't modify), leaving those sessions in place.
  */
@@ -964,6 +937,16 @@ export function useDeleteProject() {
         }
       }
       if (failed.length > 0) throw { failed, succeeded, total: ids.length };
+      const projectUrl = `/v1/projects/${encodeURIComponent(projectId)}`;
+      const current = await authenticatedFetch(projectUrl);
+      if (!current.ok) throw new Error(`${current.status} ${current.statusText}`);
+      const etag = current.headers.get("ETag");
+      if (!etag) throw new Error("Project response did not include an ETag");
+      const archived = await authenticatedFetch(`${projectUrl}/archive`, {
+        method: "POST",
+        headers: { "If-Match": etag },
+      });
+      if (!archived.ok) throw new Error(`${archived.status} ${archived.statusText}`);
       return { succeeded, failed };
     },
     onSettled: () => {

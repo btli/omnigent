@@ -403,8 +403,7 @@ describe("useStopAndDeleteConversation cache eviction", () => {
     // this hook shape fixes) — so the list is patched in place, never
     // invalidated.
     expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["conversations"] });
-    // The project list IS refreshed (DB-direct, no reindex race) so a project
-    // emptied by the delete drops its now-empty folder without a reload.
+    // Project-derived state is refreshed from the DB without a reindex race.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });
   });
 });
@@ -930,8 +929,7 @@ describe("useArchiveConversation", () => {
     expect(url).toBe("/v1/sessions/conv_a");
     expect(init.method).toBe("PATCH");
     expect(JSON.parse(init.body as string)).toEqual({ archived: true });
-    // Projects must refresh too: archiving the last live member of a project
-    // removes its folder; unarchiving restores it.
+    // Project session state and archived filters must refresh too.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });
   });
@@ -951,8 +949,8 @@ describe("useDeleteProject", () => {
     });
   }
 
-  it("archives every session in the project (keeping membership) and refreshes the lists", async () => {
-    // 1st call: page of project members. Then one PATCH archive per member.
+  it("archives every member and then archives the project row with its ETag", async () => {
+    // List members, archive each one, read the project ETag, then archive the row.
     fetchMock
       .mockResolvedValueOnce(
         mockResponse({
@@ -966,7 +964,16 @@ describe("useDeleteProject", () => {
         }),
       )
       .mockResolvedValueOnce(archivedConv("conv_a"))
-      .mockResolvedValueOnce(archivedConv("conv_b"));
+      .mockResolvedValueOnce(archivedConv("conv_b"))
+      .mockResolvedValueOnce(
+        mockResponse(
+          { id: "proj_sprint_42", name: "Sprint 42", row_version: 7 },
+          { headers: { ETag: '"7"' } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        mockResponse({ id: "proj_sprint_42", name: "Sprint 42", row_version: 8 }),
+      );
 
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
     const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
@@ -984,7 +991,7 @@ describe("useDeleteProject", () => {
 
     // Each member is archived via PATCH — NOT deleted, and project membership is
     // left intact so unarchiving restores the session to its project.
-    const patches = (fetchMock.mock.calls.slice(1) as [string, RequestInit][]).map(
+    const patches = (fetchMock.mock.calls.slice(1, 3) as [string, RequestInit][]).map(
       ([url, init]) => ({ url, init }),
     );
     expect(patches.map((p) => p.url).sort()).toEqual([
@@ -995,6 +1002,12 @@ describe("useDeleteProject", () => {
       expect(init.method).toBe("PATCH");
       expect(JSON.parse(init.body as string)).toEqual({ archived: true });
     }
+
+    expect(fetchMock.mock.calls[3][0]).toBe("/v1/projects/proj_sprint_42");
+    const [archiveUrl, archiveInit] = fetchMock.mock.calls[4] as [string, RequestInit];
+    expect(archiveUrl).toBe("/v1/projects/proj_sprint_42/archive");
+    expect(archiveInit.method).toBe("POST");
+    expect(new Headers(archiveInit.headers).get("If-Match")).toBe('"7"');
 
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });

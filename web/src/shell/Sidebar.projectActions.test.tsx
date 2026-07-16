@@ -48,7 +48,6 @@ vi.mock("@/hooks/useConversations", () => ({
   useCreateProject: () => ({ mutate: vi.fn(), isPending: false }),
   useDeleteProject: () => mocks.del,
   useRenameProject: () => mocks.rename,
-  fetchProjectSessionIds: () => Promise.resolve([]),
 }));
 
 vi.mock("./AgentTypeFilter", () => ({ AgentTypeFilter: () => null }));

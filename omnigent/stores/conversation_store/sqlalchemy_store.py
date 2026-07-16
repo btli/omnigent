@@ -1977,26 +1977,27 @@ class SqlAlchemyConversationStore(ConversationStore):
         *,
         archived: bool = False,
     ) -> list[ProjectIdentity]:
-        """Return owned projects having at least one member in the requested state."""
-        statement = (
-            select(SqlProject.id, SqlProject.name)
-            .join(
+        """Return live owned projects, or those having an archived member."""
+        statement = select(SqlProject.id, SqlProject.name).where(
+            SqlProject.workspace_id == current_workspace_id(),
+            SqlProject.owner_principal_id == owner_principal_id,
+            SqlProject.archived_at.is_(None),
+        )
+        if archived:
+            statement = statement.join(
                 SqlConversationMetadata,
                 and_(
                     SqlConversationMetadata.workspace_id == SqlProject.workspace_id,
                     SqlConversationMetadata.project_id == SqlProject.id,
                 ),
-            )
-            .where(
+            ).where(
                 SqlProject.workspace_id == current_workspace_id(),
-                SqlProject.owner_principal_id == owner_principal_id,
-                SqlProject.archived_at.is_(None),
                 SqlConversationMetadata.workspace_id == current_workspace_id(),
-                SqlConversationMetadata.archived.is_(archived),
+                SqlConversationMetadata.archived.is_(True),
             )
-            .group_by(SqlProject.id, SqlProject.name, SqlProject.normalized_name)
-            .order_by(SqlProject.normalized_name, SqlProject.id)
-        )
+        statement = statement.group_by(
+            SqlProject.id, SqlProject.name, SqlProject.normalized_name
+        ).order_by(SqlProject.normalized_name, SqlProject.id)
         with self._session() as session:
             return [
                 ProjectIdentity(id=row.id, name=row.name)

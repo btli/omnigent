@@ -42,7 +42,6 @@ vi.mock("@/hooks/useConversations", () => ({
   useCreateProject: () => ({ mutate: vi.fn(), isPending: false }),
   useMoveToProject: () => ({ mutate: vi.fn() }),
   useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  fetchProjectSessionIds: () => Promise.resolve([]),
 }));
 
 // Heavy sibling widgets pull their own hooks/providers; stub them so this

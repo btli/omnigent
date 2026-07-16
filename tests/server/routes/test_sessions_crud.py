@@ -179,7 +179,7 @@ async def test_patch_session_not_found(client: httpx.AsyncClient) -> None:
 
 
 async def test_list_projects_empty(client: httpx.AsyncClient) -> None:
-    """No project labels anywhere → empty project list."""
+    """No project rows anywhere means an empty project list."""
     resp = await client.get("/v1/sessions/projects")
     assert resp.status_code == 200
     assert resp.json() == []
@@ -205,6 +205,19 @@ async def test_list_projects_returns_names_sorted(
         {"id": customer.id, "name": "Customer X"},
         {"id": sprint.id, "name": "Sprint 42"},
     ]
+
+
+async def test_list_projects_includes_memberless_project(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A first-class project persists in the live list without sessions."""
+    project = SqlAlchemyProjectStore(db_uri).create(RESERVED_USER_LOCAL, "Empty")
+
+    resp = await client.get("/v1/sessions/projects")
+
+    assert resp.status_code == 200
+    assert resp.json() == [{"id": project.id, "name": "Empty"}]
 
 
 # ── GET /v1/sessions?project= (filter) ───────────────────────────────
