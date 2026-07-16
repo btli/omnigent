@@ -12397,6 +12397,8 @@ async def _resolve_legacy_project_label(
     project_store: ProjectStore | None,
     *,
     write_path: str,
+    explicit_project_requested: bool = False,
+    explicit_project_id: str | None = None,
 ) -> tuple[dict[str, str], str | None, bool]:
     """Consume a legacy project label and resolve its authoritative project id."""
     if PROJECT_LABEL_KEY not in labels:
@@ -12405,6 +12407,11 @@ async def _resolve_legacy_project_label(
     clean_labels = {key: value for key, value in labels.items() if key != PROJECT_LABEL_KEY}
     project_name = labels[PROJECT_LABEL_KEY]
     if not project_name:
+        if explicit_project_requested and explicit_project_id is not None:
+            raise OmnigentError(
+                "project_id and omni_project label refer to different projects",
+                code=ErrorCode.INVALID_INPUT,
+            )
         return clean_labels, None, True
     if project_store is None:
         raise OmnigentError(
@@ -12416,6 +12423,14 @@ async def _resolve_legacy_project_label(
         project_name,
         owner_principal_id,
     )
+    resolved_project_id = project.id if project is not None else None
+    if explicit_project_requested and (
+        project is None or explicit_project_id != resolved_project_id
+    ):
+        raise OmnigentError(
+            "project_id and omni_project label refer to different projects",
+            code=ErrorCode.INVALID_INPUT,
+        )
     if project is None:
         project = await asyncio.to_thread(
             project_store.create,
@@ -12487,18 +12502,10 @@ async def _create_session_from_existing_agent(
         owner_principal_id,
         project_store,
         write_path="json_create",
+        explicit_project_requested=explicit_project_requested,
+        explicit_project_id=body.project_id or None,
     )
-    if (
-        explicit_project_requested
-        and legacy_project_requested
-        and (body.project_id or None) != legacy_project_id
-    ):
-        raise OmnigentError(
-            "project_id and omni_project label refer to different projects",
-            code=ErrorCode.INVALID_INPUT,
-        )
     body = body.model_copy(update={"labels": clean_labels})
-    forward_legacy_membership = legacy_project_requested and not explicit_project_requested
 
     project_snapshot: LiveProjectSnapshot | None = None
     if body.project_id is not None and body.parent_session_id is None:
@@ -12551,6 +12558,19 @@ async def _create_session_from_existing_agent(
             project_row_version=project.row_version,
             defaults_schema_version=project.defaults_schema_version,
             defaults_json=resolved.model_dump(mode="json"),
+        )
+    elif (
+        legacy_project_requested
+        and not explicit_project_requested
+        and legacy_project_id is not None
+        and body.parent_session_id is None
+    ):
+        project_snapshot = LiveProjectSnapshot(
+            project_id=legacy_project_id,
+            project_row_version=None,
+            defaults_schema_version=1,
+            defaults_json={},
+            snapshot_origin="moved",
         )
 
     agent = await asyncio.to_thread(agent_store.get, body.agent_id)
@@ -12788,15 +12808,6 @@ async def _create_session_from_existing_agent(
             )
         raise
 
-    if forward_legacy_membership:
-        membership_updated = await asyncio.to_thread(
-            conversation_store.set_project_membership,
-            conv.id,
-            legacy_project_id,
-        )
-        if not membership_updated:
-            raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
-
     # The create request has no conv id in its URL, so the path-based
     # FastAPI hook can't tag it — stamp the minted id so the create span
     # joins the session's session.id group.
@@ -12944,6 +12955,7 @@ def _create_session_from_bundle(
     metadata: SessionCreateMetadata,
     bundle_bytes: bytes,
     runner_id: str | None = None,
+    project_snapshot: LiveProjectSnapshot | None = None,
 ) -> CreatedSessionResponse:
     """
     Validate, store, and persist a bundled session request.
@@ -12968,6 +12980,8 @@ def _create_session_from_bundle(
         parent session (caller-resolved, ownership-checked),
         e.g. ``"runner_abc123"``. ``None`` leaves the session
         unbound.
+    :param project_snapshot: Optional atomic project membership for
+        the new top-level session.
     :returns: Response with the new session id.
     :raises OmnigentError: If bundle validation or agent insert
         integrity checks fail, or the parent session vanished
@@ -13005,6 +13019,7 @@ def _create_session_from_bundle(
         agent_bundle_location=agent_bundle_location,
         agent_description=spec.description,
         runner_id=runner_id,
+        project_snapshot=project_snapshot,
     )
 
 
@@ -13018,6 +13033,7 @@ def _persist_stored_session_bundle(
     agent_bundle_location: str,
     agent_description: str | None,
     runner_id: str | None = None,
+    project_snapshot: LiveProjectSnapshot | None = None,
 ) -> CreatedSessionResponse:
     """
     Persist database rows for a bundle already written to artifacts.
@@ -13034,6 +13050,8 @@ def _persist_stored_session_bundle(
     :param agent_description: Optional description from the spec.
     :param runner_id: Optional runner binding inherited from the
         parent session, e.g. ``"runner_abc123"``.
+    :param project_snapshot: Optional atomic project membership for
+        the new top-level session.
     :returns: Response with the new session id.
     :raises OmnigentError: If the agent insert violates integrity
         checks or the parent session no longer exists.
@@ -13053,6 +13071,7 @@ def _persist_stored_session_bundle(
             terminal_launch_args=metadata.terminal_launch_args,
             parent_conversation_id=metadata.parent_session_id,
             runner_id=runner_id,
+            project_snapshot=project_snapshot,
         )
     except ConversationNotFoundError as exc:
         # Parent was authorized by the caller but vanished (deleted)
@@ -14760,6 +14779,19 @@ def create_sessions_router(
             write_path="multipart_create",
         )
         parsed_metadata = parsed_metadata.model_copy(update={"labels": clean_labels})
+        project_snapshot = (
+            LiveProjectSnapshot(
+                project_id=legacy_project_id,
+                project_row_version=None,
+                defaults_schema_version=1,
+                defaults_json={},
+                snapshot_origin="moved",
+            )
+            if legacy_project_requested
+            and legacy_project_id is not None
+            and parsed_metadata.parent_session_id is None
+            else None
+        )
 
         inherited_runner_id: str | None = None
         if parsed_metadata.parent_session_id is not None:
@@ -14779,15 +14811,8 @@ def create_sessions_router(
             parsed_metadata,
             bundle_bytes,
             inherited_runner_id,
+            project_snapshot,
         )
-        if legacy_project_requested:
-            membership_updated = await asyncio.to_thread(
-                conversation_store.set_project_membership,
-                result.session_id,
-                legacy_project_id,
-            )
-            if not membership_updated:
-                raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
         # Top-level creates (no inherited runner) skip the notify —
         # their runner registers itself later.
         if inherited_runner_id is not None:
@@ -15769,15 +15794,8 @@ def create_sessions_router(
                     owner_principal_id,
                     project_store,
                     write_path="patch",
-                )
-            if (
-                explicit_project_requested
-                and legacy_project_requested
-                and explicit_project_id != legacy_project_id
-            ):
-                raise OmnigentError(
-                    "project_id and omni_project label refer to different projects",
-                    code=ErrorCode.INVALID_INPUT,
+                    explicit_project_requested=explicit_project_requested,
+                    explicit_project_id=explicit_project_id,
                 )
             resolved_project_id = (
                 legacy_project_id if legacy_project_requested else explicit_project_id
@@ -15896,6 +15914,12 @@ def create_sessions_router(
             )
             if not membership_updated:
                 raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+            if legacy_project_requested:
+                await asyncio.to_thread(
+                    conversation_store.delete_label,
+                    session_id,
+                    PROJECT_LABEL_KEY,
+                )
         # Archiving hides the session from the default view (and its unread
         # dot), so drop its per-user read-state to bound in-memory growth.
         # Only on archive→true; unarchiving leaves it pruned (reads as seen).

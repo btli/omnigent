@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 
 @dataclass(frozen=True)
@@ -35,12 +35,17 @@ class ProjectIdentity:
 
 @dataclass(frozen=True)
 class LiveProjectSnapshot:
-    """Resolved project provenance written with session metadata."""
+    """Resolved project provenance written with session metadata.
+
+    Legacy-label forwarding uses ``moved`` with no project row version;
+    explicit project creates retain the default ``live`` origin.
+    """
 
     project_id: str
-    project_row_version: int
+    project_row_version: int | None
     defaults_schema_version: int
     defaults_json: dict[str, Any]
+    snapshot_origin: Literal["live", "moved"] = "live"
 
 
 @dataclass(frozen=True)

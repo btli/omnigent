@@ -527,6 +527,7 @@ class PolicyEngine:
                 self._conversation_id,
                 legacy_project_name,
             )
+            self._labels.pop(PROJECT_LABEL_KEY, None)
         if filtered:
             self._store.set_labels(self._conversation_id, filtered)
             self._labels.update(filtered)

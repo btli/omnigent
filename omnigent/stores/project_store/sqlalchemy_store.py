@@ -30,7 +30,7 @@ from omnigent.entities import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.projects.defaults import DEFAULTS_SCHEMA_VERSION, validate_defaults_bundle
-from omnigent.stores.conversation_store import ConversationStore
+from omnigent.stores.conversation_store import PROJECT_LABEL_KEY, ConversationStore
 from omnigent.stores.project_store import UNSET, ProjectInputError, ProjectStore, _Unset
 
 
@@ -555,4 +555,7 @@ class SqlAlchemyProjectStore(ProjectStore):
                     )
                 )
             session.flush()
-            return ProjectBackfillResult(mappings=tuple(mappings))
+            result = ProjectBackfillResult(mappings=tuple(mappings))
+        for assignment in assignments:
+            conversation_store.delete_label(assignment.session_id, PROJECT_LABEL_KEY)
+        return result

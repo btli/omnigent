@@ -139,6 +139,7 @@ def test_policy_project_label_write_forwards_membership_once(
 ) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     conversation = store.create_conversation()
+    store.set_labels(conversation.id, {"omni_project": "Stale project"})
     permissions = SqlAlchemyPermissionStore(db_uri)
     permissions.ensure_user("alice")
     permissions.grant("alice", conversation.id, LEVEL_OWNER)
@@ -147,7 +148,7 @@ def test_policy_project_label_write_forwards_membership_once(
         label_defs={"omni_project": LabelDef(values=["Different project"])},
         ask_timeout=30,
         conversation_id=conversation.id,
-        initial_labels={},
+        initial_labels={"omni_project": "Stale project"},
         conversation_store=store,
     )
 
