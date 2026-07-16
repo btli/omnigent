@@ -48,9 +48,11 @@ def test_resolve_token_by_id_roundtrips(tmp_path) -> None:
         username=None,
         token="tok",
     )
-    assert store.resolve_token(owner_user_id="alice", host_id="h", credential_id=cred.id) == "tok"
+    lease = store.resolve_lease(owner_user_id="alice", host_id="h", credential_id=cred.id)
+    assert lease is not None
+    assert lease.token == "tok"
     assert (
-        store.resolve_token(owner_user_id="alice", host_id="h", credential_id="nonexistent-id")
+        store.resolve_lease(owner_user_id="alice", host_id="h", credential_id="nonexistent-id")
         is None
     )
 
@@ -66,18 +68,19 @@ def test_resolve_token_requires_matching_owner_and_host(tmp_path) -> None:
         token="s3cret",
     )
     # The full, correct authorization tuple decrypts.
-    assert (
-        store.resolve_token(owner_user_id="alice", host_id="acme-forgejo", credential_id=cred.id)
-        == "s3cret"
+    lease = store.resolve_lease(
+        owner_user_id="alice", host_id="acme-forgejo", credential_id=cred.id
     )
+    assert lease is not None
+    assert lease.token == "s3cret"
     # A different user who knows the id gets nothing (the id is not a capability).
     assert (
-        store.resolve_token(owner_user_id="bob", host_id="acme-forgejo", credential_id=cred.id)
+        store.resolve_lease(owner_user_id="bob", host_id="acme-forgejo", credential_id=cred.id)
         is None
     )
     # The right owner but the wrong host also gets nothing.
     assert (
-        store.resolve_token(owner_user_id="alice", host_id="other-host", credential_id=cred.id)
+        store.resolve_lease(owner_user_id="alice", host_id="other-host", credential_id=cred.id)
         is None
     )
 
@@ -94,7 +97,7 @@ def test_resolve_token_malformed_id_returns_none(tmp_path) -> None:
     )
     # A non-hex id addresses no row (InvalidUuidError path) -> None, not a raise.
     assert (
-        store.resolve_token(owner_user_id="alice", host_id="h", credential_id="not-a-uuid") is None
+        store.resolve_lease(owner_user_id="alice", host_id="h", credential_id="not-a-uuid") is None
     )
 
 
@@ -118,11 +121,14 @@ def test_multiple_identities_per_host_coexist(tmp_path) -> None:
     )
     candidates = store.list_for_owner_host("alice", "h")
     assert {c.label for c in candidates} == {"work", "personal"}
-    assert store.resolve_token(owner_user_id="alice", host_id="h", credential_id=work.id) == "wtok"
-    assert (
-        store.resolve_token(owner_user_id="alice", host_id="h", credential_id=personal.id)
-        == "ptok"
+    work_lease = store.resolve_lease(owner_user_id="alice", host_id="h", credential_id=work.id)
+    assert work_lease is not None
+    assert work_lease.token == "wtok"
+    personal_lease = store.resolve_lease(
+        owner_user_id="alice", host_id="h", credential_id=personal.id
     )
+    assert personal_lease is not None
+    assert personal_lease.token == "ptok"
 
 
 def test_list_is_owner_scoped(tmp_path) -> None:
@@ -223,7 +229,7 @@ def test_delete_then_absent(tmp_path) -> None:
     )
     store.delete(cred.id)
     assert store.get(cred.id) is None
-    assert store.resolve_token(owner_user_id="alice", host_id="h", credential_id=cred.id) is None
+    assert store.resolve_lease(owner_user_id="alice", host_id="h", credential_id=cred.id) is None
 
 
 def test_unknown_well_formed_id_returns_none(tmp_path) -> None:
@@ -232,7 +238,7 @@ def test_unknown_well_formed_id_returns_none(tmp_path) -> None:
     store = _store(tmp_path)
     absent = uuid.uuid4().hex  # valid Uuid16, but no such row
     assert store.get(absent) is None
-    assert store.resolve_token(owner_user_id="alice", host_id="h", credential_id=absent) is None
+    assert store.resolve_lease(owner_user_id="alice", host_id="h", credential_id=absent) is None
     store.delete(absent)  # no-op, does not raise
 
 
@@ -253,13 +259,70 @@ def test_credentials_are_workspace_isolated(tmp_path) -> None:
     with workspace_scope(2):
         assert store.get(cred.id) is None
         assert (
-            store.resolve_token(owner_user_id="alice", host_id="h", credential_id=cred.id) is None
+            store.resolve_lease(owner_user_id="alice", host_id="h", credential_id=cred.id) is None
         )
         assert store.list_for_owner("alice") == []
         assert store.list_for_owner_host("alice", "h") == []
     # Back in its own workspace it resolves normally.
     with workspace_scope(1):
-        assert (
-            store.resolve_token(owner_user_id="alice", host_id="h", credential_id=cred.id)
-            == "secret-w1"
+        isolated_lease = store.resolve_lease(
+            owner_user_id="alice", host_id="h", credential_id=cred.id
         )
+        assert isolated_lease is not None
+        assert isolated_lease.token == "secret-w1"
+
+
+def test_resolve_lease_is_uniform_with_no_expiry_for_pat(tmp_path) -> None:
+    store = _store(tmp_path)
+    cred = store.create(
+        owner_user_id="alice",
+        host_id="h",
+        provider="forgejo",
+        label="work",
+        username=None,
+        token="s3cret",
+    )
+    lease = store.resolve_lease(owner_user_id="alice", host_id="h", credential_id=cred.id)
+    assert lease is not None
+    assert lease.token == "s3cret"
+    # PAT is long-lived; the lease shape is uniform (oauth expiry is P3).
+    assert lease.expires_at is None
+
+
+def test_credential_lease_repr_hides_token(tmp_path) -> None:
+    store = _store(tmp_path)
+    cred = store.create(
+        owner_user_id="alice",
+        host_id="h",
+        provider="forgejo",
+        label="work",
+        username=None,
+        token="topsecret",
+    )
+    lease = store.resolve_lease(owner_user_id="alice", host_id="h", credential_id=cred.id)
+    assert lease is not None
+    assert "topsecret" not in repr(lease)
+    assert "redacted" in repr(lease)
+
+
+def test_create_defaults_kind_pat_and_accepts_kind(tmp_path) -> None:
+    store = _store(tmp_path)
+    default = store.create(
+        owner_user_id="alice",
+        host_id="h",
+        provider="forgejo",
+        label="default",
+        username=None,
+        token="t",
+    )
+    assert default.kind == "pat"
+    explicit = store.create(
+        owner_user_id="alice",
+        host_id="h",
+        provider="forgejo",
+        label="oauthy",
+        username=None,
+        token="t",
+        kind="oauth",
+    )
+    assert explicit.kind == "oauth"

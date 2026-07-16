@@ -1,7 +1,7 @@
 """Encrypted-at-rest per-user git credentials.
 
 The store encrypts the token on :meth:`create` and decrypts it *only* in
-:meth:`resolve_token` (called server-side when composing a launch/handoff).
+:meth:`resolve_lease` (called server-side when composing a launch/handoff).
 The :class:`GitCredential` entity deliberately omits the secret so it can never
 be serialized into an API response.
 """
@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError, StatementError
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import InvalidUuidError, SqlGitCredential, current_workspace_id
+from omnigent.db.enum_codecs import decode_git_credential_kind, encode_git_credential_kind
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker, now_epoch
 from omnigent.git_hosts.crypto import GitCredentialCipher
 
@@ -30,9 +31,32 @@ class GitCredential:
     host_id: str
     provider: str
     label: str
+    kind: str
     username: str | None
     created_at: int
     updated_at: int
+
+
+@dataclass(frozen=True, repr=False)
+class CredentialLease:
+    """A resolved, ready-to-use git credential.
+
+    Uniform across credential ``kind`` (design §8.2) so the clone/egress
+    consumer never branches on ``pat`` vs ``oauth``. ``expires_at`` is ``None``
+    for a PAT (long-lived); an OAuth access token (P3) will carry its expiry.
+
+    :param token: The decrypted bearer token/PAT. Never log, repr, or place it
+        in an error message — hence the custom redacting ``__repr__``.
+    :param expires_at: Unix epoch seconds after which the token is invalid, or
+        ``None`` when it does not expire.
+    """
+
+    token: str
+    expires_at: int | None
+
+    def __repr__(self) -> str:
+        """Redact the token so a lease can never leak via logs/tracebacks."""
+        return f"CredentialLease(token=<redacted>, expires_at={self.expires_at!r})"
 
 
 def _find_row(session: Session, credential_id: str) -> SqlGitCredential | None:
@@ -105,6 +129,7 @@ def _row_to_entity(row: SqlGitCredential) -> GitCredential:
         host_id=row.host_id,
         provider=row.provider,
         label=row.label,
+        kind=decode_git_credential_kind(row.kind),
         username=row.username,
         created_at=row.created_at,
         updated_at=row.updated_at,
@@ -128,6 +153,7 @@ class GitCredentialStore:
         label: str,
         username: str | None,
         token: str,
+        kind: str = "pat",
     ) -> GitCredential:
         """Encrypt *token* and store a new credential.
 
@@ -143,6 +169,7 @@ class GitCredentialStore:
             owner_user_id=owner_user_id,
             host_id=host_id,
             provider=provider,
+            kind=encode_git_credential_kind(kind),
             label=label,
             username=username,
             token_ciphertext=self._cipher.encrypt(token),
@@ -213,7 +240,7 @@ class GitCredentialStore:
 
         Not an authorization boundary: ownership is enforced by the route
         layer. A handoff needing an owned, host-bound slot must use
-        :meth:`resolve_token`.
+        :meth:`resolve_lease`.
         """
         with self._session() as session:
             row = _find_row(session, credential_id)
@@ -239,32 +266,32 @@ class GitCredentialStore:
                 if not isinstance(exc.orig, InvalidUuidError):
                     raise
 
-    def resolve_token(
+    def resolve_lease(
         self,
         *,
         owner_user_id: str,
         host_id: str,
         credential_id: str,
-    ) -> str | None:
-        """Decrypt the token for a credential slot, or ``None`` if not authorized.
+    ) -> CredentialLease | None:
+        """Resolve an owned credential slot into a :class:`CredentialLease`.
 
-        The slot is resolved against the full authorization tuple
-        ``(workspace, owner_user_id, host_id, credential_id)`` and decrypted
-        **only** when all four match. A caller supplying another user's id, a
-        mismatched host, a foreign workspace (ambient, via
-        :func:`current_workspace_id`), or a malformed id gets ``None`` — never
-        plaintext. ``credential_id`` is an identifier, not a capability:
-        ownership is proven by the query, not by possession of the id.
+        Authorization is unchanged from the former ``resolve_token``: the slot
+        is resolved against the full tuple ``(workspace, owner_user_id,
+        host_id, credential_id)`` and decrypted **only** on a complete match.
+        A foreign owner/host, a foreign workspace (ambient, via
+        :func:`current_workspace_id`), or a malformed id yields ``None`` —
+        never a lease. ``credential_id`` is an identifier, not a capability.
+
+        The lease is uniform across ``kind`` (design §8.2) so the clone/egress
+        consumer never branches on ``pat`` vs ``oauth``. For a PAT
+        ``expires_at`` is ``None`` (long-lived); OAuth expiry is a P3 extension.
 
         This is the only method that returns plaintext; call server-side only.
-        The caller (the fetch/push handoff) is responsible for the remaining
-        checks the store cannot make — re-deriving the provider from the live
-        operator host config and refusing an unconfigured host.
 
         :param owner_user_id: The authenticated owner the slot must belong to.
         :param host_id: The operator host id the slot must be bound to.
         :param credential_id: The opaque slot id to resolve.
-        :returns: The decrypted token, or ``None`` if no owned row matches.
+        :returns: The lease, or ``None`` if no owned row matches.
         """
         with self._session() as session:
             row = _find_owned_row(
@@ -275,4 +302,8 @@ class GitCredentialStore:
             )
             if row is None:
                 return None
-            return self._cipher.decrypt(row.token_ciphertext)
+            # PAT has no expiry; oauth (P3) will compute expires_at from the
+            # minted access token. The lease shape is uniform either way.
+            return CredentialLease(
+                token=self._cipher.decrypt(row.token_ciphertext), expires_at=None
+            )

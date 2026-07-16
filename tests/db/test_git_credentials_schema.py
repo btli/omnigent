@@ -58,6 +58,7 @@ def test_git_credentials_table_roundtrips(tmp_path) -> None:
         assert {r.label for r in rows} == {"personal", "work"}
         assert all(r.owner_user_id == "alice@example.com" for r in rows)
         assert all(r.workspace_id == 0 for r in rows)  # single-tenant default
+        assert all(r.kind == 1 for r in rows)  # SmallInteger pat code, server_default
 
 
 def test_duplicate_owner_host_label_violates_unique_constraint(tmp_path) -> None:

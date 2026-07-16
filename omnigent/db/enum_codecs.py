@@ -5,7 +5,7 @@ Several low-cardinality closed-set columns (``conversations.kind``,
 ``account_tokens.kind``, ``policies.type``, ``policies.scope``,
 ``hosts.status``, ``agents.kind``, ``scheduled_tasks.state``,
 ``scheduled_tasks.execution_target``,
-``scheduled_task_runs.status``) are stored as
+``scheduled_task_runs.status``, ``git_credentials.kind``) are stored as
 integer codes rather
 than their string names — smaller rows and a tighter ``CHECK`` than a
 free ``VARCHAR``. The string names remain the
@@ -77,6 +77,11 @@ POLICY_TYPE: dict[str, int] = {
 HOST_STATUS: dict[str, int] = {
     "online": 1,
     "offline": 2,
+}
+
+GIT_CREDENTIAL_KIND: dict[str, int] = {
+    "pat": 1,
+    "oauth": 2,
 }
 
 AGENT_KIND: dict[str, int] = {
@@ -249,6 +254,16 @@ def encode_host_status(name: str) -> int:
 def decode_host_status(code: int) -> str:
     """Decode a ``hosts.status`` int code to its name."""
     return _decode(HOST_STATUS, code, field="hosts.status")
+
+
+def encode_git_credential_kind(name: str) -> int:
+    """Encode a ``git_credentials.kind`` name to its int code."""
+    return _encode(GIT_CREDENTIAL_KIND, name, field="git_credentials.kind")
+
+
+def decode_git_credential_kind(code: int) -> str:
+    """Decode a ``git_credentials.kind`` int code to its name."""
+    return _decode(GIT_CREDENTIAL_KIND, code, field="git_credentials.kind")
 
 
 def encode_agent_kind(name: str) -> int:

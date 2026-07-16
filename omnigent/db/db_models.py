@@ -1177,6 +1177,11 @@ class SqlGitCredential(OmnigentBase):
     label: Mapped[str] = mapped_column(String(128), nullable=False)
     username: Mapped[str | None] = mapped_column(String(256), nullable=True)
     token_ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
+    # Enum stored as a stable int code (see omnigent.db.enum_codecs
+    # GIT_CREDENTIAL_KIND: pat=1, oauth=2). Records the credential type; the
+    # resolver normalizes every kind into a uniform lease so consumers never
+    # branch on it. P1 ships pat only (default); oauth is P3.
+    kind: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
     created_at: Mapped[int] = mapped_column(Integer)
     updated_at: Mapped[int] = mapped_column(Integer)
 
@@ -1188,6 +1193,7 @@ class SqlGitCredential(OmnigentBase):
             "label",
             name="uq_git_credentials_workspace_owner_host_label",
         ),
+        CheckConstraint("kind IN (1, 2)", name="ck_git_credentials_kind"),
     )
 
 
