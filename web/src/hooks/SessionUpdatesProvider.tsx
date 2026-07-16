@@ -18,6 +18,7 @@
 import { type ReactNode, useCallback, useEffect, useRef } from "react";
 import { type QueryClient, useQueryClient } from "@tanstack/react-query";
 import { useActiveConversationId } from "@/hooks/useActiveConversationId";
+import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import {
   type ConversationsInfiniteData,
   type SessionListWireItem,
@@ -156,6 +157,21 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     // the open session even when it's off-sidebar.
     const active = activeIdRef.current;
     if (active && !ids.includes(active)) ids.push(active);
+    // Include all child session ids from the sub-agent tree caches so the
+    // server streams status changes for them. When a child's changed frame
+    // arrives below, we invalidate its parent's child_sessions query key,
+    // giving the tree views push-style freshness without polling.
+    const childEntries = queryClient.getQueriesData<ChildSessionInfo[]>({
+      queryKey: ["conversation"],
+    });
+    for (const [key, children] of childEntries) {
+      // Only ["conversation", <id>, "child_sessions"] entries carry child lists.
+      if (Array.isArray(key) && key[2] === "child_sessions" && Array.isArray(children)) {
+        for (const child of children) {
+          if (!ids.includes(child.id)) ids.push(child.id);
+        }
+      }
+    }
     sessionUpdatesSocket.setWatched(ids);
   }, [queryClient]);
 
@@ -203,6 +219,9 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
       switch (frame.type) {
         case "heartbeat":
           return;
+        case "hosts_changed":
+          void queryClient.invalidateQueries({ queryKey: ["hosts"] });
+          return;
         case "removed":
           for (const id of frame.ids) commentsFingerprintsRef.current.delete(id);
           if (removeSessionsFromListCaches(queryClient, frame.ids)) scheduleInvalidate();
@@ -220,6 +239,17 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
               if (!watchedIds.has(id)) commentsFingerprintsRef.current.delete(id);
             }
           }
+          // For child sessions the server includes parent_session_id in the
+          // wire item. Invalidate the parent's child_sessions cache so tree
+          // views (SubagentsPanel, SubagentsGraphView) pick up status changes
+          // without polling.
+          const parentIds = new Set<string>();
+          for (const item of frame.items) {
+            if (item.parent_session_id) parentIds.add(item.parent_session_id);
+          }
+          for (const parentId of parentIds) {
+            void queryClient.invalidateQueries({ queryKey: childSessionsQueryKey(parentId) });
+          }
           const { missingIds, needsRefetch } = applyItemsToCache(
             queryClient,
             frame.items,
@@ -229,7 +259,15 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           // position we can't place locally. Membership-affecting deltas
           // (archive/search/connected filters) and updated_at resorting need
           // the same server-side reconciliation.
-          if (missingIds.length > 0 || needsRefetch) scheduleInvalidate();
+          //
+          // Skip the active session: its updated_at bumps on open before the
+          // initial list fetch returns, so it lands in missingIds even though
+          // it isn't a genuinely new session. Its data is covered by
+          // useSession and it's pinned in the sidebar via ActiveChatOverride.
+          const sidebarMissingIds = activeIdRef.current
+            ? missingIds.filter((id) => id !== activeIdRef.current)
+            : missingIds;
+          if (sidebarMissingIds.length > 0 || needsRefetch) scheduleInvalidate();
           return;
         }
       }
@@ -254,6 +292,11 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
       // folder's list changes (fetch, pagination, splice) so newly loaded
       // folder members join the stream's watch-set.
       if (Array.isArray(key) && (key[0] === "conversations" || key[0] === "project-sessions")) {
+        scheduleWatch();
+      }
+      // Also recompute when a child-sessions list loads so the tree nodes
+      // join the watch-set and the server starts streaming their status.
+      if (Array.isArray(key) && key[0] === "conversation" && key[2] === "child_sessions") {
         scheduleWatch();
       }
     });

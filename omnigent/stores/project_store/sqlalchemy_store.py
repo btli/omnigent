@@ -16,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import (
+    SqlConversation,
     SqlConversationMetadata,
     SqlProject,
     SqlProjectMigrationLedger,
@@ -23,7 +24,12 @@ from omnigent.db.db_models import (
     SqlUser,
     current_workspace_id,
 )
-from omnigent.db.utils import get_or_create_engine, make_managed_session_maker, now_epoch
+from omnigent.db.utils import (
+    get_or_create_conversation_engine,
+    get_or_create_engine,
+    make_managed_session_maker,
+    now_epoch,
+)
 from omnigent.entities import (
     LegacyProjectLabel,
     LiveProjectSnapshot,
@@ -195,10 +201,21 @@ class _BackfillProposal:
 class SqlAlchemyProjectStore(ProjectStore):
     """Relational project persistence with workspace and owner isolation."""
 
-    def __init__(self, storage_location: str) -> None:
+    def __init__(
+        self,
+        storage_location: str,
+        conversation_storage_location: str | None = None,
+    ) -> None:
         super().__init__(storage_location)
         self._engine = get_or_create_engine(storage_location)
+        conv_uri = conversation_storage_location or storage_location
+        self._conv_engine = (
+            self._engine
+            if conv_uri == storage_location
+            else get_or_create_conversation_engine(conv_uri)
+        )
         self._session = make_managed_session_maker(self._engine, immediate=True)
+        self._conv_session = make_managed_session_maker(self._conv_engine)
 
     def create(
         self,
@@ -285,20 +302,38 @@ class SqlAlchemyProjectStore(ProjectStore):
             SqlProject.workspace_id == current_workspace_id(),
             SqlProject.owner_principal_id == owner_principal_id,
         )
-        if archived_members:
-            statement = statement.join(
-                SqlConversationMetadata,
-                (SqlConversationMetadata.workspace_id == SqlProject.workspace_id)
-                & (SqlConversationMetadata.project_id == SqlProject.id),
-            ).where(
-                SqlProject.archived_at.is_(None),
-                SqlConversationMetadata.archived.is_(True),
-            )
-        elif not include_archived:
+        if archived_members or not include_archived:
             statement = statement.where(SqlProject.archived_at.is_(None))
         statement = statement.order_by(SqlProject.normalized_name, SqlProject.id).distinct()
         with self._session() as session:
-            return [_to_entity(row) for row in session.execute(statement).scalars().all()]
+            projects = [_to_entity(row) for row in session.execute(statement).scalars().all()]
+            if not archived_members or not projects:
+                return projects
+            memberships = session.execute(
+                select(SqlConversationMetadata.id, SqlConversationMetadata.project_id).where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.project_id.in_([project.id for project in projects]),
+                )
+            ).all()
+
+        session_to_project = {row.id: row.project_id for row in memberships}
+        archived_session_ids: set[str] = set()
+        with self._conv_session() as session:
+            session_ids = list(session_to_project)
+            for offset in range(0, len(session_ids), 500):
+                archived_session_ids.update(
+                    session.execute(
+                        select(SqlConversation.id).where(
+                            SqlConversation.workspace_id == current_workspace_id(),
+                            SqlConversation.id.in_(session_ids[offset : offset + 500]),
+                            SqlConversation.archived.is_(True),
+                        )
+                    ).scalars()
+                )
+        archived_project_ids = {
+            session_to_project[session_id] for session_id in archived_session_ids
+        }
+        return [project for project in projects if project.id in archived_project_ids]
 
     def transfer(
         self,

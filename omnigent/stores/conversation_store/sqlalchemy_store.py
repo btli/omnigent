@@ -24,7 +24,7 @@ from sqlalchemy import (
     text,
     update,
 )
-from sqlalchemy.orm import QueryableAttribute, Session
+from sqlalchemy.orm import QueryableAttribute, Session, aliased
 from sqlalchemy.sql.selectable import Subquery
 
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
@@ -44,9 +44,9 @@ from omnigent.db.db_models import (
     SqlSessionProjectSnapshot,
     SqlUserDailyCost,
     current_workspace_id,
+    uuid_to_bytes,
 )
 from omnigent.db.enum_codecs import (
-    decode_conversation_kind,
     decode_item_status,
     decode_item_type,
     encode_agent_kind,
@@ -81,13 +81,19 @@ from omnigent.entities import (
     project_snapshot_values,
 )
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.session_import.models import (
+    IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
+    IMPORT_SOURCE_LABEL_KEY,
+)
 from omnigent.stores.conversation_store import (
+    _FORK_ONLY_DROPPED_LABEL_KEYS,
     _INSTANCE_SCOPED_LABEL_KEYS,
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
     PROJECT_LABEL_KEY,
     SWITCH_PREVIOUS_BUILTIN_LABEL_KEY,
+    ConversationAlreadyExistsError,
     ConversationNotFoundError,
     ConversationStore,
     CreatedSession,
@@ -169,7 +175,11 @@ def _to_conversation(
         created_at=row.created_at,
         updated_at=row.updated_at,
         title=row.title or None,  # empty string → None at entity layer
-        kind=decode_conversation_kind(meta.kind) if meta else "default",
+        # kind is derived from parent-nullness, not the stored metadata column:
+        # a conversation is a sub-agent iff it has a parent. This is the single
+        # source of truth (every writer couples them) and stays correct even for
+        # an orphaned row whose metadata write crashed (``meta is None``).
+        kind="sub_agent" if row.parent_conversation_id is not None else "default",
         parent_conversation_id=row.parent_conversation_id,
         root_conversation_id=row.root_conversation_id,
         agent_id=agent_config.agent_id if agent_config else None,
@@ -198,7 +208,7 @@ def _to_conversation(
         ),
         workspace=meta.workspace if meta else None,
         git_branch=meta.git_branch if meta else None,
-        archived=meta.archived if meta else False,
+        archived=row.archived,
     )
 
 
@@ -306,7 +316,6 @@ def _new_session_metadata_row(
         terminal_launch_args=(
             json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
         ),
-        archived=False,
     )
 
 
@@ -641,20 +650,31 @@ def _ranked_latest_message_items(conversation_ids: list[str]) -> Subquery:
     """
     Build a ranked latest-message subquery for multiple conversations.
 
-    Selects all ``SqlConversationItem`` columns plus a per-conversation
-    ``row_num`` so the caller can filter to the top-N rows without a
-    join back to the base table. Avoiding the join is critical: the
-    primary key is ``(workspace_id, conversation_id, id)``, so a join
-    on ``id`` alone forces a full table scan.
+    Selects only the columns :func:`_to_item` needs (plus ``conversation_id``
+    and ``position`` for grouping/ordering) and a per-conversation ``row_num``
+    so the caller can filter to the top-N rows without a join back to the base
+    table. Avoiding the join is critical: the primary key is
+    ``(workspace_id, conversation_id, id)``, so a join on ``id`` alone forces a
+    full table scan. The heavy ``search_text`` column is deliberately omitted —
+    the message-preview caller never reads it, and it roughly doubles the bytes
+    pulled per row on a chatty conversation.
 
     :param conversation_ids: Conversation ids to fetch messages for,
         e.g. ``["conv_child1", "conv_child2"]``.
-    :returns: SQLAlchemy subquery with all item columns plus per-conversation
-        ``row_num``, newest message first.
+    :returns: SQLAlchemy subquery with the projected item columns plus
+        per-conversation ``row_num``, newest message first.
     """
     return (
         select(
-            SqlConversationItem,
+            SqlConversationItem.conversation_id,
+            SqlConversationItem.id,
+            SqlConversationItem.response_id,
+            SqlConversationItem.created_at,
+            SqlConversationItem.status,
+            SqlConversationItem.position,
+            SqlConversationItem.type,
+            SqlConversationItem.data,
+            SqlConversationItem.created_by,
             func.row_number()
             .over(
                 partition_by=SqlConversationItem.conversation_id,
@@ -831,29 +851,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             # want here.
             session.execute(
                 text("UPDATE conversations SET updated_at = updated_at WHERE id = :id"),
-                {"id": conversation_id},
+                # Raw SQL bypasses the Uuid16 decorator; bind the 16-byte form
+                # so the WHERE matches the binary id column.
+                {"id": uuid_to_bytes(conversation_id)},
             )
-
-    @staticmethod
-    def _set_metadata_archive_state(
-        session: Session,
-        conversation_ids: list[str],
-        archived: bool,
-    ) -> int:
-        """Apply the canonical metadata archival flag update in bounded chunks."""
-        changed = 0
-        for id_chunk in _chunked_ids(conversation_ids):
-            result = session.execute(
-                update(SqlConversationMetadata)
-                .where(
-                    SqlConversationMetadata.workspace_id == current_workspace_id(),
-                    SqlConversationMetadata.id.in_(id_chunk),
-                    SqlConversationMetadata.archived.is_not(archived),
-                )
-                .values(archived=archived)
-            )
-            changed += result.rowcount
-        return changed
 
     @staticmethod
     def _lock_active_project(session: Session, project_id: str) -> SqlProject:
@@ -903,6 +904,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
         project_snapshot: LiveProjectSnapshot | None = None,
+        conversation_id: str | None = None,
     ) -> Conversation:
         """
         Create a new conversation in the database.
@@ -951,12 +953,16 @@ class SqlAlchemyConversationStore(ConversationStore):
             terminal.
         :param project_snapshot: Optional project membership provenance
             to insert atomically with the session.
+        :param conversation_id: Optional caller-supplied identifier.
+            ``None`` generates a new random id.
         :returns: The newly created :class:`Conversation`.
         :raises NameAlreadyExistsError: If
             ``parent_conversation_id`` is set and a sibling row
             with the same ``title`` already exists.
         :raises IntegrityError: If ``host_id`` is set without
             ``workspace`` (the check constraint catches it).
+        :raises ConversationAlreadyExistsError: If a caller-supplied
+            ``conversation_id`` is already in use.
         """
         from sqlalchemy.exc import IntegrityError
 
@@ -966,7 +972,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
 
         now = now_epoch()
-        new_id = generate_conversation_id()
+        new_id = conversation_id if conversation_id is not None else generate_conversation_id()
         if parent_conversation_id is not None and project_snapshot is not None:
             raise ValueError("project snapshots are top-level-only")
         try:
@@ -1012,7 +1018,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                             if terminal_launch_args is not None
                             else None
                         ),
-                        archived=False,
                     )
                     session.add_all((row, agent_config, meta))
                     if project_snapshot is not None:
@@ -1063,7 +1068,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 terminal_launch_args=(
                     json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
                 ),
-                archived=False,
             )
             meta_session_factory = (
                 self._session_immediate if project_snapshot is not None else self._session
@@ -1093,6 +1097,36 @@ class SqlAlchemyConversationStore(ConversationStore):
             # check, which would misclassify any future unique
             # constraint added to the conversations table.
             msg = str(exc).lower()
+            is_id_unique_violation = conversation_id is not None and (
+                "conversations_pkey" in msg
+                or "agent_configuration_pkey" in msg
+                or (
+                    "duplicate entry" in msg
+                    and (
+                        "for key 'primary'" in msg
+                        or "for key 'conversations.primary'" in msg
+                        or "for key 'agent_configuration.primary'" in msg
+                    )
+                )
+                or (
+                    "unique" in msg
+                    and (
+                        (
+                            "conversations.workspace_id" in msg
+                            and "conversations.id" in msg
+                            and "parent_conversation_id" not in msg
+                        )
+                        or (
+                            "agent_configuration.workspace_id" in msg
+                            and "agent_configuration.conversation_id" in msg
+                        )
+                    )
+                )
+            )
+            if is_id_unique_violation:
+                raise ConversationAlreadyExistsError(
+                    f"conversation id {conversation_id!r} already exists"
+                ) from exc
             is_title_unique_violation = "ix_conversations_parent_title_unique" in msg or (
                 "unique" in msg and "parent_conversation_id" in msg and "title" in msg
             )
@@ -1107,13 +1141,13 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         Fetch a conversation by its unique ID.
 
-        Populates ``Conversation.labels`` via a second query
-        against ``conversation_labels`` — separate from the
-        conversation row fetch because the label JOIN would
-        otherwise multiply the row count by the label count
-        and require post-processing. The two queries run in
-        the same session so they see a consistent snapshot
-        under serializable isolation.
+        Issues two queries inside one session:
+
+        1. A single LEFT OUTER JOIN of ``conversations`` +
+           ``agent_configuration`` (same PK, same DB) so both rows
+           arrive in one round-trip instead of two serial
+           ``session.get`` calls.
+        2. A label fetch on ``conversation_labels``.
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -1121,16 +1155,58 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``None``.
         """
         with self._conv_session() as session:
-            row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
-            if row is None:
+            result = session.execute(
+                select(SqlConversation, SqlAgentConfiguration)
+                .outerjoin(
+                    SqlAgentConfiguration,
+                    (SqlAgentConfiguration.workspace_id == SqlConversation.workspace_id)
+                    & (SqlAgentConfiguration.conversation_id == SqlConversation.id),
+                )
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id == conversation_id,
+                )
+            ).first()
+            if result is None:
                 return None
-            agent_config = session.get(
-                SqlAgentConfiguration, (current_workspace_id(), conversation_id)
-            )
+            row, agent_config = result
             meta = self._get_meta(session, conversation_id)
             return _to_conversation(
                 row, meta, _fetch_labels(session, conversation_id), agent_config
             )
+
+    def find_imported_conversation(
+        self,
+        source: str,
+        external_session_id: str,
+    ) -> Conversation | None:
+        """Find the original conversation carrying an import provenance pair."""
+        source_label = aliased(SqlConversationLabel)
+        external_label = aliased(SqlConversationLabel)
+        with self._conv_session() as session:
+            conversation_id = session.execute(
+                select(SqlConversation.id)
+                .join(
+                    source_label,
+                    (source_label.workspace_id == SqlConversation.workspace_id)
+                    & (source_label.conversation_id == SqlConversation.id),
+                )
+                .join(
+                    external_label,
+                    (external_label.workspace_id == SqlConversation.workspace_id)
+                    & (external_label.conversation_id == SqlConversation.id),
+                )
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    source_label.key == IMPORT_SOURCE_LABEL_KEY,
+                    source_label.value == source,
+                    external_label.key == IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
+                    external_label.value == external_session_id,
+                )
+                .order_by(SqlConversation.created_at, SqlConversation.id)
+                .limit(1)
+            ).scalar_one_or_none()
+        return self.get_conversation(conversation_id) if conversation_id is not None else None
 
     def get_runner_ids(self, conversation_ids: list[str]) -> dict[str, str | None]:
         """
@@ -1276,10 +1352,13 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         Return direct sub-agent child ids grouped by parent conversation.
 
-        Uses the partial ``idx_conversations_parent`` index by filtering on
-        ``kind="sub_agent"`` plus ``parent_conversation_id IN (...)``. This
-        gives sidebar session-list status roll-up one batched identity query
-        instead of one full child listing per visible parent row.
+        A conversation has a parent iff it is a sub-agent (``kind`` is fully
+        determined by parent nullness), so filtering on
+        ``parent_conversation_id IN (...)`` alone already yields exactly the
+        sub-agent children — no metadata ``kind`` lookup needed. This resolves
+        as one batched query on the AP ``idx_conversations_parent`` index,
+        giving sidebar session-list status roll-up one identity query instead
+        of one full child listing per visible parent row.
 
         :param parent_conversation_ids: Parent conversation ids to
             inspect, e.g. ``["conv_parent1", "conv_parent2"]``.
@@ -1293,26 +1372,11 @@ class SqlAlchemyConversationStore(ConversationStore):
         if not unique_ids:
             return result
 
-        # kind is in the Omnigent DB (metadata); get IDs of sub_agent conversations.
-        sub_agent_kind = encode_conversation_kind("sub_agent")
-        with self._session() as meta_sess:
-            sub_agent_ids = set(
-                meta_sess.execute(
-                    select(SqlConversationMetadata.id).where(
-                        SqlConversationMetadata.workspace_id == current_workspace_id(),
-                        SqlConversationMetadata.kind == sub_agent_kind,
-                    )
-                )
-                .scalars()
-                .all()
-            )
-
         with self._conv_session() as ap_sess:
             rows = ap_sess.execute(
                 select(SqlConversation.parent_conversation_id, SqlConversation.id)
                 .where(SqlConversation.workspace_id == current_workspace_id())
                 .where(SqlConversation.parent_conversation_id.in_(unique_ids))
-                .where(SqlConversation.id.in_(sub_agent_ids))
                 .order_by(
                     SqlConversation.parent_conversation_id,
                     desc(SqlConversation.created_at),
@@ -1765,14 +1829,20 @@ class SqlAlchemyConversationStore(ConversationStore):
                         f"ORDER BY ci.created_at DESC LIMIT :limit"
                     )
                 query = like_pattern
-            params: dict[str, str | int] = {
+            params: dict[str, str | int | bytes] = {
                 "query": query,
                 "limit": limit,
                 "ws": current_workspace_id(),
             }
             if conversation_id is not None:
-                params["cid"] = conversation_id
-            item_ids = [row[0] for row in session.execute(stmt, params).fetchall()]
+                # Raw SQL bypasses Uuid16: the FTS mirror stores hex text, but
+                # conversation_items.conversation_id is 16 raw bytes — bind the
+                # form each branch actually compares against.
+                params["cid"] = conversation_id if use_fts else uuid_to_bytes(conversation_id)
+            item_ids = [
+                item_id.hex() if isinstance(item_id, (bytes, memoryview)) else item_id
+                for item_id in (row[0] for row in session.execute(stmt, params).fetchall())
+            ]
             if not item_ids:
                 return []
             rows = (
@@ -2065,12 +2135,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         *,
         expected_row_version: int | None,
     ) -> tuple[Project | None, int]:
-        """Archive member sessions and their project with per-database atomicity.
-
-        The Agent Platform ``updated_at`` writes commit first. The Omnigent
-        metadata flags and project row then commit together, so a second-phase
-        failure can leave newer timestamps but never a partially archived set.
-        """
+        """Archive member sessions and their project across the two stores."""
         from omnigent.stores.project_store.sqlalchemy_store import (
             check_project_cas,
             mutate_project_row,
@@ -2091,12 +2156,49 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .where(
                         SqlConversationMetadata.workspace_id == current_workspace_id(),
                         SqlConversationMetadata.project_id == project_id,
-                        SqlConversationMetadata.archived.is_(False),
                         _owner_permission_predicate(owner_principal_id),
                     )
                     .distinct()
                 ).scalars()
             )
+
+        now = now_epoch()
+        if self._engine is self._conv_engine:
+            with self._session_immediate() as session:
+                if (
+                    check_project_cas(
+                        session,
+                        project_id,
+                        owner_principal_id,
+                        expected_row_version,
+                        require_archived=False,
+                    )
+                    is None
+                ):
+                    return None, 0
+                pending_ids = member_ids(session)
+                archived_sessions = 0
+                for id_chunk in _chunked_ids(pending_ids):
+                    result = session.execute(
+                        update(SqlConversation)
+                        .where(
+                            SqlConversation.workspace_id == current_workspace_id(),
+                            SqlConversation.id.in_(id_chunk),
+                            SqlConversation.archived.is_(False),
+                        )
+                        .values(archived=True, updated_at=now)
+                    )
+                    archived_sessions += result.rowcount
+                updated_project = mutate_project_row(
+                    session,
+                    project_id,
+                    owner_principal_id,
+                    expected_row_version,
+                    {"archived_at": now},
+                    require_archived=False,
+                    updated_at=now,
+                )
+                return updated_project, archived_sessions
 
         with self._session() as session:
             if (
@@ -2112,18 +2214,20 @@ class SqlAlchemyConversationStore(ConversationStore):
                 return None, 0
             pending_ids = member_ids(session)
 
-        now = now_epoch()
+        archived_sessions = 0
         if pending_ids:
             with self._conv_session() as session:
                 for id_chunk in _chunked_ids(pending_ids):
-                    session.execute(
+                    result = session.execute(
                         update(SqlConversation)
                         .where(
                             SqlConversation.workspace_id == current_workspace_id(),
                             SqlConversation.id.in_(id_chunk),
+                            SqlConversation.archived.is_(False),
                         )
-                        .values(updated_at=now)
+                        .values(archived=True, updated_at=now)
                     )
+                    archived_sessions += result.rowcount
 
         with self._session_immediate() as session:
             if (
@@ -2137,8 +2241,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 is None
             ):
                 return None, 0
-            pending_ids = member_ids(session)
-            archived_sessions = self._set_metadata_archive_state(session, pending_ids, True)
             updated_project = mutate_project_row(
                 session,
                 project_id,
@@ -2325,28 +2427,30 @@ class SqlAlchemyConversationStore(ConversationStore):
         is_desc = order == "desc"
         sort_fn = desc if is_desc else asc
 
-        # Determine if we need Omnigent-side filtering (kind/archived/permissions).
+        # ``kind`` is fully determined by ``parent_conversation_id`` nullness — a
+        # child always has a parent, a top-level session never does — so the kind
+        # filter is expressed directly on the AP ``conversations`` table below
+        # instead of prefetching the metadata ``kind`` column across the pool.
+        kind_requires_parent: bool | None = None
+        if kind == "sub_agent":
+            kind_requires_parent = True
+        elif kind == "default":
+            kind_requires_parent = False
+
+        # Kind and archival filter directly on the AP table. Permissions and
+        # authoritative project membership still live in Omnigent metadata.
         needs_meta_filter = (
-            (kind is not None)
-            or (not include_archived)
-            or (accessible_by is not None)
-            or (owned_by is not None)
-            or (project_id is not None)
+            accessible_by is not None or owned_by is not None or project_id is not None
         )
 
         qualifying_ids: list[str] | None = None
         if needs_meta_filter:
-            # Pre-fetch qualifying IDs from Omnigent DB, then filter the AP query.
+            # Pre-fetch permission/project qualifying IDs from the Omnigent DB,
+            # then filter the AP query.
             with self._session() as meta_sess:
                 meta_q = select(SqlConversationMetadata.id).where(
                     SqlConversationMetadata.workspace_id == current_workspace_id()
                 )
-                if kind is not None:
-                    meta_q = meta_q.where(
-                        SqlConversationMetadata.kind == encode_conversation_kind(kind)
-                    )
-                if not include_archived:
-                    meta_q = meta_q.where(SqlConversationMetadata.archived.is_(False))
                 if accessible_by is not None:
                     accessible_ids = select(SqlSessionPermission.conversation_id).where(
                         SqlSessionPermission.workspace_id == current_workspace_id(),
@@ -2372,6 +2476,17 @@ class SqlAlchemyConversationStore(ConversationStore):
 
             if qualifying_ids is not None:
                 stmt = stmt.where(_chunked_in(SqlConversation.id, qualifying_ids))
+
+            # Kind filter as parent-nullness (see above): sub_agent ⇔ parent set.
+            if kind_requires_parent is True:
+                stmt = stmt.where(SqlConversation.parent_conversation_id.is_not(None))
+            elif kind_requires_parent is False:
+                stmt = stmt.where(SqlConversation.parent_conversation_id.is_(None))
+
+            # archived lives on the AP conversations table, so exclude it inline
+            # (no metadata prefetch, no post-fetch filtering).
+            if not include_archived:
+                stmt = stmt.where(SqlConversation.archived.is_(False))
 
             if parent_conversation_id is not None:
                 stmt = stmt.where(
@@ -2688,10 +2803,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                 agent_config.harness_override = harness_override
                 ap_changed = True
             if archived is not None:
-                ap_changed = True  # archived is a visible state change
+                # archived lives on the AP conversations row; a visible state change.
+                row.archived = archived
+                ap_changed = True
             if ap_changed:
                 row.updated_at = now
-        if archived is not None or terminal_launch_args is not None:
+        if terminal_launch_args is not None:
             with self._session() as meta_sess:
                 meta = meta_sess.get(
                     SqlConversationMetadata, (current_workspace_id(), conversation_id)
@@ -2712,13 +2829,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         parent_conversation_id=row.parent_conversation_id,
                     )
                     meta_sess.add(meta)
-                if archived is not None:
-                    if metadata_was_missing:
-                        meta.archived = archived
-                    else:
-                        self._set_metadata_archive_state(meta_sess, [conversation_id], archived)
-                if terminal_launch_args is not None:
-                    meta.terminal_launch_args = json.dumps(terminal_launch_args)
+                meta.terminal_launch_args = json.dumps(terminal_launch_args)
         return self.get_conversation(conversation_id)
 
     def set_runner_id(self, conversation_id: str, runner_id: str) -> bool:
@@ -3482,7 +3593,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             fork_labels = {
                 key: value
                 for key, value in _fetch_labels(session, source_conversation_id).items()
-                if key not in _INSTANCE_SCOPED_LABEL_KEYS
+                if key not in (_INSTANCE_SCOPED_LABEL_KEYS | _FORK_ONLY_DROPPED_LABEL_KEYS)
             }
             source_workspace = source_meta_ref.workspace if source_meta_ref else None
             source_ext_session = source_meta_ref.external_session_id if source_meta_ref else None

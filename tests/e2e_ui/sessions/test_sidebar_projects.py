@@ -67,9 +67,11 @@ def _unique(prefix: str) -> str:
 
 
 def _section(page: Page, project_name: str) -> Locator:
-    return page.locator("section").filter(
-        has=page.get_by_role("button", name=project_name, exact=True)
-    ).last
+    return (
+        page.locator("section")
+        .filter(has=page.get_by_role("button", name=project_name, exact=True))
+        .last
+    )
 
 
 def _session_href(session_id: str) -> str:

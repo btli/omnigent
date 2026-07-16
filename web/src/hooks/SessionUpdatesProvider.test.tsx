@@ -304,3 +304,25 @@ describe("SessionUpdatesProvider fingerprint pruning", () => {
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["comments", "conv_b"] });
   });
 });
+
+describe("SessionUpdatesProvider list invalidation", () => {
+  it("invalidates the archived-projects list on a remote removal", () => {
+    // Another client archiving/moving/deleting must refresh the Archived
+    // view's project picker — only local mutations invalidate it otherwise.
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a"]);
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+
+      act(() => handler({ type: "removed", ids: ["conv_a"] }));
+      act(() => vi.advanceTimersByTime(300)); // past the debounce
+
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["archived-projects"] });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

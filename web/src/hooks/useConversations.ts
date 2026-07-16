@@ -153,6 +153,13 @@ export interface Conversation {
    * matched. Absent on non-search fetches and title-only matches.
    */
   search_snippet?: string | null;
+  /**
+   * For sub-agent sessions, the id of the direct parent session.
+   * `null` / absent for top-level sessions. Included in
+   * `WS /v1/sessions/updates` frames so `SessionUpdatesProvider` can
+   * invalidate the parent's child-sessions cache when the child changes.
+   */
+  parent_session_id?: string | null;
 }
 
 export interface ConversationsPage {
@@ -255,6 +262,13 @@ async function fetchConversationsPage({
  * debounce the value before passing it. `includeArchived` controls
  * whether archived sessions are fetched — it's part of the query key
  * so toggling it triggers a refetch.
+ *
+ * `project` optionally scopes the list to one project's sessions
+ * (`?project=`, filtered server-side). It's only woven into the query key
+ * when set, so the default sidebar / search callers keep their existing
+ * three-element key and cache entry; a non-empty `project` produces a
+ * distinct four-element key that refetches when the picker changes. Used by
+ * the Archived settings view's project filter.
  */
 export function useConversations(
   searchQuery: string = "",
@@ -284,6 +298,11 @@ export function useConversations(
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage) =>
       lastPage.has_more ? (lastPage.last_id ?? undefined) : undefined,
+    // Data is kept fresh for 30 s so components that mount in quick
+    // succession after the initial fetch (AppShell, Sidebar, ChatPage)
+    // share the cache instead of each triggering a background refetch.
+    // The WS stream handles real-time updates within that window.
+    staleTime: 30_000,
     refetchInterval: streamConnected
       ? options.reconcileWhileConnected
         ? CONNECTED_STREAM_REFETCH_INTERVAL_MS

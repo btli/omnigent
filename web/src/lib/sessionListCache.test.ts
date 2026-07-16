@@ -284,6 +284,73 @@ describe("nullsToUndefined", () => {
   });
 });
 
+describe("mergeItemsIntoPages project-filtered membership", () => {
+  const alpha = filtersFromConversationQueryKey(["conversations", "", true, "Alpha"]);
+  const unfiltered = filtersFromConversationQueryKey(["conversations", "", true]);
+
+  it("evicts a row moved OUT of the selected project and flags a refetch", () => {
+    const before = data([
+      conv("a", { archived: true, project_id: "Alpha" }),
+      conv("b", { archived: true, project_id: "Alpha" }),
+    ]);
+    // A push-delta moves `a` from Alpha to Beta (full row, new project id).
+    const items = new Map<string, SessionListWireItem>([
+      ["a", { id: "a", archived: true, project_id: "Beta" }],
+    ]);
+
+    const { data: after, needsRefetch } = mergeItemsIntoPages(before, items, alpha, NO_ACTIVE);
+
+    // `a` no longer belongs in the Alpha cache; `b` (still Alpha) stays.
+    expect(after!.pages[0].data.map((c) => c.id)).toEqual(["b"]);
+    expect(needsRefetch).toBe(true);
+  });
+
+  it("flags a refetch when a row is moved INTO a project so filtered variants reconcile", () => {
+    // The row lives in the unfiltered archived variant; a session moved into
+    // "Alpha" isn't in the Alpha-filtered cache yet, so only a server reconcile
+    // can place it. The membership change here must trigger the prefix-wide refetch.
+    const before = data([conv("a", { archived: true })]);
+    const items = new Map<string, SessionListWireItem>([
+      ["a", { id: "a", archived: true, project_id: "Alpha" }],
+    ]);
+
+    const { data: after, needsRefetch } = mergeItemsIntoPages(before, items, unfiltered, NO_ACTIVE);
+
+    expect(after!.pages[0].data.map((c) => c.id)).toEqual(["a"]);
+    expect(needsRefetch).toBe(true);
+  });
+
+  it("keeps a row whose project still matches when an unrelated field changes", () => {
+    const before = data([conv("a", { archived: true, status: "idle", project_id: "Alpha" })]);
+    const items = new Map<string, SessionListWireItem>([
+      ["a", { id: "a", archived: true, status: "running", project_id: "Alpha" }],
+    ]);
+
+    const { data: after, needsRefetch } = mergeItemsIntoPages(before, items, alpha, NO_ACTIVE);
+
+    // Membership holds, so the row is patched in place (not evicted), and a
+    // status-only change needs no server reconcile.
+    expect(after!.pages[0].data.map((c) => c.id)).toEqual(["a"]);
+    expect(after!.pages[0].data[0].status).toBe("running");
+    expect(needsRefetch).toBe(false);
+  });
+
+  it("treats an empty-string project as 'all projects' (no membership constraint)", () => {
+    // The contract: a falsy project is "all projects", not a distinct "unfiled"
+    // slice (this list never requests unfiled). So gaining a project does NOT
+    // evict the row — matching the request, which omits `project_id=` for "".
+    const allProjects = filtersFromConversationQueryKey(["conversations", "", true, ""]);
+    const before = data([conv("a", { archived: true })]);
+    const items = new Map<string, SessionListWireItem>([
+      ["a", { id: "a", archived: true, project_id: "Alpha" }],
+    ]);
+
+    const { data: after } = mergeItemsIntoPages(before, items, allProjects, NO_ACTIVE);
+
+    expect(after!.pages[0].data.map((c) => c.id)).toEqual(["a"]);
+  });
+});
+
 describe("filtersFromConversationQueryKey", () => {
   it("parses current conversation query keys", () => {
     expect(filtersFromConversationQueryKey(["conversations", "needle", true])).toEqual({
@@ -302,6 +369,10 @@ describe("filtersFromConversationQueryKey", () => {
 
   it("rejects non-canonical conversation query keys", () => {
     expect(() => filtersFromConversationQueryKey(["conversations", ""])).toThrow(
+      "Invalid conversations query key",
+    );
+    // A non-string project element is malformed and must fail loudly.
+    expect(() => filtersFromConversationQueryKey(["conversations", "", true, 5])).toThrow(
       "Invalid conversations query key",
     );
   });

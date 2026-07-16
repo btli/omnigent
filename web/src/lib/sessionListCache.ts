@@ -90,7 +90,7 @@ function changedWireFields(conv: Conversation, wire: SessionListWireItem): Set<s
  *
  * @param key - TanStack Query key for a conversations query.
  * @returns Parsed list filters.
- * @throws Error if the key is not the canonical conversations list key.
+ * @throws Error if the key is not a conversations list key.
  */
 export function filtersFromConversationQueryKey(key: readonly unknown[]): ConversationListFilters {
   if ((key.length !== 3 && key.length !== 4) || key[0] !== "conversations") {
@@ -113,7 +113,14 @@ export function filtersFromConversationQueryKey(key: readonly unknown[]): Conver
 /**
  * Check membership rules the client can decide exactly from a patched row.
  *
- * Archived rows never belong in default (non-includeArchived) queries.
+ * - Archived rows never belong in default (non-includeArchived) queries.
+ * - Project-filtered variants (the Archived picker's `["conversations","",true,
+ *   id]` key) hold only rows whose `project_id` matches; a row moved out of
+ *   that project — via a push-delta — is no longer a member.
+ *   A falsy project (`undefined` or `""`) is the "all projects" list and
+ *   applies no project constraint — consistent with the request (which omits
+ *   `project_id=` for a falsy value) and the query key (which drops it). This
+ *   list never requests the server's "unfiled" (`project_id=`) slice.
  *
  * @param conv - Cached row after applying the incoming wire item.
  * @param filters - Canonical filters for the query being patched.

@@ -1,7 +1,7 @@
 """Add the flat Projects MVP schema.
 
-Revision ID: cc3d4e5f6a7b
-Revises: bb2c3d4e5f6a
+Revision ID: e9f0a1b2c3d4
+Revises: a7b3c4d5e6f7
 Create Date: 2026-07-15 00:00:00.000000
 """
 
@@ -13,8 +13,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
 
-revision: str = "cc3d4e5f6a7b"
-down_revision: str | None = "bb2c3d4e5f6a"
+revision: str = "e9f0a1b2c3d4"
+down_revision: str | None = "a7b3c4d5e6f7"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
