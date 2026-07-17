@@ -43,8 +43,10 @@ Platform notes that shape this launcher:
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import importlib
+import json
 import logging
 import os
 import re
@@ -678,15 +680,24 @@ def _redact_values(text: str, values: Iterable[str]) -> str:
 
     API response bodies and container log tails can reflect a submitted value
     (an admission webhook echoing the object; a hostile remote seeding the git
-    output), so every clone-path error/warning composition passes through here.
+    output) in more than its literal form — Kubernetes serializes Secret
+    ``stringData`` into base64 ``data``, so an admission-webhook echo can
+    reflect the encoded form, and a value embedded in a JSON body is escaped —
+    so every clone-path error/warning composition passes through here.
 
     :param text: The message to scrub.
     :param values: Credential values to replace with ``"***"``.
-    :returns: *text* with every occurrence of a non-empty value redacted.
+    :returns: *text* with every occurrence of a non-empty value — literal,
+        base64-encoded, or JSON-escaped — redacted.
     """
     for value in values:
-        if value:
-            text = text.replace(value, "***")
+        if not value:
+            continue
+        text = text.replace(value, "***")
+        text = text.replace(base64.b64encode(value.encode()).decode(), "***")
+        escaped = json.dumps(value)[1:-1]
+        if escaped != value:
+            text = text.replace(escaped, "***")
     return text
 
 
@@ -1161,6 +1172,8 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         namespace = self._resolve_namespace()
         image = self._resolve_image()
         env_literals = self._resolve_sandbox_env()
+        service_account = self._resolve_service_account()
+        harness_secret = self._resolve_secret()
         secret_name = _token_secret_name(sandbox_id)
         clone_secret = _clone_secret_name(sandbox_id) if clone_env else None
         workspace = f"{_HOME_DIR}/workspace"
@@ -1197,12 +1210,12 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                     pod_name=sandbox_id,
                     namespace=namespace,
                     image=image,
-                    service_account=self._resolve_service_account(),
+                    service_account=service_account,
                     host_id=host_id,
                     host_name=host_name,
                     server_url=server_url,
                     token_secret_name=secret_name,
-                    harness_secret=self._resolve_secret(),
+                    harness_secret=harness_secret,
                     env_literals=env_literals,
                     node_selector=self._node_selector,
                     workspace=workspace,
@@ -1259,13 +1272,26 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                 )
                 if isinstance(exc, ApiException):
                     message = _format_api_error("create sandbox pod", sandbox_id, exc)
-                    if clone_env:
-                        message = _redact_values(message, clone_env.values())
-                    raise click.ClickException(message) from exc
-                message = f"timed out creating Kubernetes pod '{sandbox_id}' ({_api_reason(exc)})"
+                else:
+                    message = (
+                        f"timed out creating Kubernetes pod '{sandbox_id}' ({_api_reason(exc)})"
+                    )
                 if clone_env:
-                    message = _redact_values(message, clone_env.values())
+                    # The chained cause would carry the original ApiException
+                    # body / log tail unredacted into a formatted traceback
+                    # (e.g. a server-side log sink that formats with
+                    # exc_info=True), so drop it here.
+                    raise click.ClickException(
+                        _redact_values(message, clone_env.values())
+                    ) from None
                 raise click.ClickException(message) from exc
+            except BaseException:
+                # Anything else in this window (e.g. a manifest-build error)
+                # must not orphan a Secret already created above.
+                self._best_effort_delete(
+                    namespace, sandbox_id, secret_name, clone_secret_name=clone_secret
+                )
+                raise
 
             try:
                 self._wait_for_pod_running(namespace, sandbox_id)
@@ -1278,9 +1304,12 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                     namespace, sandbox_id, secret_name, clone_secret_name=clone_secret
                 )
                 if clone_env and isinstance(exc, click.ClickException):
+                    # The chained cause would carry the unredacted diagnosis
+                    # (the container log tail can itself contain the
+                    # credential) into a formatted traceback.
                     raise click.ClickException(
                         _redact_values(exc.message, clone_env.values())
-                    ) from exc
+                    ) from None
                 raise
             if clone_env:
                 assert clone_secret is not None  # set together, near the top

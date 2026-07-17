@@ -9,8 +9,10 @@ fakes — there is no exec transport to fake.
 
 from __future__ import annotations
 
+import base64
 import json
 import sys
+import traceback
 import types
 from types import SimpleNamespace
 
@@ -269,13 +271,25 @@ def test_env_var_name_override_is_validated(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 class _FakeApiException(Exception):
-    """Stands in for ``kubernetes.client.rest.ApiException``."""
+    """Stands in for ``kubernetes.client.rest.ApiException``.
+
+    ``__str__`` mirrors the real class (status + reason + body), not the
+    ``Exception`` default — the real class's body lands in a chained
+    traceback exactly as F1 guards against, so a fake that dropped it would
+    let a regressed ``from exc`` pass unnoticed.
+    """
 
     def __init__(self, *, status: int | None = None, reason: str = "", body: str = "") -> None:
         super().__init__(reason or body or str(status))
         self.status = status
         self.reason = reason
         self.body = body
+
+    def __str__(self) -> str:
+        message = f"({self.status})\nReason: {self.reason}\n"
+        if self.body:
+            message += f"HTTP response body: {self.body}\n"
+        return message
 
 
 class _FakeConfigException(Exception):
@@ -478,6 +492,7 @@ def test_clone_env_lifecycle_happy_path(fake_core: _FakeCore) -> None:
     assert body["metadata"]["ownerReferences"][0]["uid"] == "pod-uid-123"
     assert body["metadata"]["ownerReferences"][0]["name"] == "omnigent-pod-1"
     # Deleted right after Running; the token Secret and Pod survive.
+    assert fake_core.calls.index("delete_secret") > fake_core.calls.index("read_pod")
     assert fake_core.deleted_secrets == ["omnigent-pod-1-clone-cred"]
     assert fake_core.deleted_pods == []
     init = fake_core.created_pods[0]["spec"]["initContainers"][0]
@@ -489,23 +504,48 @@ def test_clone_env_values_never_leave_secret_body(
 ) -> None:
     _start_with_clone(fake_core)
     assert "tok-secret-value" not in json.dumps(fake_core.created_pods)
-    assert "tok-secret-value" not in capsys.readouterr().out
+    assert "alice" not in json.dumps(fake_core.created_pods)
+    captured_out = capsys.readouterr().out
+    assert "tok-secret-value" not in captured_out
+    assert "alice" not in captured_out
 
 
 def test_clone_secret_create_failure_cleans_up(fake_core: _FakeCore) -> None:
     """Failure creating the SECOND secret still tears down the first + any Pod."""
+    token_b64 = base64.b64encode(b"tok-secret-value").decode()
     fake_core.create_secret_errors = [
         None,
         _FakeApiException(
-            status=500, reason="boom", body="admission webhook denied: tok-secret-value leaked"
+            status=500,
+            reason="boom",
+            body=f"admission webhook denied: tok-secret-value leaked (data: {token_b64})",
         ),
     ]
     with pytest.raises(click.ClickException) as excinfo:
         _start_with_clone(fake_core)
     assert "tok-secret-value" not in str(excinfo.value)
+    assert token_b64 not in str(excinfo.value)
     assert "***" in str(excinfo.value)
+    assert "tok-secret-value" not in "".join(traceback.format_exception(excinfo.value))
     assert "omnigent-pod-1-token" in fake_core.deleted_secrets
     assert "omnigent-pod-1-clone-cred" in fake_core.deleted_secrets
+
+
+def test_manifest_build_error_cleans_up_both_secrets(
+    fake_core: _FakeCore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Any exception between the Secret creates and the Pod create (e.g. a
+    manifest-build error) must not orphan either Secret."""
+
+    def _boom(**_kwargs: object) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(k8s, "build_pod_manifest", _boom)
+    with pytest.raises(RuntimeError):
+        _start_with_clone(fake_core)
+    assert "omnigent-pod-1-token" in fake_core.deleted_secrets
+    assert "omnigent-pod-1-clone-cred" in fake_core.deleted_secrets
+    assert fake_core.created_pods == []
 
 
 def test_wait_failure_redacts_and_reaps_all_three(fake_core: _FakeCore) -> None:
@@ -518,6 +558,7 @@ def test_wait_failure_redacts_and_reaps_all_three(fake_core: _FakeCore) -> None:
         _start_with_clone(fake_core)
     assert "tok-secret-value" not in str(excinfo.value)
     assert "***" in str(excinfo.value)
+    assert "tok-secret-value" not in "".join(traceback.format_exception(excinfo.value))
     assert "omnigent-pod-1" in fake_core.deleted_pods
     assert set(fake_core.deleted_secrets) == {
         "omnigent-pod-1-token",
