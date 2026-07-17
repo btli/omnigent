@@ -344,6 +344,9 @@ def test_project_settings_remains_usable_at_360px(
     session_id = project_api.create_session(project["id"], _unique("Narrow session"))
     page.goto(f"{project_api.base_url}/c/{session_id}")
 
+    # The sidebar is a closed overlay at mobile widths — open it before
+    # reaching for the project folder's kebab.
+    page.get_by_role("button", name="Open sidebar").click()
     dialog = _open_project_settings(page, project_name)
     dialog_box = dialog.bounding_box()
     assert dialog_box is not None

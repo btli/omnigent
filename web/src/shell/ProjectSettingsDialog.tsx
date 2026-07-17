@@ -231,7 +231,9 @@ export function ProjectSettingsDialog({
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
-        className="max-h-[85vh] overflow-hidden sm:max-w-2xl"
+        // flex overrides the grid base so the form's min-h-0/flex-1 body can
+        // scroll while the footer stays pinned inside the 85vh cap.
+        className="flex max-h-[85vh] flex-col overflow-hidden sm:max-w-2xl"
         onClick={(event) => event.stopPropagation()}
       >
         <DialogHeader className="shrink-0">
