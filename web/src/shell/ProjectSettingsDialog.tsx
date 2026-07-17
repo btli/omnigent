@@ -18,10 +18,7 @@ import {
   projectMutationStatus,
   ProjectMutationError,
 } from "@/hooks/useConversations";
-import {
-  invalidateProjectQueries,
-  PROJECT_RESOLVED_DEFAULTS_KEY,
-} from "@/hooks/projectQueries";
+import { invalidateProjectQueries, PROJECT_RESOLVED_DEFAULTS_KEY } from "@/hooks/projectQueries";
 import { authenticatedFetch } from "@/lib/identity";
 
 import { ProjectDefaultsEditor } from "./project-settings/ProjectDefaultsEditor";

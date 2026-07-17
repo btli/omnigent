@@ -24,13 +24,9 @@ describe("InheritedFieldShell", () => {
       "data-provenance",
       "inherited",
     );
-    expect(screen.getByTestId("project-default-model-provenance")).toHaveTextContent(
-      "Inherited",
-    );
+    expect(screen.getByTestId("project-default-model-provenance")).toHaveTextContent("Inherited");
     expect(screen.queryByTestId("project-default-model-reset")).toBeNull();
-    expect(screen.getByTestId("project-default-model-hint")).toHaveTextContent(
-      "Harness default",
-    );
+    expect(screen.getByTestId("project-default-model-hint")).toHaveTextContent("Harness default");
   });
 
   it("renders overridden provenance and calls Reset", () => {
@@ -72,8 +68,6 @@ describe("InheritedFieldShell", () => {
     expect(screen.getByTestId("project-default-host_type-provenance")).toHaveTextContent(
       "Invalid saved value",
     );
-    expect(screen.getByTestId("project-default-host_type-error")).toHaveClass(
-      "text-destructive",
-    );
+    expect(screen.getByTestId("project-default-host_type-error")).toHaveClass("text-destructive");
   });
 });

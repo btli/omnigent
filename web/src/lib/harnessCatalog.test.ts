@@ -36,12 +36,9 @@ describe("harnessCatalog", () => {
     ]);
   });
 
-  it.each(["claude-sdk", "codex-native"])(
-    "does not expose effort levels for %s",
-    (harness) => {
-      expect(effortOptionsForHarness(harness)).toEqual([]);
-    },
-  );
+  it.each(["claude-sdk", "codex-native"])("does not expose effort levels for %s", (harness) => {
+    expect(effortOptionsForHarness(harness)).toEqual([]);
+  });
 
   it.each([
     ["claude-native", true],
@@ -59,9 +56,7 @@ describe("harnessCatalog", () => {
     const ids = options.map((option) => option.id);
     expect(ids).toContain("claude-native");
     expect(ids).toContain("codex-native");
-    expect(options.find((option) => option.id === "claude-native")?.label).toBe(
-      "Claude Code",
-    );
+    expect(options.find((option) => option.id === "claude-native")?.label).toBe("Claude Code");
   });
 
   it("appends brain harnesses after natives without duplicating ids", () => {
@@ -72,9 +67,7 @@ describe("harnessCatalog", () => {
     const ids = options.map((option) => option.id);
     expect(ids.filter((id) => id === "claude-native")).toHaveLength(1);
     // The canonical native registry names the row, not the brain catalog.
-    expect(options.find((option) => option.id === "claude-native")?.label).toBe(
-      "Claude Code",
-    );
+    expect(options.find((option) => option.id === "claude-native")?.label).toBe("Claude Code");
     expect(ids.indexOf("claude-native")).toBeLessThan(ids.indexOf("claude-sdk"));
   });
 });

@@ -351,9 +351,7 @@ describe("ProjectSettingsDialog", () => {
     fireEvent.pointerDown(screen.getByTestId("project-default-reasoning_effort-control"), {
       button: 0,
     });
-    expect(
-      screen.getByTestId("project-default-reasoning_effort-option-max"),
-    ).toBeInTheDocument();
+    expect(screen.getByTestId("project-default-reasoning_effort-option-max")).toBeInTheDocument();
   });
 
   it("preserves unknown catalog values when saved untouched", async () => {

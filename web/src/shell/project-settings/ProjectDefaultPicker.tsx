@@ -23,8 +23,7 @@ export interface ProjectDefaultPickerOption {
 export function fieldControlIds(field: DefaultField, hint?: string, error?: string) {
   const prefix = `project-default-${field}`;
   const describedBy =
-    [hint && `${prefix}-hint`, error && `${prefix}-error`].filter(Boolean).join(" ") ||
-    undefined;
+    [hint && `${prefix}-hint`, error && `${prefix}-error`].filter(Boolean).join(" ") || undefined;
   return { prefix, describedBy };
 }
 
@@ -118,9 +117,7 @@ export function ProjectDefaultPicker({
                 className="min-h-11 min-w-0 text-xs"
                 title={option.label}
               >
-                <span className="min-w-0 flex-1 truncate">
-                  {option.content ?? option.label}
-                </span>
+                <span className="min-w-0 flex-1 truncate">{option.content ?? option.label}</span>
               </DropdownMenuRadioItem>
             ))}
           </DropdownMenuRadioGroup>

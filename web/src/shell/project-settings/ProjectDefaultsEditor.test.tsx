@@ -74,9 +74,7 @@ describe("ProjectDefaultsEditor", () => {
       />,
     );
 
-    expect(await screen.findByTestId("project-default-host_type-control")).toHaveValue(
-      "external",
-    );
+    expect(await screen.findByTestId("project-default-host_type-control")).toHaveValue("external");
     expect(screen.getByTestId("project-default-host_type-provenance")).toHaveAttribute(
       "data-provenance",
       "inherited",
@@ -151,9 +149,7 @@ describe("ProjectDefaultsEditor", () => {
     fireEvent.pointerDown(screen.getByTestId("project-default-reasoning_effort-control"), {
       button: 0,
     });
-    expect(
-      screen.getByTestId("project-default-reasoning_effort-option-xhigh"),
-    ).toBeInTheDocument();
+    expect(screen.getByTestId("project-default-reasoning_effort-option-xhigh")).toBeInTheDocument();
   });
 
   it("restores legacy-value preservation when a changed harness returns to its opening value", async () => {
@@ -231,9 +227,7 @@ describe("ProjectDefaultsEditor", () => {
       />,
     );
 
-    await waitFor(() =>
-      expect(screen.getByTestId("project-defaults-loading")).toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.getByTestId("project-defaults-loading")).toBeInTheDocument());
     expect(screen.queryByTestId("project-default-model-control")).toBeNull();
   });
 
@@ -279,9 +273,7 @@ describe("ProjectDefaultsEditor", () => {
     expect(await screen.findByTestId("project-defaults-error")).toHaveTextContent(
       "Preview unavailable",
     );
-    expect(screen.getByTestId("project-default-model-control")).toHaveTextContent(
-      "legacy-model",
-    );
+    expect(screen.getByTestId("project-default-model-control")).toHaveTextContent("legacy-model");
     // Controls stay enabled: a preview error is often caused by the very
     // bundle these fields repair (e.g. a branch without a host). The model
     // picker stays gated by its own missing-catalog rule (no harness), which

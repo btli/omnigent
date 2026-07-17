@@ -48,11 +48,7 @@ export function buildDraft(
     DEFAULT_FIELDS.map((field) => {
       const hasValue = Object.hasOwn(bundle, field);
       const storedValue = bundle[field];
-      const persistedKind = !hasValue
-        ? "absent"
-        : storedValue === null
-          ? "legacy-null"
-          : "value";
+      const persistedKind = !hasValue ? "absent" : storedValue === null ? "legacy-null" : "value";
 
       return [
         field,
@@ -70,10 +66,7 @@ export function buildDraft(
   return { fields };
 }
 
-export function fieldProvenance(
-  state: DefaultsDraftState,
-  field: DefaultField,
-): FieldProvenance {
+export function fieldProvenance(state: DefaultsDraftState, field: DefaultField): FieldProvenance {
   const draft = state.fields[field];
 
   // A persisted host_type: null is invalid — it overrides the server's
@@ -168,4 +161,3 @@ export function serializeBundle(state: DefaultsDraftState): DefaultsBundle {
 
   return bundle;
 }
-

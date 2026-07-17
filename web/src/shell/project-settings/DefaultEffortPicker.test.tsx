@@ -25,9 +25,9 @@ describe("DefaultEffortPicker", () => {
     fireEvent.pointerDown(screen.getByTestId("project-default-reasoning_effort-control"), {
       button: 0,
     });
-    expect(
-      screen.getByTestId("project-default-reasoning_effort-option-xhigh"),
-    ).toHaveTextContent("xHigh");
+    expect(screen.getByTestId("project-default-reasoning_effort-option-xhigh")).toHaveTextContent(
+      "xHigh",
+    );
     fireEvent.click(screen.getByTestId("project-default-reasoning_effort-option-xhigh"));
     expect(onChange).toHaveBeenCalledWith("xhigh");
   });

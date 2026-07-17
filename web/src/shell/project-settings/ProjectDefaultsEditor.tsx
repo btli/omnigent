@@ -163,9 +163,7 @@ export function ProjectDefaultsEditor({
 
   const harness = draft ? fieldDisplayValue(draft, "harness").trim() || null : null;
   const model = draft ? fieldDisplayValue(draft, "model").trim() || null : null;
-  const effort = draft
-    ? fieldDisplayValue(draft, "reasoning_effort").trim() || null
-    : null;
+  const effort = draft ? fieldDisplayValue(draft, "reasoning_effort").trim() || null : null;
   const harnessAtOpen = draft
     ? typeof bundle.harness === "string"
       ? bundle.harness.trim()
@@ -182,21 +180,21 @@ export function ProjectDefaultsEditor({
   const effortCatalog = effortOptionsForHarness(harness);
   const modelIncompatible = Boolean(
     harnessChanged &&
-      model &&
-      modelCatalog.length > 0 &&
-      !modelCatalog.some((option) => option.id === model),
+    model &&
+    modelCatalog.length > 0 &&
+    !modelCatalog.some((option) => option.id === model),
   );
   const effortIncompatible = Boolean(
     (harnessChanged || modelChanged) &&
-      effort &&
-      effortCatalog.length > 0 &&
-      !effortCatalog.some((option) => option.value === effort),
+    effort &&
+    effortCatalog.length > 0 &&
+    !effortCatalog.some((option) => option.value === effort),
   );
   const branchWithoutHost = Boolean(
     draft &&
-      effectiveHostType === "external" &&
-      fieldDisplayValue(draft, "default_branch").trim() !== "" &&
-      fieldDisplayValue(draft, "host_id").trim() === "",
+    effectiveHostType === "external" &&
+    fieldDisplayValue(draft, "default_branch").trim() !== "" &&
+    fieldDisplayValue(draft, "host_id").trim() === "",
   );
   // A workspace carried across a live External → Managed switch is a path, not
   // the repository spec managed sessions need — block Save until it is reset.
@@ -210,9 +208,9 @@ export function ProjectDefaultsEditor({
     : "external";
   const workspaceBlocksSave = Boolean(
     draft &&
-      effectiveHostType === "managed" &&
-      effectiveHostType !== hostTypeAtOpen &&
-      fieldProvenance(draft, "workspace") !== "inherited",
+    effectiveHostType === "managed" &&
+    effectiveHostType !== hostTypeAtOpen &&
+    fieldProvenance(draft, "workspace") !== "inherited",
   );
   const isValid =
     draft !== null &&
@@ -229,9 +227,7 @@ export function ProjectDefaultsEditor({
     setDraft((current) => {
       if (!current) return current;
       const next = setFieldValue(current, field, value);
-      return field === "host_type" && value === "managed"
-        ? stageManagedHostReset(next)
-        : next;
+      return field === "host_type" && value === "managed" ? stageManagedHostReset(next) : next;
     });
   }
 
@@ -269,8 +265,7 @@ export function ProjectDefaultsEditor({
     effectiveHostType === "external" && fieldProvenance(draft, "repo_url") !== "inherited";
   const retainedWorkspace =
     effectiveHostType === "managed" && fieldProvenance(draft, "workspace") !== "inherited";
-  const hostResetStaged =
-    effectiveHostType === "managed" && draft.fields.host_id.resetRequested;
+  const hostResetStaged = effectiveHostType === "managed" && draft.fields.host_id.resetRequested;
 
   return (
     <div className="space-y-3">

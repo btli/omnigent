@@ -122,5 +122,4 @@ describe("projectDefaultsDraft", () => {
     expect(fieldDisplayValue(state, "model")).toBe(BASELINES.model);
     expect(serializeBundle(state)).toEqual({});
   });
-
 });
