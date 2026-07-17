@@ -13,7 +13,6 @@ The orchestration here handles composition.
 
 from __future__ import annotations
 
-import logging
 from dataclasses import replace
 from typing import Any
 
@@ -28,12 +27,7 @@ from omnigent.spec.types import (
     StateUpdate,
     StateUpdateAction,
 )
-from omnigent.stores.conversation_store import (
-    PROJECT_LABEL_KEY,
-    ConversationStore,
-    warn_deprecated_project_label,
-)
-from omnigent.stores.project_store import ProjectStore
+from omnigent.stores.conversation_store import ConversationStore
 
 # Number of recent conversation items the engine fetches from
 # the conversation store and threads onto :class:`EvaluationContext`
@@ -43,8 +37,6 @@ from omnigent.stores.project_store import ProjectStore
 # ``foo``) rather than generic. Tunable later if needed; pinned
 # here so it surfaces in grep across the engine + prompt layers.
 # See designs/LIVE_POLICIES.md §4.1.
-_TRAJECTORY_WINDOW = 10
-_logger = logging.getLogger(__name__)
 
 
 class PolicyEngine:
@@ -124,7 +116,6 @@ class PolicyEngine:
         token_pricing: ModelPricing | None = None,
         initial_model: str | None = None,
         conversation_store: ConversationStore,
-        project_store: ProjectStore | None = None,
         root_conversation_id: str | None = None,
         llm_client: Any = None,
     ) -> None:
@@ -170,7 +161,6 @@ class PolicyEngine:
         self._token_pricing = token_pricing
         self._model = initial_model
         self._store = conversation_store
-        self._project_store = project_store
         self._llm_client = llm_client
 
     @property
@@ -350,11 +340,6 @@ class PolicyEngine:
         composed_data: Any = None
         context = self._context()
 
-        # Populate trajectory and session_state once per evaluate so
-        # PromptPolicy classifiers see situational context and function
-        # policies can read accumulated state. Both queries are bounded
-        # to avoid scanning large conversations. See §4.1.
-        ctx = self._populate_trajectory(ctx)
         ctx = self._inject_session_state(ctx)
         ctx = self._inject_usage(ctx)
         ctx = self._inject_subtree_usage(ctx)
@@ -517,23 +502,11 @@ class PolicyEngine:
         """
         if not set_labels:
             return
-        legacy_project_requested = PROJECT_LABEL_KEY in set_labels
-        legacy_project_name = set_labels.get(PROJECT_LABEL_KEY)
         filtered = self._filter_schema_valid(set_labels)
-        filtered.pop(PROJECT_LABEL_KEY, None)
-        if legacy_project_requested and legacy_project_name is not None:
-            if self._project_store is None:
-                raise RuntimeError("project store is required for legacy project label writes")
-            warn_deprecated_project_label("policy")
-            self._store.forward_legacy_project_label(
-                self._conversation_id,
-                legacy_project_name,
-                self._project_store,
-            )
-            self._labels.pop(PROJECT_LABEL_KEY, None)
-        if filtered:
-            self._store.set_labels(self._conversation_id, filtered)
-            self._labels.update(filtered)
+        if not filtered:
+            return
+        self._store.set_labels(self._conversation_id, filtered)
+        self._labels.update(filtered)
 
     def apply_state_updates(self, updates: list[StateUpdate]) -> None:
         """
@@ -922,35 +895,6 @@ class PolicyEngine:
             "conversation_id": self._conversation_id,
             "session_state": dict(self._session_state),
         }
-
-    def _populate_trajectory(self, ctx: EvaluationContext) -> EvaluationContext:
-        """
-        Return a copy of ``ctx`` with ``trajectory`` populated.
-
-        Queries the conversation store for the last
-        ``_TRAJECTORY_WINDOW`` items in chronological order. If
-        the conversation has fewer than the window size, returns
-        whatever exists (down to an empty list for brand-new
-        conversations). The store lookup is order=``"desc"`` +
-        slice + reverse so the engine asks for the *tail* without
-        first scanning the entire conversation.
-
-        :param ctx: Original :class:`EvaluationContext` from the
-            caller. ``ctx.trajectory`` is overwritten.
-        :returns: A new :class:`EvaluationContext` with
-            ``trajectory`` set to the recent items list (oldest
-            first).
-        """
-        page = self._store.list_items(
-            self._conversation_id,
-            limit=_TRAJECTORY_WINDOW,
-            order="desc",
-        )
-        # ``order="desc"`` returns most-recent first; reverse so the
-        # classifier sees items chronologically (oldest first), which
-        # matches how a human reads a conversation top-down.
-        trajectory = list(reversed(page.data))
-        return replace(ctx, trajectory=trajectory)
 
 
 def _apply_one(state: dict[str, Any], op: StateUpdate) -> None:

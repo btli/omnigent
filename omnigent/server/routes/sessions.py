@@ -206,6 +206,7 @@ from omnigent.server.routes._content_type import (
     require_json_content_type,
     require_json_or_multipart_content_type,
 )
+from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._host_worktree import CreatedWorktree
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.schemas import (
@@ -15260,10 +15261,7 @@ def create_sessions_router(
         if conv is None:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None:
-            raise OmnigentError(
-                "Session not found",
-                code=ErrorCode.NOT_FOUND,
-            )
+            raise _session_not_found()
         return SessionLabelsResponse(
             id=conv.id,
             labels=labels_with_closed_status(conv.labels, conv.title),
@@ -15954,10 +15952,7 @@ def create_sessions_router(
                 session_id,
             )
             if conv_for_collaboration_mode is None:
-                raise OmnigentError(
-                    "Session not found",
-                    code=ErrorCode.NOT_FOUND,
-                )
+                raise _session_not_found()
             if (
                 conv_for_collaboration_mode.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
                 != _CODEX_NATIVE_WRAPPER_LABEL_VALUE
@@ -16061,10 +16056,7 @@ def create_sessions_router(
                 try:
                     await asyncio.to_thread(conversation_store.clear_runner_id, session_id)
                 except ConversationNotFoundError as exc:
-                    raise OmnigentError(
-                        "Session not found",
-                        code=ErrorCode.NOT_FOUND,
-                    ) from exc
+                    raise _session_not_found() from exc
             else:
                 runner_id = _registered_runner_id(runner_router, body.runner_id, user_id=user_id)
                 try:
@@ -16072,10 +16064,7 @@ def create_sessions_router(
                         conversation_store.replace_runner_id, session_id, runner_id
                     )
                 except ConversationNotFoundError as exc:
-                    raise OmnigentError(
-                        "Session not found",
-                        code=ErrorCode.NOT_FOUND,
-                    ) from exc
+                    raise _session_not_found() from exc
                 _runner_client = await _get_runner_client(
                     session_id,
                     runner_router,
@@ -16131,10 +16120,7 @@ def create_sessions_router(
             if conv is None:
                 conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
-                raise OmnigentError(
-                    "Session not found",
-                    code=ErrorCode.NOT_FOUND,
-                )
+                raise _session_not_found()
             if conv.agent_id is None:
                 raise OmnigentError(
                     "Not a session (no agent binding)",
@@ -16155,10 +16141,7 @@ def create_sessions_router(
             archived=body.archived,
         )
         if updated is None:
-            raise OmnigentError(
-                "Session not found",
-                code=ErrorCode.NOT_FOUND,
-            )
+            raise _session_not_found()
         if project_membership_requested:
             membership_updated = await asyncio.to_thread(
                 conversation_store.set_project_membership,
@@ -16166,7 +16149,7 @@ def create_sessions_router(
                 resolved_project_id,
             )
             if not membership_updated:
-                raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+                raise _session_not_found()
             if legacy_project_requested:
                 await asyncio.to_thread(
                     conversation_store.delete_label,
@@ -16249,10 +16232,7 @@ def create_sessions_router(
             except ConversationNotFoundError as exc:
                 # Race: row vanished between the update above and this
                 # write. Reuse the NOT_FOUND code for consistency.
-                raise OmnigentError(
-                    "Session not found",
-                    code=ErrorCode.NOT_FOUND,
-                ) from exc
+                raise _session_not_found() from exc
             except ValueError as exc:
                 # Store raises ValueError on attempted overwrite of an
                 # already-set external_session_id — surface as
@@ -17743,10 +17723,7 @@ def create_sessions_router(
         if access.conversation is None:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
-                raise OmnigentError(
-                    "Session not found",
-                    code=ErrorCode.NOT_FOUND,
-                )
+                raise _session_not_found()
         page = await asyncio.to_thread(
             conversation_store.list_items,
             session_id,
@@ -17827,10 +17804,7 @@ def create_sessions_router(
         if parent is None:
             parent = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if parent is None:
-            raise OmnigentError(
-                "Session not found",
-                code=ErrorCode.NOT_FOUND,
-            )
+            raise _session_not_found()
         title_filter: str | None = None
         if tool and session_name:
             title_filter = f"{tool}:{session_name}"
@@ -17896,10 +17870,7 @@ def create_sessions_router(
         if access.conversation is None:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
-                raise OmnigentError(
-                    "Session not found",
-                    code=ErrorCode.NOT_FOUND,
-                )
+                raise _session_not_found()
         runner_client = await _get_runner_client_for_resource_access(session_id)
         if runner_client is not None:
             page = await _proxy_get_session_resources_to_runner(
@@ -17991,10 +17962,7 @@ def create_sessions_router(
         # Fallback: no-auth path, admin caller, or permissions disabled.
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None:
-            raise OmnigentError(
-                "Session not found",
-                code=ErrorCode.NOT_FOUND,
-            )
+            raise _session_not_found()
         return conv
 
     async def _proxy_get_to_runner(
@@ -19721,10 +19689,7 @@ def create_sessions_router(
         if conv is None:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
-                raise OmnigentError(
-                    "Session not found",
-                    code=ErrorCode.NOT_FOUND,
-                )
+                raise _session_not_found()
         _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
         await _resolve_elicitation(session_id, _resolve_data, runner_router, conversation_store)
         # Apply any policy writes deferred by the relay tool-call ASK gate
@@ -19778,10 +19743,7 @@ def create_sessions_router(
         if access.conversation is None:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
-                raise OmnigentError(
-                    "Session not found",
-                    code=ErrorCode.NOT_FOUND,
-                )
+                raise _session_not_found()
 
         found = pending_elicitations.lookup(elicitation_id)
         if found is None or found[0] != session_id:
@@ -19898,10 +19860,7 @@ def create_sessions_router(
         if conv is None:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
-                raise OmnigentError(
-                    "Session not found",
-                    code=ErrorCode.NOT_FOUND,
-                )
+                raise _session_not_found()
         # Validate event type at the route boundary. Anything not in
         # ``_ALLOWED_EVENT_TYPES`` is a client mistake — failing here
         # is far better than silently persisting an item the agent
@@ -20638,10 +20597,7 @@ def create_sessions_router(
                 session_id,
             )
             if conv_after_wake is None:
-                raise OmnigentError(
-                    "Session not found",
-                    code=ErrorCode.NOT_FOUND,
-                )
+                raise _session_not_found()
             conv = conv_after_wake
             _runner_needs_session_init = True
         runner_client = await _get_runner_client(session_id, runner_router)
@@ -20665,10 +20621,7 @@ def create_sessions_router(
                 # resolution below sees the bound runner.
                 conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
                 if conv is None:
-                    raise OmnigentError(
-                        "Session not found",
-                        code=ErrorCode.NOT_FOUND,
-                    )
+                    raise _session_not_found()
                 runner_client = await _get_runner_client(session_id, runner_router)
         if runner_client is None and conv.host_id is not None:
             _tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
@@ -20776,10 +20729,7 @@ def create_sessions_router(
                             conversation_store.get_conversation, session_id
                         )
                         if conv_after_relaunch is None:
-                            raise OmnigentError(
-                                "Session not found",
-                                code=ErrorCode.NOT_FOUND,
-                            )
+                            raise _session_not_found()
                         conv = conv_after_relaunch
                         runner_client = await _get_runner_client(session_id, runner_router)
             else:
@@ -20856,10 +20806,7 @@ def create_sessions_router(
             )
         refreshed_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if refreshed_conv is None:
-            raise OmnigentError(
-                "Session not found",
-                code=ErrorCode.NOT_FOUND,
-            )
+            raise _session_not_found()
         conv = refreshed_conv
         if _runner_needs_session_init:
             # The runner was unavailable when this request began, so its
@@ -21010,10 +20957,7 @@ def create_sessions_router(
         if conv is None:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
-                raise OmnigentError(
-                    "Session not found",
-                    code=ErrorCode.NOT_FOUND,
-                )
+                raise _session_not_found()
         runner_client = await _get_runner_client(
             session_id,
             runner_router,
@@ -21187,10 +21131,7 @@ def create_sessions_router(
                     )
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None:
-            raise OmnigentError(
-                "Session not found",
-                code=ErrorCode.NOT_FOUND,
-            )
+            raise _session_not_found()
         await _best_effort_stop(session_id, conversation_store, runner_router)
         # Runner-side resource cleanup is best-effort: if the bound
         # runner is offline or unbound, the session must still be
@@ -21251,10 +21192,7 @@ def create_sessions_router(
         _interrupt_fenced_sessions.discard(session_id)
         deleted = await conversation_store.delete_conversation(session_id)
         if not deleted:
-            raise OmnigentError(
-                "Session not found",
-                code=ErrorCode.NOT_FOUND,
-            )
+            raise _session_not_found()
         # The session is gone, so is its launch-progress state. Failed
         # launches are retained in the cache for reload visibility while
         # the session exists; without this eviction every deleted
@@ -22287,10 +22225,7 @@ async def _get_session_snapshot(
     if conv is None:
         conv = await asyncio.to_thread(conv_store.get_conversation, session_id)
     if conv is None:
-        raise OmnigentError(
-            "Session not found",
-            code=ErrorCode.NOT_FOUND,
-        )
+        raise _session_not_found()
     if refresh_state:
         _invalidate_runner_backed_snapshot_state(session_id, cancel_inflight=False)
     # Return the most recent committed items while preserving the
