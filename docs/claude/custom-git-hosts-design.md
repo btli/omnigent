@@ -402,8 +402,11 @@ passthrough itself — `GIT_TOKEN` is not in the default allowlist, so in-sandbo
 ambient to offer and its first tokenless request receives the per-user injection. Two deliberate
 exceptions, stated rather than implied: (a) the proxy **never clobbers a client-set,
 non-synthetic `Authorization` header** (a P1c-4 lock — it must not destroy an unrelated
-credential a tool deliberately sent), so an operator who explicitly adds `GIT_TOKEN` to
-`sandbox.env_passthrough` re-opens an ambient path by their own act; (b) **operator-
+credential a tool deliberately sent), so naming `GIT_TOKEN` in `sandbox.env_passthrough`
+re-opens an ambient path — and that field is **workspace-spec-author-declared, not
+operator-only** (admin policy can cap it; the runner-auth strip already blocks re-admitting the
+*managed* token this way, but the *ambient* token is not in that strip set) — a pre-existing
+ambient-token property this slice does not change; (b) **operator-
 `credential_source` sessions** receive §8.4/§8.4a *clone* delivery but no §8.5 *runner* delivery
 (that frame is gated on a bound slot), so their post-clone fetch/push behavior is unchanged,
 pre-existing scope — extending §8.5 delivery to operator sources is a named later item, not
@@ -444,9 +447,11 @@ pointing at host-local log paths (a provider-wide UX wart unrelated to credentia
 
 ### 8.5 Fetch/push handoff (built in P1) & long-lived hosts
 The transient clone secret is gone after clone, so later fetch/push needs its own path. **Grounded
-resolution (v4, architecture A):** the credential is delivered **once per runner launch** into the
-trusted runner-parent's in-process **egress-proxy**, which swaps it onto the git-over-HTTPS **upstream**
-leg. The sandbox child is a separate OS process that only ever emits **tokenless** traffic through the
+resolution (v4, architecture A):** for sessions with a **bound user credential slot**, the
+credential is delivered **once per runner launch** into the trusted runner-parent's in-process
+**egress-proxy**, which swaps it onto the git-over-HTTPS **upstream** leg. (Operator-
+`credential_source` sessions receive §8.4/§8.4a *clone* delivery only — this runner-delivery
+frame is slot-gated; extending it to operator sources is a named later item, see §8.4a.) The sandbox child is a separate OS process that only ever emits **tokenless** traffic through the
 proxy — it never holds the secret. Fetch/push — and any git op the runner performs after spawn —
 ride this one swap; the **pre-runner initial clone** rides §8.4/§8.4a launch-scoped delivery
 instead (it predates the runner on every provider). There is no per-git-operation hook and no
