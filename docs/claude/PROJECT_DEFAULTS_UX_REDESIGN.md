@@ -200,11 +200,18 @@ in NewChat.
 ### Models & effort
 Shared catalog resolver (`modelOptionsForHarness` / `effortOptionsForHarness`),
 not copied NewChat conditions:
-- `claude-native`: `CLAUDE_NATIVE_MODELS` + extracted `CLAUDE_NATIVE_EFFORTS`.
-- `codex-native`: cached `codexModelOptions` only when from a matching live Codex
-  session; `findCodexModelOption`, `codexEffortLevelsForModel`.
-- Cursor/Kiro/OpenCode/Pi: matching cached snapshot catalog only.
-- SDK / unknown harness: no repository-backed catalog — gate.
+- `claude-native` **only**: `CLAUDE_NATIVE_MODELS` + extracted
+  `CLAUDE_NATIVE_EFFORTS`. *(Review decision: matches the in-session picker,
+  where only the Claude Code wrapper gets the static catalog — SDK sessions
+  have no native model picker either, so `claude-sdk` gates.)*
+- All other harnesses (codex-native, Cursor/Kiro/OpenCode/Pi, SDK, unknown):
+  **gate**, preserving any stored value as a synthetic option. *(Review
+  decision: live-session snapshot catalogs are per-session state with no
+  project-scoped identity; wiring them in was dropped in favor of the
+  project-wide catalog endpoint tracked in #2734.)*
+- Harness options themselves come from `harnessOptionsForProject`: the
+  canonical native wrappers (Claude Code, Codex, …) merged ahead of the brain
+  catalog — `/v1/harnesses` deliberately excludes natives.
 - **Never union models across harnesses** (identical ids differ in support/effort
   metadata). A stored model/effort stays visible as a synthetic option even when
   its catalog is unavailable. When harness is null, gate with: *"Choose a project
