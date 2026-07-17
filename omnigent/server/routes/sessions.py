@@ -626,6 +626,150 @@ _RUNNER_CONVICTION_POLL_S = 0.25
 # through to the connect wait, preserving the prior fire-and-forget
 # behavior rather than blocking the turn.
 _HOST_LAUNCH_RESULT_TIMEOUT_S = 10.0
+# Error code surfaced on a fail-closed credential delivery (an older host
+# that can't seal, an unresolvable/revoked slot, a NACK, or a timeout). A
+# credential-bound managed launch is aborted rather than running git
+# tokenless — the launch fails closed.
+_CREDENTIAL_DELIVERY_ERROR_CODE = "credential_delivery_failed"
+_HOST_CREDENTIAL_RESULT_TIMEOUT_S = 10.0
+
+
+def _managed_repo_path(url: str) -> str:
+    """Derive the repo-path prefix an egress rule scopes to from a clone URL.
+
+    :param url: The resolved clone URL, e.g. ``"https://git.acme.com/team/proj.git"``.
+    :returns: A leading-slash path with no ``.git`` / trailing slash, e.g.
+        ``"/team/proj"``; ``""`` when the URL carries no path.
+    """
+    from urllib.parse import urlparse
+
+    path = urlparse(url).path.rstrip("/")
+    if path.endswith(".git"):
+        path = path[: -len(".git")]
+    return path
+
+
+async def _deliver_credential_for_launch(
+    *,
+    host_conn: HostConnection,
+    host_registry: HostRegistry,
+    runner_id: str,
+    launch_generation: int,
+    session_id: str,
+    repo: RepoWorkspace | None,
+    owner: str | None,
+    credential_store: GitCredentialStore | None,
+) -> str | None:
+    """Seal + deliver the owner's git credential for a pending runner.
+
+    Sent (and ACKed) BEFORE the launch frame so the host caches it and can
+    thread it into the runner at spawn — the sandboxed git op cannot precede
+    the rewrite rule. Resolves the owner's lease via the persisted slot
+    binding, seals the token to the host's ``host.hello`` key, and awaits the
+    host ACK.
+
+    :returns: ``None`` on success OR when there is nothing to deliver (no
+        credential slot / no store / an SSH repo — the backward-compatible or
+        P1c-5-deferred path). A token-free error string when an HTTPS
+        credential IS bound but delivery fails (the caller fails the launch
+        closed). Single-delivery is structural (one call per launch) plus the
+        host's own generation/runner NACK — no server-side accounting.
+    """
+    # Backward-compat: no slot bound (github default / no store) -> nothing to
+    # deliver; the launch proceeds exactly as today.
+    if repo is None or repo.credential_slot_id is None or credential_store is None:
+        return None
+    # SSH repos (git@host / ssh://) are the P1c-5 ssh-agent path, not this
+    # HTTP-token slice. P1c-3 slot selection is scheme-agnostic, so an SSH
+    # workspace can carry a slot; skip cleanly rather than garbling the
+    # scp-form URL or failing the launch closed for a repo that never needed
+    # the HTTP credential.
+    from urllib.parse import urlparse
+
+    if urlparse(repo.url).scheme not in ("http", "https"):
+        return None
+    if owner is None:
+        return "credential is bound but the session has no owner to authorize"
+    # An older host that cannot receive a sealed credential -> fail closed
+    # rather than shipping a token in cleartext.
+    sealing_public_key = host_conn.hello.sealing_public_key
+    if sealing_public_key is None:
+        return "managed host does not support sealed credential delivery"
+    lease = await asyncio.to_thread(
+        credential_store.resolve_lease,
+        owner_user_id=owner,
+        host_id=repo.host_id,
+        credential_id=repo.credential_slot_id,
+    )
+    if lease is None:
+        return "the session owner's git credential could not be resolved"
+    repo_path = _managed_repo_path(repo.url)
+    if not repo_path:
+        return "could not derive a repository path for credential scoping"
+    from omnigent.host.frames import (
+        HostDeliverCredentialFrame,
+        build_credential_delivery_aad,
+        encode_host_frame,
+    )
+    from omnigent.host.sealing import SealError, seal
+
+    # Bind the token to this exact frame identity via the AEAD AAD (the frame
+    # fields below must match these values verbatim, or the host's tag check
+    # fails). Prevents lifting the sealed blob onto a different frame.
+    canonical_host = repo.canonical_host or ""
+    auth_scheme = repo.auth_scheme or "basic"
+    credential_kind = "http-token"
+    host_id = repo.host_id or ""
+    aad = build_credential_delivery_aad(
+        runner_id=runner_id,
+        launch_generation=launch_generation,
+        session_id=session_id,
+        host_id=host_id,
+        credential_slot=repo.credential_slot_id,
+        canonical_host=canonical_host,
+        repo_path=repo_path,
+        credential_kind=credential_kind,
+        auth_scheme=auth_scheme,
+        username=repo.clone_username,
+    )
+    try:
+        sealed = seal(lease.token, recipient_public_key_b64=sealing_public_key, aad=aad)
+    except SealError:
+        return "could not seal the git credential for delivery"
+    request_id = secrets.token_hex(8)
+    cred_future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+    host_conn.pending_credentials[request_id] = cred_future
+    frame = encode_host_frame(
+        HostDeliverCredentialFrame(
+            request_id=request_id,
+            runner_id=runner_id,
+            launch_generation=launch_generation,
+            session_id=session_id,
+            credential_slot=repo.credential_slot_id,
+            canonical_host=canonical_host,
+            repo_path=repo_path,
+            credential_kind=credential_kind,
+            auth_scheme=auth_scheme,
+            username=repo.clone_username,
+            sealed_credential=sealed,
+            host_id=host_id,
+        )
+    )
+    try:
+        host_registry.send_text(host_conn, frame)
+    except ConnectionError:
+        host_conn.pending_credentials.pop(request_id, None)
+        return "managed host connection lost before credential delivery"
+    try:
+        result = await asyncio.wait_for(cred_future, timeout=_HOST_CREDENTIAL_RESULT_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        host_conn.pending_credentials.pop(request_id, None)
+        return "credential delivery to the managed host timed out"
+    if result.get("status") != "installed":
+        return "the managed host rejected the credential delivery"
+    return None
+
+
 # Server-side wait budget for Claude's ``PermissionRequest`` hook. Set
 # to one day so a native permission prompt waits ~indefinitely for the
 # user to answer in EITHER the web UI or the terminal, rather than
@@ -6374,6 +6518,10 @@ async def _launch_runner_on_host(
     conversation_store: ConversationStore,
     host_registry: HostRegistry,
     host_conn: HostConnection,
+    *,
+    repo: RepoWorkspace | None = None,
+    owner: str | None = None,
+    credential_store: GitCredentialStore | None = None,
 ) -> _HostLaunchAttempt:
     """
     Ask a host to spawn a runner for a session and capture the result.
@@ -6391,6 +6539,12 @@ async def _launch_runner_on_host(
     :param conversation_store: Store for updating ``runner_id``.
     :param host_registry: In-memory ``HostRegistry``.
     :param host_conn: The live ``HostConnection`` for the host.
+    :param repo: Resolved repository workspace, used to deliver a bound git
+        credential before the launch frame; ``None`` skips delivery.
+    :param owner: The session owner, used to authorize credential
+        resolution; ``None`` skips delivery.
+    :param credential_store: Per-user git credential store; ``None`` skips
+        delivery (backward-compatible — the feature is not configured).
     :returns: The :class:`_HostLaunchAttempt` — the new runner id plus any
         structured refusal from the host.
     """
@@ -6419,6 +6573,33 @@ async def _launch_runner_on_host(
             conv.host_id,
         )
         return _HostLaunchAttempt(runner_id=new_runner_id)
+    # Fetch/push credential handoff (managed sandboxes): deliver + ACK BEFORE
+    # the launch frame so the host caches the credential and threads it into
+    # the runner at spawn. A credential-bound session that cannot be delivered
+    # fails the launch closed (never silent tokenless git); a session with no
+    # bound slot skips this and launches exactly as before.
+    delivery_error = await _deliver_credential_for_launch(
+        host_conn=host_conn,
+        host_registry=host_registry,
+        runner_id=new_runner_id,
+        launch_generation=conv.launch_generation,
+        session_id=conv.id,
+        repo=repo,
+        owner=owner,
+        credential_store=credential_store,
+    )
+    if delivery_error is not None:
+        _logger.warning(
+            "Credential delivery failed for session %s on host %s: %s",
+            conv.id,
+            conv.host_id,
+            delivery_error,
+        )
+        return _HostLaunchAttempt(
+            runner_id=new_runner_id,
+            error_code=_CREDENTIAL_DELIVERY_ERROR_CODE,
+            error=delivery_error,
+        )
     request_id = secrets.token_hex(8)
     launch_future: asyncio.Future[dict[str, str | None]] = (
         asyncio.get_running_loop().create_future()
@@ -6589,6 +6770,9 @@ async def _run_managed_launch(
         host_store=host_store,
         host_registry=host_registry,
         tunnel_registry=tunnel_registry,
+        repo=repo,
+        owner=owner,
+        credential_store=credential_store,
     )
 
 
@@ -6692,6 +6876,9 @@ async def _bind_and_launch_managed_runner(
     host_store: HostStore,
     host_registry: HostRegistry | None,
     tunnel_registry: TunnelRegistry | None,
+    repo: RepoWorkspace | None = None,
+    owner: str | None = None,
+    credential_store: GitCredentialStore | None = None,
 ) -> None:
     """
     Bind a provisioned managed host to its session and launch a runner.
@@ -6713,6 +6900,12 @@ async def _bind_and_launch_managed_runner(
     :param tunnel_registry: Runner-tunnel registry used to await the
         launched runner's connection. ``None`` in minimal test
         wirings (the rendezvous then settles at frame-send).
+    :param repo: Resolved repository workspace, threaded to the runner
+        launch to deliver a bound git credential; ``None`` skips delivery.
+    :param owner: The session owner, threaded to the runner launch to
+        authorize credential resolution; ``None`` skips delivery.
+    :param credential_store: Per-user git credential store; ``None`` skips
+        delivery (backward-compatible — the feature is not configured).
     """
     from omnigent.server.managed_hosts import terminate_managed_host
 
@@ -6754,6 +6947,9 @@ async def _bind_and_launch_managed_runner(
                 conversation_store,
                 host_registry,
                 host_conn,
+                repo=repo,
+                owner=owner,
+                credential_store=credential_store,
             )
             if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE:
                 # The sandbox image should bake in the harness, but if the
@@ -6761,6 +6957,11 @@ async def _bind_and_launch_managed_runner(
                 # delete-during-provisioning path) rather than waiting out
                 # the connect timeout for a runner that will never appear.
                 reason = launch_attempt.error or "harness not configured on the sandbox host"
+                tracker.fail(session_id, reason)
+                _publish_sandbox_status(session_id, "failed", reason)
+                return
+            if launch_attempt.error_code == _CREDENTIAL_DELIVERY_ERROR_CODE:
+                reason = launch_attempt.error or "git credential delivery failed"
                 tracker.fail(session_id, reason)
                 _publish_sandbox_status(session_id, "failed", reason)
                 return

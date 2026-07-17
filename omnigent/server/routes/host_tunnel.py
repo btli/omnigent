@@ -29,6 +29,7 @@ from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.host.frames import (
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
+    HostDeliverCredentialResultFrame,
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
     HostListDirResultFrame,
@@ -564,6 +565,12 @@ async def _receive_loop(
                         "error": frame.error,
                     }
                 )
+            continue
+
+        if isinstance(frame, HostDeliverCredentialResultFrame):
+            cred_future = conn.pending_credentials.pop(frame.request_id, None)
+            if cred_future is not None and not cred_future.done():
+                cred_future.set_result({"status": frame.status, "error": frame.error})
             continue
 
         _logger.debug(

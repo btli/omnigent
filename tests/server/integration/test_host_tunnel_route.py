@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from omnigent.db.db_models import SqlHost
 from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.host.frames import (
+    HostDeliverCredentialResultFrame,
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
     encode_host_frame,
@@ -427,6 +428,34 @@ async def test_host_tunnel_routes_launch_result_to_future(
     assert result["status"] == "launched"
     assert result["runner_id"] == "runner_token_xyz"
     assert result["error"] is None
+
+
+async def test_host_tunnel_routes_credential_result_to_future(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """A deliver_credential_result frame resolves the pending credential future.
+
+    This is the mechanism by which _deliver_credential_for_launch awaits the
+    host's ACK before it lets the launch proceed.
+    """
+    app, registry, _store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+
+    loop = asyncio.get_event_loop()
+    future: asyncio.Future[dict[str, object]] = loop.create_future()
+    conn.pending_credentials["req_cred"] = future
+
+    result_frame = encode_host_frame(
+        HostDeliverCredentialResultFrame(request_id="req_cred", status="installed")
+    )
+    await comm.send_input({"type": "websocket.receive", "text": result_frame})
+
+    result = await asyncio.wait_for(future, timeout=2.0)
+    assert result == {"status": "installed", "error": None}
 
 
 # ── Cross-owner re-registration rejection ───────────────────

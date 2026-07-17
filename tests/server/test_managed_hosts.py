@@ -2314,3 +2314,235 @@ def test_parse_modal_secrets_malformed_fails_loud(secrets: object) -> None:
                 "modal": {"secrets": secrets},
             }
         )
+
+
+# ── _deliver_credential_for_launch ────────────────────────────────
+
+
+class _FakeHostConn:
+    def __init__(self, sealing_public_key):
+        from omnigent.host.frames import HostHelloFrame
+
+        self.hello = HostHelloFrame(
+            version="0",
+            frame_protocol_version=1,
+            name="h",
+            sealing_public_key=sealing_public_key,
+        )
+        self.pending_credentials = {}
+        self.sent = []
+
+
+class _FakeRegistry:
+    def send_text(self, conn, data):
+        conn.sent.append(data)
+
+
+async def _resolve_pending(conn, *, status):
+    """Mirror the host ACK the receive loop would resolve.
+
+    Polls for the future rather than a single ``sleep(0)`` — the caller
+    registers it only after an ``asyncio.to_thread`` credential-store
+    round trip, so a fixed single yield races the executor thread.
+    """
+    import asyncio
+
+    for _ in range(200):
+        if conn.pending_credentials:
+            break
+        await asyncio.sleep(0.005)
+    for req_id, fut in list(conn.pending_credentials.items()):
+        if not fut.done():
+            fut.set_result({"status": status, "error": None if status == "installed" else "no"})
+
+
+async def test_deliver_credential_for_launch_seals_and_acks(tmp_path) -> None:
+    import asyncio
+
+    from omnigent.host.frames import build_credential_delivery_aad, decode_host_frame
+    from omnigent.host.sealing import generate_sealing_keypair, unseal
+    from omnigent.server.routes.sessions import _deliver_credential_for_launch
+
+    kp = generate_sealing_keypair()
+    store = _cred_store(tmp_path)
+    store.create(
+        owner_user_id="alice",
+        host_id="acme",
+        provider="forgejo",
+        label="work",
+        username=None,
+        token="ghp_secret",
+    )
+    repo = resolve_repo_workspace(
+        "https://git.acme.com/team/proj",
+        _GH_HOSTS,
+        owner_user_id="alice",
+        credential_store=store,
+    )
+    conn = _FakeHostConn(kp.public_key_b64)
+    registry = _FakeRegistry()
+    task = asyncio.create_task(
+        _deliver_credential_for_launch(
+            host_conn=conn,
+            host_registry=registry,
+            runner_id="r1",
+            launch_generation=1,
+            session_id="conv_1",
+            repo=repo,
+            owner="alice",
+            credential_store=store,
+        )
+    )
+    await _resolve_pending(conn, status="installed")
+    err = await task
+    assert err is None
+    # The frame carried a SEALED token, never plaintext.
+    frame = decode_host_frame(conn.sent[0])
+    assert "ghp_secret" not in conn.sent[0]
+    aad = build_credential_delivery_aad(
+        runner_id=frame.runner_id,
+        launch_generation=frame.launch_generation,
+        session_id=frame.session_id,
+        host_id=frame.host_id,
+        credential_slot=frame.credential_slot,
+        canonical_host=frame.canonical_host,
+        repo_path=frame.repo_path,
+        credential_kind=frame.credential_kind,
+        auth_scheme=frame.auth_scheme,
+        username=frame.username,
+    )
+    assert unseal(frame.sealed_credential, private_key=kp.private_key, aad=aad) == "ghp_secret"
+    assert frame.canonical_host == "git.acme.com"
+    assert frame.repo_path == "/team/proj"
+    assert frame.credential_kind == "http-token"
+
+
+async def test_deliver_credential_skips_when_no_slot(tmp_path) -> None:
+    from omnigent.server.routes.sessions import _deliver_credential_for_launch
+
+    repo = resolve_repo_workspace("https://github.com/org/repo", _GH_HOSTS)  # no slot
+    conn = _FakeHostConn("cHVi")
+    registry = _FakeRegistry()
+    err = await _deliver_credential_for_launch(
+        host_conn=conn,
+        host_registry=registry,
+        runner_id="r1",
+        launch_generation=1,
+        session_id="conv_1",
+        repo=repo,
+        owner="alice",
+        credential_store=None,
+    )
+    assert err is None
+    assert conn.sent == []  # backward-compat: nothing sent
+
+
+async def test_deliver_credential_skips_ssh_repo_even_with_slot(tmp_path) -> None:
+    from omnigent.host.sealing import generate_sealing_keypair
+    from omnigent.server.routes.sessions import _deliver_credential_for_launch
+
+    store = _cred_store(tmp_path)
+    slot = store.create(
+        owner_user_id="alice",
+        host_id="acme",
+        provider="forgejo",
+        label="work",
+        username=None,
+        token="ghp_secret",
+    )
+    # P1c-3 slot selection is scheme-agnostic, so an SSH workspace can carry a
+    # slot — but HTTP-token delivery must skip it cleanly (SSH is P1c-5), never
+    # fail the launch closed or garble the scp-form URL.
+    repo = RepoWorkspace(
+        url="git@git.acme.com:team/proj.git",
+        branch=None,
+        repo_name="proj",
+        host_id="acme",
+        canonical_host="git.acme.com",
+        credential_slot_id=slot.id,
+        auth_scheme="basic",
+    )
+    conn = _FakeHostConn(generate_sealing_keypair().public_key_b64)
+    err = await _deliver_credential_for_launch(
+        host_conn=conn,
+        host_registry=_FakeRegistry(),
+        runner_id="r1",
+        launch_generation=1,
+        session_id="conv_1",
+        repo=repo,
+        owner="alice",
+        credential_store=store,
+    )
+    assert err is None  # skipped cleanly, not failed closed
+    assert conn.sent == []
+
+
+async def test_deliver_credential_fails_closed_when_host_cannot_seal(tmp_path) -> None:
+    from omnigent.server.routes.sessions import _deliver_credential_for_launch
+
+    store = _cred_store(tmp_path)
+    store.create(
+        owner_user_id="alice",
+        host_id="acme",
+        provider="forgejo",
+        label="work",
+        username=None,
+        token="ghp_secret",
+    )
+    repo = resolve_repo_workspace(
+        "https://git.acme.com/team/proj",
+        _GH_HOSTS,
+        owner_user_id="alice",
+        credential_store=store,
+    )
+    conn = _FakeHostConn(None)  # older host: no sealing key
+    err = await _deliver_credential_for_launch(
+        host_conn=conn,
+        host_registry=_FakeRegistry(),
+        runner_id="r1",
+        launch_generation=1,
+        session_id="conv_1",
+        repo=repo,
+        owner="alice",
+        credential_store=store,
+    )
+    assert err is not None
+    assert conn.sent == []
+    assert "ghp_secret" not in err
+
+
+async def test_deliver_credential_fails_closed_when_slot_revoked(tmp_path) -> None:
+    from omnigent.server.routes.sessions import _deliver_credential_for_launch
+
+    store = _cred_store(tmp_path)
+    slot = store.create(
+        owner_user_id="alice",
+        host_id="acme",
+        provider="forgejo",
+        label="work",
+        username=None,
+        token="ghp_secret",
+    )
+    repo = resolve_repo_workspace(
+        "https://git.acme.com/team/proj",
+        _GH_HOSTS,
+        owner_user_id="alice",
+        credential_store=store,
+    )
+    store.delete(slot.id)
+    from omnigent.host.sealing import generate_sealing_keypair
+
+    conn = _FakeHostConn(generate_sealing_keypair().public_key_b64)
+    err = await _deliver_credential_for_launch(
+        host_conn=conn,
+        host_registry=_FakeRegistry(),
+        runner_id="r1",
+        launch_generation=1,
+        session_id="conv_1",
+        repo=repo,
+        owner="alice",
+        credential_store=store,
+    )
+    assert err is not None
+    assert conn.sent == []
+    assert "ghp_secret" not in err
