@@ -2477,6 +2477,52 @@ async def test_deliver_credential_skips_ssh_repo_even_with_slot(tmp_path) -> Non
     assert conn.sent == []
 
 
+@pytest.mark.asyncio
+async def test_deliver_credential_fails_closed_on_unscopable_repo_path(tmp_path) -> None:
+    """A repo path outside the proxy allowlist fails closed, loudly, uncached.
+
+    The egress proxy attaches the token only to paths its allowlist accepts;
+    a path with an out-of-allowlist char (here ``+``) would be delivered but
+    never attached, silently 401ing the repo's own git. The server refuses it
+    up front instead — no frame sent, a token-free error, not a silent skip.
+    """
+    from omnigent.host.sealing import generate_sealing_keypair
+    from omnigent.server.routes.sessions import _deliver_credential_for_launch
+
+    store = _cred_store(tmp_path)
+    slot = store.create(
+        owner_user_id="alice",
+        host_id="acme",
+        provider="forgejo",
+        label="work",
+        username=None,
+        token="ghp_secret",
+    )
+    repo = RepoWorkspace(
+        url="https://git.acme.com/team/c++.git",
+        branch=None,
+        repo_name="c++",
+        host_id="acme",
+        canonical_host="git.acme.com",
+        credential_slot_id=slot.id,
+        auth_scheme="basic",
+    )
+    conn = _FakeHostConn(generate_sealing_keypair().public_key_b64)
+    err = await _deliver_credential_for_launch(
+        host_conn=conn,
+        host_registry=_FakeRegistry(),
+        runner_id="r1",
+        launch_generation=1,
+        session_id="conv_1",
+        repo=repo,
+        owner="alice",
+        credential_store=store,
+    )
+    assert err is not None  # loud, not a silent skip
+    assert "ghp_secret" not in err
+    assert conn.sent == []
+
+
 async def test_deliver_credential_fails_closed_when_host_cannot_seal(tmp_path) -> None:
     from omnigent.server.routes.sessions import _deliver_credential_for_launch
 

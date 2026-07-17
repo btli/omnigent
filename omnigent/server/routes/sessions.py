@@ -706,6 +706,16 @@ async def _deliver_credential_for_launch(
     repo_path = _managed_repo_path(repo.url)
     if not repo_path:
         return "could not derive a repository path for credential scoping"
+    # The runner's egress proxy attaches the token only to request paths its
+    # allowlist accepts (see egress/proxy._managed_repo_path_allows). A repo
+    # path with a character outside that allowlist (e.g. "+", a space) would
+    # be delivered but never actually attached — the repo's own git would go
+    # tokenless and 401 with no clear cause. Refuse it here, loudly, using the
+    # exact same predicate so the two sides cannot drift.
+    from omnigent.inner.egress.proxy import _managed_repo_path_allows
+
+    if not _managed_repo_path_allows(repo_path, repo_path):
+        return "the repository path contains characters unsupported by credential scoping"
     from omnigent.host.frames import (
         HostDeliverCredentialFrame,
         build_credential_delivery_aad,

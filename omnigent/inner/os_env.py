@@ -270,8 +270,15 @@ class ManagedGitCredentialError(ValueError):
     Raised for the deterministic misconfigurations the runner cannot recover
     from — no egress allowlist to scope the swap to, or a host already bound by
     an operator ``credential_proxy`` entry. A ``ValueError`` subclass so
-    existing ``except ValueError`` paths still catch it; it surfaces as the
-    session-failure reason via os_env's error path and names no token.
+    existing ``except ValueError`` paths still catch it; it names no token.
+
+    Surfacing: the sandbox helper starts lazily on the first os_env tool call,
+    so this raises then (after the runner has already connected and the launch
+    reported success), not at launch. It propagates as a repeating tool-error
+    result, and every retry re-hits it — the sandbox never starts, so no git op
+    (tokenless or otherwise) can run. The security property holds, but the
+    misconfiguration reports as a persistent tool error rather than a clean
+    launch/session failure; reporting it eagerly at startup is a follow-up.
     """
 
 
