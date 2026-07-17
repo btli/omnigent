@@ -52,7 +52,15 @@ def test_projects_schema_has_portable_keys_constraints_and_indexes(db_uri: str) 
         "owner_principal_id",
         "normalized_name_checksum",
     ) in project_uniques
-    assert all(not index["unique"] for index in inspector.get_indexes("projects"))
+    # MySQL/PostgreSQL implement UNIQUE constraints as unique indexes, and the
+    # inspector surfaces those backing indexes (SQLite hides them). Only a
+    # unique index on columns NOT covered by a declared constraint is rogue.
+    rogue_unique_indexes = [
+        index["name"]
+        for index in inspector.get_indexes("projects")
+        if index["unique"] and tuple(index["column_names"]) not in project_uniques
+    ]
+    assert rogue_unique_indexes == []
     assert all(
         foreign_keys == []
         for foreign_keys in (

@@ -94,6 +94,14 @@ function renderDialog(onOpenChange = vi.fn()) {
   return { onOpenChange, queryClient };
 }
 
+/** Save stays disabled until the defaults editor's draft/validity effect
+ *  chain flushes; slow CI schedulers can otherwise click a disabled button. */
+async function clickSave() {
+  const save = screen.getByRole("button", { name: "Save settings" });
+  await waitFor(() => expect(save).toBeEnabled());
+  fireEvent.click(save);
+}
+
 beforeEach(() => {
   fetchMock.mockReset();
   hookMocks.refetchResolved.mockReset();
@@ -163,7 +171,7 @@ describe("ProjectSettingsDialog", () => {
     fireEvent.change(screen.getByLabelText("Description"), {
       target: { value: "Updated description" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    await clickSave();
 
     await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
     expect(fetchMock).toHaveBeenCalledTimes(3);
@@ -210,7 +218,7 @@ describe("ProjectSettingsDialog", () => {
       "overridden",
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    await clickSave();
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
     const body = JSON.parse(fetchMock.mock.calls[1][1]?.body as string);
     expect(body.defaults_json).not.toHaveProperty("repo_url");
@@ -229,7 +237,7 @@ describe("ProjectSettingsDialog", () => {
     renderDialog();
 
     fireEvent.change(await screen.findByLabelText("Name"), { target: { value: "Beta" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    await clickSave();
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("A project with this name already exists.");
@@ -247,7 +255,7 @@ describe("ProjectSettingsDialog", () => {
     renderDialog();
 
     await screen.findByDisplayValue("Alpha");
-    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    await clickSave();
 
     expect(await screen.findByRole("alert")).toHaveTextContent(/changed elsewhere/i);
     expect(await screen.findByDisplayValue("Alpha from server")).toBeInTheDocument();
@@ -267,7 +275,7 @@ describe("ProjectSettingsDialog", () => {
     renderDialog();
 
     await screen.findByDisplayValue("Alpha");
-    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    await clickSave();
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Invalid project defaults: managed defaults prohibit host_id",
@@ -295,9 +303,7 @@ describe("ProjectSettingsDialog", () => {
       "data-provenance",
       "invalid",
     );
-    const save = screen.getByRole("button", { name: "Save settings" });
-    expect(save).toBeEnabled();
-    fireEvent.click(save);
+    await clickSave();
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
     const body = JSON.parse(fetchMock.mock.calls[1][1]?.body as string);
@@ -378,7 +384,7 @@ describe("ProjectSettingsDialog", () => {
     expect(screen.getByTestId("project-default-model-control")).toHaveTextContent(
       "legacy-model (not in current catalog)",
     );
-    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    await clickSave();
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
     const body = JSON.parse(fetchMock.mock.calls[1][1]?.body as string);

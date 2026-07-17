@@ -7762,6 +7762,50 @@
         ]
       }
     },
+    "/v1/projects/{project_id}/defaults/resolved": {
+      "get": {
+        "operationId": "get_resolved_project_defaults_v1_projects__project_id__defaults_resolved_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Resolved Project Defaults V1 Projects  Project Id  Defaults Resolved Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Resolved Project Defaults",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
     "/v1/projects/{project_id}/rename": {
       "post": {
         "operationId": "rename_project_v1_projects__project_id__rename_post",

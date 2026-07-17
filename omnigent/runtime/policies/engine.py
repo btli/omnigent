@@ -27,7 +27,12 @@ from omnigent.spec.types import (
     StateUpdate,
     StateUpdateAction,
 )
-from omnigent.stores.conversation_store import ConversationStore
+from omnigent.stores.conversation_store import (
+    PROJECT_LABEL_KEY,
+    ConversationStore,
+    warn_deprecated_project_label,
+)
+from omnigent.stores.project_store import ProjectStore
 
 # Number of recent conversation items the engine fetches from
 # the conversation store and threads onto :class:`EvaluationContext`
@@ -116,6 +121,7 @@ class PolicyEngine:
         token_pricing: ModelPricing | None = None,
         initial_model: str | None = None,
         conversation_store: ConversationStore,
+        project_store: ProjectStore | None = None,
         root_conversation_id: str | None = None,
         llm_client: Any = None,
     ) -> None:
@@ -161,6 +167,7 @@ class PolicyEngine:
         self._token_pricing = token_pricing
         self._model = initial_model
         self._store = conversation_store
+        self._project_store = project_store
         self._llm_client = llm_client
 
     @property
@@ -502,7 +509,22 @@ class PolicyEngine:
         """
         if not set_labels:
             return
+        legacy_project_requested = PROJECT_LABEL_KEY in set_labels
+        legacy_project_name = set_labels.get(PROJECT_LABEL_KEY)
         filtered = self._filter_schema_valid(set_labels)
+        # The legacy project label forwards to first-class membership instead
+        # of landing as a label (one-way deprecation, policy write path).
+        filtered.pop(PROJECT_LABEL_KEY, None)
+        if legacy_project_requested and legacy_project_name is not None:
+            if self._project_store is None:
+                raise RuntimeError("project store is required for legacy project label writes")
+            warn_deprecated_project_label("policy")
+            self._store.forward_legacy_project_label(
+                self._conversation_id,
+                legacy_project_name,
+                self._project_store,
+            )
+            self._labels.pop(PROJECT_LABEL_KEY, None)
         if not filtered:
             return
         self._store.set_labels(self._conversation_id, filtered)
