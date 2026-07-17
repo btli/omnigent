@@ -647,6 +647,8 @@ def test_redact_values_surrogate_safe_and_overlap_masked() -> None:
     assert k8s._redact_values("abcSECRET", ["abc", "cSECRET"]) == "***"
     # Text outside any match span is preserved.
     assert k8s._redact_values("AxxxB", ["A", "B"]) == "***xxx***"
+    # Adjacent/repeated matches (contiguous coverage) collapse to ONE marker.
+    assert k8s._redact_values("YY22", ["Y"]) == "***22"
 
 
 def test_load_core_pins_k8s_rest_logger_to_suppress_response_bodies(

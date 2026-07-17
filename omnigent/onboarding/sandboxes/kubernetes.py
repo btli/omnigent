@@ -742,15 +742,20 @@ def _redact_values(text: str, values: Iterable[str]) -> str:
     if not spans:
         return text
     spans.sort()
+    # Merge overlapping AND adjacent spans so a contiguous covered run is a single
+    # mask (else a value repeated at touching positions would emit "******").
+    merged: list[tuple[int, int]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
     out: list[str] = []
     cursor = 0
-    for start, end in spans:
-        if start >= cursor:
-            out.append(text[cursor:start])
-            out.append("***")
-            cursor = end
-        elif end > cursor:
-            cursor = end
+    for start, end in merged:
+        out.append(text[cursor:start])
+        out.append("***")
+        cursor = end
     out.append(text[cursor:])
     return "".join(out)
 
