@@ -1366,10 +1366,9 @@ class SessionCreateRequest(BaseModel):
             workspace that isn't a valid repository URL, or an
             external repository-URL workspace.
         """
-        # Lazy import: schemas is imported by nearly every module, so
-        # pulling the (FastAPI/click-importing) managed-hosts module in
-        # at module scope would risk import cycles.
-        from omnigent.server.managed_hosts import is_repo_workspace, parse_repo_workspace
+        # Schemas is imported by nearly every module, so keep workspace
+        # resolution out of its module-level dependency graph.
+        from omnigent.git_hosts.managed_workspace import is_repo_workspace, parse_repo_workspace
 
         if self.host_type == "managed":
             if self.host_id is not None:

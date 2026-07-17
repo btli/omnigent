@@ -85,6 +85,11 @@ from omnigent.entities.conversation import (
 from omnigent.entities.permission import SessionPermission
 from omnigent.entities.session_resources import session_resource_view_to_dict
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
+from omnigent.git_hosts.managed_workspace import (
+    CredentialSelectionError,
+    RepoWorkspace,
+    resolve_repo_workspace,
+)
 from omnigent.harness_plugins import (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
@@ -163,15 +168,12 @@ from omnigent.server.auth import (
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
-    CredentialSelectionError,
     ManagedHostLaunch,
     ManagedLaunch,
     ManagedLaunchTracker,
     ManagedSandboxConfig,
-    RepoWorkspace,
     host_resume_supported,
     host_sandbox_is_running,
-    resolve_repo_workspace,
 )
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.permissions import check_session_access
@@ -807,7 +809,7 @@ def _reauthorize_managed_repo_for_delivery(
         bound to deliver.
     :raises RelaunchBindingError: When the binding integrity is broken.
     """
-    from omnigent.server.managed_hosts import (
+    from omnigent.git_hosts.managed_workspace import (
         MANAGED_GIT_CREDENTIAL_SLOT_LABEL_KEY,
         MANAGED_REPO_LABEL_KEY,
         reauthorize_relaunch_binding,
@@ -7321,7 +7323,7 @@ def _kick_managed_relaunch(
     :param host_store: Persistent host registrations.
     :param app_state: ``request.app.state`` — supplies the registries.
     """
-    from omnigent.server.managed_hosts import (
+    from omnigent.git_hosts.managed_workspace import (
         MANAGED_REPO_LABEL_KEY,
         RelaunchBindingError,
         build_relaunch_binding_labels,
@@ -7512,7 +7514,8 @@ async def _run_managed_wake(
     :param app_state: ``request.app.state`` — supplies the git-hosts +
         credential registries for credential re-delivery.
     """
-    from omnigent.server.managed_hosts import RelaunchBindingError, resume_managed_host
+    from omnigent.git_hosts.managed_workspace import RelaunchBindingError
+    from omnigent.server.managed_hosts import resume_managed_host
 
     try:
         # Wake the same sandbox in place; resume_managed_host is single-flight
@@ -15000,11 +15003,11 @@ def create_sessions_router(
                     "'sandbox:' section to the server config",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            from omnigent.server.auth import RESERVED_USER_LOCAL
-            from omnigent.server.managed_hosts import (
+            from omnigent.git_hosts.managed_workspace import (
                 MANAGED_REPO_LABEL_KEY,
                 build_relaunch_binding_labels,
             )
+            from omnigent.server.auth import RESERVED_USER_LOCAL
 
             # The pre-create gate already parsed and host-resolved the
             # repository workspace; reuse that single resolution so the
@@ -15014,8 +15017,8 @@ def create_sessions_router(
                 # The session row's workspace is overwritten with the CLONED
                 # path at bind time; record the raw request value so a sandbox
                 # relaunch can re-clone the same repository, PLUS the resolved
-                # binding (host-config id + topology hash + canonical URL +
-                # credential slot id) so relaunch re-authorizes deterministically
+                # binding (host-config id + topology hash + credential slot id)
+                # so relaunch re-authorizes deterministically
                 # instead of silently re-resolving against whatever git_hosts is
                 # live. Empty for the github.com default.
                 _repo_labels = {MANAGED_REPO_LABEL_KEY: body.workspace}
@@ -20603,7 +20606,7 @@ def create_sessions_router(
             if runner_client is None and _host_reg is not None:
                 _host_conn = _host_reg.get(conv.host_id)
                 if _host_conn is not None:
-                    from omnigent.server.managed_hosts import RelaunchBindingError
+                    from omnigent.git_hosts.managed_workspace import RelaunchBindingError
 
                     # A credential-bound session's runner cache was dropped
                     # with the old runner (see _reauthorize_managed_repo_for_

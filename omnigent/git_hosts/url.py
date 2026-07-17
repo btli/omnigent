@@ -1,7 +1,8 @@
 """Canonical-host extraction for git repository URLs.
 
 Supports the two managed-clone URL forms (matching
-:func:`omnigent.server.managed_hosts.parse_repo_workspace`): ``https://<host>/<path>``
+:func:`omnigent.git_hosts.managed_workspace.parse_repo_workspace`):
+``https://<host>/<path>``
 and scp-style ``git@<host>:<path>``. Rejects embedded userinfo (a
 credential-in-URL smuggling vector) and explicit ``https`` ports or IPv6
 literal hosts — custom ports and SSH transport land with the clone-wiring

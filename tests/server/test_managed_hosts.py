@@ -13,6 +13,21 @@ from httpx import ASGITransport, AsyncClient
 
 from omnigent.db.utils import now_epoch
 from omnigent.git_hosts.config import load_git_hosts
+from omnigent.git_hosts.managed_workspace import (
+    MANAGED_GIT_CREDENTIAL_SLOT_LABEL_KEY,
+    MANAGED_GIT_HOST_HASH_LABEL_KEY,
+    MANAGED_GIT_HOST_ID_LABEL_KEY,
+    MANAGED_REPO_LABEL_KEY,
+    CredentialSelectionError,
+    RelaunchBindingError,
+    RepoWorkspace,
+    _build_clone_env,
+    build_relaunch_binding_labels,
+    host_config_hash,
+    parse_repo_workspace,
+    reauthorize_relaunch_binding,
+    resolve_repo_workspace,
+)
 from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
@@ -21,26 +36,13 @@ from omnigent.server.managed_hosts import (
     DAYTONA_MANAGED_TOKEN_TTL_S,
     ISLO_MANAGED_TOKEN_TTL_S,
     KUBERNETES_MANAGED_TOKEN_TTL_S,
-    MANAGED_GIT_CREDENTIAL_SLOT_LABEL_KEY,
-    MANAGED_GIT_HOST_HASH_LABEL_KEY,
-    MANAGED_GIT_HOST_ID_LABEL_KEY,
-    MANAGED_REPO_LABEL_KEY,
     MODAL_MANAGED_TOKEN_TTL_S,
     OPENSHELL_MANAGED_TOKEN_TTL_S,
-    CredentialSelectionError,
     ManagedSandboxConfig,
-    RelaunchBindingError,
-    RepoWorkspace,
-    _build_clone_env,
-    build_relaunch_binding_labels,
-    host_config_hash,
     host_resume_supported,
     launch_managed_host,
-    parse_repo_workspace,
     parse_sandbox_config,
-    reauthorize_relaunch_binding,
     relaunch_managed_host,
-    resolve_repo_workspace,
     resume_managed_host,
     terminate_managed_host,
 )
@@ -1129,7 +1131,7 @@ def test_build_clone_env_fails_closed_when_slot_revoked(tmp_path) -> None:
         owner_user_id="alice",
         credential_store=store,
     )
-    store.delete(slot.id)  # owner lost the slot between create and launch
+    store.delete_for_owner("alice", slot.id)  # owner lost the slot between create and launch
     with pytest.raises(ValueError) as exc:
         _build_clone_env(repo, owner="alice", credential_store=store)
     assert "SLOT_TOKEN" not in str(exc.value)  # fail-closed message names no token
@@ -1415,7 +1417,7 @@ def test_reauthorize_refuses_when_slot_revoked(tmp_path) -> None:
         credential_store=store,
     )
     labels = _bound_labels(repo, store, tmp_path)
-    store.delete(slot.id)  # owner lost the slot between create and relaunch
+    store.delete_for_owner("alice", slot.id)  # owner lost the slot between create and relaunch
     with pytest.raises(RelaunchBindingError, match="no longer available"):
         reauthorize_relaunch_binding(
             raw_repo="https://git.acme.com/team/proj",
@@ -1448,7 +1450,7 @@ def test_reauthorize_managed_repo_for_delivery_returns_binding_for_credential_se
 ) -> None:
     from types import SimpleNamespace
 
-    from omnigent.server.managed_hosts import (
+    from omnigent.git_hosts.managed_workspace import (
         MANAGED_GIT_CREDENTIAL_SLOT_LABEL_KEY,
         MANAGED_GIT_HOST_ID_LABEL_KEY,
         MANAGED_REPO_LABEL_KEY,
@@ -1489,7 +1491,7 @@ def test_reauthorize_managed_repo_for_delivery_returns_binding_for_credential_se
 def test_reauthorize_managed_repo_for_delivery_noop_without_credential_slot() -> None:
     from types import SimpleNamespace
 
-    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
+    from omnigent.git_hosts.managed_workspace import MANAGED_REPO_LABEL_KEY
     from omnigent.server.routes.sessions import _reauthorize_managed_repo_for_delivery
 
     # A managed session with a repo label but NO credential-slot label: the
@@ -1510,7 +1512,7 @@ def test_reauthorize_managed_repo_for_delivery_raises_on_revoked_slot(tmp_path) 
 
     import pytest
 
-    from omnigent.server.managed_hosts import (
+    from omnigent.git_hosts.managed_workspace import (
         MANAGED_GIT_CREDENTIAL_SLOT_LABEL_KEY,
         MANAGED_GIT_HOST_ID_LABEL_KEY,
         MANAGED_REPO_LABEL_KEY,
@@ -1535,7 +1537,7 @@ def test_reauthorize_managed_repo_for_delivery_raises_on_revoked_slot(tmp_path) 
             MANAGED_GIT_CREDENTIAL_SLOT_LABEL_KEY: slot.id,
         },
     )
-    store.delete(slot.id)  # revoked while the session slept
+    store.delete_for_owner("alice", slot.id)  # revoked while the session slept
     host_store = SimpleNamespace(get_host=lambda hid: SimpleNamespace(owner="alice"))
     app_state = SimpleNamespace(git_hosts=_GH_HOSTS, git_credential_store=store)
     with pytest.raises(RelaunchBindingError) as exc:
@@ -2749,7 +2751,7 @@ async def test_deliver_credential_fails_closed_when_slot_revoked(tmp_path) -> No
         owner_user_id="alice",
         credential_store=store,
     )
-    store.delete(slot.id)
+    store.delete_for_owner("alice", slot.id)
     from omnigent.host.sealing import generate_sealing_keypair
 
     conn = _FakeHostConn(generate_sealing_keypair().public_key_b64)

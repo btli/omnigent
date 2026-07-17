@@ -633,8 +633,8 @@ async def test_message_relaunch_credential_binding_error_persists_error_turn(
     ``_expect_no_launch`` flips ``True`` and the error-item assertion
     fails.
     """
+    from omnigent.git_hosts.managed_workspace import RelaunchBindingError
     from omnigent.runtime import set_runner_client
-    from omnigent.server.managed_hosts import RelaunchBindingError
     from omnigent.server.routes import sessions as sessions_module
 
     monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
