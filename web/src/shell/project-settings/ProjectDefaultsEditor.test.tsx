@@ -54,10 +54,9 @@ beforeEach(() => {
     ],
     isLoading: false,
   });
-  mocks.labels.mockReturnValue({
-    "claude-native": "Claude Code",
-    "codex-native": "Codex",
-  });
+  // Empty brain labels prove native wrappers self-populate from the canonical
+  // registry — /v1/harnesses deliberately excludes them.
+  mocks.labels.mockReturnValue({});
   setResolved();
 });
 
@@ -158,32 +157,29 @@ describe("ProjectDefaultsEditor", () => {
   });
 
   it("restores legacy-value preservation when a changed harness returns to its opening value", async () => {
-    mocks.labels.mockReturnValue({
-      "claude-native": "Claude Code",
-      "claude-sdk": "Claude SDK",
-    });
     render(
       <ProjectDefaultsEditor
         open
         projectId="project-1"
-        bundle={{ harness: "claude-native", model: "legacy-model" }}
+        bundle={{ harness: "codex-native", model: "legacy-model" }}
         projectRowVersion={7}
         onDraftChange={vi.fn()}
       />,
     );
 
+    // Opening state: gated catalog preserves the stored model without error.
     expect(await screen.findByTestId("project-default-model-control")).toBeInTheDocument();
     expect(screen.queryByTestId("project-default-model-error")).toBeNull();
     fireEvent.pointerDown(screen.getByTestId("project-default-harness-control"), {
       button: 0,
     });
-    fireEvent.click(screen.getByTestId("project-default-harness-option-claude-sdk"));
+    fireEvent.click(screen.getByTestId("project-default-harness-option-claude-native"));
     expect(screen.getByTestId("project-default-model-error")).toBeInTheDocument();
 
     fireEvent.pointerDown(screen.getByTestId("project-default-harness-control"), {
       button: 0,
     });
-    fireEvent.click(screen.getByTestId("project-default-harness-option-claude-native"));
+    fireEvent.click(screen.getByTestId("project-default-harness-option-codex-native"));
     expect(screen.queryByTestId("project-default-model-error")).toBeNull();
   });
 
@@ -262,7 +258,7 @@ describe("ProjectDefaultsEditor", () => {
     expect(screen.getByTestId("project-defaults-loading")).toBeInTheDocument();
   });
 
-  it("keeps raw overrides visible but disabled on preview error and retries", async () => {
+  it("keeps raw overrides visible and editable on preview error, with retry", async () => {
     mocks.resolved.mockReturnValue({
       data: undefined,
       isLoading: false,
@@ -286,7 +282,12 @@ describe("ProjectDefaultsEditor", () => {
     expect(screen.getByTestId("project-default-model-control")).toHaveTextContent(
       "legacy-model",
     );
-    expect(screen.getByTestId("project-default-model-control")).toBeDisabled();
+    // Controls stay enabled: a preview error is often caused by the very
+    // bundle these fields repair (e.g. a branch without a host). The model
+    // picker stays gated by its own missing-catalog rule (no harness), which
+    // is independent of the preview error.
+    expect(screen.getByTestId("project-default-host_type-control")).not.toBeDisabled();
+    expect(screen.getByTestId("project-default-model-reset")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Retry resolved defaults" }));
     expect(mocks.refetch).toHaveBeenCalledTimes(1);
   });
@@ -319,14 +320,23 @@ describe("ProjectDefaultsEditor", () => {
     await waitFor(() => expect(onValidityChange).toHaveBeenLastCalledWith(true));
   });
 
-  it("marks an external branch without a pinned host invalid", async () => {
-    setResolved({ host_id: null, git: { branch_name: "generated", base_branch: "feature" } });
+  it("lets a broken branch-without-host bundle be repaired under an errored preview", async () => {
+    // The real resolver rejects an external default_branch without a pinned
+    // host, so the preview arrives as an error — the editor must still expose
+    // enabled host/branch controls to fix exactly that.
+    mocks.resolved.mockReturnValue({
+      data: undefined,
+      isLoading: false,
+      isError: true,
+      error: new Error("External project default_branch requires a pinned host_id"),
+      refetch: mocks.refetch,
+    });
     const onValidityChange = vi.fn();
     render(
       <ProjectDefaultsEditor
         open
         projectId="project-1"
-        bundle={{ default_branch: "feature" }}
+        bundle={{ host_type: "external", default_branch: "feature" }}
         projectRowVersion={7}
         onDraftChange={vi.fn()}
         onValidityChange={onValidityChange}
@@ -336,5 +346,63 @@ describe("ProjectDefaultsEditor", () => {
     expect(await screen.findByTestId("project-default-host_id-error")).toBeInTheDocument();
     expect(screen.getByTestId("project-default-default_branch-error")).toBeInTheDocument();
     await waitFor(() => expect(onValidityChange).toHaveBeenLastCalledWith(false));
+
+    // The repair controls are usable: the host picker is enabled and offers
+    // the loaded hosts, and resetting the branch is possible too.
+    const hostControl = screen.getByTestId("project-default-host_id-control");
+    expect(hostControl).not.toBeDisabled();
+    fireEvent.pointerDown(hostControl, { button: 0 });
+    fireEvent.click(screen.getByTestId("project-default-host_id-option-host-1"));
+    await waitFor(() => expect(onValidityChange).toHaveBeenLastCalledWith(true));
+  });
+
+  it("invalidates a reset of the pinned host that strands a default branch", async () => {
+    // The stored host equals its own resolved echo, so the post-reset display
+    // must drop to empty — validation then catches the stranded branch.
+    setResolved({ host_id: "host-1", git: { branch_name: "generated", base_branch: "feature" } });
+    const onValidityChange = vi.fn();
+    render(
+      <ProjectDefaultsEditor
+        open
+        projectId="project-1"
+        bundle={{ host_id: "host-1", default_branch: "feature" }}
+        projectRowVersion={7}
+        onDraftChange={vi.fn()}
+        onValidityChange={onValidityChange}
+      />,
+    );
+
+    expect(await screen.findByTestId("project-default-host_id-control")).toBeInTheDocument();
+    await waitFor(() => expect(onValidityChange).toHaveBeenLastCalledWith(true));
+    fireEvent.click(screen.getByTestId("project-default-host_id-reset"));
+    expect(await screen.findByTestId("project-default-host_id-error")).toBeInTheDocument();
+    await waitFor(() => expect(onValidityChange).toHaveBeenLastCalledWith(false));
+  });
+
+  it("blocks saving a workspace carried across an External to Managed switch", async () => {
+    const onValidityChange = vi.fn();
+    render(
+      <ProjectDefaultsEditor
+        open
+        projectId="project-1"
+        bundle={{ workspace: "/Users/me/repo" }}
+        projectRowVersion={7}
+        onDraftChange={vi.fn()}
+        onValidityChange={onValidityChange}
+      />,
+    );
+
+    expect(await screen.findByTestId("project-default-workspace-field")).toBeInTheDocument();
+    await waitFor(() => expect(onValidityChange).toHaveBeenLastCalledWith(true));
+    fireEvent.change(screen.getByTestId("project-default-host_type-control"), {
+      target: { value: "managed" },
+    });
+
+    expect(screen.getByTestId("project-default-workspace-error")).toHaveTextContent(
+      "Reset it to save",
+    );
+    await waitFor(() => expect(onValidityChange).toHaveBeenLastCalledWith(false));
+    fireEvent.click(screen.getByTestId("project-default-workspace-reset"));
+    await waitFor(() => expect(onValidityChange).toHaveBeenLastCalledWith(true));
   });
 });

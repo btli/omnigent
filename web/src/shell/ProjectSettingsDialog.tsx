@@ -18,7 +18,10 @@ import {
   projectMutationStatus,
   ProjectMutationError,
 } from "@/hooks/useConversations";
-import { invalidateProjectQueries } from "@/hooks/projectQueries";
+import {
+  invalidateProjectQueries,
+  PROJECT_RESOLVED_DEFAULTS_KEY,
+} from "@/hooks/projectQueries";
 import { authenticatedFetch } from "@/lib/identity";
 
 import { ProjectDefaultsEditor } from "./project-settings/ProjectDefaultsEditor";
@@ -103,7 +106,21 @@ export function ProjectSettingsDialog({
   );
 
   useEffect(() => {
-    if (open) void loadProject();
+    if (open) {
+      void loadProject();
+    } else {
+      // Wipe editable state on close so cancelled edits (description, draft,
+      // stale ETag) can never survive into the next open and get saved there.
+      setProject(null);
+      setEtag(null);
+      setName("");
+      setDescription("");
+      setDefaultsDraft(null);
+      setDefaultsValid(false);
+      setLoadError(null);
+      setSaveError(null);
+      setNameError(null);
+    }
     return () => {
       loadSequence.current += 1;
     };
@@ -133,7 +150,7 @@ export function ProjectSettingsDialog({
   }, []);
 
   async function handleSave() {
-    if (!project || !etag || !defaultsDraft || !defaultsValid || isSaving) return;
+    if (!project || !etag || !defaultsDraft || !defaultsValid || isSaving || isLoading) return;
     const trimmedName = name.trim();
     if (!trimmedName) {
       setNameError("Project name is required.");
@@ -194,6 +211,12 @@ export function ProjectSettingsDialog({
         invalidateProjectQueries(queryClient, { sessions: true });
       } else if (status === 412) {
         setSaveError("This project changed elsewhere. Latest settings have been loaded.");
+        // Refresh the resolved baseline alongside the project: an errored
+        // preview holds no data, so the editor's row-version mismatch effect
+        // alone cannot recover it.
+        void queryClient.invalidateQueries({
+          queryKey: [...PROJECT_RESOLVED_DEFAULTS_KEY, projectId],
+        });
         await loadProject(true);
       } else {
         setSaveError(serverMessage(error));
@@ -340,7 +363,7 @@ export function ProjectSettingsDialog({
                 type="submit"
                 className="min-h-11"
                 loading={isSaving}
-                disabled={!defaultsDraft || !defaultsValid}
+                disabled={!defaultsDraft || !defaultsValid || isLoading}
               >
                 Save settings
               </Button>

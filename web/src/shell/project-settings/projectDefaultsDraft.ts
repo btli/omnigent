@@ -125,6 +125,15 @@ export function setFieldValue(
   };
 }
 
+/** What a field resolves to once its project property is removed. For a stored
+ *  value the preview echoed that value back as `resolvedAtOpen`, so it cannot
+ *  be the post-reset display: under schema v1 the only server default is
+ *  host_type=external — every other field inherits nothing. */
+function postResetValue(field: DefaultField, draft: DefaultFieldDraft): string {
+  if (draft.persistedKind !== "value") return draft.resolvedAtOpen ?? "";
+  return field === "host_type" ? "external" : "";
+}
+
 export function resetField(state: DefaultsDraftState, field: DefaultField): DefaultsDraftState {
   const draft = state.fields[field];
 
@@ -134,7 +143,7 @@ export function resetField(state: DefaultsDraftState, field: DefaultField): Defa
       ...state.fields,
       [field]: {
         ...draft,
-        value: draft.resolvedAtOpen ?? "",
+        value: postResetValue(field, draft),
         edited: false,
         resetRequested: true,
       },

@@ -12,7 +12,10 @@ describe("DefaultHarnessPicker", () => {
       <DefaultHarnessPicker
         value="claude-native"
         provenance="inherited"
-        labels={{ "claude-native": "Claude Code", "codex-native": "Codex" }}
+        harnessOptions={[
+          { id: "claude-native", label: "Claude Code" },
+          { id: "codex-native", label: "Codex" },
+        ]}
         onChange={onChange}
         onReset={vi.fn()}
       />,
@@ -34,7 +37,7 @@ describe("DefaultHarnessPicker", () => {
       <DefaultHarnessPicker
         value="legacy-harness"
         provenance="overridden"
-        labels={{ "claude-native": "Claude Code" }}
+        harnessOptions={[{ id: "claude-native", label: "Claude Code" }]}
         onChange={vi.fn()}
         onReset={onReset}
       />,

@@ -1,4 +1,5 @@
 import { CLAUDE_NATIVE_MODELS } from "./claudeNativeModels";
+import { NATIVE_CODING_AGENTS, nativeCodingAgentForHarness } from "./nativeCodingAgents";
 
 export const CLAUDE_NATIVE_EFFORTS = [
   { value: "low", label: "Low" },
@@ -18,24 +19,47 @@ export interface EffortOption {
   label: string;
 }
 
-const CLAUDE_FAMILY_HARNESSES = new Set([
-  "claude-native",
-  "claude-sdk",
-  "claude_sdk",
-  "claude",
-]);
+export interface HarnessOption {
+  id: string;
+  label: string;
+}
 
-export function isClaudeFamilyHarness(harness: string | null): boolean {
-  return harness !== null && CLAUDE_FAMILY_HARNESSES.has(harness);
+/**
+ * Whether a project harness default resolves to Claude Code's native wrapper.
+ * Alias-aware via the canonical native-agent registry. Only this harness gets
+ * the static model/effort catalog — mirroring the in-session picker, where
+ * SDK sessions have no native model picker.
+ */
+export function isClaudeNativeHarness(harness: string | null): boolean {
+  return nativeCodingAgentForHarness(harness)?.key === "claude";
+}
+
+/**
+ * Harness options for the project defaults picker: the native terminal
+ * wrappers (Claude Code, Codex, …) followed by the brain-harness catalog.
+ * `useBrainHarnessLabels()` deliberately excludes native wrappers, so both
+ * sources are needed for the full set a project can pin.
+ */
+export function harnessOptionsForProject(
+  brainLabels: Record<string, string>,
+): readonly HarnessOption[] {
+  const options: HarnessOption[] = [...NATIVE_CODING_AGENTS]
+    .sort((a, b) => a.sortRank - b.sortRank)
+    .map((agent) => ({ id: agent.harness, label: agent.displayName }));
+  const seen = new Set(options.map((option) => option.id));
+  for (const [id, label] of Object.entries(brainLabels)) {
+    if (!seen.has(id)) options.push({ id, label });
+  }
+  return options;
 }
 
 export function modelOptionsForHarness(harness: string | null): readonly ModelOption[] {
-  return isClaudeFamilyHarness(harness) ? CLAUDE_NATIVE_MODELS : [];
+  return isClaudeNativeHarness(harness) ? CLAUDE_NATIVE_MODELS : [];
 }
 
 export function effortOptionsForHarness(
   harness: string | null,
   _model: string | null,
 ): readonly EffortOption[] {
-  return isClaudeFamilyHarness(harness) ? CLAUDE_NATIVE_EFFORTS : [];
+  return isClaudeNativeHarness(harness) ? CLAUDE_NATIVE_EFFORTS : [];
 }

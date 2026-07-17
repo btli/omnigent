@@ -4,7 +4,11 @@ import { Button } from "@/components/ui/button";
 import { useResolvedProjectDefaults } from "@/hooks/useConversations";
 import { useHosts } from "@/hooks/useHosts";
 import { useBrainHarnessLabels } from "@/lib/agentLabels";
-import { effortOptionsForHarness, modelOptionsForHarness } from "@/lib/harnessCatalog";
+import {
+  effortOptionsForHarness,
+  harnessOptionsForProject,
+  modelOptionsForHarness,
+} from "@/lib/harnessCatalog";
 
 import { DefaultEffortPicker } from "./DefaultEffortPicker";
 import { DefaultHarnessPicker } from "./DefaultHarnessPicker";
@@ -127,12 +131,10 @@ export function ProjectDefaultsEditor({
       ? "managed"
       : "external"
     : "external";
+  // Also enabled while the preview errors: repairing a broken bundle (e.g. an
+  // external default_branch without a pinned host) needs the host list.
   const hosts = useHosts({
-    enabled:
-      open &&
-      draft !== null &&
-      !preview.isError &&
-      effectiveHostType === "external",
+    enabled: open && draft !== null && effectiveHostType === "external",
   });
 
   useEffect(() => {
@@ -176,8 +178,22 @@ export function ProjectDefaultsEditor({
       fieldDisplayValue(draft, "default_branch").trim() !== "" &&
       fieldDisplayValue(draft, "host_id").trim() === "",
   );
+  // A workspace carried across a live External → Managed switch is a path, not
+  // the repository spec managed sessions need — block Save until it is reset.
+  // A managed+workspace bundle loaded as-is may be a valid repo spec, so only
+  // this session's own switch gates.
+  const workspaceBlocksSave = Boolean(
+    draft &&
+      effectiveHostType === "managed" &&
+      draft.fields.host_type.edited &&
+      fieldProvenance(draft, "workspace") !== "inherited",
+  );
   const isValid =
-    draft !== null && !branchWithoutHost && !modelIncompatible && !effortIncompatible;
+    draft !== null &&
+    !branchWithoutHost &&
+    !workspaceBlocksSave &&
+    !modelIncompatible &&
+    !effortIncompatible;
 
   useEffect(() => {
     onValidityChange?.(isValid);
@@ -251,7 +267,10 @@ export function ProjectDefaultsEditor({
         </div>
       )}
 
-      <fieldset disabled={rawPreviewError} className="min-w-0">
+      {/* Controls stay enabled during a preview error: a broken saved bundle
+          (branch without host, null host type) is repaired with these very
+          fields, and the fallback baselines make edits raw overrides. */}
+      <fieldset className="min-w-0">
         <div className="grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-2">
           <div className="min-w-0 sm:col-span-2">
             <DefaultSelectField
@@ -331,9 +350,11 @@ export function ProjectDefaultsEditor({
                     : "Workspace used by new external sessions."
                 }
                 error={
-                  retainedWorkspace
-                    ? "This external-only value is retained but inactive for managed sessions."
-                    : undefined
+                  workspaceBlocksSave
+                    ? "Managed sessions cannot use this workspace path. Reset it to save."
+                    : retainedWorkspace
+                      ? "This external-only value is retained but inactive for managed sessions."
+                      : undefined
                 }
                 onChange={(value) => change("workspace", value)}
                 onReset={() => reset("workspace")}
@@ -360,7 +381,7 @@ export function ProjectDefaultsEditor({
           <DefaultHarnessPicker
             value={fieldDisplayValue(draft, "harness")}
             provenance={fieldProvenance(draft, "harness")}
-            labels={labels}
+            harnessOptions={harnessOptionsForProject(labels)}
             onChange={(value) => change("harness", value)}
             onReset={() => reset("harness")}
           />

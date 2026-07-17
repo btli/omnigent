@@ -92,10 +92,34 @@ describe("projectDefaultsDraft", () => {
     expect(serializeBundle(state)).toEqual({});
   });
 
-  it("resets a stored value to inherited and omits it", () => {
-    const state = resetField(buildDraft({ model: "stored-model" }, BASELINES), "model");
+  it("resets a stored value to inherited and shows the post-reset default", () => {
+    // The preview echoes a stored value back as its own resolved baseline, so
+    // the post-reset display must be the schema-v1 no-value default — never
+    // the stored value the reset just removed.
+    const state = resetField(
+      buildDraft({ model: "stored-model" }, { ...BASELINES, model: "stored-model" }),
+      "model",
+    );
 
     expect(fieldProvenance(state, "model")).toBe("inherited");
+    expect(fieldDisplayValue(state, "model")).toBe("");
+    expect(serializeBundle(state)).toEqual({});
+  });
+
+  it("resets a stored host_type to the external server default", () => {
+    const state = resetField(
+      buildDraft({ host_type: "managed" }, { ...BASELINES, host_type: "managed" }),
+      "host_type",
+    );
+
+    expect(fieldDisplayValue(state, "host_type")).toBe("external");
+    expect(serializeBundle(state)).toEqual({});
+  });
+
+  it("resets an unsaved edit of an absent field back to its resolved baseline", () => {
+    const edited = setFieldValue(buildDraft({}, BASELINES), "model", "scratch");
+    const state = resetField(edited, "model");
+
     expect(fieldDisplayValue(state, "model")).toBe(BASELINES.model);
     expect(serializeBundle(state)).toEqual({});
   });

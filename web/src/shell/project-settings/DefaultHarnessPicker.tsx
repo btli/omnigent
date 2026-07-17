@@ -107,21 +107,22 @@ export function ProjectDefaultPicker({
 export function DefaultHarnessPicker({
   value,
   provenance,
-  labels,
+  harnessOptions,
   onChange,
   onReset,
 }: {
   value: string;
   provenance: FieldProvenance;
-  labels: Record<string, string>;
+  harnessOptions: readonly { id: string; label: string }[];
   onChange: (value: string) => void;
   onReset: () => void;
 }) {
-  const known = Object.hasOwn(labels, value);
-  const options: ProjectDefaultPickerOption[] = Object.entries(labels).map(
-    ([optionValue, optionLabel]) => ({ value: optionValue, label: optionLabel }),
-  );
-  if (value && !known) {
+  const knownLabel = harnessOptions.find((option) => option.id === value)?.label;
+  const options: ProjectDefaultPickerOption[] = harnessOptions.map((option) => ({
+    value: option.id,
+    label: option.label,
+  }));
+  if (value && knownLabel === undefined) {
     options.unshift({
       value,
       label: `${value} (not in current catalog)`,
@@ -129,7 +130,7 @@ export function DefaultHarnessPicker({
   }
 
   const triggerLabel = value
-    ? (labels[value] ?? `${value} (not in current catalog)`)
+    ? (knownLabel ?? `${value} (not in current catalog)`)
     : "Agent default";
 
   return (
@@ -142,7 +143,7 @@ export function DefaultHarnessPicker({
       triggerLabel={triggerLabel}
       disabled={options.length === 0}
       hint={
-        value && !known
+        value && knownLabel === undefined
           ? "This saved harness is not in the current catalog. Reset it or choose a replacement."
           : "Agent default"
       }
