@@ -780,6 +780,59 @@ async def _deliver_credential_for_launch(
     return None
 
 
+def _reauthorize_managed_repo_for_delivery(
+    conv: Conversation,
+    *,
+    app_state: Any,
+    host_store: HostStore | None,
+) -> tuple[RepoWorkspace, str, GitCredentialStore] | None:
+    """Re-resolve a credential-bound session's repo binding for a respawn.
+
+    Returns ``(repo, owner, credential_store)`` so the wake / relaunch-after-Stop
+    paths can re-deliver the owner's git credential to the freshly spawned
+    runner (the host discards its per-runner cache on every runner exit). Gated
+    on a persisted credential-slot label: a session with no bound credential
+    returns ``None`` and its respawn is unchanged. The owner is the host's
+    persisted owner, never the request caller. Re-authorization reuses
+    :func:`reauthorize_relaunch_binding`, so a revoked slot / removed host /
+    rebind raises :class:`RelaunchBindingError` (the caller fails the respawn
+    closed); the message names no token.
+
+    :param conv: The session row (carries ``host_id`` and ``labels``).
+    :param app_state: ``request.app.state`` (supplies ``git_hosts`` +
+        ``git_credential_store``).
+    :param host_store: Persistent host registrations, for the owner lookup.
+    :returns: ``(repo, owner, credential_store)`` or ``None`` when nothing is
+        bound to deliver.
+    :raises RelaunchBindingError: When the binding integrity is broken.
+    """
+    from omnigent.server.managed_hosts import (
+        MANAGED_GIT_CREDENTIAL_SLOT_LABEL_KEY,
+        MANAGED_REPO_LABEL_KEY,
+        reauthorize_relaunch_binding,
+    )
+
+    if not conv.labels.get(MANAGED_GIT_CREDENTIAL_SLOT_LABEL_KEY):
+        return None  # no bound credential -> respawn unchanged
+    credential_store = getattr(app_state, "git_credential_store", None)
+    if credential_store is None or host_store is None:
+        return None  # feature not configured
+    raw_repo = conv.labels.get(MANAGED_REPO_LABEL_KEY)
+    if not raw_repo:
+        return None
+    host = host_store.get_host(conv.host_id)
+    if host is None:
+        return None  # owner unknowable; respawn's own host handling takes over
+    repo = reauthorize_relaunch_binding(
+        raw_repo=raw_repo,
+        labels=conv.labels,
+        owner=host.owner,
+        hosts=getattr(app_state, "git_hosts", ()),
+        credential_store=credential_store,
+    )
+    return repo, host.owner, credential_store
+
+
 # Server-side wait budget for Claude's ``PermissionRequest`` hook. Set
 # to one day so a native permission prompt waits ~indefinitely for the
 # user to answer in EITHER the web UI or the terminal, rather than
@@ -7398,6 +7451,7 @@ def _kick_managed_wake(
             host_store=host_store,
             host_registry=getattr(app_state, "host_registry", None),
             tunnel_registry=getattr(app_state, "tunnel_registry", None),
+            app_state=app_state,
         )
     )
     _managed_launch_tasks.add(wake_task)
@@ -7414,6 +7468,7 @@ async def _run_managed_wake(
     host_store: HostStore,
     host_registry: HostRegistry | None,
     tunnel_registry: TunnelRegistry | None,
+    app_state: Any,
 ) -> None:
     """
     Wake a dormant resumable managed host in the background, settling the
@@ -7442,8 +7497,10 @@ async def _run_managed_wake(
         frame. ``None`` in minimal test wirings.
     :param tunnel_registry: Runner-tunnel registry used to await the launched
         runner's connection. ``None`` in minimal test wirings.
+    :param app_state: ``request.app.state`` — supplies the git-hosts +
+        credential registries for credential re-delivery.
     """
-    from omnigent.server.managed_hosts import resume_managed_host
+    from omnigent.server.managed_hosts import RelaunchBindingError, resume_managed_host
 
     try:
         # Wake the same sandbox in place; resume_managed_host is single-flight
@@ -7473,14 +7530,33 @@ async def _run_managed_wake(
                 )
                 return
         if host_conn is not None:
+            try:
+                delivery = _reauthorize_managed_repo_for_delivery(
+                    refreshed, app_state=app_state, host_store=host_store
+                )
+            except RelaunchBindingError as exc:
+                tracker.fail(session_id, str(exc))
+                _publish_sandbox_status(session_id, "failed", str(exc))
+                return
+            repo = owner = credential_store = None
+            if delivery is not None:
+                repo, owner, credential_store = delivery
             launch_attempt = await _launch_runner_on_host(
                 refreshed,
                 conversation_store,
                 host_registry,
                 host_conn,
+                repo=repo,
+                owner=owner,
+                credential_store=credential_store,
             )
             if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE:
                 reason = launch_attempt.error or "harness not configured on the sandbox host"
+                tracker.fail(session_id, reason)
+                _publish_sandbox_status(session_id, "failed", reason)
+                return
+            if launch_attempt.error_code == _CREDENTIAL_DELIVERY_ERROR_CODE:
+                reason = launch_attempt.error or "git credential delivery failed"
                 tracker.fail(session_id, reason)
                 _publish_sandbox_status(session_id, "failed", reason)
                 return

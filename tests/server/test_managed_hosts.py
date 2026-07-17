@@ -1369,6 +1369,109 @@ def test_reauthorize_no_binding_preserves_degrade() -> None:
         )
 
 
+# ── _reauthorize_managed_repo_for_delivery (wake re-delivery) ───────────────
+
+
+def test_reauthorize_managed_repo_for_delivery_returns_binding_for_credential_session(
+    tmp_path,
+) -> None:
+    from types import SimpleNamespace
+
+    from omnigent.server.managed_hosts import (
+        MANAGED_GIT_CREDENTIAL_SLOT_LABEL_KEY,
+        MANAGED_GIT_HOST_ID_LABEL_KEY,
+        MANAGED_REPO_LABEL_KEY,
+    )
+    from omnigent.server.routes.sessions import _reauthorize_managed_repo_for_delivery
+
+    store = _cred_store(tmp_path)
+    slot = store.create(
+        owner_user_id="alice",
+        host_id="acme",
+        provider="forgejo",
+        label="work",
+        username=None,
+        token="ghp_secret",
+    )
+    conv = SimpleNamespace(
+        host_id="host_1",
+        labels={
+            MANAGED_REPO_LABEL_KEY: "https://git.acme.com/team/proj",
+            MANAGED_GIT_HOST_ID_LABEL_KEY: "acme",
+            MANAGED_GIT_CREDENTIAL_SLOT_LABEL_KEY: slot.id,
+        },
+    )
+    host_store = SimpleNamespace(get_host=lambda hid: SimpleNamespace(owner="alice"))
+    app_state = SimpleNamespace(git_hosts=_GH_HOSTS, git_credential_store=store)
+
+    result = _reauthorize_managed_repo_for_delivery(
+        conv, app_state=app_state, host_store=host_store
+    )
+    assert result is not None
+    repo, owner, cred_store = result
+    assert owner == "alice"
+    assert cred_store is store
+    assert repo.credential_slot_id == slot.id
+    assert repo.canonical_host == "git.acme.com"
+
+
+def test_reauthorize_managed_repo_for_delivery_noop_without_credential_slot() -> None:
+    from types import SimpleNamespace
+
+    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
+    from omnigent.server.routes.sessions import _reauthorize_managed_repo_for_delivery
+
+    # A managed session with a repo label but NO credential-slot label: the
+    # respawn must behave exactly as before — helper is a pure no-op.
+    conv = SimpleNamespace(
+        host_id="host_1",
+        labels={MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo"},
+    )
+    app_state = SimpleNamespace(git_hosts=_GH_HOSTS, git_credential_store=object())
+    result = _reauthorize_managed_repo_for_delivery(
+        conv, app_state=app_state, host_store=SimpleNamespace(get_host=lambda hid: None)
+    )
+    assert result is None
+
+
+def test_reauthorize_managed_repo_for_delivery_raises_on_revoked_slot(tmp_path) -> None:
+    from types import SimpleNamespace
+
+    import pytest
+
+    from omnigent.server.managed_hosts import (
+        MANAGED_GIT_CREDENTIAL_SLOT_LABEL_KEY,
+        MANAGED_GIT_HOST_ID_LABEL_KEY,
+        MANAGED_REPO_LABEL_KEY,
+        RelaunchBindingError,
+    )
+    from omnigent.server.routes.sessions import _reauthorize_managed_repo_for_delivery
+
+    store = _cred_store(tmp_path)
+    slot = store.create(
+        owner_user_id="alice",
+        host_id="acme",
+        provider="forgejo",
+        label="work",
+        username=None,
+        token="ghp_secret",
+    )
+    conv = SimpleNamespace(
+        host_id="host_1",
+        labels={
+            MANAGED_REPO_LABEL_KEY: "https://git.acme.com/team/proj",
+            MANAGED_GIT_HOST_ID_LABEL_KEY: "acme",
+            MANAGED_GIT_CREDENTIAL_SLOT_LABEL_KEY: slot.id,
+        },
+    )
+    store.delete(slot.id)  # revoked while the session slept
+    host_store = SimpleNamespace(get_host=lambda hid: SimpleNamespace(owner="alice"))
+    app_state = SimpleNamespace(git_hosts=_GH_HOSTS, git_credential_store=store)
+    with pytest.raises(RelaunchBindingError) as exc:
+        _reauthorize_managed_repo_for_delivery(conv, app_state=app_state, host_store=host_store)
+    assert "ghp_secret" not in str(exc.value)
+
+
 # ── GET /v1/info: managed_sandboxes_enabled ─────────────────
 
 

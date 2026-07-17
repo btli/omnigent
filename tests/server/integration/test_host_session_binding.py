@@ -1552,6 +1552,7 @@ async def test_managed_wake_fails_when_runner_never_reconnects(
         workspace="/root/workspace",
         agent_id=None,
         sub_agent_name=None,
+        labels={},  # no bound git credential -> re-authorization is a no-op
     )
     tracker = ManagedLaunchTracker()
     tracker.begin(session_id)
@@ -1592,6 +1593,7 @@ async def test_managed_wake_fails_when_runner_never_reconnects(
         host_store=SimpleNamespace(),
         host_registry=_HostRegistry(),  # type: ignore[arg-type]
         tunnel_registry=_TunnelRegistry(),  # type: ignore[arg-type]
+        app_state=SimpleNamespace(),
     )
 
     launch = tracker.get(session_id)
