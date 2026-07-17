@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from enum import Enum
 
-from sqlalchemy import delete as sa_delete
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, StatementError
 from sqlalchemy.orm import Session
@@ -20,6 +20,14 @@ from omnigent.db.db_models import InvalidUuidError, SqlGitCredential, current_wo
 from omnigent.db.enum_codecs import decode_git_credential_kind, encode_git_credential_kind
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker, now_epoch
 from omnigent.git_hosts.crypto import GitCredentialCipher
+
+
+class GitCredentialDeleteResult(Enum):
+    """Outcome of an owner-scoped credential deletion."""
+
+    DELETED = "deleted"
+    NOT_FOUND = "not_found"
+    NOT_OWNER = "not_owner"
 
 
 @dataclass
@@ -238,33 +246,25 @@ class GitCredentialStore:
     def get(self, credential_id: str) -> GitCredential | None:
         """Fetch a credential's metadata by id, workspace-scoped only.
 
-        Not an authorization boundary: ownership is enforced by the route
-        layer. A handoff needing an owned, host-bound slot must use
-        :meth:`resolve_lease`.
+        Not an authorization boundary. Use :meth:`delete_for_owner` for
+        deletion or :meth:`resolve_lease` for an owned, host-bound slot.
         """
         with self._session() as session:
             row = _find_row(session, credential_id)
             return _row_to_entity(row) if row is not None else None
 
-    def delete(self, credential_id: str) -> None:
-        """Delete a credential by id, workspace-scoped only.
-
-        Not an authorization boundary: the route layer verifies the caller
-        owns the credential before calling this. Tolerates a malformed id
-        (matches no row).
-        """
+    def delete_for_owner(
+        self, owner_user_id: str, credential_id: str
+    ) -> GitCredentialDeleteResult:
+        """Delete a credential only when it belongs to the given owner."""
         with self._session() as session:
-            try:
-                session.execute(
-                    sa_delete(SqlGitCredential).where(
-                        SqlGitCredential.workspace_id == current_workspace_id(),
-                        SqlGitCredential.id == credential_id,
-                    )
-                )
-            except StatementError as exc:
-                # A malformed opaque id matches no row; see _find_row.
-                if not isinstance(exc.orig, InvalidUuidError):
-                    raise
+            row = _find_row(session, credential_id)
+            if row is None:
+                return GitCredentialDeleteResult.NOT_FOUND
+            if row.owner_user_id != owner_user_id:
+                return GitCredentialDeleteResult.NOT_OWNER
+            session.delete(row)
+            return GitCredentialDeleteResult.DELETED
 
     def resolve_lease(
         self,

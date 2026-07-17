@@ -240,6 +240,13 @@ def test_delete_removes_credential(route_client: TestClient) -> None:
     assert remaining[0]["id"] == other["id"]
 
 
+def test_delete_missing_credential_returns_not_found(route_client: TestClient) -> None:
+    response = route_client.delete("/v1/git-credentials/not-a-credential-id")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["message"] == "Git credential not found"
+
+
 def test_create_oversized_token_rejected(route_client: TestClient) -> None:
     oversized = "x" * 9000
     resp = route_client.post(
@@ -311,7 +318,8 @@ def test_cross_user_isolation_and_foreign_delete_denied(
 
     # Bob deleting Alice's credential must not succeed and must not delete it.
     bob_delete = client.delete(f"/v1/git-credentials/{alice_cred_id}", headers=bob_headers)
-    assert bob_delete.status_code in (403, 404)
+    assert bob_delete.status_code == 403
+    assert bob_delete.json()["error"]["message"] == "Not your git credential"
 
     # Alice can still list her own credential afterward.
     alice_list = client.get("/v1/git-credentials", headers=alice_headers)

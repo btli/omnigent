@@ -20,7 +20,11 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.git_hosts.base import HostConfig
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.stores.git_credential_store import GitCredential, GitCredentialStore
+from omnigent.stores.git_credential_store import (
+    GitCredential,
+    GitCredentialDeleteResult,
+    GitCredentialStore,
+)
 
 
 class CreateGitCredentialRequest(BaseModel):
@@ -172,13 +176,15 @@ def create_git_credentials_router(
             credential does not exist, or 403 if it belongs to a
             different user.
         """
-        owner_user_id = _credential_owner(request)
-        cred = await asyncio.to_thread(git_credential_store.get, credential_id)
-        if cred is None:
+        result = await asyncio.to_thread(
+            git_credential_store.delete_for_owner,
+            _credential_owner(request),
+            credential_id,
+        )
+        if result is GitCredentialDeleteResult.NOT_FOUND:
             raise OmnigentError("Git credential not found", code=ErrorCode.NOT_FOUND)
-        if cred.owner_user_id != owner_user_id:
+        if result is GitCredentialDeleteResult.NOT_OWNER:
             raise OmnigentError("Not your git credential", code=ErrorCode.FORBIDDEN)
-        await asyncio.to_thread(git_credential_store.delete, credential_id)
         return {"deleted": True}
 
     return router

@@ -10,7 +10,11 @@ from sqlalchemy.exc import StatementError
 from sqlalchemy.orm import Session
 
 from omnigent.git_hosts.crypto import GitCredentialCipher
-from omnigent.stores.git_credential_store import GitCredential, GitCredentialStore
+from omnigent.stores.git_credential_store import (
+    GitCredential,
+    GitCredentialDeleteResult,
+    GitCredentialStore,
+)
 
 
 def _store(tmp_path) -> GitCredentialStore:
@@ -217,7 +221,7 @@ def test_create_non_integrity_statement_error_drops_ciphertext(tmp_path, monkeyp
     assert secret_marker not in formatted
 
 
-def test_delete_then_absent(tmp_path) -> None:
+def test_delete_for_owner_returns_deleted_and_removes_credential(tmp_path) -> None:
     store = _store(tmp_path)
     cred = store.create(
         owner_user_id="alice",
@@ -227,9 +231,43 @@ def test_delete_then_absent(tmp_path) -> None:
         username=None,
         token="a",
     )
-    store.delete(cred.id)
+    result = store.delete_for_owner("alice", cred.id)
+
+    assert result is GitCredentialDeleteResult.DELETED
+    assert list(GitCredentialDeleteResult) == [
+        GitCredentialDeleteResult.DELETED,
+        GitCredentialDeleteResult.NOT_FOUND,
+        GitCredentialDeleteResult.NOT_OWNER,
+    ]
     assert store.get(cred.id) is None
     assert store.resolve_lease(owner_user_id="alice", host_id="h", credential_id=cred.id) is None
+
+
+def test_delete_for_owner_returns_not_owner_without_deleting(tmp_path) -> None:
+    store = _store(tmp_path)
+    cred = store.create(
+        owner_user_id="alice",
+        host_id="h",
+        provider="forgejo",
+        label="default",
+        username=None,
+        token="a",
+    )
+
+    result = store.delete_for_owner("bob", cred.id)
+
+    assert result is GitCredentialDeleteResult.NOT_OWNER
+    assert store.get(cred.id) == cred
+
+
+def test_delete_for_owner_returns_not_found_for_unknown_id(tmp_path) -> None:
+    import uuid
+
+    store = _store(tmp_path)
+
+    result = store.delete_for_owner("alice", uuid.uuid4().hex)
+
+    assert result is GitCredentialDeleteResult.NOT_FOUND
 
 
 def test_unknown_well_formed_id_returns_none(tmp_path) -> None:
@@ -239,7 +277,6 @@ def test_unknown_well_formed_id_returns_none(tmp_path) -> None:
     absent = uuid.uuid4().hex  # valid Uuid16, but no such row
     assert store.get(absent) is None
     assert store.resolve_lease(owner_user_id="alice", host_id="h", credential_id=absent) is None
-    store.delete(absent)  # no-op, does not raise
 
 
 def test_credentials_are_workspace_isolated(tmp_path) -> None:
