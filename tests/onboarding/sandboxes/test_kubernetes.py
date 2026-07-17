@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import sys
 import traceback
 import types
@@ -617,8 +618,62 @@ def test_delete_after_running_failure_warns_not_fails(
     assert "could not delete clone credential secret" in capsys.readouterr().err
 
 
+def test_redact_values_surrogate_safe_and_longest_first() -> None:
+    """`_redact_values` never raises on a lone-surrogate value (strict UTF-8 would,
+    bypassing the callers' `from None`) and scrubs overlapping values longest-first
+    so a shorter one cannot redact-mask a longer one it is a substring of."""
+    surrogate = "tok\udcffen"  # env: credential decoded from non-UTF-8 bytes
+    out = k8s._redact_values(f"clone failed for {surrogate} here", [surrogate])
+    assert surrogate not in out
+    assert "***" in out
+    # Shorter value passed FIRST (the adversarial order) must still fully scrub
+    # the longer token it prefixes — no surviving remainder.
+    msg = "denied for oauth2-secret-token via user oauth2"
+    out2 = k8s._redact_values(msg, ["oauth2", "oauth2-secret-token"])
+    assert "oauth2-secret-token" not in out2
+    assert "secret-token" not in out2
+
+
+def test_load_core_pins_k8s_rest_logger_to_suppress_response_bodies(
+    fake_core: _FakeCore,
+) -> None:
+    """The k8s client logs every response body (which echoes Secret `data`) at DEBUG,
+    ungated; `_load_core` must pin that logger so a DEBUG-level server cannot leak it."""
+    rest_logger = logging.getLogger("kubernetes.client.rest")
+    original = rest_logger.level
+    try:
+        rest_logger.setLevel(logging.DEBUG)
+        _launcher()._load_core()
+        assert not rest_logger.isEnabledFor(logging.DEBUG)
+        assert rest_logger.isEnabledFor(logging.WARNING)
+    finally:
+        rest_logger.setLevel(original)
+
+
+def test_wait_failure_with_surrogate_token_stays_redacted(fake_core: _FakeCore) -> None:
+    """A surrogate-bearing credential on the wait-failure path must not crash redaction
+    (a raise there would re-expose the cause) and must stay scrubbed everywhere."""
+    surrogate_token = "tok\udcff-secret"
+    fake_core.read_queue = [
+        _pod(phase="Pending", init_statuses=[_terminated(128, name="workspace-init")])
+    ]
+    fake_core.logs["workspace-init"] = f"fatal: auth failed for {surrogate_token}"
+    with pytest.raises(click.ClickException) as excinfo:
+        _start_with_clone(
+            fake_core,
+            clone_env={"GIT_TOKEN": surrogate_token, "GIT_USERNAME": "alice"},
+        )
+    assert surrogate_token not in str(excinfo.value)
+    assert "***" in str(excinfo.value)
+    assert surrogate_token not in "".join(traceback.format_exception(excinfo.value))
+    assert set(fake_core.deleted_secrets) == {
+        "omnigent-pod-1-token",
+        "omnigent-pod-1-clone-cred",
+    }
+
+
 def test_invalid_or_colliding_clone_env_keys_fail_before_api(fake_core: _FakeCore) -> None:
-    for bad in ({"BAD-KEY": "v"}, {HOST_TOKEN_ENV_VAR: "v"}):
+    for bad in ({"BAD-KEY": "v"}, {HOST_TOKEN_ENV_VAR: "v"}, {"HOME": "v"}):
         with pytest.raises(click.ClickException):
             _launcher().start_host(
                 "omnigent-pod-x",

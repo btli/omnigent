@@ -685,19 +685,23 @@ def _redact_values(text: str, values: Iterable[str]) -> str:
     pre-serialized JSON through an extra layer (double-escaped backslashes) evades the
     non-base64 needles, though not the base64 one; a webhook able to construct such an
     echo already holds the Secret, so this is a backstop against accidental reflection,
-    not a malicious admission controller. Lone surrogates (invalid Unicode scalars)
-    never reach this channel — the Secret create itself cannot serialize them.
+    not a malicious admission controller. Values are scrubbed longest-first so a
+    shorter value that is a substring of a longer one cannot redact-mask it before
+    the longer needle matches. A value carrying lone surrogates (an ``env:``
+    credential decoded from non-UTF-8 bytes via ``surrogateescape``) is base64-encoded
+    with ``surrogatepass`` rather than strict UTF-8, so needle derivation never raises
+    — a raise here would bypass the callers' ``from None`` and re-expose the cause.
 
     :param text: The message to scrub.
     :param values: Credential values to replace with ``"***"``.
     :returns: *text* with every occurrence of a non-empty value — literal,
         base64-encoded, JSON-escaped, or Go-JSON-escaped — redacted.
     """
-    for value in values:
-        if not value:
-            continue
+    for value in sorted((v for v in values if v), key=len, reverse=True):
         text = text.replace(value, "***")
-        text = text.replace(base64.b64encode(value.encode()).decode(), "***")
+        text = text.replace(
+            base64.b64encode(value.encode("utf-8", "surrogatepass")).decode(), "***"
+        )
         escaped = json.dumps(value)[1:-1]
         if escaped != value:
             text = text.replace(escaped, "***")
@@ -954,6 +958,11 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                 "ServiceAccount token; out of cluster, set a kubeconfig "
                 f"(KUBECONFIG or {KUBECONFIG_ENV_VAR}). Underlying error: {exc}"
             ) from exc
+        # The kubernetes client logs every HTTP response body at DEBUG on the
+        # "kubernetes.client.rest" logger, ungated: a Secret create/patch response
+        # echoes the credential back as base64 ``data``. Pin that logger to INFO so a
+        # DEBUG-level server never writes secret material to its logs (WARNING+ flows).
+        logging.getLogger("kubernetes.client.rest").setLevel(logging.INFO)
         self._api_client = client.ApiClient(cfg)
         self._core = client.CoreV1Api(self._api_client)
         return self._core
@@ -1173,14 +1182,19 @@ class KubernetesSandboxLauncher(SandboxLauncher):
             colliding key, creation fails, or the host does not start in time.
         """
         if clone_env:
+            # Snapshot: start_host reads clone_env repeatedly (Secret manifest,
+            # init-env key exclusion, redaction needles). Copy it up front so a
+            # caller cannot mutate it mid-launch and split those reads apart.
+            clone_env = dict(clone_env)
             for key in clone_env:
                 if not key.isidentifier():
                     raise click.ClickException(
                         f"clone_env key {key!r} is not a valid environment variable name"
                     )
-                if key == HOST_TOKEN_ENV_VAR:
+                if key in _RESERVED_ENV_NAMES:
                     raise click.ClickException(
-                        f"clone_env key {key!r} collides with the launch token variable"
+                        f"clone_env key {key!r} collides with a reserved sandbox "
+                        "environment variable"
                     )
         _ensure_sdk()
         from kubernetes.client.rest import ApiException
