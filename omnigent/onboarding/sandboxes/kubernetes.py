@@ -685,8 +685,9 @@ def _redact_values(text: str, values: Iterable[str]) -> str:
     reflect the encoded form; a value embedded in a JSON body is escaped
     (Python's ``json.dumps`` default ``ensure_ascii=True`` form is scrubbed for
     that); and the apiserver's Go ``encoding/json`` escapes non-ASCII as raw
-    UTF-8 rather than ``\\uXXXX`` while still HTML-escaping ``<`` / ``>`` / ``&``
-    by default, so that distinct Go-style form is derived and scrubbed too.
+    UTF-8 rather than ``\\uXXXX``, and always escapes ``<``, ``>``, ``&``,
+    ``\\u2028``, and ``\\u2029`` — this derivation reproduces that encoder's
+    output byte-for-byte, so the Go-canonical form is scrubbed too.
 
     :param text: The message to scrub.
     :param values: Credential values to replace with ``"***"``.
@@ -703,13 +704,15 @@ def _redact_values(text: str, values: Iterable[str]) -> str:
             text = text.replace(escaped, "***")
         # Go's encoding/json (the apiserver) leaves non-ASCII as raw UTF-8
         # instead of \uXXXX-escaping it like Python's default `escaped` above,
-        # while still HTML-escaping <, >, & — derive its needle from the
-        # ensure_ascii=False form, not from `escaped`.
+        # while always escaping <, >, &, U+2028, and U+2029 — derive its
+        # needle from the ensure_ascii=False form, not from `escaped`.
         go_escaped = (
             json.dumps(value, ensure_ascii=False)[1:-1]
             .replace("&", "\\u0026")
             .replace("<", "\\u003c")
             .replace(">", "\\u003e")
+            .replace(" ", "\\u2028")
+            .replace(" ", "\\u2029")
         )
         if go_escaped != escaped:
             text = text.replace(go_escaped, "***")
