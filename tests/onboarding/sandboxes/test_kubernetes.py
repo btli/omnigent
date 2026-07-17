@@ -460,7 +460,7 @@ def test_launch_host_creates_secret_then_pod_and_returns_workspace(
 _CLONE_ENV = {"GIT_TOKEN": "tok-secret-value", "GIT_USERNAME": "alice"}
 
 
-def _start_with_clone(fake_core: _FakeCore) -> str:
+def _start_with_clone(fake_core: _FakeCore, *, clone_env: dict[str, str] | None = None) -> str:
     # Default to an immediate Running pod; a caller that pre-populates
     # read_queue (e.g. to inject a failure) keeps its own setup.
     if not fake_core.read_queue:
@@ -473,7 +473,7 @@ def _start_with_clone(fake_core: _FakeCore) -> str:
         server_url="http://srv.example.com",
         repo_url="https://forge.example/org/repo.git",
         repo_name="repo",
-        clone_env=dict(_CLONE_ENV),
+        clone_env=dict(clone_env if clone_env is not None else _CLONE_ENV),
     )
 
 
@@ -513,18 +513,29 @@ def test_clone_env_values_never_leave_secret_body(
 def test_clone_secret_create_failure_cleans_up(fake_core: _FakeCore) -> None:
     """Failure creating the SECOND secret still tears down the first + any Pod."""
     token_b64 = base64.b64encode(b"tok-secret-value").decode()
+    # Go's encoding/json (the apiserver) HTML-escapes <, >, & by default —
+    # unlike Python's json.dumps — so an echoed value can surface in this form.
+    username = "a<b&c"
+    username_go_escaped = "a\\u003cb\\u0026c"
     fake_core.create_secret_errors = [
         None,
         _FakeApiException(
             status=500,
             reason="boom",
-            body=f"admission webhook denied: tok-secret-value leaked (data: {token_b64})",
+            body=(
+                "admission webhook denied: tok-secret-value leaked "
+                f"(data: {token_b64}); reflected username: {username_go_escaped}"
+            ),
         ),
     ]
     with pytest.raises(click.ClickException) as excinfo:
-        _start_with_clone(fake_core)
+        _start_with_clone(
+            fake_core, clone_env={"GIT_TOKEN": "tok-secret-value", "GIT_USERNAME": username}
+        )
     assert "tok-secret-value" not in str(excinfo.value)
     assert token_b64 not in str(excinfo.value)
+    assert username not in str(excinfo.value)
+    assert username_go_escaped not in str(excinfo.value)
     assert "***" in str(excinfo.value)
     assert "tok-secret-value" not in "".join(traceback.format_exception(excinfo.value))
     assert "omnigent-pod-1-token" in fake_core.deleted_secrets

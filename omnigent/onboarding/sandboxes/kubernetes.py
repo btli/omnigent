@@ -682,13 +682,15 @@ def _redact_values(text: str, values: Iterable[str]) -> str:
     (an admission webhook echoing the object; a hostile remote seeding the git
     output) in more than its literal form — Kubernetes serializes Secret
     ``stringData`` into base64 ``data``, so an admission-webhook echo can
-    reflect the encoded form, and a value embedded in a JSON body is escaped —
-    so every clone-path error/warning composition passes through here.
+    reflect the encoded form; a value embedded in a JSON body is escaped; and
+    the apiserver's Go ``encoding/json`` additionally HTML-escapes ``<`` / ``>``
+    / ``&`` by default (Python's ``json.dumps`` does not), so that variant is
+    scrubbed too.
 
     :param text: The message to scrub.
     :param values: Credential values to replace with ``"***"``.
     :returns: *text* with every occurrence of a non-empty value — literal,
-        base64-encoded, or JSON-escaped — redacted.
+        base64-encoded, JSON-escaped, or Go-JSON-escaped — redacted.
     """
     for value in values:
         if not value:
@@ -698,6 +700,11 @@ def _redact_values(text: str, values: Iterable[str]) -> str:
         escaped = json.dumps(value)[1:-1]
         if escaped != value:
             text = text.replace(escaped, "***")
+        go_escaped = (
+            escaped.replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e")
+        )
+        if go_escaped != escaped:
+            text = text.replace(go_escaped, "***")
     return text
 
 
