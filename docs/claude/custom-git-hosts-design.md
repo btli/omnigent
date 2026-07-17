@@ -87,11 +87,10 @@ protocol did not match how the runtime actually works, and is **amended**:
 - **The frame is sealed** — the credential field is encrypted to a runner-held key established at
   launch, so confidentiality does **not** depend on deployment TLS (the tunnel can be `ws://` on
   loopback). Sealing is **pluggable** so `binding_token` can adopt it later.
-- **PAT-first with a `kind: pat | oauth` discriminator** (§8.2, §12.2). The resolver returns a uniform
-  **credential lease** (bearer token + optional `expires_at`); the egress-proxy never branches on
-  `kind`. **OAuth is deferred to P3** as an extension of the SSO/OIDC work (access token minted at
-  helper spawn + pre-expiry helper restart; no rotation channel) — a user-pasted PAT is
-  zero-operator-setup and long-lived, so it sidesteps rotation entirely.
+- **PAT-first stored credentials** (§8.2, §12.2). The resolver returns a token-only
+  **credential lease**. **OAuth is deferred to P3** as an extension of the SSO/OIDC work (access
+  token minted at helper spawn + pre-expiry helper restart; no rotation channel) — a user-pasted
+  PAT is zero-operator-setup and long-lived, so it sidesteps rotation entirely.
 - **P1-achievable hardenings applied now:** the rewrite rule is **scoped to the repo-path prefix**
   (limits the host-scoped confused-deputy surface — hooks/submodule/LFS/terminal) and revocation is
   **kill+relaunch**. The residual is **accepted and documented**: a user PAT sits in trusted runner
@@ -216,12 +215,14 @@ protocols beyond HTTPS/SSH; a full in-process REST client per forge (native adap
 
 ## 6. Provider model
 
-`GitHostProvider(ABC)` — `provider`/`default_clone_username` ClassVars; `matches`,
-`normalize_repo_url`, `clone_binding` (auth *shape*, not a secret), `egress_rules`,
-`mcp_server_config` (P2), `cli_env`, `oauth_config` (P3), `api_client` (native-ready, default `None`),
-`policy_peer`. Mirrors `SandboxLauncher(ABC)` (`omnigent/onboarding/sandboxes/base.py:152`). Registry
-`_GIT_HOSTS` + `get_git_host()` + `available_providers()` (mirrors `sandboxes/__init__.py:54-132`);
-closed set; github.com → built-in default. Onboarding collects **non-secret topology only** (LLM-style
+`ProviderSpec` — a frozen data record per forge: `name`, `clone_username` (auth *shape*, not a
+secret), `api_base_template`, `builtin_host` (github.com → built-in default). P1 providers turned
+out to be pure data — every URL normalization was identity and every binding `basic` + a constant
+username — so the original `GitHostProvider(ABC)` collapsed into a literal spec table
+(`_PROVIDERS` + `provider_spec()` + `available_providers()`; closed set; adding a forge is one
+entry — github, ghe, gitea, forgejo, gitlab today). The P2/P3 per-forge *behavior* hooks
+(`egress_rules`, `mcp_server_config`, `cli_env`, `oauth_config`, `api_client`, `policy_peer`)
+re-introduce a behavior seam when the first one lands. Onboarding collects **non-secret topology only** (LLM-style
 `AuthField`/`AuthMode` schema, `omnigent/onboarding/providers/__init__.py:46-92`); **no `keychain:`
 ref** (reversible-file fallback contradicts the model).
 
@@ -244,9 +245,8 @@ trusted parent. `command` is operator-only.
 ### 8.2 User / bot credentials — encrypted at rest
 `SqlGitCredential` (§12.2) holds `token_ciphertext` (Fernet; **key list** in env; decrypt-only in the
 trusted parent; never in `SandboxPolicy`). A user/operator supplies only an opaque token bound to an
-operator host — never a command or URL. A **`kind: pat | oauth`** discriminator (default `pat`) records
-the credential type; the resolver normalizes both into a uniform **credential lease** (bearer token +
-optional `expires_at`) so the egress-proxy never branches on `kind`. **P1 ships `pat` only** (zero
+operator host — never a command or URL. The resolver returns a token-only **credential lease**.
+**P1 ships user-pasted PATs only** (zero
 operator setup, long-lived → no rotation needed); **`oauth` is a P3 extension** of the SSO/OIDC work
 (refresh-token grant → access token minted at helper spawn + pre-expiry helper restart; no rotation
 channel).
@@ -602,11 +602,9 @@ Mirrors `SqlHost` (`omnigent/db/db_models.py:1063-1150`): composite PK `(workspa
 **`id` is the opaque credential slot** (`Uuid16`); `owner_user_id: String(256)`; `host_id: String(256)`
 (the operator host config id); `provider: String(32)` (validated denormalized snapshot, mirroring
 `SqlHost.sandbox_provider`); `label: String(128)` (user-chosen, distinguishes multiple identities on
-one host); `username: String(256) | None`; `token_ciphertext: Text` (Fernet);
-`kind: SmallInteger` (enum `pat`|`oauth` via the codec, default `pat`, `CheckConstraint`; §8.2);
+one host); `token_ciphertext: Text` (Fernet);
 timestamps. `UniqueConstraint(workspace_id, owner_user_id, host_id, label)` — not a partial index.
-Multiple labeled rows per `(owner, host)` are the 0..n-identity model (§8.3). (`kind` lands with the
-P1c-3 resolver work; P1c-1 shipped without it and defaults existing rows to `pat`.)
+Multiple labeled rows per `(owner, host)` are the 0..n-identity model (§8.3).
 `canonical_host`/`provider` are **validated denormalized snapshots** of operator topology, re-checked
 at launch (topology can drift). **No FK**; app-cascade (`omnigent/stores/host_store.py:736-763`) **plus
 a reconciliation sweeper** that also scrubs credentials orphaned by **operator-host removal from YAML**
@@ -618,8 +616,7 @@ a reconciliation sweeper** that also scrubs credentials orphaned by **operator-h
 Topology: operator-only → github.com default. Credential for a resolved host: in a session, the
 **owner's** slot for that host (model A) or the workspace **bot** slot (model B), else the operator
 host credential source, else legacy `GIT_TOKEN` (github.com). No user topology override. Resolution is
-owner/host-scoped (§8.3, P1c-2) and returns a **credential lease** — bearer token + optional
-`expires_at`, uniform across `kind` (§8.2) — never the raw row.
+owner/host-scoped (§8.3, P1c-2) and returns a token-only **credential lease** — never the raw row.
 
 ## 13. Provider matrix
 
@@ -634,7 +631,7 @@ owner/host-scoped (§8.3, P1c-2) and returns a **credential lease** — bearer t
 ## 14. Phasing
 
 ### P1 — Foundation (closes #2125)
-Provider ABC + registry; operator topology (typed parser); `SqlGitCredential` (slot-id, encrypted,
+Provider specs + registry (§6); operator topology (typed parser); `SqlGitCredential` (slot-id, encrypted,
 server-derived fields, sweeper incl. YAML-removal); owner-aware resolver → `ClonePlan` **before
 durable create** (locked relaunch); **launcher secret-delivery capability** (exec + k8s distinct clone
 Secret deleted post-init); **server→runner fetch/push handoff**; runner placeholders; commit-author =
@@ -649,7 +646,7 @@ starter. Live Forgejo/Gitea containers; sharing/handoff integration tests.
 - **P1a/P1b** *(done)* — provider ABC/registry/resolver + operator-credential clone wiring (PR #2708).
 - **P1c-1** *(done)* — encrypted-at-rest user credentials (`SqlGitCredential` + store + `/v1/git-credentials`), 0..n labeled identities per `(user, host)`.
 - **P1c-2** *(done)* — owner/host-scoped `resolve_token` (opaque id ≠ authorization).
-- **P1c-3** — owner-aware resolver + `RepoWorkspace`/`ClonePlan` field-widening + relaunch **binding persistence** (host-config id/version + canonical URL + slot id) + **add `launch_generation`** (the anti-replay anchor P1c-4 needs) + the `kind` column.
+- **P1c-3** — owner-aware resolver + `RepoWorkspace`/`ClonePlan` field-widening + relaunch **binding persistence** (host-config id/version + canonical URL + slot id) + **add `launch_generation`** (the anti-replay anchor P1c-4 needs).
 - **P1c-4** — the sealed, ACKed, type-tagged **`deliver_credential`** frame (§8.5) + host-parent egress-proxy install with a **repo-path-scoped** rule, on **exec (bwrap/seatbelt)** sandboxes; `invalidate_credential` in the contract; kill/relaunch revocation. HTTPS-token only.
 - **P1c-4b** *(done)* — wake/relaunch credential **re-delivery** (re-authorize the binding, fail closed, distinct `credential_delivery_failed` classification).
 - **P1c-5a** — **k8s parity** (§8.4a): accept `clone_env` in the k8s launcher via the distinct init-scoped, delete-after-init per-Pod Secret; the two provider-neutral fail-closed gates (HTTPS-only credentialed URLs; sandbox-inactive consumption refusal); verify the §8.5 chain in-Pod (no new swap layer); live-validate on a real cluster.
@@ -675,8 +672,15 @@ GitLab / Bitbucket providers; native `api_client` where MCP is inadequate.
   server-derived authority, decrypt parent-only, never in `SandboxPolicy`; clone secret launch-scoped +
   redacted + immediately deleted; fetch/push via authenticated in-memory handoff; two-layer enforcement;
   sharing warns on exposure incl. late attach; private egress operator-only with a validated merge point.
-- **Portability:** `SqlGitCredential` obeys R032/no-partial-index/workspace-scoped; `SmallInteger`
-  enum + `CheckConstraint`; `Uuid16` slot id.
+- **Operator guidance (ambient `GIT_TOKEN` on k8s):** when a managed credential is delivered, the
+  host scrubs every ambient `GIT_TOKEN`/`GIT_USERNAME` variant from the **runner** env, so the
+  sandboxed agent never sees the deployment-wide token. The Pod's host-process container, however,
+  still receives the shared harness Secret via `envFrom` — Kubernetes offers no per-key filter, and
+  a live process's environment cannot be scrubbed after exec. The host process is trusted and the
+  runner cannot read it, but operators who want zero ambient git token anywhere in the Pod should
+  remove `GIT_TOKEN`/`GIT_USERNAME` from the harness Secret once users are on managed credentials
+  (the legacy github.com single-token path stops working at that point, by definition).
+- **Portability:** `SqlGitCredential` obeys R032/no-partial-index/workspace-scoped; `Uuid16` slot id.
 - **Testing:** unit (registry, canonicalization, authorization at write+launch, resolver precedence,
   sharing signal, egress merge non-broadening); integration on **real Forgejo/Gitea/GitLab** for exec
   **and** k8s incl. fetch/push + the handoff + multi-host; SSO vs real GitLab OIDC; live `glab`/`tea`.
