@@ -9,6 +9,8 @@ import sys
 import pytest
 
 from omnigent.runner.identity import (
+    MANAGED_GIT_CANONICAL_HOST_ENV_VAR,
+    MANAGED_GIT_TOKEN_ENV_VAR,
     RUNNER_AUTH_SECRET_ENV_VARS,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     strip_runner_auth_secrets,
@@ -100,6 +102,28 @@ def test_strip_runner_auth_secrets_does_not_mutate_input() -> None:
     assert source == {RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR: "tok", "HOME": "/home/x"}
     assert result == {"HOME": "/home/x"}
     assert result is not source
+
+
+def test_managed_git_token_is_stripped_from_child_env() -> None:
+    """The real git token is stripped before the runner spawns the sandbox helper.
+
+    The non-secret binding vars (canonical host, repo path, auth scheme,
+    username) pass through unstripped — only the token itself is
+    registered as a runner-auth secret.
+
+    :returns: None.
+    """
+    assert MANAGED_GIT_TOKEN_ENV_VAR in RUNNER_AUTH_SECRET_ENV_VARS
+
+    stripped = strip_runner_auth_secrets(
+        {
+            MANAGED_GIT_TOKEN_ENV_VAR: "ghp_tok",
+            MANAGED_GIT_CANONICAL_HOST_ENV_VAR: "git.acme.com",
+        }
+    )
+
+    assert MANAGED_GIT_TOKEN_ENV_VAR not in stripped
+    assert stripped[MANAGED_GIT_CANONICAL_HOST_ENV_VAR] == "git.acme.com"
 
 
 def test_importing_identity_does_not_pull_in_fastapi() -> None:

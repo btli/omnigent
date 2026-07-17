@@ -2572,3 +2572,57 @@ def test_alive_runner_ids_reap_discards_cached_credential(tmp_path: Path) -> Non
     proc._runners["r1"] = _RunnerHandle(proc=dead_proc, log_path=tmp_path / "r1.log")
     proc._alive_runner_ids()
     assert "r1" not in proc._pending_credentials
+
+
+# ── _build_runner_env managed git credential ───
+
+
+def test_build_runner_env_omits_managed_git_vars_without_credential() -> None:
+    from omnigent.host.connect import _build_runner_env
+    from omnigent.runner.identity import MANAGED_GIT_TOKEN_ENV_VAR
+
+    env = _build_runner_env(
+        {},
+        server_url="https://x",
+        runner_id="r1",
+        binding_token="bt",
+        workspace="/w",
+        parent_pid=1,
+    )
+    assert MANAGED_GIT_TOKEN_ENV_VAR not in env
+
+
+def test_build_runner_env_sets_managed_git_vars_with_credential() -> None:
+    from omnigent.host.connect import _build_runner_env, _DeliveredCredential
+    from omnigent.runner.identity import (
+        MANAGED_GIT_AUTH_SCHEME_ENV_VAR,
+        MANAGED_GIT_CANONICAL_HOST_ENV_VAR,
+        MANAGED_GIT_REPO_PATH_ENV_VAR,
+        MANAGED_GIT_TOKEN_ENV_VAR,
+        MANAGED_GIT_USERNAME_ENV_VAR,
+    )
+
+    cred = _DeliveredCredential(
+        token="ghp_tok",
+        launch_generation=1,
+        session_id="conv_1",
+        credential_slot="slot_1",
+        canonical_host="git.acme.com",
+        repo_path="/team/proj",
+        auth_scheme="basic",
+        username="x-access-token",
+    )
+    env = _build_runner_env(
+        {},
+        server_url="https://x",
+        runner_id="r1",
+        binding_token="bt",
+        workspace="/w",
+        parent_pid=1,
+        credential=cred,
+    )
+    assert env[MANAGED_GIT_TOKEN_ENV_VAR] == "ghp_tok"
+    assert env[MANAGED_GIT_CANONICAL_HOST_ENV_VAR] == "git.acme.com"
+    assert env[MANAGED_GIT_REPO_PATH_ENV_VAR] == "/team/proj"
+    assert env[MANAGED_GIT_AUTH_SCHEME_ENV_VAR] == "basic"
+    assert env[MANAGED_GIT_USERNAME_ENV_VAR] == "x-access-token"

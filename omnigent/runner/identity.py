@@ -46,13 +46,27 @@ RUNNER_ISOLATE_SESSION_ENV_VAR = "OMNIGENT_RUNNER_ISOLATE_SESSION"
 OMNIGENT_SESSION_ENV_VAR = "OMNIGENT"
 OMNIGENT_SESSION_ENV_VALUE = "1"
 
+# Server-delivered git fetch/push credential threaded host→runner at spawn.
+# The TOKEN var is a real secret: it is registered in
+# RUNNER_AUTH_SECRET_ENV_VARS below so it is stripped at every runner→child
+# spawn boundary (the sandboxed helper never inherits it — it lives only in
+# the trusted runner's egress-proxy). The rest are non-secret binding metadata
+# the runner's os_env reads to build the swap + repo-scoped egress rule.
+MANAGED_GIT_TOKEN_ENV_VAR = "OMNIGENT_MANAGED_GIT_TOKEN"
+MANAGED_GIT_CANONICAL_HOST_ENV_VAR = "OMNIGENT_MANAGED_GIT_CANONICAL_HOST"
+MANAGED_GIT_REPO_PATH_ENV_VAR = "OMNIGENT_MANAGED_GIT_REPO_PATH"
+MANAGED_GIT_AUTH_SCHEME_ENV_VAR = "OMNIGENT_MANAGED_GIT_AUTH_SCHEME"
+MANAGED_GIT_USERNAME_ENV_VAR = "OMNIGENT_MANAGED_GIT_USERNAME"
+
 # Env vars carrying the runner's control-plane auth secret. The tunnel
 # binding token is seeded into the runner process by the launcher and
 # reused as the runner-side request auth token, but must never reach a
 # spawned child: the agent payload there could use it to impersonate the
 # runner. Stripped at every runner→child spawn boundary via
 # :func:`strip_runner_auth_secrets`.
-RUNNER_AUTH_SECRET_ENV_VARS: frozenset[str] = frozenset({RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR})
+RUNNER_AUTH_SECRET_ENV_VARS: frozenset[str] = frozenset(
+    {RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, MANAGED_GIT_TOKEN_ENV_VAR}
+)
 
 
 def strip_runner_auth_secrets(env: Mapping[str, str]) -> dict[str, str]:

@@ -79,6 +79,11 @@ from omnigent.process_logging import (
     process_log_dir,
 )
 from omnigent.runner.identity import (
+    MANAGED_GIT_AUTH_SCHEME_ENV_VAR,
+    MANAGED_GIT_CANONICAL_HOST_ENV_VAR,
+    MANAGED_GIT_REPO_PATH_ENV_VAR,
+    MANAGED_GIT_TOKEN_ENV_VAR,
+    MANAGED_GIT_USERNAME_ENV_VAR,
     RUNNER_ID_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
@@ -514,6 +519,7 @@ def _build_runner_env(
     binding_token: str,
     workspace: str,
     parent_pid: int,
+    credential: _DeliveredCredential | None = None,
 ) -> dict[str, str]:
     """
     Build the environment for a spawned runner subprocess.
@@ -537,6 +543,10 @@ def _build_runner_env(
     :param workspace: Absolute runner cwd on the host, e.g.
         ``"/Users/alice/proj"``.
     :param parent_pid: Host process pid, for orphan detection.
+    :param credential: A git credential delivered for this runner via
+        ``host.deliver_credential``, or ``None``. When present, the real
+        token (child-stripped) and its non-secret binding are added so the
+        runner's os_env can install the fetch/push swap.
     :returns: The runner subprocess environment.
     """
     extra_names = {
@@ -557,6 +567,16 @@ def _build_runner_env(
     env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] = binding_token
     env[RUNNER_WORKSPACE_ENV_VAR] = workspace
     env[RUNNER_PARENT_PID_ENV_VAR] = str(parent_pid)
+    if credential is not None:
+        # The real token is a child-stripped secret (see
+        # RUNNER_AUTH_SECRET_ENV_VARS); the rest is non-secret binding the
+        # runner's os_env reads to install the swap + repo-scoped egress rule.
+        env[MANAGED_GIT_TOKEN_ENV_VAR] = credential.token
+        env[MANAGED_GIT_CANONICAL_HOST_ENV_VAR] = credential.canonical_host
+        env[MANAGED_GIT_REPO_PATH_ENV_VAR] = credential.repo_path
+        env[MANAGED_GIT_AUTH_SCHEME_ENV_VAR] = credential.auth_scheme
+        if credential.username is not None:
+            env[MANAGED_GIT_USERNAME_ENV_VAR] = credential.username
     return env
 
 
@@ -1127,6 +1147,7 @@ class HostProcess:
             )
 
         runner_id = token_bound_runner_id(frame.binding_token)
+        credential = self._pending_credentials.get(runner_id)
         env = _build_runner_env(
             os.environ,
             server_url=self._server_url,
@@ -1134,6 +1155,7 @@ class HostProcess:
             binding_token=frame.binding_token,
             workspace=str(workspace),
             parent_pid=os.getpid(),
+            credential=credential,
         )
 
         try:
@@ -1171,6 +1193,7 @@ class HostProcess:
             finally:
                 _log_fh.close()
         except OSError as exc:
+            self._pending_credentials.pop(runner_id, None)
             return HostLaunchRunnerResultFrame(
                 request_id=frame.request_id,
                 status="failed",
@@ -1181,6 +1204,7 @@ class HostProcess:
             # The runner died before Popen returned — its actual error
             # is in the captured log, so ship the tail with the result
             # instead of making the user go find the file on the host.
+            self._pending_credentials.pop(runner_id, None)
             return HostLaunchRunnerResultFrame(
                 request_id=frame.request_id,
                 status="failed",
