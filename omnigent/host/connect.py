@@ -580,6 +580,13 @@ def _build_runner_env(
     ):
         env.pop(managed_var, None)
     if credential is not None:
+        # Ambient legacy credentials must not coexist with managed delivery,
+        # or the host owner's token would remain readable in the sandbox.
+        for legacy_var in (
+            *env_names_with_omnigent_prefix("GIT_TOKEN"),
+            *env_names_with_omnigent_prefix("GIT_USERNAME"),
+        ):
+            env.pop(legacy_var, None)
         # The real token is a child-stripped secret (see
         # RUNNER_AUTH_SECRET_ENV_VARS); the rest is non-secret binding the
         # runner's os_env reads to install the swap + repo-scoped egress rule.

@@ -2613,6 +2613,98 @@ def test_build_runner_env_omits_managed_git_vars_without_credential() -> None:
         assert name not in env
 
 
+def test_build_runner_env_scrubs_ambient_git_credentials_with_managed_credential() -> None:
+    from omnigent.env_credentials import env_names_with_omnigent_prefix
+    from omnigent.host.connect import _build_runner_env, _DeliveredCredential
+    from omnigent.runner.identity import MANAGED_GIT_TOKEN_ENV_VAR
+
+    ambient_names = (
+        *env_names_with_omnigent_prefix("GIT_TOKEN"),
+        *env_names_with_omnigent_prefix("GIT_USERNAME"),
+    )
+    base_env = {name: f"ambient-{name.lower()}" for name in ambient_names}
+    credential = _DeliveredCredential(
+        token="ghp_managed",
+        launch_generation=1,
+        session_id="conv_1",
+        credential_slot="slot_1",
+        canonical_host="git.acme.com",
+        repo_path="/team/proj",
+        auth_scheme="basic",
+        username=None,
+    )
+
+    env = _build_runner_env(
+        base_env,
+        server_url="https://x",
+        runner_id="r1",
+        binding_token="bt",
+        workspace="/w",
+        parent_pid=1,
+        credential=credential,
+    )
+
+    for name in ambient_names:
+        assert name not in env
+    assert env[MANAGED_GIT_TOKEN_ENV_VAR] == "ghp_managed"
+
+
+def test_build_runner_env_keeps_ambient_git_credentials_without_managed_credential() -> None:
+    from omnigent.env_credentials import env_names_with_omnigent_prefix
+
+    ambient_names = (
+        *env_names_with_omnigent_prefix("GIT_TOKEN"),
+        *env_names_with_omnigent_prefix("GIT_USERNAME"),
+    )
+    base_env = {name: f"ambient-{name.lower()}" for name in ambient_names}
+
+    env = _build_runner_env(
+        base_env,
+        server_url="https://x",
+        runner_id="r1",
+        binding_token="bt",
+        workspace="/w",
+        parent_pid=1,
+        credential=None,
+    )
+
+    for name in ambient_names:
+        assert env[name] == base_env[name]
+
+
+def test_build_runner_env_sets_managed_username_without_ambient_username() -> None:
+    from omnigent.env_credentials import env_names_with_omnigent_prefix
+    from omnigent.host.connect import _build_runner_env, _DeliveredCredential
+    from omnigent.runner.identity import MANAGED_GIT_USERNAME_ENV_VAR
+
+    ambient_names = env_names_with_omnigent_prefix("GIT_USERNAME")
+    base_env = dict.fromkeys(ambient_names, "ambient-user")
+    credential = _DeliveredCredential(
+        token="ghp_managed",
+        launch_generation=1,
+        session_id="conv_1",
+        credential_slot="slot_1",
+        canonical_host="git.acme.com",
+        repo_path="/team/proj",
+        auth_scheme="basic",
+        username="managed-user",
+    )
+
+    env = _build_runner_env(
+        base_env,
+        server_url="https://x",
+        runner_id="r1",
+        binding_token="bt",
+        workspace="/w",
+        parent_pid=1,
+        credential=credential,
+    )
+
+    for name in ambient_names:
+        assert name not in env
+    assert env[MANAGED_GIT_USERNAME_ENV_VAR] == "managed-user"
+
+
 def test_build_runner_env_sets_managed_git_vars_with_credential() -> None:
     from omnigent.host.connect import _build_runner_env, _DeliveredCredential
     from omnigent.runner.identity import (
