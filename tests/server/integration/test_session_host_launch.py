@@ -618,7 +618,7 @@ async def test_message_relaunch_credential_binding_error_persists_error_turn(
     error_turn`` for the OTHER failure this same relaunch site must
     refuse: a credential-bound session whose binding integrity broke
     while it slept (revoked slot / removed host / rebind — P1c-4b Task
-    2). ``_reauthorize_managed_repo_for_delivery`` is stubbed to raise
+    2). ``reauthorize_managed_repo_for_delivery`` is stubbed to raise
     ``RelaunchBindingError`` so the test doesn't need a real credential
     store / git-hosts config wired through the route (that resolution
     path is covered directly by the Task-1 helper unit tests in
@@ -626,7 +626,7 @@ async def test_message_relaunch_credential_binding_error_persists_error_turn(
     the WIRING: the route must call the helper and fail closed BEFORE
     ever asking the host to launch a runner.
 
-    Mutation check: drop the ``_reauthorize_managed_repo_for_delivery``
+    Mutation check: drop the ``reauthorize_managed_repo_for_delivery``
     call (or its ``except RelaunchBindingError`` branch) from
     ``post_event``'s relaunch-after-Stop path and this message instead
     sends a ``host.launch_runner`` frame with no binding re-check —
@@ -639,22 +639,29 @@ async def test_message_relaunch_credential_binding_error_persists_error_turn(
 
     monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
 
-    def _raise_binding_error(conv: object, *, app_state: object, host_store: object) -> None:
+    def _raise_binding_error(
+        conv: object,
+        *,
+        host_store: object,
+        hosts: object,
+        credential_store: object,
+    ) -> None:
         """Stand in for a session whose credential binding broke while asleep.
 
         :param conv: Session row the route passed through (unused; the
             stub fails unconditionally).
-        :param app_state: ``request.app.state`` the route passed through
-            (unused).
         :param host_store: Host store the route passed through (unused).
+        :param hosts: Git-host configuration the route passed through (unused).
+        :param credential_store: Credential store the route passed through
+            (unused).
         :raises RelaunchBindingError: Always — simulates a revoked slot /
             removed host / rebind discovered at respawn.
         """
-        del conv, app_state, host_store
+        del conv, host_store, hosts, credential_store
         raise RelaunchBindingError(_BINDING_ERROR)
 
     monkeypatch.setattr(
-        sessions_module, "_reauthorize_managed_repo_for_delivery", _raise_binding_error
+        sessions_module, "reauthorize_managed_repo_for_delivery", _raise_binding_error
     )
 
     comm = await _connect_host(app)

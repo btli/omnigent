@@ -435,7 +435,7 @@ async def test_host_tunnel_routes_credential_result_to_future(
 ) -> None:
     """A deliver_credential_result frame resolves the pending credential future.
 
-    This is the mechanism by which _deliver_credential_for_launch awaits the
+    This is the mechanism by which deliver_credential_for_launch awaits the
     host's ACK before it lets the launch proceed.
     """
     app, registry, _store = host_app

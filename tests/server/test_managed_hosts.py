@@ -1442,7 +1442,7 @@ def test_reauthorize_no_binding_preserves_degrade() -> None:
         )
 
 
-# ── _reauthorize_managed_repo_for_delivery (wake re-delivery) ───────────────
+# ── reauthorize_managed_repo_for_delivery (wake re-delivery) ───────────────
 
 
 def test_reauthorize_managed_repo_for_delivery_returns_binding_for_credential_session(
@@ -1455,7 +1455,7 @@ def test_reauthorize_managed_repo_for_delivery_returns_binding_for_credential_se
         MANAGED_GIT_HOST_ID_LABEL_KEY,
         MANAGED_REPO_LABEL_KEY,
     )
-    from omnigent.server.routes.sessions import _reauthorize_managed_repo_for_delivery
+    from omnigent.server.managed_git_delivery import reauthorize_managed_repo_for_delivery
 
     store = _cred_store(tmp_path)
     slot = store.create(
@@ -1475,10 +1475,11 @@ def test_reauthorize_managed_repo_for_delivery_returns_binding_for_credential_se
         },
     )
     host_store = SimpleNamespace(get_host=lambda hid: SimpleNamespace(owner="alice"))
-    app_state = SimpleNamespace(git_hosts=_GH_HOSTS, git_credential_store=store)
-
-    result = _reauthorize_managed_repo_for_delivery(
-        conv, app_state=app_state, host_store=host_store
+    result = reauthorize_managed_repo_for_delivery(
+        conv,
+        host_store=host_store,
+        hosts=_GH_HOSTS,
+        credential_store=store,
     )
     assert result is not None
     repo, owner, cred_store = result
@@ -1492,7 +1493,7 @@ def test_reauthorize_managed_repo_for_delivery_noop_without_credential_slot() ->
     from types import SimpleNamespace
 
     from omnigent.git_hosts.managed_workspace import MANAGED_REPO_LABEL_KEY
-    from omnigent.server.routes.sessions import _reauthorize_managed_repo_for_delivery
+    from omnigent.server.managed_git_delivery import reauthorize_managed_repo_for_delivery
 
     # A managed session with a repo label but NO credential-slot label: the
     # respawn must behave exactly as before — helper is a pure no-op.
@@ -1500,9 +1501,11 @@ def test_reauthorize_managed_repo_for_delivery_noop_without_credential_slot() ->
         host_id="host_1",
         labels={MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo"},
     )
-    app_state = SimpleNamespace(git_hosts=_GH_HOSTS, git_credential_store=object())
-    result = _reauthorize_managed_repo_for_delivery(
-        conv, app_state=app_state, host_store=SimpleNamespace(get_host=lambda hid: None)
+    result = reauthorize_managed_repo_for_delivery(
+        conv,
+        host_store=SimpleNamespace(get_host=lambda hid: None),
+        hosts=_GH_HOSTS,
+        credential_store=object(),
     )
     assert result is None
 
@@ -1518,7 +1521,7 @@ def test_reauthorize_managed_repo_for_delivery_raises_on_revoked_slot(tmp_path) 
         MANAGED_REPO_LABEL_KEY,
         RelaunchBindingError,
     )
-    from omnigent.server.routes.sessions import _reauthorize_managed_repo_for_delivery
+    from omnigent.server.managed_git_delivery import reauthorize_managed_repo_for_delivery
 
     store = _cred_store(tmp_path)
     slot = store.create(
@@ -1539,9 +1542,13 @@ def test_reauthorize_managed_repo_for_delivery_raises_on_revoked_slot(tmp_path) 
     )
     store.delete_for_owner("alice", slot.id)  # revoked while the session slept
     host_store = SimpleNamespace(get_host=lambda hid: SimpleNamespace(owner="alice"))
-    app_state = SimpleNamespace(git_hosts=_GH_HOSTS, git_credential_store=store)
     with pytest.raises(RelaunchBindingError) as exc:
-        _reauthorize_managed_repo_for_delivery(conv, app_state=app_state, host_store=host_store)
+        reauthorize_managed_repo_for_delivery(
+            conv,
+            host_store=host_store,
+            hosts=_GH_HOSTS,
+            credential_store=store,
+        )
     assert "ghp_secret" not in str(exc.value)
 
 
@@ -2492,7 +2499,7 @@ def test_parse_modal_secrets_malformed_fails_loud(secrets: object) -> None:
         )
 
 
-# ── _deliver_credential_for_launch ────────────────────────────────
+# ── deliver_credential_for_launch ────────────────────────────────
 
 
 class _FakeHostConn:
@@ -2537,7 +2544,7 @@ async def test_deliver_credential_for_launch_seals_and_acks(tmp_path) -> None:
 
     from omnigent.host.frames import build_credential_delivery_aad, decode_host_frame
     from omnigent.host.sealing import generate_sealing_keypair, unseal
-    from omnigent.server.routes.sessions import _deliver_credential_for_launch
+    from omnigent.server.managed_git_delivery import deliver_credential_for_launch
 
     kp = generate_sealing_keypair()
     store = _cred_store(tmp_path)
@@ -2558,7 +2565,7 @@ async def test_deliver_credential_for_launch_seals_and_acks(tmp_path) -> None:
     conn = _FakeHostConn(kp.public_key_b64)
     registry = _FakeRegistry()
     task = asyncio.create_task(
-        _deliver_credential_for_launch(
+        deliver_credential_for_launch(
             host_conn=conn,
             host_registry=registry,
             runner_id="r1",
@@ -2594,12 +2601,12 @@ async def test_deliver_credential_for_launch_seals_and_acks(tmp_path) -> None:
 
 
 async def test_deliver_credential_skips_when_no_slot(tmp_path) -> None:
-    from omnigent.server.routes.sessions import _deliver_credential_for_launch
+    from omnigent.server.managed_git_delivery import deliver_credential_for_launch
 
     repo = resolve_repo_workspace("https://github.com/org/repo", _GH_HOSTS)  # no slot
     conn = _FakeHostConn("cHVi")
     registry = _FakeRegistry()
-    err = await _deliver_credential_for_launch(
+    err = await deliver_credential_for_launch(
         host_conn=conn,
         host_registry=registry,
         runner_id="r1",
@@ -2615,7 +2622,7 @@ async def test_deliver_credential_skips_when_no_slot(tmp_path) -> None:
 
 async def test_deliver_credential_skips_ssh_repo_even_with_slot(tmp_path) -> None:
     from omnigent.host.sealing import generate_sealing_keypair
-    from omnigent.server.routes.sessions import _deliver_credential_for_launch
+    from omnigent.server.managed_git_delivery import deliver_credential_for_launch
 
     store = _cred_store(tmp_path)
     slot = store.create(
@@ -2639,7 +2646,7 @@ async def test_deliver_credential_skips_ssh_repo_even_with_slot(tmp_path) -> Non
         auth_scheme="basic",
     )
     conn = _FakeHostConn(generate_sealing_keypair().public_key_b64)
-    err = await _deliver_credential_for_launch(
+    err = await deliver_credential_for_launch(
         host_conn=conn,
         host_registry=_FakeRegistry(),
         runner_id="r1",
@@ -2663,7 +2670,7 @@ async def test_deliver_credential_fails_closed_on_unscopable_repo_path(tmp_path)
     up front instead — no frame sent, a token-free error, not a silent skip.
     """
     from omnigent.host.sealing import generate_sealing_keypair
-    from omnigent.server.routes.sessions import _deliver_credential_for_launch
+    from omnigent.server.managed_git_delivery import deliver_credential_for_launch
 
     store = _cred_store(tmp_path)
     slot = store.create(
@@ -2684,7 +2691,7 @@ async def test_deliver_credential_fails_closed_on_unscopable_repo_path(tmp_path)
         auth_scheme="basic",
     )
     conn = _FakeHostConn(generate_sealing_keypair().public_key_b64)
-    err = await _deliver_credential_for_launch(
+    err = await deliver_credential_for_launch(
         host_conn=conn,
         host_registry=_FakeRegistry(),
         runner_id="r1",
@@ -2700,7 +2707,7 @@ async def test_deliver_credential_fails_closed_on_unscopable_repo_path(tmp_path)
 
 
 async def test_deliver_credential_fails_closed_when_host_cannot_seal(tmp_path) -> None:
-    from omnigent.server.routes.sessions import _deliver_credential_for_launch
+    from omnigent.server.managed_git_delivery import deliver_credential_for_launch
 
     store = _cred_store(tmp_path)
     store.create(
@@ -2718,7 +2725,7 @@ async def test_deliver_credential_fails_closed_when_host_cannot_seal(tmp_path) -
         credential_store=store,
     )
     conn = _FakeHostConn(None)  # older host: no sealing key
-    err = await _deliver_credential_for_launch(
+    err = await deliver_credential_for_launch(
         host_conn=conn,
         host_registry=_FakeRegistry(),
         runner_id="r1",
@@ -2734,7 +2741,7 @@ async def test_deliver_credential_fails_closed_when_host_cannot_seal(tmp_path) -
 
 
 async def test_deliver_credential_fails_closed_when_slot_revoked(tmp_path) -> None:
-    from omnigent.server.routes.sessions import _deliver_credential_for_launch
+    from omnigent.server.managed_git_delivery import deliver_credential_for_launch
 
     store = _cred_store(tmp_path)
     slot = store.create(
@@ -2755,7 +2762,7 @@ async def test_deliver_credential_fails_closed_when_slot_revoked(tmp_path) -> No
     from omnigent.host.sealing import generate_sealing_keypair
 
     conn = _FakeHostConn(generate_sealing_keypair().public_key_b64)
-    err = await _deliver_credential_for_launch(
+    err = await deliver_credential_for_launch(
         host_conn=conn,
         host_registry=_FakeRegistry(),
         runner_id="r1",
@@ -2778,11 +2785,11 @@ async def test_no_credential_delivery_for_github_default(tmp_path) -> None:
     no error is returned.
     """
     from omnigent.host.sealing import generate_sealing_keypair
-    from omnigent.server.routes.sessions import _deliver_credential_for_launch
+    from omnigent.server.managed_git_delivery import deliver_credential_for_launch
 
     repo = resolve_repo_workspace("https://github.com/org/repo", _GH_HOSTS)
     conn = _FakeHostConn(generate_sealing_keypair().public_key_b64)
-    err = await _deliver_credential_for_launch(
+    err = await deliver_credential_for_launch(
         host_conn=conn,
         host_registry=_FakeRegistry(),
         runner_id="r1",
