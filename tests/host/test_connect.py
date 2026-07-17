@@ -2626,3 +2626,63 @@ def test_build_runner_env_sets_managed_git_vars_with_credential() -> None:
     assert env[MANAGED_GIT_REPO_PATH_ENV_VAR] == "/team/proj"
     assert env[MANAGED_GIT_AUTH_SCHEME_ENV_VAR] == "basic"
     assert env[MANAGED_GIT_USERNAME_ENV_VAR] == "x-access-token"
+
+
+async def test_launch_refused_for_bad_workspace_discards_pending_credential() -> None:
+    """A launch refused pre-spawn (bad workspace) discards the delivered credential.
+
+    The pre-flight returns fire before any runner exists, so no exit-path
+    discard would ever cover the never-spawned runner's secret.
+    """
+    from omnigent.host.sealing import generate_sealing_keypair
+
+    proc = _make_host_process()
+    proc._sealing_keypair = generate_sealing_keypair()
+    runner_id = token_bound_runner_id("token_xyz")
+    proc._handle_deliver_credential(
+        _managed_deliver_frame(
+            proc._sealing_keypair.public_key_b64, runner_id=runner_id, generation=1
+        )
+    )
+    result = await proc._handle_launch(
+        HostLaunchRunnerFrame(
+            request_id="req_cred_ws",
+            binding_token="token_xyz",
+            workspace="/nonexistent/path/that/does/not/exist",
+        )
+    )
+    assert result.status == "failed"
+    assert runner_id not in proc._pending_credentials
+
+
+async def test_launch_refused_for_unconfigured_harness_discards_pending_credential(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A launch refused pre-spawn (harness check) discards the delivered credential."""
+    from omnigent.host.sealing import generate_sealing_keypair
+
+    proc = _make_host_process()
+    proc._sealing_keypair = generate_sealing_keypair()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    monkeypatch.setattr(
+        "omnigent.host.connect.harness_is_configured",
+        lambda harness: False,
+    )
+    runner_id = token_bound_runner_id("token_abc")
+    proc._handle_deliver_credential(
+        _managed_deliver_frame(
+            proc._sealing_keypair.public_key_b64, runner_id=runner_id, generation=1
+        )
+    )
+    result = await proc._handle_launch(
+        HostLaunchRunnerFrame(
+            request_id="req_cred_harness",
+            binding_token="token_abc",
+            workspace=str(workspace),
+            harness="codex",
+        )
+    )
+    assert result.status == "failed"
+    assert runner_id not in proc._pending_credentials

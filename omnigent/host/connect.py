@@ -1122,12 +1122,18 @@ class HostProcess:
             ``"harness_not_configured"`` when the harness check
             refuses the launch.
         """
+        # Derived up front so every failed return below can discard a
+        # credential delivered ahead of this launch — a refused launch must
+        # not leave the never-spawned runner's secret cached.
+        runner_id = token_bound_runner_id(frame.binding_token)
+
         # Refuse to spawn for a harness this machine can't actually run —
         # otherwise the runner starts, the session looks alive, and the
         # first turn dies confusingly inside the executor. ``None`` (an
         # older server, or a session with no resolvable harness) skips the
         # check so version skew fails open.
         if frame.harness is not None and not harness_is_configured(frame.harness):
+            self._pending_credentials.pop(runner_id, None)
             return HostLaunchRunnerResultFrame(
                 request_id=frame.request_id,
                 status="failed",
@@ -1140,13 +1146,13 @@ class HostProcess:
 
         workspace = Path(frame.workspace).expanduser()
         if not workspace.is_dir():
+            self._pending_credentials.pop(runner_id, None)
             return HostLaunchRunnerResultFrame(
                 request_id=frame.request_id,
                 status="failed",
                 error=f"workspace path does not exist: {workspace}",
             )
 
-        runner_id = token_bound_runner_id(frame.binding_token)
         credential = self._pending_credentials.get(runner_id)
         env = _build_runner_env(
             os.environ,
