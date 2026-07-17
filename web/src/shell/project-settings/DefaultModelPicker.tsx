@@ -1,15 +1,13 @@
-import { modelOptionsForHarness } from "@/lib/harnessCatalog";
+import type { ModelOption } from "@/lib/harnessCatalog";
 
-import {
-  ProjectDefaultPicker,
-  type ProjectDefaultPickerOption,
-} from "./DefaultHarnessPicker";
+import { ProjectDefaultPicker, withCurrentOption } from "./ProjectDefaultPicker";
 import type { FieldProvenance } from "./projectDefaultsDraft";
 
 export function DefaultModelPicker({
   value,
   provenance,
   harness,
+  catalog,
   error,
   onChange,
   onReset,
@@ -17,29 +15,23 @@ export function DefaultModelPicker({
   value: string;
   provenance: FieldProvenance;
   harness: string | null;
+  catalog: readonly ModelOption[];
   error?: string;
   onChange: (value: string) => void;
   onReset: () => void;
 }) {
-  const catalog = modelOptionsForHarness(harness);
-  const known = catalog.some((option) => option.id === value);
-  const options: ProjectDefaultPickerOption[] = catalog.map((option) => ({
-    value: option.id,
-    label: option.label,
-  }));
-  if (value && !known) {
-    options.unshift({ value, label: `${value} (not in current catalog)` });
-  }
+  const { options, selected } = withCurrentOption(
+    catalog.map((option) => ({ value: option.id, label: option.label })),
+    value,
+    `${value} (not in current catalog)`,
+  );
 
-  const noHarnessHint =
-    "Choose a project harness to select a compatible model. Without one, the future session's agent decides.";
-  const noCatalogHint =
-    "No project-wide model catalog available. The future session's agent decides.";
-  const hint = harness === null ? noHarnessHint : catalog.length === 0 ? noCatalogHint : "Harness default";
-  const triggerLabel = value
-    ? (catalog.find((option) => option.id === value)?.label ??
-      `${value} (not in current catalog)`)
-    : "Harness default";
+  const hint =
+    harness === null
+      ? "Choose a project harness to select a compatible model. Without one, the future session's agent decides."
+      : catalog.length === 0
+        ? "No project-wide model catalog available. The future session's agent decides."
+        : "Harness default";
 
   return (
     <ProjectDefaultPicker
@@ -48,7 +40,7 @@ export function DefaultModelPicker({
       value={value}
       provenance={provenance}
       options={options}
-      triggerLabel={triggerLabel}
+      triggerLabel={value ? (selected?.label ?? value) : "Harness default"}
       disabled={catalog.length === 0}
       hint={hint}
       error={error}

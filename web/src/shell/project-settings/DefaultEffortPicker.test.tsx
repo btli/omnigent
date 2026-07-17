@@ -1,6 +1,8 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { effortOptionsForHarness } from "@/lib/harnessCatalog";
+
 import { DefaultEffortPicker } from "./DefaultEffortPicker";
 
 afterEach(cleanup);
@@ -14,6 +16,7 @@ describe("DefaultEffortPicker", () => {
         provenance="inherited"
         harness="claude-native"
         model="sonnet"
+        catalog={effortOptionsForHarness("claude-native")}
         onChange={onChange}
         onReset={vi.fn()}
       />,
@@ -36,6 +39,7 @@ describe("DefaultEffortPicker", () => {
         provenance="inherited"
         harness="claude-native"
         model={null}
+        catalog={effortOptionsForHarness("claude-native")}
         onChange={vi.fn()}
         onReset={vi.fn()}
       />,
@@ -54,6 +58,7 @@ describe("DefaultEffortPicker", () => {
         provenance="overridden"
         harness="codex-native"
         model="gpt-5.4"
+        catalog={[]}
         onChange={vi.fn()}
         onReset={vi.fn()}
       />,

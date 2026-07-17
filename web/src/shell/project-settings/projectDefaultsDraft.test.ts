@@ -4,7 +4,6 @@ import {
   buildDraft,
   fieldDisplayValue,
   fieldProvenance,
-  isDirty,
   resetField,
   serializeBundle,
   setFieldValue,
@@ -86,7 +85,7 @@ describe("projectDefaultsDraft", () => {
   it("marks a null host type invalid and repairs it by omission", () => {
     const state = buildDraft({ host_type: null }, BASELINES);
 
-    expect(state.invalidHostTypeNull).toBe(true);
+    expect(state.fields.host_type.persistedKind).toBe("legacy-null");
     expect(fieldProvenance(state, "host_type")).toBe("invalid");
     expect(fieldDisplayValue(state, "host_type")).toBe("external");
     expect(serializeBundle(state)).toEqual({});
@@ -124,11 +123,4 @@ describe("projectDefaultsDraft", () => {
     expect(serializeBundle(state)).toEqual({});
   });
 
-  it("compares serialized state with a null-normalized original bundle", () => {
-    const original = { model: null };
-    const state = buildDraft(original, { ...BASELINES, model: null });
-
-    expect(isDirty(state, original)).toBe(false);
-    expect(isDirty(setFieldValue(state, "model", "new-model"), original)).toBe(true);
-  });
 });

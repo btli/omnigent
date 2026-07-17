@@ -379,6 +379,72 @@ describe("ProjectDefaultsEditor", () => {
     await waitFor(() => expect(onValidityChange).toHaveBeenLastCalledWith(false));
   });
 
+  it("carries error-mode edits across a recovered preview instead of discarding them", async () => {
+    mocks.resolved.mockReturnValue({
+      data: undefined,
+      isLoading: false,
+      isError: true,
+      error: new Error("Transient failure"),
+      refetch: mocks.refetch,
+    });
+    const { rerender } = render(
+      <ProjectDefaultsEditor
+        open
+        projectId="project-1"
+        bundle={{}}
+        projectRowVersion={7}
+        onDraftChange={vi.fn()}
+      />,
+    );
+
+    // Edit a field while running on fallback baselines.
+    const branch = await screen.findByTestId("project-default-default_branch-control");
+    fireEvent.change(branch, { target: { value: "edited-branch" } });
+    expect(branch).toHaveValue("edited-branch");
+
+    // Retry succeeds: the draft rebases onto real baselines, keeping the edit.
+    setResolved();
+    rerender(
+      <ProjectDefaultsEditor
+        open
+        projectId="project-1"
+        bundle={{}}
+        projectRowVersion={7}
+        onDraftChange={vi.fn()}
+      />,
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("project-default-default_branch-control")).toHaveValue(
+        "edited-branch",
+      ),
+    );
+    // Untouched fields pick up the recovered baseline.
+    expect(screen.getByTestId("project-default-workspace-control")).toHaveValue("/workspace");
+  });
+
+  it("does not block Save after a Managed round-trip that changes nothing", async () => {
+    setResolved({ host_type: "managed", host_id: null, workspace: null, git: null });
+    const onValidityChange = vi.fn();
+    render(
+      <ProjectDefaultsEditor
+        open
+        projectId="project-1"
+        bundle={{ host_type: "managed", workspace: "owner/repo#main" }}
+        projectRowVersion={7}
+        onDraftChange={vi.fn()}
+        onValidityChange={onValidityChange}
+      />,
+    );
+
+    const hostType = await screen.findByTestId("project-default-host_type-control");
+    await waitFor(() => expect(onValidityChange).toHaveBeenLastCalledWith(true));
+    fireEvent.change(hostType, { target: { value: "external" } });
+    fireEvent.change(hostType, { target: { value: "managed" } });
+    // Back at its opening value with the workspace untouched — still saveable.
+    await waitFor(() => expect(onValidityChange).toHaveBeenLastCalledWith(true));
+    expect(screen.queryByTestId("project-default-workspace-error")).toBeNull();
+  });
+
   it("blocks saving a workspace carried across an External to Managed switch", async () => {
     const onValidityChange = vi.fn();
     render(

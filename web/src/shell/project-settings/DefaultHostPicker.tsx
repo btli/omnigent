@@ -1,11 +1,21 @@
 import { HostOption } from "@/components/HostOption";
 import type { Host } from "@/hooks/useHosts";
 
-import {
-  ProjectDefaultPicker,
-  type ProjectDefaultPickerOption,
-} from "./DefaultHarnessPicker";
+import { ProjectDefaultPicker, withCurrentOption } from "./ProjectDefaultPicker";
 import type { FieldProvenance } from "./projectDefaultsDraft";
+
+function hostRow(host: Host) {
+  return (
+    <HostOption
+      host={host}
+      subtitle={
+        host.status === "offline"
+          ? "Future sessions may fail until this host reconnects"
+          : undefined
+      }
+    />
+  );
+}
 
 export function DefaultHostPicker({
   value,
@@ -24,41 +34,26 @@ export function DefaultHostPicker({
   onChange: (value: string) => void;
   onReset: () => void;
 }) {
+  const { options, selected, unknown } = withCurrentOption(
+    hosts.map((host) => ({
+      value: host.host_id,
+      label: `${host.name} (${host.status})`,
+      content: hostRow(host),
+    })),
+    value,
+    `${value} (unavailable)`,
+  );
   const selectedHost = hosts.find((host) => host.host_id === value);
-  const unavailable = value !== "" && !selectedHost;
-  const options: ProjectDefaultPickerOption[] = hosts.map((host) => ({
-    value: host.host_id,
-    label: `${host.name} (${host.status})`,
-    content: (
-      <HostOption
-        host={host}
-        subtitle={
-          host.status === "offline"
-            ? "Future sessions may fail until this host reconnects"
-            : undefined
-        }
-      />
-    ),
-  }));
-
-  if (unavailable) {
-    options.unshift({
-      value,
-      label: `${value} (unavailable)`,
-    });
-  }
 
   const empty = hosts.length === 0;
   const triggerLabel = isLoading
     ? "Loading hosts…"
     : empty && !value
       ? "No connected hosts"
-      : unavailable
-        ? `${value} (unavailable)`
-        : selectedHost
-          ? `${selectedHost.name} (${selectedHost.status})`
-          : "No pinned host";
-  const hint = unavailable
+      : value
+        ? (selected?.label ?? value)
+        : "No pinned host";
+  const hint = unknown
     ? "This saved host is unavailable. Reset it or choose a connected host."
     : selectedHost?.status === "offline"
       ? "This host is offline. Future sessions may fail until it reconnects."
@@ -74,18 +69,7 @@ export function DefaultHostPicker({
       provenance={provenance}
       options={options}
       triggerLabel={triggerLabel}
-      triggerContent={
-        selectedHost ? (
-          <HostOption
-            host={selectedHost}
-            subtitle={
-              selectedHost.status === "offline"
-                ? "Future sessions may fail until this host reconnects"
-                : undefined
-            }
-          />
-        ) : undefined
-      }
+      triggerContent={selectedHost ? hostRow(selectedHost) : undefined}
       disabled={isLoading || empty}
       hint={hint}
       error={error}

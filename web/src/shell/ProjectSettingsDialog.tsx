@@ -149,8 +149,10 @@ export function ProjectSettingsDialog({
     setDefaultsValid(isValid);
   }, []);
 
+  const defaultsSaveBlocked = !defaultsDraft || !defaultsValid || isLoading;
+
   async function handleSave() {
-    if (!project || !etag || !defaultsDraft || !defaultsValid || isSaving || isLoading) return;
+    if (!project || !etag || defaultsSaveBlocked || isSaving) return;
     const trimmedName = name.trim();
     if (!trimmedName) {
       setNameError("Project name is required.");
@@ -363,7 +365,7 @@ export function ProjectSettingsDialog({
                 type="submit"
                 className="min-h-11"
                 loading={isSaving}
-                disabled={!defaultsDraft || !defaultsValid || isLoading}
+                disabled={defaultsSaveBlocked}
               >
                 Save settings
               </Button>

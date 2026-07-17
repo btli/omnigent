@@ -114,8 +114,28 @@ export function ProjectDefaultsEditor({
     const initializationKey = `${projectId}:${projectRowVersion}:${source}:${bundleKey}:${baselineKey}`;
     if (initializedKeyRef.current === initializationKey) return;
 
+    // Rebasing onto new baselines for the same project row (e.g. fallback
+    // baselines replaced by a recovered preview after Retry) must not discard
+    // fields the user already touched — carry their edits into the rebuild.
+    const isRebase = initializedKeyRef.current?.startsWith(`${projectId}:${projectRowVersion}:`);
     initializedKeyRef.current = initializationKey;
-    setDraft(stageManagedHostReset(buildDraft(bundle, baselines)));
+    setDraft((previous) => {
+      const next = stageManagedHostReset(buildDraft(bundle, baselines));
+      if (!previous || !isRebase) return next;
+      const fields = { ...next.fields };
+      for (const field of Object.keys(fields) as (keyof typeof fields)[]) {
+        const touched = previous.fields[field];
+        if (touched.edited || touched.resetRequested) {
+          fields[field] = {
+            ...fields[field],
+            value: touched.value,
+            edited: touched.edited,
+            resetRequested: touched.resetRequested,
+          };
+        }
+      }
+      return { ...next, fields };
+    });
   }, [baselines, bundle, bundleKey, matchingPreview, open, projectId, projectRowVersion]);
 
   useEffect(() => {
@@ -159,7 +179,7 @@ export function ProjectDefaultsEditor({
   const harnessChanged = draft !== null && (harness ?? "") !== harnessAtOpen;
   const modelChanged = draft !== null && (model ?? "") !== modelAtOpen;
   const modelCatalog = modelOptionsForHarness(harness);
-  const effortCatalog = effortOptionsForHarness(harness, model);
+  const effortCatalog = effortOptionsForHarness(harness);
   const modelIncompatible = Boolean(
     harnessChanged &&
       model &&
@@ -180,12 +200,18 @@ export function ProjectDefaultsEditor({
   );
   // A workspace carried across a live External → Managed switch is a path, not
   // the repository spec managed sessions need — block Save until it is reset.
-  // A managed+workspace bundle loaded as-is may be a valid repo spec, so only
-  // this session's own switch gates.
+  // A managed+workspace bundle loaded as-is may be a valid repo spec, and a
+  // Managed→External→Managed round-trip changes nothing, so only a host type
+  // that DIFFERS from its opening value gates.
+  const hostTypeAtOpen = draft
+    ? typeof bundle.host_type === "string"
+      ? bundle.host_type
+      : (draft.fields.host_type.resolvedAtOpen ?? "external")
+    : "external";
   const workspaceBlocksSave = Boolean(
     draft &&
       effectiveHostType === "managed" &&
-      draft.fields.host_type.edited &&
+      effectiveHostType !== hostTypeAtOpen &&
       fieldProvenance(draft, "workspace") !== "inherited",
   );
   const isValid =
@@ -346,15 +372,13 @@ export function ProjectDefaultsEditor({
                 placeholder="No project workspace"
                 hint={
                   retainedWorkspace
-                    ? "Managed sessions cannot use this stored workspace. Reset it to remove the legacy value."
+                    ? "Managed sessions use this as their repository spec. Reset it if it is a leftover external path."
                     : "Workspace used by new external sessions."
                 }
                 error={
                   workspaceBlocksSave
                     ? "Managed sessions cannot use this workspace path. Reset it to save."
-                    : retainedWorkspace
-                      ? "This external-only value is retained but inactive for managed sessions."
-                      : undefined
+                    : undefined
                 }
                 onChange={(value) => change("workspace", value)}
                 onReset={() => reset("workspace")}
@@ -390,6 +414,7 @@ export function ProjectDefaultsEditor({
             value={fieldDisplayValue(draft, "model")}
             provenance={fieldProvenance(draft, "model")}
             harness={harness}
+            catalog={modelCatalog}
             error={modelError}
             onChange={(value) => change("model", value)}
             onReset={() => reset("model")}
@@ -400,6 +425,7 @@ export function ProjectDefaultsEditor({
             provenance={fieldProvenance(draft, "reasoning_effort")}
             harness={harness}
             model={model}
+            catalog={effortCatalog}
             error={effortError}
             onChange={(value) => change("reasoning_effort", value)}
             onReset={() => reset("reasoning_effort")}

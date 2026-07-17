@@ -1,6 +1,8 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { modelOptionsForHarness } from "@/lib/harnessCatalog";
+
 import { DefaultModelPicker } from "./DefaultModelPicker";
 
 afterEach(cleanup);
@@ -13,6 +15,7 @@ describe("DefaultModelPicker", () => {
         value="sonnet"
         provenance="inherited"
         harness="claude-native"
+        catalog={modelOptionsForHarness("claude-native")}
         onChange={onChange}
         onReset={vi.fn()}
       />,
@@ -30,6 +33,7 @@ describe("DefaultModelPicker", () => {
         value=""
         provenance="inherited"
         harness={null}
+        catalog={[]}
         onChange={vi.fn()}
         onReset={vi.fn()}
       />,
@@ -48,6 +52,7 @@ describe("DefaultModelPicker", () => {
         value="legacy-model"
         provenance="overridden"
         harness="codex-native"
+        catalog={[]}
         onChange={vi.fn()}
         onReset={onReset}
       />,

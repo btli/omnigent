@@ -34,7 +34,6 @@ export interface DefaultFieldDraft {
 
 export interface DefaultsDraftState {
   fields: Record<DefaultField, DefaultFieldDraft>;
-  invalidHostTypeNull: boolean;
 }
 
 function normalizedValue(value: string): string {
@@ -68,10 +67,7 @@ export function buildDraft(
     }),
   ) as Record<DefaultField, DefaultFieldDraft>;
 
-  return {
-    fields,
-    invalidHostTypeNull: bundle.host_type === null,
-  };
+  return { fields };
 }
 
 export function fieldProvenance(
@@ -80,9 +76,11 @@ export function fieldProvenance(
 ): FieldProvenance {
   const draft = state.fields[field];
 
+  // A persisted host_type: null is invalid — it overrides the server's
+  // external default and breaks resolution — until the user touches it.
   if (
     field === "host_type" &&
-    state.invalidHostTypeNull &&
+    draft.persistedKind === "legacy-null" &&
     !draft.resetRequested &&
     !draft.edited
   ) {
@@ -128,7 +126,10 @@ export function setFieldValue(
 /** What a field resolves to once its project property is removed. For a stored
  *  value the preview echoed that value back as `resolvedAtOpen`, so it cannot
  *  be the post-reset display: under schema v1 the only server default is
- *  host_type=external — every other field inherits nothing. */
+ *  host_type=external — every other field inherits nothing. (A reset managed
+ *  workspace would re-derive from repo_url#branch at resolve time, but that
+ *  field unmounts on reset — managed shows it only while retained — so the
+ *  empty display is never rendered and no client-side derivation is needed.) */
 function postResetValue(field: DefaultField, draft: DefaultFieldDraft): string {
   if (draft.persistedKind !== "value") return draft.resolvedAtOpen ?? "";
   return field === "host_type" ? "external" : "";
@@ -168,20 +169,3 @@ export function serializeBundle(state: DefaultsDraftState): DefaultsBundle {
   return bundle;
 }
 
-function normalizeBundle(bundle: DefaultsBundle): DefaultsBundle {
-  const normalized: DefaultsBundle = {};
-
-  for (const field of DEFAULT_FIELDS) {
-    const value = bundle[field];
-    if (value == null) continue;
-
-    const trimmed = normalizedValue(value);
-    if (trimmed !== "") normalized[field] = trimmed;
-  }
-
-  return normalized;
-}
-
-export function isDirty(state: DefaultsDraftState, originalBundle: DefaultsBundle): boolean {
-  return JSON.stringify(serializeBundle(state)) !== JSON.stringify(normalizeBundle(originalBundle));
-}

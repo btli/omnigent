@@ -1,6 +1,7 @@
 import { cn } from "@/lib/utils";
 
 import { InheritedFieldShell } from "./InheritedFieldShell";
+import { fieldControlIds } from "./ProjectDefaultPicker";
 import type { DefaultField, FieldProvenance } from "./projectDefaultsDraft";
 
 export function DefaultSelectField({
@@ -24,10 +25,7 @@ export function DefaultSelectField({
   onChange: (value: string) => void;
   onReset: () => void;
 }) {
-  const prefix = `project-default-${field}`;
-  const describedBy = [hint && `${prefix}-hint`, error && `${prefix}-error`]
-    .filter(Boolean)
-    .join(" ");
+  const { prefix, describedBy } = fieldControlIds(field, hint, error);
 
   return (
     <InheritedFieldShell
@@ -43,7 +41,7 @@ export function DefaultSelectField({
         data-testid={`${prefix}-control`}
         value={value}
         title={options.find((option) => option.value === value)?.label ?? value}
-        aria-describedby={describedBy || undefined}
+        aria-describedby={describedBy}
         aria-invalid={error ? true : undefined}
         className={cn(
           "h-11 w-full min-w-0 rounded-lg border border-input bg-background px-2.5 text-sm outline-none",

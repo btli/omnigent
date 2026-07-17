@@ -1,9 +1,6 @@
-import { effortOptionsForHarness } from "@/lib/harnessCatalog";
+import type { EffortOption } from "@/lib/harnessCatalog";
 
-import {
-  ProjectDefaultPicker,
-  type ProjectDefaultPickerOption,
-} from "./DefaultHarnessPicker";
+import { ProjectDefaultPicker, withCurrentOption } from "./ProjectDefaultPicker";
 import type { FieldProvenance } from "./projectDefaultsDraft";
 
 export function DefaultEffortPicker({
@@ -11,6 +8,7 @@ export function DefaultEffortPicker({
   provenance,
   harness,
   model,
+  catalog,
   error,
   onChange,
   onReset,
@@ -19,19 +17,16 @@ export function DefaultEffortPicker({
   provenance: FieldProvenance;
   harness: string | null;
   model: string | null;
+  catalog: readonly EffortOption[];
   error?: string;
   onChange: (value: string) => void;
   onReset: () => void;
 }) {
-  const catalog = effortOptionsForHarness(harness, model);
-  const known = catalog.some((option) => option.value === value);
-  const options: ProjectDefaultPickerOption[] = catalog.map((option) => ({
-    value: option.value,
-    label: option.label,
-  }));
-  if (value && !known) {
-    options.unshift({ value, label: `${value} (not in current catalog)` });
-  }
+  const { options, selected } = withCurrentOption(
+    catalog.map((option) => ({ value: option.value, label: option.label })),
+    value,
+    `${value} (not in current catalog)`,
+  );
 
   const hint =
     harness === null
@@ -41,10 +36,6 @@ export function DefaultEffortPicker({
         : catalog.length === 0
           ? "No project-wide effort catalog available. The future session's agent decides."
           : "Harness default";
-  const triggerLabel = value
-    ? (catalog.find((option) => option.value === value)?.label ??
-      `${value} (not in current catalog)`)
-    : "Harness default";
 
   return (
     <ProjectDefaultPicker
@@ -53,7 +44,7 @@ export function DefaultEffortPicker({
       value={value}
       provenance={provenance}
       options={options}
-      triggerLabel={triggerLabel}
+      triggerLabel={value ? (selected?.label ?? value) : "Harness default"}
       disabled={model === null || model === "" || catalog.length === 0}
       hint={hint}
       error={error}

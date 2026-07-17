@@ -26,9 +26,7 @@ describe("harnessCatalog", () => {
   );
 
   it("returns all five Claude effort levels for claude-native", () => {
-    expect(effortOptionsForHarness("claude-native", "sonnet")).toEqual(
-      CLAUDE_NATIVE_EFFORTS,
-    );
+    expect(effortOptionsForHarness("claude-native")).toEqual(CLAUDE_NATIVE_EFFORTS);
     expect(CLAUDE_NATIVE_EFFORTS.map((option) => option.value)).toEqual([
       "low",
       "medium",
@@ -41,7 +39,7 @@ describe("harnessCatalog", () => {
   it.each(["claude-sdk", "codex-native"])(
     "does not expose effort levels for %s",
     (harness) => {
-      expect(effortOptionsForHarness(harness, "gpt-5.4")).toEqual([]);
+      expect(effortOptionsForHarness(harness)).toEqual([]);
     },
   );
 

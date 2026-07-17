@@ -34,6 +34,10 @@ export function isClaudeNativeHarness(harness: string | null): boolean {
   return nativeCodingAgentForHarness(harness)?.key === "claude";
 }
 
+const NATIVE_HARNESS_OPTIONS: readonly HarnessOption[] = [...NATIVE_CODING_AGENTS]
+  .sort((a, b) => a.sortRank - b.sortRank)
+  .map((agent) => ({ id: agent.harness, label: agent.displayName }));
+
 /**
  * Harness options for the project defaults picker: the native terminal
  * wrappers (Claude Code, Codex, …) followed by the brain-harness catalog.
@@ -43,9 +47,7 @@ export function isClaudeNativeHarness(harness: string | null): boolean {
 export function harnessOptionsForProject(
   brainLabels: Record<string, string>,
 ): readonly HarnessOption[] {
-  const options: HarnessOption[] = [...NATIVE_CODING_AGENTS]
-    .sort((a, b) => a.sortRank - b.sortRank)
-    .map((agent) => ({ id: agent.harness, label: agent.displayName }));
+  const options = [...NATIVE_HARNESS_OPTIONS];
   const seen = new Set(options.map((option) => option.id));
   for (const [id, label] of Object.entries(brainLabels)) {
     if (!seen.has(id)) options.push({ id, label });
@@ -57,9 +59,6 @@ export function modelOptionsForHarness(harness: string | null): readonly ModelOp
   return isClaudeNativeHarness(harness) ? CLAUDE_NATIVE_MODELS : [];
 }
 
-export function effortOptionsForHarness(
-  harness: string | null,
-  _model: string | null,
-): readonly EffortOption[] {
+export function effortOptionsForHarness(harness: string | null): readonly EffortOption[] {
   return isClaudeNativeHarness(harness) ? CLAUDE_NATIVE_EFFORTS : [];
 }

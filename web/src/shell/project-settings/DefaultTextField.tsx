@@ -1,6 +1,7 @@
 import { Input } from "@/components/ui/input";
 
 import { InheritedFieldShell } from "./InheritedFieldShell";
+import { fieldControlIds } from "./ProjectDefaultPicker";
 import type { DefaultField, FieldProvenance } from "./projectDefaultsDraft";
 
 export function DefaultTextField({
@@ -24,10 +25,7 @@ export function DefaultTextField({
   onChange: (value: string) => void;
   onReset: () => void;
 }) {
-  const prefix = `project-default-${field}`;
-  const describedBy = [hint && `${prefix}-hint`, error && `${prefix}-error`]
-    .filter(Boolean)
-    .join(" ");
+  const { prefix, describedBy } = fieldControlIds(field, hint, error);
 
   return (
     <InheritedFieldShell
@@ -44,7 +42,7 @@ export function DefaultTextField({
         value={value}
         placeholder={placeholder}
         title={value || placeholder}
-        aria-describedby={describedBy || undefined}
+        aria-describedby={describedBy}
         aria-invalid={error ? true : undefined}
         className="h-11 w-full min-w-0"
         onChange={(event) => onChange(event.target.value)}
