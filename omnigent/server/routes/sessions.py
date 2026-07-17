@@ -20585,11 +20585,42 @@ def create_sessions_router(
             if runner_client is None and _host_reg is not None:
                 _host_conn = _host_reg.get(conv.host_id)
                 if _host_conn is not None:
+                    from omnigent.server.managed_hosts import RelaunchBindingError
+
+                    # A credential-bound session's runner cache was dropped
+                    # with the old runner (see _reauthorize_managed_repo_for_
+                    # delivery); re-resolve the binding before asking the
+                    # host to launch so the fresh runner gets the owner's git
+                    # credential re-delivered. A session with no bound
+                    # credential slot gets None back and this is a no-op.
+                    try:
+                        _delivery = _reauthorize_managed_repo_for_delivery(
+                            conv,
+                            app_state=request.app.state,
+                            host_store=getattr(request.app.state, "host_store", None),
+                        )
+                    except RelaunchBindingError as exc:
+                        item_id = await _persist_host_launch_failure_turn(
+                            session_id,
+                            conv,
+                            body,
+                            conversation_store,
+                            str(exc),
+                            runner_router,
+                            created_by=_attribution_user(user_id),
+                        )
+                        return {"queued": True, "item_id": item_id}
+                    _repo = _owner = _cred_store = None
+                    if _delivery is not None:
+                        _repo, _owner, _cred_store = _delivery
                     launch_attempt = await _launch_runner_on_host(
                         conv,
                         conversation_store,
                         _host_reg,
                         _host_conn,
+                        repo=_repo,
+                        owner=_owner,
+                        credential_store=_cred_store,
                     )
                     if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE:
                         # The host refused: the agent's harness isn't
@@ -20600,6 +20631,22 @@ def create_sessions_router(
                         # banner — instead of timing out into a generic
                         # RUNNER_UNAVAILABLE. The binding stays so a later
                         # message relaunches once setup is done.
+                        item_id = await _persist_host_launch_failure_turn(
+                            session_id,
+                            conv,
+                            body,
+                            conversation_store,
+                            launch_attempt.error,
+                            runner_router,
+                            created_by=_attribution_user(user_id),
+                        )
+                        return {"queued": True, "item_id": item_id}
+                    if launch_attempt.error_code == _CREDENTIAL_DELIVERY_ERROR_CODE:
+                        # The host is alive and the harness is fine, but
+                        # delivering the owner's re-authorized git credential
+                        # to the fresh runner failed. Same consume-and-record
+                        # surface as the harness refusal above — never let
+                        # the runner start with stale/no git auth.
                         item_id = await _persist_host_launch_failure_turn(
                             session_id,
                             conv,

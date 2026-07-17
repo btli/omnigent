@@ -602,6 +602,119 @@ async def test_message_relaunch_harness_not_configured_persists_error_turn(
     assert conv.host_id == _HOST_ID
 
 
+_BINDING_ERROR = "git host binding is no longer valid for this session"
+
+
+async def test_message_relaunch_credential_binding_error_persists_error_turn(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message whose relaunch credential re-authorization fails closed
+    persists user msg + error, without ever asking the host to launch.
+
+    Sibling of ``test_message_relaunch_harness_not_configured_persists_
+    error_turn`` for the OTHER failure this same relaunch site must
+    refuse: a credential-bound session whose binding integrity broke
+    while it slept (revoked slot / removed host / rebind — P1c-4b Task
+    2). ``_reauthorize_managed_repo_for_delivery`` is stubbed to raise
+    ``RelaunchBindingError`` so the test doesn't need a real credential
+    store / git-hosts config wired through the route (that resolution
+    path is covered directly by the Task-1 helper unit tests in
+    ``tests/server/test_managed_hosts.py``); this test's job is proving
+    the WIRING: the route must call the helper and fail closed BEFORE
+    ever asking the host to launch a runner.
+
+    Mutation check: drop the ``_reauthorize_managed_repo_for_delivery``
+    call (or its ``except RelaunchBindingError`` branch) from
+    ``post_event``'s relaunch-after-Stop path and this message instead
+    sends a ``host.launch_runner`` frame with no binding re-check —
+    ``_expect_no_launch`` flips ``True`` and the error-item assertion
+    fails.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.managed_hosts import RelaunchBindingError
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+
+    def _raise_binding_error(conv: object, *, app_state: object, host_store: object) -> None:
+        """Stand in for a session whose credential binding broke while asleep.
+
+        :param conv: Session row the route passed through (unused; the
+            stub fails unconditionally).
+        :param app_state: ``request.app.state`` the route passed through
+            (unused).
+        :param host_store: Host store the route passed through (unused).
+        :raises RelaunchBindingError: Always — simulates a revoked slot /
+            removed host / rebind discovered at respawn.
+        """
+        del conv, app_state, host_store
+        raise RelaunchBindingError(_BINDING_ERROR)
+
+    monkeypatch.setattr(
+        sessions_module, "_reauthorize_managed_repo_for_delivery", _raise_binding_error
+    )
+
+    comm = await _connect_host(app)
+    agent = await create_test_agent(client)
+    create_responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    create_resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    await create_responder
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["id"]
+
+    # Runner offline (none ever connected) → the message takes the relaunch
+    # branch, where the binding re-check must fail BEFORE any launch frame.
+    set_runner_client(None)
+    try:
+        msg_resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            },
+        )
+        saw_launch = await _expect_no_launch(comm, budget_s=0.2)
+    finally:
+        set_runner_client(None)
+
+    assert not saw_launch, (
+        "a broken credential binding must refuse the relaunch before asking "
+        "the host to launch a runner"
+    )
+    # The message is accepted (not a 503 RUNNER_UNAVAILABLE): the server
+    # consumed it and recorded the failure turn.
+    assert msg_resp.status_code == 202, (
+        f"expected 202, got {msg_resp.status_code}: {msg_resp.text}"
+    )
+
+    items = await client.get(f"/v1/sessions/{session_id}/items")
+    assert items.status_code == 200, items.text
+    data = items.json()["data"]
+    user_texts = [
+        part.get("text", "")
+        for item in data
+        if item.get("type") == "message"
+        for part in item.get("content", [])
+    ]
+    assert "hi" in user_texts, f"user message should be persisted, got {user_texts!r}"
+    error_items = [item for item in data if item.get("type") == "error"]
+    assert len(error_items) == 1, (
+        f"expected exactly one error item for the refused relaunch, got {error_items!r}"
+    )
+    assert _BINDING_ERROR in error_items[0]["message"]
+
+    # Binding kept so a message after the binding is fixed can relaunch.
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.host_id == _HOST_ID
+
+
 @pytest.mark.parametrize(
     "workspace,expected_detail",
     [
