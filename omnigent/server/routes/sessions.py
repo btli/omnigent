@@ -6841,9 +6841,7 @@ async def _bind_and_launch_managed_runner(
                 _publish_sandbox_status(session_id, "failed", reason)
                 return
             if launch_attempt.error_code == _CREDENTIAL_DELIVERY_ERROR_CODE:
-                _settle_credential_delivery_failure(
-                    session_id, tracker, launch_attempt.error
-                )
+                _settle_credential_delivery_failure(session_id, tracker, launch_attempt.error)
                 return
             runner_id = launch_attempt.runner_id
     if runner_id is not None and tunnel_registry is not None:
@@ -7377,9 +7375,7 @@ async def _run_managed_wake(
                 _publish_sandbox_status(session_id, "failed", reason)
                 return
             if launch_attempt.error_code == _CREDENTIAL_DELIVERY_ERROR_CODE:
-                _settle_credential_delivery_failure(
-                    session_id, tracker, launch_attempt.error
-                )
+                _settle_credential_delivery_failure(session_id, tracker, launch_attempt.error)
                 return
             runner_id = launch_attempt.runner_id
         if runner_id is not None and tunnel_registry is not None:

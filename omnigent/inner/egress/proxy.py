@@ -130,6 +130,7 @@ _CLOUD_TRAP_NETWORKS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] 
     ipaddress.ip_network("168.63.129.16/32"),
 )
 
+
 class EgressProxy:
     """Asyncio-based MITM HTTP(S) proxy with rule enforcement.
 

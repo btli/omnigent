@@ -224,6 +224,7 @@ _HOST_LOG_PATH = "/tmp/omnigent-host.log"
 # genuinely slow launch.
 MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S = MANAGED_HOST_ONLINE_TIMEOUT_S + 120
 
+
 @dataclass
 class ManagedLaunch:
     """
