@@ -401,3 +401,106 @@ def test_shell_command_does_not_see_omnigent_project_root(
     out = result.get("stdout", "")
     assert project_entry in out
     assert str(_project_root()) not in out
+
+
+# ---------------------------------------------------------------------------
+# Managed-git credential install (path-aware rule + fail-closed egress)
+# ---------------------------------------------------------------------------
+
+
+def test_install_managed_git_credential_appends_path_scoped_swap_rule() -> None:
+    from omnigent.inner.credential_proxy import CredentialProxyRuntime
+    from omnigent.inner.os_env import _install_managed_git_credential
+
+    runtime = _install_managed_git_credential(
+        None,
+        canonical_host="git.acme.com",
+        repo_path="/team/proj",
+        auth_scheme="basic",
+        username="x-access-token",
+        token="ghp_tok",
+    )
+    assert isinstance(runtime, CredentialProxyRuntime)
+    rule = runtime.rewrites[0]
+    assert rule.host == "git.acme.com"
+    assert rule.real_secret == "ghp_tok"
+    assert rule.synthetic is None  # swap-on-access: nothing enters the sandbox
+    assert rule.repo_path == "/team/proj"  # path-aware
+
+
+def test_merge_managed_git_egress_rules_scopes_to_repo_path() -> None:
+    from omnigent.inner.os_env import _merge_managed_git_egress_rules
+
+    rules = _merge_managed_git_egress_rules(
+        None, canonical_host="git.acme.com", repo_path="/team/proj"
+    )
+    assert rules == [
+        "* git.acme.com/team/proj/**",
+        "* git.acme.com/team/proj.git/**",
+    ]
+    again = _merge_managed_git_egress_rules(
+        rules, canonical_host="git.acme.com", repo_path="/team/proj"
+    )
+    assert again == rules  # idempotent
+
+
+def test_apply_managed_git_credential_installs_rule_and_preserves_egress() -> None:
+    from omnigent.inner.os_env import _apply_managed_git_credential
+
+    runtime, egress = _apply_managed_git_credential(
+        None,
+        ["* github.com/**"],
+        canonical_host="git.acme.com",
+        repo_path="/team/proj",
+        auth_scheme="basic",
+        username="x-access-token",
+        token="ghp_tok",
+    )
+    assert runtime.rewrites[0].repo_path == "/team/proj"
+    assert "* git.acme.com/team/proj/**" in egress
+    assert "* git.acme.com/team/proj.git/**" in egress
+    assert "* github.com/**" in egress  # existing allowlist preserved
+
+
+def test_apply_managed_git_credential_fails_closed_without_egress_allowlist() -> None:
+    import pytest
+
+    from omnigent.inner.os_env import ManagedGitCredentialError, _apply_managed_git_credential
+
+    # #4 (user decision): a credential into a sandbox with NO egress allowlist
+    # must NOT silently narrow the network — fail closed with an actionable msg.
+    for empty in (None, []):
+        with pytest.raises(ManagedGitCredentialError) as exc:
+            _apply_managed_git_credential(
+                None,
+                empty,
+                canonical_host="git.acme.com",
+                repo_path="/team/proj",
+                auth_scheme="basic",
+                username=None,
+                token="ghp_tok",
+            )
+        assert "egress allowlist" in str(exc.value)
+        assert "ghp_tok" not in str(exc.value)
+
+
+def test_apply_managed_git_credential_rejects_operator_host_conflict() -> None:
+    import pytest
+
+    from omnigent.inner.credential_proxy import CredentialProxyRuntime, CredentialRewriteRule
+    from omnigent.inner.os_env import ManagedGitCredentialError, _apply_managed_git_credential
+
+    operator = CredentialProxyRuntime(
+        rewrites=[CredentialRewriteRule(host="git.acme.com", scheme="basic", real_secret="op")]
+    )
+    with pytest.raises(ManagedGitCredentialError) as exc:
+        _apply_managed_git_credential(
+            operator,
+            ["* git.acme.com/**"],
+            canonical_host="GIT.ACME.COM",  # case-insensitive clash
+            repo_path="/team/proj",
+            auth_scheme="basic",
+            username=None,
+            token="ghp_tok",
+        )
+    assert "ghp_tok" not in str(exc.value)

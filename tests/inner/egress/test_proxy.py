@@ -1987,3 +1987,103 @@ async def test_stop_cancels_in_flight_connection_handlers(
     finally:
         for s in socks:
             s.close()
+
+
+# ---------------------------------------------------------------------------
+# Repo-path-scoped credential swap (managed git, §8.5 v4 security keystone)
+#
+# A repo-scoped credential rule must enforce the repo boundary ITSELF, not
+# rely solely on the egress allow-rule: the egress rule matcher does no
+# ``..`` normalization and matches the raw path, so a broader co-existing
+# egress rule (or a forge that normalizes a `..`/encoded traversal) could
+# otherwise steer the owner's token onto a different repo than the one the
+# credential was scoped to.
+# ---------------------------------------------------------------------------
+
+
+def test_repo_scoped_swap_only_attaches_within_repo_path(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    """A repo-scoped credential rule attaches ONLY within the repo prefix.
+
+    A BROAD egress rule co-exists, proving the credential RULE (not just the
+    egress allow-rule) enforces the scope — and that a `..`/encoded traversal
+    that the forge would normalize elsewhere never gets the token.
+    """
+    cert_path, key_path, _ = ca_paths
+    rule = CredentialRewriteRule(
+        host="git.acme.com",
+        scheme="basic",
+        real_secret="SECRET",
+        synthetic=None,
+        username="x-access-token",
+        repo_path="/team/proj",
+    )
+    proxy = EgressProxy(
+        parse_rules(["* git.acme.com/**"]),  # broad host allow — the trap
+        cert_path,
+        key_path,
+        credential_rewrites=[rule],
+    )
+    header_block = b"Host: git.acme.com\r\n\r\n"
+
+    def _attaches(path: str) -> bool:
+        result = proxy._rewrite_authorization(
+            host="git.acme.com", path=path, headers_raw=header_block
+        )
+        return b"authorization" in result.headers.lower()
+
+    # Legit git smart-HTTP paths for THIS repo (bare + .git) -> attached.
+    assert _attaches("/team/proj/info/refs?service=git-upload-pack")
+    assert _attaches("/team/proj.git/git-receive-pack")
+    # Dot-segment traversal the forge would normalize to another repo -> NOT attached.
+    assert not _attaches("/team/proj/../other/info/refs")
+    # Percent-encoded traversal -> NOT attached.
+    assert not _attaches("/team/proj/%2e%2e/other/info/refs")
+    # A different repo on the same host (reachable via the broad egress rule) -> NOT attached.
+    assert not _attaches("/other/repo.git/git-receive-pack")
+
+
+def test_host_scoped_operator_rule_still_attaches_to_any_path(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    """repo_path=None keeps operator-credential behavior byte-identical."""
+    cert_path, key_path, _ = ca_paths
+    rule = CredentialRewriteRule(
+        host="git.acme.com", scheme="bearer", real_secret="OP", synthetic=None
+    )
+    proxy = EgressProxy(
+        parse_rules(["* git.acme.com/**"]),
+        cert_path,
+        key_path,
+        credential_rewrites=[rule],
+    )
+    result = proxy._rewrite_authorization(
+        host="git.acme.com",
+        path="/anything/at/all",
+        headers_raw=b"Host: git.acme.com\r\n\r\n",
+    )
+    assert b"Bearer OP" in result.headers
+
+
+def test_managed_repo_path_allows_vectors() -> None:
+    from omnigent.inner.egress.proxy import _managed_repo_path_allows
+
+    base = "/team/proj"
+    # Legit git paths + exact-prefix roots -> attached.
+    assert _managed_repo_path_allows("/team/proj/info/refs", base)
+    assert _managed_repo_path_allows("/team/proj.git/git-receive-pack", base)
+    assert _managed_repo_path_allows("/team/proj/git-receive-pack?x=1", base)  # query stripped
+    assert _managed_repo_path_allows("/team/proj", base)  # exact bare root
+    assert _managed_repo_path_allows("/team/proj.git", base)  # exact .git root
+    # Escape vectors the allowlist rejects in one rule.
+    assert not _managed_repo_path_allows("/team/proj/../secret/info/refs", base)  # literal ..
+    assert not _managed_repo_path_allows("/team/proj/%2e%2e/secret", base)  # single-encoded
+    assert not _managed_repo_path_allows("/team/proj/%252e%252e/other", base)  # double-encoded
+    assert not _managed_repo_path_allows("/team/proj/..\\other", base)  # literal backslash
+    assert not _managed_repo_path_allows("/team/proj/..;x/other", base)  # matrix param
+    assert not _managed_repo_path_allows("/team/proj/%2fother", base)  # any percent-encoding
+    assert not _managed_repo_path_allows("/team/proj/a\\b", base)  # any backslash
+    # Prefix-not-boundary and cross-repo.
+    assert not _managed_repo_path_allows("/team/project/info/refs", base)  # prefix, not boundary
+    assert not _managed_repo_path_allows("/other/repo.git/info/refs", base)

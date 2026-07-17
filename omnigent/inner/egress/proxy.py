@@ -30,6 +30,7 @@ import email.policy
 import hmac
 import ipaddress
 import logging
+import re
 import socket
 import ssl
 from dataclasses import dataclass
@@ -128,6 +129,34 @@ _CLOUD_TRAP_NETWORKS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] 
     # See: https://learn.microsoft.com/en-us/azure/virtual-network/what-is-ip-address-168-63-129-16
     ipaddress.ip_network("168.63.129.16/32"),
 )
+
+_GIT_PATH_SAFE = re.compile(r"\A[A-Za-z0-9._~/-]+\Z")
+
+
+def _managed_repo_path_allows(request_path: str, repo_path: str) -> bool:
+    """Whether a repo-scoped credential may attach to *request_path*.
+
+    Fails closed via an allowlist: a legit git smart-HTTP path is plain ASCII
+    within ``[A-Za-z0-9._~/-]`` (repo/namespace names + fixed endpoints; the
+    ``?query`` is stripped first), so anything with ``%`` (any/double
+    percent-encoding), ``\\``, ``;`` (matrix params), a control/null byte, or a
+    non-ASCII char — every path a forge might normalize to escape the prefix —
+    is rejected in one rule. Then the ``..``-segment and repo-prefix checks
+    (bare and ``.git``) pin it to this repository.
+
+    The prefix match is case-sensitive: a case-variant path on a
+    case-insensitive forge declines the swap (fail-closed, functional-only —
+    git uses the clone URL's exact case).
+    """
+    target = request_path.split("?", 1)[0]
+    if not _GIT_PATH_SAFE.match(target):
+        return False
+    if ".." in target.split("/"):
+        return False
+    for base in (repo_path, f"{repo_path}.git"):
+        if target == base or target.startswith(f"{base}/"):
+            return True
+    return False
 
 
 class EgressProxy:
@@ -676,7 +705,7 @@ class EgressProxy:
         connect_host = pinned_ip or host
         # Swap any synthetic credential placeholder for the real secret,
         # bound to this host (rejects cross-host replay with 403).
-        rewrite = self._rewrite_authorization(host=host, headers_raw=headers_raw)
+        rewrite = self._rewrite_authorization(host=host, path=path, headers_raw=headers_raw)
         if rewrite.error is not None:
             logger.warning(
                 "BLOCKED-CREDENTIAL %s https://%s%s — %s", method, host, path, rewrite.error
@@ -816,7 +845,7 @@ class EgressProxy:
             body = await asyncio.wait_for(reader.readexactly(content_length), timeout=30)
 
         relative_line = f"{method} {path} HTTP/1.1\r\n".encode("latin-1")
-        rewrite = self._rewrite_authorization(host=host, headers_raw=headers_raw)
+        rewrite = self._rewrite_authorization(host=host, path=path, headers_raw=headers_raw)
         if rewrite.error is not None:
             logger.warning(
                 "BLOCKED-CREDENTIAL %s http://%s%s — %s", method, host, path, rewrite.error
@@ -1081,7 +1110,9 @@ class EgressProxy:
         except Exception:  # noqa: BLE001 — response write is best-effort
             pass
 
-    def _rewrite_authorization(self, *, host: str, headers_raw: bytes) -> _AuthRewriteResult:
+    def _rewrite_authorization(
+        self, *, host: str, path: str, headers_raw: bytes
+    ) -> _AuthRewriteResult:
         """
         Attach the real credential to a bound-host request.
 
@@ -1090,7 +1121,13 @@ class EgressProxy:
         - **Swap-on-access (default).** When a rule binds *host* and the
           request carries no ``Authorization`` header, the proxy injects
           ``Authorization: <scheme> <real>`` on the way out. The sandbox
-          never held anything credential-shaped.
+          never held anything credential-shaped. When the matched rule
+          carries a :attr:`~omnigent.inner.credential_proxy.
+          CredentialRewriteRule.repo_path` (a server-delivered managed-git
+          credential), the injection additionally requires
+          :func:`_managed_repo_path_allows` to pass for *path* — a broader
+          co-existing egress rule or a ``..``/encoded traversal must not
+          steer the token onto a different repo on the same host.
         - **Placeholder swap (opt-in).** When the request's
           ``Authorization`` header carries one of this proxy's synthetic
           placeholders (recognised by
@@ -1105,6 +1142,8 @@ class EgressProxy:
         clobbers an unrelated credential a tool deliberately sent.
 
         :param host: Upstream request host (case-insensitive).
+        :param path: Upstream request path (the same value authorized by
+            ``check_request``), used only to gate a repo-scoped rule.
         :param headers_raw: Raw HTTP header block (CRLF-separated).
         :returns: An :class:`_AuthRewriteResult` carrying either the
             (possibly rewritten / injected) headers or a rejection reason.
@@ -1142,9 +1181,14 @@ class EgressProxy:
                 del msg["Authorization"]
                 for value in rewritten:
                     msg["Authorization"] = value
-        elif host_rule is not None:
-            # Swap-on-access: the request reached a bound host with no
-            # Authorization header, so attach the real credential now.
+        elif host_rule is not None and (
+            host_rule.repo_path is None or _managed_repo_path_allows(path, host_rule.repo_path)
+        ):
+            # Swap-on-access: a bound host with no Authorization header. For a
+            # repo-scoped rule (managed git) attach ONLY within the repo prefix
+            # — a broad co-existing egress rule or a `..`/encoded traversal must
+            # not steer the owner's token onto another repo. Out-of-scope paths
+            # fall through untouched (tokenless), never leaking the credential.
             msg["Authorization"] = self._format_real_auth(host_rule)
             changed = True
         if not changed:

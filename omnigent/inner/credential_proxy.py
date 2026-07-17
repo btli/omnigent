@@ -74,6 +74,12 @@ class CredentialRewriteRule:
         placeholder will appear in requests).
     :param username: Basic-auth username emitted when ``scheme="basic"``,
         e.g. ``"x-access-token"``. ``None`` for ``bearer`` / ``token``.
+    :param repo_path: When set (server-delivered per-repo git credential),
+        the swap attaches ONLY to requests whose path is within this repo
+        prefix (leading slash, no ``.git``/trailing slash, e.g.
+        ``"/team/proj"``); a ``..``/encoded traversal or an out-of-prefix
+        path gets no token even if a broader egress rule allowed the request.
+        ``None`` (operator credentials) keeps the host-scoped behavior.
     """
 
     host: str
@@ -81,6 +87,7 @@ class CredentialRewriteRule:
     real_secret: str
     synthetic: str | None = None
     username: str | None = None
+    repo_path: str | None = None
 
 
 @dataclass

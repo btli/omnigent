@@ -22,6 +22,11 @@ from urllib.parse import urlparse, urlunparse
 
 from omnigent._platform import IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
 from omnigent.runner.identity import (
+    MANAGED_GIT_AUTH_SCHEME_ENV_VAR,
+    MANAGED_GIT_CANONICAL_HOST_ENV_VAR,
+    MANAGED_GIT_REPO_PATH_ENV_VAR,
+    MANAGED_GIT_TOKEN_ENV_VAR,
+    MANAGED_GIT_USERNAME_ENV_VAR,
     OMNIGENT_SESSION_ENV_VAR,
     strip_runner_auth_secrets,
 )
@@ -259,6 +264,133 @@ def _build_credential_proxy_parent_env(
     return resolved
 
 
+class ManagedGitCredentialError(ValueError):
+    """A server-delivered git credential could not be installed in the sandbox.
+
+    Raised for the deterministic misconfigurations the runner cannot recover
+    from — no egress allowlist to scope the swap to, or a host already bound by
+    an operator ``credential_proxy`` entry. A ``ValueError`` subclass so
+    existing ``except ValueError`` paths still catch it; it surfaces as the
+    session-failure reason via os_env's error path and names no token.
+    """
+
+
+def _install_managed_git_credential(
+    runtime: CredentialProxyRuntime | None,
+    *,
+    canonical_host: str,
+    repo_path: str,
+    auth_scheme: str,
+    username: str | None,
+    token: str,
+) -> CredentialProxyRuntime:
+    """Append a path-scoped swap-on-access rewrite rule for a delivered token.
+
+    ``synthetic=None`` means pure swap-on-access — nothing credential-shaped
+    enters the sandbox; the proxy attaches the real token on the upstream leg
+    of a tokenless request to :paramref:`canonical_host`. ``repo_path`` is set
+    on the rule so the proxy attaches ONLY within the repo prefix (the rule is
+    path-aware; see ``EgressProxy._rewrite_authorization``).
+
+    Fails closed on a duplicate host: the proxy's ``_cred_by_host`` is
+    last-wins, so silently clobbering an operator ``credential_proxy`` binding
+    for the same host is refused here (the parser's duplicate guard does not
+    cover this direct-mint path).
+
+    :raises ManagedGitCredentialError: If a rewrite already binds this host.
+    """
+    if runtime is None:
+        runtime = CredentialProxyRuntime()
+    host_lower = canonical_host.lower()
+    for existing in runtime.rewrites:
+        if existing.host.lower() == host_lower:
+            raise ManagedGitCredentialError(
+                f"managed git credential for host {canonical_host!r} conflicts "
+                "with an existing credential_proxy binding for the same host"
+            )
+    runtime.rewrites.append(
+        CredentialRewriteRule(
+            host=canonical_host,
+            scheme=auth_scheme,
+            real_secret=token,
+            synthetic=None,
+            username=username or None,
+            repo_path=repo_path,
+        )
+    )
+    return runtime
+
+
+def _merge_managed_git_egress_rules(
+    rules: list[str] | None,
+    *,
+    canonical_host: str,
+    repo_path: str,
+) -> list[str]:
+    """Append repo-path-scoped egress allow-rules for a delivered credential.
+
+    Defense-in-depth alongside the path-aware credential rule: the egress proxy
+    is default-deny, so the git host+path must be allowed for git to leave at
+    all; scoping the allow-rule to the repo prefix keeps that hole tight. Both
+    the bare and ``.git`` path forms are emitted because forges accept either.
+
+    :param rules: Existing egress rule strings.
+    :param canonical_host: Host to scope to, e.g. ``"git.acme.com"``.
+    :param repo_path: Repo path prefix (leading slash, no ``.git``/trailing
+        slash), e.g. ``"/team/proj"``.
+    :returns: The merged rule list (deduped, order-preserving).
+    """
+    merged = list(rules or [])
+    for candidate in (
+        f"* {canonical_host}{repo_path}/**",
+        f"* {canonical_host}{repo_path}.git/**",
+    ):
+        if candidate not in merged:
+            merged.append(candidate)
+    return merged
+
+
+def _apply_managed_git_credential(
+    runtime: CredentialProxyRuntime | None,
+    egress_rules: list[str] | None,
+    *,
+    canonical_host: str,
+    repo_path: str,
+    auth_scheme: str,
+    username: str | None,
+    token: str,
+) -> tuple[CredentialProxyRuntime, list[str]]:
+    """Install the swap rule + repo-scoped egress rule, or fail closed.
+
+    A delivered credential is inert without an egress proxy, and starting the
+    proxy on a sandbox that had NO egress allowlist would flip it from
+    full-network to repo-only — a silent, surprising narrowing. Per the
+    fail-closed decision, that case is refused with an actionable error rather
+    than either narrowing the sandbox or auto-adding a broad rule (the
+    preserve-broad-egress convenience is the P1d §11 merge-point's job).
+
+    :raises ManagedGitCredentialError: When there is no existing egress
+        allowlist, or a credential_proxy binding already covers this host.
+    """
+    if not egress_rules:
+        raise ManagedGitCredentialError(
+            "per-repo git credentials require an egress allowlist — "
+            "add os_env.sandbox.egress_rules"
+        )
+    runtime = _install_managed_git_credential(
+        runtime,
+        canonical_host=canonical_host,
+        repo_path=repo_path,
+        auth_scheme=auth_scheme,
+        username=username,
+        token=token,
+    )
+    merged = _merge_managed_git_egress_rules(
+        egress_rules, canonical_host=canonical_host, repo_path=repo_path
+    )
+    return runtime, merged
+
+
 @dataclass
 class OSEnvironment(ABC):
     """Base OS environment interface."""
@@ -441,6 +573,29 @@ class _HelperProcessClient:
                     parent_env=credential_parent_env,
                 )
                 env.update(credential_runtime.helper_env_updates)
+
+            # A server-delivered managed-git credential (see
+            # host.deliver_credential): the real token arrives in this
+            # process's env, stripped from the sandbox helper's env. Install a
+            # repo-path-scoped swap rule + egress allow-rule here so the egress
+            # proxy below picks them up; the token never enters the sandbox. A
+            # deterministic misconfig (no egress allowlist, or a host already
+            # bound) raises ManagedGitCredentialError, which surfaces as the
+            # session-failure reason via os_env's error path (finding #4/D).
+            managed_token = os.environ.get(MANAGED_GIT_TOKEN_ENV_VAR)
+            if managed_token:
+                canonical_host = os.environ.get(MANAGED_GIT_CANONICAL_HOST_ENV_VAR, "")
+                repo_path = os.environ.get(MANAGED_GIT_REPO_PATH_ENV_VAR, "")
+                if canonical_host and repo_path:
+                    credential_runtime, self._egress_rules = _apply_managed_git_credential(
+                        credential_runtime,
+                        self._egress_rules,
+                        canonical_host=canonical_host,
+                        repo_path=repo_path,
+                        auth_scheme=os.environ.get(MANAGED_GIT_AUTH_SCHEME_ENV_VAR, "basic"),
+                        username=os.environ.get(MANAGED_GIT_USERNAME_ENV_VAR),
+                        token=managed_token,
+                    )
 
         # Start L7 egress proxy if rules are configured. The proxy
         # listens on a Unix socket in the scratch tmpdir; the helper
