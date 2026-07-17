@@ -26,8 +26,9 @@ bwrap smoke test on a restricted-PSA cluster):
   the two small **provider-neutral** fail-closed gates below (one server-side launch check, one
   runner-side consumption check).
 - **Init-clone delivery is specified concretely (§8.4a)**, honoring the v3.1/v4 locked properties
-  with **one explicit, gate-routed deviation** (no in-server reconciler — labels remain the sweep
-  hook; §8.4a item 4, decision owner: project review):
+  with **one explicit deviation, ratified at the v5 review gate (2026-07-16)**: no in-server
+  reconciler — labels remain the sweep hook (§8.4a item 4); a sweeper stays available as later
+  P1d hardening:
   a **distinct clone-only per-Pod Secret** (never the token Secret, never literal Pod-spec env),
   projected **only** to the init container which **drops the shared `harness_secret` `envFrom`**
   (the clone step stops seeing the deployment's LLM credentials — least privilege), best-effort
