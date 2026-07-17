@@ -678,16 +678,15 @@ def _redact_values(text: str, values: Iterable[str]) -> str:
     """
     Scrub credential *values* from *text* before it reaches logs / errors.
 
-    API response bodies and container log tails can reflect a submitted value
-    (an admission webhook echoing the object; a hostile remote seeding the git
-    output) in more than its literal form — Kubernetes serializes Secret
-    ``stringData`` into base64 ``data``, so an admission-webhook echo can
-    reflect the encoded form; a value embedded in a JSON body is escaped
-    (Python's ``json.dumps`` default ``ensure_ascii=True`` form is scrubbed for
-    that); and the apiserver's Go ``encoding/json`` escapes non-ASCII as raw
-    UTF-8 rather than ``\\uXXXX``, and always escapes ``<``, ``>``, ``&``,
-    ``\\u2028``, and ``\\u2029`` — this derivation reproduces that encoder's
-    output byte-for-byte, so the Go-canonical form is scrubbed too.
+    Needles cover the literal value; its base64 form (immune to any depth of JSON
+    re-escaping — the base64 alphabet has no JSON-special characters); Python's
+    JSON-escaped form; and Go's canonical one-level form (raw UTF-8, ``<``, ``>``,
+    ``&``, ``\\u2028``, and ``\\u2029`` escaped). Accepted residual: a value echoed as
+    pre-serialized JSON through an extra layer (double-escaped backslashes) evades the
+    non-base64 needles, though not the base64 one; a webhook able to construct such an
+    echo already holds the Secret, so this is a backstop against accidental reflection,
+    not a malicious admission controller. Lone surrogates (invalid Unicode scalars)
+    never reach this channel — the Secret create itself cannot serialize them.
 
     :param text: The message to scrub.
     :param values: Credential values to replace with ``"***"``.
