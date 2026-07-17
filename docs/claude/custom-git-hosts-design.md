@@ -22,8 +22,12 @@ bwrap smoke test on a restricted-PSA cluster):
   (`omnigent host`, the Pod's main container) and the runner's in-process egress proxy already run
   **in-Pod**. The sealed `deliver_credential` frame, the path-scoped swap, wake/relaunch re-delivery
   (P1c-4b), and every fail-closed gate are provider-independent and transfer verbatim. There is no
-  swap layer to build — P1c-5a's runtime scope is the **init-container clone only**.
-- **Init-clone delivery is specified concretely (§8.4a)**, honoring every v3.1/v4 locked property:
+  swap layer to build — P1c-5a's **k8s-specific** runtime scope is the init-container clone, plus
+  the two small **provider-neutral** fail-closed gates below (one server-side launch check, one
+  runner-side consumption check).
+- **Init-clone delivery is specified concretely (§8.4a)**, honoring the v3.1/v4 locked properties
+  with **one explicit, gate-routed deviation** (no in-server reconciler — labels remain the sweep
+  hook; §8.4a item 4, decision owner: project review):
   a **distinct clone-only per-Pod Secret** (never the token Secret, never literal Pod-spec env),
   projected **only** to the init container which **drops the shared `harness_secret` `envFrom`**
   (the clone step stops seeing the deployment's LLM credentials — least privilege), best-effort
@@ -40,11 +44,12 @@ bwrap smoke test on a restricted-PSA cluster):
   `HARNESS_CREDENTIAL_ENV_VARS`) kept flowing to git — the "silently the wrong identity" class.
   P1c-5a moves the delivery check ahead of the gate: delivery vars present + sandbox inactive ⇒
   `ManagedGitCredentialError` (same deterministic-misconfig surface as the no-egress-allowlist
-  case). This also fixes the identical latent gap on exec. (2) **HTTPS-only launch gate** — slot
-  selection is scheme-agnostic and `_build_clone_env` emits the HTTPS helper pair for every bound
-  slot, so a bound `ssh://`/`git@` URL would clone via ambient SSH identity, bypassing the
-  credential. Until P1c-5b, a bound slot requires an HTTPS clone URL; launch refuses otherwise
-  (server chokepoint, all providers — on exec this is a bug fix, not a regression).
+  case). This also fixes the identical latent gap on exec. (2) **HTTPS-only launch gate** —
+  `_build_clone_env` emits the HTTPS helper pair for **every** credentialed launch (a bound user
+  slot *or* an operator `credential_source`), and an `ssh://`/`git@` URL cannot consume it — git
+  would clone via ambient SSH identity, silently bypassing the selected credential. Until P1c-5b,
+  **any launch that would deliver `clone_env` requires an HTTPS clone URL**; launch refuses
+  otherwise (server chokepoint, all providers — on exec this is a bug fix, not a regression).
 - **Cluster caveat recorded (out of scope):** on clusters that deny unprivileged user namespaces
   to restricted Pods (e.g. Debian 13's AppArmor default; smoke-tested 2026-07-16), the default
   `linux_bwrap` sandbox cannot start: bound sessions on such clusters fail **loud** (the helper
@@ -69,8 +74,9 @@ protocol did not match how the runtime actually works, and is **amended**:
   (a compromised *runner* is itself the per-op requester, so per-op does not contain it). §8.5's
   "single-use/TTL/re-fetch/discard-on-tunnel-loss" is **reconciled to launch/runner granularity**:
   single-delivery-per-launch, discard on runner exit, re-authorize on relaunch, kept across a
-  *transient* tunnel reconnect. Clone/fetch/push all ride the one swap. (A is also a net improvement
-  over today's ambient `GIT_TOKEN` env.)
+  *transient* tunnel reconnect. Clone/fetch/push all ride the one swap *(v4 wording — refined in
+  v5: the pre-runner initial clone rides §8.4/§8.4a delivery; see §8.5)*. (A is also a net
+  improvement over today's ambient `GIT_TOKEN` env.)
 - **The credential rides a dedicated `deliver_credential` frame** (§8.5) — separate from the launch
   frame, **ACKed** (git is gated until the rule is installed, closing the spawn-race), **type-tagged**
   `{http-token | ssh-key | oauth}` and keyed by `{credential_slot, canonical_host}` (multi-host = N
@@ -93,8 +99,10 @@ protocol did not match how the runtime actually works, and is **amended**:
 - **Handoff decomposed** (§14): P1c-2 `resolve_token` owner/host-scoping *(done)* → P1c-3 resolver
   widening + relaunch binding persistence + **add `launch_generation`** → P1c-4 the sealed
   `deliver_credential` frame + host-parent swap + repo-scoped rule → P1c-5 k8s in-Pod proxy + SSH
-  ssh-agent → P1c-6 commit identity + sharing notice. **k8s, the init-container clone, the tmux
-  terminal, and SSH keys are explicitly separate coverage items**, not folded into P1c-4.
+  ssh-agent *(v4 roadmap — superseded in v5: no in-Pod proxy layer is needed; now split
+  P1c-5a/5b/5c, see §0 and §14)* → P1c-6 commit identity + sharing notice. **k8s, the
+  init-container clone, the tmux terminal, and SSH keys are explicitly separate coverage items**,
+  not folded into P1c-4.
 
 ## 0.2 What changed in v3
 
@@ -314,7 +322,11 @@ every failure path. P1c-5a replaces the rejection with delivery that reuses thos
    only reach the init container via the harness Secret, the credential-bound manifest **also
    projects `env_literals`** (the non-secret, sensitivity-filtered `sandbox.kubernetes.env`
    passthrough the main container already receives) **into the init container** — the supported
-   channel for proxy/CA config once the harness ref is dropped. The **main container is untouched**
+   channel for proxy/CA config once the harness ref is dropped. **Collision rule:** keys present
+   in `clone_env` are **excluded** from that projection — explicit `env` entries beat `envFrom`
+   in Kubernetes, and the sensitivity filter blocks `GIT_TOKEN` from `env_literals` but not
+   `GIT_USERNAME`, so an operator literal must never half-override the delivered credential pair
+   (the clone Secret's keys are authoritative for the clone). The **main container is untouched**
    (keeps the harness `envFrom`; never references the clone Secret in any form). When `None`, the
    manifest is **byte-identical to today** (ambient behavior preserved, no `env_literals` added).
 3. **`start_host` order & lifecycle:** validate `clone_env` keys (env-name charset; reject a
@@ -352,15 +364,16 @@ every failure path. P1c-5a replaces the rejection with delivery that reuses thos
    §8.4 exec interim channel: every error/warning/log string the launcher emits on the clone path
    is scrubbed of the credential values before it propagates (helper-based auth already keeps the
    token off argv/URL; this closes the reflection channels).
-6. **HTTPS-only launch gate (until P1c-5b).** Slot selection is scheme-agnostic and
-   `_build_clone_env` emits the HTTPS helper pair for every bound slot — but an `ssh://`/`git@`
-   clone URL cannot consume it (git ignores the helper for SSH transport), and the §8.5 rewrite
-   rule is HTTP(S)-only, so a bound SSH session would clone/push under the **ambient SSH
-   identity**, silently bypassing the selected credential. Today k8s masks this by rejecting all
-   `clone_env`; removing the rejection must not inherit the bypass: **a bound credential slot
-   requires an HTTPS clone URL at launch** — refused at the server chokepoint (candidate:
-   `_build_clone_env`, which sees both the slot and the URL), for **all providers** (on exec this
-   is a bug fix — the same silent bypass exists there today), with a distinct fail-closed error.
+6. **HTTPS-only launch gate (until P1c-5b).** `_build_clone_env` emits the HTTPS helper pair for
+   **every credentialed launch** — a bound user slot *or* an operator `credential_source` — but an
+   `ssh://`/`git@` clone URL cannot consume it (git ignores the helper for SSH transport), and the
+   §8.5 rewrite rule is HTTP(S)-only, so an SSH-URL session would clone/push under the **ambient
+   SSH identity**, silently bypassing the selected credential in either case. Today k8s masks this
+   by rejecting all `clone_env`; removing the rejection must not inherit the bypass: **any launch
+   that would deliver `clone_env` requires an HTTPS clone URL** — refused at the server chokepoint
+   (candidate: `_build_clone_env`, which sees the slot, the operator source, and the URL), for
+   **all providers** (on exec this is a bug fix — the same silent bypass exists there today), with
+   a distinct fail-closed error.
 7. **Sandbox-inactive consumption gate (runner-side, provider-neutral).** The runner consumes a
    delivered credential only inside `if sandbox.active:` (`omnigent/inner/os_env.py`); with
    `sandbox.type: none` the delivery was silently ignored (stripped, unvalidated, no proxy, no
@@ -378,8 +391,12 @@ the per-user token never joins it (it exists only in the init container's env an
 runner-proxy swap). Residual, pre-existing, **non-bound sessions only**: where ambient
 `GIT_TOKEN` is visible to git (the init clone without a bound slot; inactive-sandbox runners),
 git's 401 fallback consults the image helper with the *ambient* token — cross-host bleed under
-operator control. Bound sessions can no longer reach any ambient fallback: the P1c-4 launch gate,
-the HTTPS-only gate (item 6), and the sandbox-inactive gate (item 7) each fail closed first.
+operator control. On the **launch and runner-proxy git paths**, credentialed sessions can no
+longer reach an ambient fallback: the P1c-4 launch gate, the HTTPS-only gate (item 6), and the
+sandbox-inactive gate (item 7) each fail closed first. The **tmux interactive terminal** remains
+the named exception — it inherits ambient `GIT_TOKEN` (while the managed token is stripped), so
+terminal-typed git can still authenticate ambiently; that surface is exactly the deliberate
+P1c-5c decision, not silently covered here.
 
 **Deploy/RBAC.** The server SA already needs create/delete on `secrets` (token Secret). New:
 `patch` on `secrets` for the ownerRef, with graceful degradation when absent — a chart
@@ -395,8 +412,10 @@ after the token Secret exists); zero clone-Secret API calls when `clone_env` is 
 credential value absent from every non-Secret API body, echoed line, raised exception, and
 redacted from API-error/log-tail compositions; `terminate` deletes both 404-ok **and still
 deletes the clone Secret when the Pod delete raises**; the server-side HTTPS-only gate refuses a
-bound non-HTTPS URL (all providers); the runner-side sandbox-inactive gate raises
-`ManagedGitCredentialError` when delivery env is present without an active sandbox.
+non-HTTPS URL for **both** a bound slot and an operator `credential_source` (all providers); the
+runner-side sandbox-inactive gate raises `ManagedGitCredentialError` when delivery env is present
+without an active sandbox; the init `env_literals` projection **excludes `clone_env` keys** (an
+operator `GIT_USERNAME` literal must not override the delivered pair).
 Live (per §15): a private Forgejo repo + per-user slot on a real cluster — observe the clone
 Secret create→delete, then fetch/push through the delivered §8.5 rule; an ambient-only session as
 regression.
