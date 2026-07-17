@@ -1,8 +1,8 @@
-# Custom git-host provider abstraction — design spec (v4)
+# Custom git-host provider abstraction — design spec (v5)
 
-**Status:** Draft for review (v4 — P1c handoff architecture resolved: launch-scoped secretless swap
-[architecture A]; sealed, ACKed, type-tagged `deliver_credential` frame; repo-path-scoped rule +
-kill/relaunch revocation; PAT-first with a `kind` discriminator, OAuth deferred to P3)
+**Status:** Draft for review (v5 — P1c-5a Kubernetes parity grounded: init-clone credential via a
+distinct, init-scoped, delete-after-init per-Pod Secret [§8.4a]; the §8.5 fetch/push chain verified
+provider-independent on k8s [no in-Pod swap layer to build]; P1c-5 split into 5a/5b/5c)
 **Date:** 2026-07-16
 **Branch:** `feat/custom-git-hosts` (worktree off `upstream/main` @ `0f6e82fb`)
 **Anchor issue:** omnigent-ai#2125. **Related:** #1937, #1421, #236.
@@ -11,7 +11,37 @@ kill/relaunch revocation; PAT-first with a `kind` discriminator, OAuth deferred 
 > phased plan (P1a/P1b landed here, P1c/P1d to follow) and review history live in the PR
 > discussion rather than in-tree.
 
-## 0. What changed in v4 (P1c handoff architecture resolved)
+## 0. What changed in v5 (P1c-5a Kubernetes parity grounded)
+
+P1c-5's Kubernetes leg was grounded against the code and the target cluster before design lock
+(recon of `kubernetes.py` / `managed_hosts.py` / the host image, a Codex design review, and a live
+bwrap smoke test on a restricted-PSA cluster):
+
+- **The §8.5 fetch/push chain needs no k8s work.** v4 deferred "k8s in-Pod swap layer" as an open
+  item; grounding resolved it: k8s is entrypoint-as-host, so the trusted host parent
+  (`omnigent host`, the Pod's main container) and the runner's in-process egress proxy already run
+  **in-Pod**. The sealed `deliver_credential` frame, the path-scoped swap, wake/relaunch re-delivery
+  (P1c-4b), and every fail-closed gate are provider-independent and transfer verbatim. There is no
+  swap layer to build — P1c-5a's runtime scope is the **init-container clone only**.
+- **Init-clone delivery is specified concretely (§8.4a)**, honoring every v3.1/v4 locked property:
+  a **distinct clone-only per-Pod Secret** (never the token Secret, never literal Pod-spec env),
+  projected **only** to the init container which **drops the shared `harness_secret` `envFrom`**
+  (the clone step stops seeing the deployment's LLM credentials — least privilege), best-effort
+  **`OwnerReference` to the Pod** (crash insurance), and **deleted as soon as init succeeds** plus
+  on every failure path and defensively at terminate. The server seam is already provider-uniform
+  (`_build_clone_env` → `start_host(clone_env=...)` on launch *and* relaunch), so the k8s launcher
+  replaces its fail-closed `SandboxCapabilityError` with delivery — no server-route changes.
+- **The image contract already fits:** the host image ships a git credential helper that reads
+  `GIT_TOKEN`/`GIT_USERNAME` from env, exactly the pair `_build_clone_env` emits — no image change.
+- **Cluster caveat recorded (out of scope):** on clusters that deny unprivileged user namespaces to
+  restricted Pods (e.g. Debian 13's AppArmor default; smoke-tested 2026-07-16), the default
+  `linux_bwrap` sandbox cannot start. Credential **scoping** is unaffected (git reaches the runner
+  proxy via `HTTPS_PROXY`); what's absent is the sandbox's *hard* egress enforcement — a
+  pre-existing cluster/infra gap, tracked separately from this program.
+- **P1c-5 split (§14):** P1c-5a k8s parity (this slice) → P1c-5b SSH ssh-agent → P1c-5c the tmux
+  terminal swap decision.
+
+## 0.1 What changed in v4 (P1c handoff architecture resolved)
 
 The fetch/push handoff (§8.5) was grounded against the code (a 6-subsystem recon) and re-decided
 through a diverse-lens + multi-engine review. The locked v3.1 "single-use, per-operation, TTL"
@@ -53,7 +83,7 @@ protocol did not match how the runtime actually works, and is **amended**:
   ssh-agent → P1c-6 commit identity + sharing notice. **k8s, the init-container clone, the tmux
   terminal, and SSH keys are explicitly separate coverage items**, not folded into P1c-4.
 
-## 0.1 What changed in v3
+## 0.2 What changed in v3
 
 - **Shared-session identity model settled.** Push auth = session **owner** (default, model A) or an
   optional per-workspace **service "bot"** (model B); per-user push is deferred. **Commit authorship
@@ -231,14 +261,88 @@ args/logs, or `SandboxPolicy`.
   before it reaches logs/SSE/error bodies. Residual: the token rides the provider exec API and
   the sandbox process table during the clone. The §8.4-conformant channel (askpass/secret-env
   primitive) is a named P1c task alongside the k8s init-container Secret.
-- **Kubernetes:** a **distinct clone-only Secret** projected to the init container
-  (`omnigent/onboarding/sandboxes/kubernetes.py:359-393,447-591`). The init container **must drop the
-  shared `harness_secret` `envFrom`** (else it still sees every credential) and receive **only** the
-  per-clone Secret; the main container never receives it. Created with an **`OwnerReference` to the
-  Pod** (GC reaps it if the server crashes) plus a label-based reconciler, and **deleted as soon as
-  init succeeds** (and on every failure path) — not carried to teardown.
+- **Kubernetes:** a **distinct clone-only Secret** projected to the init container only; the init
+  container **drops the shared `harness_secret` `envFrom`**; `OwnerReference` to the Pod; **deleted
+  as soon as init succeeds**. Fully specified in **§8.4a** (P1c-5a, grounded v5).
 - **Framing:** unless a provider actually mints/exchanges a token, this is **launch-scoped delivery of
   the existing credential**, not a "short-lived token" (a copied PAT stays long-lived).
+
+### 8.4a Kubernetes init-clone delivery (P1c-5a, grounded v5)
+
+**Grounding (verified in code, 2026-07-16).** The server seam is already provider-uniform:
+`omnigent/server/managed_hosts.py` resolves the owner's slot (or the operator `credential_source`)
+via `_build_clone_env(...)` → `{"GIT_TOKEN": ..., "GIT_USERNAME": ...}` and passes it to
+`launcher.start_host(clone_env=...)` on **launch and relaunch alike** (managed wake respawns
+through the same path). The k8s launcher (`omnigent/onboarding/sandboxes/kubernetes.py`) currently
+**fails closed** with `SandboxCapabilityError` — so today a custom-host or per-user-credential
+session on the k8s provider cannot launch at all. The host image ships a git credential helper
+that answers `git credential get` from `GIT_TOKEN` / `GIT_USERNAME` env
+(`deploy/docker/Dockerfile`, `.ubi`), exactly the pair `_build_clone_env` emits; the launch token
+already rides a per-Pod Secret (`build_token_secret_manifest`) whose create/delete lifecycle covers
+every failure path. P1c-5a replaces the rejection with delivery that reuses those two contracts.
+
+**Mechanics.**
+
+1. **A second, distinct per-Pod Secret** — `"{pod}-clone-cred"` — built by a new pure
+   `build_clone_secret_manifest(*, secret_name, namespace, clone_env)`: `type: Opaque`,
+   `stringData = clone_env`, the same managed-by/role GC labels as the token Secret. It is **not**
+   merged into the token Secret: the clone credential's lifetime (delete after init) is deliberately
+   shorter than the token's (delete at terminate), and a user PAT must not inherit a longer at-rest
+   window for implementation convenience.
+2. **Manifest projection is value-free.** `build_pod_manifest` gains `clone_secret_name: str | None`
+   (a *name*, never values — the builder stays pure and its output audit-loggable). When set, the
+   **init container's** `envFrom` becomes `[{secretRef: clone_secret_name}]`, **replacing** the
+   shared `harness_secret` ref — the clone step sees only the git pair, not the deployment's LLM
+   credentials, and the replacement removes any two-sources-of-`GIT_TOKEN` precedence question. The
+   **main container is untouched** (keeps the harness `envFrom`; never references the clone Secret
+   in any form). When `None`, the manifest is byte-identical to today (ambient behavior preserved).
+3. **`start_host` order & lifecycle:** validate `clone_env` keys (env-name charset; reject a
+   collision with the token key) → create token Secret → create clone Secret → create Pod
+   (Secrets first, so `secretKeyRef`/`envFrom` resolve — a Pod referencing a missing Secret sits in
+   `CreateContainerConfigError`, which the start wait treats as terminal) → **best-effort PATCH**
+   the clone Secret with an `ownerReferences` entry for the created Pod (apiserver GC reaps it if
+   the server crashes mid-launch; on RBAC/patch failure: warn and continue — the primary lifecycle
+   below still bounds the window) → wait for `Running` (all init containers succeeded) → **delete
+   the clone Secret immediately** (at-rest window ≈ scheduling + init duration, not Pod lifetime).
+4. **Failure paths, fail-closed inventory:** clone-Secret create failure → launch fails, Pod +
+   token Secret torn down; Pod create / readiness failure → the existing best-effort teardown also
+   deletes the clone Secret; init-clone failure (bad credential, unreachable host) → init exits
+   non-zero → the start wait fast-fails with the git log tail (helper-based auth keeps the token
+   off argv/URL, so the tail cannot contain it) and everything is reaped; delete-after-init
+   transient failure → warn; `terminate()` gains a defensive 404-ok delete of the derivable clone
+   Secret name; a crash **before** Pod create leaves a labeled orphan covered by the same
+   operator GC sweep posture as the token Secret (no in-server reconciler is added in this slice —
+   the labels are the sweep hook; ownerRef + delete-after-init + failure-path deletes + terminate
+   are the four in-code mechanisms).
+5. **Values never leave the Secret body.** The credential appears only in the clone-Secret create
+   call: never in the Pod manifest, `click.echo` progress lines, or exception strings (API error
+   formatting carries object names, not request bodies).
+
+**Ambient interaction (documented).** Sessions with **no** bound slot and **no** operator
+`credential_source` are byte-identical to today (init container keeps the harness `envFrom`,
+ambient `GIT_TOKEN` clones). The deployment's shared harness Secret continues to flow to runners
+via `HARNESS_CREDENTIAL_ENV_VARS` in the **main** container — pre-existing, operator-controlled;
+the per-user token never joins it (it exists only in the init container's env and the §8.5
+runner-proxy swap). Residual, pre-existing: if no proxy rule matches, git's 401 fallback consults
+the image helper with the *ambient* token (cross-host bleed under operator control); the P1c-4
+fail-closed launch gate keeps per-user-bound sessions from reaching that fallback.
+
+**Deploy/RBAC.** The server SA already needs create/delete on `secrets` (token Secret). New:
+`patch` on `secrets` for the ownerRef, with graceful degradation when absent — a chart
+(`omnigent-server-kubernetes`) values note, called out in the PR.
+
+**Testing.** Unit: clone-Secret manifest (labels/type/stringData); Pod manifest `envFrom` swap +
+"main container never references the clone Secret name" (serialize-and-scan) + `None` ⇒
+regression-identical; `start_host` create order, ownerRef patch target, delete-after-Running, both
+failure-path deletes, zero clone-Secret API calls when `clone_env` is absent, credential value
+absent from every non-Secret API body and echoed line; `terminate` deletes both, 404-ok.
+Live (per §15): a private Forgejo repo + per-user slot on a real cluster — observe the clone
+Secret create→delete, then fetch/push through the delivered §8.5 rule; an ambient-only session as
+regression.
+
+**Out of scope for P1c-5a:** SSH remotes (P1c-5b), the tmux terminal swap decision (P1c-5c), the
+§8.4-conformant exec askpass channel (separate named obligation), cluster userns/bwrap hardening
+(infra track), PVC-backed workspace persistence.
 
 ### 8.5 Fetch/push handoff (built in P1) & long-lived hosts
 The transient clone secret is gone after clone, so later fetch/push needs its own path. **Grounded
@@ -290,11 +394,13 @@ per-operation, TTL" framing is **reconciled to launch/runner granularity** (see 
 - **Egress coupling:** the swap is a **no-op without an egress rule** for the canonical host; launching
   a managed-git session must **auto-merge that host's egress rule** at the §11 merge point, or
   push/fetch silently goes out tokenless.
-- **Coverage explicitly deferred to separate slices (not folded into P1c-4):** **k8s** (no parent-side
-  proxy — the same runner→helper→bwrap tree runs in-Pod, so the swap layer must run in the Pod) and the
-  **init-container clone** (the *first* git op, predating the runner — a projected Secret / short-lived
-  clone token, §8.4); the **tmux terminal** swap (a new auth surface — deliberate decision required);
-  and **SSH** as above.
+- **Coverage status (updated v5):** **k8s fetch/push is NOT a separate layer** — grounding confirmed
+  the entrypoint-as-host Pod runs the same trusted host parent + in-runner egress proxy in-Pod, so
+  this §8.5 chain (sealing, ACK, path-scoping, wake/relaunch re-delivery, fail-closed gates)
+  transfers verbatim with no k8s-specific code. The **k8s init-container clone** (the *first* git
+  op, predating the runner) is covered by **§8.4a (P1c-5a)**. Still deferred to their own slices:
+  the **tmux terminal** swap (a new auth surface — deliberate decision required, P1c-5c) and
+  **SSH** as above (P1c-5b).
 - **Long-lived `omni host`:** the server env is not the external host's env. External hosts use a
   **host-local per-git-host credential config** keyed to the server-provided canonical host identity
   (name the schema + lookup-failure behavior); only **non-secret** provider/topology + CA/known-hosts
@@ -439,7 +545,10 @@ starter. Live Forgejo/Gitea containers; sharing/handoff integration tests.
 - **P1c-2** *(done)* — owner/host-scoped `resolve_token` (opaque id ≠ authorization).
 - **P1c-3** — owner-aware resolver + `RepoWorkspace`/`ClonePlan` field-widening + relaunch **binding persistence** (host-config id/version + canonical URL + slot id) + **add `launch_generation`** (the anti-replay anchor P1c-4 needs) + the `kind` column.
 - **P1c-4** — the sealed, ACKed, type-tagged **`deliver_credential`** frame (§8.5) + host-parent egress-proxy install with a **repo-path-scoped** rule, on **exec (bwrap/seatbelt)** sandboxes; `invalidate_credential` in the contract; kill/relaunch revocation. HTTPS-token only.
-- **P1c-5** — **k8s** in-Pod swap layer + init-container clone credential; **SSH** ssh-agent path; the **tmux terminal** swap decision.
+- **P1c-4b** *(done)* — wake/relaunch credential **re-delivery** (re-authorize the binding, fail closed, distinct `credential_delivery_failed` classification).
+- **P1c-5a** — **k8s parity** (§8.4a): accept `clone_env` in the k8s launcher via the distinct init-scoped, delete-after-init per-Pod Secret; verify the §8.5 chain in-Pod (no new swap layer); live-validate on a real cluster.
+- **P1c-5b** — **SSH** ssh-agent path (ephemeral agent in the runner parent, `SSH_AUTH_SOCK` to the sandbox; `ssh-key` frame kind).
+- **P1c-5c** — the **tmux terminal** swap decision (deliberate new-auth-surface call, not an accident of 5a/5b).
 - **P1c-6** — commit identity (session starter, §8.6) + the session-sharing notice (§8.7).
 
 ### P2 — PR/issue + tools
