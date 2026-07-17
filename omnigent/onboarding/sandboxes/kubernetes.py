@@ -1198,6 +1198,12 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         if on_stage is not None:
             on_stage("starting")
         core = self._load_core()
+
+        def _reap_launch_objects() -> None:
+            self._best_effort_delete(
+                namespace, sandbox_id, secret_name, clone_secret_name=clone_secret
+            )
+
         click.echo(
             f"▸ Creating Kubernetes pod '{sandbox_id}' in namespace '{namespace}' from {image}"
         )
@@ -1284,9 +1290,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                 # apiserver accepted before the response failed) so a failed
                 # create never leaks the token Secret, the clone Secret, or a
                 # running Pod.
-                self._best_effort_delete(
-                    namespace, sandbox_id, secret_name, clone_secret_name=clone_secret
-                )
+                _reap_launch_objects()
                 if isinstance(exc, ApiException):
                     message = _format_api_error("create sandbox pod", sandbox_id, exc)
                 else:
@@ -1305,9 +1309,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
             except BaseException:
                 # Anything else in this window (e.g. a manifest-build error)
                 # must not orphan a Secret already created above.
-                self._best_effort_delete(
-                    namespace, sandbox_id, secret_name, clone_secret_name=clone_secret
-                )
+                _reap_launch_objects()
                 raise
 
             try:
@@ -1317,9 +1319,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                 # the host will never come online, so reap the Pod + Secrets and
                 # re-raise the diagnosed reason (the container log tail can
                 # itself contain a credential value, e.g. a git auth failure).
-                self._best_effort_delete(
-                    namespace, sandbox_id, secret_name, clone_secret_name=clone_secret
-                )
+                _reap_launch_objects()
                 if clone_env and isinstance(exc, click.ClickException):
                     # The chained cause would carry the unredacted diagnosis
                     # (the container log tail can itself contain the
@@ -1549,23 +1549,21 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         from kubernetes.client.rest import ApiException
         from urllib3.exceptions import HTTPError
 
+        def _warn(detail: str) -> None:
+            click.echo(
+                f"  → warning: could not delete clone credential secret '{name}': {detail}",
+                err=True,
+            )
+
         try:
             core.delete_namespaced_secret(
                 name, namespace, _request_timeout=_POD_READY_REQUEST_TIMEOUT_S
             )
         except ApiException as exc:
             if getattr(exc, "status", None) != 404:
-                click.echo(
-                    f"  → warning: could not delete clone credential secret "
-                    f"'{name}': {_api_reason(exc)}",
-                    err=True,
-                )
+                _warn(_api_reason(exc))
         except HTTPError as exc:
-            click.echo(
-                f"  → warning: could not delete clone credential secret "
-                f"'{name}': {_api_reason(exc)}",
-                err=True,
-            )
+            _warn(_api_reason(exc))
 
     def _best_effort_delete(
         self,
