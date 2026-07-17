@@ -379,6 +379,20 @@ describe("pinned row project subtitle", () => {
     expect(screen.queryByTestId("pinned-project-subtitle")).toBeNull();
   });
 
+  it("omits the subtitle when the project name is unknown, never showing a raw id", () => {
+    // A shared pinned session's project isn't in the viewer's owner-scoped
+    // project list (same shape as the list still loading) — the subtitle must
+    // be omitted rather than render the opaque project id.
+    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_1"]));
+    mocks.projects = [];
+    mockConversations([{ ...CONV, project_id: "proj_unknown" }]);
+    renderSidebar();
+    expect(screen.getByText("Pinned")).toBeInTheDocument();
+
+    expect(screen.queryByTestId("pinned-project-subtitle")).toBeNull();
+    expect(screen.queryByText("proj_unknown")).toBeNull();
+  });
+
   it("shows the project subtitle on a mobile viewport too", () => {
     mocks.isMobile = true;
     localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_1"]));

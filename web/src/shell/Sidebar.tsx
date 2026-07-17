@@ -2470,10 +2470,13 @@ function ConversationRow({
   // Pinned sessions are lifted OUT of their project folder into the flat
   // "Pinned" section, so the row would otherwise not show which project it
   // belongs to. Surface the project name as a subtitle under those rows;
-  // rows inside a folder already sit under the project header.
+  // rows inside a folder already sit under the project header. Only a
+  // resolved display name renders — while the owner-scoped project list is
+  // loading, or for a shared session whose project isn't the viewer's, the
+  // subtitle is omitted rather than showing a raw project id.
   const pinnedProjectName =
     isPinned && currentProject
-      ? (projects.find((project) => project.id === currentProject)?.name ?? currentProject)
+      ? (projects.find((project) => project.id === currentProject)?.name ?? null)
       : null;
 
   const label = conversationDisplayLabel(conversation);
