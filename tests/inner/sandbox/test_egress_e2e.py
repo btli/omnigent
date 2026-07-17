@@ -42,11 +42,11 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.credential_sources import CredentialSourceSpec
 from omnigent.inner.credential_proxy import SYNTHETIC_CREDENTIAL_PREFIX
 from omnigent.inner.datamodel import (
     CredentialProxyEntry,
     CredentialProxySpec,
-    CredentialSourceSpec,
     OSEnvSandboxSpec,
     OSEnvSpec,
 )

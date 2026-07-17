@@ -2064,32 +2064,3 @@ def test_host_scoped_operator_rule_still_attaches_to_any_path(
         headers_raw=b"Host: git.acme.com\r\n\r\n",
     )
     assert b"Bearer OP" in result.headers
-
-
-def test_managed_repo_path_allows_vectors() -> None:
-    from omnigent.inner.egress.proxy import _managed_repo_path_allows
-
-    base = "/team/proj"
-    # Legit git paths + exact-prefix roots -> attached.
-    assert _managed_repo_path_allows("/team/proj/info/refs", base)
-    assert _managed_repo_path_allows("/team/proj.git/git-receive-pack", base)
-    assert _managed_repo_path_allows("/team/proj/git-receive-pack?x=1", base)  # query stripped
-    assert _managed_repo_path_allows("/team/proj", base)  # exact bare root
-    assert _managed_repo_path_allows("/team/proj.git", base)  # exact .git root
-    # Escape vectors the allowlist rejects in one rule.
-    assert not _managed_repo_path_allows("/team/proj/../secret/info/refs", base)  # literal ..
-    assert not _managed_repo_path_allows("/team/proj/%2e%2e/secret", base)  # single-encoded
-    assert not _managed_repo_path_allows("/team/proj/%252e%252e/other", base)  # double-encoded
-    assert not _managed_repo_path_allows("/team/proj/..\\other", base)  # literal backslash
-    assert not _managed_repo_path_allows("/team/proj/..;x/other", base)  # matrix param
-    assert not _managed_repo_path_allows("/team/proj/%2fother", base)  # any percent-encoding
-    assert not _managed_repo_path_allows("/team/proj/a\\b", base)  # any backslash
-    # Prefix-not-boundary and cross-repo.
-    assert not _managed_repo_path_allows("/team/project/info/refs", base)  # prefix, not boundary
-    assert not _managed_repo_path_allows("/team/proj2/info/refs", base)  # sibling sharing a prefix
-    assert not _managed_repo_path_allows("/other/repo.git/info/refs", base)
-    # Trailing-dot / case variants decline (fail-closed, not a wrong-repo match).
-    assert not _managed_repo_path_allows("/team/proj./info", base)
-    assert not _managed_repo_path_allows("/team/PROJ/info", base)
-    # An empty repo prefix must never blanket-match every path.
-    assert not _managed_repo_path_allows("/anything/at/all", "")

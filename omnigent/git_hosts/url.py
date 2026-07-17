@@ -1,4 +1,4 @@
-"""Canonical-host extraction for git repository URLs.
+"""Host extraction and credential path scoping for git repository URLs.
 
 Supports the two managed-clone URL forms (matching
 :func:`omnigent.git_hosts.managed_workspace.parse_repo_workspace`):
@@ -10,6 +10,57 @@ plan (design §9).
 """
 
 from __future__ import annotations
+
+import re
+
+_GIT_PATH_SAFE = re.compile(r"\A[A-Za-z0-9._~/-]+\Z")
+
+
+def managed_repo_path(url: str) -> str:
+    """Derive the repo-path prefix an egress rule scopes to from a clone URL.
+
+    :param url: The resolved clone URL, e.g. ``"https://git.acme.com/team/proj.git"``.
+    :returns: A leading-slash path with no ``.git`` / trailing slash, e.g.
+        ``"/team/proj"``; ``""`` when the URL carries no path.
+    """
+    from urllib.parse import urlparse
+
+    path = urlparse(url).path.rstrip("/")
+    if path.endswith(".git"):
+        path = path[: -len(".git")]
+    return path
+
+
+def managed_repo_path_allows(request_path: str, repo_path: str) -> bool:
+    """Whether a repo-scoped credential may attach to *request_path*.
+
+    Fails closed via an allowlist: a legit git smart-HTTP path is plain ASCII
+    within ``[A-Za-z0-9._~/-]`` (repo/namespace names + fixed endpoints; the
+    ``?query`` is stripped first), so anything with ``%`` (any/double
+    percent-encoding), ``\\``, ``;`` (matrix params), a control/null byte, or a
+    non-ASCII char — every path a forge might normalize to escape the prefix —
+    is rejected in one rule. Then the ``..``-segment and repo-prefix checks
+    (bare and ``.git``) pin it to this repository.
+
+    The prefix match is case-sensitive: a case-variant path on a
+    case-insensitive forge declines the swap (fail-closed, functional-only —
+    git uses the clone URL's exact case).
+    """
+    if not repo_path:
+        # An empty prefix would make every path "within" the repo — refuse
+        # rather than blanket-attach. Unreachable via the os_env install
+        # (it fails closed on an empty repo_path), but this is the security
+        # boundary; it must never depend on the caller for that.
+        return False
+    target = request_path.split("?", 1)[0]
+    if not _GIT_PATH_SAFE.match(target):
+        return False
+    if ".." in target.split("/"):
+        return False
+    for base in (repo_path, f"{repo_path}.git"):
+        if target == base or target.startswith(f"{base}/"):
+            return True
+    return False
 
 
 def split_host(url: str) -> str:

@@ -90,6 +90,7 @@ from omnigent.git_hosts.managed_workspace import (
     RepoWorkspace,
     resolve_repo_workspace,
 )
+from omnigent.git_hosts.url import managed_repo_path, managed_repo_path_allows
 from omnigent.harness_plugins import (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
@@ -636,21 +637,6 @@ _CREDENTIAL_DELIVERY_ERROR_CODE = "credential_delivery_failed"
 _HOST_CREDENTIAL_RESULT_TIMEOUT_S = 10.0
 
 
-def _managed_repo_path(url: str) -> str:
-    """Derive the repo-path prefix an egress rule scopes to from a clone URL.
-
-    :param url: The resolved clone URL, e.g. ``"https://git.acme.com/team/proj.git"``.
-    :returns: A leading-slash path with no ``.git`` / trailing slash, e.g.
-        ``"/team/proj"``; ``""`` when the URL carries no path.
-    """
-    from urllib.parse import urlparse
-
-    path = urlparse(url).path.rstrip("/")
-    if path.endswith(".git"):
-        path = path[: -len(".git")]
-    return path
-
-
 async def _deliver_credential_for_launch(
     *,
     host_conn: HostConnection,
@@ -705,18 +691,16 @@ async def _deliver_credential_for_launch(
     )
     if lease is None:
         return "the session owner's git credential could not be resolved"
-    repo_path = _managed_repo_path(repo.url)
+    repo_path = managed_repo_path(repo.url)
     if not repo_path:
         return "could not derive a repository path for credential scoping"
     # The runner's egress proxy attaches the token only to request paths its
-    # allowlist accepts (see egress/proxy._managed_repo_path_allows). A repo
+    # allowlist accepts (see git_hosts.url.managed_repo_path_allows). A repo
     # path with a character outside that allowlist (e.g. "+", a space) would
     # be delivered but never actually attached — the repo's own git would go
     # tokenless and 401 with no clear cause. Refuse it here, loudly, using the
     # exact same predicate so the two sides cannot drift.
-    from omnigent.inner.egress.proxy import _managed_repo_path_allows
-
-    if not _managed_repo_path_allows(repo_path, repo_path):
+    if not managed_repo_path_allows(repo_path, repo_path):
         return "the repository path contains characters unsupported by credential scoping"
     from omnigent.host.frames import (
         HTTP_TOKEN_CREDENTIAL_KIND,

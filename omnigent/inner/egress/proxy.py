@@ -30,7 +30,6 @@ import email.policy
 import hmac
 import ipaddress
 import logging
-import re
 import socket
 import ssl
 from dataclasses import dataclass
@@ -39,6 +38,7 @@ from email.parser import BytesParser
 from pathlib import Path
 from urllib.parse import urlparse
 
+from omnigent.git_hosts.url import managed_repo_path_allows
 from omnigent.inner.credential_proxy import (
     SYNTHETIC_CREDENTIAL_PREFIX,
     CredentialRewriteRule,
@@ -129,41 +129,6 @@ _CLOUD_TRAP_NETWORKS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] 
     # See: https://learn.microsoft.com/en-us/azure/virtual-network/what-is-ip-address-168-63-129-16
     ipaddress.ip_network("168.63.129.16/32"),
 )
-
-_GIT_PATH_SAFE = re.compile(r"\A[A-Za-z0-9._~/-]+\Z")
-
-
-def _managed_repo_path_allows(request_path: str, repo_path: str) -> bool:
-    """Whether a repo-scoped credential may attach to *request_path*.
-
-    Fails closed via an allowlist: a legit git smart-HTTP path is plain ASCII
-    within ``[A-Za-z0-9._~/-]`` (repo/namespace names + fixed endpoints; the
-    ``?query`` is stripped first), so anything with ``%`` (any/double
-    percent-encoding), ``\\``, ``;`` (matrix params), a control/null byte, or a
-    non-ASCII char — every path a forge might normalize to escape the prefix —
-    is rejected in one rule. Then the ``..``-segment and repo-prefix checks
-    (bare and ``.git``) pin it to this repository.
-
-    The prefix match is case-sensitive: a case-variant path on a
-    case-insensitive forge declines the swap (fail-closed, functional-only —
-    git uses the clone URL's exact case).
-    """
-    if not repo_path:
-        # An empty prefix would make every path "within" the repo — refuse
-        # rather than blanket-attach. Unreachable via the os_env install
-        # (it fails closed on an empty repo_path), but this is the security
-        # boundary; it must never depend on the caller for that.
-        return False
-    target = request_path.split("?", 1)[0]
-    if not _GIT_PATH_SAFE.match(target):
-        return False
-    if ".." in target.split("/"):
-        return False
-    for base in (repo_path, f"{repo_path}.git"):
-        if target == base or target.startswith(f"{base}/"):
-            return True
-    return False
-
 
 class EgressProxy:
     """Asyncio-based MITM HTTP(S) proxy with rule enforcement.
@@ -1131,7 +1096,8 @@ class EgressProxy:
           carries a :attr:`~omnigent.inner.credential_proxy.
           CredentialRewriteRule.repo_path` (a server-delivered managed-git
           credential), the injection additionally requires
-          :func:`_managed_repo_path_allows` to pass for *path* — a broader
+          :func:`~omnigent.git_hosts.url.managed_repo_path_allows` to pass for
+          *path* — a broader
           co-existing egress rule or a ``..``/encoded traversal must not
           steer the token onto a different repo on the same host.
         - **Placeholder swap (opt-in).** When the request's
@@ -1188,7 +1154,7 @@ class EgressProxy:
                 for value in rewritten:
                     msg["Authorization"] = value
         elif host_rule is not None and (
-            host_rule.repo_path is None or _managed_repo_path_allows(path, host_rule.repo_path)
+            host_rule.repo_path is None or managed_repo_path_allows(path, host_rule.repo_path)
         ):
             # Swap-on-access: a bound host with no Authorization header. For a
             # repo-scoped rule (managed git) attach ONLY within the repo prefix
