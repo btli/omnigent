@@ -396,7 +396,8 @@ def _render_workspace_prep_command(
         # ``--`` separates options from the (already-validated) URL so it can
         # never be parsed as a flag; --single-branch keeps branch-pinned clones
         # fast. Private repos authenticate via the image's GIT_TOKEN credential
-        # helper (projected from the harness Secret).
+        # helper (projected from the clone-credential Secret when one is
+        # delivered, else the shared harness Secret).
         branch = (
             f"--branch {shlex.quote(repo_branch)} --single-branch "
             if repo_branch is not None
