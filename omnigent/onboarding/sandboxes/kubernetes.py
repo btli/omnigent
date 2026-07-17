@@ -575,12 +575,9 @@ def build_pod_manifest(
 
     init_env: list[dict[str, object]] = [{"name": "HOME", "value": _HOME_DIR}]
     if clone_secret_name:
-        # The clone credential Secret REPLACES the shared harness ref for the
-        # init container: the clone step sees only the git pair plus the
-        # non-secret operator env passthrough — not the deployment's LLM
-        # credentials. Keys the Secret owns are excluded from the literal
-        # projection (explicit env would beat envFrom and half-override the
-        # delivered pair).
+        # Replaces the shared harness ref for the init container, so the clone
+        # step can't see the deployment's LLM credentials. Secret-owned keys are
+        # excluded from the literal projection — explicit env beats envFrom.
         excluded = frozenset(clone_env_keys or ())
         init_env.extend(
             {"name": name, "value": value}

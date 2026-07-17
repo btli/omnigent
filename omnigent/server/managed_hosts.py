@@ -918,8 +918,9 @@ def _build_clone_env(
         the feature is not configured (opt-in).
     :returns: ``{"GIT_TOKEN": ..., "GIT_USERNAME": ...}`` or ``None``.
     :raises ValueError: When a bound slot cannot be resolved for *owner* at
-        launch (fail closed — never clone unauthenticated), or when the
-        operator source cannot be resolved. The token is never in the message.
+        launch (fail closed — never clone unauthenticated), when the
+        operator source cannot be resolved, or when a credentialed repo's
+        clone URL is not HTTPS. The token is never in the message.
     """
     if repo is None:
         return None

@@ -268,9 +268,15 @@ class ManagedGitCredentialError(ValueError):
     """A server-delivered git credential could not be installed in the sandbox.
 
     Raised for the deterministic misconfigurations the runner cannot recover
-    from — no egress allowlist to scope the swap to, or a host already bound by
-    an operator ``credential_proxy`` entry. A ``ValueError`` subclass so
-    existing ``except ValueError`` paths still catch it; it names no token.
+    from:
+
+    - no egress allowlist to scope the swap to;
+    - a host already bound by an operator ``credential_proxy`` entry;
+    - a delivery missing its host/repo binding (partial binding);
+    - a delivery arriving while the sandbox is inactive (``sandbox.type: none``).
+
+    A ``ValueError`` subclass so existing ``except ValueError`` paths still
+    catch it; it names no token.
 
     Surfacing: the sandbox helper starts lazily on the first os_env tool call,
     so this raises then (after the runner has already connected and the launch
