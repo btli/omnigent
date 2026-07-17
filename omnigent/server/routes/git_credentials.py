@@ -38,7 +38,6 @@ class CreateGitCredentialRequest(BaseModel):
         ``(owner, host_id)``.
     :param token: The secret credential value. Encrypted immediately by
         the store and never echoed back.
-    :param username: Optional username to pair with the token.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -46,7 +45,6 @@ class CreateGitCredentialRequest(BaseModel):
     host_id: str = Field(min_length=1, max_length=256)
     label: str = Field(min_length=1, max_length=128)
     token: str = Field(min_length=1, max_length=8192)
-    username: str | None = Field(default=None, max_length=256)
 
 
 def _find_host(git_hosts: tuple[HostConfig, ...], host_id: str) -> HostConfig | None:
@@ -70,15 +68,13 @@ def _entity_to_response(cred: GitCredential) -> dict[str, Any]:
     the secret token.
 
     :param cred: The entity to convert.
-    :returns: A dict with ``id, host_id, provider, label, username,
-        created_at``.
+    :returns: A dict with ``id, host_id, provider, label, created_at``.
     """
     return {
         "id": cred.id,
         "host_id": cred.host_id,
         "provider": cred.provider,
         "label": cred.label,
-        "username": cred.username,
         "created_at": cred.created_at,
     }
 
@@ -140,7 +136,6 @@ def create_git_credentials_router(
                 host_id=body.host_id,
                 provider=host.provider,
                 label=body.label,
-                username=body.username,
                 token=body.token,
             )
         except ValueError as exc:

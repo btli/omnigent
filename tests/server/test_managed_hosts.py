@@ -950,7 +950,6 @@ def test_resolve_repo_workspace_selects_single_slot(tmp_path) -> None:
         host_id="acme",
         provider="forgejo",
         label="work",
-        username=None,
         token="t",
     )
     repo = resolve_repo_workspace(
@@ -969,7 +968,6 @@ def test_resolve_repo_workspace_multiple_slots_requires_label(tmp_path) -> None:
         host_id="acme",
         provider="forgejo",
         label="work",
-        username=None,
         token="t1",
     )
     personal = store.create(
@@ -977,7 +975,6 @@ def test_resolve_repo_workspace_multiple_slots_requires_label(tmp_path) -> None:
         host_id="acme",
         provider="forgejo",
         label="personal",
-        username=None,
         token="t2",
     )
     with pytest.raises(CredentialSelectionError, match="multiple git credentials"):
@@ -1004,7 +1001,6 @@ def test_resolve_repo_workspace_unknown_label_lists_available(tmp_path) -> None:
         host_id="acme",
         provider="forgejo",
         label="work",
-        username=None,
         token="t",
     )
     with pytest.raises(CredentialSelectionError, match="work"):
@@ -1102,7 +1098,6 @@ def test_build_clone_env_uses_owner_slot_lease(tmp_path) -> None:
         host_id="acme",
         provider="forgejo",
         label="work",
-        username=None,
         token="SLOT_TOKEN",
     )
     repo = resolve_repo_workspace(
@@ -1122,7 +1117,6 @@ def test_build_clone_env_fails_closed_when_slot_revoked(tmp_path) -> None:
         host_id="acme",
         provider="forgejo",
         label="work",
-        username=None,
         token="SLOT_TOKEN",
     )
     repo = resolve_repo_workspace(
@@ -1147,7 +1141,6 @@ def test_build_clone_env_bound_slot_without_deps_fails_closed(tmp_path) -> None:
         host_id="acme",
         provider="forgejo",
         label="work",
-        username=None,
         token="SLOT_TOKEN",
     )
     repo = resolve_repo_workspace(
@@ -1189,7 +1182,6 @@ def test_build_clone_env_refuses_ssh_url_for_bound_slot(tmp_path) -> None:
         host_id="acme",
         provider="forgejo",
         label="work",
-        username=None,
         token="SLOT_TOKEN",
     )
     repo = RepoWorkspace(
@@ -1226,7 +1218,6 @@ def test_build_clone_env_refuses_plain_http_for_bound_slot(tmp_path) -> None:
         host_id="acme",
         provider="forgejo",
         label="work",
-        username=None,
         token="SLOT_TOKEN",
     )
     repo = RepoWorkspace(
@@ -1269,7 +1260,6 @@ def test_build_relaunch_binding_labels_for_operator_host(tmp_path) -> None:
         host_id="acme",
         provider="forgejo",
         label="work",
-        username=None,
         token="t",
     )
     repo = resolve_repo_workspace(
@@ -1296,7 +1286,6 @@ def test_reauthorize_relaunch_binding_happy_path(tmp_path) -> None:
         host_id="acme",
         provider="forgejo",
         label="work",
-        username=None,
         token="t",
     )
     repo = resolve_repo_workspace(
@@ -1323,7 +1312,6 @@ def test_reauthorize_refuses_when_host_removed(tmp_path) -> None:
         host_id="acme",
         provider="forgejo",
         label="work",
-        username=None,
         token="t",
     )
     repo = resolve_repo_workspace(
@@ -1353,7 +1341,6 @@ def test_reauthorize_same_host_config_drift_takes_effect(tmp_path, caplog) -> No
         host_id="acme",
         provider="forgejo",
         label="work",
-        username=None,
         token="t",
     )
     repo = resolve_repo_workspace(
@@ -1407,7 +1394,6 @@ def test_reauthorize_refuses_when_slot_revoked(tmp_path) -> None:
         host_id="acme",
         provider="forgejo",
         label="work",
-        username=None,
         token="t",
     )
     repo = resolve_repo_workspace(
@@ -1463,7 +1449,6 @@ def test_reauthorize_managed_repo_for_delivery_returns_binding_for_credential_se
         host_id="acme",
         provider="forgejo",
         label="work",
-        username=None,
         token="ghp_secret",
     )
     conv = SimpleNamespace(
@@ -1529,7 +1514,6 @@ def test_reauthorize_managed_repo_for_delivery_raises_on_revoked_slot(tmp_path) 
         host_id="acme",
         provider="forgejo",
         label="work",
-        username=None,
         token="ghp_secret",
     )
     conv = SimpleNamespace(
@@ -2553,7 +2537,6 @@ async def test_deliver_credential_for_launch_seals_and_acks(tmp_path) -> None:
         host_id="acme",
         provider="forgejo",
         label="work",
-        username=None,
         token="ghp_secret",
     )
     repo = resolve_repo_workspace(
@@ -2630,7 +2613,6 @@ async def test_deliver_credential_skips_ssh_repo_even_with_slot(tmp_path) -> Non
         host_id="acme",
         provider="forgejo",
         label="work",
-        username=None,
         token="ghp_secret",
     )
     # P1c-3 slot selection is scheme-agnostic, so an SSH workspace can carry a
@@ -2678,7 +2660,6 @@ async def test_deliver_credential_fails_closed_on_unscopable_repo_path(tmp_path)
         host_id="acme",
         provider="forgejo",
         label="work",
-        username=None,
         token="ghp_secret",
     )
     repo = RepoWorkspace(
@@ -2715,7 +2696,6 @@ async def test_deliver_credential_fails_closed_when_host_cannot_seal(tmp_path) -
         host_id="acme",
         provider="forgejo",
         label="work",
-        username=None,
         token="ghp_secret",
     )
     repo = resolve_repo_workspace(
@@ -2749,7 +2729,6 @@ async def test_deliver_credential_fails_closed_when_slot_revoked(tmp_path) -> No
         host_id="acme",
         provider="forgejo",
         label="work",
-        username=None,
         token="ghp_secret",
     )
     repo = resolve_repo_workspace(

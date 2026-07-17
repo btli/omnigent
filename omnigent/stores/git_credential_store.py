@@ -17,7 +17,6 @@ from sqlalchemy.exc import IntegrityError, StatementError
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import InvalidUuidError, SqlGitCredential, current_workspace_id
-from omnigent.db.enum_codecs import decode_git_credential_kind, encode_git_credential_kind
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker, now_epoch
 from omnigent.git_hosts.crypto import GitCredentialCipher
 
@@ -39,8 +38,6 @@ class GitCredential:
     host_id: str
     provider: str
     label: str
-    kind: str
-    username: str | None
     created_at: int
     updated_at: int
 
@@ -49,22 +46,15 @@ class GitCredential:
 class CredentialLease:
     """A resolved, ready-to-use git credential.
 
-    Uniform across credential ``kind`` (design §8.2) so the clone/egress
-    consumer never branches on ``pat`` vs ``oauth``. ``expires_at`` is ``None``
-    for a PAT (long-lived); an OAuth access token (P3) will carry its expiry.
-
     :param token: The decrypted bearer token/PAT. Never log, repr, or place it
         in an error message — hence the custom redacting ``__repr__``.
-    :param expires_at: Unix epoch seconds after which the token is invalid, or
-        ``None`` when it does not expire.
     """
 
     token: str
-    expires_at: int | None
 
     def __repr__(self) -> str:
         """Redact the token so a lease can never leak via logs/tracebacks."""
-        return f"CredentialLease(token=<redacted>, expires_at={self.expires_at!r})"
+        return "CredentialLease(token=<redacted>)"
 
 
 def _find_row(session: Session, credential_id: str) -> SqlGitCredential | None:
@@ -137,8 +127,6 @@ def _row_to_entity(row: SqlGitCredential) -> GitCredential:
         host_id=row.host_id,
         provider=row.provider,
         label=row.label,
-        kind=decode_git_credential_kind(row.kind),
-        username=row.username,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -159,9 +147,7 @@ class GitCredentialStore:
         host_id: str,
         provider: str,
         label: str,
-        username: str | None,
         token: str,
-        kind: str = "pat",
     ) -> GitCredential:
         """Encrypt *token* and store a new credential.
 
@@ -177,9 +163,7 @@ class GitCredentialStore:
             owner_user_id=owner_user_id,
             host_id=host_id,
             provider=provider,
-            kind=encode_git_credential_kind(kind),
             label=label,
-            username=username,
             token_ciphertext=self._cipher.encrypt(token),
             created_at=now,
             updated_at=now,
@@ -282,10 +266,6 @@ class GitCredentialStore:
         :func:`current_workspace_id`), or a malformed id yields ``None`` —
         never a lease. ``credential_id`` is an identifier, not a capability.
 
-        The lease is uniform across ``kind`` (design §8.2) so the clone/egress
-        consumer never branches on ``pat`` vs ``oauth``. For a PAT
-        ``expires_at`` is ``None`` (long-lived); OAuth expiry is a P3 extension.
-
         This is the only method that returns plaintext; call server-side only.
 
         :param owner_user_id: The authenticated owner the slot must belong to.
@@ -302,8 +282,4 @@ class GitCredentialStore:
             )
             if row is None:
                 return None
-            # PAT has no expiry; oauth (P3) will compute expires_at from the
-            # minted access token. The lease shape is uniform either way.
-            return CredentialLease(
-                token=self._cipher.decrypt(row.token_ciphertext), expires_at=None
-            )
+            return CredentialLease(token=self._cipher.decrypt(row.token_ciphertext))

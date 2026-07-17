@@ -1,7 +1,7 @@
 """add launch_generation to conversations
 
 Revision ID: za1b2c3d4e5f
-Revises: z9a2b3c4d5e6
+Revises: z8a2b3c4d5e6
 Create Date: 2026-07-16 00:00:00.000000
 
 Adds ``conversations.launch_generation``: a monotonic per-session launch
@@ -19,7 +19,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "za1b2c3d4e5f"
-down_revision: str | None = "z9a2b3c4d5e6"
+down_revision: str | None = "z8a2b3c4d5e6"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

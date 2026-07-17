@@ -34,7 +34,6 @@ def upgrade() -> None:
         sa.Column("host_id", sa.String(length=256), nullable=False),
         sa.Column("provider", sa.String(length=32), nullable=False),
         sa.Column("label", sa.String(length=128), nullable=False),
-        sa.Column("username", sa.String(length=256), nullable=True),
         sa.Column("token_ciphertext", sa.Text(), nullable=False),
         sa.Column("created_at", sa.Integer(), nullable=False),
         sa.Column("updated_at", sa.Integer(), nullable=False),

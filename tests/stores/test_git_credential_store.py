@@ -29,13 +29,14 @@ def test_create_returns_entity_without_secret(tmp_path) -> None:
         host_id="acme-forgejo",
         provider="forgejo",
         label="work",
-        username="alice",
         token="ghp_secret",
     )
     assert isinstance(cred, GitCredential)
     assert cred.host_id == "acme-forgejo"
     assert cred.provider == "forgejo"
     assert cred.label == "work"
+    assert not hasattr(cred, "kind")
+    assert not hasattr(cred, "username")
     # The entity must not expose the secret in any field.
     assert "ghp_secret" not in repr(cred)
     assert not hasattr(cred, "token")
@@ -49,7 +50,6 @@ def test_resolve_token_by_id_roundtrips(tmp_path) -> None:
         host_id="h",
         provider="forgejo",
         label="default",
-        username=None,
         token="tok",
     )
     lease = store.resolve_lease(owner_user_id="alice", host_id="h", credential_id=cred.id)
@@ -68,7 +68,6 @@ def test_resolve_token_requires_matching_owner_and_host(tmp_path) -> None:
         host_id="acme-forgejo",
         provider="forgejo",
         label="work",
-        username=None,
         token="s3cret",
     )
     # The full, correct authorization tuple decrypts.
@@ -96,7 +95,6 @@ def test_resolve_token_malformed_id_returns_none(tmp_path) -> None:
         host_id="h",
         provider="forgejo",
         label="work",
-        username=None,
         token="tok",
     )
     # A non-hex id addresses no row (InvalidUuidError path) -> None, not a raise.
@@ -112,7 +110,6 @@ def test_multiple_identities_per_host_coexist(tmp_path) -> None:
         host_id="h",
         provider="forgejo",
         label="work",
-        username="alice-w",
         token="wtok",
     )
     personal = store.create(
@@ -120,7 +117,6 @@ def test_multiple_identities_per_host_coexist(tmp_path) -> None:
         host_id="h",
         provider="forgejo",
         label="personal",
-        username="alice-p",
         token="ptok",
     )
     candidates = store.list_for_owner_host("alice", "h")
@@ -142,7 +138,6 @@ def test_list_is_owner_scoped(tmp_path) -> None:
         host_id="h1",
         provider="forgejo",
         label="default",
-        username=None,
         token="a",
     )
     store.create(
@@ -150,7 +145,6 @@ def test_list_is_owner_scoped(tmp_path) -> None:
         host_id="h2",
         provider="gitea",
         label="default",
-        username=None,
         token="b",
     )
     alice = store.list_for_owner("alice")
@@ -164,7 +158,6 @@ def test_duplicate_owner_host_label_rejected(tmp_path) -> None:
         host_id="h",
         provider="forgejo",
         label="work",
-        username=None,
         token="a",
     )
     with pytest.raises(ValueError, match="already"):
@@ -173,7 +166,6 @@ def test_duplicate_owner_host_label_rejected(tmp_path) -> None:
             host_id="h",
             provider="forgejo",
             label="work",
-            username=None,
             token="b",
         )
 
@@ -210,7 +202,6 @@ def test_create_non_integrity_statement_error_drops_ciphertext(tmp_path, monkeyp
             host_id="h",
             provider="forgejo",
             label="work",
-            username=None,
             token="tok",
         )
 
@@ -228,7 +219,6 @@ def test_delete_for_owner_returns_deleted_and_removes_credential(tmp_path) -> No
         host_id="h",
         provider="forgejo",
         label="default",
-        username=None,
         token="a",
     )
     result = store.delete_for_owner("alice", cred.id)
@@ -250,7 +240,6 @@ def test_delete_for_owner_returns_not_owner_without_deleting(tmp_path) -> None:
         host_id="h",
         provider="forgejo",
         label="default",
-        username=None,
         token="a",
     )
 
@@ -289,7 +278,6 @@ def test_credentials_are_workspace_isolated(tmp_path) -> None:
             host_id="h",
             provider="forgejo",
             label="work",
-            username=None,
             token="secret-w1",
         )
     # A different workspace must not see, resolve, or list workspace 1's credential.
@@ -309,21 +297,19 @@ def test_credentials_are_workspace_isolated(tmp_path) -> None:
         assert isolated_lease.token == "secret-w1"
 
 
-def test_resolve_lease_is_uniform_with_no_expiry_for_pat(tmp_path) -> None:
+def test_resolve_lease_contains_only_the_token(tmp_path) -> None:
     store = _store(tmp_path)
     cred = store.create(
         owner_user_id="alice",
         host_id="h",
         provider="forgejo",
         label="work",
-        username=None,
         token="s3cret",
     )
     lease = store.resolve_lease(owner_user_id="alice", host_id="h", credential_id=cred.id)
     assert lease is not None
     assert lease.token == "s3cret"
-    # PAT is long-lived; the lease shape is uniform (oauth expiry is P3).
-    assert lease.expires_at is None
+    assert list(lease.__dataclass_fields__) == ["token"]
 
 
 def test_credential_lease_repr_hides_token(tmp_path) -> None:
@@ -333,33 +319,9 @@ def test_credential_lease_repr_hides_token(tmp_path) -> None:
         host_id="h",
         provider="forgejo",
         label="work",
-        username=None,
         token="topsecret",
     )
     lease = store.resolve_lease(owner_user_id="alice", host_id="h", credential_id=cred.id)
     assert lease is not None
     assert "topsecret" not in repr(lease)
     assert "redacted" in repr(lease)
-
-
-def test_create_defaults_kind_pat_and_accepts_kind(tmp_path) -> None:
-    store = _store(tmp_path)
-    default = store.create(
-        owner_user_id="alice",
-        host_id="h",
-        provider="forgejo",
-        label="default",
-        username=None,
-        token="t",
-    )
-    assert default.kind == "pat"
-    explicit = store.create(
-        owner_user_id="alice",
-        host_id="h",
-        provider="forgejo",
-        label="oauthy",
-        username=None,
-        token="t",
-        kind="oauth",
-    )
-    assert explicit.kind == "oauth"

@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import inspect, select
 from sqlalchemy.exc import IntegrityError
 
 from omnigent.db.db_models import SqlGitCredential
@@ -19,7 +19,6 @@ def _row(**overrides: object) -> SqlGitCredential:
         "host_id": "acme-forgejo",
         "provider": "forgejo",
         "label": "work",
-        "username": "alice",
         "token_ciphertext": "gAAAA-fake",
         "created_at": now_epoch(),
         "updated_at": now_epoch(),
@@ -41,7 +40,6 @@ def test_git_credentials_table_roundtrips(tmp_path) -> None:
                     host_id="acme-forgejo",
                     provider="forgejo",
                     label=label,
-                    username="alice",
                     token_ciphertext=f"gAAAA-fake-{label}",
                     created_at=now_epoch(),
                     updated_at=now_epoch(),
@@ -58,7 +56,9 @@ def test_git_credentials_table_roundtrips(tmp_path) -> None:
         assert {r.label for r in rows} == {"personal", "work"}
         assert all(r.owner_user_id == "alice@example.com" for r in rows)
         assert all(r.workspace_id == 0 for r in rows)  # single-tenant default
-        assert all(r.kind == 1 for r in rows)  # SmallInteger pat code, server_default
+    columns = {column["name"] for column in inspect(engine).get_columns("git_credentials")}
+    assert "kind" not in columns
+    assert "username" not in columns
 
 
 def test_duplicate_owner_host_label_violates_unique_constraint(tmp_path) -> None:

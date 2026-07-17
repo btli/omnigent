@@ -131,14 +131,14 @@ def multi_user_route_client(tmp_path: Path) -> Iterator[TestClient]:
 def test_create_returns_metadata_without_token(route_client: TestClient) -> None:
     resp = route_client.post(
         "/v1/git-credentials",
-        json={"host_id": _HOST_ID, "label": "work", "token": _SECRET_TOKEN, "username": "alice"},
+        json={"host_id": _HOST_ID, "label": "work", "token": _SECRET_TOKEN},
     )
     assert resp.status_code in (200, 201)
     body = resp.json()
     assert body["host_id"] == _HOST_ID
     assert body["provider"] == "forgejo"
     assert body["label"] == "work"
-    assert body["username"] == "alice"
+    assert "username" not in body
     assert "id" in body
     assert "created_at" in body
     assert "token" not in body
@@ -327,12 +327,11 @@ def test_cross_user_isolation_and_foreign_delete_denied(
     assert {item["id"] for item in alice_list.json()["data"]} == {alice_cred_id}
 
 
-@pytest.mark.parametrize("field", ["owner_user_id", "provider", "workspace_id"])
-def test_client_supplied_authority_field_rejected(
+@pytest.mark.parametrize("field", ["owner_user_id", "provider", "workspace_id", "username"])
+def test_client_supplied_extra_field_rejected(
     multi_user_route_client: TestClient, field: str
 ) -> None:
-    # None of the server-derived authority fields may be supplied by the client
-    # (the request model forbids extras).
+    # Server-derived and removed fields cannot be supplied by the client.
     resp = multi_user_route_client.post(
         "/v1/git-credentials",
         json={
