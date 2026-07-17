@@ -682,10 +682,11 @@ def _redact_values(text: str, values: Iterable[str]) -> str:
     (an admission webhook echoing the object; a hostile remote seeding the git
     output) in more than its literal form — Kubernetes serializes Secret
     ``stringData`` into base64 ``data``, so an admission-webhook echo can
-    reflect the encoded form; a value embedded in a JSON body is escaped; and
-    the apiserver's Go ``encoding/json`` additionally HTML-escapes ``<`` / ``>``
-    / ``&`` by default (Python's ``json.dumps`` does not), so that variant is
-    scrubbed too.
+    reflect the encoded form; a value embedded in a JSON body is escaped
+    (Python's ``json.dumps`` default ``ensure_ascii=True`` form is scrubbed for
+    that); and the apiserver's Go ``encoding/json`` escapes non-ASCII as raw
+    UTF-8 rather than ``\\uXXXX`` while still HTML-escaping ``<`` / ``>`` / ``&``
+    by default, so that distinct Go-style form is derived and scrubbed too.
 
     :param text: The message to scrub.
     :param values: Credential values to replace with ``"***"``.
@@ -700,8 +701,15 @@ def _redact_values(text: str, values: Iterable[str]) -> str:
         escaped = json.dumps(value)[1:-1]
         if escaped != value:
             text = text.replace(escaped, "***")
+        # Go's encoding/json (the apiserver) leaves non-ASCII as raw UTF-8
+        # instead of \uXXXX-escaping it like Python's default `escaped` above,
+        # while still HTML-escaping <, >, & — derive its needle from the
+        # ensure_ascii=False form, not from `escaped`.
         go_escaped = (
-            escaped.replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e")
+            json.dumps(value, ensure_ascii=False)[1:-1]
+            .replace("&", "\\u0026")
+            .replace("<", "\\u003c")
+            .replace(">", "\\u003e")
         )
         if go_escaped != escaped:
             text = text.replace(go_escaped, "***")

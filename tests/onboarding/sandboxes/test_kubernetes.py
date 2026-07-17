@@ -517,6 +517,11 @@ def test_clone_secret_create_failure_cleans_up(fake_core: _FakeCore) -> None:
     # unlike Python's json.dumps — so an echoed value can surface in this form.
     username = "a<b&c"
     username_go_escaped = "a\\u003cb\\u0026c"
+    # Go also leaves non-ASCII as raw UTF-8 (unlike Python's default
+    # ensure_ascii=True, which \uXXXX-escapes it), so a value combining both
+    # surfaces with the non-ASCII character raw and only the HTML char escaped.
+    email = "é<c"
+    email_go_escaped = "é\\u003cc"
     fake_core.create_secret_errors = [
         None,
         _FakeApiException(
@@ -524,18 +529,26 @@ def test_clone_secret_create_failure_cleans_up(fake_core: _FakeCore) -> None:
             reason="boom",
             body=(
                 "admission webhook denied: tok-secret-value leaked "
-                f"(data: {token_b64}); reflected username: {username_go_escaped}"
+                f"(data: {token_b64}); reflected username: {username_go_escaped}; "
+                f"reflected email: {email_go_escaped}"
             ),
         ),
     ]
     with pytest.raises(click.ClickException) as excinfo:
         _start_with_clone(
-            fake_core, clone_env={"GIT_TOKEN": "tok-secret-value", "GIT_USERNAME": username}
+            fake_core,
+            clone_env={
+                "GIT_TOKEN": "tok-secret-value",
+                "GIT_USERNAME": username,
+                "GIT_EMAIL": email,
+            },
         )
     assert "tok-secret-value" not in str(excinfo.value)
     assert token_b64 not in str(excinfo.value)
     assert username not in str(excinfo.value)
     assert username_go_escaped not in str(excinfo.value)
+    assert email not in str(excinfo.value)
+    assert email_go_escaped not in str(excinfo.value)
     assert "***" in str(excinfo.value)
     assert "tok-secret-value" not in "".join(traceback.format_exception(excinfo.value))
     assert "omnigent-pod-1-token" in fake_core.deleted_secrets
