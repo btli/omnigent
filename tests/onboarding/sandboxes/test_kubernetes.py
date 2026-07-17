@@ -618,30 +618,35 @@ def test_delete_after_running_failure_warns_not_fails(
     assert "could not delete clone credential secret" in capsys.readouterr().err
 
 
-def test_redact_values_surrogate_safe_and_longest_first() -> None:
+def test_redact_values_surrogate_safe_and_overlap_masked() -> None:
     """`_redact_values` never raises on a lone-surrogate value (strict UTF-8 would,
-    bypassing the callers' `from None`) and scrubs overlapping values longest-first
-    so a shorter one cannot redact-mask a longer one it is a substring of."""
+    bypassing the callers' `from None`) and masks the union of all needle match
+    spans so overlaps between values or representations cannot leak a fragment."""
     surrogate = "tok\udcffen"  # env: credential decoded from non-UTF-8 bytes
     out = k8s._redact_values(f"clone failed for {surrogate} here", [surrogate])
     assert surrogate not in out
     assert "***" in out
-    # Shorter value passed FIRST (the adversarial order) must still fully scrub
-    # the longer token it prefixes — no surviving remainder.
-    msg = "denied for oauth2-secret-token via user oauth2"
-    out2 = k8s._redact_values(msg, ["oauth2", "oauth2-secret-token"])
+    # A shorter value that is a substring of a longer one, passed either order,
+    # leaves no remainder of the longer token.
+    out2 = k8s._redact_values(
+        "denied for oauth2-secret-token via user oauth2", ["oauth2", "oauth2-secret-token"]
+    )
     assert "oauth2-secret-token" not in out2
     assert "secret-token" not in out2
     # Cross-representation: a shorter value's LITERAL must not corrupt a longer
-    # value's DERIVED needle. Needles are scrubbed globally longest-first, not
-    # per value — else "Yg" (a substring of base64("😀")) or "u00" (a substring
-    # of the JSON escape of "é") would mask the token's base64/escaped needle.
+    # value's DERIVED needle — "Yg" is a substring of base64("😀"), "u00" of the
+    # JSON escape of "é"; both tokens must still fully mask.
     assert k8s._redact_values("8J+YgA==", ["😀", "Yg"]) == "***"
     assert k8s._redact_values("\\u00e9", ["é", "u00"]) == "***"
-    # Single pass over the original text: replacing base64("😀") must not synthesize
-    # a "***X" match (a credential value that literally contains the marker) and
-    # over-redact the legitimate trailing "X".
+    # Working from the original text (not a mutated copy): replacing base64("😀")
+    # must not synthesize a "***X" match (a value literally containing the marker)
+    # and over-redact the legitimate trailing "X".
     assert k8s._redact_values("8J+YgA==X", ["***X", "😀"]) == "***X"
+    # Two credentials whose matches partially overlap at a boundary char are BOTH
+    # fully masked (the merged span union is redacted, not just one needle).
+    assert k8s._redact_values("abcSECRET", ["abc", "cSECRET"]) == "***"
+    # Text outside any match span is preserved.
+    assert k8s._redact_values("AxxxB", ["A", "B"]) == "***xxx***"
 
 
 def test_load_core_pins_k8s_rest_logger_to_suppress_response_bodies(
