@@ -224,7 +224,7 @@ class GitCredentialStore:
             return [_row_to_entity(r) for r in rows]
 
     def list_for_owner_host(self, owner_user_id: str, host_id: str) -> list[GitCredential]:
-        """The owner's candidate identities on *host_id* (a future selector picks one)."""
+        """List the owner's credential identities registered for *host_id*."""
         with self._session() as session:
             rows = session.execute(
                 select(SqlGitCredential).where(

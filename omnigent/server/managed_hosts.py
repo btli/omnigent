@@ -121,6 +121,7 @@ from fastapi import HTTPException
 from omnigent.db.utils import now_epoch
 from omnigent.git_hosts.base import ClonePlan, HostConfig
 from omnigent.git_hosts.credentials import resolve_credential
+from omnigent.git_hosts.github import DEFAULT_CLONE_USERNAME
 from omnigent.git_hosts.resolver import resolve_clone_plan
 from omnigent.stores.host_store import Host, HostStore
 
@@ -924,7 +925,7 @@ def _build_clone_env(
     """
     if repo is None:
         return None
-    username = repo.clone_username or "x-access-token"
+    username = repo.clone_username or DEFAULT_CLONE_USERNAME
     if repo.credential_slot_id is not None:
         # A bound session MUST clone with its owner's slot: fail closed if the
         # dependencies to resolve it are absent, rather than silently falling
@@ -2163,10 +2164,9 @@ async def launch_managed_host(
         coming online.
     :param repo: Parsed repository-URL workspace to clone into the
         sandbox as the session's working directory, or ``None`` for
-        an empty workspace. Private repositories authenticate via the
-        host image's git credential helper when the sandbox env
-        carries ``GIT_TOKEN`` (injected through Modal secrets — see
-        deploy/modal/README.md "Git credentials").
+        an empty workspace. Private-clone credentials are supplied to
+        every launcher through the launch-scoped ``clone_env`` and do
+        not enter the long-lived sandbox environment.
     :param credential_store: Per-user git credential store used to
         resolve the owner's selected slot at launch, or ``None`` when
         the feature is not configured.

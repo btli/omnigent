@@ -26,6 +26,7 @@ from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
 from omnigent.env_credentials import env_names_with_omnigent_prefix
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HTTP_TOKEN_CREDENTIAL_KIND,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
@@ -681,8 +682,6 @@ class _DeliveredCredential:
 
     :param token: The unsealed upstream git token (the real secret).
     :param launch_generation: Generation this delivery is bound to.
-    :param session_id: Session the runner serves.
-    :param credential_slot: Server-side slot id the token came from.
     :param canonical_host: Host the swap binds to, e.g. ``"git.acme.com"``.
     :param repo_path: Repo path prefix the egress rule scopes to.
     :param auth_scheme: Upstream ``Authorization`` scheme.
@@ -691,8 +690,6 @@ class _DeliveredCredential:
 
     token: str
     launch_generation: int
-    session_id: str
-    credential_slot: str
     canonical_host: str
     repo_path: str
     auth_scheme: str
@@ -1320,7 +1317,7 @@ class HostProcess:
             )
         # Only HTTPS-token swaps are implemented; ssh-key / oauth are reserved
         # envelope values that slot in later without a frame redesign.
-        if frame.credential_kind != "http-token":
+        if frame.credential_kind != HTTP_TOKEN_CREDENTIAL_KIND:
             return HostDeliverCredentialResultFrame(
                 request_id=frame.request_id,
                 status="rejected",
@@ -1371,8 +1368,6 @@ class HostProcess:
         self._pending_credentials[frame.runner_id] = _DeliveredCredential(
             token=token,
             launch_generation=frame.launch_generation,
-            session_id=frame.session_id,
-            credential_slot=frame.credential_slot,
             canonical_host=frame.canonical_host,
             repo_path=frame.repo_path,
             auth_scheme=frame.auth_scheme,

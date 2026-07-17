@@ -283,8 +283,7 @@ class ManagedGitCredentialError(ValueError):
     reported success), not at launch. It propagates as a repeating tool-error
     result, and every retry re-hits it — the sandbox never starts, so no git op
     (tokenless or otherwise) can run. The security property holds, but the
-    misconfiguration reports as a persistent tool error rather than a clean
-    launch/session failure; reporting it eagerly at startup is a follow-up.
+    misconfiguration reports lazily as a persistent tool error.
     """
 
 
@@ -640,8 +639,8 @@ class _HelperProcessClient:
             # proxy below picks them up; the token never enters the sandbox. A
             # deterministic misconfig (no egress allowlist, a host already
             # bound, or a token missing its binding) raises
-            # ManagedGitCredentialError, which surfaces as the session-failure
-            # reason via os_env's error path.
+            # ManagedGitCredentialError, which lazy helper startup surfaces as
+            # a repeating os_env tool error on every retry.
             if delivery is not None:
                 canonical_host, repo_path, auth_scheme, username, managed_token = delivery
                 credential_runtime, self._egress_rules = _apply_managed_git_credential(

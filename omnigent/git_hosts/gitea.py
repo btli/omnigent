@@ -8,8 +8,7 @@ from omnigent.git_hosts.base import GitHostProvider
 class GiteaProvider(GitHostProvider):
     """Forgejo and Gitea. Registered under both names; the API is ``<host>/api/v1``.
 
-    ``default_clone_username`` is a starting default; the exact HTTPS username a
-    Gitea/Forgejo token expects is refined when credential injection lands (P1b).
+    Token-authenticated HTTPS clones use ``oauth2`` as their default username.
     """
 
     provider = "gitea"

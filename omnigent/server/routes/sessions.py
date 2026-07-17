@@ -717,6 +717,7 @@ async def _deliver_credential_for_launch(
     if not _managed_repo_path_allows(repo_path, repo_path):
         return "the repository path contains characters unsupported by credential scoping"
     from omnigent.host.frames import (
+        HTTP_TOKEN_CREDENTIAL_KIND,
         HostDeliverCredentialFrame,
         build_credential_delivery_aad,
         encode_host_frame,
@@ -728,7 +729,7 @@ async def _deliver_credential_for_launch(
     # fails). Prevents lifting the sealed blob onto a different frame.
     canonical_host = repo.canonical_host or ""
     auth_scheme = repo.auth_scheme or "basic"
-    credential_kind = "http-token"
+    credential_kind = HTTP_TOKEN_CREDENTIAL_KIND
     host_id = repo.host_id or ""
     aad = build_credential_delivery_aad(
         runner_id=runner_id,
@@ -6709,6 +6710,17 @@ async def _launch_runner_on_host(
     return _HostLaunchAttempt(runner_id=new_runner_id)
 
 
+def _settle_credential_delivery_failure(
+    session_id: str,
+    tracker: ManagedLaunchTracker,
+    error: str | None,
+) -> None:
+    """Fail a managed launch after git credential delivery fails."""
+    reason = error or "git credential delivery failed"
+    tracker.fail(session_id, reason)
+    _publish_sandbox_status(session_id, "failed", reason)
+
+
 # Strong references to in-flight background managed-launch tasks.
 # asyncio.create_task results are weakly held by the loop; without a
 # reference here a long provision could be garbage-collected mid-flight.
@@ -7024,9 +7036,9 @@ async def _bind_and_launch_managed_runner(
                 _publish_sandbox_status(session_id, "failed", reason)
                 return
             if launch_attempt.error_code == _CREDENTIAL_DELIVERY_ERROR_CODE:
-                reason = launch_attempt.error or "git credential delivery failed"
-                tracker.fail(session_id, reason)
-                _publish_sandbox_status(session_id, "failed", reason)
+                _settle_credential_delivery_failure(
+                    session_id, tracker, launch_attempt.error
+                )
                 return
             runner_id = launch_attempt.runner_id
     if runner_id is not None and tunnel_registry is not None:
@@ -7556,9 +7568,9 @@ async def _run_managed_wake(
                 _publish_sandbox_status(session_id, "failed", reason)
                 return
             if launch_attempt.error_code == _CREDENTIAL_DELIVERY_ERROR_CODE:
-                reason = launch_attempt.error or "git credential delivery failed"
-                tracker.fail(session_id, reason)
-                _publish_sandbox_status(session_id, "failed", reason)
+                _settle_credential_delivery_failure(
+                    session_id, tracker, launch_attempt.error
+                )
                 return
             runner_id = launch_attempt.runner_id
         if runner_id is not None and tunnel_registry is not None:

@@ -61,7 +61,7 @@ class ClonePlan:
     """The resolved, non-secret plan for cloning one repository.
 
     Produced by :func:`omnigent.git_hosts.resolver.resolve_clone_plan`; consumed
-    by the launcher clone path (a later plan). Carries no secret — only a
+    by the launcher clone path. Carries no secret — only a
     ``credential_source`` reference the trusted parent resolves.
 
     :param provider: Provider name from operator config, or ``"github"`` for the
@@ -91,8 +91,8 @@ class GitHostProvider(ABC):
     """Per-forge behavior: host identity, URL normalization, and auth shape.
 
     Subclasses set ``provider`` and ``default_clone_username`` and implement
-    :meth:`matches` and :meth:`default_api_base`. Later phases extend this with
-    MCP, egress, and OAuth hooks.
+    :meth:`matches` and :meth:`default_api_base`; the base class supplies the
+    default URL normalization and HTTPS clone binding.
     """
 
     provider: ClassVar[str]

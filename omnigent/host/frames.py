@@ -1314,6 +1314,9 @@ def _decode_deliver_credential_result(
     )
 
 
+HTTP_TOKEN_CREDENTIAL_KIND = "http-token"
+
+
 def build_credential_delivery_aad(
     *,
     runner_id: str,

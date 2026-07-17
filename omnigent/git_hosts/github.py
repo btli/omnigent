@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from omnigent.git_hosts.base import GitHostProvider
 
+DEFAULT_CLONE_USERNAME = "x-access-token"
+
 
 class GitHubProvider(GitHostProvider):
     """github.com — the built-in default."""
 
     provider = "github"
-    default_clone_username = "x-access-token"
+    default_clone_username = DEFAULT_CLONE_USERNAME
 
     def matches(self, host: str) -> bool:
         return host == "github.com"
@@ -26,7 +28,7 @@ class GitHubEnterpriseProvider(GitHostProvider):
     """
 
     provider = "ghe"
-    default_clone_username = "x-access-token"
+    default_clone_username = DEFAULT_CLONE_USERNAME
 
     def matches(self, _host: str) -> bool:
         return False

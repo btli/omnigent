@@ -2,8 +2,8 @@
 
 Operator hosts are matched by exact canonical host; github.com falls back to the
 built-in provider (legacy ``GIT_TOKEN``). Any other host is rejected — topology
-is operator-only (design §7, §12.3). This function has no request identity; the
-owner-aware wiring (which credential slot to use) is a later plan.
+is operator-controlled. This function has no request identity; owner-aware
+credential selection happens after it returns the non-secret clone metadata.
 """
 
 from __future__ import annotations

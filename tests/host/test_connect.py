@@ -2610,8 +2610,6 @@ def test_build_runner_env_scrubs_ambient_git_credentials_with_managed_credential
     credential = _DeliveredCredential(
         token="ghp_managed",
         launch_generation=1,
-        session_id="conv_1",
-        credential_slot="slot_1",
         canonical_host="git.acme.com",
         repo_path="/team/proj",
         auth_scheme="basic",
@@ -2666,8 +2664,6 @@ def test_build_runner_env_sets_managed_username_without_ambient_username() -> No
     credential = _DeliveredCredential(
         token="ghp_managed",
         launch_generation=1,
-        session_id="conv_1",
-        credential_slot="slot_1",
         canonical_host="git.acme.com",
         repo_path="/team/proj",
         auth_scheme="basic",
@@ -2702,8 +2698,6 @@ def test_build_runner_env_sets_managed_git_vars_with_credential() -> None:
     cred = _DeliveredCredential(
         token="ghp_tok",
         launch_generation=1,
-        session_id="conv_1",
-        credential_slot="slot_1",
         canonical_host="git.acme.com",
         repo_path="/team/proj",
         auth_scheme="basic",

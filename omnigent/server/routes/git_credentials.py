@@ -101,6 +101,11 @@ def create_git_credentials_router(
     """
     router = APIRouter()
 
+    def _credential_owner(request: Request) -> str:
+        """Return the credential owner for the current auth mode."""
+        user_id = require_user(request, auth_provider)
+        return user_id if user_id is not None else RESERVED_USER_LOCAL
+
     @router.post("/git-credentials")
     async def create_credential(
         request: Request,
@@ -117,8 +122,7 @@ def create_git_credentials_router(
             does not match a configured host, or 409 if this owner
             already has a credential with that ``(host_id, label)``.
         """
-        user_id = require_user(request, auth_provider)
-        owner_user_id = user_id if user_id is not None else RESERVED_USER_LOCAL
+        owner_user_id = _credential_owner(request)
         host = _find_host(git_hosts, body.host_id)
         if host is None:
             raise OmnigentError(
@@ -148,8 +152,7 @@ def create_git_credentials_router(
         :returns: ``{"object": "list", "data": [...]}``, token-free.
         :raises OmnigentError: 401 if unauthenticated.
         """
-        user_id = require_user(request, auth_provider)
-        owner_user_id = user_id if user_id is not None else RESERVED_USER_LOCAL
+        owner_user_id = _credential_owner(request)
         creds = await asyncio.to_thread(git_credential_store.list_for_owner, owner_user_id)
         return {"object": "list", "data": [_entity_to_response(c) for c in creds]}
 
@@ -169,8 +172,7 @@ def create_git_credentials_router(
             credential does not exist, or 403 if it belongs to a
             different user.
         """
-        user_id = require_user(request, auth_provider)
-        owner_user_id = user_id if user_id is not None else RESERVED_USER_LOCAL
+        owner_user_id = _credential_owner(request)
         cred = await asyncio.to_thread(git_credential_store.get, credential_id)
         if cred is None:
             raise OmnigentError("Git credential not found", code=ErrorCode.NOT_FOUND)
