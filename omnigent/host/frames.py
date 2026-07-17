@@ -57,7 +57,6 @@ class HostFrameKind(str, Enum):
     CREATE_DIR_RESULT = "host.create_dir_result"
     DELIVER_CREDENTIAL = "host.deliver_credential"
     DELIVER_CREDENTIAL_RESULT = "host.deliver_credential_result"
-    INVALIDATE_CREDENTIAL = "host.invalidate_credential"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -596,25 +595,6 @@ class HostDeliverCredentialResultFrame:
     error: str | None = None
 
 
-@dataclass
-class HostInvalidateCredentialFrame:
-    """Server → host: discard a cached credential (one-way; contract-only).
-
-    Defined now so server-driven revocation can ship without a contract
-    change. In P1 the operational revocation story is kill+relaunch; the
-    host handler simply drops the cached credential for the runner. No
-    result frame.
-
-    :param runner_id: The runner whose cached credential to discard.
-    :param launch_generation: The generation the discard targets.
-    :param reason: Optional human-readable reason (audit only).
-    """
-
-    runner_id: str
-    launch_generation: int
-    reason: str | None = None
-
-
 HostFrame = (
     HostHelloFrame
     | HostLaunchRunnerFrame
@@ -636,7 +616,6 @@ HostFrame = (
     | HostCreateDirResultFrame
     | HostDeliverCredentialFrame
     | HostDeliverCredentialResultFrame
-    | HostInvalidateCredentialFrame
 )
 
 
@@ -888,15 +867,6 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error": frame.error,
             }
         )
-    if isinstance(frame, HostInvalidateCredentialFrame):
-        return _encode_payload(
-            {
-                "kind": HostFrameKind.INVALIDATE_CREDENTIAL.value,
-                "runner_id": frame.runner_id,
-                "launch_generation": frame.launch_generation,
-                "reason": frame.reason,
-            }
-        )
     raise TypeError(f"unknown host frame type: {type(frame).__name__}")
 
 
@@ -997,8 +967,6 @@ def _decode_known_host_frame(
             return _decode_deliver_credential(msg)
         case HostFrameKind.DELIVER_CREDENTIAL_RESULT:
             return _decode_deliver_credential_result(msg)
-        case HostFrameKind.INVALIDATE_CREDENTIAL:
-            return _decode_invalidate_credential(msg)
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
 
 
@@ -1343,21 +1311,6 @@ def _decode_deliver_credential_result(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
         error=_optional_nullable_str(msg, "error"),
-    )
-
-
-def _decode_invalidate_credential(
-    msg: dict[str, Any],
-) -> HostInvalidateCredentialFrame:
-    """Decode a host.invalidate_credential frame.
-
-    :param msg: Decoded frame object.
-    :returns: Typed host.invalidate_credential frame.
-    """
-    return HostInvalidateCredentialFrame(
-        runner_id=_required_str(msg, "runner_id"),
-        launch_generation=_required_int(msg, "launch_generation"),
-        reason=_optional_nullable_str(msg, "reason"),
     )
 
 

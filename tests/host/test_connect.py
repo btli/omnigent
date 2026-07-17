@@ -2384,7 +2384,7 @@ def test_run_host_process_announces_session_log_dir_on_start(
     assert "This host's log: ~/.omnigent/logs/host/host-" in out
 
 
-# ── host.deliver_credential / host.invalidate_credential ───
+# ── host.deliver_credential ───
 
 
 def _managed_deliver_frame(
@@ -2509,22 +2509,6 @@ def test_deliver_credential_rejects_generation_conflict() -> None:
     )
     assert result.status == "rejected"
     assert proc._pending_credentials["runner_abc"].launch_generation == 1
-
-
-def test_invalidate_credential_discards_cache() -> None:
-    """host.invalidate_credential drops the cached credential for the runner."""
-    from omnigent.host.frames import HostInvalidateCredentialFrame
-    from omnigent.host.sealing import generate_sealing_keypair
-
-    proc = _make_host_process()
-    proc._sealing_keypair = generate_sealing_keypair()
-    proc._handle_deliver_credential(
-        _managed_deliver_frame(proc._sealing_keypair.public_key_b64, runner_id="r1", generation=1)
-    )
-    proc._handle_invalidate_credential(
-        HostInvalidateCredentialFrame(runner_id="r1", launch_generation=1)
-    )
-    assert "r1" not in proc._pending_credentials
 
 
 def test_handle_stop_discards_cached_credential() -> None:

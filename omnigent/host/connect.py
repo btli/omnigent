@@ -33,7 +33,6 @@ from omnigent.host.frames import (
     HostDeliverCredentialFrame,
     HostDeliverCredentialResultFrame,
     HostHelloFrame,
-    HostInvalidateCredentialFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
     HostListDirEntry,
@@ -1390,26 +1389,6 @@ class HostProcess:
             status="installed",
         )
 
-    def _handle_invalidate_credential(
-        self,
-        frame: HostInvalidateCredentialFrame,
-    ) -> None:
-        """Discard a cached credential (one-way; contract-only in P1).
-
-        The live runner still holds the credential in its own egress-proxy
-        heap (there is no post-spawn rotate channel); operational revocation
-        is kill+relaunch. This only drops the host's cached copy.
-
-        :param frame: The invalidate frame.
-        :returns: None.
-        """
-        self._pending_credentials.pop(frame.runner_id, None)
-        _logger.info(
-            "Discarded cached credential for runner %s (generation %d)",
-            frame.runner_id,
-            frame.launch_generation,
-        )
-
     async def _watch_runner(self, runner_id: str) -> None:
         """Watch a spawned runner and report an unexpected exit.
 
@@ -2182,8 +2161,6 @@ class HostProcess:
             await ws.send(encode_host_frame(await self._handle_list_worktrees(frame)))
         elif isinstance(frame, HostDeliverCredentialFrame):
             await ws.send(encode_host_frame(self._handle_deliver_credential(frame)))
-        elif isinstance(frame, HostInvalidateCredentialFrame):
-            self._handle_invalidate_credential(frame)
 
 
 def run_host_process(

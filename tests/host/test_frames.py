@@ -1055,19 +1055,6 @@ def test_deliver_credential_result_roundtrips() -> None:
         assert decode_host_frame(encode_host_frame(result)) == result
 
 
-def test_invalidate_credential_roundtrips() -> None:
-    from omnigent.host.frames import (
-        HostInvalidateCredentialFrame,
-        decode_host_frame,
-        encode_host_frame,
-    )
-
-    frame = HostInvalidateCredentialFrame(
-        runner_id="runner_abc", launch_generation=3, reason="revoked"
-    )
-    assert decode_host_frame(encode_host_frame(frame)) == frame
-
-
 def test_hello_carries_sealing_public_key() -> None:
     from omnigent.host.frames import HostHelloFrame, decode_host_frame, encode_host_frame
 
