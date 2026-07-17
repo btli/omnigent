@@ -26,6 +26,7 @@ from omnigent.host.identity import (
 from omnigent.onboarding.sandboxes.base import SandboxCapabilityError
 from omnigent.onboarding.sandboxes.kubernetes import (
     KubernetesSandboxLauncher,
+    build_clone_secret_manifest,
     build_pod_manifest,
     build_token_secret_manifest,
 )
@@ -117,6 +118,21 @@ def test_build_token_secret_manifest_carries_token_in_stringdata() -> None:
     assert secret["type"] == "Opaque"
 
 
+def test_clone_secret_manifest_shape() -> None:
+    """Opaque, GC-labeled like the token Secret, stringData = the env pairs."""
+    manifest = build_clone_secret_manifest(
+        secret_name="omnigent-pod-1-clone-cred",
+        namespace="ns",
+        clone_env={"GIT_TOKEN": "tok-value", "GIT_USERNAME": "alice"},
+    )
+    assert manifest["type"] == "Opaque"
+    assert manifest["metadata"]["labels"] == {
+        "app.kubernetes.io/managed-by": "omnigent",
+        "omnigent.ai/role": "sandbox-host",
+    }
+    assert manifest["stringData"] == {"GIT_TOKEN": "tok-value", "GIT_USERNAME": "alice"}
+
+
 def test_build_pod_manifest_harness_secret_projects_into_both_containers() -> None:
     """The harness creds Secret is projected via envFrom on init (for clone) + host."""
     manifest = build_pod_manifest(**_MANIFEST_KW)
@@ -131,6 +147,39 @@ def test_build_pod_manifest_omits_envfrom_without_harness_secret() -> None:
     manifest = build_pod_manifest(**{**_MANIFEST_KW, "harness_secret": None})
     assert "envFrom" not in manifest["spec"]["initContainers"][0]
     assert "envFrom" not in manifest["spec"]["containers"][0]
+
+
+def test_pod_manifest_clone_secret_projection() -> None:
+    """Init container swaps to the clone Secret; main container is untouched."""
+    manifest = build_pod_manifest(
+        **{
+            **_MANIFEST_KW,
+            "env_literals": {"HTTPS_PROXY": "http://proxy:3128", "GIT_USERNAME": "operator-lit"},
+        },
+        clone_secret_name="omnigent-pod-1-clone-cred",
+        clone_env_keys=("GIT_TOKEN", "GIT_USERNAME"),
+    )
+    init = manifest["spec"]["initContainers"][0]
+    main = manifest["spec"]["containers"][0]
+    # Init: clone Secret ref REPLACES the harness ref.
+    assert init["envFrom"] == [{"secretRef": {"name": "omnigent-pod-1-clone-cred"}}]
+    # Init env: HOME + env_literals MINUS clone_env_keys (collision rule).
+    init_names = [e["name"] for e in init["env"]]
+    assert "HTTPS_PROXY" in init_names
+    assert "GIT_USERNAME" not in init_names
+    # Main: harness ref intact, ALL env_literals intact (colliding name included),
+    # and no reference to the clone Secret anywhere in the container spec.
+    assert main["envFrom"] == [{"secretRef": {"name": "omnigent-creds"}}]
+    assert {"name": "GIT_USERNAME", "value": "operator-lit"} in main["env"]
+    assert "clone-cred" not in json.dumps(manifest["spec"]["containers"])
+
+
+def test_pod_manifest_without_clone_secret_is_unchanged() -> None:
+    """clone_secret_name=None keeps today's exact init shape (regression)."""
+    manifest = build_pod_manifest(**_MANIFEST_KW)
+    init = manifest["spec"]["initContainers"][0]
+    assert init["envFrom"] == [{"secretRef": {"name": "omnigent-creds"}}]
+    assert init["env"] == [{"name": "HOME", "value": "/home/omnigent"}]
 
 
 def test_build_pod_manifest_defaults_to_amd64_node_selector() -> None:

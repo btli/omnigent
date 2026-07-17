@@ -51,7 +51,7 @@ import re
 import shlex
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, ClassVar, Literal
 
 import click
@@ -357,6 +357,19 @@ def _token_secret_name(pod_name: str) -> str:
     return f"{pod_name}-token"
 
 
+def _clone_secret_name(pod_name: str) -> str:
+    """
+    Name of the per-Pod clone-credential Secret for *pod_name*.
+
+    Distinct from the token Secret: the clone credential is deleted as soon
+    as init succeeds, while the token Secret lives until terminate.
+
+    :param pod_name: The Pod name (≤63 chars).
+    :returns: The Secret name, e.g. ``"omnigent-managed-a1b2c3d4-1a2b3c-clone-cred"``.
+    """
+    return f"{pod_name}-clone-cred"
+
+
 def _render_workspace_prep_command(
     workspace: str,
     clone_dir: str | None,
@@ -445,6 +458,36 @@ def build_token_secret_manifest(
     }
 
 
+def build_clone_secret_manifest(
+    *, secret_name: str, namespace: str, clone_env: Mapping[str, str]
+) -> dict[str, object]:
+    """
+    Build the per-Pod clone-credential Secret manifest as a plain dict.
+
+    Projected ONLY into the init container (per-key ownership stays with the
+    Pod builder); carries the same GC labels as the token Secret and is
+    deleted right after the init containers succeed — it never lives for the
+    Pod's lifetime.
+
+    :param secret_name: The Secret name (see :func:`_clone_secret_name`).
+    :param namespace: Namespace the Secret is created in.
+    :param clone_env: The credential env pairs (e.g. ``GIT_TOKEN`` /
+        ``GIT_USERNAME``); values ride ``stringData`` only.
+    :returns: The Secret manifest dict.
+    """
+    return {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": secret_name,
+            "namespace": namespace,
+            "labels": {_MANAGED_BY_LABEL: _MANAGED_BY_VALUE, _ROLE_LABEL: _ROLE_VALUE},
+        },
+        "type": "Opaque",
+        "stringData": dict(clone_env),
+    }
+
+
 def build_pod_manifest(
     *,
     pod_name: str,
@@ -463,6 +506,8 @@ def build_pod_manifest(
     repo_url: str | None = None,
     repo_branch: str | None = None,
     resources: dict[str, object] | None = None,
+    clone_secret_name: str | None = None,
+    clone_env_keys: Sequence[str] | None = None,
 ) -> dict[str, object]:
     """
     Build the sandbox Pod manifest as a plain dict.
@@ -512,6 +557,14 @@ def build_pod_manifest(
     :param repo_url: Repository clone URL, or ``None`` for an empty workspace.
     :param repo_branch: Branch to clone, or ``None`` for the default branch.
     :param resources: Configured resources block, or ``None`` for the defaults.
+    :param clone_secret_name: Name of the clone-credential Secret (see
+        :func:`_clone_secret_name`) projected via ``envFrom`` into the init
+        container ONLY, replacing *harness_secret* there, or ``None`` for no
+        clone Secret (today's behavior).
+    :param clone_env_keys: Key names owned by *clone_secret_name* — never
+        their values. Excluded from the init container's *env_literals*
+        projection so an explicit literal cannot half-override the delivered
+        pair; ignored when *clone_secret_name* is ``None``.
     :returns: The Pod manifest dict.
     """
     pod_resources = _resolve_pod_resources(resources)
@@ -521,17 +574,33 @@ def build_pod_manifest(
     }
     home_mount = [{"name": "home", "mountPath": _HOME_DIR}]
 
+    init_env: list[dict[str, object]] = [{"name": "HOME", "value": _HOME_DIR}]
+    if clone_secret_name:
+        # The clone credential Secret REPLACES the shared harness ref for the
+        # init container: the clone step sees only the git pair plus the
+        # non-secret operator env passthrough — not the deployment's LLM
+        # credentials. Keys the Secret owns are excluded from the literal
+        # projection (explicit env would beat envFrom and half-override the
+        # delivered pair).
+        excluded = frozenset(clone_env_keys or ())
+        init_env.extend(
+            {"name": name, "value": value}
+            for name, value in env_literals.items()
+            if name not in excluded
+        )
     init_container: dict[str, object] = {
         "name": _INIT_CONTAINER_NAME,
         "image": image,
         "workingDir": _HOME_DIR,
         "command": _render_workspace_prep_command(workspace, clone_dir, repo_url, repo_branch),
-        "env": [{"name": "HOME", "value": _HOME_DIR}],
+        "env": init_env,
         "resources": pod_resources,
         "securityContext": container_security,
         "volumeMounts": home_mount,
     }
-    if harness_secret:
+    if clone_secret_name:
+        init_container["envFrom"] = [{"secretRef": {"name": clone_secret_name}}]
+    elif harness_secret:
         # The clone may need GIT_TOKEN (private repos) from the harness Secret.
         init_container["envFrom"] = [{"secretRef": {"name": harness_secret}}]
 
