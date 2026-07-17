@@ -51,7 +51,7 @@ import re
 import shlex
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, ClassVar, Literal
 
 import click
@@ -64,7 +64,6 @@ from omnigent.host.identity import (
 from omnigent.onboarding.sandboxes.base import (
     DEFAULT_HOST_IMAGE,
     RemoteCommandResult,
-    SandboxCapabilityError,
     SandboxLauncher,
 )
 
@@ -675,6 +674,24 @@ def _api_reason(exc: Exception) -> str:
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
+def _redact_values(text: str, values: Iterable[str]) -> str:
+    """
+    Scrub credential *values* from *text* before it reaches logs / errors.
+
+    API response bodies and container log tails can reflect a submitted value
+    (an admission webhook echoing the object; a hostile remote seeding the git
+    output), so every clone-path error/warning composition passes through here.
+
+    :param text: The message to scrub.
+    :param values: Credential values to replace with ``"***"``.
+    :returns: *text* with every occurrence of a non-empty value redacted.
+    """
+    for value in values:
+        if value:
+            text = text.replace(value, "***")
+    return text
+
+
 def _format_api_error(action: str, name: str, exc: k8s_client.ApiException) -> str:
     """
     Build a launcher-contract message for a Kubernetes ``ApiException``.
@@ -1116,22 +1133,29 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         :param repo_url: Repository clone URL, or ``None`` for an empty workspace.
         :param repo_branch: Branch to clone, or ``None`` for the default branch.
         :param repo_name: Directory the clone lands in, or ``None``.
-        :param clone_env: Per-clone credential env. Not yet supported by this
-            provider — the init container clone has no path to consume it, so
-            a request fails closed rather than silently cloning without the
-            credential.
+        :param clone_env: Per-clone credential env (e.g. ``GIT_TOKEN`` /
+            ``GIT_USERNAME``), delivered to the init container ONLY via a
+            dedicated per-Pod Secret — never the Pod spec. The Secret is
+            best-effort owner-referenced to the Pod once created, then deleted
+            again as soon as the init containers finish, so the credential
+            does not live for the Pod's lifetime. ``None``/empty skips the
+            Secret entirely.
         :param on_stage: Progress observer; invoked with ``"starting"``.
         :returns: The absolute in-sandbox workspace path (the cloned repository
             directory when *repo_url* is set).
-        :raises click.ClickException: When creation fails or the host does not
-            start in time.
-        :raises SandboxCapabilityError: When *clone_env* is set — per-host
-            clone credentials are not yet supported by this provider.
+        :raises click.ClickException: When *clone_env* has an invalid or
+            colliding key, creation fails, or the host does not start in time.
         """
         if clone_env:
-            raise SandboxCapabilityError(
-                "the kubernetes provider does not support per-host clone credentials yet"
-            )
+            for key in clone_env:
+                if not key.isidentifier():
+                    raise click.ClickException(
+                        f"clone_env key {key!r} is not a valid environment variable name"
+                    )
+                if key == HOST_TOKEN_ENV_VAR:
+                    raise click.ClickException(
+                        f"clone_env key {key!r} collides with the launch token variable"
+                    )
         _ensure_sdk()
         from kubernetes.client.rest import ApiException
         from urllib3.exceptions import HTTPError
@@ -1140,6 +1164,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         image = self._resolve_image()
         env_literals = self._resolve_sandbox_env()
         secret_name = _token_secret_name(sandbox_id)
+        clone_secret = _clone_secret_name(sandbox_id) if clone_env else None
         workspace = f"{_HOME_DIR}/workspace"
         clone_dir = f"{workspace}/{repo_name}" if repo_name else None
         if on_stage is not None:
@@ -1161,6 +1186,15 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                     ),
                     _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
                 )
+                if clone_env:
+                    assert clone_secret is not None  # set together, just above
+                    core.create_namespaced_secret(
+                        namespace,
+                        build_clone_secret_manifest(
+                            secret_name=clone_secret, namespace=namespace, clone_env=clone_env
+                        ),
+                        _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
+                    )
                 manifest = build_pod_manifest(
                     pod_name=sandbox_id,
                     namespace=namespace,
@@ -1178,31 +1212,83 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                     repo_url=repo_url,
                     repo_branch=repo_branch,
                     resources=self._resources,
+                    clone_secret_name=clone_secret,
+                    clone_env_keys=tuple(clone_env) if clone_env else None,
                 )
-                core.create_namespaced_pod(
+                created = core.create_namespaced_pod(
                     namespace, manifest, _request_timeout=_POD_READY_REQUEST_TIMEOUT_S
                 )
+                if clone_env:
+                    # Best-effort: let the Pod own the Secret so a straggler
+                    # (the delete-after-init step itself failing) is still GC'd
+                    # when the Pod eventually goes; a patch failure only means
+                    # that GC backstop is missing, so it warns and continues.
+                    pod_uid = getattr(getattr(created, "metadata", None), "uid", None)
+                    if pod_uid:
+                        try:
+                            core.patch_namespaced_secret(
+                                clone_secret,
+                                namespace,
+                                {
+                                    "metadata": {
+                                        "ownerReferences": [
+                                            {
+                                                "apiVersion": "v1",
+                                                "kind": "Pod",
+                                                "name": sandbox_id,
+                                                "uid": pod_uid,
+                                            }
+                                        ]
+                                    }
+                                },
+                                _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
+                            )
+                        except (ApiException, HTTPError) as exc:
+                            click.echo(
+                                f"  → warning: could not set owner reference on "
+                                f"'{clone_secret}' ({_api_reason(exc)}); the "
+                                "delete-after-init lifecycle still applies",
+                                err=True,
+                            )
             except (ApiException, HTTPError) as exc:
                 # Tear down whatever landed (a created Secret, or a Pod the
                 # apiserver accepted before the response failed) so a failed
-                # create never leaks the token Secret or a running Pod.
-                self._best_effort_delete(namespace, sandbox_id, secret_name)
+                # create never leaks the token Secret, the clone Secret, or a
+                # running Pod.
+                self._best_effort_delete(
+                    namespace, sandbox_id, secret_name, clone_secret_name=clone_secret
+                )
                 if isinstance(exc, ApiException):
-                    raise click.ClickException(
-                        _format_api_error("create sandbox pod", sandbox_id, exc)
-                    ) from exc
-                raise click.ClickException(
-                    f"timed out creating Kubernetes pod '{sandbox_id}' ({_api_reason(exc)})"
-                ) from exc
+                    message = _format_api_error("create sandbox pod", sandbox_id, exc)
+                    if clone_env:
+                        message = _redact_values(message, clone_env.values())
+                    raise click.ClickException(message) from exc
+                message = f"timed out creating Kubernetes pod '{sandbox_id}' ({_api_reason(exc)})"
+                if clone_env:
+                    message = _redact_values(message, clone_env.values())
+                raise click.ClickException(message) from exc
 
             try:
                 self._wait_for_pod_running(namespace, sandbox_id)
-            except BaseException:
+            except BaseException as exc:
                 # Readiness failed (Unschedulable, ImagePull, clone error, …):
-                # the host will never come online, so reap the Pod + Secret and
-                # re-raise the diagnosed reason.
-                self._best_effort_delete(namespace, sandbox_id, secret_name)
+                # the host will never come online, so reap the Pod + Secrets and
+                # re-raise the diagnosed reason (the container log tail can
+                # itself contain a credential value, e.g. a git auth failure).
+                self._best_effort_delete(
+                    namespace, sandbox_id, secret_name, clone_secret_name=clone_secret
+                )
+                if clone_env and isinstance(exc, click.ClickException):
+                    raise click.ClickException(
+                        _redact_values(exc.message, clone_env.values())
+                    ) from exc
                 raise
+            if clone_env:
+                assert clone_secret is not None  # set together, near the top
+                # The credential has done its job (the init container either
+                # consumed it or failed, handled above) — delete it now rather
+                # than let it live for the Pod's (possibly long) lifetime.
+                self._delete_secret_best_effort(core, namespace, clone_secret)
         finally:
             # start_host is the launcher's only API work on the launch path
             # (the online wait that follows polls the host store), so release
@@ -1399,9 +1485,54 @@ class KubernetesSandboxLauncher(SandboxLauncher):
             return ""
         return log
 
-    def _best_effort_delete(self, namespace: str, pod_name: str, secret_name: str) -> None:
+    def _delete_secret_best_effort(
+        self, core: k8s_client.CoreV1Api, namespace: str, name: str
+    ) -> None:
         """
-        Delete a Pod and its token Secret, swallowing (and logging) any failure.
+        Delete a Secret, swallowing (and logging) any failure — 404 is success.
+
+        Shared by the create/wait-failure cleanup (:meth:`_best_effort_delete`),
+        the delete-after-init step once the Pod is running, and
+        :meth:`terminate`'s independent clone-Secret reap. None of those
+        callers may let a credential-bearing Secret's delete failure mask or
+        block their own result.
+
+        :param core: The ``CoreV1Api`` to delete through.
+        :param namespace: Namespace the Secret lives in.
+        :param name: The Secret to delete.
+        """
+        from kubernetes.client.rest import ApiException
+        from urllib3.exceptions import HTTPError
+
+        try:
+            core.delete_namespaced_secret(
+                name, namespace, _request_timeout=_POD_READY_REQUEST_TIMEOUT_S
+            )
+        except ApiException as exc:
+            if getattr(exc, "status", None) != 404:
+                click.echo(
+                    f"  → warning: could not delete clone credential secret "
+                    f"'{name}': {_api_reason(exc)}",
+                    err=True,
+                )
+        except HTTPError as exc:
+            click.echo(
+                f"  → warning: could not delete clone credential secret "
+                f"'{name}': {_api_reason(exc)}",
+                err=True,
+            )
+
+    def _best_effort_delete(
+        self,
+        namespace: str,
+        pod_name: str,
+        secret_name: str,
+        *,
+        clone_secret_name: str | None = None,
+    ) -> None:
+        """
+        Delete a Pod and its token Secret (and, when set, its clone-credential
+        Secret), swallowing (and logging) any failure.
 
         Used to reap a partially-created or failed-to-start launch: the cleanup
         must not mask the original error, so a delete that itself errors only
@@ -1410,6 +1541,8 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         :param namespace: Namespace the objects live in.
         :param pod_name: The Pod to delete.
         :param secret_name: The token Secret to delete.
+        :param clone_secret_name: The clone-credential Secret to delete, or
+            ``None`` when the launch had no *clone_env*.
         """
         from kubernetes.client.rest import ApiException
         from urllib3.exceptions import HTTPError
@@ -1449,15 +1582,23 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                     _warn(kind, _api_reason(exc))
             except HTTPError as exc:
                 _warn(kind, _api_reason(exc))
+        if clone_secret_name:
+            self._delete_secret_best_effort(core, namespace, clone_secret_name)
 
     def terminate(self, sandbox_id: str) -> None:
         """
-        Delete a sandbox Pod and its token Secret, releasing compute.
+        Delete a sandbox Pod, its token Secret, and its clone-credential
+        Secret, releasing compute.
 
-        Idempotent: an object that no longer exists (404) is success. Kubernetes
-        Pods have no platform lifetime cap, so a transient timeout/connection
-        error is retried a few bounded times before giving up best-effort — a
-        straggler keeps its managed-by/role labels for a cluster GC sweep.
+        Idempotent: an object that no longer exists (404) is success. The
+        clone-credential Secret is derived from *sandbox_id* and reaped
+        independently FIRST — a launch may have deleted it already (the
+        happy-path delete-after-init), so this is almost always a 404, but a
+        launch that crashed before that step must not leak the credential.
+        Kubernetes Pods have no platform lifetime cap, so a transient
+        timeout/connection error deleting the Pod is retried a few bounded
+        times before giving up best-effort — a straggler keeps its
+        managed-by/role labels for a cluster GC sweep.
 
         :param sandbox_id: The Pod to delete.
         :raises click.ClickException: On an API delete failure other than
@@ -1469,6 +1610,9 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         namespace = self._resolve_namespace()
         secret_name = _token_secret_name(sandbox_id)
         try:
+            self._delete_secret_best_effort(
+                self._load_core(), namespace, _clone_secret_name(sandbox_id)
+            )
             for kind, name, delete in (
                 (
                     "pod",

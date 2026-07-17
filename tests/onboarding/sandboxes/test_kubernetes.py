@@ -291,18 +291,23 @@ class _FakeCore:
         self.created_pods: list[dict[str, object]] = []
         self.deleted_pods: list[str] = []
         self.deleted_secrets: list[str] = []
+        self.patched_secrets: list[tuple[str, dict[str, object]]] = []
         self.events: list[object] = []
         self.logs: dict[str, str] = {}
         self.read_queue: list[object] = []
         self.read_default: object = _pod(phase="Pending")
-        self.create_secret_error: Exception | None = None
+        self.create_secret_errors: list[Exception | None] = []
         self.create_pod_error: Exception | None = None
         self.delete_pod_errors: list[Exception | None] = []
+        self.delete_secret_errors: list[Exception | None] = []
+        self.patch_secret_error: Exception | None = None
 
     def create_namespaced_secret(self, namespace, body, _request_timeout=None):
         self.calls.append("create_secret")
-        if self.create_secret_error is not None:
-            raise self.create_secret_error
+        if self.create_secret_errors:
+            err = self.create_secret_errors.pop(0)
+            if err is not None:
+                raise err
         self.created_secrets.append(body)
 
     def create_namespaced_pod(self, namespace, body, _request_timeout=None):
@@ -310,6 +315,7 @@ class _FakeCore:
         if self.create_pod_error is not None:
             raise self.create_pod_error
         self.created_pods.append(body)
+        return SimpleNamespace(metadata=SimpleNamespace(uid="pod-uid-123"))
 
     def read_namespaced_pod(self, name, namespace, _request_timeout=None):
         self.calls.append("read_pod")
@@ -330,7 +336,17 @@ class _FakeCore:
 
     def delete_namespaced_secret(self, name, namespace, _request_timeout=None):
         self.calls.append("delete_secret")
+        if self.delete_secret_errors:
+            err = self.delete_secret_errors.pop(0)
+            if err is not None:
+                raise err
         self.deleted_secrets.append(name)
+
+    def patch_namespaced_secret(self, name, namespace, body, _request_timeout=None):
+        self.calls.append("patch_secret")
+        if self.patch_secret_error is not None:
+            raise self.patch_secret_error
+        self.patched_secrets.append((name, body))
 
     def list_namespaced_event(self, namespace, field_selector=None, _request_timeout=None):
         return SimpleNamespace(items=self.events)
@@ -427,24 +443,138 @@ def test_launch_host_creates_secret_then_pod_and_returns_workspace(
     assert fake_core.deleted_pods == []
 
 
-def test_start_host_rejects_clone_env(fake_core: _FakeCore) -> None:
-    """
-    A per-host clone credential fails closed before any API call — the init
-    container clone has no path to consume it yet.
-    """
-    with pytest.raises(SandboxCapabilityError, match="does not support per-host clone"):
-        _launcher().start_host(
-            "omnigent-pod-x",
-            token=_TOKEN,
-            host_id="host_x",
-            host_name="managed-x",
-            server_url="http://srv.example.com",
-            repo_url="https://github.com/org/repo.git",
-            repo_name="repo",
-            clone_env={"GIT_TOKEN": "abc123"},
-        )
-    # Fails before any Secret/Pod create call is made.
+_CLONE_ENV = {"GIT_TOKEN": "tok-secret-value", "GIT_USERNAME": "alice"}
+
+
+def _start_with_clone(fake_core: _FakeCore) -> str:
+    # Default to an immediate Running pod; a caller that pre-populates
+    # read_queue (e.g. to inject a failure) keeps its own setup.
+    if not fake_core.read_queue:
+        fake_core.read_queue = [_pod(phase="Running")]
+    return _launcher().start_host(
+        "omnigent-pod-1",
+        token=_TOKEN,
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="http://srv.example.com",
+        repo_url="https://forge.example/org/repo.git",
+        repo_name="repo",
+        clone_env=dict(_CLONE_ENV),
+    )
+
+
+def test_clone_env_lifecycle_happy_path(fake_core: _FakeCore) -> None:
+    """token Secret → clone Secret → Pod → ownerRef patch → delete clone Secret."""
+    workspace = _start_with_clone(fake_core)
+    assert workspace == "/home/omnigent/workspace/repo"
+    assert fake_core.calls.index("create_secret") < fake_core.calls.index("create_pod")
+    assert fake_core.calls.count("create_secret") == 2
+    assert fake_core.calls.index("create_pod") < fake_core.calls.index("patch_secret")
+    clone = fake_core.created_secrets[1]
+    assert clone["metadata"]["name"] == "omnigent-pod-1-clone-cred"
+    assert clone["stringData"] == _CLONE_ENV
+    name, body = fake_core.patched_secrets[0]
+    assert name == "omnigent-pod-1-clone-cred"
+    assert body["metadata"]["ownerReferences"][0]["uid"] == "pod-uid-123"
+    assert body["metadata"]["ownerReferences"][0]["name"] == "omnigent-pod-1"
+    # Deleted right after Running; the token Secret and Pod survive.
+    assert fake_core.deleted_secrets == ["omnigent-pod-1-clone-cred"]
+    assert fake_core.deleted_pods == []
+    init = fake_core.created_pods[0]["spec"]["initContainers"][0]
+    assert init["envFrom"] == [{"secretRef": {"name": "omnigent-pod-1-clone-cred"}}]
+
+
+def test_clone_env_values_never_leave_secret_body(
+    fake_core: _FakeCore, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _start_with_clone(fake_core)
+    assert "tok-secret-value" not in json.dumps(fake_core.created_pods)
+    assert "tok-secret-value" not in capsys.readouterr().out
+
+
+def test_clone_secret_create_failure_cleans_up(fake_core: _FakeCore) -> None:
+    """Failure creating the SECOND secret still tears down the first + any Pod."""
+    fake_core.create_secret_errors = [None, _FakeApiException(status=500, reason="boom")]
+    with pytest.raises(click.ClickException) as excinfo:
+        _start_with_clone(fake_core)
+    assert "tok-secret-value" not in str(excinfo.value)
+    assert "omnigent-pod-1-token" in fake_core.deleted_secrets
+    assert "omnigent-pod-1-clone-cred" in fake_core.deleted_secrets
+
+
+def test_wait_failure_redacts_and_reaps_all_three(fake_core: _FakeCore) -> None:
+    """A failed init clone reaps Pod + both Secrets; the log tail is scrubbed."""
+    fake_core.read_queue = [
+        _pod(phase="Pending", init_statuses=[_terminated(128, name="workspace-init")])
+    ]
+    fake_core.logs["workspace-init"] = "fatal: auth failed for tok-secret-value"
+    with pytest.raises(click.ClickException) as excinfo:
+        _start_with_clone(fake_core)
+    assert "tok-secret-value" not in str(excinfo.value)
+    assert "***" in str(excinfo.value)
+    assert "omnigent-pod-1" in fake_core.deleted_pods
+    assert set(fake_core.deleted_secrets) == {
+        "omnigent-pod-1-token",
+        "omnigent-pod-1-clone-cred",
+    }
+
+
+def test_owner_ref_patch_failure_warns_and_continues(
+    fake_core: _FakeCore, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake_core.patch_secret_error = _FakeApiException(status=403, reason="forbidden")
+    workspace = _start_with_clone(fake_core)
+    assert workspace.endswith("/repo")
+    assert "could not set owner reference" in capsys.readouterr().err
+    assert fake_core.deleted_secrets == ["omnigent-pod-1-clone-cred"]
+
+
+def test_delete_after_running_failure_warns_not_fails(
+    fake_core: _FakeCore, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake_core.delete_secret_errors = [_FakeApiException(status=500, reason="hiccup")]
+    workspace = _start_with_clone(fake_core)
+    assert workspace.endswith("/repo")
+    assert "could not delete clone credential secret" in capsys.readouterr().err
+
+
+def test_invalid_or_colliding_clone_env_keys_fail_before_api(fake_core: _FakeCore) -> None:
+    for bad in ({"BAD-KEY": "v"}, {HOST_TOKEN_ENV_VAR: "v"}):
+        with pytest.raises(click.ClickException):
+            _launcher().start_host(
+                "omnigent-pod-x",
+                token=_TOKEN,
+                host_id="h",
+                host_name="m",
+                server_url="http://srv.example.com",
+                repo_url="https://forge.example/org/repo.git",
+                repo_name="repo",
+                clone_env=bad,
+            )
     assert fake_core.calls == []
+
+
+def test_no_clone_env_makes_zero_clone_secret_calls(fake_core: _FakeCore) -> None:
+    fake_core.read_queue = [_pod(phase="Running")]
+    _launcher().start_host(
+        "omnigent-pod-1",
+        token=_TOKEN,
+        host_id="h",
+        host_name="m",
+        server_url="http://srv.example.com",
+    )
+    assert fake_core.calls.count("create_secret") == 1
+    assert "patch_secret" not in fake_core.calls
+    assert fake_core.deleted_secrets == []
+
+
+def test_terminate_deletes_clone_secret_even_when_pod_delete_raises(
+    fake_core: _FakeCore,
+) -> None:
+    fake_core.delete_pod_errors = [_FakeApiException(status=500, reason="boom")]
+    with pytest.raises(click.ClickException):
+        _launcher().terminate("omnigent-pod-1")
+    assert "omnigent-pod-1-clone-cred" in fake_core.deleted_secrets
 
 
 def test_launch_host_with_repo_returns_clone_dir(fake_core: _FakeCore) -> None:
@@ -533,17 +663,17 @@ def test_launch_host_times_out_with_reason(
 
 
 def test_terminate_deletes_pod_and_secret(fake_core: _FakeCore) -> None:
-    """Terminate deletes both the Pod and its token Secret."""
+    """Terminate deletes the Pod, its token Secret, and the derivable clone Secret."""
     _launcher().terminate("omnigent-pod-6")
     assert fake_core.deleted_pods == ["omnigent-pod-6"]
-    assert fake_core.deleted_secrets == ["omnigent-pod-6-token"]
+    assert fake_core.deleted_secrets == ["omnigent-pod-6-clone-cred", "omnigent-pod-6-token"]
 
 
 def test_terminate_is_idempotent_on_404(fake_core: _FakeCore) -> None:
-    """A Pod that no longer exists (404) is treated as success, and the Secret too."""
+    """A Pod that no longer exists (404) is treated as success, and the Secrets too."""
     fake_core.delete_pod_errors = [_FakeApiException(status=404, reason="Not Found")]
     _launcher().terminate("omnigent-pod-7")  # must not raise
-    assert fake_core.deleted_secrets == ["omnigent-pod-7-token"]
+    assert fake_core.deleted_secrets == ["omnigent-pod-7-clone-cred", "omnigent-pod-7-token"]
 
 
 def test_terminate_retries_transient_then_gives_up_best_effort(
@@ -555,8 +685,8 @@ def test_terminate_retries_transient_then_gives_up_best_effort(
     fake_core.delete_pod_errors = [HTTPError("timeout")] * k8s._POD_DELETE_MAX_ATTEMPTS
     _launcher().terminate("omnigent-pod-8")  # best-effort: must not raise
     assert "could not delete Kubernetes pod 'omnigent-pod-8'" in capsys.readouterr().err
-    # The Secret delete still runs after the Pod gives up.
-    assert fake_core.deleted_secrets == ["omnigent-pod-8-token"]
+    # The token Secret delete still runs after the Pod gives up.
+    assert fake_core.deleted_secrets == ["omnigent-pod-8-clone-cred", "omnigent-pod-8-token"]
 
 
 def test_provision_reserves_pod_name_and_run_is_unsupported() -> None:
