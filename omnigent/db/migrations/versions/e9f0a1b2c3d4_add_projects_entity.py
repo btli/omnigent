@@ -14,7 +14,7 @@ from alembic import op
 from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
 
 revision: str = "e9f0a1b2c3d4"
-down_revision: str | None = "d7f1a2b3c4e5"
+down_revision: str | None = "d1e2f3a4b5c6"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
