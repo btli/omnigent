@@ -632,6 +632,12 @@ def test_redact_values_surrogate_safe_and_longest_first() -> None:
     out2 = k8s._redact_values(msg, ["oauth2", "oauth2-secret-token"])
     assert "oauth2-secret-token" not in out2
     assert "secret-token" not in out2
+    # Cross-representation: a shorter value's LITERAL must not corrupt a longer
+    # value's DERIVED needle. Needles are scrubbed globally longest-first, not
+    # per value — else "Yg" (a substring of base64("😀")) or "u00" (a substring
+    # of the JSON escape of "é") would mask the token's base64/escaped needle.
+    assert k8s._redact_values("8J+YgA==", ["😀", "Yg"]) == "***"
+    assert k8s._redact_values("\\u00e9", ["é", "u00"]) == "***"
 
 
 def test_load_core_pins_k8s_rest_logger_to_suppress_response_bodies(
@@ -696,6 +702,22 @@ def test_no_clone_env_makes_zero_clone_secret_calls(fake_core: _FakeCore) -> Non
         host_id="h",
         host_name="m",
         server_url="http://srv.example.com",
+    )
+    assert fake_core.calls.count("create_secret") == 1
+    assert "patch_secret" not in fake_core.calls
+    assert fake_core.deleted_secrets == []
+
+
+def test_empty_clone_env_makes_zero_clone_secret_calls(fake_core: _FakeCore) -> None:
+    """An empty ``clone_env`` is no-credential: snapshotted but treated as absent."""
+    fake_core.read_queue = [_pod(phase="Running")]
+    _launcher().start_host(
+        "omnigent-pod-1",
+        token=_TOKEN,
+        host_id="h",
+        host_name="m",
+        server_url="http://srv.example.com",
+        clone_env={},
     )
     assert fake_core.calls.count("create_secret") == 1
     assert "patch_secret" not in fake_core.calls

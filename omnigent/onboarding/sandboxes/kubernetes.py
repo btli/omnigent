@@ -678,33 +678,40 @@ def _redact_values(text: str, values: Iterable[str]) -> str:
     """
     Scrub credential *values* from *text* before it reaches logs / errors.
 
-    Needles cover the literal value; its base64 form (immune to any depth of JSON
-    re-escaping — the base64 alphabet has no JSON-special characters); Python's
-    JSON-escaped form; and Go's canonical one-level form (raw UTF-8, ``<``, ``>``,
-    ``&``, ``\\u2028``, and ``\\u2029`` escaped). Accepted residual: a value echoed as
-    pre-serialized JSON through an extra layer (double-escaped backslashes) evades the
-    non-base64 needles, though not the base64 one; a webhook able to construct such an
-    echo already holds the Secret, so this is a backstop against accidental reflection,
-    not a malicious admission controller. Values are scrubbed longest-first so a
-    shorter value that is a substring of a longer one cannot redact-mask it before
-    the longer needle matches. A value carrying lone surrogates (an ``env:``
-    credential decoded from non-UTF-8 bytes via ``surrogateescape``) is base64-encoded
-    with ``surrogatepass`` rather than strict UTF-8, so needle derivation never raises
-    — a raise here would bypass the callers' ``from None`` and re-expose the cause.
+    For each value four needles are derived: the literal value; its base64 form
+    (immune to any depth of JSON re-escaping — the base64 alphabet has no
+    JSON-special characters); Python's JSON-escaped form; and Go's canonical
+    one-level form (raw UTF-8, ``<``, ``>``, ``&``, ``\\u2028``, and ``\\u2029``
+    escaped). Every needle of every value is then replaced longest-first, so a
+    shorter needle can never redact-mask a longer one it is a substring of —
+    across values AND representations (a short value's literal must not corrupt a
+    long value's escaped/base64 needle before it matches).
+
+    Accepted residuals — each needs a reflector that already holds the Secret, so
+    this is a backstop against accidental reflection, not a malicious admission
+    controller: a value echoed as pre-serialized JSON through an extra layer
+    (double-escaped backslashes) evades the non-base64 needles, though not the
+    base64 one; and a value carrying lone surrogates (an ``env:`` credential
+    decoded from non-UTF-8 bytes via ``surrogateescape``) whose base64/JSON echo
+    the apiserver normalized to U+FFFD is matched only in its literal (in-process)
+    and ``surrogatepass`` forms, not the normalized one. Surrogate values are
+    base64-encoded with ``surrogatepass`` rather than strict UTF-8 so needle
+    derivation never raises — a raise here would bypass the callers' ``from None``
+    and re-expose the cause.
 
     :param text: The message to scrub.
     :param values: Credential values to replace with ``"***"``.
     :returns: *text* with every occurrence of a non-empty value — literal,
         base64-encoded, JSON-escaped, or Go-JSON-escaped — redacted.
     """
-    for value in sorted((v for v in values if v), key=len, reverse=True):
-        text = text.replace(value, "***")
-        text = text.replace(
-            base64.b64encode(value.encode("utf-8", "surrogatepass")).decode(), "***"
-        )
+    needles: set[str] = set()
+    for value in values:
+        if not value:
+            continue
+        needles.add(value)
+        needles.add(base64.b64encode(value.encode("utf-8", "surrogatepass")).decode())
         escaped = json.dumps(value)[1:-1]
-        if escaped != value:
-            text = text.replace(escaped, "***")
+        needles.add(escaped)
         # Go's encoding/json (the apiserver) leaves non-ASCII as raw UTF-8
         # instead of \uXXXX-escaping it like Python's default `escaped` above,
         # while always escaping <, >, &, U+2028, and U+2029 — derive its
@@ -717,8 +724,12 @@ def _redact_values(text: str, values: Iterable[str]) -> str:
             .replace(" ", "\\u2028")
             .replace(" ", "\\u2029")
         )
-        if go_escaped != escaped:
-            text = text.replace(go_escaped, "***")
+        needles.add(go_escaped)
+    # Longest needle first so a shorter needle can never redact-mask a longer one
+    # it is a substring of — across values AND representations; the (len, text)
+    # key breaks ties deterministically.
+    for needle in sorted((n for n in needles if n), key=lambda n: (len(n), n), reverse=True):
+        text = text.replace(needle, "***")
     return text
 
 
@@ -961,7 +972,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         # The kubernetes client logs every HTTP response body at DEBUG on the
         # "kubernetes.client.rest" logger, ungated: a Secret create/patch response
         # echoes the credential back as base64 ``data``. Pin that logger to INFO so a
-        # DEBUG-level server never writes secret material to its logs (WARNING+ flows).
+        # DEBUG-level server never writes secret material to its logs (INFO+ still flows).
         logging.getLogger("kubernetes.client.rest").setLevel(logging.INFO)
         self._api_client = client.ApiClient(cfg)
         self._core = client.CoreV1Api(self._api_client)
@@ -1181,10 +1192,11 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         :raises click.ClickException: When *clone_env* has an invalid or
             colliding key, creation fails, or the host does not start in time.
         """
-        if clone_env:
+        if clone_env is not None:
             # Snapshot: start_host reads clone_env repeatedly (Secret manifest,
-            # init-env key exclusion, redaction needles). Copy it up front so a
-            # caller cannot mutate it mid-launch and split those reads apart.
+            # init-env key exclusion, redaction needles). Copy it up front — the
+            # empty dict included — so a caller cannot mutate it mid-launch and
+            # split those reads apart.
             clone_env = dict(clone_env)
             for key in clone_env:
                 if not key.isidentifier():
