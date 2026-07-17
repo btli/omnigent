@@ -8214,6 +8214,7 @@ async def _persist_host_launch_failure_turn(
     runner_router: RunnerRouter | None,
     *,
     created_by: str | None,
+    code: str = "harness_not_configured",
 ) -> str:
     """
     Persist a consumed user message and a host-launch failure error.
@@ -8244,13 +8245,18 @@ async def _persist_host_launch_failure_turn(
         the parent-wake forward, or ``None`` in in-process / test setups.
     :param created_by: Authenticated posting actor, e.g.
         ``"alice@example.com"``; ``None`` in single-user mode.
+    :param code: Stable error classifier for the persisted error item.
+        Defaults to the harness refusal; a credential-delivery failure on
+        relaunch passes ``credential_delivery_failed`` so the two failure
+        modes stay distinguishable.
     :returns: Store-assigned id of the consumed user message item.
     """
     error = ErrorData(
         source="execution",
         # Stable classifier mirroring the host's wire error code, so the
-        # web can special-case the banner if it ever wants to.
-        code="harness_not_configured",
+        # web can special-case the banner if it ever wants to. Defaults to
+        # the harness refusal; a credential-delivery failure passes its own.
+        code=code,
         message=(
             host_error
             if host_error
@@ -20608,6 +20614,7 @@ def create_sessions_router(
                             str(exc),
                             runner_router,
                             created_by=_attribution_user(user_id),
+                            code=_CREDENTIAL_DELIVERY_ERROR_CODE,
                         )
                         return {"queued": True, "item_id": item_id}
                     _repo = _owner = _cred_store = None
@@ -20655,6 +20662,7 @@ def create_sessions_router(
                             launch_attempt.error,
                             runner_router,
                             created_by=_attribution_user(user_id),
+                            code=_CREDENTIAL_DELIVERY_ERROR_CODE,
                         )
                         return {"queued": True, "item_id": item_id}
                     relaunched_runner_id = launch_attempt.runner_id

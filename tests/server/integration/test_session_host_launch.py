@@ -708,6 +708,9 @@ async def test_message_relaunch_credential_binding_error_persists_error_turn(
         f"expected exactly one error item for the refused relaunch, got {error_items!r}"
     )
     assert _BINDING_ERROR in error_items[0]["message"]
+    # Classified as a credential failure, not the harness refusal it reuses the
+    # persist path from — the two respawn failures stay distinguishable.
+    assert error_items[0].get("code") == "credential_delivery_failed"
 
     # Binding kept so a message after the binding is fixed can relaunch.
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
