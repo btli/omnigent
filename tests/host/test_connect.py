@@ -2388,7 +2388,12 @@ def test_run_host_process_announces_session_log_dir_on_start(
 
 
 def _managed_deliver_frame(
-    kp_public_b64: str, *, runner_id: str, generation: int, token: str = "ghp_tok"
+    kp_public_b64: str,
+    *,
+    runner_id: str,
+    generation: int,
+    token: str = "ghp_tok",
+    credential_kind: str = "http-token",
 ):
     """Build a ``host.deliver_credential`` frame sealed to *kp_public_b64*.
 
@@ -2396,6 +2401,9 @@ def _managed_deliver_frame(
     :param runner_id: Runner the credential binds to.
     :param generation: Launch generation the credential binds to.
     :param token: Plaintext token to seal, e.g. ``"ghp_tok"``.
+    :param credential_kind: Kind baked into both the frame and its AAD, so a
+        non-default kind still carries a VALID seal and only the handler's
+        kind gate can reject it.
     :returns: A frame ready to hand to ``_handle_deliver_credential``.
     """
     from omnigent.host.frames import (
@@ -2412,7 +2420,7 @@ def _managed_deliver_frame(
         "credential_slot": "slot_1",
         "canonical_host": "git.acme.com",
         "repo_path": "/team/proj",
-        "credential_kind": "http-token",
+        "credential_kind": credential_kind,
         "auth_scheme": "basic",
         "username": "x-access-token",
     }
@@ -2445,19 +2453,24 @@ def test_deliver_credential_unseals_caches_and_acks() -> None:
 def test_deliver_credential_rejects_unknown_kind_without_token() -> None:
     """A reserved (not-yet-implemented) credential_kind is NACKed, uncached.
 
-    The rejection reason must not leak the token even though it never got
-    as far as unsealing it.
+    The frame is sealed with ``ssh-key`` baked into frame AND AAD, so the
+    seal itself is valid and only the handler's kind gate can reject it —
+    removing the gate would cache the token and ACK ``installed``. The
+    rejection reason must not leak the token.
     """
     from omnigent.host.sealing import generate_sealing_keypair
 
     proc = _make_host_process()
     proc._sealing_keypair = generate_sealing_keypair()
     frame = _managed_deliver_frame(
-        proc._sealing_keypair.public_key_b64, runner_id="runner_abc", generation=1
+        proc._sealing_keypair.public_key_b64,
+        runner_id="runner_abc",
+        generation=1,
+        credential_kind="ssh-key",  # reserved, not implemented
     )
-    frame.credential_kind = "ssh-key"  # reserved, not implemented
     result = proc._handle_deliver_credential(frame)
     assert result.status == "rejected"
+    assert "unsupported credential kind" in (result.error or "")
     assert "runner_abc" not in proc._pending_credentials
     assert "ghp_tok" not in (result.error or "")
 
