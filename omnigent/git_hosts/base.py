@@ -1,18 +1,8 @@
-"""Git-host provider abstraction: identity, URL normalization, and the
-resolved, non-secret clone plan a launcher consumes.
-
-A ``GitHostProvider`` is the per-forge behavior seam (github.com, GitHub
-Enterprise, Forgejo/Gitea, …), mirroring the sandbox-launcher registry in
-:mod:`omnigent.onboarding.sandboxes`. This module holds the abstract base and
-the plain value types; concrete providers live in sibling modules and are
-registered in :mod:`omnigent.git_hosts`.
-"""
+"""Non-secret git-host configuration and resolved clone-plan value types."""
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import ClassVar
 
 
 @dataclass(frozen=True)
@@ -85,36 +75,3 @@ class ClonePlan:
     ssh_host: str | None = None
     ssh_port: int | None = None
     ca_bundle: str | None = None
-
-
-class GitHostProvider(ABC):
-    """Per-forge behavior: host identity, URL normalization, and auth shape.
-
-    Subclasses set ``provider`` and ``default_clone_username`` and implement
-    :meth:`matches` and :meth:`default_api_base`; the base class supplies the
-    default URL normalization and HTTPS clone binding.
-    """
-
-    provider: ClassVar[str]
-    default_clone_username: ClassVar[str]
-
-    @abstractmethod
-    def matches(self, host: str) -> bool:
-        """Whether this provider serves *host* (canonical lowercase).
-
-        Used only for the built-in default (github.com); operator-configured
-        hosts select their provider explicitly by name, so self-hosted providers
-        return ``False`` here.
-        """
-
-    @abstractmethod
-    def default_api_base(self, web_host: str) -> str:
-        """The API base URL for *web_host* when the operator omits one."""
-
-    def normalize_repo_url(self, url: str) -> str:
-        """Return the clone URL, normalized. Default: unchanged."""
-        return url
-
-    def clone_binding(self) -> CloneAuthBinding:
-        """The HTTPS auth shape for this provider (default: basic + username)."""
-        return CloneAuthBinding(scheme="basic", username=self.default_clone_username)

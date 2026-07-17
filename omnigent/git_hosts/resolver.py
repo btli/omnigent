@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from omnigent.git_hosts import get_git_host
+from omnigent.git_hosts import provider_spec
 from omnigent.git_hosts.base import ClonePlan, HostConfig
 from omnigent.git_hosts.url import split_host
 
@@ -31,27 +31,27 @@ def resolve_clone_plan(url: str, hosts: Sequence[HostConfig]) -> ClonePlan:
     host = split_host(url)
     for cfg in hosts:
         if cfg.web_host == host:
-            provider = get_git_host(cfg.provider)
+            spec = provider_spec(cfg.provider)
             return ClonePlan(
                 provider=cfg.provider,
                 host_id=cfg.id,
                 canonical_host=host,
-                normalized_url=provider.normalize_repo_url(clone_url),
+                normalized_url=clone_url,
                 api_base=cfg.api_base,
-                auth=provider.clone_binding(),
+                auth=spec.clone_binding(),
                 credential_source=cfg.credential_source,
                 ssh_host=cfg.ssh_host,
                 ssh_port=cfg.ssh_port,
                 ca_bundle=cfg.ca_bundle,
             )
 
-    github = get_git_host("github")
-    if github.matches(host):
+    github = provider_spec("github")
+    if github.builtin_host == host:
         return ClonePlan(
             provider="github",
             host_id="github",
             canonical_host=host,
-            normalized_url=github.normalize_repo_url(clone_url),
+            normalized_url=clone_url,
             api_base=github.default_api_base(host),
             auth=github.clone_binding(),
             credential_source=None,

@@ -1,45 +1,65 @@
-"""Git-host provider abstraction (design docs/claude/custom-git-hosts-design.md).
+"""Data specs for supported git-host providers.
 
-The registry maps a provider name to a ``"module:ClassName"`` target imported
-lazily on first use — mirroring :mod:`omnigent.onboarding.sandboxes` — so a
-provider's optional dependencies never load unless it is selected.
+Self-hosted GitLab accepts a PAT or OAuth token as the HTTPS basic-auth password
+for username ``oauth2`` and serves its REST API under ``<host>/api/v4``.
 """
 
 from __future__ import annotations
 
-import importlib
+from dataclasses import dataclass
 
-from omnigent.git_hosts.base import GitHostProvider
+from omnigent.git_hosts.base import CloneAuthBinding
 
-# Provider name → "module:ClassName". Closed set; forgejo and gitea share one
-# implementation (identical API).
-_GIT_HOSTS: dict[str, str] = {
-    "github": "omnigent.git_hosts.github:GitHubProvider",
-    "ghe": "omnigent.git_hosts.github:GitHubEnterpriseProvider",
-    "gitea": "omnigent.git_hosts.gitea:GiteaProvider",
-    "forgejo": "omnigent.git_hosts.gitea:ForgejoProvider",
+DEFAULT_CLONE_USERNAME = "x-access-token"
+
+
+@dataclass(frozen=True)
+class ProviderSpec:
+    """Per-forge data: identity, API base pattern, and HTTPS auth username."""
+
+    name: str
+    clone_username: str
+    api_base_template: str
+    builtin_host: str | None = None
+
+    def default_api_base(self, web_host: str) -> str:
+        """Build the default API base for *web_host*."""
+        return self.api_base_template.format(host=web_host)
+
+    def clone_binding(self) -> CloneAuthBinding:
+        """Build the provider's HTTPS clone authentication binding."""
+        return CloneAuthBinding(scheme="basic", username=self.clone_username)
+
+
+_PROVIDERS: dict[str, ProviderSpec] = {
+    "github": ProviderSpec(
+        "github",
+        "x-access-token",
+        "https://api.github.com",
+        builtin_host="github.com",
+    ),
+    "ghe": ProviderSpec("ghe", "x-access-token", "https://{host}/api/v3"),
+    "gitea": ProviderSpec("gitea", "oauth2", "https://{host}/api/v1"),
+    "forgejo": ProviderSpec("forgejo", "oauth2", "https://{host}/api/v1"),
+    "gitlab": ProviderSpec("gitlab", "oauth2", "https://{host}/api/v4"),
 }
 
 
-def get_git_host(provider: str) -> GitHostProvider:
-    """Instantiate the provider registered under *provider*.
+def provider_spec(provider: str) -> ProviderSpec:
+    """Return the spec registered under *provider*.
 
     :param provider: A registered provider name, e.g. ``"forgejo"``.
-    :returns: A fresh provider instance.
+    :returns: The provider's immutable data spec.
     :raises ValueError: When *provider* is not registered.
     """
     try:
-        target = _GIT_HOSTS[provider]
+        return _PROVIDERS[provider]
     except KeyError:
         raise ValueError(
             f"unknown git host provider {provider!r}; known: {available_providers()}"
         ) from None
-    module_path, _, class_name = target.partition(":")
-    module = importlib.import_module(module_path)
-    provider_cls: type[GitHostProvider] = getattr(module, class_name)
-    return provider_cls()
 
 
 def available_providers() -> list[str]:
     """The sorted list of registered provider names."""
-    return sorted(_GIT_HOSTS)
+    return sorted(_PROVIDERS)

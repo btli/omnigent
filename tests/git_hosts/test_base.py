@@ -6,33 +6,24 @@ import dataclasses
 
 import pytest
 
+import omnigent.git_hosts as git_hosts
 from omnigent.git_hosts.base import (
     CloneAuthBinding,
     ClonePlan,
-    GitHostProvider,
     HostConfig,
 )
 
 
-class _StubProvider(GitHostProvider):
-    provider = "stub"
-    default_clone_username = "x-access-token"
-
-    def matches(self, host: str) -> bool:
-        return host == "stub.example.com"
-
-    def default_api_base(self, web_host: str) -> str:
-        return f"https://{web_host}/api/v1"
-
-
-def test_clone_binding_uses_default_username() -> None:
-    binding = _StubProvider().clone_binding()
-    assert binding == CloneAuthBinding(scheme="basic", username="x-access-token")
-
-
-def test_normalize_repo_url_is_identity_by_default() -> None:
-    url = "https://stub.example.com/org/repo"
-    assert _StubProvider().normalize_repo_url(url) == url
+def test_provider_spec_is_a_frozen_value_type() -> None:
+    spec = git_hosts.ProviderSpec(
+        name="stub",
+        clone_username="token-user",
+        api_base_template="https://{host}/api/v1",
+    )
+    assert spec.default_api_base("stub.example.com") == "https://stub.example.com/api/v1"
+    assert spec.clone_binding() == CloneAuthBinding(scheme="basic", username="token-user")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        spec.name = "other"
 
 
 def test_host_config_and_clone_plan_are_frozen_value_types() -> None:

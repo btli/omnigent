@@ -29,6 +29,21 @@ def test_resolves_a_configured_host() -> None:
     assert plan.auth == CloneAuthBinding(scheme="basic", username="oauth2")
 
 
+def test_resolves_a_configured_gitlab_host() -> None:
+    gitlab = HostConfig(
+        id="acme-gitlab",
+        provider="gitlab",
+        web_host="gitlab.acme.com",
+        api_base="https://gitlab.acme.com/api/v4",
+        credential_source="env:ACME_GITLAB_TOKEN",
+    )
+    plan = resolve_clone_plan("https://gitlab.acme.com/team/proj", [gitlab])
+    assert plan.provider == "gitlab"
+    assert plan.host_id == "acme-gitlab"
+    assert plan.api_base == "https://gitlab.acme.com/api/v4"
+    assert plan.auth == CloneAuthBinding(scheme="basic", username="oauth2")
+
+
 def test_github_com_falls_back_to_builtin_default() -> None:
     plan = resolve_clone_plan("https://github.com/org/repo", [_ACME])
     assert plan.provider == "github"

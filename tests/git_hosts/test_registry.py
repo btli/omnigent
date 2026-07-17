@@ -1,43 +1,45 @@
-"""Tests for the git-host provider registry."""
+"""Tests for the git-host provider specs."""
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
-from omnigent.git_hosts import available_providers, get_git_host
-from omnigent.git_hosts.gitea import GiteaProvider
-from omnigent.git_hosts.github import GitHubProvider
+import omnigent.git_hosts as git_hosts
+from omnigent.git_hosts.base import CloneAuthBinding
 
 
 def test_available_providers_lists_known_names() -> None:
-    assert available_providers() == ["forgejo", "ghe", "gitea", "github"]
+    assert git_hosts.available_providers() == ["forgejo", "ghe", "gitea", "github", "gitlab"]
 
 
-def test_get_git_host_returns_provider_instance() -> None:
-    assert isinstance(get_git_host("github"), GitHubProvider)
-    # Forgejo and Gitea share the Gitea API implementation.
-    assert isinstance(get_git_host("forgejo"), GiteaProvider)
-    assert isinstance(get_git_host("gitea"), GiteaProvider)
-    # ...but each keeps its own provider identity for config/API selection.
-    assert get_git_host("forgejo").provider == "forgejo"
-    assert get_git_host("gitea").provider == "gitea"
+@pytest.mark.parametrize(
+    ("name", "host", "api_base", "username", "builtin_host"),
+    [
+        ("github", "github.com", "https://api.github.com", "x-access-token", "github.com"),
+        ("ghe", "ghe.acme.com", "https://ghe.acme.com/api/v3", "x-access-token", None),
+        ("gitea", "git.acme.com", "https://git.acme.com/api/v1", "oauth2", None),
+        ("forgejo", "git.acme.com", "https://git.acme.com/api/v1", "oauth2", None),
+        ("gitlab", "gitlab.acme.com", "https://gitlab.acme.com/api/v4", "oauth2", None),
+    ],
+)
+def test_provider_specs_preserve_forge_defaults(
+    name: str,
+    host: str,
+    api_base: str,
+    username: str,
+    builtin_host: str | None,
+) -> None:
+    spec = git_hosts.provider_spec(name)
+    assert spec.name == name
+    assert spec.default_api_base(host) == api_base
+    assert spec.clone_binding() == CloneAuthBinding(scheme="basic", username=username)
+    assert spec.builtin_host == builtin_host
 
 
-def test_get_git_host_unknown_name_raises() -> None:
-    with pytest.raises(ValueError, match="unknown git host provider 'svn'"):
-        get_git_host("svn")
-
-
-def test_github_matches_only_github_com() -> None:
-    gh = GitHubProvider()
-    assert gh.matches("github.com") is True
-    assert gh.matches("git.acme.com") is False
-    assert gh.default_api_base("github.com") == "https://api.github.com"
-
-
-def test_enterprise_and_gitea_default_api_bases() -> None:
-    assert get_git_host("ghe").default_api_base("ghe.acme.com") == "https://ghe.acme.com/api/v3"
-    assert get_git_host("gitea").default_api_base("git.acme.com") == "https://git.acme.com/api/v1"
-    # Self-hosted providers never auto-match a host; they are selected by config.
-    assert get_git_host("ghe").matches("ghe.acme.com") is False
-    assert get_git_host("gitea").matches("git.acme.com") is False
+def test_provider_spec_unknown_name_raises_with_known_set() -> None:
+    known = ["forgejo", "ghe", "gitea", "github", "gitlab"]
+    expected = f"unknown git host provider 'svn'; known: {known}"
+    with pytest.raises(ValueError, match=re.escape(expected)):
+        git_hosts.provider_spec("svn")

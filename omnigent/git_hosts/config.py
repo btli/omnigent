@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from omnigent.credential_sources import parse_credential_source
-from omnigent.git_hosts import available_providers, get_git_host
+from omnigent.git_hosts import provider_spec
 from omnigent.git_hosts.base import HostConfig
 
 _REQUIRED = ("id", "provider", "web_host", "credential_source")
@@ -58,11 +58,11 @@ def load_git_hosts(raw: object) -> tuple[HostConfig, ...]:
         for key in _REQUIRED:
             _require_str(entry, key, index)
         provider = entry["provider"]
-        if provider not in available_providers():
-            raise ValueError(
-                f"git_hosts[{index}].provider: unknown git host provider {provider!r}; "
-                f"known: {available_providers()}"
-            )
+        try:
+            spec = provider_spec(provider)
+        except ValueError as exc:
+            # Re-raise with the config-entry index so the operator can find it.
+            raise ValueError(f"git_hosts[{index}].provider: {exc}") from None
         web_host = _require_str(entry, "web_host", index).lower()
         if any(c in web_host for c in ":/@") or any(c.isspace() for c in web_host):
             raise ValueError(
@@ -76,7 +76,7 @@ def load_git_hosts(raw: object) -> tuple[HostConfig, ...]:
         api_base_raw = entry.get("api_base")
         if api_base_raw is not None and (not isinstance(api_base_raw, str) or not api_base_raw):
             raise ValueError(f"git_hosts[{index}].api_base must be a non-empty string when set")
-        api_base = api_base_raw or get_git_host(provider).default_api_base(web_host)
+        api_base = api_base_raw or spec.default_api_base(web_host)
 
         ssh_port_raw = entry.get("ssh_port")
         if ssh_port_raw is not None and (
