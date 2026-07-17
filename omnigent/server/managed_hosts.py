@@ -879,6 +879,21 @@ def reauthorize_relaunch_binding(
     return repo
 
 
+def _require_https_clone_url(repo: RepoWorkspace) -> None:
+    """A credentialed clone must ride HTTPS.
+
+    The delivered pair feeds git's HTTP credential helper and the runner's
+    HTTPS rewrite rule; git ignores both for SSH transport, so a credentialed
+    SSH/scp-style (or cleartext http) URL would silently clone under ambient
+    identity instead of the selected credential. Refuse rather than bypass.
+    """
+    if not repo.url.lower().startswith("https://"):
+        raise ValueError(
+            "this session's git credential requires an HTTPS clone URL; "
+            "SSH and non-HTTPS remotes cannot use a stored credential yet"
+        )
+
+
 def _build_clone_env(
     repo: RepoWorkspace | None,
     *,
@@ -920,6 +935,7 @@ def _build_clone_env(
             raise ValueError(
                 "the git credential bound to this session cannot be resolved at launch"
             )
+        _require_https_clone_url(repo)
         # resolve_lease scopes by current_workspace_id() ambiently (see
         # GitCredentialStore). The single-tenant default (workspace 0)
         # resolves correctly with no scope wrapper here; a multi-tenant
@@ -942,6 +958,7 @@ def _build_clone_env(
         return {"GIT_TOKEN": lease.token, "GIT_USERNAME": username}
     if repo.credential_source is None:
         return None
+    _require_https_clone_url(repo)
     token = resolve_credential(repo.credential_source, parent_env=os.environ.copy())
     return {"GIT_TOKEN": token, "GIT_USERNAME": username}
 

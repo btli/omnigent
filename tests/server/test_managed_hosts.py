@@ -1179,6 +1179,77 @@ def test_build_clone_env_github_default_unchanged() -> None:
     assert _build_clone_env(None) is None
 
 
+def test_build_clone_env_refuses_ssh_url_for_bound_slot(tmp_path) -> None:
+    """A bound user slot with a non-HTTPS clone URL fails closed at launch."""
+    store = _cred_store(tmp_path)
+    slot = store.create(
+        owner_user_id="alice",
+        host_id="acme",
+        provider="forgejo",
+        label="work",
+        username=None,
+        token="SLOT_TOKEN",
+    )
+    repo = RepoWorkspace(
+        url="ssh://git@forge.example/org/repo.git",
+        branch=None,
+        repo_name="repo",
+        host_id="acme",
+        credential_slot_id=slot.id,
+    )
+    with pytest.raises(ValueError, match="requires an HTTPS clone URL"):
+        _build_clone_env(repo, owner="alice", credential_store=store)
+
+
+def test_build_clone_env_refuses_scp_like_url_for_operator_source() -> None:
+    """An operator credential_source with a git@ URL fails closed at launch."""
+    repo = RepoWorkspace(
+        url="git@forge.example:org/repo.git",
+        branch=None,
+        repo_name="repo",
+        canonical_host="git.acme.com",
+        provider="forgejo",
+        credential_source="env:ACME_TOKEN",
+        clone_username="oauth2",
+    )
+    with pytest.raises(ValueError, match="requires an HTTPS clone URL"):
+        _build_clone_env(repo, owner=None, credential_store=None)
+
+
+def test_build_clone_env_refuses_plain_http_for_bound_slot(tmp_path) -> None:
+    """Plain http would send the token in cleartext — refused like SSH."""
+    store = _cred_store(tmp_path)
+    slot = store.create(
+        owner_user_id="alice",
+        host_id="acme",
+        provider="forgejo",
+        label="work",
+        username=None,
+        token="SLOT_TOKEN",
+    )
+    repo = RepoWorkspace(
+        url="http://forge.example/org/repo.git",
+        branch=None,
+        repo_name="repo",
+        host_id="acme",
+        credential_slot_id=slot.id,
+    )
+    with pytest.raises(ValueError, match="requires an HTTPS clone URL"):
+        _build_clone_env(repo, owner="alice", credential_store=store)
+
+
+def test_build_clone_env_ssh_url_without_credential_is_unaffected() -> None:
+    """No slot + no operator source: SSH URLs keep today's None (ambient) path."""
+    repo = RepoWorkspace(
+        url="ssh://git@forge.example/org/repo.git",
+        branch=None,
+        repo_name="repo",
+        credential_slot_id=None,
+        credential_source=None,
+    )
+    assert _build_clone_env(repo, owner=None, credential_store=None) is None
+
+
 # ── relaunch binding: persistence + re-authorization ────────
 
 
