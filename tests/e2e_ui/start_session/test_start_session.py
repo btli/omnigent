@@ -2211,6 +2211,7 @@ def test_start_session_project_prefill(seeded_session: tuple[str, str]) -> None:
 
 async def _drive_project_prefill(base_url: str, session_id: str) -> None:
     project = "E2E Prefill"
+    project_id = "proj_e2e_prefill"
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
         page = await browser.new_page()
@@ -2221,11 +2222,33 @@ async def _drive_project_prefill(base_url: str, session_id: str) -> None:
             )
 
             async def handle_projects(route: Route) -> None:
-                # One project so exactly one folder (and pencil) renders.
+                # One first-class project so exactly one folder (and pencil)
+                # renders.
                 await route.fulfill(
                     status=200,
                     content_type="application/json",
-                    body=json.dumps([project]),
+                    body=json.dumps([{"id": project_id, "name": project, "archived_at": None}]),
+                )
+
+            async def handle_resolved_defaults(route: Route) -> None:
+                # A defaults-less project resolves to the server baseline —
+                # every override null — so the composer prefills from the
+                # project's newest session instead.
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "host_type": "external",
+                            "host_id": None,
+                            "workspace": None,
+                            "git": None,
+                            "harness_override": None,
+                            "model_override": None,
+                            "reasoning_effort": None,
+                            "row_version": 1,
+                        }
+                    ),
                 )
 
             async def handle_worktrees(route: Route) -> None:
@@ -2258,10 +2281,10 @@ async def _drive_project_prefill(base_url: str, session_id: str) -> None:
 
             async def handle_newest_session(route: Route) -> None:
                 # The prefill's newest-session lookup (``GET /v1/sessions``
-                # with ``?project=``): a session that ran in a linked worktree
-                # of /work/repo on the stubbed host. Everything else falls
-                # back to the common sessions handler.
-                if route.request.method == "GET" and "project=" in route.request.url:
+                # with ``?project_id=``): a session that ran in a linked
+                # worktree of /work/repo on the stubbed host. Everything else
+                # falls back to the common sessions handler.
+                if route.request.method == "GET" and "project_id=" in route.request.url:
                     await route.fulfill(
                         status=200,
                         content_type="application/json",
@@ -2274,7 +2297,7 @@ async def _drive_project_prefill(base_url: str, session_id: str) -> None:
                                         "title": "Previous project session",
                                         "created_at": 0,
                                         "updated_at": 9,
-                                        "labels": {"omni_project": project},
+                                        "project_id": project_id,
                                         "host_id": _HOST_ID,
                                         "workspace": "/work/repo-worktrees/feature-x",
                                         "git_branch": "feature/x",
@@ -2291,7 +2314,11 @@ async def _drive_project_prefill(base_url: str, session_id: str) -> None:
                     await route.fallback()
 
             # Registered after the common routes so they win for their URLs.
-            await page.route("**/v1/sessions/projects*", handle_projects)
+            await page.route(
+                re.compile(r"/v1/projects/[^/]+/defaults/resolved$"),
+                handle_resolved_defaults,
+            )
+            await page.route(re.compile(r"/v1/projects(\?[^/]*)?$"), handle_projects)
             await page.route(_WORKTREES_RE, handle_worktrees)
             await page.route(_SESSIONS_RE, handle_newest_session)
 

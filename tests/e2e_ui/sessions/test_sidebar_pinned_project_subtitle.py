@@ -1,18 +1,17 @@
-"""Browser e2e for the pinned-row project hover flyout.
+"""Browser e2e for the pinned-row project subtitle.
 
 Pinning lifts a session out of its project folder into the flat "Pinned"
 section (see ``test_sidebar_pin_unpin`` / ``test_sidebar_projects``), which
 drops the visual cue for which project the session came from. To restore it,
-hovering a pinned, project-owned row opens a flyout
-(``data-testid="pinned-project-flyout"``) showing the session title plus a
-folder icon and the project name (``ConversationRow`` / ``HoverCard`` in
-Sidebar.tsx).
+a pinned, project-owned row renders a subtitle
+(``data-testid="pinned-project-subtitle"``) with a folder icon and the
+project name (``ConversationRow`` in Sidebar.tsx) — visible on every
+viewport, no hover needed.
 
 This drives the real chain the ``Sidebar`` unit tests mock out: the live
-``PATCH /v1/sessions/{id}`` project move → the ``omni_project`` label on the
-refreshed ``GET /v1/sessions`` list → the pinned peel keeping the label →
-the hover flyout resolving the project name from it. A browser hover (which
-jsdom can't do) is what actually opens the Radix HoverCard here.
+create-project + move flow → ``project_id`` on the refreshed
+``GET /v1/sessions`` list → the pinned peel keeping the membership → the
+subtitle resolving the project name from the owner's project list.
 """
 
 from __future__ import annotations
@@ -57,17 +56,17 @@ def _move_to_new_project(page: Page, row: Locator, name: str) -> None:
     new_input.press("Enter")
 
 
-def test_pinned_project_row_hover_shows_project_name(
+def test_pinned_project_row_shows_project_subtitle(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Hovering a pinned, project-owned row surfaces its project name.
+    """A pinned, project-owned row names its project in a visible subtitle.
 
     Files the session into a fresh project, pins it (which lifts it into the
-    flat "Pinned" section, away from the project folder), then hovers the
-    pinned row and asserts the flyout shows the session title plus the project
-    name. Catches a regression where the pinned peel drops the project label or
-    the flyout stops resolving it.
+    flat "Pinned" section, away from the project folder), then asserts the
+    pinned row carries the project-name subtitle. Catches a regression where
+    the pinned peel drops the membership or the subtitle stops resolving the
+    project's display name.
     """
     base_url, session_id = seeded_session
     title = f"e2e-flyout-{uuid.uuid4().hex[:8]}"
@@ -99,10 +98,9 @@ def test_pinned_project_row_hover_shows_project_name(
     )
     expect(pinned_row).to_be_visible()
 
-    # Hovering the pinned row opens the project flyout with the folder icon +
-    # project name and the session title.
-    pinned_row.get_by_role("link").hover()
-    flyout = page.get_by_test_id("pinned-project-flyout")
-    expect(flyout).to_be_visible()
-    expect(flyout).to_contain_text(project)
-    expect(flyout).to_contain_text(title)
+    # The pinned row names its project in an always-visible subtitle — the
+    # folder no longer conveys it, and there is no hover-only affordance.
+    subtitle = pinned_row.get_by_test_id("pinned-project-subtitle")
+    expect(subtitle).to_be_visible()
+    expect(subtitle).to_contain_text(project)
+    expect(pinned_row).to_contain_text(title)

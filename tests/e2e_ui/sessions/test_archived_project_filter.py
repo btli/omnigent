@@ -31,7 +31,7 @@ from tests.e2e_ui.conftest import _build_hello_world_bundle
 _PROJECT_LABEL_KEY = "omni_project"
 
 # Server page size for ``GET /v1/sessions`` (see ``fetchConversationsPage``).
-_PAGE_SIZE = 30
+_PAGE_SIZE = 20
 
 
 def _seed_archived_session(base_url: str, *, title: str, project: str | None) -> str:
@@ -79,16 +79,14 @@ def _delete_sessions(base_url: str, session_ids: list[str]) -> None:
 def _pick_project(page: Page, option_name: str) -> None:
     """Open the Project picker and select an option.
 
-    :param option_name: A project name (matched via its
-        ``archived-project-option-<name>`` testid) or the literal
-        ``"All projects"`` reset option (matched by role, since the reset
-        item carries no per-project testid).
+    :param option_name: A project display name or the literal
+        ``"All projects"`` reset option. Options are matched by role +
+        accessible name: the per-project testids key on the opaque
+        first-class project id, while the name is the stable handle a
+        test seeded.
     """
     page.get_by_test_id("archived-project-filter").click()
-    if option_name == "All projects":
-        option = page.get_by_role("option", name="All projects", exact=True)
-    else:
-        option = page.get_by_test_id(f"archived-project-option-{option_name}")
+    option = page.get_by_role("option", name=option_name, exact=True)
     expect(option).to_be_visible()
     option.click()
 
@@ -132,9 +130,9 @@ def test_archived_project_filter_narrows_and_resets(
 
         # Both all-archived projects are offered as options.
         page.get_by_test_id("archived-project-filter").click()
-        expect(page.get_by_test_id(f"archived-project-option-{proj_a}")).to_be_visible()
-        expect(page.get_by_test_id(f"archived-project-option-{proj_b}")).to_be_visible()
-        page.get_by_test_id(f"archived-project-option-{proj_a}").click()
+        expect(page.get_by_role("option", name=proj_a, exact=True)).to_be_visible()
+        expect(page.get_by_role("option", name=proj_b, exact=True)).to_be_visible()
+        page.get_by_role("option", name=proj_a, exact=True).click()
 
         # Filtered to A: exactly A's rows; B's row is gone.
         expect(rows.filter(has_text=titles["a1"])).to_have_count(1)

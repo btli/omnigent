@@ -15,9 +15,9 @@ Determinism strategy — the sidebar is a pure function of the committed bundle
 plus ``page.route`` stubs and two extra pins, mirroring the landing:
 
 * The main session list (``GET /v1/sessions``) and the per-project list
-  (``?project=``) return fixed fixtures; ``GET /v1/sessions/projects`` names the
-  two folders. Every row carries ``comments_count: 0`` so no per-row comment
-  fetch mounts.
+  (``?project_id=``) return fixed fixtures; ``GET /v1/projects`` supplies the
+  two first-class folders. Every row carries ``comments_count: 0`` so no
+  per-row comment fetch mounts.
 * Row timestamps are relative ("2h ago") and would drift, so the clock is pinned
   with ``page.clock.set_fixed_time`` to a fixed "now" a known distance past each
   row's ``updated_at`` — the rendered pill text is then constant.
@@ -41,12 +41,13 @@ from playwright.sync_api import Page, expect
 _HOST_ID = "host_e2e"
 
 # Bare session list/scan — the flat sidebar list. Anchored so it matches
-# `/v1/sessions` (+ query) but NOT `/v1/sessions/projects` or the per-session
-# `/v1/sessions/{id}/...` sub-paths, so the routes never overlap.
-_SESSIONS_RE = re.compile(r"/v1/sessions(\?(?!.*\bproject=)[^/]*)?$")
-# Per-project list — `/v1/sessions?...&project=<name>` (folder contents).
-_PROJECT_SESSIONS_RE = re.compile(r"/v1/sessions\?[^/]*\bproject=")
-_PROJECTS_RE = re.compile(r"/v1/sessions/projects$")
+# `/v1/sessions` (+ query) but NOT the per-project `?project_id=` fetch or the
+# per-session `/v1/sessions/{id}/...` sub-paths, so the routes never overlap.
+_SESSIONS_RE = re.compile(r"/v1/sessions(\?(?!.*\bproject_id=)[^/]*)?$")
+# Per-project list — `/v1/sessions?...&project_id=<id>` (folder contents).
+_PROJECT_SESSIONS_RE = re.compile(r"/v1/sessions\?[^/]*\bproject_id=")
+# The first-class project list (bare collection only — never `/{id}/...`).
+_PROJECTS_RE = re.compile(r"/v1/projects(\?[^/]*)?$")
 _FILESYSTEM_RE = re.compile(r"/v1/hosts/[^/]+/filesystem")
 
 _AGENTS_BODY = {
@@ -75,7 +76,9 @@ _DAY = 86_400
 
 _PINNED_ID = "conv_pinned"
 _PROJECT_OPEN = "Moonshot"
+_PROJECT_OPEN_ID = "proj_moonshot"
 _PROJECT_EMPTY = "Fixit"
+_PROJECT_EMPTY_ID = "proj_fixit"
 
 
 def _row(
@@ -138,25 +141,31 @@ _SESSIONS_BODY = {
     "has_more": False,
 }
 
-# The open "Moonshot" folder's contents (its own `?project=` fetch). One nested
-# chat is enough to show the row indented under the folder name.
+# The open "Moonshot" folder's contents (its own `?project_id=` fetch). One
+# nested chat is enough to show the row indented under the folder name.
 _PROJECT_SESSIONS_BODY = {
     "object": "list",
     "data": [
-        _row(
-            "conv_proj_1",
-            "Spike on multi-model routing for the planner",
-            updated_at=_NOW_S - 4 * _HOUR,
-            labels={"omni_project": _PROJECT_OPEN},
-        ),
+        {
+            **_row(
+                "conv_proj_1",
+                "Spike on multi-model routing for the planner",
+                updated_at=_NOW_S - 4 * _HOUR,
+            ),
+            "project_id": _PROJECT_OPEN_ID,
+        },
     ],
     "first_id": "conv_proj_1",
     "last_id": "conv_proj_1",
     "has_more": False,
 }
 
-# Two project folders: one expanded (seeded below), one left collapsed/empty.
-_PROJECTS_BODY = [_PROJECT_OPEN, _PROJECT_EMPTY]
+# Two first-class project folders: one expanded (seeded below), one left
+# collapsed/empty.
+_PROJECTS_BODY = [
+    {"id": _PROJECT_OPEN_ID, "name": _PROJECT_OPEN, "archived_at": None},
+    {"id": _PROJECT_EMPTY_ID, "name": _PROJECT_EMPTY, "archived_at": None},
+]
 
 
 @pytest.mark.visual
@@ -214,7 +223,7 @@ def test_populated_sidebar_matches_baseline(
         f'window.localStorage.setItem("omnigent:pinned-conversation-ids",'
         f" {json.dumps(json.dumps([_PINNED_ID]))});"
         f'window.localStorage.setItem("omnigent:expanded-project-sections",'
-        f" {json.dumps(json.dumps([_PROJECT_OPEN]))});"
+        f" {json.dumps(json.dumps([_PROJECT_OPEN_ID]))});"
     )
 
     page.goto(f"{live_server}/")
@@ -224,7 +233,7 @@ def test_populated_sidebar_matches_baseline(
     expect(landing).to_be_visible(timeout=30_000)
     # Wait for the sidebar's populated regions to settle: the pinned row, both
     # project folders, and the nested project chat (the last row to arrive, via
-    # its own `?project=` fetch). Match row text — "Sessions" as a section-header
+    # its own `?project_id=` fetch). Match row text — "Sessions" as a section-header
     # name collides with the "Select sessions" button, so key off content.
     expect(page.get_by_text("Prototype the agent orchestration")).to_be_visible(timeout=30_000)
     expect(page.get_by_role("button", name=_PROJECT_OPEN, exact=True)).to_be_visible(
