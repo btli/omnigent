@@ -81,7 +81,7 @@ def test_managed_repo_path_allows_vectors() -> None:
 
 def test_managed_repo_path_predicate_is_shared_by_both_callers() -> None:
     from omnigent.inner.egress import proxy as egress_proxy
-    from omnigent.server.routes import sessions
+    from omnigent.server import managed_git_delivery
 
     assert egress_proxy.managed_repo_path_allows is managed_repo_path_allows
-    assert sessions.managed_repo_path_allows is managed_repo_path_allows
+    assert managed_git_delivery.managed_repo_path_allows is managed_repo_path_allows
