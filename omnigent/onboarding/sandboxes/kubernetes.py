@@ -682,19 +682,23 @@ def _redact_values(text: str, values: Iterable[str]) -> str:
     (immune to any depth of JSON re-escaping — the base64 alphabet has no
     JSON-special characters); Python's JSON-escaped form; and Go's canonical
     one-level form (raw UTF-8, ``<``, ``>``, ``&``, ``\\u2028``, and ``\\u2029``
-    escaped). Every needle of every value is then replaced longest-first, so a
-    shorter needle can never redact-mask a longer one it is a substring of —
-    across values AND representations (a short value's literal must not corrupt a
-    long value's escaped/base64 needle before it matches).
+    escaped). Every needle of every value is then replaced in a single left-to-right
+    pass over the original text (a longest-first alternation), so a shorter needle
+    can never mask a longer one it is a substring of — across values AND
+    representations — and a replacement can never synthesize a match of another
+    needle.
 
     Accepted residuals — each needs a reflector that already holds the Secret, so
     this is a backstop against accidental reflection, not a malicious admission
     controller: a value echoed as pre-serialized JSON through an extra layer
     (double-escaped backslashes) evades the non-base64 needles, though not the
-    base64 one; and a value carrying lone surrogates (an ``env:`` credential
-    decoded from non-UTF-8 bytes via ``surrogateescape``) whose base64/JSON echo
-    the apiserver normalized to U+FFFD is matched only in its literal (in-process)
-    and ``surrogatepass`` forms, not the normalized one. Surrogate values are
+    base64 one; a value carrying lone surrogates (an ``env:`` credential decoded
+    from non-UTF-8 bytes via ``surrogateescape``) whose base64/JSON echo the
+    apiserver normalized to U+FFFD is matched only in its literal (in-process) and
+    ``surrogatepass`` forms, not the normalized one; and two distinct credentials
+    whose needles partially overlap in the text (share a boundary character) leave
+    a fragment of one, as a single pass masks only the needle starting first at the
+    shared position. Surrogate values are
     base64-encoded with ``surrogatepass`` rather than strict UTF-8 so needle
     derivation never raises — a raise here would bypass the callers' ``from None``
     and re-expose the cause.
@@ -725,12 +729,15 @@ def _redact_values(text: str, values: Iterable[str]) -> str:
             .replace(" ", "\\u2029")
         )
         needles.add(go_escaped)
-    # Longest needle first so a shorter needle can never redact-mask a longer one
-    # it is a substring of — across values AND representations; the (len, text)
-    # key breaks ties deterministically.
-    for needle in sorted((n for n in needles if n), key=lambda n: (len(n), n), reverse=True):
-        text = text.replace(needle, "***")
-    return text
+    # Replace every needle in ONE left-to-right pass over the original text: a
+    # longest-first alternation (a longer needle wins at each position), the
+    # (len, text) key breaking ties deterministically. A single pass — rather than
+    # sequential str.replace — means a replacement can neither synthesize a match
+    # of another needle nor let overlapping needles mask by input order.
+    ordered = sorted((n for n in needles if n), key=lambda n: (len(n), n), reverse=True)
+    if not ordered:
+        return text
+    return re.sub("|".join(re.escape(n) for n in ordered), "***", text)
 
 
 def _format_api_error(action: str, name: str, exc: k8s_client.ApiException) -> str:

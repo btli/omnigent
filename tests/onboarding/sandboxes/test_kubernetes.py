@@ -638,6 +638,10 @@ def test_redact_values_surrogate_safe_and_longest_first() -> None:
     # of the JSON escape of "é") would mask the token's base64/escaped needle.
     assert k8s._redact_values("8J+YgA==", ["😀", "Yg"]) == "***"
     assert k8s._redact_values("\\u00e9", ["é", "u00"]) == "***"
+    # Single pass over the original text: replacing base64("😀") must not synthesize
+    # a "***X" match (a credential value that literally contains the marker) and
+    # over-redact the legitimate trailing "X".
+    assert k8s._redact_values("8J+YgA==X", ["***X", "😀"]) == "***X"
 
 
 def test_load_core_pins_k8s_rest_logger_to_suppress_response_bodies(
