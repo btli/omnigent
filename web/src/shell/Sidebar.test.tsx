@@ -805,9 +805,12 @@ describe("Sidebar project sections", () => {
     const pinnedSection = screen.getByText("Pinned").closest("section")!;
     expect(within(pinnedSection).getByText("conv_pinned")).toBeInTheDocument();
 
-    // The project folder keeps only its non-pinned session.
-    fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
-    const projectSection = screen.getByText("Customer X").closest("section")!;
+    // The project folder keeps only its non-pinned session. Query the folder by
+    // its header button — the pinned row now also shows "Customer X" as its
+    // project subtitle, so a bare getByText("Customer X") would be ambiguous.
+    const projectHeader = screen.getByRole("button", { name: /^Customer X/ });
+    fireEvent.click(projectHeader);
+    const projectSection = projectHeader.closest("section")!;
     expect(within(projectSection).getByText("conv_plain")).toBeInTheDocument();
     expect(within(projectSection).queryByText("conv_pinned")).toBeNull();
   });

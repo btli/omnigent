@@ -351,13 +351,13 @@ describe("double-click to rename", () => {
   });
 });
 
-describe("pinned row project flyout", () => {
+describe("pinned row project subtitle", () => {
   // Pinning lifts a session out of its project folder into the flat "Pinned"
-  // section, so the folder no longer conveys which project it came from. The
-  // hover flyout restores that cue: title + folder icon + project name. It
-  // opens on focus/hover — fire focus on the row link and await the portal.
+  // section, so the folder no longer conveys which project it came from. A
+  // subtitle under the row restores that cue — a folder icon + project name —
+  // and is not hover-gated, so it shows on every viewport.
 
-  it("shows the project name in the flyout for a pinned, project-owned row", async () => {
+  it("shows the project name as a subtitle for a pinned, project-owned row", () => {
     // Seed the pin so the row lifts into the always-expanded Pinned section
     // (a project-owned row otherwise sits inside a collapsed project folder).
     localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_1"]));
@@ -366,33 +366,34 @@ describe("pinned row project flyout", () => {
     renderSidebar();
     expect(screen.getByText("Pinned")).toBeInTheDocument();
 
-    // Focus opens the HoverCard (onFocus is one of its open triggers); the
-    // content is portalled, so query the whole document after the open delay.
-    fireEvent.focus(screen.getByRole("link", { name: /My Session/ }));
-    const flyout = await screen.findByTestId("pinned-project-flyout");
-    expect(within(flyout).getByText("Moonshot")).toBeInTheDocument();
-    expect(within(flyout).getByText("My Session")).toBeInTheDocument();
+    const subtitle = screen.getByTestId("pinned-project-subtitle");
+    expect(within(subtitle).getByText("Moonshot")).toBeInTheDocument();
   });
 
-  it("renders no project flyout for a pinned row with no project", () => {
-    // No project label → nothing to surface, so the row keeps its plain native
-    // title tooltip and never mounts a hover-card trigger.
+  it("renders no project subtitle for a pinned row with no project", () => {
     localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_1"]));
-    mockConversations([{ ...CONV, labels: {} }]);
+    mockConversations([{ ...CONV }]);
     renderSidebar();
     expect(screen.getByText("Pinned")).toBeInTheDocument();
 
-    const row = screen.getByRole("link", { name: /My Session/ });
-    expect(row).not.toHaveAttribute("data-slot", "hover-card-trigger");
-    fireEvent.focus(row);
-    expect(screen.queryByTestId("pinned-project-flyout")).toBeNull();
+    expect(screen.queryByTestId("pinned-project-subtitle")).toBeNull();
   });
 
-  it("disables the flyout on a mobile viewport, keeping the native title", () => {
-    // Mobile has no real hover, so the flyout is gated off there: a tap that
-    // navigates must not also open (and strand) a HoverCard over the chat. The
-    // row falls back to the plain link path — no hover-card trigger, native
-    // title restored — even though it IS pinned + project-owned.
+  it("omits the subtitle when the project name is unknown, never showing a raw id", () => {
+    // A shared pinned session's project isn't in the viewer's owner-scoped
+    // project list (same shape as the list still loading) — the subtitle must
+    // be omitted rather than render the opaque project id.
+    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_1"]));
+    mocks.projects = [];
+    mockConversations([{ ...CONV, project_id: "proj_unknown" }]);
+    renderSidebar();
+    expect(screen.getByText("Pinned")).toBeInTheDocument();
+
+    expect(screen.queryByTestId("pinned-project-subtitle")).toBeNull();
+    expect(screen.queryByText("proj_unknown")).toBeNull();
+  });
+
+  it("shows the project subtitle on a mobile viewport too", () => {
     mocks.isMobile = true;
     localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_1"]));
     mocks.projects = [{ id: "proj_moon", name: "Moonshot" }];
@@ -400,13 +401,8 @@ describe("pinned row project flyout", () => {
     renderSidebar();
     expect(screen.getByText("Pinned")).toBeInTheDocument();
 
-    const row = screen.getByRole("link", { name: /My Session/ });
-    // No hover-card trigger is mounted, and the native title tooltip is kept.
-    expect(row).not.toHaveAttribute("data-slot", "hover-card-trigger");
-    expect(row).toHaveAttribute("title", "My Session");
-    // Focusing the row opens nothing — the flyout never mounts on mobile.
-    fireEvent.focus(row);
-    expect(screen.queryByTestId("pinned-project-flyout")).toBeNull();
+    const subtitle = screen.getByTestId("pinned-project-subtitle");
+    expect(within(subtitle).getByText("Moonshot")).toBeInTheDocument();
   });
 });
 

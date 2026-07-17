@@ -1,16 +1,12 @@
 // Layout regression tests for the project-folder header's icon/chevron.
-// Desired behaviour: a project folder shows its folder icon by default and,
-// on desktop hover/focus, swaps that folder icon for a chevron *in place*
-// (rather than trailing the name). On mobile (no hover) the folder icon
-// stays put and the trailing chevron is shown instead. Plain section headers
-// with no leading icon keep the old behaviour: a trailing chevron revealed on
-// desktop hover/focus. These tests lock that structure in:
-//   1. The project header renders the folder icon and an overlaid chevron in
-//      the icon slot; the folder fades out and the chevron fades in on
-//      desktop hover/focus.
-//   2. The project header's trailing chevron is mobile-only (`md:hidden`).
-//   3. A header without a leading icon (the "Projects" group header) keeps a
-//      hover-revealed trailing chevron and does NOT swap an icon.
+// Desired behaviour: a project folder shows its folder icon (open when
+// expanded, closed when collapsed) and NO chevron — the folder icon itself is
+// the expand/collapse cue, so clicking the folder toggles it. Plain section
+// headers with no leading icon keep a trailing chevron revealed on desktop
+// hover/focus (always shown on mobile). These tests lock that structure in:
+//   1. A project header renders the folder icon and no chevron.
+//   2. A header without a leading icon (the "Projects" group header) keeps a
+//      hover-revealed trailing chevron and renders no folder icon.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen } from "@testing-library/react";
@@ -114,47 +110,18 @@ afterEach(() => {
 });
 
 describe("project folder header icon/chevron", () => {
-  it("shows the folder icon and overlays a chevron that swaps on desktop hover/focus", () => {
+  it("shows the folder icon and no chevron on a project folder header", () => {
     renderSidebar();
     const header = headerButton("My Project");
 
-    const folder = header.querySelector(".lucide-folder") as HTMLElement;
-    expect(folder).not.toBeNull();
+    // The folder icon is present (open/closed folder conveys expand state).
+    expect(header.querySelector(".lucide-folder")).not.toBeNull();
 
-    // The folder icon sits in a wrapper that fades out on desktop hover/focus.
-    const folderWrapper = folder.parentElement as HTMLElement;
-    expect(classOf(folderWrapper)).toMatch(/md:group-hover:opacity-0/);
-    expect(classOf(folderWrapper)).toMatch(/md:group-focus-visible:opacity-0/);
-
-    // A chevron shares the icon slot (absolute), hidden by default and fading
-    // in on desktop hover/focus so it takes the folder's place.
-    const chevrons = Array.from(header.querySelectorAll(".lucide-chevron-right"));
-    const swap = chevrons.find((c) => classOf(c).includes("absolute")) as HTMLElement;
-    expect(swap).toBeTruthy();
-    expect(classOf(swap)).toMatch(/opacity-0/);
-    expect(classOf(swap)).toMatch(/md:group-hover:opacity-100/);
-    expect(classOf(swap)).toMatch(/md:group-focus-visible:opacity-100/);
-
-    // The swap chevron lives in the same icon slot as the folder (not trailing
-    // the title), so it overlays the folder position.
-    expect(swap.parentElement).toBe(folderWrapper.parentElement);
+    // No chevron on a project folder — clicking the folder toggles it.
+    expect(header.querySelectorAll(".lucide-chevron-right")).toHaveLength(0);
   });
 
-  it("keeps the project header's trailing chevron mobile-only", () => {
-    renderSidebar();
-    const header = headerButton("My Project");
-
-    const chevrons = Array.from(header.querySelectorAll(".lucide-chevron-right"));
-    // Two chevrons: the in-slot swap (absolute) and the trailing one.
-    const trailing = chevrons.find((c) => !classOf(c).includes("absolute")) as HTMLElement;
-    expect(trailing).toBeTruthy();
-    // Trailing chevron is hidden on desktop (the swap replaces it there) and
-    // shown on mobile where there's no hover.
-    expect(classOf(trailing)).toMatch(/md:hidden/);
-    expect(classOf(trailing)).not.toMatch(/md:group-hover:opacity-100/);
-  });
-
-  it("leaves iconless section headers with a hover-revealed trailing chevron and no swap", () => {
+  it("leaves iconless section headers with a hover-revealed trailing chevron and no folder icon", () => {
     renderSidebar();
     // The "Projects" group header carries no leading icon.
     const header = headerButton("Projects");
@@ -162,8 +129,7 @@ describe("project folder header icon/chevron", () => {
     expect(header.querySelector(".lucide-folder")).toBeNull();
 
     const chevrons = Array.from(header.querySelectorAll(".lucide-chevron-right"));
-    // Exactly one chevron (no in-slot swap), and it is the classic
-    // desktop-hover-revealed trailing caret — not mobile-only.
+    // Exactly one chevron: the classic desktop-hover-revealed trailing caret.
     expect(chevrons).toHaveLength(1);
     const [chevron] = chevrons;
     expect(classOf(chevron)).not.toMatch(/\babsolute\b/);

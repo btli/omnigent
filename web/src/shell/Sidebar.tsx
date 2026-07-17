@@ -81,7 +81,6 @@ import {
   ContextMenuSubTrigger,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
-import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -1758,8 +1757,10 @@ function projectMarkerState(conversations: Conversation[]): SessionState | null 
 }
 
 // The shared collapsible header used by every sidebar section and section
-// group, so they all align and animate identically (icon · title · marker ·
-// hover-chevron). Headers carry no count badge.
+// group. Section headers (no leading icon) show a chevron after the title that
+// rotates on expand; project-folder headers pass a folder icon and show no
+// chevron — the open vs closed folder icon is their expand/collapse cue.
+// Headers carry no count badge.
 function SectionHeader({
   title,
   icon,
@@ -1786,37 +1787,21 @@ function SectionHeader({
         onClick={onToggleCollapsed}
         className="group flex w-full items-center gap-1 rounded-md px-2 py-1 text-left text-sm text-muted-foreground transition-colors hover:text-foreground"
       >
-        {icon ? (
-          // Headers with a leading icon (project folders) swap the folder for a
-          // chevron on desktop hover/focus, so the caret takes the icon's place
-          // rather than trailing the name. Mobile (no hover) keeps the folder
-          // icon and shows the trailing chevron below.
-          <span className="relative flex size-4 shrink-0 items-center justify-center">
-            <span className="flex md:transition-opacity md:group-hover:opacity-0 md:group-focus-visible:opacity-0">
-              {icon}
-            </span>
-            <ChevronRightIcon
-              className={cn(
-                "absolute size-3.5 opacity-0 transition-[transform,opacity]",
-                !collapsed && "rotate-90",
-                "hidden md:flex md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
-              )}
-            />
-          </span>
-        ) : null}
+        {icon}
         <span className="min-w-0 truncate">{title}</span>
-        {/* Trailing chevron, rotating on expand. Headers without a leading icon
-            reveal it on desktop hover/focus; icon headers show it only on mobile
-            (no hover) since desktop swaps the folder for the chevron above. */}
-        <ChevronRightIcon
-          className={cn(
-            "size-3.5 shrink-0 transition-[transform,opacity]",
-            !collapsed && "rotate-90",
-            icon
-              ? "md:hidden"
-              : "md:opacity-0 md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
-          )}
-        />
+        {/* Section headers (no leading icon) get a chevron after the name that
+            rotates on expand — revealed on desktop hover/focus, always shown on
+            mobile. Project folders pass a folder icon and intentionally have no
+            chevron: the open vs closed folder icon is the expand/collapse cue. */}
+        {!icon && (
+          <ChevronRightIcon
+            className={cn(
+              "size-3.5 shrink-0 transition-[transform,opacity]",
+              !collapsed && "rotate-90",
+              "md:opacity-0 md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
+            )}
+          />
+        )}
         {/* A hidden row inside this collapsed section carries a marker — surface
             the exact same badge a row would show, pinned to the right edge. */}
         {collapsed && marker && (
@@ -2411,10 +2396,6 @@ function ConversationRow({
   const activeRootId = useActiveRootSessionId(activeId ?? null);
   const isActive = (activeRootId ?? activeId) === conversation.id;
   const navigate = useNavigate();
-  // Mobile has no real hover, so a tap that navigates would also trip the
-  // project flyout's HoverCard and leave it lingering over the chat. Gate the
-  // flyout off below the `md` breakpoint (see `projectFlyoutName`).
-  const isMobile = useIsMobileViewport();
   // Track the *live* active conversation id. Delete is fire-and-forget,
   // so the user can navigate to another conversation before the mutation
   // resolves — the onSuccess redirect must key off where they are now,
@@ -2487,16 +2468,15 @@ function ConversationRow({
   const currentProject = conversation.project_id ?? null;
   const { data: projects = [] } = useProjects();
   // Pinned sessions are lifted OUT of their project folder into the flat
-  // "Pinned" section, so the row no longer shows which project it belongs to.
-  // For those rows only, surface the project in a hover flyout. Non-pinned
-  // rows already sit inside their project folder, so they don't need it.
-  // Disabled on mobile: there's no hover, so a tap would open the HoverCard
-  // and leave it overlaying the chat after navigation. Forcing null there
-  // routes the row through the plain ContextMenu/link path and restores the
-  // native `title` tooltip.
-  const projectFlyoutName =
-    !isMobile && isPinned && currentProject
-      ? (projects.find((project) => project.id === currentProject)?.name ?? currentProject)
+  // "Pinned" section, so the row would otherwise not show which project it
+  // belongs to. Surface the project name as a subtitle under those rows;
+  // rows inside a folder already sit under the project header. Only a
+  // resolved display name renders — while the owner-scoped project list is
+  // loading, or for a shared session whose project isn't the viewer's, the
+  // subtitle is omitted rather than showing a raw project id.
+  const pinnedProjectName =
+    isPinned && currentProject
+      ? (projects.find((project) => project.id === currentProject)?.name ?? null)
       : null;
 
   const label = conversationDisplayLabel(conversation);
@@ -2732,9 +2712,7 @@ function ConversationRow({
         e.preventDefault();
         setIsEditing(true);
       }}
-      // The rich project flyout replaces the native tooltip on pinned,
-      // project-owned rows so the two don't stack; other rows keep it.
-      title={projectFlyoutName ? undefined : (conversation.title ?? conversation.id)}
+      title={conversation.title ?? conversation.id}
     >
       {/* Row 1: the session name. Status markers (working, needs-approval,
           unseen) render in the trailing time-marker slot below, replacing
@@ -2757,6 +2735,18 @@ function ConversationRow({
           <span className="truncate">{gitBranch}</span>
         </span>
       )}
+      {/* Project subtitle: pinned rows sit in the flat Pinned section, so name
+          the project they belong to here. */}
+      {pinnedProjectName !== null && (
+        <span
+          className="flex items-center gap-1 font-normal text-xs text-muted-foreground"
+          title={pinnedProjectName}
+          data-testid="pinned-project-subtitle"
+        >
+          <FolderIcon className="size-3 shrink-0" />
+          <span className="truncate">{pinnedProjectName}</span>
+        </span>
+      )}
     </Link>
   );
 
@@ -2772,42 +2762,9 @@ function ConversationRow({
           Suppressed in selection mode (bulk-select owns the row), where the
           bare link is rendered instead. ContextMenuTrigger preventDefaults the
           native contextmenu event, so right-click never navigates; asChild
-          merges its handler onto the Link, preserving left-click / double-click.
-          Pinned, project-owned rows nest a HoverCardTrigger around the Link so
-          hovering surfaces the project flyout — the trigger sits innermost so
-          both the context menu and the hover card keep their handlers/refs on
-          the Link. */}
+          merges its handler onto the Link, preserving left-click / double-click. */}
       {selectionMode ? (
-        projectFlyoutName ? (
-          <HoverCard openDelay={150} closeDelay={0}>
-            <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
-            <PinnedProjectFlyoutContent
-              title={conversation.title ?? conversation.id}
-              projectName={projectFlyoutName}
-            />
-          </HoverCard>
-        ) : (
-          rowLink
-        )
-      ) : projectFlyoutName ? (
-        <HoverCard openDelay={150} closeDelay={0}>
-          <ContextMenu>
-            <ContextMenuTrigger asChild>
-              <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
-            </ContextMenuTrigger>
-            <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-xs">
-              <ConversationMenuItems
-                components={contextBundle}
-                setMenuOpen={() => {}}
-                {...menuItemProps}
-              />
-            </ContextMenuContent>
-          </ContextMenu>
-          <PinnedProjectFlyoutContent
-            title={conversation.title ?? conversation.id}
-            projectName={projectFlyoutName}
-          />
-        </HoverCard>
+        rowLink
       ) : (
         <ContextMenu>
           <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
@@ -3046,33 +3003,6 @@ function ConversationRow({
  * Mirrors {@link AgentHoverCard}'s Cursor-style placement (right / top-aligned)
  * and the muted, small-icon foreground used elsewhere in the sidebar.
  */
-function PinnedProjectFlyoutContent({
-  title,
-  projectName,
-}: {
-  title: string;
-  projectName: string;
-}) {
-  return (
-    <HoverCardContent
-      side="right"
-      align="start"
-      sideOffset={8}
-      className="w-64"
-      data-testid="pinned-project-flyout"
-    >
-      {/* Titles have no length cap (server + rename input are unbounded), so
-          clamp to 3 wrapped lines to keep the card tidy — full text stays in
-          the DOM. */}
-      <p className="line-clamp-3 font-medium text-sm">{title}</p>
-      <p className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
-        <FolderIcon className="size-3.5 shrink-0" />
-        <span className="truncate">{projectName}</span>
-      </p>
-    </HoverCardContent>
-  );
-}
-
 /**
  * Status row shown in place of a conversation while its delete is in
  * flight (`isError === false`) or after it failed (`isError === true`).
