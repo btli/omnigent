@@ -2709,3 +2709,38 @@ async def test_launch_refused_for_unconfigured_harness_discards_pending_credenti
     )
     assert result.status == "failed"
     assert runner_id not in proc._pending_credentials
+
+
+def test_end_to_end_delivered_credential_reaches_runner_env_not_child() -> None:
+    """Full receiver chain: seal -> deliver -> cache -> runner env, child-stripped.
+
+    The trusted runner parent receives the unsealed token in its env; the
+    sandbox helper it spawns never inherits it (the strip boundary).
+    """
+    from omnigent.host.connect import _build_runner_env
+    from omnigent.host.sealing import generate_sealing_keypair
+    from omnigent.runner.identity import (
+        MANAGED_GIT_TOKEN_ENV_VAR,
+        strip_runner_auth_secrets,
+    )
+
+    proc = _make_host_process()
+    proc._sealing_keypair = generate_sealing_keypair()
+    proc._handle_deliver_credential(
+        _managed_deliver_frame(
+            proc._sealing_keypair.public_key_b64, runner_id="r1", generation=1, token="ghp_e2e"
+        )
+    )
+    runner_env = _build_runner_env(
+        {},
+        server_url="https://x",
+        runner_id="r1",
+        binding_token="bt",
+        workspace="/w",
+        parent_pid=1,
+        credential=proc._pending_credentials["r1"],
+    )
+    # The trusted runner receives the token...
+    assert runner_env[MANAGED_GIT_TOKEN_ENV_VAR] == "ghp_e2e"
+    # ...but the sandbox helper child never does.
+    assert MANAGED_GIT_TOKEN_ENV_VAR not in strip_runner_auth_secrets(runner_env)

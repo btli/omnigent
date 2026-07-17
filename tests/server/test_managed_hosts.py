@@ -2546,3 +2546,29 @@ async def test_deliver_credential_fails_closed_when_slot_revoked(tmp_path) -> No
     assert err is not None
     assert conn.sent == []
     assert "ghp_secret" not in err
+
+
+@pytest.mark.asyncio
+async def test_no_credential_delivery_for_github_default(tmp_path) -> None:
+    """Backward-compat: a github.com session with no bound slot delivers nothing.
+
+    The launch proceeds exactly as before the feature — no frame is sent and
+    no error is returned.
+    """
+    from omnigent.host.sealing import generate_sealing_keypair
+    from omnigent.server.routes.sessions import _deliver_credential_for_launch
+
+    repo = resolve_repo_workspace("https://github.com/org/repo", _GH_HOSTS)
+    conn = _FakeHostConn(generate_sealing_keypair().public_key_b64)
+    err = await _deliver_credential_for_launch(
+        host_conn=conn,
+        host_registry=_FakeRegistry(),
+        runner_id="r1",
+        launch_generation=1,
+        session_id="conv_1",
+        repo=repo,
+        owner="alice",
+        credential_store=_cred_store(tmp_path),
+    )
+    assert err is None
+    assert conn.sent == []  # no slot on the github default -> nothing delivered
