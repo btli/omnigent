@@ -148,6 +148,12 @@ def _managed_repo_path_allows(request_path: str, repo_path: str) -> bool:
     case-insensitive forge declines the swap (fail-closed, functional-only —
     git uses the clone URL's exact case).
     """
+    if not repo_path:
+        # An empty prefix would make every path "within" the repo — refuse
+        # rather than blanket-attach. Unreachable via the os_env install
+        # (it fails closed on an empty repo_path), but this is the security
+        # boundary; it must never depend on the caller for that.
+        return False
     target = request_path.split("?", 1)[0]
     if not _GIT_PATH_SAFE.match(target):
         return False

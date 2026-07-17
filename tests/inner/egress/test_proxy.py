@@ -2086,4 +2086,10 @@ def test_managed_repo_path_allows_vectors() -> None:
     assert not _managed_repo_path_allows("/team/proj/a\\b", base)  # any backslash
     # Prefix-not-boundary and cross-repo.
     assert not _managed_repo_path_allows("/team/project/info/refs", base)  # prefix, not boundary
+    assert not _managed_repo_path_allows("/team/proj2/info/refs", base)  # sibling sharing a prefix
     assert not _managed_repo_path_allows("/other/repo.git/info/refs", base)
+    # Trailing-dot / case variants decline (fail-closed, not a wrong-repo match).
+    assert not _managed_repo_path_allows("/team/proj./info", base)
+    assert not _managed_repo_path_allows("/team/PROJ/info", base)
+    # An empty repo prefix must never blanket-match every path.
+    assert not _managed_repo_path_allows("/anything/at/all", "")
