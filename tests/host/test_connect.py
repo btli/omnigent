@@ -2578,18 +2578,39 @@ def test_alive_runner_ids_reap_discards_cached_credential(tmp_path: Path) -> Non
 
 
 def test_build_runner_env_omits_managed_git_vars_without_credential() -> None:
-    from omnigent.host.connect import _build_runner_env
-    from omnigent.runner.identity import MANAGED_GIT_TOKEN_ENV_VAR
+    """Without a delivered credential the managed-git vars are absent — even
+    when the host env carries them and the owner's passthrough list names
+    them. This function is their sole writer; ambient values must never
+    impersonate a delivery."""
+    from omnigent.host.connect import RUNNER_ENV_PASSTHROUGH_ENV_VAR, _build_runner_env
+    from omnigent.runner.identity import (
+        MANAGED_GIT_AUTH_SCHEME_ENV_VAR,
+        MANAGED_GIT_CANONICAL_HOST_ENV_VAR,
+        MANAGED_GIT_REPO_PATH_ENV_VAR,
+        MANAGED_GIT_TOKEN_ENV_VAR,
+        MANAGED_GIT_USERNAME_ENV_VAR,
+    )
 
+    managed_vars = (
+        MANAGED_GIT_TOKEN_ENV_VAR,
+        MANAGED_GIT_CANONICAL_HOST_ENV_VAR,
+        MANAGED_GIT_REPO_PATH_ENV_VAR,
+        MANAGED_GIT_AUTH_SCHEME_ENV_VAR,
+        MANAGED_GIT_USERNAME_ENV_VAR,
+    )
+    base_env = dict.fromkeys(managed_vars, "ambient-junk")
+    # The passthrough door would forward these names without the scrub.
+    base_env[RUNNER_ENV_PASSTHROUGH_ENV_VAR] = ",".join(managed_vars)
     env = _build_runner_env(
-        {},
+        base_env,
         server_url="https://x",
         runner_id="r1",
         binding_token="bt",
         workspace="/w",
         parent_pid=1,
     )
-    assert MANAGED_GIT_TOKEN_ENV_VAR not in env
+    for name in managed_vars:
+        assert name not in env
 
 
 def test_build_runner_env_sets_managed_git_vars_with_credential() -> None:
@@ -2644,6 +2665,7 @@ async def test_launch_refused_for_bad_workspace_discards_pending_credential() ->
             proc._sealing_keypair.public_key_b64, runner_id=runner_id, generation=1
         )
     )
+    assert runner_id in proc._pending_credentials  # delivery really cached
     result = await proc._handle_launch(
         HostLaunchRunnerFrame(
             request_id="req_cred_ws",
@@ -2676,6 +2698,7 @@ async def test_launch_refused_for_unconfigured_harness_discards_pending_credenti
             proc._sealing_keypair.public_key_b64, runner_id=runner_id, generation=1
         )
     )
+    assert runner_id in proc._pending_credentials  # delivery really cached
     result = await proc._handle_launch(
         HostLaunchRunnerFrame(
             request_id="req_cred_harness",

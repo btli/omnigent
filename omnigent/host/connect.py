@@ -567,6 +567,18 @@ def _build_runner_env(
     env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] = binding_token
     env[RUNNER_WORKSPACE_ENV_VAR] = workspace
     env[RUNNER_PARENT_PID_ENV_VAR] = str(parent_pid)
+    # The managed-git vars are the delivery channel for a server-resolved
+    # credential: this function is their SOLE writer. Scrub any inherited
+    # value (owner passthrough today, a future allowlist-prefix broadening
+    # tomorrow) so ambient env can never impersonate a delivery.
+    for managed_var in (
+        MANAGED_GIT_TOKEN_ENV_VAR,
+        MANAGED_GIT_CANONICAL_HOST_ENV_VAR,
+        MANAGED_GIT_REPO_PATH_ENV_VAR,
+        MANAGED_GIT_AUTH_SCHEME_ENV_VAR,
+        MANAGED_GIT_USERNAME_ENV_VAR,
+    ):
+        env.pop(managed_var, None)
     if credential is not None:
         # The real token is a child-stripped secret (see
         # RUNNER_AUTH_SECRET_ENV_VARS); the rest is non-secret binding the
