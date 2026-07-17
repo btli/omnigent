@@ -12,12 +12,12 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
 
+from omnigent.credential_sources import CredentialSourceSpec
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.datamodel import (
     DEFAULT_BASIC_USERNAME,
     CredentialProxyEntry,
     CredentialProxySpec,
-    CredentialSourceSpec,
     OSEnvSandboxSpec,
     OSEnvSpec,
     TerminalEnvSpec,

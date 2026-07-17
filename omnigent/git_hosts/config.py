@@ -9,9 +9,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from omnigent.credential_sources import parse_credential_source
 from omnigent.git_hosts import available_providers, get_git_host
 from omnigent.git_hosts.base import HostConfig
-from omnigent.git_hosts.credentials import parse_credential_source
 
 _REQUIRED = ("id", "provider", "web_host", "credential_source")
 _ALLOWED_KEYS = frozenset(

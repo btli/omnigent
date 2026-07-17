@@ -16,15 +16,12 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.credential_sources import CredentialSourceSpec
 from omnigent.inner.credential_proxy import (
     SYNTHETIC_CREDENTIAL_PREFIX,
     prepare_credential_proxy_runtime,
 )
-from omnigent.inner.datamodel import (
-    CredentialProxyEntry,
-    CredentialProxySpec,
-    CredentialSourceSpec,
-)
+from omnigent.inner.datamodel import CredentialProxyEntry, CredentialProxySpec
 
 
 def _bearer_entry(

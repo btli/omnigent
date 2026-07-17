@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, TypeAlias
 
+from omnigent.credential_sources import CredentialSourceSpec
+
 # ---------------------------------------------------------------------------
 # Type aliases for JSON-shaped / heterogeneous-value boundaries
 # ---------------------------------------------------------------------------
@@ -372,29 +374,6 @@ class ExecutorSpec:
 # egress proxy's Basic emit path so the literal lives in exactly one
 # place.
 DEFAULT_BASIC_USERNAME = "x-access-token"
-
-
-@dataclass
-class CredentialSourceSpec:
-    """Where the parent process resolves a real secret from.
-
-    The secret is resolved in the *parent* (trusted) process and never
-    handed to the sandbox verbatim — only a synthetic placeholder is.
-
-    :param kind: Resolution mode, one of ``"env"``, ``"file"``, or
-        ``"command"``.
-    :param env: Environment-variable name carrying the secret when
-        ``kind="env"``, e.g. ``"OA_TEST_GITHUB_PAT"``.
-    :param path: File path to read when ``kind="file"`` (``~`` is
-        expanded), e.g. ``"~/.config/tokens/github_pat.txt"``.
-    :param command: Shell command whose stdout is the secret when
-        ``kind="command"``, e.g. ``"gh auth token"``.
-    """
-
-    kind: Literal["env", "file", "command"]
-    env: str | None = None
-    path: str | None = None
-    command: str | None = None
 
 
 @dataclass

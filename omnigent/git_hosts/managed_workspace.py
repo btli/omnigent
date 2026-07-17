@@ -10,8 +10,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from omnigent.credential_sources import resolve_credential
 from omnigent.git_hosts.base import ClonePlan, HostConfig
-from omnigent.git_hosts.credentials import resolve_credential
 from omnigent.git_hosts.github import DEFAULT_CLONE_USERNAME
 from omnigent.git_hosts.resolver import resolve_clone_plan
 

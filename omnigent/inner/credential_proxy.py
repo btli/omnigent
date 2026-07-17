@@ -27,16 +27,11 @@ This module owns two pieces:
 
 from __future__ import annotations
 
-import os
 import secrets
-import subprocess
 from dataclasses import dataclass, field
-from pathlib import Path
 
-from omnigent.inner.datamodel import (
-    CredentialProxySpec,
-    CredentialSourceSpec,
-)
+from omnigent.credential_sources import resolve_credential
+from omnigent.inner.datamodel import CredentialProxySpec
 
 # Prefix on every minted placeholder. The proxy uses it to recognise a
 # value as one of *its* synthetic credentials (so it can reject a
@@ -44,8 +39,6 @@ from omnigent.inner.datamodel import (
 # to be unmistakable and to use only base64url-safe characters so it
 # survives Basic-auth ``base64(user:pass)`` round-trips intact.
 SYNTHETIC_CREDENTIAL_PREFIX = "oa_cred_"
-# Timeout for a ``command:`` source subprocess, in seconds.
-_COMMAND_SOURCE_TIMEOUT_SECONDS = 30
 
 
 @dataclass
@@ -139,7 +132,7 @@ def prepare_credential_proxy_runtime(
         return runtime
 
     for entry in spec.entries:
-        real_secret = _resolve_secret(entry.source, parent_env=parent_env)
+        real_secret = resolve_credential(entry.source, parent_env=parent_env)
         # Mint a placeholder only when the entry injects an env var. The
         # placeholder is what the cross-host leak guard keys on; pure
         # swap-on-access entries put nothing in the sandbox, so there is
@@ -161,62 +154,6 @@ def prepare_credential_proxy_runtime(
             )
         )
     return runtime
-
-
-def _resolve_secret(source: CredentialSourceSpec, *, parent_env: dict[str, str]) -> str:
-    """
-    Resolve a real secret from an ``env`` / ``file`` / ``command`` source.
-
-    :param source: The parsed source descriptor.
-    :param parent_env: Parent process environment for ``env`` lookups and
-        as the environment for ``command`` execution.
-    :returns: The resolved secret with surrounding whitespace stripped.
-    :raises ValueError: If the source is misconfigured, missing, empty,
-        or (for ``command``) exits non-zero.
-    """
-    if source.kind == "env":
-        if not source.env:
-            raise ValueError("credential_proxy env source requires an 'env' name")
-        value = parent_env.get(source.env)
-        if value is None or not value.strip():
-            raise ValueError(f"credential_proxy env source {source.env!r} is missing or empty")
-        return value.strip()
-    if source.kind == "file":
-        if not source.path:
-            raise ValueError("credential_proxy file source requires a 'path'")
-        path = Path(os.path.expanduser(source.path))
-        if not path.is_file():
-            raise ValueError(f"credential_proxy file source does not exist: {path}")
-        value = path.read_text(encoding="utf-8").strip()
-        if not value:
-            raise ValueError(f"credential_proxy file source is empty: {path}")
-        return value
-    if source.kind == "command":
-        if not source.command:
-            raise ValueError("credential_proxy command source requires a 'command'")
-        # ``shell=True`` is intentional: the command is spec-author
-        # supplied (e.g. ``gh auth token``) and runs in the trusted
-        # parent process, never inside the sandbox.
-        completed = subprocess.run(
-            source.command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            env=parent_env,
-            timeout=_COMMAND_SOURCE_TIMEOUT_SECONDS,
-            check=False,
-        )
-        if completed.returncode != 0:
-            stderr = (completed.stderr or "").strip()
-            raise ValueError(
-                f"credential_proxy command source exited {completed.returncode}"
-                + (f": {stderr}" if stderr else "")
-            )
-        value = completed.stdout.strip()
-        if not value:
-            raise ValueError("credential_proxy command source produced empty stdout")
-        return value
-    raise ValueError(f"unsupported credential_proxy source kind: {source.kind!r}")
 
 
 __all__ = [
