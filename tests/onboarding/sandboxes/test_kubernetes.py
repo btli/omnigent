@@ -494,10 +494,16 @@ def test_clone_env_values_never_leave_secret_body(
 
 def test_clone_secret_create_failure_cleans_up(fake_core: _FakeCore) -> None:
     """Failure creating the SECOND secret still tears down the first + any Pod."""
-    fake_core.create_secret_errors = [None, _FakeApiException(status=500, reason="boom")]
+    fake_core.create_secret_errors = [
+        None,
+        _FakeApiException(
+            status=500, reason="boom", body="admission webhook denied: tok-secret-value leaked"
+        ),
+    ]
     with pytest.raises(click.ClickException) as excinfo:
         _start_with_clone(fake_core)
     assert "tok-secret-value" not in str(excinfo.value)
+    assert "***" in str(excinfo.value)
     assert "omnigent-pod-1-token" in fake_core.deleted_secrets
     assert "omnigent-pod-1-clone-cred" in fake_core.deleted_secrets
 

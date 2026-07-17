@@ -1244,12 +1244,13 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                                 _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
                             )
                         except (ApiException, HTTPError) as exc:
-                            click.echo(
+                            message = (
                                 f"  → warning: could not set owner reference on "
                                 f"'{clone_secret}' ({_api_reason(exc)}); the "
-                                "delete-after-init lifecycle still applies",
-                                err=True,
+                                "delete-after-init lifecycle still applies"
                             )
+                            message = _redact_values(message, clone_env.values())
+                            click.echo(message, err=True)
             except (ApiException, HTTPError) as exc:
                 # Tear down whatever landed (a created Secret, or a Pod the
                 # apiserver accepted before the response failed) so a failed
