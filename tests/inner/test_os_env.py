@@ -504,3 +504,76 @@ def test_apply_managed_git_credential_rejects_operator_host_conflict() -> None:
             token="ghp_tok",
         )
     assert "ghp_tok" not in str(exc.value)
+
+
+def test_read_managed_git_delivery_absent_and_full() -> None:
+    from omnigent.inner.os_env import _read_managed_git_delivery
+    from omnigent.runner.identity import (
+        MANAGED_GIT_AUTH_SCHEME_ENV_VAR,
+        MANAGED_GIT_CANONICAL_HOST_ENV_VAR,
+        MANAGED_GIT_REPO_PATH_ENV_VAR,
+        MANAGED_GIT_TOKEN_ENV_VAR,
+        MANAGED_GIT_USERNAME_ENV_VAR,
+    )
+
+    assert _read_managed_git_delivery({}) is None
+    full = _read_managed_git_delivery(
+        {
+            MANAGED_GIT_TOKEN_ENV_VAR: "ghp_tok",
+            MANAGED_GIT_CANONICAL_HOST_ENV_VAR: "git.acme.com",
+            MANAGED_GIT_REPO_PATH_ENV_VAR: "/team/proj",
+            MANAGED_GIT_AUTH_SCHEME_ENV_VAR: "basic",
+            MANAGED_GIT_USERNAME_ENV_VAR: "x-access-token",
+        }
+    )
+    assert full == ("git.acme.com", "/team/proj", "basic", "x-access-token", "ghp_tok")
+    # Scheme defaults to basic; username defaults to None.
+    minimal = _read_managed_git_delivery(
+        {
+            MANAGED_GIT_TOKEN_ENV_VAR: "ghp_tok",
+            MANAGED_GIT_CANONICAL_HOST_ENV_VAR: "git.acme.com",
+            MANAGED_GIT_REPO_PATH_ENV_VAR: "/team/proj",
+        }
+    )
+    assert minimal == ("git.acme.com", "/team/proj", "basic", None, "ghp_tok")
+
+
+def test_read_managed_git_delivery_fails_closed_on_partial_binding() -> None:
+    import pytest
+
+    from omnigent.inner.os_env import ManagedGitCredentialError, _read_managed_git_delivery
+    from omnigent.runner.identity import (
+        MANAGED_GIT_CANONICAL_HOST_ENV_VAR,
+        MANAGED_GIT_REPO_PATH_ENV_VAR,
+        MANAGED_GIT_TOKEN_ENV_VAR,
+    )
+
+    # A token without its binding is a delivery misconfig, not tokenless git.
+    for partial in (
+        {MANAGED_GIT_TOKEN_ENV_VAR: "ghp_tok"},
+        {
+            MANAGED_GIT_TOKEN_ENV_VAR: "ghp_tok",
+            MANAGED_GIT_CANONICAL_HOST_ENV_VAR: "git.acme.com",
+        },
+        {
+            MANAGED_GIT_TOKEN_ENV_VAR: "ghp_tok",
+            MANAGED_GIT_REPO_PATH_ENV_VAR: "/team/proj",
+        },
+    ):
+        with pytest.raises(ManagedGitCredentialError) as exc:
+            _read_managed_git_delivery(partial)
+        assert "ghp_tok" not in str(exc.value)
+
+
+def test_credential_rewrite_rule_repr_hides_real_secret() -> None:
+    from omnigent.inner.credential_proxy import CredentialRewriteRule
+
+    rule = CredentialRewriteRule(
+        host="git.acme.com",
+        scheme="basic",
+        real_secret="ghp_tok",
+        username="x-access-token",
+        repo_path="/team/proj",
+    )
+    assert "ghp_tok" not in repr(rule)
+    assert "git.acme.com" in repr(rule)

@@ -84,7 +84,10 @@ class CredentialRewriteRule:
 
     host: str
     scheme: str
-    real_secret: str
+    # The real upstream credential — kept out of the dataclass repr so a
+    # logged/raised rule never carries it (the synthetic placeholder is the
+    # only value meant to be visible).
+    real_secret: str = field(repr=False)
     synthetic: str | None = None
     username: str | None = None
     repo_path: str | None = None

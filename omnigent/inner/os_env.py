@@ -350,6 +350,40 @@ def _merge_managed_git_egress_rules(
     return merged
 
 
+def _read_managed_git_delivery(
+    environ: Mapping[str, str],
+) -> tuple[str, str, str, str | None, str] | None:
+    """Read a delivered managed-git credential from the runner environment.
+
+    The host writes the ``MANAGED_GIT_*`` vars together at spawn, so a token
+    without its host/repo binding is a delivery misconfig, not a state to
+    guess around — fail closed rather than degrade to tokenless git that
+    surfaces later as a confusing forge 401.
+
+    :param environ: The runner process environment, e.g. ``os.environ``.
+    :returns: ``(canonical_host, repo_path, auth_scheme, username, token)``,
+        or ``None`` when no credential was delivered.
+    :raises ManagedGitCredentialError: If the token is present but its
+        host/repo binding is missing (message names no token).
+    """
+    token = environ.get(MANAGED_GIT_TOKEN_ENV_VAR)
+    if not token:
+        return None
+    canonical_host = environ.get(MANAGED_GIT_CANONICAL_HOST_ENV_VAR, "")
+    repo_path = environ.get(MANAGED_GIT_REPO_PATH_ENV_VAR, "")
+    if not canonical_host or not repo_path:
+        raise ManagedGitCredentialError(
+            "managed git credential was delivered without its host/repo binding"
+        )
+    return (
+        canonical_host,
+        repo_path,
+        environ.get(MANAGED_GIT_AUTH_SCHEME_ENV_VAR, "basic"),
+        environ.get(MANAGED_GIT_USERNAME_ENV_VAR),
+        token,
+    )
+
+
 def _apply_managed_git_credential(
     runtime: CredentialProxyRuntime | None,
     egress_rules: list[str] | None,
@@ -579,23 +613,22 @@ class _HelperProcessClient:
             # process's env, stripped from the sandbox helper's env. Install a
             # repo-path-scoped swap rule + egress allow-rule here so the egress
             # proxy below picks them up; the token never enters the sandbox. A
-            # deterministic misconfig (no egress allowlist, or a host already
-            # bound) raises ManagedGitCredentialError, which surfaces as the
-            # session-failure reason via os_env's error path (finding #4/D).
-            managed_token = os.environ.get(MANAGED_GIT_TOKEN_ENV_VAR)
-            if managed_token:
-                canonical_host = os.environ.get(MANAGED_GIT_CANONICAL_HOST_ENV_VAR, "")
-                repo_path = os.environ.get(MANAGED_GIT_REPO_PATH_ENV_VAR, "")
-                if canonical_host and repo_path:
-                    credential_runtime, self._egress_rules = _apply_managed_git_credential(
-                        credential_runtime,
-                        self._egress_rules,
-                        canonical_host=canonical_host,
-                        repo_path=repo_path,
-                        auth_scheme=os.environ.get(MANAGED_GIT_AUTH_SCHEME_ENV_VAR, "basic"),
-                        username=os.environ.get(MANAGED_GIT_USERNAME_ENV_VAR),
-                        token=managed_token,
-                    )
+            # deterministic misconfig (no egress allowlist, a host already
+            # bound, or a token missing its binding) raises
+            # ManagedGitCredentialError, which surfaces as the session-failure
+            # reason via os_env's error path.
+            delivery = _read_managed_git_delivery(os.environ)
+            if delivery is not None:
+                canonical_host, repo_path, auth_scheme, username, managed_token = delivery
+                credential_runtime, self._egress_rules = _apply_managed_git_credential(
+                    credential_runtime,
+                    self._egress_rules,
+                    canonical_host=canonical_host,
+                    repo_path=repo_path,
+                    auth_scheme=auth_scheme,
+                    username=username,
+                    token=managed_token,
+                )
 
         # Start L7 egress proxy if rules are configured. The proxy
         # listens on a Unix socket in the scratch tmpdir; the helper
