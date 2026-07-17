@@ -590,6 +590,18 @@ class _HelperProcessClient:
 
         helper_cwd = self.cwd
         credential_runtime: CredentialProxyRuntime | None = None
+        # A server-delivered managed-git credential is consumable only by an
+        # active sandbox (the swap lives in the egress proxy). With
+        # sandbox.type: none the managed token is stripped from the helper env,
+        # so git would silently run on whatever ambient credentials the
+        # environment carries — refuse to start instead.
+        delivery = _read_managed_git_delivery(os.environ)
+        if delivery is not None and not sandbox.active:
+            raise ManagedGitCredentialError(
+                "a managed git credential was delivered but the sandbox is "
+                "inactive (sandbox.type: none); refusing to run git without "
+                "the credential swap"
+            )
         if sandbox.active:
             self._tmpdir = create_private_tmpdir()
             sandbox = with_additional_write_roots(sandbox, [self._tmpdir])
@@ -624,7 +636,6 @@ class _HelperProcessClient:
             # bound, or a token missing its binding) raises
             # ManagedGitCredentialError, which surfaces as the session-failure
             # reason via os_env's error path.
-            delivery = _read_managed_git_delivery(os.environ)
             if delivery is not None:
                 canonical_host, repo_path, auth_scheme, username, managed_token = delivery
                 credential_runtime, self._egress_rules = _apply_managed_git_credential(

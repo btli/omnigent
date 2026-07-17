@@ -577,3 +577,46 @@ def test_credential_rewrite_rule_repr_hides_real_secret() -> None:
     )
     assert "ghp_tok" not in repr(rule)
     assert "git.acme.com" in repr(rule)
+
+
+def test_inactive_sandbox_with_delivery_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Delivered credential + sandbox.type none must refuse, not silently drop the swap."""
+    from omnigent.inner.os_env import ManagedGitCredentialError
+    from omnigent.runner.identity import (
+        MANAGED_GIT_AUTH_SCHEME_ENV_VAR,
+        MANAGED_GIT_CANONICAL_HOST_ENV_VAR,
+        MANAGED_GIT_REPO_PATH_ENV_VAR,
+        MANAGED_GIT_TOKEN_ENV_VAR,
+        MANAGED_GIT_USERNAME_ENV_VAR,
+    )
+
+    monkeypatch.setenv(MANAGED_GIT_TOKEN_ENV_VAR, "ghp_tok")
+    monkeypatch.setenv(MANAGED_GIT_CANONICAL_HOST_ENV_VAR, "git.acme.com")
+    monkeypatch.setenv(MANAGED_GIT_REPO_PATH_ENV_VAR, "/team/proj")
+    monkeypatch.setenv(MANAGED_GIT_AUTH_SCHEME_ENV_VAR, "basic")
+    monkeypatch.setenv(MANAGED_GIT_USERNAME_ENV_VAR, "x-access-token")
+
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert os_env is not None
+    try:
+        with pytest.raises(ManagedGitCredentialError, match="sandbox is inactive"):
+            asyncio.run(os_env.shell("echo ok"))
+    finally:
+        os_env.close()
+
+
+def test_inactive_sandbox_without_delivery_is_unchanged() -> None:
+    """No delivery env: inactive sandbox keeps today's passthrough behavior."""
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert os_env is not None
+    try:
+        result = asyncio.run(os_env.shell("echo ok"))
+    finally:
+        os_env.close()
+
+    assert "ok" in result.get("stdout", "")
+    assert "error" not in result
