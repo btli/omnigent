@@ -2537,3 +2537,25 @@ def test_deliver_credential_repr_hides_token() -> None:
         _managed_deliver_frame(proc._sealing_keypair.public_key_b64, runner_id="r1", generation=1)
     )
     assert "ghp_tok" not in repr(proc._pending_credentials["r1"])
+
+
+def test_alive_runner_ids_reap_discards_cached_credential(tmp_path: Path) -> None:
+    """The reconnect-time dead-runner reap also discards the runner's credential.
+
+    A runner that dies while the tunnel is down can be reaped by
+    _alive_runner_ids before _watch_runner's poll notices (whose guard then
+    reads the removal as an intentional stop); the cached credential must
+    not outlive the runner on that path either.
+    """
+    from omnigent.host.sealing import generate_sealing_keypair
+
+    proc = _make_host_process()
+    proc._sealing_keypair = generate_sealing_keypair()
+    proc._handle_deliver_credential(
+        _managed_deliver_frame(proc._sealing_keypair.public_key_b64, runner_id="r1", generation=1)
+    )
+    dead_proc = subprocess.Popen(["true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    dead_proc.wait()
+    proc._runners["r1"] = _RunnerHandle(proc=dead_proc, log_path=tmp_path / "r1.log")
+    proc._alive_runner_ids()
+    assert "r1" not in proc._pending_credentials

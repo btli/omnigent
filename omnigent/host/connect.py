@@ -917,13 +917,18 @@ class HostProcess:
     def _alive_runner_ids(self) -> list[str]:
         """Return IDs of runners that are still alive.
 
-        Cleans up dead entries as a side effect.
+        Cleans up dead entries — and any credential cached for them — as a
+        side effect. A runner that dies while the tunnel is down can be
+        reaped here before :meth:`_watch_runner` notices, and that watcher
+        then treats the removal as an intentional stop; discarding here too
+        keeps the credential from outliving its runner on that path.
 
         :returns: List of alive runner ID strings.
         """
         dead = [rid for rid, handle in self._runners.items() if handle.proc.poll() is not None]
         for rid in dead:
             self._runners.pop(rid)
+            self._pending_credentials.pop(rid, None)
         return list(self._runners.keys())
 
     def _tunnel_url(self) -> str:
