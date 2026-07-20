@@ -16,7 +16,7 @@ import { TerminalView } from "@/components/blocks/TerminalView";
 import { inventoryTerminals, terminalTabKey, useTerminals } from "@/hooks/useTerminals";
 import { NewTerminalButton } from "./NewTerminalButton";
 import { useTerminalFirst } from "./TerminalFirstContext";
-import { TerminalStatusBadge } from "./terminalStatus";
+import { TerminalIdentityChip, TerminalStatusBadge } from "./terminalStatus";
 import { useTerminalStatuses } from "./useTerminalStatuses";
 
 interface InlineTerminalsSectionProps {
@@ -83,18 +83,23 @@ export function InlineTerminalsSection({
 
   useEffect(() => {
     if (!hostInline || !activeKey) return;
-    if (activeTerminal) {
-      if (pendingCreatedKeyRef.current === activeKey) pendingCreatedKeyRef.current = null;
-      return;
-    }
     // onCreated fires before the terminals hook necessarily exposes the
-    // cache update. Keep that selection until the new shell appears.
-    if (pendingCreatedKeyRef.current === activeKey) return;
-    returnToList(true);
+    // cache update, so a freshly-created shell is briefly absent from the
+    // inventory. pending marks that gap.
+    const pending = pendingCreatedKeyRef.current === activeKey;
+    // The pending shell surfaced — drop its marker.
+    if (activeTerminal && pending) pendingCreatedKeyRef.current = null;
+    // The selection vanished without a pending marker — it closed
+    // unexpectedly, so fall back to the list.
+    if (!activeTerminal && !pending) returnToList(true);
   }, [activeKey, activeTerminal, hostInline, returnToList]);
 
+  // `returnToList` is the only setter of shouldFocusListRef, and it nulls
+  // activeKey in the same call — so when the ref is set, activeKey is
+  // already null and the list is rendered and focusable. activeKey stays
+  // in the deps to re-run once that null commit lands.
   useEffect(() => {
-    if (!hostInline || activeKey !== null || !shouldFocusListRef.current) return;
+    if (!hostInline || !shouldFocusListRef.current) return;
     shellListRef.current?.focus();
     shouldFocusListRef.current = false;
   }, [activeKey, hostInline]);
@@ -103,25 +108,18 @@ export function InlineTerminalsSection({
   // full-screen takeover (mobile / terminal-first). New-shell creation
   // follows the same split so a freshly-created shell lands in the active
   // surface.
+  // `pendingInventory` marks the creation path: a freshly-created shell
+  // is selected before the terminals hook exposes it, so record it in
+  // pendingCreatedKeyRef to bridge the create->inventory gap (the focus
+  // effect above keeps the selection instead of misreading the gap as an
+  // unexpected close). Selecting an existing shell clears the ref.
   const openShell = useCallback(
-    (key: string) => {
+    (key: string, pendingInventory: boolean) => {
       if (!hostInline) {
         onExpand(key);
         return;
       }
-      pendingCreatedKeyRef.current = null;
-      setAnnouncement("");
-      setActiveKey(key);
-    },
-    [hostInline, onExpand],
-  );
-  const openCreatedShell = useCallback(
-    (key: string) => {
-      if (!hostInline) {
-        onExpand(key);
-        return;
-      }
-      pendingCreatedKeyRef.current = key;
+      pendingCreatedKeyRef.current = pendingInventory ? key : null;
       setAnnouncement("");
       setActiveKey(key);
     },
@@ -148,16 +146,11 @@ export function InlineTerminalsSection({
             >
               <ChevronLeftIcon className="size-4 shrink-0" />
             </button>
-            <span className="flex min-w-0 items-center gap-1.5 rounded-sm bg-muted px-2 py-1 text-foreground text-xs">
-              <TerminalIcon className="size-3 shrink-0" />
-              <span className="max-w-[8rem] truncate">{activeTerminal.name}</span>
-              {activeTerminal.session && (
-                <span className="shrink-0 text-muted-foreground/60">
-                  · {activeTerminal.session}
-                </span>
-              )}
-              <TerminalStatusBadge status={getStatus(activeTerminal)} />
-            </span>
+            <TerminalIdentityChip
+              terminal={activeTerminal}
+              status={getStatus(activeTerminal)}
+              className="min-w-0"
+            />
           </div>
           <div key={activeTerminal.id} className="flex min-h-0 flex-1 flex-col p-2">
             <TerminalView
@@ -188,7 +181,7 @@ export function InlineTerminalsSection({
         >
           <NewTerminalButton
             conversationId={conversationId}
-            onCreated={openCreatedShell}
+            onCreated={(key) => openShell(key, true)}
             variant="row"
           />
           {terminals.map((t) => (
@@ -196,7 +189,7 @@ export function InlineTerminalsSection({
               key={terminalTabKey(t)}
               type="button"
               className="flex w-full items-center gap-2 px-2 py-1.5 text-left hover:bg-accent/60"
-              onClick={() => openShell(terminalTabKey(t))}
+              onClick={() => openShell(terminalTabKey(t), false)}
             >
               <TerminalIcon className="size-3.5 shrink-0 text-muted-foreground" />
               {t.session && <span className="shrink-0 text-xs font-medium">{t.session}</span>}
