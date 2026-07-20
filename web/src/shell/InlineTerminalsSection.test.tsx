@@ -12,6 +12,27 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   useTerminals: vi.fn(),
 }));
 
+// Stub the xterm view so inline-mode tests can assert which terminal is
+// hosted (and its read-only flag) without dragging in the WebSocket stack.
+vi.mock("@/components/blocks/TerminalView", () => ({
+  TerminalView: ({
+    sessionId,
+    terminalId,
+    readOnly,
+  }: {
+    sessionId: string;
+    terminalId: string;
+    readOnly?: boolean;
+  }) => (
+    <div
+      data-testid="terminal-view"
+      data-session-id={sessionId}
+      data-terminal-id={terminalId}
+      data-read-only={String(readOnly ?? false)}
+    />
+  ),
+}));
+
 // These tests cover row navigation, not shell creation. The button
 // needs a QueryClient (it reads the session agent for its access
 // gate); its behavior is covered by NewTerminalButton.test.tsx. The
@@ -50,15 +71,31 @@ const TERMINAL_FIRST_SDK_CTX = {
   terminalStartingUp: false,
 } as TerminalFirstContextValue;
 
-function renderInlineSection(terminals: TerminalInfo[], onExpand: (key: string) => void = vi.fn()) {
+// A regular (non-terminal-first) session: the rail hosts shells inline
+// rather than replacing the main column. This is the desktop-fix path.
+const REGULAR_CTX = {
+  ...TERMINAL_FIRST_SDK_CTX,
+  isTerminalFirst: false,
+} as TerminalFirstContextValue;
+
+function renderInlineSection(
+  terminals: TerminalInfo[],
+  onExpand: (key: string) => void = vi.fn(),
+  opts: { inline?: boolean; readOnly?: boolean; ctx?: TerminalFirstContextValue } = {},
+) {
   useTerminalsMock.mockReturnValue({
     terminals,
     isLoading: false,
     error: null,
   });
   return render(
-    <TerminalFirstContextProvider value={TERMINAL_FIRST_SDK_CTX}>
-      <InlineTerminalsSection conversationId="conv_terminal" onExpand={onExpand} />
+    <TerminalFirstContextProvider value={opts.ctx ?? TERMINAL_FIRST_SDK_CTX}>
+      <InlineTerminalsSection
+        conversationId="conv_terminal"
+        onExpand={onExpand}
+        inline={opts.inline}
+        readOnly={opts.readOnly}
+      />
     </TerminalFirstContextProvider>,
   );
 }
@@ -134,5 +171,95 @@ describe("InlineTerminalsSection rows open shells in the main view", () => {
     // drift down as shells accumulate.
     const shellRow = screen.getByRole("button", { name: /s1/ });
     expect(row.compareDocumentPosition(shellRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+});
+
+describe("InlineTerminalsSection inline mode hosts the shell in the rail", () => {
+  it("clicking a shell row mounts its TerminalView in-rail instead of calling onExpand", () => {
+    const onExpand = vi.fn();
+    renderInlineSection(
+      [
+        makeTerminal("terminal_bash_s1", "bash", "s1"),
+        makeTerminal("terminal_worker_s2", "worker", "s2"),
+      ],
+      onExpand,
+      { inline: true, ctx: REGULAR_CTX },
+    );
+
+    // Baseline: the list is showing, no xterm yet.
+    expect(screen.queryByTestId("terminal-view")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /s1/ }));
+
+    // The shell now renders INSIDE the rail (the FileViewer-in-rail
+    // mirror) and onExpand — the full-screen overlay path — is never
+    // called on desktop.
+    const view = screen.getByTestId("terminal-view");
+    expect(view).toHaveAttribute("data-terminal-id", "terminal_bash_s1");
+    expect(onExpand).not.toHaveBeenCalled();
+  });
+
+  it("shows a back control that returns from the hosted shell to the list", () => {
+    renderInlineSection([makeTerminal("terminal_bash_s1", "bash", "s1")], vi.fn(), {
+      inline: true,
+      ctx: REGULAR_CTX,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /s1/ }));
+    expect(screen.getByTestId("terminal-view")).toBeInTheDocument();
+
+    // Back returns to the list so other shells / "+ New shell" stay reachable.
+    fireEvent.click(screen.getByRole("button", { name: /back to shells/i }));
+    expect(screen.queryByTestId("terminal-view")).toBeNull();
+    expect(screen.getByTestId("new-shell-button")).toBeInTheDocument();
+  });
+
+  it("attaches the hosted shell read-only for non-owners", () => {
+    renderInlineSection([makeTerminal("terminal_bash_s1", "bash", "s1")], vi.fn(), {
+      inline: true,
+      readOnly: true,
+      ctx: REGULAR_CTX,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /s1/ }));
+    expect(screen.getByTestId("terminal-view")).toHaveAttribute("data-read-only", "true");
+  });
+
+  it("falls back to the list when the hosted shell disappears", () => {
+    const { rerender } = renderInlineSection(
+      [makeTerminal("terminal_bash_s1", "bash", "s1")],
+      vi.fn(),
+      { inline: true, ctx: REGULAR_CTX },
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /s1/ }));
+    expect(screen.getByTestId("terminal-view")).toBeInTheDocument();
+
+    // The shell closes out from under the rail — the view drops back to
+    // the list rather than stranding an xterm on a dead terminal.
+    useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
+    rerender(
+      <TerminalFirstContextProvider value={REGULAR_CTX}>
+        <InlineTerminalsSection conversationId="conv_terminal" onExpand={vi.fn()} inline />
+      </TerminalFirstContextProvider>,
+    );
+
+    expect(screen.queryByTestId("terminal-view")).toBeNull();
+    expect(screen.getByTestId("new-shell-button")).toBeInTheDocument();
+  });
+
+  it("routes terminal-first shells to onExpand even with inline set (main-column takeover)", () => {
+    // Terminal-first sessions keep their chat-replacing UX: the shell
+    // opens in the main column via MainTerminalView, not in the rail.
+    const onExpand = vi.fn();
+    renderInlineSection([makeTerminal("terminal_bash_s1", "bash", "s1")], onExpand, {
+      inline: true,
+      ctx: TERMINAL_FIRST_SDK_CTX,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /s1/ }));
+
+    expect(onExpand).toHaveBeenCalledWith("terminal:terminal_bash_s1");
+    expect(screen.queryByTestId("terminal-view")).toBeNull();
   });
 });
