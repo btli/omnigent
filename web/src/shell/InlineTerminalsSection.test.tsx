@@ -199,7 +199,7 @@ describe("InlineTerminalsSection inline mode hosts the shell in the rail", () =>
     expect(onExpand).not.toHaveBeenCalled();
   });
 
-  it("shows a back control that returns from the hosted shell to the list", () => {
+  it("returns focus to the shell list without announcing an intentional back action", () => {
     renderInlineSection([makeTerminal("terminal_bash_s1", "bash", "s1")], vi.fn(), {
       inline: true,
       ctx: REGULAR_CTX,
@@ -208,10 +208,13 @@ describe("InlineTerminalsSection inline mode hosts the shell in the rail", () =>
     fireEvent.click(screen.getByRole("button", { name: /s1/ }));
     expect(screen.getByTestId("terminal-view")).toBeInTheDocument();
 
-    // Back returns to the list so other shells / "+ New shell" stay reachable.
+    // Back returns keyboard users to the list without presenting an
+    // intentional navigation action as a shell failure.
     fireEvent.click(screen.getByRole("button", { name: /back to shells/i }));
     expect(screen.queryByTestId("terminal-view")).toBeNull();
     expect(screen.getByTestId("new-shell-button")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: /shell list/i })).toHaveFocus();
+    expect(screen.getByRole("status")).toBeEmptyDOMElement();
   });
 
   it("attaches the hosted shell read-only for non-owners", () => {
@@ -225,7 +228,7 @@ describe("InlineTerminalsSection inline mode hosts the shell in the rail", () =>
     expect(screen.getByTestId("terminal-view")).toHaveAttribute("data-read-only", "true");
   });
 
-  it("falls back to the list when the hosted shell disappears", () => {
+  it("focuses the list and announces when the hosted shell disappears", () => {
     const { rerender } = renderInlineSection(
       [makeTerminal("terminal_bash_s1", "bash", "s1")],
       vi.fn(),
@@ -236,7 +239,7 @@ describe("InlineTerminalsSection inline mode hosts the shell in the rail", () =>
     expect(screen.getByTestId("terminal-view")).toBeInTheDocument();
 
     // The shell closes out from under the rail — the view drops back to
-    // the list rather than stranding an xterm on a dead terminal.
+    // the list, restores focus, and tells assistive tech what happened.
     useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
     rerender(
       <TerminalFirstContextProvider value={REGULAR_CTX}>
@@ -246,6 +249,10 @@ describe("InlineTerminalsSection inline mode hosts the shell in the rail", () =>
 
     expect(screen.queryByTestId("terminal-view")).toBeNull();
     expect(screen.getByTestId("new-shell-button")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: /shell list/i })).toHaveFocus();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "The active shell closed unexpectedly. Focus returned to the shell list.",
+    );
   });
 
   it("routes terminal-first shells to onExpand even with inline set (main-column takeover)", () => {
