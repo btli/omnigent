@@ -234,6 +234,22 @@ export function normalizePinnedConversationIds(
 
 // ── Drag-and-drop ────────────────────────────────────────────────────────────
 
+// A pinned conversation renders in two sections (Pinned + its home), so each
+// rendered row needs a distinct dnd-kit draggable id — one registration per id.
+// We namespace by section as `<prefix>:<conversationId>`. The conversation id is
+// a bare hex uuid (no colon), so the real id is always the tail after the LAST
+// colon, robust even when a prefix (e.g. `project:<name>`) itself contains one.
+export function buildDragId(prefix: string, conversationId: string): string {
+  return `${prefix}:${conversationId}`;
+}
+
+/** Recover the conversation id from a section-namespaced draggable id. Returns
+    the input unchanged when it carries no prefix. */
+export function conversationIdFromDragId(dragId: string): string {
+  const lastColon = dragId.lastIndexOf(":");
+  return lastColon === -1 ? dragId : dragId.slice(lastColon + 1);
+}
+
 /** The session being dragged: its id, the project it's currently filed under
     (`null` when it lives in the flat list, outside any project), and whether
     it's already pinned. */
@@ -245,9 +261,9 @@ export interface SidebarDragSource {
 
 /** What a row was dropped onto. A project folder files the session into that
     project; the "ungroup" zone removes it from its project; the "pin" zone
-    pins it (additive — the session keeps its project and stays in the flat
-    list, and also appears under Pinned). `null` is a drop that landed on
-    nothing droppable (e.g. "Shared with me", which is never a target —
+    pins it (additive — the session keeps its one home, its project folder or
+    the flat list, and also appears under Pinned). `null` is a drop that landed
+    on nothing droppable (e.g. "Shared with me", which is never a target —
     sessions can't be filed there). */
 export type SidebarDropTarget =
   | { type: "project"; name: string }
@@ -260,8 +276,8 @@ export type SidebarDropTarget =
     when it's the project's last member); `pin` pins it; `none` is a no-op.
 
     Pinning is orthogonal to project membership: a pinned session still shows
-    in its project folder and the flat list, so moving/unfiling it never has to
-    unpin it. Unpinning is done through the row's pin button / kebab. */
+    in its one home (project folder or flat list), so moving/unfiling it never
+    has to unpin it. Unpinning is done through the row's pin button / kebab. */
 export type SidebarDropAction =
   | { kind: "move"; project: string }
   | { kind: "ungroup"; project: string }

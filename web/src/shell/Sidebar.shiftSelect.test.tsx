@@ -2,7 +2,7 @@
 // Covers the pure range computation helper and the integrated click behavior.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -272,6 +272,32 @@ describe("Sidebar shift-click selection", () => {
     // isn't in the global list).
     fireEvent.click(screen.getByTitle("p1").closest("a")!);
     fireEvent.click(screen.getByTitle("p3").closest("a")!, { shiftKey: true });
+
+    await waitFor(() => {
+      expect(screen.getByText("3 selected")).toBeInTheDocument();
+    });
+  });
+
+  it("shift-select counts a pinned+duplicated conversation once across its two rows", async () => {
+    // A pinned unfiled conversation renders in BOTH Pinned and Sessions. The
+    // visible-id order is de-duped, so a shift range spanning both copies must
+    // count that conversation once — not inflate the selection.
+    const sessions = [conv("s_pinned"), conv("s_a"), conv("s_b")];
+    mockConversations(sessions);
+    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["s_pinned"]));
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: /select/i }));
+
+    // Anchor on the Pinned-section copy of s_pinned.
+    const pinnedSection = screen.getByText("Pinned").closest("section")!;
+    fireEvent.click(within(pinnedSection).getByTitle("s_pinned").closest("a")!);
+
+    // Shift-click s_b in Sessions. Deduped visible order is [s_pinned, s_a,
+    // s_b], so the range is those 3 unique ids — s_pinned's second (Sessions)
+    // row does not add a phantom fourth.
+    const sessionsSection = screen.getByText("Sessions").closest("section")!;
+    fireEvent.click(within(sessionsSection).getByTitle("s_b").closest("a")!, { shiftKey: true });
 
     await waitFor(() => {
       expect(screen.getByText("3 selected")).toBeInTheDocument();

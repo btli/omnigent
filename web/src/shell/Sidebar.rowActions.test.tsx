@@ -431,15 +431,22 @@ describe("pinned row sub-text", () => {
     expect(within(row).getByText("feature/login")).toBeInTheDocument();
   });
 
-  it("renders no sub-text (no icons, no separator) when neither project nor branch exists", () => {
+  it("renders no sub-text wrapper at all when neither project nor branch exists", () => {
     localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_1"]));
     mockConversations([{ ...CONV, labels: {}, git_branch: null }]);
     renderSidebar();
 
     const row = pinnedRowLink();
-    // No folder / branch icon and no empty sub-text scaffold at all.
+    // No folder / branch icon...
     expect(row.querySelector(FOLDER_ICON)).toBeNull();
     expect(row.querySelector(BRANCH_ICON)).toBeNull();
+    // ...and the whole Row-2 sub-text scaffold is omitted, not just left empty.
+    // The wrapper is the sole `gap-2` flex span; Row 1 (the name) uses `gap-1.5`.
+    // Its absence proves the conditional dropped the element entirely.
+    const subtextWrapper = [...row.querySelectorAll("span.gap-2")];
+    expect(subtextWrapper).toHaveLength(0);
+    // The link's only content row is the name (one flex child), no sub-text row.
+    expect(within(row).getByText("My Session")).toBeInTheDocument();
   });
 
   it("keeps a non-pinned, filed row's sub-text branch-only (no inline project)", () => {

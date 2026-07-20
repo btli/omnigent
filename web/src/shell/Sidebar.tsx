@@ -142,6 +142,8 @@ import {
   COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY,
   computeNextActiveOverride,
   conversationDisplayLabel,
+  buildDragId,
+  conversationIdFromDragId,
   dedupeConversationsById,
   dedupeIds,
   EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
@@ -1021,12 +1023,12 @@ function ConversationList({
         ? notArchived.filter((c) => !isOwnedByViewer(c, viewerId))
         : notArchived.filter((c) => isOwnedByViewer(c, viewerId));
 
-    // Pinning is ADDITIVE: a pinned session also appears in the flat global
-    // Pinned section, but stays in its project folder and the flat list too.
-    // Ordered strictly by when they were pinned (newest pin at the bottom), not
-    // by `updated_at`, so a pinned session doesn't jump when it gets a new
-    // message. Pins are localStorage and ownership-agnostic, so a pinned shared
-    // session shows under Pinned on the Shared tab just like an owned one.
+    // Pinning is ADDITIVE: a pinned session also appears in the global Pinned
+    // section while staying in its one home — its project folder if filed, else
+    // the flat Sessions list. Ordered strictly by when they were pinned (newest
+    // pin at the bottom), not by `updated_at`, so a pinned session doesn't jump
+    // when it gets a new message. Pins are localStorage and ownership-agnostic,
+    // so a pinned shared session shows under Pinned on the Shared tab too.
     const pinned = orderByPinnedSequence(
       tabScoped.filter((c) => pinnedSet.has(c.id)),
       pinnedConversationIds,
@@ -1051,9 +1053,9 @@ function ConversationList({
     // unloaded page. We render it as a folder with a "No chats" placeholder
     // rather than hiding it (matches the target sidebar layout).
 
-    // Sessions: the remainder of the tab's slice — not filed under a project.
-    // Pinned sessions still appear here (pinning is additive); they also show
-    // in the Pinned section above.
+    // Sessions: the remainder of the tab's slice — the unfiled sessions. A
+    // pinned unfiled session stays here (its home) and also shows under Pinned;
+    // a filed session lives in its project folder, never here.
     const sessions = sortByUpdatedAtDesc(
       tabScoped.filter((c) => !filedIds.has(c.id)),
       activeOverride,
@@ -1206,8 +1208,9 @@ function ConversationList({
       | undefined;
     // The draggable id is section-namespaced (`<prefix>:<id>`); the real
     // conversation id rides in `data` so drop resolution targets the session,
-    // not the per-section row.
-    const id = data?.conversationId ?? String(event.active.id);
+    // not the per-section row. The fallback strips the prefix off the active id
+    // in case `data.conversationId` is ever absent.
+    const id = data?.conversationId ?? conversationIdFromDragId(String(event.active.id));
     setActiveDrag({
       id,
       label: data?.label ?? id,
@@ -2465,11 +2468,15 @@ function ConversationRow({
   // When this row becomes the active conversation (e.g. a freshly created
   // session navigated to via `/c/:id`), scroll it toward the center of the
   // sidebar so it's comfortably in view rather than pinned to an edge.
+  // A pinned conversation renders twice (Pinned + its home); let ONLY the
+  // Pinned copy scroll so the two instances don't fight over the viewport.
+  // An unpinned active row is a single instance, so it always scrolls.
   const rowRef = useRef<HTMLLIElement>(null);
+  const scrollsWhenActive = !isPinned || dragIdPrefix === "pinned";
   useEffect(() => {
-    if (!isActive) return;
+    if (!isActive || !scrollsWhenActive) return;
     rowRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
-  }, [isActive]);
+  }, [isActive, scrollsWhenActive]);
   const rename = useRenameConversation();
   const del = useStopAndDeleteConversation();
   const archive = useArchiveConversation();
@@ -2573,7 +2580,7 @@ function ConversationRow({
     // Section-namespaced so a pinned conversation's two rendered rows register
     // distinct draggables; `conversationId` in `data` resolves back to the real
     // id for drop handling.
-    id: `${dragIdPrefix}:${conversation.id}`,
+    id: buildDragId(dragIdPrefix, conversation.id),
     data: {
       type: "session",
       conversationId: conversation.id,

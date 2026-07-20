@@ -7,7 +7,7 @@
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
@@ -823,6 +823,10 @@ describe("Sidebar project sections", () => {
     const projectSection = folderButton.closest("section")!;
     expect(within(projectSection).getByText("conv_pinned")).toBeInTheDocument();
     expect(within(projectSection).getByText("conv_plain")).toBeInTheDocument();
+    // Unpin touches ONLY the localStorage pin set — it must never fire a project
+    // mutation (the omni_project label PATCH), so membership is untouched.
+    expect(moveToProjectSpy).not.toHaveBeenCalled();
+    expect(localStorage.getItem("omnigent:pinned-conversation-ids")).toBe("[]");
   });
 
   it("keeps a pinned unfiled session in the flat Sessions list too (additive)", () => {
@@ -854,6 +858,50 @@ describe("Sidebar project sections", () => {
     // Two unique conversations selected → the control flips to "Deselect all".
     expect(screen.getByRole("button", { name: "Deselect all" })).toBeInTheDocument();
     expect(screen.getByText("2 selected")).toBeInTheDocument();
+  });
+
+  it("keyboard next-session nav visits a pinned+duplicated conversation once", () => {
+    // Cmd+↓ steps through the visible order, which is de-duped. With a pinned
+    // unfiled conversation rendered in both Pinned and Sessions, stepping from
+    // it must land on the OTHER conversation — not no-op on its own second row.
+    // Visible order is [conv_pinned (Pinned), conv_pinned (Sessions dup),
+    // conv_a]; deduped → [conv_pinned, conv_a], so ↓ from conv_pinned → conv_a.
+    let pathname = "";
+    function LocationProbe() {
+      pathname = useLocation().pathname;
+      return null;
+    }
+    mockConversations([conv("conv_a", "Claude Code"), conv("conv_pinned", "Claude Code")]);
+    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_pinned"]));
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_pinned"]}>
+            <Routes>
+              <Route
+                path="/c/:conversationId"
+                element={
+                  <>
+                    <Sidebar open onClose={vi.fn()} />
+                    <LocationProbe />
+                  </>
+                }
+              />
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+
+    // Step down once: from conv_pinned → conv_a (skips conv_pinned's duplicate).
+    fireEvent.keyDown(window, { key: "ArrowDown", metaKey: true });
+    expect(pathname).toBe("/c/conv_a");
+
+    // Step down again wraps back to conv_pinned — proving the deduped order has
+    // exactly two stops, not three.
+    fireEvent.keyDown(window, { key: "ArrowDown", metaKey: true });
+    expect(pathname).toBe("/c/conv_pinned");
   });
 
   it("does not render a project section when useProjects returns nothing", () => {
@@ -1266,6 +1314,23 @@ describe("Sidebar active-row auto-scroll", () => {
     renderAtRoute("/");
 
     expect(scrollIntoView).not.toHaveBeenCalled();
+
+    vi.restoreAllMocks();
+  });
+
+  it("scrolls only ONCE for an active conversation rendered in both Pinned and Sessions", () => {
+    // A pinned active conversation renders twice (Pinned + Sessions). Only the
+    // Pinned copy auto-scrolls, so the two instances don't fight over the
+    // viewport — exactly one scrollIntoView call, not two.
+    const scrollIntoView = vi.fn();
+    vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(scrollIntoView);
+
+    mockConversations([conv("conv_top", "Claude Code"), conv("conv_active", "Claude Code")]);
+    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_active"]));
+    renderAtRoute("/c/conv_active");
+
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "smooth", block: "center" });
 
     vi.restoreAllMocks();
   });

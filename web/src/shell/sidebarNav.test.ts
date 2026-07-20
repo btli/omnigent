@@ -3,9 +3,12 @@ import type { Conversation } from "@/hooks/useConversations";
 import {
   type ActiveChatOverride,
   bareConversationId,
+  buildDragId,
   computeNextActiveOverride,
   conversationDisplayLabel,
+  conversationIdFromDragId,
   dedupeConversationsById,
+  dedupeIds,
   filterConversations,
   getConversationIconKind,
   getConversationAgentType,
@@ -518,5 +521,44 @@ describe("resolveSidebarDrop", () => {
     expect(resolveSidebarDrop(src({ project: "Sprint 42" }), null)).toEqual({ kind: "none" });
     expect(resolveSidebarDrop(src(), null)).toEqual({ kind: "none" });
     expect(resolveSidebarDrop(src({ isPinned: true }), null)).toEqual({ kind: "none" });
+  });
+});
+
+describe("draggable id namespacing", () => {
+  const CONV_ID = "dcbb7a71241f4b11a33bf00438a1d7d2";
+
+  it("builds distinct draggable ids for a conversation rendered in two sections", () => {
+    const pinned = buildDragId("pinned", CONV_ID);
+    const filed = buildDragId(`project:Omnigent`, CONV_ID);
+    const unfiled = buildDragId("sessions", CONV_ID);
+    // Each rendered copy gets its own id (dnd-kit keeps one registration per id).
+    expect(pinned).toBe(`pinned:${CONV_ID}`);
+    expect(filed).toBe(`project:Omnigent:${CONV_ID}`);
+    expect(new Set([pinned, filed, unfiled]).size).toBe(3);
+  });
+
+  it("recovers the real conversation id from a namespaced draggable id", () => {
+    // Mirrors handleDragStart's fallback: the conversation id is the tail after
+    // the LAST colon, so a prefix that itself contains a colon still resolves.
+    expect(conversationIdFromDragId(buildDragId("pinned", CONV_ID))).toBe(CONV_ID);
+    expect(conversationIdFromDragId(buildDragId("sessions", CONV_ID))).toBe(CONV_ID);
+    expect(conversationIdFromDragId(buildDragId("project:Omnigent", CONV_ID))).toBe(CONV_ID);
+    // A project named with a colon is still handled (last segment wins).
+    expect(conversationIdFromDragId(buildDragId("project:a:b:c", CONV_ID))).toBe(CONV_ID);
+    // A bare id (no prefix) is returned unchanged.
+    expect(conversationIdFromDragId(CONV_ID)).toBe(CONV_ID);
+  });
+});
+
+describe("dedupeIds", () => {
+  it("keeps the first occurrence and drops later duplicates", () => {
+    // A pinned conversation appears in Pinned AND its home, so the concatenated
+    // visible order carries its id twice; dedupe counts/visits it once.
+    expect(dedupeIds(["a", "b", "a", "c", "b"])).toEqual(["a", "b", "c"]);
+  });
+
+  it("returns an empty array unchanged and preserves already-unique order", () => {
+    expect(dedupeIds([])).toEqual([]);
+    expect(dedupeIds(["x", "y", "z"])).toEqual(["x", "y", "z"]);
   });
 });
