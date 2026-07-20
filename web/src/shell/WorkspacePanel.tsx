@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef } from "react";
 import { cn } from "@/lib/utils";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
+import { isOwnerLevel } from "@/lib/permissionsApi";
 import { FilesPanel } from "./FilesPanel";
 import { FileViewer } from "./FileViewer";
 import type { ChangedSort } from "./FlatFileList";
@@ -189,7 +190,11 @@ interface WorkspacePanelProps {
   /** Surface the file viewer's comments-open state up to AppShell (it
    *  widens the rail to fit the comments column). */
   onCommentsOpenChange: (open: boolean) => void;
-  /** Expand a terminal into the full-width terminals push panel. */
+  /**
+   * Expand a terminal into the full-width terminals push panel — the
+   * mobile fallback. On desktop the Shells tab hosts the terminal inline
+   * (see the ``inline`` prop passed below), so this stays unused there.
+   */
   openTerminalsPanel: (key: string) => void;
   /** Viewer's permission level (gates edit affordances). */
   permissionLevel: number | null;
@@ -416,13 +421,12 @@ export function WorkspacePanel({
         )}
       </div>
       {/* Tab content — single slot. Files holds FileViewer when a
-          file is open, FilesPanel otherwise; Shells holds the
-          list-only inline section (clicking a row opens the shell in
-          the main view — no in-rail xterm); Subagents lists the
-          root's children + a "main" link back to the parent.
-          The Shells branch is unreachable when its tab is hidden —
-          native wrappers, claude-native sub-agents, or no shell
-          attached. */}
+          file is open, FilesPanel otherwise; Shells hosts the active
+          shell's terminal inline (list ↔ terminal, mirroring the Files
+          tab); Subagents lists the root's children + a "main" link back
+          to the parent. The Shells branch is unreachable when its tab
+          is hidden — native wrappers, claude-native sub-agents, or no
+          shell attached. */}
       <div data-workspace-panel-content className="flex min-h-0 flex-1 flex-col overflow-hidden">
         {selectedFilePath !== null ? (
           <FileViewer
@@ -446,7 +450,15 @@ export function WorkspacePanel({
         ) : rightRailTab === "todos" && todosSupported ? (
           <TodoPanel frameless />
         ) : rightRailTab === "terminals" && showShellsTab ? (
-          <InlineTerminalsSection conversationId={conversationId} onExpand={openTerminalsPanel} />
+          // Desktop rail: host the active shell inline, mirroring the
+          // Files tab's inline FileViewer — chat stays visible. The
+          // full-screen overlay path (`onExpand`) is the mobile fallback.
+          <InlineTerminalsSection
+            conversationId={conversationId}
+            onExpand={openTerminalsPanel}
+            inline
+            readOnly={!isOwnerLevel(permissionLevel)}
+          />
         ) : (
           showFilesPanel && (
             <FilesPanel

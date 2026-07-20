@@ -16,7 +16,15 @@ vi.mock("./FilesPanel", () => ({
   FilesPanel: () => <div data-testid="files-panel-stub" />,
 }));
 vi.mock("./InlineTerminalsSection", () => ({
-  InlineTerminalsSection: () => <div data-testid="terminals-stub" />,
+  // Echo the desktop props (inline + readOnly) so the rail's Shells tab
+  // can be proven to host the terminal inline, not route to the overlay.
+  InlineTerminalsSection: ({ inline, readOnly }: { inline?: boolean; readOnly?: boolean }) => (
+    <div
+      data-testid="terminals-stub"
+      data-inline={String(inline ?? false)}
+      data-read-only={String(readOnly ?? false)}
+    />
+  ),
 }));
 vi.mock("./SubagentsPanel", () => ({
   SubagentsPanel: () => <div data-testid="subagents-stub" />,
@@ -46,6 +54,8 @@ function renderWorkspace(
     selectedFilePath?: string | null;
     openFiles?: string[];
     showBrowserTab?: boolean;
+    showShellsTab?: boolean;
+    permissionLevel?: number | null;
   } = {},
 ) {
   const openFileViewer = vi.fn();
@@ -61,7 +71,7 @@ function renderWorkspace(
       showFilesPanel
       showBrowserTab={overrides.showBrowserTab ?? false}
       changedCount={0}
-      showShellsTab={false}
+      showShellsTab={overrides.showShellsTab ?? false}
       terminalsLength={0}
       subagentsWorking={0}
       agentCount={1}
@@ -76,7 +86,7 @@ function renderWorkspace(
       onShowScopeView={vi.fn()}
       onCommentsOpenChange={vi.fn()}
       openTerminalsPanel={vi.fn()}
-      permissionLevel={null}
+      permissionLevel={overrides.permissionLevel ?? null}
       filesPanelSort={"recent" as ChangedSort}
       onSortChange={vi.fn()}
       filesPanelFlatView={false}
@@ -184,6 +194,34 @@ describe("WorkspacePanel content area", () => {
     // slot and the viewer is unmounted.
     expect(screen.getByTestId("files-panel-stub")).toBeInTheDocument();
     expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+  });
+});
+
+describe("WorkspacePanel shells tab", () => {
+  it("hosts the shells section inline (desktop) when the Shells tab is active", () => {
+    renderWorkspace({ rightRailTab: "terminals", showShellsTab: true });
+
+    // The rail hosts the terminal inline (mirroring the Files tab's
+    // FileViewer), not via the full-screen overlay. `inline` proves the
+    // desktop path; a false value would regress to the overlay.
+    const stub = screen.getByTestId("terminals-stub");
+    expect(stub).toBeInTheDocument();
+    expect(stub).toHaveAttribute("data-inline", "true");
+    // Owner (null level) attaches read-write.
+    expect(stub).toHaveAttribute("data-read-only", "false");
+  });
+
+  it("attaches the inline shell read-only for non-owners", () => {
+    renderWorkspace({ rightRailTab: "terminals", showShellsTab: true, permissionLevel: 2 });
+
+    // A non-owner (EDIT level) watches but can't type — a shared PTY
+    // can't attribute keystrokes per-user.
+    expect(screen.getByTestId("terminals-stub")).toHaveAttribute("data-read-only", "true");
+  });
+
+  it("hides the Shells tab when showShellsTab is false", () => {
+    renderWorkspace({ showShellsTab: false });
+    expect(screen.queryByRole("tab", { name: /shells/i })).toBeNull();
   });
 });
 

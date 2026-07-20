@@ -133,9 +133,18 @@ vi.mock("./FileViewer", () => ({
   ),
 }));
 vi.mock("./InlineTerminalsSection", () => ({
-  // Minimal stand-in exposing onExpand so tests can trigger the inline terminal expand path.
-  InlineTerminalsSection: ({ onExpand }: { onExpand: (key: string) => void }) => (
-    <div data-testid="inline-terminals-section">
+  // Stand-in exposing onExpand + the desktop `inline` flag. Desktop hosts
+  // the shell inside the rail (inline=true → the row click stays local,
+  // no AppShell overlay); mobile hands off via onExpand. Tests assert the
+  // flag and can still drive the overlay path through onExpand.
+  InlineTerminalsSection: ({
+    onExpand,
+    inline,
+  }: {
+    onExpand: (key: string) => void;
+    inline?: boolean;
+  }) => (
+    <div data-testid="inline-terminals-section" data-inline={String(inline ?? false)}>
       <button
         type="button"
         aria-label="rail: open terminal"
@@ -826,7 +835,40 @@ describe("Right-rail terminals card", () => {
 
     // Radix Tabs activates on mousedown, not click.
     fireEvent.mouseDown(terminalsTab);
-    expect(screen.getByTestId("inline-terminals-section")).toBeInTheDocument();
+    const section = screen.getByTestId("inline-terminals-section");
+    expect(section).toBeInTheDocument();
+    // Desktop rail hosts the shell inline (mirroring the Files tab's
+    // FileViewer) — inline=true routes the row click into the rail, not
+    // the full-screen overlay.
+    expect(section).toHaveAttribute("data-inline", "true");
+  });
+
+  it("hosting a shell inline in the desktop rail never opens the full-screen overlay", () => {
+    // The desktop rail's Shells tab renders inline (inline=true), so
+    // selecting a shell stays inside the rail: chat is NOT hidden
+    // (no md:hidden on the chat+workspace group) and the TerminalsPanel
+    // drawer stays closed. This is the core desktop fix.
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_main", name: "main", session: "main", running: true }],
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_abc");
+
+    const chatGroup = () => screen.getByRole("main").parentElement as HTMLElement;
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /Shells/i }));
+
+    // The inline section is mounted with inline=true, and the overlay
+    // signals stay quiescent: chat visible, drawer closed.
+    expect(screen.getByTestId("inline-terminals-section")).toHaveAttribute("data-inline", "true");
+    expect(chatGroup().className.split(" ")).not.toContain("md:hidden");
+    expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "closed");
   });
 
   it("hides the Terminals tab in a regular session with no terminal attached", () => {
@@ -946,8 +988,12 @@ describe("Right-rail terminals card", () => {
 });
 
 describe("Chat-mode terminal panel layout", () => {
-  it("hides chat and makes the panel fluid when a terminal is opened from the rail", () => {
-    // Rail click → chat hidden, panel fluid (no split, no resize).
+  it("hides chat and makes the panel fluid via the overlay fallback (onExpand)", () => {
+    // The full-screen overlay is the mobile fallback: `onExpand`
+    // (openTerminalsPanel) → chat hidden, panel fluid (no split, no
+    // resize). Desktop uses the inline path instead (covered above); this
+    // exercises the shared overlay mechanism the mobile drawer routes
+    // through.
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null },
       isLoading: false,
@@ -968,12 +1014,13 @@ describe("Chat-mode terminal panel layout", () => {
     expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-fluid", "false");
     expect(chatGroup().className.split(" ")).not.toContain("md:hidden");
 
-    // Switch the rail to the Terminals tab so the inline section mounts.
+    // Switch the rail to the Terminals tab so the inline section mounts,
+    // then fire its onExpand (the overlay fallback the mobile drawer uses).
     // Radix Tabs activates on mousedown, not click.
     fireEvent.mouseDown(screen.getByRole("tab", { name: /Shells/i }));
     fireEvent.click(screen.getByRole("button", { name: /rail: open terminal/i }));
 
-    // After click: open, fluid, chat hidden.
+    // After onExpand: open, fluid, chat hidden.
     expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "open");
     expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-fluid", "true");
     expect(chatGroup().className.split(" ")).toContain("md:hidden");
