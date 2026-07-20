@@ -16,9 +16,9 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 
 // Controllable rename mutation so the double-click test can assert the
 // committed title was forwarded to the PATCH. `isMobile` toggles the mocked
-// `useIsMobileViewport` so a test can render the row on a mobile viewport (the
-// project flyout is disabled there). Declared via vi.hoisted so the vi.mock
-// factories (hoisted above imports) can reference them.
+// `useIsMobileViewport` so the mobile in-place project picker test can render
+// on a mobile viewport. Declared via vi.hoisted so the vi.mock factories
+// (hoisted above imports) can reference them.
 const mocks = vi.hoisted(() => ({
   rename: { mutate: vi.fn() },
   isMobile: false,
@@ -26,11 +26,15 @@ const mocks = vi.hoisted(() => ({
   // mobile in-place project view test can assert both the list and the pick.
   projects: [] as string[],
   moveToProject: { mutate: vi.fn() },
+  // Latest conversations handed to the list mock; the useProjectSessions mock
+  // derives each folder's rows from this by label (mirrors the server's
+  // ?project= filter) so a filed-row test can expand its folder.
+  conversationsRef: { current: [] as { id: string; labels?: Record<string, string> }[] },
 }));
 
 // Mock the mobile-viewport hook — jsdom doesn't evaluate media queries, so
-// drive it explicitly. Defaults to desktop (false); the mobile flyout test
-// flips `mocks.isMobile` for the duration of that case.
+// drive it explicitly. Defaults to desktop (false); the mobile project-picker
+// test flips `mocks.isMobile` for the duration of that case.
 vi.mock("@/hooks/useIsMobileViewport", () => ({
   useIsMobileViewport: () => mocks.isMobile,
 }));
@@ -53,18 +57,28 @@ vi.mock("@/hooks/useConversations", () => ({
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useStopSession: () => ({ mutate: vi.fn() }),
   useProjects: () => ({ data: mocks.projects }),
-  // A non-empty `useProjects` renders a project folder, which queries its
-  // sessions — return the collapsed (disabled) shape so the folder is inert
-  // (this suite keeps its test row unfiled; the picker only needs the name).
-  useProjectSessions: () => ({
-    data: undefined,
-    isLoading: false,
-    isError: false,
-    error: null,
-    fetchNextPage: vi.fn(),
-    hasNextPage: false,
-    isFetchingNextPage: false,
-  }),
+  // Each project folder fetches its own sessions (server-side ?project=). When
+  // enabled (expanded), derive them from the list fixture by label so a test
+  // can expand a folder and reach a filed row; disabled folders stay inert.
+  useProjectSessions: (project: string, enabled: boolean) => {
+    const rows = enabled
+      ? mocks.conversationsRef.current.filter((c) => (c.labels?.omni_project ?? null) === project)
+      : [];
+    return {
+      data: enabled
+        ? {
+            pages: [{ data: rows, first_id: null, last_id: null, has_more: false }],
+            pageParams: [undefined],
+          }
+        : undefined,
+      isLoading: false,
+      isError: false,
+      error: null,
+      fetchNextPage: vi.fn(),
+      hasNextPage: false,
+      isFetchingNextPage: false,
+    };
+  },
   useMoveToProject: () => mocks.moveToProject,
   useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: () => Promise.resolve([]),
@@ -119,6 +133,7 @@ function mockConversations(conversations: Conversation[]) {
     hasNextPage: false,
     isFetchingNextPage: false,
   } as unknown as ReturnType<typeof useConversations>;
+  mocks.conversationsRef.current = conversations;
   useConvMock.mockImplementation(() => dataResult);
 }
 
@@ -171,7 +186,8 @@ beforeEach(() => {
   mocks.rename.mutate.mockReset();
   mocks.moveToProject.mutate.mockReset();
   mocks.projects = [];
-  // Default every test to the desktop viewport; the mobile flyout test opts in.
+  // Default every test to the desktop viewport; the mobile project-picker test
+  // opts in.
   mocks.isMobile = false;
   useConvMock.mockReset();
   // Pins persist to localStorage; clear it so a seeded pin doesn't leak into
@@ -358,45 +374,93 @@ describe("pinned row sub-text", () => {
   // project (folder icon + name) and git branch (branch icon + name) as
   // persistent sub-text, each part shown only when its value is present.
 
-  it("shows the project name and git branch in a pinned row's sub-text", () => {
+  // lucide-react tags each icon with a kebab-cased class (`lucide-folder`,
+  // `lucide-git-branch`), which lets us assert the actual icon renders — not
+  // just its adjacent text.
+  const FOLDER_ICON = ".lucide-folder";
+  const BRANCH_ICON = ".lucide-git-branch";
+
+  // The Pinned-section copy of the row's <a> link (the row is a link to /c/:id).
+  function pinnedRowLink() {
+    const pinnedSection = screen.getByText("Pinned").closest("section")!;
+    return within(pinnedSection).getByRole("link", { name: /My Session/ });
+  }
+
+  it("renders folder+project then branch icon+branch, in that order", () => {
     localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_1"]));
     mockConversations([
       { ...CONV, labels: { omni_project: "Moonshot" }, git_branch: "feature/login" },
     ]);
     renderSidebar();
 
-    const pinnedSection = screen.getByText("Pinned").closest("section")!;
-    expect(within(pinnedSection).getByText("Moonshot")).toBeInTheDocument();
-    expect(within(pinnedSection).getByText("feature/login")).toBeInTheDocument();
+    const row = pinnedRowLink();
+    // Both icons render (not just their text).
+    const folder = row.querySelector(FOLDER_ICON);
+    const branch = row.querySelector(BRANCH_ICON);
+    expect(folder).not.toBeNull();
+    expect(branch).not.toBeNull();
+    expect(within(row).getByText("Moonshot")).toBeInTheDocument();
+    expect(within(row).getByText("feature/login")).toBeInTheDocument();
+
+    // Order: PROJECT before BRANCH. `compareDocumentPosition` returns
+    // FOLLOWING when `branch` comes after `folder` in document order.
+    expect(
+      folder!.compareDocumentPosition(branch!) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 
-  it("shows only the project when a pinned row has a project but no branch", () => {
+  it("shows only the project (folder icon, no branch icon) when there's no branch", () => {
     localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_1"]));
     mockConversations([{ ...CONV, labels: { omni_project: "Moonshot" }, git_branch: null }]);
     renderSidebar();
 
-    const pinnedSection = screen.getByText("Pinned").closest("section")!;
-    expect(within(pinnedSection).getByText("Moonshot")).toBeInTheDocument();
+    const row = pinnedRowLink();
+    expect(row.querySelector(FOLDER_ICON)).not.toBeNull();
+    expect(row.querySelector(BRANCH_ICON)).toBeNull();
+    expect(within(row).getByText("Moonshot")).toBeInTheDocument();
   });
 
-  it("shows only the branch when a pinned row has a branch but no project", () => {
+  it("shows only the branch (branch icon, no folder icon) when there's no project", () => {
     localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_1"]));
     mockConversations([{ ...CONV, labels: {}, git_branch: "feature/login" }]);
     renderSidebar();
 
-    const pinnedSection = screen.getByText("Pinned").closest("section")!;
-    expect(within(pinnedSection).getByText("feature/login")).toBeInTheDocument();
+    const row = pinnedRowLink();
+    expect(row.querySelector(BRANCH_ICON)).not.toBeNull();
+    expect(row.querySelector(FOLDER_ICON)).toBeNull();
+    expect(within(row).getByText("feature/login")).toBeInTheDocument();
   });
 
-  it("does not surface a project in the sub-text of a non-pinned, unfiled row", () => {
-    // Non-pinned rows show branch only; their project (when filed) is implied by
-    // the enclosing folder, so it's never rendered inline on the row.
-    mockConversations([{ ...CONV, labels: { omni_project: "Moonshot" }, git_branch: null }]);
+  it("renders no sub-text (no icons, no separator) when neither project nor branch exists", () => {
+    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_1"]));
+    mockConversations([{ ...CONV, labels: {}, git_branch: null }]);
     renderSidebar();
 
-    // Unpinned + filed → lives in its project folder; no "Pinned" section, and
-    // the row itself carries no inline project sub-text.
+    const row = pinnedRowLink();
+    // No folder / branch icon and no empty sub-text scaffold at all.
+    expect(row.querySelector(FOLDER_ICON)).toBeNull();
+    expect(row.querySelector(BRANCH_ICON)).toBeNull();
+  });
+
+  it("keeps a non-pinned, filed row's sub-text branch-only (no inline project)", () => {
+    // Non-pinned rows show the branch only; their project (when filed) is
+    // implied by the enclosing folder, so it's never rendered inline. Expand the
+    // folder to reach the row.
+    mocks.projects = ["Moonshot"];
+    mockConversations([
+      { ...CONV, labels: { omni_project: "Moonshot" }, git_branch: "feature/login" },
+    ]);
+    renderSidebar();
+
+    // No Pinned section — the chat lives only in its project folder.
     expect(screen.queryByText("Pinned")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /^Moonshot/ }));
+    const row = screen.getByRole("link", { name: /My Session/ });
+    // Branch icon + name render; the folder/project is NOT inlined on the row.
+    expect(row.querySelector(BRANCH_ICON)).not.toBeNull();
+    expect(row.querySelector(FOLDER_ICON)).toBeNull();
+    expect(within(row).getByText("feature/login")).toBeInTheDocument();
+    expect(within(row).queryByText("Moonshot")).toBeNull();
   });
 });
 

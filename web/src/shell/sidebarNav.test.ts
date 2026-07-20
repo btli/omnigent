@@ -463,10 +463,13 @@ describe("resolveSidebarDrop", () => {
     expect(resolveSidebarDrop(src(), { type: "ungroup" })).toEqual({ kind: "none" });
   });
 
-  it("pins an unpinned session dropped on the Pinned zone", () => {
-    expect(resolveSidebarDrop(src({ project: "Sprint 42" }), { type: "pin" })).toEqual({
-      kind: "pin",
-    });
+  it("pins an unpinned session dropped on the Pinned zone (additive, no project change)", () => {
+    // A pin drop resolves to a bare `pin` — no `move`/`ungroup` and no project
+    // in the action — so the caller only adds the pin; the session keeps its
+    // `omni_project` label and its project-folder slot.
+    const filed = resolveSidebarDrop(src({ project: "Sprint 42" }), { type: "pin" });
+    expect(filed).toEqual({ kind: "pin" });
+    expect(filed).not.toHaveProperty("project");
     // Also pins an unfiled session (pinning is independent of project membership).
     expect(resolveSidebarDrop(src(), { type: "pin" })).toEqual({ kind: "pin" });
   });

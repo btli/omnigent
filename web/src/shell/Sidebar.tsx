@@ -143,6 +143,7 @@ import {
   computeNextActiveOverride,
   conversationDisplayLabel,
   dedupeConversationsById,
+  dedupeIds,
   EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
   migratePinnedConversationIds,
   normalizePinnedConversationIds,
@@ -868,6 +869,9 @@ function ProjectFolder({
         selectedIds={selectedIds}
         onToggleSelected={onToggleSelected}
         onProjectAssigned={onProjectAssigned}
+        // A pinned filed conversation also renders under Pinned; scope this
+        // folder copy's draggable id by project so both register distinctly.
+        dragIdPrefix={`project:${name}`}
         emptyMessage={loadingFirstPage ? undefined : "No chats"}
         indentRows
         headerAction={<ProjectFolderActions projectName={name} onNavigate={onRowClick} />}
@@ -1198,11 +1202,15 @@ function ConversationList({
   );
   const handleDragStart = useCallback((event: DragStartEvent) => {
     const data = event.active.data.current as
-      | { label?: string; project?: string | null; isPinned?: boolean }
+      | { conversationId?: string; label?: string; project?: string | null; isPinned?: boolean }
       | undefined;
+    // The draggable id is section-namespaced (`<prefix>:<id>`); the real
+    // conversation id rides in `data` so drop resolution targets the session,
+    // not the per-section row.
+    const id = data?.conversationId ?? String(event.active.id);
     setActiveDrag({
-      id: String(event.active.id),
-      label: data?.label ?? String(event.active.id),
+      id,
+      label: data?.label ?? id,
       project: data?.project ?? null,
       isPinned: data?.isPinned ?? false,
     });
@@ -1300,6 +1308,10 @@ function ConversationList({
 
   // Visible rows in render order (collapsed sections excluded) for the Cmd+↑/↓
   // session hotkey. Titles must match the <ConversationSection> props below.
+  // A pinned conversation renders in BOTH Pinned and its project / Sessions
+  // home, so the concatenated walk would list its id twice — de-dupe (keeping
+  // the first, i.e. the Pinned occurrence) so navigation visits it once and the
+  // reported count matches the unique selectable set.
   const orderedConversationIds = useMemo(() => {
     const visible = (title: string, list: readonly Conversation[]) =>
       effectiveCollapsedSections.includes(title) ? [] : list;
@@ -1311,11 +1323,13 @@ function ConversationList({
       !projectsCollapsed && expandedProjects.includes(name) ? list : [];
     // `sections` is already scoped to the active tab, so the same Pinned /
     // Projects / Sessions walk covers both tabs (Projects is empty on shared).
-    return [
-      ...visible("Pinned", sections.pinned),
-      ...sections.projectGroups.flatMap((g) => projectVisible(g.name, g.conversations)),
-      ...visible("Chats", sections.sessions),
-    ].map((c) => c.id);
+    return dedupeIds(
+      [
+        ...visible("Pinned", sections.pinned),
+        ...sections.projectGroups.flatMap((g) => projectVisible(g.name, g.conversations)),
+        ...visible("Chats", sections.sessions),
+      ].map((c) => c.id),
+    );
   }, [sections, effectiveCollapsedSections, expandedProjects]);
   useEffect(() => {
     onVisibleCountChange(orderedConversationIds.length);
@@ -1326,11 +1340,14 @@ function ConversationList({
     const projectsCollapsed = effectiveCollapsedSections.includes("Projects");
     const projectVisible = (name: string, list: readonly Conversation[]) =>
       !projectsCollapsed && expandedProjects.includes(name) ? [...list] : [];
-    return [
+    // De-dupe by id: a pinned conversation appears in Pinned AND its home, so
+    // Select-all must count it once (else the count never equals the unique
+    // selected size and the toggle can't reach "Deselect all").
+    return dedupeConversationsById([
       ...visible("Pinned", sections.pinned),
       ...sections.projectGroups.flatMap((g) => projectVisible(g.name, g.conversations)),
       ...visible("Chats", sections.sessions),
-    ];
+    ]);
   };
   // Getter that builds the shift-select visible order on demand (at click
   // time). Reading projectRenderedIdsRef lazily — rather than snapshotting it
@@ -1341,13 +1358,15 @@ function ConversationList({
     const vis = (title: string, list: readonly Conversation[]) =>
       effectiveCollapsedSections.includes(title) ? [] : list.map((c) => c.id);
     const projCollapsed = effectiveCollapsedSections.includes("Projects");
-    return [
+    // De-dupe: a pinned conversation is listed in Pinned and its home, so the
+    // shift-select range must treat it as one anchor point.
+    return dedupeIds([
       ...vis("Pinned", sections.pinned),
       ...(projCollapsed
         ? []
         : sections.projectGroups.flatMap((g) => projectRenderedIdsRef.current.get(g.name) ?? [])),
       ...vis("Chats", sections.sessions),
-    ];
+    ]);
   };
   useSessionSwitchHotkey(orderedConversationIds, activeId);
 
@@ -1471,6 +1490,9 @@ function ConversationList({
                   onToggleSelected={onToggleSelected}
                   onProjectAssigned={expandProject}
                   showProjectSubtext
+                  // Distinct from the same conversation's copy in its project
+                  // folder / Sessions, so both rows register their own drag.
+                  dragIdPrefix="pinned"
                 />
               </PinDropZone>
             )}
@@ -1579,6 +1601,9 @@ function ConversationList({
                   selectedIds={selectedIds}
                   onToggleSelected={onToggleSelected}
                   onProjectAssigned={expandProject}
+                  // A pinned unfiled conversation also renders under Pinned;
+                  // this copy needs its own draggable id.
+                  dragIdPrefix="sessions"
                 />
               </ChatsDropZone>
             )}
@@ -1899,6 +1924,7 @@ function ConversationSection({
   footer,
   onProjectAssigned,
   showProjectSubtext,
+  dragIdPrefix,
 }: {
   title?: string;
   /** Optional icon rendered before the title (e.g. project folder icon). */
@@ -1931,6 +1957,10 @@ function ConversationSection({
   /** Show each row's project in its sub-text — set for the Pinned section,
       whose rows sit outside their project folder. */
   showProjectSubtext?: boolean;
+  /** Namespaces each row's dnd-kit draggable id so a conversation rendered in
+      two sections (Pinned + its home) registers distinct draggables. Defaults
+      to the section title. */
+  dragIdPrefix?: string;
 }) {
   // An untitled section is always open — there's no header to collapse it.
   const isCollapsed = title != null && collapsed;
@@ -1972,6 +2002,7 @@ function ConversationSection({
                   conversation={conv}
                   isPinned={pinnedConversationIds.includes(conv.id)}
                   showProjectSubtext={showProjectSubtext}
+                  dragIdPrefix={dragIdPrefix ?? title ?? "row"}
                   onClick={onRowClick}
                   onTogglePinned={onTogglePinned}
                   selectionMode={selectionMode}
@@ -2382,6 +2413,7 @@ function ConversationRow({
   conversation,
   isPinned,
   showProjectSubtext = false,
+  dragIdPrefix = "row",
   onClick,
   onTogglePinned,
   selectionMode,
@@ -2394,6 +2426,12 @@ function ConversationRow({
   /** Show the project name (folder icon) in the row's sub-text. Set for
       Pinned-section rows, which sit outside their project folder. */
   showProjectSubtext?: boolean;
+  /** Namespaces the dnd-kit draggable id per section. A pinned conversation
+      renders twice (Pinned + its project/Sessions home); dnd-kit keeps one
+      registration per id, so both copies need distinct ids or the second
+      overwrites the first. The real conversation id travels in the drag
+      `data` for drop resolution. */
+  dragIdPrefix?: string;
   onClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   onTogglePinned: (conversationId: string) => void;
   selectionMode: boolean;
@@ -2532,8 +2570,17 @@ function ConversationRow({
     setNodeRef: setDragNodeRef,
     isDragging,
   } = useDraggable({
-    id: conversation.id,
-    data: { type: "session", label, project: currentProject, isPinned },
+    // Section-namespaced so a pinned conversation's two rendered rows register
+    // distinct draggables; `conversationId` in `data` resolves back to the real
+    // id for drop handling.
+    id: `${dragIdPrefix}:${conversation.id}`,
+    data: {
+      type: "session",
+      conversationId: conversation.id,
+      label,
+      project: currentProject,
+      isPinned,
+    },
     disabled: !isOwner || selectionMode || isArchived || isEditing,
   });
   // A drag ends with a synthetic click on the row's <Link> (mousedown + mouseup

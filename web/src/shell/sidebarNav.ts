@@ -168,6 +168,22 @@ export function migratePinnedConversationIds(ids: readonly string[]): string[] {
   return migrated;
 }
 
+// Drop ids that already appeared, keeping the first occurrence. A pinned
+// conversation is rendered in both the Pinned section and its project /
+// Sessions home, so a concatenated visible-order list carries its id twice;
+// callers computing counts / navigation order / shift-select ranges de-dupe so
+// each conversation is counted and visited once.
+export function dedupeIds(ids: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+  for (const id of ids) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    deduped.push(id);
+  }
+  return deduped;
+}
+
 // Drop conversations whose id already appeared, keeping the first occurrence.
 // The pinned-backfill fetches a session by id and can return a copy that is
 // also present in the paginated list; merging both would render the row twice.

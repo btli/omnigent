@@ -802,6 +802,29 @@ describe("Sidebar project sections", () => {
     expect(within(projectSection).getByText("conv_pinned")).toBeInTheDocument();
   });
 
+  it("retains a filed pin in its project folder after unpinning (Pinned section clears)", () => {
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_plain", "Claude Code", { labels: { omni_project: "Customer X" } }),
+      conv("conv_pinned", "Claude Code", { labels: { omni_project: "Customer X" } }),
+    ]);
+    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_pinned"]));
+    renderSidebar();
+
+    // Unpin from the Pinned-section copy's quick control.
+    const pinnedSection = screen.getByText("Pinned").closest("section")!;
+    fireEvent.click(within(pinnedSection).getByTestId("quick-pin-conversation"));
+
+    // Pinned section is gone (no more pins), but the chat stays filed under its
+    // project — unpinning never removes the project label.
+    expect(screen.queryByText("Pinned")).toBeNull();
+    const folderButton = screen.getByRole("button", { name: /^Customer X/ });
+    fireEvent.click(folderButton);
+    const projectSection = folderButton.closest("section")!;
+    expect(within(projectSection).getByText("conv_pinned")).toBeInTheDocument();
+    expect(within(projectSection).getByText("conv_plain")).toBeInTheDocument();
+  });
+
   it("keeps a pinned unfiled session in the flat Sessions list too (additive)", () => {
     mockConversations([conv("conv_a", "Claude Code"), conv("conv_pinned", "Claude Code")]);
     localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_pinned"]));
@@ -815,6 +838,22 @@ describe("Sidebar project sections", () => {
     const sessionsSection = screen.getByText("Sessions").closest("section")!;
     expect(within(sessionsSection).getByText("conv_pinned")).toBeInTheDocument();
     expect(within(sessionsSection).getByText("conv_a")).toBeInTheDocument();
+  });
+
+  it("Select-all toggles to Deselect-all with a duplicated (pinned) visible row", () => {
+    // A pinned unfiled session renders twice (Pinned + Sessions). The visible
+    // count must de-dupe so selecting each unique id reaches the count and the
+    // toggle flips to Deselect all — otherwise it'd stick on "Select all".
+    mockConversations([conv("conv_a", "Claude Code"), conv("conv_pinned", "Claude Code")]);
+    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_pinned"]));
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Select all" }));
+
+    // Two unique conversations selected → the control flips to "Deselect all".
+    expect(screen.getByRole("button", { name: "Deselect all" })).toBeInTheDocument();
+    expect(screen.getByText("2 selected")).toBeInTheDocument();
   });
 
   it("does not render a project section when useProjects returns nothing", () => {
