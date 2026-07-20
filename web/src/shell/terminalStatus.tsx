@@ -1,3 +1,4 @@
+import { TerminalIcon } from "lucide-react";
 import { type ConnectionState } from "@/components/blocks/TerminalSession";
 import { type TerminalInfo } from "@/hooks/useTerminals";
 import { cn } from "@/lib/utils";
@@ -34,6 +35,41 @@ export function TerminalStatusBadge({ status }: { status: TerminalStatus }) {
     >
       <span className={cn("inline-block size-1.5 rounded-full", className)} />
       <span>{label}</span>
+    </span>
+  );
+}
+
+/**
+ * Identity chip for a terminal's inline header: icon, name, optional
+ * session key, and status dot. Shared by the rail's inline shell header
+ * and the main-column shell header so both stay pixel-identical.
+ *
+ * :param terminal: Terminal whose name/session drive the chip.
+ * :param status: Terminal-local display status for the trailing badge.
+ * :param className: Extra classes on the outer span (e.g. ``min-w-0``).
+ */
+export function TerminalIdentityChip({
+  terminal,
+  status,
+  className,
+}: {
+  terminal: TerminalInfo;
+  status: TerminalStatus;
+  className?: string;
+}) {
+  return (
+    <span
+      className={cn(
+        "flex items-center gap-1.5 rounded-sm bg-muted px-2 py-1 text-foreground text-xs",
+        className,
+      )}
+    >
+      <TerminalIcon className="size-3 shrink-0" />
+      <span className="max-w-[8rem] truncate">{terminal.name}</span>
+      {terminal.session && (
+        <span className="shrink-0 text-muted-foreground/60">· {terminal.session}</span>
+      )}
+      <TerminalStatusBadge status={status} />
     </span>
   );
 }
