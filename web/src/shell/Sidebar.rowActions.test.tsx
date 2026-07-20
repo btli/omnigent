@@ -186,23 +186,23 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("quick pin/unpin hover button", () => {
-  it("toggles the pin without opening the kebab menu, moving the row under Pinned", () => {
+  it("toggles the pin without opening the kebab menu, adding the row under Pinned", () => {
     renderSidebar();
 
-    // No "Pinned" section to start; the row lives under Recent.
+    // No "Pinned" section to start; the row lives under Sessions.
     expect(screen.queryByText("Pinned")).toBeNull();
     const pinButton = screen.getByTestId("quick-pin-conversation");
     expect(pinButton).toHaveAttribute("aria-label", "Pin conversation");
 
     fireEvent.click(pinButton);
 
-    // The row is now grouped under a "Pinned" header, and the quick button
-    // flips to its unpin affordance — both prove the toggle ran through the
+    // A "Pinned" section now holds the row (pinning is additive — the row also
+    // stays in Sessions, so the same session renders twice). Its quick button
+    // flips to the unpin affordance — both prove the toggle ran through the
     // sidebar's pin state (not just a local no-op).
-    const pinnedHeader = screen.getByText("Pinned");
-    const pinnedSection = pinnedHeader.closest("section")!;
+    const pinnedSection = screen.getByText("Pinned").closest("section")!;
     expect(within(pinnedSection).getByText("My Session")).toBeInTheDocument();
-    expect(screen.getByTestId("quick-pin-conversation")).toHaveAttribute(
+    expect(within(pinnedSection).getByTestId("quick-pin-conversation")).toHaveAttribute(
       "aria-label",
       "Unpin conversation",
     );
@@ -212,7 +212,7 @@ describe("quick pin/unpin hover button", () => {
     expect(localStorage.getItem("omnigent:pinned-conversation-ids")).toContain("conv_1");
 
     // Clicking again unpins: the Pinned section disappears.
-    fireEvent.click(screen.getByTestId("quick-pin-conversation"));
+    fireEvent.click(within(pinnedSection).getByTestId("quick-pin-conversation"));
     expect(screen.queryByText("Pinned")).toBeNull();
   });
 
@@ -352,60 +352,51 @@ describe("double-click to rename", () => {
   });
 });
 
-describe("pinned row project flyout", () => {
-  // Pinning lifts a session out of its project folder into the flat "Pinned"
-  // section, so the folder no longer conveys which project it came from. The
-  // hover flyout restores that cue: title + folder icon + project name. It
-  // opens on focus/hover — fire focus on the row link and await the portal.
+describe("pinned row sub-text", () => {
+  // Pinning is additive: the row also shows in the flat "Pinned" section, which
+  // sits outside any project folder. So a Pinned-section row surfaces its
+  // project (folder icon + name) and git branch (branch icon + name) as
+  // persistent sub-text, each part shown only when its value is present.
 
-  it("shows the project name in the flyout for a pinned, project-owned row", async () => {
-    // Seed the pin so the row lifts into the always-expanded Pinned section
-    // (a project-owned row otherwise sits inside a collapsed project folder).
+  it("shows the project name and git branch in a pinned row's sub-text", () => {
     localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_1"]));
-    mockConversations([{ ...CONV, labels: { omni_project: "Moonshot" } }]);
+    mockConversations([
+      { ...CONV, labels: { omni_project: "Moonshot" }, git_branch: "feature/login" },
+    ]);
     renderSidebar();
-    expect(screen.getByText("Pinned")).toBeInTheDocument();
 
-    // Focus opens the HoverCard (onFocus is one of its open triggers); the
-    // content is portalled, so query the whole document after the open delay.
-    fireEvent.focus(screen.getByRole("link", { name: /My Session/ }));
-    const flyout = await screen.findByTestId("pinned-project-flyout");
-    expect(within(flyout).getByText("Moonshot")).toBeInTheDocument();
-    expect(within(flyout).getByText("My Session")).toBeInTheDocument();
+    const pinnedSection = screen.getByText("Pinned").closest("section")!;
+    expect(within(pinnedSection).getByText("Moonshot")).toBeInTheDocument();
+    expect(within(pinnedSection).getByText("feature/login")).toBeInTheDocument();
   });
 
-  it("renders no project flyout for a pinned row with no project", () => {
-    // No project label → nothing to surface, so the row keeps its plain native
-    // title tooltip and never mounts a hover-card trigger.
+  it("shows only the project when a pinned row has a project but no branch", () => {
     localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_1"]));
-    mockConversations([{ ...CONV, labels: {} }]);
+    mockConversations([{ ...CONV, labels: { omni_project: "Moonshot" }, git_branch: null }]);
     renderSidebar();
-    expect(screen.getByText("Pinned")).toBeInTheDocument();
 
-    const row = screen.getByRole("link", { name: /My Session/ });
-    expect(row).not.toHaveAttribute("data-slot", "hover-card-trigger");
-    fireEvent.focus(row);
-    expect(screen.queryByTestId("pinned-project-flyout")).toBeNull();
+    const pinnedSection = screen.getByText("Pinned").closest("section")!;
+    expect(within(pinnedSection).getByText("Moonshot")).toBeInTheDocument();
   });
 
-  it("disables the flyout on a mobile viewport, keeping the native title", () => {
-    // Mobile has no real hover, so the flyout is gated off there: a tap that
-    // navigates must not also open (and strand) a HoverCard over the chat. The
-    // row falls back to the plain link path — no hover-card trigger, native
-    // title restored — even though it IS pinned + project-owned.
-    mocks.isMobile = true;
+  it("shows only the branch when a pinned row has a branch but no project", () => {
     localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_1"]));
-    mockConversations([{ ...CONV, labels: { omni_project: "Moonshot" } }]);
+    mockConversations([{ ...CONV, labels: {}, git_branch: "feature/login" }]);
     renderSidebar();
-    expect(screen.getByText("Pinned")).toBeInTheDocument();
 
-    const row = screen.getByRole("link", { name: /My Session/ });
-    // No hover-card trigger is mounted, and the native title tooltip is kept.
-    expect(row).not.toHaveAttribute("data-slot", "hover-card-trigger");
-    expect(row).toHaveAttribute("title", "My Session");
-    // Focusing the row opens nothing — the flyout never mounts on mobile.
-    fireEvent.focus(row);
-    expect(screen.queryByTestId("pinned-project-flyout")).toBeNull();
+    const pinnedSection = screen.getByText("Pinned").closest("section")!;
+    expect(within(pinnedSection).getByText("feature/login")).toBeInTheDocument();
+  });
+
+  it("does not surface a project in the sub-text of a non-pinned, unfiled row", () => {
+    // Non-pinned rows show branch only; their project (when filed) is implied by
+    // the enclosing folder, so it's never rendered inline on the row.
+    mockConversations([{ ...CONV, labels: { omni_project: "Moonshot" }, git_branch: null }]);
+    renderSidebar();
+
+    // Unpinned + filed → lives in its project folder; no "Pinned" section, and
+    // the row itself carries no inline project sub-text.
+    expect(screen.queryByText("Pinned")).toBeNull();
   });
 });
 

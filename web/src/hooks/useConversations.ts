@@ -882,7 +882,7 @@ async function fetchAllProjectSessionIds(project: string): Promise<string[]> {
  * Fetch up to `limit` session ids filed under a project (archived included),
  * server-side via the `?project=` filter. A single page — enough to answer
  * "is this session the project's last member?" reliably (unaffected by the
- * sidebar's loaded window or pin-precedence placement). Default `limit=2` is
+ * sidebar's loaded window). Default `limit=2` is
  * the minimum that distinguishes "only this one" from "more than one".
  */
 export async function fetchProjectSessionIds(project: string, limit = 2): Promise<string[]> {

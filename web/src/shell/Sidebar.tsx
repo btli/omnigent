@@ -80,7 +80,6 @@ import {
   ContextMenuSubTrigger,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
-import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -809,15 +808,12 @@ function ProjectFolder({
   projectRenderedIdsRef?: RefObject<Map<string, string[]>>;
 }) {
   const query = useProjectSessions(name, expanded);
-  const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
   const conversations = useMemo(() => {
     const loaded = query.data?.pages.flatMap((page) => page.data) ?? [];
-    // Pinned sessions live in the global Pinned section, not their folder.
-    return sortByUpdatedAtDesc(
-      loaded.filter((c) => !pinnedSet.has(c.id)),
-      activeOverride,
-    );
-  }, [query.data, pinnedSet, activeOverride]);
+    // Pinning is additive: a pinned session still shows in its folder (it also
+    // appears in the global Pinned section).
+    return sortByUpdatedAtDesc(loaded, activeOverride);
+  }, [query.data, activeOverride]);
 
   // Register this folder's rendered IDs synchronously during render so the
   // shift-select range uses the real per-project data, not the global list.
@@ -1021,31 +1017,27 @@ function ConversationList({
         ? notArchived.filter((c) => !isOwnedByViewer(c, viewerId))
         : notArchived.filter((c) => isOwnedByViewer(c, viewerId));
 
-    // Pinned takes precedence over Project: pinning a session moves it OUT of
-    // its project into the flat global Pinned section (no nested pins). Ordered
-    // strictly by when they were pinned (newest pin at the bottom), not by
-    // `updated_at`, so a pinned session doesn't jump when it gets a new message.
-    // Pins are localStorage and ownership-agnostic, so a pinned shared session
-    // floats to Pinned on the Shared tab just like an owned one on My sessions.
+    // Pinning is ADDITIVE: a pinned session also appears in the flat global
+    // Pinned section, but stays in its project folder and the flat list too.
+    // Ordered strictly by when they were pinned (newest pin at the bottom), not
+    // by `updated_at`, so a pinned session doesn't jump when it gets a new
+    // message. Pins are localStorage and ownership-agnostic, so a pinned shared
+    // session shows under Pinned on the Shared tab just like an owned one.
     const pinned = orderByPinnedSequence(
       tabScoped.filter((c) => pinnedSet.has(c.id)),
       pinnedConversationIds,
     );
-    const pinnedIdSet = new Set(pinned.map((c) => c.id));
 
     // Projects are a "My sessions"-only tool (filing into a project is
     // owner-only), so the Shared tab renders no folders. On "mine" each folder
-    // holds its non-pinned, non-archived sessions; a pinned member is excluded
-    // (it lives under Pinned), so pinning a project's last session leaves the
-    // folder showing "No chats".
+    // holds its non-archived sessions; a pinned member stays here (it's also
+    // shown under Pinned) so pinning never empties a folder.
     const filedIds = new Set<string>();
     const projectGroups: { name: string; conversations: Conversation[] }[] =
       activeTab === "shared"
         ? []
         : projectNames.map((name) => {
-            const inProject = tabScoped.filter(
-              (c) => c.labels?.[PROJECT_LABEL_KEY] === name && !pinnedIdSet.has(c.id),
-            );
+            const inProject = tabScoped.filter((c) => c.labels?.[PROJECT_LABEL_KEY] === name);
             inProject.forEach((c) => filedIds.add(c.id));
             return { name, conversations: sortByUpdatedAtDesc(inProject, activeOverride) };
           });
@@ -1055,9 +1047,11 @@ function ConversationList({
     // unloaded page. We render it as a folder with a "No chats" placeholder
     // rather than hiding it (matches the target sidebar layout).
 
-    // Sessions: the remainder of the tab's slice — not pinned, not filed.
+    // Sessions: the remainder of the tab's slice — not filed under a project.
+    // Pinned sessions still appear here (pinning is additive); they also show
+    // in the Pinned section above.
     const sessions = sortByUpdatedAtDesc(
-      tabScoped.filter((c) => !pinnedIdSet.has(c.id) && !filedIds.has(c.id)),
+      tabScoped.filter((c) => !filedIds.has(c.id)),
       activeOverride,
     );
     const archived = sortByUpdatedAtDesc(
@@ -1171,8 +1165,9 @@ function ConversationList({
 
   // ── Drag-and-drop: file sessions into / out of projects ────────────────────
   // A session row can be dragged onto a project folder (file it there), onto the
-  // "Chats" list / a fallback strip (unfile it), or onto "Pinned" (pin it, which
-  // floats it out of its project). "Shared with me" is deliberately not a drop
+  // "Chats" list / a fallback strip (unfile it), or onto "Pinned" (pin it — the
+  // session keeps its project and flat-list slot and also joins Pinned).
+  // "Shared with me" is deliberately not a drop
   // target — you can't file sessions there. The kebab "Move session" menu + the
   // pin button remain the keyboard-accessible paths; DnD is a pointer
   // enhancement on top of them, so the sensors are pointer-only.
@@ -1189,12 +1184,10 @@ function ConversationList({
   } | null>(null);
   // A drop-to-ungroup that turned out to remove the project's last session —
   // held here to confirm (the implicit project vanishes with it), mirroring the
-  // kebab's "Remove from project" flow. `unpin` carries through whether the
-  // dragged session was also pinned (and so must be unpinned to leave Pinned).
+  // kebab's "Remove from project" flow.
   const [pendingUngroup, setPendingUngroup] = useState<{
     id: string;
     project: string;
-    unpin: boolean;
   } | null>(null);
   // Mouse: a small drag threshold so a plain click still navigates / opens the
   // kebab. Touch: a press-and-hold delay so scrolling the list isn't hijacked
@@ -1226,22 +1219,17 @@ function ConversationList({
       );
       if (action.kind === "move") {
         moveToProject.mutate({ id: dragged.id, project: action.project });
-        // Unpin a pinned session so it actually drops into the folder instead of
-        // staying floated up in Pinned (pin outranks project membership).
-        if (action.unpin) onTogglePinned(dragged.id);
         // Open the (possibly brand-new) folder so the session is visible in it.
         expandProject(action.project);
         return;
       }
-      if (action.kind === "pin" || action.kind === "unpin") {
-        // Toggle the pin: `pin` is only emitted for an unpinned session, `unpin`
-        // only for a pinned one, so a single toggle lands the intended state.
-        // Unpinning a pinned session drops it back into its project / Chats.
+      if (action.kind === "pin") {
+        // Additive pin: only emitted for an unpinned session, so a single toggle
+        // pins it. It keeps its project / flat-list slot and also joins Pinned.
         onTogglePinned(dragged.id);
         return;
       }
       if (action.kind === "ungroup") {
-        const unpin = action.unpin;
         // Removing a project's LAST session deletes the implicit project, so
         // confirm that case (server-side check, accurate regardless of the
         // loaded window); otherwise remove silently. Mirrors the kebab flow.
@@ -1254,10 +1242,9 @@ function ConversationList({
             isLastSession = true;
           }
           if (isLastSession) {
-            setPendingUngroup({ id: dragged.id, project: action.project, unpin });
+            setPendingUngroup({ id: dragged.id, project: action.project });
           } else {
             moveToProject.mutate({ id: dragged.id, project: "" });
-            if (unpin) onTogglePinned(dragged.id);
           }
         })();
       }
@@ -1467,9 +1454,9 @@ function ConversationList({
         ) : (
           <>
             {sections.pinned.length > 0 && (
-              // Drop a session here to pin it — pin-precedence then floats it
-              // out of any project into this section. Active only while dragging
-              // an unpinned session; outline-only highlight.
+              // Drop a session here to pin it — it also appears in this section
+              // while keeping its project / flat-list slot. Active only while
+              // dragging an unpinned session; outline-only highlight.
               <PinDropZone active={activeDrag != null && !activeDrag.isPinned}>
                 <ConversationSection
                   title="Pinned"
@@ -1483,6 +1470,7 @@ function ConversationList({
                   selectedIds={selectedIds}
                   onToggleSelected={onToggleSelected}
                   onProjectAssigned={expandProject}
+                  showProjectSubtext
                 />
               </PinDropZone>
             )}
@@ -1575,12 +1563,10 @@ function ConversationList({
             )}
             {sections.sessions.length > 0 && (
               // Drop a session here to send it to the flat "Chats" list — where
-              // unfiled, unpinned sessions live. Active while dragging a filed
-              // session (removes it from its project) or a pinned one (unpins
-              // it), since both have somewhere to land here.
-              <ChatsDropZone
-                active={activeDrag != null && (activeDrag.project != null || activeDrag.isPinned)}
-              >
+              // unfiled sessions live. Active only while dragging a filed
+              // session (removes it from its project); an unfiled session
+              // already lives here, so there's nowhere to land.
+              <ChatsDropZone active={activeDrag != null && activeDrag.project != null}>
                 <ConversationSection
                   title="Sessions"
                   conversations={sections.sessions}
@@ -1661,9 +1647,6 @@ function ConversationList({
                   { id: pendingUngroup.id, project: "" },
                   { onSuccess: () => setPendingUngroup(null) },
                 );
-                // A pinned session must also be unpinned to leave Pinned and
-                // land in the flat list.
-                if (pendingUngroup.unpin) onTogglePinned(pendingUngroup.id);
               }}
             >
               Remove from project
@@ -1699,8 +1682,8 @@ function ChatsDropZone({ active, children }: { active: boolean; children: ReactN
 }
 
 /** Wraps the "Pinned" section as a pin drop target: a session released here is
-    pinned, which (via the list's pin-precedence) floats it out of any project
-    into this section. `active` gates the droppable so it only intercepts drops
+    added to this section while keeping its project / flat-list slot (pinning is
+    additive). `active` gates the droppable so it only intercepts drops
     while dragging an unpinned session — at rest, or for an already-pinned
     session, it's an inert wrapper. Outline-only highlight on drag-over,
     matching the project folders and {@link ChatsDropZone}. */
@@ -1915,6 +1898,7 @@ function ConversationSection({
   headerAction,
   footer,
   onProjectAssigned,
+  showProjectSubtext,
 }: {
   title?: string;
   /** Optional icon rendered before the title (e.g. project folder icon). */
@@ -1944,6 +1928,9 @@ function ConversationSection({
   /** Called with the project name when a row is filed into one, so the sidebar
       can expand that (possibly brand-new) project folder. */
   onProjectAssigned?: (projectName: string) => void;
+  /** Show each row's project in its sub-text — set for the Pinned section,
+      whose rows sit outside their project folder. */
+  showProjectSubtext?: boolean;
 }) {
   // An untitled section is always open — there's no header to collapse it.
   const isCollapsed = title != null && collapsed;
@@ -1984,6 +1971,7 @@ function ConversationSection({
                   key={conv.id}
                   conversation={conv}
                   isPinned={pinnedConversationIds.includes(conv.id)}
+                  showProjectSubtext={showProjectSubtext}
                   onClick={onRowClick}
                   onTogglePinned={onTogglePinned}
                   selectionMode={selectionMode}
@@ -2393,6 +2381,7 @@ function ConversationMenuItems({
 function ConversationRow({
   conversation,
   isPinned,
+  showProjectSubtext = false,
   onClick,
   onTogglePinned,
   selectionMode,
@@ -2402,6 +2391,9 @@ function ConversationRow({
 }: {
   conversation: Conversation;
   isPinned: boolean;
+  /** Show the project name (folder icon) in the row's sub-text. Set for
+      Pinned-section rows, which sit outside their project folder. */
+  showProjectSubtext?: boolean;
   onClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   onTogglePinned: (conversationId: string) => void;
   selectionMode: boolean;
@@ -2424,10 +2416,6 @@ function ConversationRow({
   const activeRootId = useActiveRootSessionId(activeId ?? null);
   const isActive = (activeRootId ?? activeId) === conversation.id;
   const navigate = useNavigate();
-  // Mobile has no real hover, so a tap that navigates would also trip the
-  // project flyout's HoverCard and leave it lingering over the chat. Gate the
-  // flyout off below the `md` breakpoint (see `projectFlyoutName`).
-  const isMobile = useIsMobileViewport();
   // Track the *live* active conversation id. Delete is fire-and-forget,
   // so the user can navigate to another conversation before the mutation
   // resolves — the onSuccess redirect must key off where they are now,
@@ -2503,15 +2491,6 @@ function ConversationRow({
   // The session's current project (reserved label), or null when unfiled —
   // drives the kebab submenu label ("Add to project" vs "Change project").
   const currentProject = conversation.labels?.[PROJECT_LABEL_KEY] ?? null;
-  // Pinned sessions are lifted OUT of their project folder into the flat
-  // "Pinned" section, so the row no longer shows which project it belongs to.
-  // For those rows only, surface the project in a hover flyout. Non-pinned
-  // rows already sit inside their project folder, so they don't need it.
-  // Disabled on mobile: there's no hover, so a tap would open the HoverCard
-  // and leave it overlaying the chat after navigation. Forcing null there
-  // routes the row through the plain ContextMenu/link path and restores the
-  // native `title` tooltip.
-  const projectFlyoutName = !isMobile && isPinned ? currentProject : null;
 
   const label = conversationDisplayLabel(conversation);
   // Recompute unseen state the moment the last-seen map changes (e.g. the
@@ -2746,9 +2725,7 @@ function ConversationRow({
         e.preventDefault();
         setIsEditing(true);
       }}
-      // The rich project flyout replaces the native tooltip on pinned,
-      // project-owned rows so the two don't stack; other rows keep it.
-      title={projectFlyoutName ? undefined : (conversation.title ?? conversation.id)}
+      title={conversation.title ?? conversation.id}
     >
       {/* Row 1: the session name. Status markers (working, needs-approval,
           unseen) render in the trailing time-marker slot below, replacing
@@ -2761,14 +2738,24 @@ function ConversationRow({
           {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
         </span>
       </div>
-      {/* Row 2: git branch subtitle, spanning the full row below. */}
-      {gitBranch !== null && (
-        <span
-          className="flex items-center gap-1 font-normal text-xs text-muted-foreground"
-          title={gitBranch}
-        >
-          <GitBranchIcon className="size-3 shrink-0" />
-          <span className="truncate">{gitBranch}</span>
+      {/* Row 2: sub-text below the name. Non-pinned rows show only the git
+          branch (their project is implied by the enclosing folder). Pinned-
+          section rows sit outside any folder, so they also surface the project
+          (folder icon) before the branch — each part shows only when present. */}
+      {(gitBranch !== null || (showProjectSubtext && currentProject !== null)) && (
+        <span className="flex min-w-0 items-center gap-2 font-normal text-xs text-muted-foreground">
+          {showProjectSubtext && currentProject !== null && (
+            <span className="flex min-w-0 items-center gap-1" title={currentProject}>
+              <FolderIcon className="size-3 shrink-0" />
+              <span className="truncate">{currentProject}</span>
+            </span>
+          )}
+          {gitBranch !== null && (
+            <span className="flex min-w-0 items-center gap-1" title={gitBranch}>
+              <GitBranchIcon className="size-3 shrink-0" />
+              <span className="truncate">{gitBranch}</span>
+            </span>
+          )}
         </span>
       )}
     </Link>
@@ -2786,42 +2773,9 @@ function ConversationRow({
           Suppressed in selection mode (bulk-select owns the row), where the
           bare link is rendered instead. ContextMenuTrigger preventDefaults the
           native contextmenu event, so right-click never navigates; asChild
-          merges its handler onto the Link, preserving left-click / double-click.
-          Pinned, project-owned rows nest a HoverCardTrigger around the Link so
-          hovering surfaces the project flyout — the trigger sits innermost so
-          both the context menu and the hover card keep their handlers/refs on
-          the Link. */}
+          merges its handler onto the Link, preserving left-click / double-click. */}
       {selectionMode ? (
-        projectFlyoutName ? (
-          <HoverCard openDelay={150} closeDelay={0}>
-            <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
-            <PinnedProjectFlyoutContent
-              title={conversation.title ?? conversation.id}
-              projectName={projectFlyoutName}
-            />
-          </HoverCard>
-        ) : (
-          rowLink
-        )
-      ) : projectFlyoutName ? (
-        <HoverCard openDelay={150} closeDelay={0}>
-          <ContextMenu>
-            <ContextMenuTrigger asChild>
-              <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
-            </ContextMenuTrigger>
-            <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-xs">
-              <ConversationMenuItems
-                components={contextBundle}
-                setMenuOpen={() => {}}
-                {...menuItemProps}
-              />
-            </ContextMenuContent>
-          </ContextMenu>
-          <PinnedProjectFlyoutContent
-            title={conversation.title ?? conversation.id}
-            projectName={projectFlyoutName}
-          />
-        </HoverCard>
+        rowLink
       ) : (
         <ContextMenu>
           <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
@@ -3084,42 +3038,6 @@ function ConversationRow({
         </DialogContent>
       </Dialog>
     </li>
-  );
-}
-
-/**
- * Hover flyout body for a pinned, project-owned conversation row.
- *
- * Pinning lifts a session out of its project folder into the flat "Pinned"
- * section, dropping the visual project cue the folder provided. Hovering the
- * row surfaces it again: the session title, then a folder icon + project name.
- * Mirrors {@link AgentHoverCard}'s Cursor-style placement (right / top-aligned)
- * and the muted, small-icon foreground used elsewhere in the sidebar.
- */
-function PinnedProjectFlyoutContent({
-  title,
-  projectName,
-}: {
-  title: string;
-  projectName: string;
-}) {
-  return (
-    <HoverCardContent
-      side="right"
-      align="start"
-      sideOffset={8}
-      className="w-64"
-      data-testid="pinned-project-flyout"
-    >
-      {/* Titles have no length cap (server + rename input are unbounded), so
-          clamp to 3 wrapped lines to keep the card tidy — full text stays in
-          the DOM. */}
-      <p className="line-clamp-3 font-medium text-sm">{title}</p>
-      <p className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
-        <FolderIcon className="size-3.5 shrink-0" />
-        <span className="truncate">{projectName}</span>
-      </p>
-    </HoverCardContent>
   );
 }
 
