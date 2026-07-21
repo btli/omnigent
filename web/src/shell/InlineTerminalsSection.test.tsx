@@ -78,6 +78,14 @@ const REGULAR_CTX = {
   isTerminalFirst: false,
 } as TerminalFirstContextValue;
 
+// A native-CLI wrapper session (claude-native / codex-native). These
+// keep the full-screen main-column takeover for user shells — the only
+// session shape that still routes to `onExpand` when inline is set.
+const NATIVE_WRAPPER_CTX = {
+  ...TERMINAL_FIRST_SDK_CTX,
+  isNativeWrapper: true,
+} as TerminalFirstContextValue;
+
 function renderInlineSection(
   terminals: TerminalInfo[],
   onExpand: (key: string) => void = vi.fn(),
@@ -255,13 +263,33 @@ describe("InlineTerminalsSection inline mode hosts the shell in the rail", () =>
     );
   });
 
-  it("routes terminal-first shells to onExpand even with inline set (main-column takeover)", () => {
-    // Terminal-first sessions keep their chat-replacing UX: the shell
-    // opens in the main column via MainTerminalView, not in the rail.
+  it("hosts a chat-first SDK session's user shell inline (chat stays visible)", () => {
+    // Chat-first SDK sessions (polly/debby) are terminal-first only
+    // because the runner hosts an embedded REPL. Their user-created
+    // shells belong inline beside the chat — the +New Shell fix. The
+    // REPL itself is excluded by inventoryTerminals, so every row here
+    // is a user shell that must render in-rail, not full-screen.
     const onExpand = vi.fn();
     renderInlineSection([makeTerminal("terminal_bash_s1", "bash", "s1")], onExpand, {
       inline: true,
       ctx: TERMINAL_FIRST_SDK_CTX,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /s1/ }));
+
+    const view = screen.getByTestId("terminal-view");
+    expect(view).toHaveAttribute("data-terminal-id", "terminal_bash_s1");
+    expect(onExpand).not.toHaveBeenCalled();
+  });
+
+  it("routes native-wrapper shells to onExpand even with inline set (main-column takeover)", () => {
+    // Native-CLI wrappers keep their chat-replacing UX: the shell opens
+    // in the main column via MainTerminalView, not in the rail. This is
+    // the sole session shape that still routes full-screen when inline.
+    const onExpand = vi.fn();
+    renderInlineSection([makeTerminal("terminal_bash_s1", "bash", "s1")], onExpand, {
+      inline: true,
+      ctx: NATIVE_WRAPPER_CTX,
     });
 
     fireEvent.click(screen.getByRole("button", { name: /s1/ }));
