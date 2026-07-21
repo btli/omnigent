@@ -226,7 +226,20 @@ def test_populated_sidebar_matches_baseline(
     # project folders, and the nested project chat (the last row to arrive, via
     # its own `?project=` fetch). Match row text — "Sessions" as a section-header
     # name collides with the "Select sessions" button, so key off content.
-    expect(page.get_by_text("Prototype the agent orchestration")).to_be_visible(timeout=30_000)
+    #
+    # Pinning is additive: the seeded pinned session renders BOTH under the
+    # Pinned section AND in its home (the flat Sessions list), so its title
+    # resolves to two elements. Scope each wait to its section wrapper (the
+    # pin / chats drop zones) to keep the locator unambiguous and to assert the
+    # duplication holds — the row is present in both places.
+    pinned_section = page.get_by_test_id("sidebar-pin-drop-zone")
+    sessions_section = page.get_by_test_id("sidebar-chats-drop-zone")
+    expect(pinned_section.get_by_text("Prototype the agent orchestration")).to_be_visible(
+        timeout=30_000
+    )
+    expect(sessions_section.get_by_text("Prototype the agent orchestration")).to_be_visible(
+        timeout=30_000
+    )
     expect(page.get_by_role("button", name=_PROJECT_OPEN, exact=True)).to_be_visible(
         timeout=30_000
     )
