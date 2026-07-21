@@ -413,23 +413,39 @@ def disabled_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Te
 
 
 def test_device_grant_routes_absent_by_default(disabled_app: TestClient) -> None:
-    """Default-off: the /oauth/* router is not mounted unless explicitly
-    enabled, so the device-grant POST handlers don't run.
+    """Default-off: the RFC 8628 device-consent surface is not mounted
+    unless explicitly enabled, so its POST handlers don't run.
 
     With no mounted handler the POST is not routed: it 404s when nothing else
     claims the path, or 405s when a built web SPA is mounted at ``/`` (its
-    catch-all serves GET only). Either way NO device-grant logic executes —
-    no device_code is issued and no OAuth error shape is returned.
+    catch-all serves GET only). Either way NO device-consent logic executes —
+    no device_code is issued.
+
+    The token/revoke half is different: login-issued refresh grants need it
+    in every accounts/oidc deployment, so ``/oauth/token`` and
+    ``/oauth/revoke`` mount regardless of the flag — but the device_code
+    grant type is refused there when the device flow is off.
     """
     r = disabled_app.post("/oauth/device/authorize", json={"client_id": "slack"})
     assert r.status_code in (404, 405)
     assert "device_code" not in r.text
+    # Token endpoint is live (login grants) but knows no device_code grant.
+    r = disabled_app.post(
+        "/oauth/token",
+        data={"grant_type": "urn:ietf:params:oauth:grant-type:device_code", "device_code": "x"},
+    )
+    assert r.status_code == 400
+    assert r.json()["error"] == "unsupported_grant_type"
+    # Refresh with an unknown token fails closed with the OAuth shape.
     r = disabled_app.post(
         "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": "x"}
     )
-    assert r.status_code in (404, 405)
+    assert r.status_code == 400
+    assert r.json()["error"] == "invalid_grant"
+    # Revoke stays idempotent.
     r = disabled_app.post("/oauth/revoke", data={"refresh_token": "x"})
-    assert r.status_code in (404, 405)
+    assert r.status_code == 200
+    assert r.json() == {"revoked": True}
 
 
 def test_account_auth_available_when_device_grant_disabled(disabled_app: TestClient) -> None:
@@ -446,7 +462,7 @@ def test_account_auth_available_when_device_grant_disabled(disabled_app: TestCli
     # And an authenticated account-management route works.
     r = disabled_app.get("/auth/users")
     assert r.status_code == 200, r.text
-    # Sanity: the device-grant surface is still absent (no /oauth handler) —
+    # Sanity: the device-consent surface is still absent (no handler) —
     # 404 with no SPA catch-all, 405 when a built SPA is mounted at "/".
     r = disabled_app.post("/oauth/device/authorize", json={"client_id": "slack"})
     assert r.status_code in (404, 405)
@@ -503,3 +519,161 @@ def test_no_secret_configured_stays_public(app: TestClient) -> None:
     """Without the env var, authorize stays open (backward compatible)."""
     r = app.post("/oauth/device/authorize", json={"client_id": "slack"})
     assert r.status_code == 200, r.text
+
+
+# ── Login-issued refresh grants ───────────────────────────────────
+
+
+def test_create_redeemed_grant_refresh_cycle(store: DeviceGrantStore) -> None:
+    """A login-issued grant (born redeemed) rotates and reuse-revokes exactly
+    like one that walked the device flow."""
+    refresh_hash = hash_secret("r1", _KEY)
+    g = store.create_redeemed_grant(
+        "lg1",
+        user_id="alice@example.com",
+        client_id="omnigent-cli",
+        refresh_token_hash=refresh_hash,
+        created_at=1000,
+    )
+    assert g.status == "redeemed"
+    assert g.user_id == "alice@example.com"
+    assert g.approved_at == 1000
+    # Its refresh token resolves and rotates.
+    assert store.get_by_refresh_hash(refresh_hash) is not None
+    rotated = store.rotate_refresh_token(
+        g.id,
+        expected_hash=refresh_hash,
+        new_hash=hash_secret("r2", _KEY),
+        now_epoch_seconds=1010,
+        max_lifetime_seconds=_LIFETIME,
+    )
+    assert rotated is not None
+    # Replaying the pre-rotation token is reuse — the whole grant dies.
+    assert store.get_by_refresh_hash(refresh_hash) is None
+    stale = store.get_by_prev_refresh_hash(refresh_hash)
+    assert stale is not None and stale.id == g.id
+
+
+def test_create_redeemed_grant_survives_pending_purge(store: DeviceGrantStore) -> None:
+    """expires_at (the device_code window) is meaningless for a grant born
+    redeemed — the pending/denied purge bucket must never collect it."""
+    store.create_redeemed_grant(
+        "lg2",
+        user_id="alice@example.com",
+        client_id="omnigent-cli",
+        refresh_token_hash=hash_secret("r1", _KEY),
+        created_at=1000,
+    )
+    # Way past the (already-elapsed) expires_at, within grant lifetime.
+    assert store.purge_expired(1000 + 3600) == 0
+    assert store.get_by_id("lg2") is not None
+    # But the lifetime purge does collect it once the grant ages out.
+    assert store.purge_expired(1000 + _LIFETIME + 1, max_lifetime_seconds=_LIFETIME) == 1
+    assert store.get_by_id("lg2") is None
+
+
+def test_accounts_login_issue_refresh_round_trip(disabled_app: TestClient) -> None:
+    """A CLI login (issue_refresh) yields refresh material that renews via
+    /oauth/token even with the device flow disabled — the core unattended-host
+    fix. A rotated-out token then fails closed."""
+    r = disabled_app.post(
+        "/auth/login",
+        json={"username": "admin", "password": "admin-pw-12345", "issue_refresh": True},
+    )
+    assert r.status_code == 200, r.text
+    refresh = r.json().get("refresh_token")
+    assert refresh, "login with issue_refresh must return a refresh token"
+
+    # Refresh: new delegated access token + rotated refresh token.
+    r = disabled_app.post(
+        "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": refresh}
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["access_token"] and body["refresh_token"] != refresh
+    assert body["expires_in"] == 3600
+
+    # The delegated token authenticates against an allowlisted API path.
+    r = disabled_app.get("/v1/hosts", headers={"Authorization": f"Bearer {body['access_token']}"})
+    assert r.status_code == 200, r.text
+
+    # Replaying the pre-rotation refresh token is reuse → grant revoked.
+    r = disabled_app.post(
+        "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": refresh}
+    )
+    assert r.status_code == 400 and r.json()["error"] == "invalid_grant"
+    r = disabled_app.post(
+        "/oauth/token",
+        data={"grant_type": "refresh_token", "refresh_token": body["refresh_token"]},
+    )
+    assert r.status_code == 400 and r.json()["error"] == "invalid_grant"
+
+
+def test_web_login_never_issues_refresh(disabled_app: TestClient) -> None:
+    """A plain browser-shaped login (no issue_refresh) must not hand out
+    refresh material."""
+    r = disabled_app.post("/auth/login", json={"username": "admin", "password": "admin-pw-12345"})
+    assert r.status_code == 200, r.text
+    assert "refresh_token" not in r.json()
+
+
+def test_grant_lifetime_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OMNIGENT_GRANT_MAX_LIFETIME_DAYS scales the absolute lifetime; junk
+    and non-positive values fall back to the 30-day default."""
+    from omnigent.server.routes.device_auth import (
+        _GRANT_MAX_LIFETIME_SECONDS,
+        _grant_max_lifetime_seconds,
+    )
+
+    monkeypatch.delenv("OMNIGENT_GRANT_MAX_LIFETIME_DAYS", raising=False)
+    assert _grant_max_lifetime_seconds() == _GRANT_MAX_LIFETIME_SECONDS
+    monkeypatch.setenv("OMNIGENT_GRANT_MAX_LIFETIME_DAYS", "90")
+    assert _grant_max_lifetime_seconds() == 90 * 86400
+    monkeypatch.setenv("OMNIGENT_GRANT_MAX_LIFETIME_DAYS", "0")
+    assert _grant_max_lifetime_seconds() == _GRANT_MAX_LIFETIME_SECONDS
+    monkeypatch.setenv("OMNIGENT_GRANT_MAX_LIFETIME_DAYS", "soon")
+    assert _grant_max_lifetime_seconds() == _GRANT_MAX_LIFETIME_SECONDS
+
+
+def test_oauth_token_router_oidc_mode(tmp_path: Path) -> None:
+    """The token/revoke router builds and refreshes under an OIDC-mode
+    provider — the half of the machinery DEVICE_AUTH.md said OIDC would
+    never need, until login-issued grants needed it."""
+    from types import SimpleNamespace
+
+    from fastapi import FastAPI
+
+    from omnigent.server.routes.device_auth import (
+        create_oauth_token_router,
+        issue_login_grant,
+    )
+
+    provider = SimpleNamespace(_source="oidc", _oidc_config=SimpleNamespace(cookie_secret=_KEY))
+    store = DeviceGrantStore(f"sqlite:///{tmp_path}/dg.db")
+    app = FastAPI()
+    app.include_router(create_oauth_token_router(provider, store))  # type: ignore[arg-type]
+
+    refresh = issue_login_grant(store, user_id="alice@example.com", cookie_secret=_KEY)
+    with TestClient(app) as client:
+        # device_code exchanges are refused on a standalone mount.
+        r = client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": "x",
+            },
+        )
+        assert r.status_code == 400 and r.json()["error"] == "unsupported_grant_type"
+        # Refresh works.
+        r = client.post(
+            "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": refresh}
+        )
+        assert r.status_code == 200, r.text
+        rotated = r.json()["refresh_token"]
+        # Revoke by the rotated token, then refresh fails closed.
+        r = client.post("/oauth/revoke", data={"refresh_token": rotated})
+        assert r.status_code == 200
+        r = client.post(
+            "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": rotated}
+        )
+        assert r.status_code == 400 and r.json()["error"] == "invalid_grant"
