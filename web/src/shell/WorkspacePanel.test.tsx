@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { TerminalInfo } from "@/hooks/useTerminals";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ChangedSort } from "./FlatFileList";
 import type { RightRailTab } from "./railTabs";
@@ -49,6 +50,10 @@ afterEach(() => {
  * the spied callbacks the tests assert against (openFileViewer / onCloseFile /
  * onRightRailTabChange) alongside the render result.
  */
+function makeTerminal(id: string, name: string, session: string): TerminalInfo {
+  return { id, name, session, running: true };
+}
+
 function renderWorkspace(
   overrides: {
     rightRailTab?: RightRailTab;
@@ -57,11 +62,16 @@ function renderWorkspace(
     showBrowserTab?: boolean;
     showShellsTab?: boolean;
     permissionLevel?: number | null;
+    openShells?: TerminalInfo[];
+    activeShellKey?: string | null;
   } = {},
 ) {
   const openFileViewer = vi.fn();
   const onCloseFile = vi.fn();
   const onRightRailTabChange = vi.fn();
+  const onOpenShell = vi.fn();
+  const onCloseShell = vi.fn();
+  const onReturnToShellList = vi.fn();
   render(
     <TooltipProvider delayDuration={0}>
       <WorkspacePanel
@@ -88,6 +98,11 @@ function renderWorkspace(
         onShowScopeView={vi.fn()}
         onCommentsOpenChange={vi.fn()}
         openTerminalsPanel={vi.fn()}
+        openShells={overrides.openShells ?? []}
+        activeShellKey={overrides.activeShellKey ?? null}
+        onOpenShell={onOpenShell}
+        onCloseShell={onCloseShell}
+        onReturnToShellList={onReturnToShellList}
         permissionLevel={overrides.permissionLevel ?? null}
         filesPanelSort={"recent" as ChangedSort}
         onSortChange={vi.fn()}
@@ -98,7 +113,7 @@ function renderWorkspace(
       />
     </TooltipProvider>,
   );
-  return { openFileViewer, onCloseFile, onRightRailTabChange };
+  return { openFileViewer, onCloseFile, onRightRailTabChange, onOpenShell, onCloseShell };
 }
 
 describe("WorkspacePanel surface presentation", () => {
@@ -257,6 +272,51 @@ describe("WorkspacePanel shells tab", () => {
   it("hides the Shells tab when showShellsTab is false", () => {
     renderWorkspace({ showShellsTab: false });
     expect(screen.queryByRole("tab", { name: /shells/i })).toBeNull();
+  });
+});
+
+describe("WorkspacePanel shell identity tabs (header parity with Files)", () => {
+  it("renders a top-strip tab per open shell showing its name · session identity", () => {
+    renderWorkspace({
+      rightRailTab: "terminals",
+      showShellsTab: true,
+      openShells: [makeTerminal("terminal_bash_s1", "bash", "s1")],
+      activeShellKey: "terminal:terminal_bash_s1",
+    });
+
+    // The shell surfaces as a tab in the shared top strip (mirroring file
+    // tabs) with its identity — name and session — not just the rail content.
+    expect(screen.getByText("bash · s1")).toBeInTheDocument();
+    // And it's the active tab; the fixed Shells trigger reads inactive so both
+    // aren't highlighted at once (the sentinel that prevents that).
+    const tab = screen.getByRole("button", { name: /close bash · s1/i }).closest("[role='button']");
+    expect(tab).toHaveAttribute("aria-current", "true");
+    expect(screen.getByRole("tab", { name: /shells/i })).toHaveAttribute("data-state", "inactive");
+  });
+
+  it("selects a shell tab via onOpenShell and closes it via onCloseShell", () => {
+    const { onOpenShell, onCloseShell } = renderWorkspace({
+      rightRailTab: "terminals",
+      showShellsTab: true,
+      openShells: [
+        makeTerminal("terminal_bash_s1", "bash", "s1"),
+        makeTerminal("terminal_worker_s2", "worker", "s2"),
+      ],
+      activeShellKey: "terminal:terminal_bash_s1",
+    });
+
+    fireEvent.click(screen.getByText("worker · s2"));
+    expect(onOpenShell).toHaveBeenCalledWith("terminal:terminal_worker_s2", false);
+
+    fireEvent.click(screen.getByRole("button", { name: /close worker · s2/i }));
+    expect(onCloseShell).toHaveBeenCalledWith("terminal:terminal_worker_s2");
+    // The x must not also activate the tab (stopPropagation).
+    expect(onOpenShell).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows no shell tabs when none are open", () => {
+    renderWorkspace({ rightRailTab: "terminals", showShellsTab: true, openShells: [] });
+    expect(screen.queryByRole("button", { name: /^Close .* · / })).toBeNull();
   });
 });
 

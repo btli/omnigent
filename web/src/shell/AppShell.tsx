@@ -200,6 +200,14 @@ export function AppShell() {
   const [openFiles, setOpenFiles] = useState<string[]>(() =>
     conversationId ? (readSessionWorkspaceState(conversationId).openFiles ?? []) : [],
   );
+  // Open shell tabs (terminalTabKey values) surfaced in the top strip beside
+  // the file tabs, the Shells-tab peer of ``openFiles``. ``activeShellKey`` is
+  // the active tab (null = the shell list is shown). Session-scoped and
+  // transient — NOT persisted, so a reload of a chat-first session lands back
+  // on chat + the shell list, never a hosted shell. Reset on conversation
+  // switch alongside the other rail state.
+  const [openShellKeys, setOpenShellKeys] = useState<string[]>([]);
+  const [activeShellKey, setActiveShellKey] = useState<string | null>(null);
   // false = full folder tree ("All"), true = changed-files-only flat list.
   // Surfaced as the Changed | All toggle inside the Files panel. Seeded from
   // the persisted, app-global preference (defaults to "All") so the choice
@@ -427,6 +435,27 @@ export function AppShell() {
     () => inventoryTerminals(terminals, terminalFirst),
     [terminals, terminalFirst],
   );
+  // Resolve the open shell tabs (keys) to their live inventory entries, in tab
+  // order, dropping any whose PTY has closed. Feeds the top-strip ShellTabsStrip.
+  const openShells = useMemo(
+    () =>
+      openShellKeys
+        .map((key) => railTerminals.find((t) => terminalTabKey(t) === key))
+        .filter((t): t is (typeof railTerminals)[number] => t !== undefined),
+    [openShellKeys, railTerminals],
+  );
+  // Prune BACKGROUND shell tabs whose PTY disappeared (a shell closed while a
+  // sibling tab was showing). The ACTIVE tab is left to InlineTerminalsSection,
+  // which owns the create-gap bridge and the "closed unexpectedly" announce and
+  // calls back through ``returnToShellList(true)`` — pruning it here would race
+  // that (and could drop a freshly-created tab before inventory catches up).
+  useEffect(() => {
+    const live = new Set(railTerminals.map((t) => terminalTabKey(t)));
+    setOpenShellKeys((prev) => {
+      const next = prev.filter((k) => live.has(k) || k === activeShellKey);
+      return next.length === prev.length ? prev : next;
+    });
+  }, [railTerminals, activeShellKey]);
   // The agent's spec declares shell access (a ``terminals:`` block) —
   // the rail's Shells tab then shows BY DEFAULT, before any shell
   // exists: its empty state carries the "+ New shell" affordance, so
@@ -701,6 +730,10 @@ export function AppShell() {
     setShellsPanelOpen(false);
     setTodosPanelOpen(false);
     setFilesPanelShowHidden(false);
+    // Shell tabs are transient (never persisted) — always start fresh on a
+    // conversation switch so a new session opens on chat + the shell list.
+    setOpenShellKeys([]);
+    setActiveShellKey(null);
     if (!conversationId) {
       // No session → no rail; false (not the open default) so rail-gated
       // effects like the ?view= URL sync stay quiet on non-session routes.
@@ -714,8 +747,23 @@ export function AppShell() {
     }
     const persisted = readSessionWorkspaceState(conversationId);
 
+    // Restore the terminal-first center view from sessionStorage — but for a
+    // chat-first, non-wrapper session (polly/debby), a stored USER-shell key
+    // must NOT replay into the center: user shells now host inline in the rail,
+    // so a reload starts in chat, not a chrome-free center shell. The agent's
+    // own terminal (the pill's Terminal view) is exempt — that center takeover
+    // is still its home. Native wrappers keep replaying any stored key.
     const stored = sessionStorage.getItem(`omnigent.web.panel-key:${conversationId}`);
-    setPanelInitialKeyState(stored);
+    const dropStoredUserShell =
+      terminalFirst && !isNativeWrapper && stored !== null && !isAgentTerminalKey(stored);
+    if (dropStoredUserShell) {
+      // Clear the stale center key so the next persist can't re-write it, and
+      // start the view on chat.
+      sessionStorage.removeItem(`omnigent.web.panel-key:${conversationId}`);
+      setPanelInitialKeyState(null);
+    } else {
+      setPanelInitialKeyState(stored);
+    }
 
     // Restore the Files view scope. A deep-link ?view= param wins and forces
     // the rail onto the Files tab: ?view=changed → "Changed" (flat list),
@@ -1036,6 +1084,12 @@ export function AppShell() {
     }
   }
 
+  // Full-screen / overlay shell takeover — the MOBILE drawer path and the
+  // NATIVE-WRAPPER desktop path (both route here via InlineTerminalsSection's
+  // ``onExpand`` when it is NOT hosting inline). Sets the center terminal key
+  // so MainTerminalView / the mobile TerminalsPanel takes over. Chat-first,
+  // non-wrapper desktop sessions never reach this for a user shell: their rail
+  // hosts the shell inline via ``openShellTab`` below.
   function openTerminalsPanel(key: string) {
     setSelectedFilePath(null); // close file viewer
     clearFileViewerUrl();
@@ -1045,6 +1099,55 @@ export function AppShell() {
     setShellsPanelOpen(false); // close mobile shells drawer
     setTodosPanelOpen(false); // close mobile tasks drawer
     setPanelInitialKey(key);
+  }
+
+  // Desktop rail: host a user shell INLINE in the Shells tab (never the
+  // center), mirroring how ``openFileViewer`` reveals a file in the Files tab.
+  // Reveals the rail + selects the Shells tab, records the open tab, and marks
+  // it active — WITHOUT touching ``panelInitialKey``, so the center stays on
+  // chat. The freshly-created (``pendingInventory``) case is recorded the same
+  // way; the shell surfaces once the inventory catches up.
+  function openShellTab(key: string, _pendingInventory: boolean) {
+    setSelectedFilePath(null); // close file viewer
+    clearFileViewerUrl();
+    setExecutionLogsKey(null);
+    setFilesPanelOpen(false);
+    setSubagentsPanelOpen(false);
+    setShellsPanelOpen(false);
+    setTodosPanelOpen(false);
+    setRightRailTab("terminals");
+    setOpenShellKeys((prev) => (prev.includes(key) ? prev : [...prev, key]));
+    setActiveShellKey(key);
+    setRightPanelOpen(true);
+    if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
+  }
+
+  // Close a single shell tab. If it was active, activate a neighbor (prefer the
+  // previous, else the next); with none left, drop back to the shell list.
+  // Mirrors ``closeFile``. Closing the tab does not kill the PTY — it just
+  // stops hosting it inline.
+  function closeShellTab(key: string) {
+    setOpenShellKeys((prev) => {
+      const idx = prev.indexOf(key);
+      if (idx === -1) return prev;
+      const next = prev.filter((k) => k !== key);
+      setActiveShellKey((active) => {
+        if (active !== key) return active;
+        return next[idx - 1] ?? next[idx] ?? next[0] ?? null;
+      });
+      return next;
+    });
+  }
+
+  // Deselect the active shell back to the list. On an unexpected close (the
+  // PTY vanished from under the rail) also drop its now-dangling tab.
+  function returnToShellList(unexpected: boolean) {
+    setActiveShellKey((active) => {
+      if (unexpected && active !== null) {
+        setOpenShellKeys((prev) => prev.filter((k) => k !== active));
+      }
+      return null;
+    });
   }
 
   function openExecutionLogsPanel(key: string) {
@@ -1174,13 +1277,16 @@ export function AppShell() {
     !terminalsAvailable &&
     sessionStatus !== "failed" &&
     (liveness.kind === "starting" || terminalPending);
-  // A rail-opened shell (any open terminal key other than the agent's
-  // own terminal) takes over the main view chrome-free:
-  // ConnectionIndicator hides the Chat/Terminal pill while this is
-  // true, and MainTerminalView renders the shell with its own close
-  // affordance. The PANEL_NO_TERMINAL_KEY sentinel ("") is falsy, so
-  // "open with no target" stays a pill view.
-  const isShellView = terminalFirst && !!panelInitialKey && !isAgentTerminalKey(panelInitialKey);
+  // A center-hosted user shell (a terminal key other than the agent's own)
+  // takes over the main view chrome-free: ConnectionIndicator hides the
+  // Chat/Terminal pill and MainTerminalView renders the shell with its own
+  // close affordance. This is the NATIVE-WRAPPER UX only — chat-first,
+  // non-wrapper sessions host user shells inline in the rail, never the
+  // center, so gating on ``isNativeWrapper`` (not ``terminalFirst``) means a
+  // stray user-shell key can't render a chrome-free center for them. The
+  // PANEL_NO_TERMINAL_KEY sentinel ("") is falsy, so "open with no target"
+  // stays a pill view.
+  const isShellView = isNativeWrapper && !!panelInitialKey && !isAgentTerminalKey(panelInitialKey);
   const terminalFirstContextValue = useMemo<TerminalFirstContextValue>(
     () => ({
       isClaudeNative,
@@ -1373,6 +1479,11 @@ export function AppShell() {
                     onShowScopeView={showScopeView}
                     onCommentsOpenChange={setFileViewerCommentsOpen}
                     openTerminalsPanel={openTerminalsPanel}
+                    openShells={openShells}
+                    activeShellKey={activeShellKey}
+                    onOpenShell={openShellTab}
+                    onCloseShell={closeShellTab}
+                    onReturnToShellList={returnToShellList}
                     permissionLevel={permissionLevel}
                     filesPanelSort={filesPanelSort}
                     onSortChange={handleFilesSortChange}

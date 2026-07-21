@@ -282,6 +282,62 @@ describe("InlineTerminalsSection inline mode hosts the shell in the rail", () =>
     expect(onExpand).not.toHaveBeenCalled();
   });
 
+  it("routes shell selection to the parent in controlled mode (rail-lifted active shell)", () => {
+    // When the parent owns the active shell (onOpenShell supplied — the
+    // desktop rail's top-strip-tab wiring), a row click must call back
+    // instead of self-hosting, so the shell surfaces as a header tab.
+    const onOpenShell = vi.fn();
+    useTerminalsMock.mockReturnValue({
+      terminals: [makeTerminal("terminal_bash_s1", "bash", "s1")],
+      isLoading: false,
+      error: null,
+    });
+    render(
+      <TerminalFirstContextProvider value={TERMINAL_FIRST_SDK_CTX}>
+        <InlineTerminalsSection
+          conversationId="conv_terminal"
+          onExpand={vi.fn()}
+          inline
+          activeKey={null}
+          onOpenShell={onOpenShell}
+          onReturnToList={vi.fn()}
+        />
+      </TerminalFirstContextProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /s1/ }));
+    expect(onOpenShell).toHaveBeenCalledWith("terminal:terminal_bash_s1", false);
+    // Parent-controlled: no self-hosted xterm until activeKey is fed back in.
+    expect(screen.queryByTestId("terminal-view")).toBeNull();
+  });
+
+  it("hosts the parent's active shell inline in controlled mode", () => {
+    // With the parent feeding activeKey back, the section hosts that shell's
+    // TerminalView in-rail (the content half of the lifted-state contract).
+    useTerminalsMock.mockReturnValue({
+      terminals: [makeTerminal("terminal_bash_s1", "bash", "s1")],
+      isLoading: false,
+      error: null,
+    });
+    render(
+      <TerminalFirstContextProvider value={TERMINAL_FIRST_SDK_CTX}>
+        <InlineTerminalsSection
+          conversationId="conv_terminal"
+          onExpand={vi.fn()}
+          inline
+          activeKey="terminal:terminal_bash_s1"
+          onOpenShell={vi.fn()}
+          onReturnToList={vi.fn()}
+        />
+      </TerminalFirstContextProvider>,
+    );
+
+    expect(screen.getByTestId("terminal-view")).toHaveAttribute(
+      "data-terminal-id",
+      "terminal_bash_s1",
+    );
+  });
+
   it("routes native-wrapper shells to onExpand even with inline set (main-column takeover)", () => {
     // Native-CLI wrappers keep their chat-replacing UX: the shell opens
     // in the main column via MainTerminalView, not in the rail. This is

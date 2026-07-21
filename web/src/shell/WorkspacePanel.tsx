@@ -5,9 +5,11 @@ import {
   GlobeIcon,
   ListTodoIcon,
   SquareTerminalIcon,
+  TerminalIcon,
   XIcon,
 } from "lucide-react";
 import { type ReactElement, useCallback, useEffect, useRef } from "react";
+import { type TerminalInfo, terminalTabKey } from "@/hooks/useTerminals";
 import { cn } from "@/lib/utils";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -18,6 +20,7 @@ import { FileViewer } from "./FileViewer";
 import type { ChangedSort } from "./FlatFileList";
 import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { SubagentsPanel } from "./SubagentsPanel";
+import { deriveTerminalStatus, TerminalStatusBadge } from "./terminalStatus";
 import { TodoPanel } from "./TodoPanel";
 import { type RightRailTab, TAB_BADGE_BASE } from "./railTabs";
 
@@ -138,6 +141,101 @@ function FileTabsStrip({
   );
 }
 
+// ---------------------------------------------------------------------------
+// ShellTabsStrip — open shell tabs in the top rail strip, the Shells-tab peer
+// of FileTabsStrip. Each tab shows the shell's identity (icon, name · session,
+// status dot) and an "x" close button; clicking the cell activates the shell
+// (hosting its terminal inline below), clicking the x closes it. Same box
+// metrics and hover-close treatment as FileTabsStrip so files and shells line
+// up in one strip.
+// ---------------------------------------------------------------------------
+
+function ShellTabsStrip({
+  shells,
+  activeShellKey,
+  onShellSelect,
+  onCloseShell,
+}: {
+  /** Open shells, in tab order. */
+  shells: TerminalInfo[];
+  /** Currently active shell tab key, or null when another tab is active. */
+  activeShellKey: string | null;
+  /** Activate a shell tab by key. */
+  onShellSelect: (key: string) => void;
+  /** Close a shell tab by key. */
+  onCloseShell: (key: string) => void;
+}) {
+  const activeTabRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    activeTabRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [activeShellKey]);
+  return (
+    <div className="flex items-center gap-0.5">
+      {shells.map((t) => {
+        const key = terminalTabKey(t);
+        const active = key === activeShellKey;
+        // Tabs are lightweight index entries — no live bridge state here, so
+        // status is running/closed off the resource flag alone.
+        const status = deriveTerminalStatus(t, null);
+        const label = t.session ? `${t.name} · ${t.session}` : t.name;
+        return (
+          <div
+            key={key}
+            ref={active ? activeTabRef : undefined}
+            role="button"
+            tabIndex={0}
+            aria-current={active}
+            title={label}
+            onClick={() => onShellSelect(key)}
+            onAuxClick={(e) => {
+              if (e.button === 1) {
+                e.preventDefault();
+                onCloseShell(key);
+              }
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                onShellSelect(key);
+              }
+            }}
+            className={cn(
+              "group/tab relative flex h-[32px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-[8px] px-[12px] text-[13px] font-medium leading-5 transition-colors",
+              active
+                ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
+                : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            <TerminalIcon className="size-4 shrink-0" />
+            <span className="min-w-0 truncate">{label}</span>
+            <TerminalStatusBadge status={status} />
+            <span
+              className={cn(
+                "absolute inset-y-0 right-[2px] flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100",
+                active
+                  ? "[background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]"
+                  : "[background:linear-gradient(to_right,transparent,var(--card)_40%)]",
+              )}
+            >
+              <button
+                type="button"
+                aria-label={`Close ${label}`}
+                className="flex size-6 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onCloseShell(key);
+                }}
+              >
+                <XIcon className="size-4" />
+              </button>
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 /**
  * Props for {@link WorkspacePanel}. All state lives in AppShell; this
  * component is a pure view. Handlers wrap the AppShell setters so the
@@ -216,6 +314,21 @@ interface WorkspacePanelProps {
    * (see the ``inline`` prop passed below), so this stays unused there.
    */
   openTerminalsPanel: (key: string) => void;
+  /**
+   * Open shells shown as tabs in the top strip, resolved to their terminal
+   * info — the Shells-tab peer of ``openFiles``. Mirrors how AppShell lifts
+   * the open-file set so the shell identity surfaces in the shared header.
+   */
+  openShells: TerminalInfo[];
+  /** Active shell tab key, or null when the Shells tab shows the list. */
+  activeShellKey: string | null;
+  /** Select a shell (adds/activates its tab). ``pendingInventory`` is true
+   *  for a freshly-created shell not yet in the terminal inventory. */
+  onOpenShell: (key: string, pendingInventory: boolean) => void;
+  /** Close a single open shell tab by key. */
+  onCloseShell: (key: string) => void;
+  /** Deselect the active shell tab, revealing the shell list. */
+  onReturnToShellList: (unexpected: boolean) => void;
   /** Viewer's permission level (gates edit affordances). */
   permissionLevel: number | null;
   /** Changed-files sort order, shared with the viewer's prev/next order. */
@@ -272,6 +385,11 @@ export function WorkspacePanel({
   onShowScopeView,
   onCommentsOpenChange,
   openTerminalsPanel,
+  openShells,
+  activeShellKey,
+  onOpenShell,
+  onCloseShell,
+  onReturnToShellList,
   permissionLevel,
   filesPanelSort,
   onSortChange,
@@ -327,10 +445,17 @@ export function WorkspacePanel({
           // the left in the ≥500px case and contributes its full width to the
           // outer scroller in the <500px case.
           className="shrink-0"
-          // When a file tab is active no fixed trigger should highlight, so feed
-          // the radix group a sentinel that matches none of them. The active
-          // file tab carries its own highlight (see FileTabsStrip).
-          value={selectedFilePath !== null ? "__file__" : rightRailTab}
+          // When a file OR shell tab is active no fixed trigger should
+          // highlight, so feed the radix group a sentinel that matches none of
+          // them. The active file/shell tab carries its own highlight (see
+          // FileTabsStrip / ShellTabsStrip).
+          value={
+            selectedFilePath !== null
+              ? "__file__"
+              : rightRailTab === "terminals" && activeShellKey !== null
+                ? "__shell__"
+                : rightRailTab
+          }
           onValueChange={(v) => onRightRailTabChange(v as RightRailTab)}
         >
           <TabsList variant="pill" className="gap-1">
@@ -442,6 +567,25 @@ export function WorkspacePanel({
             </div>
           </>
         )}
+        {/* Shell tabs — the Shells-tab peer of the file tabs, surfaced only
+            while the Shells tab is active (its content is the only slot that
+            hosts a shell inline). Same divider + scroll treatment as files. */}
+        {rightRailTab === "terminals" && openShells.length > 0 && (
+          <>
+            <div
+              aria-hidden
+              className="mx-[4px] hidden h-[14px] w-px shrink-0 self-center bg-border-strong @min-[500px]/rail:block"
+            />
+            <div className="flex shrink-0 items-center [scrollbar-width:thin] @min-[500px]/rail:min-w-0 @min-[500px]/rail:flex-1 @min-[500px]/rail:overflow-x-auto @min-[500px]/rail:overflow-y-hidden [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent">
+              <ShellTabsStrip
+                shells={openShells}
+                activeShellKey={activeShellKey}
+                onShellSelect={(key) => onOpenShell(key, false)}
+                onCloseShell={onCloseShell}
+              />
+            </div>
+          </>
+        )}
       </div>
       {/* Tab content — single slot. Files holds FileViewer when a
           file is open, FilesPanel otherwise; Shells hosts the active
@@ -481,6 +625,9 @@ export function WorkspacePanel({
             onExpand={openTerminalsPanel}
             inline
             readOnly={!isOwnerLevel(permissionLevel)}
+            activeKey={activeShellKey}
+            onOpenShell={onOpenShell}
+            onReturnToList={onReturnToShellList}
           />
         ) : (
           showFilesPanel && (

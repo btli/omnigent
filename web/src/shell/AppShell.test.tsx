@@ -133,24 +133,40 @@ vi.mock("./FileViewer", () => ({
   ),
 }));
 vi.mock("./InlineTerminalsSection", () => ({
-  // Stand-in exposing onExpand + the desktop `inline` flag. Desktop hosts
-  // the shell inside the rail (inline=true → the row click stays local,
-  // no AppShell overlay); mobile hands off via onExpand. Tests assert the
-  // flag and can still drive the overlay path through onExpand.
+  // Stand-in exposing onExpand + the desktop `inline` flag, plus the
+  // controlled-hosting props (activeKey/onOpenShell). Desktop hosts the shell
+  // inside the rail via the parent's onOpenShell (activeKey echoed back);
+  // mobile / native-wrapper hand off full-screen via onExpand. Tests drive
+  // whichever path applies and assert the resulting state.
   InlineTerminalsSection: ({
     onExpand,
     inline,
+    activeKey,
+    onOpenShell,
   }: {
     onExpand: (key: string) => void;
     inline?: boolean;
+    activeKey?: string | null;
+    onOpenShell?: (key: string, pendingInventory: boolean) => void;
   }) => (
-    <div data-testid="inline-terminals-section" data-inline={String(inline ?? false)}>
+    <div
+      data-testid="inline-terminals-section"
+      data-inline={String(inline ?? false)}
+      data-active-key={activeKey ?? ""}
+    >
       <button
         type="button"
         aria-label="rail: open terminal"
         onClick={() => onExpand("terminal:terminal_main")}
       >
         rail-terminal
+      </button>
+      <button
+        type="button"
+        aria-label="rail: host shell"
+        onClick={() => onOpenShell?.("terminal:terminal_bash_s1", false)}
+      >
+        host-shell
       </button>
     </div>
   ),
@@ -236,6 +252,9 @@ function TerminalFirstViewProbe() {
       data-testid="view-probe"
       data-is-terminal-first={ctx.isTerminalFirst ? "true" : "false"}
       data-is-claude-native={ctx.isClaudeNative ? "true" : "false"}
+      data-is-native-wrapper={ctx.isNativeWrapper ? "true" : "false"}
+      data-is-shell-view={ctx.isShellView ? "true" : "false"}
+      data-terminal-view-key={ctx.terminalViewKey ?? ""}
       data-view={ctx.view}
       data-terminals-available={ctx.terminalsAvailable ? "true" : "false"}
       data-terminal-starting-up={ctx.terminalStartingUp ? "true" : "false"}
@@ -719,14 +738,16 @@ describe("TerminalFirstContext", () => {
       { id: "conv_other", permission_level: null, labels: {} },
     ]);
     useTerminalsMock.mockReturnValue({
-      terminals: [{ id: "terminal_main", name: "claude", session: "main", running: true }],
+      terminals: [{ id: "terminal_tui_main", name: "tui", session: "main", running: true }],
       isLoading: false,
       error: null,
     });
 
     const { unmount } = renderShell("/c/conv_native");
 
-    // Opt into terminal view.
+    // Opt into terminal view. The pill targets the AGENT terminal (the
+    // embedded REPL), so the restore exemption applies — only stored USER
+    // shells are dropped for chat-first sessions.
     fireEvent.click(screen.getByRole("button", { name: "Terminal" }));
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
 
@@ -1024,6 +1045,109 @@ describe("Chat-mode terminal panel layout", () => {
     expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "open");
     expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-fluid", "true");
     expect(chatGroup().className.split(" ")).toContain("md:hidden");
+  });
+});
+
+describe("User-shell routing gates on isNativeWrapper (not isTerminalFirst)", () => {
+  // A chat-first, NON-wrapper SDK session (polly/debby shape): omnigent.ui
+  // is "terminal" (embedded REPL) but there is NO omnigent.wrapper. Its
+  // user shells must host INLINE in the rail, never take over the center.
+  function mockPollyShape() {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      { id: "conv_polly", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      // The embedded REPL (agent terminal) plus a user shell.
+      terminals: [
+        { id: "terminal_tui_main", name: "tui", session: "main", running: true },
+        { id: "terminal_bash_s1", name: "bash", session: "s1", running: true },
+      ],
+      isLoading: false,
+      error: null,
+    });
+  }
+
+  it("hosts a polly-shape user shell inline in the rail (no center takeover)", () => {
+    mockPollyShape();
+    renderShell("/c/conv_polly");
+
+    // The session is chat-first but not a native wrapper.
+    const probe = () => screen.getByTestId("view-probe");
+    expect(probe()).toHaveAttribute("data-is-terminal-first", "true");
+    expect(probe()).toHaveAttribute("data-is-native-wrapper", "false");
+
+    // Open the Shells tab and host a user shell via the rail's controlled
+    // onOpenShell (the inline path).
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /Shells/i }));
+    fireEvent.click(screen.getByRole("button", { name: /rail: host shell/i }));
+
+    // The rail now hosts the shell inline (activeKey fed back to the
+    // section), and the center stays on chat — no shell-view takeover.
+    expect(screen.getByTestId("inline-terminals-section")).toHaveAttribute(
+      "data-active-key",
+      "terminal:terminal_bash_s1",
+    );
+    expect(probe()).toHaveAttribute("data-view", "chat");
+    expect(probe()).toHaveAttribute("data-is-shell-view", "false");
+  });
+
+  it("still routes a native-wrapper user shell to the center MainTerminalView", () => {
+    // Genuine native-CLI wrapper: user shells KEEP their chat-replacing,
+    // center full-screen UX — the sole shape that routes via onExpand.
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      {
+        id: "conv_native",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui" },
+      },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [
+        { id: "terminal_claude_main", name: "claude", session: "main", running: true },
+        { id: "terminal_bash_s1", name: "bash", session: "s1", running: true },
+      ],
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_native");
+
+    const probe = () => screen.getByTestId("view-probe");
+    expect(probe()).toHaveAttribute("data-is-native-wrapper", "true");
+
+    // Fire the rail's onExpand (native wrappers route full-screen).
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /Shells/i }));
+    fireEvent.click(screen.getByRole("button", { name: /rail: open terminal/i }));
+
+    // Center takeover: the terminal key is set and it reads as a shell view
+    // (chrome-free MainTerminalView), which chat-first sessions never do.
+    expect(probe()).toHaveAttribute("data-view", "terminal");
+    expect(probe()).toHaveAttribute("data-is-shell-view", "true");
+    expect(probe()).toHaveAttribute("data-terminal-view-key", "terminal:terminal_main");
+  });
+
+  it("does not replay a stored user-shell key into the center for a polly session", () => {
+    // A stale sessionStorage panel-key pointing at a USER shell must NOT
+    // reopen the center shell on reload of a chat-first, non-wrapper
+    // session — it starts on chat instead. (The agent terminal is exempt.)
+    mockPollyShape();
+    sessionStorage.setItem("omnigent.web.panel-key:conv_polly", "terminal:terminal_bash_s1");
+
+    renderShell("/c/conv_polly");
+
+    const probe = () => screen.getByTestId("view-probe");
+    expect(probe()).toHaveAttribute("data-view", "chat");
+    expect(probe()).toHaveAttribute("data-is-shell-view", "false");
+    // The stale key is scrubbed so a later persist can't resurrect it.
+    expect(sessionStorage.getItem("omnigent.web.panel-key:conv_polly")).toBeNull();
   });
 });
 

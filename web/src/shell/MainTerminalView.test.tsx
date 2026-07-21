@@ -150,7 +150,13 @@ describe("MainTerminalView — terminal-first SDK sessions", () => {
     expect(view).toHaveAttribute("data-read-only", "true");
   });
 
-  it("renders a rail-opened shell chrome-free: shell header + close, no agent tab", () => {
+  it("does NOT render a chrome-free shell view for a stray user-shell key (hardening)", () => {
+    // Chat-first, non-wrapper SDK sessions host user shells INLINE in the
+    // rail — they never take over the center. This hardens the center path:
+    // even if a user-shell key reaches MainTerminalView here (a stale key,
+    // a bug), ``isShellView`` gates on ``isNativeWrapper`` (false), so the
+    // chrome-free shell header + close X must NOT render — that UX belongs
+    // to native wrappers only.
     const setView = vi.fn();
     renderView({
       terminals: [REPL_TERMINAL, BASH_SHELL],
@@ -158,22 +164,15 @@ describe("MainTerminalView — terminal-first SDK sessions", () => {
       setView,
     });
 
-    // The shell replaced the view (this is the rail row's target).
+    // The terminal still mounts (the key is honored), but with no shell
+    // chrome: no identity header naming the shell, no "Close shell" X.
     expect(screen.getByTestId("terminal-view")).toHaveAttribute(
       "data-terminal-id",
       "terminal_bash_s1",
     );
-    // The header names the shell only — an agent tab ("polly"/"tui")
-    // here is the reported regression: the shell view must not imply
-    // the shell is the agent.
-    expect(screen.getByText("bash")).toBeInTheDocument();
-    expect(screen.queryByText("tui")).toBeNull();
+    expect(screen.queryByText("bash")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Close shell" })).toBeNull();
     expect(screen.queryByTestId("new-shell-button")).toBeNull();
-
-    // The close X is the way back to chat (the Chat/Terminal pill is
-    // hidden in shell view — ConnectionIndicator gates on isShellView).
-    fireEvent.click(screen.getByRole("button", { name: "Close shell" }));
-    expect(setView).toHaveBeenCalledWith("chat");
   });
 });
 
