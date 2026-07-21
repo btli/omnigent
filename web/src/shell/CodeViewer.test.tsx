@@ -605,6 +605,14 @@ describe("CodeViewer 3D model routing", () => {
     renderModel("assembly.3mf", "base64", "application/octet-stream");
     expect(await screen.findByTestId("model-viewer-stub")).toBeDefined();
   });
+
+  it("routes by content_type when the extension is unknown (MIME-only)", async () => {
+    // A file with no recognizable model extension but a model MIME must still
+    // route to the viewer — dispatch and loader selection share one resolver.
+    renderModel("download", "base64", "model/stl");
+    expect(await screen.findByTestId("model-viewer-stub")).toBeDefined();
+    expect(screen.queryByText(/binary file/i)).toBeNull();
+  });
 });
 
 describe("CodeViewer .ipynb routing", () => {

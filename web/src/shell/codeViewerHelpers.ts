@@ -146,38 +146,62 @@ export function isPdfFile(path: string, contentType?: string | null): boolean {
 
 // 3D model formats we render in an interactive WebGL preview (three.js). Scoped
 // deliberately to the three loaders we ship — STL, 3MF, OBJ — and nothing else.
-const MODEL_EXTENSIONS = new Set(["stl", "3mf", "obj"]);
+export type ModelFormat = "stl" | "3mf" | "obj";
 
-// MIME types servers commonly report for these formats. Extension-driven
-// `guess_type` and some toolchains disagree on the canonical value (STL in
-// particular has several historical types), so match a small explicit set
-// rather than a `model/` prefix — `model/gltf+json` etc. are NOT in scope.
-const MODEL_CONTENT_TYPES = new Set([
-  "model/stl",
-  "application/sla",
-  "application/vnd.ms-pki.stl",
-  "model/3mf",
-  "application/vnd.ms-package.3dmanufacturing-3dmodel+xml",
-  "model/obj",
-]);
+// Model file extensions → the loader format they select.
+const MODEL_EXTENSION_FORMATS: Record<string, ModelFormat> = {
+  stl: "stl",
+  "3mf": "3mf",
+  obj: "obj",
+};
+
+// MIME types servers commonly report for these formats → the loader format.
+// Extension-driven `guess_type` and some toolchains disagree on the canonical
+// value (STL in particular has several historical types), so match a small
+// explicit set rather than a `model/` prefix — `model/gltf+json` etc. are NOT
+// in scope. Generic types (`application/octet-stream`, `text/plain`) are
+// deliberately absent so they fall through to the extension.
+const MODEL_CONTENT_TYPE_FORMATS: Record<string, ModelFormat> = {
+  "model/stl": "stl",
+  "application/sla": "stl",
+  "application/vnd.ms-pki.stl": "stl",
+  "model/3mf": "3mf",
+  "application/vnd.ms-package.3dmanufacturing-3dmodel+xml": "3mf",
+  "model/obj": "obj",
+};
+
+/**
+ * Resolve the 3D-model loader format for `path` / `contentType`, or `null` if
+ * it isn't a previewable model.
+ *
+ * This is the SINGLE source of truth shared by both the dispatch decision
+ * (`isModelFile`) and the loader selection in `ModelViewer` — so what routes
+ * into the viewer is exactly what the parser accepts, with no divergence.
+ *
+ * MIME-first: a recognized model content type wins and picks the loader
+ * (handles files with missing or misleading extensions). Falls back to the
+ * file extension otherwise — which is what carries the ambiguous cases, since
+ * binary STL/3MF are often served as `application/octet-stream` and ASCII OBJ
+ * as `text/plain` (neither of which is a model MIME).
+ */
+export function getModelFormat(path: string, contentType?: string | null): ModelFormat | null {
+  if (contentType) {
+    const type = contentType.split(";")[0].trim().toLowerCase();
+    const byMime = MODEL_CONTENT_TYPE_FORMATS[type];
+    if (byMime) return byMime;
+  }
+  const ext = path.split(".").pop()?.toLowerCase() ?? "";
+  return MODEL_EXTENSION_FORMATS[ext] ?? null;
+}
 
 /**
  * Return true if `path` should be previewed as an interactive 3D model.
  *
- * MIME-first like `isImageFile`, but the extension is authoritative for the
- * ambiguous cases: OBJ is plain ASCII (often served as `text/plain`) and
- * binary STL/3MF are frequently served as `application/octet-stream`, so a
- * matching extension always wins. A recognized model content type on an
- * unknown extension also counts.
+ * Thin wrapper over `getModelFormat` so detection and loader selection can
+ * never disagree.
  */
 export function isModelFile(path: string, contentType?: string | null): boolean {
-  const ext = path.split(".").pop()?.toLowerCase() ?? "";
-  if (MODEL_EXTENSIONS.has(ext)) return true;
-  if (contentType) {
-    const type = contentType.split(";")[0].trim().toLowerCase();
-    return MODEL_CONTENT_TYPES.has(type);
-  }
-  return false;
+  return getModelFormat(path, contentType) !== null;
 }
 
 export function detectLang(path: string): BundledLanguage | "text" {

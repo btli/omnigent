@@ -4,6 +4,7 @@ import {
   detectLang,
   getSelectionOffsets,
   indexToLine,
+  getModelFormat,
   isBinaryPath,
   isImageFile,
   isModelFile,
@@ -266,6 +267,62 @@ describe("isModelFile", () => {
 
   it("treats extension-less paths with no content type as non-model", () => {
     expect(isModelFile("Dockerfile")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getModelFormat — the SINGLE resolver shared by dispatch and loader selection
+// ---------------------------------------------------------------------------
+
+describe("getModelFormat", () => {
+  it.each([
+    ["part.stl", "stl"],
+    ["assembly.3mf", "3mf"],
+    ["mesh.obj", "obj"],
+    ["dir/WIDGET.STL", "stl"],
+  ])("resolves %s to %s by extension", (path, format) => {
+    expect(getModelFormat(path)).toBe(format);
+  });
+
+  it("resolves a recognized model MIME to the matching loader on an unknown extension", () => {
+    // MIME-first: a file with no/unknown extension still selects the correct
+    // loader — this is what keeps dispatch and parsing in lockstep.
+    expect(getModelFormat("blob", "model/stl")).toBe("stl");
+    expect(getModelFormat("download.bin", "application/vnd.ms-pki.stl")).toBe("stl");
+    expect(getModelFormat("blob", "model/3mf")).toBe("3mf");
+    expect(getModelFormat("blob", "model/obj")).toBe("obj");
+  });
+
+  it("prefers the MIME format over the extension when both are model types", () => {
+    // A .obj served with an STL MIME resolves to the STL loader (MIME-first).
+    expect(getModelFormat("weird.obj", "model/stl")).toBe("stl");
+  });
+
+  it("falls back to the extension for generic content types", () => {
+    expect(getModelFormat("part.stl", "application/octet-stream")).toBe("stl");
+    expect(getModelFormat("mesh.obj", "text/plain")).toBe("obj");
+  });
+
+  it("ignores charset parameters on the content type", () => {
+    expect(getModelFormat("blob", "model/obj; charset=utf-8")).toBe("obj");
+  });
+
+  it("returns null for non-model files", () => {
+    expect(getModelFormat("app.py")).toBeNull();
+    expect(getModelFormat("scene.gltf")).toBeNull();
+    expect(getModelFormat("readme.txt", "text/plain")).toBeNull();
+    expect(getModelFormat("Dockerfile")).toBeNull();
+  });
+
+  it("agrees with isModelFile (detection is exactly getModelFormat !== null)", () => {
+    for (const [path, ct] of [
+      ["part.stl", null],
+      ["blob", "model/3mf"],
+      ["app.py", null],
+      ["readme.txt", "text/plain"],
+    ] as const) {
+      expect(isModelFile(path, ct)).toBe(getModelFormat(path, ct) !== null);
+    }
   });
 });
 
