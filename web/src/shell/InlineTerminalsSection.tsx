@@ -56,12 +56,18 @@ export function InlineTerminalsSection({
   const { getStatus, setTerminalConnectionState, markTerminalActive } =
     useTerminalStatuses(terminals);
 
-  // Host the shell inside the rail only for non-terminal-first sessions.
-  // Terminal-first sessions (SDK REPL / native wrappers) keep routing to
-  // `onExpand`, which opens the shell in the main column via
-  // MainTerminalView — their established, chat-replacing UX.
-  const isTerminalFirst = terminalFirstCtx?.isTerminalFirst ?? false;
-  const hostInline = inline && !isTerminalFirst;
+  // Host the shell inside the rail for every session EXCEPT native-CLI
+  // wrappers. The Shells list is already the user-shell inventory: the
+  // embedded REPL / native vendor pane is excluded by
+  // `inventoryTerminals`, so every row here is a user-created shell.
+  // Chat-first SDK sessions (polly/debby) are terminal-first only because
+  // the runner hosts an embedded REPL — their user shells belong inline
+  // beside the chat, so we gate on `isNativeWrapper`, never
+  // `isTerminalFirst`. Native wrappers keep routing to `onExpand`, which
+  // opens the shell full-screen in the main column via MainTerminalView —
+  // their established, chat-replacing UX.
+  const isNativeWrapper = terminalFirstCtx?.isNativeWrapper ?? false;
+  const hostInline = inline && !isNativeWrapper;
 
   // Inline hosting only: which shell is shown in the rail. Null shows the
   // list. A closed/disappeared shell falls back to the list below.

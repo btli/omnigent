@@ -13,12 +13,12 @@
 // single header row (identity + close X). There is no tab strip —
 // shells are enumerated and created in the rail's Shells tab.
 
-import { XIcon } from "lucide-react";
+import { TerminalIcon, XIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { TerminalView } from "@/components/blocks/TerminalView";
 import { AGENT_TERMINAL_IDS, terminalTabKey, useTerminals } from "@/hooks/useTerminals";
 import { useTerminalFirst } from "./TerminalFirstContext";
-import { TerminalIdentityChip } from "./terminalStatus";
+import { TerminalStatusBadge } from "./terminalStatus";
 import { useTerminalStatuses } from "./useTerminalStatuses";
 
 interface MainTerminalViewProps {
@@ -139,7 +139,14 @@ export function MainTerminalView({
             {isShellView && activeTerminal && (
               // Shell header — identity + close, nothing else.
               <div className="flex shrink-0 items-center gap-1.5 border-b border-border px-2 pt-1 pb-2">
-                <TerminalIdentityChip terminal={activeTerminal} status={getStatus(activeTerminal)} />
+                <span className="flex items-center gap-1.5 rounded-sm bg-muted px-2 py-1 text-foreground text-xs">
+                  <TerminalIcon className="size-3 shrink-0" />
+                  <span className="max-w-[8rem] truncate">{activeTerminal.name}</span>
+                  <span className="shrink-0 text-muted-foreground/60">
+                    · {activeTerminal.session}
+                  </span>
+                  <TerminalStatusBadge status={getStatus(activeTerminal)} />
+                </span>
                 <span className="flex-1" />
                 <button
                   type="button"
