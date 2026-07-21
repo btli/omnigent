@@ -95,13 +95,16 @@ export function MainTerminalView({
   }, [terminals, agentTerminals, activeKey]);
 
   const activeTerminal = terminals.find((t) => terminalTabKey(t) === activeKey) ?? null;
-  // A user shell opened from the rail takes over the pane chrome-free:
-  // a single header row naming the shell plus a close X — no agent tab
-  // (the shell is not the agent). The Chat/Terminal pill is hidden in
-  // this state too (ConnectionIndicator gates on the context's
-  // `isShellView`), so the X is the way back to chat.
+  // A center-hosted user shell takes over the pane chrome-free: a single
+  // header row naming the shell plus a close X — no agent tab (the shell is
+  // not the agent). The Chat/Terminal pill is hidden in this state too
+  // (ConnectionIndicator gates on the context's `isShellView`), so the X is
+  // the way back to chat. This is the NATIVE-WRAPPER UX only — chat-first,
+  // non-wrapper sessions host user shells inline in the rail, never the
+  // center, so gate on `isNativeWrapper` (not `isTerminalFirst`) to keep a
+  // stray user-shell key from rendering chrome-free here for them.
   const isShellView =
-    (terminalFirstCtx?.isTerminalFirst ?? false) &&
+    (terminalFirstCtx?.isNativeWrapper ?? false) &&
     activeTerminal !== null &&
     !AGENT_TERMINAL_IDS.has(activeTerminal.id);
   const setSurfaceElement = useCallback(

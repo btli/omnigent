@@ -9,6 +9,13 @@
 //     Files tab renders a FileViewer inline. Chat stays visible on the
 //     left. A back affordance returns to the list so other shells stay
 //     reachable. `onExpand` is unused here.
+//
+// Inline hosting is CONTROLLED: the active shell (and the open-tab set) is
+// owned by AppShell — mirroring how Files lift `selectedFilePath`/`openFiles`
+// — so the shell's identity can surface as a tab in the shared top header
+// strip (see WorkspacePanel's ShellTabsStrip) beside the open file tabs.
+// `activeKey`/`onOpenShell`/`onReturnToList` wire that up; when omitted, the
+// section stays list-only (the mobile drawer path).
 
 import { ChevronLeftIcon, TerminalIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -36,6 +43,26 @@ interface InlineTerminalsSectionProps {
    * meaningful in inline mode. Default false.
    */
   readOnly?: boolean;
+  /**
+   * Active shell tab key when inline hosting is CONTROLLED by the parent
+   * (desktop rail). Mirrors the Files tab's `selectedFilePath`: null shows
+   * the shell list, a key hosts that shell. Providing `onOpenShell` opts
+   * into controlled mode; omit both to keep the section list-only /
+   * self-hosting (mobile drawer + unit tests).
+   */
+  activeKey?: string | null;
+  /**
+   * Select a shell (controlled mode). `pendingInventory` is true for a
+   * freshly-created shell not yet in the terminals inventory. The parent
+   * records the open tab and sets it active.
+   */
+  onOpenShell?: (key: string, pendingInventory: boolean) => void;
+  /**
+   * Deselect the active shell back to the list (controlled mode).
+   * `unexpected` is true when the shell vanished on its own (closed out
+   * from under the rail) rather than via the back affordance.
+   */
+  onReturnToList?: (unexpected: boolean) => void;
 }
 
 export function InlineTerminalsSection({
@@ -43,6 +70,9 @@ export function InlineTerminalsSection({
   onExpand,
   inline = false,
   readOnly = false,
+  activeKey: controlledActiveKey,
+  onOpenShell,
+  onReturnToList,
 }: InlineTerminalsSectionProps) {
   const { terminals: allTerminals } = useTerminals(conversationId);
   // Inventory view: the agent's own terminal (SDK REPL / native vendor
@@ -69,23 +99,35 @@ export function InlineTerminalsSection({
   const isNativeWrapper = terminalFirstCtx?.isNativeWrapper ?? false;
   const hostInline = inline && !isNativeWrapper;
 
-  // Inline hosting only: which shell is shown in the rail. Null shows the
-  // list. A closed/disappeared shell falls back to the list below.
-  const [activeKey, setActiveKey] = useState<string | null>(null);
+  // Inline hosting: which shell is shown in the rail. Null shows the list;
+  // a closed/disappeared shell falls back to the list below. CONTROLLED
+  // when the parent supplies `onOpenShell` (desktop rail lifts the active
+  // shell so it can render as a top-strip tab, mirroring Files); otherwise
+  // self-hosted via local state (list-only paths + unit tests).
+  const controlled = onOpenShell !== undefined;
+  const [localActiveKey, setLocalActiveKey] = useState<string | null>(null);
+  const activeKey = controlled ? (controlledActiveKey ?? null) : localActiveKey;
   const [announcement, setAnnouncement] = useState("");
   const shellListRef = useRef<HTMLDivElement>(null);
   const shouldFocusListRef = useRef(false);
   const pendingCreatedKeyRef = useRef<string | null>(null);
   const activeTerminal = terminals.find((t) => terminalTabKey(t) === activeKey) ?? null;
 
-  const returnToList = useCallback((unexpected: boolean) => {
-    shouldFocusListRef.current = true;
-    pendingCreatedKeyRef.current = null;
-    setAnnouncement(
-      unexpected ? "The active shell closed unexpectedly. Focus returned to the shell list." : "",
-    );
-    setActiveKey(null);
-  }, []);
+  const returnToList = useCallback(
+    (unexpected: boolean) => {
+      shouldFocusListRef.current = true;
+      pendingCreatedKeyRef.current = null;
+      setAnnouncement(
+        unexpected ? "The active shell closed unexpectedly. Focus returned to the shell list." : "",
+      );
+      if (controlled) {
+        onReturnToList?.(unexpected);
+      } else {
+        setLocalActiveKey(null);
+      }
+    },
+    [controlled, onReturnToList],
+  );
 
   useEffect(() => {
     if (!hostInline || !activeKey) return;
@@ -127,9 +169,13 @@ export function InlineTerminalsSection({
       }
       pendingCreatedKeyRef.current = pendingInventory ? key : null;
       setAnnouncement("");
-      setActiveKey(key);
+      if (controlled) {
+        onOpenShell?.(key, pendingInventory);
+      } else {
+        setLocalActiveKey(key);
+      }
     },
-    [hostInline, onExpand],
+    [hostInline, onExpand, controlled, onOpenShell],
   );
 
   return (
