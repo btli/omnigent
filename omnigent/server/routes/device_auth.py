@@ -53,6 +53,7 @@ import logging
 import os
 import secrets
 import time
+from collections.abc import Callable
 
 import jwt
 from fastapi import APIRouter, HTTPException, Request
@@ -91,6 +92,41 @@ _ACCESS_TOKEN_TTL_SECONDS = 3600
 # re-consent through the flow. Bounds the blast radius of a leaked/phished
 # grant to this window even if revocation is never called.
 _GRANT_MAX_LIFETIME_SECONDS = 30 * 24 * 3600  # 30 days
+# Operator override for the grant lifetime, in whole days. Deployments
+# running unattended hosts can extend the re-consent window deliberately;
+# the 30-day default stays the safe posture.
+_GRANT_MAX_LIFETIME_ENV = "OMNIGENT_GRANT_MAX_LIFETIME_DAYS"
+
+
+def _grant_max_lifetime_seconds() -> int:
+    """Return the grant's absolute lifetime, honoring the env override.
+
+    Invalid or non-positive values fall back to the default — auth
+    lifetimes must never fail open to "unbounded" on a typo.
+    """
+    raw = os.environ.get(_GRANT_MAX_LIFETIME_ENV, "").strip()
+    if raw:
+        try:
+            days = int(raw)
+        except ValueError:
+            _logger.warning(
+                "%s=%r is not an integer — using the %d-day default",
+                _GRANT_MAX_LIFETIME_ENV,
+                raw,
+                _GRANT_MAX_LIFETIME_SECONDS // 86400,
+            )
+        else:
+            if days > 0:
+                return days * 86400
+            _logger.warning(
+                "%s=%r must be positive — using the %d-day default",
+                _GRANT_MAX_LIFETIME_ENV,
+                raw,
+                _GRANT_MAX_LIFETIME_SECONDS // 86400,
+            )
+    return _GRANT_MAX_LIFETIME_SECONDS
+
+
 # user_code alphabet excludes easily-confused chars (0/O, 1/I/L).
 _USER_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
@@ -256,6 +292,240 @@ class _SlidingWindowRateLimiter:
         return True
 
 
+def _resolve_signing_config(auth_provider: UnifiedAuthProvider) -> tuple[bytes, str]:
+    """Return ``(cookie_secret, provider_name)`` for token minting.
+
+    Works for both server-mintable providers: ``accounts`` and ``oidc``.
+    Header mode has no server-held signing identity, so grant routes
+    cannot be built for it.
+    """
+    if auth_provider._source == "accounts":
+        config = auth_provider._accounts_config
+        assert config is not None, "accounts mode must have an accounts config"
+        return config.cookie_secret, auth_provider._source
+    if auth_provider._source == "oidc":
+        oidc_config = auth_provider._oidc_config
+        assert oidc_config is not None, "oidc mode must have an oidc config"
+        return oidc_config.cookie_secret, auth_provider._source
+    raise RuntimeError(
+        f"grant routes require accounts or oidc auth (got {auth_provider._source!r})"
+    )
+
+
+def _make_client_secret_gate() -> Callable[[Request], bool]:
+    """Build the optional shared-secret check for client-facing endpoints.
+
+    Reads the env once at mount (toggling requires a restart, consistent
+    with the other auth env vars). Open when no secret is configured.
+    """
+    client_secret = os.environ.get(_CLIENT_SECRET_ENV, "").strip() or None
+    if client_secret is not None:
+        _logger.info("device-auth: client-secret enforcement enabled")
+
+    def _client_secret_ok(request: Request) -> bool:
+        if client_secret is None:
+            return True
+        # Compare on bytes: compare_digest raises TypeError on non-ASCII str
+        # operands, and ASGI decodes header bytes as latin-1, so a crafted
+        # non-ASCII header would otherwise 500 instead of cleanly failing.
+        presented = request.headers.get(_CLIENT_SECRET_HEADER, "")
+        return hmac.compare_digest(presented.encode("utf-8"), client_secret.encode("utf-8"))
+
+    return _client_secret_ok
+
+
+def issue_login_grant(
+    device_grant_store: DeviceGrantStore,
+    *,
+    user_id: str,
+    cookie_secret: bytes,
+    client_id: str = "omnigent-cli",
+) -> str:
+    """Create a redeemed refresh grant for an interactive login.
+
+    Called by the login flows (OIDC cli-ticket fulfillment, accounts
+    ``/auth/login``) so the CLI walks away with refresh material and can
+    renew its access without a human re-running ``omnigent login``. The
+    interactive login *is* the consent step, so the grant is born
+    ``redeemed``.
+
+    :param device_grant_store: Grant persistence.
+    :param user_id: The just-authenticated identity.
+    :param cookie_secret: HMAC key for hashing the refresh token.
+    :param client_id: Public client name for audit.
+    :returns: The raw refresh token to hand to the client (stored hashed).
+    """
+    refresh_token = _mint_refresh_token()
+    device_grant_store.create_redeemed_grant(
+        secrets.token_urlsafe(24),
+        user_id=user_id,
+        client_id=client_id,
+        refresh_token_hash=hash_secret(refresh_token, cookie_secret),
+        created_at=int(time.time()),
+    )
+    return refresh_token
+
+
+def create_oauth_token_router(
+    auth_provider: UnifiedAuthProvider,
+    device_grant_store: DeviceGrantStore,
+    *,
+    handle_device_code: Callable[[str], Response] | None = None,
+) -> APIRouter:
+    """Build the ``/oauth/token`` + ``/oauth/revoke`` router.
+
+    The refresh/revoke half of the grant machinery, mountable on its own:
+    login-issued refresh grants (see :func:`issue_login_grant`) need these
+    endpoints in **both** accounts and OIDC modes, independent of the
+    RFC 8628 device-code consent flow (which stays accounts-only behind
+    ``OMNIGENT_DEVICE_GRANT_ENABLED``).
+
+    :param auth_provider: The active provider — ``accounts`` or ``oidc``.
+    :param device_grant_store: Persistence for grants.
+    :param handle_device_code: Optional device-code grant handler.
+        :func:`create_device_auth_router` passes its polling closure so
+        the full flow keeps one token endpoint; standalone mounts leave
+        it ``None`` and ``device_code`` exchanges get
+        ``unsupported_grant_type``.
+    :returns: APIRouter to mount at the app root.
+    """
+    cookie_secret, provider_name = _resolve_signing_config(auth_provider)
+    _client_secret_ok = _make_client_secret_gate()
+    router = APIRouter()
+
+    def _issue_access_token(grant_id: str, user_id: str, client_id: str) -> str:
+        return mint_delegated_token(
+            user_id,
+            cookie_secret,
+            _ACCESS_TOKEN_TTL_SECONDS,
+            provider_name,
+            grant_id=grant_id,
+            client_id=client_id or "",
+            jti=secrets.token_urlsafe(16),
+        )
+
+    @router.post("/oauth/token", dependencies=[])
+    async def token(request: Request) -> Response:
+        """Exchange a device_code or refresh_token for an access token.
+
+        RFC 8628 / 6749 error shapes: ``authorization_pending``,
+        ``slow_down``, ``expired_token``, ``access_denied``,
+        ``invalid_grant``, ``unsupported_grant_type``.
+        """
+        if not _client_secret_ok(request):
+            return _oauth_error("invalid_client", status_code=401)
+        form = await request.form()
+        grant_type = str(form.get("grant_type") or "")
+
+        if grant_type == "urn:ietf:params:oauth:grant-type:device_code":
+            if handle_device_code is None:
+                return _oauth_error("unsupported_grant_type")
+            return handle_device_code(str(form.get("device_code") or ""))
+        if grant_type == "refresh_token":
+            return _handle_refresh_grant(str(form.get("refresh_token") or ""))
+        return _oauth_error("unsupported_grant_type")
+
+    def _handle_refresh_grant(refresh_token: str) -> Response:
+        if not refresh_token:
+            return _oauth_error("invalid_request")
+        presented_hash = hash_secret(refresh_token, cookie_secret)
+        # A refresh token doesn't name its grant, so locate it by digest.
+        # Only a live (redeemed, non-revoked) grant holds a matching hash.
+        grant = device_grant_store.get_by_refresh_hash(presented_hash)
+        if grant is None:
+            # Not the current token. If it matches a grant's *previous*
+            # token, a stale token was replayed — reuse/theft. Revoke the
+            # whole grant so the attacker's freshly-rotated token dies too.
+            stale = device_grant_store.get_by_prev_refresh_hash(presented_hash)
+            if stale is not None:
+                device_grant_store.revoke(stale.id)
+                _logger.warning(
+                    "oauth/token: refresh reuse detected on grant %s — revoked", stale.id
+                )
+            return _oauth_error("invalid_grant")
+        # Refuse to refresh a grant past its absolute lifetime — the user
+        # must re-consent. Checked before rotating so an aged grant simply
+        # stops working (it is NOT reuse, so it must not revoke/oscillate).
+        if grant.approved_at is not None and (
+            int(time.time()) - grant.approved_at >= _grant_max_lifetime_seconds()
+        ):
+            return _oauth_error("expired_token")
+        new_refresh = _mint_refresh_token()
+        rotated = device_grant_store.rotate_refresh_token(
+            grant.id,
+            expected_hash=presented_hash,
+            new_hash=hash_secret(new_refresh, cookie_secret),
+            now_epoch_seconds=int(time.time()),
+            max_lifetime_seconds=_grant_max_lifetime_seconds(),
+        )
+        if rotated is None:
+            # Lost a concurrent rotation race, or the grant aged out between
+            # the check above and here — reject without revoking (this is not
+            # a reuse signal, so the grant must not be killed/oscillate).
+            return _oauth_error("invalid_grant")
+        if rotated.user_id is None:
+            return _oauth_error("invalid_grant")
+        access_token = _issue_access_token(
+            rotated.id,
+            rotated.user_id,
+            rotated.client_id or "",
+        )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "access_token": access_token,
+                "refresh_token": new_refresh,
+                "token_type": "Bearer",
+                "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
+            },
+        )
+
+    # ── Revocation ────────────────────────────────────────────────
+
+    @router.post("/oauth/revoke", dependencies=[])
+    async def revoke(request: Request) -> Response:
+        """Revoke a grant by refresh token or by the caller's access token.
+
+        Backs ``/omnigent logout``. Accepts a ``refresh_token`` form
+        field; falls back to the ``grant_id`` on the caller's own
+        delegated access token so a client with only its access token
+        can still log out.
+        """
+        if not _client_secret_ok(request):
+            return _oauth_error("invalid_client", status_code=401)
+        form = await request.form()
+        refresh_token = str(form.get("refresh_token") or "")
+        grant = None
+        if refresh_token:
+            grant = device_grant_store.get_by_refresh_hash(
+                hash_secret(refresh_token, cookie_secret)
+            )
+        if grant is None:
+            grant_id = _grant_id_from_bearer(request)
+            if grant_id is not None:
+                grant = device_grant_store.get_by_id(grant_id)
+        if grant is None:
+            # Idempotent: nothing to revoke is still "revoked" from the
+            # caller's perspective. Don't leak which tokens exist.
+            return JSONResponse(status_code=200, content={"revoked": True})
+        device_grant_store.revoke(grant.id)
+        _logger.info("oauth/revoke: revoked grant %s", grant.id)
+        return JSONResponse(status_code=200, content={"revoked": True})
+
+    def _grant_id_from_bearer(request: Request) -> str | None:
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return None
+        try:
+            payload = jwt.decode(auth_header[7:], cookie_secret, algorithms=["HS256"])
+        except jwt.InvalidTokenError:
+            return None
+        grant_id = payload.get("grant_id")
+        return grant_id if isinstance(grant_id, str) else None
+
+    return router
+
+
 def create_device_auth_router(
     auth_provider: UnifiedAuthProvider,
     device_grant_store: DeviceGrantStore,
@@ -277,28 +547,7 @@ def create_device_auth_router(
     base_url = cookie_config.base_url
     provider_name = auth_provider._source
 
-    # Read the optional client secret once at mount. When set, the
-    # client-facing endpoints require a matching header; when unset they
-    # stay public. Captured here (not per-request) so toggling it needs a
-    # restart — consistent with the other auth env vars.
-    client_secret = os.environ.get(_CLIENT_SECRET_ENV, "").strip() or None
-    if client_secret is not None:
-        _logger.info("device-auth: client-secret enforcement enabled")
-
-    def _client_secret_ok(request: Request) -> bool:
-        """Return True if the request may use the client-facing endpoints.
-
-        Open when no secret is configured; otherwise requires the presented
-        header to match, compared in constant time to avoid leaking the
-        secret through timing.
-        """
-        if client_secret is None:
-            return True
-        # Compare on bytes: compare_digest raises TypeError on non-ASCII str
-        # operands, and ASGI decodes header bytes as latin-1, so a crafted
-        # non-ASCII header would otherwise 500 instead of cleanly failing.
-        presented = request.headers.get(_CLIENT_SECRET_HEADER, "")
-        return hmac.compare_digest(presented.encode("utf-8"), client_secret.encode("utf-8"))
+    _client_secret_ok = _make_client_secret_gate()
 
     router = APIRouter()
     _rate_limiter = _SlidingWindowRateLimiter(
@@ -346,7 +595,7 @@ def create_device_auth_router(
             _last_purge["at"] = now_wall
             try:
                 device_grant_store.purge_expired(
-                    int(now_wall), max_lifetime_seconds=_GRANT_MAX_LIFETIME_SECONDS
+                    int(now_wall), max_lifetime_seconds=_grant_max_lifetime_seconds()
                 )
             except Exception:  # housekeeping must never fail a request
                 _logger.exception("device grant purge failed")
@@ -485,26 +734,10 @@ def create_device_auth_router(
             device_grant_store.deny(grant.id)
         return HTMLResponse(_consent_html(denied=True), status_code=200)
 
-    # ── Token endpoint (client polling + refresh) ─────────────────
-
-    @router.post("/oauth/token", dependencies=[])
-    async def token(request: Request) -> Response:
-        """Exchange a device_code or refresh_token for an access token.
-
-        RFC 8628 / 6749 error shapes: ``authorization_pending``,
-        ``slow_down``, ``expired_token``, ``access_denied``,
-        ``invalid_grant``, ``unsupported_grant_type``.
-        """
-        if not _client_secret_ok(request):
-            return _oauth_error("invalid_client", status_code=401)
-        form = await request.form()
-        grant_type = str(form.get("grant_type") or "")
-
-        if grant_type == "urn:ietf:params:oauth:grant-type:device_code":
-            return _handle_device_code_grant(str(form.get("device_code") or ""))
-        if grant_type == "refresh_token":
-            return _handle_refresh_grant(str(form.get("refresh_token") or ""))
-        return _oauth_error("unsupported_grant_type")
+    # ── Token + revocation endpoints ──────────────────────────────
+    # Shared with the standalone login-grant mount: the device flow's
+    # only addition is the device_code grant handler, injected here so
+    # /oauth/token stays a single registration either way.
 
     def _handle_device_code_grant(device_code: str) -> Response:
         if not device_code:
@@ -555,103 +788,13 @@ def create_device_auth_router(
             },
         )
 
-    def _handle_refresh_grant(refresh_token: str) -> Response:
-        if not refresh_token:
-            return _oauth_error("invalid_request")
-        presented_hash = hash_secret(refresh_token, cookie_secret)
-        # A refresh token doesn't name its grant, so locate it by digest.
-        # Only a live (redeemed, non-revoked) grant holds a matching hash.
-        grant = device_grant_store.get_by_refresh_hash(presented_hash)
-        if grant is None:
-            # Not the current token. If it matches a grant's *previous*
-            # token, a stale token was replayed — reuse/theft. Revoke the
-            # whole grant so the attacker's freshly-rotated token dies too.
-            stale = device_grant_store.get_by_prev_refresh_hash(presented_hash)
-            if stale is not None:
-                device_grant_store.revoke(stale.id)
-                _logger.warning(
-                    "oauth/token: refresh reuse detected on grant %s — revoked", stale.id
-                )
-            return _oauth_error("invalid_grant")
-        # Refuse to refresh a grant past its absolute lifetime — the user
-        # must re-consent. Checked before rotating so an aged grant simply
-        # stops working (it is NOT reuse, so it must not revoke/oscillate).
-        if grant.approved_at is not None and (
-            int(time.time()) - grant.approved_at >= _GRANT_MAX_LIFETIME_SECONDS
-        ):
-            return _oauth_error("expired_token")
-        new_refresh = _mint_refresh_token()
-        rotated = device_grant_store.rotate_refresh_token(
-            grant.id,
-            expected_hash=presented_hash,
-            new_hash=hash_secret(new_refresh, cookie_secret),
-            now_epoch_seconds=int(time.time()),
-            max_lifetime_seconds=_GRANT_MAX_LIFETIME_SECONDS,
+    router.include_router(
+        create_oauth_token_router(
+            auth_provider,
+            device_grant_store,
+            handle_device_code=_handle_device_code_grant,
         )
-        if rotated is None:
-            # Lost a concurrent rotation race, or the grant aged out between
-            # the check above and here — reject without revoking (this is not
-            # a reuse signal, so the grant must not be killed/oscillate).
-            return _oauth_error("invalid_grant")
-        if rotated.user_id is None:
-            return _oauth_error("invalid_grant")
-        access_token = _issue_access_token(
-            rotated.id,
-            rotated.user_id,
-            rotated.client_id or "",
-        )
-        return JSONResponse(
-            status_code=200,
-            content={
-                "access_token": access_token,
-                "refresh_token": new_refresh,
-                "token_type": "Bearer",
-                "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
-            },
-        )
-
-    # ── Revocation ────────────────────────────────────────────────
-
-    @router.post("/oauth/revoke", dependencies=[])
-    async def revoke(request: Request) -> Response:
-        """Revoke a grant by refresh token or by the caller's access token.
-
-        Backs ``/omnigent logout``. Accepts a ``refresh_token`` form
-        field; falls back to the ``grant_id`` on the caller's own
-        delegated access token so a client with only its access token
-        can still log out.
-        """
-        if not _client_secret_ok(request):
-            return _oauth_error("invalid_client", status_code=401)
-        form = await request.form()
-        refresh_token = str(form.get("refresh_token") or "")
-        grant = None
-        if refresh_token:
-            grant = device_grant_store.get_by_refresh_hash(
-                hash_secret(refresh_token, cookie_secret)
-            )
-        if grant is None:
-            grant_id = _grant_id_from_bearer(request)
-            if grant_id is not None:
-                grant = device_grant_store.get_by_id(grant_id)
-        if grant is None:
-            # Idempotent: nothing to revoke is still "revoked" from the
-            # caller's perspective. Don't leak which tokens exist.
-            return JSONResponse(status_code=200, content={"revoked": True})
-        device_grant_store.revoke(grant.id)
-        _logger.info("oauth/revoke: revoked grant %s", grant.id)
-        return JSONResponse(status_code=200, content={"revoked": True})
-
-    def _grant_id_from_bearer(request: Request) -> str | None:
-        auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
-            return None
-        try:
-            payload = jwt.decode(auth_header[7:], cookie_secret, algorithms=["HS256"])
-        except jwt.InvalidTokenError:
-            return None
-        grant_id = payload.get("grant_id")
-        return grant_id if isinstance(grant_id, str) else None
+    )
 
     return router
 
