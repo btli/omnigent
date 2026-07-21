@@ -41,8 +41,7 @@ export function TerminalStatusBadge({ status }: { status: TerminalStatus }) {
 
 /**
  * Identity chip for a terminal's inline header: icon, name, optional
- * session key, and status dot. Shared by the rail's inline shell header
- * and the main-column shell header so both stay pixel-identical.
+ * session key, and status dot. Used by the rail's inline shell header.
  *
  * :param terminal: Terminal whose name/session drive the chip.
  * :param status: Terminal-local display status for the trailing badge.

@@ -111,7 +111,7 @@ export function InlineTerminalsSection({
   }, [activeKey, hostInline]);
 
   // Row click: host the shell in the rail (inline) or hand it off for a
-  // full-screen takeover (mobile / terminal-first). New-shell creation
+  // full-screen takeover (mobile / native-CLI wrappers). New-shell creation
   // follows the same split so a freshly-created shell lands in the active
   // surface.
   // `pendingInventory` marks the creation path: a freshly-created shell
