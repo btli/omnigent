@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
   MemoryRouter,
   Route,
@@ -1147,6 +1147,85 @@ describe("User-shell routing gates on isNativeWrapper (not isTerminalFirst)", ()
     expect(probe()).toHaveAttribute("data-view", "chat");
     expect(probe()).toHaveAttribute("data-is-shell-view", "false");
     // The stale key is scrubbed so a later persist can't resurrect it.
+    expect(sessionStorage.getItem("omnigent.web.panel-key:conv_polly")).toBeNull();
+  });
+
+  it("does not replay a stored user-shell key on a COLD reload where labels load late", async () => {
+    // Cold hard reload: the sidebar list and the session snapshot both start
+    // empty/loading (no localStorage persistence), so terminalFirst reads
+    // false when the restore effect runs. A stored user-shell key must NOT be
+    // eagerly replayed into the center during that window — it's parked, the
+    // center stays on chat — and once the polly labels resolve it's scrubbed.
+    // Regression: eager replay opened MainTerminalView in a polly session
+    // (view flipped to terminal the moment isTerminalFirst turned true).
+    sessionStorage.setItem("omnigent.web.panel-key:conv_polly", "terminal:terminal_bash_s1");
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+
+    // Phase 1 — cold: no conversation row yet, snapshot still loading.
+    useConvMock.mockReturnValue({ data: undefined } as ReturnType<typeof useConversations>);
+    useSessionMock.mockReturnValue({ session: null, isLoading: true, error: null });
+    useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const makeTree = () => (
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_polly"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route
+                  path="c/:conversationId"
+                  element={
+                    <>
+                      <TerminalFirstViewProbe />
+                      <LocationDisplay />
+                    </>
+                  }
+                />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(makeTree());
+
+    const probe = () => screen.getByTestId("view-probe");
+    // While labels are unknown the shape isn't decided, but the key is parked
+    // (not replayed): the center stays on chat.
+    expect(probe()).toHaveAttribute("data-view", "chat");
+
+    // Phase 2 — labels resolve to a polly session (terminal-first, no wrapper).
+    mockConversations([
+      { id: "conv_polly", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+    ]);
+    useSessionMock.mockReturnValue({
+      session: { id: "conv_polly", labels: { "omnigent.ui": "terminal" } },
+      isLoading: false,
+      error: null,
+    } as unknown as ReturnType<typeof useSession>);
+    useTerminalsMock.mockReturnValue({
+      terminals: [
+        { id: "terminal_tui_main", name: "tui", session: "main", running: true },
+        { id: "terminal_bash_s1", name: "bash", session: "s1", running: true },
+      ],
+      isLoading: false,
+      error: null,
+    });
+    rerender(makeTree());
+
+    // The session is now known to be chat-first non-wrapper; the parked key
+    // resolves to a scrub, so the center never takes over and the stale key
+    // is gone.
+    await waitFor(() => {
+      expect(probe()).toHaveAttribute("data-is-terminal-first", "true");
+    });
+    expect(probe()).toHaveAttribute("data-is-native-wrapper", "false");
+    expect(probe()).toHaveAttribute("data-view", "chat");
+    expect(probe()).toHaveAttribute("data-is-shell-view", "false");
     expect(sessionStorage.getItem("omnigent.web.panel-key:conv_polly")).toBeNull();
   });
 });
