@@ -249,6 +249,20 @@ describe("ModelViewer loader selection (unified with dispatch)", () => {
     expect(screen.queryByText(/Unable to render/)).toBeNull();
   });
 
+  it("selects the 3MF loader by MIME when the extension is absent", async () => {
+    // A file with no recognizable extension but a 3MF content type must parse
+    // through the 3MF loader — proving detection and parsing use one resolver.
+    render(
+      <ModelViewer
+        data={makeData({ path: "download", content_type: "model/3mf" })}
+        path="download"
+      />,
+    );
+    await waitFor(() => expect(parseCalls).toContain("3mf"));
+    expect(parseCalls).not.toContain("stl");
+    expect(screen.queryByText(/Unable to render/)).toBeNull();
+  });
+
   it("selects the STL loader for a binary .stl (extension fallback)", async () => {
     render(
       <ModelViewer
