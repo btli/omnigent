@@ -10,15 +10,31 @@
 // geometry, materials, renderer, the animation frame, and the WebGL context are
 // all released so repeatedly opening model files can't leak GPU memory.
 
+import { useTheme } from "next-themes";
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import { ThreeMFLoader } from "three/examples/jsm/loaders/3MFLoader.js";
 import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
+import { normalizeResolvedTheme } from "@/components/theme/themeMode";
 import { type FileContentResponse, fileContentToBlob } from "@/hooks/useFileContent";
-import { type ModelFormat, getModelFormat } from "./codeViewerHelpers";
+import {
+  type ModelFormat,
+  type ModelViewerTheme,
+  getModelFormat,
+  modelViewerTheme,
+} from "./codeViewerHelpers";
 import { TruncatedBanner } from "./TruncatedBanner";
+
+// What parseModel produces: the object to add to the scene, plus a handle to
+// the STL default material when we created one. The material handle lets the
+// theme-update effect recolor STL surfaces live; 3MF/OBJ carry their own
+// materials, so we never touch those.
+interface ParsedModel {
+  object: THREE.Object3D;
+  stlMaterial: THREE.MeshStandardMaterial | null;
+}
 
 /**
  * Parse raw model bytes into a three.js Object3D for the given format.
@@ -29,25 +45,31 @@ import { TruncatedBanner } from "./TruncatedBanner";
  * loader's `parse` is synchronous and self-contained (no network), so a
  * truncated or malformed file throws here and the caller surfaces the error
  * state.
+ *
+ * STL carries no material, so we give it a theme-derived surface (`theme`);
+ * the returned `stlMaterial` handle lets the caller recolor it on a theme
+ * toggle without reparsing.
  */
-function parseModel(format: ModelFormat, buffer: ArrayBuffer): THREE.Object3D {
+function parseModel(
+  format: ModelFormat,
+  buffer: ArrayBuffer,
+  theme: ModelViewerTheme,
+): ParsedModel {
   if (format === "stl") {
     const geometry = new STLLoader().parse(buffer);
-    // STL carries no material — give it a neutral surface that shows the
-    // geometry's shading under the scene lights.
     const material = new THREE.MeshStandardMaterial({
-      color: 0x9aa0a6,
+      color: theme.stlMaterial,
       metalness: 0.1,
       roughness: 0.6,
     });
-    return new THREE.Mesh(geometry, material);
+    return { object: new THREE.Mesh(geometry, material), stlMaterial: material };
   }
   if (format === "3mf") {
-    return new ThreeMFLoader().parse(buffer);
+    return { object: new ThreeMFLoader().parse(buffer), stlMaterial: null };
   }
   // OBJ is ASCII text.
   const text = new TextDecoder().decode(buffer);
-  return new OBJLoader().parse(text);
+  return { object: new OBJLoader().parse(text), stlMaterial: null };
 }
 
 /**
@@ -130,6 +152,24 @@ interface SceneResources {
   object: THREE.Object3D | null;
   rafId: number;
   resizeObserver: ResizeObserver | null;
+  // Theme-driven handles, kept so a live theme toggle can recolor the scene
+  // without reparsing the model. null until the scene is built.
+  ambient: THREE.HemisphereLight | null;
+  key: THREE.DirectionalLight | null;
+  stlMaterial: THREE.MeshStandardMaterial | null;
+}
+
+/**
+ * Push `theme` onto a built scene: canvas clear color, light intensities, and
+ * the STL default material (3MF/OBJ keep their own materials). Safe to call on
+ * a partially-built `res` — each field is guarded — so the theme effect can run
+ * before or after the async scene build completes.
+ */
+function applyTheme(res: SceneResources, theme: ModelViewerTheme): void {
+  res.renderer?.setClearColor(theme.background, 1);
+  if (res.ambient) res.ambient.intensity = theme.ambientIntensity;
+  if (res.key) res.key.intensity = theme.keyIntensity;
+  res.stlMaterial?.color.setHex(theme.stlMaterial);
 }
 
 /**
@@ -169,6 +209,26 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
   const containerRef = useRef<HTMLDivElement>(null);
   const [errored, setErrored] = useState(false);
 
+  // Theme comes from the app's shared next-themes source (same hook Monaco and
+  // the terminal use). `mode` is a stable "light"|"dark" string, so the theme
+  // effect below re-runs only on an actual toggle.
+  const { resolvedTheme } = useTheme();
+  const mode = normalizeResolvedTheme(resolvedTheme);
+
+  // The live scene, so the theme effect can recolor it without a rebuild, and
+  // the latest theme, so the build effect can seed it without depending on the
+  // theme (which would reparse the model on every toggle).
+  const resRef = useRef<SceneResources | null>(null);
+  const themeRef = useRef<ModelViewerTheme>(modelViewerTheme(mode));
+
+  // A theme toggle while a model is open updates the live scene in place —
+  // clear color, light intensities, and the STL material — with no reload.
+  useEffect(() => {
+    const theme = modelViewerTheme(mode);
+    themeRef.current = theme;
+    if (resRef.current) applyTheme(resRef.current, theme);
+  }, [mode]);
+
   useEffect(() => {
     const container = containerRef.current;
     // The container is always mounted (even in the error state, the canvas host
@@ -200,13 +260,22 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
       object: null,
       rafId: 0,
       resizeObserver: null,
+      ambient: null,
+      key: null,
+      stlMaterial: null,
     };
+    resRef.current = res;
+    // Read the current theme without re-subscribing: the theme effect keeps
+    // this ref fresh, so a build triggered by a data/path change always seeds
+    // the scene with the active mode.
+    const theme = themeRef.current;
     const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 1000);
 
     const fail = () => {
       // Free anything created before the failure, then show the error UI. The
       // cleanup return also calls teardownScene, which is idempotent.
       teardownScene(res);
+      if (resRef.current === res) resRef.current = null;
       if (!disposed) setErrored(true);
     };
 
@@ -218,7 +287,8 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
       .then((buffer) => {
         if (disposed) return;
 
-        const object = parseModel(format, buffer);
+        const { object, stlMaterial } = parseModel(format, buffer, theme);
+        res.stlMaterial = stlMaterial;
         // Validate BEFORE building the scene: an empty/degenerate model (e.g. a
         // comment-only OBJ) has no finite bounds and would render a blank
         // canvas, so surface the error UI instead.
@@ -232,14 +302,21 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
         res.scene.add(object);
 
         // Lighting: a hemisphere fill plus a key directional light so surfaces
-        // read with depth rather than as a flat silhouette.
-        res.scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.0));
-        const key = new THREE.DirectionalLight(0xffffff, 1.2);
+        // read with depth rather than as a flat silhouette. Intensities come
+        // from the active theme (brighter in dark) and are kept on `res` so a
+        // theme toggle can update them live.
+        const ambient = new THREE.HemisphereLight(0xffffff, 0x444444, theme.ambientIntensity);
+        res.ambient = ambient;
+        res.scene.add(ambient);
+        const key = new THREE.DirectionalLight(0xffffff, theme.keyIntensity);
         key.position.set(1, 1, 1);
+        res.key = key;
         res.scene.add(key);
 
-        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
         res.renderer = renderer;
+        // Canvas background follows the theme so it sits flush with the panel.
+        renderer.setClearColor(theme.background, 1);
         renderer.setPixelRatio(window.devicePixelRatio);
         const rect = container.getBoundingClientRect();
         renderer.setSize(rect.width || 1, rect.height || 1);
@@ -275,6 +352,7 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
     return () => {
       disposed = true;
       teardownScene(res);
+      if (resRef.current === res) resRef.current = null;
     };
   }, [data, path]);
 

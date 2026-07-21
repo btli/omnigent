@@ -2,6 +2,7 @@
 // No React imports — these are plain functions, easy to unit-test in isolation.
 
 import type { BundledLanguage } from "shiki";
+import type { ResolvedThemeMode } from "@/components/theme/themeMode";
 
 // ---------------------------------------------------------------------------
 // Shared selection type
@@ -202,6 +203,59 @@ export function getModelFormat(path: string, contentType?: string | null): Model
  */
 export function isModelFile(path: string, contentType?: string | null): boolean {
   return getModelFormat(path, contentType) !== null;
+}
+
+/**
+ * Theme-derived appearance for the 3D model preview, keyed by the app's
+ * resolved light/dark mode.
+ *
+ * Mirrors `resolvedThemeToMonaco`: one pure map from the concrete theme mode to
+ * the values the viewer needs, so STL/3MF/OBJ all share a single source of
+ * theme truth instead of hardcoding a neutral scene. WebGL wants numeric colors
+ * (`0xRRGGBB`), and the values track the app's `--background`/`--foreground`
+ * tokens so the canvas sits flush with the surrounding panel in both modes.
+ *
+ *   • `background`       — canvas clear color (the panel background per mode).
+ *   • `stlMaterial`      — default surface for STL (which carries no material);
+ *                          a mid-grey that reads against the mode's background.
+ *   • `ambientIntensity` — hemisphere fill; higher in dark so the mesh stays
+ *                          legible against the dark background.
+ *   • `keyIntensity`     — directional key light, likewise boosted in dark.
+ */
+export interface ModelViewerTheme {
+  background: number;
+  stlMaterial: number;
+  ambientIntensity: number;
+  keyIntensity: number;
+}
+
+const MODEL_VIEWER_THEMES: Record<ResolvedThemeMode, ModelViewerTheme> = {
+  // Light: white canvas (matches `--background: #fff`), a neutral grey surface,
+  // and moderate lights.
+  light: {
+    background: 0xffffff,
+    stlMaterial: 0x9aa0a6,
+    ambientIntensity: 1.0,
+    keyIntensity: 1.2,
+  },
+  // Dark: the app's dark panel color (`--background: #0d1218`), a lighter grey
+  // surface, and brighter lights so the mesh doesn't sink into the background.
+  dark: {
+    background: 0x0d1218,
+    stlMaterial: 0xc4c9ce,
+    ambientIntensity: 1.5,
+    keyIntensity: 1.6,
+  },
+};
+
+/**
+ * Map the app's resolved palette to the 3D model preview's appearance.
+ *
+ * @param resolved Concrete mode from `normalizeResolvedTheme`, e.g. `"dark"`.
+ * @returns The background/material/light values for that mode.
+ */
+export function modelViewerTheme(resolved: ResolvedThemeMode): ModelViewerTheme {
+  return MODEL_VIEWER_THEMES[resolved];
 }
 
 export function detectLang(path: string): BundledLanguage | "text" {

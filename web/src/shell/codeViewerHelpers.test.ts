@@ -11,6 +11,7 @@ import {
   isNotebookPath,
   isPdfFile,
   lineOverlapsSelection,
+  modelViewerTheme,
   openHtmlArtifactInNewTab,
   prepareHtmlPreviewDoc,
 } from "./codeViewerHelpers";
@@ -323,6 +324,28 @@ describe("getModelFormat", () => {
     ] as const) {
       expect(isModelFile(path, ct)).toBe(getModelFormat(path, ct) !== null);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// modelViewerTheme — resolved theme → 3D preview appearance (shared by formats)
+// ---------------------------------------------------------------------------
+
+describe("modelViewerTheme", () => {
+  it("returns distinct backgrounds for light and dark", () => {
+    expect(modelViewerTheme("light").background).not.toBe(modelViewerTheme("dark").background);
+  });
+
+  it("brightens the lights in dark mode so the mesh stays legible", () => {
+    const light = modelViewerTheme("light");
+    const dark = modelViewerTheme("dark");
+    expect(dark.ambientIntensity).toBeGreaterThan(light.ambientIntensity);
+    expect(dark.keyIntensity).toBeGreaterThan(light.keyIntensity);
+  });
+
+  it("provides an STL default material color for each mode", () => {
+    expect(typeof modelViewerTheme("light").stlMaterial).toBe("number");
+    expect(typeof modelViewerTheme("dark").stlMaterial).toBe("number");
   });
 });
 

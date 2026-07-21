@@ -25,8 +25,13 @@ const parseCalls: string[] = [];
 interface RendererRecord {
   disposed: boolean;
   contextLost: boolean;
+  clearColor?: number;
 }
 let lastRenderer: RendererRecord | null = null;
+
+// The mesh's material, exposed so theme tests can assert its color. Set when
+// the STL loader runs (the only format that builds its own material).
+let lastMaterial: { color: number } | null = null;
 
 function makeParsedObject() {
   // Object3D stand-in. Box3.setFromObject reads boxSpec to decide bounds.
@@ -117,6 +122,9 @@ vi.mock("three", () => {
     }
     setPixelRatio() {}
     setSize() {}
+    setClearColor(color: number) {
+      this.record.clearColor = color;
+    }
     render() {}
     dispose() {
       this.record.disposed = true;
@@ -145,17 +153,42 @@ vi.mock("three", () => {
     Scene,
     Mesh,
     MeshStandardMaterial: class {
+      color: { setHex: (hex: number) => void };
+      constructor(opts?: { color?: number }) {
+        const rec = { hex: opts?.color ?? 0 };
+        this.color = {
+          setHex: (hex: number) => {
+            rec.hex = hex;
+            if (lastMaterial) lastMaterial.color = hex;
+          },
+        };
+        lastMaterial = { color: rec.hex };
+      }
       dispose() {}
     },
     HemisphereLight: class {
       position = new Vector3();
+      intensity: number;
+      constructor(_sky?: number, _ground?: number, intensity = 1) {
+        this.intensity = intensity;
+      }
     },
     DirectionalLight: class {
       position = new Vector3();
+      intensity: number;
+      constructor(_color?: number, intensity = 1) {
+        this.intensity = intensity;
+      }
     },
   };
 });
 
+// Theme comes from next-themes; drive it per-test via this mutable holder,
+// mirroring the mock pattern in MonacoCodeEditor.test.tsx.
+const themeState: { resolvedTheme: string } = { resolvedTheme: "light" };
+vi.mock("next-themes", () => ({ useTheme: () => themeState }));
+
+import { modelViewerTheme } from "./codeViewerHelpers";
 import { ModelViewer } from "./ModelViewer";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -180,6 +213,8 @@ beforeEach(() => {
   behavior.orbitThrows = false;
   parseCalls.length = 0;
   lastRenderer = null;
+  lastMaterial = null;
+  themeState.resolvedTheme = "light";
   vi.stubGlobal(
     "requestAnimationFrame",
     vi.fn(() => 1),
@@ -291,5 +326,52 @@ describe("ModelViewer teardown", () => {
     unmount();
     expect(lastRenderer?.contextLost).toBe(true);
     expect(lastRenderer?.disposed).toBe(true);
+  });
+});
+
+describe("ModelViewer theme awareness", () => {
+  const light = modelViewerTheme("light");
+  const dark = modelViewerTheme("dark");
+
+  it("builds the scene from the active light theme", async () => {
+    themeState.resolvedTheme = "light";
+    render(<ModelViewer data={makeData()} path="part.stl" />);
+    await waitFor(() => expect(lastRenderer).not.toBeNull());
+    // Canvas clear color and STL material track the light theme.
+    expect(lastRenderer?.clearColor).toBe(light.background);
+    expect(lastMaterial?.color).toBe(light.stlMaterial);
+  });
+
+  it("builds the scene from the active dark theme", async () => {
+    themeState.resolvedTheme = "dark";
+    render(<ModelViewer data={makeData()} path="part.stl" />);
+    await waitFor(() => expect(lastRenderer).not.toBeNull());
+    expect(lastRenderer?.clearColor).toBe(dark.background);
+    expect(lastMaterial?.color).toBe(dark.stlMaterial);
+    // Dark theme brightens the lights so the mesh stays legible.
+    expect(dark.background).not.toBe(light.background);
+    expect(dark.ambientIntensity).toBeGreaterThan(light.ambientIntensity);
+    expect(dark.keyIntensity).toBeGreaterThan(light.keyIntensity);
+  });
+
+  it("updates the live scene when the theme toggles (no reload)", async () => {
+    themeState.resolvedTheme = "light";
+    // Reuse ONE data object across renders: the build effect keys on
+    // [data, path], so a fresh object would rebuild and mask the in-place path.
+    const stableData = makeData();
+    const { rerender } = render(<ModelViewer data={stableData} path="part.stl" />);
+    await waitFor(() => expect(lastRenderer).not.toBeNull());
+    expect(lastRenderer?.clearColor).toBe(light.background);
+    const rendererBefore = lastRenderer;
+    const parsesBefore = parseCalls.length;
+
+    // Toggle to dark and re-render with the SAME data/path — the scene must
+    // recolor in place rather than rebuild (same renderer, no extra parse).
+    themeState.resolvedTheme = "dark";
+    rerender(<ModelViewer data={stableData} path="part.stl" />);
+    await waitFor(() => expect(lastRenderer?.clearColor).toBe(dark.background));
+    expect(lastMaterial?.color).toBe(dark.stlMaterial);
+    expect(lastRenderer).toBe(rendererBefore);
+    expect(parseCalls.length).toBe(parsesBefore);
   });
 });
