@@ -144,6 +144,42 @@ export function isPdfFile(path: string, contentType?: string | null): boolean {
   return path.split(".").pop()?.toLowerCase() === "pdf";
 }
 
+// 3D model formats we render in an interactive WebGL preview (three.js). Scoped
+// deliberately to the three loaders we ship — STL, 3MF, OBJ — and nothing else.
+const MODEL_EXTENSIONS = new Set(["stl", "3mf", "obj"]);
+
+// MIME types servers commonly report for these formats. Extension-driven
+// `guess_type` and some toolchains disagree on the canonical value (STL in
+// particular has several historical types), so match a small explicit set
+// rather than a `model/` prefix — `model/gltf+json` etc. are NOT in scope.
+const MODEL_CONTENT_TYPES = new Set([
+  "model/stl",
+  "application/sla",
+  "application/vnd.ms-pki.stl",
+  "model/3mf",
+  "application/vnd.ms-package.3dmanufacturing-3dmodel+xml",
+  "model/obj",
+]);
+
+/**
+ * Return true if `path` should be previewed as an interactive 3D model.
+ *
+ * MIME-first like `isImageFile`, but the extension is authoritative for the
+ * ambiguous cases: OBJ is plain ASCII (often served as `text/plain`) and
+ * binary STL/3MF are frequently served as `application/octet-stream`, so a
+ * matching extension always wins. A recognized model content type on an
+ * unknown extension also counts.
+ */
+export function isModelFile(path: string, contentType?: string | null): boolean {
+  const ext = path.split(".").pop()?.toLowerCase() ?? "";
+  if (MODEL_EXTENSIONS.has(ext)) return true;
+  if (contentType) {
+    const type = contentType.split(";")[0].trim().toLowerCase();
+    return MODEL_CONTENT_TYPES.has(type);
+  }
+  return false;
+}
+
 export function detectLang(path: string): BundledLanguage | "text" {
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
   const map: Record<string, BundledLanguage> = {

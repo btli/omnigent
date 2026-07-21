@@ -6,6 +6,7 @@ import {
   indexToLine,
   isBinaryPath,
   isImageFile,
+  isModelFile,
   isNotebookPath,
   isPdfFile,
   lineOverlapsSelection,
@@ -212,6 +213,59 @@ describe("isPdfFile", () => {
     expect(isPdfFile("report.pdf", null)).toBe(true);
     expect(isPdfFile("report.pdf", undefined)).toBe(true);
     expect(isPdfFile("notes.txt", null)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isModelFile — 3D model preview detection (STL / 3MF / OBJ)
+// ---------------------------------------------------------------------------
+
+describe("isModelFile", () => {
+  it.each(["part.stl", "assembly.3mf", "mesh.obj", "dir/nested/widget.STL", "MODEL.OBJ"])(
+    "classifies %s as a model by extension",
+    (path) => {
+      expect(isModelFile(path)).toBe(true);
+    },
+  );
+
+  it.each([
+    "app.py",
+    "logo.png",
+    "scene.gltf",
+    "model.glb",
+    "part.step",
+    "part.stp",
+    "notes.txt",
+    "data.json",
+  ])("classifies %s as non-model (out of scope or unrelated)", (path) => {
+    expect(isModelFile(path)).toBe(false);
+  });
+
+  it("treats a recognized model content type as authoritative on an unknown extension", () => {
+    expect(isModelFile("blob", "model/stl")).toBe(true);
+    expect(isModelFile("download", "application/vnd.ms-pki.stl")).toBe(true);
+    expect(isModelFile("blob", "model/3mf")).toBe(true);
+    expect(isModelFile("blob", "model/obj")).toBe(true);
+  });
+
+  it("ignores charset parameters on the content type", () => {
+    expect(isModelFile("blob", "model/obj; charset=utf-8")).toBe(true);
+  });
+
+  it("still previews a model extension even when the server reports a generic type", () => {
+    // Binary STL/3MF are commonly served as octet-stream and ASCII OBJ as
+    // text/plain — the extension must win so they don't fall to the binary or
+    // raw-text paths.
+    expect(isModelFile("part.stl", "application/octet-stream")).toBe(true);
+    expect(isModelFile("mesh.obj", "text/plain")).toBe(true);
+  });
+
+  it("does not treat plain text (no model extension) as a model", () => {
+    expect(isModelFile("readme.txt", "text/plain")).toBe(false);
+  });
+
+  it("treats extension-less paths with no content type as non-model", () => {
+    expect(isModelFile("Dockerfile")).toBe(false);
   });
 });
 
