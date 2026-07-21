@@ -15,13 +15,7 @@ import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
 import { resolveIdentity } from "./lib/identity";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
-import {
-  applyUiFontFamily,
-  applyUiFontScale,
-  readUiFontFamily,
-  readUiFontSizePx,
-} from "./lib/uiFontPreferences";
-import { loadCodeFontFamily, readCodeFontFamily } from "./lib/codeFontPreferences";
+import { restoreFontPreferences } from "./lib/restoreFontPreferences";
 import { applyThemePalette, readThemePalette } from "./lib/themePalette";
 import { applyCustomTheme, readCustomTheme } from "./lib/customTheme";
 import { initChatStore } from "./store/chatStore";
@@ -58,17 +52,10 @@ void resolveIdentity();
 // No-op off the iOS shell (the inset vars stay at their env()-only defaults).
 initNativeInsets();
 
-// Apply the saved UI font size and family before first paint so there's no flash.
-// applyUiFontFamily also kicks off the webfont load when the saved family is a
-// catalog font, so a chosen font is fetched on boot rather than only on the next
-// Settings change.
-applyUiFontScale(readUiFontSizePx());
-applyUiFontFamily(readUiFontFamily());
-
-// Restore the saved code font's webfont on boot too: the code font rides a
-// pub/sub (not a CSS var), so nothing loads it unless we ask. Editors/terminals
-// re-measure when it lands (see codeFontPreferences.loadCodeFontFamily).
-loadCodeFontFamily(readCodeFontFamily());
+// Apply the saved UI + code font preferences before first paint so there's no
+// flash, and kick off the catalog webfont loads so a chosen font is fetched on
+// boot rather than only on the next Settings change.
+restoreFontPreferences();
 
 // Apply the saved color palette (data-theme on <html>) before first paint too,
 // so the app renders in the chosen theme rather than flashing the brand default.
