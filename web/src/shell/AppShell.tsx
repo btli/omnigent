@@ -250,7 +250,25 @@ export function AppShell() {
   const [filesPanelSort, setFilesPanelSort] = useState<ChangedSort>(
     () => readFilesPanelPreferences().sort,
   );
-  const [panelInitialKey, setPanelInitialKeyState] = useState<string | null>(null);
+  // The center-view terminal key (agent terminal or, for native wrappers, a
+  // user shell). Raw state paired with its owning conversation — the SAME
+  // ownership guarantee the lifted shell state (``shellStateConv``) carries,
+  // for the SAME reason: terminal resource ids (e.g. ``terminal_bash_s1``) are
+  // deterministic and NOT conversation-scoped, so on a warm A→B navigation B's
+  // first render still holds A's stale key. If B's terminal query is warm-
+  // cached the stale key resolves to B's same-id terminal and MainTerminalView
+  // would mount TerminalView, firing a real read-write WebSocket attach to the
+  // wrong session. The gated ``panelInitialKey`` below is null whenever the
+  // owner doesn't match the current ``conversationId``, so a stale key can
+  // never reach the center path during the transition — the label-aware
+  // restore effect then re-owns it for the destination a render later.
+  const [panelInitialKeyRaw, setPanelInitialKeyState] = useState<string | null>(null);
+  const [panelKeyConv, setPanelKeyConv] = useState<string | null>(null);
+  // The center-view key applies only while its owning conversation is on
+  // screen. On a warm A→B nav the new conversationId renders before the
+  // restore effect re-owns (or scrubs) the key, so gate here — mirroring
+  // ``shellStateActive`` for the rail's lifted shell state.
+  const panelInitialKey = panelKeyConv === conversationId ? panelInitialKeyRaw : null;
   const [executionLogsKey, setExecutionLogsKey] = useState<string | null>(null);
   const [filesPanelOpen, setFilesPanelOpen] = useState(false);
   // Mobile-only full-screen drawers for the rail tabs that have no desktop
@@ -752,6 +770,10 @@ export function AppShell() {
   const setPanelInitialKey = useCallback(
     (key: string | null) => {
       setPanelInitialKeyState(key);
+      // Tag the key with the current conversation so the gated
+      // ``panelInitialKey`` only surfaces it here (a null owner would gate it
+      // out). A null key clears ownership too — no owner needed for "no key".
+      setPanelKeyConv(key === null ? null : (conversationId ?? null));
       if (!conversationId) return;
       const storageKey = `omnigent.web.panel-key:${conversationId}`;
       if (key === null) {
@@ -790,6 +812,7 @@ export function AppShell() {
       setSelectedFilePath(null);
       setOpenFiles([]);
       setPanelInitialKeyState(null);
+      setPanelKeyConv(null);
       stateConvRef.current = null;
       return;
     }
@@ -880,24 +903,32 @@ export function AppShell() {
   // client-side switch resolves immediately with no flash.
   useEffect(() => {
     if (!conversationId) return;
+    // Re-own the key for THIS conversation whenever a value is restored. The
+    // gated ``panelInitialKey`` ignores any key whose owner isn't the current
+    // conversationId, so this re-ownership (and the null-owner reset for a
+    // parked/scrubbed key) is what lets a restored key reach the center path.
+    const restore = (key: string | null) => {
+      setPanelInitialKeyState(key);
+      setPanelKeyConv(key === null ? null : conversationId);
+    };
     const storageKey = `omnigent.web.panel-key:${conversationId}`;
     const stored = sessionStorage.getItem(storageKey);
     const isUserShell =
       stored !== null && stored !== PANEL_NO_TERMINAL_KEY && !isAgentTerminalKey(stored);
     if (!isUserShell) {
-      setPanelInitialKeyState(stored);
+      restore(stored);
       return;
     }
     if (!sessionLabelsReady) {
       // Shape unknown → park: chat now, revisit when a label source resolves.
-      setPanelInitialKeyState(null);
+      restore(null);
       return;
     }
     if (hostsShellsInline) {
       sessionStorage.removeItem(storageKey);
-      setPanelInitialKeyState(null);
+      restore(null);
     } else {
-      setPanelInitialKeyState(stored);
+      restore(stored);
     }
   }, [conversationId, sessionLabelsReady, hostsShellsInline]);
 
