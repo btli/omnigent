@@ -335,6 +335,49 @@ describe("WorkspacePanel shell identity tabs (header parity with Files)", () => 
     expect(onOpenShell).toHaveBeenCalledWith("terminal:terminal_bash_s1");
   });
 
+  it("does not highlight the shell tab when another rail tab is displayed (highlight-desync)", () => {
+    // Regression: ``activeShellKey`` stays set so returning to the Shells tab
+    // resumes the same shell, but the tab highlight must track the DISPLAYED
+    // surface. With the Files (Agents/etc.) tab selected, the shell tab must
+    // read inactive and the fixed Files trigger active — not a stale shell tab
+    // left aria-current while other content shows.
+    renderWorkspace({
+      rightRailTab: "files",
+      showShellsTab: true,
+      openShells: [makeTerminal("terminal_bash_s1", "bash", "s1")],
+      activeShellKey: "terminal:terminal_bash_s1",
+    });
+
+    const shellTab = screen
+      .getByRole("button", { name: /close bash · s1/i })
+      .closest("[role='button']");
+    expect(shellTab).toHaveAttribute("aria-current", "false");
+    expect(screen.getByRole("tab", { name: /files/i })).toHaveAttribute("data-state", "active");
+  });
+
+  it("does not highlight the shell tab when a file is open (highlight-desync)", () => {
+    // Even on the Shells rail tab, an open file wins the content slot (FileViewer
+    // renders), so the file tab is current and the shell tab must not be.
+    renderWorkspace({
+      rightRailTab: "terminals",
+      showShellsTab: true,
+      selectedFilePath: "README.md",
+      openFiles: ["README.md"],
+      openShells: [makeTerminal("terminal_bash_s1", "bash", "s1")],
+      activeShellKey: "terminal:terminal_bash_s1",
+    });
+
+    const shellTab = screen
+      .getByRole("button", { name: /close bash · s1/i })
+      .closest("[role='button']");
+    expect(shellTab).toHaveAttribute("aria-current", "false");
+    // The open file's tab carries the highlight instead.
+    const fileTab = screen
+      .getByRole("button", { name: /close readme\.md/i })
+      .closest("[role='button']");
+    expect(fileTab).toHaveAttribute("aria-current", "true");
+  });
+
   it("renders the in-tab status as a DOT ONLY, without the status word (A2)", () => {
     renderWorkspace({
       rightRailTab: "terminals",

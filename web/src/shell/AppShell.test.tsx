@@ -280,6 +280,25 @@ function TerminalFirstViewProbe() {
 }
 
 /**
+ * Records the center-view terminal key (``terminalViewKey`` =
+ * AppShell's gated ``panelInitialKey``) on EVERY render into a shared
+ * array, so a test can assert on the render SEQUENCE — not just the
+ * settled end state. The B2 center-path race is a transient-render bug:
+ * on a warm A→B nav B's first render inherits A's stale key before the
+ * restore effect reconciles it, so the settled state converges either
+ * way and only the transient reveals a missing owner-gate.
+ */
+const centerKeyRenders: Array<{ path: string; key: string }> = [];
+function CenterKeyRecorder() {
+  const ctx = useTerminalFirst();
+  const { pathname } = useLocation();
+  // Pushing during render is impure but deliberate here — we need every
+  // render pass, including transient ones an effect immediately corrects.
+  centerKeyRenders.push({ path: pathname, key: ctx?.terminalViewKey ?? "" });
+  return null;
+}
+
+/**
  * Probe for ForkDialogContext — the per-message "Fork from here" entry
  * point lives in ChatPage (not mounted here), so these tests consume the
  * context the same way the real action does: read `canFork` for gating
@@ -488,6 +507,9 @@ beforeEach(() => {
   // Reset terminal-first startup signals so one test's terminalPending /
   // failed status can't leak into another's terminalStartingUp.
   useChatStore.setState({ todos: [], terminalPending: false, sessionStatus: "idle" });
+  // Clear the center-view render recorder so one test's render sequence
+  // can't leak into another's.
+  centerKeyRenders.length = 0;
 });
 
 afterEach(cleanup);
@@ -1400,6 +1422,96 @@ describe("User-shell routing gates on isNativeWrapper (not isTerminalFirst)", ()
     // Re-open the Shells tab in B; the rail must NOT carry A's active key.
     fireEvent.mouseDown(screen.getByRole("tab", { name: /Shells/i }));
     expect(screen.getByTestId("inline-terminals-section")).toHaveAttribute("data-active-key", "");
+  });
+
+  it("does not carry a stale center panelInitialKey to a different conversation on warm navigation", () => {
+    // B2 (center path): the CENTER-view key (``panelInitialKey``) is
+    // conversation-scoped the same way the rail's lifted shell state is.
+    // Terminal ids are deterministic and not conversation-scoped, so on a warm
+    // A→B nav B's FIRST render inherits A's stale key; with B's terminal query
+    // warm-cached it would resolve to B's same-id terminal and MainTerminalView
+    // would mount TerminalView — a real read-write WebSocket attach to the
+    // WRONG session. AppShell's owner-gate makes ``panelInitialKey`` null the
+    // instant conversationId flips (owner still A ≠ B), so no stale key ever
+    // reaches the center path during the transition.
+    //
+    // This asserts the owner-GATE outcome: while on B's route the center-view
+    // key is never A's stale key on ANY render pass (transient included, via
+    // the render recorder) — NOT literal WebSocket non-attachment, since this
+    // suite stubs TerminalView. A true transport assertion would need the real
+    // component (out of scope for this harness).
+    //
+    // Native-wrapper shape: only there does a user shell occupy the CENTER
+    // (chat-first sessions host inline in the rail), so it's the shape whose
+    // center panelInitialKey can carry a stale user-shell key across a nav.
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      {
+        id: "conv_a",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui" },
+      },
+      {
+        id: "conv_b",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui" },
+      },
+    ]);
+    // Both sessions warm-cached with the SAME deterministic terminal ids.
+    useTerminalsMock.mockReturnValue({
+      terminals: [
+        { id: "terminal_claude_main", name: "claude", session: "main", running: true },
+        { id: "terminal_bash_s1", name: "bash", session: "s1", running: true },
+      ],
+      isLoading: false,
+      error: null,
+    });
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_a"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route
+                  path="c/:conversationId"
+                  element={
+                    <>
+                      <TerminalFirstViewProbe />
+                      <CenterKeyRecorder />
+                      <SessionNavButton to="/c/conv_b" />
+                      <LocationDisplay />
+                    </>
+                  }
+                />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+
+    // Take over the center in A with a user shell (native-wrapper onExpand).
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /Shells/i }));
+    fireEvent.click(screen.getByRole("button", { name: /rail: open terminal/i }));
+    const staleKey = "terminal:terminal_main";
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-view-key", staleKey);
+
+    // Warm-navigate to B (AppShell stays mounted, only the route param changes).
+    fireEvent.click(screen.getByTestId("nav-session"));
+
+    // On EVERY render pass while on B's route the center key must not be A's
+    // stale key — the owner-gate nulls it out before it can reach the center,
+    // so B never briefly mounts A's terminal.
+    const bRenders = centerKeyRenders.filter((r) => r.path === "/c/conv_b");
+    expect(bRenders.length).toBeGreaterThan(0);
+    expect(bRenders.every((r) => r.key !== staleKey)).toBe(true);
+    // Settled: B is on chat with no stale center key.
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-view-key", "");
   });
 });
 

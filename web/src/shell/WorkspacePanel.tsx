@@ -403,6 +403,15 @@ export function WorkspacePanel({
   const handleCloseTab = useCallback(() => {
     if (selectedFilePath !== null) onCloseFile(selectedFilePath);
   }, [onCloseFile, selectedFilePath]);
+  // Which surface is ACTUALLY on screen decides the tab highlight — not the raw
+  // ``activeShellKey``, which stays set (so returning to the Shells tab resumes
+  // the same shell) even while a file or another tab is shown. Content priority
+  // is: an open file wins, else the selected ``rightRailTab``. A shell is the
+  // displayed surface only when no file is open AND the Shells tab is selected;
+  // otherwise its tab must not read as current (the desync: a shell tab left
+  // ``aria-current`` while Files/Agents content shows).
+  const displayedShellKey =
+    selectedFilePath === null && rightRailTab === "terminals" ? activeShellKey : null;
   return (
     <aside
       aria-label="Workspace"
@@ -451,7 +460,7 @@ export function WorkspacePanel({
           value={
             selectedFilePath !== null
               ? "__file__"
-              : activeShellKey !== null
+              : displayedShellKey !== null
                 ? "__shell__"
                 : rightRailTab
           }
@@ -573,7 +582,7 @@ export function WorkspacePanel({
               />
               <ShellTabsStrip
                 shells={openShells}
-                activeShellKey={activeShellKey}
+                activeShellKey={displayedShellKey}
                 onShellSelect={onOpenShell}
                 onCloseShell={onCloseShell}
               />
