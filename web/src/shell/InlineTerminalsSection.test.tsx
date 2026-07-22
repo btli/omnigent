@@ -4,6 +4,7 @@ import { type TerminalInfo, useTerminals } from "@/hooks/useTerminals";
 import type { TerminalFirstContextValue } from "./TerminalFirstContext";
 import { TerminalFirstContextProvider } from "./TerminalFirstContext";
 import { InlineTerminalsSection } from "./InlineTerminalsSection";
+import { makeTerminal } from "./testTerminals";
 
 vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   // Keep the real module (inventoryTerminals etc.) — only the
@@ -45,15 +46,6 @@ vi.mock("./NewTerminalButton", () => ({
 }));
 
 const useTerminalsMock = vi.mocked(useTerminals);
-
-function makeTerminal(id: string, name: string, session: string): TerminalInfo {
-  return {
-    id,
-    name,
-    session,
-    running: true,
-  };
-}
 
 /**
  * Minimal TerminalFirst context for a terminal-first SDK session, so
@@ -306,7 +298,7 @@ describe("InlineTerminalsSection inline mode hosts the shell in the rail", () =>
     );
 
     fireEvent.click(screen.getByRole("button", { name: /s1/ }));
-    expect(onOpenShell).toHaveBeenCalledWith("terminal:terminal_bash_s1", false);
+    expect(onOpenShell).toHaveBeenCalledWith("terminal:terminal_bash_s1");
     // Parent-controlled: no self-hosted xterm until activeKey is fed back in.
     expect(screen.queryByTestId("terminal-view")).toBeNull();
   });

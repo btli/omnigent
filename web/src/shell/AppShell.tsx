@@ -207,7 +207,17 @@ export function AppShell() {
   // on chat + the shell list, never a hosted shell. Reset on conversation
   // switch alongside the other rail state.
   const [openShellKeys, setOpenShellKeys] = useState<string[]>([]);
-  const [activeShellKey, setActiveShellKey] = useState<string | null>(null);
+  const [activeShellKeyState, setActiveShellKey] = useState<string | null>(null);
+  // The conversation the lifted shell state (open/active shell keys) belongs
+  // to. Terminal resource ids (e.g. ``terminal_bash_s1``) are deterministic
+  // and NOT conversation-scoped, so on a warm navigation the destination's
+  // terminal query may already be cached and a STALE active-shell key from the
+  // previous conversation would resolve to the destination's shell and attach a
+  // real (read-write) WebSocket to the WRONG session before the passive reset
+  // effect runs. Rendering the inline shell is gated on this matching the
+  // current ``conversationId`` (see ``shellStateActive``), so stale state can
+  // never reach TerminalView during the transition. Set by ``openShellTab``.
+  const [shellStateConv, setShellStateConv] = useState<string | null>(null);
   // false = full folder tree ("All"), true = changed-files-only flat list.
   // Surfaced as the Changed | All toggle inside the Files panel. Seeded from
   // the persisted, app-global preference (defaults to "All") so the choice
@@ -233,15 +243,6 @@ export function AppShell() {
   // Skips the first persist run so mount can't write default state over the
   // values the restore effect is about to apply.
   const workspacePersistHydrated = useRef(false);
-  // A stored center-view key (``omnigent.web.panel-key:<conv>``) whose restore
-  // had to WAIT for the session labels. A user-shell key is ambiguous until we
-  // know the session shape — on a chat-first non-wrapper session it must be
-  // scrubbed (host inline, start on chat), on a native wrapper it replays into
-  // the center. On a cold hard reload the labels aren't loaded when the restore
-  // effect runs, so we park the key here (leaving the center on chat) and a
-  // follow-up effect resolves it once ``sessionLabelsReady`` flips true. Holds
-  // the conversation id it belongs to so a fast switch can't misapply it.
-  const pendingPanelKeyRef = useRef<{ conv: string; key: string } | null>(null);
   const [filesPanelShowHidden, setFilesPanelShowHidden] = useState(false);
   // Lifted so the Changes list order and the FileViewer prev/next order
   // share one source of truth (otherwise the "X/N" index won't match the
@@ -325,7 +326,11 @@ export function AppShell() {
   // For sub-agent (child) sessions the sidebar list omits the row, so this
   // is the only path through which the UI learns the user's permission
   // level. ``derivePermissionLevel`` prefers this over ``activeConv``.
-  const { session: activeSession, isLoading: sessionLoading } = useSession(conversationId);
+  const {
+    session: activeSession,
+    isLoading: sessionLoading,
+    error: sessionError,
+  } = useSession(conversationId);
   // Same liveness the chat surface switches on (see ChatPage / useSessionLiveness).
   // AppShell reads it only to drive the Terminal pill's "loading" state: a session
   // in `starting` (a relaunch the moment a message is sent — `turnActive`) is
@@ -370,15 +375,27 @@ export function AppShell() {
   // (embedded Omnigent REPL terminal) have NO wrapper label and must
   // keep regular chat behavior. See TerminalFirstContext.tsx.
   const isNativeWrapper = isNativeWrapperLabel(sessionLabels["omnigent.wrapper"]);
-  // Whether the labels that decide the session shape (terminalFirst /
-  // isNativeWrapper) have actually loaded. On a hard reload the sidebar list
-  // and the session snapshot both start COLD (no localStorage persistence), so
-  // ``terminalFirst``/``isNativeWrapper`` read false until a query resolves —
-  // the workspace-restore effect must not treat that transient false as a real
-  // "regular session" verdict. True once either source has produced a row/
-  // snapshot, or the snapshot query has settled (a genuinely label-less
-  // regular session).
-  const sessionLabelsReady = activeConv !== null || activeSession !== null || !sessionLoading;
+  // User shells host INLINE in the rail (beside chat) for every session EXCEPT
+  // native-CLI wrappers, whose established UX is a chat-replacing full-screen
+  // center terminal. This is the single "hosts shells inline, not center"
+  // verdict — the ONE gate every shell-routing site keys on, so the gate can't
+  // drift (that drift caused the original bug). It is purely ``!isNativeWrapper``
+  // (NOT ``terminalFirst``): a regular non-wrapper session with a stray stored
+  // shell key must also flow through the inline path, never the center. Center
+  // takeover is reserved for ``isNativeWrapper`` alone.
+  const hostsShellsInline = !isNativeWrapper;
+  // Whether a SUCCESSFUL label source has identified this conversation's shape
+  // (terminalFirst / isNativeWrapper). On a hard reload the sidebar list and
+  // the session snapshot both start COLD (no localStorage persistence), so the
+  // shape flags read false until a query resolves — the panel-key restore must
+  // not treat that transient false as a real verdict. Crucially, a snapshot
+  // ERROR is NOT readiness: if useSession failed and no conversations row has
+  // arrived yet, the shape is still unknown, so an ambiguous stored shell key
+  // stays parked (chat shown) rather than replaying into the center. Ready when
+  // a row/snapshot exists, OR the snapshot settled successfully with no row
+  // (a genuinely label-less regular session).
+  const sessionLabelsReady =
+    activeConv !== null || activeSession !== null || (!sessionLoading && sessionError === null);
   const todos = useChatStore((s) => s.todos);
   const todosCompleted = todos.filter((t) => t.status === "completed").length;
   // Used for the header "Back to parent" link, which is hidden on
@@ -453,14 +470,23 @@ export function AppShell() {
     () => inventoryTerminals(terminals, terminalFirst),
     [terminals, terminalFirst],
   );
+  // The lifted shell state applies only while its owning conversation is the
+  // one on screen. During a warm navigation the new conversationId renders
+  // before the reset effect clears the old keys, so gate here to keep stale
+  // keys from resolving against the destination's (possibly cache-warm)
+  // terminals and attaching a WebSocket to the wrong session.
+  const shellStateActive = shellStateConv !== null && shellStateConv === conversationId;
+  const activeShellKey = shellStateActive ? activeShellKeyState : null;
   // Resolve the open shell tabs (keys) to their live inventory entries, in tab
   // order, dropping any whose PTY has closed. Feeds the top-strip ShellTabsStrip.
   const openShells = useMemo(
     () =>
-      openShellKeys
-        .map((key) => railTerminals.find((t) => terminalTabKey(t) === key))
-        .filter((t): t is (typeof railTerminals)[number] => t !== undefined),
-    [openShellKeys, railTerminals],
+      shellStateActive
+        ? openShellKeys
+            .map((key) => railTerminals.find((t) => terminalTabKey(t) === key))
+            .filter((t): t is (typeof railTerminals)[number] => t !== undefined)
+        : [],
+    [shellStateActive, openShellKeys, railTerminals],
   );
   // Prune BACKGROUND shell tabs whose PTY disappeared (a shell closed while a
   // sibling tab was showing). The ACTIVE tab is left to InlineTerminalsSection,
@@ -470,10 +496,10 @@ export function AppShell() {
   useEffect(() => {
     const live = new Set(railTerminals.map((t) => terminalTabKey(t)));
     setOpenShellKeys((prev) => {
-      const next = prev.filter((k) => live.has(k) || k === activeShellKey);
+      const next = prev.filter((k) => live.has(k) || k === activeShellKeyState);
       return next.length === prev.length ? prev : next;
     });
-  }, [railTerminals, activeShellKey]);
+  }, [railTerminals, activeShellKeyState]);
   // The agent's spec declares shell access (a ``terminals:`` block) —
   // the rail's Shells tab then shows BY DEFAULT, before any shell
   // exists: its empty state carries the "+ New shell" affordance, so
@@ -750,8 +776,12 @@ export function AppShell() {
     setFilesPanelShowHidden(false);
     // Shell tabs are transient (never persisted) — always start fresh on a
     // conversation switch so a new session opens on chat + the shell list.
+    // (Rendering is ALSO gated on the owning conversation — see
+    // ``shellStateActive`` — so stale shell keys can't attach to the new
+    // session during the transition, before this reset commits.)
     setOpenShellKeys([]);
     setActiveShellKey(null);
+    setShellStateConv(null);
     if (!conversationId) {
       // No session → no rail; false (not the open default) so rail-gated
       // effects like the ?view= URL sync stay quiet on non-session routes.
@@ -765,39 +795,11 @@ export function AppShell() {
     }
     const persisted = readSessionWorkspaceState(conversationId);
 
-    // Restore the terminal-first center view from sessionStorage — but for a
-    // chat-first, non-wrapper session (polly/debby), a stored USER-shell key
-    // must NOT replay into the center: user shells now host inline in the rail,
-    // so a reload starts in chat, not a chrome-free center shell. The agent's
-    // own terminal (the pill's Terminal view) is exempt — that center takeover
-    // is still its home. Native wrappers keep replaying any stored key.
-    //
-    // A stored USER-shell key is ambiguous until the labels load, so it can't
-    // be replayed eagerly: on a cold hard reload the labels are absent when
-    // this effect runs, and eagerly restoring it would open MainTerminalView
-    // in the center of a polly session for a frame (or until the user flips the
-    // pill). So restore only the unambiguous keys eagerly (null, or the agent
-    // terminal — safe in every shape) and PARK a user-shell key for the
-    // labels-resolved effect below. When labels are already loaded (a
-    // client-side conversation switch) we resolve it right here, no flash.
-    pendingPanelKeyRef.current = null;
-    const stored = sessionStorage.getItem(`omnigent.web.panel-key:${conversationId}`);
-    const storedIsUserShell = stored !== null && !isAgentTerminalKey(stored);
-    if (!storedIsUserShell) {
-      // null or the agent terminal — replay as-is.
-      setPanelInitialKeyState(stored);
-    } else if (!sessionLabelsReady) {
-      // Labels unknown → hold the key, start on chat, resolve once they arrive.
-      pendingPanelKeyRef.current = { conv: conversationId, key: stored };
-      setPanelInitialKeyState(null);
-    } else if (terminalFirst && !isNativeWrapper) {
-      // Chat-first non-wrapper: scrub the stale center key and start on chat.
-      sessionStorage.removeItem(`omnigent.web.panel-key:${conversationId}`);
-      setPanelInitialKeyState(null);
-    } else {
-      // Native wrapper (or non-terminal-first): the center is this key's home.
-      setPanelInitialKeyState(stored);
-    }
+    // The center-view key (``omnigent.web.panel-key:<conv>``) is restored by a
+    // dedicated, label-aware effect below (not here), so it can re-evaluate
+    // once the async session labels resolve. Leaving it out of this
+    // [conversationId] effect keeps the shape verdict from being computed
+    // against transiently-empty labels on a cold reload.
 
     // Restore the Files view scope. A deep-link ?view= param wins and forces
     // the rail onto the Files tab: ?view=changed → "Changed" (flat list),
@@ -858,23 +860,46 @@ export function AppShell() {
     stateConvRef.current = conversationId;
   }, [conversationId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Resolve a stored user-shell center key that the restore effect had to park
-  // because the labels weren't loaded yet (cold hard reload). Once the labels
-  // for the SAME conversation resolve, apply the shape verdict: a chat-first
-  // non-wrapper session scrubs it (stays on chat — the shell hosts inline),
-  // any other shape replays it into the center. Guarded on the parked conv id
-  // so a fast switch can't misapply it to the wrong session.
+  // Restore (or scrub) the stored center-view key, label-aware. A SINGLE
+  // effect keyed on the shape flags so it re-evaluates as the async session
+  // labels resolve — re-reading sessionStorage each run (the key survives
+  // there until we decide). It classifies the stored key:
+  //
+  //   - null or the agent terminal (incl. the PANEL_NO_TERMINAL_KEY "" sentinel,
+  //     which ``isAgentTerminalKey`` does NOT match but which must NOT be
+  //     treated as a user shell): safe in every shape → restore as-is.
+  //   - a user-shell key while labels are NOT ready: PARK it — render null
+  //     (chat), leave the key in storage — until a successful label source
+  //     resolves. On a cold reload (or a snapshot error before the list lands)
+  //     this keeps polly/debby on chat instead of flashing a center shell.
+  //   - a user-shell key on an inline-hosting session (``hostsShellsInline``):
+  //     scrub it (the shell hosts in the rail; the center stays on chat).
+  //   - a user-shell key on a native wrapper: restore it (the center is home).
+  //
+  // Runs on conversation switch too (deps include conversationId), so a warm
+  // client-side switch resolves immediately with no flash.
   useEffect(() => {
-    const pending = pendingPanelKeyRef.current;
-    if (!pending || !sessionLabelsReady || pending.conv !== conversationId) return;
-    pendingPanelKeyRef.current = null;
-    if (terminalFirst && !isNativeWrapper) {
-      sessionStorage.removeItem(`omnigent.web.panel-key:${conversationId}`);
-      // Already null (parked → chat); leave the center on chat.
-    } else {
-      setPanelInitialKeyState(pending.key);
+    if (!conversationId) return;
+    const storageKey = `omnigent.web.panel-key:${conversationId}`;
+    const stored = sessionStorage.getItem(storageKey);
+    const isUserShell =
+      stored !== null && stored !== PANEL_NO_TERMINAL_KEY && !isAgentTerminalKey(stored);
+    if (!isUserShell) {
+      setPanelInitialKeyState(stored);
+      return;
     }
-  }, [conversationId, sessionLabelsReady, terminalFirst, isNativeWrapper]);
+    if (!sessionLabelsReady) {
+      // Shape unknown → park: chat now, revisit when a label source resolves.
+      setPanelInitialKeyState(null);
+      return;
+    }
+    if (hostsShellsInline) {
+      sessionStorage.removeItem(storageKey);
+      setPanelInitialKeyState(null);
+    } else {
+      setPanelInitialKeyState(stored);
+    }
+  }, [conversationId, sessionLabelsReady, hostsShellsInline]);
 
   // Persist the per-session rail tab + open file tabs whenever they change.
   // Keyed on the state (not conversationId) and targeted at the conversation
@@ -1155,11 +1180,15 @@ export function AppShell() {
 
   // Desktop rail: host a user shell INLINE in the Shells tab (never the
   // center), mirroring how ``openFileViewer`` reveals a file in the Files tab.
-  // Reveals the rail + selects the Shells tab, records the open tab, and marks
-  // it active — WITHOUT touching ``panelInitialKey``, so the center stays on
-  // chat. The freshly-created (``pendingInventory``) case is recorded the same
-  // way; the shell surfaces once the inventory catches up.
-  function openShellTab(key: string, _pendingInventory: boolean) {
+  // Reveals the rail + selects the Shells tab, records the open tab (tagged
+  // with the owning conversation), and marks it active. Crucially it also
+  // returns the CENTER to chat (``setPanelInitialKey(null)``): a terminal-first
+  // SDK session may be showing its AGENT terminal in the center, and hosting a
+  // user shell in the rail while that stays mounted would hide chat AND leave
+  // two live PTY connections. Clearing the center key puts chat beside the
+  // rail-hosted shell with a single PTY, matching the Files-tab pattern.
+  function openShellTab(key: string) {
+    if (!conversationId) return;
     setSelectedFilePath(null); // close file viewer
     clearFileViewerUrl();
     setExecutionLogsKey(null);
@@ -1167,11 +1196,13 @@ export function AppShell() {
     setSubagentsPanelOpen(false);
     setShellsPanelOpen(false);
     setTodosPanelOpen(false);
+    setPanelInitialKey(null); // return the center to chat (no agent-terminal takeover)
     setRightRailTab("terminals");
     setOpenShellKeys((prev) => (prev.includes(key) ? prev : [...prev, key]));
     setActiveShellKey(key);
+    setShellStateConv(conversationId);
     setRightPanelOpen(true);
-    if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
+    writeSessionWorkspaceState(conversationId, { open: true });
   }
 
   // Close a single shell tab. If it was active, activate a neighbor (prefer the
@@ -1183,7 +1214,7 @@ export function AppShell() {
     if (idx === -1) return;
     const next = openShellKeys.filter((k) => k !== key);
     setOpenShellKeys(next);
-    if (activeShellKey === key) {
+    if (activeShellKeyState === key) {
       setActiveShellKey(next[idx - 1] ?? next[idx] ?? next[0] ?? null);
     }
   }
@@ -1191,8 +1222,8 @@ export function AppShell() {
   // Deselect the active shell back to the list. On an unexpected close (the
   // PTY vanished from under the rail) also drop its now-dangling tab.
   function returnToShellList(unexpected: boolean) {
-    if (unexpected && activeShellKey !== null) {
-      setOpenShellKeys((prev) => prev.filter((k) => k !== activeShellKey));
+    if (unexpected && activeShellKeyState !== null) {
+      setOpenShellKeys((prev) => prev.filter((k) => k !== activeShellKeyState));
     }
     setActiveShellKey(null);
   }
@@ -1327,13 +1358,14 @@ export function AppShell() {
   // A center-hosted user shell (a terminal key other than the agent's own)
   // takes over the main view chrome-free: ConnectionIndicator hides the
   // Chat/Terminal pill and MainTerminalView renders the shell with its own
-  // close affordance. This is the NATIVE-WRAPPER UX only — chat-first,
-  // non-wrapper sessions host user shells inline in the rail, never the
-  // center, so gating on ``isNativeWrapper`` (not ``terminalFirst``) means a
-  // stray user-shell key can't render a chrome-free center for them. The
-  // PANEL_NO_TERMINAL_KEY sentinel ("") is falsy, so "open with no target"
+  // close affordance. This is the NATIVE-WRAPPER UX only — inline-hosting
+  // sessions (``hostsShellsInline``) put user shells in the rail, never the
+  // center, so gating on ``!hostsShellsInline`` (i.e. ``isNativeWrapper``)
+  // means a stray user-shell key can't render a chrome-free center for them.
+  // The PANEL_NO_TERMINAL_KEY sentinel ("") is falsy, so "open with no target"
   // stays a pill view.
-  const isShellView = isNativeWrapper && !!panelInitialKey && !isAgentTerminalKey(panelInitialKey);
+  const isShellView =
+    !hostsShellsInline && !!panelInitialKey && !isAgentTerminalKey(panelInitialKey);
   const terminalFirstContextValue = useMemo<TerminalFirstContextValue>(
     () => ({
       isClaudeNative,

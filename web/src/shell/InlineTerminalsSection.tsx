@@ -52,11 +52,11 @@ interface InlineTerminalsSectionProps {
    */
   activeKey?: string | null;
   /**
-   * Select a shell (controlled mode). `pendingInventory` is true for a
-   * freshly-created shell not yet in the terminals inventory. The parent
-   * records the open tab and sets it active.
+   * Select a shell (controlled mode) — the parent records the open tab and
+   * sets it active. The create->inventory gap marker stays internal to this
+   * component (see ``pendingCreatedKeyRef``), so this exposes only the key.
    */
-  onOpenShell?: (key: string, pendingInventory: boolean) => void;
+  onOpenShell?: (key: string) => void;
   /**
    * Deselect the active shell back to the list (controlled mode).
    * `unexpected` is true when the shell vanished on its own (closed out
@@ -170,7 +170,7 @@ export function InlineTerminalsSection({
       pendingCreatedKeyRef.current = pendingInventory ? key : null;
       setAnnouncement("");
       if (controlled) {
-        onOpenShell?.(key, pendingInventory);
+        onOpenShell?.(key);
       } else {
         setLocalActiveKey(key);
       }

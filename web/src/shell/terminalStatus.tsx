@@ -17,8 +17,34 @@ export const STATUS_CONFIG: Record<TerminalStatus, { label: string; className: s
   idle: { label: "Idle", className: "bg-muted-foreground/55" },
   connecting: { label: "Connecting", className: "bg-amber-500 animate-pulse" },
   error: { label: "Error", className: "bg-red-500" },
-  closed: { label: "Closed", className: "bg-black dark:bg-white" },
+  // Softened from a stark solid black/white blob to a muted foreground tone so
+  // a closed dot reads as "inactive", not an alarm — especially in the compact
+  // tab strip where it sits beside busier chrome.
+  closed: { label: "Closed", className: "bg-muted-foreground/40" },
 };
+
+/** ``name · session`` identity string for a terminal (session omitted if absent). */
+export function terminalLabel(t: TerminalInfo): string {
+  return t.session ? `${t.name} · ${t.session}` : t.name;
+}
+
+/**
+ * Status DOT only (no text word) — for compact contexts like the top tab
+ * strip where the full badge's label would make tabs busier than file tabs.
+ * The accessible name is preserved via ``aria-label``/``title`` on the dot.
+ *
+ * :param status: Terminal-local display status, e.g. ``"idle"``.
+ */
+export function TerminalStatusDot({ status }: { status: TerminalStatus }) {
+  const { label, className } = STATUS_CONFIG[status];
+  return (
+    <span
+      aria-label={label}
+      title={label}
+      className={cn("inline-block size-1.5 shrink-0 rounded-full", className)}
+    />
+  );
+}
 
 /**
  * Render a visible status dot and label for a terminal tab or selector row.
