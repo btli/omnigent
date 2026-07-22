@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { TerminalInfo } from "@/hooks/useTerminals";
 import type { ChangedSort } from "./FlatFileList";
 import type { RightRailTab } from "./railTabs";
+import { makeTerminal } from "./testTerminals";
 import { WorkspacePanel } from "./WorkspacePanel";
 
 // The rail's content children are exercised by their own suites; stub them so
@@ -49,10 +50,6 @@ afterEach(() => {
  * the spied callbacks the tests assert against (openFileViewer / onCloseFile /
  * onRightRailTabChange) alongside the render result.
  */
-function makeTerminal(id: string, name: string, session: string): TerminalInfo {
-  return { id, name, session, running: true };
-}
-
 function renderWorkspace(
   overrides: {
     rightRailTab?: RightRailTab;
@@ -271,7 +268,7 @@ describe("WorkspacePanel shell identity tabs (header parity with Files)", () => 
     });
 
     fireEvent.click(screen.getByText("worker · s2"));
-    expect(onOpenShell).toHaveBeenCalledWith("terminal:terminal_worker_s2", false);
+    expect(onOpenShell).toHaveBeenCalledWith("terminal:terminal_worker_s2");
 
     fireEvent.click(screen.getByRole("button", { name: /close worker · s2/i }));
     expect(onCloseShell).toHaveBeenCalledWith("terminal:terminal_worker_s2");
@@ -282,6 +279,39 @@ describe("WorkspacePanel shell identity tabs (header parity with Files)", () => 
   it("shows no shell tabs when none are open", () => {
     renderWorkspace({ rightRailTab: "terminals", showShellsTab: true, openShells: [] });
     expect(screen.queryByRole("button", { name: /^Close .* · / })).toBeNull();
+  });
+
+  it("shows open shell tabs even while a NON-shell rail tab is active (symmetric with files)", () => {
+    // D2: shell tabs are peers of file tabs in the shared strip — visible and
+    // switchable regardless of the selected rail tab, so one click reaches any
+    // open surface. Here the Files tab is active but the shell tab still shows.
+    const { onOpenShell } = renderWorkspace({
+      rightRailTab: "files",
+      showShellsTab: true,
+      openShells: [makeTerminal("terminal_bash_s1", "bash", "s1")],
+      activeShellKey: null,
+    });
+
+    const shellTab = screen.getByText("bash · s1");
+    expect(shellTab).toBeInTheDocument();
+    // Clicking it activates the shell inline (AppShell pulls the rail to
+    // Shells) — the same one-click switch a file tab gives.
+    fireEvent.click(shellTab);
+    expect(onOpenShell).toHaveBeenCalledWith("terminal:terminal_bash_s1");
+  });
+
+  it("renders the in-tab status as a DOT ONLY, without the status word (A2)", () => {
+    renderWorkspace({
+      rightRailTab: "terminals",
+      showShellsTab: true,
+      openShells: [makeTerminal("terminal_bash_s1", "bash", "s1")],
+      activeShellKey: "terminal:terminal_bash_s1",
+    });
+
+    // The status dot carries its label for a11y/tooltip, but the word must not
+    // render as visible text in the tab (keeps shell tabs as light as file tabs).
+    expect(screen.getByLabelText("Idle")).toBeInTheDocument();
+    expect(screen.queryByText("Idle")).toBeNull();
   });
 });
 

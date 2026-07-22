@@ -147,7 +147,7 @@ vi.mock("./InlineTerminalsSection", () => ({
     onExpand: (key: string) => void;
     inline?: boolean;
     activeKey?: string | null;
-    onOpenShell?: (key: string, pendingInventory: boolean) => void;
+    onOpenShell?: (key: string) => void;
   }) => (
     <div
       data-testid="inline-terminals-section"
@@ -164,7 +164,7 @@ vi.mock("./InlineTerminalsSection", () => ({
       <button
         type="button"
         aria-label="rail: host shell"
-        onClick={() => onOpenShell?.("terminal:terminal_bash_s1", false)}
+        onClick={() => onOpenShell?.("terminal:terminal_bash_s1")}
       >
         host-shell
       </button>
@@ -1227,6 +1227,179 @@ describe("User-shell routing gates on isNativeWrapper (not isTerminalFirst)", ()
     expect(probe()).toHaveAttribute("data-view", "chat");
     expect(probe()).toHaveAttribute("data-is-shell-view", "false");
     expect(sessionStorage.getItem("omnigent.web.panel-key:conv_polly")).toBeNull();
+  });
+
+  it("does not replay a stored user-shell key when the snapshot ERRORS before the list loads", async () => {
+    // B2: a snapshot ERROR must NOT be treated as "labels ready". In the window
+    // where useSession has errored but the conversations list is still loading,
+    // the shape is unknown — the stored user-shell key stays parked (chat), not
+    // replayed into the center. When the list later succeeds with polly labels
+    // the key is scrubbed. Regression: treating !isLoading as ready on the error
+    // path replayed the key and reopened MainTerminalView on a polly session.
+    sessionStorage.setItem("omnigent.web.panel-key:conv_polly", "terminal:terminal_bash_s1");
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+
+    // Phase 1 — snapshot errored, conversations list STILL loading (no row).
+    useConvMock.mockReturnValue({ data: undefined } as ReturnType<typeof useConversations>);
+    useSessionMock.mockReturnValue({
+      session: null,
+      isLoading: false,
+      error: new Error("snapshot failed"),
+    });
+    useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const makeTree = () => (
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_polly"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route
+                  path="c/:conversationId"
+                  element={
+                    <>
+                      <TerminalFirstViewProbe />
+                      <LocationDisplay />
+                    </>
+                  }
+                />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(makeTree());
+
+    const probe = () => screen.getByTestId("view-probe");
+    // Shape unknown despite the error → parked, center stays on chat, and the
+    // key is NOT scrubbed yet (treating the error as "ready" would scrub it
+    // here — the regression — losing a native wrapper's center key too).
+    expect(probe()).toHaveAttribute("data-view", "chat");
+    expect(sessionStorage.getItem("omnigent.web.panel-key:conv_polly")).toBe(
+      "terminal:terminal_bash_s1",
+    );
+
+    // Phase 2 — conversations list resolves with polly labels.
+    mockConversations([
+      { id: "conv_polly", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [
+        { id: "terminal_tui_main", name: "tui", session: "main", running: true },
+        { id: "terminal_bash_s1", name: "bash", session: "s1", running: true },
+      ],
+      isLoading: false,
+      error: null,
+    });
+    rerender(makeTree());
+
+    await waitFor(() => {
+      expect(probe()).toHaveAttribute("data-is-terminal-first", "true");
+    });
+    expect(probe()).toHaveAttribute("data-view", "chat");
+    expect(probe()).toHaveAttribute("data-is-shell-view", "false");
+    expect(sessionStorage.getItem("omnigent.web.panel-key:conv_polly")).toBeNull();
+  });
+
+  it("returns the center to chat when a user shell is hosted inline (no dual PTY)", () => {
+    // M2: a terminal-first SDK session showing its AGENT terminal in the center
+    // must drop that center view when the user opens a rail shell — otherwise
+    // chat is hidden and two PTYs are live. Opening a shell clears the center
+    // key (view → chat) and hosts the shell inline (activeKey fed to the rail).
+    mockPollyShape();
+    renderShell("/c/conv_polly");
+
+    const probe = () => screen.getByTestId("view-probe");
+    // Put the center on the agent terminal via the pill.
+    fireEvent.click(screen.getByRole("button", { name: "Terminal" }));
+    expect(probe()).toHaveAttribute("data-view", "terminal");
+
+    // Open a user shell inline from the rail.
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /Shells/i }));
+    fireEvent.click(screen.getByRole("button", { name: /rail: host shell/i }));
+
+    // Center returned to chat; the rail hosts the shell.
+    expect(probe()).toHaveAttribute("data-view", "chat");
+    expect(probe()).toHaveAttribute("data-is-shell-view", "false");
+    expect(screen.getByTestId("inline-terminals-section")).toHaveAttribute(
+      "data-active-key",
+      "terminal:terminal_bash_s1",
+    );
+  });
+
+  it("does not carry a stale active-shell key to a different conversation on warm navigation", () => {
+    // B3: terminal ids are deterministic and not conversation-scoped, so a
+    // warm-cached destination that contains the same id (terminal_bash_s1)
+    // could resolve a STALE active-shell key and attach to the wrong session.
+    // AppShell gates the lifted shell state on its OWNING conversation, so the
+    // stale key must not reach the rail for conversation B.
+    //
+    // NOTE: this asserts the AppShell owner-gate (the fix) — that no stale
+    // active-key is handed to the rail after the switch. It does NOT prove a
+    // real WebSocket never attaches, because this suite stubs both
+    // InlineTerminalsSection and TerminalView; a true attachment assertion
+    // would need the real components (out of scope for this harness).
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    // Two polly-shape sessions; both warm-cached with the SAME terminal id.
+    mockConversations([
+      { id: "conv_a", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+      { id: "conv_b", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [
+        { id: "terminal_tui_main", name: "tui", session: "main", running: true },
+        { id: "terminal_bash_s1", name: "bash", session: "s1", running: true },
+      ],
+      isLoading: false,
+      error: null,
+    });
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_a"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route
+                  path="c/:conversationId"
+                  element={
+                    <>
+                      <TerminalFirstViewProbe />
+                      <SessionNavButton to="/c/conv_b" />
+                      <LocationDisplay />
+                    </>
+                  }
+                />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+
+    // Host a shell inline in A.
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /Shells/i }));
+    fireEvent.click(screen.getByRole("button", { name: /rail: host shell/i }));
+    expect(screen.getByTestId("inline-terminals-section")).toHaveAttribute(
+      "data-active-key",
+      "terminal:terminal_bash_s1",
+    );
+
+    // Warm-navigate to B (AppShell stays mounted, only the route param changes).
+    fireEvent.click(screen.getByTestId("nav-session"));
+
+    // Re-open the Shells tab in B; the rail must NOT carry A's active key.
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /Shells/i }));
+    expect(screen.getByTestId("inline-terminals-section")).toHaveAttribute("data-active-key", "");
   });
 });
 

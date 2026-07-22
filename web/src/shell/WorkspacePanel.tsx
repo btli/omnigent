@@ -10,7 +10,7 @@ import { FileViewer } from "./FileViewer";
 import type { ChangedSort } from "./FlatFileList";
 import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { SubagentsPanel } from "./SubagentsPanel";
-import { deriveTerminalStatus, TerminalStatusBadge } from "./terminalStatus";
+import { deriveTerminalStatus, terminalLabel, TerminalStatusDot } from "./terminalStatus";
 import { TodoPanel } from "./TodoPanel";
 import { type RightRailTab, TAB_BADGE_BASE } from "./railTabs";
 
@@ -156,7 +156,7 @@ function ShellTabsStrip({
         // Tabs are lightweight index entries — no live bridge state here, so
         // status is running/closed off the resource flag alone.
         const status = deriveTerminalStatus(t, null);
-        const label = t.session ? `${t.name} · ${t.session}` : t.name;
+        const label = terminalLabel(t);
         return (
           <div
             key={key}
@@ -187,7 +187,7 @@ function ShellTabsStrip({
           >
             <TerminalIcon className="size-4 shrink-0" />
             <span className="min-w-0 truncate">{label}</span>
-            <TerminalStatusBadge status={status} />
+            <TerminalStatusDot status={status} />
             <span
               className={cn(
                 "absolute inset-y-0 right-[2px] flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100",
@@ -301,9 +301,8 @@ interface WorkspacePanelProps {
   openShells: TerminalInfo[];
   /** Active shell tab key, or null when the Shells tab shows the list. */
   activeShellKey: string | null;
-  /** Select a shell (adds/activates its tab). ``pendingInventory`` is true
-   *  for a freshly-created shell not yet in the terminal inventory. */
-  onOpenShell: (key: string, pendingInventory: boolean) => void;
+  /** Select a shell (adds/activates its tab and hosts it inline). */
+  onOpenShell: (key: string) => void;
   /** Close a single open shell tab by key. */
   onCloseShell: (key: string) => void;
   /** Deselect the active shell tab, revealing the shell list. */
@@ -437,7 +436,7 @@ export function WorkspacePanel({
           value={
             selectedFilePath !== null
               ? "__file__"
-              : rightRailTab === "terminals" && activeShellKey !== null
+              : activeShellKey !== null
                 ? "__shell__"
                 : rightRailTab
           }
@@ -515,9 +514,16 @@ export function WorkspacePanel({
             )}
           </TabsList>
         </Tabs>
-        {openFiles.length > 0 && (
+        {/* Open file AND shell tabs share ONE horizontal scroll region (A1) so
+            they can't split the rail width 50/50 with competing scrollers. Both
+            are ALWAYS present (D2): open shell tabs are peers of open file tabs
+            in the shared strip, so one click switches to any open surface
+            regardless of the selected rail tab — clicking a shell tab activates
+            it inline (pulling the rail to Shells, via ``onOpenShell``), exactly
+            as a file tab pulls the rail to Files. */}
+        {(openFiles.length > 0 || openShells.length > 0) && (
           <>
-            {/* 1px divider separating the static tabs from the file tabs.
+            {/* 1px divider separating the static tabs from the open-surface tabs.
                 Only meaningful in the ≥500px case where the static tabs are
                 anchored; in the <500px whole-strip-scroll case there's no fixed
                 boundary, so hide it. */}
@@ -525,38 +531,26 @@ export function WorkspacePanel({
               aria-hidden
               className="mx-[4px] hidden h-[14px] w-px shrink-0 self-center bg-border-strong @min-[500px]/rail:block"
             />
-            {/* File-tabs region. ≥500px (rail container query): the ONLY
-                horizontal scroller (flex-1 + overflow-x-auto), so the static
-                tabs stay anchored. <500px: shrink-0 with NO overflow set — it
-                keeps its natural width and the whole row overflows into the
-                outer scroller, so the strip scrolls as one. (overflow-y-hidden
-                must stay scoped to the ≥500px case: setting it while overflow-x
-                is `visible` would force overflow-x to `auto`, turning this into
-                its own scroller and defeating the <500px whole-strip scroll.) */}
-            <div className="flex shrink-0 items-center [scrollbar-width:thin] @min-[500px]/rail:min-w-0 @min-[500px]/rail:flex-1 @min-[500px]/rail:overflow-x-auto @min-[500px]/rail:overflow-y-hidden [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent">
+            {/* Combined open-surface region — the single scroller. ≥500px (rail
+                container query): the ONLY horizontal scroller (flex-1 +
+                overflow-x-auto), so the static tabs stay anchored. <500px:
+                shrink-0 with NO overflow set — it keeps its natural width and
+                the whole row overflows into the outer scroller, so the strip
+                scrolls as one. (overflow-y-hidden must stay scoped to the ≥500px
+                case: setting it while overflow-x is `visible` would force
+                overflow-x to `auto`, turning this into its own scroller and
+                defeating the <500px whole-strip scroll.) */}
+            <div className="flex shrink-0 items-center gap-0.5 [scrollbar-width:thin] @min-[500px]/rail:min-w-0 @min-[500px]/rail:flex-1 @min-[500px]/rail:overflow-x-auto @min-[500px]/rail:overflow-y-hidden [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent">
               <FileTabsStrip
                 openFiles={openFiles}
                 activeFilePath={selectedFilePath}
                 onFileSelect={openFileViewer}
                 onCloseFile={onCloseFile}
               />
-            </div>
-          </>
-        )}
-        {/* Shell tabs — the Shells-tab peer of the file tabs, surfaced only
-            while the Shells tab is active (its content is the only slot that
-            hosts a shell inline). Same divider + scroll treatment as files. */}
-        {rightRailTab === "terminals" && openShells.length > 0 && (
-          <>
-            <div
-              aria-hidden
-              className="mx-[4px] hidden h-[14px] w-px shrink-0 self-center bg-border-strong @min-[500px]/rail:block"
-            />
-            <div className="flex shrink-0 items-center [scrollbar-width:thin] @min-[500px]/rail:min-w-0 @min-[500px]/rail:flex-1 @min-[500px]/rail:overflow-x-auto @min-[500px]/rail:overflow-y-hidden [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent">
               <ShellTabsStrip
                 shells={openShells}
                 activeShellKey={activeShellKey}
-                onShellSelect={(key) => onOpenShell(key, false)}
+                onShellSelect={onOpenShell}
                 onCloseShell={onCloseShell}
               />
             </div>

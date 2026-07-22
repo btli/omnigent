@@ -2,7 +2,12 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { type ConnectionState } from "@/components/blocks/TerminalSession";
 import { type TerminalInfo } from "@/hooks/useTerminals";
-import { deriveTerminalStatus, TerminalStatusBadge } from "./terminalStatus";
+import {
+  deriveTerminalStatus,
+  terminalLabel,
+  TerminalStatusBadge,
+  TerminalStatusDot,
+} from "./terminalStatus";
 
 afterEach(() => {
   cleanup();
@@ -71,6 +76,28 @@ describe("TerminalStatusBadge", () => {
 
     rerender(<TerminalStatusBadge status="closed" />);
     dot = screen.getByLabelText("Closed").querySelector("span");
-    expect(dot).toHaveClass("size-1.5", "bg-black", "dark:bg-white");
+    // Softened from bg-black/dark:bg-white to a muted tone (A2).
+    expect(dot).toHaveClass("size-1.5", "bg-muted-foreground/40");
+  });
+});
+
+describe("TerminalStatusDot", () => {
+  it("renders a dot with the accessible status label but NO text word", () => {
+    render(<TerminalStatusDot status="idle" />);
+
+    // The dot carries the label for assistive tech / tooltip...
+    const dot = screen.getByLabelText("Idle");
+    expect(dot).toHaveClass("size-1.5", "bg-muted-foreground/55");
+    // ...but the word must not render as visible text (keeps tab strip compact).
+    expect(screen.queryByText("Idle")).toBeNull();
+  });
+});
+
+describe("terminalLabel", () => {
+  it("joins name and session, omitting the session when absent", () => {
+    expect(terminalLabel({ id: "t", name: "bash", session: "s1", running: true })).toBe(
+      "bash · s1",
+    );
+    expect(terminalLabel({ id: "t", name: "bash", session: "", running: true })).toBe("bash");
   });
 });
