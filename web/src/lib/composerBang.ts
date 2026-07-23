@@ -49,6 +49,14 @@ export type BangAction =
       terminalId: string;
     }
   | {
+      /** Resolution needs the agent's declared shell types to finish loading. */
+      kind: "needsTypes";
+      /** Candidate type token, empty for the default type. */
+      target: string;
+      /** Command suffix preserved verbatim while resolution is deferred. */
+      command: string | null;
+    }
+  | {
       /** Unresolvable input; ``reason`` feeds the inline composer error bar. */
       kind: "error";
       reason: string;
@@ -117,7 +125,7 @@ export function parseBangCommand(text: string, ctx: BangContext): BangAction {
   if (target === "") {
     const defaultType = ctx.declaredTypes[0];
     if (defaultType === undefined) {
-      return { kind: "error", reason: NO_SHELL_ACCESS };
+      return { kind: "needsTypes", target, command };
     }
     return { kind: "new", type: defaultType, command };
   }
@@ -138,8 +146,8 @@ export function parseBangCommand(text: string, ctx: BangContext): BangAction {
     return { kind: "new", type: target, command };
   }
 
-  if (ctx.declaredTypes.length === 0 && shells.length === 0) {
-    return { kind: "error", reason: NO_SHELL_ACCESS };
+  if (ctx.declaredTypes.length === 0) {
+    return { kind: "needsTypes", target, command };
   }
   return { kind: "error", reason: `No shell \`${target}\` — press ! to see running shells` };
 }

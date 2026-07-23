@@ -22,6 +22,8 @@ export interface MentionBrowserParams {
   text: string;
   setText: (next: string) => void;
   textareaRef: RefObject<HTMLTextAreaElement | null>;
+  /** Called for chip-only mutations that do not also pass through setText. */
+  onMutate?: () => void;
   /** On mobile, Enter inserts a newline rather than acting on the menu. */
   isMobile?: boolean;
 }
@@ -56,6 +58,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     text,
     setText,
     textareaRef,
+    onMutate,
     isMobile = false,
   } = params;
   const [mentionIndex, setMentionIndex] = useState(-1);
@@ -112,8 +115,10 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     });
   };
 
-  const removeMentionedItem = (index: number) =>
+  const removeMentionedItem = (index: number) => {
+    onMutate?.();
     setMentionedItems((prev) => prev.filter((_, i) => i !== index));
+  };
 
   const dismiss = () => {
     if (!mention) return;

@@ -4,13 +4,38 @@
 
 import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RenderItem } from "@/lib/renderItems";
+import {
+  reconcileTerminal,
+  resetTerminalReconciliationForTests,
+  type TerminalInfo,
+  terminalsQueryKey,
+} from "@/hooks/useTerminals";
 import { FileViewerContext } from "@/shell/FileViewerContext";
+import { ShellFocusProvider } from "@/shell/ShellFocusContext";
 import { BlockRenderer } from "./BlockRenderer";
 
-afterEach(cleanup);
+// Force a specific useTerminals return for the load-window test; null falls
+// through to the real hook (cache-seeded) so every other test is unaffected.
+const terminalsHook = vi.hoisted(() => ({
+  override: null as { terminals: TerminalInfo[]; isLoading: boolean; error: Error | null } | null,
+}));
+vi.mock("@/hooks/useTerminals", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/hooks/useTerminals")>();
+  return {
+    ...actual,
+    useTerminals: (...args: Parameters<typeof actual.useTerminals>) =>
+      terminalsHook.override ?? actual.useTerminals(...args),
+  };
+});
+
+afterEach(() => {
+  cleanup();
+  terminalsHook.override = null;
+  resetTerminalReconciliationForTests();
+});
 
 const FILE_VIEWER_NOOP = {
   openFile: () => {},
@@ -19,6 +44,41 @@ const FILE_VIEWER_NOOP = {
   workspaceRoot: null,
   workspaceHome: null,
 };
+
+// TerminalCommandItemView reads the terminal cache via useTerminals, so
+// dispatching a terminal_command item needs a QueryClient. This helper wraps
+// the render and optionally seeds the cache (a running/stopped shell) plus a
+// conversation id and focus handler so the receipt chip resolves its state.
+function renderTerminalCommand(
+  items: RenderItem[],
+  opts: {
+    focusShell?: (key: string) => void;
+    conversationId?: string;
+    terminals?: TerminalInfo[];
+  } = {},
+) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  if (opts.conversationId && opts.terminals) {
+    qc.setQueryData(terminalsQueryKey(opts.conversationId), opts.terminals);
+  }
+  const fileCtx = { ...FILE_VIEWER_NOOP, conversationId: opts.conversationId };
+  let tree: ReactNode = <BlockRenderer items={items} sessionStatus="idle" />;
+  if (opts.focusShell) {
+    tree = <ShellFocusProvider value={opts.focusShell}>{tree}</ShellFocusProvider>;
+  }
+  return {
+    qc,
+    ...render(
+      <QueryClientProvider client={qc}>
+        <FileViewerContext.Provider value={fileCtx}>{tree}</FileViewerContext.Provider>
+      </QueryClientProvider>,
+    ),
+  };
+}
+
+function terminal(overrides: Partial<TerminalInfo> & { id: string }): TerminalInfo {
+  return { name: "zsh", session: "u-ab12cd", running: true, ...overrides };
+}
 
 describe("BlockRenderer dispatch", () => {
   it("renders a slash_command RenderItem via SlashCommandCard", () => {
@@ -67,10 +127,198 @@ describe("BlockRenderer dispatch", () => {
         stderr: null,
       },
     ];
-    render(<BlockRenderer items={items} sessionStatus="idle" />);
+    renderTerminalCommand(items);
     const card = screen.getByTestId("terminal-command-card");
     expect(card.getAttribute("data-terminal-kind")).toBe("input");
     expect(screen.getByText("pwd")).toBeDefined();
+  });
+
+  it("wires a live receipt's chip to the shell-focus context and forwards createdBy", () => {
+    const focusShell = vi.fn();
+    const items: RenderItem[] = [
+      {
+        kind: "terminal_command",
+        itemId: "tc_r1",
+        terminalKind: "input",
+        input: "echo hi",
+        stdout: null,
+        stderr: null,
+        action: "spawn",
+        terminalId: "terminal_zsh_u-ab12cd",
+        terminalName: "zsh",
+        sessionKey: "u-ab12cd",
+        status: "ok",
+        createdBy: "bryan@example.com",
+      },
+    ];
+    renderTerminalCommand(items, {
+      focusShell,
+      conversationId: "conv_1",
+      terminals: [terminal({ id: "terminal_zsh_u-ab12cd", running: true })],
+    });
+    const chip = screen.getByTestId("terminal-command-chip");
+    expect(chip.tagName).toBe("BUTTON");
+    expect(chip.getAttribute("data-shell-state")).toBe("live");
+    fireEvent.click(chip);
+    expect(focusShell).toHaveBeenCalledWith("terminal:terminal_zsh_u-ab12cd");
+    expect(screen.getByTestId("terminal-command-card").getAttribute("title")).toBe(
+      "Run by bryan@example.com",
+    );
+  });
+
+  it("renders a receipt chip as a static label outside a shell-focus tree", () => {
+    const items: RenderItem[] = [
+      {
+        kind: "terminal_command",
+        itemId: "tc_r2",
+        terminalKind: "input",
+        input: "echo hi",
+        stdout: null,
+        stderr: null,
+        action: "send",
+        terminalId: "terminal_zsh_u-ab12cd",
+      },
+    ];
+    renderTerminalCommand(items, {
+      conversationId: "conv_1",
+      terminals: [terminal({ id: "terminal_zsh_u-ab12cd", running: true })],
+    });
+    expect(screen.getByTestId("terminal-command-chip").tagName).toBe("SPAN");
+  });
+
+  it("a closed shell keeps the chip clickable with a closed hint", () => {
+    const focusShell = vi.fn();
+    const items: RenderItem[] = [
+      {
+        kind: "terminal_command",
+        itemId: "tc_closed",
+        terminalKind: "input",
+        input: "echo hi",
+        stdout: null,
+        stderr: null,
+        action: "send",
+        terminalId: "terminal_zsh_u-ab12cd",
+        terminalName: "zsh",
+        sessionKey: "u-ab12cd",
+        status: "ok",
+      },
+    ];
+    renderTerminalCommand(items, {
+      focusShell,
+      conversationId: "conv_1",
+      terminals: [terminal({ id: "terminal_zsh_u-ab12cd", running: false })],
+    });
+    const chip = screen.getByTestId("terminal-command-chip");
+    expect(chip.tagName).toBe("BUTTON");
+    expect(chip.getAttribute("data-shell-state")).toBe("closed");
+    expect(chip.textContent).toContain("closed");
+    fireEvent.click(chip);
+    expect(focusShell).toHaveBeenCalledWith("terminal:terminal_zsh_u-ab12cd");
+  });
+
+  it("a gone shell renders a non-actionable chip whose click does nothing", () => {
+    const focusShell = vi.fn();
+    const items: RenderItem[] = [
+      {
+        kind: "terminal_command",
+        itemId: "tc_gone",
+        terminalKind: "input",
+        input: "echo hi",
+        stdout: null,
+        stderr: null,
+        action: "send",
+        terminalId: "terminal_zsh_u-ab12cd",
+        terminalName: "zsh",
+        sessionKey: "u-ab12cd",
+        status: "ok",
+      },
+    ];
+    // Cache seeded with a different shell, so the receipt's target is absent.
+    renderTerminalCommand(items, {
+      focusShell,
+      conversationId: "conv_1",
+      terminals: [terminal({ id: "terminal_zsh_u-other" })],
+    });
+    const chip = screen.getByTestId("terminal-command-chip");
+    expect(chip.tagName).toBe("SPAN");
+    expect(chip.getAttribute("data-shell-state")).toBe("gone");
+    expect(chip.getAttribute("aria-disabled")).toBe("true");
+    fireEvent.click(chip);
+    expect(focusShell).not.toHaveBeenCalled();
+  });
+
+  it("stays state-agnostic (no GONE flash) while the terminal cache is still loading", () => {
+    // Empty cache mid-load must NOT read as gone: the chip keeps its
+    // state-agnostic rendering (focusable, no closed/gone hint) until the fetch lands.
+    terminalsHook.override = { terminals: [], isLoading: true, error: null };
+    const focusShell = vi.fn();
+    const items: RenderItem[] = [
+      {
+        kind: "terminal_command",
+        itemId: "tc_loading",
+        terminalKind: "input",
+        input: "echo hi",
+        stdout: null,
+        stderr: null,
+        action: "send",
+        terminalId: "terminal_zsh_u-ab12cd",
+        terminalName: "zsh",
+        sessionKey: "u-ab12cd",
+        status: "ok",
+      },
+    ];
+    renderTerminalCommand(items, { focusShell, conversationId: "conv_1" });
+    const chip = screen.getByTestId("terminal-command-chip");
+    expect(chip.getAttribute("data-shell-state")).toBeNull();
+    expect(chip.textContent).not.toContain("closed");
+    expect(chip.tagName).toBe("BUTTON");
+    fireEvent.click(chip);
+    expect(focusShell).toHaveBeenCalledWith("terminal:terminal_zsh_u-ab12cd");
+  });
+
+  it("transitions a live receipt chip to GONE after a reconcileTerminal delete settles", async () => {
+    const focusShell = vi.fn();
+    const items: RenderItem[] = [
+      {
+        kind: "terminal_command",
+        itemId: "tc_reconcile",
+        terminalKind: "input",
+        input: "echo hi",
+        stdout: null,
+        stderr: null,
+        action: "send",
+        terminalId: "terminal_zsh_u-ab12cd",
+        terminalName: "zsh",
+        sessionKey: "u-ab12cd",
+        status: "ok",
+      },
+    ];
+    const { qc } = renderTerminalCommand(items, {
+      focusShell,
+      conversationId: "conv_1",
+      terminals: [terminal({ id: "terminal_zsh_u-ab12cd", running: true })],
+    });
+    const chip = screen.getByTestId("terminal-command-chip");
+    expect(chip.tagName).toBe("BUTTON");
+    expect(chip.getAttribute("data-shell-state")).toBe("live");
+
+    // The shell is torn down: a `deleted` tombstone drops it from the cache.
+    act(() => {
+      reconcileTerminal(qc, "conv_1", {
+        kind: "deleted",
+        id: "terminal_zsh_u-ab12cd",
+        sequence: 100,
+      });
+    });
+
+    await waitFor(() => {
+      const gone = screen.getByTestId("terminal-command-chip");
+      expect(gone.tagName).toBe("SPAN");
+      expect(gone.getAttribute("data-shell-state")).toBe("gone");
+      expect(gone.getAttribute("aria-disabled")).toBe("true");
+    });
+    fireEvent.click(screen.getByTestId("terminal-command-chip"));
+    expect(focusShell).not.toHaveBeenCalled();
   });
 
   it("renders a terminal_command output RenderItem via TerminalCommandCard", () => {
@@ -84,7 +332,7 @@ describe("BlockRenderer dispatch", () => {
         stderr: "",
       },
     ];
-    render(<BlockRenderer items={items} sessionStatus="idle" />);
+    renderTerminalCommand(items);
     const card = screen.getByTestId("terminal-command-card");
     expect(card.getAttribute("data-terminal-kind")).toBe("output");
   });

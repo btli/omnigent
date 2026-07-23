@@ -243,6 +243,28 @@ describe("TerminalCommandCard — bang receipt variants", () => {
     expect(screen.getByTestId("terminal-command-chip").textContent).toBe("→ terminal_zsh_u-ab12cd");
   });
 
+  it("receipt with createdBy carries authorship as a hover title", () => {
+    render(
+      <TerminalCommandCard {...receipt} action="send" status="ok" createdBy="bryan@example.com" />,
+    );
+    expect(screen.getByTestId("terminal-command-card").getAttribute("title")).toBe(
+      "Run by bryan@example.com",
+    );
+  });
+
+  it("legacy item ignores createdBy (renders exactly as before)", () => {
+    render(
+      <TerminalCommandCard
+        kind="input"
+        input="pwd"
+        stdout={null}
+        stderr={null}
+        createdBy="bryan@example.com"
+      />,
+    );
+    expect(screen.getByTestId("terminal-command-card").getAttribute("title")).toBeNull();
+  });
+
   it("legacy item (no action) renders no chip, no error line, no data attrs", () => {
     render(<TerminalCommandCard kind="input" input="pwd" stdout={null} stderr={null} />);
     const card = screen.getByTestId("terminal-command-card");

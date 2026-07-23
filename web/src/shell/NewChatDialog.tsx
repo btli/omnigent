@@ -88,6 +88,11 @@ import {
   rankedSlashCommandNames,
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
+import {
+  isBangCommandText,
+  SHELL_COMMANDS_NO_ATTACHMENTS,
+  stripBangEscape,
+} from "@/lib/composerBang";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -2914,6 +2919,18 @@ export function NewChatLandingScreen() {
     // and form-submit paths that call this directly can't create a session with
     // a blank message, host, agent, or workspace.
     if (!canSubmit) return;
+    // `!` is a reserved shell-command prefix at every composer entry point.
+    // A new session has no shells yet, so a bang message can't start one —
+    // intercept before create so `!...` never reaches the agent. `\!` and a
+    // leading space escape to a normal message (stripped below at send).
+    if (isBangCommandText(message)) {
+      setCreateError(
+        files.length > 0 || mentionedItems.length > 0
+          ? SHELL_COMMANDS_NO_ATTACHMENTS
+          : "Shell commands can't start a session — send a message first",
+      );
+      return;
+    }
     setCreating(true);
     setCreateError(null);
     try {
@@ -3068,9 +3085,13 @@ export function NewChatLandingScreen() {
       // the same wording the native executors emit and that title-seeding
       // strips. The runner, rooted at this workspace, reads the on-disk file
       // from the marker; no upload happens. Folders carry a trailing "/".
+      // `\!` escape: strip the backslash so the agent sees the literal
+      // `!...` text (mirrors the in-session composer). Non-escaped bang
+      // input never reaches here — it's intercepted above.
+      const messageForSend = stripBangEscape(message) ?? message;
       const initialPrompt =
         buildMentionPreamble(mentionedItems, selectedAgent?.harness ?? null) +
-        sanitizeInitialPrompt(message);
+        sanitizeInitialPrompt(messageForSend);
       // A first message matching one of the agent's bundled skills is
       // handed off as a structured invocation so ChatPage auto-sends it
       // as a `slash_command` event (server resolves the skill) instead

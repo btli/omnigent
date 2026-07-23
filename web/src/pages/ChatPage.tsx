@@ -118,6 +118,19 @@ import {
   rankMentionEntries,
 } from "@/lib/composerMentions";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
+import {
+  type BangAction,
+  isBangCommandText,
+  NO_SHELL_ACCESS,
+  parseBangCommand,
+  SHELL_COMMANDS_NO_ATTACHMENTS,
+  stripBangEscape,
+  targetableShells,
+} from "@/lib/composerBang";
+import { useBangShellMenu } from "@/hooks/useBangShellMenu";
+import { BangShellMenu } from "@/components/BangShellMenu";
+import { type BangRunResult, useRunBangCommand } from "@/hooks/useRunBangCommand";
+import { inventoryTerminals, useTerminals, type TerminalInfo } from "@/hooks/useTerminals";
 // Re-exported so existing tests importing these from "./ChatPage" keep working
 // after the pure helpers moved to the shared lib.
 export { detectMentionAt, mentionMarkerFor };
@@ -275,6 +288,22 @@ export function splitSlashCommand(
   if (!m) return null;
   const [, before, token] = m;
   return { before, token, after: value.slice(before.length + token.length) };
+}
+
+// The `!<target>` token for the composer overlay's bang tint. No leading-
+// whitespace group: interception requires the UNTRIMMED value to start
+// with `!`, so a match always begins at index 0.
+const BANG_COMMAND_SPLIT_RE = /^!\S*/;
+
+/**
+ * Split a bang-command draft into the `!<target>` token and the rest, for
+ * the composer highlight overlay. Returns null when the text isn't a bang
+ * command (callers gate on `isBangCommandText`).
+ */
+export function splitBangCommand(value: string): { token: string; after: string } | null {
+  const m = value.match(BANG_COMMAND_SPLIT_RE);
+  if (!m) return null;
+  return { token: m[0], after: value.slice(m[0].length) };
 }
 
 /** Joins all `kind: "text"` items into a single markdown string for copying. */
@@ -1647,6 +1676,47 @@ function MainAgentSurface({
   // with the full server-side slash_command path.
   const isTerminalFirst = terminalFirst?.isTerminalFirst === true;
   const isNativeWrapper = terminalFirst?.isNativeWrapper === true;
+  // `!` shell-command wiring for the composer: shells from the SSE-live
+  // terminals cache, launchable types from the session agent's declared
+  // `terminals:` block, execution via the `shell_command` event. Owner-only
+  // (keystroke injection — same rule as terminal write-attach).
+  const { terminals: sessionTerminals } = useTerminals(conversationId);
+  const {
+    data: bangSessionAgent,
+    isLoading: bangMetadataLoading,
+    isError: bangMetadataError,
+  } = useSessionAgent(conversationId);
+  const {
+    run: runBangAction,
+    clearAttempt: clearBangAttempt,
+    pending: bangPending,
+  } = useRunBangCommand(conversationId);
+  const composerBang = useMemo<ComposerBangControl | undefined>(() => {
+    if (!conversationId) return undefined;
+    return {
+      shells: inventoryTerminals(sessionTerminals, isTerminalFirst),
+      declaredTypes: bangSessionAgent?.terminals ?? [],
+      metadataLoading: bangMetadataLoading,
+      metadataError: bangMetadataError,
+      isOwner: isOwnerLevel(permissionLevel),
+      hasDefaultType: isNativeWrapper,
+      run: runBangAction,
+      clearAttempt: clearBangAttempt,
+      pending: bangPending,
+    };
+  }, [
+    conversationId,
+    sessionTerminals,
+    isTerminalFirst,
+    bangSessionAgent?.terminals,
+    bangMetadataLoading,
+    bangMetadataError,
+    permissionLevel,
+    isNativeWrapper,
+    runBangAction,
+    clearBangAttempt,
+    bangPending,
+  ]);
   const handleSendSlashCommand = useMemo(
     () =>
       onSendSlashCommand && !isNativeWrapper
@@ -1833,6 +1903,7 @@ function MainAgentSurface({
         isWorking={isWorking}
         onSend={handleSend}
         onSendSlashCommand={handleSendSlashCommand}
+        bang={composerBang}
         onStop={onStop}
         agents={agents}
         selectedAgentId={selectedAgentId}
@@ -3321,6 +3392,36 @@ function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistan
   );
 }
 
+/** `!` shell-command wiring the composer receives (see `ComposerProps.bang`). */
+export interface ComposerBangControl {
+  /** The session's user-shell inventory (agent panes excluded, SSE-live). */
+  shells: TerminalInfo[];
+  /** Declared terminal type names from the agent spec, default first. */
+  declaredTypes: string[];
+  /** Declared terminal metadata has not resolved yet. */
+  metadataLoading: boolean;
+  /** Declared terminal metadata failed to load. */
+  metadataError: boolean;
+  /**
+   * Owner-only gate: bang commands are keystroke injection, matching the
+   * write-attach rule. Non-owners get no menu and an inline error on
+   * submit (the server enforces 403 regardless).
+   */
+  isOwner: boolean;
+  /** Native sessions declare `$SHELL` first — a meaningful default type. */
+  hasDefaultType: boolean;
+  /** Executes a parsed action; rejects with a user-facing error message. */
+  run: (action: BangAction, originalText: string) => Promise<BangRunResult>;
+  /**
+   * Discard a retained attempt after the draft or target changes. Passing the
+   * current draft keeps the attempt while it still matches the command that
+   * produced it, so an identical resubmit reuses its id.
+   */
+  clearAttempt: (currentText?: string) => void;
+  /** True while an execution is in flight — guards double submits. */
+  pending: boolean;
+}
+
 interface ComposerProps {
   status: "idle" | "streaming";
   /** Local stream OR cross-client `session.status: running`. */
@@ -3336,6 +3437,14 @@ interface ComposerProps {
    * the vendor TUI loads the skill itself.
    */
   onSendSlashCommand?: (name: string, args: string) => void;
+  /**
+   * `!` shell-command wiring (menu data + executor). When present, input
+   * starting with `!` is intercepted client-side and routed to the shell
+   * subsystem — it NEVER reaches the agent (escape with `\!` or a
+   * leading space). Undefined only where the feature is unwired (tests);
+   * the in-session composer always receives it.
+   */
+  bang?: ComposerBangControl;
   onStop: () => void;
   agents: Agent[] | undefined;
   selectedAgentId: string | null;
@@ -3826,6 +3935,7 @@ export function Composer({
   disabled,
   onSend,
   onSendSlashCommand,
+  bang,
   onStop,
   agents,
   selectedAgentId,
@@ -3855,6 +3965,10 @@ export function Composer({
   subAgentLabel = null,
 }: ComposerProps) {
   const [value, setValue] = useState("");
+  // Caret offset, tracked so the `!`-shell menu can open only while the
+  // caret is inside the first (`!<token>`) segment (reopening when it
+  // moves back in). null = follow the value's end (plain typing).
+  const [caret, setCaret] = useState<number | null>(null);
   const dictation = useDictationInsert(setValue);
   const [files, setFiles] = useState<File[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
@@ -3989,6 +4103,25 @@ export function Composer({
   const dirtyRef = useRef(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
+  // A failed bang restores only when no later composer mutation advanced this
+  // revision. The attempt id itself remains in the shared attempt ledger.
+  const bangRestoreRef = useRef<number | null>(null);
+  const draftRevisionRef = useRef(0);
+  const activeConversationRef = useRef(conversationId);
+  activeConversationRef.current = conversationId;
+  const clearBangAttempt = bang?.clearAttempt;
+  // Advance the draft revision and drop any pending bang restore. `nextText`,
+  // when known, preserves a retained response-loss attempt while the draft
+  // still matches it (identical resubmit reuses its id); omit it to clear
+  // unconditionally.
+  const markComposerRevised = useCallback(
+    (nextText?: string) => {
+      draftRevisionRef.current += 1;
+      bangRestoreRef.current = null;
+      clearBangAttempt?.(nextText);
+    },
+    [clearBangAttempt],
+  );
   // On mobile, programmatic focus immediately summons the software keyboard.
   // Keep desktop's fast-type affordance, but let mobile users explicitly tap
   // the composer when switching back from Terminal or changing sessions.
@@ -4005,6 +4138,8 @@ export function Composer({
   }, []);
 
   useEffect(() => {
+    draftRevisionRef.current += 1;
+    bangRestoreRef.current = null;
     const restored = conversationId ? sessionDrafts.get(conversationId) : undefined;
     setValue(restored?.text ?? "");
     setFiles(restored?.files ?? []);
@@ -4075,6 +4210,12 @@ export function Composer({
   // Tint the `/skill` token blue while the draft reads as a slash command, so
   // the command shape is signalled as the user types it.
   const composerIsCommand = files.length === 0 && isSlashCommandText(value);
+  // Tint the `!<target>` token (terminal green) while the draft reads as a
+  // bang command, so interception is signalled before submit — `!` is a
+  // reserved prefix even for non-owners (inline error) and even with
+  // attachments (hard error), so the tint holds in both cases: submit still
+  // intercepts, so it must not read as a normal message.
+  const composerIsBang = bang !== undefined && isBangCommandText(value);
   const toggleCodexPlanMode = async () => {
     if (planModeBusy) return;
     setCommandError(null);
@@ -4161,9 +4302,40 @@ export function Composer({
     text: value,
     setText: (next) => {
       setValue(next);
+      markComposerRevised(next);
       dirtyRef.current = true;
     },
     textareaRef,
+    onMutate: markComposerRevised,
+    isMobile,
+  });
+
+  // `!` shell autocomplete: running shells on top, declared "New shell…"
+  // types below (see useBangShellMenu). Owner-only, and never alongside
+  // attachments / mention chips — those hard-error at submit, so offering
+  // completions there would be misleading.
+  const bangMenu = useBangShellMenu({
+    text: value,
+    setText: (next) => {
+      setValue(next);
+      markComposerRevised(next);
+      dirtyRef.current = true;
+    },
+    setCaret,
+    textareaRef,
+    // Owner-only and never alongside attachments / mention chips. Live
+    // shells remain targetable while declared-type metadata is unavailable.
+    enabled:
+      bang !== undefined &&
+      bang.isOwner &&
+      files.length === 0 &&
+      mentionedItems.length === 0 &&
+      (targetableShells(bang.shells).length > 0 || bang.declaredTypes.length > 0),
+    shells: bang?.shells ?? [],
+    declaredTypes: bang?.declaredTypes ?? [],
+    hasDefaultType: bang?.hasDefaultType ?? false,
+    caret: caret ?? undefined,
+    revision: draftRevisionRef.current,
     isMobile,
   });
 
@@ -4177,6 +4349,7 @@ export function Composer({
   // ``useMentionBrowser`` since it owns ``setMentionedItems``.
   useEffect(() => {
     if (pendingComposerAttachments.length === 0) return;
+    markComposerRevised();
     setMentionedItems((prev) => {
       // Dedup against already-tagged chips AND within this batch (accumulate
       // into ``seen`` as we go) so a duplicated queue can't double-apply.
@@ -4199,7 +4372,7 @@ export function Composer({
     // resets the queue, but this closes the non-switch unmount paths too.
     return () => useChatStore.getState().clearPendingComposerAttachments();
     // setMentionedItems is a stable useState setter (from useMentionBrowser).
-  }, [pendingComposerAttachments, setMentionedItems]);
+  }, [pendingComposerAttachments, setMentionedItems, markComposerRevised]);
 
   /**
    * Execute a slash command by name + optional argument string.
@@ -4319,6 +4492,7 @@ export function Composer({
    * All other commands execute immediately.
    */
   const applyMenuSelection = (cmd: string) => {
+    markComposerRevised();
     setMenuIndex(-1);
     if (slashCommandsWithArgs.has(cmd)) {
       // Fill in "cmd " and let the user type the argument.
@@ -4352,6 +4526,7 @@ export function Composer({
     // message. The server enforces the same limits authoritatively.
     const { accepted, errors } = validateAttachments(incoming);
     if (accepted.length > 0) {
+      markComposerRevised();
       setFiles((prev) => [...prev, ...accepted]);
       dirtyRef.current = true;
       // Return focus to the composer so the user can keep typing right
@@ -4390,6 +4565,7 @@ export function Composer({
   };
 
   const removeFile = (index: number) => {
+    markComposerRevised();
     setFiles((prev) => prev.filter((_, i) => i !== index));
     setAttachmentError(null);
     dirtyRef.current = true;
@@ -4404,6 +4580,89 @@ export function Composer({
       hasPendingElicitation
     )
       return;
+
+    // `!` shell-command interception — checked on the UNTRIMMED value (a
+    // leading space defeats it, mirroring the `\!` escape) and ahead of the
+    // slash branch: bang input never becomes an agent message. Every error
+    // path surfaces inline and preserves the typed input.
+    if (bang !== undefined && isBangCommandText(value)) {
+      if (bang.pending) return;
+      if (!bang.isOwner) {
+        bang.clearAttempt();
+        setCommandError("Only the session owner can run shell commands");
+        return;
+      }
+      if (files.length > 0 || mentionedItems.length > 0) {
+        bang.clearAttempt();
+        setCommandError(SHELL_COMMANDS_NO_ATTACHMENTS);
+        return;
+      }
+      const action = parseBangCommand(value, {
+        shells: bang.shells,
+        declaredTypes: bang.declaredTypes,
+      });
+      if (action.kind === "needsTypes") {
+        bang.clearAttempt();
+        const hasLiveShell = targetableShells(bang.shells).some((shell) => shell.running);
+        if (bang.metadataLoading) {
+          setCommandError("Loading shells…");
+        } else if (bang.metadataError) {
+          setCommandError("Couldn't load shell access");
+        } else if (!hasLiveShell) {
+          setCommandError(NO_SHELL_ACCESS);
+        } else if (action.target === "") {
+          setCommandError("No launchable shell type — press ! to see running shells");
+        } else {
+          setCommandError(`No shell \`${action.target}\` — press ! to see running shells`);
+        }
+        return;
+      }
+      if (action.kind === "error") {
+        bang.clearAttempt();
+        setCommandError(action.reason);
+        return;
+      }
+      appendEntry(trimmed);
+      setCommandError(null);
+      // Clear immediately, like a normal send: focusing the spawned shell
+      // can unmount this composer (the shell view takes over main), and a
+      // deferred clear would be lost to the unmount draft-save, resurrecting
+      // the command on return. On failure restore the typed input — but only
+      // if the composer still holds THIS dispatch's cleared state (token
+      // unchanged). Any later edit or send revises the token, so a newer
+      // draft (empty or not) is never clobbered.
+      const typed = value;
+      dirtyRef.current = true;
+      setValue("");
+      draftRevisionRef.current += 1;
+      const dispatchRevision = draftRevisionRef.current;
+      bangRestoreRef.current = dispatchRevision;
+      void bang
+        .run(action, typed)
+        .then((result) => {
+          if (activeConversationRef.current !== conversationId) return;
+          bangRestoreRef.current = null;
+          if (result?.status === "unknown") {
+            setCommandError("Delivery unknown — check the terminal before retrying.");
+          }
+        })
+        .catch((err: unknown) => {
+          if (activeConversationRef.current !== conversationId) return;
+          setCommandError(err instanceof Error ? err.message : String(err));
+          if (
+            bangRestoreRef.current === dispatchRevision &&
+            draftRevisionRef.current === dispatchRevision
+          ) {
+            bangRestoreRef.current = null;
+            draftRevisionRef.current += 1;
+            setValue(typed);
+          }
+        });
+      return;
+    }
+
+    // Any non-bang submit supersedes a retained response-loss attempt.
+    markComposerRevised();
 
     // Slash command path: the first token must read as "/name" (the shared
     // isSlashCommandText guard — file paths like "/Users/foo/bar.txt" don't
@@ -4463,6 +4722,10 @@ export function Composer({
     }
 
     setCommandError(null);
+    // `\!` escape hatch: send as a normal chat message with the backslash
+    // stripped, so the agent sees the literal `!...` text.
+    const bangEscaped = bang !== undefined ? stripBangEscape(value) : null;
+    const sendText = bangEscaped !== null ? bangEscaped.trim() : trimmed;
     // Prepend all active reply quotes as Markdown blockquotes.
     const quotePreamble =
       replyQuotes.length > 0
@@ -4482,12 +4745,12 @@ export function Composer({
     // agent knows to open the directory. The native vendor reads the on-disk
     // workspace file/folder from this marker; no upload happens.
     const messageText =
-      buildMentionPreamble(mentionedItems, sessionHarness) + quotePreamble + trimmed;
+      buildMentionPreamble(mentionedItems, sessionHarness) + quotePreamble + sendText;
     // Sending while a prior response is streaming is fine — the
     // server queues the message and delivers it to the running task
     // (or starts a fresh one once the current drains). Escape still
     // interrupts.
-    if (trimmed) appendEntry(trimmed);
+    if (sendText) appendEntry(sendText);
     onSend(messageText, files.length > 0 ? files : undefined);
     dirtyRef.current = true;
     setValue("");
@@ -4511,6 +4774,8 @@ export function Composer({
     recallingRef.current = true;
     setValue(recalled);
     dirtyRef.current = true;
+    // Recall replaces the draft — supersede any pending bang restore.
+    markComposerRevised();
     // Move the caret to the end after React applies the new value. Without
     // this, the browser leaves the caret at its previous index, which can
     // land mid-word and feels broken.
@@ -4528,6 +4793,12 @@ export function Composer({
     // exclusive with the slash menu below (a mention token can't also read as a
     // "/"-command). Takes priority over history recall and submission.
     if (handleMentionKeyDown(e)) return;
+
+    // `!`-shell menu — slots between the mention and slash menus. The
+    // three triggers are mutually exclusive (`@token` / `!token` / `/name`
+    // can't coexist as the first token), so priority order only settles
+    // who consumes when a menu is open.
+    if (bangMenu.handleKeyDown(e)) return;
 
     // When the suggestions menu is open, ArrowUp/Down navigate it and
     // Enter/Tab complete the highlighted item. These take priority over
@@ -4551,6 +4822,7 @@ export function Composer({
       if (e.key === "Escape") {
         e.preventDefault();
         // Dismiss the menu by clearing the input so the user can start fresh.
+        markComposerRevised();
         setValue("");
         setMenuIndex(-1);
         return;
@@ -4660,6 +4932,7 @@ export function Composer({
           if (!target) return;
           setValue(target.text);
           setFiles(target.files ?? []);
+          markComposerRevised();
           dequeueMessage(queueId);
           textareaRef.current?.focus();
         }}
@@ -4707,6 +4980,14 @@ export function Composer({
             commands={slashCommands}
           />
         )}
+        {/* `!`-shell suggestions — running shells + "New shell…" types */}
+        {bangMenu.open && (
+          <BangShellMenu
+            rows={bangMenu.rows}
+            activeIndex={bangMenu.activeIndex}
+            onSelect={bangMenu.complete}
+          />
+        )}
         {/* "@"-file-mention browser — native coding-agent sessions only.
             Also shown (as a loading row) while the listing is still fetching,
             so "@" isn't silently dead during runner cold-boot or a drill-in. */}
@@ -4748,7 +5029,7 @@ export function Composer({
             behind it. Same box/typography so wrapping matches the textarea
             exactly. Only mounted while the draft is a command. */}
         <div className="relative">
-          {composerIsCommand && (
+          {(composerIsCommand || composerIsBang) && (
             <div
               ref={backdropRef}
               aria-hidden
@@ -4756,6 +5037,18 @@ export function Composer({
               className="pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words px-4 pt-3 pb-2 text-sm text-foreground"
             >
               {(() => {
+                if (composerIsBang) {
+                  // Terminal green for the `!<target>` token — matches the
+                  // receipt card's icon, distinct from the slash tint.
+                  const split = splitBangCommand(value);
+                  if (!split) return value;
+                  return (
+                    <>
+                      <span className="text-emerald-600 dark:text-emerald-400">{split.token}</span>
+                      {split.after}
+                    </>
+                  );
+                }
                 const split = splitSlashCommand(value);
                 if (!split) return value;
                 return (
@@ -4773,7 +5066,13 @@ export function Composer({
             value={value}
             onChange={(e) => {
               setValue(e.target.value);
+              setCaret(e.target.selectionStart);
               dirtyRef.current = true;
+              // A real edit (typing OR deleting) supersedes a pending bang
+              // restore, so a failed command can't overwrite the new draft.
+              // Pass the new text so a retained response-loss attempt survives
+              // while the draft still matches the command that produced it.
+              markComposerRevised(e.target.value);
               if (commandError !== null) setCommandError(null);
               // Recompute the active "@"-mention from the caret on every
               // keystroke (native coding-agent sessions — ``mentionEnabled``).
@@ -4798,6 +5097,11 @@ export function Composer({
               isComposingRef.current = false;
             }}
             onKeyDown={handleKeyDown}
+            onSelect={(e) => {
+              // Caret moves without a value change (click, arrow keys)
+              // drive the `!`-menu's inside-the-token open/close too.
+              setCaret(e.currentTarget.selectionStart);
+            }}
             onBlur={() => {
               // Dismiss the "@"-mention menu when focus leaves the textarea
               // (clicking a chip's ✕, the Send button, or another field).
@@ -4805,6 +5109,7 @@ export function Composer({
               // keeps focus and does NOT blur — this only fires for genuine
               // focus-out, where the lingering menu would otherwise float.
               dismissMention();
+              bangMenu.dismiss();
             }}
             onPaste={handlePaste}
             onScroll={(e) => {
@@ -4834,11 +5139,12 @@ export function Composer({
             rows={1}
             disabled={disabled || isReadOnly || unreachable || hasPendingElicitation}
             data-slash-command={composerIsCommand ? "true" : undefined}
+            data-bang-command={composerIsBang ? "true" : undefined}
             className={cn(
               "relative w-full resize-none bg-transparent px-4 pt-3 pb-2 text-sm outline-none placeholder:text-muted-foreground disabled:opacity-60",
               // Hand glyph painting to the overlay while a command is drafted;
               // the caret stays visible via caret-foreground.
-              composerIsCommand && "text-transparent caret-foreground",
+              (composerIsCommand || composerIsBang) && "text-transparent caret-foreground",
             )}
           />
         </div>
@@ -4942,8 +5248,10 @@ export function Composer({
               onTranscript={(text) => {
                 dictation.appendFinal(text);
                 dirtyRef.current = true;
-                // Dictation is a user-driven edit — exit prompt-recall mode
-                // so ArrowUp/ArrowDown don't clobber the dictated text.
+                // Dictation is a user-driven edit — supersede a pending bang
+                // restore, and exit prompt-recall mode so ArrowUp/ArrowDown
+                // don't clobber the dictated text.
+                markComposerRevised();
                 resetCursor();
                 if (commandError !== null) setCommandError(null);
               }}

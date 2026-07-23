@@ -62,3 +62,15 @@ export function deriveTerminalStatus(
 
 /** State of a bang-receipt's target shell, driving the receipt chip. */
 export type ReceiptShellState = "live" | "closed" | "gone";
+
+/** Classify a receipt's target shell: `null` if not a receipt / no shell, else
+ *  `gone` / `closed` / `live` — stopped check reuses `deriveTerminalStatus`. */
+export function receiptShellState(
+  action: "spawn" | "send" | undefined,
+  terminalId: string | undefined,
+  terminal: TerminalInfo | null,
+): ReceiptShellState | null {
+  if (action === undefined || !terminalId) return null;
+  if (terminal === null) return "gone";
+  return deriveTerminalStatus(terminal, null, false) === "closed" ? "closed" : "live";
+}

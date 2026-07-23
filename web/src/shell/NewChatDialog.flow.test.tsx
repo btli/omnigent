@@ -449,6 +449,59 @@ describe("NewChatLandingScreen create flow", () => {
     );
   });
 
+  it("intercepts a `!` message: no session is created and an inline error shows", async () => {
+    renderLanding();
+    await waitForWorkspaceSeed();
+    // `!` is a reserved shell-command prefix at every entry point. A fresh
+    // session has no shells, so it can't start one — the message must never
+    // reach the agent.
+    typeMessage("!ls -la");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    expect(
+      await screen.findByText("Shell commands can't start a session — send a message first"),
+    ).toBeDefined();
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+    expect(navigateMock).not.toHaveBeenCalled();
+    expect(setPendingInitialPromptMock).not.toHaveBeenCalled();
+  });
+
+  it("hard-errors a `!` message that also carries attachments", async () => {
+    renderLanding();
+    await waitForWorkspaceSeed();
+    const file = new File(["x"], "diagram.png", { type: "image/png" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [file] },
+    });
+    typeMessage("! echo hi");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    expect(await screen.findByText("Shell commands can't carry attachments")).toBeDefined();
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+  });
+
+  it("passes a `\\!` escaped message through with the backslash stripped", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("\\!important note");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    // The escape is stripped so the agent sees the literal `!important note`.
+    await waitFor(() =>
+      expect(setPendingInitialPromptMock).toHaveBeenCalledWith("conv_new", {
+        text: "!important note",
+        skill: null,
+        files: [],
+      }),
+    );
+  });
+
   it("hands a bundled-skill first message off as a structured invocation", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,

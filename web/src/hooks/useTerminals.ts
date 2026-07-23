@@ -1,8 +1,9 @@
 import { useEffect, useRef } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 
 import { authenticatedFetch } from "../lib/identity";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { claimShellAttempt, clearShellAttempt, ShellResponseLossError } from "@/lib/shellAttempt";
 
 /**
  * UI-facing terminal record.
@@ -43,6 +44,17 @@ export interface TerminalInfo {
  */
 export function terminalTabKey(t: TerminalInfo): string {
   return `terminal:${t.id}`;
+}
+
+/**
+ * Cached terminal addressed by a :func:`terminalTabKey` value, or ``null``
+ * when none matches. One lookup shared by the split-view and receipt chip.
+ */
+export function findTerminalByTabKey(
+  terminals: TerminalInfo[],
+  tabKey: string,
+): TerminalInfo | null {
+  return terminals.find((t) => terminalTabKey(t) === tabKey) ?? null;
 }
 
 /**
@@ -129,6 +141,239 @@ export function inventoryTerminals(
  */
 export function terminalsQueryKey(conversationId: string): readonly unknown[] {
   return ["conversation", conversationId, "terminals"];
+}
+
+type TerminalPresence =
+  | { sequence: number; state: "present"; info: TerminalInfo }
+  | { sequence: number; state: "deleted" };
+
+interface TerminalReconciliationState {
+  authoritativeFloor: number;
+  byId: Map<string, TerminalPresence>;
+  hasAuthoritativeSnapshot: boolean;
+  snapshotRequested: boolean;
+}
+
+export interface TerminalSnapshot {
+  terminals: TerminalInfo[];
+  resourceRevision?: number;
+  fullSnapshot: boolean;
+}
+
+export type TerminalReconciliationUpdate =
+  | { kind: "created"; info: TerminalInfo; sequence?: number }
+  | { kind: "deleted"; id: string; sequence?: number }
+  | ({ kind: "snapshot" } & TerminalSnapshot)
+  | { kind: "reset" };
+
+const TERMINAL_RECONCILIATION_TARGET = 4_096;
+const terminalReconciliation = new Map<string, TerminalReconciliationState>();
+
+function reconciliationState(conversationId: string): TerminalReconciliationState {
+  let state = terminalReconciliation.get(conversationId);
+  if (state === undefined) {
+    state = {
+      authoritativeFloor: 0,
+      byId: new Map(),
+      hasAuthoritativeSnapshot: false,
+      snapshotRequested: false,
+    };
+    terminalReconciliation.set(conversationId, state);
+  }
+  return state;
+}
+
+function validSequence(value: unknown, allowZero = false): value is number {
+  return (
+    typeof value === "number" && Number.isSafeInteger(value) && (allowZero ? value >= 0 : value > 0)
+  );
+}
+
+function sameTerminal(left: TerminalInfo, right: TerminalInfo): boolean {
+  return (
+    left.id === right.id &&
+    left.name === right.name &&
+    left.session === right.session &&
+    left.running === right.running &&
+    left.transport === right.transport
+  );
+}
+
+function sameTerminalList(left: TerminalInfo[], right: TerminalInfo[]): boolean {
+  return (
+    left.length === right.length && left.every((item, index) => sameTerminal(item, right[index]!))
+  );
+}
+
+function currentTerminals(queryClient: QueryClient, conversationId: string): TerminalInfo[] {
+  return queryClient.getQueryData<TerminalInfo[]>(terminalsQueryKey(conversationId)) ?? [];
+}
+
+function requestTerminalSnapshot(
+  queryClient: QueryClient,
+  conversationId: string,
+  state: TerminalReconciliationState,
+): void {
+  if (state.snapshotRequested) return;
+  state.snapshotRequested = true;
+  void queryClient.invalidateQueries({ queryKey: terminalsQueryKey(conversationId) });
+}
+
+function logSequenceConflict(conversationId: string, id: string, sequence: number): void {
+  console.error(
+    `terminal reconciliation equal-sequence conflict: conversation=${conversationId} id=${id} sequence=${sequence}`,
+  );
+}
+
+function applySnapshot(
+  queryClient: QueryClient,
+  conversationId: string,
+  update: Extract<TerminalReconciliationUpdate, { kind: "snapshot" }>,
+  state: TerminalReconciliationState,
+): TerminalInfo[] {
+  const current = currentTerminals(queryClient, conversationId);
+  state.snapshotRequested = false;
+  const watermark = update.resourceRevision;
+  if (!update.fullSnapshot || !validSequence(watermark, true)) {
+    if (update.terminals.length === 0 || state.hasAuthoritativeSnapshot) return current;
+    const next = [...current];
+    for (const row of update.terminals) {
+      const ordered = state.byId.get(row.id);
+      if (ordered?.state === "deleted") continue;
+      const candidate = ordered?.state === "present" ? ordered.info : row;
+      const index = next.findIndex((item) => item.id === row.id);
+      if (index >= 0) next[index] = candidate;
+      else if (!state.hasAuthoritativeSnapshot) next.push(candidate);
+    }
+    queryClient.setQueryData<TerminalInfo[]>(terminalsQueryKey(conversationId), next);
+    return next;
+  }
+
+  if (watermark < state.authoritativeFloor) return current;
+  const snapshotById = new Map(update.terminals.map((info) => [info.id, info]));
+  for (const [id, entry] of state.byId) {
+    if (entry.sequence !== watermark) continue;
+    const snapshotInfo = snapshotById.get(id);
+    const agrees =
+      entry.state === "deleted"
+        ? snapshotInfo === undefined
+        : snapshotInfo !== undefined && sameTerminal(entry.info, snapshotInfo);
+    if (!agrees) {
+      logSequenceConflict(conversationId, id, watermark);
+      return current;
+    }
+  }
+
+  const candidate = [...update.terminals];
+  for (const [id, entry] of state.byId) {
+    if (entry.sequence <= watermark) continue;
+    const index = candidate.findIndex((item) => item.id === id);
+    if (entry.state === "deleted") {
+      if (index >= 0) candidate.splice(index, 1);
+    } else if (index >= 0) {
+      candidate[index] = entry.info;
+    } else {
+      candidate.push(entry.info);
+    }
+  }
+
+  if (watermark === state.authoritativeFloor && state.hasAuthoritativeSnapshot) {
+    if (!sameTerminalList(current, candidate)) {
+      logSequenceConflict(conversationId, "<snapshot>", watermark);
+    }
+    return current;
+  }
+
+  state.authoritativeFloor = watermark;
+  state.hasAuthoritativeSnapshot = true;
+  state.snapshotRequested = false;
+  for (const [id, entry] of state.byId) {
+    if (entry.sequence <= watermark) state.byId.delete(id);
+  }
+  queryClient.setQueryData<TerminalInfo[]>(terminalsQueryKey(conversationId), candidate);
+  return candidate;
+}
+
+/**
+ * The sole terminal-presence cache writer. Ordered deltas beat older responses;
+ * authoritative snapshots advance a retained floor and compact covered entries.
+ */
+export function reconcileTerminal(
+  queryClient: QueryClient,
+  conversationId: string,
+  update: TerminalReconciliationUpdate,
+): TerminalInfo[] {
+  if (!conversationId) return [];
+  const state = reconciliationState(conversationId);
+  if (update.kind === "reset") {
+    requestTerminalSnapshot(queryClient, conversationId, state);
+    return currentTerminals(queryClient, conversationId);
+  }
+  if (update.kind === "snapshot") {
+    return applySnapshot(queryClient, conversationId, update, state);
+  }
+
+  const current = currentTerminals(queryClient, conversationId);
+  if (!validSequence(update.sequence)) {
+    requestTerminalSnapshot(queryClient, conversationId, state);
+    return current;
+  }
+  const id = update.kind === "created" ? update.info.id : update.id;
+  if (!id || update.sequence < state.authoritativeFloor) return current;
+  if (update.sequence === state.authoritativeFloor) {
+    const cached = current.find((item) => item.id === id);
+    const agrees =
+      update.kind === "deleted"
+        ? cached === undefined
+        : cached !== undefined && sameTerminal(cached, update.info);
+    if (!agrees) logSequenceConflict(conversationId, id, update.sequence);
+    return current;
+  }
+  const previous = state.byId.get(id);
+  if (previous !== undefined) {
+    if (update.sequence < previous.sequence) return current;
+    if (update.sequence === previous.sequence) {
+      const agrees =
+        update.kind === "deleted"
+          ? previous.state === "deleted"
+          : previous.state === "present" && sameTerminal(previous.info, update.info);
+      if (!agrees) logSequenceConflict(conversationId, id, update.sequence);
+      return current;
+    }
+  }
+
+  const next = [...current];
+  const index = next.findIndex((item) => item.id === id);
+  if (update.kind === "deleted") {
+    state.byId.set(id, { sequence: update.sequence, state: "deleted" });
+    if (index >= 0) next.splice(index, 1);
+  } else {
+    state.byId.set(id, { sequence: update.sequence, state: "present", info: update.info });
+    if (index >= 0) next[index] = update.info;
+    else next.push(update.info);
+  }
+  queryClient.setQueryData<TerminalInfo[]>(terminalsQueryKey(conversationId), next);
+  if (state.byId.size > TERMINAL_RECONCILIATION_TARGET) {
+    requestTerminalSnapshot(queryClient, conversationId, state);
+  }
+  return next;
+}
+
+export function terminalReconciliationStats(conversationId: string): {
+  authoritativeFloor: number;
+  entryCount: number;
+  snapshotRequested: boolean;
+} {
+  const state = reconciliationState(conversationId);
+  return {
+    authoritativeFloor: state.authoritativeFloor,
+    entryCount: state.byId.size,
+    snapshotRequested: state.snapshotRequested,
+  };
+}
+
+export function resetTerminalReconciliationForTests(): void {
+  terminalReconciliation.clear();
 }
 
 interface UseTerminalsResult {
@@ -264,17 +509,23 @@ const _SOFT_TERMINAL_LIST_STATUSES = new Set([404, 409, 502, 503]);
  *
  * :param conversationId: Session/conversation identifier,
  *     e.g. ``"conv_abc123"``.
- * :returns: The mapped terminals, or an empty array when the runner is
- *     not yet reachable (see :data:`_SOFT_TERMINAL_LIST_STATUSES`).
+ * :returns: Mapped terminals plus the optional authoritative watermark.
+ *     Soft runner failures return a non-authoritative empty snapshot.
  * :raises Error: On a non-soft HTTP error status.
  */
-export async function fetchTerminals(conversationId: string): Promise<TerminalInfo[]> {
+export async function fetchTerminals(conversationId: string): Promise<TerminalSnapshot> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/terminals?order=asc&limit=1000`,
   );
-  if (_SOFT_TERMINAL_LIST_STATUSES.has(res.status)) return [];
+  if (_SOFT_TERMINAL_LIST_STATUSES.has(res.status)) {
+    return { terminals: [], fullSnapshot: false };
+  }
   if (!res.ok) throw new Error(`terminals fetch failed: ${res.status} ${res.statusText}`);
-  const json = (await res.json()) as { data?: unknown };
+  const json = (await res.json()) as {
+    data?: unknown;
+    resource_revision?: unknown;
+    full_snapshot?: unknown;
+  };
   const rows = Array.isArray(json.data) ? json.data : [];
   const out: TerminalInfo[] = [];
   for (const row of rows) {
@@ -283,7 +534,18 @@ export async function fetchTerminals(conversationId: string): Promise<TerminalIn
       if (info !== null) out.push(info);
     }
   }
-  return out;
+  return {
+    terminals: out,
+    resourceRevision: validSequence(json.resource_revision, true)
+      ? json.resource_revision
+      : undefined,
+    fullSnapshot: json.full_snapshot === true,
+  };
+}
+
+export interface TerminalMutationResult {
+  terminal: TerminalInfo;
+  sequence?: number;
 }
 
 /**
@@ -300,26 +562,29 @@ export async function fetchTerminals(conversationId: string): Promise<TerminalIn
  * :param terminal: Declared terminal name from the agent spec,
  *     e.g. ``"shell"`` (or a shell basename like ``"zsh"`` for a native
  *     session offering the host's installed shells).
- * :returns: The created terminal mapped to :class:`TerminalInfo`.
+ * :param attemptId: Canonical UUIDv4 reused after ambiguous response loss.
+ * :returns: The created terminal and its lifecycle sequence.
  * :raises Error: When the server rejects the create (e.g. the agent
  *     has no terminal access) or the launch fails.
  */
 export async function createTerminal(
   conversationId: string,
   terminal: string,
-): Promise<TerminalInfo> {
-  // Random session key so repeated clicks launch fresh terminals —
-  // the runner's launch is idempotent per (terminal, session_key), so
-  // a fixed key would silently return the same terminal every time.
-  const sessionKey = `u-${Math.random().toString(36).slice(2, 8)}`;
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/terminals`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ terminal, session_key: sessionKey }),
-    },
-  );
+  attemptId: string,
+): Promise<TerminalMutationResult> {
+  let res: Response;
+  try {
+    res = await authenticatedFetch(
+      `/v1/sessions/${encodeURIComponent(conversationId)}/resources/terminals`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ terminal, attempt_id: attemptId }),
+      },
+    );
+  } catch (error) {
+    throw new ShellResponseLossError(error);
+  }
   if (!res.ok) {
     let message = `terminal create failed: ${res.status} ${res.statusText}`;
     try {
@@ -330,20 +595,31 @@ export async function createTerminal(
     }
     throw new Error(message);
   }
-  const info = terminalInfoFromResource((await res.json()) as Record<string, unknown>);
-  if (info === null) {
-    throw new Error("terminal create returned an unrecognized resource shape");
+  let body: Record<string, unknown>;
+  try {
+    body = (await res.json()) as Record<string, unknown>;
+  } catch (error) {
+    throw new ShellResponseLossError(error);
   }
-  return info;
+  const resource =
+    body.terminal && typeof body.terminal === "object" && !Array.isArray(body.terminal)
+      ? (body.terminal as Record<string, unknown>)
+      : body;
+  const info = terminalInfoFromResource(resource);
+  if (info === null) {
+    throw new ShellResponseLossError("terminal create returned an unrecognized resource shape");
+  }
+  return {
+    terminal: info,
+    sequence: validSequence(body.sequence) ? body.sequence : undefined,
+  };
 }
 
 /**
  * Mutation hook around :func:`createTerminal`.
  *
- * On success the created terminal is merged into the terminals query
- * cache immediately (deduped by id), so the new tab appears without
- * waiting for the ``session.resource.created`` SSE round-trip — which
- * still arrives and dedupes as a no-op.
+ * On success the sequenced resource is reconciled immediately; the matching
+ * SSE delta is idempotent.
  *
  * :param conversationId: Session/conversation identifier.
  * :returns: TanStack mutation taking the declared terminal name.
@@ -351,12 +627,35 @@ export async function createTerminal(
 export function useCreateTerminal(conversationId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (terminal: string) => createTerminal(conversationId, terminal),
-    onSuccess: (info) => {
-      const key = terminalsQueryKey(conversationId);
-      const current = queryClient.getQueryData<TerminalInfo[]>(key) ?? [];
-      if (current.some((t) => t.id === info.id)) return;
-      queryClient.setQueryData<TerminalInfo[]>(key, [...current, info]);
+    onMutate: (terminal: string) => {
+      const attempt = claimShellAttempt(
+        "direct-create",
+        conversationId,
+        terminal,
+        `create:${terminal}`,
+      );
+      return { attemptId: attempt.attemptId };
+    },
+    mutationFn: async (terminal: string) => {
+      const attempt = claimShellAttempt(
+        "direct-create",
+        conversationId,
+        terminal,
+        `create:${terminal}`,
+      );
+      return createTerminal(conversationId, terminal, attempt.attemptId);
+    },
+    onSuccess: (result, _terminal, context) => {
+      reconcileTerminal(queryClient, conversationId, {
+        kind: "created",
+        info: result.terminal,
+        sequence: result.sequence,
+      });
+      clearShellAttempt("direct-create", conversationId, context.attemptId);
+    },
+    onError: (error, _terminal, context) => {
+      if (error instanceof ShellResponseLossError) return;
+      clearShellAttempt("direct-create", conversationId, context?.attemptId);
     },
   });
 }
@@ -380,10 +679,8 @@ export function useCreateTerminal(conversationId: string) {
  *    (``sys_terminal_launch`` / ``sys_terminal_close``) that the AP
  *    relay republishes onto the stream.
  *
- * ``staleTime: Infinity`` keeps the seed from refetching and clobbering
- * SSE-written data. To avoid dropping a terminal that an SSE event added
- * to the cache while the seed fetch was in flight, the ``queryFn`` unions
- * the fetched list with whatever is already cached, deduped by id.
+ * Every source passes through :func:`reconcileTerminal`; snapshot watermarks
+ * and ordered deltas prevent a crossed fetch from clobbering newer state.
  */
 export function useTerminals(
   conversationId: string | null,
@@ -407,15 +704,17 @@ export function useTerminals(
         ? ["conversation", null, "terminals"]
         : terminalsQueryKey(conversationId),
     queryFn: async () => {
-      const key = terminalsQueryKey(conversationId!);
-      const fetched = await fetchTerminals(conversationId!);
-      // Union with any SSE-written entries already in the cache so a
-      // ``session.resource.created`` that raced the fetch is not lost.
-      // Fetched rows win on id collision (they are the fresher snapshot).
-      const byId = new Map<string, TerminalInfo>();
-      for (const t of queryClient.getQueryData<TerminalInfo[]>(key) ?? []) byId.set(t.id, t);
-      for (const t of fetched) byId.set(t.id, t);
-      return [...byId.values()];
+      const activeConversationId = conversationId!;
+      try {
+        const fetched = await fetchTerminals(activeConversationId);
+        return reconcileTerminal(queryClient, activeConversationId, {
+          kind: "snapshot",
+          ...fetched,
+        });
+      } catch (fetchError) {
+        reconciliationState(activeConversationId).snapshotRequested = false;
+        throw fetchError;
+      }
     },
     enabled: conversationId !== null,
     staleTime: Infinity,
@@ -429,27 +728,15 @@ export function useTerminals(
     refetchInterval: (query) =>
       terminalsReconcileInterval(reconcileWhilePending, query.state.data?.length ?? 0),
   });
-  // The poll corrects the SSE-driven list ONLY on runner-liveness edges — it
-  // never masks continuously. Two corrections, both keyed off the edge so a
-  // stale-`false` read during boot (before the runner has ever been seen up)
-  // can't wipe a terminal the SSE just delivered:
-  //
-  //   - `→ true` (came online): re-read the authoritative endpoint to pick up
-  //     a `session.resource.created` the SSE may have dropped. The queryFn
-  //     unions, so a live SSE entry is never lost — this is purely additive.
-  //   - `true → false` (confirmed stop): the runner's PTYs are gone, but a
-  //     stop emits no `session.resource.deleted`, so the SSE list would keep
-  //     showing dead terminals. Clear them. Gated on the *was-online* edge so
-  //     it fires for a real stop, not for the cold-boot `undefined → false`
-  //     window (where the runner is on its way up and a terminal may already
-  //     have arrived via SSE).
+  // Liveness edges request an authoritative snapshot. They do not synthesize
+  // unordered creates/deletes or clear canonical state.
   const wasRunnerOnline = useRef<boolean | undefined>(undefined);
   useEffect(() => {
     if (conversationId !== null) {
       if (runnerOnline === true && wasRunnerOnline.current !== true) {
-        void queryClient.invalidateQueries({ queryKey: terminalsQueryKey(conversationId) });
+        reconcileTerminal(queryClient, conversationId, { kind: "reset" });
       } else if (runnerOnline === false && wasRunnerOnline.current === true) {
-        queryClient.setQueryData<TerminalInfo[]>(terminalsQueryKey(conversationId), []);
+        reconcileTerminal(queryClient, conversationId, { kind: "reset" });
       }
     }
     wasRunnerOnline.current = runnerOnline;

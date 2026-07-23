@@ -7,7 +7,7 @@
 // already-running terminal on load / after a missed SSE event.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, renderHook } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -16,17 +16,22 @@ import {
   inventoryTerminals,
   isAgentTerminalKey,
   PENDING_RECONCILE_INTERVAL_MS,
+  reconcileTerminal,
+  resetTerminalReconciliationForTests,
   terminalInfoFromResource,
+  terminalReconciliationStats,
   terminalsReconcileInterval,
+  terminalsQueryKey,
   terminalTabKey,
+  useCreateTerminal,
   useTerminals,
   type TerminalInfo,
 } from "./useTerminals";
+import { resetShellAttemptsForTests } from "@/lib/shellAttempt";
 
-// useTerminals reads runner liveness to treat an offline runner as zero
-// terminals. Mock it so we can drive that signal directly; it defaults to
-// `undefined` (the no-provider value), which leaves the other tests'
-// behavior unchanged.
+// useTerminals reads runner liveness to request an authoritative correction
+// on state edges. Mock it so we can drive that signal directly; it defaults
+// to `undefined` (the no-provider value), which leaves other tests unchanged.
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionRunnerOnline: vi.fn(() => undefined),
 }));
@@ -43,6 +48,150 @@ function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): 
 }
 
 const fetchMock = vi.fn();
+
+beforeEach(() => {
+  resetTerminalReconciliationForTests();
+  resetShellAttemptsForTests();
+});
+
+describe("reconcileTerminal", () => {
+  let client: QueryClient;
+
+  beforeEach(() => {
+    client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    resetTerminalReconciliationForTests();
+  });
+
+  const terminal = (id = "terminal_zsh_u-one"): TerminalInfo => ({
+    id,
+    name: "zsh",
+    session: id.replace("terminal_zsh_", ""),
+    running: true,
+  });
+
+  it("keeps a delete that crosses a deferred older full snapshot", () => {
+    const info = terminal();
+    reconcileTerminal(client, "conv_race", {
+      kind: "snapshot",
+      terminals: [info],
+      resourceRevision: 10,
+      fullSnapshot: true,
+    });
+    reconcileTerminal(client, "conv_race", { kind: "deleted", id: info.id, sequence: 12 });
+
+    reconcileTerminal(client, "conv_race", {
+      kind: "snapshot",
+      terminals: [info],
+      resourceRevision: 11,
+      fullSnapshot: true,
+    });
+
+    expect(client.getQueryData(terminalsQueryKey("conv_race"))).toEqual([]);
+  });
+
+  it("allows a higher-sequence create to retire a same-id delete", () => {
+    const info = terminal();
+    reconcileTerminal(client, "conv_recreate", { kind: "deleted", id: info.id, sequence: 20 });
+    reconcileTerminal(client, "conv_recreate", { kind: "created", info, sequence: 21 });
+    expect(client.getQueryData(terminalsQueryKey("conv_recreate"))).toEqual([info]);
+  });
+
+  it("fails closed and logs an equal-sequence conflict", () => {
+    const info = terminal();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    reconcileTerminal(client, "conv_conflict", { kind: "created", info, sequence: 30 });
+    reconcileTerminal(client, "conv_conflict", { kind: "deleted", id: info.id, sequence: 30 });
+    expect(client.getQueryData(terminalsQueryKey("conv_conflict"))).toEqual([info]);
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("equal-sequence conflict"));
+    error.mockRestore();
+  });
+
+  it("fails closed on an equal-floor conflict after snapshot compaction", () => {
+    const info = terminal();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    reconcileTerminal(client, "conv_floor_conflict", {
+      kind: "snapshot",
+      terminals: [info],
+      resourceRevision: 35,
+      fullSnapshot: true,
+    });
+    reconcileTerminal(client, "conv_floor_conflict", {
+      kind: "deleted",
+      id: info.id,
+      sequence: 35,
+    });
+    expect(client.getQueryData(terminalsQueryKey("conv_floor_conflict"))).toEqual([info]);
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("equal-sequence conflict"));
+    error.mockRestore();
+  });
+
+  it("requests a snapshot at sustained growth and compacts only at its watermark", () => {
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    for (let sequence = 1; sequence <= 4_097; sequence += 1) {
+      reconcileTerminal(client, "conv_growth", {
+        kind: "deleted",
+        id: `terminal_zsh_u-${sequence}`,
+        sequence,
+      });
+    }
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: terminalsQueryKey("conv_growth") });
+    expect(terminalReconciliationStats("conv_growth").entryCount).toBe(4_097);
+
+    reconcileTerminal(client, "conv_growth", {
+      kind: "snapshot",
+      terminals: [],
+      resourceRevision: 4_097,
+      fullSnapshot: true,
+    });
+    expect(terminalReconciliationStats("conv_growth")).toEqual({
+      authoritativeFloor: 4_097,
+      entryCount: 0,
+      snapshotRequested: false,
+    });
+  });
+
+  it("leaves canonical state intact on reset and rejects a crossed late response", () => {
+    const info = terminal();
+    reconcileTerminal(client, "conv_reset", { kind: "created", info, sequence: 41 });
+    reconcileTerminal(client, "conv_reset", { kind: "reset" });
+    reconcileTerminal(client, "conv_reset", {
+      kind: "created",
+      info: { ...info, name: "stale" },
+      sequence: 40,
+    });
+    expect(client.getQueryData(terminalsQueryKey("conv_reset"))).toEqual([info]);
+  });
+
+  it("does not mutate ordered state from an unsequenced legacy delta", () => {
+    const info = terminal();
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    reconcileTerminal(client, "conv_legacy", {
+      kind: "snapshot",
+      terminals: [info],
+      resourceRevision: 60,
+      fullSnapshot: true,
+    });
+    reconcileTerminal(client, "conv_legacy", {
+      kind: "created",
+      info: { ...info, name: "legacy" },
+    });
+    expect(client.getQueryData(terminalsQueryKey("conv_legacy"))).toEqual([info]);
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: terminalsQueryKey("conv_legacy") });
+  });
+
+  it("re-arms snapshot invalidation after a non-authoritative response", () => {
+    const info = terminal();
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    reconcileTerminal(client, "conv_soft", { kind: "created", info });
+    reconcileTerminal(client, "conv_soft", {
+      kind: "snapshot",
+      terminals: [],
+      fullSnapshot: false,
+    });
+    reconcileTerminal(client, "conv_soft", { kind: "deleted", id: info.id });
+    expect(invalidate).toHaveBeenCalledTimes(2);
+  });
+});
 
 describe("terminalInfoFromResource", () => {
   it("lifts id, metadata.terminal_name, metadata.session_key, metadata.running", () => {
@@ -137,6 +286,8 @@ describe("fetchTerminals", () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse({
         object: "list",
+        resource_revision: 7,
+        full_snapshot: true,
         data: [
           {
             id: "terminal_codex_main",
@@ -159,9 +310,11 @@ describe("fetchTerminals", () => {
       "/v1/sessions/conv_abc/resources/terminals?order=asc&limit=1000",
       expect.anything(),
     );
-    expect(out).toEqual([
-      { id: "terminal_codex_main", name: "codex", session: "main", running: true },
-    ]);
+    expect(out).toEqual({
+      terminals: [{ id: "terminal_codex_main", name: "codex", session: "main", running: true }],
+      resourceRevision: 7,
+      fullSnapshot: true,
+    });
   });
 
   it("returns [] for a not-yet-reachable runner (404/409/502/503)", async () => {
@@ -169,7 +322,7 @@ describe("fetchTerminals", () => {
     // the rail once the runner binds, so the seed must not throw.
     for (const status of [404, 409, 502, 503]) {
       fetchMock.mockResolvedValueOnce(mockResponse(null, { ok: false, status }));
-      expect(await fetchTerminals("conv_abc")).toEqual([]);
+      expect(await fetchTerminals("conv_abc")).toEqual({ terminals: [], fullSnapshot: false });
     }
   });
 
@@ -188,36 +341,39 @@ describe("createTerminal", () => {
     vi.unstubAllGlobals();
   });
 
-  it("POSTs the declared name with a fresh u- session key and maps the resource", async () => {
+  it("POSTs the declared name with the canonical attempt id and maps the sequenced resource", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse({
-        id: "terminal_shell_u-abc123",
-        object: "session.resource",
-        type: "terminal",
-        session_id: "conv_abc",
-        name: "shell:u-abc123",
-        metadata: { terminal_name: "shell", session_key: "u-abc123", running: true },
+        terminal: {
+          id: "terminal_shell_u-abc123",
+          object: "session.resource",
+          type: "terminal",
+          session_id: "conv_abc",
+          name: "shell:u-abc123",
+          metadata: { terminal_name: "shell", session_key: "u-abc123", running: true },
+        },
+        sequence: 8,
       }),
     );
 
-    const out = await createTerminal("conv_abc", "shell");
+    const attemptId = "123e4567-e89b-42d3-a456-426614174000";
+    const out = await createTerminal("conv_abc", "shell", attemptId);
 
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_abc/resources/terminals");
     expect(init.method).toBe("POST");
-    const body = JSON.parse(init.body as string) as { terminal: string; session_key: string };
-    expect(body.terminal).toBe("shell");
-    // A fresh random `u-` key per call: the runner's launch is
-    // idempotent per (terminal, session_key), so a fixed key would
-    // return the SAME terminal on every click instead of a new one.
-    expect(body.session_key).toMatch(/^u-/);
+    const body = JSON.parse(init.body as string) as Record<string, unknown>;
+    expect(body).toEqual({ terminal: "shell", attempt_id: attemptId });
     // Mapped through terminalInfoFromResource — proves the POST
     // response shape lands as a usable TerminalInfo, not raw wire.
     expect(out).toEqual({
-      id: "terminal_shell_u-abc123",
-      name: "shell",
-      session: "u-abc123",
-      running: true,
+      terminal: {
+        id: "terminal_shell_u-abc123",
+        name: "shell",
+        session: "u-abc123",
+        running: true,
+      },
+      sequence: 8,
     });
   });
 
@@ -231,7 +387,47 @@ describe("createTerminal", () => {
         { ok: false, status: 400 },
       ),
     );
-    await expect(createTerminal("conv_abc", "zsh")).rejects.toThrow(/not declared/);
+    await expect(
+      createTerminal("conv_abc", "zsh", "123e4567-e89b-42d3-a456-426614174000"),
+    ).rejects.toThrow(/not declared/);
+  });
+});
+
+describe("useCreateTerminal attempt lifecycle", () => {
+  beforeEach(() => {
+    fetchMock.mockReset();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("reuses the direct-create attempt id after response loss", async () => {
+    const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client }, children);
+    fetchMock.mockRejectedValueOnce(new TypeError("create response lost"));
+    const { result } = renderHook(() => useCreateTerminal("conv_direct"), { wrapper });
+
+    await expect(result.current.mutateAsync("zsh")).rejects.toThrow("create response lost");
+    const firstBody = JSON.parse(
+      String((fetchMock.mock.calls[0]![1] as RequestInit).body),
+    ) as Record<string, unknown>;
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        terminal: {
+          id: "terminal_zsh_u-direct",
+          name: "zsh:u-direct",
+          metadata: { terminal_name: "zsh", session_key: "u-direct", running: true },
+        },
+        sequence: 15,
+      }),
+    );
+    await result.current.mutateAsync("zsh");
+    const secondBody = JSON.parse(
+      String((fetchMock.mock.calls[1]![1] as RequestInit).body),
+    ) as Record<string, unknown>;
+    expect(secondBody.attempt_id).toBe(firstBody.attempt_id);
   });
 });
 
@@ -251,6 +447,53 @@ describe("terminalsReconcileInterval", () => {
   it("never polls when the runner is not spinning up a terminal", () => {
     expect(terminalsReconcileInterval(false, 0)).toBe(false);
     expect(terminalsReconcileInterval(false, 2)).toBe(false);
+  });
+});
+
+describe("useTerminals ordered fetch races", () => {
+  beforeEach(() => {
+    fetchMock.mockReset();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("keeps a delete SSE that crosses a deferred older snapshot fetch", async () => {
+    let resolveFetch: (response: Response) => void = () => {};
+    fetchMock.mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveFetch = resolve;
+      }),
+    );
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client }, children);
+    const info: TerminalInfo = {
+      id: "terminal_zsh_u-race",
+      name: "zsh",
+      session: "u-race",
+      running: true,
+    };
+    const { result } = renderHook(() => useTerminals("conv_fetch_race"), { wrapper });
+    reconcileTerminal(client, "conv_fetch_race", { kind: "created", info, sequence: 10 });
+    reconcileTerminal(client, "conv_fetch_race", { kind: "deleted", id: info.id, sequence: 12 });
+
+    resolveFetch(
+      mockResponse({
+        data: [
+          {
+            id: info.id,
+            name: "zsh:u-race",
+            metadata: { terminal_name: "zsh", session_key: "u-race", running: true },
+          },
+        ],
+        resource_revision: 11,
+        full_snapshot: true,
+      }),
+    );
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    expect(result.current.terminals).toEqual([]);
   });
 });
 
@@ -410,7 +653,7 @@ describe("useTerminals — SSE-primary list, poll corrects on edges", () => {
     expect(result.current.terminals).toEqual([TERMINAL]);
   });
 
-  it("clears terminals on a confirmed stop (true → false edge)", async () => {
+  it("keeps canonical terminals on an unsequenced confirmed-stop reset", async () => {
     // The poll's subtractive correction: a running runner's terminal is shown,
     // then the poll confirms the runner went offline. Its PTYs are gone but a
     // stop emits no `session.resource.deleted`, so the SSE list would keep
@@ -427,14 +670,15 @@ describe("useTerminals — SSE-primary list, poll corrects on edges", () => {
     // Online: the seeded terminal is shown.
     expect(result.current.terminals).toEqual([TERMINAL]);
 
-    // Runner stops: the true → false edge clears the now-dead terminal.
+    // Runner stops: request reconciliation, but do not synthesize an
+    // unordered delete that a crossed late response could overwrite.
     runnerOnlineMock.mockReturnValue(false);
     await act(async () => {
       rerender();
       await vi.runAllTimersAsync();
     });
     await act(async () => void rerender());
-    expect(result.current.terminals).toEqual([]);
+    expect(result.current.terminals).toEqual([TERMINAL]);
   });
 
   it("re-reads the endpoint on the → online edge to recover a missed created event", async () => {

@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
-import { inventoryTerminals, terminalTabKey, useTerminals } from "@/hooks/useTerminals";
+import { findTerminalByTabKey, inventoryTerminals, useTerminals } from "@/hooks/useTerminals";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { useTerminalStatuses } from "./useTerminalStatuses";
 
@@ -27,8 +27,7 @@ export function useTerminalSplit(conversationId: string) {
   const { getStatus, setTerminalConnectionState, markTerminalActive } =
     useTerminalStatuses(terminals);
 
-  const activeTerminal =
-    activeKey !== null ? (terminals.find((t) => terminalTabKey(t) === activeKey) ?? null) : null;
+  const activeTerminal = activeKey !== null ? findTerminalByTabKey(terminals, activeKey) : null;
 
   const {
     width: listWidth,
@@ -40,7 +39,7 @@ export function useTerminalSplit(conversationId: string) {
   // auto-select — null is the intentional "no terminal selected" state.
   useEffect(() => {
     if (activeKey === null) return;
-    if (!terminals.some((t) => terminalTabKey(t) === activeKey)) setActiveKey(null);
+    if (findTerminalByTabKey(terminals, activeKey) === null) setActiveKey(null);
   }, [terminals, activeKey]);
 
   return {

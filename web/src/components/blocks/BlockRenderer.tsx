@@ -31,6 +31,9 @@ import {
   useWorkspacePaths,
 } from "@/shell/FileViewerContext";
 import { toWorkspaceRelativePath, useWorkspaceFileExists } from "@/hooks/useWorkspaceChangedFiles";
+import { findTerminalByTabKey, useTerminals } from "@/hooks/useTerminals";
+import { receiptShellState } from "@/shell/terminalStatus";
+import { useFocusShell } from "@/shell/ShellFocusContext";
 import { ElicitationCard } from "./ApprovalCard";
 import { ReasoningView } from "./ReasoningView";
 import { SlashCommandCard } from "./SlashCommandCard";
@@ -486,6 +489,54 @@ function isInProgressTool(item: RenderItem): boolean {
   return item.kind === "tool" && item.state === "input-available";
 }
 
+/**
+ * `terminal_command` card wired to the rail: a receipt's shell chip
+ * focuses that shell's tab via the AppShell-provided focus context
+ * (renderItem is a plain function, so the hook lives in this wrapper).
+ * Outside an AppShell tree the context is null and the chip renders as
+ * a static label. `createdBy` rides along so web-originated receipts
+ * show authorship in shared sessions.
+ *
+ * The chip's shell state is read from the live terminal cache: a stopped
+ * shell shows a "closed" hint but stays focusable (scrollback), while a
+ * removed shell becomes non-actionable so the click can't silently no-op.
+ */
+function TerminalCommandItemView({
+  item,
+}: {
+  item: Extract<RenderItem, { kind: "terminal_command" }>;
+}) {
+  const focusShell = useFocusShell();
+  const conversationId = useFileViewerConversationId();
+  const { terminals, isLoading } = useTerminals(conversationId ?? null);
+  const shellTabKey = item.terminalId ? `terminal:${item.terminalId}` : null;
+  const terminal = shellTabKey ? findTerminalByTabKey(terminals, shellTabKey) : null;
+  // An empty cache mid-load isn't "gone": keep the chip state-agnostic
+  // until the first fetch lands so a live shell isn't misread as removed.
+  const shellState =
+    isLoading && terminals.length === 0
+      ? undefined
+      : (receiptShellState(item.action, item.terminalId, terminal) ?? undefined);
+  const canFocusShell = focusShell !== null && shellTabKey !== null && shellState !== "gone";
+  return (
+    <TerminalCommandCard
+      kind={item.terminalKind}
+      input={item.input}
+      stdout={item.stdout}
+      stderr={item.stderr}
+      action={item.action}
+      terminalId={item.terminalId}
+      terminalName={item.terminalName}
+      sessionKey={item.sessionKey}
+      status={item.status}
+      error={item.error}
+      createdBy={item.createdBy}
+      shellState={shellState}
+      onFocusShell={canFocusShell ? () => focusShell(shellTabKey) : undefined}
+    />
+  );
+}
+
 function renderItem(
   item: RenderItem,
   index: number,
@@ -563,21 +614,7 @@ function renderItem(
         />
       );
     case "terminal_command":
-      return (
-        <TerminalCommandCard
-          key={key}
-          kind={item.terminalKind}
-          input={item.input}
-          stdout={item.stdout}
-          stderr={item.stderr}
-          action={item.action}
-          terminalId={item.terminalId}
-          terminalName={item.terminalName}
-          sessionKey={item.sessionKey}
-          status={item.status}
-          error={item.error}
-        />
-      );
+      return <TerminalCommandItemView key={key} item={item} />;
     case "error":
       return <ErrorBanner key={key} message={item.message} source={item.source} code={item.code} />;
     case "policy_denied":

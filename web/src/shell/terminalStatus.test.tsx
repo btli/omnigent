@@ -2,7 +2,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { type ConnectionState } from "@/components/blocks/TerminalSession";
 import { type TerminalInfo } from "@/hooks/useTerminals";
-import { deriveTerminalStatus, TerminalStatusBadge } from "./terminalStatus";
+import { deriveTerminalStatus, receiptShellState, TerminalStatusBadge } from "./terminalStatus";
 
 afterEach(() => {
   cleanup();
@@ -52,6 +52,30 @@ describe("deriveTerminalStatus", () => {
       );
     },
   );
+});
+
+describe("receiptShellState", () => {
+  it("returns null for a legacy item (no action)", () => {
+    expect(receiptShellState(undefined, "terminal_bash_s1", terminal())).toBeNull();
+  });
+
+  it("returns null for a receipt that names no shell", () => {
+    expect(receiptShellState("send", undefined, null)).toBeNull();
+  });
+
+  it("classifies a running cached shell as live", () => {
+    expect(receiptShellState("send", "terminal_bash_s1", terminal({ running: true }))).toBe("live");
+  });
+
+  it("classifies a stopped cached shell as closed (same rule as the rail)", () => {
+    expect(receiptShellState("spawn", "terminal_bash_s1", terminal({ running: false }))).toBe(
+      "closed",
+    );
+  });
+
+  it("classifies a shell missing from the cache as gone", () => {
+    expect(receiptShellState("send", "terminal_bash_s1", null)).toBe("gone");
+  });
 });
 
 describe("TerminalStatusBadge", () => {

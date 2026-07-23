@@ -43,7 +43,11 @@ import type {
   StreamEvent,
 } from "@/lib/events";
 import type { TerminalInfo } from "@/hooks/useTerminals";
-import { terminalsQueryKey } from "@/hooks/useTerminals";
+import {
+  reconcileTerminal,
+  resetTerminalReconciliationForTests,
+  terminalsQueryKey,
+} from "@/hooks/useTerminals";
 import { type ChildSessionInfo, childSessionsQueryKey } from "@/hooks/useChildSessions";
 import {
   consumePendingInitialPrompt,
@@ -358,6 +362,7 @@ function readConversationRows(): Conversation[] {
 }
 
 beforeEach(() => {
+  resetTerminalReconciliationForTests();
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   sessionSnapshots = new Map();
   sessionItems = new Map();
@@ -3586,16 +3591,20 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(state.pendingUserMessages).toEqual(pending);
     });
 
-    it("resets the switched session's terminal cache and refetches it", async () => {
+    it("requests ordered terminal reconciliation without clearing canonical state", async () => {
       seedSession("conv_sw", []);
       await useChatStore.getState().switchTo("conv_sw");
       // Stale entry: the old agent's terminal. The switch's runner-side
       // reset closes it, but the cache is SSE-primary with union-on-fetch
       // semantics, so a missed `session.resource.deleted` would pin it
       // forever — the dead "tui · Closed" tab whose attach fails.
-      client.setQueryData<TerminalInfo[]>(terminalsQueryKey("conv_sw"), [
-        { id: "terminal_tui_main", name: "tui", session: "main", running: true },
-      ]);
+      const original = {
+        id: "terminal_tui_main",
+        name: "tui",
+        session: "main",
+        running: true,
+      };
+      reconcileTerminal(client, "conv_sw", { kind: "created", info: original, sequence: 20 });
       const spy = vi.spyOn(client, "invalidateQueries");
 
       serveNativeSnapshot();
@@ -3606,10 +3615,14 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         agentName: "Claude Code (switch ag_clone)",
       });
 
-      // The stale terminal is dropped synchronously…
-      expect(client.getQueryData<TerminalInfo[]>(terminalsQueryKey("conv_sw"))).toEqual([]);
-      // …and the authoritative list is refetched (the new agent's
-      // terminal still lands via its own `created` event regardless).
+      // An unordered reset cannot erase the floor. A crossed older response
+      // must not repopulate or replace canonical state.
+      reconcileTerminal(client, "conv_sw", {
+        kind: "created",
+        info: { ...original, name: "late" },
+        sequence: 19,
+      });
+      expect(client.getQueryData<TerminalInfo[]>(terminalsQueryKey("conv_sw"))).toEqual([original]);
       expect(spy).toHaveBeenCalledWith({ queryKey: terminalsQueryKey("conv_sw") });
       await tick();
     });
@@ -4559,6 +4572,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       client.setQueryData<TerminalInfo[]>(terminalsQueryKey("conv_abc"), []);
       const event: SessionResourceCreatedEvent = {
         type: "session_resource_created",
+        sequence: 1,
         resource: makeTerminalResource("terminal_bash_s1") as never,
       };
 
@@ -4576,6 +4590,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       ]);
       handleSessionEvent({
         type: "session_resource_created",
+        sequence: 1,
         resource: makeTerminalResource("terminal_bash_s1") as never,
       });
       const cached = client.getQueryData<TerminalInfo[]>(terminalsQueryKey("conv_abc"));
@@ -4589,6 +4604,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       // this is what makes the terminal count update live.
       handleSessionEvent({
         type: "session_resource_created",
+        sequence: 1,
         resource: makeTerminalResource("terminal_bash_s1") as never,
       });
       const cached = client.getQueryData<TerminalInfo[]>(terminalsQueryKey("conv_abc"));
@@ -4601,6 +4617,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       client.setQueryData<TerminalInfo[]>(terminalsQueryKey("conv_abc"), []);
       handleSessionEvent({
         type: "session_resource_created",
+        sequence: 1,
         resource: {
           id: "file_abc",
           type: "file",
@@ -4621,6 +4638,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       ]);
       const event: SessionResourceDeletedEvent = {
         type: "session_resource_deleted",
+        sequence: 2,
         resourceId: "terminal_bash_s1",
         resourceType: "terminal",
         sessionId: "conv_abc",
@@ -4641,6 +4659,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       client.setQueryData<TerminalInfo[]>(terminalsQueryKey("conv_abc"), initial);
       handleSessionEvent({
         type: "session_resource_deleted",
+        sequence: 2,
         resourceId: "terminal_nope",
         resourceType: "terminal",
         sessionId: "conv_abc",
@@ -4655,12 +4674,32 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       client.setQueryData<TerminalInfo[]>(terminalsQueryKey("conv_abc"), initial);
       handleSessionEvent({
         type: "session_resource_deleted",
+        sequence: 2,
         resourceId: "file_abc",
         resourceType: "file",
         sessionId: "conv_abc",
       });
       expect(client.getQueryData<TerminalInfo[]>(terminalsQueryKey("conv_abc"))).toEqual(initial);
     });
+  });
+
+  it("keeps a deleted terminal absent when a late response crosses a real switchTo", async () => {
+    seedSession("conv_order_a", []);
+    seedSession("conv_order_b", []);
+    await useChatStore.getState().switchTo("conv_order_a");
+    const info: TerminalInfo = {
+      id: "terminal_zsh_u-crossed",
+      name: "zsh",
+      session: "u-crossed",
+      running: true,
+    };
+    reconcileTerminal(client, "conv_order_a", { kind: "created", info, sequence: 50 });
+    reconcileTerminal(client, "conv_order_a", { kind: "deleted", id: info.id, sequence: 51 });
+
+    await useChatStore.getState().switchTo("conv_order_b");
+    reconcileTerminal(client, "conv_order_a", { kind: "created", info, sequence: 50 });
+
+    expect(client.getQueryData<TerminalInfo[]>(terminalsQueryKey("conv_order_a"))).toEqual([]);
   });
 
   describe("session.child_session.updated", () => {

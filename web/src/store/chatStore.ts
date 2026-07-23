@@ -56,6 +56,7 @@ import type {
 import { BlockStream } from "@/lib/blockStream";
 import { isSystemUserContent } from "@/lib/systemMessage";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
+import type { ConversationItem } from "@/lib/conversationItems";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import {
   ApiError,
@@ -84,11 +85,7 @@ import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 import { useTerminalActivityStore } from "./terminalActivity";
-import {
-  terminalInfoFromResource,
-  terminalsQueryKey,
-  type TerminalInfo,
-} from "@/hooks/useTerminals";
+import { reconcileTerminal, terminalInfoFromResource } from "@/hooks/useTerminals";
 import type {
   ContentBlock,
   ModelUsage,
@@ -655,6 +652,14 @@ export interface ChatState {
   loadHistoryUntilUserMessages: (minUserMessages: number) => Promise<void>;
   /** Flash a bubble briefly; rapid calls reschedule so the latest target wins. */
   flashUserMessage: (itemId: string) => void;
+  /**
+   * Append a server-persisted conversation item to the transcript, deduped
+   * by item id against blocks already present. Session-scoped: no-ops when
+   * ``conversationId`` isn't the active session. Used by the composer's
+   * ``shell_command`` path to render the POST-returned receipt immediately,
+   * without waiting on (or double-rendering against) its SSE copy.
+   */
+  appendConversationItem: (conversationId: string, item: Record<string, unknown>) => void;
   /** Queue an "@"-mention chip into the active composer from outside it. */
   addComposerAttachment: (attachment: ComposerAttachment) => void;
   /** Drain the queued composer attachments (called by the composer). */
@@ -1702,6 +1707,23 @@ export const useChatStore = create<ChatState>((set, get) => ({
       flashTimer = null;
       set({ flashItemId: null });
     }, FLASH_DURATION_MS);
+  },
+
+  appendConversationItem: (conversationId, item) => {
+    set((s) => {
+      // Session-scoped: a receipt for a session the user has since left
+      // must never leak into the active transcript.
+      if (s.conversationId !== conversationId) return {};
+      // Same api-dict shape as the reload and SSE paths, so it renders
+      // identically. Dedupe by item id against blocks already committed —
+      // this covers the SSE-first ordering; the pump's own itemId dedupe
+      // covers POST-first (its later copy is skipped).
+      const fresh = itemsToBlocks([item as unknown as ConversationItem]).filter(
+        (b) => !b.ctx.itemId || !hasCommittedItem(s.blocks, b.ctx.itemId),
+      );
+      if (fresh.length === 0) return {};
+      return { blocks: [...s.blocks, ...fresh] };
+    });
   },
 
   addComposerAttachment: (attachment) => {
@@ -4230,16 +4252,11 @@ export function handleSessionEvent(event: StreamEvent): void {
         queryKey: ["workspace-environment", event.conversationId],
         refetchType: "none",
       });
-      // The switch closes the old agent's terminals on the runner
-      // (reset-state). The runner announces each close with a
-      // `session.resource.deleted`, but the terminals cache is
-      // SSE-primary with union-on-fetch semantics, so a missed event
-      // would leave a dead terminal pinned forever. Reset the cache and
-      // refetch from the authoritative endpoint; the new agent's
-      // terminal still lands via its own `created` event (the queryFn
-      // union keeps any entry that races the fetch).
-      queryClient?.setQueryData<TerminalInfo[]>(terminalsQueryKey(event.conversationId), []);
-      queryClient?.invalidateQueries({ queryKey: terminalsQueryKey(event.conversationId) });
+      // Agent reset has no ordering sequence. Request a full snapshot while
+      // preserving the retained floor and canonical cache.
+      if (queryClient !== null) {
+        reconcileTerminal(queryClient, event.conversationId, { kind: "reset" });
+      }
       return;
     case "compaction_completed":
       // Update the context-ring immediately with the post-compaction token
@@ -4604,12 +4621,12 @@ export function handleSessionEvent(event: StreamEvent): void {
       return;
     case "session_resource_created":
       if (event.resource.type === "terminal") {
-        applyTerminalCreated(event.resource as unknown as Record<string, unknown>);
+        applyTerminalCreated(event.resource as unknown as Record<string, unknown>, event.sequence);
       }
       return;
     case "session_resource_deleted":
       if (event.resourceType === "terminal") {
-        applyTerminalDeleted(event.sessionId, event.resourceId);
+        applyTerminalDeleted(event.sessionId, event.resourceId, event.sequence);
       }
       return;
     case "session_child_session_updated":
@@ -4753,16 +4770,13 @@ function patchConversationStatusInCache(
  * (e.g. the panel is closed) — otherwise the count only moved on the
  * response-end refetch (turn boundary). Idempotent by id.
  */
-function applyTerminalCreated(resource: Record<string, unknown>): void {
+function applyTerminalCreated(resource: Record<string, unknown>, sequence?: number): void {
   const sessionId = resource.session_id;
   if (typeof sessionId !== "string" || !sessionId) return;
   const info = terminalInfoFromResource(resource);
   if (info === null) return;
   if (queryClient === null) return;
-  const key = terminalsQueryKey(sessionId);
-  const current = queryClient.getQueryData<TerminalInfo[]>(key) ?? [];
-  if (current.some((t) => t.id === info.id)) return;
-  queryClient.setQueryData<TerminalInfo[]>(key, [...current, info]);
+  reconcileTerminal(queryClient, sessionId, { kind: "created", info, sequence });
 }
 
 /**
@@ -4770,14 +4784,9 @@ function applyTerminalCreated(resource: Record<string, unknown>): void {
  *
  * Idempotent: a delete for an unknown id is a no-op.
  */
-function applyTerminalDeleted(sessionId: string, resourceId: string): void {
+function applyTerminalDeleted(sessionId: string, resourceId: string, sequence?: number): void {
   if (queryClient === null) return;
-  const key = terminalsQueryKey(sessionId);
-  const current = queryClient.getQueryData<TerminalInfo[]>(key);
-  if (current === undefined) return;
-  const next = current.filter((t) => t.id !== resourceId);
-  if (next.length === current.length) return;
-  queryClient.setQueryData<TerminalInfo[]>(key, next);
+  reconcileTerminal(queryClient, sessionId, { kind: "deleted", id: resourceId, sequence });
 }
 
 /**

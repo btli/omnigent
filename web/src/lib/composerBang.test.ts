@@ -329,24 +329,27 @@ describe("parseBangCommand — dead shells and agent panes", () => {
   });
 });
 
-describe("parseBangCommand — no shell access", () => {
+describe("parseBangCommand — deferred declared-type resolution", () => {
   const none = ctx({ shells: [], declaredTypes: [] });
 
-  it("bare `!` with no declared types errors", () => {
+  it("defers bare `!` while declared types are unavailable", () => {
     expect(parseBangCommand("!", none)).toEqual({
-      kind: "error",
-      reason: "this agent has no shell access",
+      kind: "needsTypes",
+      target: "",
+      command: null,
     });
     expect(parseBangCommand("! echo hi", none)).toEqual({
-      kind: "error",
-      reason: "this agent has no shell access",
+      kind: "needsTypes",
+      target: "",
+      command: "echo hi",
     });
   });
 
-  it("any target with no shells and no types errors with the same reason", () => {
+  it("defers an unmatched target until declared types settle", () => {
     expect(parseBangCommand("!zsh echo hi", none)).toEqual({
-      kind: "error",
-      reason: "this agent has no shell access",
+      kind: "needsTypes",
+      target: "zsh",
+      command: "echo hi",
     });
   });
 
@@ -359,8 +362,9 @@ describe("parseBangCommand — no shell access", () => {
     });
     // But the spawn path is gone: bare `!` has no default type to use.
     expect(parseBangCommand("!", shellsOnly)).toEqual({
-      kind: "error",
-      reason: "this agent has no shell access",
+      kind: "needsTypes",
+      target: "",
+      command: null,
     });
   });
 });

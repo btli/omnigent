@@ -30,6 +30,9 @@ interface TerminalCommandCardProps {
   status?: "ok" | "error" | "unknown";
   /** Human-readable failure when `status="error"`. */
   error?: string;
+  /** Human author (email) of a web-originated receipt — shown as a hover
+   *  title so authorship reads in multi-user sessions. */
+  createdBy?: string;
   /** Target shell state from the cache. Absent keeps the pre-state
    *  rendering so legacy snapshots hold; `"gone"` is non-actionable. */
   shellState?: ReceiptShellState;
@@ -48,6 +51,7 @@ export function TerminalCommandCard({
   sessionKey,
   status,
   error,
+  createdBy,
   shellState,
   onFocusShell,
 }: TerminalCommandCardProps) {
@@ -92,6 +96,7 @@ export function TerminalCommandCard({
         data-terminal-kind="input"
         data-terminal-action={action}
         data-terminal-status={isReceipt ? status : undefined}
+        title={isReceipt && createdBy ? `Run by ${createdBy}` : undefined}
       >
         <span className="flex w-full items-center gap-1.5 py-0.5 text-left text-muted-foreground text-xs">
           <SquareTerminalIcon
