@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
 import os
 import stat
 import time
@@ -29,6 +30,14 @@ from pathlib import Path
 
 _logger = logging.getLogger(__name__)
 _TOKEN_FILE_NAME = "auth_tokens.json"
+
+# Treat a stored token with less than this much life left as needing
+# renewal. Shared by the "is it still usable" read path and the refresh
+# path's already-renewed check, so a caller that decides to refresh is
+# never handed back the same near-expiry token it wanted to replace.
+# Comfortably longer than a WebSocket handshake, far shorter than the
+# server's 1-hour access-token TTL.
+REFRESH_MIN_REMAINING_SECONDS = 90.0
 
 
 def _token_file_path() -> Path:
@@ -166,11 +175,15 @@ def _load_entry(server_url: str) -> dict[str, str | float] | None:
     except (json.JSONDecodeError, OSError):
         return None
 
+    # A token file holding valid JSON of the wrong shape (``[]``, ``null``,
+    # a bare string) is corrupt, not fatal — read as "nothing stored".
+    if not isinstance(data, dict):
+        return None
     entry = data.get(_normalize_server_url(server_url))
     return entry if isinstance(entry, dict) else None
 
 
-def load_token(server_url: str) -> str | None:
+def load_token(server_url: str, *, min_remaining_seconds: float = 0.0) -> str | None:
     """Load a stored session token for a server.
 
     Returns ``None`` if no token is stored, the token has expired,
@@ -180,6 +193,11 @@ def load_token(server_url: str) -> str | None:
 
     :param server_url: The server URL, e.g.
         ``"http://localhost:6767"``.
+    :param min_remaining_seconds: Require at least this much remaining
+        lifetime. ``0`` (the default) accepts any not-yet-expired token —
+        the historical behaviour. A caller that can renew passes
+        :data:`REFRESH_MIN_REMAINING_SECONDS` so a token about to lapse
+        mid-handshake is refreshed instead of used.
     :returns: The session JWT string, or ``None``.
     """
     entry = _load_entry(server_url)
@@ -189,6 +207,14 @@ def load_token(server_url: str) -> str | None:
     expires_at = entry.get("expires_at", 0)
     if isinstance(expires_at, (int, float)) and expires_at < time.time():
         _warn_expired_once(server_url, expires_at, has_refresh="refresh_token" in entry)
+        return None
+    # Near-expiry but still valid: decline quietly (no expiry warning — it
+    # has not expired) so the caller can choose to renew.
+    if (
+        min_remaining_seconds > 0
+        and isinstance(expires_at, (int, float))
+        and expires_at - time.time() < min_remaining_seconds
+    ):
         return None
 
     token = entry.get("token")
@@ -256,11 +282,14 @@ def _token_file_lock() -> Iterator[None]:
     """Exclusive advisory lock over token-file read-modify-write cycles.
 
     Serializes concurrent refreshes on one machine (host + CLI sharing
-    ``auth_tokens.json``): the loser re-reads and finds the winner's
-    rotated pair instead of replaying the stale refresh token — which
-    the server would treat as reuse and revoke the whole grant.
-    Best-effort on platforms without ``fcntl`` (Windows): the refresh
-    still works, only the local anti-race serialization is lost.
+    ``auth_tokens.json``) so only one performs the network exchange and
+    the other picks up its result. Best-effort on platforms without
+    ``fcntl`` (Windows): the refresh still works, only the local
+    serialization is lost.
+
+    :raises OSError: If the lock file cannot be created or opened — the
+        caller degrades to "cannot refresh" (a state directory we cannot
+        write is one we could not persist the result to either).
     """
     lock_path = _token_file_path().with_suffix(".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -281,11 +310,11 @@ def refresh_stored_token(server_url: str, *, timeout: float = 10.0) -> str | Non
     """Renew the stored access token from its login-issued refresh grant.
 
     POSTs ``grant_type=refresh_token`` to the server's ``/oauth/token``,
-    persists the rotated pair, and returns the fresh delegated access
-    token. Safe to call opportunistically: returns ``None`` when there
-    is nothing to refresh (no entry / no refresh material) or when the
-    server refuses (grant revoked, past its absolute lifetime, or an
-    older server without the endpoint).
+    persists the result, and returns the fresh access token. Safe to call
+    opportunistically: returns ``None`` when there is nothing to refresh
+    (no entry / no refresh material) or when the server refuses (grant
+    revoked, past its absolute lifetime, or an older server without the
+    endpoint).
 
     Runs under the token-file lock and re-checks state after acquiring
     it, so of two concurrent callers only one performs the network
@@ -296,67 +325,116 @@ def refresh_stored_token(server_url: str, *, timeout: float = 10.0) -> str | Non
     :returns: A valid access token, or ``None``.
     """
     normalized = _normalize_server_url(server_url)
-    with _token_file_lock():
-        entry = _load_entry(server_url)
-        if entry is None:
-            return None
-        # Another process may have refreshed while we waited on the lock.
-        expires_at = entry.get("expires_at", 0)
-        token = entry.get("token")
-        if (
-            isinstance(token, str)
-            and isinstance(expires_at, (int, float))
-            # Small skew guard: don't hand back a token about to lapse
-            # mid-handshake.
-            and expires_at - time.time() > 30
-        ):
-            return token
-        refresh_token = entry.get("refresh_token")
-        if not isinstance(refresh_token, str) or not refresh_token:
-            return None
+    # Cheap pre-check BEFORE touching the lock file: with no refresh
+    # material there is nothing to do, and creating a lock file would
+    # raise on a read-only state directory — masking the caller's other
+    # credential sources (e.g. the Databricks SDK fallback).
+    pre = _load_entry(server_url)
+    if pre is None or not isinstance(pre.get("refresh_token"), str) or not pre["refresh_token"]:
+        return None
+    try:
+        with _token_file_lock():
+            return _refresh_locked(server_url, normalized, timeout)
+    except OSError as exc:
+        # Cannot lock/persist (read-only or full state dir) — a refresh we
+        # could not store is worse than none, so decline and let the caller
+        # fall through to its other credential sources.
+        _logger.debug("Token refresh for %s skipped, state dir unusable: %s", normalized, exc)
+        return None
 
-        import httpx
 
-        try:
-            resp = httpx.post(
-                f"{normalized}/oauth/token",
-                data={"grant_type": "refresh_token", "refresh_token": refresh_token},
-                timeout=timeout,
-            )
-        except httpx.HTTPError as exc:
-            _logger.warning("Token refresh against %s failed: %s", normalized, exc)
-            return None
-        if resp.status_code != 200:
-            _logger.warning(
-                "Token refresh against %s refused (HTTP %d) — run `omnigent login %s` "
-                "to re-authenticate.",
-                normalized,
-                resp.status_code,
-                normalized,
-            )
-            return None
-        try:
-            payload = resp.json()
-            access_token = payload["access_token"]
-            new_refresh = payload["refresh_token"]
-            expires_in = float(payload.get("expires_in", 3600))
-        except (ValueError, KeyError, TypeError):
-            _logger.warning("Token refresh against %s returned a malformed response", normalized)
-            return None
+def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | None:
+    """Perform the refresh exchange; caller holds the token-file lock."""
+    entry = _load_entry(server_url)
+    if entry is None:
+        return None
+    # Another process may have refreshed while we waited on the lock. A
+    # freshly minted token is far from expiry, so this cleanly separates
+    # "someone already renewed" from "this is the same near-expiry token".
+    expires_at = entry.get("expires_at", 0)
+    token = entry.get("token")
+    if (
+        isinstance(token, str)
+        and isinstance(expires_at, (int, float))
+        and expires_at - time.time() > REFRESH_MIN_REMAINING_SECONDS
+    ):
+        return token
+    refresh_token = entry.get("refresh_token")
+    if not isinstance(refresh_token, str) or not refresh_token:
+        return None
 
-        user_id = entry.get("user_id")
-        store_token(
-            server_url,
-            token=access_token,
-            user_id=user_id if isinstance(user_id, str) else "",
-            expires_at=time.time() + expires_in,
-            refresh_token=new_refresh,
+    import httpx
+
+    try:
+        resp = httpx.post(
+            f"{normalized}/oauth/token",
+            data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+            timeout=timeout,
         )
-        # A fresh token means any earlier expiry warning is stale; allow
-        # a new one if this credential ever lapses again.
-        _warned_expired_servers.discard(normalized)
-        _logger.info("Refreshed login session for %s", normalized)
-        return str(access_token)
+    except httpx.HTTPError as exc:
+        _logger.warning("Token refresh against %s failed: %s", normalized, exc)
+        return None
+    if resp.status_code != 200:
+        _logger.warning(
+            "Token refresh against %s refused (HTTP %d) — run `omnigent login %s` "
+            "to re-authenticate.",
+            normalized,
+            resp.status_code,
+            normalized,
+        )
+        return None
+    try:
+        payload = resp.json()
+    except ValueError:
+        _logger.warning("Token refresh against %s returned a malformed response", normalized)
+        return None
+    if not isinstance(payload, dict):
+        _logger.warning("Token refresh against %s returned a malformed response", normalized)
+        return None
+    access_token = payload.get("access_token")
+    new_refresh = payload.get("refresh_token")
+    # Only overwrite the stored pair with genuinely usable material —
+    # a null/non-string field must never clobber a working credential.
+    if not isinstance(access_token, str) or not access_token:
+        _logger.warning("Token refresh against %s returned no access token", normalized)
+        return None
+    if not isinstance(new_refresh, str) or not new_refresh:
+        # A server that renews without returning refresh material keeps the
+        # one we already hold (login grants deliberately do not rotate).
+        new_refresh = refresh_token
+    expires_in = _coerce_expires_in(payload.get("expires_in"))
+
+    user_id = entry.get("user_id")
+    store_token(
+        server_url,
+        token=access_token,
+        user_id=user_id if isinstance(user_id, str) else "",
+        expires_at=time.time() + expires_in,
+        refresh_token=new_refresh,
+    )
+    # A fresh token means any earlier expiry warning is stale; allow
+    # a new one if this credential ever lapses again.
+    _warned_expired_servers.discard(normalized)
+    _logger.info("Refreshed login session for %s", normalized)
+    return access_token
+
+
+def _coerce_expires_in(raw: object) -> float:
+    """Return a sane access-token lifetime in seconds from *raw*.
+
+    Falls back to one hour for anything missing, non-numeric, or
+    non-finite — ``float("NaN")``/``float("Infinity")`` parse happily but
+    would yield an expiry that never compares as expired, pinning a dead
+    token forever.
+    """
+    default = 3600.0
+    try:
+        value = float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value) or value <= 0:
+        return default
+    return value
 
 
 def load_databricks_workspace_host(server_url: str) -> str | None:
