@@ -2669,13 +2669,18 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
 // needs-setup harnesses, "Custom agents") are unreachable there. Below the
 // `md` breakpoint the picker swaps its contents in place: tapping the row
 // drills into that group's page with a Back row. jsdom's matchMedia mock
-// reports non-mobile, so these tests force the `max-width` query to match.
+// reports non-mobile, so these tests force the mobile query to match. The
+// mobile query is the logical complement of the `md` boundary
+// (`not all and (min-width: 768px)`); a plain `(min-width: 768px)` desktop
+// check stays false, so desktop consumers keep reading not-mobile.
 // ---------------------------------------------------------------------------
 
 function forceMobileViewport(): () => void {
   const real = window.matchMedia;
   window.matchMedia = ((query: string) => ({
-    matches: /max-width/.test(query),
+    // Mobile branch: the negated min-width query matches; the bare min-width
+    // desktop query does not.
+    matches: /max-width/.test(query) || /^\s*not all and/.test(query),
     media: query,
     onchange: null,
     addListener: () => {},

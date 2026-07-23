@@ -151,6 +151,16 @@ export function AppShell() {
   // Read early: the conversationId scopes the per-session workspace state
   // (rail open/width/tab/open files) used throughout this component.
   const { conversationId } = useParams<{ conversationId: string }>();
+  // Latest conversation id in a ref, updated every render. A shell-create
+  // callback captured in conversation A's render can survive an A→B navigation
+  // (the A-render ``openShellTab`` closure fires late, tagging its mutation with
+  // source A). Comparing source against a render-captured ``conversationId`` is
+  // not enough: a surviving A-render closure holds conversationId A too, so
+  // source A === conversationId A passes the guard and mutates B's current
+  // shared state. The guard reads THIS ref instead, so a deferred A create
+  // resolving after nav to B is rejected (source A !== latest B).
+  const conversationIdRef = useRef<string | null>(conversationId ?? null);
+  conversationIdRef.current = conversationId ?? null;
   const [fileViewerCommentsOpen, setFileViewerCommentsOpen] = useState(false);
   const [rightRailTab, setRightRailTab] = useState<RightRailTab>(() =>
     conversationId ? (readSessionWorkspaceState(conversationId).rightRailTab ?? "files") : "files",
@@ -217,6 +227,16 @@ export function AppShell() {
   // switch alongside the other rail state.
   const [openShellKeys, setOpenShellKeys] = useState<string[]>([]);
   const [activeShellKeyState, setActiveShellKey] = useState<string | null>(null);
+  // The active shell key that was just CREATED and is still bridging the
+  // create→inventory gap (the POST resolved and set it active before
+  // ``railTerminals`` exposes it). InlineTerminalsSection owns the same bridge
+  // internally while it's mounted, but when the user navigates off the shell
+  // surface during that gap the section unmounts and its bridge is gone — the
+  // off-surface cleanup below would then mistake the not-yet-in-inventory key
+  // for a dead shell and erase it. This lifts the bridge so cleanup skips a
+  // legitimately-pending key. Cleared once the key surfaces in inventory (the
+  // pruning effect) or on conversation switch.
+  const pendingCreatedShellKeyRef = useRef<string | null>(null);
   // The conversation the lifted shell state (open/active shell keys) belongs
   // to. Terminal resource ids (e.g. ``terminal_bash_s1``) are deterministic
   // and NOT conversation-scoped, so on a warm navigation the destination's
@@ -522,6 +542,12 @@ export function AppShell() {
   // that (and could drop a freshly-created tab before inventory catches up).
   useEffect(() => {
     const live = new Set(railTerminals.map((t) => terminalTabKey(t)));
+    // The pending-created key's bridge ends once it surfaces in inventory —
+    // clear it so the off-surface cleanup can treat it as an established shell
+    // again (and prune it if it later dies).
+    if (pendingCreatedShellKeyRef.current !== null && live.has(pendingCreatedShellKeyRef.current)) {
+      pendingCreatedShellKeyRef.current = null;
+    }
     setOpenShellKeys((prev) => {
       const next = prev.filter((k) => live.has(k) || k === activeShellKeyState);
       return next.length === prev.length ? prev : next;
@@ -676,6 +702,11 @@ export function AppShell() {
     // to handle its own active tab, and while the PTY is still live.
     if (activeKey === null || shellStateConv !== conversationId) return;
     if (inlineShellSurfaceDisplayed) return;
+    // A just-created key legitimately PRECEDES inventory while its bridge is
+    // live (the section owned that bridge but unmounted when the user left the
+    // shell surface). Absent-from-inventory is not proof of death here — skip
+    // until inventory catches up (the pruning effect clears the marker then).
+    if (activeKey === pendingCreatedShellKeyRef.current) return;
     const live = new Set(railTerminals.map((t) => terminalTabKey(t)));
     if (live.has(activeKey)) return;
     setActiveShellKey(null);
@@ -862,6 +893,7 @@ export function AppShell() {
     setOpenShellKeys([]);
     setActiveShellKey(null);
     setShellStateConv(null);
+    pendingCreatedShellKeyRef.current = null;
     if (!conversationId) {
       // No session → no rail; false (not the open default) so rail-gated
       // effects like the ?view= URL sync stay quiet on non-session routes.
@@ -1281,8 +1313,19 @@ export function AppShell() {
   // here late; reject the WHOLE mutation (file/panel clear, tab select, rail
   // open, active-shell set, persistence) unless the source still matches the
   // current conversation, so a pending create in A can't rewrite B's workspace.
-  function openShellTab(key: string, source: string) {
-    if (!conversationId || source !== conversationId) return;
+  function openShellTab(key: string, source: string, pendingInventory: boolean) {
+    // Compare against the LATEST conversation id (ref, updated every render),
+    // not this closure's captured ``conversationId``. A deferred create from A
+    // whose A-render callback survives an A→B nav still tags ``source`` with A;
+    // that surviving closure also holds conversationId A, so a captured-value
+    // comparison (A === A) would wrongly pass and mutate B. The ref holds B, so
+    // source A !== latest B rejects it.
+    const current = conversationIdRef.current;
+    if (!current || source !== current) return;
+    // Record the create→inventory bridge so the off-surface cleanup doesn't
+    // erase this key while it's legitimately ahead of inventory. Selecting an
+    // existing shell (not a create) clears any prior marker.
+    pendingCreatedShellKeyRef.current = pendingInventory ? key : null;
     setSelectedFilePath(null); // close file viewer
     clearFileViewerUrl();
     setExecutionLogsKey(null);
@@ -1294,9 +1337,9 @@ export function AppShell() {
     setRightRailTab("terminals");
     setOpenShellKeys((prev) => (prev.includes(key) ? prev : [...prev, key]));
     setActiveShellKey(key);
-    setShellStateConv(conversationId);
+    setShellStateConv(current);
     setRightPanelOpen(true);
-    writeSessionWorkspaceState(conversationId, { open: true });
+    writeSessionWorkspaceState(current, { open: true });
   }
 
   // Close a single shell tab. If it was active, activate a neighbor (prefer the
@@ -1319,6 +1362,9 @@ export function AppShell() {
     if (unexpected && activeShellKeyState !== null) {
       setOpenShellKeys((prev) => prev.filter((k) => k !== activeShellKeyState));
     }
+    // The active shell is being dropped; its create→inventory bridge (if any)
+    // no longer applies.
+    pendingCreatedShellKeyRef.current = null;
     setActiveShellKey(null);
   }
 

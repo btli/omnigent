@@ -328,9 +328,11 @@ interface WorkspacePanelProps {
   /**
    * Select a shell (adds/activates its tab and hosts it inline). ``source``
    * is the conversation the selection originated in; AppShell drops the
-   * mutation if navigation has since moved on.
+   * mutation if navigation has since moved on. ``pendingInventory`` is true
+   * only on the create path (shell not yet in inventory) so AppShell can
+   * bridge the create→inventory gap for its off-surface cleanup.
    */
-  onOpenShell: (key: string, source: string) => void;
+  onOpenShell: (key: string, source: string, pendingInventory: boolean) => void;
   /**
    * AppShell's single "hosts shells inline, not center" verdict, forwarded
    * to the inline shell section so it never recomputes routing from a
@@ -616,8 +618,9 @@ export function WorkspacePanel({
                 shells={openShells}
                 activeShellKey={displayedShellKey}
                 // A strip-tab click is synchronous in the current
-                // conversation, so it is always its own source.
-                onShellSelect={(key) => onOpenShell(key, conversationId)}
+                // conversation, so it is always its own source. The shell is
+                // already open/in inventory, so it's never a pending create.
+                onShellSelect={(key) => onOpenShell(key, conversationId, false)}
                 onCloseShell={onCloseShell}
               />
             </div>

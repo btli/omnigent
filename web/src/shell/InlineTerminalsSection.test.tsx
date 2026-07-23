@@ -299,8 +299,9 @@ describe("InlineTerminalsSection inline mode hosts the shell in the rail", () =>
 
     fireEvent.click(screen.getByRole("button", { name: /s1/ }));
     // The callback carries the SOURCE conversation so the parent can reject a
-    // mutation that lands after navigation moved on (see AppShell.openShellTab).
-    expect(onOpenShell).toHaveBeenCalledWith("terminal:terminal_bash_s1", "conv_terminal");
+    // mutation that lands after navigation moved on (see AppShell.openShellTab),
+    // plus pendingInventory=false — selecting an existing shell, not a create.
+    expect(onOpenShell).toHaveBeenCalledWith("terminal:terminal_bash_s1", "conv_terminal", false);
     // Parent-controlled: no self-hosted xterm until activeKey is fed back in.
     expect(screen.queryByTestId("terminal-view")).toBeNull();
   });

@@ -132,6 +132,16 @@ vi.mock("./FileViewer", () => ({
     </div>
   ),
 }));
+// Captured by the InlineTerminalsSection mock on each render: the latest
+// onOpenShell callback and the conversation whose render produced it. Lets a
+// test invoke A's render-bound callback after navigating to B (deferred-create
+// survival). ``mock``-prefixed so vitest's hoisted vi.mock factory may close
+// over them.
+let mockCapturedOnOpenShell:
+  | ((key: string, source: string, pendingInventory: boolean) => void)
+  | null = null;
+let mockCapturedOnOpenShellConv: string | null = null;
+
 vi.mock("./InlineTerminalsSection", () => ({
   // Stand-in exposing onExpand + the desktop `inline` flag, plus the
   // controlled-hosting props (activeKey/onOpenShell). Desktop hosts the shell
@@ -149,41 +159,61 @@ vi.mock("./InlineTerminalsSection", () => ({
     onExpand: (key: string) => void;
     inline?: boolean;
     activeKey?: string | null;
-    onOpenShell?: (key: string, source: string) => void;
-  }) => (
-    <div
-      data-testid="inline-terminals-section"
-      data-inline={String(inline ?? false)}
-      data-active-key={activeKey ?? ""}
-    >
-      <button
-        type="button"
-        aria-label="rail: open terminal"
-        onClick={() => onExpand("terminal:terminal_main")}
+    onOpenShell?: (key: string, source: string, pendingInventory: boolean) => void;
+  }) => {
+    // Capture the LATEST onOpenShell + its owning conversation on every render,
+    // so a test can grab the callback bound to conversation A's render, then
+    // invoke it AFTER navigating to B — simulating a deferred create whose
+    // A-render callback survives the unmount.
+    mockCapturedOnOpenShell = onOpenShell ?? null;
+    mockCapturedOnOpenShellConv = conversationId;
+    return (
+      <div
+        data-testid="inline-terminals-section"
+        data-inline={String(inline ?? false)}
+        data-active-key={activeKey ?? ""}
       >
-        rail-terminal
-      </button>
-      <button
-        type="button"
-        aria-label="rail: host shell"
-        // Mirror the real section: the mutation carries its SOURCE
-        // conversation so AppShell can reject a late callback after nav.
-        onClick={() => onOpenShell?.("terminal:terminal_bash_s1", conversationId)}
-      >
-        host-shell
-      </button>
-      <button
-        type="button"
-        aria-label="rail: stale-source shell"
-        // Simulate a create that STARTED in conv_a and resolves after the
-        // user navigated away — its callback still carries "conv_a" as the
-        // source. AppShell must reject it against the current conversation.
-        onClick={() => onOpenShell?.("terminal:terminal_bash_s1", "conv_a")}
-      >
-        host-shell-stale
-      </button>
-    </div>
-  ),
+        <button
+          type="button"
+          aria-label="rail: open terminal"
+          onClick={() => onExpand("terminal:terminal_main")}
+        >
+          rail-terminal
+        </button>
+        <button
+          type="button"
+          aria-label="rail: host shell"
+          // Mirror the real section selecting an EXISTING shell: the mutation
+          // carries its SOURCE conversation (so AppShell can reject a late
+          // callback after nav) and pendingInventory=false (already in
+          // inventory).
+          onClick={() => onOpenShell?.("terminal:terminal_bash_s1", conversationId, false)}
+        >
+          host-shell
+        </button>
+        <button
+          type="button"
+          aria-label="rail: create shell"
+          // Mirror the real section's CREATE path: the freshly-created shell
+          // isn't in the inventory yet (pendingInventory=true), so AppShell
+          // bridges the create→inventory gap for its off-surface cleanup.
+          onClick={() => onOpenShell?.("terminal:terminal_bash_s1", conversationId, true)}
+        >
+          create-shell
+        </button>
+        <button
+          type="button"
+          aria-label="rail: stale-source shell"
+          // Simulate a create that STARTED in conv_a and resolves after the
+          // user navigated away — its callback still carries "conv_a" as the
+          // source. AppShell must reject it against the current conversation.
+          onClick={() => onOpenShell?.("terminal:terminal_bash_s1", "conv_a", true)}
+        >
+          host-shell-stale
+        </button>
+      </div>
+    );
+  },
 }));
 vi.mock("./SubagentsPanel", () => ({
   SubagentsPanel: ({ conversationId }: { conversationId: string }) => (
@@ -524,6 +554,10 @@ beforeEach(() => {
   // Clear the center-view render recorder so one test's render sequence
   // can't leak into another's.
   centerKeyRenders.length = 0;
+  // Reset the captured rail callback so one test's deferred-callback grab
+  // can't leak into another.
+  mockCapturedOnOpenShell = null;
+  mockCapturedOnOpenShellConv = null;
 });
 
 afterEach(cleanup);
@@ -1505,6 +1539,86 @@ describe("User-shell routing gates on isNativeWrapper (not isTerminalFirst)", ()
     );
   });
 
+  it("M5-residual: rejects a deferred create from A whose SURVIVING callback resolves after A→B nav", () => {
+    // The source guard compares ``source`` against AppShell's LATEST
+    // conversation id (a ref), not the id captured in the render that produced
+    // the callback. Distinct from the M5 test above (a fresh B handler firing a
+    // literal "conv_a" source): here we grab the REAL callback bound to
+    // conversation A's render — its closure carries conversationId A AND tags
+    // source A — then invoke it AFTER navigating to B. A captured-value guard
+    // (source A === captured conversationId A) would PASS and mutate B; the
+    // ref-based guard (source A !== latest B) rejects it.
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      { id: "conv_a", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+      { id: "conv_b", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [
+        { id: "terminal_tui_main", name: "tui", session: "main", running: true },
+        { id: "terminal_bash_s1", name: "bash", session: "s1", running: true },
+      ],
+      isLoading: false,
+      error: null,
+    });
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_a"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route
+                  path="c/:conversationId"
+                  element={
+                    <>
+                      <TerminalFirstViewProbe />
+                      <SessionNavButton to="/c/conv_b" />
+                      <LocationDisplay />
+                    </>
+                  }
+                />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+
+    // Open the Shells tab in A so the section mounts and the mock captures the
+    // onOpenShell callback bound to conversation A's render.
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /Shells/i }));
+    const deferredCreate = mockCapturedOnOpenShell;
+    expect(deferredCreate).not.toBeNull();
+    expect(mockCapturedOnOpenShellConv).toBe("conv_a");
+
+    // Warm-navigate to B (AppShell stays mounted, only the route param changes)
+    // and park B on the Files tab — a surface OTHER than Shells, so a leaked
+    // mutation's ungated tab switch is observable.
+    fireEvent.click(screen.getByTestId("nav-session"));
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /^Files$/i }));
+    expect(screen.getByRole("tab", { name: /^Files$/i })).toHaveAttribute("aria-selected", "true");
+
+    // The deferred create from A now resolves — its A-render closure fires late,
+    // still tagging source "conv_a". The B3 owner-gate hides the active shell
+    // KEY regardless, but the guarded mutation ALSO force-switches the rail to
+    // Shells and reopens the panel (both ungated). Those must NOT happen for B:
+    // the ref-based guard rejects the stale source, so B stays on Files.
+    act(() => {
+      deferredCreate?.("terminal:terminal_bash_s1", "conv_a", true);
+    });
+
+    // B is untouched: still on Files, no shell section forced open. (A captured-
+    // value guard would have passed — source A === captured conversationId A —
+    // and yanked B onto the Shells tab.)
+    expect(screen.getByRole("tab", { name: /^Files$/i })).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByTestId("inline-terminals-section")).toBeNull();
+  });
+
   it("M6: mounts only ONE inline shell terminal across a desktop→mobile breakpoint change", () => {
     // Desktop hosts the shell inline (inline=true). Below the md breakpoint
     // the desktop rail is CSS-hidden but STAYS MOUNTED, so its TerminalView +
@@ -1517,10 +1631,11 @@ describe("User-shell routing gates on isNativeWrapper (not isTerminalFirst)", ()
     let mobileMatches = false;
     // Only the mobile-breakpoint query's listeners drive this test; other
     // matchMedia consumers (e.g. useResizablePanel) still get a stub but we
-    // don't notify them. useIsMobileViewport uses "(max-width: 767.98px)".
+    // don't notify them. useIsMobileViewport uses the `md`-complement query
+    // "not all and (min-width: 768px)".
     const mobileListeners = new Set<(e: { matches: boolean }) => void>();
     window.matchMedia = ((query: string) => {
-      const isMobileQuery = query.includes("max-width: 767.98px");
+      const isMobileQuery = query.startsWith("not all and (min-width: 768px)");
       return {
         get matches() {
           return isMobileQuery ? mobileMatches : false;
@@ -1572,6 +1687,83 @@ describe("User-shell routing gates on isNativeWrapper (not isTerminalFirst)", ()
       mobileListeners.forEach((cb) => cb({ matches: true }));
     });
     expect(section()).toHaveAttribute("data-inline", "false");
+
+    // Restore the shared matchMedia stub for later tests.
+    window.matchMedia = ((query: string) => ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    })) as unknown as typeof window.matchMedia;
+  });
+
+  it("M6-residual: keeps the hidden rail non-inline in the 767.98–768px fractional gap", () => {
+    // The rail's CSS visibility flips on Tailwind's `md` (>= 768px), but the
+    // OLD useIsMobileViewport matched `(max-width: 767.98px)`. In the OPEN
+    // interval (767.98, 768) — reachable under browser zoom / display scaling —
+    // BOTH the old mobile query (max-width: 767.98px) AND the desktop query
+    // (min-width: 768px) are false: the rail is CSS-hidden (< 768) yet the old
+    // hook read desktop, so ``inline`` stayed true and the hidden rail kept a
+    // live PTY while the mobile surface could open another. The fix expresses
+    // mobile as the exact logical complement of `(min-width: 768px)`, closing
+    // the gap.
+    //
+    // We simulate a real viewport at 767.99px by evaluating each media query
+    // against that width. Pre-fix (reads `max-width: 767.98px` → false → not
+    // mobile) leaves inline=true; post-fix (reads `not all and (min-width:
+    // 768px)` → true → mobile) drops inline to false — the single-mounted-
+    // terminal outcome. A plain matches:false stub can't tell the two apart, so
+    // the query-aware evaluator is what makes this fail pre-fix and pass after.
+    const GAP_WIDTH = 767.99;
+    const evalQuery = (query: string): boolean => {
+      const minMatch = query.match(/min-width:\s*([\d.]+)px/);
+      const maxMatch = query.match(/max-width:\s*([\d.]+)px/);
+      let result = true;
+      if (minMatch) result = result && GAP_WIDTH >= parseFloat(minMatch[1]);
+      if (maxMatch) result = result && GAP_WIDTH <= parseFloat(maxMatch[1]);
+      // `not all and (...)` negates the enclosed feature test.
+      return query.trim().startsWith("not all and") ? !result : result;
+    };
+    window.matchMedia = ((query: string) => ({
+      matches: evalQuery(query),
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    })) as unknown as typeof window.matchMedia;
+
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      { id: "conv_polly", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [
+        { id: "terminal_tui_main", name: "tui", session: "main", running: true },
+        { id: "terminal_bash_s1", name: "bash", session: "s1", running: true },
+      ],
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_polly");
+
+    // Host the shell inline, then read the rail's inline flag. In the fractional
+    // gap the (CSS-hidden) rail must NOT host a live inline terminal.
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /Shells/i }));
+    fireEvent.click(screen.getByRole("button", { name: /rail: host shell$/i }));
+    const section = screen.getByTestId("inline-terminals-section");
+    expect(section).toHaveAttribute("data-active-key", "terminal:terminal_bash_s1");
+    expect(section).toHaveAttribute("data-inline", "false");
 
     // Restore the shared matchMedia stub for later tests.
     window.matchMedia = ((query: string) => ({
@@ -1644,6 +1836,85 @@ describe("User-shell routing gates on isNativeWrapper (not isTerminalFirst)", ()
     fireEvent.mouseDown(screen.getByRole("tab", { name: /Shells/i }));
     await waitFor(() =>
       expect(screen.getByTestId("inline-terminals-section")).toHaveAttribute("data-active-key", ""),
+    );
+  });
+
+  it("LOW-residual: preserves a just-CREATED active key that leaves the shell surface before inventory arrives", async () => {
+    // The off-surface cleanup treats "active key absent from railTerminals" as
+    // proof the shell died. But right after a create SUCCEEDS the active key
+    // legitimately PRECEDES inventory while the pending-created bridge covers
+    // the gap. The existing LOW test above only covers an ESTABLISHED shell
+    // (already in inventory) that later closes; here the shell is freshly
+    // created (pendingInventory=true, NOT yet in inventory) and the user leaves
+    // the shell surface DURING the gap. Pre-fix the cleanup mistakes the pending
+    // key for a dead shell and erases it; the fix skips cleanup while the active
+    // key equals the pending-created key, so the key survives until inventory
+    // lands.
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      { id: "conv_polly", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+    ]);
+    // Agent declares shell access so the Shells tab is default-visible before
+    // any shell exists (the "+ New shell" empty state) — the create path needs
+    // it available while inventory is still empty of the new shell.
+    useSessionAgentMock.mockReturnValue({
+      data: { id: "ag_1", object: "agent", name: "polly", terminals: ["shell"] } as Agent,
+    } as ReturnType<typeof useSessionAgent>);
+    // Inventory does NOT yet contain the freshly-created shell — only the
+    // agent's own TUI pane (excluded from the shell inventory).
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_tui_main", name: "tui", session: "main", running: true }],
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_polly");
+
+    // Create a shell: pendingInventory=true. AppShell sets it active and records
+    // the create→inventory bridge; the shell isn't in the inventory yet.
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /Shells/i }));
+    fireEvent.click(screen.getByRole("button", { name: /rail: create shell$/i }));
+    expect(screen.getByTestId("inline-terminals-section")).toHaveAttribute(
+      "data-active-key",
+      "terminal:terminal_bash_s1",
+    );
+
+    // Leave the shell surface DURING the gap — switch to Agents. The inline
+    // section unmounts (its internal bridge is gone) and the off-surface
+    // cleanup runs against an inventory that still lacks the new shell.
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /Agents/i }));
+    expect(screen.queryByTestId("inline-terminals-section")).toBeNull();
+    // Nudge extra cleanup passes via a harmless tab round-trip.
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /Files/i }));
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /Agents/i }));
+
+    // The legitimate pending key must NOT have been erased: returning to Shells
+    // still shows it active. Pre-fix the cleanup dropped it while off-surface.
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /Shells/i }));
+    expect(screen.getByTestId("inline-terminals-section")).toHaveAttribute(
+      "data-active-key",
+      "terminal:terminal_bash_s1",
+    );
+
+    // Inventory now catches up — the shell is real and stays intact.
+    useTerminalsMock.mockReturnValue({
+      terminals: [
+        { id: "terminal_tui_main", name: "tui", session: "main", running: true },
+        { id: "terminal_bash_s1", name: "bash", session: "s1", running: true },
+      ],
+      isLoading: false,
+      error: null,
+    });
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /Files/i }));
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /Shells/i }));
+    await waitFor(() =>
+      expect(screen.getByTestId("inline-terminals-section")).toHaveAttribute(
+        "data-active-key",
+        "terminal:terminal_bash_s1",
+      ),
     );
   });
 
