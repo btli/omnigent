@@ -570,6 +570,12 @@ function renderItem(
           input={item.input}
           stdout={item.stdout}
           stderr={item.stderr}
+          action={item.action}
+          terminalId={item.terminalId}
+          terminalName={item.terminalName}
+          sessionKey={item.sessionKey}
+          status={item.status}
+          error={item.error}
         />
       );
     case "error":

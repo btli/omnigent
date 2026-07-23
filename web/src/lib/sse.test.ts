@@ -157,3 +157,160 @@ describe("parseEvent — session.mcp_startup", () => {
     ).toBeNull();
   });
 });
+
+describe("parseEvent — response.output_item.done (terminal_command)", () => {
+  function parseTerminalItem(item: Record<string, unknown>) {
+    const ev = parseEvent("response.output_item.done", { item });
+    expect(ev?.type).toBe("terminal_command");
+    return ev as Extract<NonNullable<typeof ev>, { type: "terminal_command" }>;
+  }
+
+  it("parses a legacy TUI-observer input item with no receipt fields", () => {
+    const ev = parseTerminalItem({
+      id: "tc_1",
+      response_id: "resp_1",
+      type: "terminal_command",
+      status: "completed",
+      kind: "input",
+      input: "pwd",
+    });
+    expect(ev.kind).toBe("input");
+    expect(ev.input).toBe("pwd");
+    expect(ev.action).toBeUndefined();
+    expect(ev.terminalId).toBeUndefined();
+    expect(ev.terminalName).toBeUndefined();
+    expect(ev.sessionKey).toBeUndefined();
+    expect(ev.status).toBeUndefined();
+    expect(ev.error).toBeUndefined();
+    expect(ev.createdBy).toBeUndefined();
+  });
+
+  it("threads bang-receipt fields incl. created_by through", () => {
+    const ev = parseTerminalItem({
+      id: "tc_2",
+      response_id: "turn_abc",
+      type: "terminal_command",
+      status: "ok",
+      kind: "input",
+      input: "echo hi",
+      action: "spawn",
+      terminal_id: "terminal_zsh_u-ab12cd",
+      terminal_name: "zsh",
+      session_key: "u-ab12cd",
+      created_by: "alice@example.com",
+    });
+    expect(ev.action).toBe("spawn");
+    expect(ev.terminalId).toBe("terminal_zsh_u-ab12cd");
+    expect(ev.terminalName).toBe("zsh");
+    expect(ev.sessionKey).toBe("u-ab12cd");
+    expect(ev.status).toBe("ok");
+    expect(ev.createdBy).toBe("alice@example.com");
+    expect(ev.itemId).toBe("tc_2");
+    expect(ev.responseId).toBe("turn_abc");
+  });
+
+  it("threads an error receipt's status + message", () => {
+    const ev = parseTerminalItem({
+      id: "tc_3",
+      response_id: "turn_err",
+      type: "terminal_command",
+      status: "error",
+      kind: "input",
+      input: "make",
+      action: "send",
+      terminal_id: "terminal_zsh_u-dead00",
+      error: "shell u-dead00 is not running",
+    });
+    expect(ev.action).toBe("send");
+    expect(ev.status).toBe("error");
+    expect(ev.error).toBe("shell u-dead00 is not running");
+  });
+
+  it("threads a delivery-unknown receipt status", () => {
+    const ev = parseTerminalItem({
+      id: "tc_unknown",
+      response_id: "turn_unknown",
+      type: "terminal_command",
+      status: "unknown",
+      kind: "input",
+      input: "make",
+      action: "send",
+      terminal_id: "terminal_zsh_u-ab12cd",
+    });
+    expect(ev.action).toBe("send");
+    expect(ev.status).toBe("unknown");
+    expect(ev.error).toBeUndefined();
+  });
+
+  it("lifecycle statuses and wrong-typed receipt fields are dropped, not surfaced", () => {
+    const ev = parseTerminalItem({
+      id: "tc_4",
+      response_id: "resp_4",
+      type: "terminal_command",
+      // The receipt outcome rides the item-level status slot; a lifecycle
+      // value must not read as a delivery outcome.
+      status: "completed",
+      kind: "input",
+      input: "ls",
+      action: "detonate",
+      terminal_id: 42,
+      session_key: ["u-x"],
+      error: { message: "boom" },
+    });
+    expect(ev.status).toBeUndefined();
+    expect(ev.action).toBeUndefined();
+    expect(ev.terminalId).toBeUndefined();
+    expect(ev.sessionKey).toBeUndefined();
+    expect(ev.error).toBeUndefined();
+  });
+});
+
+describe("parseEvent — terminal_command status is gated on the action discriminator", () => {
+  it("a no-action item carrying a flattened 'error' status surfaces no status", () => {
+    const ev = parseEvent("response.output_item.done", {
+      item: {
+        id: "tc_5",
+        response_id: "resp_5",
+        type: "terminal_command",
+        status: "error",
+        kind: "input",
+        input: "pwd",
+      },
+    });
+    expect(ev?.type).toBe("terminal_command");
+    const tc = ev as Extract<NonNullable<typeof ev>, { type: "terminal_command" }>;
+    expect(tc.action).toBeUndefined();
+    expect(tc.status).toBeUndefined();
+  });
+
+  it("a no-action item carrying 'ok' status surfaces no status either", () => {
+    const ev = parseEvent("response.output_item.done", {
+      item: {
+        id: "tc_6",
+        response_id: "resp_6",
+        type: "terminal_command",
+        status: "ok",
+        kind: "input",
+        input: "pwd",
+      },
+    });
+    const tc = ev as Extract<NonNullable<typeof ev>, { type: "terminal_command" }>;
+    expect(tc.status).toBeUndefined();
+  });
+
+  it("a no-action item carrying 'unknown' status surfaces no status either", () => {
+    const ev = parseEvent("response.output_item.done", {
+      item: {
+        id: "tc_7",
+        response_id: "resp_7",
+        type: "terminal_command",
+        status: "unknown",
+        kind: "input",
+        input: "pwd",
+      },
+    });
+    const tc = ev as Extract<NonNullable<typeof ev>, { type: "terminal_command" }>;
+    expect(tc.action).toBeUndefined();
+    expect(tc.status).toBeUndefined();
+  });
+});

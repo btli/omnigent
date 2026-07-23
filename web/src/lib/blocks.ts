@@ -225,6 +225,22 @@ export interface TerminalCommandBlock {
   stdout: string | null;
   /** Captured stderr; set when `kind="output"`. */
   stderr: string | null;
+  /**
+   * `"spawn"` = new shell + run; `"send"` = into an existing shell.
+   * Absent on legacy TUI-observer items — those render without the
+   * target-shell chip. Human authorship rides `ctx.createdBy`.
+   */
+  action?: "spawn" | "send";
+  /** Target shell resource id, e.g. `terminal_zsh_u-ab12cd`. */
+  terminalId?: string;
+  /** Shell type for display, e.g. `zsh`. */
+  terminalName?: string;
+  /** Display session key, e.g. `u-ab12cd`. */
+  sessionKey?: string;
+  /** Delivery outcome (not the command's exit code). */
+  status?: "ok" | "error" | "unknown";
+  /** Human-readable failure when `status="error"`. */
+  error?: string;
 }
 
 // ── Text ─────────────────────────────────────────────────

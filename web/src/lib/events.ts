@@ -345,7 +345,9 @@ export interface RoutingDecision {
 
 /**
  * Terminal command item from `output_item.done` (type `terminal_command`).
- * Produced by the claude-native transcript forwarder when the user types `!cmd`.
+ * Produced by the claude-native transcript forwarder when the user types
+ * `!cmd` in the embedded TUI (legacy — no `action`), and by the server's
+ * bang-command receipts from the web composer (`action` + target fields set).
  */
 export interface TerminalCommandEvent {
   type: "terminal_command";
@@ -354,6 +356,20 @@ export interface TerminalCommandEvent {
   input: string | null;
   stdout: string | null;
   stderr: string | null;
+  /** `"spawn"` = new shell + run; `"send"` = into an existing shell. Absent on legacy items. */
+  action?: "spawn" | "send";
+  /** Target shell resource id, e.g. `terminal_zsh_u-ab12cd`. */
+  terminalId?: string;
+  /** Shell type for display, e.g. `zsh`. */
+  terminalName?: string;
+  /** Display session key, e.g. `u-ab12cd`. */
+  sessionKey?: string;
+  /** Delivery outcome (not the command's exit code). */
+  status?: "ok" | "error" | "unknown";
+  /** Human-readable failure when `status="error"`. */
+  error?: string;
+  /** Human author email; present on web-originated receipts. */
+  createdBy?: string;
   itemId: string;
   responseId: string;
 }
@@ -724,6 +740,8 @@ export interface SessionResource {
 export interface SessionResourceCreatedEvent {
   type: "session_resource_created";
   resource: SessionResource;
+  /** Process-local resource-event ordering token. Absent on legacy frames. */
+  sequence?: number;
 }
 
 /**
@@ -734,6 +752,8 @@ export interface SessionResourceDeletedEvent {
   resourceId: string;
   resourceType: string;
   sessionId: string;
+  /** Process-local resource-event ordering token. Absent on legacy frames. */
+  sequence?: number;
 }
 
 /**

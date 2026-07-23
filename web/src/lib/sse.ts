@@ -66,6 +66,7 @@ import type {
   ToolOutputDelta,
   ToolResult,
 } from "./events";
+import { receiptFieldsFromWire } from "./conversationItems";
 import { NATIVE_TOOL_TYPES } from "./events";
 import type { ErrorInfo, ModelUsage, RememberScope, Response } from "./types";
 
@@ -719,7 +720,12 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
   if (eventType === "session.resource.created") {
     const resource = parseSessionResource(data.resource);
     if (resource === null) return null;
-    return { type: "session_resource_created", resource } satisfies SessionResourceCreatedEvent;
+    const sequence = parseResourceSequence(data.sequence);
+    return {
+      type: "session_resource_created",
+      resource,
+      ...(sequence !== undefined ? { sequence } : {}),
+    } satisfies SessionResourceCreatedEvent;
   }
   if (eventType === "session.resource.deleted") {
     const resourceId = data.resource_id;
@@ -728,11 +734,13 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     if (typeof resourceId !== "string" || !resourceId) return null;
     if (typeof resourceType !== "string" || !resourceType) return null;
     if (typeof sessionId !== "string" || !sessionId) return null;
+    const sequence = parseResourceSequence(data.sequence);
     return {
       type: "session_resource_deleted",
       resourceId,
       resourceType,
       sessionId,
+      ...(sequence !== undefined ? { sequence } : {}),
     } satisfies SessionResourceDeletedEvent;
   }
   if (eventType === "session.child_session.updated") {
@@ -944,6 +952,10 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
   return null;
 }
 
+function parseResourceSequence(raw: unknown): number | undefined {
+  return typeof raw === "number" && Number.isSafeInteger(raw) && raw > 0 ? raw : undefined;
+}
+
 function parseSessionResource(raw: unknown): SessionResource | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const rec = raw as Record<string, unknown>;
@@ -1071,12 +1083,19 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
   }
 
   if (itemType === "terminal_command") {
+    // Bang-receipt fields; all absent on legacy TUI-observer items. The
+    // receipt's delivery outcome rides the item-level `status` slot (the
+    // server flattens data over the envelope) and is gated on the
+    // `action` discriminator by the shared `terminalCommandStatus` rule —
+    // lifecycle statuses and action-less statuses stay dropped.
     return {
       type: "terminal_command",
       kind: rec.kind === "output" ? "output" : "input",
       input: typeof rec.input === "string" ? rec.input : null,
       stdout: typeof rec.stdout === "string" ? rec.stdout : null,
       stderr: typeof rec.stderr === "string" ? rec.stderr : null,
+      ...receiptFieldsFromWire(rec),
+      ...(typeof rec.created_by === "string" ? { createdBy: rec.created_by } : {}),
       itemId,
       responseId,
     } satisfies TerminalCommandEvent;

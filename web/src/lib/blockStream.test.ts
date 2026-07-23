@@ -12,6 +12,7 @@ import type {
   ReasoningChunk,
   ResponseEndBlock,
   SlashCommandBlock,
+  TerminalCommandBlock,
   TextChunk,
   TextDone,
   ToolGroup,
@@ -1653,5 +1654,105 @@ describe("BlockStream — interrupt (Stop) finalizes in-flight content", () => {
     );
     expect(done1).toBeGreaterThanOrEqual(0);
     expect(start2).toBeGreaterThan(done1);
+  });
+});
+
+describe("terminal_command (!cmd) blocks", () => {
+  it("bang receipt threads target fields + createdBy onto the block", () => {
+    const blocks = reduce([
+      {
+        type: "terminal_command",
+        kind: "input",
+        input: "echo hi",
+        stdout: null,
+        stderr: null,
+        action: "spawn",
+        terminalId: "terminal_zsh_u-ab12cd",
+        terminalName: "zsh",
+        sessionKey: "u-ab12cd",
+        status: "ok",
+        createdBy: "alice@example.com",
+        itemId: "tc_1",
+        responseId: "turn_bang",
+      },
+    ]);
+    expect(blocks.map((b) => b.type)).toEqual(["terminal_command"]);
+    const tc = blocks[0] as TerminalCommandBlock;
+    expect(tc.kind).toBe("input");
+    expect(tc.input).toBe("echo hi");
+    expect(tc.action).toBe("spawn");
+    expect(tc.terminalId).toBe("terminal_zsh_u-ab12cd");
+    expect(tc.terminalName).toBe("zsh");
+    expect(tc.sessionKey).toBe("u-ab12cd");
+    expect(tc.status).toBe("ok");
+    expect(tc.error).toBeUndefined();
+    // Synthetic receipt turn id adopted for grouping; authorship on ctx.
+    expect(tc.ctx.responseId).toBe("turn_bang");
+    expect(tc.ctx.itemId).toBe("tc_1");
+    expect(tc.ctx.createdBy).toBe("alice@example.com");
+  });
+
+  it("error receipt carries status + error text", () => {
+    const blocks = reduce([
+      {
+        type: "terminal_command",
+        kind: "input",
+        input: "make",
+        stdout: null,
+        stderr: null,
+        action: "send",
+        terminalId: "terminal_zsh_u-dead00",
+        status: "error",
+        error: "shell u-dead00 is not running",
+        itemId: "tc_err",
+        responseId: "turn_err",
+      },
+    ]);
+    const tc = blocks[0] as TerminalCommandBlock;
+    expect(tc.status).toBe("error");
+    expect(tc.error).toBe("shell u-dead00 is not running");
+  });
+
+  it("delivery-unknown receipt carries the informational status", () => {
+    const blocks = reduce([
+      {
+        type: "terminal_command",
+        kind: "input",
+        input: "make",
+        stdout: null,
+        stderr: null,
+        action: "send",
+        terminalId: "terminal_zsh_u-ab12cd",
+        status: "unknown",
+        itemId: "tc_unknown",
+        responseId: "turn_unknown",
+      },
+    ]);
+    const tc = blocks[0] as TerminalCommandBlock;
+    expect(tc.status).toBe("unknown");
+    expect(tc.error).toBeUndefined();
+  });
+
+  it("legacy TUI-observer event yields a block without receipt fields", () => {
+    const blocks = reduce([
+      {
+        type: "terminal_command",
+        kind: "input",
+        input: "pwd",
+        stdout: null,
+        stderr: null,
+        itemId: "tc_legacy",
+        responseId: "resp_1",
+      },
+    ]);
+    const tc = blocks[0] as TerminalCommandBlock;
+    expect(tc.input).toBe("pwd");
+    expect(tc.action).toBeUndefined();
+    expect(tc.terminalId).toBeUndefined();
+    expect(tc.terminalName).toBeUndefined();
+    expect(tc.sessionKey).toBeUndefined();
+    expect(tc.status).toBeUndefined();
+    expect(tc.error).toBeUndefined();
+    expect(tc.ctx.createdBy).toBeUndefined();
   });
 });

@@ -120,9 +120,11 @@ export interface SlashCommandItem extends BaseItem {
 }
 
 /**
- * A runner-side terminal command (`!cmd`) observed in a Claude Code
- * embedded TUI transcript. Two items per invocation: one `kind="input"`
- * (the command text) and one `kind="output"` (stdout + stderr).
+ * A runner-side terminal command (`!cmd`). Two producers: the Claude Code
+ * embedded-TUI observer (legacy — one `kind="input"` item plus one
+ * `kind="output"` item per invocation, no `action`), and the web composer's
+ * bang-command receipts (always `kind="input"`, with `action` and the
+ * target-shell fields set; output stays in the live terminal).
  */
 export interface TerminalCommandItem extends BaseItem {
   type: "terminal_command";
@@ -134,6 +136,92 @@ export interface TerminalCommandItem extends BaseItem {
   stdout?: string;
   /** Captured stderr; present when `kind="output"`. */
   stderr?: string;
+  /** `"spawn"` = new shell + run; `"send"` = into an existing shell. Absent on legacy TUI-observer items. */
+  action?: "spawn" | "send";
+  /** Target shell resource id, e.g. `terminal_zsh_u-ab12cd`. */
+  terminal_id?: string;
+  /** Shell type for display, e.g. `zsh`. */
+  terminal_name?: string;
+  /** Display session key, e.g. `u-ab12cd`. */
+  session_key?: string;
+  /** Human-readable failure when the delivery outcome is `"error"`. */
+  error?: string;
+  /** Human author email; present on web-originated receipts. */
+  created_by?: string;
+}
+
+/**
+ * Delivery outcome of a bang-command receipt (not the command's exit
+ * code). The server flattens the data payload over the item envelope, so
+ * a receipt's outcome arrives in the item-level `status` slot — `"ok"`,
+ * `"error"`, or `"unknown"` on receipts, and a lifecycle status
+ * (`"completed"`) on legacy TUI-observer items.
+ *
+ * `action` is the receipt discriminator (absent = legacy), so a status is
+ * surfaced ONLY when a valid `action` accompanies it — a legacy item that
+ * somehow carries a receipt status must keep rendering exactly as legacy.
+ * Single source of the rule for both the SSE and reload chokepoints.
+ */
+export function terminalCommandStatus(
+  action: unknown,
+  status: unknown,
+): "ok" | "error" | "unknown" | undefined {
+  if (action !== "spawn" && action !== "send") return undefined;
+  return status === "ok" || status === "error" || status === "unknown" ? status : undefined;
+}
+
+/**
+ * The optional bang-receipt fields shared by terminal-command items,
+ * events, and blocks. Authorship (`createdBy`) is deliberately excluded —
+ * it rides the block context, not the receipt payload.
+ */
+export interface TerminalReceiptFields {
+  action?: "spawn" | "send";
+  terminalId?: string;
+  terminalName?: string;
+  sessionKey?: string;
+  status?: "ok" | "error" | "unknown";
+  error?: string;
+}
+
+/**
+ * Copy the optional receipt fields off a wire/snake-cased source (raw item
+ * or persisted `TerminalCommandItem`), gating `status` through
+ * `terminalCommandStatus`. Absent fields stay omitted (not set to
+ * `undefined`) so legacy TUI-observer items hydrate byte-identically.
+ */
+export function receiptFieldsFromWire(rec: {
+  action?: unknown;
+  terminal_id?: unknown;
+  terminal_name?: unknown;
+  session_key?: unknown;
+  status?: unknown;
+  error?: unknown;
+}): TerminalReceiptFields {
+  const status = terminalCommandStatus(rec.action, rec.status);
+  return {
+    ...(rec.action === "spawn" || rec.action === "send" ? { action: rec.action } : {}),
+    ...(typeof rec.terminal_id === "string" ? { terminalId: rec.terminal_id } : {}),
+    ...(typeof rec.terminal_name === "string" ? { terminalName: rec.terminal_name } : {}),
+    ...(typeof rec.session_key === "string" ? { sessionKey: rec.session_key } : {}),
+    ...(status !== undefined ? { status } : {}),
+    ...(typeof rec.error === "string" ? { error: rec.error } : {}),
+  };
+}
+
+/**
+ * Copy the optional receipt fields off an already-camel source (event or
+ * block). Absent fields stay omitted so legacy items stay byte-identical.
+ */
+export function receiptFieldsFromCamel(src: TerminalReceiptFields): TerminalReceiptFields {
+  return {
+    ...(src.action !== undefined ? { action: src.action } : {}),
+    ...(src.terminalId !== undefined ? { terminalId: src.terminalId } : {}),
+    ...(src.terminalName !== undefined ? { terminalName: src.terminalName } : {}),
+    ...(src.sessionKey !== undefined ? { sessionKey: src.sessionKey } : {}),
+    ...(src.status !== undefined ? { status: src.status } : {}),
+    ...(src.error !== undefined ? { error: src.error } : {}),
+  };
 }
 
 /**
