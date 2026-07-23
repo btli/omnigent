@@ -50,6 +50,7 @@ import {
   isRoutingDecisionItem,
   isSlashCommandItem,
   isTerminalCommandItem,
+  receiptFieldsFromWire,
 } from "./conversationItems";
 
 /**
@@ -313,6 +314,10 @@ function routingDecisionToBlock(item: RoutingDecisionItem): RoutingDecisionBlock
 }
 
 function terminalCommandToBlock(item: TerminalCommandItem): TerminalCommandBlock {
+  // Bang-receipt fields are absent on legacy TUI-observer items; the
+  // delivery outcome rides the item-level `status` slot and only counts
+  // when the `action` discriminator is present (see
+  // `terminalCommandStatus`). `created_by` flows through ctxFor.
   return {
     type: "terminal_command",
     ctx: ctxFor(item),
@@ -320,6 +325,7 @@ function terminalCommandToBlock(item: TerminalCommandItem): TerminalCommandBlock
     input: item.input ?? null,
     stdout: item.stdout ?? null,
     stderr: item.stderr ?? null,
+    ...receiptFieldsFromWire(item),
   };
 }
 

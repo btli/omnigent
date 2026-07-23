@@ -37,6 +37,7 @@ import {
   slashCommandEchoItemId,
   slashCommandEchoText,
 } from "./blocks";
+import { receiptFieldsFromCamel } from "./conversationItems";
 import type { StreamEvent } from "./events";
 import type { Response } from "./types";
 
@@ -669,11 +670,15 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       adoptResponseIdIfUnset(state, event.responseId);
       yield {
         type: "terminal_command",
-        ctx: ctx(state, event.itemId || null, event.responseId || null),
+        ctx: {
+          ...ctx(state, event.itemId || null, event.responseId || null),
+          ...(event.createdBy !== undefined ? { createdBy: event.createdBy } : {}),
+        },
         kind: event.kind,
         input: event.input,
         stdout: event.stdout,
         stderr: event.stderr,
+        ...receiptFieldsFromCamel(event),
       } satisfies TerminalCommandBlock;
       return;
     }

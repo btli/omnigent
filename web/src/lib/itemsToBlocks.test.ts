@@ -9,6 +9,7 @@ import type {
   NativeToolBlock,
   ReasoningBlock,
   SlashCommandBlock,
+  TerminalCommandBlock,
   TextDone,
   ToolGroup,
   ToolResultBlock,
@@ -581,5 +582,154 @@ describe("itemsToBlocks — edge cases", () => {
     expect(texts).toContain("hello");
     expect(texts).toContain("what next?");
     expect(texts.some((t) => t.includes("continued from a previous conversation"))).toBe(false);
+  });
+});
+
+describe("terminal_command items", () => {
+  it("legacy TUI-observer item hydrates a block without receipt fields", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "tc_legacy",
+        response_id: "resp_1",
+        type: "terminal_command",
+        status: "completed",
+        kind: "input",
+        input: "pwd",
+      },
+    ];
+    const blocks = itemsToBlocks(items);
+    const tc = blocks.find((b): b is TerminalCommandBlock => b.type === "terminal_command");
+    expect(tc).toBeDefined();
+    expect(tc!.kind).toBe("input");
+    expect(tc!.input).toBe("pwd");
+    expect(tc!.action).toBeUndefined();
+    expect(tc!.terminalId).toBeUndefined();
+    expect(tc!.terminalName).toBeUndefined();
+    expect(tc!.sessionKey).toBeUndefined();
+    // Lifecycle status must not read as a delivery outcome.
+    expect(tc!.status).toBeUndefined();
+    expect(tc!.error).toBeUndefined();
+    expect(tc!.ctx.createdBy).toBeUndefined();
+  });
+
+  it("bang receipt hydrates target fields, outcome, and authorship", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "tc_receipt",
+        response_id: "turn_bang",
+        type: "terminal_command",
+        // Receipt outcome rides the item-level status slot on the wire.
+        status: "ok",
+        kind: "input",
+        input: "echo hi",
+        action: "spawn",
+        terminal_id: "terminal_zsh_u-ab12cd",
+        terminal_name: "zsh",
+        session_key: "u-ab12cd",
+        created_by: "alice@example.com",
+      },
+    ];
+    const blocks = itemsToBlocks(items);
+    const tc = blocks.find((b): b is TerminalCommandBlock => b.type === "terminal_command");
+    expect(tc).toBeDefined();
+    expect(tc!.action).toBe("spawn");
+    expect(tc!.terminalId).toBe("terminal_zsh_u-ab12cd");
+    expect(tc!.terminalName).toBe("zsh");
+    expect(tc!.sessionKey).toBe("u-ab12cd");
+    expect(tc!.status).toBe("ok");
+    expect(tc!.ctx.createdBy).toBe("alice@example.com");
+    expect(tc!.ctx.itemId).toBe("tc_receipt");
+    expect(tc!.ctx.responseId).toBe("turn_bang");
+  });
+
+  it("error receipt hydrates status='error' + message", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "tc_err",
+        response_id: "turn_err",
+        type: "terminal_command",
+        status: "error",
+        kind: "input",
+        input: "make",
+        action: "send",
+        terminal_id: "terminal_zsh_u-dead00",
+        error: "shell u-dead00 is not running",
+      },
+    ];
+    const blocks = itemsToBlocks(items);
+    const tc = blocks.find((b): b is TerminalCommandBlock => b.type === "terminal_command");
+    expect(tc!.status).toBe("error");
+    expect(tc!.error).toBe("shell u-dead00 is not running");
+  });
+
+  it("delivery-unknown receipt hydrates status='unknown' without an error", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "tc_unknown",
+        response_id: "turn_unknown",
+        type: "terminal_command",
+        status: "unknown",
+        kind: "input",
+        input: "make",
+        action: "send",
+        terminal_id: "terminal_zsh_u-ab12cd",
+      },
+    ];
+    const blocks = itemsToBlocks(items);
+    const tc = blocks.find((b): b is TerminalCommandBlock => b.type === "terminal_command");
+    expect(tc!.status).toBe("unknown");
+    expect(tc!.error).toBeUndefined();
+  });
+});
+
+describe("terminal_command status is gated on the action discriminator", () => {
+  it("a legacy no-action item carrying a flattened 'error' status hydrates statusless", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "tc_stray",
+        response_id: "resp_1",
+        type: "terminal_command",
+        status: "error",
+        kind: "input",
+        input: "pwd",
+      },
+    ];
+    const blocks = itemsToBlocks(items);
+    const tc = blocks.find((b): b is TerminalCommandBlock => b.type === "terminal_command");
+    expect(tc!.action).toBeUndefined();
+    expect(tc!.status).toBeUndefined();
+  });
+
+  it("a legacy no-action item carrying 'ok' hydrates statusless too", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "tc_stray_ok",
+        response_id: "resp_1",
+        type: "terminal_command",
+        status: "ok",
+        kind: "input",
+        input: "pwd",
+      },
+    ];
+    const blocks = itemsToBlocks(items);
+    const tc = blocks.find((b): b is TerminalCommandBlock => b.type === "terminal_command");
+    expect(tc!.status).toBeUndefined();
+  });
+
+  it("a legacy no-action item carrying 'unknown' hydrates statusless too", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "tc_stray_unknown",
+        response_id: "resp_1",
+        type: "terminal_command",
+        status: "unknown",
+        kind: "input",
+        input: "pwd",
+      },
+    ];
+    const blocks = itemsToBlocks(items);
+    const tc = blocks.find((b): b is TerminalCommandBlock => b.type === "terminal_command");
+    expect(tc!.action).toBeUndefined();
+    expect(tc!.status).toBeUndefined();
   });
 });

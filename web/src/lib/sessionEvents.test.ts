@@ -278,6 +278,7 @@ describe("session.resource.created (FLAT envelope)", () => {
   it("lifts the resource record", () => {
     const out = parse("session.resource.created", {
       type: "session.resource.created",
+      sequence: 41,
       resource: {
         id: "terminal_bash_s1",
         object: "session.resource",
@@ -291,6 +292,7 @@ describe("session.resource.created (FLAT envelope)", () => {
     expect(out).toHaveLength(1);
     const ev = out[0] as SessionResourceCreatedEvent;
     expect(ev.type).toBe("session_resource_created");
+    expect(ev.sequence).toBe(41);
     expect(ev.resource.id).toBe("terminal_bash_s1");
     expect(ev.resource.type).toBe("terminal");
     expect(ev.resource.name).toBe("bash:s1");
@@ -375,6 +377,7 @@ describe("session.resource.deleted (FLAT envelope)", () => {
   it("lifts resource_id, resource_type, session_id", () => {
     const out = parse("session.resource.deleted", {
       type: "session.resource.deleted",
+      sequence: 42,
       resource_id: "terminal_bash_s1",
       resource_type: "terminal",
       session_id: "conv_abc",
@@ -382,9 +385,21 @@ describe("session.resource.deleted (FLAT envelope)", () => {
     expect(out).toHaveLength(1);
     const ev = out[0] as SessionResourceDeletedEvent;
     expect(ev.type).toBe("session_resource_deleted");
+    expect(ev.sequence).toBe(42);
     expect(ev.resourceId).toBe("terminal_bash_s1");
     expect(ev.resourceType).toBe("terminal");
     expect(ev.sessionId).toBe("conv_abc");
+  });
+
+  it("keeps legacy unsequenced deletes parseable", () => {
+    const out = parse("session.resource.deleted", {
+      type: "session.resource.deleted",
+      resource_id: "terminal_bash_s1",
+      resource_type: "terminal",
+      session_id: "conv_abc",
+    });
+    const ev = out[0] as SessionResourceDeletedEvent;
+    expect(ev.sequence).toBeUndefined();
   });
 
   it("rejects missing resource_id", () => {

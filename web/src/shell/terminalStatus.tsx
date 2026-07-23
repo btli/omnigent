@@ -59,3 +59,6 @@ export function deriveTerminalStatus(
   if (isActive) return "active";
   return "idle";
 }
+
+/** State of a bang-receipt's target shell, driving the receipt chip. */
+export type ReceiptShellState = "live" | "closed" | "gone";

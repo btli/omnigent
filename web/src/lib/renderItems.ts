@@ -19,6 +19,7 @@
 // Pure function. No React, no DOM. Tested in `renderItems.test.ts`.
 
 import type { AnyBlock, MessageContentBlock, ToolExecution, ToolResultBlock } from "./blocks";
+import { receiptFieldsFromCamel } from "./conversationItems";
 import type { RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
 
@@ -77,6 +78,20 @@ export type RenderItem =
       input: string | null;
       stdout: string | null;
       stderr: string | null;
+      /** `"spawn"` = new shell + run; `"send"` = into an existing shell. Absent on legacy items. */
+      action?: "spawn" | "send";
+      /** Target shell resource id, e.g. `terminal_zsh_u-ab12cd`. */
+      terminalId?: string;
+      /** Shell type for display, e.g. `zsh`. */
+      terminalName?: string;
+      /** Display session key, e.g. `u-ab12cd`. */
+      sessionKey?: string;
+      /** Delivery outcome (not the command's exit code). */
+      status?: "ok" | "error" | "unknown";
+      /** Human-readable failure when `status="error"`. */
+      error?: string;
+      /** Human author email; present on web-originated receipts. */
+      createdBy?: string;
     }
   | { kind: "policy_denied"; itemId: string | null; reason: string; phase: string }
   | { kind: "error"; itemId: string | null; message: string; source: string; code: string }
@@ -670,6 +685,8 @@ function buildAssistantItems(
         input: b.input,
         stdout: b.stdout,
         stderr: b.stderr,
+        ...receiptFieldsFromCamel(b),
+        ...(b.ctx.createdBy !== undefined ? { createdBy: b.ctx.createdBy } : {}),
       });
       i += 1;
       continue;

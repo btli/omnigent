@@ -1588,3 +1588,83 @@ describe("buildBubbles — incremental reuse cache", () => {
     expect((bubbles[0] as Extract<Bubble, { kind: "assistant" }>).lifecycle).toBe("cancelled");
   });
 });
+
+describe("buildBubbles — terminal_command receipts", () => {
+  it("bang receipt block threads target fields + createdBy onto the RenderItem", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "terminal_command",
+        ctx: ctx({ itemId: "tc_1", responseId: "turn_bang", createdBy: "alice@example.com" }),
+        kind: "input",
+        input: "echo hi",
+        stdout: null,
+        stderr: null,
+        action: "spawn",
+        terminalId: "terminal_zsh_u-ab12cd",
+        terminalName: "zsh",
+        sessionKey: "u-ab12cd",
+        status: "ok",
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    const items = (bubbles[0] as Extract<Bubble, { kind: "assistant" }>).items;
+    expect(items.length).toBe(1);
+    const tc = items[0] as Extract<RenderItem, { kind: "terminal_command" }>;
+    expect(tc.terminalKind).toBe("input");
+    expect(tc.input).toBe("echo hi");
+    expect(tc.action).toBe("spawn");
+    expect(tc.terminalId).toBe("terminal_zsh_u-ab12cd");
+    expect(tc.terminalName).toBe("zsh");
+    expect(tc.sessionKey).toBe("u-ab12cd");
+    expect(tc.status).toBe("ok");
+    expect(tc.error).toBeUndefined();
+    expect(tc.createdBy).toBe("alice@example.com");
+    expect(tc.itemId).toBe("tc_1");
+  });
+
+  it("error receipt keeps status + error on the RenderItem", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "terminal_command",
+        ctx: ctx({ itemId: "tc_err", responseId: "turn_err" }),
+        kind: "input",
+        input: "make",
+        stdout: null,
+        stderr: null,
+        action: "send",
+        terminalId: "terminal_zsh_u-dead00",
+        status: "error",
+        error: "shell u-dead00 is not running",
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    const items = (bubbles[0] as Extract<Bubble, { kind: "assistant" }>).items;
+    const tc = items[0] as Extract<RenderItem, { kind: "terminal_command" }>;
+    expect(tc.status).toBe("error");
+    expect(tc.error).toBe("shell u-dead00 is not running");
+  });
+
+  it("legacy block yields a RenderItem with no receipt fields", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "terminal_command",
+        ctx: ctx({ itemId: "tc_legacy", responseId: "resp_1" }),
+        kind: "input",
+        input: "pwd",
+        stdout: null,
+        stderr: null,
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    const items = (bubbles[0] as Extract<Bubble, { kind: "assistant" }>).items;
+    const tc = items[0] as Extract<RenderItem, { kind: "terminal_command" }>;
+    expect(tc.input).toBe("pwd");
+    expect(tc.action).toBeUndefined();
+    expect(tc.terminalId).toBeUndefined();
+    expect(tc.terminalName).toBeUndefined();
+    expect(tc.sessionKey).toBeUndefined();
+    expect(tc.status).toBeUndefined();
+    expect(tc.error).toBeUndefined();
+    expect(tc.createdBy).toBeUndefined();
+  });
+});
