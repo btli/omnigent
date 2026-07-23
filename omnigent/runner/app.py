@@ -1758,6 +1758,24 @@ class _TerminalInputOutcome:
     body: dict[str, Any]
 
 
+_DELIVERY_UNKNOWN = _TerminalInputOutcome(
+    status_code=200,
+    body={"outcome": "delivery_unknown"},
+)
+
+
+def _terminal_not_running(terminal_id: str) -> _TerminalInputOutcome:
+    return _TerminalInputOutcome(
+        status_code=404,
+        body={
+            "error": {
+                "code": "terminal_not_running",
+                "message": f"Terminal {terminal_id!r} is not running",
+            }
+        },
+    )
+
+
 @dataclasses.dataclass
 class _TerminalInputAttempt:
     """One in-flight or completed attempt bound to its request fingerprint."""
@@ -1851,10 +1869,7 @@ class _TerminalInputAttempts:
             raise
         except Exception:
             _logger.exception("terminal input attempt failed after dispatch")
-            outcome = _TerminalInputOutcome(
-                status_code=200,
-                body={"outcome": "delivery_unknown"},
-            )
+            outcome = _DELIVERY_UNKNOWN
         await self._mark_completed(key)
         return outcome
 
@@ -8287,7 +8302,8 @@ def create_runner_app(
 
         :param session_id: Session/conversation identifier.
         :param terminal_id: Opaque terminal resource id.
-        :param request: JSON body containing ``text`` and optional ``keys``.
+        :param request: JSON body containing ``text`` and optional ``keys`` /
+            ``wait_for_ready`` fields.
         :returns: The terminal send result or a structured error response.
         """
         body = await request.json()
@@ -8331,15 +8347,7 @@ def create_runner_app(
 
         async def _execute_input() -> _TerminalInputOutcome:
             if terminal_registry is None:
-                return _TerminalInputOutcome(
-                    status_code=404,
-                    body={
-                        "error": {
-                            "code": "terminal_not_running",
-                            "message": f"Terminal {terminal_id!r} is not running",
-                        }
-                    },
-                )
+                return _terminal_not_running(terminal_id)
             resolved = terminal_registry.resolve_snapshot(session_id, terminal_id)
             if isinstance(resolved, AmbiguousResourceId):
                 return _TerminalInputOutcome(
@@ -8352,15 +8360,7 @@ def create_runner_app(
                     },
                 )
             if resolved is None:
-                return _TerminalInputOutcome(
-                    status_code=404,
-                    body={
-                        "error": {
-                            "code": "terminal_not_running",
-                            "message": f"Terminal {terminal_id!r} is not running",
-                        }
-                    },
-                )
+                return _terminal_not_running(terminal_id)
 
             from omnigent.tools.builtins.sys_terminal import send_terminal_input
 
@@ -8380,15 +8380,9 @@ def create_runner_app(
                     terminal_id,
                     exc_info=True,
                 )
-                return _TerminalInputOutcome(
-                    status_code=200,
-                    body={"outcome": "delivery_unknown"},
-                )
+                return _DELIVERY_UNKNOWN
             if result.get("delivery_unknown"):
-                return _TerminalInputOutcome(
-                    status_code=200,
-                    body={"outcome": "delivery_unknown"},
-                )
+                return _DELIVERY_UNKNOWN
             if "error" in result:
                 code = str(result.get("code") or "terminal_not_running")
                 return _TerminalInputOutcome(

@@ -71,6 +71,7 @@ import pytest
 
 from omnigent.runner import create_runner_app
 from omnigent.terminals import TerminalRegistry
+from omnigent.tools.builtins import sys_terminal as sys_terminal_module
 from tests.e2e.conftest import (
     configure_mock_llm,
     create_runner_bound_session,
@@ -355,6 +356,222 @@ async def test_runner_terminal_input_waits_past_startup_stdin_consumer(tmp_path:
                 "a 200/sent readiness result must prove the final shell, not "
                 "the startup stdin consumer, received the command"
             )
+    finally:
+        await registry.shutdown()
+
+
+async def _wait_for_exact_shell_output(
+    registry: TerminalRegistry,
+    *,
+    session_id: str,
+    terminal_name: str,
+    session_key: str,
+    marker: str,
+) -> str:
+    """Wait until a live shell pane contains ``marker`` as its own output line."""
+    instance = registry.get(session_id, terminal_name, session_key)
+    assert instance is not None
+    screens: list[str] = []
+    for _ in range(40):
+        read_result = await instance.read(scrollback=100)
+        screen = str(read_result.get("screen", ""))
+        screens.append(screen)
+        if any(line.strip() == marker for line in screen.splitlines()):
+            return screen
+        await asyncio.sleep(0.05)
+    last_screen = screens[-1] if screens else ""
+    raise AssertionError(f"shell output {marker!r} did not appear:\n{last_screen}")
+
+
+def _write_delayed_shell_wrapper(
+    tmp_path: Path,
+    *,
+    shell_name: str,
+    real_shell: str,
+    delay_s: float,
+) -> Path:
+    """Create a shell-named shim that delays before preserving the real argv."""
+    wrapper_dir = tmp_path / "delayed-shells"
+    wrapper_dir.mkdir(exist_ok=True)
+    wrapper = wrapper_dir / shell_name
+    wrapper.write_text(
+        f"#!{sys.executable}\n"
+        "import os\n"
+        "import sys\n"
+        "import time\n"
+        f"time.sleep({delay_s!r})\n"
+        f"real_shell = {real_shell!r}\n"
+        "os.execv(real_shell, [real_shell, *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    return wrapper
+
+
+def _encoded_output_command(marker: str) -> str:
+    """Return a short shell command whose typed form omits *marker*."""
+    encoded = "".join(f"\\0{ord(char):03o}" for char in marker)
+    return f"builtin printf '%b\\n' '{encoded}'"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("shell_name", "shell_args"),
+    [
+        ("bash", ["--noprofile", "--norc"]),
+        ("zsh", ["-f"]),
+    ],
+)
+async def test_runner_terminal_input_waits_past_old_gate_for_direct_shell(
+    tmp_path: Path,
+    shell_name: str,
+    shell_args: list[str],
+) -> None:
+    """A delayed direct shell ACKs after one second and runs the command once."""
+    real_shell = shutil.which(shell_name)
+    if shutil.which("tmux") is None or real_shell is None:
+        pytest.skip(f"tmux and {shell_name} are required for live readiness coverage")
+
+    registry = TerminalRegistry()
+    app = create_runner_app(
+        terminal_registry=registry,
+        runner_workspace=tmp_path,
+        per_session_workspace=False,
+        server_client=NullServerClient(),
+    )
+    transport = httpx.ASGITransport(app=app)
+    marker = f"O{uuid.uuid4().hex[:6]}"
+    command = _encoded_output_command(marker)
+    wrapper = _write_delayed_shell_wrapper(
+        tmp_path,
+        shell_name=shell_name,
+        real_shell=real_shell,
+        delay_s=1.35,
+    )
+    session_key = f"spawn-{shell_name}"
+
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+            create = await client.post(
+                "/v1/sessions/conv_bang/resources/terminals",
+                json={
+                    "terminal": shell_name,
+                    "session_key": session_key,
+                    "spec": {
+                        "command": str(wrapper),
+                        "args": shell_args,
+                        "cwd": str(tmp_path),
+                    },
+                },
+            )
+            assert create.status_code == 200, create.text
+
+            instance = registry.get("conv_bang", shell_name, session_key)
+            assert instance is not None
+            assert instance.args == shell_args
+            assert instance.ready_process is None
+            assert instance.shell_ready_nonce is not None
+
+            started = time.monotonic()
+            sent = await client.post(
+                (
+                    "/v1/sessions/conv_bang/resources/terminals/"
+                    f"terminal_{shell_name}_{session_key}/input"
+                ),
+                json={
+                    "attempt_id": str(uuid.uuid4()),
+                    "text": command,
+                    "keys": "Enter",
+                    "wait_for_ready": True,
+                },
+            )
+            elapsed = time.monotonic() - started
+            assert sent.status_code == 200, sent.text
+            assert sent.json() == {"status": "sent", "outcome": "sent"}
+            assert elapsed > 1.0, "the positive ACK must arrive after the retired 1s gate"
+
+            screen = await _wait_for_exact_shell_output(
+                registry,
+                session_id="conv_bang",
+                terminal_name=shell_name,
+                session_key=session_key,
+                marker=marker,
+            )
+            assert screen.count(command) == 1, screen
+            assert sum(line.strip() == marker for line in screen.splitlines()) == 1, screen
+    finally:
+        await registry.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_runner_terminal_input_readiness_timeout_rejects_without_send(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A readiness timeout is definite non-delivery with zero input calls."""
+    if shutil.which("tmux") is None:
+        pytest.skip("tmux not installed; runner terminal input needs tmux on PATH")
+
+    monkeypatch.setattr(
+        sys_terminal_module,
+        "_SHELL_READINESS_TIMEOUT_SECONDS",
+        0.05,
+    )
+    registry = TerminalRegistry()
+    app = create_runner_app(
+        terminal_registry=registry,
+        runner_workspace=tmp_path,
+        per_session_workspace=False,
+        server_client=NullServerClient(),
+    )
+    transport = httpx.ASGITransport(app=app)
+    marker = f"BANG_TIMEOUT_MARKER_{uuid.uuid4().hex[:8]}"
+    command = f"echo {marker}"
+
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+            create = await client.post(
+                "/v1/sessions/conv_timeout/resources/terminals",
+                json={
+                    "terminal": "bash",
+                    "session_key": "timeout",
+                    "spec": {
+                        "command": "/bin/sh",
+                        "args": [
+                            "-c",
+                            "sleep 0.3; exec bash --noprofile --norc -i",
+                        ],
+                        "cwd": str(tmp_path),
+                        "ready_process": "never-ready",
+                    },
+                },
+            )
+            assert create.status_code == 200, create.text
+
+            instance = registry.get("conv_timeout", "bash", "timeout")
+            assert instance is not None
+            send_calls = 0
+            real_send = instance.send
+
+            async def record_send(text: str | None, *, keys: str = "Enter") -> dict[str, Any]:
+                nonlocal send_calls
+                send_calls += 1
+                return await real_send(text, keys=keys)
+
+            monkeypatch.setattr(instance, "send", record_send)
+
+            sent = await client.post(
+                "/v1/sessions/conv_timeout/resources/terminals/terminal_bash_timeout/input",
+                json={
+                    "attempt_id": str(uuid.uuid4()),
+                    "text": command,
+                    "keys": "Enter",
+                    "wait_for_ready": True,
+                },
+            )
+            assert sent.status_code == 409, sent.text
+            assert sent.json()["error"]["code"] == "terminal_not_ready"
+            assert send_calls == 0
     finally:
         await registry.shutdown()
 

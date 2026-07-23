@@ -672,7 +672,6 @@ async def bridge_tmux_pty_to_websocket(
                                     reason="terminal ownership changed",
                                 )
                             return
-                        continue
                     # Probe pane liveness only if we haven't checked recently (cache
                     # for ~100ms to avoid a subprocess per keystroke). When remain-on-exit
                     # keeps a dead pane alive, Ctrl-C silently fails; detect and close
@@ -697,6 +696,8 @@ async def bridge_tmux_pty_to_websocket(
                                 )
                             return
                         # is_dead is False (live) or None (inconclusive) → continue
+                    if on_client_input is not None:
+                        continue
                     last_client_input_at = _monotonic()
                     await _write_all_nonblocking(loop, master_fd, data)
         except WebSocketDisconnect:

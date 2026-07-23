@@ -860,6 +860,16 @@ async def test_terminal_input_sends_under_instance_lock(
 
     monkeypatch.setattr(instance, "send", record_send)
 
+    async def forbid_readiness_wait(**kwargs: float) -> bool:
+        del kwargs
+        raise AssertionError("ordinary terminal input must not wait for shell readiness")
+
+    monkeypatch.setattr(
+        instance,
+        "wait_for_shell_ready",
+        forbid_readiness_wait,
+    )
+
     resp = await client.post(
         "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/input",
         json={"text": "printf '$HOME | literal'"},
@@ -911,6 +921,7 @@ async def test_terminal_input_returns_409_when_send_observes_exit(
         text: str | None = None,
         *,
         keys: str = "Enter",
+        wait_for_ready: bool = False,
     ) -> dict[str, str]:
         del text, keys
         instance.running = False
@@ -944,10 +955,18 @@ async def test_terminal_input_requires_json_content_type(
 async def test_terminal_input_rejects_invalid_body(
     client: httpx.AsyncClient,
 ) -> None:
-    """POST /input requires string text and keys fields."""
+    """POST /input validates text, keys, and the readiness opt-in."""
     resp = await client.post(
         "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/input",
         json={"text": 42, "keys": ["Enter"]},
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "invalid_input"
+
+    resp = await client.post(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/input",
+        json={"text": "echo ignored", "wait_for_ready": "yes"},
     )
 
     assert resp.status_code == 400

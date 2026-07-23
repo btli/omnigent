@@ -23,6 +23,9 @@ class ErrorCode:
     :cvar INVALID_INPUT: Request validation failed (HTTP 400).
     :cvar ALREADY_EXISTS: Duplicate resource (HTTP 409).
     :cvar CONFLICT: Operation conflicts with current state (HTTP 409).
+    :cvar ATTEMPT_CONFLICT: An idempotency key was rebound (HTTP 409).
+    :cvar IDEMPOTENCY_CAPACITY_EXHAUSTED: A bounded idempotency ledger
+        rejected a new attempt before execution (HTTP 503).
     :cvar INTERNAL_ERROR: Unexpected server error (HTTP 500).
     :cvar HARNESS_PROTOCOL_VIOLATION: A harness emitted an SSE
         sequence that violates the Omnigent↔harness contract — e.g.
@@ -53,6 +56,8 @@ class ErrorCode:
     INVALID_INPUT = "invalid_input"
     ALREADY_EXISTS = "already_exists"
     CONFLICT = "conflict"
+    ATTEMPT_CONFLICT = "attempt_conflict"
+    IDEMPOTENCY_CAPACITY_EXHAUSTED = "idempotency_capacity_exhausted"
     INTERNAL_ERROR = "internal_error"
     HARNESS_PROTOCOL_VIOLATION = "harness_protocol_violation"
     RUNNER_UNAVAILABLE = "runner_unavailable"
@@ -70,6 +75,8 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     ErrorCode.INVALID_INPUT: 400,
     ErrorCode.ALREADY_EXISTS: 409,
     ErrorCode.CONFLICT: 409,
+    ErrorCode.ATTEMPT_CONFLICT: 409,
+    ErrorCode.IDEMPOTENCY_CAPACITY_EXHAUSTED: 503,
     ErrorCode.INTERNAL_ERROR: 500,
     # Harness protocol violations are server-side bugs in the
     # harness implementation — surface as 500 (no client action
