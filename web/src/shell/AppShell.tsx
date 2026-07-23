@@ -11,6 +11,7 @@ import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
@@ -125,14 +126,22 @@ import type { RightRailTab } from "./railTabs";
  * within it a "Changed only" toggle filters the full folder tree down to
  * just the changed files (flat list). Opening a file (chat link or rail
  * click) forces the rail to the Files tab so the viewer is visible.
- * Terminal-first sessions render the terminal inline in main and therefore
- * hide the rail's Terminals tab. The Agents tab only appears once there's
- * more than one agent (the root has at least one child).
+ * The Shells tab is hidden only for claude-native sub-agents (the parent
+ * owns the tmux pane) and for agents with neither an existing shell nor
+ * declared shell access; every other session — native wrapper or SDK —
+ * gets it. The Agents tab is always present (its "main" row links back to
+ * the root, so a lone agent is a one-entry list, not a dead end).
  */
 export function AppShell() {
   // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
   // here so it works on every chat route, regardless of where focus sits.
   useApproveHotkey();
+
+  // Reactive md-breakpoint signal. Drives the off-surface dead-shell cleanup
+  // below (the desktop inline shell host is CSS-hidden but mounted below md,
+  // so it can't be the cleanup handler there). Named distinctly from the
+  // ``isMobileViewport()`` helper imported from Sidebar.
+  const mobileViewport = useIsMobileViewport();
 
   // Lock the iOS shell to the visual viewport so the soft keyboard can't pan
   // the whole document (which would hide the header and break the layout).
@@ -627,8 +636,8 @@ export function AppShell() {
   // render an empty white card with no way to dismiss it.
   const hasRailContent = Object.values(railTabsAvailable).some(Boolean);
   // Keep the selected tab valid. When the current tab disappears — files
-  // panel turns off, or the Shells tab hides (native wrapper / no shell
-  // and no shell access) — fall back to the first still-visible tab in
+  // panel turns off, or the Shells tab hides (claude-native sub-agent, or no
+  // shell and no shell access) — fall back to the first still-visible tab in
   // display order (Files · Agents · Shells · Tasks · Browser). Picking the first
   // available (rather than ping-ponging between two effects) keeps this
   // convergent even when several tabs vanish at once.
@@ -639,6 +648,45 @@ export function AppShell() {
     );
     if (next) setRightRailTab(next);
   }, [railTabsAvailable, rightRailTab]);
+
+  // Off-surface dead-active-shell cleanup. The ACTIVE shell tab is normally
+  // pruned by the mounted InlineTerminalsSection (it calls
+  // ``returnToShellList(true)`` on an unexpected close, owning the create-gap
+  // bridge + announce). But when the inline shell surface is NOT the displayed
+  // one — the user switched to Files/Agents, collapsed the rail, or is on
+  // mobile — that section is unmounted and can't fire, so an active shell that
+  // closes externally leaves a dangling active key. That silently drops the
+  // tab (the pruning effect above retains the active key) and lets a same-id
+  // relaunch resurrect a stale tab. Handle it here where the state lives.
+  const inlineShellSurfaceDisplayed =
+    hostsShellsInline &&
+    hasRailContent &&
+    rightPanelOpen &&
+    (terminalFirst || !panelOpen) &&
+    !executionLogsOpen &&
+    !filesPanelOpen &&
+    selectedFilePath === null &&
+    rightRailTab === "terminals" &&
+    railTabsAvailable.terminals &&
+    !mobileViewport;
+  useEffect(() => {
+    const activeKey = activeShellKeyState;
+    // Only act on the CURRENT conversation's active key (the reset effect
+    // clears a stale one on switch); skip while the inline section is mounted
+    // to handle its own active tab, and while the PTY is still live.
+    if (activeKey === null || shellStateConv !== conversationId) return;
+    if (inlineShellSurfaceDisplayed) return;
+    const live = new Set(railTerminals.map((t) => terminalTabKey(t)));
+    if (live.has(activeKey)) return;
+    setActiveShellKey(null);
+    setOpenShellKeys((prev) => prev.filter((k) => k !== activeKey));
+  }, [
+    activeShellKeyState,
+    shellStateConv,
+    conversationId,
+    inlineShellSurfaceDisplayed,
+    railTerminals,
+  ]);
 
   // Mount the relay at the always-present shell level (not BrowserPane, which
   // only mounts while its tab is selected) so it's listening before the first
@@ -767,13 +815,23 @@ export function AppShell() {
   // a deliberately narrow scope so a stale "terminal view" preference
   // can't survive across browser sessions, where the user's mental model
   // may have moved on.
+  // Set the center-view key + its owning conversation together so the two
+  // React states can never drift. ``conv`` is the owner to tag; a null key
+  // clears ownership too (no owner needed for "no key"). This does NOT touch
+  // sessionStorage — the storage writer is ``setPanelInitialKey`` below, and
+  // the restore effect's park path must set the React key to null WITHOUT
+  // removing storage. Keeping this pure to the two React states preserves both.
+  const applyPanelKey = useCallback((key: string | null, conv: string | null) => {
+    setPanelInitialKeyState(key);
+    setPanelKeyConv(key === null ? null : conv);
+  }, []);
+
   const setPanelInitialKey = useCallback(
     (key: string | null) => {
-      setPanelInitialKeyState(key);
       // Tag the key with the current conversation so the gated
       // ``panelInitialKey`` only surfaces it here (a null owner would gate it
-      // out). A null key clears ownership too — no owner needed for "no key".
-      setPanelKeyConv(key === null ? null : (conversationId ?? null));
+      // out).
+      applyPanelKey(key, conversationId ?? null);
       if (!conversationId) return;
       const storageKey = `omnigent.web.panel-key:${conversationId}`;
       if (key === null) {
@@ -782,7 +840,7 @@ export function AppShell() {
         sessionStorage.setItem(storageKey, key);
       }
     },
-    [conversationId],
+    [conversationId, applyPanelKey],
   );
 
   // Restore the per-session workspace state when switching conversations:
@@ -811,8 +869,7 @@ export function AppShell() {
       setRightRailTab("files");
       setSelectedFilePath(null);
       setOpenFiles([]);
-      setPanelInitialKeyState(null);
-      setPanelKeyConv(null);
+      applyPanelKey(null, null);
       stateConvRef.current = null;
       return;
     }
@@ -907,10 +964,10 @@ export function AppShell() {
     // gated ``panelInitialKey`` ignores any key whose owner isn't the current
     // conversationId, so this re-ownership (and the null-owner reset for a
     // parked/scrubbed key) is what lets a restored key reach the center path.
-    const restore = (key: string | null) => {
-      setPanelInitialKeyState(key);
-      setPanelKeyConv(key === null ? null : conversationId);
-    };
+    // ``applyPanelKey`` sets only the two React states — it never touches
+    // sessionStorage, so the park path below (restore(null)) leaves the stored
+    // key in place to revisit, while the scrub path removes storage explicitly.
+    const restore = (key: string | null) => applyPanelKey(key, conversationId);
     const storageKey = `omnigent.web.panel-key:${conversationId}`;
     const stored = sessionStorage.getItem(storageKey);
     const isUserShell =
@@ -930,7 +987,7 @@ export function AppShell() {
     } else {
       restore(stored);
     }
-  }, [conversationId, sessionLabelsReady, hostsShellsInline]);
+  }, [conversationId, sessionLabelsReady, hostsShellsInline, applyPanelKey]);
 
   // Persist the per-session rail tab + open file tabs whenever they change.
   // Keyed on the state (not conversationId) and targeted at the conversation
@@ -1218,8 +1275,14 @@ export function AppShell() {
   // user shell in the rail while that stays mounted would hide chat AND leave
   // two live PTY connections. Clearing the center key puts chat beside the
   // rail-hosted shell with a single PTY, matching the Files-tab pattern.
-  function openShellTab(key: string) {
-    if (!conversationId) return;
+  //
+  // ``source`` is the conversation the selection originated in. A shell-create
+  // started in A whose POST resolves after the user navigated to B calls back
+  // here late; reject the WHOLE mutation (file/panel clear, tab select, rail
+  // open, active-shell set, persistence) unless the source still matches the
+  // current conversation, so a pending create in A can't rewrite B's workspace.
+  function openShellTab(key: string, source: string) {
+    if (!conversationId || source !== conversationId) return;
     setSelectedFilePath(null); // close file viewer
     clearFileViewerUrl();
     setExecutionLogsKey(null);
@@ -1594,6 +1657,8 @@ export function AppShell() {
                     onOpenShell={openShellTab}
                     onCloseShell={closeShellTab}
                     onReturnToShellList={returnToShellList}
+                    hostsShellsInline={hostsShellsInline}
+                    sessionLabelsReady={sessionLabelsReady}
                     permissionLevel={permissionLevel}
                     filesPanelSort={filesPanelSort}
                     onSortChange={handleFilesSortChange}
