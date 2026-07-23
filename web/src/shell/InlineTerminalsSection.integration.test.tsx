@@ -302,6 +302,8 @@ describe("InlineTerminalsSection new-shell integration", () => {
 
     // The selection callback tags conversation A as the source — AppShell's
     // openShellTab rejects it whenever the current conversation is no longer A.
-    expect(onOpenShell).toHaveBeenCalledWith("terminal:terminal_shell_new", "conv_a");
+    // pendingInventory=true: a freshly-created shell not yet in the inventory,
+    // so AppShell bridges the create→inventory gap for its off-surface cleanup.
+    expect(onOpenShell).toHaveBeenCalledWith("terminal:terminal_shell_new", "conv_a", true);
   });
 });

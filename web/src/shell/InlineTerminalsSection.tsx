@@ -74,9 +74,12 @@ interface InlineTerminalsSectionProps {
    * component (see ``pendingCreatedKeyRef``), so this exposes only the key.
    * ``source`` is the conversation the selection originated in; the parent
    * drops the mutation when navigation has since moved to another session
-   * (a pending create in A must not rewrite B's workspace).
+   * (a pending create in A must not rewrite B's workspace). ``pendingInventory``
+   * is true on the create path (the shell isn't in the inventory yet) so the
+   * parent can bridge the create→inventory gap for its off-surface cleanup —
+   * this component owns the same bridge only while it stays mounted.
    */
-  onOpenShell?: (key: string, source: string) => void;
+  onOpenShell?: (key: string, source: string, pendingInventory: boolean) => void;
   /**
    * Deselect the active shell back to the list (controlled mode).
    * `unexpected` is true when the shell vanished on its own (closed out
@@ -217,8 +220,10 @@ export function InlineTerminalsSection({
         // Tag the mutation with its source conversation. AppShell rejects the
         // whole UI mutation (file/panel clear, tab select, rail open, active
         // shell, persistence) when navigation has moved on, so a pending
-        // create in A can't rewrite B's workspace.
-        onOpenShell?.(key, source);
+        // create in A can't rewrite B's workspace. ``pendingInventory`` lets
+        // AppShell bridge the create→inventory gap for its off-surface cleanup
+        // if this section unmounts before the shell surfaces.
+        onOpenShell?.(key, source, pendingInventory);
       } else {
         setLocalActiveKey(key);
       }
