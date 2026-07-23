@@ -372,9 +372,24 @@ the stored `{token, user_id, expires_at}` record simply lapsed, default
   token rides back once (`/auth/cli-poll` / the login response) as an
   optional `refresh_token` key — old CLIs ignore it, new CLIs against old
   servers see it absent. `client_id` is `"omnigent-cli"`.
+- **Authority** — a refreshed login-grant token carries `grant_id` (so
+  revocation still kills it) but **no `scope` claim**, so the delegated
+  path allowlist does not apply: it renews the session JWT and keeps that
+  same authority. Scoping it like a third-party device grant instead made
+  every non-allowlisted route (`/v1/usage`, `/v1/scheduled-tasks`,
+  `/v1/policy-registry`) 401 after the first refresh. `LOGIN_GRANT_CLIENT_ID`
+  is the marker and is **reserved** — `/oauth/device/authorize` refuses a
+  request naming it, so a device client cannot self-declare into this class.
+- **No rotation** — login grants return the SAME refresh token on every
+  renewal. Rotation + reuse detection is right for a browser-adjacent
+  third-party client, but for an unattended host it turns any ambiguous
+  network failure (lost response, crash between the server committing and
+  the client persisting) into a permanently revoked grant. Only the
+  short-lived access token is renewed; revocation and the absolute lifetime
+  cap still bound exposure. Device grants keep rotating.
 - **Renewal** — `omnigent.cli_auth.refresh_stored_token` POSTs
-  `grant_type=refresh_token`, persists the rotated pair, and returns the
-  fresh **delegated** access token. The runner/host auth-token factory
+  `grant_type=refresh_token`, persists the result, and returns the
+  fresh access token. The runner/host auth-token factory
   calls it when the stored token lapses, and the host tunnel rebuilds
   headers through that factory on every reconnect — so an unattended
   host renews itself for the grant's lifetime. Refreshes on one machine
@@ -382,16 +397,30 @@ the stored `{token, user_id, expires_at}` record simply lapsed, default
   so a losing racer picks up the winner's rotated pair instead of
   replaying the stale token (which reuse detection would punish by
   revoking the grant).
-- **One grant per host replica** — rotation + reuse detection means N
-  replicas stamped with *copies* of one token file will revoke each
-  other's grant. Each unattended host must get its own `omnigent login`
-  (mirroring how each managed sandbox runner gets its own binding
-  token).
+- **One grant per host replica (recommended)** — since login grants do
+  not rotate, N replicas sharing one token file no longer revoke each
+  other. A per-replica login is still preferred so a single host can be
+  revoked without cutting off the rest.
 - **Lifetime** — the absolute grant lifetime stays 30 days by default;
   `OMNIGENT_GRANT_MAX_LIFETIME_DAYS` lets an operator extend it
   deliberately for long-lived unattended hosts. Invalid values fall back
   to the default (never fail open to unbounded).
-- **Privilege** — after the first refresh the client holds a
-  delegated-scope token (session APIs only, admin paths refused), which
-  is the right posture for a long-lived unattended credential. Admin CLI
-  operations keep working within the initial session-JWT lifetime.
+- **Client-secret interaction** — `OMNIGENT_DEVICE_CLIENT_SECRET` gates
+  the endpoints that mint from an ephemeral code (device authorize + the
+  `device_code` exchange). Refresh and revoke are NOT gated: the presented
+  refresh/access token is itself the credential, and a CLI renewing its own
+  login has no way to carry that secret (gating it made every automatic
+  refresh 401 in a Slack-serving deployment).
+- **Housekeeping** — `/oauth/token` opportunistically purges expired and
+  aged-out grants. The device flow purges on `authorize`, which a
+  standalone token-router mount does not have, so login-grant rows would
+  otherwise accumulate one per login.
+
+### Known limitation
+
+General CLI commands (`omnigent usage`, session commands, direct
+remote-URL chat) still read the stored token without attempting a refresh —
+only the host/runner auth-token factory renews today. An expired login with
+valid refresh material therefore leaves those commands unauthenticated
+until something on the host path renews the shared file. Wiring the
+remaining CLI entrypoints is follow-up work.
