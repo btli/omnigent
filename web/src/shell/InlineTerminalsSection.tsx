@@ -44,6 +44,23 @@ interface InlineTerminalsSectionProps {
    */
   readOnly?: boolean;
   /**
+   * AppShell's single "hosts shells inline, not center" verdict, passed
+   * down so this section never recomputes it from a possibly-stale label
+   * source. When omitted (mobile drawer / unit tests) it falls back to the
+   * context-derived ``!isNativeWrapper``. Combined with ``inline`` it
+   * decides whether a row hosts in-rail or hands off to ``onExpand``.
+   */
+  hostsShellsInline?: boolean;
+  /**
+   * Whether a successful label source has settled the session's shape
+   * (native wrapper vs inline-hosting). While false the routing verdict is
+   * not yet authoritative, so shell-create is parked/disabled — starting a
+   * shell against a mislabeled default could capture the wrong host and
+   * leave a highlighted tab that renders no terminal. Default true (the
+   * self-hosting paths that don't supply it aren't shape-sensitive).
+   */
+  sessionLabelsReady?: boolean;
+  /**
    * Active shell tab key when inline hosting is CONTROLLED by the parent
    * (desktop rail). Mirrors the Files tab's `selectedFilePath`: null shows
    * the shell list, a key hosts that shell. Providing `onOpenShell` opts
@@ -55,8 +72,11 @@ interface InlineTerminalsSectionProps {
    * Select a shell (controlled mode) — the parent records the open tab and
    * sets it active. The create->inventory gap marker stays internal to this
    * component (see ``pendingCreatedKeyRef``), so this exposes only the key.
+   * ``source`` is the conversation the selection originated in; the parent
+   * drops the mutation when navigation has since moved to another session
+   * (a pending create in A must not rewrite B's workspace).
    */
-  onOpenShell?: (key: string) => void;
+  onOpenShell?: (key: string, source: string) => void;
   /**
    * Deselect the active shell back to the list (controlled mode).
    * `unexpected` is true when the shell vanished on its own (closed out
@@ -70,6 +90,8 @@ export function InlineTerminalsSection({
   onExpand,
   inline = false,
   readOnly = false,
+  hostsShellsInline,
+  sessionLabelsReady = true,
   activeKey: controlledActiveKey,
   onOpenShell,
   onReturnToList,
@@ -96,8 +118,14 @@ export function InlineTerminalsSection({
   // `isTerminalFirst`. Native wrappers keep routing to `onExpand`, which
   // opens the shell full-screen in the main column via MainTerminalView —
   // their established, chat-replacing UX.
+  // Prefer AppShell's single hostsShellsInline verdict when supplied (the
+  // controlled desktop rail) so this section can't recompute a DIFFERENT
+  // answer from a label source that resolved on a different tick. Fall back to
+  // the context-derived ``!isNativeWrapper`` only for the self-hosting paths
+  // (mobile drawer / unit tests) that don't lift the verdict.
   const isNativeWrapper = terminalFirstCtx?.isNativeWrapper ?? false;
-  const hostInline = inline && !isNativeWrapper;
+  const hostsInlineVerdict = hostsShellsInline ?? !isNativeWrapper;
+  const hostInline = inline && hostsInlineVerdict;
 
   // Inline hosting: which shell is shown in the rail. Null shows the list;
   // a closed/disappeared shell falls back to the list below. CONTROLLED
@@ -112,6 +140,16 @@ export function InlineTerminalsSection({
   const shouldFocusListRef = useRef(false);
   const pendingCreatedKeyRef = useRef<string | null>(null);
   const activeTerminal = terminals.find((t) => terminalTabKey(t) === activeKey) ?? null;
+  // Latest routing inputs, so a create callback that fires AFTER an async
+  // POST resolves re-checks the CURRENT verdict rather than the one captured
+  // when creation started. Between "New shell" click and POST completion the
+  // session labels can resolve (native wrapper revealed), flipping the
+  // routing target — reading the ref keeps a native session from capturing an
+  // inline-owned shell tab that renders no terminal.
+  const hostInlineRef = useRef(hostInline);
+  hostInlineRef.current = hostInline;
+  const conversationIdRef = useRef(conversationId);
+  conversationIdRef.current = conversationId;
 
   const returnToList = useCallback(
     (unexpected: boolean) => {
@@ -163,19 +201,29 @@ export function InlineTerminalsSection({
   // unexpected close). Selecting an existing shell clears the ref.
   const openShell = useCallback(
     (key: string, pendingInventory: boolean) => {
-      if (!hostInline) {
+      // ``pendingInventory`` is the create path — its callback runs after an
+      // async POST, so re-read the LATEST routing verdict (ref, not the value
+      // captured when the click happened). A native-wrapper label that
+      // resolved mid-flight flips the target: route full-screen via onExpand
+      // instead of capturing an inline-owned tab that renders no terminal.
+      const source = conversationIdRef.current;
+      if (!hostInlineRef.current) {
         onExpand(key);
         return;
       }
       pendingCreatedKeyRef.current = pendingInventory ? key : null;
       setAnnouncement("");
       if (controlled) {
-        onOpenShell?.(key);
+        // Tag the mutation with its source conversation. AppShell rejects the
+        // whole UI mutation (file/panel clear, tab select, rail open, active
+        // shell, persistence) when navigation has moved on, so a pending
+        // create in A can't rewrite B's workspace.
+        onOpenShell?.(key, source);
       } else {
         setLocalActiveKey(key);
       }
     },
-    [hostInline, onExpand, controlled, onOpenShell],
+    [onExpand, controlled, onOpenShell],
   );
 
   return (
@@ -235,6 +283,12 @@ export function InlineTerminalsSection({
             conversationId={conversationId}
             onCreated={(key) => openShell(key, true)}
             variant="row"
+            // Park shell-create until the routing verdict is authoritative:
+            // a shell started against a mislabeled default could complete
+            // after native labels arrive and capture the wrong host. Only
+            // gates the controlled inline rail; self-hosting paths pass
+            // sessionLabelsReady=true (their shape isn't ambiguous here).
+            disabled={hostInline && !sessionLabelsReady}
           />
           {terminals.map((t) => (
             <button

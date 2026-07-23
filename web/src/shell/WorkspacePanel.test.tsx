@@ -60,6 +60,8 @@ function renderWorkspace(
     permissionLevel?: number | null;
     openShells?: TerminalInfo[];
     activeShellKey?: string | null;
+    hostsShellsInline?: boolean;
+    sessionLabelsReady?: boolean;
   } = {},
 ) {
   const openFileViewer = vi.fn();
@@ -98,6 +100,8 @@ function renderWorkspace(
       onOpenShell={onOpenShell}
       onCloseShell={onCloseShell}
       onReturnToShellList={onReturnToShellList}
+      hostsShellsInline={overrides.hostsShellsInline ?? true}
+      sessionLabelsReady={overrides.sessionLabelsReady ?? true}
       permissionLevel={overrides.permissionLevel ?? null}
       filesPanelSort={"recent" as ChangedSort}
       onSortChange={vi.fn()}
@@ -268,7 +272,8 @@ describe("WorkspacePanel shell identity tabs (header parity with Files)", () => 
     });
 
     fireEvent.click(screen.getByText("worker · s2"));
-    expect(onOpenShell).toHaveBeenCalledWith("terminal:terminal_worker_s2");
+    // Strip-tab clicks carry the current conversation as the mutation source.
+    expect(onOpenShell).toHaveBeenCalledWith("terminal:terminal_worker_s2", "conv_ws");
 
     fireEvent.click(screen.getByRole("button", { name: /close worker · s2/i }));
     expect(onCloseShell).toHaveBeenCalledWith("terminal:terminal_worker_s2");
@@ -297,7 +302,7 @@ describe("WorkspacePanel shell identity tabs (header parity with Files)", () => 
     // Clicking it activates the shell inline (AppShell pulls the rail to
     // Shells) — the same one-click switch a file tab gives.
     fireEvent.click(shellTab);
-    expect(onOpenShell).toHaveBeenCalledWith("terminal:terminal_bash_s1");
+    expect(onOpenShell).toHaveBeenCalledWith("terminal:terminal_bash_s1", "conv_ws");
   });
 
   it("does not highlight the shell tab when another rail tab is displayed (highlight-desync)", () => {

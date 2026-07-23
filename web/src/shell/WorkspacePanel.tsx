@@ -1,5 +1,6 @@
 import { BotIcon, FileIcon, GlobeIcon, ListTodoIcon, TerminalIcon, XIcon } from "lucide-react";
 import { useCallback, useEffect, useRef } from "react";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { type TerminalInfo, terminalTabKey } from "@/hooks/useTerminals";
 import { cn } from "@/lib/utils";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -248,9 +249,11 @@ interface WorkspacePanelProps {
   changedCount: number;
   /**
    * Whether the Shells tab is available — AppShell's combined gate
-   * (not a native wrapper, AND either a shell exists or the agent's
-   * spec declares shell access, which makes the tab show by default
-   * with its "+ New shell" empty state).
+   * (not a claude-native sub-agent, AND either a shell exists or the
+   * agent's spec declares shell access, which makes the tab show by
+   * default with its "+ New shell" empty state). Native wrappers get the
+   * tab too; only claude-native sub-agents are excluded (parent owns the
+   * tmux pane).
    */
   showShellsTab: boolean;
   /** Number of open shells, shown as the Shells tab badge when > 0. */
@@ -301,8 +304,23 @@ interface WorkspacePanelProps {
   openShells: TerminalInfo[];
   /** Active shell tab key, or null when the Shells tab shows the list. */
   activeShellKey: string | null;
-  /** Select a shell (adds/activates its tab and hosts it inline). */
-  onOpenShell: (key: string) => void;
+  /**
+   * Select a shell (adds/activates its tab and hosts it inline). ``source``
+   * is the conversation the selection originated in; AppShell drops the
+   * mutation if navigation has since moved on.
+   */
+  onOpenShell: (key: string, source: string) => void;
+  /**
+   * AppShell's single "hosts shells inline, not center" verdict, forwarded
+   * to the inline shell section so it never recomputes routing from a
+   * possibly-stale label source.
+   */
+  hostsShellsInline: boolean;
+  /**
+   * Whether a successful label source has settled the session shape. Gates
+   * shell-create in the inline section until routing is authoritative.
+   */
+  sessionLabelsReady: boolean;
   /** Close a single open shell tab by key. */
   onCloseShell: (key: string) => void;
   /** Deselect the active shell tab, revealing the shell list. */
@@ -368,6 +386,8 @@ export function WorkspacePanel({
   onOpenShell,
   onCloseShell,
   onReturnToShellList,
+  hostsShellsInline,
+  sessionLabelsReady,
   permissionLevel,
   filesPanelSort,
   onSortChange,
@@ -382,6 +402,12 @@ export function WorkspacePanel({
   const handleCloseTab = useCallback(() => {
     if (selectedFilePath !== null) onCloseFile(selectedFilePath);
   }, [onCloseFile, selectedFilePath]);
+  // This rail is CSS-hidden below md (`hidden md:flex`) but stays MOUNTED, so
+  // its inline TerminalView + read-write PTY WebSocket would stay live under
+  // the mobile drawer/overlay path — two attachments to the same shell. Gate
+  // the inline shell host on the real breakpoint so only the visible surface
+  // holds a live PTY. Reactive: crossing the breakpoint unmounts/remounts it.
+  const isMobileViewport = useIsMobileViewport();
   // Which surface is ACTUALLY on screen decides the tab highlight — not the raw
   // ``activeShellKey``, which stays set (so returning to the Shells tab resumes
   // the same shell) even while a file or another tab is shown. Content priority
@@ -391,6 +417,18 @@ export function WorkspacePanel({
   // ``aria-current`` while Files/Agents content shows).
   const displayedShellKey =
     selectedFilePath === null && rightRailTab === "terminals" ? activeShellKey : null;
+  // The value fed to the static Tabs group. When a file OR shell tab is the
+  // displayed surface, feed a sentinel that matches no fixed trigger (the
+  // file/shell tab carries its own highlight in FileTabsStrip / ShellTabsStrip);
+  // otherwise the selected rail tab drives it. Priority: file > shell > rail.
+  let stripTabsValue: string;
+  if (selectedFilePath !== null) {
+    stripTabsValue = "__file__";
+  } else if (displayedShellKey !== null) {
+    stripTabsValue = "__shell__";
+  } else {
+    stripTabsValue = rightRailTab;
+  }
   return (
     <aside
       aria-label="Workspace"
@@ -438,17 +476,11 @@ export function WorkspacePanel({
           // the left in the ≥500px case and contributes its full width to the
           // outer scroller in the <500px case.
           className="shrink-0"
-          // When a file OR shell tab is active no fixed trigger should
-          // highlight, so feed the radix group a sentinel that matches none of
-          // them. The active file/shell tab carries its own highlight (see
-          // FileTabsStrip / ShellTabsStrip).
-          value={
-            selectedFilePath !== null
-              ? "__file__"
-              : displayedShellKey !== null
-                ? "__shell__"
-                : rightRailTab
-          }
+          // ``stripTabsValue`` (computed above) resolves file > shell > rail:
+          // a file/shell surface feeds a sentinel that matches no fixed
+          // trigger, so the active file/shell tab carries its own highlight
+          // (see FileTabsStrip / ShellTabsStrip).
+          value={stripTabsValue}
           onValueChange={(v) => onRightRailTabChange(v as RightRailTab)}
         >
           <TabsList variant="pill">
@@ -559,7 +591,9 @@ export function WorkspacePanel({
               <ShellTabsStrip
                 shells={openShells}
                 activeShellKey={displayedShellKey}
-                onShellSelect={onOpenShell}
+                // A strip-tab click is synchronous in the current
+                // conversation, so it is always its own source.
+                onShellSelect={(key) => onOpenShell(key, conversationId)}
                 onCloseShell={onCloseShell}
               />
             </div>
@@ -570,9 +604,10 @@ export function WorkspacePanel({
           file is open, FilesPanel otherwise; Shells hosts the active
           shell's terminal inline (list ↔ terminal, mirroring the Files
           tab); Subagents lists the root's children + a "main" link back
-          to the parent. The Shells branch is unreachable when its tab
-          is hidden — native wrappers, claude-native sub-agents, or no
-          shell attached. */}
+          to the parent. The Shells branch is unreachable only when its
+          tab is hidden — a claude-native sub-agent, or an agent with no
+          shell and no declared shell access. (Native wrappers DO get the
+          tab; the section just routes their rows full-screen.) */}
       <div data-workspace-panel-content className="flex min-h-0 flex-1 flex-col overflow-hidden">
         {selectedFilePath !== null ? (
           <FileViewer
@@ -599,11 +634,22 @@ export function WorkspacePanel({
           // Desktop rail: host the active shell inline, mirroring the
           // Files tab's inline FileViewer — chat stays visible. The
           // full-screen overlay path (`onExpand`) is the mobile fallback.
+          // ``inline`` drops to false while this (still-mounted but
+          // CSS-hidden) rail is below the md breakpoint, so its TerminalView
+          // and PTY WebSocket don't stay live under the mobile overlay path —
+          // only one surface holds a read-write attachment at a time.
           <InlineTerminalsSection
+            // Key by conversation so a client-side navigation unmounts this
+            // instance and cancels any per-mutation create callback bound to
+            // the previous session, rather than letting it fire against the
+            // new one.
+            key={conversationId}
             conversationId={conversationId}
             onExpand={openTerminalsPanel}
-            inline
+            inline={!isMobileViewport}
             readOnly={!isOwnerLevel(permissionLevel)}
+            hostsShellsInline={hostsShellsInline}
+            sessionLabelsReady={sessionLabelsReady}
             activeKey={activeShellKey}
             onOpenShell={onOpenShell}
             onReturnToList={onReturnToShellList}

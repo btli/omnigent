@@ -49,15 +49,26 @@ interface NewTerminalButtonProps {
    * entry rather than floating in empty space.
    */
   variant?: "icon" | "row";
+  /**
+   * Park the affordance while the caller's routing verdict isn't yet
+   * authoritative — the inline rail sets this until the session labels
+   * settle so a shell can't be created against a mislabeled shape. Merged
+   * with the in-flight ``create.isPending`` gate.
+   */
+  disabled?: boolean;
 }
 
 export function NewTerminalButton({
   conversationId,
   onCreated,
   variant = "icon",
+  disabled = false,
 }: NewTerminalButtonProps) {
   const { data: agent } = useSessionAgent(conversationId);
   const create = useCreateTerminal(conversationId);
+  // Disabled while a create is in flight OR the caller hasn't cleared its
+  // routing gate (labels still pending on the inline rail).
+  const isDisabled = create.isPending || disabled;
   // Native-wrapper sessions declare the host's installed shells as their
   // terminals (default `$SHELL` first); SDK agents declare distinct-purpose
   // terminals with no default. Only the native case gets the split-button
@@ -90,7 +101,7 @@ export function NewTerminalButton({
       <button
         type="button"
         aria-label="New shell"
-        disabled={create.isPending}
+        disabled={isDisabled}
         className="flex w-full items-center gap-2 px-2 py-1.5 text-left text-muted-foreground hover:bg-accent/60 hover:text-foreground disabled:cursor-default disabled:opacity-50"
         onClick={onTriggerClick}
       >
@@ -103,7 +114,7 @@ export function NewTerminalButton({
       <button
         type="button"
         aria-label="New shell"
-        disabled={create.isPending}
+        disabled={isDisabled}
         className="cursor-pointer rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50"
         onClick={onTriggerClick}
       >
@@ -159,7 +170,7 @@ export function NewTerminalButton({
       <button
         type="button"
         aria-label="Choose shell"
-        disabled={create.isPending}
+        disabled={isDisabled}
         className={
           variant === "row"
             ? "flex shrink-0 items-center px-2 py-1.5 text-muted-foreground hover:bg-accent/60 hover:text-foreground disabled:cursor-default disabled:opacity-50"
