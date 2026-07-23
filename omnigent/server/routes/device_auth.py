@@ -81,6 +81,26 @@ _CLIENT_SECRET_HEADER = "X-Omnigent-Client-Secret"
 # refuses admin / user-management paths for a token carrying this scope.
 DELEGATED_SCOPE = "sessions"
 
+# Reserved ``client_id`` for a first-party login grant (issued by
+# ``omnigent login``, not the RFC 8628 device flow). It is a
+# security-decision key here, so the device-authorize endpoint REFUSES a
+# request that names it — a third-party device client can never obtain a
+# grant tagged this way, and a refresh of such a grant is therefore safe
+# to treat as first-party. See :func:`issue_login_grant`,
+# ``_is_login_grant``, and the reservation guard in ``device_authorize``.
+LOGIN_GRANT_CLIENT_ID = "omnigent-cli"
+
+
+def _is_login_grant(client_id: str | None) -> bool:
+    """Return True for a first-party login grant (vs. a device grant).
+
+    Trustworthy because :data:`LOGIN_GRANT_CLIENT_ID` is reserved: the
+    device-authorize path rejects it, so only the server-side login flow
+    can create a grant carrying it.
+    """
+    return client_id == LOGIN_GRANT_CLIENT_ID
+
+
 # RFC 8628 timings.
 _DEVICE_CODE_TTL_SECONDS = 600  # 10 min — bounds the unapproved window.
 _POLL_INTERVAL_SECONDS = 5  # minimum client poll interval.
@@ -142,9 +162,16 @@ def _client_id(body: dict) -> str | None:
 
     A public string naming the requesting application (e.g. Slack passes
     ``"slack"``), the same for every grant that application initiates.
-    Display + audit only — never an authorization key.
+    Display + audit only for device grants — but see
+    :data:`LOGIN_GRANT_CLIENT_ID`, which is reserved and refused here.
+
+    Non-string values (``{"client_id": 123}``) read as absent rather than
+    raising, so a malformed body is a clean 400 and not a 500.
     """
-    return (body.get("client_id") or "").strip() or None
+    raw = body.get("client_id")
+    if not isinstance(raw, str):
+        return None
+    return raw.strip() or None
 
 
 def _mint_refresh_token() -> str:
@@ -161,34 +188,38 @@ def mint_delegated_token(
     grant_id: str,
     client_id: str,
     jti: str,
-    scope: str = DELEGATED_SCOPE,
+    scope: str | None = DELEGATED_SCOPE,
 ) -> str:
-    """Mint a delegated access token for a device-authorization grant.
+    """Mint a grant-derived access token.
 
     Same HS256 shape as
     :func:`omnigent.server.oidc.mint_session_token` (so
     :meth:`UnifiedAuthProvider._check_cookie` validates it unchanged),
-    plus four delegated-only claims:
+    plus grant claims:
 
-    - ``scope`` — restricts the token to the session APIs; the auth
-      layer rejects admin endpoints when this claim is present.
-    - ``grant_id`` — the device grant this token was issued from,
-      checked against the revocation denylist so revoking the grant
-      immediately kills the token.
+    - ``scope`` — present ⇒ the auth layer restricts the token to the
+      session APIs and refuses admin endpoints. ``None`` omits the claim,
+      giving the token the SAME authority as the session JWT it renews —
+      used ONLY for first-party login grants, whose bearer is the
+      authenticated user's own CLI/host, not a third-party client.
+    - ``grant_id`` — the grant this token was issued from, checked against
+      the revocation denylist so revoking the grant immediately kills the
+      token. Carried regardless of scope.
     - ``jti`` — unique token id, for audit/log correlation.
     - ``act`` — provenance (RFC 8693 style), ``{"client_id": "<app>"}``,
-      naming the application that obtained the grant so every delegated
-      action is attributable to it.
+      naming the application that obtained the grant so every action is
+      attributable to it.
 
     :param user_id: The Omnigent identity the token acts as (``sub``).
     :param cookie_secret: HMAC key for HS256 signing.
     :param ttl_seconds: Token lifetime in seconds (kept short — ≤ 1 h).
     :param provider: Identity provider name (informational claim).
-    :param grant_id: The device grant id.
-    :param client_id: The RFC 8628 client id (the requesting application,
+    :param grant_id: The grant id.
+    :param client_id: The client id (the requesting application,
         e.g. ``"slack"``); recorded in the ``act`` claim for audit.
     :param jti: Unique token id.
-    :param scope: Granted scope; defaults to :data:`DELEGATED_SCOPE`.
+    :param scope: Granted scope, or ``None`` for a full-authority
+        (login-grant) token. Defaults to :data:`DELEGATED_SCOPE`.
     :returns: An HS256-signed JWT string.
     """
     now = int(time.time())
@@ -197,11 +228,12 @@ def mint_delegated_token(
         "iat": now,
         "exp": now + ttl_seconds,
         "provider": provider,
-        "scope": scope,
         "grant_id": grant_id,
         "jti": jti,
         "act": {"client_id": client_id},
     }
+    if scope is not None:
+        payload["scope"] = scope
     return jwt.encode(payload, cookie_secret, algorithm="HS256")
 
 
@@ -339,7 +371,6 @@ def issue_login_grant(
     *,
     user_id: str,
     cookie_secret: bytes,
-    client_id: str = "omnigent-cli",
 ) -> str:
     """Create a redeemed refresh grant for an interactive login.
 
@@ -347,19 +378,20 @@ def issue_login_grant(
     ``/auth/login``) so the CLI walks away with refresh material and can
     renew its access without a human re-running ``omnigent login``. The
     interactive login *is* the consent step, so the grant is born
-    ``redeemed``.
+    ``redeemed`` and tagged with the reserved
+    :data:`LOGIN_GRANT_CLIENT_ID` — which the device-authorize path
+    refuses, so this authority class can only originate here.
 
     :param device_grant_store: Grant persistence.
     :param user_id: The just-authenticated identity.
     :param cookie_secret: HMAC key for hashing the refresh token.
-    :param client_id: Public client name for audit.
     :returns: The raw refresh token to hand to the client (stored hashed).
     """
     refresh_token = _mint_refresh_token()
     device_grant_store.create_redeemed_grant(
         secrets.token_urlsafe(24),
         user_id=user_id,
-        client_id=client_id,
+        client_id=LOGIN_GRANT_CLIENT_ID,
         refresh_token_hash=hash_secret(refresh_token, cookie_secret),
         created_at=int(time.time()),
     )
@@ -392,8 +424,35 @@ def create_oauth_token_router(
     cookie_secret, provider_name = _resolve_signing_config(auth_provider)
     _client_secret_ok = _make_client_secret_gate()
     router = APIRouter()
+    # Throttle for the opportunistic grant purge (bounds the table without a
+    # separate scheduler). Mutable one-field dict so the closures can update
+    # it. ``0.0`` forces a purge on the first refresh after boot.
+    _last_purge = {"at": 0.0}
+
+    def _maybe_purge() -> None:
+        """Purge expired/aged grants at most once per interval.
+
+        The device flow purges on ``/oauth/device/authorize``, but the
+        standalone token router (OIDC, or accounts without the device flow)
+        has no authorize route — so login grants would otherwise accumulate
+        one row per login. Piggyback the purge on refresh instead.
+        """
+        now_wall = time.time()
+        if now_wall - _last_purge["at"] < _PURGE_MIN_INTERVAL_SECONDS:
+            return
+        _last_purge["at"] = now_wall
+        try:
+            device_grant_store.purge_expired(
+                int(now_wall), max_lifetime_seconds=_grant_max_lifetime_seconds()
+            )
+        except Exception:  # noqa: BLE001 — housekeeping must never fail a refresh
+            _logger.debug("oauth/token: opportunistic grant purge failed", exc_info=True)
 
     def _issue_access_token(grant_id: str, user_id: str, client_id: str) -> str:
+        # A first-party login grant renews with the SAME authority as the
+        # session JWT it replaces (scope=None); a third-party device grant
+        # stays restricted to the delegated allowlist.
+        scope = None if _is_login_grant(client_id) else DELEGATED_SCOPE
         return mint_delegated_token(
             user_id,
             cookie_secret,
@@ -402,6 +461,7 @@ def create_oauth_token_router(
             grant_id=grant_id,
             client_id=client_id or "",
             jti=secrets.token_urlsafe(16),
+            scope=scope,
         )
 
     @router.post("/oauth/token", dependencies=[])
@@ -412,12 +472,17 @@ def create_oauth_token_router(
         ``slow_down``, ``expired_token``, ``access_denied``,
         ``invalid_grant``, ``unsupported_grant_type``.
         """
-        if not _client_secret_ok(request):
-            return _oauth_error("invalid_client", status_code=401)
         form = await request.form()
         grant_type = str(form.get("grant_type") or "")
 
         if grant_type == "urn:ietf:params:oauth:grant-type:device_code":
+            # The device-code exchange mints from the ephemeral device_code
+            # alone, so it stays behind the client-secret gate. Refresh
+            # presents the refresh token itself as the credential, so it is
+            # not additionally gated (a CLI/host renewing its own login has
+            # no way to carry the device client secret).
+            if not _client_secret_ok(request):
+                return _oauth_error("invalid_client", status_code=401)
             if handle_device_code is None:
                 return _oauth_error("unsupported_grant_type")
             return handle_device_code(str(form.get("device_code") or ""))
@@ -428,6 +493,9 @@ def create_oauth_token_router(
     def _handle_refresh_grant(refresh_token: str) -> Response:
         if not refresh_token:
             return _oauth_error("invalid_request")
+        # Opportunistic housekeeping so login-grant rows (one per login)
+        # don't accumulate where no device-authorize purge runs.
+        _maybe_purge()
         presented_hash = hash_secret(refresh_token, cookie_secret)
         # A refresh token doesn't name its grant, so locate it by digest.
         # Only a live (redeemed, non-revoked) grant holds a matching hash.
@@ -436,6 +504,8 @@ def create_oauth_token_router(
             # Not the current token. If it matches a grant's *previous*
             # token, a stale token was replayed — reuse/theft. Revoke the
             # whole grant so the attacker's freshly-rotated token dies too.
+            # (Login grants don't rotate, so they never populate the prev
+            # hash and can't reach this revoke.)
             stale = device_grant_store.get_by_prev_refresh_hash(presented_hash)
             if stale is not None:
                 device_grant_store.revoke(stale.id)
@@ -450,6 +520,28 @@ def create_oauth_token_router(
             int(time.time()) - grant.approved_at >= _grant_max_lifetime_seconds()
         ):
             return _oauth_error("expired_token")
+        if grant.user_id is None:
+            return _oauth_error("invalid_grant")
+
+        if _is_login_grant(grant.client_id):
+            # First-party login grants do NOT rotate. The bearer is an
+            # unattended host/CLI, so a lost refresh response (network blip,
+            # crash between the server committing and the client persisting)
+            # must not brick the grant via reuse detection. The same refresh
+            # token stays valid for the grant lifetime; only the short-lived
+            # access token is renewed. Revocation + the absolute lifetime cap
+            # bound the exposure.
+            access_token = _issue_access_token(grant.id, grant.user_id, grant.client_id or "")
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                    "token_type": "Bearer",
+                    "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
+                },
+            )
+
         new_refresh = _mint_refresh_token()
         rotated = device_grant_store.rotate_refresh_token(
             grant.id,
@@ -489,10 +581,10 @@ def create_oauth_token_router(
         Backs ``/omnigent logout``. Accepts a ``refresh_token`` form
         field; falls back to the ``grant_id`` on the caller's own
         delegated access token so a client with only its access token
-        can still log out.
+        can still log out. Not behind the device client-secret gate: the
+        presented refresh/access token IS the credential, and a CLI
+        logging out its own login grant cannot carry that secret.
         """
-        if not _client_secret_ok(request):
-            return _oauth_error("invalid_client", status_code=401)
         form = await request.form()
         refresh_token = str(form.get("refresh_token") or "")
         grant = None
@@ -607,6 +699,15 @@ def create_device_auth_router(
         if not isinstance(body, dict):
             body = {}
         client_id = _client_id(body)
+        # LOGIN_GRANT_CLIENT_ID marks a first-party login grant, whose
+        # refreshed tokens carry full session authority. It is reserved:
+        # a device client must never be able to self-declare into that
+        # class by naming it here.
+        if _is_login_grant(client_id):
+            _logger.warning(
+                "device/authorize: refused reserved client_id %r", LOGIN_GRANT_CLIENT_ID
+            )
+            return _oauth_error("invalid_request")
 
         device_code = secrets.token_urlsafe(32)
         grant_id = secrets.token_urlsafe(16)

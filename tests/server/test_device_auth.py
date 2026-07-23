@@ -19,6 +19,7 @@ import secrets
 from collections.abc import Iterator
 from pathlib import Path
 
+import jwt
 import pytest
 from fastapi.testclient import TestClient
 
@@ -476,8 +477,8 @@ def secret_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Test
 
 
 def test_client_secret_required_when_configured(secret_app: TestClient) -> None:
-    """With the secret set, the client-facing endpoints reject a missing/wrong
-    header and accept the matching one."""
+    """With the secret set, the endpoints that mint from an ephemeral code
+    reject a missing/wrong header and accept the matching one."""
     hdr = {"X-Omnigent-Client-Secret": _SECRET}
 
     # authorize: no header → 401 invalid_client; wrong → 401; correct → 200.
@@ -492,18 +493,32 @@ def test_client_secret_required_when_configured(secret_app: TestClient) -> None:
     r = secret_app.post("/oauth/device/authorize", json={"client_id": "slack"}, headers=hdr)
     assert r.status_code == 200, r.text
 
-    # token + revoke are gated the same way (checked before any body parsing).
-    r = secret_app.post("/oauth/token", data={"grant_type": "refresh_token", "refresh_token": "x"})
-    assert r.status_code == 401 and r.json()["error"] == "invalid_client"
-    r = secret_app.post("/oauth/revoke", data={"refresh_token": "x"})
-    assert r.status_code == 401 and r.json()["error"] == "invalid_client"
-    # With the header, token reaches normal error handling (bad token, not 401).
+    # The device_code exchange mints from the device_code alone, so it stays
+    # gated.
     r = secret_app.post(
         "/oauth/token",
-        data={"grant_type": "refresh_token", "refresh_token": "x"},
-        headers=hdr,
+        data={
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "device_code": "x",
+        },
     )
+    assert r.status_code == 401 and r.json()["error"] == "invalid_client"
+
+
+def test_client_secret_does_not_gate_refresh_or_revoke(secret_app: TestClient) -> None:
+    """Refresh and revoke present their own grant-bound secret, so they are
+    NOT additionally gated by the device client secret.
+
+    A CLI/host renewing its own login grant has no way to carry that secret;
+    gating these would make every automatic refresh fail with 401 in any
+    deployment that sets it (e.g. one also serving Slack).
+    """
+    # No client-secret header: reaches normal OAuth error handling, not 401.
+    r = secret_app.post("/oauth/token", data={"grant_type": "refresh_token", "refresh_token": "x"})
     assert r.status_code == 400 and r.json()["error"] == "invalid_grant"
+    # Revoke stays idempotent without the header.
+    r = secret_app.post("/oauth/revoke", data={"refresh_token": "x"})
+    assert r.status_code == 200 and r.json() == {"revoked": True}
 
 
 def test_browser_consent_not_gated_by_client_secret(secret_app: TestClient) -> None:
@@ -575,7 +590,12 @@ def test_create_redeemed_grant_survives_pending_purge(store: DeviceGrantStore) -
 def test_accounts_login_issue_refresh_round_trip(disabled_app: TestClient) -> None:
     """A CLI login (issue_refresh) yields refresh material that renews via
     /oauth/token even with the device flow disabled — the core unattended-host
-    fix. A rotated-out token then fails closed."""
+    fix.
+
+    Login grants deliberately do NOT rotate: the same refresh token keeps
+    working, so a lost response or a crash between the server committing and
+    the client persisting cannot brick an unattended host.
+    """
     r = disabled_app.post(
         "/auth/login",
         json={"username": "admin", "password": "admin-pw-12345", "issue_refresh": True},
@@ -584,29 +604,116 @@ def test_accounts_login_issue_refresh_round_trip(disabled_app: TestClient) -> No
     refresh = r.json().get("refresh_token")
     assert refresh, "login with issue_refresh must return a refresh token"
 
-    # Refresh: new delegated access token + rotated refresh token.
+    # Refresh: fresh access token, SAME refresh token handed back.
     r = disabled_app.post(
         "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": refresh}
     )
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["access_token"] and body["refresh_token"] != refresh
+    assert body["access_token"]
+    assert body["refresh_token"] == refresh
     assert body["expires_in"] == 3600
 
-    # The delegated token authenticates against an allowlisted API path.
+    # The token authenticates against the API.
     r = disabled_app.get("/v1/hosts", headers={"Authorization": f"Bearer {body['access_token']}"})
     assert r.status_code == 200, r.text
 
-    # Replaying the pre-rotation refresh token is reuse → grant revoked.
+    # Repeat use of the same token keeps working — no reuse revocation.
+    for _ in range(3):
+        again = disabled_app.post(
+            "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": refresh}
+        )
+        assert again.status_code == 200, again.text
+        assert again.json()["refresh_token"] == refresh
+
+
+def test_login_grant_token_keeps_session_authority(disabled_app: TestClient) -> None:
+    """A refreshed login-grant token reaches routes OUTSIDE the delegated
+    allowlist — it renews the session JWT and must keep its authority.
+
+    Regression guard: minting it as a scope-restricted delegated token made
+    ``/v1/usage``-style routes 401 after the first refresh, silently breaking
+    agents and CLI commands on a long-lived host.
+    """
+    r = disabled_app.post(
+        "/auth/login",
+        json={"username": "admin", "password": "admin-pw-12345", "issue_refresh": True},
+    )
+    refresh = r.json()["refresh_token"]
     r = disabled_app.post(
         "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": refresh}
     )
-    assert r.status_code == 400 and r.json()["error"] == "invalid_grant"
-    r = disabled_app.post(
+    access = r.json()["access_token"]
+    auth = {"Authorization": f"Bearer {access}"}
+    # Drop the browser session cookie that /auth/login set, so the bearer
+    # token is the ONLY credential — otherwise the cookie answers and every
+    # assertion below passes vacuously.
+    disabled_app.cookies.clear()
+
+    # Carries grant_id (revocable) but no scope claim (unrestricted).
+    claims = jwt.decode(access, options={"verify_signature": False})
+    assert claims["grant_id"]
+    assert "scope" not in claims
+
+    # Allowlisted route works...
+    assert disabled_app.get("/v1/hosts", headers=auth).status_code == 200
+    # ...and so does one outside the delegated allowlist. A scope-restricted
+    # delegated token is refused here; this one must not be.
+    r = disabled_app.get("/v1/usage", headers=auth)
+    assert r.status_code != 401, f"login-grant token must not be scope-restricted: {r.text}"
+
+    # Revocation still kills it despite the wider authority.
+    assert disabled_app.post("/oauth/revoke", data={"refresh_token": refresh}).status_code == 200
+    assert disabled_app.get("/v1/hosts", headers=auth).status_code == 401
+
+
+def test_device_authorize_refuses_reserved_login_client_id(app: TestClient) -> None:
+    """A device client cannot self-declare into the first-party login-grant
+    class by naming its reserved client_id — that would hand it a
+    full-authority (unscoped) token on refresh."""
+    from omnigent.server.routes.device_auth import LOGIN_GRANT_CLIENT_ID
+
+    r = app.post("/oauth/device/authorize", json={"client_id": LOGIN_GRANT_CLIENT_ID})
+    assert r.status_code == 400 and r.json()["error"] == "invalid_request"
+    assert "device_code" not in r.text
+
+
+def test_device_grant_refresh_stays_scope_restricted(app: TestClient) -> None:
+    """Third-party device grants keep the delegated scope AND keep rotating —
+    the login-grant carve-out must not leak to them."""
+    import time as _time
+
+    r = app.post("/oauth/device/authorize", json={"client_id": "slack"})
+    data = r.json()
+    _login_admin(app)
+    app.post(
+        "/oauth/device/approve",
+        data={"user_code": data["user_code"]},
+        headers={"Origin": "http://localhost:8000"},
+    )
+    for _ in range(4):
+        r = app.post(
+            "/oauth/token",
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": data["device_code"],
+            },
+        )
+        if r.status_code == 200:
+            break
+        _time.sleep(1.2)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    claims = jwt.decode(body["access_token"], options={"verify_signature": False})
+    assert claims["scope"] == "sessions"
+
+    # And it still rotates.
+    r2 = app.post(
         "/oauth/token",
         data={"grant_type": "refresh_token", "refresh_token": body["refresh_token"]},
     )
-    assert r.status_code == 400 and r.json()["error"] == "invalid_grant"
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["refresh_token"] != body["refresh_token"]
 
 
 def test_web_login_never_issues_refresh(disabled_app: TestClient) -> None:

@@ -549,10 +549,16 @@ def test_cli_ticket_fulfillment_issues_refresh_grant(
         )
         assert r.status_code == 200, r.text
         renewed = r.json()
-        assert renewed["access_token"] and renewed["refresh_token"] != refresh
+        assert renewed["access_token"]
+        # Login grants do not rotate — the same refresh token stays valid, so
+        # a lost response cannot brick an unattended host.
+        assert renewed["refresh_token"] == refresh
         decoded = jwt.decode(renewed["access_token"], _TEST_SECRET, algorithms=["HS256"])
         assert decoded["sub"] == "alice@example.com"
-        assert decoded["scope"] == "sessions"
+        # Revocable (grant_id) but NOT scope-restricted: it renews the session
+        # JWT, so it keeps that authority rather than the delegated allowlist.
+        assert decoded["grant_id"]
+        assert "scope" not in decoded
 
 
 def test_cli_poll_without_grant_store_keeps_legacy_shape(
