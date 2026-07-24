@@ -100,6 +100,11 @@ class SessionPollWorker(
                         title = sessionDisplayLabel(session.title),
                         body = IDLE_BODY,
                         navigatePath = "/c/${session.id}",
+                        // Stable per-session id: a fresh manager is built each
+                        // run, so an incrementing counter would restart and let a
+                        // later session's finish replace an earlier one's still-
+                        // undismissed notification.
+                        notificationId = notificationIdFor(session.id),
                     )
                 }
                 for (session in detectNewElicitations(previous, sessions)) {
@@ -108,6 +113,7 @@ class SessionPollWorker(
                         title = sessionDisplayLabel(session.title),
                         body = ELICITATION_BODY,
                         navigatePath = "/c/${session.id}",
+                        notificationId = notificationIdFor(session.id),
                     )
                 }
             }
@@ -136,8 +142,12 @@ class SessionPollWorker(
         jwt: String,
         secure: Boolean,
     ): String? {
-        val conn = (URL(origin + SESSIONS_LIST_PATH).openConnection() as HttpURLConnection)
+        // Build the connection INSIDE the try: a malformed/legacy non-HTTP
+        // persisted origin makes URL(...)/openConnection()/the cast throw, and
+        // that must no-op like every other error path rather than fail the run.
+        var conn: HttpURLConnection? = null
         return try {
+            conn = URL(origin + SESSIONS_LIST_PATH).openConnection() as HttpURLConnection
             conn.requestMethod = "GET"
             // This request carries the session JWT (Cookie + Bearer). Do NOT
             // auto-follow redirects: a cross-origin or HTTPS→HTTP-downgrade 3xx
@@ -169,7 +179,7 @@ class SessionPollWorker(
         } catch (_: Throwable) {
             null
         } finally {
-            conn.disconnect()
+            conn?.disconnect()
         }
     }
 

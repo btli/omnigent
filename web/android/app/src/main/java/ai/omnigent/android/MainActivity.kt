@@ -411,10 +411,13 @@ class MainActivity : AppCompatActivity() {
                 append("; SameSite=Lax")
             }
         // Fresh session: drop any prior-user snapshot so the background poll
-        // seeds from scratch and can't fire stale transitions across a re-login.
+        // seeds from scratch and can't fire stale transitions across a re-login,
+        // and clear any per-session notifications the prior account left on
+        // screen (they'd show the old titles and deep-link into old session ids).
         // Re-arm the periodic poll in case it was never scheduled (login before
         // a server was pinned) — KEEP makes an already-scheduled poll a no-op.
         SessionSnapshotStore(applicationContext).clear()
+        notifications.cancelAll()
         SessionPollScheduler.ensureScheduled(applicationContext)
         val cookies = CookieManager.getInstance()
         cookies.setAcceptCookie(true)

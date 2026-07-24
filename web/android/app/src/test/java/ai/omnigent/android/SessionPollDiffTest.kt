@@ -208,4 +208,38 @@ class SessionPollDiffTest {
         assertEquals("New session", sessionDisplayLabel(null))
         assertEquals("New session", sessionDisplayLabel("   "))
     }
+
+    // --- stable per-session notification ids ------------------------------
+
+    @Test
+    fun `notificationIdFor is stable for the same session id`() {
+        // Same id across worker runs / manager instances must map to the same
+        // notification id, so a re-fire updates rather than duplicates.
+        assertEquals(notificationIdFor("conv_abc123"), notificationIdFor("conv_abc123"))
+    }
+
+    @Test
+    fun `notificationIdFor differs across distinct session ids`() {
+        // Distinct sessions must not collide, or a later finish would silently
+        // replace an earlier, still-undismissed notification.
+        val ids = listOf("conv_a", "conv_b", "conv_c", "ecaf7591", "refactor-auth", "42")
+        val mapped = ids.map { notificationIdFor(it) }
+        assertEquals(ids.size, mapped.toSet().size)
+    }
+
+    @Test
+    fun `notificationIdFor never collides with the badge id`() {
+        // Must stay strictly above the reserved badge id (1) for every input,
+        // including ones whose raw hash would otherwise land low or negative.
+        val samples =
+            listOf("", "1", "a", "conv_1", " ", "z".repeat(200)) +
+                (0 until 1000).map { "conv_$it" }
+        for (id in samples) {
+            val n = notificationIdFor(id)
+            assertTrue(
+                "id for '$id' = $n must be >= $MIN_SESSION_NOTIFICATION_ID",
+                n >= MIN_SESSION_NOTIFICATION_ID,
+            )
+        }
+    }
 }

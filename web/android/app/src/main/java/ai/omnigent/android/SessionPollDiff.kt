@@ -142,6 +142,31 @@ fun extractCookieValue(
  */
 fun sessionDisplayLabel(title: String?): String = title?.takeIf { it.isNotBlank() } ?: "New session"
 
+/**
+ * Lowest notification id a per-session notification may use. Kept strictly
+ * above the reserved badge-summary id (1, `BADGE_NOTIFICATION_ID`) so a session
+ * notification can never replace the badge.
+ */
+const val MIN_SESSION_NOTIFICATION_ID = 2
+
+/**
+ * Stable per-session notification id, derived deterministically from the
+ * session id and mapped into `[MIN_SESSION_NOTIFICATION_ID, Int.MAX_VALUE]`.
+ *
+ * Deterministic across worker runs and manager instances (same id → same
+ * notification id), so a session that finishes, is re-observed, and fires again
+ * UPDATES its own notification instead of spawning a duplicate — and, crucially,
+ * distinct sessions get distinct ids so a later session's finish never silently
+ * replaces an earlier, still-undismissed one. `String.hashCode` is a specified,
+ * stable algorithm, so the mapping is reproducible. Guarded to never land on the
+ * reserved badge id (1).
+ */
+fun notificationIdFor(sessionId: String): Int {
+    val span = (Int.MAX_VALUE - MIN_SESSION_NOTIFICATION_ID).toLong() + 1
+    val unsigned = sessionId.hashCode().toLong() and 0xFFFFFFFFL
+    return MIN_SESSION_NOTIFICATION_ID + (unsigned % span).toInt()
+}
+
 /** The list query the poller hits — the existing endpoint, no new params. */
 const val SESSIONS_LIST_PATH =
     "/v1/sessions?order=desc&sort_by=updated_at&limit=20&include_archived=true"
