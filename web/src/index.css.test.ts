@@ -130,3 +130,36 @@ describe("index.css bg-card glass rule selector", () => {
     aside.remove();
   });
 });
+
+describe("index.css sidebar wordmark theme rule", () => {
+  const wordmarkRules = (cssSource.match(/[^{}]+\{[^{}]*\}/g) ?? [])
+    .filter((rule) => rule.includes(".sidebar-wordmark"))
+    .join("\n");
+
+  it("updates the black wordmark filter when the root dark class changes", () => {
+    expect(wordmarkRules).toMatch(/\.sidebar-wordmark\s*\{[^}]*filter:\s*none/);
+    expect(wordmarkRules).toMatch(/\.dark\s+\.sidebar-wordmark\s*\{[^}]*filter:\s*invert\(1\)/);
+
+    const style = document.createElement("style");
+    style.textContent = wordmarkRules;
+    const wordmark = document.createElement("img");
+    wordmark.className = "sidebar-wordmark";
+    document.head.appendChild(style);
+    document.body.appendChild(wordmark);
+
+    try {
+      document.documentElement.classList.remove("dark");
+      expect(getComputedStyle(wordmark).filter).toBe("none");
+
+      document.documentElement.classList.add("dark");
+      expect(getComputedStyle(wordmark).filter).toBe("invert(1)");
+
+      document.documentElement.classList.remove("dark");
+      expect(getComputedStyle(wordmark).filter).toBe("none");
+    } finally {
+      document.documentElement.classList.remove("dark");
+      wordmark.remove();
+      style.remove();
+    }
+  });
+});

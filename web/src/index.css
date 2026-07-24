@@ -470,6 +470,16 @@
   border: 1px solid rgba(255, 255, 255, 0.08);
 }
 
+/* The source SVG is black; keep this root-theme rule flat for WebViews that
+ * do not apply nested dark variants. */
+.sidebar-wordmark {
+  filter: none;
+}
+
+.dark .sidebar-wordmark {
+  filter: invert(1);
+}
+
 /* Electron desktop shell on macOS (AppShell sets data-electron-mac when the
  * preload bridge is present on a Mac). The shell hides the native title bar
  * (titleBarStyle "hiddenInset"), which means (a) the traffic lights float

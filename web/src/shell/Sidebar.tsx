@@ -603,7 +603,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 src={omnigentWordmark}
                 alt="Omnigent"
                 data-testid="sidebar-wordmark"
-                className="h-[15px] w-auto shrink-0 dark:invert"
+                className="sidebar-wordmark h-[15px] w-auto shrink-0"
               />
             </Link>
             <div className="flex items-center gap-1" data-testid="sidebar-header-actions">

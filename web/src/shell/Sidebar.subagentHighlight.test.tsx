@@ -143,7 +143,7 @@ describe("sidebar highlight while viewing a sub-agent", () => {
 
     const wordmark = screen.getByTestId("sidebar-wordmark");
     expect(wordmark).toHaveAttribute("alt", "Omnigent");
-    expect(wordmark).toHaveClass("h-[15px]", "dark:invert");
+    expect(wordmark).toHaveClass("h-[15px]", "sidebar-wordmark");
     expect(wordmark.getAttribute("src")).toContain("omnigent-wordmark");
   });
 
