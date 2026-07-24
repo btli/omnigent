@@ -45,6 +45,14 @@ def _open_appearance(page: Page, base_url: str) -> None:
     expect(_theme_radiogroup(page)).to_be_visible(timeout=30_000)
 
 
+def _open_session_wordmark(page: Page, base_url: str, session_id: str) -> Locator:
+    """Navigate to a session and wait for the sidebar wordmark."""
+    page.goto(f"{base_url}/c/{session_id}")
+    wordmark = page.get_by_test_id("sidebar-wordmark")
+    expect(wordmark).to_be_visible(timeout=30_000)
+    return wordmark
+
+
 def test_theme_toggle_cycles_and_persists(page: Page, seeded_session: tuple[str, str]) -> None:
     """On a light OS, selecting Dark then System flips the class and persists.
 
@@ -81,6 +89,34 @@ def test_theme_toggle_cycles_and_persists(page: Page, seeded_session: tuple[str,
     expect(system).to_have_attribute("aria-checked", "true")
     assert not _html_has_dark(page), "<html> kept the dark class after returning to System"
     assert _stored_theme(page) == "system"
+
+
+def test_sidebar_wordmark_filter_tracks_theme(page: Page, seeded_session: tuple[str, str]) -> None:
+    """The sidebar wordmark is inverted in Dark mode and unchanged in Light."""
+    page.emulate_media(color_scheme="light")
+    base_url, session_id = seeded_session
+
+    _open_session_wordmark(page, base_url, session_id)
+
+    _open_appearance(page, base_url)
+    dark = _theme_radiogroup(page).get_by_role("radio", name="Dark")
+    dark.click()
+    expect(dark).to_have_attribute("aria-checked", "true")
+    assert _html_has_dark(page), "<html> did not gain the dark class after selecting Dark"
+
+    wordmark = _open_session_wordmark(page, base_url, session_id)
+    assert _html_has_dark(page), "dark class was lost after returning to the session"
+    expect(wordmark).to_have_css("filter", "invert(1)")
+
+    _open_appearance(page, base_url)
+    light = _theme_radiogroup(page).get_by_role("radio", name="Light")
+    light.click()
+    expect(light).to_have_attribute("aria-checked", "true")
+    assert not _html_has_dark(page), "<html> kept the dark class after selecting Light"
+
+    wordmark = _open_session_wordmark(page, base_url, session_id)
+    assert not _html_has_dark(page), "dark class returned after navigating to the session"
+    expect(wordmark).to_have_css("filter", "none")
 
 
 def test_theme_toggle_reaches_explicit_light_on_dark_os(
