@@ -666,6 +666,28 @@ async def test_process_ready_path_sends_no_direct_shell_probe(tmp_path: Path) ->
     assert process_polls == terminal_mod._SHELL_READY_STABLE_SAMPLES
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_keys", ["-X", "+", "Enter -N", "C-c +5"])
+async def test_send_rejects_flag_like_key_tokens(tmp_path: Path, bad_keys: str) -> None:
+    """A key token starting with '-'/'+' is rejected before any tmux dispatch."""
+    instance = TerminalInstance(
+        name="bash",
+        session_key="flag-guard",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        command="bash",
+        running=True,
+    )
+
+    async def reject_tmux(*args: str) -> None:
+        raise AssertionError(f"flag-like key reached tmux: {args!r}")
+
+    instance._tmux = reject_tmux  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError, match="must not start with '-' or '\\+'"):
+        await instance.send("hello", keys=bad_keys)
+
+
 @pytest.mark.parametrize("keep_alive", [True, False])
 def test_create_terminal_instance_propagates_keep_alive_after_exit(
     tmp_path: Path,

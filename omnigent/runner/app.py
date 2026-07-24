@@ -1834,21 +1834,35 @@ class _TerminalInputAttempts:
         try:
             outcome = await operation()
         except asyncio.CancelledError:
-            outcome = _TerminalInputOutcome(
-                status_code=200,
-                body={"outcome": "delivery_unknown"},
-            )
+            # Cancellation only happens at teardown today; stamp completion so
+            # the slot stays purgeable (never a permanently-leaked, replay-
+            # poisoning entry) if that ever changes. Synchronous write, no
+            # await — safe on the single event-loop thread mid-cancellation.
+            entry = self._entries.get(key)
+            if entry is not None:
+                entry.completed_at = time.monotonic()
+            raise
+        except (ValueError, OmnigentError):
+            # These carry dedicated global handlers that answer 4xx (a
+            # flag-like ``keys`` token raises ValueError before any dispatch).
+            # Record completion so a same-id replay re-hits this failing task,
+            # then propagate instead of faking a delivery_unknown.
+            await self._mark_completed(key)
+            raise
         except Exception:
             _logger.exception("terminal input attempt failed after dispatch")
             outcome = _TerminalInputOutcome(
                 status_code=200,
                 body={"outcome": "delivery_unknown"},
             )
+        await self._mark_completed(key)
+        return outcome
+
+    async def _mark_completed(self, key: tuple[str, str]) -> None:
         async with self._lock:
             entry = self._entries.get(key)
             if entry is not None:
                 entry.completed_at = time.monotonic()
-        return outcome
 
     def _purge_expired_locked(self) -> None:
         cutoff = time.monotonic() - _TERMINAL_INPUT_ATTEMPT_TTL_SECONDS
