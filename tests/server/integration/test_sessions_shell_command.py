@@ -15,6 +15,7 @@ terminal resource proxies use — with an ``httpx.MockTransport``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
 import shutil
@@ -23,6 +24,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -2598,3 +2600,72 @@ async def test_shell_command_bearer_token_without_identity_denied(
     assert resp.status_code == 401, resp.text
     assert calls == []
     assert await _terminal_command_items(auth_client, sid, headers=owner_headers) == []
+
+
+# ── ledger single-flight lifecycle (unit-level) ───────────
+
+
+class _EmptyItemsStore:
+    """Conversation store stub with no prior receipts for any attempt."""
+
+    def list_items(self, *args: Any, **kwargs: Any) -> Any:
+        """Return an empty terminal_command page so no receipt replays."""
+        return SimpleNamespace(data=[], has_more=False, last_id=None)
+
+
+async def test_shell_command_ledger_retains_cleanup_task_until_done() -> None:
+    """An abandoned-owner cleanup task stays strong-referenced until done.
+
+    asyncio keeps only a weak reference to fire-and-forget tasks, so a
+    cleanup task that is not retained can be garbage-collected before it
+    releases the in-flight slot — wedging every later duplicate on that
+    attempt. The ledger must hold the task until it finishes, then drop
+    it and leave the slot free.
+    """
+    ledger = events_module._ShellCommandAttemptLedger(_EmptyItemsStore())
+
+    async def _owner() -> None:
+        claimed = await ledger.wait_or_claim(session_id="s", attempt_id="a", fingerprint="fp")
+        assert claimed is None  # this task now owns the attempt
+
+    owner = asyncio.create_task(_owner())
+    await owner
+    # Let the owner's done-callback schedule the retained cleanup task.
+    await asyncio.sleep(0)
+    assert ledger._cleanup_tasks  # strong reference held while it runs
+
+    await asyncio.gather(*ledger._cleanup_tasks)
+    assert not ledger._cleanup_tasks  # reference dropped once finished
+    assert not ledger._in_flight  # slot released
+
+
+async def test_shell_command_ledger_cancelled_owner_gives_waiters_retryable() -> None:
+    """A cancelled owner resolves duplicate waiters as retryable, not 500.
+
+    Cancelling the shared future would surface as a ``CancelledError``
+    (HTTP 500) on innocent concurrent duplicates. They must instead see
+    a retryable ``attempt_abandoned`` so a resend re-claims and runs.
+    """
+    ledger = events_module._ShellCommandAttemptLedger(_EmptyItemsStore())
+    started = asyncio.Event()
+
+    async def _owner() -> None:
+        claimed = await ledger.wait_or_claim(session_id="s", attempt_id="a", fingerprint="fp")
+        assert claimed is None
+        started.set()
+        await asyncio.sleep(3600)  # never persists a receipt
+
+    owner = asyncio.create_task(_owner())
+    await started.wait()
+    entry = ledger._in_flight[("s", "a")]  # future duplicate waiters await
+
+    owner.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await owner
+    await asyncio.gather(*ledger._cleanup_tasks)
+
+    assert not entry.result.cancelled()
+    exc = entry.result.exception()
+    assert isinstance(exc, OmnigentError)
+    assert exc.code == ErrorCode.ATTEMPT_ABANDONED
+    assert not ledger._in_flight  # slot released for a retry

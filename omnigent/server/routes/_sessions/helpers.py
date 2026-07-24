@@ -4302,7 +4302,7 @@ async def _proxy_get_to_runner(
             body = resp.json()
             error = body.get("error", {})
             msg = error.get("message") or "runner resource endpoint failed"
-        except (ValueError, AttributeError, TypeError):
+        except (ValueError, AttributeError, TypeError, httpx.HTTPError):
             msg = "runner resource endpoint failed"
         raise HTTPException(status_code=502, detail=msg)
     return resp.json()

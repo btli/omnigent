@@ -24,6 +24,10 @@ class ErrorCode:
     :cvar ALREADY_EXISTS: Duplicate resource (HTTP 409).
     :cvar CONFLICT: Operation conflicts with current state (HTTP 409).
     :cvar ATTEMPT_CONFLICT: An idempotency key was rebound (HTTP 409).
+    :cvar ATTEMPT_ABANDONED: The single-flight owner of an idempotent
+        attempt exited before persisting a receipt (e.g. cancelled),
+        so a concurrent duplicate waiter has no result to replay and
+        should simply retry the same request (HTTP 503).
     :cvar IDEMPOTENCY_CAPACITY_EXHAUSTED: A bounded idempotency ledger
         rejected a new attempt before execution (HTTP 503).
     :cvar INTERNAL_ERROR: Unexpected server error (HTTP 500).
@@ -57,6 +61,7 @@ class ErrorCode:
     ALREADY_EXISTS = "already_exists"
     CONFLICT = "conflict"
     ATTEMPT_CONFLICT = "attempt_conflict"
+    ATTEMPT_ABANDONED = "attempt_abandoned"
     IDEMPOTENCY_CAPACITY_EXHAUSTED = "idempotency_capacity_exhausted"
     INTERNAL_ERROR = "internal_error"
     HARNESS_PROTOCOL_VIOLATION = "harness_protocol_violation"
@@ -76,6 +81,7 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     ErrorCode.ALREADY_EXISTS: 409,
     ErrorCode.CONFLICT: 409,
     ErrorCode.ATTEMPT_CONFLICT: 409,
+    ErrorCode.ATTEMPT_ABANDONED: 503,
     ErrorCode.IDEMPOTENCY_CAPACITY_EXHAUSTED: 503,
     ErrorCode.INTERNAL_ERROR: 500,
     # Harness protocol violations are server-side bugs in the

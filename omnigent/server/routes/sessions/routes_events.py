@@ -198,6 +198,10 @@ class _ShellCommandAttemptLedger:
         self._conversation_store = conversation_store
         self._lock = asyncio.Lock()
         self._in_flight: dict[tuple[str, str], _InFlightShellCommand] = {}
+        # Retain the fire-and-forget cleanup tasks: the event loop keeps
+        # only a weak reference, so an un-held task can be GC'd before it
+        # releases the abandoned slot, wedging duplicate waiters forever.
+        self._cleanup_tasks: set[asyncio.Task[None]] = set()
 
     def _find_receipt(self, session_id: str, attempt_id: str) -> ConversationItem | None:
         after: str | None = None
@@ -262,12 +266,26 @@ class _ShellCommandAttemptLedger:
                     self._in_flight.pop(key, None)
                     raise RuntimeError("shell-command claim requires an asyncio task")
                 owner.add_done_callback(
-                    lambda completed: asyncio.create_task(
-                        self._finish_abandoned(key, entry, completed)
-                    )
+                    lambda completed: self._schedule_finish_abandoned(key, entry, completed)
                 )
                 return None
         return await asyncio.shield(result)
+
+    def _schedule_finish_abandoned(
+        self,
+        key: tuple[str, str],
+        entry: _InFlightShellCommand,
+        owner: asyncio.Task[Any],
+    ) -> None:
+        """Spawn and retain the abandoned-owner cleanup task.
+
+        Holding a strong reference until the task finishes keeps the
+        loop from garbage-collecting it mid-run, which would otherwise
+        leave the in-flight slot un-released.
+        """
+        task = asyncio.create_task(self._finish_abandoned(key, entry, owner))
+        self._cleanup_tasks.add(task)
+        task.add_done_callback(self._cleanup_tasks.discard)
 
     async def complete(
         self,
@@ -297,7 +315,17 @@ class _ShellCommandAttemptLedger:
             if entry.result.done():
                 return
             if owner.cancelled():
-                entry.result.cancel()
+                # The owner was cancelled before persisting a receipt.
+                # Cancelling the shared future would surface as a
+                # CancelledError (HTTP 500) on innocent duplicate
+                # waiters — resolve them with a retryable error so a
+                # resend of the same attempt re-claims and executes.
+                entry.result.set_exception(
+                    OmnigentError(
+                        "shell-command attempt was abandoned before completing; retry",
+                        code=ErrorCode.ATTEMPT_ABANDONED,
+                    )
+                )
                 return
             exc = owner.exception()
             entry.result.set_exception(
