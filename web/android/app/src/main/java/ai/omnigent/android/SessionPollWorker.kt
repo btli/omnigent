@@ -28,7 +28,10 @@ import java.net.URL
  * mid-run process kill after notifying must not advance the snapshot, or the
  * finish would be silently missed. The snapshot is MERGED, not replaced, so a
  * `running` session that scrolls off the fixed top-window keeps its prior
- * status until observed terminal.
+ * status until observed terminal. Posting goes through
+ * [NativeNotificationManager], whose constructor (re-)creates the channel so a
+ * cold background process still has it, and which no-ops when the
+ * POST_NOTIFICATIONS grant is missing.
  *
  * Graceful no-ops (always [Result.success], never a crash or retry storm):
  *   * not logged in / cookie expired → no session cookie → nothing to poll
@@ -58,6 +61,20 @@ class SessionPollWorker(
             val body = fetchSessions(origin, jwt, secure) ?: return@withContext Result.success()
             val sessions = parseSessionList(body)
 
+            // Cheap multi-account guard: a poll started against account A can
+            // land after account B logs in and re-points ServerStore. Re-read the
+            // pinned origin right before we act on the fetched data; if it
+            // changed mid-poll, bail without notifying or saving so we don't post
+            // A's sessions (or persist A's snapshot) into B's session. This is a
+            // best-effort recheck, not full account-generation plumbing (see the
+            // PR's follow-ups) — a switch in the narrow window after this line is
+            // still possible.
+            val currentOrigin =
+                ServerStore(applicationContext).let {
+                    if (it.hasServer()) originOf(it.currentServerUrl()) else null
+                }
+            if (currentOrigin != origin) return@withContext Result.success()
+
             val store = SessionSnapshotStore(applicationContext)
             val previous = store.load()
 
@@ -70,6 +87,12 @@ class SessionPollWorker(
             // A first run (empty `previous`) yields no transitions, so nothing
             // fires; we still fall through to save so the next run has a baseline.
             if (previous.isNotEmpty()) {
+                // Constructing this ensures the notification channel exists in
+                // THIS process — the worker often runs in a cold background
+                // process where no Activity created it, and an O+ post to a
+                // missing channel is silently dropped. post() itself no-ops when
+                // POST_NOTIFICATIONS is not granted, so an ungranted background
+                // run never crashes.
                 val notifications = NativeNotificationManager(applicationContext)
                 for (session in detectIdleTransitions(previous, sessions)) {
                     if (session.runnerOnline == false) continue // stale dead-runner reconciliation
@@ -116,13 +139,33 @@ class SessionPollWorker(
         val conn = (URL(origin + SESSIONS_LIST_PATH).openConnection() as HttpURLConnection)
         return try {
             conn.requestMethod = "GET"
+            // This request carries the session JWT (Cookie + Bearer). Do NOT
+            // auto-follow redirects: a cross-origin or HTTPS→HTTP-downgrade 3xx
+            // would otherwise resend the credential off the pinned origin. A 3xx
+            // now surfaces as a non-200 responseCode and is treated as a no-op.
+            conn.instanceFollowRedirects = false
             conn.setRequestProperty("Cookie", "${sessionCookieName(secure)}=$jwt")
             conn.setRequestProperty("Authorization", "Bearer $jwt")
             conn.setRequestProperty("Accept", "application/json")
             conn.connectTimeout = HTTP_TIMEOUT_MS
             conn.readTimeout = HTTP_TIMEOUT_MS
             if (conn.responseCode != 200) return null
-            conn.inputStream.bufferedReader().use { it.readText() }
+            // Cheap size cap: the endpoint is limit=20 so a well-behaved body is
+            // small, but readText() is otherwise unbounded. Read at most
+            // MAX_RESPONSE_BYTES; a larger body is treated as a no-op (null)
+            // rather than buffered whole.
+            conn.inputStream.bufferedReader().use { reader ->
+                val buf = CharArray(MAX_RESPONSE_BYTES)
+                var total = 0
+                while (total < MAX_RESPONSE_BYTES) {
+                    val n = reader.read(buf, total, MAX_RESPONSE_BYTES - total)
+                    if (n < 0) break
+                    total += n
+                }
+                // At capacity with more to read → oversized, bail.
+                if (total == MAX_RESPONSE_BYTES && reader.read() >= 0) return null
+                String(buf, 0, total)
+            }
         } catch (_: Throwable) {
             null
         } finally {
@@ -135,5 +178,10 @@ class SessionPollWorker(
         const val IDLE_BODY = "Agent finished and is ready for your input."
         const val ELICITATION_BODY = "Agent is asking for your input."
         private const val HTTP_TIMEOUT_MS = 15_000
+
+        // Upper bound on the list-response body we buffer. The endpoint is
+        // limit=20, so a sane page is well under this; a larger body is treated
+        // as a no-op rather than read whole. ~1M chars.
+        private const val MAX_RESPONSE_BYTES = 1_048_576
     }
 }

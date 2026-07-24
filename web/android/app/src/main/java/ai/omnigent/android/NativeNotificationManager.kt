@@ -44,6 +44,18 @@ class NativeNotificationManager(
     private var lastBadge: BadgeState? = null
 
     init {
+        ensureChannel()
+    }
+
+    /**
+     * Create the notification channel, idempotently. `createNotificationChannel`
+     * is a no-op when the channel already exists, so this is cheap to call
+     * repeatedly. Exposed (and re-run from the constructor) so a WorkManager-only
+     * process — one that spawned in the background with no Activity ever
+     * on-screen — still has the channel before it posts; otherwise an O+ post to
+     * a missing channel is silently dropped. A no-op on pre-O.
+     */
+    fun ensureChannel() {
         val channel =
             NotificationChannel(
                 CHANNEL_ID,
