@@ -44,11 +44,7 @@ class SessionPollWorker(
 ) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result =
         withContext(Dispatchers.IO) {
-            val serverUrl =
-                ServerStore(applicationContext).let {
-                    if (it.hasServer()) it.currentServerUrl() else null
-                }
-            val origin = originOf(serverUrl) ?: return@withContext Result.success()
+            val origin = pinnedOrigin() ?: return@withContext Result.success()
 
             val secure = origin.startsWith("https://")
             val jwt =
@@ -69,11 +65,7 @@ class SessionPollWorker(
             // best-effort recheck, not full account-generation plumbing (see the
             // PR's follow-ups) — a switch in the narrow window after this line is
             // still possible.
-            val currentOrigin =
-                ServerStore(applicationContext).let {
-                    if (it.hasServer()) originOf(it.currentServerUrl()) else null
-                }
-            if (currentOrigin != origin) return@withContext Result.success()
+            if (pinnedOrigin() != origin) return@withContext Result.success()
 
             val store = SessionSnapshotStore(applicationContext)
             val previous = store.load()
@@ -94,28 +86,11 @@ class SessionPollWorker(
                 // POST_NOTIFICATIONS is not granted, so an ungranted background
                 // run never crashes.
                 val notifications = NativeNotificationManager(applicationContext)
-                for (session in detectIdleTransitions(previous, sessions)) {
-                    if (session.runnerOnline == false) continue // stale dead-runner reconciliation
-                    notifications.notify(
-                        title = sessionDisplayLabel(session.title),
-                        body = IDLE_BODY,
-                        navigatePath = "/c/${session.id}",
-                        // Stable per-session id: a fresh manager is built each
-                        // run, so an incrementing counter would restart and let a
-                        // later session's finish replace an earlier one's still-
-                        // undismissed notification.
-                        notificationId = notificationIdFor(session.id),
-                    )
-                }
-                for (session in detectNewElicitations(previous, sessions)) {
-                    if (session.runnerOnline == false) continue
-                    notifications.notify(
-                        title = sessionDisplayLabel(session.title),
-                        body = ELICITATION_BODY,
-                        navigatePath = "/c/${session.id}",
-                        notificationId = notificationIdFor(session.id),
-                    )
-                }
+                // Idle loop then elicitation loop, in that order. A session that
+                // both finished and raised a prompt this poll shares one
+                // notificationId, so the elicitation post is last-write-wins.
+                notify(notifications, detectIdleTransitions(previous, sessions), IDLE_BODY)
+                notify(notifications, detectNewElicitations(previous, sessions), ELICITATION_BODY)
             }
 
             // MERGE rather than replace: the list endpoint returns only the top
@@ -130,6 +105,35 @@ class SessionPollWorker(
             store.save(mergeSnapshot(previous, sessions))
             Result.success()
         }
+
+    /** The pinned server's origin, or null when no server is set. */
+    private fun pinnedOrigin(): String? =
+        ServerStore(applicationContext).let {
+            if (it.hasServer()) originOf(it.currentServerUrl()) else null
+        }
+
+    /**
+     * Post one notification per session in [sessions] with [body], skipping
+     * dead-runner sessions. Each uses a stable per-session [notificationIdFor]
+     * id (a fresh manager is built each run, so an incrementing counter would
+     * restart and let a later session's finish replace an earlier one's still-
+     * undismissed notification), deep-linking to the session.
+     */
+    private fun notify(
+        notifications: NativeNotificationManager,
+        sessions: List<SessionState>,
+        body: String,
+    ) {
+        for (session in sessions) {
+            if (session.runnerOnline == false) continue // stale dead-runner reconciliation
+            notifications.notify(
+                title = sessionDisplayLabel(session.title),
+                body = body,
+                navigatePath = "/c/${session.id}",
+                notificationId = notificationIdFor(session.id),
+            )
+        }
+    }
 
     /**
      * GET the sessions list, authenticating with the reused JWT as both a
