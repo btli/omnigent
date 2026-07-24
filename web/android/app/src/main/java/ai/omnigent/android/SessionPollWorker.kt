@@ -165,20 +165,22 @@ class SessionPollWorker(
             conn.readTimeout = HTTP_TIMEOUT_MS
             if (conn.responseCode != 200) return null
             // Cheap size cap: the endpoint is limit=20 so a well-behaved body is
-            // small, but readText() is otherwise unbounded. Read at most
+            // small, but readText() is otherwise unbounded. Read in fixed chunks
+            // into a StringBuilder that grows to the actual body size, capped at
             // MAX_RESPONSE_BYTES; a larger body is treated as a no-op (null)
-            // rather than buffered whole.
+            // rather than buffered whole. Sizing the buffer to the response (a
+            // sane page is a few KB) avoids allocating the full cap every poll.
             conn.inputStream.bufferedReader().use { reader ->
-                val buf = CharArray(MAX_RESPONSE_BYTES)
-                var total = 0
-                while (total < MAX_RESPONSE_BYTES) {
-                    val n = reader.read(buf, total, MAX_RESPONSE_BYTES - total)
+                val chunk = CharArray(READ_CHUNK_CHARS)
+                val out = StringBuilder()
+                while (true) {
+                    val n = reader.read(chunk)
                     if (n < 0) break
-                    total += n
+                    // Appending this chunk would exceed the cap → oversized, bail.
+                    if (out.length + n > MAX_RESPONSE_BYTES) return null
+                    out.append(chunk, 0, n)
                 }
-                // At capacity with more to read → oversized, bail.
-                if (total == MAX_RESPONSE_BYTES && reader.read() >= 0) return null
-                String(buf, 0, total)
+                out.toString()
             }
         } catch (_: Throwable) {
             null
@@ -197,5 +199,9 @@ class SessionPollWorker(
         // limit=20, so a sane page is well under this; a larger body is treated
         // as a no-op rather than read whole. ~1M chars.
         private const val MAX_RESPONSE_BYTES = 1_048_576
+
+        // Per-read chunk size. Small and fixed so the buffer footprint tracks
+        // the actual (tiny) response rather than the cap above.
+        private const val READ_CHUNK_CHARS = 8_192
     }
 }
