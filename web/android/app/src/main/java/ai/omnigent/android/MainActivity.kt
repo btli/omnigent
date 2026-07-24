@@ -277,6 +277,10 @@ class MainActivity : AppCompatActivity() {
         )
 
         ensureNotificationPermission()
+        // Interim background-poll notifications: fire local notifications when a
+        // session finishes or raises a prompt while the app isn't foregrounded.
+        // Idempotent (KEEP), so scheduling every launch is safe.
+        SessionPollScheduler.ensureScheduled(applicationContext)
         webView.loadUrl(serverUrl)
     }
 
@@ -406,6 +410,12 @@ class MainActivity : AppCompatActivity() {
                 if (secure) append("; Secure")
                 append("; SameSite=Lax")
             }
+        // Fresh session: drop any prior-user snapshot so the background poll
+        // seeds from scratch and can't fire stale transitions across a re-login.
+        // Re-arm the periodic poll in case it was never scheduled (login before
+        // a server was pinned) — KEEP makes an already-scheduled poll a no-op.
+        SessionSnapshotStore(applicationContext).clear()
+        SessionPollScheduler.ensureScheduled(applicationContext)
         val cookies = CookieManager.getInstance()
         cookies.setAcceptCookie(true)
         authLog("onSessionToken: injecting $name (token len=${token.length})")
