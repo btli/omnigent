@@ -24,10 +24,16 @@ import java.net.URL
  * a session seen `running` a poll ago and terminal now is genuinely finished,
  * so unlike the live hook this worker needs no in-worker deferral.
  *
+ * Order within a successful poll is detect → notify → save (see doWork): a
+ * mid-run process kill after notifying must not advance the snapshot, or the
+ * finish would be silently missed. The snapshot is MERGED, not replaced, so a
+ * `running` session that scrolls off the fixed top-window keeps its prior
+ * status until observed terminal.
+ *
  * Graceful no-ops (always [Result.success], never a crash or retry storm):
  *   * not logged in / cookie expired → no session cookie → nothing to poll
  *   * no pinned server → nothing to poll
- *   * network/HTTP error → skip this run, persist nothing, try again next tick
+ *   * network/HTTP error → skip this run, prior snapshot untouched, retry next tick
  */
 class SessionPollWorker(
     context: Context,
@@ -51,39 +57,48 @@ class SessionPollWorker(
 
             val body = fetchSessions(origin, jwt, secure) ?: return@withContext Result.success()
             val sessions = parseSessionList(body)
-            // An empty parse means either no sessions or a transient bad body —
-            // either way there's nothing to diff. Don't overwrite the prior
-            // snapshot with empty: a `running` session that briefly drops off a
-            // poll would otherwise lose its state and never notify on finish.
-            // Mirrors the SPA hook's empty-list early return.
-            if (sessions.isEmpty()) return@withContext Result.success()
 
             val store = SessionSnapshotStore(applicationContext)
             val previous = store.load()
 
-            // Persist the new snapshot BEFORE posting: the snapshot is the dedup
-            // key, so even if a notify throws, the next run won't re-fire the
-            // same edge. A first run (empty `previous`) yields no transitions.
-            store.save(buildSnapshot(sessions))
-            if (previous.isEmpty()) return@withContext Result.success()
+            // Diff FIRST, then notify, then save (in that order). If the process
+            // is killed after notifying but before saving, the next run diffs
+            // against the un-advanced snapshot and re-fires — an occasional
+            // duplicate beats a silently-missed finish alert. Saving first would
+            // turn a mid-run kill into a permanent miss.
+            //
+            // A first run (empty `previous`) yields no transitions, so nothing
+            // fires; we still fall through to save so the next run has a baseline.
+            if (previous.isNotEmpty()) {
+                val notifications = NativeNotificationManager(applicationContext)
+                for (session in detectIdleTransitions(previous, sessions)) {
+                    if (session.runnerOnline == false) continue // stale dead-runner reconciliation
+                    notifications.notify(
+                        title = sessionDisplayLabel(session.title),
+                        body = IDLE_BODY,
+                        navigatePath = "/c/${session.id}",
+                    )
+                }
+                for (session in detectNewElicitations(previous, sessions)) {
+                    if (session.runnerOnline == false) continue
+                    notifications.notify(
+                        title = sessionDisplayLabel(session.title),
+                        body = ELICITATION_BODY,
+                        navigatePath = "/c/${session.id}",
+                    )
+                }
+            }
 
-            val notifications = NativeNotificationManager(applicationContext)
-            for (session in detectIdleTransitions(previous, sessions)) {
-                if (session.runnerOnline == false) continue // stale dead-runner reconciliation
-                notifications.notify(
-                    title = sessionDisplayLabel(session.title),
-                    body = IDLE_BODY,
-                    navigatePath = "/c/${session.id}",
-                )
-            }
-            for (session in detectNewElicitations(previous, sessions)) {
-                if (session.runnerOnline == false) continue
-                notifications.notify(
-                    title = sessionDisplayLabel(session.title),
-                    body = ELICITATION_BODY,
-                    navigatePath = "/c/${session.id}",
-                )
-            }
+            // MERGE rather than replace: the list endpoint returns only the top
+            // window (limit=20, no `since`), so a `running` session can scroll
+            // off between polls. A full-replace would drop its prior `running`
+            // status, and its later `running` → terminal finish (observed
+            // off-window, or in a poll whose window happens to exclude it) would
+            // be missed. Carrying prior off-window entries forward preserves that
+            // edge until we actually see the session terminal. An empty parse
+            // (no sessions, or a transient all-invalid body) therefore just
+            // carries the prior snapshot forward unchanged — no state lost.
+            store.save(mergeSnapshot(previous, sessions))
             Result.success()
         }
 

@@ -109,6 +109,78 @@ class SessionPollDiffTest {
         assertTrue(detectNewElicitations(afterNotify, current).isEmpty())
     }
 
+    // --- merge: off-window running sessions survive (Blocking 1) -----------
+
+    @Test
+    fun `merge carries forward a prior session absent from the current poll`() {
+        // "a" was running last poll but scrolled off the top-window this poll.
+        // Its prior running status must survive in the merged snapshot.
+        val previous = mapOf("a" to SessionSnapshot("running", 0))
+        val current = listOf(session("b", "idle"))
+        val merged = mergeSnapshot(previous, current)
+        assertEquals(SessionSnapshot("running", 0), merged["a"])
+        assertEquals(SessionSnapshot("idle", 0), merged["b"])
+    }
+
+    @Test
+    fun `off-window running session still fires an idle transition when it reappears`() {
+        // Poll 1: "a" running, in window. Poll 2: "a" off-window (only "b").
+        // Poll 3: "a" reappears idle. The finish must STILL fire — which only
+        // works if the merge kept "a"=running through poll 2.
+        var snapshot = buildSnapshot(listOf(session("a", "running"), session("b", "idle")))
+        // Poll 2 — "a" absent from the window.
+        val poll2 = listOf(session("b", "idle"))
+        assertTrue(detectIdleTransitions(snapshot, poll2).isEmpty()) // "a" not seen terminal yet
+        snapshot = mergeSnapshot(snapshot, poll2)
+        assertEquals("running", snapshot["a"]?.status) // survived the off-window poll
+        // Poll 3 — "a" reappears, now idle.
+        val poll3 = listOf(session("a", "idle"), session("b", "idle"))
+        assertEquals(listOf("a"), detectIdleTransitions(snapshot, poll3).map { it.id })
+    }
+
+    @Test
+    fun `empty poll does not drop a prior running entry`() {
+        // A poll whose data is legitimately empty (or all-invalid) must not wipe
+        // the prior snapshot — otherwise an off-window finish is lost forever.
+        val previous = mapOf("a" to SessionSnapshot("running", 0))
+        val merged = mergeSnapshot(previous, emptyList())
+        assertEquals(previous, merged)
+    }
+
+    @Test
+    fun `merge caps size, keeping current window and mid-flight priors`() {
+        // Current window (idle) always kept; a running prior is carried even when
+        // the cap forces settled priors to be dropped.
+        val previous =
+            buildMap {
+                put("run", SessionSnapshot("running", 0)) // mid-flight — must survive
+                // settled priors — droppable when the cap is tight
+                for (i in 0 until 10) put("old$i", SessionSnapshot("idle", 0))
+            }
+        val current = listOf(session("cur", "idle"))
+        val merged = mergeSnapshot(previous, current, cap = 3)
+        assertEquals(3, merged.size)
+        assertTrue("current window entry kept", merged.containsKey("cur"))
+        assertTrue("mid-flight running prior kept over settled", merged.containsKey("run"))
+    }
+
+    // --- ordering: crash between notify and save re-fires (Blocking 2) -----
+
+    @Test
+    fun `a finish missed by a save-skipping crash still fires on the next run`() {
+        // doWork detects -> notifies -> saves. If the process dies after
+        // notifying but before saving, the snapshot is NOT advanced, so the next
+        // run diffs the SAME prior and re-detects the transition (a duplicate,
+        // never a silent miss). Save-first would instead lose it permanently.
+        val previous = mapOf("a" to SessionSnapshot("running", 0))
+        val current = listOf(session("a", "idle"))
+        // Run 1 detects the transition (would notify)...
+        assertEquals(listOf("a"), detectIdleTransitions(previous, current).map { it.id })
+        // ...then the process dies before save, so `previous` is unchanged.
+        // Run 2 (same prior, same list) still detects it.
+        assertEquals(listOf("a"), detectIdleTransitions(previous, current).map { it.id })
+    }
+
     // --- cookie extraction ------------------------------------------------
 
     @Test
