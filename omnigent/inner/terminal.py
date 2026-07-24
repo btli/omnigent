@@ -1259,6 +1259,16 @@ class TerminalInstance:
         if not self.running:
             return {"error": "Terminal is not running"}
 
+        # ``keys`` tokens are passed to ``tmux send-keys`` as bare arguments
+        # (no ``-l``), so a token beginning with ``-``/``+`` would be parsed as
+        # a send-keys flag rather than a key name. Reject before any dispatch.
+        for key in keys.split():
+            if key.startswith(("-", "+")):
+                raise ValueError(
+                    f"Invalid tmux key name {key!r}: key names must not start "
+                    "with '-' or '+' (they would be consumed as send-keys flags)"
+                )
+
         dispatch_started = False
         try:
             if text:
@@ -1333,7 +1343,11 @@ class TerminalInstance:
         deadline: float,
         poll_interval_s: float,
     ) -> bool:
-        """Clear the acknowledged probe from the screen and pane history."""
+        """Clear the acknowledged probe from the screen and scrollback.
+
+        Sends ``C-l`` then ``clear-history`` so the typed readiness probe
+        leaves no residue in the pane or its history.
+        """
         loop = asyncio.get_running_loop()
         remaining = deadline - loop.time()
         if remaining <= 0:
@@ -1397,7 +1411,12 @@ class TerminalInstance:
         timeout_s: float,
         poll_interval_s: float,
     ) -> bool:
-        """Run one bounded shell-readiness evaluation."""
+        """Run one bounded shell-readiness evaluation.
+
+        Under the nonce contract this types a probe into the live pane and,
+        once acknowledged, clears it plus the scrollback via
+        ``_clear_shell_readiness_residue`` so the user never sees it.
+        """
         if not self.running or timeout_s <= 0:
             return False
         if self.shell_ready_nonce is None and self.ready_process is None:

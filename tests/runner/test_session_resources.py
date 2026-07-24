@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import threading
+import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
@@ -954,6 +955,47 @@ async def test_terminal_input_rejects_invalid_body(
 
 
 @pytest.mark.asyncio
+async def test_terminal_input_flag_like_keys_returns_400_without_attempt_id(
+    client: httpx.AsyncClient,
+) -> None:
+    """A flag-like ``keys`` token surfaces the send guard's 400 invalid_input."""
+    resp = await client.post(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/input",
+        json={"text": "echo hi", "keys": "-X"},
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "invalid_input"
+
+
+@pytest.mark.asyncio
+async def test_terminal_input_flag_like_keys_returns_400_with_attempt_id(
+    client: httpx.AsyncClient,
+) -> None:
+    """The idempotency ledger must not mask the guard's 400 as delivery_unknown.
+
+    A same-``attempt_id`` replay of the rejected request must return the same
+    400 — the ledger caches the failing task, not a fake ``delivery_unknown``.
+    """
+    attempt_id = _attempt_id()
+    body = {"attempt_id": attempt_id, "text": "echo hi", "keys": "-X"}
+
+    first = await client.post(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/input",
+        json=body,
+    )
+    assert first.status_code == 400
+    assert first.json()["error"]["code"] == "invalid_input"
+
+    replay = await client.post(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/input",
+        json=body,
+    )
+    assert replay.status_code == 400
+    assert replay.json()["error"]["code"] == "invalid_input"
+
+
+@pytest.mark.asyncio
 async def test_terminal_input_route_and_send_tool_share_primitive(
     client: httpx.AsyncClient,
     registry: TerminalRegistry,
@@ -1360,6 +1402,44 @@ async def test_terminal_input_cancelling_first_waiter_keeps_single_flight(
     assert response.status_code == 200
     assert response.json()["outcome"] == "sent"
     assert send_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_input_cancelled_owner_entry_stays_purgeable() -> None:
+    """A directly-cancelled owner task stamps completion so its slot is reclaimed.
+
+    ``_purge_expired_locked`` only evicts completed entries; without the
+    synchronous stamp a cancelled owner would leak its slot forever and poison
+    that attempt_id for the process lifetime.
+    """
+    from omnigent.runner.app import (
+        _TERMINAL_INPUT_ATTEMPT_TTL_SECONDS,
+        _TerminalInputAttempt,
+        _TerminalInputAttempts,
+    )
+
+    attempts = _TerminalInputAttempts()
+    key = ("conv_abc", "attempt-cancelled")
+    placeholder = asyncio.create_task(asyncio.sleep(0))
+    await placeholder
+    attempts._entries[key] = _TerminalInputAttempt(
+        fingerprint=("terminal_bash_s1", "echo hi", "Enter", False),
+        task=placeholder,
+    )
+
+    async def _cancelled_operation() -> Any:
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await attempts._run_claimed(key, _cancelled_operation)
+
+    assert attempts._entries[key].completed_at is not None
+
+    attempts._entries[key].completed_at = (
+        time.monotonic() - _TERMINAL_INPUT_ATTEMPT_TTL_SECONDS - 1
+    )
+    attempts._purge_expired_locked()
+    assert key not in attempts._entries
 
 
 @pytest.mark.asyncio
