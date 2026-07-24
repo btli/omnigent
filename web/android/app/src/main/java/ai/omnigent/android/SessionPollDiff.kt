@@ -33,6 +33,46 @@ data class SessionSnapshot(
 fun buildSnapshot(sessions: List<SessionState>): Map<String, SessionSnapshot> =
     sessions.associate { it.id to SessionSnapshot(it.status, it.pendingElicitations) }
 
+/** Cap on the persisted snapshot so carried-forward off-window entries can't grow unbounded. */
+const val MAX_SNAPSHOT_ENTRIES = 200
+
+/**
+ * Merge the current poll's snapshot over the previous one, carrying forward
+ * prior entries for sessions NOT in this poll's window.
+ *
+ * The list endpoint returns only the top window (`limit=20`, no `since`), so a
+ * `running` session can scroll off the window between polls and reappear later
+ * as terminal. A full-replace snapshot would drop its prior `running` status
+ * while it's off-window, so the eventual `running` → terminal edge would be
+ * missed. Merging keeps the off-window entry until we actually observe it
+ * terminal — then the current window's terminal status overwrites it.
+ *
+ * Bounded by [cap]: current-window entries are always kept; carried-forward
+ * prior entries fill the remaining slots, prioritizing sessions mid-flight
+ * (`running`, or with pending elicitations) — those whose finish/elicitation
+ * edge we'd lose if dropped — over already-settled ones, so a churn of
+ * ephemeral sessions can't grow the snapshot without bound.
+ */
+fun mergeSnapshot(
+    previous: Map<String, SessionSnapshot>,
+    sessions: List<SessionState>,
+    cap: Int = MAX_SNAPSHOT_ENTRIES,
+): Map<String, SessionSnapshot> {
+    val current = buildSnapshot(sessions)
+    val merged = LinkedHashMap<String, SessionSnapshot>(current)
+    val room = cap - current.size
+    if (room <= 0) return merged
+    val carried =
+        previous
+            .filterKeys { it !in current }
+            .entries
+            // Keep mid-flight sessions first so a cap can never drop a `running`
+            // (or elicitation-bearing) entry in favor of a settled one.
+            .sortedByDescending { it.value.status == "running" || it.value.pendingElicitations > 0 }
+    for ((id, snapshot) in carried.take(room)) merged[id] = snapshot
+    return merged
+}
+
 /**
  * Sessions whose status went `running` → `idle`/`failed` between the previous
  * snapshot and the current list.
