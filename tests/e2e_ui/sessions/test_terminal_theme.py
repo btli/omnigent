@@ -71,12 +71,19 @@ def _open_new_shell(page: Page) -> None:
     rail.get_by_role("button", name="New shell").click()
 
 
-def _connected_main_terminal(page: Page):
-    """Wait for a freshly opened shell's xterm to mount + connect in the main view."""
-    main_terminal = page.get_by_test_id("main-terminal-view")
-    expect(main_terminal).to_be_visible(timeout=60_000)
-    terminal_view = main_terminal.get_by_test_id("terminal-view").last
-    expect(terminal_view).to_be_visible(timeout=20_000)
+def _connected_rail_terminal(page: Page):
+    """Wait for a freshly opened shell's xterm to mount + connect inline in the rail.
+
+    A chat-first, non-wrapper ``terminal_session`` hosts its user shells INLINE
+    in the workspace rail, not in the center ``main-terminal-view`` (see
+    ``shells/test_new_shell.py``). The terminal-theme signal rides the same
+    ``TerminalView`` wherever it mounts (``data-terminal-theme`` is set
+    unconditionally), so the rail-hosted terminal carries it just as the center
+    one did.
+    """
+    rail = page.get_by_role("complementary", name="Workspace")
+    terminal_view = rail.get_by_test_id("terminal-view")
+    expect(terminal_view).to_be_visible(timeout=60_000)
     expect(terminal_view).to_have_attribute("data-state", "connected", timeout=20_000)
     return terminal_view
 
@@ -99,7 +106,7 @@ def test_light_terminal_under_dark_app(page: Page, terminal_session: tuple[str, 
 
     page.goto(f"{base_url}/c/{session_id}")
     _open_new_shell(page)
-    terminal_view = _connected_main_terminal(page)
+    terminal_view = _connected_rail_terminal(page)
 
     # The terminal is light despite the dark app chrome — the two themes are
     # independent, which is the whole point of the feature.
@@ -124,7 +131,7 @@ def test_dark_terminal_under_light_app(page: Page, terminal_session: tuple[str, 
 
     page.goto(f"{base_url}/c/{session_id}")
     _open_new_shell(page)
-    terminal_view = _connected_main_terminal(page)
+    terminal_view = _connected_rail_terminal(page)
 
     expect(terminal_view).to_have_attribute("data-terminal-theme", "dark")
     assert not _html_has_dark(page), "app theme must stay light while the terminal is dark"

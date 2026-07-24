@@ -6,21 +6,28 @@ virtual "+ New shell" row (``NewTerminalButton`` in
 ``web/src/shell/NewTerminalButton.tsx``). With a single declared
 terminal name the row creates the shell directly on click (no dropdown),
 POSTing ``/resources/terminals`` and handing the new terminal's tab key
-to ``onExpand``, which opens it in the main column via
-``MainTerminalView``. None of this needs an LLM turn — the user, not the
-agent, launches the shell — so these tests never send a chat message.
+to ``onOpenShell``. For a chat-first, non-wrapper terminal session (an
+``openai-agents`` harness with a ``terminals:`` block and no
+``omnigent.wrapper``), that hosts the shell INLINE in the workspace rail
+— the Shells tab swaps its list for the shell's terminal, mirroring the
+Files tab's inline viewer — instead of taking over the center. The
+chat-replacing full-screen center view (``MainTerminalView``) is the
+native-wrapper / mobile path only. None of this needs an LLM turn — the
+user, not the agent, launches the shell — so these tests never send a
+chat message.
 
 Three behaviors are covered:
 
-1. **"+ New shell" launches and opens a shell.** Clicking the row creates
-   a ``zsh`` shell and replaces the main session view with it: the
-   chrome-light shell view (``MainTerminalView``'s ``isShellView``) shows
-   a header naming the shell and a "Close shell" X, its xterm connects,
-   and the X returns to the conversation surface.
+1. **"+ New shell" launches and hosts the shell inline in the rail.**
+   Clicking the row creates a ``zsh`` shell and opens it inside the rail's
+   Shells tab: an inline terminal whose xterm connects, with the rail
+   naming the shell. The center is untouched — no ``main-terminal-view``
+   mounts — and "Back to shells" collapses the inline terminal back to the
+   list without closing the PTY.
 
 2. **The user can type a command into the shell.** We type ``pwd`` into
-   the connected shell and assert it keeps running — the keystrokes are
-   accepted and the bridge does not error or close. We deliberately do
+   the connected inline shell and assert it keeps running — the keystrokes
+   are accepted and the bridge does not error or close. We deliberately do
    NOT assert on the command's output: xterm renders to a WebGL canvas,
    so stdout is not in the DOM (the same reason
    ``files/test_right_panel.py`` only checks ``data-state``), and reading
@@ -44,11 +51,6 @@ from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import open_right_rail
 
-# Tab key prefix for a user-created ``zsh`` shell: ``createTerminal``
-# mints a ``u-<rand>`` session key, yielding the resource id
-# ``terminal_zsh_u-<rand>`` and the tab key ``terminal:terminal_zsh_u-…``.
-_USER_ZSH_KEY_RE = re.compile(r"^terminal:terminal_zsh_u-")
-
 
 def _open_new_shell(page: Page) -> None:
     """Open the Shells tab and click the "+ New shell" row.
@@ -70,45 +72,46 @@ def _open_new_shell(page: Page) -> None:
 
 
 def test_new_shell_launches_and_opens(page: Page, terminal_session: tuple[str, str]) -> None:
-    """Clicking "+ New shell" launches a shell and opens it in the main view.
+    """Clicking "+ New shell" launches a shell hosted inline in the rail.
 
     The create is user-driven (no chat message), so the only wait is for
-    the runner to spin the PTY up and the xterm to connect. The opened
-    view must focus the freshly-created shell — a ``terminal_tui_main``
-    active key here would mean the new key was dropped and the view fell
-    back to the agent's REPL — and render as the chrome-light shell view
-    (header + close X, no Chat/Terminal pill). The X returns to chat.
+    the runner to spin the PTY up and the xterm to connect. For a chat-first
+    non-wrapper session the created shell hosts INLINE in the rail's Shells
+    tab — not the center: its xterm mounts inside the "Workspace" rail and
+    connects, the rail names the freshly-created ``zsh`` shell (a fall-back
+    to the agent's ``tui`` REPL would mean the new key was dropped), and no
+    center ``main-terminal-view`` takes over. "Back to shells" collapses the
+    inline terminal back to the list without closing the PTY.
     """
     base_url, session_id = terminal_session
 
     page.goto(f"{base_url}/c/{session_id}")
     _open_new_shell(page)
 
-    # The new shell takes over the main column (terminal-first session).
-    main_terminal = page.get_by_test_id("main-terminal-view")
-    expect(main_terminal).to_be_visible(timeout=60_000)
-    # The view focuses the CLICKED shell, not the agent's REPL terminal.
-    expect(main_terminal).to_have_attribute("data-active-terminal", _USER_ZSH_KEY_RE)
-    # Chrome-light shell view: the shell header names it and a "Close
-    # shell" X is present; the Chat/Terminal pill is hidden (a "Chat"
-    # option under a shell misreads as the shell being the agent).
-    expect(main_terminal).to_contain_text("zsh")
-    expect(page.get_by_role("button", name="Chat", exact=True)).to_have_count(0)
+    rail = page.get_by_role("complementary", name="Workspace")
+    # The new shell hosts INLINE in the rail: its xterm mounts inside the
+    # Shells tab and connects.
+    terminal_view = rail.get_by_test_id("terminal-view")
+    expect(terminal_view).to_be_visible(timeout=60_000)
+    expect(terminal_view).to_have_attribute("data-state", "connected", timeout=20_000)
+    # The rail names the CLICKED shell (zsh), not the agent's REPL (tui).
+    expect(rail).to_contain_text("zsh")
 
-    # The shell's xterm mounts in the main pane and connects.
-    terminal_view = page.get_by_test_id("terminal-view")
-    expect(terminal_view.last).to_be_visible(timeout=20_000)
-    expect(terminal_view.last).to_have_attribute("data-state", "connected", timeout=20_000)
+    # No center takeover: the chat-replacing full-screen shell view is the
+    # native-wrapper / mobile path only, so a chat-first session never mounts
+    # ``main-terminal-view`` here.
+    expect(page.get_by_test_id("main-terminal-view")).to_have_count(0)
 
-    # The header's close X is the way back to the conversation surface.
-    page.get_by_role("button", name="Close shell").click()
-    expect(main_terminal).to_have_count(0)
+    # "Back to shells" collapses the inline terminal back to the shell list
+    # (the "+ New shell" row is visible again) without closing the PTY.
+    rail.get_by_role("button", name="Back to shells").click()
+    expect(rail.get_by_role("button", name="New shell")).to_be_visible()
 
 
 def test_new_shell_accepts_typed_command(page: Page, terminal_session: tuple[str, str]) -> None:
-    """The user can type a command into a freshly created shell.
+    """The user can type a command into a freshly created inline shell.
 
-    Types ``pwd`` into the connected shell and asserts the bridge keeps
+    Types ``pwd`` into the connected inline shell and asserts the bridge keeps
     running: the keystrokes are accepted and the PTY neither errors nor
     closes. We do NOT assert on the command's output — xterm renders to a
     WebGL canvas, so stdout never reaches the DOM, and capturing it via a
@@ -121,9 +124,10 @@ def test_new_shell_accepts_typed_command(page: Page, terminal_session: tuple[str
     page.goto(f"{base_url}/c/{session_id}")
     _open_new_shell(page)
 
-    # Wait for the shell's xterm to connect before sending keystrokes —
-    # input typed before the WS attach opens is dropped.
-    terminal_view = page.get_by_test_id("terminal-view").last
+    # Wait for the rail's inline shell xterm to connect before sending
+    # keystrokes — input typed before the WS attach opens is dropped.
+    rail = page.get_by_role("complementary", name="Workspace")
+    terminal_view = rail.get_by_test_id("terminal-view")
     expect(terminal_view).to_be_visible(timeout=60_000)
     expect(terminal_view).to_have_attribute("data-state", "connected", timeout=20_000)
 
