@@ -99,12 +99,12 @@ export function MainTerminalView({
   // header row naming the shell plus a close X — no agent tab (the shell is
   // not the agent). The Chat/Terminal pill is hidden in this state too
   // (ConnectionIndicator gates on the context's `isShellView`), so the X is
-  // the way back to chat. This is the NATIVE-WRAPPER UX only — chat-first,
-  // non-wrapper sessions host user shells inline in the rail, never the
-  // center, so gate on `isNativeWrapper` (not `isTerminalFirst`) to keep a
-  // stray user-shell key from rendering chrome-free here for them.
+  // the way back to chat. This view only ever renders in the center, so a
+  // non-agent terminal here IS a center-hosted shell — a native wrapper, or a
+  // chat-first session on mobile where there's no rail — and gates on
+  // `isTerminalFirst`; on desktop the rail hosts those shells, never here.
   const isShellView =
-    (terminalFirstCtx?.isNativeWrapper ?? false) &&
+    (terminalFirstCtx?.isTerminalFirst ?? false) &&
     activeTerminal !== null &&
     !AGENT_TERMINAL_IDS.has(activeTerminal.id);
   const setSurfaceElement = useCallback(

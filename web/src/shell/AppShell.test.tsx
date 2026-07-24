@@ -250,6 +250,15 @@ vi.mock("./TerminalsPanel", () => ({
     />
   ),
 }));
+// Stub the PTY renderer so the mobile-surface test can mount the real
+// MainTerminalView (for its shell chrome) without dragging in xterm. Existing
+// tests never mount TerminalView — TerminalsPanel and the rail section are
+// stubbed above — so this global mock is inert for them.
+vi.mock("@/components/blocks/TerminalView", () => ({
+  TerminalView: ({ terminalId }: { terminalId: string }) => (
+    <div data-testid="terminal-view" data-terminal-id={terminalId} />
+  ),
+}));
 
 import { useConversations } from "@/hooks/useConversations";
 import { useTerminals } from "@/hooks/useTerminals";
@@ -274,6 +283,7 @@ import type { Agent } from "@/hooks/useAgents";
 const useSessionAgentMock = vi.mocked(useSessionAgent);
 
 import { AppShell } from "./AppShell";
+import { MainTerminalView } from "./MainTerminalView";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { useForkDialog } from "./ForkDialogContext";
 import { useChatStore } from "@/store/chatStore";
@@ -320,6 +330,28 @@ function TerminalFirstViewProbe() {
         terminal
       </button>
     </div>
+  );
+}
+
+/**
+ * Route element that pairs the view probe with the REAL MainTerminalView,
+ * mounted (as ChatPage does) only while the view is on the terminal. Lets a
+ * test assert that a center-hosted shell's chrome — the identity header and
+ * "Close shell" X — actually reaches the DOM through AppShell's routing, not
+ * just that the context flags it.
+ */
+function MainTerminalSurfaceProbe({ conversationId }: { conversationId: string }) {
+  const ctx = useTerminalFirst();
+  return (
+    <>
+      <TerminalFirstViewProbe />
+      {ctx?.view === "terminal" && (
+        <MainTerminalView
+          conversationId={conversationId}
+          initialTerminalKey={ctx.terminalViewKey}
+        />
+      )}
+    </>
   );
 }
 
@@ -1202,6 +1234,88 @@ describe("User-shell routing gates on isNativeWrapper (not isTerminalFirst)", ()
     expect(probe()).toHaveAttribute("data-view", "terminal");
     expect(probe()).toHaveAttribute("data-is-shell-view", "true");
     expect(probe()).toHaveAttribute("data-terminal-view-key", "terminal:terminal_main");
+  });
+
+  it("center-hosts a chat-first user shell WITH its header + close X on mobile (no rail)", () => {
+    // Below md there is no rail, so a polly-shape (terminal-first, NON-wrapper)
+    // user shell hands off full-screen to the center via openTerminalsPanel —
+    // the same path a native wrapper uses. The center-hosted shell must render
+    // its own chrome (identity header + close X) and flag isShellView so the
+    // Chat/Terminal pill hides; the earlier isNativeWrapper gate left it bare
+    // and the pill mislabeled "Terminal".
+    const originalMatchMedia = window.matchMedia;
+    // useIsMobileViewport reads the `md`-complement query; report it as matching
+    // so the shell surface behaves as mobile.
+    window.matchMedia = ((query: string) => ({
+      matches: query.startsWith("not all and (min-width: 768px)"),
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    })) as unknown as typeof window.matchMedia;
+
+    try {
+      useEnvironmentMock.mockReturnValue({
+        data: { available: true, root: null },
+        isLoading: false,
+      } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+      mockConversations([
+        { id: "conv_polly", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+      ]);
+      useTerminalsMock.mockReturnValue({
+        terminals: [
+          { id: "terminal_tui_main", name: "tui", session: "main", running: true },
+          // The rail mock's onExpand targets "terminal:terminal_main"; give that
+          // key a real user shell so MainTerminalView can render its header.
+          { id: "terminal_main", name: "bash", session: "s1", running: true },
+        ],
+        isLoading: false,
+        error: null,
+      });
+
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        <QueryClientProvider client={qc}>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/c/conv_polly"]}>
+              <Routes>
+                <Route element={<AppShell />}>
+                  <Route
+                    path="c/:conversationId"
+                    element={<MainTerminalSurfaceProbe conversationId="conv_polly" />}
+                  />
+                </Route>
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </QueryClientProvider>,
+      );
+
+      const probe = () => screen.getByTestId("view-probe");
+      expect(probe()).toHaveAttribute("data-is-terminal-first", "true");
+      expect(probe()).toHaveAttribute("data-is-native-wrapper", "false");
+
+      // Open a shell through the full-screen path (onExpand → openTerminalsPanel),
+      // the same handler the mobile shells drawer routes through.
+      fireEvent.mouseDown(screen.getByRole("tab", { name: /Shells/i }));
+      fireEvent.click(screen.getByRole("button", { name: /rail: open terminal/i }));
+
+      // The center now hosts the shell: the view flips to terminal and
+      // isShellView is set, so the Chat/Terminal pill hides.
+      expect(probe()).toHaveAttribute("data-view", "terminal");
+      expect(probe()).toHaveAttribute("data-is-shell-view", "true");
+
+      // MainTerminalView renders the shell chrome — an identity header naming
+      // the shell and a working "Close shell" X back to chat, not a bare pane.
+      expect(screen.getByText("bash")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Close shell" }));
+      expect(probe()).toHaveAttribute("data-view", "chat");
+    } finally {
+      window.matchMedia = originalMatchMedia;
+    }
   });
 
   it("does not replay a stored user-shell key into the center for a polly session", () => {

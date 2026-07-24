@@ -1498,14 +1498,13 @@ export function AppShell() {
   // A center-hosted user shell (a terminal key other than the agent's own)
   // takes over the main view chrome-free: ConnectionIndicator hides the
   // Chat/Terminal pill and MainTerminalView renders the shell with its own
-  // close affordance. This is the NATIVE-WRAPPER UX only — inline-hosting
-  // sessions (``hostsShellsInline``) put user shells in the rail, never the
-  // center, so gating on ``!hostsShellsInline`` (i.e. ``isNativeWrapper``)
-  // means a stray user-shell key can't render a chrome-free center for them.
-  // The PANEL_NO_TERMINAL_KEY sentinel ("") is falsy, so "open with no target"
-  // stays a pill view.
-  const isShellView =
-    !hostsShellsInline && !!panelInitialKey && !isAgentTerminalKey(panelInitialKey);
+  // close affordance. ``panelInitialKey`` is a user-shell key only when the
+  // center genuinely hosts one — ``openTerminalsPanel`` sets it (native wrapper,
+  // and the mobile drawer where there's no rail), while the desktop rail's
+  // ``openShellTab`` clears it and the restore effect scrubs stray inline-host
+  // keys — so gate on ``terminalFirst``. The PANEL_NO_TERMINAL_KEY sentinel ("")
+  // is falsy, so "open with no target" stays a pill view.
+  const isShellView = terminalFirst && !!panelInitialKey && !isAgentTerminalKey(panelInitialKey);
   const terminalFirstContextValue = useMemo<TerminalFirstContextValue>(
     () => ({
       isClaudeNative,
