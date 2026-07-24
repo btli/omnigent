@@ -16,9 +16,35 @@ interface LoaderBehavior {
   // If set, the OrbitControls constructor throws AFTER the renderer is created,
   // exercising the partial-init failure/teardown path.
   orbitThrows: boolean;
+  // If set, the parsed object carries a mesh whose material references textures
+  // (as a textured 3MF does), so teardown's texture disposal can be asserted.
+  texturedMaterial: boolean;
 }
 
-const behavior: LoaderBehavior = { mode: "valid", orbitThrows: false };
+const behavior: LoaderBehavior = {
+  mode: "valid",
+  orbitThrows: false,
+  texturedMaterial: false,
+};
+
+// Textures the textured-material mesh references; disposed flags are asserted
+// by the teardown test to prove the material's textures are freed, not leaked.
+interface TextureRecord {
+  isTexture: true;
+  disposed: boolean;
+  dispose: () => void;
+}
+function makeTextureRecord(): TextureRecord {
+  const rec: TextureRecord = { isTexture: true, disposed: false, dispose: () => {} };
+  rec.dispose = () => {
+    rec.disposed = true;
+  };
+  return rec;
+}
+const materialTextures: { map: TextureRecord; normalMap: TextureRecord } = {
+  map: makeTextureRecord(),
+  normalMap: makeTextureRecord(),
+};
 
 // Records so tests can assert which loader ran and that teardown happened.
 const parseCalls: string[] = [];
@@ -34,6 +60,19 @@ let lastRenderer: RendererRecord | null = null;
 let lastMaterial: { color: number } | null = null;
 
 function makeParsedObject() {
+  // A textured mesh mirrors what a 3MF loader yields: a material whose slots
+  // (map, normalMap) hold Texture instances. disposeObject must free those, so
+  // dispose() flips the shared records the teardown test asserts.
+  const child = behavior.texturedMaterial
+    ? {
+        geometry: { dispose: () => {} },
+        material: {
+          map: materialTextures.map,
+          normalMap: materialTextures.normalMap,
+          dispose: () => {},
+        },
+      }
+    : { geometry: null, material: null };
   // Object3D stand-in. Box3.setFromObject reads boxSpec to decide bounds.
   return {
     boxSpec:
@@ -43,7 +82,7 @@ function makeParsedObject() {
           ? { empty: false, nan: true }
           : { empty: false, nan: false },
     position: { sub: () => {} },
-    traverse: (cb: (child: unknown) => void) => cb({ geometry: null, material: null }),
+    traverse: (cb: (child: unknown) => void) => cb(child),
   };
 }
 
@@ -211,6 +250,9 @@ function makeData(overrides: Partial<FileContentResponse> = {}): FileContentResp
 beforeEach(() => {
   behavior.mode = "valid";
   behavior.orbitThrows = false;
+  behavior.texturedMaterial = false;
+  materialTextures.map = makeTextureRecord();
+  materialTextures.normalMap = makeTextureRecord();
   parseCalls.length = 0;
   lastRenderer = null;
   lastMaterial = null;
@@ -340,6 +382,21 @@ describe("ModelViewer teardown", () => {
     unmount();
     expect(lastRenderer?.contextLost).toBe(true);
     expect(lastRenderer?.disposed).toBe(true);
+  });
+
+  it("disposes the material's textures on unmount (no GPU texture leak)", async () => {
+    // A textured 3MF's material references textures (map, normalMap). Disposing
+    // only the material would leak those GPU allocations, so teardown must free
+    // each texture the material holds.
+    behavior.texturedMaterial = true;
+    const { unmount } = render(
+      <ModelViewer data={makeData({ path: "part.3mf" })} path="part.3mf" />,
+    );
+    await waitFor(() => expect(lastRenderer).not.toBeNull());
+    expect(materialTextures.map.disposed).toBe(false);
+    unmount();
+    expect(materialTextures.map.disposed).toBe(true);
+    expect(materialTextures.normalMap.disposed).toBe(true);
   });
 });
 

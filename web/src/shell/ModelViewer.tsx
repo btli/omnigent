@@ -126,6 +126,22 @@ function hasRenderableBounds(box: THREE.Box3): boolean {
 }
 
 /**
+ * Dispose a material and every texture it references (`map`, `normalMap`,
+ * `roughnessMap`, …) so their GPU allocations are released. three.js frees
+ * neither the material nor its textures automatically, so a textured 3MF would
+ * otherwise leak its GPU textures on unmount. Texture slots are detected by the
+ * three.js `isTexture` flag rather than `instanceof` (the loaders and the app
+ * can hold different three copies).
+ */
+function disposeMaterial(material: THREE.Material): void {
+  for (const value of Object.values(material)) {
+    const texture = value as THREE.Texture | null;
+    if (texture?.isTexture) texture.dispose();
+  }
+  material.dispose();
+}
+
+/**
  * Dispose all geometries and materials reachable from `object` so the GPU
  * buffers backing them are released. three.js does not do this automatically.
  */
@@ -135,9 +151,9 @@ function disposeObject(object: THREE.Object3D): void {
     mesh.geometry?.dispose();
     const material = mesh.material;
     if (Array.isArray(material)) {
-      material.forEach((m) => m.dispose());
-    } else {
-      material?.dispose();
+      material.forEach(disposeMaterial);
+    } else if (material) {
+      disposeMaterial(material);
     }
   });
 }
