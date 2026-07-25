@@ -154,7 +154,7 @@ describe("UserBubble copy button", () => {
     vi.stubGlobal("navigator", { clipboard: { writeText } });
     const real = window.matchMedia;
     window.matchMedia = ((query: string) => ({
-      matches: /max-width/.test(query),
+      matches: /max-width/.test(query) || /^\s*not all and/.test(query),
       media: query,
       onchange: null,
       addListener: () => {},
