@@ -1,5 +1,8 @@
 package ai.omnigent.android
 
+import kotlin.math.ceil
+import kotlin.math.floor
+
 /** Validated horizontal bounds, normalized to the current WebView width. */
 data class ServerSwitcherBand(
     val left: Double,
@@ -18,17 +21,30 @@ data class ServerSwitcherBand(
     }
 }
 
-/** Centre within [band], clamping the recovery control fully on-screen. */
+private fun ServerSwitcherBand.pixelBounds(containerWidth: Int): Pair<Int, Int> {
+    val width = containerWidth.coerceAtLeast(0)
+    val leftPx = ceil(width * left).toInt().coerceIn(0, width)
+    val rightPx = floor(width * right).toInt().coerceIn(leftPx, width)
+    return leftPx to rightPx
+}
+
+fun serverSwitcherBandWidth(
+    containerWidth: Int,
+    band: ServerSwitcherBand,
+): Int {
+    val (bandLeft, bandRight) = band.pixelBounds(containerWidth)
+    return bandRight - bandLeft
+}
+
+/** Centre within [band], preferring its edge when the supplied pill cannot fit. */
 fun serverSwitcherLeftMargin(
     containerWidth: Int,
     switcherWidth: Int,
     band: ServerSwitcherBand,
 ): Int {
-    val bandLeft = containerWidth * band.left
-    val bandRight = containerWidth * band.right
+    val (bandLeft, bandRight) = band.pixelBounds(containerWidth)
     val centered = (bandLeft + bandRight) / 2.0 - switcherWidth / 2.0
-    return centered
-        .toInt()
-        .coerceAtMost((containerWidth - switcherWidth).coerceAtLeast(0))
-        .coerceAtLeast(0)
+    val maxLeft = bandRight - switcherWidth
+    if (bandLeft > maxLeft) return bandLeft
+    return centered.toInt().coerceIn(bandLeft, maxLeft)
 }
