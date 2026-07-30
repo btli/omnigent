@@ -154,10 +154,11 @@ describe("index.css Workspace rail safe-area rule", () => {
     ':is([data-ios-native], [data-android-native]) aside[aria-label="Workspace"]';
   // Match on the rail's aria-label rather than the exact selector text, so an
   // equivalently-spelled selector cannot introduce a margin the checks miss.
-  // Shorthand `margin:` counts too — it overrides both edges at once.
+  // Shorthand `margin:` counts too, as do the logical `margin-block` forms —
+  // each overrides the block-start/end edges this rule sets.
+  const marginDeclaration = /margin(?:-(?:top|bottom|block(?:-(?:start|end))?))?\s*:/;
   const ruleMatches = [...cssSource.matchAll(/[^{}]+\{[^{}]*\}/g)].filter(
-    ([block]) =>
-      block.includes('aria-label="Workspace"') && /margin(?:-(?:top|bottom))?\s*:/.test(block),
+    ([block]) => block.includes('aria-label="Workspace"') && marginDeclaration.test(block),
   );
   const rule = ruleMatches[0]?.[0];
   const selector = (rule ?? "")
