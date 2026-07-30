@@ -3,7 +3,15 @@ import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  within,
+} from "@testing-library/react";
 import {
   MemoryRouter,
   Route,
@@ -223,6 +231,7 @@ import type { Agent } from "@/hooks/useAgents";
 
 const useSessionAgentMock = vi.mocked(useSessionAgent);
 
+import { useNativeServerSwitcherBand } from "@/hooks/useNativeServerSwitcherBand";
 import { AppShell } from "./AppShell";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { useForkDialog } from "./ForkDialogContext";
@@ -485,6 +494,136 @@ beforeEach(() => {
 });
 
 afterEach(cleanup);
+
+describe("native server switcher band", () => {
+  class TestResizeObserver {
+    observe = vi.fn();
+    disconnect = vi.fn();
+  }
+
+  function installShell(kind: "android" | "ios" | null, setter: ReturnType<typeof vi.fn>) {
+    if (kind === null) {
+      delete (window as unknown as Record<string, unknown>).omnigentNative;
+      return;
+    }
+    (window as unknown as Record<string, unknown>).omnigentNative = {
+      kind,
+      setBadgeCount: vi.fn(),
+      notify: vi.fn().mockResolvedValue(true),
+      setServerSwitcherBand: setter,
+    };
+  }
+
+  function setMainRect(width: number) {
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      if (this.tagName === "MAIN") {
+        return {
+          x: 320,
+          y: 0,
+          left: 320,
+          right: 320 + width,
+          top: 0,
+          bottom: 600,
+          width,
+          height: 600,
+          toJSON: () => ({}),
+        };
+      }
+      return {
+        x: 0,
+        y: 0,
+        left: 0,
+        right: 0,
+        top: 0,
+        bottom: 0,
+        width: 0,
+        height: 0,
+        toJSON: () => ({}),
+      };
+    });
+  }
+
+  beforeEach(() => {
+    vi.stubGlobal("ResizeObserver", TestResizeObserver);
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      callback(0);
+      return 1;
+    });
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 1000 });
+  });
+
+  afterEach(() => {
+    delete (window as unknown as Record<string, unknown>).omnigentNative;
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("publishes the main column fractions in an Android shell", () => {
+    const setBand = vi.fn();
+    installShell("android", setBand);
+    setMainRect(400);
+    mockConversations([]);
+
+    renderShell("/");
+
+    expect(setBand).toHaveBeenCalledWith(0.32, 0.72);
+  });
+
+  it("does not publish outside a native mobile shell", () => {
+    const setBand = vi.fn();
+    installShell(null, setBand);
+    setMainRect(400);
+    mockConversations([]);
+
+    renderShell("/");
+
+    expect(setBand).not.toHaveBeenCalled();
+  });
+
+  it("does not publish when the main column has zero width", () => {
+    const setBand = vi.fn();
+    installShell("android", setBand);
+    setMainRect(0);
+    mockConversations([]);
+
+    renderShell("/");
+
+    expect(setBand).not.toHaveBeenCalled();
+  });
+
+  it("does not publish when the main column is absent", () => {
+    const setBand = vi.fn();
+    installShell("android", setBand);
+
+    renderHook(() => useNativeServerSwitcherBand(null));
+
+    expect(setBand).not.toHaveBeenCalled();
+  });
+
+  it("coalesces resize events through an animation frame", () => {
+    const callbacks: FrameRequestCallback[] = [];
+    vi.mocked(window.requestAnimationFrame).mockImplementation((callback) => {
+      callbacks.push(callback);
+      return callbacks.length;
+    });
+    const setBand = vi.fn();
+    installShell("android", setBand);
+    setMainRect(400);
+    mockConversations([]);
+    renderShell("/");
+
+    act(() => {
+      window.dispatchEvent(new Event("resize"));
+      window.dispatchEvent(new Event("orientationchange"));
+    });
+
+    expect(callbacks).toHaveLength(1);
+    act(() => callbacks[0](0));
+    expect(setBand).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe("AppShell header", () => {
   it("renders the sidebar toggle on all pages", () => {
