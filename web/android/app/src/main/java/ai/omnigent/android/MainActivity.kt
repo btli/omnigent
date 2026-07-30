@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.text.TextUtils
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -36,6 +37,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.webkit.ScriptHandler
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import java.lang.ref.WeakReference
 
 /**
  * The single WebView host. Mirrors the iOS `WebShellView` + `OmnigentWebView`:
@@ -66,6 +68,9 @@ class MainActivity : AppCompatActivity() {
     // visible so it's always available as a recovery path (backward compatible
     // with older web builds). Theme-aware via brand colors (light/dark XML).
     private lateinit var switchButton: View
+
+    // Null before each page publishes, preserving whole-window centring.
+    private var switcherBand: ServerSwitcherBand? = null
 
     // WebChromeClient affordances that need Activity-scoped result launchers.
     // Transient by design: rotation is covered by configChanges (no recreation),
@@ -144,6 +149,7 @@ class MainActivity : AppCompatActivity() {
                         },
                         onPageReady = ::onPageReady,
                         onLoginRequired = ::startLogin,
+                        onNavigationStarted = ::clearServerSwitcherBand,
                     )
                 webChromeClient =
                     OmnigentWebChromeClient(
@@ -171,6 +177,12 @@ class MainActivity : AppCompatActivity() {
                 elevation = 6 * dp
                 isClickable = true
                 isFocusable = true
+                // Match the iOS ceiling; the full host remains accessible.
+                maxWidth = (SWITCHER_MAX_WIDTH_DP * dp).toInt()
+                minWidth = (SWITCHER_MIN_WIDTH_DP * dp).toInt()
+                isSingleLine = true
+                ellipsize = TextUtils.TruncateAt.MIDDLE
+                contentDescription = hostLabelOf(serverUrl)
                 setOnClickListener { showServerSwitcherMenu(it) }
             }
         switchButton.layoutParams =
@@ -185,6 +197,8 @@ class MainActivity : AppCompatActivity() {
                     topMargin = (8 * dp).toInt()
                 }
         container.addView(switchButton)
+        // Label and container size changes both affect centring.
+        switchButton.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> positionServerSwitcher() }
         setContentView(container)
         applySystemBarContrast()
         installBridge()
@@ -228,6 +242,7 @@ class MainActivity : AppCompatActivity() {
                 lp.topMargin = bars.top + (8 * dp).toInt()
                 switchButton.layoutParams = lp
             }
+            positionServerSwitcher()
             emitInsets()
             insets
         }
@@ -286,6 +301,7 @@ class MainActivity : AppCompatActivity() {
         if (::webView.isInitialized) {
             // Notify matchMedia listeners without reloading the SPA.
             webView.dispatchConfigurationChanged(newConfig)
+            webView.post(::positionServerSwitcher)
         }
     }
 
@@ -308,6 +324,9 @@ class MainActivity : AppCompatActivity() {
                 OmnigentBridgeListener(
                     notifications = notifications,
                     blobSaver = blobSaver,
+                    onServerSwitcherBand = WeakReference(this).let { host ->
+                        { band -> host.get()?.receiveServerSwitcherBand(band) }
+                    },
                 ),
             )
         } catch (_: IllegalArgumentException) {
@@ -453,6 +472,44 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun receiveServerSwitcherBand(band: ServerSwitcherBand) {
+        runOnUiThread {
+            if (isDestroyed || isFinishing || switcherBand == band) return@runOnUiThread
+            switcherBand = band
+            positionServerSwitcher()
+        }
+    }
+
+    /** Forget the web-published band; the pill returns to the window centre. */
+    private fun clearServerSwitcherBand() {
+        if (switcherBand == null) return
+        switcherBand = null
+        positionServerSwitcher()
+    }
+
+    /** Centre in the latest band, or in the whole window before publication. */
+    private fun positionServerSwitcher() {
+        if (!::switchButton.isInitialized) return
+        val lp = switchButton.layoutParams as? FrameLayout.LayoutParams ?: return
+        val band = switcherBand
+        val containerWidth = webView.width
+        val switcherWidth = switchButton.width
+
+        val gravity: Int
+        val leftMargin: Int
+        if (band == null || containerWidth <= 0 || switcherWidth <= 0) {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            leftMargin = 0
+        } else {
+            gravity = Gravity.TOP or Gravity.START
+            leftMargin = serverSwitcherLeftMargin(containerWidth, switcherWidth, band)
+        }
+        if (lp.gravity == gravity && lp.leftMargin == leftMargin) return
+        lp.gravity = gravity
+        lp.leftMargin = leftMargin
+        switchButton.layoutParams = lp
+    }
+
     /**
      * Extract a short host[:port] label from a URL for the server switcher pill.
      * Mirrors the iOS `URL.omnigentHostLabel` in `URL+Omnigent.swift`.
@@ -524,7 +581,11 @@ class MainActivity : AppCompatActivity() {
         pageLoaded = false
         historyCleared = false
         loginAttempts = 0
-        (switchButton as? TextView)?.text = hostLabelOf(serverUrl)
+        val label = hostLabelOf(serverUrl)
+        (switchButton as? TextView)?.let { button ->
+            button.text = label
+            button.contentDescription = label
+        }
         installBridge()
         webView.loadUrl(serverUrl)
     }
@@ -781,6 +842,10 @@ class MainActivity : AppCompatActivity() {
 
     private companion object {
         const val MAX_LOGIN_ATTEMPTS = 3
+
+        // The 48dp floor is tap safety, not the iOS 120dp visual floor.
+        const val SWITCHER_MAX_WIDTH_DP = 172
+        const val SWITCHER_MIN_WIDTH_DP = 48
 
         // Back-press fallback: long enough that a healthy renderer's JS round-trip
         // (a few ms) always wins the race, short enough to not feel stuck if it
