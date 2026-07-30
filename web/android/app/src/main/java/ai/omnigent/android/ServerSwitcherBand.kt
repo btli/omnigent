@@ -45,6 +45,10 @@ fun serverSwitcherLeftMargin(
     val (bandLeft, bandRight) = band.pixelBounds(containerWidth)
     val centered = (bandLeft + bandRight) / 2.0 - switcherWidth / 2.0
     val maxLeft = bandRight - switcherWidth
-    if (bandLeft > maxLeft) return bandLeft
-    return centered.toInt().coerceIn(bandLeft, maxLeft)
+    val bandAnchoredLeft =
+        if (bandLeft > maxLeft) bandLeft else centered.toInt().coerceIn(bandLeft, maxLeft)
+    // A narrow right-edge band should overflow to the left, not beyond the parent.
+    return bandAnchoredLeft
+        .coerceAtMost((containerWidth - switcherWidth).coerceAtLeast(0))
+        .coerceAtLeast(0)
 }
