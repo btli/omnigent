@@ -153,7 +153,8 @@ describe("index.css Workspace rail safe-area rule", () => {
   const workspaceSelector =
     ':is([data-ios-native], [data-android-native]) aside[aria-label="Workspace"]';
   const ruleMatches = [...cssSource.matchAll(/[^{}]+\{[^{}]*\}/g)].filter(
-    ([block]) => block.includes(workspaceSelector) && /margin-(?:top|bottom)\s*:/.test(block),
+    // Shorthand `margin:` counts too — it overrides both edges at once.
+    ([block]) => block.includes(workspaceSelector) && /margin(?:-(?:top|bottom))?\s*:/.test(block),
   );
   const rule = ruleMatches[0]?.[0];
   const selector = (rule ?? "")
