@@ -157,8 +157,11 @@ describe("index.css Workspace rail safe-area rule", () => {
   // Shorthand `margin:` counts too, as do the logical `margin-block` forms —
   // each overrides the block-start/end edges this rule sets.
   const marginDeclaration = /margin(?:-(?:top|bottom|block(?:-(?:start|end))?))?\s*:/;
+  // Any quoting or spacing of the attribute selector counts — an equivalently
+  // spelled one would otherwise slip past the checks below.
+  const workspaceAttribute = /\[\s*aria-label\s*=\s*("Workspace"|'Workspace'|Workspace)\s*\]/;
   const ruleMatches = [...cssSource.matchAll(/[^{}]+\{[^{}]*\}/g)].filter(
-    ([block]) => block.includes('aria-label="Workspace"') && marginDeclaration.test(block),
+    ([block]) => workspaceAttribute.test(block) && marginDeclaration.test(block),
   );
   const rule = ruleMatches[0]?.[0];
   const selector = (rule ?? "")
