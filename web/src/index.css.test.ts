@@ -243,7 +243,11 @@ describe("index.css Workspace rail safe-area rule", () => {
   it("uses safe-area margins on both edges", () => {
     expect(rule).toMatch(/margin-top\s*:\s*calc\(0\.5rem \+ var\(--omnigent-safe-top\)\)/);
     expect(rule).toMatch(/margin-bottom\s*:\s*calc\(0\.5rem \+ var\(--omnigent-safe-bottom\)\)/);
-    expect(rule).not.toMatch(/--omnigent-(?:inset|native)-/);
+    // Every margin rule, not just the first: a later one could re-introduce the
+    // inset vars and double-count the native bottom bar.
+    for (const [block] of ruleMatches) {
+      expect(block).not.toMatch(/--omnigent-(?:inset|native)-/);
+    }
   });
 });
 
