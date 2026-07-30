@@ -152,9 +152,12 @@ describe("index.css app-shell viewport lock", () => {
 describe("index.css Workspace rail safe-area rule", () => {
   const workspaceSelector =
     ':is([data-ios-native], [data-android-native]) aside[aria-label="Workspace"]';
+  // Match on the rail's aria-label rather than the exact selector text, so an
+  // equivalently-spelled selector cannot introduce a margin the checks miss.
+  // Shorthand `margin:` counts too — it overrides both edges at once.
   const ruleMatches = [...cssSource.matchAll(/[^{}]+\{[^{}]*\}/g)].filter(
-    // Shorthand `margin:` counts too — it overrides both edges at once.
-    ([block]) => block.includes(workspaceSelector) && /margin(?:-(?:top|bottom))?\s*:/.test(block),
+    ([block]) =>
+      block.includes('aria-label="Workspace"') && /margin(?:-(?:top|bottom))?\s*:/.test(block),
   );
   const rule = ruleMatches[0]?.[0];
   const selector = (rule ?? "")
@@ -210,6 +213,9 @@ describe("index.css Workspace rail safe-area rule", () => {
   it("has no enclosing at-rule", () => {
     expect(rule, "the Workspace safe-area rule is gone from index.css").toBeDefined();
     if (!rule) return;
+    // Exactly one rule may set the rail's margins; a second could override the
+    // safe area without tripping any of the value checks below.
+    expect(ruleMatches).toHaveLength(1);
 
     for (const match of ruleMatches) {
       const selectorIndex = cssSource.indexOf(workspaceSelector, match.index);
