@@ -527,11 +527,13 @@ class MainActivity : AppCompatActivity() {
             if (band == null || containerWidth <= 0) {
                 defaultMax
             } else {
-                minOf(defaultMax, serverSwitcherBandWidth(containerWidth, band))
+                maxOf(
+                    defaultMin,
+                    minOf(defaultMax, serverSwitcherBandWidth(containerWidth, band)),
+                )
             }
-        // A narrow band must win over the minimum tap target to avoid covering either rail.
-        val min = minOf(defaultMin, max)
-        if (pill.minWidth != min) pill.minWidth = min
+        // Keep the recovery control tappable; bounded band overflow is safer than losing it.
+        if (pill.minWidth != defaultMin) pill.minWidth = defaultMin
         if (pill.maxWidth != max) pill.maxWidth = max
     }
 
