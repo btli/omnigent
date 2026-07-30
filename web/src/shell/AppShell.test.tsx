@@ -630,6 +630,22 @@ describe("native server switcher band", () => {
     expect(setBand).toHaveBeenCalledWith(0.32, 1);
   });
 
+  it.each([
+    // Just below the usable-band threshold: hand over to the content region.
+    [63, 0.32, 1],
+    // Exactly at it: the column itself is wide enough to host the pill.
+    [64, 0.32, 0.384],
+  ])("picks the band source at a %ipx main column", (mainWidth, left, right) => {
+    const setBand = vi.fn();
+    installShell("android", setBand);
+    installLayoutRects(mainWidth);
+    mockConversations([]);
+
+    renderShell("/");
+
+    expect(setBand).toHaveBeenCalledWith(left, right);
+  });
+
   it("does not publish when both observed elements are absent", () => {
     const setBand = vi.fn();
     installShell("android", setBand);
