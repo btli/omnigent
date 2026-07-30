@@ -141,6 +141,26 @@ class MainActivityTest {
     }
 
     @Test
+    fun `server switcher remains fully visible beside a narrow right edge band`() {
+        val host = "a-very-long-server-hostname-that-needs-truncation.example.com"
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://$host")
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        val button = activity.switchButton()
+        val parent = button.parent as View
+        val band = ServerSwitcherBand(0.99, 1.0)
+        layout(parent, width = 1000, height = 600)
+        activity.setSwitcherBand(band)
+
+        layout(parent, width = 1000, height = 600)
+
+        val visibleWidth = minOf(button.right, parent.width) - maxOf(button.left, 0)
+        assertTrue(button.width > serverSwitcherBandWidth(parent.width, band))
+        assertTrue(button.left >= 0)
+        assertTrue(button.right <= parent.width)
+        assertEquals(button.width, visibleWidth)
+    }
+
+    @Test
     fun `server switcher absolute left margin does not mirror in RTL`() {
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
