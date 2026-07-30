@@ -61,6 +61,45 @@ class ServerSwitcherPositionTest {
     }
 
     @Test
+    fun `pill wider than a right edge band stays inside the container`() {
+        val containerWidth = 1000
+        val switcherWidth = 160
+        val left =
+            serverSwitcherLeftMargin(
+                containerWidth = containerWidth,
+                switcherWidth = switcherWidth,
+                band = ServerSwitcherBand(0.98, 1.0),
+            )
+
+        assertTrue(left + switcherWidth <= containerWidth)
+        assertEquals(switcherWidth, minOf(left + switcherWidth, containerWidth) - maxOf(left, 0))
+    }
+
+    @Test
+    fun `pill wider than a left edge band stays inside the container`() {
+        val left =
+            serverSwitcherLeftMargin(
+                containerWidth = 1000,
+                switcherWidth = 160,
+                band = ServerSwitcherBand(0.0, 0.02),
+            )
+
+        assertTrue(left >= 0)
+    }
+
+    @Test
+    fun `parent clamp does not move a pill that fits its band`() {
+        assertEquals(
+            470,
+            serverSwitcherLeftMargin(
+                containerWidth = 1000,
+                switcherWidth = 160,
+                band = ServerSwitcherBand(0.3, 0.8),
+            ),
+        )
+    }
+
+    @Test
     fun `fractional band bounds round inward`() {
         val band = ServerSwitcherBand(0.3005, 0.7002)
 
@@ -111,9 +150,9 @@ class ServerSwitcherPositionTest {
     }
 
     @Test
-    fun `pill wider than the container remains anchored to its band`() {
+    fun `pill wider than the container stays at the parent start`() {
         assertEquals(
-            20,
+            0,
             serverSwitcherLeftMargin(
                 containerWidth = 100,
                 switcherWidth = 160,
