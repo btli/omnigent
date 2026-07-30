@@ -125,33 +125,86 @@ class MainActivityTest {
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
         val button = activity.switchButton()
-        activity.setSwitcherBand(ServerSwitcherBand(0.3, 0.8))
-        (button.parent as View).layout(0, 0, 1000, 600)
-        // Sizing the pill last fires the layout listener, which is the path
-        // that repositions it in production.
-        button.layout(0, 0, 160, 48)
+        val parent = button.parent as View
+        val band = ServerSwitcherBand(0.3, 0.8)
+        activity.setSwitcherBand(band)
+
+        layout(parent, width = 1000, height = 600)
+        layout(parent, width = 1000, height = 600)
 
         val layout = button.layoutParams as FrameLayout.LayoutParams
+        val expectedLeft = serverSwitcherLeftMargin(1000, button.width, band)
         assertEquals(Gravity.TOP or Gravity.LEFT, layout.gravity)
-        assertEquals(470, layout.leftMargin)
+        assertEquals(expectedLeft, layout.leftMargin)
+        assertEquals(expectedLeft, button.left)
+        assertEquals(expectedLeft + button.width, button.right)
+    }
+
+    @Test
+    fun `server switcher absolute left margin does not mirror in RTL`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        val button = activity.switchButton()
+        val parent = button.parent as View
+        val band = ServerSwitcherBand(0.3, 0.8)
+        parent.layoutDirection = View.LAYOUT_DIRECTION_RTL
+        activity.setSwitcherBand(band)
+
+        layout(parent, width = 1000, height = 600)
+        layout(parent, width = 1000, height = 600)
+
+        val expectedLeft = serverSwitcherLeftMargin(1000, button.width, band)
+        assertEquals(expectedLeft, button.left)
+        assertEquals(expectedLeft + button.width, button.right)
     }
 
     @Test
     fun `server switcher width bounds follow the published band`() {
-        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        val host = "a-very-long-server-hostname-that-needs-truncation.example.com"
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://$host")
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
         val button = activity.switchButton()
+        val parent = button.parent as View
         val density = activity.resources.displayMetrics.density
-        (button.parent as View).layout(0, 0, 1000, 600)
-        button.layout(0, 0, 160, 48)
+        val defaultMax = (172 * density).toInt()
+        val recoveryFloor = (48 * density).toInt()
+        layout(parent, width = 1000, height = 600)
 
         activity.setSwitcherBand(ServerSwitcherBand(0.45, 0.55))
-        assertEquals(100, button.maxWidth)
-        assertEquals((48 * density).toInt(), button.minWidth)
+        val expectedWideBandWidth = maxOf(recoveryFloor, minOf(defaultMax, 100))
+        assertEquals(expectedWideBandWidth, button.maxWidth)
+        assertEquals(recoveryFloor, button.minWidth)
+        layout(parent, width = 1000, height = 600)
+        // The pill may measure narrower than the cap; what matters is that it
+        // stays inside the band it was given.
+        assertTrue(button.width <= expectedWideBandWidth)
+        assertTrue(button.left >= 450)
+        assertTrue(button.right <= 550)
 
         activity.setSwitcherBand(ServerSwitcherBand(0.49, 0.51))
-        assertEquals(20, button.maxWidth)
-        assertEquals(20, button.minWidth)
+        assertEquals(recoveryFloor, button.maxWidth)
+        assertEquals(recoveryFloor, button.minWidth)
+        layout(parent, width = 1000, height = 600)
+        // Band narrower than the recovery floor: keep the pill tappable and
+        // anchored at the band's left edge, accepting bounded overflow.
+        assertEquals(recoveryFloor, button.width)
+        assertEquals(490, button.left)
+        assertEquals(490 + button.width, button.right)
+    }
+
+    private fun layout(
+        view: View,
+        width: Int,
+        height: Int,
+    ) {
+        // Force the traversal: an unchanged frame otherwise skips onLayout, so
+        // children keep their stale positions.
+        view.requestLayout()
+        view.measure(
+            View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY),
+        )
+        view.layout(0, 0, width, height)
     }
 
     private fun MainActivity.webView(): WebView =

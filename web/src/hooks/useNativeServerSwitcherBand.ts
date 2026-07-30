@@ -8,6 +8,7 @@ import {
 } from "@/lib/nativeBridge";
 
 const NATIVE_READY_EVENT = "omnigent:native-ready";
+const MIN_USABLE_BAND_PX = 64;
 
 /**
  * Publish the chat column's horizontal extent so the native server switcher can
@@ -38,8 +39,12 @@ export function useNativeServerSwitcherBand(
       const viewport = window.innerWidth;
       if (viewport <= 0) return;
       const columnRect = column?.getBoundingClientRect();
+      // Preserve a usable recovery control: the content region is clear of rail controls.
+      // This assumes push-panel titles and controls stay at their horizontal edges.
       const rect =
-        columnRect && columnRect.width > 0 ? columnRect : contentRegion?.getBoundingClientRect();
+        columnRect && columnRect.width >= MIN_USABLE_BAND_PX
+          ? columnRect
+          : contentRegion?.getBoundingClientRect();
       if (!rect || rect.width <= 0) return;
       setNativeServerSwitcherBand(rect.left / viewport, rect.right / viewport);
     };
