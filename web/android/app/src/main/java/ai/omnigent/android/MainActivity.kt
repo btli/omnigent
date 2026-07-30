@@ -492,7 +492,9 @@ class MainActivity : AppCompatActivity() {
         if (!::switchButton.isInitialized) return
         val lp = switchButton.layoutParams as? FrameLayout.LayoutParams ?: return
         val band = switcherBand
-        val containerWidth = webView.width
+        // The pill's leftMargin is relative to its parent, so the band fraction
+        // must resolve against the parent's width.
+        val containerWidth = (switchButton.parent as? View)?.width ?: 0
         val switcherWidth = switchButton.width
 
         val gravity: Int
@@ -501,7 +503,8 @@ class MainActivity : AppCompatActivity() {
             gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
             leftMargin = 0
         } else {
-            gravity = Gravity.TOP or Gravity.START
+            // The band uses physical viewport coordinates, so it must not mirror in RTL.
+            gravity = Gravity.TOP or Gravity.LEFT
             leftMargin = serverSwitcherLeftMargin(containerWidth, switcherWidth, band)
         }
         if (lp.gravity == gravity && lp.leftMargin == leftMargin) return
