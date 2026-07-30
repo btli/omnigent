@@ -480,8 +480,24 @@ afterEach(cleanup);
 
 describe("native server switcher band", () => {
   class TestResizeObserver {
-    observe = vi.fn();
+    static instances: TestResizeObserver[] = [];
+
+    readonly observed = new Set<Element>();
+    readonly callback: ResizeObserverCallback;
+    observe = vi.fn((element: Element) => this.observed.add(element));
     disconnect = vi.fn();
+
+    constructor(callback: ResizeObserverCallback) {
+      this.callback = callback;
+      TestResizeObserver.instances.push(this);
+    }
+
+    trigger() {
+      const entries = [...this.observed].map(
+        (target) => ({ target }) as unknown as ResizeObserverEntry,
+      );
+      this.callback(entries, this as unknown as ResizeObserver);
+    }
   }
 
   function installShell(kind: "android" | "ios" | null, setter: ReturnType<typeof vi.fn>) {
@@ -497,19 +513,38 @@ describe("native server switcher band", () => {
     };
   }
 
-  function setMainRect(width: number) {
+  function installLayoutRects(mainWidth: number, contentWidth = 680) {
+    const rects = {
+      mainLeft: 320,
+      mainWidth,
+      contentLeft: 320,
+      contentWidth,
+    };
     vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
       this: HTMLElement,
     ) {
       if (this.tagName === "MAIN") {
         return {
-          x: 320,
+          x: rects.mainLeft,
           y: 0,
-          left: 320,
-          right: 320 + width,
+          left: rects.mainLeft,
+          right: rects.mainLeft + rects.mainWidth,
           top: 0,
           bottom: 600,
-          width,
+          width: rects.mainWidth,
+          height: 600,
+          toJSON: () => ({}),
+        };
+      }
+      if (this.parentElement?.classList.contains("app-shell")) {
+        return {
+          x: rects.contentLeft,
+          y: 0,
+          left: rects.contentLeft,
+          right: rects.contentLeft + rects.contentWidth,
+          top: 0,
+          bottom: 600,
+          width: rects.contentWidth,
           height: 600,
           toJSON: () => ({}),
         };
@@ -526,9 +561,11 @@ describe("native server switcher band", () => {
         toJSON: () => ({}),
       };
     });
+    return rects;
   }
 
   beforeEach(() => {
+    TestResizeObserver.instances = [];
     vi.stubGlobal("ResizeObserver", TestResizeObserver);
     vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
       callback(0);
@@ -546,7 +583,7 @@ describe("native server switcher band", () => {
   it("publishes the main column fractions in an Android shell", () => {
     const setBand = vi.fn();
     installShell("android", setBand);
-    setMainRect(400);
+    installLayoutRects(400);
     mockConversations([]);
 
     renderShell("/");
@@ -557,7 +594,7 @@ describe("native server switcher band", () => {
   it("does not publish outside a native mobile shell", () => {
     const setBand = vi.fn();
     installShell(null, setBand);
-    setMainRect(400);
+    installLayoutRects(400);
     mockConversations([]);
 
     renderShell("/");
@@ -565,24 +602,91 @@ describe("native server switcher band", () => {
     expect(setBand).not.toHaveBeenCalled();
   });
 
-  it("does not publish when the main column has zero width", () => {
+  it("publishes the content region when the main column has zero width", () => {
     const setBand = vi.fn();
     installShell("android", setBand);
-    setMainRect(0);
+    installLayoutRects(0);
     mockConversations([]);
 
     renderShell("/");
 
-    expect(setBand).not.toHaveBeenCalled();
+    expect(setBand).toHaveBeenCalledWith(0.32, 1);
   });
 
-  it("does not publish when the main column is absent", () => {
+  it("does not publish when both observed elements are absent", () => {
     const setBand = vi.fn();
     installShell("android", setBand);
 
-    renderHook(() => useNativeServerSwitcherBand(null));
+    renderHook(() => useNativeServerSwitcherBand(null, null));
 
     expect(setBand).not.toHaveBeenCalled();
+  });
+
+  it("observes both layout elements and republishes changed main fractions", () => {
+    const setBand = vi.fn();
+    installShell("android", setBand);
+    const rects = installLayoutRects(400);
+    mockConversations([]);
+
+    renderShell("/");
+
+    const main = document.querySelector("main");
+    const contentRegion = main?.parentElement?.parentElement;
+    const observer = TestResizeObserver.instances[0];
+    expect(observer.observe).toHaveBeenCalledWith(main);
+    expect(observer.observe).toHaveBeenCalledWith(contentRegion);
+
+    rects.mainLeft = 400;
+    rects.mainWidth = 300;
+    act(() => observer.trigger());
+
+    expect(setBand).toHaveBeenLastCalledWith(0.4, 0.7);
+  });
+
+  it("republishes changed content-region fractions while main is collapsed", () => {
+    const setBand = vi.fn();
+    installShell("android", setBand);
+    const rects = installLayoutRects(0);
+    mockConversations([]);
+    renderShell("/");
+    setBand.mockClear();
+
+    rects.contentLeft = 500;
+    rects.contentWidth = 500;
+    act(() => TestResizeObserver.instances[0].trigger());
+
+    expect(setBand).toHaveBeenCalledWith(0.5, 1);
+  });
+
+  it("publishes after the Android bridge is installed at page ready", () => {
+    const setBand = vi.fn();
+    installShell(null, setBand);
+    const rects = installLayoutRects(400);
+    mockConversations([]);
+    renderShell("/");
+    expect(setBand).not.toHaveBeenCalled();
+
+    let emitInsets: ((insets: { topBar: number; bottomBar: number }) => void) | undefined;
+    (window as unknown as Record<string, unknown>).omnigentNative = {
+      kind: "android",
+      setBadgeCount: vi.fn(),
+      notify: vi.fn().mockResolvedValue(true),
+      setServerSwitcherBand: setBand,
+      onNativeInsets: (callback: typeof emitInsets) => {
+        emitInsets = callback;
+        return () => {
+          emitInsets = undefined;
+        };
+      },
+    };
+
+    act(() => window.dispatchEvent(new Event("omnigent:native-ready")));
+    expect(setBand).toHaveBeenLastCalledWith(0.32, 0.72);
+
+    rects.mainLeft = 400;
+    rects.mainWidth = 300;
+    act(() => emitInsets?.({ topBar: 0, bottomBar: 0 }));
+    expect(setBand).toHaveBeenLastCalledWith(0.4, 0.7);
   });
 
   it("coalesces resize events through an animation frame", () => {
@@ -593,7 +697,7 @@ describe("native server switcher band", () => {
     });
     const setBand = vi.fn();
     installShell("android", setBand);
-    setMainRect(400);
+    installLayoutRects(400);
     mockConversations([]);
     renderShell("/");
 

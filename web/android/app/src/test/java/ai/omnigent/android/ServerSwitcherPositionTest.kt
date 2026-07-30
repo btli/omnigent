@@ -2,6 +2,7 @@ package ai.omnigent.android
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ServerSwitcherPositionTest {
@@ -36,34 +37,80 @@ class ServerSwitcherPositionTest {
     }
 
     @Test
-    fun `pill is clamped fully on screen at either edge`() {
+    fun `pill exactly as wide as the band is anchored to its left edge`() {
+        assertEquals(
+            400,
+            serverSwitcherLeftMargin(
+                containerWidth = 1000,
+                switcherWidth = 160,
+                band = ServerSwitcherBand(0.4, 0.56),
+            ),
+        )
+    }
+
+    @Test
+    fun `pill wider than the band is anchored to the band edge`() {
+        assertEquals(
+            450,
+            serverSwitcherLeftMargin(
+                containerWidth = 1000,
+                switcherWidth = 160,
+                band = ServerSwitcherBand(0.45, 0.55),
+            ),
+        )
+    }
+
+    @Test
+    fun `pill is clamped to bands at either container edge`() {
         assertEquals(
             0,
             serverSwitcherLeftMargin(
                 containerWidth = 1000,
-                switcherWidth = 160,
+                switcherWidth = 50,
                 band = ServerSwitcherBand(0.0, 0.05),
             ),
         )
         assertEquals(
-            840,
+            950,
             serverSwitcherLeftMargin(
                 containerWidth = 1000,
-                switcherWidth = 160,
+                switcherWidth = 50,
                 band = ServerSwitcherBand(0.95, 1.0),
             ),
         )
     }
 
     @Test
-    fun `pill wider than the container remains anchored on screen`() {
+    fun `pill wider than the container remains anchored to its band`() {
         assertEquals(
-            0,
+            20,
             serverSwitcherLeftMargin(
                 containerWidth = 100,
                 switcherWidth = 160,
                 band = ServerSwitcherBand(0.2, 0.8),
             ),
         )
+    }
+
+    @Test
+    fun `pill stays within every band that can contain it`() {
+        listOf(
+            ServerSwitcherBand(0.0, 0.16),
+            ServerSwitcherBand(0.2, 0.36),
+            ServerSwitcherBand(0.3, 0.8),
+            ServerSwitcherBand(0.84, 1.0),
+        ).forEach { band ->
+            val left =
+                serverSwitcherLeftMargin(
+                    containerWidth = 1000,
+                    switcherWidth = 160,
+                    band = band,
+                )
+            val bandLeft = (1000 * band.left).toInt()
+            val bandRight = (1000 * band.right).toInt()
+
+            assertTrue(left >= bandLeft)
+            assertTrue(left + 160 <= bandRight)
+        }
     }
 }

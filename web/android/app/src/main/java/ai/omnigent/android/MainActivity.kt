@@ -496,6 +496,7 @@ class MainActivity : AppCompatActivity() {
         // The pill's leftMargin is relative to its parent, so the band fraction
         // must resolve against the parent's width.
         val containerWidth = (switchButton.parent as? View)?.width ?: 0
+        applyServerSwitcherWidthBounds(containerWidth, band)
         val switcherWidth = switchButton.width
 
         val gravity: Int
@@ -512,6 +513,26 @@ class MainActivity : AppCompatActivity() {
         lp.gravity = gravity
         lp.leftMargin = leftMargin
         switchButton.layoutParams = lp
+    }
+
+    private fun applyServerSwitcherWidthBounds(
+        containerWidth: Int,
+        band: ServerSwitcherBand?,
+    ) {
+        val pill = switchButton as? TextView ?: return
+        val dp = resources.displayMetrics.density
+        val defaultMax = (SWITCHER_MAX_WIDTH_DP * dp).toInt()
+        val defaultMin = (SWITCHER_MIN_WIDTH_DP * dp).toInt()
+        val max =
+            if (band == null || containerWidth <= 0) {
+                defaultMax
+            } else {
+                minOf(defaultMax, serverSwitcherBandWidth(containerWidth, band))
+            }
+        // A narrow band must win over the minimum tap target to avoid covering either rail.
+        val min = minOf(defaultMin, max)
+        if (pill.minWidth != min) pill.minWidth = min
+        if (pill.maxWidth != max) pill.maxWidth = max
     }
 
     /**
