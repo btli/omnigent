@@ -791,12 +791,20 @@ html:not(.dark) .conversations-sidebar {
       [data-testid="file-viewer"],
       [data-testid="files-panel-drawer"],
       [data-testid="terminals-panel"],
+      [data-testid="execution-logs-panel"],
       [data-testid="subagents-panel-drawer"],
       [data-testid="todos-panel-drawer"]
     ) {
     padding-top: var(--omnigent-safe-top);
     padding-bottom: var(--omnigent-safe-bottom);
   }
+}
+
+/* The Workspace rail only exists at md+, outside the mobile-only inset rules
+ * above. It is already hidden below md, so no media wrapper is needed. */
+:is([data-ios-native], [data-android-native]) aside[aria-label="Workspace"] {
+  margin-top: calc(0.5rem + var(--omnigent-safe-top));
+  margin-bottom: calc(0.5rem + var(--omnigent-safe-bottom));
 }
 
 @media (width < 48rem) and (prefers-reduced-motion: reduce) {
