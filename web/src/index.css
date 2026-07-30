@@ -791,10 +791,10 @@ aside[aria-label="Workspace"][data-maximized] {
   :is([data-ios-native], [data-android-native])
     :is(
       .conversations-sidebar,
+      [data-testid="execution-logs-panel"],
       [data-testid="file-viewer"],
       [data-testid="files-panel-drawer"],
       [data-testid="terminals-panel"],
-      [data-testid="execution-logs-panel"],
       .mobile-panel-drawer
     ) {
     padding-top: var(--omnigent-safe-top);

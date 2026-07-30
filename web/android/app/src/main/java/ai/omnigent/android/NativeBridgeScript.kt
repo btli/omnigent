@@ -76,7 +76,7 @@ object NativeBridgeScript {
               ".terminal-first-switcher-container{padding-bottom:calc(0.35rem + " + B + ") !important}",
               "aside[aria-label=\"Workspace\"]{margin-top:calc(0.5rem + " + T + ") !important;margin-bottom:calc(0.5rem + " + B + ") !important}",
               // Drawers/panels span full height — clear both bars.
-              ":is(.conversations-sidebar,[data-testid=\"file-viewer\"],[data-testid=\"files-panel-drawer\"],[data-testid=\"terminals-panel\"],[data-testid=\"subagents-panel-drawer\"],[data-testid=\"todos-panel-drawer\"]){padding-top:" + T + " !important;padding-bottom:" + B + " !important}",
+              ":is(.conversations-sidebar,[data-testid=\"execution-logs-panel\"],[data-testid=\"file-viewer\"],[data-testid=\"files-panel-drawer\"],[data-testid=\"terminals-panel\"],[data-testid=\"subagents-panel-drawer\"],[data-testid=\"todos-panel-drawer\"]){padding-top:" + T + " !important;padding-bottom:" + B + " !important}",
             ].join("");
             (document.head || document.documentElement).appendChild(style);
           };
