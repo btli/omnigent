@@ -619,10 +619,10 @@ describe("native server switcher band", () => {
     expect(setBand).not.toHaveBeenCalled();
   });
 
-  it("publishes the content region when the main column has zero width", () => {
+  it("publishes the content region when the main column is only one pixel wide", () => {
     const setBand = vi.fn();
     installShell("android", setBand);
-    installLayoutRects(0);
+    installLayoutRects(1);
     mockConversations([]);
 
     renderShell("/");
@@ -675,6 +675,19 @@ describe("native server switcher band", () => {
     expect(setBand).toHaveBeenCalledWith(0.5, 1);
   });
 
+  it("disconnects the layout observer on unmount", () => {
+    const setBand = vi.fn();
+    installShell("android", setBand);
+    installLayoutRects(400);
+    mockConversations([]);
+    const { unmount } = renderShell("/");
+    const observer = TestResizeObserver.instances[0];
+
+    unmount();
+
+    expect(observer.disconnect).toHaveBeenCalledOnce();
+  });
+
   it("publishes after the Android bridge is installed at page ready", () => {
     const setBand = vi.fn();
     installShell(null, setBand);
@@ -706,7 +719,7 @@ describe("native server switcher band", () => {
     expect(setBand).toHaveBeenLastCalledWith(0.4, 0.7);
   });
 
-  it("coalesces resize events through an animation frame", () => {
+  it("coalesces each window resize source through an animation frame", () => {
     const callbacks: FrameRequestCallback[] = [];
     vi.mocked(window.requestAnimationFrame).mockImplementation((callback) => {
       callbacks.push(callback);
@@ -725,12 +738,19 @@ describe("native server switcher band", () => {
 
     act(() => {
       window.dispatchEvent(new Event("resize"));
-      window.dispatchEvent(new Event("orientationchange"));
+      window.dispatchEvent(new Event("resize"));
     });
 
     expect(callbacks).toHaveLength(2);
     act(() => callbacks[1](0));
     expect(setBand).toHaveBeenCalledTimes(2);
+    expect(setBand).toHaveBeenLastCalledWith(0.32, 0.72);
+
+    act(() => window.dispatchEvent(new Event("orientationchange")));
+
+    expect(callbacks).toHaveLength(3);
+    act(() => callbacks[2](0));
+    expect(setBand).toHaveBeenCalledTimes(3);
     expect(setBand).toHaveBeenLastCalledWith(0.32, 0.72);
   });
 });

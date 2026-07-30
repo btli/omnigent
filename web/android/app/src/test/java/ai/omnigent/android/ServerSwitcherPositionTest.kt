@@ -61,6 +61,36 @@ class ServerSwitcherPositionTest {
     }
 
     @Test
+    fun `fractional band bounds round inward`() {
+        val band = ServerSwitcherBand(0.3005, 0.7002)
+
+        assertEquals(399, serverSwitcherBandWidth(containerWidth = 1000, band))
+        assertEquals(
+            301,
+            serverSwitcherLeftMargin(
+                containerWidth = 1000,
+                switcherWidth = 399,
+                band = band,
+            ),
+        )
+    }
+
+    @Test
+    fun `zero pixel band anchors the pill at the band edge`() {
+        val band = ServerSwitcherBand(0.4501, 0.4502)
+
+        assertEquals(0, serverSwitcherBandWidth(containerWidth = 1000, band))
+        assertEquals(
+            451,
+            serverSwitcherLeftMargin(
+                containerWidth = 1000,
+                switcherWidth = 48,
+                band = band,
+            ),
+        )
+    }
+
+    @Test
     fun `pill is clamped to bands at either container edge`() {
         assertEquals(
             0,
