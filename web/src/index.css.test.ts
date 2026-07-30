@@ -150,9 +150,12 @@ describe("index.css app-shell viewport lock", () => {
 /* The Workspace rail only renders at md+, so its native safe-area rule must
  * stay at the top level and cover both native shells. */
 describe("index.css Workspace rail safe-area rule", () => {
-  const rule = (cssSource.match(/[^{}]+\{[^{}]*\}/g) ?? []).find((block) =>
-    block.includes(':is([data-ios-native], [data-android-native]) aside[aria-label="Workspace"]'),
+  const workspaceSelector =
+    ':is([data-ios-native], [data-android-native]) aside[aria-label="Workspace"]';
+  const ruleMatches = [...cssSource.matchAll(/[^{}]+\{[^{}]*\}/g)].filter(
+    ([block]) => block.includes(workspaceSelector) && /margin-(?:top|bottom)\s*:/.test(block),
   );
+  const rule = ruleMatches[0]?.[0];
   const selector = (rule ?? "")
     .slice(0, rule ? rule.indexOf("{") : 0)
     .replace(/\/\*[\s\S]*?\*\//g, "")
@@ -207,17 +210,19 @@ describe("index.css Workspace rail safe-area rule", () => {
     expect(rule, "the Workspace safe-area rule is gone from index.css").toBeDefined();
     if (!rule) return;
 
-    const selectorIndex = cssSource.indexOf(selector, cssSource.indexOf(rule));
-    expect(
-      selectorIndex,
-      "the Workspace safe-area selector is gone from index.css",
-    ).toBeGreaterThan(-1);
-    if (selectorIndex < 0) return;
+    for (const match of ruleMatches) {
+      const selectorIndex = cssSource.indexOf(workspaceSelector, match.index);
+      expect(
+        selectorIndex,
+        "the Workspace safe-area selector is gone from index.css",
+      ).toBeGreaterThan(-1);
+      if (selectorIndex < 0) continue;
 
-    expect(
-      atRuleAncestorsAt(selectorIndex),
-      "the Workspace safe-area rule must not be nested in an at-rule",
-    ).toEqual([]);
+      expect(
+        atRuleAncestorsAt(selectorIndex),
+        "Workspace margin rules must not be nested in an at-rule",
+      ).toEqual([]);
+    }
   });
 
   it.each(["android", "ios"])("matches the Workspace rail in the %s native shell", (platform) => {
