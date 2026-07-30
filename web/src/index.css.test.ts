@@ -148,8 +148,7 @@ describe("index.css app-shell viewport lock", () => {
 });
 
 /* The Workspace rail only renders at md+, so its native safe-area rule must
- * stay outside the mobile-only inset block and cover both native shells.
- */
+ * stay at the top level and cover both native shells. */
 describe("index.css Workspace rail safe-area rule", () => {
   const rule = (cssSource.match(/[^{}]+\{[^{}]*\}/g) ?? []).find((block) =>
     block.includes(':is([data-ios-native], [data-android-native]) aside[aria-label="Workspace"]'),
@@ -159,34 +158,66 @@ describe("index.css Workspace rail safe-area rule", () => {
     .replace(/\/\*[\s\S]*?\*\//g, "")
     .trim();
 
-  /** Bodies of every `@media (width < 48rem)` block, brace-matched. */
-  function mobileOnlyBlocks(): string[] {
-    const bodies: string[] = [];
-    const marker = /@media \(width < 48rem\)[^{]*\{/g;
-    for (const match of cssSource.matchAll(marker)) {
-      const openBraceIndex = match.index + match[0].length - 1;
-      let depth = 1;
-      for (let index = openBraceIndex + 1; index < cssSource.length; index += 1) {
-        if (cssSource[index] === "{") depth += 1;
-        if (cssSource[index] === "}") depth -= 1;
-        if (depth === 0) {
-          bodies.push(cssSource.slice(openBraceIndex + 1, index));
-          break;
-        }
+  /** At-rule block headers still open at a source index. */
+  function atRuleAncestorsAt(sourceIndex: number): string[] {
+    const ancestors: { depth: number; header: string }[] = [];
+    let depth = 0;
+    let statementStart = 0;
+    let quote: '"' | "'" | undefined;
+
+    for (let index = 0; index < sourceIndex; index += 1) {
+      const character = cssSource[index];
+
+      if (quote) {
+        if (character === "\\") index += 1;
+        else if (character === quote) quote = undefined;
+        continue;
+      }
+      if (character === "/" && cssSource[index + 1] === "*") {
+        const commentEnd = cssSource.indexOf("*/", index + 2);
+        index = commentEnd === -1 ? sourceIndex : commentEnd + 1;
+        continue;
+      }
+      if (character === '"' || character === "'") {
+        quote = character;
+        continue;
+      }
+
+      if (character === "{") {
+        const header = cssSource
+          .slice(statementStart, index)
+          .replace(/\/\*[\s\S]*?\*\//g, "")
+          .trim();
+        depth += 1;
+        if (header.startsWith("@")) ancestors.push({ depth, header });
+        statementStart = index + 1;
+      } else if (character === "}") {
+        if (ancestors.at(-1)?.depth === depth) ancestors.pop();
+        depth -= 1;
+        statementStart = index + 1;
+      } else if (character === ";") {
+        statementStart = index + 1;
       }
     }
-    return bodies;
+
+    return ancestors.map(({ header }) => header);
   }
 
-  it("exists outside every mobile-only native inset block", () => {
+  it("has no enclosing at-rule", () => {
     expect(rule, "the Workspace safe-area rule is gone from index.css").toBeDefined();
     if (!rule) return;
 
-    // The rail is `hidden md:flex`, so a rule tucked inside any width < 48rem
-    // block never applies to it — the tablet/foldable case this exists for.
-    const blocks = mobileOnlyBlocks();
-    expect(blocks.length).toBeGreaterThan(0);
-    for (const block of blocks) expect(block).not.toContain(rule);
+    const selectorIndex = cssSource.indexOf(selector, cssSource.indexOf(rule));
+    expect(
+      selectorIndex,
+      "the Workspace safe-area selector is gone from index.css",
+    ).toBeGreaterThan(-1);
+    if (selectorIndex < 0) return;
+
+    expect(
+      atRuleAncestorsAt(selectorIndex),
+      "the Workspace safe-area rule must not be nested in an at-rule",
+    ).toEqual([]);
   });
 
   it.each(["android", "ios"])("matches the Workspace rail in the %s native shell", (platform) => {
