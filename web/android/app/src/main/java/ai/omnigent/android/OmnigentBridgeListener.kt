@@ -20,9 +20,11 @@ import org.json.JSONObject
  *
  * [BlobSaver] offloads writes to its own worker.
  */
-class OmnigentBridgeListener(
+internal class OmnigentBridgeListener(
     private val notifications: NativeNotificationManager,
     private val blobSaver: BlobSaver,
+    /** Relays validated bounds without retaining the Activity-owned view. */
+    private val onServerSwitcherBand: (ServerSwitcherBand) -> Unit = {},
 ) : WebViewCompat.WebMessageListener {
     override fun onPostMessage(
         view: WebView,
@@ -85,6 +87,16 @@ class OmnigentBridgeListener(
                     body = params.optString("body").ifEmpty { null },
                     navigatePath = params.optString("navigatePath").ifEmpty { null },
                 )
+            }
+
+            "setServerSwitcherBand" -> {
+                // Reject strings before optDouble can coerce them.
+                if (json.opt("leftFraction") !is Number) return
+                if (json.opt("rightFraction") !is Number) return
+                val left = json.optDouble("leftFraction", Double.NaN)
+                val right = json.optDouble("rightFraction", Double.NaN)
+                val band = ServerSwitcherBand.from(left, right) ?: return
+                onServerSwitcherBand(band)
             }
 
             "blobBase64" -> {
