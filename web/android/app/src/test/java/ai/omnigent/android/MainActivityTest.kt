@@ -3,6 +3,7 @@ package ai.omnigent.android
 import android.content.res.Configuration
 import android.text.TextUtils
 import android.view.Gravity
+import android.view.View
 import android.webkit.WebView
 import android.widget.FrameLayout
 import android.widget.TextView
@@ -119,6 +120,22 @@ class MainActivityTest {
         assertEquals(host, button.contentDescription)
     }
 
+    @Test
+    fun `server switcher band uses an absolute left margin`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        val button = activity.switchButton()
+        activity.setSwitcherBand(ServerSwitcherBand(0.3, 0.8))
+        (button.parent as View).layout(0, 0, 1000, 600)
+        // Sizing the pill last fires the layout listener, which is the path
+        // that repositions it in production.
+        button.layout(0, 0, 160, 48)
+
+        val layout = button.layoutParams as FrameLayout.LayoutParams
+        assertEquals(Gravity.TOP or Gravity.LEFT, layout.gravity)
+        assertEquals(470, layout.leftMargin)
+    }
+
     private fun MainActivity.webView(): WebView =
         MainActivity::class
             .java
@@ -132,4 +149,12 @@ class MainActivityTest {
             .getDeclaredField("switchButton")
             .apply { isAccessible = true }
             .get(this) as TextView
+
+    private fun MainActivity.setSwitcherBand(band: ServerSwitcherBand) {
+        MainActivity::class
+            .java
+            .getDeclaredField("switcherBand")
+            .apply { isAccessible = true }
+            .set(this, band)
+    }
 }

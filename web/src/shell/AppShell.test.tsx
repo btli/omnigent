@@ -614,14 +614,20 @@ describe("native server switcher band", () => {
     mockConversations([]);
     renderShell("/");
 
+    expect(callbacks).toHaveLength(1);
+    act(() => callbacks[0](0));
+    expect(setBand).toHaveBeenCalledTimes(1);
+    expect(setBand).toHaveBeenLastCalledWith(0.32, 0.72);
+
     act(() => {
       window.dispatchEvent(new Event("resize"));
       window.dispatchEvent(new Event("orientationchange"));
     });
 
-    expect(callbacks).toHaveLength(1);
-    act(() => callbacks[0](0));
-    expect(setBand).toHaveBeenCalledTimes(1);
+    expect(callbacks).toHaveLength(2);
+    act(() => callbacks[1](0));
+    expect(setBand).toHaveBeenCalledTimes(2);
+    expect(setBand).toHaveBeenLastCalledWith(0.32, 0.72);
   });
 });
 
