@@ -1,6 +1,13 @@
 import { useEffect } from "react";
 
-import { isAndroidShell, isIOSShell, setNativeServerSwitcherBand } from "@/lib/nativeBridge";
+import {
+  isAndroidShell,
+  isIOSShell,
+  onNativeInsets,
+  setNativeServerSwitcherBand,
+} from "@/lib/nativeBridge";
+
+const NATIVE_READY_EVENT = "omnigent:native-ready";
 
 /**
  * Publish the chat column's horizontal extent so the native server switcher can
@@ -14,22 +21,26 @@ import { isAndroidShell, isIOSShell, setNativeServerSwitcherBand } from "@/lib/n
  *
  * No-op outside the native shells.
  */
-export function useNativeServerSwitcherBand(column: HTMLElement | null): void {
+export function useNativeServerSwitcherBand(
+  column: HTMLElement | null,
+  contentRegion: HTMLElement | null,
+): void {
   useEffect(() => {
-    if (!isAndroidShell() && !isIOSShell()) return;
-    if (!column) return;
+    if (!column && !contentRegion) return;
 
     let pending = false;
     let frame = 0;
+    let unsubscribeInsets = () => {};
     const publish = () => {
       pending = false;
       frame = 0;
+      if (!isAndroidShell() && !isIOSShell()) return;
       const viewport = window.innerWidth;
       if (viewport <= 0) return;
-      const rect = column.getBoundingClientRect();
-      // A push panel can take the column's place, leaving it collapsed. Publish
-      // nothing and let native keep its last good band.
-      if (rect.width <= 0) return;
+      const columnRect = column?.getBoundingClientRect();
+      const rect =
+        columnRect && columnRect.width > 0 ? columnRect : contentRegion?.getBoundingClientRect();
+      if (!rect || rect.width <= 0) return;
       setNativeServerSwitcherBand(rect.left / viewport, rect.right / viewport);
     };
     // Coalesce to one frame so a drag-resize does not post per pointer event.
@@ -38,19 +49,29 @@ export function useNativeServerSwitcherBand(column: HTMLElement | null): void {
       pending = true;
       frame = requestAnimationFrame(publish);
     };
+    const handleNativeReady = () => {
+      unsubscribeInsets();
+      unsubscribeInsets = onNativeInsets(schedule);
+      schedule();
+    };
 
     schedule();
+    unsubscribeInsets = onNativeInsets(schedule);
 
     const observer = typeof ResizeObserver !== "undefined" ? new ResizeObserver(schedule) : null;
-    observer?.observe(column);
+    if (column) observer?.observe(column);
+    if (contentRegion) observer?.observe(contentRegion);
     window.addEventListener("resize", schedule);
     window.addEventListener("orientationchange", schedule);
+    window.addEventListener(NATIVE_READY_EVENT, handleNativeReady);
 
     return () => {
       if (frame !== 0) cancelAnimationFrame(frame);
+      unsubscribeInsets();
       observer?.disconnect();
       window.removeEventListener("resize", schedule);
       window.removeEventListener("orientationchange", schedule);
+      window.removeEventListener(NATIVE_READY_EVENT, handleNativeReady);
     };
-  }, [column]);
+  }, [column, contentRegion]);
 }

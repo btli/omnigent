@@ -256,6 +256,7 @@ object NativeBridgeScript {
               return () => insetCallbacks.delete(callback);
             },
           });
+          window.dispatchEvent(new Event("omnigent:native-ready"));
         })();
         """.trimIndent()
 }

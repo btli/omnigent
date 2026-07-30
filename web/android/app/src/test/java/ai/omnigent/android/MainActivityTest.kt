@@ -136,6 +136,24 @@ class MainActivityTest {
         assertEquals(470, layout.leftMargin)
     }
 
+    @Test
+    fun `server switcher width bounds follow the published band`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        val button = activity.switchButton()
+        val density = activity.resources.displayMetrics.density
+        (button.parent as View).layout(0, 0, 1000, 600)
+        button.layout(0, 0, 160, 48)
+
+        activity.setSwitcherBand(ServerSwitcherBand(0.45, 0.55))
+        assertEquals(100, button.maxWidth)
+        assertEquals((48 * density).toInt(), button.minWidth)
+
+        activity.setSwitcherBand(ServerSwitcherBand(0.49, 0.51))
+        assertEquals(20, button.maxWidth)
+        assertEquals(20, button.minWidth)
+    }
+
     private fun MainActivity.webView(): WebView =
         MainActivity::class
             .java
@@ -156,5 +174,10 @@ class MainActivityTest {
             .getDeclaredField("switcherBand")
             .apply { isAccessible = true }
             .set(this, band)
+        MainActivity::class
+            .java
+            .getDeclaredMethod("positionServerSwitcher")
+            .apply { isAccessible = true }
+            .invoke(this)
     }
 }
