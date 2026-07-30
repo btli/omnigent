@@ -147,6 +147,70 @@ describe("index.css app-shell viewport lock", () => {
   });
 });
 
+/* The Workspace rail only renders at md+, so its native safe-area rule must
+ * stay outside the mobile-only inset block and cover both native shells.
+ */
+describe("index.css Workspace rail safe-area rule", () => {
+  const rule = (cssSource.match(/[^{}]+\{[^{}]*\}/g) ?? []).find((block) =>
+    block.includes(':is([data-ios-native], [data-android-native]) aside[aria-label="Workspace"]'),
+  );
+  const selector = (rule ?? "")
+    .slice(0, rule ? rule.indexOf("{") : 0)
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .trim();
+
+  /** Bodies of every `@media (width < 48rem)` block, brace-matched. */
+  function mobileOnlyBlocks(): string[] {
+    const bodies: string[] = [];
+    const marker = /@media \(width < 48rem\)[^{]*\{/g;
+    for (const match of cssSource.matchAll(marker)) {
+      const openBraceIndex = match.index + match[0].length - 1;
+      let depth = 1;
+      for (let index = openBraceIndex + 1; index < cssSource.length; index += 1) {
+        if (cssSource[index] === "{") depth += 1;
+        if (cssSource[index] === "}") depth -= 1;
+        if (depth === 0) {
+          bodies.push(cssSource.slice(openBraceIndex + 1, index));
+          break;
+        }
+      }
+    }
+    return bodies;
+  }
+
+  it("exists outside every mobile-only native inset block", () => {
+    expect(rule, "the Workspace safe-area rule is gone from index.css").toBeDefined();
+    if (!rule) return;
+
+    // The rail is `hidden md:flex`, so a rule tucked inside any width < 48rem
+    // block never applies to it — the tablet/foldable case this exists for.
+    const blocks = mobileOnlyBlocks();
+    expect(blocks.length).toBeGreaterThan(0);
+    for (const block of blocks) expect(block).not.toContain(rule);
+  });
+
+  it.each(["android", "ios"])("matches the Workspace rail in the %s native shell", (platform) => {
+    expect(selector, "the Workspace safe-area selector is gone from index.css").not.toBe("");
+    if (!selector) return;
+
+    const shell = document.createElement("div");
+    shell.setAttribute(`data-${platform}-native`, "");
+    const workspace = document.createElement("aside");
+    workspace.setAttribute("aria-label", "Workspace");
+    shell.appendChild(workspace);
+    document.body.appendChild(shell);
+
+    expect(workspace.matches(selector)).toBe(true);
+    shell.remove();
+  });
+
+  it("uses safe-area margins on both edges", () => {
+    expect(rule).toMatch(/margin-top\s*:\s*calc\(0\.5rem \+ var\(--omnigent-safe-top\)\)/);
+    expect(rule).toMatch(/margin-bottom\s*:\s*calc\(0\.5rem \+ var\(--omnigent-safe-bottom\)\)/);
+    expect(rule).not.toMatch(/--omnigent-(?:inset|native)-/);
+  });
+});
+
 /* Regression test for the "table link column collapses to ~2ch" bug.
  *
  * Streamdown styles links with `wrap-anywhere`, which also drops the
