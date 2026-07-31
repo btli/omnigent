@@ -24,7 +24,7 @@ internal class OmnigentBridgeListener(
     private val notifications: NativeNotificationManager,
     private val blobSaver: BlobSaver,
     /** Relays validated bounds without retaining the Activity-owned view. */
-    private val onServerSwitcherBand: (ServerSwitcherBand) -> Unit = {},
+    private val onServerSwitcherBand: (ServerSwitcherBand) -> Unit,
 ) : WebViewCompat.WebMessageListener {
     override fun onPostMessage(
         view: WebView,
