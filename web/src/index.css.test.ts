@@ -154,7 +154,7 @@ describe("index.css Workspace rail safe-area rule", () => {
   // equivalently-spelled selector cannot introduce a margin the checks miss.
   // Shorthand `margin:` counts too, as do the logical `margin-block` forms —
   // each overrides the block-start/end edges this rule sets.
-  const marginDeclaration = /margin(?:-(?:top|bottom|block(?:-(?:start|end))?))?\s*:/;
+  const marginDeclaration = /(?<![-\w])margin(?:-(?:top|bottom|block(?:-(?:start|end))?))?\s*:/;
   // Any quoting or spacing of the attribute selector counts — an equivalently
   // spelled one would otherwise slip past the checks below.
   const workspaceAttribute = /\[\s*aria-label\s*=\s*("Workspace"|'Workspace'|Workspace)\s*\]/;
@@ -167,11 +167,9 @@ describe("index.css Workspace rail safe-area rule", () => {
     .replace(/\/\*[\s\S]*?\*\//g, "")
     .trim();
 
-  /** At-rule block headers still open at a source index. */
-  function atRuleAncestorsAt(sourceIndex: number): string[] {
-    const ancestors: { depth: number; header: string }[] = [];
+  /** Brace nesting depth at a source index; 0 is top level. */
+  function braceDepthAt(sourceIndex: number): number {
     let depth = 0;
-    let statementStart = 0;
     let quote: '"' | "'" | undefined;
 
     for (let index = 0; index < sourceIndex; index += 1) {
@@ -180,39 +178,22 @@ describe("index.css Workspace rail safe-area rule", () => {
       if (quote) {
         if (character === "\\") index += 1;
         else if (character === quote) quote = undefined;
-        continue;
-      }
-      if (character === "/" && cssSource[index + 1] === "*") {
+      } else if (character === "/" && cssSource[index + 1] === "*") {
         const commentEnd = cssSource.indexOf("*/", index + 2);
         index = commentEnd === -1 ? sourceIndex : commentEnd + 1;
-        continue;
-      }
-      if (character === '"' || character === "'") {
+      } else if (character === '"' || character === "'") {
         quote = character;
-        continue;
-      }
-
-      if (character === "{") {
-        const header = cssSource
-          .slice(statementStart, index)
-          .replace(/\/\*[\s\S]*?\*\//g, "")
-          .trim();
+      } else if (character === "{") {
         depth += 1;
-        if (header.startsWith("@")) ancestors.push({ depth, header });
-        statementStart = index + 1;
       } else if (character === "}") {
-        if (ancestors.at(-1)?.depth === depth) ancestors.pop();
         depth -= 1;
-        statementStart = index + 1;
-      } else if (character === ";") {
-        statementStart = index + 1;
       }
     }
 
-    return ancestors.map(({ header }) => header);
+    return depth;
   }
 
-  it("has no enclosing at-rule", () => {
+  it("stays at the top level", () => {
     expect(rule, "the Workspace safe-area rule is gone from index.css").toBeDefined();
     if (!rule) return;
     // Exactly one rule may set the rail's margins; a second could override the
@@ -221,9 +202,9 @@ describe("index.css Workspace rail safe-area rule", () => {
 
     for (const match of ruleMatches) {
       expect(
-        atRuleAncestorsAt(match.index),
-        "Workspace margin rules must not be nested in an at-rule",
-      ).toEqual([]);
+        braceDepthAt(match.index),
+        "the Workspace margin rule must stay at the top level",
+      ).toBe(0);
     }
   });
 
