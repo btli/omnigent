@@ -20,7 +20,7 @@ class OmnigentWebViewClient(
     private val shouldInjectBridgeAtPageReady: () -> Boolean,
     private val onPageReady: (url: String?) -> Unit,
     private val onLoginRequired: () -> Unit,
-    private val onNavigationStarted: () -> Unit = {},
+    private val onNavigationStarted: () -> Unit,
 ) : WebViewClient() {
     override fun onPageStarted(
         view: WebView,
