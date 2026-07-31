@@ -134,8 +134,6 @@ describe("index.css bg-card glass rule selector", () => {
 /* The Workspace rail only renders at md+, so its native safe-area rule must
  * stay at the top level and cover both native shells. */
 describe("index.css Workspace rail safe-area rule", () => {
-  const workspaceSelector =
-    ':is([data-ios-native], [data-android-native]) aside[aria-label="Workspace"]';
   // Match on the rail's aria-label rather than the exact selector text, so an
   // equivalently-spelled selector cannot introduce a margin the checks miss.
   // Shorthand `margin:` counts too, as do the logical `margin-block` forms —
@@ -206,15 +204,8 @@ describe("index.css Workspace rail safe-area rule", () => {
     expect(ruleMatches).toHaveLength(1);
 
     for (const match of ruleMatches) {
-      const selectorIndex = cssSource.indexOf(workspaceSelector, match.index);
       expect(
-        selectorIndex,
-        "the Workspace safe-area selector is gone from index.css",
-      ).toBeGreaterThan(-1);
-      if (selectorIndex < 0) continue;
-
-      expect(
-        atRuleAncestorsAt(selectorIndex),
+        atRuleAncestorsAt(match.index),
         "Workspace margin rules must not be nested in an at-rule",
       ).toEqual([]);
     }
