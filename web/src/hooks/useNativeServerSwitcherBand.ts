@@ -29,6 +29,9 @@ export function useNativeServerSwitcherBand(
   useEffect(() => {
     if (!column && !contentRegion) return;
 
+    // `pending` is deliberately separate from `frame`: it is set before
+    // requestAnimationFrame returns, so a callback that runs re-entrantly cannot
+    // be overwritten by the handle and wedge scheduling.
     let pending = false;
     let frame = 0;
     let unsubscribeInsets = () => {};

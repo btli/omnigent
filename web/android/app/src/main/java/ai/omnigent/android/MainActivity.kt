@@ -67,7 +67,7 @@ class MainActivity : AppCompatActivity() {
     // Floating server switcher — mirrors the iOS `ServerSwitcher`. Always
     // visible so it's always available as a recovery path (backward compatible
     // with older web builds). Theme-aware via brand colors (light/dark XML).
-    private lateinit var switchButton: View
+    private lateinit var switchButton: TextView
 
     // Null before each page publishes, preserving whole-window centring.
     private var switcherBand: ServerSwitcherBand? = null
@@ -521,7 +521,6 @@ class MainActivity : AppCompatActivity() {
         containerWidth: Int,
         band: ServerSwitcherBand?,
     ) {
-        val pill = switchButton as? TextView ?: return
         val dp = resources.displayMetrics.density
         val defaultMax = (SWITCHER_MAX_WIDTH_DP * dp).toInt()
         val defaultMin = (SWITCHER_MIN_WIDTH_DP * dp).toInt()
@@ -535,8 +534,8 @@ class MainActivity : AppCompatActivity() {
                 )
             }
         // Keep the recovery control tappable; bounded band overflow is safer than losing it.
-        if (pill.minWidth != defaultMin) pill.minWidth = defaultMin
-        if (pill.maxWidth != max) pill.maxWidth = max
+        if (switchButton.minWidth != defaultMin) switchButton.minWidth = defaultMin
+        if (switchButton.maxWidth != max) switchButton.maxWidth = max
     }
 
     /**
@@ -611,10 +610,8 @@ class MainActivity : AppCompatActivity() {
         historyCleared = false
         loginAttempts = 0
         val label = hostLabelOf(serverUrl)
-        (switchButton as? TextView)?.let { button ->
-            button.text = label
-            button.contentDescription = label
-        }
+        switchButton.text = label
+        switchButton.contentDescription = label
         installBridge()
         webView.loadUrl(serverUrl)
     }
