@@ -197,7 +197,9 @@ class MainActivity : AppCompatActivity() {
                     topMargin = (8 * dp).toInt()
                 }
         container.addView(switchButton)
-        // Label and container size changes both affect centring.
+        // The pill's own bounds can stay unchanged when only its parent resizes,
+        // so observe both views.
+        container.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> positionServerSwitcher() }
         switchButton.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> positionServerSwitcher() }
         setContentView(container)
         applySystemBarContrast()
@@ -475,7 +477,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun receiveServerSwitcherBand(band: ServerSwitcherBand) {
         runOnUiThread {
-            if (isDestroyed || isFinishing || switcherBand == band) return@runOnUiThread
+            if (isDestroyed || isFinishing) return@runOnUiThread
             switcherBand = band
             positionServerSwitcher()
         }
