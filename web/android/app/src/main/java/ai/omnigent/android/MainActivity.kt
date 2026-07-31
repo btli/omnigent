@@ -195,7 +195,7 @@ class MainActivity : AppCompatActivity() {
         val dp = resources.displayMetrics.density
         switchButton =
             TextView(this).apply {
-                text = hostLabelOf(serverUrl)
+                applyHostLabel(serverUrl)
                 background =
                     ContextCompat.getDrawable(this@MainActivity, R.drawable.bg_floating_switch)
                 setTextColor(ContextCompat.getColor(this@MainActivity, R.color.brand_foreground))
@@ -204,14 +204,12 @@ class MainActivity : AppCompatActivity() {
                 elevation = 6 * dp
                 isClickable = true
                 isFocusable = true
-                // Match the iOS ceiling; the full host remains accessible.
-                maxWidth = (SWITCHER_MAX_WIDTH_DP * dp).toInt()
-                minWidth = (SWITCHER_MIN_WIDTH_DP * dp).toInt()
                 isSingleLine = true
                 ellipsize = TextUtils.TruncateAt.MIDDLE
-                contentDescription = hostLabelOf(serverUrl)
                 setOnClickListener { showServerSwitcherMenu(it) }
             }
+        // Same helper the runtime path uses, so the no-band defaults agree.
+        applyServerSwitcherWidthBounds(containerWidth = 0, band = null)
         switchButton.layoutParams =
             FrameLayout
                 .LayoutParams(
@@ -344,6 +342,8 @@ class MainActivity : AppCompatActivity() {
      */
     private fun installBridge() {
         val origin = pinnedOrigin ?: return
+        // Weak so the long-lived listener cannot pin this Activity.
+        val host = WeakReference(this)
         if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) return
         try {
             WebViewCompat.addWebMessageListener(
@@ -353,9 +353,7 @@ class MainActivity : AppCompatActivity() {
                 OmnigentBridgeListener(
                     notifications = notifications,
                     blobSaver = blobSaver,
-                    onServerSwitcherBand = WeakReference(this).let { host ->
-                        { band -> host.get()?.receiveServerSwitcherBand(band) }
-                    },
+                    onServerSwitcherBand = { band -> host.get()?.receiveServerSwitcherBand(band) },
                 ),
             )
         } catch (_: IllegalArgumentException) {
@@ -502,6 +500,13 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** The visible text is middle-ellipsized, so the description carries the full host. */
+    private fun TextView.applyHostLabel(url: String) {
+        val label = hostLabelOf(url)
+        text = label
+        contentDescription = label
+    }
+
     private fun receiveServerSwitcherBand(band: ServerSwitcherBand) {
         runOnUiThread {
             if (isDestroyed || isFinishing) return@runOnUiThread
@@ -560,7 +565,8 @@ class MainActivity : AppCompatActivity() {
                     minOf(defaultMax, serverSwitcherBandWidth(containerWidth, band)),
                 )
             }
-        // Keep the recovery control tappable; bounded band overflow is safer than losing it.
+        // Floors the WIDTH only — the height stays the text's — so this bounds how
+        // far a label can shrink, not the full touch target.
         if (switchButton.minWidth != defaultMin) switchButton.minWidth = defaultMin
         if (switchButton.maxWidth != max) switchButton.maxWidth = max
     }
@@ -636,9 +642,7 @@ class MainActivity : AppCompatActivity() {
         pageLoaded = false
         historyCleared = false
         loginAttempts = 0
-        val label = hostLabelOf(serverUrl)
-        switchButton.text = label
-        switchButton.contentDescription = label
+        switchButton.applyHostLabel(serverUrl)
         installBridge()
         webView.loadUrl(serverUrl)
     }
