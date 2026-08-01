@@ -37,6 +37,17 @@ class OriginsTest {
     }
 
     @Test
+    fun `own oidc bounce with trailing slash is not a proxy url`() {
+        assertFalse(
+            isProxyAuthUrl(
+                "https://accounts.google.com/o/oauth2/v2/auth" +
+                    "?client_id=abc&redirect_uri=https%3A%2F%2Fapp.example.com%2Fauth%2Fcallback%2F",
+                "https://app.example.com",
+            ),
+        )
+    }
+
+    @Test
     fun `redirect_uri to a foreign origin is not a proxy url`() {
         assertFalse(
             isProxyAuthUrl(

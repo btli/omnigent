@@ -58,7 +58,8 @@ fun isProxyAuthUrl(
     if (uri.isOpaque) return false
     val redirect = uri.getQueryParameter("redirect_uri") ?: return false
     if (originOf(redirect) != pinnedOrigin) return false
-    return Uri.parse(redirect).path != "/auth/callback"
+    // Trailing-slash-insensitive: `/auth/callback/` is still the server's own.
+    return Uri.parse(redirect).path?.trimEnd('/') != "/auth/callback"
 }
 
 /**
