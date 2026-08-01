@@ -26,9 +26,36 @@ class OmnigentWebViewClient(
     // pinned-origin page loads again (the proxy callback bounced us home).
     private var proxyAuthInFlight = false
 
+    // The pre-flow user agent, held while it's masked (see [enterProxyAuth]).
+    private var originalUserAgent: String? = null
+
     /** Forget an in-flight proxy auth flow — call when the pinned server changes. */
     fun resetProxyAuth() {
         proxyAuthInFlight = false
+    }
+
+    /**
+     * Enter (or continue) a proxy-auth flow. While it runs, present a
+     * Chrome-like user agent: IdPs the proxy may federate to (notably Google)
+     * refuse logins from an embedded WebView, keyed on the `; wv` and
+     * `Version/4.0` UA markers. The flow can't run in the system browser — the
+     * proxy's session cookie must land in this WebView — so masking for the
+     * flow's duration is the only client-side option. Restored in [endProxyAuth].
+     */
+    private fun enterProxyAuth(view: WebView) {
+        proxyAuthInFlight = true
+        if (originalUserAgent != null) return
+        val ua = view.settings.userAgentString ?: return
+        originalUserAgent = ua
+        view.settings.userAgentString =
+            ua.replace("; wv", "").replace("Version/4.0 ", "")
+    }
+
+    /** A pinned-origin page loaded — the flow is over; restore the real UA. */
+    private fun endProxyAuth(view: WebView) {
+        proxyAuthInFlight = false
+        originalUserAgent?.let { view.settings.userAgentString = it }
+        originalUserAgent = null
     }
 
     override fun onPageStarted(
@@ -56,7 +83,7 @@ class OmnigentWebViewClient(
             // A hosting front door bouncing to its IdP must complete inline —
             // its session cookie has to land in this WebView's cookie store.
             if (proxyAuthInFlight || isProxyAuthUrl(url, pinnedOrigin())) {
-                proxyAuthInFlight = true
+                enterProxyAuth(view)
                 authLog("proxy-auth landing $origin — loading inline")
                 return
             }
@@ -66,7 +93,7 @@ class OmnigentWebViewClient(
             onLoginRequired()
             return
         }
-        if (origin == pinnedOrigin()) proxyAuthInFlight = false
+        if (origin == pinnedOrigin()) endProxyAuth(view)
     }
 
     override fun onPageFinished(
@@ -101,7 +128,7 @@ class OmnigentWebViewClient(
         // Same-origin app pages load in the WebView.
         val origin = originOf(url.toString())
         if (origin == pinnedOrigin()) {
-            proxyAuthInFlight = false
+            endProxyAuth(view)
             return false
         }
 
@@ -111,7 +138,7 @@ class OmnigentWebViewClient(
         // login page — stays in the WebView until we return to the pinned
         // origin, so the proxy cookie ends up where the app pages load.
         if (proxyAuthInFlight || isProxyAuthUrl(url.toString(), pinnedOrigin())) {
-            proxyAuthInFlight = true
+            enterProxyAuth(view)
             authLog("proxy-auth nav $origin — loading inline")
             return false
         }

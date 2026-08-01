@@ -112,6 +112,24 @@ class OmnigentWebViewClientTest {
     }
 
     @Test
+    fun `proxy auth flow masks the webview user agent and restores it after`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        webView.settings.userAgentString =
+            "Mozilla/5.0 (Linux; Android 14; Pixel Build/X; wv) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Version/4.0 Chrome/126.0.0.0 Mobile Safari/537.36"
+        val client = client(shouldInjectBridgeAtPageReady = false)
+
+        client.shouldOverrideUrlLoading(webView, request(PROXY_AUTH_URL))
+        val masked = webView.settings.userAgentString
+        assertFalse(masked.contains("; wv"))
+        assertFalse(masked.contains("Version/4.0"))
+
+        client.onPageStarted(webView, PINNED_URL, null)
+        assertTrue(webView.settings.userAgentString.contains("; wv"))
+        assertTrue(webView.settings.userAgentString.contains("Version/4.0"))
+    }
+
+    @Test
     fun `resetProxyAuth ends the flow without a pinned page load`() {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
         var loginRequired = false
