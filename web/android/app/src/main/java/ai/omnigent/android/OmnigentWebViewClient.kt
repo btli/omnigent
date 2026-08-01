@@ -35,21 +35,36 @@ class OmnigentWebViewClient(
         endProxyAuth(view)
     }
 
-    /**
-     * Enter (or continue) a proxy-auth flow. While it runs, present a
-     * Chrome-like user agent: IdPs the proxy may federate to (notably Google)
-     * refuse logins from an embedded WebView, keyed on the `; wv` and
-     * `Version/4.0` UA markers. The flow can't run in the system browser — the
-     * proxy's session cookie must land in this WebView — so masking for the
-     * flow's duration is the only client-side option. Restored in [endProxyAuth].
-     */
-    private fun enterProxyAuth(view: WebView) {
+    /** Enter (or continue) a proxy-auth flow. */
+    private fun enterProxyAuth() {
         proxyAuthInFlight = true
-        if (originalUserAgent != null) return
-        val ua = view.settings.userAgentString ?: return
+    }
+
+    /**
+     * Recover from an IdP that refuses to authenticate in an embedded WebView
+     * (Google answers `disallowed_useragent`). The flow can't move to the system
+     * browser: the proxy binds it to the cookie jar that started it, and Android
+     * can't import a cookie from the browser — so drop the `; wv` /
+     * `Version/4.0` markers the check keys on and restart from the server, which
+     * issues fresh flow state. Applied only after a refusal, never pre-emptively,
+     * and undone in [endProxyAuth].
+     *
+     * Returns true when a restart is under way.
+     */
+    private fun recoverFromEmbeddedRejection(
+        view: WebView,
+        url: String?,
+    ): Boolean {
+        if (!proxyAuthInFlight || url?.contains(EMBEDDED_REJECTION) != true) return false
+        // Already unmarked and still refused — retrying would loop; let it show.
+        if (originalUserAgent != null) return false
+        val ua = view.settings.userAgentString ?: return false
+        val server = pinnedOrigin() ?: return false
         originalUserAgent = ua
-        view.settings.userAgentString =
-            ua.replace("; wv", "").replace("Version/4.0 ", "")
+        view.settings.userAgentString = ua.replace("; wv", "").replace("Version/4.0 ", "")
+        authLog("IdP refused the embedded WebView — retrying the flow unmarked")
+        view.loadUrl(server)
+        return true
     }
 
     /**
@@ -90,7 +105,8 @@ class OmnigentWebViewClient(
             // A hosting front door bouncing to its IdP must complete inline —
             // its session cookie has to land in this WebView's cookie store.
             if (proxyAuthInFlight || isProxyAuthUrl(url, pinnedOrigin())) {
-                enterProxyAuth(view)
+                if (recoverFromEmbeddedRejection(view, url)) return
+                enterProxyAuth()
                 authLog("proxy-auth landing $origin — loading inline")
                 return
             }
@@ -150,7 +166,7 @@ class OmnigentWebViewClient(
         if (proxyAuthInFlight ||
             (!request.hasGesture() && isProxyAuthUrl(url.toString(), pinnedOrigin()))
         ) {
-            enterProxyAuth(view)
+            enterProxyAuth()
             authLog("proxy-auth nav $origin — loading inline")
             return false
         }
@@ -167,5 +183,10 @@ class OmnigentWebViewClient(
             onLoginRequired()
         }
         return true
+    }
+
+    private companion object {
+        // The error an IdP redirects to when it refuses an embedded WebView.
+        const val EMBEDDED_REJECTION = "disallowed_useragent"
     }
 }

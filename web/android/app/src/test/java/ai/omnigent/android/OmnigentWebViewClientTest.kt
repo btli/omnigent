@@ -147,22 +147,67 @@ class OmnigentWebViewClientTest {
     }
 
     @Test
-    fun `proxy auth flow masks the webview user agent and restores it after`() {
-        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
-        webView.settings.userAgentString =
-            "Mozilla/5.0 (Linux; Android 14; Pixel Build/X; wv) AppleWebKit/537.36 " +
-            "(KHTML, like Gecko) Version/4.0 Chrome/126.0.0.0 Mobile Safari/537.36"
+    fun `a proxy auth flow keeps the real user agent`() {
+        val webView = webViewWithWebViewUa()
         val client = client(shouldInjectBridgeAtPageReady = false)
 
         client.shouldOverrideUrlLoading(webView, request(PROXY_AUTH_URL))
+
+        // Masking is a fallback for IdPs that reject embedded WebViews, not
+        // the default posture — most proxy IdPs accept the real UA.
+        assertTrue(webView.settings.userAgentString.contains("; wv"))
+        assertNull(webView.loadedUrl)
+    }
+
+    @Test
+    fun `an embedded-webview rejection masks the user agent and restarts the flow`() {
+        val webView = webViewWithWebViewUa()
+        val client = client(shouldInjectBridgeAtPageReady = false)
+
+        client.shouldOverrideUrlLoading(webView, request(PROXY_AUTH_URL))
+        client.onPageStarted(webView, REJECTION_URL, null)
+
         val masked = webView.settings.userAgentString
         assertFalse(masked.contains("; wv"))
         assertFalse(masked.contains("Version/4.0"))
-
-        client.onPageStarted(webView, PINNED_URL, null)
-        assertTrue(webView.settings.userAgentString.contains("; wv"))
-        assertTrue(webView.settings.userAgentString.contains("Version/4.0"))
+        assertTrue(masked.contains("Chrome/126.0.0.0"))
+        // Restart from the server so the front door issues fresh flow state.
+        assertEquals(PINNED_ORIGIN, webView.loadedUrl)
     }
+
+    @Test
+    fun `a rejection after masking is not retried`() {
+        val webView = webViewWithWebViewUa()
+        val client = client(shouldInjectBridgeAtPageReady = false)
+
+        client.shouldOverrideUrlLoading(webView, request(PROXY_AUTH_URL))
+        client.onPageStarted(webView, REJECTION_URL, null)
+        webView.loadedUrl = null
+        client.onPageStarted(webView, REJECTION_URL, null)
+
+        // Already masked — reloading again would loop forever.
+        assertNull(webView.loadedUrl)
+    }
+
+    @Test
+    fun `a masked user agent is restored when the flow ends`() {
+        val webView = webViewWithWebViewUa()
+        val original = webView.settings.userAgentString
+        val client = client(shouldInjectBridgeAtPageReady = false)
+
+        client.shouldOverrideUrlLoading(webView, request(PROXY_AUTH_URL))
+        client.onPageStarted(webView, REJECTION_URL, null)
+        client.onPageStarted(webView, PINNED_URL, null)
+
+        assertEquals(original, webView.settings.userAgentString)
+    }
+
+    private fun webViewWithWebViewUa(): RecordingWebView =
+        RecordingWebView(ApplicationProvider.getApplicationContext()).apply {
+            settings.userAgentString =
+                "Mozilla/5.0 (Linux; Android 14; Pixel Build/X; wv) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Version/4.0 Chrome/126.0.0.0 Mobile Safari/537.36"
+        }
 
     @Test
     fun `resetProxyAuth ends the flow without a pinned page load`() {
@@ -214,7 +259,12 @@ class OmnigentWebViewClientTest {
     ) : WebView(context) {
         var evaluatedScript: String? = null
         var stoppedLoading = false
+        var loadedUrl: String? = null
         private var callback: ValueCallback<String>? = null
+
+        override fun loadUrl(url: String) {
+            loadedUrl = url
+        }
 
         override fun evaluateJavascript(
             script: String,
@@ -247,5 +297,9 @@ class OmnigentWebViewClientTest {
         const val OWN_IDP_URL =
             "https://accounts.example.org/authorize?response_type=code" +
                 "&redirect_uri=https%3A%2F%2Fexample.com%2Fauth%2Fcallback"
+
+        // Where an IdP that refuses embedded WebViews lands the flow.
+        const val REJECTION_URL =
+            "https://accounts.google.com/v3/signin/rejected?error=disallowed_useragent"
     }
 }
