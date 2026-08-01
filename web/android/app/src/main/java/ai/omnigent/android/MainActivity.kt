@@ -76,6 +76,7 @@ internal fun androidSafeAreaScript(
  */
 class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
+    private lateinit var shellWebViewClient: OmnigentWebViewClient
     private lateinit var notifications: NativeNotificationManager
     private lateinit var blobSaver: BlobSaver
     private val loginManager = OidcLoginManager()
@@ -169,7 +170,7 @@ class MainActivity : AppCompatActivity() {
                 settings.domStorageEnabled = true
                 settings.mediaPlaybackRequiresUserGesture = false
 
-                webViewClient =
+                shellWebViewClient =
                     OmnigentWebViewClient(
                         pinnedOrigin = { pinnedOrigin },
                         shouldInjectBridgeAtPageReady = {
@@ -179,6 +180,7 @@ class MainActivity : AppCompatActivity() {
                         onLoginRequired = ::startLogin,
                         onNavigationStarted = ::clearServerSwitcherBand,
                     )
+                webViewClient = shellWebViewClient
                 webChromeClient =
                     OmnigentWebChromeClient(
                         onChooseFiles = ::chooseFiles,
@@ -671,6 +673,7 @@ class MainActivity : AppCompatActivity() {
     ) {
         removeBridge()
         pinnedOrigin = newOrigin
+        shellWebViewClient.resetProxyAuth()
         pageLoaded = false
         historyCleared = false
         loginAttempts = 0

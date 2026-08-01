@@ -99,6 +99,9 @@ class OidcLoginManager {
         // Bodyless POST — set Content-Length explicitly; some servers/WAFs reject
         // a POST without it (411 Length Required).
         conn.setRequestProperty("Content-Length", "0")
+        // A front-door auth proxy 302s this endpoint to its IdP's HTML login
+        // page; following it would "succeed" with unparseable HTML. Fail fast.
+        conn.instanceFollowRedirects = false
         conn.connectTimeout = HTTP_TIMEOUT_MS
         conn.readTimeout = HTTP_TIMEOUT_MS
         return try {
