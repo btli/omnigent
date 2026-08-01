@@ -21,6 +21,16 @@ class OmnigentWebViewClient(
     private val onPageReady: (url: String?) -> Unit,
     private val onLoginRequired: () -> Unit,
 ) : WebViewClient() {
+    // True while the WebView is walking a front-door auth proxy's IdP flow
+    // (see [isProxyAuthUrl]): off-origin navigation stays inline until a
+    // pinned-origin page loads again (the proxy callback bounced us home).
+    private var proxyAuthInFlight = false
+
+    /** Forget an in-flight proxy auth flow — call when the pinned server changes. */
+    fun resetProxyAuth() {
+        proxyAuthInFlight = false
+    }
+
     override fun onPageStarted(
         view: WebView,
         url: String?,
@@ -43,12 +53,20 @@ class OmnigentWebViewClient(
         // don't misread it as a bounce and pop the browser. Mirror the http(s)
         // gate in shouldOverrideUrlLoading.
         if (isHttpScheme(scheme) && origin != pinnedOrigin()) {
+            // A hosting front door bouncing to its IdP must complete inline —
+            // its session cookie has to land in this WebView's cookie store.
+            if (proxyAuthInFlight || isProxyAuthUrl(url, pinnedOrigin())) {
+                proxyAuthInFlight = true
+                authLog("proxy-auth landing $origin — loading inline")
+                return
+            }
             // Log origin only, never the full URL (carries OAuth state/PKCE).
             authLog("off-origin landing $origin -> login")
             view.stopLoading()
             onLoginRequired()
             return
         }
+        if (origin == pinnedOrigin()) proxyAuthInFlight = false
     }
 
     override fun onPageFinished(
@@ -82,7 +100,21 @@ class OmnigentWebViewClient(
 
         // Same-origin app pages load in the WebView.
         val origin = originOf(url.toString())
-        if (origin == pinnedOrigin()) return false
+        if (origin == pinnedOrigin()) {
+            proxyAuthInFlight = false
+            return false
+        }
+
+        // A front-door proxy's IdP flow loads inline: the initial authorize
+        // bounce (redirect_uri back to the pinned origin) enters the flow, and
+        // every navigation inside it — SSO hops, form posts, gestures on the
+        // login page — stays in the WebView until we return to the pinned
+        // origin, so the proxy cookie ends up where the app pages load.
+        if (proxyAuthInFlight || isProxyAuthUrl(url.toString(), pinnedOrigin())) {
+            proxyAuthInFlight = true
+            authLog("proxy-auth nav $origin — loading inline")
+            return false
+        }
 
         // Off-origin top-level navigation. A server redirect (no user gesture) is
         // the OIDC flow bouncing to the IdP -> run native system-browser login. A
