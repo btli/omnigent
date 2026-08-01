@@ -145,6 +145,9 @@ class MainActivity : AppCompatActivity() {
                         },
                         onPageReady = ::onPageReady,
                         onLoginRequired = ::startLogin,
+                        // Drop the IdP hops a completed proxy flow left on the
+                        // back stack once the next pinned page is ready.
+                        onProxyAuthFlowEnded = { historyCleared = false },
                     )
                 webViewClient = shellWebViewClient
                 webChromeClient =
@@ -523,7 +526,7 @@ class MainActivity : AppCompatActivity() {
     ) {
         removeBridge()
         pinnedOrigin = newOrigin
-        shellWebViewClient.resetProxyAuth()
+        shellWebViewClient.resetProxyAuth(webView)
         pageLoaded = false
         historyCleared = false
         loginAttempts = 0

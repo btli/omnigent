@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.webkit.CookieManager
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -93,6 +94,20 @@ class OidcLoginManager {
         val loginUrl: String,
     )
 
+    /**
+     * Carry the WebView's cookies for [origin] on a login-endpoint request.
+     * HttpURLConnection has its own (empty) cookie store, so without this a
+     * server behind a front-door auth proxy would 302 these endpoints to its
+     * IdP even after the WebView already holds the proxy's session.
+     */
+    private fun attachWebViewCookies(
+        conn: HttpURLConnection,
+        origin: String,
+    ) {
+        val cookies = runCatching { CookieManager.getInstance().getCookie(origin) }.getOrNull()
+        if (!cookies.isNullOrBlank()) conn.setRequestProperty("Cookie", cookies)
+    }
+
     private fun requestTicket(origin: String): Ticket? {
         val conn = (URL("$origin/auth/cli-login").openConnection() as HttpURLConnection)
         conn.requestMethod = "POST"
@@ -102,6 +117,7 @@ class OidcLoginManager {
         // A front-door auth proxy 302s this endpoint to its IdP's HTML login
         // page; following it would "succeed" with unparseable HTML. Fail fast.
         conn.instanceFollowRedirects = false
+        attachWebViewCookies(conn, origin)
         conn.connectTimeout = HTTP_TIMEOUT_MS
         conn.readTimeout = HTTP_TIMEOUT_MS
         return try {
@@ -150,6 +166,10 @@ class OidcLoginManager {
                 ).openConnection() as HttpURLConnection
             )
             conn.requestMethod = "GET"
+            // Mirror requestTicket: a proxied 302 must fail fast (fall through
+            // to the non-200 branch), not spin in the retry loop as HTML.
+            conn.instanceFollowRedirects = false
+            attachWebViewCookies(conn, origin)
             conn.connectTimeout = HTTP_TIMEOUT_MS
             conn.readTimeout = HTTP_TIMEOUT_MS
             try {

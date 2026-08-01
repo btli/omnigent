@@ -20,6 +20,7 @@ class OmnigentWebViewClient(
     private val shouldInjectBridgeAtPageReady: () -> Boolean,
     private val onPageReady: (url: String?) -> Unit,
     private val onLoginRequired: () -> Unit,
+    private val onProxyAuthFlowEnded: () -> Unit = {},
 ) : WebViewClient() {
     // True while the WebView is walking a front-door auth proxy's IdP flow
     // (see [isProxyAuthUrl]): off-origin navigation stays inline until a
@@ -30,8 +31,8 @@ class OmnigentWebViewClient(
     private var originalUserAgent: String? = null
 
     /** Forget an in-flight proxy auth flow — call when the pinned server changes. */
-    fun resetProxyAuth() {
-        proxyAuthInFlight = false
+    fun resetProxyAuth(view: WebView) {
+        endProxyAuth(view)
     }
 
     /**
@@ -51,11 +52,17 @@ class OmnigentWebViewClient(
             ua.replace("; wv", "").replace("Version/4.0 ", "")
     }
 
-    /** A pinned-origin page loaded — the flow is over; restore the real UA. */
+    /**
+     * A pinned-origin page loaded (or the server changed) — the flow is over.
+     * Restore the real UA and let the host re-arm its one-shot history clear,
+     * so Back can't walk into the IdP pages the flow left on the back stack.
+     */
     private fun endProxyAuth(view: WebView) {
+        if (!proxyAuthInFlight) return
         proxyAuthInFlight = false
         originalUserAgent?.let { view.settings.userAgentString = it }
         originalUserAgent = null
+        onProxyAuthFlowEnded()
     }
 
     override fun onPageStarted(
@@ -136,8 +143,13 @@ class OmnigentWebViewClient(
         // bounce (redirect_uri back to the pinned origin) enters the flow, and
         // every navigation inside it — SSO hops, form posts, gestures on the
         // login page — stays in the WebView until we return to the pinned
-        // origin, so the proxy cookie ends up where the app pages load.
-        if (proxyAuthInFlight || isProxyAuthUrl(url.toString(), pinnedOrigin())) {
+        // origin, so the proxy cookie ends up where the app pages load. Only a
+        // server redirect (no gesture) may ENTER the flow: a user-clicked link
+        // whose URL merely carries a pinned-origin redirect_uri is an external
+        // link, not the front door bouncing us.
+        if (proxyAuthInFlight ||
+            (!request.hasGesture() && isProxyAuthUrl(url.toString(), pinnedOrigin()))
+        ) {
             enterProxyAuth(view)
             authLog("proxy-auth nav $origin — loading inline")
             return false

@@ -31,9 +31,10 @@ class OmnigentWebViewClientTest {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
         var readyUrl: String? = null
         val client =
-            client(shouldInjectBridgeAtPageReady = true) { url ->
-                readyUrl = url
-            }
+            client(
+                shouldInjectBridgeAtPageReady = true,
+                onPageReady = { url -> readyUrl = url },
+            )
 
         client.onPageFinished(webView, PINNED_URL)
 
@@ -76,6 +77,40 @@ class OmnigentWebViewClientTest {
 
         assertFalse(client.shouldOverrideUrlLoading(webView, request(PROXY_AUTH_URL)))
         assertFalse(loginRequired)
+    }
+
+    @Test
+    fun `a user-clicked proxy-looking link does not enter the flow`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        var loginRequired = false
+        val client = client(shouldInjectBridgeAtPageReady = false, onLoginRequired = { loginRequired = true })
+
+        // A gesture means an external link, even if its URL happens to carry a
+        // pinned-origin redirect_uri — hand off, don't start inline browsing.
+        assertTrue(client.shouldOverrideUrlLoading(webView, request(PROXY_AUTH_URL, gesture = true)))
+        assertFalse(loginRequired)
+        // Not in flight: a subsequent server bounce still routes to native login.
+        assertTrue(client.shouldOverrideUrlLoading(webView, request(OWN_IDP_URL)))
+        assertTrue(loginRequired)
+    }
+
+    @Test
+    fun `completed proxy flow requests a history clear`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        var flowEnded = 0
+        val client = client(shouldInjectBridgeAtPageReady = false, onProxyAuthFlowEnded = { flowEnded++ })
+
+        // No flow ran: pinned-origin loads don't signal an ended flow.
+        client.onPageStarted(webView, PINNED_URL, null)
+        assertEquals(0, flowEnded)
+
+        assertFalse(client.shouldOverrideUrlLoading(webView, request(PROXY_AUTH_URL)))
+        client.onPageStarted(webView, PINNED_URL, null)
+        assertEquals(1, flowEnded)
+
+        // And only once per flow.
+        client.onPageStarted(webView, PINNED_URL, null)
+        assertEquals(1, flowEnded)
     }
 
     @Test
@@ -136,7 +171,7 @@ class OmnigentWebViewClientTest {
         val client = client(shouldInjectBridgeAtPageReady = false, onLoginRequired = { loginRequired = true })
 
         assertFalse(client.shouldOverrideUrlLoading(webView, request(PROXY_AUTH_URL)))
-        client.resetProxyAuth()
+        client.resetProxyAuth(webView)
 
         assertTrue(client.shouldOverrideUrlLoading(webView, request(OWN_IDP_URL)))
         assertTrue(loginRequired)
@@ -165,11 +200,13 @@ class OmnigentWebViewClientTest {
         shouldInjectBridgeAtPageReady: Boolean,
         onLoginRequired: () -> Unit = {},
         onPageReady: (String?) -> Unit = {},
+        onProxyAuthFlowEnded: () -> Unit = {},
     ) = OmnigentWebViewClient(
         pinnedOrigin = { PINNED_ORIGIN },
         shouldInjectBridgeAtPageReady = { shouldInjectBridgeAtPageReady },
         onPageReady = onPageReady,
         onLoginRequired = onLoginRequired,
+        onProxyAuthFlowEnded = onProxyAuthFlowEnded,
     )
 
     private class RecordingWebView(
