@@ -191,7 +191,7 @@ class MainActivity : AppCompatActivity() {
                 }
         container.addView(switchButton)
         setContentView(container)
-        applySystemBarContrast()
+        applySystemBarContrast(resources.configuration)
         installBridge()
 
         // Measure the OS safe area and push it into the page as CSS custom
@@ -287,7 +287,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        applySystemBarContrast()
+        applySystemBarContrast(newConfig)
         if (::webView.isInitialized) {
             // Notify matchMedia listeners without reloading the SPA.
             webView.dispatchConfigurationChanged(newConfig)
@@ -334,9 +334,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun applySystemBarContrast() {
+    // Takes the Configuration rather than reading resources.configuration:
+    // onConfigurationChanged already holds the new one, and resources may not
+    // yet reflect it when the callback is invoked directly (Robolectric).
+    private fun applySystemBarContrast(config: Configuration) {
         val isLightMode =
-            resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK !=
+            config.uiMode and Configuration.UI_MODE_NIGHT_MASK !=
                 Configuration.UI_MODE_NIGHT_YES
         WindowInsetsControllerCompat(window, window.decorView).apply {
             isAppearanceLightStatusBars = isLightMode
