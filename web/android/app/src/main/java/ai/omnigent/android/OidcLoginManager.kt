@@ -14,7 +14,9 @@ import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
 
 sealed interface LoginResult {
-    data class Success(val token: String) : LoginResult
+    data class Success(
+        val token: String,
+    ) : LoginResult
 
     data object Rejected : LoginResult
 
@@ -68,48 +70,53 @@ class OidcLoginManager(
     ): Boolean {
         if (!inFlight.compareAndSet(false, true)) return false
         resultCallback = onResult
-        try {
+        return try {
             io.execute {
-                val result =
-                    try {
-                        val ticket = requestTicket(origin)
-                        authLog("cli-login -> ${if (ticket != null) "ticket ok" else "FAILED"}")
-                        if (ticket == null) {
-                            LoginResult.Rejected
-                        } else {
-                            main.post { launchTab(activity, origin + ticket.loginUrl) }
-                            pollForToken(origin, ticket.id).also { pollResult ->
-                                authLog(
-                                    "poll -> " +
-                                        when (pollResult) {
-                                            is LoginResult.Success ->
-                                                "token (len=${pollResult.token.length})"
-
-                                            LoginResult.Rejected -> "rejected"
-                                            LoginResult.TimedOut -> "timed out"
-                                        },
-                                )
-                            }
-                        }
-                    } catch (_: InterruptedException) {
-                        // shutdown() interrupted the poll — the host is going away; drop.
-                        null
-                    } catch (t: Throwable) {
-                        authLog("login flow error: ${t.javaClass.simpleName}")
-                        LoginResult.Rejected
-                    } finally {
-                        inFlight.set(false)
-                    }
+                val result = runFlow(activity, origin)
                 // resultCallback is null once shutdown() ran — never invoke into a
                 // destroyed host.
                 if (result != null) main.post { resultCallback?.invoke(result) }
             }
+            true
         } catch (_: RejectedExecutionException) {
             resultCallback = null
             inFlight.set(false)
-            return false
+            false
         }
-        return true
+    }
+
+    /** Run one flow to completion off the main thread, or null once shutdown cancels it. */
+    private fun runFlow(
+        activity: Activity,
+        origin: String,
+    ): LoginResult? =
+        try {
+            val ticket = requestTicket(origin)
+            authLog("cli-login -> ${if (ticket != null) "ticket ok" else "FAILED"}")
+            if (ticket == null) {
+                LoginResult.Rejected
+            } else {
+                main.post { launchTab(activity, origin + ticket.loginUrl) }
+                pollForToken(origin, ticket.id).also(::logPollResult)
+            }
+        } catch (_: InterruptedException) {
+            // shutdown() interrupted the poll — the host is going away; drop.
+            null
+        } catch (t: Throwable) {
+            authLog("login flow error: ${t.javaClass.simpleName}")
+            LoginResult.Rejected
+        } finally {
+            inFlight.set(false)
+        }
+
+    private fun logPollResult(result: LoginResult) {
+        val outcome =
+            when (result) {
+                is LoginResult.Success -> "token (len=${result.token.length})"
+                LoginResult.Rejected -> "rejected"
+                LoginResult.TimedOut -> "timed out"
+            }
+        authLog("poll -> $outcome")
     }
 
     internal fun isInFlightForTest(): Boolean = inFlight.get()

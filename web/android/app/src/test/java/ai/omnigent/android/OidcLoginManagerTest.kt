@@ -141,7 +141,6 @@ class OidcLoginManagerTest {
         val result = runLogin(manager(pollTimeoutMs = 50))
 
         assertEquals(LoginResult.TimedOut, result)
-        assertFalse(result == LoginResult.Rejected)
     }
 
     @Test
