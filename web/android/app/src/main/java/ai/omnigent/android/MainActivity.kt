@@ -375,7 +375,7 @@ class MainActivity : AppCompatActivity() {
         // Count (and re-arm the history clear for) only a call that actually
         // launches a flow, so re-entrant redirects can't burn the retry budget
         // without ever relaunching and suppress a legitimate later retry.
-        if (!loginManager.start(this, origin, ::onSessionToken)) return
+        if (!loginManager.start(this, origin, ::onLoginResult)) return
         loginAttempts++
         // A re-login (session expired mid-use) bounces through the IdP again,
         // leaving a stopped off-origin entry + stale pre-expiry pages on the back
@@ -383,6 +383,20 @@ class MainActivity : AppCompatActivity() {
         // page-ready purges them — otherwise Back walks into the stopped IdP entry
         // and re-pops the login browser.
         historyCleared = false
+    }
+
+    internal fun onLoginResult(result: LoginResult) {
+        when (result) {
+            is LoginResult.Success -> onSessionToken(result.token)
+            LoginResult.Rejected, LoginResult.TimedOut -> {
+                val origin = pinnedOrigin ?: return
+                Toast.makeText(
+                    this,
+                    getString(R.string.login_failed_toast, hostLabelOf(origin)),
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }
     }
 
     /**

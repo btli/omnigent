@@ -295,6 +295,19 @@ class MainActivityTest {
     }
 
     @Test
+    fun `rejected login shows generic failure and never the refusal dialog`() {
+        val activity = activity()
+
+        activity.onLoginResult(LoginResult.Rejected)
+
+        assertEquals(
+            activity.getString(R.string.login_failed_toast, "example.com"),
+            ShadowToast.getTextOfLatestToast(),
+        )
+        assertNull(ShadowAlertDialog.getLatestAlertDialog())
+    }
+
+    @Test
     fun `browsable host deep-link handler is not treated as a browser`() {
         val activity = activity()
         val deepLinkIntent =
