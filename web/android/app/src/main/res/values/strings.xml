@@ -16,5 +16,12 @@
     <string name="connect_recents">Recent servers</string>
     <string name="connect_invalid">Enter a valid http(s) server URL</string>
     <string name="menu_reload">Reload</string>
+    <string name="menu_open_in_browser">Trouble signing in? Open in browser</string>
     <string name="menu_connect_new">Connect to New Server</string>
+    <string name="proxy_auth_refused_title">Sign-in needs a browser</string>
+    <string name="proxy_auth_refused_body">This server\'s sign-in provider doesn\'t allow signing in inside an app. Open %1$s in your browser to continue.</string>
+    <string name="proxy_auth_open_browser">Open browser</string>
+    <string name="proxy_auth_cancel">Cancel</string>
+    <string name="proxy_auth_no_browser_body">No browser is available. Install or enable a browser to continue.</string>
+    <string name="proxy_auth_no_browser_toast">No browser is available.</string>
 </resources>
