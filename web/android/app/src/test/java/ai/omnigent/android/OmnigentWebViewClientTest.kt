@@ -1,11 +1,20 @@
 package ai.omnigent.android
 
 import android.content.Context
+import android.content.ContextWrapper
+import android.content.Intent
 import android.net.Uri
+import android.net.http.SslCertificate
+import android.net.http.SslError
+import android.webkit.RenderProcessGoneDetail
+import android.webkit.SslErrorHandler
 import android.webkit.ValueCallback
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import androidx.test.core.app.ApplicationProvider
+import java.io.ByteArrayInputStream
+import java.util.Date
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -13,13 +22,14 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.util.ReflectionHelpers
 
 @RunWith(RobolectricTestRunner::class)
 class OmnigentWebViewClientTest {
     @Test
     fun `page start does not inject into the outgoing document`() {
-        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
-        val client = client(shouldInjectBridgeAtPageReady = false)
+        val webView = webView()
+        val client = client()
 
         client.onPageStarted(webView, PINNED_URL, null)
 
@@ -28,7 +38,7 @@ class OmnigentWebViewClientTest {
 
     @Test
     fun `fallback injects the facade before declaring the page ready`() {
-        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val webView = webView()
         var readyUrl: String? = null
         val client =
             client(
@@ -47,192 +57,753 @@ class OmnigentWebViewClientTest {
 
     @Test
     fun `off-origin idp bounce stops the load and starts native login`() {
-        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val webView = webView()
         var loginRequired = false
-        val client = client(shouldInjectBridgeAtPageReady = false, onLoginRequired = { loginRequired = true })
+        val client = client(onLoginRequired = { loginRequired = true })
 
         client.onPageStarted(webView, OWN_IDP_URL, null)
 
-        assertTrue(webView.stoppedLoading)
+        assertEquals(1, webView.stopLoadingCalls)
         assertTrue(loginRequired)
     }
 
     @Test
     fun `front-door proxy authorize page loads inline`() {
-        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val webView = webView()
         var loginRequired = false
-        val client = client(shouldInjectBridgeAtPageReady = false, onLoginRequired = { loginRequired = true })
+        val client = client(onLoginRequired = { loginRequired = true })
 
         client.onPageStarted(webView, PROXY_AUTH_URL, null)
 
-        assertFalse(webView.stoppedLoading)
+        assertEquals(0, webView.stopLoadingCalls)
         assertFalse(loginRequired)
     }
 
     @Test
     fun `proxy authorize navigation is not overridden`() {
-        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val webView = webView()
         var loginRequired = false
-        val client = client(shouldInjectBridgeAtPageReady = false, onLoginRequired = { loginRequired = true })
+        val client = client(onLoginRequired = { loginRequired = true })
 
         assertFalse(client.shouldOverrideUrlLoading(webView, request(PROXY_AUTH_URL)))
+        client.onPageStarted(webView, PROXY_AUTH_URL, null)
+
+        assertFalse(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
         assertFalse(loginRequired)
     }
 
     @Test
-    fun `a user-clicked proxy-looking link does not enter the flow`() {
-        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
-        var loginRequired = false
-        val client = client(shouldInjectBridgeAtPageReady = false, onLoginRequired = { loginRequired = true })
+    fun `redirect leg enters the flow with or without a gesture`() {
+        listOf(false, true).forEach { gesture ->
+            val webView = webView()
+            var loginRequired = false
+            val client = client(onLoginRequired = { loginRequired = true })
 
-        // A gesture means an external link, even if its URL happens to carry a
-        // pinned-origin redirect_uri — hand off, don't start inline browsing.
-        assertTrue(client.shouldOverrideUrlLoading(webView, request(PROXY_AUTH_URL, gesture = true)))
+            assertFalse(
+                client.shouldOverrideUrlLoading(
+                    webView,
+                    request(PROXY_AUTH_URL, gesture = gesture, redirect = true),
+                ),
+            )
+            assertFalse(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
+            assertFalse(loginRequired)
+        }
+    }
+
+    @Test
+    fun `a proxy-shaped gestureless non-redirect navigation enters on page start`() {
+        val webView = webView()
+        var loginRequired = false
+        val client = client(onLoginRequired = { loginRequired = true })
+
+        assertFalse(client.shouldOverrideUrlLoading(webView, request(PROXY_AUTH_URL)))
+        client.onPageStarted(webView, PROXY_AUTH_URL, null)
+
+        assertFalse(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
         assertFalse(loginRequired)
-        // Not in flight: a subsequent server bounce still routes to native login.
-        assertTrue(client.shouldOverrideUrlLoading(webView, request(OWN_IDP_URL)))
+    }
+
+    @Test
+    fun `a proxy-shaped gestured non-redirect navigation is handed off`() {
+        val webView = webView()
+        var loginRequired = false
+        val client = client(onLoginRequired = { loginRequired = true })
+
+        assertTrue(
+            client.shouldOverrideUrlLoading(
+                webView,
+                request(PROXY_AUTH_URL, gesture = true),
+            ),
+        )
+        val startedIntent = webView.startedActivities.singleOrNull()
+        assertEquals(Intent.ACTION_VIEW, startedIntent?.action)
+        assertEquals(PROXY_AUTH_URL, startedIntent?.dataString)
+
+        assertTrue(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
         assertTrue(loginRequired)
     }
 
     @Test
-    fun `completed proxy flow requests a history clear`() {
-        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
-        var flowEnded = 0
-        val client = client(shouldInjectBridgeAtPageReady = false, onProxyAuthFlowEnded = { flowEnded++ })
+    fun `a non-proxy gestureless navigation still starts native login`() {
+        val webView = webView()
+        var loginRequired = false
+        val client = client(onLoginRequired = { loginRequired = true })
 
-        // No flow ran: pinned-origin loads don't signal an ended flow.
-        client.onPageStarted(webView, PINNED_URL, null)
-        assertEquals(0, flowEnded)
+        assertTrue(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
 
-        assertFalse(client.shouldOverrideUrlLoading(webView, request(PROXY_AUTH_URL)))
-        client.onPageStarted(webView, PINNED_URL, null)
-        assertEquals(1, flowEnded)
-
-        // And only once per flow.
-        client.onPageStarted(webView, PINNED_URL, null)
-        assertEquals(1, flowEnded)
+        assertTrue(loginRequired)
     }
 
     @Test
-    fun `off-origin navigation stays inline while a proxy auth flow is in flight`() {
-        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+    fun `a gestured cross-origin navigation stays inline while in flight`() {
+        val webView = webView()
         var loginRequired = false
-        val client = client(shouldInjectBridgeAtPageReady = false, onLoginRequired = { loginRequired = true })
+        val client = client(onLoginRequired = { loginRequired = true })
 
-        // Enter the proxy IdP flow, then navigate within the IdP (no
-        // redirect_uri on intermediate pages, with or without a gesture).
-        assertFalse(client.shouldOverrideUrlLoading(webView, request(PROXY_AUTH_URL)))
-        assertFalse(client.shouldOverrideUrlLoading(webView, request("https://idp.example.com/login/sso")))
+        enterFlow(client, webView)
+
         assertFalse(
             client.shouldOverrideUrlLoading(
                 webView,
-                request("https://idp.example.com/login/password", gesture = true),
+                request(GOOGLE_IDP_URL, gesture = true),
             ),
         )
+        assertFalse(loginRequired)
+        assertTrue(webView.startedActivities.isEmpty())
+    }
+
+    @Test
+    fun `deadline expiry ends the flow in shouldOverrideUrlLoading`() {
+        var now = 0L
+        val webView = webView()
+        var loginRequired = false
+        var flowEnded = 0
+        val client =
+            client(
+                clock = { now },
+                onLoginRequired = { loginRequired = true },
+                onProxyAuthFlowEnded = { flowEnded++ },
+            )
+        enterFlow(client, webView)
+
+        now = DEADLINE_MILLIS + 1
+
+        assertTrue(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
+        assertTrue(loginRequired)
+        assertEquals(0, flowEnded)
+    }
+
+    @Test
+    fun `the flow survives just short of the deadline`() {
+        var now = 0L
+        val webView = webView()
+        var loginRequired = false
+        val client = client(clock = { now }, onLoginRequired = { loginRequired = true })
+        enterFlow(client, webView)
+
+        now = DEADLINE_MILLIS - 1
+
+        assertFalse(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
         assertFalse(loginRequired)
     }
 
     @Test
-    fun `returning to the pinned origin ends the proxy auth flow`() {
-        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+    fun `deadline expiry is observed first in onPageStarted`() {
+        var now = 0L
+        val webView = webView()
         var loginRequired = false
-        val client = client(shouldInjectBridgeAtPageReady = false, onLoginRequired = { loginRequired = true })
+        val client = client(clock = { now }, onLoginRequired = { loginRequired = true })
+        enterFlow(client, webView)
+
+        now = DEADLINE_MILLIS + 1
+        client.onPageStarted(webView, PLAIN_IDP_URL, null)
+
+        assertEquals(1, webView.stopLoadingCalls)
+        assertTrue(loginRequired)
+    }
+
+    @Test
+    fun `a stale page start after reset does not resurrect the error tracker`() {
+        val webView = webView()
+        var loginRequired = false
+        val client = client(onLoginRequired = { loginRequired = true })
+
+        client.resetProxyAuth(webView)
+        client.onPageStarted(webView, STALE_IDP_URL, null)
+        assertFalse(
+            client.shouldOverrideUrlLoading(
+                webView,
+                request(PROXY_AUTH_URL, redirect = true),
+            ),
+        )
+        client.handleReceivedError(request(STALE_IDP_URL))
+
+        loginRequired = false
+        assertFalse(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
+        assertFalse(loginRequired)
+    }
+
+    @Test
+    fun `a ledgered pinned-origin finish does not end a new same-server flow`() {
+        val webView = webView()
+        var flowEnded = 0
+        val client = client(onProxyAuthFlowEnded = { flowEnded++ })
+
+        client.onPageStarted(webView, PINNED_URL, null)
+        client.stopLoadingAndLedger(webView)
+        enterFlow(client, webView)
+        client.onPageStarted(webView, PLAIN_IDP_URL, null)
+        client.onPageFinished(webView, PINNED_URL)
+
+        assertEquals(0, flowEnded)
+        assertFalse(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
+    }
+
+    @Test
+    fun `reload sequence resets then ledgers then loads`() {
+        val webView = webView()
+        var flowEnded = 0
+        val client = client(onProxyAuthFlowEnded = { flowEnded++ })
+
+        enterFlow(client, webView)
+        client.onPageStarted(webView, PINNED_URL, null)
+        client.resetProxyAuth(webView)
+        client.stopLoadingAndLedger(webView)
+        webView.loadUrl(PINNED_URL)
+
+        enterFlow(client, webView)
+        client.onPageStarted(webView, PLAIN_IDP_URL, null)
+        client.onPageFinished(webView, PINNED_URL)
+
+        assertEquals(listOf("stopLoading", "loadUrl:$PINNED_URL"), webView.callOrder)
+        assertEquals(0, flowEnded)
+        assertFalse(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
+    }
+
+    @Test
+    fun `a stale slot spares page plumbing for a genuine same-url finish`() {
+        val webView = webView()
+        var flowEnded = 0
+        var readyUrl: String? = null
+        val client =
+            client(
+                shouldInjectBridgeAtPageReady = true,
+                onPageReady = { readyUrl = it },
+                onProxyAuthFlowEnded = { flowEnded++ },
+            )
+
+        client.onPageStarted(webView, PINNED_URL, null)
+        client.stopLoadingAndLedger(webView)
+        enterFlow(client, webView)
+        client.onPageStarted(webView, PLAIN_IDP_URL, null)
+
+        assertFalse(client.shouldOverrideUrlLoading(webView, request(PINNED_URL)))
+        client.onPageStarted(webView, PINNED_URL, null)
+        client.onPageFinished(webView, PINNED_URL)
+
+        assertEquals(0, flowEnded)
+        assertEquals(NativeBridgeScript.source, webView.evaluatedScript)
+        assertNull(readyUrl)
+        webView.completeEvaluation()
+        assertEquals(PINNED_URL, readyUrl)
+        assertFalse(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
+    }
+
+    @Test
+    fun `an unledgered override cancel never suppresses a later genuine entry`() {
+        val webView = webView()
+        var loginRequired = false
+        val client = client(onLoginRequired = { loginRequired = true })
+
+        assertTrue(
+            client.shouldOverrideUrlLoading(
+                webView,
+                request(PROXY_AUTH_URL, gesture = true),
+            ),
+        )
 
         assertFalse(client.shouldOverrideUrlLoading(webView, request(PROXY_AUTH_URL)))
+        client.onPageStarted(webView, PROXY_AUTH_URL, null)
+
+        assertFalse(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
+        assertFalse(loginRequired)
+    }
+
+    @Test
+    fun `the ledger slot clears on a non-matching page finish only`() {
+        val survivingView = webView()
+        val survivingClient = client()
+        survivingClient.onPageStarted(survivingView, PINNED_URL, null)
+        survivingClient.stopLoadingAndLedger(survivingView)
+        survivingClient.onPageStarted(survivingView, PROXY_AUTH_URL, null)
+        survivingClient.onPageFinished(survivingView, PINNED_URL)
+        assertFalse(
+            survivingClient.shouldOverrideUrlLoading(
+                survivingView,
+                request(PLAIN_IDP_URL),
+            ),
+        )
+
+        val clearedView = webView()
+        var loginRequired = false
+        val clearedClient = client(onLoginRequired = { loginRequired = true })
+        clearedClient.onPageStarted(clearedView, PINNED_URL, null)
+        clearedClient.stopLoadingAndLedger(clearedView)
+        clearedClient.onPageStarted(clearedView, PROXY_AUTH_URL, null)
+        clearedClient.onPageFinished(clearedView, OTHER_IDP_URL)
+        clearedClient.onPageFinished(clearedView, PINNED_URL)
+
+        assertTrue(clearedClient.shouldOverrideUrlLoading(clearedView, request(PLAIN_IDP_URL)))
+        assertTrue(loginRequired)
+    }
+
+    @Test
+    fun `a stale error after a server switch does not kill the new flow`() {
+        var currentOrigin = OLD_PINNED_ORIGIN
+        val webView = webView()
+        val client = client(pinnedOrigin = { currentOrigin })
+        val oldProxyUrl = proxyAuthUrl(OLD_PINNED_ORIGIN)
+        val newProxyUrl = proxyAuthUrl(NEW_PINNED_ORIGIN)
+
+        assertFalse(
+            client.shouldOverrideUrlLoading(
+                webView,
+                request(oldProxyUrl, redirect = true),
+            ),
+        )
+        client.onPageStarted(webView, STALE_IDP_URL, null)
+
+        currentOrigin = NEW_PINNED_ORIGIN
+        client.resetProxyAuth(webView)
+        client.stopLoadingAndLedger(webView)
+        webView.loadUrl(NEW_PINNED_URL)
+        assertFalse(
+            client.shouldOverrideUrlLoading(
+                webView,
+                request(newProxyUrl, redirect = true),
+            ),
+        )
+        client.handleReceivedError(request(STALE_IDP_URL))
+
+        assertFalse(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
+    }
+
+    @Test
+    fun `an error before any page start does not exit the flow`() {
+        val webView = webView()
+        val client = client()
+
+        enterFlow(client, webView)
+        client.handleReceivedError(request(PROXY_AUTH_URL))
+
+        assertFalse(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
+    }
+
+    @Test
+    fun `flow survives a pinned-origin hop mid-flow`() {
+        val webView = webView()
+        val client = client()
+        enterFlow(client, webView)
+
+        assertFalse(client.shouldOverrideUrlLoading(webView, request(PINNED_URL)))
+
+        assertFalse(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
+    }
+
+    @Test
+    fun `flow does not end at navigation start`() {
+        val webView = webView()
+        val client = client()
+        enterFlow(client, webView)
+
+        assertFalse(client.shouldOverrideUrlLoading(webView, request(PINNED_URL)))
         client.onPageStarted(webView, PINNED_URL, null)
 
-        // Flow over: a fresh off-origin server bounce routes to native login again.
-        assertTrue(client.shouldOverrideUrlLoading(webView, request(OWN_IDP_URL)))
+        assertFalse(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
+    }
+
+    @Test
+    fun `flow ends on a pinned-origin page finish with either bridge path`() {
+        listOf(false, true).forEach { injectAtPageReady ->
+            val webView = webView()
+            var loginRequired = false
+            val client =
+                client(
+                    shouldInjectBridgeAtPageReady = injectAtPageReady,
+                    onLoginRequired = { loginRequired = true },
+                )
+            enterFlow(client, webView)
+            client.onPageStarted(webView, PINNED_URL, null)
+
+            client.onPageFinished(webView, PINNED_URL)
+
+            assertTrue(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
+            assertTrue(loginRequired)
+        }
+    }
+
+    @Test
+    fun `onProxyAuthFlowEnded fires once before onPageReady`() {
+        val webView = webView()
+        val events = mutableListOf<String>()
+        val client =
+            client(
+                onPageReady = { events += "ready" },
+                onProxyAuthFlowEnded = { events += "ended" },
+            )
+        enterFlow(client, webView)
+
+        client.onPageFinished(webView, PINNED_URL)
+        client.onPageFinished(webView, PINNED_URL)
+
+        assertEquals(1, events.count { it == "ended" })
+        assertEquals(listOf("ended", "ready"), events.take(2))
+    }
+
+    @Test
+    fun `a finish for the old origin after a server switch does not end the new flow`() {
+        var currentOrigin = OLD_PINNED_ORIGIN
+        val webView = webView()
+        var flowEnded = 0
+        val client =
+            client(
+                pinnedOrigin = { currentOrigin },
+                onProxyAuthFlowEnded = { flowEnded++ },
+            )
+
+        assertFalse(
+            client.shouldOverrideUrlLoading(
+                webView,
+                request(proxyAuthUrl(OLD_PINNED_ORIGIN), redirect = true),
+            ),
+        )
+        currentOrigin = NEW_PINNED_ORIGIN
+        client.resetProxyAuth(webView)
+        assertFalse(
+            client.shouldOverrideUrlLoading(
+                webView,
+                request(proxyAuthUrl(NEW_PINNED_ORIGIN), redirect = true),
+            ),
+        )
+
+        client.onPageFinished(webView, OLD_PINNED_URL)
+
+        assertEquals(0, flowEnded)
+        assertFalse(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
+    }
+
+    @Test
+    fun `main-frame onReceivedError for the current URL ends the flow`() {
+        val webView = webView()
+        var loginRequired = false
+        val client = client(onLoginRequired = { loginRequired = true })
+        enterFlow(client, webView)
+        client.onPageStarted(webView, PLAIN_IDP_URL, null)
+
+        client.handleReceivedError(request(PLAIN_IDP_URL))
+
+        assertTrue(client.shouldOverrideUrlLoading(webView, request(OTHER_IDP_URL)))
+        assertTrue(loginRequired)
+    }
+
+    @Test
+    fun `a subframe error does not end the flow`() {
+        val webView = webView()
+        val client = client()
+        enterFlow(client, webView)
+        client.onPageStarted(webView, PLAIN_IDP_URL, null)
+
+        client.handleReceivedError(request(PLAIN_IDP_URL, mainFrame = false))
+
+        assertFalse(client.shouldOverrideUrlLoading(webView, request(OTHER_IDP_URL)))
+    }
+
+    @Test
+    fun `main-frame onReceivedHttpError for the current URL ends the flow`() {
+        val webView = webView()
+        var loginRequired = false
+        val client = client(onLoginRequired = { loginRequired = true })
+        enterFlow(client, webView)
+        client.onPageStarted(webView, PLAIN_IDP_URL, null)
+
+        client.onReceivedHttpError(
+            webView,
+            request(PLAIN_IDP_URL),
+            httpErrorResponse(),
+        )
+
+        assertTrue(client.shouldOverrideUrlLoading(webView, request(OTHER_IDP_URL)))
+        assertTrue(loginRequired)
+    }
+
+    @Test
+    fun `onReceivedSslError ends the flow`() {
+        val webView = webView()
+        var loginRequired = false
+        val client = client(onLoginRequired = { loginRequired = true })
+        enterFlow(client, webView)
+
+        val handler = ReflectionHelpers.callConstructor(SslErrorHandler::class.java)
+        val certificate = SslCertificate("CN=subject", "CN=issuer", Date(0), Date(1))
+        client.onReceivedSslError(
+            webView,
+            handler,
+            SslError(SslError.SSL_UNTRUSTED, certificate, PLAIN_IDP_URL),
+        )
+
+        assertTrue(client.shouldOverrideUrlLoading(webView, request(OTHER_IDP_URL)))
+        assertTrue(loginRequired)
+    }
+
+    @Test
+    fun `onRenderProcessGone ends the flow`() {
+        val webView = webView()
+        var loginRequired = false
+        val client = client(onLoginRequired = { loginRequired = true })
+        enterFlow(client, webView)
+
+        client.onRenderProcessGone(webView, renderProcessGoneDetail())
+
+        assertTrue(client.shouldOverrideUrlLoading(webView, request(OTHER_IDP_URL)))
         assertTrue(loginRequired)
     }
 
     @Test
     fun `a proxy auth flow keeps the real user agent`() {
         val webView = webViewWithWebViewUa()
-        val client = client(shouldInjectBridgeAtPageReady = false)
+        val original = webView.settings.userAgentString
+        val client = client()
 
-        client.shouldOverrideUrlLoading(webView, request(PROXY_AUTH_URL))
+        enterFlow(client, webView)
 
-        // Masking is a fallback for IdPs that reject embedded WebViews, not
-        // the default posture — most proxy IdPs accept the real UA.
-        assertTrue(webView.settings.userAgentString.contains("; wv"))
-        assertNull(webView.loadedUrl)
+        assertEquals(original, webView.settings.userAgentString)
+        assertTrue(webView.loadedUrls.isEmpty())
     }
 
     @Test
-    fun `an embedded-webview rejection masks the user agent and restarts the flow`() {
-        val webView = webViewWithWebViewUa()
-        val client = client(shouldInjectBridgeAtPageReady = false)
-
-        client.shouldOverrideUrlLoading(webView, request(PROXY_AUTH_URL))
-        client.onPageStarted(webView, REJECTION_URL, null)
-
-        val masked = webView.settings.userAgentString
-        assertFalse(masked.contains("; wv"))
-        assertFalse(masked.contains("Version/4.0"))
-        assertTrue(masked.contains("Chrome/126.0.0.0"))
-        // Restart from the server so the front door issues fresh flow state.
-        assertEquals(PINNED_ORIGIN, webView.loadedUrl)
-    }
-
-    @Test
-    fun `a rejection after masking is not retried`() {
-        val webView = webViewWithWebViewUa()
-        val client = client(shouldInjectBridgeAtPageReady = false)
-
-        client.shouldOverrideUrlLoading(webView, request(PROXY_AUTH_URL))
-        client.onPageStarted(webView, REJECTION_URL, null)
-        webView.loadedUrl = null
-        client.onPageStarted(webView, REJECTION_URL, null)
-
-        // Already masked — reloading again would loop forever.
-        assertNull(webView.loadedUrl)
-    }
-
-    @Test
-    fun `a masked user agent is restored when the flow ends`() {
+    fun `refusal stops loading and notifies without reloading or mutating the user agent`() {
         val webView = webViewWithWebViewUa()
         val original = webView.settings.userAgentString
-        val client = client(shouldInjectBridgeAtPageReady = false)
+        var unsupported = 0
+        val client = client(onEmbeddedSignInUnsupported = { unsupported++ })
+        enterFlow(client, webView)
 
-        client.shouldOverrideUrlLoading(webView, request(PROXY_AUTH_URL))
-        client.onPageStarted(webView, REJECTION_URL, null)
-        client.onPageStarted(webView, PINNED_URL, null)
+        client.onPageStarted(webView, REJECTION_QUERY_URL, null)
 
+        assertEquals(1, webView.stopLoadingCalls)
+        assertEquals(1, unsupported)
+        assertTrue(webView.loadedUrls.isEmpty())
         assertEquals(original, webView.settings.userAgentString)
     }
 
-    private fun webViewWithWebViewUa(): RecordingWebView =
-        RecordingWebView(ApplicationProvider.getApplicationContext()).apply {
-            settings.userAgentString =
-                "Mozilla/5.0 (Linux; Android 14; Pixel Build/X; wv) AppleWebKit/537.36 " +
-                "(KHTML, like Gecko) Version/4.0 Chrome/126.0.0.0 Mobile Safari/537.36"
-        }
+    @Test
+    fun `refusal is detected in the query`() {
+        val webView = webView()
+        var unsupported = 0
+        val client = client(onEmbeddedSignInUnsupported = { unsupported++ })
+        enterFlow(client, webView)
+
+        client.onPageStarted(webView, REJECTION_QUERY_URL, null)
+
+        assertEquals(1, unsupported)
+    }
+
+    @Test
+    fun `refusal is detected in the fragment`() {
+        val webView = webView()
+        var unsupported = 0
+        val client = client(onEmbeddedSignInUnsupported = { unsupported++ })
+        enterFlow(client, webView)
+
+        client.onPageStarted(webView, REJECTION_FRAGMENT_URL, null)
+
+        assertEquals(1, unsupported)
+    }
+
+    @Test
+    fun `refusal is detected one decoded nesting level deep`() {
+        val webView = webView()
+        var unsupported = 0
+        val client = client(onEmbeddedSignInUnsupported = { unsupported++ })
+        enterFlow(client, webView)
+
+        client.onPageStarted(webView, REJECTION_NESTED_URL, null)
+
+        assertEquals(1, unsupported)
+    }
+
+    @Test
+    fun `repeated refusal page starts notify once and never start native login`() {
+        val webView = webView()
+        var unsupported = 0
+        var loginRequired = false
+        val client =
+            client(
+                onLoginRequired = { loginRequired = true },
+                onEmbeddedSignInUnsupported = { unsupported++ },
+            )
+        enterFlow(client, webView)
+
+        client.onPageStarted(webView, REJECTION_QUERY_URL, null)
+        client.onPageStarted(webView, REJECTION_QUERY_URL, null)
+
+        assertEquals(1, unsupported)
+        assertEquals(1, webView.stopLoadingCalls)
+        assertFalse(loginRequired)
+    }
+
+    @Test
+    fun `while refused an off-origin navigation is cancelled without handoff or login`() {
+        val webView = webView()
+        var loginRequired = false
+        val client = client(onLoginRequired = { loginRequired = true })
+        refuse(client, webView)
+
+        assertTrue(
+            client.shouldOverrideUrlLoading(
+                webView,
+                request(OTHER_IDP_URL, gesture = true),
+            ),
+        )
+
+        assertFalse(loginRequired)
+        assertTrue(webView.startedActivities.isEmpty())
+    }
+
+    @Test
+    fun `while refused a same-origin navigation loads inline`() {
+        val webView = webView()
+        var loginRequired = false
+        val client = client(onLoginRequired = { loginRequired = true })
+        refuse(client, webView)
+
+        assertFalse(client.shouldOverrideUrlLoading(webView, request(PINNED_URL)))
+        assertFalse(loginRequired)
+    }
+
+    @Test
+    fun `while refused a subframe navigation remains unchanged`() {
+        val webView = webView()
+        val client = client()
+        refuse(client, webView)
+
+        assertFalse(
+            client.shouldOverrideUrlLoading(
+                webView,
+                request(OTHER_IDP_URL, mainFrame = false),
+            ),
+        )
+    }
+
+    @Test
+    fun `while refused page finishes do not change state or notify again`() {
+        val webView = webView()
+        var unsupported = 0
+        var loginRequired = false
+        val client =
+            client(
+                onLoginRequired = { loginRequired = true },
+                onEmbeddedSignInUnsupported = { unsupported++ },
+            )
+        refuse(client, webView, REJECTION_QUERY_URL)
+
+        client.onPageFinished(webView, REJECTION_QUERY_URL)
+        client.onPageFinished(webView, PINNED_URL)
+
+        assertEquals(1, unsupported)
+        assertTrue(client.shouldOverrideUrlLoading(webView, request(OTHER_IDP_URL)))
+        assertFalse(loginRequired)
+    }
+
+    @Test
+    fun `while refused a main-frame terminal callback is ignored`() {
+        val webView = webView()
+        var loginRequired = false
+        val client = client(onLoginRequired = { loginRequired = true })
+        refuse(client, webView)
+
+        client.handleReceivedError(request(REJECTION_QUERY_URL))
+
+        assertTrue(client.shouldOverrideUrlLoading(webView, request(OTHER_IDP_URL)))
+        assertFalse(loginRequired)
+    }
+
+    @Test
+    fun `resetProxyAuth returns refused state to idle`() {
+        val webView = webView()
+        var loginRequired = false
+        val client = client(onLoginRequired = { loginRequired = true })
+        refuse(client, webView)
+
+        client.resetProxyAuth(webView)
+
+        assertTrue(client.shouldOverrideUrlLoading(webView, request(OTHER_IDP_URL)))
+        assertTrue(loginRequired)
+    }
 
     @Test
     fun `resetProxyAuth ends the flow without a pinned page load`() {
-        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val webView = webView()
         var loginRequired = false
-        val client = client(shouldInjectBridgeAtPageReady = false, onLoginRequired = { loginRequired = true })
+        val client = client(onLoginRequired = { loginRequired = true })
+        enterFlow(client, webView)
 
-        assertFalse(client.shouldOverrideUrlLoading(webView, request(PROXY_AUTH_URL)))
         client.resetProxyAuth(webView)
 
         assertTrue(client.shouldOverrideUrlLoading(webView, request(OWN_IDP_URL)))
         assertTrue(loginRequired)
     }
 
+    @Test
+    fun `a path mentioning disallowed_useragent is not a refusal`() {
+        val webView = webViewWithWebViewUa()
+        val original = webView.settings.userAgentString
+        var unsupported = 0
+        val client = client(onEmbeddedSignInUnsupported = { unsupported++ })
+        enterFlow(client, webView)
+
+        client.onPageStarted(webView, REJECTION_PATH_URL, null)
+
+        assertEquals(0, unsupported)
+        assertEquals(0, webView.stopLoadingCalls)
+        assertTrue(webView.loadedUrls.isEmpty())
+        assertEquals(original, webView.settings.userAgentString)
+        assertFalse(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
+    }
+
+    private fun enterFlow(
+        client: OmnigentWebViewClient,
+        webView: RecordingWebView,
+    ) {
+        assertFalse(
+            client.shouldOverrideUrlLoading(
+                webView,
+                request(PROXY_AUTH_URL, redirect = true),
+            ),
+        )
+    }
+
+    private fun refuse(
+        client: OmnigentWebViewClient,
+        webView: RecordingWebView,
+        url: String = REJECTION_QUERY_URL,
+    ) {
+        enterFlow(client, webView)
+        client.onPageStarted(webView, url, null)
+    }
+
     private fun request(
         url: String,
         gesture: Boolean = false,
         mainFrame: Boolean = true,
+        redirect: Boolean = false,
     ): WebResourceRequest =
         object : WebResourceRequest {
             override fun getUrl(): Uri = Uri.parse(url)
 
             override fun isForMainFrame(): Boolean = mainFrame
 
-            override fun isRedirect(): Boolean = false
+            override fun isRedirect(): Boolean = redirect
 
             override fun hasGesture(): Boolean = gesture
 
@@ -241,29 +812,79 @@ class OmnigentWebViewClientTest {
             override fun getRequestHeaders(): Map<String, String> = emptyMap()
         }
 
+    private fun httpErrorResponse() =
+        WebResourceResponse(
+            "text/plain",
+            "UTF-8",
+            500,
+            "Internal Server Error",
+            emptyMap(),
+            ByteArrayInputStream("error".toByteArray()),
+        )
+
+    private fun renderProcessGoneDetail() =
+        object : RenderProcessGoneDetail() {
+            override fun didCrash(): Boolean = true
+
+            override fun rendererPriorityAtExit(): Int = 0
+        }
+
     private fun client(
-        shouldInjectBridgeAtPageReady: Boolean,
+        pinnedOrigin: () -> String? = { PINNED_ORIGIN },
+        shouldInjectBridgeAtPageReady: Boolean = false,
         onLoginRequired: () -> Unit = {},
         onPageReady: (String?) -> Unit = {},
         onProxyAuthFlowEnded: () -> Unit = {},
+        clock: () -> Long = { 0L },
+        onEmbeddedSignInUnsupported: () -> Unit = {},
     ) = OmnigentWebViewClient(
-        pinnedOrigin = { PINNED_ORIGIN },
+        pinnedOrigin = pinnedOrigin,
         shouldInjectBridgeAtPageReady = { shouldInjectBridgeAtPageReady },
         onPageReady = onPageReady,
         onLoginRequired = onLoginRequired,
         onProxyAuthFlowEnded = onProxyAuthFlowEnded,
+        clock = clock,
+        onEmbeddedSignInUnsupported = onEmbeddedSignInUnsupported,
     )
 
+    private fun webView(): RecordingWebView =
+        RecordingWebView(
+            RecordingContext(ApplicationProvider.getApplicationContext()),
+        )
+
+    private fun webViewWithWebViewUa(): RecordingWebView =
+        webView().apply {
+            settings.userAgentString = WEBVIEW_USER_AGENT
+        }
+
+    private fun proxyAuthUrl(origin: String): String =
+        "https://idp.example.com/oidc/oauth2/v2.0/authorize?response_type=code" +
+            "&redirect_uri=${Uri.encode("$origin/.auth/callback")}"
+
+    private class RecordingContext(
+        base: Context,
+    ) : ContextWrapper(base) {
+        val startedActivities = mutableListOf<Intent>()
+
+        override fun startActivity(intent: Intent) {
+            startedActivities += intent
+        }
+    }
+
     private class RecordingWebView(
-        context: Context,
-    ) : WebView(context) {
+        private val recordingContext: RecordingContext,
+    ) : WebView(recordingContext) {
         var evaluatedScript: String? = null
-        var stoppedLoading = false
-        var loadedUrl: String? = null
+        var stopLoadingCalls = 0
+        val loadedUrls = mutableListOf<String>()
+        val callOrder = mutableListOf<String>()
+        val startedActivities: List<Intent>
+            get() = recordingContext.startedActivities
         private var callback: ValueCallback<String>? = null
 
         override fun loadUrl(url: String) {
-            loadedUrl = url
+            loadedUrls += url
+            callOrder += "loadUrl:$url"
         }
 
         override fun evaluateJavascript(
@@ -275,7 +896,8 @@ class OmnigentWebViewClientTest {
         }
 
         override fun stopLoading() {
-            stoppedLoading = true
+            stopLoadingCalls++
+            callOrder += "stopLoading"
         }
 
         fun completeEvaluation() {
@@ -286,20 +908,37 @@ class OmnigentWebViewClientTest {
     private companion object {
         const val PINNED_ORIGIN = "https://example.com"
         const val PINNED_URL = "$PINNED_ORIGIN/app"
+        const val OLD_PINNED_ORIGIN = "https://old.example.com"
+        const val OLD_PINNED_URL = "$OLD_PINNED_ORIGIN/app"
+        const val NEW_PINNED_ORIGIN = "https://new.example.com"
+        const val NEW_PINNED_URL = "$NEW_PINNED_ORIGIN/app"
+        const val DEADLINE_MILLIS = 6 * 60_000L
 
-        // A hosting front door (e.g. Databricks Apps) bouncing to its IdP with
-        // a redirect_uri returning to the pinned origin's proxy callback.
         const val PROXY_AUTH_URL =
             "https://idp.example.com/oidc/oauth2/v2.0/authorize?response_type=code" +
                 "&redirect_uri=https%3A%2F%2Fexample.com%2F.auth%2Fcallback"
 
-        // The app's own OIDC bounce: redirect_uri is the server's /auth/callback.
         const val OWN_IDP_URL =
             "https://accounts.example.org/authorize?response_type=code" +
                 "&redirect_uri=https%3A%2F%2Fexample.com%2Fauth%2Fcallback"
 
-        // Where an IdP that refuses embedded WebViews lands the flow.
-        const val REJECTION_URL =
+        const val PLAIN_IDP_URL = "https://idp.example.com/login/sso"
+        const val OTHER_IDP_URL = "https://other-idp.example.net/login"
+        const val GOOGLE_IDP_URL = "https://accounts.google.com/signin"
+        const val STALE_IDP_URL = "https://stale-idp.example.net/login"
+
+        const val REJECTION_QUERY_URL =
             "https://accounts.google.com/v3/signin/rejected?error=disallowed_useragent"
+        const val REJECTION_FRAGMENT_URL =
+            "https://accounts.google.com/v3/signin/rejected#error=disallowed_useragent"
+        const val REJECTION_NESTED_URL =
+            "https://accounts.google.com/signin?continue=https%3A%2F%2Faccounts.google.com" +
+                "%2Frejected%3Ferror%3Ddisallowed%5Fuseragent"
+        const val REJECTION_PATH_URL =
+            "https://accounts.google.com/help/disallowed_useragent/details"
+
+        const val WEBVIEW_USER_AGENT =
+            "Mozilla/5.0 (Linux; Android 14; Pixel Build/X; wv) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Version/4.0 Chrome/126.0.0.0 Mobile Safari/537.36"
     }
 }
