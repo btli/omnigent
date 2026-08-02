@@ -2,7 +2,9 @@ package ai.omnigent.android
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.AlertDialog
 import android.app.DownloadManager
+import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
@@ -22,6 +24,7 @@ import android.webkit.WebView
 import android.widget.FrameLayout
 import android.widget.PopupMenu
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -52,6 +55,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var blobSaver: BlobSaver
     private val loginManager = OidcLoginManager()
     private var pinnedOrigin: String? = null
+    private var embeddedSignInDialog: AlertDialog? = null
 
     // Bridge-dependent work deferred until the page (and its injected emit
     // callbacks) exist — see onPageReady.
@@ -148,6 +152,7 @@ class MainActivity : AppCompatActivity() {
                         // Drop the IdP hops a completed proxy flow left on the
                         // back stack once the next pinned page is ready.
                         onProxyAuthFlowEnded = { historyCleared = false },
+                        onEmbeddedSignInUnsupported = ::showEmbeddedSignInUnsupported,
                     )
                 webViewClient = shellWebViewClient
                 webChromeClient =
@@ -490,6 +495,8 @@ class MainActivity : AppCompatActivity() {
         loginManager.shutdown()
         if (::blobSaver.isInitialized) blobSaver.shutdown()
         if (::webView.isInitialized) {
+            shellWebViewClient.resetProxyAuth(webView)
+            dismissEmbeddedSignInDialogWithoutReset()
             removeBridge()
             webView.destroy()
         }
@@ -528,8 +535,10 @@ class MainActivity : AppCompatActivity() {
         newOrigin: String,
     ) {
         removeBridge()
-        pinnedOrigin = newOrigin
+        dismissEmbeddedSignInDialogWithoutReset()
         shellWebViewClient.resetProxyAuth(webView)
+        shellWebViewClient.stopLoadingAndLedger(webView)
+        pinnedOrigin = newOrigin
         pageLoaded = false
         historyCleared = false
         loginAttempts = 0
@@ -555,9 +564,8 @@ class MainActivity : AppCompatActivity() {
     /**
      * Show the server-switcher dropdown menu, mirroring the iOS `ServerSwitcher`
      * `Menu`. Lists the current server (disabled header), other recent servers,
-     * Reload, and Connect to New Server. Tapping a recent server switches
-     * directly without leaving the app; "Connect to New Server" opens
-     * [ConnectActivity] for manual URL entry.
+     * Reload, the browser escape hatch, and Connect to New Server. Tapping a
+     * recent server switches directly without leaving the app.
      */
     private fun showServerSwitcherMenu(anchor: View) {
         val store = ServerStore(this)
@@ -575,7 +583,8 @@ class MainActivity : AppCompatActivity() {
             }
             // Group 2: actions (divider before this group).
             add(2, 3, 0, getString(R.string.menu_reload))
-            add(2, 4, 0, getString(R.string.menu_connect_new))
+            add(2, 5, 1, getString(R.string.menu_open_in_browser))
+            add(2, 4, 2, getString(R.string.menu_connect_new))
         }
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
@@ -586,6 +595,13 @@ class MainActivity : AppCompatActivity() {
 
                 4 -> {
                     startActivity(Intent(this@MainActivity, ConnectActivity::class.java))
+                    true
+                }
+
+                5 -> {
+                    shellWebViewClient.resetProxyAuth(webView)
+                    dismissEmbeddedSignInDialogWithoutReset()
+                    openPinnedOriginInBrowser()
                     true
                 }
 
@@ -602,6 +618,118 @@ class MainActivity : AppCompatActivity() {
             }
         }
         popup.show()
+    }
+
+    private fun showEmbeddedSignInUnsupported() {
+        if (isFinishing || isDestroyed) {
+            shellWebViewClient.resetProxyAuth(webView)
+            return
+        }
+        if (embeddedSignInDialog?.isShowing == true) return
+
+        val origin = pinnedOrigin
+        if (origin == null) {
+            shellWebViewClient.resetProxyAuth(webView)
+            return
+        }
+
+        var dismissalHandled = false
+        val dialog =
+            AlertDialog
+                .Builder(this)
+                .setTitle(R.string.proxy_auth_refused_title)
+                .setMessage(
+                    getString(
+                        R.string.proxy_auth_refused_body,
+                        hostLabelOf(origin),
+                    ),
+                ).setPositiveButton(R.string.proxy_auth_open_browser, null)
+                .setNegativeButton(R.string.proxy_auth_cancel, null)
+                .create()
+        dialog.setCanceledOnTouchOutside(true)
+        embeddedSignInDialog = dialog
+        dialog.setOnDismissListener {
+            if (dismissalHandled) return@setOnDismissListener
+            dismissalHandled = true
+            if (embeddedSignInDialog === dialog) embeddedSignInDialog = null
+            if (!isFinishing && !isDestroyed) {
+                shellWebViewClient.resetProxyAuth(webView)
+            }
+        }
+        dialog.show()
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            if (openPinnedOriginInBrowser()) dialog.dismiss()
+        }
+    }
+
+    private fun dismissEmbeddedSignInDialogWithoutReset() {
+        val dialog = embeddedSignInDialog ?: return
+        dialog.setOnDismissListener(null)
+        embeddedSignInDialog = null
+        dialog.dismiss()
+    }
+
+    private fun openPinnedOriginInBrowser(): Boolean {
+        val origin = pinnedOrigin
+        if (origin == null) {
+            showNoBrowserAvailable()
+            return false
+        }
+        val browserProbe =
+            Intent(Intent.ACTION_VIEW, Uri.parse("http:"))
+                .addCategory(Intent.CATEGORY_BROWSABLE)
+        val components =
+            packageManager
+                .queryIntentActivities(browserProbe, PackageManager.MATCH_DEFAULT_ONLY)
+                .mapNotNull { result ->
+                    val activityInfo = result.activityInfo ?: return@mapNotNull null
+                    if (activityInfo.packageName == packageName) return@mapNotNull null
+                    ComponentName(activityInfo.packageName, activityInfo.name)
+                }.distinct()
+
+        if (components.isEmpty()) {
+            showNoBrowserAvailable()
+            return false
+        }
+
+        val browserIntents =
+            components.map { component ->
+                Intent(Intent.ACTION_VIEW, Uri.parse(origin))
+                    .addCategory(Intent.CATEGORY_BROWSABLE)
+                    .setComponent(component)
+            }
+        val launchIntent =
+            if (browserIntents.size == 1) {
+                browserIntents.single()
+            } else {
+                Intent
+                    .createChooser(browserIntents.first(), null)
+                    .putExtra(
+                        Intent.EXTRA_INITIAL_INTENTS,
+                        browserIntents.drop(1).toTypedArray(),
+                    )
+            }
+        return runCatching { startActivity(launchIntent) }
+            .fold(
+                onSuccess = { true },
+                onFailure = {
+                    showNoBrowserAvailable()
+                    false
+                },
+            )
+    }
+
+    private fun showNoBrowserAvailable() {
+        val dialog = embeddedSignInDialog?.takeIf { it.isShowing }
+        if (dialog != null) {
+            dialog.setMessage(getString(R.string.proxy_auth_no_browser_body))
+        } else {
+            Toast.makeText(
+                this,
+                R.string.proxy_auth_no_browser_toast,
+                Toast.LENGTH_LONG,
+            ).show()
+        }
     }
 
     /** Run bridge-dependent work once a pinned-origin page has finished loading. */
