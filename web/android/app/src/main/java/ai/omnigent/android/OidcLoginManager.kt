@@ -10,7 +10,16 @@ import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
+
+sealed interface LoginResult {
+    data class Success(val token: String) : LoginResult
+
+    data object Rejected : LoginResult
+
+    data object TimedOut : LoginResult
+}
 
 /**
  * Drives the RFC 8252 login flow for the shell: authenticate in the system
@@ -30,7 +39,10 @@ import java.util.concurrent.atomic.AtomicBoolean
  * HS256 JWT as either the session cookie or a `Bearer`), so [MainActivity]
  * injects it into the WebView's CookieManager and reloads — authenticated.
  */
-class OidcLoginManager {
+class OidcLoginManager(
+    private val pollIntervalMs: Long = DEFAULT_POLL_INTERVAL_MS,
+    private val pollTimeoutMs: Long = DEFAULT_POLL_TIMEOUT_MS,
+) {
     private val io = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
     private val inFlight = AtomicBoolean(false)
@@ -38,12 +50,12 @@ class OidcLoginManager {
     // Held only for the duration of a login; nulled by [shutdown] so a poll that
     // finishes after the host is destroyed can neither invoke into a dead
     // Activity nor pin it (and its View tree) for the poll's lifetime.
-    @Volatile private var sessionCallback: ((String) -> Unit)? = null
+    @Volatile private var resultCallback: ((LoginResult) -> Unit)? = null
 
     /**
      * Begin a login against [origin] (the pinned server). Opens the browser and
-     * polls in the background; [onSession] is invoked on the main thread with the
-     * session JWT once the browser flow completes.
+     * polls in the background; [onResult] is invoked on the main thread when the
+     * flow succeeds, is rejected, or reaches its deadline.
      *
      * Returns true if this call started a flow, or false if one was already in
      * flight (a second concurrent call is ignored). The caller uses the result so
@@ -52,40 +64,59 @@ class OidcLoginManager {
     fun start(
         activity: Activity,
         origin: String,
-        onSession: (String) -> Unit,
+        onResult: (LoginResult) -> Unit,
     ): Boolean {
         if (!inFlight.compareAndSet(false, true)) return false
-        sessionCallback = onSession
-        io.execute {
-            var token: String? = null
-            try {
-                val ticket = requestTicket(origin)
-                authLog("cli-login -> ${if (ticket != null) "ticket ok" else "FAILED"}")
-                if (ticket != null) {
-                    main.post { launchTab(activity, origin + ticket.loginUrl) }
-                    token = pollForToken(origin, ticket.id)
-                    authLog(
-                        "poll -> ${if (token != null) "token (len=${token.length})" else "no token"}",
-                    )
-                }
-            } catch (_: InterruptedException) {
-                // shutdown() interrupted the poll — the host is going away; drop.
-            } catch (t: Throwable) {
-                authLog("login flow error: ${t.javaClass.simpleName}")
-            } finally {
-                inFlight.set(false)
+        resultCallback = onResult
+        try {
+            io.execute {
+                val result =
+                    try {
+                        val ticket = requestTicket(origin)
+                        authLog("cli-login -> ${if (ticket != null) "ticket ok" else "FAILED"}")
+                        if (ticket == null) {
+                            LoginResult.Rejected
+                        } else {
+                            main.post { launchTab(activity, origin + ticket.loginUrl) }
+                            pollForToken(origin, ticket.id).also { pollResult ->
+                                authLog(
+                                    "poll -> " +
+                                        when (pollResult) {
+                                            is LoginResult.Success ->
+                                                "token (len=${pollResult.token.length})"
+
+                                            LoginResult.Rejected -> "rejected"
+                                            LoginResult.TimedOut -> "timed out"
+                                        },
+                                )
+                            }
+                        }
+                    } catch (_: InterruptedException) {
+                        // shutdown() interrupted the poll — the host is going away; drop.
+                        null
+                    } catch (t: Throwable) {
+                        authLog("login flow error: ${t.javaClass.simpleName}")
+                        LoginResult.Rejected
+                    } finally {
+                        inFlight.set(false)
+                    }
+                // resultCallback is null once shutdown() ran — never invoke into a
+                // destroyed host.
+                if (result != null) main.post { resultCallback?.invoke(result) }
             }
-            val result = token
-            // sessionCallback is null once shutdown() ran — never invoke into a
-            // destroyed host.
-            if (result != null) main.post { sessionCallback?.invoke(result) }
+        } catch (_: RejectedExecutionException) {
+            resultCallback = null
+            inFlight.set(false)
+            return false
         }
         return true
     }
 
+    internal fun isInFlightForTest(): Boolean = inFlight.get()
+
     /** Cancel an in-flight login and release the host. Call from onDestroy. */
     fun shutdown() {
-        sessionCallback = null
+        resultCallback = null
         io.shutdownNow() // interrupts the polling sleep so the task exits promptly
     }
 
@@ -155,52 +186,68 @@ class OidcLoginManager {
     private fun pollForToken(
         origin: String,
         ticket: String,
-    ): String? {
-        val deadline = System.currentTimeMillis() + POLL_TIMEOUT_MS
+    ): LoginResult {
+        val deadline = System.currentTimeMillis() + pollTimeoutMs
         val encoded = Uri.encode(ticket)
         while (System.currentTimeMillis() < deadline) {
-            Thread.sleep(POLL_INTERVAL_MS) // throws InterruptedException on shutdownNow()
-            val conn = (
-                URL(
-                    "$origin/auth/cli-poll?ticket=$encoded",
-                ).openConnection() as HttpURLConnection
-            )
-            conn.requestMethod = "GET"
-            // Mirror requestTicket: a proxied 302 must fail fast (fall through
-            // to the non-200 branch), not spin in the retry loop as HTML.
-            conn.instanceFollowRedirects = false
-            attachWebViewCookies(conn, origin)
-            conn.connectTimeout = HTTP_TIMEOUT_MS
-            conn.readTimeout = HTTP_TIMEOUT_MS
-            try {
-                when (conn.responseCode) {
-                    202 -> {
-                        continue
-                    }
+            Thread.sleep(pollIntervalMs) // throws InterruptedException on shutdownNow()
+            if (System.currentTimeMillis() >= deadline) break
 
-                    // still pending
-                    200 -> {
-                        val body = conn.inputStream.bufferedReader().use { it.readText() }
-                        return JSONObject(body).optString("token").ifEmpty { null }
-                    }
+            var conn: HttpURLConnection? = null
+            val body =
+                try {
+                    conn = (
+                        URL(
+                            "$origin/auth/cli-poll?ticket=$encoded",
+                        ).openConnection() as HttpURLConnection
+                    )
+                    conn.requestMethod = "GET"
+                    // A proxied 302 is a terminal rejection, never redirect HTML.
+                    conn.instanceFollowRedirects = false
+                    attachWebViewCookies(conn, origin)
+                    conn.connectTimeout = HTTP_TIMEOUT_MS
+                    conn.readTimeout = HTTP_TIMEOUT_MS
+                    when (conn.responseCode) {
+                        202 -> {
+                            null
+                        }
 
-                    else -> {
-                        return null
-                    } // 410 expired/rejected, or other
+                        200 -> {
+                            conn.inputStream.bufferedReader().use { it.readText() }
+                        }
+
+                        else -> {
+                            return LoginResult.Rejected
+                        }
+                    }
+                } catch (e: InterruptedException) {
+                    throw e
+                } catch (_: Throwable) {
+                    if (Thread.currentThread().isInterrupted) throw InterruptedException()
+                    continue // transient network error — keep polling until the deadline
+                } finally {
+                    conn?.disconnect()
                 }
+            if (body == null) continue
+
+            // Parsing is outside the transient-error catch: a 200 with a bad
+            // payload is terminal and must not be retried to the deadline.
+            return try {
+                JSONObject(body)
+                    .optString("token")
+                    .takeIf { it.isNotEmpty() }
+                    ?.let { LoginResult.Success(it) }
+                    ?: LoginResult.Rejected
             } catch (_: Throwable) {
-                if (Thread.currentThread().isInterrupted) return null // shutdown mid-request
-                continue // transient network error — keep polling until the deadline
-            } finally {
-                conn.disconnect()
+                LoginResult.Rejected
             }
         }
-        return null
+        return LoginResult.TimedOut
     }
 
     private companion object {
-        const val POLL_INTERVAL_MS = 2_000L
-        const val POLL_TIMEOUT_MS = 5 * 60 * 1_000L // mirrors the CLI's 5-minute window
+        const val DEFAULT_POLL_INTERVAL_MS = 2_000L
+        const val DEFAULT_POLL_TIMEOUT_MS = 5 * 60 * 1_000L // mirrors the CLI's window
         const val HTTP_TIMEOUT_MS = 10_000 // connect + read timeout for the login endpoints
     }
 }
