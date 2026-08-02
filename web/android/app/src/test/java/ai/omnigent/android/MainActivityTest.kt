@@ -134,7 +134,7 @@ class MainActivityTest {
         )
         assertTrue(dialog.isShowing)
         assertNull(shadowOf(activity).peekNextStartedActivity())
-        assertEquals(0, CountingOmnigentWebViewClientShadow.resetCalls)
+        assertEquals(0, ActivityCallLog.endProxyAuthCalls)
     }
 
     @Test
@@ -152,7 +152,7 @@ class MainActivityTest {
         assertEquals(EXTERNAL_BROWSER_PACKAGE, started.component?.packageName)
         assertTrue(started.component?.packageName != activity.packageName)
         assertFalse(dialog.isShowing)
-        assertEquals(1, CountingOmnigentWebViewClientShadow.resetCalls)
+        assertEquals(1, ActivityCallLog.endProxyAuthCalls)
     }
 
     @Test
@@ -202,7 +202,7 @@ class MainActivityTest {
         )
         assertTrue(dialog.isShowing)
         assertNull(shadowOf(activity).peekNextStartedActivity())
-        assertEquals(0, CountingOmnigentWebViewClientShadow.resetCalls)
+        assertEquals(0, ActivityCallLog.endProxyAuthCalls)
     }
 
     @Test
@@ -228,11 +228,11 @@ class MainActivityTest {
 
             assertFalse(dialog.isShowing)
             assertEquals(ProxyAuthState.IDLE, activity.shellWebViewClient().proxyAuthState())
-            assertEquals(index + 1, CountingOmnigentWebViewClientShadow.resetCalls)
+            assertEquals(index + 1, ActivityCallLog.endProxyAuthCalls)
 
             dialog.dismiss()
             idleMainLooper()
-            assertEquals(index + 1, CountingOmnigentWebViewClientShadow.resetCalls)
+            assertEquals(index + 1, ActivityCallLog.endProxyAuthCalls)
         }
     }
 
@@ -240,14 +240,14 @@ class MainActivityTest {
     fun `server reload dismisses the refusal dialog without double reset`() {
         val activity = activity()
         val dialog = activity.refuseEmbeddedSignIn()
-        CountingOmnigentWebViewClientShadow.clear()
+        ActivityCallLog.clear()
 
         activity.reloadWithNewServer(NEW_SERVER_URL, NEW_ORIGIN)
 
         assertFalse(dialog.isShowing)
         assertNull(activity.embeddedSignInDialog())
         assertEquals(ProxyAuthState.IDLE, activity.shellWebViewClient().proxyAuthState())
-        assertEquals(1, CountingOmnigentWebViewClientShadow.resetCalls)
+        assertEquals(1, ActivityCallLog.endProxyAuthCalls)
     }
 
     @Test
@@ -260,7 +260,7 @@ class MainActivityTest {
 
         assertEquals(ProxyAuthState.IDLE, activity.shellWebViewClient().proxyAuthState())
         assertNull(ShadowAlertDialog.getLatestAlertDialog())
-        assertEquals(1, CountingOmnigentWebViewClientShadow.resetCalls)
+        assertEquals(1, ActivityCallLog.endProxyAuthCalls)
     }
 
     @Test
@@ -273,7 +273,7 @@ class MainActivityTest {
         activity.selectOpenInBrowserMenuItem()
 
         assertEquals(ProxyAuthState.IDLE, activity.shellWebViewClient().proxyAuthState())
-        assertEquals(1, CountingOmnigentWebViewClientShadow.resetCalls)
+        assertEquals(1, ActivityCallLog.endProxyAuthCalls)
         val started = checkNotNull(shadowOf(activity).nextStartedActivity)
         assertEquals(EXTERNAL_BROWSER_PACKAGE, started.component?.packageName)
         assertNull(ShadowAlertDialog.getLatestAlertDialog())
@@ -291,7 +291,7 @@ class MainActivityTest {
         )
         assertNull(ShadowAlertDialog.getLatestAlertDialog())
         assertNull(shadowOf(activity).peekNextStartedActivity())
-        assertEquals(1, CountingOmnigentWebViewClientShadow.resetCalls)
+        assertEquals(1, ActivityCallLog.endProxyAuthCalls)
     }
 
     @Test
@@ -341,7 +341,7 @@ class MainActivityTest {
 
         assertEquals(
             listOf(
-                "resetProxyAuth",
+                "endProxyAuth",
                 "stopLoading",
                 "loadUrl:$NEW_SERVER_URL",
             ),
@@ -363,7 +363,7 @@ class MainActivityTest {
         while (shadowOf(activity).nextStartedActivity != null) {
             // Drain setup-only launches before testing browser dispatch.
         }
-        CountingOmnigentWebViewClientShadow.clear()
+        ActivityCallLog.clear()
         return activity
     }
 
@@ -422,43 +422,23 @@ class MainActivityTest {
         serverUrl: String,
         newOrigin: String,
     ) {
-        MainActivity::class
-            .java
-            .getDeclaredMethod(
-                "reloadWithNewServer",
-                String::class.java,
-                String::class.java,
-            ).apply { isAccessible = true }
-            .invoke(this, serverUrl, newOrigin)
+        ReflectionHelpers.callInstanceMethod<Unit>(
+            this,
+            "reloadWithNewServer",
+            ClassParameter.from(String::class.java, serverUrl),
+            ClassParameter.from(String::class.java, newOrigin),
+        )
     }
 
     private fun MainActivity.shellWebViewClient(): OmnigentWebViewClient =
-        MainActivity::class
-            .java
-            .getDeclaredField("shellWebViewClient")
-            .apply { isAccessible = true }
-            .get(this) as OmnigentWebViewClient
+        ReflectionHelpers.getField(this, "shellWebViewClient")
 
     private fun MainActivity.embeddedSignInDialog(): AlertDialog? =
-        MainActivity::class
-            .java
-            .getDeclaredField("embeddedSignInDialog")
-            .apply { isAccessible = true }
-            .get(this) as AlertDialog?
+        ReflectionHelpers.getField(this, "embeddedSignInDialog")
 
-    private fun MainActivity.switchButton(): View =
-        MainActivity::class
-            .java
-            .getDeclaredField("switchButton")
-            .apply { isAccessible = true }
-            .get(this) as View
+    private fun MainActivity.switchButton(): View = ReflectionHelpers.getField(this, "switchButton")
 
-    private fun MainActivity.webView(): WebView =
-        MainActivity::class
-            .java
-            .getDeclaredField("webView")
-            .apply { isAccessible = true }
-            .get(this) as WebView
+    private fun MainActivity.webView(): WebView = ReflectionHelpers.getField(this, "webView")
 
     private fun OmnigentWebViewClient.proxyAuthState(): ProxyAuthState =
         ReflectionHelpers.getField(this, "proxyAuthState")
@@ -510,8 +490,13 @@ class MainActivityTest {
     }
 }
 
+/** Ordered record of the shell calls the Activity makes on its collaborators. */
 private object ActivityCallLog {
     val entries = mutableListOf<String>()
+
+    val endProxyAuthCalls: Int get() = entries.count { it == "endProxyAuth" }
+
+    fun clear() = entries.clear()
 }
 
 @Implements(OmnigentWebViewClient::class, isInAndroidSdk = false)
@@ -520,24 +505,13 @@ class CountingOmnigentWebViewClientShadow {
     private lateinit var realClient: OmnigentWebViewClient
 
     @Implementation
-    fun resetProxyAuth(view: WebView) {
-        resetCalls++
-        ActivityCallLog.entries += "resetProxyAuth"
+    fun endProxyAuth() {
+        ActivityCallLog.entries += "endProxyAuth"
         Shadow.directlyOn<Any?>(
             realClient,
             OmnigentWebViewClient::class.java.name,
-            "resetProxyAuth",
-            ClassParameter.from(WebView::class.java, view),
+            "endProxyAuth",
         )
-    }
-
-    companion object {
-        var resetCalls = 0
-
-        fun clear() {
-            resetCalls = 0
-            ActivityCallLog.entries.clear()
-        }
     }
 }
 

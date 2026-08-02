@@ -387,14 +387,18 @@ class MainActivity : AppCompatActivity() {
 
     internal fun onLoginResult(result: LoginResult) {
         when (result) {
-            is LoginResult.Success -> onSessionToken(result.token)
+            is LoginResult.Success -> {
+                onSessionToken(result.token)
+            }
+
             LoginResult.Rejected, LoginResult.TimedOut -> {
                 val origin = pinnedOrigin ?: return
-                Toast.makeText(
-                    this,
-                    getString(R.string.login_failed_toast, hostLabelOf(origin)),
-                    Toast.LENGTH_LONG,
-                ).show()
+                Toast
+                    .makeText(
+                        this,
+                        getString(R.string.login_failed_toast, hostLabelOf(origin)),
+                        Toast.LENGTH_LONG,
+                    ).show()
             }
         }
     }
@@ -509,7 +513,7 @@ class MainActivity : AppCompatActivity() {
         loginManager.shutdown()
         if (::blobSaver.isInitialized) blobSaver.shutdown()
         if (::webView.isInitialized) {
-            shellWebViewClient.resetProxyAuth(webView)
+            shellWebViewClient.endProxyAuth()
             dismissEmbeddedSignInDialogWithoutReset()
             removeBridge()
             webView.destroy()
@@ -550,7 +554,7 @@ class MainActivity : AppCompatActivity() {
     ) {
         removeBridge()
         dismissEmbeddedSignInDialogWithoutReset()
-        shellWebViewClient.resetProxyAuth(webView)
+        shellWebViewClient.endProxyAuth()
         shellWebViewClient.stopLoadingAndLedger(webView)
         pinnedOrigin = newOrigin
         pageLoaded = false
@@ -613,7 +617,7 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 5 -> {
-                    shellWebViewClient.resetProxyAuth(webView)
+                    shellWebViewClient.endProxyAuth()
                     dismissEmbeddedSignInDialogWithoutReset()
                     openPinnedOriginInBrowser()
                     true
@@ -636,14 +640,14 @@ class MainActivity : AppCompatActivity() {
 
     private fun showEmbeddedSignInUnsupported() {
         if (isFinishing || isDestroyed) {
-            shellWebViewClient.resetProxyAuth(webView)
+            shellWebViewClient.endProxyAuth()
             return
         }
         if (embeddedSignInDialog?.isShowing == true) return
 
         val origin = pinnedOrigin
         if (origin == null) {
-            shellWebViewClient.resetProxyAuth(webView)
+            shellWebViewClient.endProxyAuth()
             return
         }
 
@@ -667,7 +671,7 @@ class MainActivity : AppCompatActivity() {
             dismissalHandled = true
             if (embeddedSignInDialog === dialog) embeddedSignInDialog = null
             if (!isFinishing && !isDestroyed) {
-                shellWebViewClient.resetProxyAuth(webView)
+                shellWebViewClient.endProxyAuth()
             }
         }
         dialog.show()
@@ -724,13 +728,8 @@ class MainActivity : AppCompatActivity() {
                     )
             }
         return runCatching { startActivity(launchIntent) }
-            .fold(
-                onSuccess = { true },
-                onFailure = {
-                    showNoBrowserAvailable()
-                    false
-                },
-            )
+            .onFailure { showNoBrowserAvailable() }
+            .isSuccess
     }
 
     private fun showNoBrowserAvailable() {
@@ -738,11 +737,12 @@ class MainActivity : AppCompatActivity() {
         if (dialog != null) {
             dialog.setMessage(getString(R.string.proxy_auth_no_browser_body))
         } else {
-            Toast.makeText(
-                this,
-                R.string.proxy_auth_no_browser_toast,
-                Toast.LENGTH_LONG,
-            ).show()
+            Toast
+                .makeText(
+                    this,
+                    R.string.proxy_auth_no_browser_toast,
+                    Toast.LENGTH_LONG,
+                ).show()
         }
     }
 

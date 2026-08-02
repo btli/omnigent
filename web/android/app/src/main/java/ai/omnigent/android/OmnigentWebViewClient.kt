@@ -32,7 +32,7 @@ class OmnigentWebViewClient(
     private val shouldInjectBridgeAtPageReady: () -> Boolean,
     private val onPageReady: (url: String?) -> Unit,
     private val onLoginRequired: () -> Unit,
-    private val onProxyAuthFlowEnded: () -> Unit = {},
+    private val onProxyAuthFlowEnded: () -> Unit,
     private val clock: () -> Long = { SystemClock.elapsedRealtime() },
     private val onEmbeddedSignInUnsupported: () -> Unit,
 ) : WebViewClient() {
@@ -48,11 +48,6 @@ class OmnigentWebViewClient(
     private var isLoading = false
     private var lastSelfStoppedUrl: String? = null
 
-    /** Forget an in-flight proxy auth flow when the pinned server changes. */
-    fun resetProxyAuth(view: WebView) {
-        endProxyAuth()
-    }
-
     /** Stop the current load while owning the compatibility finish it causes. */
     fun stopLoadingAndLedger(view: WebView) {
         if (isLoading) lastSelfStoppedUrl = activeMainFrameUrl
@@ -65,7 +60,8 @@ class OmnigentWebViewClient(
         flowStartedAt = clock()
     }
 
-    private fun endProxyAuth() {
+    /** End any flow silently — the reset for server switches, expiry, and teardown. */
+    fun endProxyAuth() {
         proxyAuthState = ProxyAuthState.IDLE
         flowStartedAt = 0L
         trackedMainFrameUrl = null
@@ -94,11 +90,11 @@ class OmnigentWebViewClient(
         if (proxyAuthState == ProxyAuthState.REFUSED) return
 
         val origin = originOf(url)
-        val scheme = url?.let { Uri.parse(it).scheme?.lowercase() }
+        val isOffOrigin =
+            isHttpScheme(url?.let { Uri.parse(it).scheme }) && origin != pinnedOrigin()
 
         if (proxyAuthState == ProxyAuthState.IDLE &&
-            isHttpScheme(scheme) &&
-            origin != pinnedOrigin() &&
+            isOffOrigin &&
             isProxyAuthUrl(url, pinnedOrigin())
         ) {
             enterProxyAuth()
@@ -114,7 +110,7 @@ class OmnigentWebViewClient(
             }
         }
 
-        if (isHttpScheme(scheme) && origin != pinnedOrigin()) {
+        if (isOffOrigin) {
             if (proxyAuthState == ProxyAuthState.IN_FLIGHT) {
                 authLog("proxy-auth landing $origin — loading inline")
                 return
@@ -134,15 +130,16 @@ class OmnigentWebViewClient(
 
         if (isLoading && activeMainFrameUrl == url) isLoading = false
 
+        // Any main-frame finish clears the ledger; a matching one is also
+        // consumed — it must not end the flow the shell's own stop preceded.
         val consumesSelfStoppedFinish = lastSelfStoppedUrl != null && lastSelfStoppedUrl == url
-        if (consumesSelfStoppedFinish) {
-            lastSelfStoppedUrl = null
-        } else {
-            if (lastSelfStoppedUrl != null) lastSelfStoppedUrl = null
-            if (proxyAuthState == ProxyAuthState.IN_FLIGHT && originOf(url) == pinnedOrigin()) {
-                endProxyAuth()
-                onProxyAuthFlowEnded()
-            }
+        lastSelfStoppedUrl = null
+        if (!consumesSelfStoppedFinish &&
+            proxyAuthState == ProxyAuthState.IN_FLIGHT &&
+            originOf(url) == pinnedOrigin()
+        ) {
+            endProxyAuth()
+            onProxyAuthFlowEnded()
         }
 
         if (originOf(url) == pinnedOrigin() && shouldInjectBridgeAtPageReady()) {
@@ -157,21 +154,21 @@ class OmnigentWebViewClient(
         request: WebResourceRequest,
     ): Boolean {
         val url = request.url
-        val scheme = url.scheme?.lowercase()
 
         // Subframes (cross-origin iframes: web previews, embeds) load inline.
         if (!request.isForMainFrame) return false
 
         expireProxyAuthIfNeeded()
 
-        val origin = originOf(url.toString())
+        val urlString = url.toString()
+        val origin = originOf(urlString)
         if (proxyAuthState == ProxyAuthState.REFUSED) {
             return origin != pinnedOrigin()
         }
 
         // Non-http(s) schemes must be handed to an installed system handler.
-        if (!isHttpScheme(scheme)) {
-            runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
+        if (!isHttpScheme(url.scheme)) {
+            openExternally(view, url)
             return true
         }
 
@@ -182,8 +179,7 @@ class OmnigentWebViewClient(
             return false
         }
 
-        val isProxyAuth = isProxyAuthUrl(url.toString(), pinnedOrigin())
-        if (isProxyAuth) {
+        if (isProxyAuthUrl(urlString, pinnedOrigin())) {
             if (request.isRedirect) {
                 enterProxyAuth()
                 authLog("proxy-auth nav $origin — loading inline")
@@ -192,13 +188,13 @@ class OmnigentWebViewClient(
             if (!request.hasGesture()) return false
 
             authLog("proxy-shaped external nav $origin")
-            runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
+            openExternally(view, url)
             return true
         }
 
         authLog("off-origin nav $origin gesture=${request.hasGesture()}")
         if (request.hasGesture()) {
-            runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
+            openExternally(view, url)
         } else {
             onLoginRequired()
         }
@@ -211,7 +207,7 @@ class OmnigentWebViewClient(
         error: WebResourceError,
     ) {
         super.onReceivedError(view, request, error)
-        handleUrlBearingTerminalCallback(request)
+        handleReceivedError(request)
     }
 
     override fun onReceivedHttpError(
@@ -220,7 +216,7 @@ class OmnigentWebViewClient(
         errorResponse: WebResourceResponse,
     ) {
         super.onReceivedHttpError(view, request, errorResponse)
-        handleUrlBearingTerminalCallback(request)
+        handleReceivedError(request)
     }
 
     override fun onReceivedSslError(
@@ -243,11 +239,12 @@ class OmnigentWebViewClient(
         return handled
     }
 
+    /**
+     * Settle the trackers for a main-frame load that ended in an error, from
+     * either error callback. `internal` because [WebResourceError] has no
+     * constructor tests can reach.
+     */
     internal fun handleReceivedError(request: WebResourceRequest) {
-        handleUrlBearingTerminalCallback(request)
-    }
-
-    private fun handleUrlBearingTerminalCallback(request: WebResourceRequest) {
         if (!request.isForMainFrame) return
 
         val requestUrl = request.url.toString()
@@ -257,8 +254,16 @@ class OmnigentWebViewClient(
         }
     }
 
+    // Hand a URL to the system, fail-closed if nothing handles it.
+    private fun openExternally(
+        view: WebView,
+        url: Uri,
+    ) {
+        runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
+    }
+
     private fun isEmbeddedSignInUnsupported(url: String?): Boolean {
-        val uri = url?.let { runCatching { Uri.parse(it) }.getOrNull() } ?: return false
+        val uri = url?.let(Uri::parse) ?: return false
         return containsEmbeddedRejection(uri.encodedQuery) ||
             containsEmbeddedRejection(uri.encodedFragment)
     }

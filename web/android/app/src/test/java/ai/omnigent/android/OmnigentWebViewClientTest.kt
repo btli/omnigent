@@ -13,8 +13,6 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import androidx.test.core.app.ApplicationProvider
-import java.io.ByteArrayInputStream
-import java.util.Date
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -23,6 +21,8 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.util.ReflectionHelpers
+import java.io.ByteArrayInputStream
+import java.util.Date
 
 @RunWith(RobolectricTestRunner::class)
 class OmnigentWebViewClientTest {
@@ -74,6 +74,22 @@ class OmnigentWebViewClientTest {
         val client = client(onLoginRequired = { loginRequired = true })
 
         client.onPageStarted(webView, PROXY_AUTH_URL, null)
+
+        assertEquals(0, webView.stopLoadingCalls)
+        assertFalse(loginRequired)
+    }
+
+    @Test
+    fun `a failed or transitional page start does not trigger native login`() {
+        val webView = webView()
+        var loginRequired = false
+        val client = client(onLoginRequired = { loginRequired = true })
+
+        // Null / about:blank / chrome-error:// mean the pinned server failed or
+        // is transitioning, not that an IdP bounced us — never pop the browser.
+        client.onPageStarted(webView, null, null)
+        client.onPageStarted(webView, "about:blank", null)
+        client.onPageStarted(webView, "chrome-error://chromewebdata/", null)
 
         assertEquals(0, webView.stopLoadingCalls)
         assertFalse(loginRequired)
@@ -228,7 +244,7 @@ class OmnigentWebViewClientTest {
         var loginRequired = false
         val client = client(onLoginRequired = { loginRequired = true })
 
-        client.resetProxyAuth(webView)
+        client.endProxyAuth()
         client.onPageStarted(webView, STALE_IDP_URL, null)
         assertFalse(
             client.shouldOverrideUrlLoading(
@@ -267,7 +283,7 @@ class OmnigentWebViewClientTest {
 
         enterFlow(client, webView)
         client.onPageStarted(webView, PINNED_URL, null)
-        client.resetProxyAuth(webView)
+        client.endProxyAuth()
         client.stopLoadingAndLedger(webView)
         webView.loadUrl(PINNED_URL)
 
@@ -374,7 +390,7 @@ class OmnigentWebViewClientTest {
         client.onPageStarted(webView, STALE_IDP_URL, null)
 
         currentOrigin = NEW_PINNED_ORIGIN
-        client.resetProxyAuth(webView)
+        client.endProxyAuth()
         client.stopLoadingAndLedger(webView)
         webView.loadUrl(NEW_PINNED_URL)
         assertFalse(
@@ -478,7 +494,7 @@ class OmnigentWebViewClientTest {
             ),
         )
         currentOrigin = NEW_PINNED_ORIGIN
-        client.resetProxyAuth(webView)
+        client.endProxyAuth()
         assertFalse(
             client.shouldOverrideUrlLoading(
                 webView,
@@ -729,26 +745,26 @@ class OmnigentWebViewClientTest {
     }
 
     @Test
-    fun `resetProxyAuth returns refused state to idle`() {
+    fun `endProxyAuth returns refused state to idle`() {
         val webView = webView()
         var loginRequired = false
         val client = client(onLoginRequired = { loginRequired = true })
         refuse(client, webView)
 
-        client.resetProxyAuth(webView)
+        client.endProxyAuth()
 
         assertTrue(client.shouldOverrideUrlLoading(webView, request(OTHER_IDP_URL)))
         assertTrue(loginRequired)
     }
 
     @Test
-    fun `resetProxyAuth ends the flow without a pinned page load`() {
+    fun `endProxyAuth ends the flow without a pinned page load`() {
         val webView = webView()
         var loginRequired = false
         val client = client(onLoginRequired = { loginRequired = true })
         enterFlow(client, webView)
 
-        client.resetProxyAuth(webView)
+        client.endProxyAuth()
 
         assertTrue(client.shouldOverrideUrlLoading(webView, request(OWN_IDP_URL)))
         assertTrue(loginRequired)
