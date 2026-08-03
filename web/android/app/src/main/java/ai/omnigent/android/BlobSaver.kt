@@ -8,10 +8,12 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
 import android.util.Base64
+import android.util.Log
 import android.widget.Toast
 import androidx.annotation.RequiresApi
 import java.io.File
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 
 /**
  * Decodes a base64 payload (produced by [BlobDownloadScript], dispatched by
@@ -38,24 +40,28 @@ class BlobSaver(
         mimeType: String,
         suggestedName: String,
     ) {
-        io.execute {
-            val bytes =
-                try {
-                    Base64.decode(base64, Base64.DEFAULT)
-                } catch (_: Throwable) {
-                    return@execute
+        try {
+            io.execute {
+                val bytes =
+                    try {
+                        Base64.decode(base64, Base64.DEFAULT)
+                    } catch (_: Throwable) {
+                        return@execute
+                    }
+                val name = safeFileName(suggestedName)
+                val saved =
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        saveViaMediaStore(name, mimeType, bytes)
+                    } else {
+                        saveToAppDownloads(name, bytes)
+                    }
+                main.post {
+                    val msg = if (saved) "Saved $name to Downloads" else "Couldn't save $name"
+                    Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                 }
-            val name = safeFileName(suggestedName)
-            val saved =
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    saveViaMediaStore(name, mimeType, bytes)
-                } else {
-                    saveToAppDownloads(name, bytes)
-                }
-            main.post {
-                val msg = if (saved) "Saved $name to Downloads" else "Couldn't save $name"
-                Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
             }
+        } catch (_: RejectedExecutionException) {
+            Log.w(TAG, "Dropping blob save because the worker is shut down")
         }
     }
 
@@ -110,5 +116,9 @@ class BlobSaver(
         } else {
             cleaned
         }
+    }
+
+    private companion object {
+        const val TAG = "BlobSaver"
     }
 }
