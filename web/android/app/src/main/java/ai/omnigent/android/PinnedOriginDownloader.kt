@@ -1,12 +1,14 @@
 package ai.omnigent.android
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Log
 import android.webkit.CookieManager
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.Data
 import androidx.work.ExistingWorkPolicy
+import androidx.work.ForegroundInfo
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequest
 import androidx.work.OneTimeWorkRequestBuilder
@@ -19,6 +21,11 @@ import java.net.HttpURLConnection
 import java.net.MalformedURLException
 import java.net.URL
 import java.security.MessageDigest
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
+import java.time.format.DateTimeParseException
+import java.util.UUID
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -47,6 +54,8 @@ internal class PinnedOriginDownloader(
     context: Context,
     private val workEnqueuer: PinnedOriginWorkEnqueuer = defaultWorkEnqueuer(context),
 ) : PinnedOriginDownloadHandler {
+    private val context = context.applicationContext ?: context
+    private val notifications = DownloadNotificationManager(this.context)
     private val shutDown = AtomicBoolean()
 
     override fun download(
@@ -63,25 +72,48 @@ internal class PinnedOriginDownloader(
         }
 
         val request =
-            PinnedOriginDownloadWorker.request(
-                url,
-                pinnedOrigin,
-                userAgent,
-                mimeType,
-                suggestedName,
-            )
+            try {
+                PinnedOriginDownloadWorker.request(
+                    url,
+                    pinnedOrigin,
+                    userAgent,
+                    mimeType,
+                    suggestedName,
+                )
+            } catch (failure: RuntimeException) {
+                reportEnqueueFailure(url, pinnedOrigin, suggestedName, failure)
+                return
+            }
         // KEEP lets a pending or running transfer finish instead of restarting it
         // when the user taps the same download again.
-        workEnqueuer.enqueue(
-            uniqueWorkName(url, pinnedOrigin, suggestedName),
-            ExistingWorkPolicy.KEEP,
-            request,
-        )
+        try {
+            workEnqueuer.enqueue(
+                uniqueWorkName(url, pinnedOrigin, suggestedName),
+                ExistingWorkPolicy.KEEP,
+                request,
+            )
+            notifications.queued(DownloadStorage(context).failed(suggestedName).name)
+        } catch (failure: RuntimeException) {
+            reportEnqueueFailure(url, pinnedOrigin, suggestedName, failure)
+        }
     }
 
     /** Stops this Activity-owned scheduler; already-enqueued work remains durable. */
     override fun shutdown() {
         shutDown.set(true)
+    }
+
+    private fun reportEnqueueFailure(
+        url: String,
+        pinnedOrigin: String,
+        suggestedName: String,
+        failure: RuntimeException,
+    ) {
+        Log.e(TAG, "Couldn't enqueue download for $suggestedName", failure)
+        val name = DownloadStorage(context).failed(suggestedName).name
+        val failureId =
+            UUID.nameUUIDFromBytes("$pinnedOrigin\u0000$url\u0000$suggestedName".toByteArray())
+        notifications.failed(name, failureId)
     }
 
     private companion object {
@@ -122,7 +154,12 @@ internal class PinnedOriginDownloadWorker(
     private val storage = DownloadStorage(applicationContext)
     private val notifications = DownloadNotificationManager(applicationContext)
 
+    @Volatile
+    private var activeConnection: HttpURLConnection? = null
+
     override fun doWork(): Result {
+        establishForeground()
+        if (isStopped) return stoppedFailure()
         val input = readInput()
         if (input == null) {
             return terminalFailure(
@@ -152,33 +189,75 @@ internal class PinnedOriginDownloadWorker(
         // WorkManager persists input Data, so fetch the live cookie only when execution starts.
         // This keeps session credentials out of WorkManager's on-disk database.
         val cookie = CookieManager.getInstance().getCookie(input.url)
-        return try {
-            val saved =
-                downloadFollowingRedirects(
-                    initialUrl,
-                    input.pinnedOrigin,
-                    cookie,
-                    input.userAgent,
-                    input.mimeType,
-                    input.suggestedName,
-                )
-            if (saved.saved) {
-                notifications.succeeded(saved.name, id)
-                Result.success()
-            } else {
-                terminalFailure(
+        var usedRetryAfter = false
+        while (true) {
+            try {
+                throwIfStopped()
+                val saved =
+                    downloadFollowingRedirects(
+                        initialUrl,
+                        input.pinnedOrigin,
+                        cookie,
+                        input.userAgent,
+                        input.mimeType,
+                        input.suggestedName,
+                    )
+                throwIfStopped()
+                if (saved.saved) {
+                    notifications.succeeded(saved.name, id)
+                    return Result.success()
+                }
+                return terminalFailure(
                     saved.name,
                     TerminalDownloadException("Couldn't save download"),
                 )
+            } catch (failure: RetryAfterDownloadException) {
+                if (!usedRetryAfter && runAttemptCount < MAX_ATTEMPTS - 1) {
+                    usedRetryAfter = true
+                    if (!waitForRetryAfter(failure.delayMillis)) return stoppedFailure()
+                    continue
+                }
+                return transientFailure(input.suggestedName, failure)
+            } catch (_: StoppedDownloadException) {
+                return stoppedFailure()
+            } catch (failure: TransientDownloadException) {
+                return transientFailure(input.suggestedName, failure)
+            } catch (failure: IOException) {
+                if (isStopped) return stoppedFailure()
+                return transientFailure(input.suggestedName, failure)
+            } catch (failure: AuthenticationRequiredException) {
+                return terminalFailure(input.suggestedName, failure)
+            } catch (failure: TerminalDownloadException) {
+                return terminalFailure(input.suggestedName, failure)
+            } catch (failure: Throwable) {
+                if (isStopped) return stoppedFailure()
+                return terminalFailure(input.suggestedName, failure)
             }
-        } catch (failure: TransientDownloadException) {
-            transientFailure(input.suggestedName, failure)
-        } catch (failure: IOException) {
-            transientFailure(input.suggestedName, failure)
-        } catch (failure: TerminalDownloadException) {
-            terminalFailure(input.suggestedName, failure)
-        } catch (failure: Throwable) {
-            terminalFailure(input.suggestedName, failure)
+        }
+    }
+
+    override fun getForegroundInfo(): ForegroundInfo =
+        notifications.foregroundInfo(
+            inputData.getString(KEY_SUGGESTED_NAME) ?: FALLBACK_NAME,
+            id,
+        )
+
+    override fun onStopped() {
+        activeConnection?.disconnect()
+        super.onStopped()
+    }
+
+    private fun establishForeground() {
+        try {
+            setForegroundAsync(getForegroundInfo()).get()
+        } catch (failure: InterruptedException) {
+            Thread.currentThread().interrupt()
+            Log.w(TAG, "Foreground download setup was interrupted", failure)
+        } catch (failure: ExecutionException) {
+            Log.w(TAG, "Foreground download notification is unavailable", failure.cause)
+        } catch (failure: RuntimeException) {
+            // Notification permission or foreground-service state can change at runtime.
+            Log.w(TAG, "Foreground download notification is unavailable", failure)
         }
     }
 
@@ -214,8 +293,36 @@ internal class PinnedOriginDownloadWorker(
         failure: Throwable,
     ): Result {
         Log.e(TAG, "Download failed for $suggestedName", failure)
-        notifications.failed(suggestedName, id)
+        if (failure is AuthenticationRequiredException) {
+            notifications.authenticationRequired(suggestedName, id)
+        } else {
+            notifications.failed(suggestedName, id)
+        }
         return Result.failure()
+    }
+
+    private fun stoppedFailure(): Result {
+        Log.w(TAG, "Download stopped; retrying from byte zero")
+        return Result.retry()
+    }
+
+    private fun throwIfStopped() {
+        if (isStopped) throw StoppedDownloadException()
+    }
+
+    private fun waitForRetryAfter(delayMillis: Long): Boolean {
+        val deadline = SystemClock.elapsedRealtime() + delayMillis
+        while (true) {
+            if (isStopped) return false
+            val remaining = deadline - SystemClock.elapsedRealtime()
+            if (remaining <= 0) return true
+            try {
+                Thread.sleep(minOf(remaining, STOP_POLL_INTERVAL_MS))
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return false
+            }
+        }
     }
 
     private fun downloadFollowingRedirects(
@@ -231,8 +338,11 @@ internal class PinnedOriginDownloadWorker(
         var redirectCount = 0
 
         while (true) {
+            throwIfStopped()
             val connection = currentUrl.openConnection() as HttpURLConnection
+            activeConnection = connection
             try {
+                throwIfStopped()
                 connection.instanceFollowRedirects = false
                 connection.connectTimeout = CONNECT_TIMEOUT_MS
                 connection.readTimeout = READ_TIMEOUT_MS
@@ -243,6 +353,7 @@ internal class PinnedOriginDownloadWorker(
                 }
 
                 val status = connection.responseCode
+                throwIfStopped()
                 if (status in REDIRECT_STATUS_CODES) {
                     if (redirectCount >= MAX_REDIRECTS) {
                         throw TerminalDownloadException("Too many redirects")
@@ -261,12 +372,25 @@ internal class PinnedOriginDownloadWorker(
                     if (!isHttpScheme(nextUrl.protocol)) {
                         throw TerminalDownloadException("Unsupported redirect scheme")
                     }
+                    if (isProxyAuthUrl(nextUrl.toString(), pinnedOrigin)) {
+                        throw AuthenticationRequiredException()
+                    }
                     cookieAllowed = cookieAllowed && hasPinnedOrigin(nextUrl, pinnedOrigin)
                     currentUrl = nextUrl
                     redirectCount++
+                    throwIfStopped()
                     continue
                 }
-                if (status in 500..599) {
+                if (status == 408 || status == 429 || status in 500..599) {
+                    val retryAfterMillis =
+                        if (status == 429 || status == 503) {
+                            retryAfterMillis(connection.getHeaderField("Retry-After"))
+                        } else {
+                            null
+                        }
+                    if (retryAfterMillis != null) {
+                        throw RetryAfterDownloadException(status, retryAfterMillis)
+                    }
                     throw TransientDownloadException("Download failed with HTTP $status")
                 }
                 if (status !in 200..299) {
@@ -283,9 +407,14 @@ internal class PinnedOriginDownloadWorker(
                 return connection.inputStream.use { input ->
                     var streamFailure: Throwable? = null
                     val result =
-                        storage.save(suggestedName, resolvedMimeType) { output ->
+                        storage.save(
+                            suggestedName,
+                            resolvedMimeType,
+                            operationId = id.toString(),
+                            shouldAbort = { isStopped },
+                        ) { output ->
                             try {
-                                input.copyTo(output)
+                                copyUntilStopped(input, output)
                             } catch (failure: Throwable) {
                                 streamFailure = failure
                                 throw failure
@@ -295,9 +424,44 @@ internal class PinnedOriginDownloadWorker(
                     result
                 }
             } finally {
+                if (activeConnection === connection) activeConnection = null
                 connection.disconnect()
             }
         }
+    }
+
+    private fun copyUntilStopped(
+        input: java.io.InputStream,
+        output: java.io.OutputStream,
+    ) {
+        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+        while (true) {
+            throwIfStopped()
+            val read = input.read(buffer)
+            if (read == -1) break
+            throwIfStopped()
+            output.write(buffer, 0, read)
+        }
+        throwIfStopped()
+    }
+
+    private fun retryAfterMillis(value: String?): Long? {
+        val candidate = value?.trim()?.takeIf(String::isNotEmpty) ?: return null
+        val seconds = candidate.toLongOrNull()
+        val delayMillis =
+            if (seconds != null) {
+                if (seconds < 0 || seconds > MAX_RETRY_AFTER_SECONDS) return null
+                TimeUnit.SECONDS.toMillis(seconds)
+            } else {
+                val retryAt =
+                    try {
+                        ZonedDateTime.parse(candidate, DateTimeFormatter.RFC_1123_DATE_TIME)
+                    } catch (_: DateTimeParseException) {
+                        return null
+                    }
+                maxOf(0L, retryAt.toInstant().toEpochMilli() - System.currentTimeMillis())
+            }
+        return delayMillis.takeIf { it <= TimeUnit.SECONDS.toMillis(MAX_RETRY_AFTER_SECONDS) }
     }
 
     internal fun hasPinnedOrigin(
@@ -325,6 +489,15 @@ internal class PinnedOriginDownloadWorker(
         message: String,
     ) : Exception(message)
 
+    private class RetryAfterDownloadException(
+        status: Int,
+        val delayMillis: Long,
+    ) : Exception("Download failed with HTTP $status")
+
+    private class StoppedDownloadException : Exception()
+
+    private class AuthenticationRequiredException : Exception("Sign in again to download")
+
     private class TerminalDownloadException(
         message: String,
         cause: Throwable? = null,
@@ -342,9 +515,11 @@ internal class PinnedOriginDownloadWorker(
         private const val MAX_REDIRECTS = 10
         private const val CONNECT_TIMEOUT_MS = 15_000
         private const val READ_TIMEOUT_MS = 30_000
+        private const val STOP_POLL_INTERVAL_MS = 250L
+        private const val MAX_RETRY_AFTER_SECONDS = 15 * 60L
         private const val DEFAULT_MIME_TYPE = "application/octet-stream"
         private const val FALLBACK_NAME = "download"
-        private const val BACKOFF_SECONDS = 30L
+        private const val BACKOFF_SECONDS = 45L
         private val REDIRECT_STATUS_CODES = setOf(301, 302, 303, 307, 308)
 
         internal fun request(
