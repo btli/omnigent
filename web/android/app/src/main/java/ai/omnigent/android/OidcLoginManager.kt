@@ -233,7 +233,11 @@ class OidcLoginManager(
                 if (!canDeliverLocked(flow)) return
                 val currentAttachment = attachment
                 if (currentAttachment == null) {
-                    heldResult = HeldResult(flow, result)
+                    if (result is LoginResult.Success) {
+                        heldResult = HeldResult(flow, result)
+                    } else {
+                        authLog("dropping unattached login failure from ${flow.origin}")
+                    }
                     return
                 }
                 if (currentAttachment.origin != flow.origin) {

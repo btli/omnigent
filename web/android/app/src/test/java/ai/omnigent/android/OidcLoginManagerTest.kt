@@ -17,6 +17,7 @@ import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import org.robolectric.shadows.ShadowCookieManager
+import org.robolectric.shadows.ShadowLog
 import org.robolectric.shadows.ShadowLooper
 import java.net.InetSocketAddress
 import java.nio.charset.StandardCharsets
@@ -271,6 +272,41 @@ class OidcLoginManagerTest {
         assertEquals(LoginResult.Success(TOKEN), result.get())
         assertEquals(0, detachedCalls.get())
         assertFalse(manager.hasHeldResultForTest())
+    }
+
+    @Test
+    fun `rejected result completed while detached is dropped`() {
+        val requestEntered = CountDownLatch(1)
+        val releaseRequest = CountDownLatch(1)
+        server.createContext("/auth/cli-login") { exchange ->
+            requestEntered.countDown()
+            releaseRequest.await(5, TimeUnit.SECONDS)
+            exchange.respond(500)
+        }
+        val manager = manager()
+        val detachedCalls = AtomicInteger()
+        val firstAttachment =
+            manager.attach(origin) { _, _ ->
+                detachedCalls.incrementAndGet()
+            }
+
+        assertTrue(manager.start(activity(), origin))
+        assertTrue(requestEntered.await(5, TimeUnit.SECONDS))
+        manager.detach(firstAttachment)
+        releaseRequest.countDown()
+        awaitFlowCompletion(manager)
+        ShadowLooper.idleMainLooper()
+
+        assertEquals(0, detachedCalls.get())
+        assertFalse(manager.hasHeldResultForTest())
+        assertTrue(
+            ShadowLog
+                .getLogsForTag("OmnigentAuth")
+                .any { item -> item.msg.contains("dropping unattached login failure") },
+        )
+        val laterCalls = AtomicInteger()
+        manager.attach(origin) { _, _ -> laterCalls.incrementAndGet() }
+        assertEquals(0, laterCalls.get())
     }
 
     @Test

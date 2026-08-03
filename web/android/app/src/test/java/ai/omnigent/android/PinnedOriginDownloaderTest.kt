@@ -25,6 +25,7 @@ import org.robolectric.util.ReflectionHelpers
 import java.io.File
 import java.net.InetSocketAddress
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -68,33 +69,25 @@ class PinnedOriginDownloaderTest {
         val sameOriginCookie = AtomicReference<String?>()
         val otherCookie = AtomicReference<String?>()
         val returnedCookie = AtomicReference<String?>()
-        val userAgents = mutableListOf<String?>()
+        val userAgents = ConcurrentLinkedQueue<String>()
         pinnedServer.createContext("/start") { exchange ->
             firstCookie.set(exchange.requestHeaders.getFirst("Cookie"))
-            synchronized(userAgents) {
-                userAgents += exchange.requestHeaders.getFirst("User-Agent")
-            }
+            userAgents += checkNotNull(exchange.requestHeaders.getFirst("User-Agent"))
             exchange.redirect("/same-origin")
         }
         pinnedServer.createContext("/same-origin") { exchange ->
             sameOriginCookie.set(exchange.requestHeaders.getFirst("Cookie"))
-            synchronized(userAgents) {
-                userAgents += exchange.requestHeaders.getFirst("User-Agent")
-            }
+            userAgents += checkNotNull(exchange.requestHeaders.getFirst("User-Agent"))
             exchange.redirect("$otherOrigin/middle")
         }
         otherServer.createContext("/middle") { exchange ->
             otherCookie.set(exchange.requestHeaders.getFirst("Cookie"))
-            synchronized(userAgents) {
-                userAgents += exchange.requestHeaders.getFirst("User-Agent")
-            }
+            userAgents += checkNotNull(exchange.requestHeaders.getFirst("User-Agent"))
             exchange.redirect("$pinnedOrigin/final")
         }
         pinnedServer.createContext("/final") { exchange ->
             returnedCookie.set(exchange.requestHeaders.getFirst("Cookie"))
-            synchronized(userAgents) {
-                userAgents += exchange.requestHeaders.getFirst("User-Agent")
-            }
+            userAgents += checkNotNull(exchange.requestHeaders.getFirst("User-Agent"))
             exchange.respond(200, DOWNLOAD_BODY)
         }
         CookieManager.getInstance().setCookie(pinnedOrigin, SESSION_COOKIE)
@@ -114,7 +107,7 @@ class PinnedOriginDownloaderTest {
         assertEquals(SESSION_COOKIE, sameOriginCookie.get())
         assertNull(otherCookie.get())
         assertNull(returnedCookie.get())
-        assertEquals(listOf(USER_AGENT, USER_AGENT, USER_AGENT, USER_AGENT), userAgents)
+        assertEquals(listOf(USER_AGENT, USER_AGENT, USER_AGENT, USER_AGENT), userAgents.toList())
         assertEquals(DOWNLOAD_BODY, target.readText())
         assertEquals("Saved ${target.name} to Downloads", ShadowToast.getTextOfLatestToast())
     }
