@@ -108,6 +108,16 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+    override fun onStart() {
+        super.onStart()
+        DownloadNotificationManager.activityStarted(this)
+    }
+
+    override fun onStop() {
+        DownloadNotificationManager.activityStopped(this)
+        super.onStop()
+    }
+
     private val pickFiles =
         registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
             val callback = pendingFileCallback
@@ -982,7 +992,8 @@ class MainActivity : AppCompatActivity() {
         val origin = intent?.getStringExtra(NativeNotificationManager.EXTRA_NOTIFICATION_ORIGIN)
         intent?.removeExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH)
         intent?.removeExtra(NativeNotificationManager.EXTRA_NOTIFICATION_ORIGIN)
-        return path?.takeIf { it.startsWith("/") && origin == expectedOrigin }
+        val trustedOrigin = expectedOrigin ?: return null
+        return path?.takeIf { it.startsWith("/") && origin == trustedOrigin }
     }
 
     private fun emitNotificationActivation(path: String?) {

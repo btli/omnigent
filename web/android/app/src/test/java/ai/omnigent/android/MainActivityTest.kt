@@ -806,6 +806,36 @@ class MainActivityTest {
     }
 
     @Test
+    fun `restored notification activation rejects a path without a leading slash`() {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        ServerStore(context).connect(PINNED_ORIGIN)
+        val savedState =
+            Bundle().apply {
+                putString("pendingNavigatePath", "https://evil.example/capture")
+                putString("pendingNavigateOrigin", PINNED_ORIGIN)
+            }
+
+        val activity =
+            Robolectric
+                .buildActivity(MainActivity::class.java)
+                .setup(savedState)
+                .get()
+
+        assertNull(activity.pendingNavigatePath())
+    }
+
+    @Test
+    fun `notification activation fails closed when no expected origin exists`() {
+        val activity = activity()
+        val intent = notificationIntent("/c/untrusted", null)
+
+        val path = activity.takeNavigatePathOf(intent, null)
+
+        assertNull(path)
+        assertFalse(intent.hasExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH))
+    }
+
+    @Test
     fun `saved state without an activation does not replay the launch intent`() {
         val context: Context = ApplicationProvider.getApplicationContext()
         ServerStore(context).connect(PINNED_ORIGIN)
@@ -1460,6 +1490,17 @@ class MainActivityTest {
 
     private fun MainActivity.pendingNavigatePath(): String? =
         ReflectionHelpers.getField(this, "pendingNavigatePath")
+
+    private fun MainActivity.takeNavigatePathOf(
+        intent: Intent,
+        expectedOrigin: String?,
+    ): String? =
+        ReflectionHelpers.callInstanceMethod(
+            this,
+            "takeNavigatePathOf",
+            ClassParameter.from(Intent::class.java, intent),
+            ClassParameter.from(String::class.java, expectedOrigin),
+        )
 
     private fun MainActivity.pendingFileCallback(): ValueCallback<Array<Uri>>? =
         ReflectionHelpers.getField(this, "pendingFileCallback")

@@ -236,7 +236,7 @@ class NativeNotificationManager(
         } else {
             editor.putString(KEY_LAST_PINNED_ORIGIN, origin)
         }
-        editor.apply()
+        editor.commit()
     }
 
     private fun cancelSessionNotifications() {

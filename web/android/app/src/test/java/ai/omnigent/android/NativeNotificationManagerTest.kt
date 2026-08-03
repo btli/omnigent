@@ -28,6 +28,12 @@ class NativeNotificationManagerTest {
     @Before
     fun setUp() {
         context = ApplicationProvider.getApplicationContext()
+        ShadowNotificationManager.reset()
+        context
+            .getSharedPreferences(NOTIFICATION_PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .clear()
+            .commit()
         manager = NativeNotificationManager(context, ORIGIN)
         shadow =
             shadowOf(
@@ -153,6 +159,17 @@ class NativeNotificationManagerTest {
         NativeNotificationManager(context, NEW_ORIGIN)
 
         assertTrue(shadow.allNotifications.isEmpty())
+    }
+
+    @Test
+    fun `origin switched in place is persisted for the next manager`() {
+        manager.setOrigin(NEW_ORIGIN)
+        manager.notify("new origin", null, "/c/new")
+        assertNotNull(shadow.getNotification(FIRST_NOTIFICATION_ID))
+
+        NativeNotificationManager(context, NEW_ORIGIN)
+
+        assertNotNull(shadow.getNotification(FIRST_NOTIFICATION_ID))
     }
 
     @Test
