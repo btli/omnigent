@@ -409,6 +409,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun showLoginFailed(origin: String) {
         if (isFinishing || isDestroyed) return
+        if (embeddedSignInDialog?.isShowing == true) return
 
         val existingDialog = loginFailedDialog
         if (existingDialog?.isShowing == true) {
@@ -596,6 +597,7 @@ class MainActivity : AppCompatActivity() {
         newOrigin: String,
     ) {
         removeBridge()
+        loginManager.cancel()
         shellWebViewClient.endProxyAuth()
         dismissEmbeddedSignInDialogWithoutReset()
         loginFailedDialog?.dismiss()
@@ -693,6 +695,9 @@ class MainActivity : AppCompatActivity() {
             return
         }
         if (embeddedSignInDialog?.isShowing == true) return
+
+        loginFailedDialog?.dismiss()
+        loginFailedDialog = null
 
         val origin = pinnedOrigin
         if (origin == null) {

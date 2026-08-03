@@ -280,6 +280,36 @@ class MainActivityTest {
     }
 
     @Test
+    fun `server reload cancels an in-flight native login`() {
+        val activity = activity()
+        val loginManager = activity.loginManager()
+        val executor: ExecutorService = ReflectionHelpers.getField(loginManager, "io")
+        val workerStarted = CountDownLatch(1)
+        val holdWorker = CountDownLatch(1)
+        executor.execute {
+            workerStarted.countDown()
+            runCatching { holdWorker.await() }
+        }
+        assertTrue(workerStarted.await(5, TimeUnit.SECONDS))
+
+        try {
+            assertTrue(
+                loginManager.start(activity, PINNED_ORIGIN) {
+                    throw AssertionError("cancelled login delivered a callback")
+                },
+            )
+            assertTrue(loginManager.isInFlightForTest())
+
+            activity.reloadWithNewServer(NEW_SERVER_URL, NEW_ORIGIN)
+
+            assertFalse(loginManager.isInFlightForTest())
+        } finally {
+            holdWorker.countDown()
+            loginManager.shutdown()
+        }
+    }
+
+    @Test
     fun `refusal while finishing resets to idle without showing a dialog`() {
         val activity = activity()
         activity.finish()
@@ -383,6 +413,19 @@ class MainActivityTest {
     }
 
     @Test
+    fun `login failures do not stack a generic dialog over the refusal dialog`() {
+        val activity = activity()
+        val refusalDialog = activity.refuseEmbeddedSignIn()
+
+        activity.onLoginResult(PINNED_ORIGIN, LoginResult.Rejected)
+        activity.onLoginResult(PINNED_ORIGIN, LoginResult.TimedOut)
+
+        assertSame(refusalDialog, ShadowAlertDialog.getLatestAlertDialog())
+        assertTrue(refusalDialog.isShowing)
+        assertNull(activity.loginFailedDialog())
+    }
+
+    @Test
     fun `repeated login failure reuses the generic dialog`() {
         val activity = activity()
         activity.onLoginResult(PINNED_ORIGIN, LoginResult.Rejected)
@@ -464,6 +507,17 @@ class MainActivityTest {
         activity.reloadWithNewServer(NEW_SERVER_URL, NEW_ORIGIN)
 
         activity.onLoginResult(PINNED_ORIGIN, LoginResult.Rejected)
+
+        assertNull(activity.loginFailedDialog())
+        assertNull(ShadowAlertDialog.getLatestAlertDialog())
+    }
+
+    @Test
+    fun `timeout from the previous origin shows no failure surface`() {
+        val activity = activity()
+        activity.reloadWithNewServer(NEW_SERVER_URL, NEW_ORIGIN)
+
+        activity.onLoginResult(PINNED_ORIGIN, LoginResult.TimedOut)
 
         assertNull(activity.loginFailedDialog())
         assertNull(ShadowAlertDialog.getLatestAlertDialog())

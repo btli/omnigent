@@ -540,6 +540,33 @@ class OmnigentWebViewClientTest {
     }
 
     @Test
+    fun `matching terminal callback prevents a later stop from creating a ledger`() {
+        val webView = webView()
+        var flowEnded = 0
+        var loginRequired = false
+        val client =
+            client(
+                onProxyAuthFlowEnded = { flowEnded++ },
+                onLoginRequired = { loginRequired = true },
+            )
+        client.onPageStarted(webView, PINNED_URL, null)
+        client.onReceivedHttpError(
+            webView,
+            request(PINNED_URL),
+            httpErrorResponse(),
+        )
+
+        client.stopLoadingAndLedger(webView)
+        enterFlow(client, webView)
+        client.onPageStarted(webView, PLAIN_IDP_URL, null)
+        client.onPageFinished(webView, PINNED_URL)
+
+        assertEquals(1, flowEnded)
+        assertTrue(client.shouldOverrideUrlLoading(webView, request(OTHER_IDP_URL)))
+        assertTrue(loginRequired)
+    }
+
+    @Test
     fun `onReceivedSslError ends the flow`() {
         val webView = webView()
         var loginRequired = false
@@ -556,6 +583,36 @@ class OmnigentWebViewClientTest {
 
         assertTrue(client.shouldOverrideUrlLoading(webView, request(OTHER_IDP_URL)))
         assertTrue(loginRequired)
+    }
+
+    @Test
+    fun `onReceivedSslError preserves loading state for a later ledgered stop`() {
+        val webView = webView()
+        var flowEnded = 0
+        var loginRequired = false
+        val client =
+            client(
+                onProxyAuthFlowEnded = { flowEnded++ },
+                onLoginRequired = { loginRequired = true },
+            )
+        client.onPageStarted(webView, PINNED_URL, null)
+
+        val handler = ReflectionHelpers.callConstructor(SslErrorHandler::class.java)
+        val certificate = SslCertificate("CN=subject", "CN=issuer", Date(0), Date(1))
+        client.onReceivedSslError(
+            webView,
+            handler,
+            SslError(SslError.SSL_UNTRUSTED, certificate, PINNED_URL),
+        )
+
+        client.stopLoadingAndLedger(webView)
+        enterFlow(client, webView)
+        client.onPageStarted(webView, PLAIN_IDP_URL, null)
+        client.onPageFinished(webView, PINNED_URL)
+
+        assertEquals(0, flowEnded)
+        assertFalse(client.shouldOverrideUrlLoading(webView, request(OTHER_IDP_URL)))
+        assertFalse(loginRequired)
     }
 
     @Test
