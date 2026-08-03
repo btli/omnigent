@@ -11,6 +11,9 @@ import android.widget.Toast
 import androidx.annotation.RequiresApi
 import java.io.File
 import java.io.OutputStream
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 
 internal data class DownloadSaveResult(
     val name: String,
@@ -29,10 +32,12 @@ internal class DownloadStorage(context: Context) {
     ): DownloadSaveResult {
         val name = safeFileName(suggestedName)
         val saved =
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                saveViaMediaStore(name, mimeType, write)
-            } else {
-                saveToAppDownloads(name, write)
+            synchronized(saveLockFor(name)) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    saveViaMediaStore(name, mimeType, write)
+                } else {
+                    saveToAppDownloads(name, write)
+                }
             }
         return DownloadSaveResult(name, saved)
     }
@@ -44,7 +49,11 @@ internal class DownloadStorage(context: Context) {
         main.post {
             val message =
                 if (result.saved) {
-                    "Saved ${result.name} to Downloads"
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        "Saved ${result.name} to Downloads"
+                    } else {
+                        "Saved ${result.name} to app storage"
+                    }
                 } else {
                     "Couldn't save ${result.name}"
                 }
@@ -92,27 +101,62 @@ internal class DownloadStorage(context: Context) {
     private fun saveToAppDownloads(
         name: String,
         write: (OutputStream) -> Unit,
-    ): Boolean =
-        runCatching {
-            val dir =
-                context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
-                    ?: context.filesDir
-            File(dir, name).outputStream().use(write)
+    ): Boolean {
+        val dir =
+            context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+                ?: context.filesDir
+        var temporary: File? = null
+        return try {
+            temporary = File.createTempFile(".omnigent-", ".tmp", dir)
+            temporary.outputStream().use(write)
+            replaceFile(temporary, File(dir, name))
             true
-        }.getOrDefault(false)
+        } catch (_: Throwable) {
+            false
+        } finally {
+            temporary?.delete()
+        }
+    }
+
+    private fun replaceFile(
+        source: File,
+        destination: File,
+    ) {
+        try {
+            Files.move(
+                source.toPath(),
+                destination.toPath(),
+                StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING,
+            )
+        } catch (_: AtomicMoveNotSupportedException) {
+            Files.move(
+                source.toPath(),
+                destination.toPath(),
+                StandardCopyOption.REPLACE_EXISTING,
+            )
+        }
+    }
 
     private fun safeFileName(suggested: String): String {
         // Treat both separator styles as paths before replacing unsafe characters.
-        val cleaned =
+        val leaf =
             suggested
                 .substringAfterLast('/')
                 .substringAfterLast('\\')
-                .replace(Regex("[^A-Za-z0-9._-]"), "_")
+        val cleaned = leaf.replace(Regex("[^A-Za-z0-9._-]"), "_")
         // Dot paths resolve to directories on the pre-Q filesystem destination.
-        return if (cleaned.isBlank() || cleaned == "." || cleaned == "..") {
+        return if (leaf.isBlank() || cleaned == "." || cleaned == "..") {
             "omnigent-${System.currentTimeMillis()}"
         } else {
             cleaned
         }
+    }
+
+    private companion object {
+        private val SAVE_LOCKS = Array(32) { Any() }
+
+        private fun saveLockFor(name: String): Any =
+            SAVE_LOCKS[Math.floorMod(name.hashCode(), SAVE_LOCKS.size)]
     }
 }

@@ -49,7 +49,8 @@ internal class PinnedOriginDownloader(
                             mimeType,
                             suggestedName,
                         )
-                    }.getOrElse {
+                    }.getOrElse { failure ->
+                        Log.e(TAG, "Download failed for $suggestedName", failure)
                         storage.failed(suggestedName)
                     }
                 storage.report(result)
@@ -110,9 +111,18 @@ internal class PinnedOriginDownloader(
                             ?.takeIf(String::isNotBlank)
                         ?: DEFAULT_MIME_TYPE
                 return connection.inputStream.use { input ->
-                    storage.save(suggestedName, resolvedMimeType) { output ->
-                        input.copyTo(output)
-                    }
+                    var streamFailure: Throwable? = null
+                    val result =
+                        storage.save(suggestedName, resolvedMimeType) { output ->
+                            try {
+                                input.copyTo(output)
+                            } catch (failure: Throwable) {
+                                streamFailure = failure
+                                throw failure
+                            }
+                        }
+                    streamFailure?.let { throw it }
+                    result
                 }
             } finally {
                 connection.disconnect()
@@ -120,7 +130,7 @@ internal class PinnedOriginDownloader(
         }
     }
 
-    private fun hasPinnedOrigin(
+    internal fun hasPinnedOrigin(
         url: URL,
         pinnedOrigin: String,
     ): Boolean {

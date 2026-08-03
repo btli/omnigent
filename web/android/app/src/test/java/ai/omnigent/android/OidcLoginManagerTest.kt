@@ -295,7 +295,11 @@ class OidcLoginManagerTest {
         manager.detach(firstAttachment)
         releaseRequest.countDown()
         awaitFlowCompletion(manager)
-        ShadowLooper.idleMainLooper()
+        awaitMainThread {
+            ShadowLog
+                .getLogsForTag("OmnigentAuth")
+                .any { item -> item.msg.contains("dropping unattached login failure") }
+        }
 
         assertEquals(0, detachedCalls.get())
         assertFalse(manager.hasHeldResultForTest())
@@ -340,6 +344,62 @@ class OidcLoginManagerTest {
         assertEquals(0, staleOriginCalls.get())
         assertEquals(0, originalOriginCalls.get())
         assertFalse(manager.hasHeldResultForTest())
+    }
+
+    @Test
+    fun `a different origin attachment abandons the active flow and permits a new start`() {
+        val requestEntered = CountDownLatch(1)
+        val releaseRequest = CountDownLatch(1)
+        server.createContext("/auth/cli-login") { exchange ->
+            requestEntered.countDown()
+            releaseRequest.await(5, TimeUnit.SECONDS)
+            exchange.respond(500)
+        }
+        val manager = manager(pollTimeoutMs = 30_000)
+        val firstAttachment = manager.attach(origin) { _, _ -> }
+
+        try {
+            assertTrue(manager.start(activity(), origin))
+            assertTrue(requestEntered.await(5, TimeUnit.SECONDS))
+            manager.detach(firstAttachment)
+
+            manager.attach("http://localhost:${server.address.port}") { _, _ -> }
+
+            assertFalse(manager.isInFlightForTest())
+            assertTrue(
+                manager.start(activity(), "http://localhost:${server.address.port}") { _ -> },
+            )
+        } finally {
+            manager.cancel()
+            releaseRequest.countDown()
+        }
+    }
+
+    @Test
+    fun `a matching origin attachment leaves the active flow running`() {
+        val requestEntered = CountDownLatch(1)
+        val releaseRequest = CountDownLatch(1)
+        server.createContext("/auth/cli-login") { exchange ->
+            requestEntered.countDown()
+            releaseRequest.await(5, TimeUnit.SECONDS)
+            exchange.respond(500)
+        }
+        val manager = manager(pollTimeoutMs = 30_000)
+        val firstAttachment = manager.attach(origin) { _, _ -> }
+
+        try {
+            assertTrue(manager.start(activity(), origin))
+            assertTrue(requestEntered.await(5, TimeUnit.SECONDS))
+            manager.detach(firstAttachment)
+
+            manager.attach(origin) { _, _ -> }
+
+            assertTrue(manager.isInFlightForTest())
+            assertFalse(manager.start(activity(), origin) { _ -> })
+        } finally {
+            manager.cancel()
+            releaseRequest.countDown()
+        }
     }
 
     @Test
@@ -512,6 +572,19 @@ class OidcLoginManagerTest {
         }
         ShadowLooper.idleMainLooper()
         assertTrue("login callback was not delivered", delivered.await(0, TimeUnit.MILLISECONDS))
+    }
+
+    /**
+     * The worker clears the in-flight flag before it enqueues the result, so a
+     * single drain can race the post. Idle until the outcome is observable.
+     */
+    private fun awaitMainThread(condition: () -> Boolean) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (!condition() && System.nanoTime() < deadline) {
+            ShadowLooper.idleMainLooper()
+            Thread.yield()
+        }
+        ShadowLooper.idleMainLooper()
     }
 
     private fun awaitFlowCompletion(manager: OidcLoginManager) {

@@ -56,6 +56,7 @@ class NativeNotificationManager(
                 NotificationManager.IMPORTANCE_HIGH,
             )
         manager.createNotificationChannel(channel)
+        claimNotificationOrigin(notificationOrigin)
     }
 
     fun notify(
@@ -154,6 +155,7 @@ class NativeNotificationManager(
 
     fun setOrigin(origin: String?) {
         notificationOrigin = origin
+        rememberNotificationOrigin(origin)
     }
 
     fun cancelAll() {
@@ -212,6 +214,31 @@ class NativeNotificationManager(
             id
         }
 
+    private fun claimNotificationOrigin(origin: String?) {
+        synchronized(ID_LOCK) {
+            if (notificationIds.contains(KEY_LAST_PINNED_ORIGIN) &&
+                notificationIds.getString(KEY_LAST_PINNED_ORIGIN, null) != origin
+            ) {
+                manager.cancelAll()
+            }
+            rememberNotificationOriginLocked(origin)
+        }
+    }
+
+    private fun rememberNotificationOrigin(origin: String?) {
+        synchronized(ID_LOCK) { rememberNotificationOriginLocked(origin) }
+    }
+
+    private fun rememberNotificationOriginLocked(origin: String?) {
+        val editor = notificationIds.edit()
+        if (origin == null) {
+            editor.remove(KEY_LAST_PINNED_ORIGIN)
+        } else {
+            editor.putString(KEY_LAST_PINNED_ORIGIN, origin)
+        }
+        editor.apply()
+    }
+
     companion object {
         const val EXTRA_NAVIGATE_PATH = "ai.omnigent.android.NAVIGATE_PATH"
         const val EXTRA_NOTIFICATION_ORIGIN = "ai.omnigent.android.NOTIFICATION_ORIGIN"
@@ -220,6 +247,7 @@ class NativeNotificationManager(
         private const val FIRST_NOTIFICATION_ID = BADGE_NOTIFICATION_ID + 1
         private const val NOTIFICATION_PREFS = "ai.omnigent.android.notifications"
         private const val KEY_NEXT_NOTIFICATION_ID = "next_notification_id"
+        private const val KEY_LAST_PINNED_ORIGIN = "last_pinned_origin"
         private val ID_LOCK = Any()
     }
 }

@@ -68,12 +68,21 @@ class OidcLoginManager(
         onResult: (String, LoginResult) -> Unit,
     ): Attachment {
         val newAttachment = Attachment(origin, onResult)
+        var abandonedFuture: Future<*>? = null
         val held =
             synchronized(stateLock) {
                 attachment?.callback = null
                 attachment = newAttachment
-                heldResult?.also { heldResult = null }
+                activeFlow?.takeIf { it.origin != origin }?.let { staleFlow ->
+                    cancellationGeneration++
+                    activeFlow = null
+                    abandonedFuture = staleFlow.future
+                }
+                heldResult
+                    ?.takeIf { it.flow.origin == origin }
+                    .also { heldResult = null }
             }
+        abandonedFuture?.cancel(true)
         held?.let { it.flow.callback(it.result) }
         return newAttachment
     }
