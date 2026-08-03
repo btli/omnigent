@@ -131,16 +131,19 @@ class OidcLoginManagerTest {
 
     @Test
     fun `deadline expiry is timed out rather than rejected`() {
+        val pollHits = AtomicInteger()
         server.createContext("/auth/cli-login") { exchange ->
             exchange.respond(200, ticketBody())
         }
         server.createContext("/auth/cli-poll") { exchange ->
+            pollHits.incrementAndGet()
             exchange.respond(202)
         }
 
-        val result = runLogin(manager(pollTimeoutMs = 50))
+        val result = runLogin(manager(pollTimeoutMs = 250))
 
         assertEquals(LoginResult.TimedOut, result)
+        assertTrue(pollHits.get() >= 2)
     }
 
     @Test
