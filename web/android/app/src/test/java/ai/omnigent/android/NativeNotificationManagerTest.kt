@@ -144,19 +144,19 @@ class NativeNotificationManagerTest {
     }
 
     @Test
-    fun `notification ids wrap without overflowing`() {
+    fun `negative stored notification id is normalized above the badge id`() {
         context
             .getSharedPreferences(NOTIFICATION_PREFS, Context.MODE_PRIVATE)
             .edit()
-            .putInt(KEY_NEXT_NOTIFICATION_ID, Int.MAX_VALUE)
+            .putInt(KEY_NEXT_NOTIFICATION_ID, -17)
             .commit()
-        val overflowManager = NativeNotificationManager(context, ORIGIN)
+        val normalizedManager = NativeNotificationManager(context, ORIGIN)
 
-        overflowManager.notify("last", null, "/c/last")
-        overflowManager.notify("wrapped", null, "/c/wrapped")
+        normalizedManager.notify("normalized", null, "/c/normalized")
 
-        assertNotNull(shadow.getNotification(Int.MAX_VALUE))
         assertNotNull(shadow.getNotification(FIRST_NOTIFICATION_ID))
+        assertNull(shadow.getNotification(badgeId))
+        assertNull(shadow.getNotification(-17))
     }
 
     private companion object {
