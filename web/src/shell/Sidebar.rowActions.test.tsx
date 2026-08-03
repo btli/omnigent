@@ -1208,6 +1208,42 @@ describe("useRowSwipe — dnd coexistence", () => {
     expect(onAction).not.toHaveBeenCalled();
   });
 
+  it("(f) tracks 1:1 to the commit point, then resists so the title stays in panel", () => {
+    const onAction = vi.fn();
+    const { result } = renderHook(() =>
+      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging: false, onAction }),
+    );
+
+    act(() => {
+      result.current.onPointerDown(makePointer({ pointerId: 1, clientX: 400, clientY: 100 }));
+    });
+    // Up to the threshold the row follows the finger exactly.
+    act(() => {
+      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 340, clientY: 100 }));
+    });
+    expect(result.current.dx).toBe(-60);
+
+    // Well past it, travel is damped and never exceeds the cap — so the row
+    // can't be dragged far enough to push its title out of the panel.
+    act(() => {
+      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
+    });
+    expect(Math.abs(result.current.dx)).toBeLessThanOrEqual(96);
+    expect(Math.abs(result.current.dx)).toBeGreaterThanOrEqual(72);
+
+    // A 300px drag is still capped at 96.
+    act(() => {
+      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
+    });
+    expect(result.current.dx).toBe(-96);
+
+    // Still commits — damping is visual only.
+    act(() => {
+      result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
+    });
+    expect(onAction).toHaveBeenCalledWith("archive");
+  });
+
   it("(e) ignores a pointerdown that bubbled out of a portal (open dialog)", () => {
     // The row's dialogs render in portals but are React children, so their
     // events bubble to the row's handlers. A drag inside the open delete dialog
