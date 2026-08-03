@@ -10,8 +10,8 @@ import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.RejectedExecutionException
-import java.util.concurrent.atomic.AtomicBoolean
 
 sealed interface LoginResult {
     data class Success(
@@ -47,12 +47,10 @@ class OidcLoginManager(
 ) {
     private val io = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
-    private val inFlight = AtomicBoolean(false)
-
-    // Held only for the duration of a login; nulled by [shutdown] so a poll that
-    // finishes after the host is destroyed can neither invoke into a dead
-    // Activity nor pin it (and its View tree) for the poll's lifetime.
-    @Volatile private var resultCallback: ((LoginResult) -> Unit)? = null
+    private val stateLock = Any()
+    private var activeFlow: Flow? = null
+    private var cancellationGeneration = 0L
+    private var shutDown = false
 
     /**
      * Begin a login against [origin] (the pinned server). Opens the browser and
@@ -67,28 +65,40 @@ class OidcLoginManager(
         activity: Activity,
         origin: String,
         onResult: (LoginResult) -> Unit,
-    ): Boolean {
-        if (!inFlight.compareAndSet(false, true)) return false
-        resultCallback = onResult
-        return try {
-            io.execute {
-                val result = runFlow(activity, origin)
-                // resultCallback is null once shutdown() ran — never invoke into a
-                // destroyed host.
-                if (result != null) main.post { resultCallback?.invoke(result) }
-            }
-            true
-        } catch (_: RejectedExecutionException) {
-            resultCallback = null
-            inFlight.set(false)
-            false
-        }
-    }
+    ): Boolean =
+        synchronized(stateLock) {
+            if (shutDown || activeFlow != null) return@synchronized false
 
-    /** Run one flow to completion off the main thread, or null once shutdown cancels it. */
+            val flow = Flow(cancellationGeneration)
+            val callback = onResult
+            activeFlow = flow
+            try {
+                flow.future =
+                    io.submit {
+                        val result = runFlow(activity, origin, flow)
+                        synchronized(stateLock) {
+                            if (activeFlow === flow) activeFlow = null
+                        }
+                        if (result != null) {
+                            main.post {
+                                // New starts keep the generation; only cancel/shutdown
+                                // invalidate captured callbacks.
+                                if (canDeliver(flow)) callback(result)
+                            }
+                        }
+                    }
+                true
+            } catch (_: RejectedExecutionException) {
+                if (activeFlow === flow) activeFlow = null
+                false
+            }
+        }
+
+    /** Run one flow off the main thread, or return null once it is interrupted. */
     private fun runFlow(
         activity: Activity,
         origin: String,
+        flow: Flow,
     ): LoginResult? =
         try {
             val ticket = requestTicket(origin)
@@ -96,17 +106,17 @@ class OidcLoginManager(
             if (ticket == null) {
                 LoginResult.Rejected
             } else {
-                main.post { launchTab(activity, origin + ticket.loginUrl) }
+                main.post {
+                    if (canDeliver(flow)) launchTab(activity, origin + ticket.loginUrl)
+                }
                 pollForToken(origin, ticket.id).also(::logPollResult)
             }
         } catch (_: InterruptedException) {
-            // shutdown() interrupted the poll — the host is going away; drop.
+            // Cancellation interrupted the poll; abandon the result.
             null
         } catch (t: Throwable) {
             authLog("login flow error: ${t.javaClass.simpleName}")
             LoginResult.Rejected
-        } finally {
-            inFlight.set(false)
         }
 
     private fun logPollResult(result: LoginResult) {
@@ -119,12 +129,43 @@ class OidcLoginManager(
         authLog("poll -> $outcome")
     }
 
-    internal fun isInFlightForTest(): Boolean = inFlight.get()
+    internal fun isInFlightForTest(): Boolean = synchronized(stateLock) { activeFlow != null }
+
+    /** Abandon the current flow while keeping the worker available for another login. */
+    fun cancel() {
+        val future =
+            synchronized(stateLock) {
+                cancellationGeneration++
+                val flow = activeFlow
+                activeFlow = null
+                flow?.future
+            }
+        future?.cancel(true)
+    }
 
     /** Cancel an in-flight login and release the host. Call from onDestroy. */
     fun shutdown() {
-        resultCallback = null
+        val future =
+            synchronized(stateLock) {
+                shutDown = true
+                cancellationGeneration++
+                val flow = activeFlow
+                activeFlow = null
+                flow?.future
+            }
+        future?.cancel(true)
         io.shutdownNow() // interrupts the polling sleep so the task exits promptly
+    }
+
+    private fun canDeliver(flow: Flow): Boolean =
+        synchronized(stateLock) {
+            !shutDown && cancellationGeneration == flow.generation
+        }
+
+    private class Flow(
+        val generation: Long,
+    ) {
+        var future: Future<*>? = null
     }
 
     private data class Ticket(
