@@ -9,10 +9,17 @@
 
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
 
+    <!--
+      Package visibility for the browser probe on API 30+. One scheme per
+      intent: the package parser rejects an intent tag carrying two.
+    -->
     <queries>
         <intent>
             <action android:name="android.intent.action.VIEW" />
             <data android:scheme="https" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
             <data android:scheme="http" />
         </intent>
     </queries>
