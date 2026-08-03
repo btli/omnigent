@@ -132,11 +132,11 @@ class MainActivity : AppCompatActivity() {
 
         // Application context for the long-lived helpers so the WebView's bridge
         // reference chain can't pin this Activity.
-        notifications = NativeNotificationManager(applicationContext)
+        notifications = NativeNotificationManager(applicationContext, pinnedOrigin)
         blobSaver = BlobSaver(applicationContext)
 
         // Capture (don't replay yet) a notification tap that cold-started us.
-        pendingNavigatePath = navigatePathOf(intent)
+        pendingNavigatePath = takeNavigatePathOf(intent)
 
         if (BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true) // chrome://inspect
 
@@ -572,13 +572,13 @@ class MainActivity : AppCompatActivity() {
         loginFailedDialog = null
         rendererFailedDialog?.dismiss()
         rendererFailedDialog = null
-        if (::blobSaver.isInitialized) blobSaver.shutdown()
         if (::webView.isInitialized) {
             shellWebViewClient.endProxyAuth()
             dismissEmbeddedSignInDialogWithoutReset()
             removeBridge()
             webView.destroy()
         }
+        if (::blobSaver.isInitialized) blobSaver.shutdown()
         super.onDestroy()
     }
 
@@ -597,7 +597,7 @@ class MainActivity : AppCompatActivity() {
             reloadWithNewServer(newServerUrl, newOrigin)
         }
 
-        val path = navigatePathOf(intent) ?: return
+        val path = takeNavigatePathOf(intent) ?: return
         pendingNavigatePath = path
         // Replay now if the page is up; otherwise onPageReady will flush it.
         if (pageLoaded) flushPendingActivation()
@@ -620,7 +620,10 @@ class MainActivity : AppCompatActivity() {
         loginFailedDialog?.dismiss()
         loginFailedDialog = null
         shellWebViewClient.stopLoadingAndLedger(webView)
+        notifications.cancelAll()
+        pendingNavigatePath = null
         pinnedOrigin = newOrigin
+        notifications.setOrigin(newOrigin)
         pageLoaded = false
         historyCleared = false
         loginAttempts = 0
@@ -884,10 +887,13 @@ class MainActivity : AppCompatActivity() {
         pendingNavigatePath = null
     }
 
-    private fun navigatePathOf(intent: Intent?): String? =
-        intent
-            ?.getStringExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH)
-            ?.takeIf { it.startsWith("/") }
+    private fun takeNavigatePathOf(intent: Intent?): String? {
+        val path = intent?.getStringExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH)
+        val origin = intent?.getStringExtra(NativeNotificationManager.EXTRA_NOTIFICATION_ORIGIN)
+        intent?.removeExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH)
+        intent?.removeExtra(NativeNotificationManager.EXTRA_NOTIFICATION_ORIGIN)
+        return path?.takeIf { it.startsWith("/") && origin == pinnedOrigin }
+    }
 
     private fun emitNotificationActivation(path: String?) {
         if (path == null) return

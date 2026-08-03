@@ -34,7 +34,7 @@ class OmnigentBridgeListenerTest {
         context = ApplicationProvider.getApplicationContext()
         listener =
             OmnigentBridgeListener(
-                notifications = NativeNotificationManager(context),
+                notifications = NativeNotificationManager(context, "https://example.com"),
                 blobSaver = BlobSaver(context),
             )
         shadow =

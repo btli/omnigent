@@ -44,8 +44,10 @@ import org.robolectric.shadows.ShadowToast
 import org.robolectric.shadows.ShadowWebView
 import org.robolectric.util.ReflectionHelpers
 import org.robolectric.util.ReflectionHelpers.ClassParameter
+import java.util.concurrent.AbstractExecutorService
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 
 @RunWith(RobolectricTestRunner::class)
@@ -392,6 +394,117 @@ class MainActivityTest {
         assertNull(activity.embeddedSignInDialog())
         assertEquals(ProxyAuthState.IDLE, activity.shellWebViewClient().proxyAuthState())
         assertEquals(1, ActivityCallLog.endProxyAuthCalls)
+    }
+
+    @Test
+    fun `server reload cancels notifications from the previous origin`() {
+        ShadowNotificationManager.reset()
+        val activity = activity()
+        activity.notifications().setBadgeCount(2, navigatePath = "/inbox")
+        activity.notifications().notify("done", null, "/c/old")
+        assertEquals(2, activity.notificationManager().allNotifications.size)
+
+        activity.reloadWithNewServer(NEW_SERVER_URL, NEW_ORIGIN)
+
+        assertTrue(activity.notificationManager().allNotifications.isEmpty())
+    }
+
+    @Test
+    fun `server reload clears a pending notification activation`() {
+        val activity = activity()
+        ReflectionHelpers.setField(activity, "pendingNavigatePath", "/c/old")
+
+        activity.reloadWithNewServer(NEW_SERVER_URL, NEW_ORIGIN)
+
+        assertNull(activity.pendingNavigatePath())
+    }
+
+    @Test
+    fun `server reload pins future notification activations to the new origin`() {
+        ShadowNotificationManager.reset()
+        val activity = activity()
+        activity.reloadWithNewServer(NEW_SERVER_URL, NEW_ORIGIN)
+
+        activity.notifications().notify("done", null, "/c/new")
+
+        val posted = activity.notificationManager().allNotifications.single()
+        val intent = shadowOf(posted.contentIntent).savedIntent
+        assertEquals(
+            NEW_ORIGIN,
+            intent.getStringExtra(NativeNotificationManager.EXTRA_NOTIFICATION_ORIGIN),
+        )
+    }
+
+    @Test
+    fun `notification activations without the pinned origin are dropped`() {
+        val activity = activity()
+        ReflectionHelpers.setField(activity, "pageLoaded", false)
+
+        listOf(
+            notificationIntent("/c/stale", NEW_ORIGIN),
+            notificationIntent("/c/missing", null),
+        ).forEach { intent ->
+            activity.invokeOnNewIntent(intent)
+            assertNull(activity.pendingNavigatePath())
+        }
+    }
+
+    @Test
+    fun `cold start notification activation is consumed before recreate`() {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        ServerStore(context).connect(PINNED_ORIGIN)
+        val intent = notificationIntent("/c/cold", PINNED_ORIGIN)
+        val controller = Robolectric.buildActivity(MainActivity::class.java, intent).setup()
+        val firstActivity = controller.get()
+
+        assertEquals("/c/cold", firstActivity.pendingNavigatePath())
+        assertFalse(firstActivity.intent.hasExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH))
+        firstActivity.recreate()
+        idleMainLooper()
+
+        assertNull(controller.get().pendingNavigatePath())
+    }
+
+    @Test
+    fun `new intent notification activation is consumed before recreate`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect(PINNED_ORIGIN)
+        val activityController = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val firstActivity = activityController.get()
+        val intent = notificationIntent("/c/warm", PINNED_ORIGIN)
+        ReflectionHelpers.setField(firstActivity, "pageLoaded", false)
+
+        firstActivity.invokeOnNewIntent(intent)
+
+        assertEquals("/c/warm", firstActivity.pendingNavigatePath())
+        assertFalse(firstActivity.intent.hasExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH))
+        firstActivity.recreate()
+        idleMainLooper()
+
+        assertNull(activityController.get().pendingNavigatePath())
+    }
+
+    @Test
+    fun `onDestroy removes the bridge before shutting down the blob saver`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect(PINNED_ORIGIN)
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        val saver = activity.blobSaver()
+        val originalExecutor: ExecutorService = ReflectionHelpers.getField(saver, "io")
+        originalExecutor.shutdown()
+        var bridgeInstalledAtShutdown: Boolean? = null
+        ReflectionHelpers.setField(
+            saver,
+            "io",
+            RecordingShutdownExecutor {
+                bridgeInstalledAtShutdown =
+                    ReflectionHelpers.getField(activity, "bridgeTransportInstalled")
+            },
+        )
+        ReflectionHelpers.setField(activity, "bridgeTransportInstalled", true)
+
+        controller.destroy()
+
+        assertEquals(false, bridgeInstalledAtShutdown)
     }
 
     @Test
@@ -849,6 +962,14 @@ class MainActivityTest {
     private fun MainActivity.loginManager(): OidcLoginManager =
         ReflectionHelpers.getField(this, "loginManager")
 
+    private fun MainActivity.notifications(): NativeNotificationManager =
+        ReflectionHelpers.getField(this, "notifications")
+
+    private fun MainActivity.blobSaver(): BlobSaver = ReflectionHelpers.getField(this, "blobSaver")
+
+    private fun MainActivity.pendingNavigatePath(): String? =
+        ReflectionHelpers.getField(this, "pendingNavigatePath")
+
     private fun MainActivity.notificationManager(): ShadowNotificationManager =
         shadowOf(getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
 
@@ -870,6 +991,14 @@ class MainActivityTest {
             this,
             "onPageReady",
             ClassParameter.from(String::class.java, url),
+        )
+    }
+
+    private fun MainActivity.invokeOnNewIntent(intent: Intent) {
+        ReflectionHelpers.callInstanceMethod<Unit>(
+            this,
+            "onNewIntent",
+            ClassParameter.from(Intent::class.java, intent),
         )
     }
 
@@ -916,6 +1045,17 @@ class MainActivityTest {
         "https://idp.example.com/oidc/oauth2/v2.0/authorize?response_type=code" +
             "&redirect_uri=" + Uri.encode("$origin/.auth/callback")
 
+    private fun notificationIntent(
+        path: String,
+        origin: String?,
+    ): Intent =
+        Intent(ApplicationProvider.getApplicationContext(), MainActivity::class.java).apply {
+            putExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH, path)
+            if (origin != null) {
+                putExtra(NativeNotificationManager.EXTRA_NOTIFICATION_ORIGIN, origin)
+            }
+        }
+
     private class RejectingCookieManager : RoboCookieManager() {
         override fun setCookie(
             url: String,
@@ -941,6 +1081,36 @@ class MainActivityTest {
         const val SECOND_BROWSER_ACTIVITY = "org.example.browser.BrowserActivity"
         const val DEEP_LINK_PACKAGE = "com.example.deep-link"
         const val DEEP_LINK_ACTIVITY = "com.example.deep-link.DeepLinkActivity"
+    }
+}
+
+private class RecordingShutdownExecutor(
+    private val onShutdown: () -> Unit,
+) : AbstractExecutorService() {
+    private var shutDown = false
+
+    override fun shutdown() {
+        onShutdown()
+        shutDown = true
+    }
+
+    override fun shutdownNow(): MutableList<Runnable> {
+        shutdown()
+        return mutableListOf()
+    }
+
+    override fun isShutdown(): Boolean = shutDown
+
+    override fun isTerminated(): Boolean = shutDown
+
+    override fun awaitTermination(
+        timeout: Long,
+        unit: TimeUnit,
+    ): Boolean = shutDown
+
+    override fun execute(command: Runnable) {
+        if (shutDown) throw RejectedExecutionException()
+        command.run()
     }
 }
 
