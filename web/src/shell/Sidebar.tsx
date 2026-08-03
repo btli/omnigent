@@ -217,12 +217,17 @@ export function useRowSwipe({
   // `target` holds the element we called setPointerCapture on, so reset() can
   // release it (capture lives on the translating row surface; a leak would
   // interfere with adjacent rows and the dnd-kit handoff).
+  // `offset` mirrors the rendered `dx` but updates synchronously, so release
+  // commits on where the finger actually ended rather than on whatever render
+  // last landed — a fast flick can otherwise lift before React commits the
+  // final move, and the action would be decided from a stale offset.
   const state = useRef<{
     pointerId: number;
     startX: number;
     startY: number;
     decided: "swipe" | "other" | null;
     target: Element | null;
+    offset: number;
   } | null>(null);
 
   const reset = useCallback(() => {
@@ -240,12 +245,19 @@ export function useRowSwipe({
     (e: ReactPointerEvent) => {
       // Touch-only: pen/stylus/mouse never trigger a swipe.
       if (!enabled || e.pointerType !== "touch" || !e.isPrimary) return;
+      // The row's dialogs/menus are React children but render into portals, and
+      // React bubbles portal events up the component tree — so a drag inside the
+      // open delete dialog would otherwise start a swipe on the row behind it.
+      // Portal content is not a DOM descendant, so containment rejects it.
+      const target = e.target;
+      if (target instanceof Node && !e.currentTarget.contains(target)) return;
       state.current = {
         pointerId: e.pointerId,
         startX: e.clientX,
         startY: e.clientY,
         decided: null,
         target: null,
+        offset: 0,
       };
     },
     [enabled],
@@ -258,6 +270,7 @@ export function useRowSwipe({
       // Once dnd-kit takes over (long-press drag), the swipe yields entirely.
       if (isDragging) {
         s.decided = "other";
+        s.offset = 0;
         setDx(0);
         return;
       }
@@ -283,6 +296,7 @@ export function useRowSwipe({
       }
       e.preventDefault();
       const clamped = Math.max(-SWIPE_MAX_PX, Math.min(SWIPE_MAX_PX, deltaX));
+      s.offset = clamped;
       setDx(clamped);
     },
     [actions.left, actions.right, isDragging],
@@ -292,12 +306,14 @@ export function useRowSwipe({
     (e: ReactPointerEvent) => {
       const s = state.current;
       if (!s || s.pointerId !== e.pointerId) return;
-      const committed = s.decided === "swipe" && Math.abs(dx) >= SWIPE_COMMIT_PX;
-      const action = dx < 0 ? actions.left : actions.right;
+      // Commit off the synchronous offset, not the rendered `dx`.
+      const offset = s.offset;
+      const committed = s.decided === "swipe" && Math.abs(offset) >= SWIPE_COMMIT_PX;
+      const action = offset < 0 ? actions.left : actions.right;
       reset();
       if (committed && action !== "none") onAction(action);
     },
-    [actions.left, actions.right, dx, onAction, reset],
+    [actions.left, actions.right, onAction, reset],
   );
 
   return { dx, onPointerDown, onPointerMove, onPointerUp, onPointerCancel: reset };
@@ -3157,17 +3173,21 @@ function ConversationRow({
   // runArchive; swipe→delete opens the same confirm dialog the kebab uses
   // (never an immediate delete).
   const swipeActions = useSwipeActions();
-  const onSwipeAction = useCallback(
-    (action: Exclude<SwipeAction, "none">) => {
-      if (action === "archive") runArchive();
-      else setDeleteOpen(true);
-    },
-    // runArchive is a stable hoisted declaration; setDeleteOpen is a stable setter.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [],
-  );
+  // `runArchive` is re-created every render, so an empty-dep useCallback would
+  // capture a stale one. Keep the latest in a ref and hand the hook a stable
+  // wrapper: the callback identity never changes, but it always calls current
+  // code when the gesture releases.
+  const swipeActionRef = useRef<(action: Exclude<SwipeAction, "none">) => void>(() => {});
+  swipeActionRef.current = (action: Exclude<SwipeAction, "none">) => {
+    if (action === "archive") runArchive();
+    else setDeleteOpen(true);
+  };
+  const onSwipeAction = useCallback((action: Exclude<SwipeAction, "none">) => {
+    swipeActionRef.current(action);
+  }, []);
+  const swipeEnabled = isMobile && !selectionMode && isOwner && !isEditing;
   const swipe = useRowSwipe({
-    enabled: isMobile && !selectionMode && isOwner && !isEditing,
+    enabled: swipeEnabled,
     actions: swipeActions,
     isDragging,
     onAction: onSwipeAction,
@@ -3389,12 +3409,22 @@ function ConversationRow({
       onPointerMove={swipe.onPointerMove}
       onPointerUp={swipe.onPointerUp}
       onPointerCancel={swipe.onPointerCancel}
-      className={cn("group relative", isDragging && "opacity-40")}
+      className={cn(
+        "group relative",
+        isDragging && "opacity-40",
+        // Keep vertical scrolling native while claiming the horizontal axis for
+        // the swipe: without this the browser can take the horizontal pan (or
+        // back-navigation gesture) and cancel the gesture mid-drag. Only where
+        // a swipe can actually fire, so rows without one keep default behavior.
+        swipeEnabled && "touch-pan-y",
+      )}
     >
       {/* Swipe reveal hint: sits behind the moving surface, showing the
           configured action's icon on the side being revealed. Inert (no pointer
           events) and only rendered mid-swipe, so at rest the row markup is
-          exactly what it was before the gesture existed. */}
+          exactly what it was before the gesture existed. Passing the commit
+          threshold scales the glyph up as well as tinting it, so the "will
+          fire on release" state isn't carried by color alone. */}
       {isSwiping && (
         <div
           aria-hidden
@@ -3409,11 +3439,18 @@ function ConversationRow({
               : "text-muted-foreground",
           )}
         >
-          {swipingAction === "delete" ? (
-            <Trash2Icon className="size-4" />
-          ) : (
-            <ArchiveIcon className="size-4" />
-          )}
+          <span
+            className={cn(
+              "flex items-center transition-transform",
+              swipeCommitted ? "scale-125" : "scale-100",
+            )}
+          >
+            {swipingAction === "delete" ? (
+              <Trash2Icon className="size-4" />
+            ) : (
+              <ArchiveIcon className="size-4" />
+            )}
+          </span>
         </div>
       )}
       {/* Moving surface: the WHOLE row — link, session-state badge, and the
@@ -3425,8 +3462,11 @@ function ConversationRow({
           when the gesture ends (dx → 0). */}
       <div
         className={cn(
-          "relative transition-transform duration-200",
+          "relative",
           isSwiping && "rounded-[var(--radius-otto-sm)] bg-sidebar",
+          // Transition only at rest, so the row eases back when the gesture
+          // ends but tracks the finger 1:1 while swiping.
+          swipe.dx === 0 && "transition-transform duration-200",
         )}
         style={swipe.dx !== 0 ? { transform: `translateX(${swipe.dx}px)` } : undefined}
       >
