@@ -65,6 +65,7 @@ class MainActivity : AppCompatActivity() {
     // Bridge-dependent work deferred until the page (and its injected emit
     // callbacks) exist — see onPageReady.
     private var pendingNavigatePath: String? = null
+    private var pendingNavigateOrigin: String? = null
     private var lastInsets: Insets? = null
     private var pageLoaded = false
     private var bridgeTransportInstalled = false
@@ -142,8 +143,18 @@ class MainActivity : AppCompatActivity() {
 
         // Consume the launch intent even when saved state already owns a tap.
         val launchedNavigatePath = takeNavigatePathOf(intent)
-        pendingNavigatePath =
-            savedInstanceState?.getString(PENDING_NAVIGATE_PATH_KEY) ?: launchedNavigatePath
+        if (savedInstanceState == null) {
+            pendingNavigatePath = launchedNavigatePath
+            pendingNavigateOrigin = pinnedOrigin.takeIf { launchedNavigatePath != null }
+        } else {
+            val restoredPath = savedInstanceState.getString(PENDING_NAVIGATE_PATH_KEY)
+            val restoredOrigin = savedInstanceState.getString(PENDING_NAVIGATE_ORIGIN_KEY)
+            pendingNavigatePath =
+                restoredPath?.takeIf {
+                    it.startsWith("/") && restoredOrigin == pinnedOrigin
+                }
+            pendingNavigateOrigin = restoredOrigin.takeIf { pendingNavigatePath != null }
+        }
 
         if (BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true) // chrome://inspect
 
@@ -323,7 +334,12 @@ class MainActivity : AppCompatActivity() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putInt(RENDERER_RECREATION_ATTEMPTS_KEY, rendererRecreationAttempts)
-        pendingNavigatePath?.let { outState.putString(PENDING_NAVIGATE_PATH_KEY, it) }
+        pendingNavigatePath?.let { path ->
+            pendingNavigateOrigin?.let { origin ->
+                outState.putString(PENDING_NAVIGATE_PATH_KEY, path)
+                outState.putString(PENDING_NAVIGATE_ORIGIN_KEY, origin)
+            }
+        }
         super.onSaveInstanceState(outState)
     }
 
@@ -609,15 +625,21 @@ class MainActivity : AppCompatActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        setIntent(intent)
         val store = ServerStore(this)
         val newServerUrl = store.currentServerUrl()
         val newOrigin = originOf(newServerUrl)
+        val activationOrigin = newOrigin ?: pinnedOrigin
+        val deliveredNavigatePath = takeNavigatePathOf(intent, activationOrigin)
         if (webViewUnusable) {
             if (newOrigin != null && newOrigin != pinnedOrigin) {
                 loginManager.cancel()
                 notifications.cancelAll()
                 pendingNavigatePath = null
+                pendingNavigateOrigin = null
+            }
+            if (deliveredNavigatePath != null) {
+                pendingNavigatePath = deliveredNavigatePath
+                pendingNavigateOrigin = activationOrigin
             }
             recreate()
             return
@@ -631,8 +653,9 @@ class MainActivity : AppCompatActivity() {
             reloadWithNewServer(newServerUrl, newOrigin)
         }
 
-        val path = takeNavigatePathOf(intent) ?: return
-        pendingNavigatePath = path
+        if (deliveredNavigatePath == null) return
+        pendingNavigatePath = deliveredNavigatePath
+        pendingNavigateOrigin = activationOrigin
         // Replay now if the page is up; otherwise onPageReady will flush it.
         if (pageLoaded) flushPendingActivation()
     }
@@ -652,6 +675,7 @@ class MainActivity : AppCompatActivity() {
                 loginManager.cancel()
                 notifications.cancelAll()
                 pendingNavigatePath = null
+                pendingNavigateOrigin = null
             }
             recreate()
             return
@@ -665,6 +689,7 @@ class MainActivity : AppCompatActivity() {
         shellWebViewClient.stopLoadingAndLedger(webView)
         notifications.cancelAll()
         pendingNavigatePath = null
+        pendingNavigateOrigin = null
         pinnedOrigin = newOrigin
         loginAttachment?.let(loginManager::detach)
         loginAttachment = loginManager.attach(newOrigin, ::onLoginResult)
@@ -946,14 +971,18 @@ class MainActivity : AppCompatActivity() {
         if (originOf(webView.url) != pinnedOrigin) return
         emitNotificationActivation(pendingNavigatePath)
         pendingNavigatePath = null
+        pendingNavigateOrigin = null
     }
 
-    private fun takeNavigatePathOf(intent: Intent?): String? {
+    private fun takeNavigatePathOf(
+        intent: Intent?,
+        expectedOrigin: String? = pinnedOrigin,
+    ): String? {
         val path = intent?.getStringExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH)
         val origin = intent?.getStringExtra(NativeNotificationManager.EXTRA_NOTIFICATION_ORIGIN)
         intent?.removeExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH)
         intent?.removeExtra(NativeNotificationManager.EXTRA_NOTIFICATION_ORIGIN)
-        return path?.takeIf { it.startsWith("/") && origin == pinnedOrigin }
+        return path?.takeIf { it.startsWith("/") && origin == expectedOrigin }
     }
 
     private fun emitNotificationActivation(path: String?) {
@@ -1129,6 +1158,7 @@ class MainActivity : AppCompatActivity() {
         const val MAX_WEBVIEW_RECREATIONS = 2
         const val RENDERER_RECREATION_ATTEMPTS_KEY = "rendererRecreationAttempts"
         const val PENDING_NAVIGATE_PATH_KEY = "pendingNavigatePath"
+        const val PENDING_NAVIGATE_ORIGIN_KEY = "pendingNavigateOrigin"
 
         // Back-press fallback: long enough that a healthy renderer's JS round-trip
         // (a few ms) always wins the race, short enough to not feel stuck if it

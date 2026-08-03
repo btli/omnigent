@@ -10,6 +10,7 @@ import android.content.pm.ActivityInfo
 import android.content.pm.ResolveInfo
 import android.content.res.Configuration
 import android.net.Uri
+import android.os.Bundle
 import android.view.View
 import android.webkit.CookieManager
 import android.webkit.RenderProcessGoneDetail
@@ -782,6 +783,75 @@ class MainActivityTest {
         idleMainLooper()
 
         assertNull(controller.get().pendingNavigatePath())
+    }
+
+    @Test
+    fun `restored notification activation takes precedence over the launch intent`() {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        ServerStore(context).connect(PINNED_ORIGIN)
+        val savedState =
+            Bundle().apply {
+                putString("pendingNavigatePath", "/c/restored")
+                putString("pendingNavigateOrigin", PINNED_ORIGIN)
+            }
+        val launchIntent = notificationIntent("/c/launch", PINNED_ORIGIN)
+
+        val activity =
+            Robolectric
+                .buildActivity(MainActivity::class.java, launchIntent)
+                .setup(savedState)
+                .get()
+
+        assertEquals("/c/restored", activity.pendingNavigatePath())
+    }
+
+    @Test
+    fun `saved state without an activation does not replay the launch intent`() {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        ServerStore(context).connect(PINNED_ORIGIN)
+        val launchIntent = notificationIntent("/c/already-handled", PINNED_ORIGIN)
+
+        val activity =
+            Robolectric
+                .buildActivity(MainActivity::class.java, launchIntent)
+                .setup(Bundle())
+                .get()
+
+        assertNull(activity.pendingNavigatePath())
+    }
+
+    @Test
+    fun `restored notification activation is dropped after the pinned origin changes`() {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        ServerStore(context).connect(NEW_SERVER_URL)
+        val savedState =
+            Bundle().apply {
+                putString("pendingNavigatePath", "/c/old-server")
+                putString("pendingNavigateOrigin", PINNED_ORIGIN)
+            }
+
+        val activity =
+            Robolectric
+                .buildActivity(MainActivity::class.java)
+                .setup(savedState)
+                .get()
+
+        assertNull(activity.pendingNavigatePath())
+    }
+
+    @Test
+    fun `fresh notification intent survives recreation of an unusable WebView`() {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        ServerStore(context).connect(PINNED_ORIGIN)
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val firstActivity = controller.get()
+        ReflectionHelpers.setField(firstActivity, "webViewUnusable", true)
+
+        firstActivity.invokeOnNewIntent(notificationIntent("/c/fresh", PINNED_ORIGIN))
+        idleMainLooper()
+
+        assertTrue(firstActivity.isDestroyed)
+        assertEquals("/c/fresh", controller.get().pendingNavigatePath())
     }
 
     @Test
