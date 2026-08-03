@@ -95,6 +95,7 @@ class MainActivityTest {
         idleMainLooper()
         val thirdActivity = controller.get()
         val thirdWebView = thirdActivity.webView()
+        val thirdAttachment = checkNotNull(thirdActivity.loginAttachment())
 
         assertTrue(secondActivity.isDestroyed)
         assertNotSame(secondActivity, thirdActivity)
@@ -115,6 +116,9 @@ class MainActivityTest {
         assertTrue(shadowOf(dialog).title != thirdActivity.getString(R.string.login_failed_title))
         assertNull(thirdActivity.loginFailedDialog())
         assertTrue(thirdActivity.webViewUnusable())
+        assertNull(thirdActivity.loginAttachment())
+        assertNull(thirdAttachment.callback)
+        assertFalse(thirdActivity.loginManager().hasAttachmentForTest())
         assertNull(thirdWebView.parent)
         assertTrue(shadowOf(thirdWebView).wasDestroyCalled())
 
@@ -176,6 +180,82 @@ class MainActivityTest {
         assertTrue(activity.isDestroyed)
         assertNotSame(activity, recreatedActivity)
         assertEquals(NEW_SERVER_URL, shadowOf(recreatedActivity.webView()).lastLoadedUrl)
+    }
+
+    @Test
+    fun `direct server switch tears down login and notifications after renderer exhaustion`() {
+        ShadowNotificationManager.reset()
+        val store = ServerStore(ApplicationProvider.getApplicationContext())
+        store.connect(PINNED_ORIGIN)
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        val (loginManager, releaseWorker) = activity.startBlockedLogin()
+
+        try {
+            activity.notifications().setBadgeCount(2, navigatePath = "/inbox")
+            activity.notifications().notify("done", null, "/c/old")
+            ReflectionHelpers.setField(activity, "rendererRecreationAttempts", 2)
+            assertTrue(
+                activity.shellWebViewClient().onRenderProcessGone(
+                    activity.webView(),
+                    renderProcessGoneDetail(),
+                ),
+            )
+            idleMainLooper()
+            assertTrue(loginManager.isInFlightForTest())
+            assertEquals(2, activity.notificationManager().allNotifications.size)
+            ReflectionHelpers.setField(activity, "pendingNavigatePath", "/c/old")
+            store.connect(NEW_SERVER_URL)
+
+            activity.reloadWithNewServer(NEW_SERVER_URL, NEW_ORIGIN)
+            idleMainLooper()
+
+            assertFalse(loginManager.isInFlightForTest())
+            assertTrue(activity.notificationManager().allNotifications.isEmpty())
+            assertTrue(activity.isDestroyed)
+            assertNull(controller.get().pendingNavigatePath())
+            assertEquals(NEW_SERVER_URL, shadowOf(controller.get().webView()).lastLoadedUrl)
+        } finally {
+            releaseWorker.countDown()
+        }
+    }
+
+    @Test
+    fun `new intent server switch tears down login and notifications after renderer exhaustion`() {
+        ShadowNotificationManager.reset()
+        val store = ServerStore(ApplicationProvider.getApplicationContext())
+        store.connect(PINNED_ORIGIN)
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        val (loginManager, releaseWorker) = activity.startBlockedLogin()
+
+        try {
+            activity.notifications().setBadgeCount(2, navigatePath = "/inbox")
+            activity.notifications().notify("done", null, "/c/old")
+            ReflectionHelpers.setField(activity, "rendererRecreationAttempts", 2)
+            assertTrue(
+                activity.shellWebViewClient().onRenderProcessGone(
+                    activity.webView(),
+                    renderProcessGoneDetail(),
+                ),
+            )
+            idleMainLooper()
+            assertTrue(loginManager.isInFlightForTest())
+            assertEquals(2, activity.notificationManager().allNotifications.size)
+            ReflectionHelpers.setField(activity, "pendingNavigatePath", "/c/old")
+            store.connect(NEW_SERVER_URL)
+
+            activity.invokeOnNewIntent(Intent(activity, MainActivity::class.java))
+            idleMainLooper()
+
+            assertFalse(loginManager.isInFlightForTest())
+            assertTrue(activity.notificationManager().allNotifications.isEmpty())
+            assertTrue(activity.isDestroyed)
+            assertNull(controller.get().pendingNavigatePath())
+            assertEquals(NEW_SERVER_URL, shadowOf(controller.get().webView()).lastLoadedUrl)
+        } finally {
+            releaseWorker.countDown()
+        }
     }
 
     @Test
@@ -649,7 +729,7 @@ class MainActivityTest {
     }
 
     @Test
-    fun `cold start notification activation is consumed before recreate`() {
+    fun `cold start pending notification activation survives recreate`() {
         val context: Context = ApplicationProvider.getApplicationContext()
         ServerStore(context).connect(PINNED_ORIGIN)
         val intent = notificationIntent("/c/cold", PINNED_ORIGIN)
@@ -661,11 +741,11 @@ class MainActivityTest {
         firstActivity.recreate()
         idleMainLooper()
 
-        assertNull(controller.get().pendingNavigatePath())
+        assertEquals("/c/cold", controller.get().pendingNavigatePath())
     }
 
     @Test
-    fun `new intent notification activation is consumed before recreate`() {
+    fun `new intent pending notification activation survives recreate`() {
         ServerStore(ApplicationProvider.getApplicationContext()).connect(PINNED_ORIGIN)
         val activityController = Robolectric.buildActivity(MainActivity::class.java).setup()
         val firstActivity = activityController.get()
@@ -679,7 +759,29 @@ class MainActivityTest {
         firstActivity.recreate()
         idleMainLooper()
 
-        assertNull(activityController.get().pendingNavigatePath())
+        assertEquals("/c/warm", activityController.get().pendingNavigatePath())
+    }
+
+    @Test
+    fun `handled notification activation is not replayed after recreate`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect(PINNED_ORIGIN)
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val firstActivity = controller.get()
+        val intent = notificationIntent("/c/handled", PINNED_ORIGIN)
+        firstActivity.invokeOnPageReady(PINNED_ORIGIN)
+
+        firstActivity.invokeOnNewIntent(intent)
+
+        assertNull(firstActivity.pendingNavigatePath())
+        assertTrue(
+            checkNotNull(shadowOf(firstActivity.webView()).lastEvaluatedJavascript)
+                .contains("/c/handled"),
+        )
+        assertFalse(firstActivity.intent.hasExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH))
+        firstActivity.recreate()
+        idleMainLooper()
+
+        assertNull(controller.get().pendingNavigatePath())
     }
 
     @Test
@@ -782,8 +884,7 @@ class MainActivityTest {
             activity.finish()
             controller.destroy()
 
-            // Otherwise the flow polls on unattached, and its eventual timeout is
-            // held and replayed as a sign-in failure on the next launch.
+            // Finishing abandons process-scoped work instead of polling after exit.
             assertFalse(loginManager.isInFlightForTest())
             assertFalse(loginManager.hasHeldResultForTest())
         } finally {
@@ -1328,6 +1429,20 @@ class MainActivityTest {
         )
     }
 
+    private fun MainActivity.startBlockedLogin(): Pair<OidcLoginManager, CountDownLatch> {
+        val manager = loginManager()
+        val executor: ExecutorService = ReflectionHelpers.getField(manager, "io")
+        val workerStarted = CountDownLatch(1)
+        val releaseWorker = CountDownLatch(1)
+        executor.execute {
+            workerStarted.countDown()
+            runCatching { releaseWorker.await() }
+        }
+        assertTrue(workerStarted.await(5, TimeUnit.SECONDS))
+        assertTrue(manager.start(this, PINNED_ORIGIN))
+        return manager to releaseWorker
+    }
+
     private fun MainActivity.switchButton(): View = ReflectionHelpers.getField(this, "switchButton")
 
     private fun MainActivity.webView(): WebView = ReflectionHelpers.getField(this, "webView")
@@ -1440,7 +1555,6 @@ private data class RecordedDownload(
 
 private class RecordingPinnedOriginDownloader : PinnedOriginDownloadHandler {
     val downloads = mutableListOf<RecordedDownload>()
-    var shutDown = false
 
     override fun download(
         url: String,
@@ -1452,9 +1566,7 @@ private class RecordingPinnedOriginDownloader : PinnedOriginDownloadHandler {
         downloads += RecordedDownload(url, pinnedOrigin, userAgent, mimeType, suggestedName)
     }
 
-    override fun shutdown() {
-        shutDown = true
-    }
+    override fun shutdown() = Unit
 }
 
 private class RecordingShutdownExecutor(

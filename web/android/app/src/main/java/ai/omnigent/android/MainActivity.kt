@@ -140,8 +140,10 @@ class MainActivity : AppCompatActivity() {
         blobSaver = BlobSaver(applicationContext)
         pinnedOriginDownloader = PinnedOriginDownloader(applicationContext)
 
-        // Capture (don't replay yet) a notification tap that cold-started us.
-        pendingNavigatePath = takeNavigatePathOf(intent)
+        // Consume the launch intent even when saved state already owns a tap.
+        val launchedNavigatePath = takeNavigatePathOf(intent)
+        pendingNavigatePath =
+            savedInstanceState?.getString(PENDING_NAVIGATE_PATH_KEY) ?: launchedNavigatePath
 
         if (BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true) // chrome://inspect
 
@@ -321,6 +323,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putInt(RENDERER_RECREATION_ATTEMPTS_KEY, rendererRecreationAttempts)
+        pendingNavigatePath?.let { outState.putString(PENDING_NAVIGATE_PATH_KEY, it) }
         super.onSaveInstanceState(outState)
     }
 
@@ -343,6 +346,7 @@ class MainActivity : AppCompatActivity() {
                 OmnigentBridgeListener(
                     notifications = notifications,
                     blobSaver = blobSaver,
+                    pinnedOrigin = { pinnedOrigin },
                 ),
             )
         } catch (_: IllegalArgumentException) {
@@ -582,8 +586,7 @@ class MainActivity : AppCompatActivity() {
         pendingMicRequest?.deny()
         pendingMicRequest = null
         // Leaving for good abandons the flow; a recreation keeps it polling so a
-        // login finished in the browser still lands. Without this an exit mid-login
-        // holds the eventual timeout and replays it as a failure on the next launch.
+        // successful login finished in the browser still lands.
         if (isFinishing) loginManager.cancel()
         loginAttachment?.let(loginManager::detach)
         loginAttachment = null
@@ -607,7 +610,15 @@ class MainActivity : AppCompatActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        val store = ServerStore(this)
+        val newServerUrl = store.currentServerUrl()
+        val newOrigin = originOf(newServerUrl)
         if (webViewUnusable) {
+            if (newOrigin != null && newOrigin != pinnedOrigin) {
+                loginManager.cancel()
+                notifications.cancelAll()
+                pendingNavigatePath = null
+            }
             recreate()
             return
         }
@@ -616,9 +627,6 @@ class MainActivity : AppCompatActivity() {
         // CLEAR_TOP|SINGLE_TOP after the user picks a different server. The
         // bridge is origin-allowlisted, so a server switch without re-registering
         // leaves the bridge dead for the new origin.
-        val store = ServerStore(this)
-        val newServerUrl = store.currentServerUrl()
-        val newOrigin = originOf(newServerUrl)
         if (newOrigin != null && newOrigin != pinnedOrigin) {
             reloadWithNewServer(newServerUrl, newOrigin)
         }
@@ -640,6 +648,11 @@ class MainActivity : AppCompatActivity() {
         newOrigin: String,
     ) {
         if (webViewUnusable) {
+            if (newOrigin != pinnedOrigin) {
+                loginManager.cancel()
+                notifications.cancelAll()
+                pendingNavigatePath = null
+            }
             recreate()
             return
         }
@@ -684,6 +697,8 @@ class MainActivity : AppCompatActivity() {
         pendingFileCallback = null
         pendingMicRequest?.deny()
         pendingMicRequest = null
+        loginAttachment?.let(loginManager::detach)
+        loginAttachment = null
         removeBridge()
         (webView.parent as? ViewGroup)?.removeView(webView)
         webView.destroy()
@@ -1113,6 +1128,7 @@ class MainActivity : AppCompatActivity() {
         const val MAX_LOGIN_ATTEMPTS = 3
         const val MAX_WEBVIEW_RECREATIONS = 2
         const val RENDERER_RECREATION_ATTEMPTS_KEY = "rendererRecreationAttempts"
+        const val PENDING_NAVIGATE_PATH_KEY = "pendingNavigatePath"
 
         // Back-press fallback: long enough that a healthy renderer's JS round-trip
         // (a few ms) always wins the race, short enough to not feel stuck if it

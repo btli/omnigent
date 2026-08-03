@@ -3,6 +3,7 @@ package ai.omnigent.android
 import android.app.Application
 import android.app.NotificationManager
 import android.content.Context
+import android.net.Uri
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
@@ -24,7 +25,9 @@ import org.robolectric.shadows.ShadowNotificationManager
 class OmnigentBridgeListenerTest {
     private lateinit var context: Application
     private lateinit var listener: OmnigentBridgeListener
+    private lateinit var notifications: NativeNotificationManager
     private lateinit var shadow: ShadowNotificationManager
+    private var pinnedOrigin = ORIGIN
 
     private val badgeId = 1
 
@@ -32,10 +35,13 @@ class OmnigentBridgeListenerTest {
     fun setUp() {
         AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM)
         context = ApplicationProvider.getApplicationContext()
+        pinnedOrigin = ORIGIN
+        notifications = NativeNotificationManager(context, ORIGIN)
         listener =
             OmnigentBridgeListener(
-                notifications = NativeNotificationManager(context, "https://example.com"),
+                notifications = notifications,
                 blobSaver = BlobSaver(context),
+                pinnedOrigin = { pinnedOrigin },
             )
         shadow =
             shadowOf(
@@ -126,10 +132,29 @@ class OmnigentBridgeListenerTest {
     }
 
     @Test
+    fun `queued message from the previous origin is dropped after a server switch`() {
+        pinnedOrigin = NEW_ORIGIN
+        notifications.setOrigin(NEW_ORIGIN)
+
+        listener.handle(
+            """{"method":"notify","params":{"title":"stale","navigatePath":"/c/a"}}""",
+            Uri.parse(ORIGIN),
+            true,
+        )
+
+        assertEquals(0, shadow.allNotifications.size)
+    }
+
+    @Test
     fun `malformed and unknown messages are dropped without crashing`() {
         listener.handle("not json at all")
         listener.handle("""{"method":"unknownThing","count":5}""")
         listener.handle("""{"count":5}""")
         assertEquals(0, shadow.allNotifications.size)
+    }
+
+    private companion object {
+        const val ORIGIN = "https://example.com"
+        const val NEW_ORIGIN = "https://new.example.com"
     }
 }
