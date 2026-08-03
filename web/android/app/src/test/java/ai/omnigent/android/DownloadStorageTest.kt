@@ -17,6 +17,7 @@ import androidx.test.core.app.ApplicationProvider
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -191,6 +192,51 @@ class DownloadStorageTest {
             provider.insertedUri.toString(),
             journal.getString(operationKey("op-$cap"), null),
         )
+        // Eviction must drop the seq sibling with the entry, or orphaned seq
+        // Longs accumulate forever — cap ops, cap seqs, one counter.
+        assertFalse(journal.contains("seq." + operationKey("op-0")))
+        assertEquals(cap * 2 + 1, journal.all.size)
+    }
+
+    @Test
+    fun `journal eviction spares a live operation`() {
+        val storage = DownloadStorage(context)
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val executor = Executors.newSingleThreadExecutor()
+
+        try {
+            val live =
+                executor.submit<DownloadSaveResult> {
+                    storage.save("live.txt", "text/plain", operationId = "live-op") { stream ->
+                        stream.write(byteArrayOf(1))
+                        entered.countDown()
+                        check(release.await(5, TimeUnit.SECONDS))
+                    }
+                }
+            assertTrue(entered.await(5, TimeUnit.SECONDS))
+
+            (1..64).forEach { index ->
+                val saved =
+                    storage.save(
+                        "evict-live-$index.txt",
+                        "text/plain",
+                        operationId = "later-$index",
+                    ) { stream -> stream.write(byteArrayOf(1)) }
+                assertTrue(saved.saved)
+            }
+
+            // The in-flight operation outlasts 64 younger entries; eviction takes
+            // the oldest completed one instead.
+            val journal = mediaStoreJournal()
+            assertNotNull(journal.getString(operationKey("live-op"), null))
+            assertNull(journal.getString(operationKey("later-1"), null))
+            release.countDown()
+            assertTrue(live.get(5, TimeUnit.SECONDS).saved)
+        } finally {
+            release.countDown()
+            executor.shutdownNow()
+        }
     }
 
     @Test

@@ -86,39 +86,47 @@ internal class DownloadStorage(context: Context) {
         write: (OutputStream) -> Unit,
     ): Boolean {
         val resolver = context.contentResolver
+        val journalKey = operationKey(operationId)
         val destination =
             synchronized(MEDIA_STORE_LOCK) {
                 sweepOrphanedMediaStoreRows()
+                // A live operation's entry must not be evicted while it writes:
+                // the next save's sweep would delete the row under the writer.
                 mediaStoreDestination(operationId, name, mimeType)
+                    ?.also { if (!it.published) ACTIVE_MEDIA_OPERATIONS += journalKey }
             } ?: return false
         if (destination.published) return true
-        val uri = destination.uri
-        if (shouldAbort()) return false
+        try {
+            val uri = destination.uri
+            if (shouldAbort()) return false
 
-        val wrote =
-            runCatching {
-                val output = resolver.openOutputStream(uri) ?: error("No output stream")
-                output.use(write)
-            }.isSuccess
-        if (!wrote) {
-            deleteMediaStoreDestination(operationId, uri)
-            return false
-        }
-        if (shouldAbort()) {
-            deleteMediaStoreDestination(operationId, uri)
-            return false
-        }
+            val wrote =
+                runCatching {
+                    val output = resolver.openOutputStream(uri) ?: error("No output stream")
+                    output.use(write)
+                }.isSuccess
+            if (!wrote) {
+                deleteMediaStoreDestination(operationId, uri)
+                return false
+            }
+            if (shouldAbort()) {
+                deleteMediaStoreDestination(operationId, uri)
+                return false
+            }
 
-        val publishValues = ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }
-        val published =
-            runCatching {
-                resolver.update(uri, publishValues, null, null) > 0
-            }.getOrDefault(false)
-        if (!published || shouldAbort()) {
-            deleteMediaStoreDestination(operationId, uri)
-            return false
+            val publishValues = ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }
+            val published =
+                runCatching {
+                    resolver.update(uri, publishValues, null, null) > 0
+                }.getOrDefault(false)
+            if (!published || shouldAbort()) {
+                deleteMediaStoreDestination(operationId, uri)
+                return false
+            }
+            return true
+        } finally {
+            synchronized(MEDIA_STORE_LOCK) { ACTIVE_MEDIA_OPERATIONS -= journalKey }
         }
-        return true
     }
 
     @RequiresApi(Build.VERSION_CODES.Q)
@@ -181,7 +189,7 @@ internal class DownloadStorage(context: Context) {
             entries.keys.filter { key -> key != KEY_JOURNAL_SEQ && !key.startsWith(SEQ_PREFIX) }
         if (operationKeys.size + 1 > MAX_JOURNAL_ENTRIES) {
             operationKeys
-                .filter { key -> key != journalKey }
+                .filter { key -> key != journalKey && key !in ACTIVE_MEDIA_OPERATIONS }
                 .sortedBy { key -> entries[SEQ_PREFIX + key] as? Long ?: 0L }
                 .take(operationKeys.size + 1 - MAX_JOURNAL_ENTRIES)
                 .forEach { key -> editor.remove(key).remove(SEQ_PREFIX + key) }
@@ -409,6 +417,7 @@ internal class DownloadStorage(context: Context) {
         private val MEDIA_STORE_LOCK = Any()
         private val TEMPORARY_LOCK = Any()
         private val ACTIVE_TEMPORARIES = mutableSetOf<String>()
+        private val ACTIVE_MEDIA_OPERATIONS = mutableSetOf<String>()
 
         private fun operationKey(operationId: String): String =
             MessageDigest
