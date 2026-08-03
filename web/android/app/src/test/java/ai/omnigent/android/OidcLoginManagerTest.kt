@@ -234,6 +234,30 @@ class OidcLoginManagerTest {
     }
 
     @Test
+    fun `cancel suppresses a result that completed before it`() {
+        server.createContext("/auth/cli-login") { exchange ->
+            exchange.respond(200, ticketBody())
+        }
+        server.createContext("/auth/cli-poll") { exchange ->
+            exchange.respond(200, tokenBody())
+        }
+        val manager = manager()
+        val delivered = AtomicInteger()
+
+        // The flow finishes and posts its result; the cancel lands before the
+        // main looper drains it, so the abandoned callback must never run.
+        assertTrue(manager.start(activity(), origin) { delivered.incrementAndGet() })
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (manager.isInFlightForTest() && System.nanoTime() < deadline) Thread.yield()
+        assertFalse(manager.isInFlightForTest())
+
+        manager.cancel()
+        ShadowLooper.idleMainLooper()
+
+        assertEquals(0, delivered.get())
+    }
+
+    @Test
     fun `cancel permits a new start and suppresses the abandoned callback`() {
         val loginAttempts = AtomicInteger()
         val firstPollCompleted = CountDownLatch(1)
