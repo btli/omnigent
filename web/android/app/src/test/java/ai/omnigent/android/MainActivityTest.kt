@@ -442,6 +442,23 @@ class MainActivityTest {
     }
 
     @Test
+    @Config(
+        sdk = [35],
+        shadows = [CountingOmnigentWebViewClientShadow::class, RecordingWebViewShadow::class],
+    )
+    fun `a server switch before the cookie callback cancels the reload`() {
+        val activity = activity()
+        activity.reloadWithNewServer(NEW_SERVER_URL, NEW_ORIGIN)
+        ActivityCallLog.clear()
+
+        // setCookie acknowledges asynchronously: a switch landing between the
+        // write and its callback must not reload the previous server.
+        activity.onSessionCookieSet(PINNED_ORIGIN, accepted = true)
+
+        assertTrue(ActivityCallLog.entries.none { it.startsWith("loadUrl:") })
+    }
+
+    @Test
     fun `rejection from the previous origin shows no failure surface`() {
         val activity = activity()
         activity.reloadWithNewServer(NEW_SERVER_URL, NEW_ORIGIN)

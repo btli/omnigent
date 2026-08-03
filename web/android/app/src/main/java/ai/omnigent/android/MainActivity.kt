@@ -475,20 +475,7 @@ class MainActivity : AppCompatActivity() {
         cookies.setAcceptCookie(true)
         authLog("onSessionToken: injecting $name (token len=${token.length})")
         cookies.setCookie(origin, cookie) { accepted ->
-            // setCookie's callback is async — re-check the WebView is still alive.
-            if (isDestroyed || !::webView.isInitialized) return@setCookie
-            authLog(
-                "setCookie accepted=$accepted present=${cookies
-                    .getCookie(
-                        origin,
-                    )?.contains(name) == true}",
-            )
-            // A rejected cookie means the reload would land unauthenticated,
-            // bounce to login, and re-launch the browser — burning the retry
-            // budget on a failure that retrying can't fix. Stay put instead.
-            if (!accepted) return@setCookie
-            cookies.flush()
-            webView.loadUrl(origin)
+            onSessionCookieSet(origin, accepted)
         }
         startActivity(
             Intent(this, MainActivity::class.java)
@@ -499,6 +486,26 @@ class MainActivity : AppCompatActivity() {
             body = getString(R.string.signed_in_body),
             navigatePath = "/",
         )
+    }
+
+    /**
+     * Finish a session injection once the cookie store acknowledges the write.
+     * The acknowledgement is asynchronous, so the host may have been torn down
+     * or switched servers in the meantime — either way, drop it.
+     */
+    internal fun onSessionCookieSet(
+        origin: String,
+        accepted: Boolean,
+    ) {
+        if (isDestroyed || !::webView.isInitialized) return
+        if (origin != pinnedOrigin) return
+        authLog("setCookie accepted=$accepted")
+        // A rejected cookie means the reload would land unauthenticated, bounce
+        // to login, and re-launch the browser — burning the retry budget on a
+        // failure that retrying can't fix. Stay put instead.
+        if (!accepted) return
+        CookieManager.getInstance().flush()
+        webView.loadUrl(origin)
     }
 
     /**
