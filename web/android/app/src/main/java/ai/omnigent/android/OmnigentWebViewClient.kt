@@ -35,6 +35,7 @@ class OmnigentWebViewClient(
     private val onProxyAuthFlowEnded: () -> Unit,
     private val clock: () -> Long = { SystemClock.elapsedRealtime() },
     private val onEmbeddedSignInUnsupported: () -> Unit,
+    private val onWebViewUnusable: () -> Unit,
 ) : WebViewClient() {
     private var proxyAuthState = ProxyAuthState.IDLE
     private var flowStartedAt = 0L
@@ -232,11 +233,11 @@ class OmnigentWebViewClient(
         view: WebView,
         detail: RenderProcessGoneDetail,
     ): Boolean {
-        val handled = super.onRenderProcessGone(view, detail)
         activeMainFrameUrl = null
         isLoading = false
         endProxyAuth()
-        return handled
+        onWebViewUnusable()
+        return true
     }
 
     /**

@@ -56,6 +56,7 @@ class MainActivity : AppCompatActivity() {
     private val loginManager = OidcLoginManager()
     private var pinnedOrigin: String? = null
     private var embeddedSignInDialog: AlertDialog? = null
+    private var loginFailedDialog: AlertDialog? = null
 
     // Bridge-dependent work deferred until the page (and its injected emit
     // callbacks) exist — see onPageReady.
@@ -153,6 +154,7 @@ class MainActivity : AppCompatActivity() {
                         // back stack once the next pinned page is ready.
                         onProxyAuthFlowEnded = { historyCleared = false },
                         onEmbeddedSignInUnsupported = ::showEmbeddedSignInUnsupported,
+                        onWebViewUnusable = ::handleWebViewUnusable,
                     )
                 webViewClient = shellWebViewClient
                 webChromeClient =
@@ -375,7 +377,7 @@ class MainActivity : AppCompatActivity() {
         // Count (and re-arm the history clear for) only a call that actually
         // launches a flow, so re-entrant redirects can't burn the retry budget
         // without ever relaunching and suppress a legitimate later retry.
-        if (!loginManager.start(this, origin, ::onLoginResult)) return
+        if (!loginManager.start(this, origin) { result -> onLoginResult(origin, result) }) return
         loginAttempts++
         // A re-login (session expired mid-use) bounces through the IdP again,
         // leaving a stopped off-origin entry + stale pre-expiry pages on the back
@@ -385,22 +387,52 @@ class MainActivity : AppCompatActivity() {
         historyCleared = false
     }
 
-    internal fun onLoginResult(result: LoginResult) {
+    internal fun onLoginResult(
+        origin: String,
+        result: LoginResult,
+    ) {
+        if (origin != pinnedOrigin) {
+            authLog("dropping login result from stale origin $origin")
+            return
+        }
+
         when (result) {
             is LoginResult.Success -> {
-                onSessionToken(result.token)
+                onSessionToken(origin, result.token)
             }
 
             LoginResult.Rejected, LoginResult.TimedOut -> {
-                val origin = pinnedOrigin ?: return
-                Toast
-                    .makeText(
-                        this,
-                        getString(R.string.login_failed_toast, hostLabelOf(origin)),
-                        Toast.LENGTH_LONG,
-                    ).show()
+                showLoginFailed(origin)
             }
         }
+    }
+
+    private fun showLoginFailed(origin: String) {
+        if (isFinishing || isDestroyed) return
+
+        val existingDialog = loginFailedDialog
+        if (existingDialog?.isShowing == true) {
+            existingDialog.setMessage(
+                getString(R.string.login_failed_body, hostLabelOf(origin)),
+            )
+            return
+        }
+
+        val dialog =
+            AlertDialog
+                .Builder(this)
+                .setTitle(R.string.login_failed_title)
+                .setMessage(getString(R.string.login_failed_body, hostLabelOf(origin)))
+                .setPositiveButton(R.string.login_failed_retry) { _, _ ->
+                    loginAttempts = 0
+                    startLogin()
+                }.setNegativeButton(R.string.proxy_auth_cancel, null)
+                .create()
+        loginFailedDialog = dialog
+        dialog.setOnDismissListener {
+            if (loginFailedDialog === dialog) loginFailedDialog = null
+        }
+        dialog.show()
     }
 
     /**
@@ -414,7 +446,10 @@ class MainActivity : AppCompatActivity() {
      * rules, so we both attempt a reorder-to-front (works within the grace
      * period) AND post a "tap to return" notification as the reliable path back.
      */
-    private fun onSessionToken(token: String) {
+    private fun onSessionToken(
+        origin: String,
+        token: String,
+    ) {
         // The poll can land after the activity is gone (it ran on a background
         // thread up to 5 min) — never touch a destroyed WebView.
         if (isDestroyed || isFinishing || !::webView.isInitialized) return
@@ -427,7 +462,6 @@ class MainActivity : AppCompatActivity() {
             authLog("onSessionToken: token not JWT-shaped — rejecting")
             return
         }
-        val origin = pinnedOrigin ?: return
         val secure = origin.startsWith("https://")
         // Matches the server's session_cookie_name: __Host- prefix on HTTPS.
         val name = if (secure) "__Host-ap_session" else "ap_session"
@@ -511,6 +545,8 @@ class MainActivity : AppCompatActivity() {
         pendingMicRequest?.deny()
         pendingMicRequest = null
         loginManager.shutdown()
+        loginFailedDialog?.dismiss()
+        loginFailedDialog = null
         if (::blobSaver.isInitialized) blobSaver.shutdown()
         if (::webView.isInitialized) {
             shellWebViewClient.endProxyAuth()
@@ -553,8 +589,10 @@ class MainActivity : AppCompatActivity() {
         newOrigin: String,
     ) {
         removeBridge()
-        dismissEmbeddedSignInDialogWithoutReset()
         shellWebViewClient.endProxyAuth()
+        dismissEmbeddedSignInDialogWithoutReset()
+        loginFailedDialog?.dismiss()
+        loginFailedDialog = null
         shellWebViewClient.stopLoadingAndLedger(webView)
         pinnedOrigin = newOrigin
         pageLoaded = false
@@ -563,6 +601,10 @@ class MainActivity : AppCompatActivity() {
         (switchButton as? TextView)?.text = hostLabelOf(serverUrl)
         installBridge()
         webView.loadUrl(serverUrl)
+    }
+
+    private fun handleWebViewUnusable() {
+        if (!isFinishing && !isDestroyed) recreate()
     }
 
     private fun removeBridge() {

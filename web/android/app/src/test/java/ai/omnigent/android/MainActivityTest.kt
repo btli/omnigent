@@ -7,13 +7,17 @@ import android.content.pm.ResolveInfo
 import android.content.res.Configuration
 import android.net.Uri
 import android.view.View
+import android.webkit.CookieManager
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -26,16 +30,41 @@ import org.robolectric.annotation.Implements
 import org.robolectric.annotation.RealObject
 import org.robolectric.shadow.api.Shadow
 import org.robolectric.shadows.ShadowAlertDialog
+import org.robolectric.shadows.ShadowCookieManager
 import org.robolectric.shadows.ShadowLooper.idleMainLooper
 import org.robolectric.shadows.ShadowPopupMenu
 import org.robolectric.shadows.ShadowToast
 import org.robolectric.shadows.ShadowWebView
 import org.robolectric.util.ReflectionHelpers
 import org.robolectric.util.ReflectionHelpers.ClassParameter
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.TimeUnit
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35], shadows = [CountingOmnigentWebViewClientShadow::class])
 class MainActivityTest {
+    @Test
+    fun `renderer crash recreates the activity and WebView`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect(PINNED_ORIGIN)
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        val oldWebView = activity.webView()
+
+        val handled =
+            activity.shellWebViewClient().onRenderProcessGone(
+                oldWebView,
+                renderProcessGoneDetail(),
+            )
+        idleMainLooper()
+
+        val recreatedActivity = controller.get()
+        assertTrue(handled)
+        assertTrue(activity.isDestroyed)
+        assertNotSame(activity, recreatedActivity)
+        assertNotSame(oldWebView, recreatedActivity.webView())
+    }
+
     @Test
     fun `webview leaves algorithmic darkening disabled`() {
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
@@ -280,6 +309,24 @@ class MainActivityTest {
     }
 
     @Test
+    fun `menu escape hatch dismisses refusal and resets exactly once`() {
+        val activity = activity()
+        activity.addBrowser(EXTERNAL_BROWSER_PACKAGE, EXTERNAL_BROWSER_ACTIVITY)
+        val dialog = activity.refuseEmbeddedSignIn()
+        ActivityCallLog.clear()
+
+        activity.selectOpenInBrowserMenuItem()
+        idleMainLooper()
+
+        assertFalse(dialog.isShowing)
+        assertNull(activity.embeddedSignInDialog())
+        assertEquals(ProxyAuthState.IDLE, activity.shellWebViewClient().proxyAuthState())
+        assertEquals(1, ActivityCallLog.endProxyAuthCalls)
+        val started = checkNotNull(shadowOf(activity).nextStartedActivity)
+        assertEquals(EXTERNAL_BROWSER_PACKAGE, started.component?.packageName)
+    }
+
+    @Test
     fun `menu escape hatch with no browsers shows a toast without a dialog`() {
         val activity = activity()
 
@@ -295,15 +342,113 @@ class MainActivityTest {
     }
 
     @Test
-    fun `rejected login shows generic failure and never the refusal dialog`() {
+    fun `rejected login shows generic retry dialog and never the refusal dialog`() {
         val activity = activity()
 
-        activity.onLoginResult(LoginResult.Rejected)
+        activity.onLoginResult(PINNED_ORIGIN, LoginResult.Rejected)
+        val dialog = checkNotNull(ShadowAlertDialog.getLatestAlertDialog())
+        val shadowDialog = shadowOf(dialog)
 
         assertEquals(
-            activity.getString(R.string.login_failed_toast, "example.com"),
-            ShadowToast.getTextOfLatestToast(),
+            activity.getString(R.string.login_failed_title),
+            shadowDialog.title,
         )
+        assertEquals(
+            activity.getString(R.string.login_failed_body, "example.com"),
+            shadowDialog.message,
+        )
+        assertTrue(shadowDialog.title != activity.getString(R.string.proxy_auth_refused_title))
+        assertEquals(
+            activity.getString(R.string.login_failed_retry),
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).text,
+        )
+        assertEquals(
+            activity.getString(R.string.proxy_auth_cancel),
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE).text,
+        )
+    }
+
+    @Test
+    fun `timed out login shows the generic retry dialog`() {
+        val activity = activity()
+
+        activity.onLoginResult(PINNED_ORIGIN, LoginResult.TimedOut)
+        val dialog = checkNotNull(ShadowAlertDialog.getLatestAlertDialog())
+
+        assertEquals(activity.getString(R.string.login_failed_title), shadowOf(dialog).title)
+        assertEquals(
+            activity.getString(R.string.login_failed_body, "example.com"),
+            shadowOf(dialog).message,
+        )
+    }
+
+    @Test
+    fun `repeated login failure reuses the generic dialog`() {
+        val activity = activity()
+        activity.onLoginResult(PINNED_ORIGIN, LoginResult.Rejected)
+        val firstDialog = checkNotNull(ShadowAlertDialog.getLatestAlertDialog())
+
+        activity.onLoginResult(PINNED_ORIGIN, LoginResult.TimedOut)
+
+        assertSame(firstDialog, ShadowAlertDialog.getLatestAlertDialog())
+        assertSame(firstDialog, activity.loginFailedDialog())
+        assertTrue(firstDialog.isShowing)
+    }
+
+    @Test
+    fun `retry resets the login budget and starts a fresh attempt`() {
+        val activity = activity()
+        val loginManager = activity.loginManager()
+        val executor: ExecutorService = ReflectionHelpers.getField(loginManager, "io")
+        val workerStarted = CountDownLatch(1)
+        val holdWorker = CountDownLatch(1)
+        executor.execute {
+            workerStarted.countDown()
+            runCatching { holdWorker.await() }
+        }
+        assertTrue(workerStarted.await(5, TimeUnit.SECONDS))
+
+        try {
+            ReflectionHelpers.setField(activity, "loginAttempts", 3)
+            activity.onLoginResult(PINNED_ORIGIN, LoginResult.Rejected)
+            val dialog = checkNotNull(ShadowAlertDialog.getLatestAlertDialog())
+
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).performClick()
+            idleMainLooper()
+
+            assertEquals(1, activity.loginAttempts())
+        } finally {
+            loginManager.shutdown()
+            holdWorker.countDown()
+        }
+    }
+
+    @Test
+    @Config(
+        sdk = [35],
+        shadows = [CountingOmnigentWebViewClientShadow::class, RecordingWebViewShadow::class],
+    )
+    fun `success from the previous origin sets no cookie and loads nothing`() {
+        ShadowCookieManager.resetCookies()
+        val activity = activity()
+        activity.reloadWithNewServer(NEW_SERVER_URL, NEW_ORIGIN)
+        ActivityCallLog.clear()
+
+        activity.onLoginResult(PINNED_ORIGIN, LoginResult.Success(SESSION_TOKEN))
+
+        assertNull(CookieManager.getInstance().getCookie(PINNED_ORIGIN))
+        assertNull(CookieManager.getInstance().getCookie(NEW_ORIGIN))
+        assertTrue(ActivityCallLog.entries.isEmpty())
+    }
+
+    @Test
+    fun `rejection from the previous origin shows no failure surface`() {
+        val activity = activity()
+        activity.reloadWithNewServer(NEW_SERVER_URL, NEW_ORIGIN)
+
+        activity.onLoginResult(PINNED_ORIGIN, LoginResult.Rejected)
+
+        assertNull(activity.loginFailedDialog())
         assertNull(ShadowAlertDialog.getLatestAlertDialog())
     }
 
@@ -436,6 +581,15 @@ class MainActivityTest {
     private fun MainActivity.embeddedSignInDialog(): AlertDialog? =
         ReflectionHelpers.getField(this, "embeddedSignInDialog")
 
+    private fun MainActivity.loginFailedDialog(): AlertDialog? =
+        ReflectionHelpers.getField(this, "loginFailedDialog")
+
+    private fun MainActivity.loginAttempts(): Int =
+        ReflectionHelpers.getField(this, "loginAttempts")
+
+    private fun MainActivity.loginManager(): OidcLoginManager =
+        ReflectionHelpers.getField(this, "loginManager")
+
     private fun MainActivity.switchButton(): View = ReflectionHelpers.getField(this, "switchButton")
 
     private fun MainActivity.webView(): WebView = ReflectionHelpers.getField(this, "webView")
@@ -464,6 +618,13 @@ class MainActivityTest {
             override fun getRequestHeaders(): Map<String, String> = emptyMap()
         }
 
+    private fun renderProcessGoneDetail() =
+        object : RenderProcessGoneDetail() {
+            override fun didCrash(): Boolean = true
+
+            override fun rendererPriorityAtExit(): Int = 0
+        }
+
     private fun browserProbe(): Intent =
         Intent(Intent.ACTION_VIEW, Uri.parse("http:"))
             .addCategory(Intent.CATEGORY_BROWSABLE)
@@ -480,6 +641,7 @@ class MainActivityTest {
         const val PLAIN_IDP_URL = "https://idp.example.com/login/sso"
         const val REFUSAL_URL =
             "https://accounts.google.com/v3/signin/rejected?error=disallowed_useragent"
+        const val SESSION_TOKEN = "header.payload.signature"
 
         const val EXTERNAL_BROWSER_PACKAGE = "com.example.browser"
         const val EXTERNAL_BROWSER_ACTIVITY = "com.example.browser.MainActivity"

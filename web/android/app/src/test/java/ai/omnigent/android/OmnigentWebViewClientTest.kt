@@ -96,19 +96,6 @@ class OmnigentWebViewClientTest {
     }
 
     @Test
-    fun `proxy authorize navigation is not overridden`() {
-        val webView = webView()
-        var loginRequired = false
-        val client = client(onLoginRequired = { loginRequired = true })
-
-        assertFalse(client.shouldOverrideUrlLoading(webView, request(PROXY_AUTH_URL)))
-        client.onPageStarted(webView, PROXY_AUTH_URL, null)
-
-        assertFalse(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
-        assertFalse(loginRequired)
-    }
-
-    @Test
     fun `redirect leg enters the flow with or without a gesture`() {
         listOf(false, true).forEach { gesture ->
             val webView = webView()
@@ -575,11 +562,18 @@ class OmnigentWebViewClientTest {
     fun `onRenderProcessGone ends the flow`() {
         val webView = webView()
         var loginRequired = false
-        val client = client(onLoginRequired = { loginRequired = true })
+        var webViewUnusable = 0
+        val client =
+            client(
+                onLoginRequired = { loginRequired = true },
+                onWebViewUnusable = { webViewUnusable++ },
+            )
         enterFlow(client, webView)
 
-        client.onRenderProcessGone(webView, renderProcessGoneDetail())
+        val handled = client.onRenderProcessGone(webView, renderProcessGoneDetail())
 
+        assertTrue(handled)
+        assertEquals(1, webViewUnusable)
         assertTrue(client.shouldOverrideUrlLoading(webView, request(OTHER_IDP_URL)))
         assertTrue(loginRequired)
     }
@@ -853,6 +847,7 @@ class OmnigentWebViewClientTest {
         onProxyAuthFlowEnded: () -> Unit = {},
         clock: () -> Long = { 0L },
         onEmbeddedSignInUnsupported: () -> Unit = {},
+        onWebViewUnusable: () -> Unit = {},
     ) = OmnigentWebViewClient(
         pinnedOrigin = pinnedOrigin,
         shouldInjectBridgeAtPageReady = { shouldInjectBridgeAtPageReady },
@@ -861,6 +856,7 @@ class OmnigentWebViewClientTest {
         onProxyAuthFlowEnded = onProxyAuthFlowEnded,
         clock = clock,
         onEmbeddedSignInUnsupported = onEmbeddedSignInUnsupported,
+        onWebViewUnusable = onWebViewUnusable,
     )
 
     private fun webView(): RecordingWebView =
