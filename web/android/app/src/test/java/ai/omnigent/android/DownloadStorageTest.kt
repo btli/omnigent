@@ -17,6 +17,7 @@ import androidx.test.core.app.ApplicationProvider
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -105,11 +106,15 @@ class DownloadStorageTest {
         assertEquals(0, provider.updatedValues?.getAsInteger(MediaStore.Downloads.IS_PENDING))
         assertEquals("report", output.toString(Charsets.UTF_8.name()))
         assertEquals(0, provider.deleteCalls)
-        assertTrue(mediaStoreJournal().all.isEmpty())
+        // The entry survives publication so a stop-voided result's rerun can
+        // recognize this row instead of downloading a duplicate.
+        assertTrue(
+            mediaStoreJournal().all.values.contains(provider.insertedUri.toString()),
+        )
     }
 
     @Test
-    fun `remembered published MediaStore row is reused and removed from the journal`() {
+    fun `remembered published MediaStore row is reused and stays journaled`() {
         val operationId = "published-work"
         insertMediaStoreRow(pending = false)
         rememberMediaStoreRow(operationId, provider.insertedUri)
@@ -125,7 +130,10 @@ class DownloadStorageTest {
         assertEquals(1, provider.insertCalls)
         assertEquals(0, provider.updateCalls)
         assertEquals(0, writes)
-        assertTrue(mediaStoreJournal().all.isEmpty())
+        assertEquals(
+            provider.insertedUri.toString(),
+            mediaStoreJournal().getString(operationKey(operationId), null),
+        )
     }
 
     @Test
@@ -153,7 +161,36 @@ class DownloadStorageTest {
         } else {
             assertTrue(provider.uriIncludePendingQueries > 0)
         }
-        assertTrue(mediaStoreJournal().all.isEmpty())
+        assertEquals(
+            provider.insertedUri.toString(),
+            mediaStoreJournal().getString(operationKey(operationId), null),
+        )
+    }
+
+    @Test
+    fun `journal evicts its oldest entries past the cap`() {
+        val storage = DownloadStorage(context)
+        val cap = 64
+
+        (0..cap).forEach { index ->
+            val saved =
+                storage.save("evict-$index.txt", "text/plain", operationId = "op-$index") {
+                        stream ->
+                    stream.write(byteArrayOf(1))
+                }
+            assertTrue(saved.saved)
+        }
+
+        val journal = mediaStoreJournal()
+        assertNull(journal.getString(operationKey("op-0"), null))
+        assertEquals(
+            provider.insertedUri.toString(),
+            journal.getString(operationKey("op-1"), null),
+        )
+        assertEquals(
+            provider.insertedUri.toString(),
+            journal.getString(operationKey("op-$cap"), null),
+        )
     }
 
     @Test

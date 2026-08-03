@@ -161,19 +161,26 @@ private object DownloadOutcomeFallback {
 
     fun activityStarted(activity: Activity) {
         if (activity.isFinishing || activity.isDestroyed) return
-        synchronized(lock) { foregroundActivity = WeakReference(activity) }
-        val preferences = activity.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        // Registration and drain stay atomic with deliverOrRemember's
+        // check-then-commit, or a message committed in between is stranded.
         val pending =
-            preferences.all
-                .filterKeys { key -> key.startsWith(KEY_PREFIX) }
-                .values
-                .filterIsInstance<String>()
-        if (pending.isEmpty()) return
-        preferences.edit().apply {
-            preferences.all.keys
-                .filter { key -> key.startsWith(KEY_PREFIX) }
-                .forEach { key -> remove(key) }
-        }.commit()
+            synchronized(lock) {
+                foregroundActivity = WeakReference(activity)
+                val preferences = activity.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                val messages =
+                    preferences.all
+                        .filterKeys { key -> key.startsWith(KEY_PREFIX) }
+                        .values
+                        .filterIsInstance<String>()
+                if (messages.isNotEmpty()) {
+                    preferences.edit().apply {
+                        preferences.all.keys
+                            .filter { key -> key.startsWith(KEY_PREFIX) }
+                            .forEach { key -> remove(key) }
+                    }.commit()
+                }
+                messages
+            }
         pending.forEach { message -> showIfForeground(activity, message) }
     }
 
@@ -188,12 +195,14 @@ private object DownloadOutcomeFallback {
         workId: UUID,
         message: String,
     ) {
-        if (showIfForeground(context, message)) return
-        context
-            .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .edit()
-            .putString(KEY_PREFIX + workId, message)
-            .commit()
+        synchronized(lock) {
+            if (showIfForeground(context, message)) return
+            context
+                .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_PREFIX + workId, message)
+                .commit()
+        }
     }
 
     fun showIfForeground(
