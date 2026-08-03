@@ -112,6 +112,31 @@ class DownloadNotificationManagerTest {
     }
 
     @Test
+    fun `blocked download channel falls back to a toast in the foreground`() {
+        val controller = Robolectric.buildActivity(Activity::class.java).setup()
+        val activity = controller.get()
+        DownloadNotificationManager.activityStarted(activity)
+        val notifications = DownloadNotificationManager(context)
+        shadow.notificationChannels
+            .single { channel -> channel.id == DownloadNotificationManager.CHANNEL_ID }
+            .importance = NotificationManager.IMPORTANCE_NONE
+        val workId = UUID.randomUUID()
+
+        notifications.failed("report.pdf", workId)
+        idleMainLooper()
+
+        assertNull(
+            shadow.getNotification(
+                DownloadNotificationManager.notificationTag(workId),
+                DownloadNotificationManager.NOTIFICATION_ID,
+            ),
+        )
+        assertEquals("Couldn't download report.pdf", ShadowToast.getTextOfLatestToast())
+        DownloadNotificationManager.activityStopped(activity)
+        controller.destroy()
+    }
+
+    @Test
     fun `background fallback is shown when an activity next reaches foreground`() {
         shadow.setNotificationsEnabled(false)
         DownloadNotificationManager(context).failed("report.pdf", UUID.randomUUID())

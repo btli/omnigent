@@ -1,10 +1,12 @@
 package ai.omnigent.android
 
+import android.content.ContentResolver
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
@@ -18,6 +20,8 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import java.util.UUID
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
 
 internal data class DownloadSaveResult(
     val name: String,
@@ -37,13 +41,18 @@ internal class DownloadStorage(context: Context) {
         write: (OutputStream) -> Unit,
     ): DownloadSaveResult {
         val name = safeFileName(suggestedName)
+        val saveLock =
+            acquireSaveLock(name, shouldAbort) ?: return DownloadSaveResult(name, false)
         val saved =
-            synchronized(saveLockFor(name)) {
+            try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     saveViaMediaStore(name, mimeType, operationId, shouldAbort, write)
                 } else {
                     saveToAppDownloads(name, operationId, shouldAbort, write)
                 }
+            } finally {
+                saveLock.lock.unlock()
+                releaseSaveLock(name, saveLock)
             }
         return DownloadSaveResult(name, saved)
     }
@@ -108,6 +117,7 @@ internal class DownloadStorage(context: Context) {
             deleteMediaStoreDestination(operationId, uri)
             return false
         }
+        forgetMediaStoreDestination(operationId)
         return true
     }
 
@@ -123,7 +133,10 @@ internal class DownloadStorage(context: Context) {
         if (remembered != null) {
             when (mediaStoreRowState(remembered)) {
                 MediaStoreRowState.PENDING -> return MediaStoreDestination(remembered, false)
-                MediaStoreRowState.PUBLISHED -> return MediaStoreDestination(remembered, true)
+                MediaStoreRowState.PUBLISHED -> {
+                    journal.edit().remove(journalKey).commit()
+                    return MediaStoreDestination(remembered, true)
+                }
                 MediaStoreRowState.UNKNOWN -> return null
                 MediaStoreRowState.MISSING -> journal.edit().remove(journalKey).commit()
             }
@@ -152,17 +165,18 @@ internal class DownloadStorage(context: Context) {
     @RequiresApi(Build.VERSION_CODES.Q)
     private fun mediaStoreRowState(uri: Uri): MediaStoreRowState =
         try {
-            context.contentResolver
-                .query(uri, arrayOf(MediaStore.Downloads.IS_PENDING), null, null, null)
-                ?.use { cursor ->
-                    if (!cursor.moveToFirst()) {
-                        MediaStoreRowState.MISSING
-                    } else if (cursor.getInt(0) == 0) {
-                        MediaStoreRowState.PUBLISHED
-                    } else {
-                        MediaStoreRowState.PENDING
-                    }
-                } ?: MediaStoreRowState.UNKNOWN
+            queryIncludingPending(
+                uri,
+                arrayOf(MediaStore.Downloads.IS_PENDING),
+            )?.use { cursor ->
+                if (!cursor.moveToFirst()) {
+                    MediaStoreRowState.MISSING
+                } else if (cursor.getInt(0) == 0) {
+                    MediaStoreRowState.PUBLISHED
+                } else {
+                    MediaStoreRowState.PENDING
+                }
+            } ?: MediaStoreRowState.UNKNOWN
         } catch (_: Throwable) {
             MediaStoreRowState.UNKNOWN
         }
@@ -178,28 +192,53 @@ internal class DownloadStorage(context: Context) {
                 .filterIsInstance<String>()
                 .toSet()
         runCatching {
-            resolver
-                .query(
-                    MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-                    arrayOf(MediaStore.Downloads._ID),
-                    "${MediaStore.Downloads.IS_PENDING} = ? AND " +
-                        "${MediaStore.MediaColumns.OWNER_PACKAGE_NAME} = ?",
-                    arrayOf("1", context.packageName),
-                    null,
-                )?.use { cursor ->
-                    while (cursor.moveToNext()) {
-                        val uri =
-                            ContentUris.withAppendedId(
-                                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-                                cursor.getLong(0),
-                            )
-                        if (uri.toString() !in journalUris) {
-                            runCatching { resolver.delete(uri, null, null) }
-                        }
+            queryIncludingPending(
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                arrayOf(MediaStore.Downloads._ID),
+                "${MediaStore.Downloads.IS_PENDING} = ? AND " +
+                    "${MediaStore.MediaColumns.OWNER_PACKAGE_NAME} = ?",
+                arrayOf("1", context.packageName),
+            )?.use { cursor ->
+                while (cursor.moveToNext()) {
+                    val uri =
+                        ContentUris.withAppendedId(
+                            MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                            cursor.getLong(0),
+                        )
+                    if (uri.toString() !in journalUris) {
+                        runCatching { resolver.delete(uri, null, null) }
                     }
                 }
+            }
         }
     }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun queryIncludingPending(
+        uri: Uri,
+        projection: Array<String>,
+        selection: String? = null,
+        selectionArgs: Array<String>? = null,
+    ) =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val queryArgs =
+                Bundle().apply {
+                    selection?.let { putString(ContentResolver.QUERY_ARG_SQL_SELECTION, it) }
+                    selectionArgs?.let {
+                        putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, it)
+                    }
+                    putInt(MediaStore.QUERY_ARG_MATCH_PENDING, MediaStore.MATCH_INCLUDE)
+                }
+            context.contentResolver.query(uri, projection, queryArgs, null)
+        } else {
+            context.contentResolver.query(
+                MediaStore.setIncludePending(uri),
+                projection,
+                selection,
+                selectionArgs,
+                null,
+            )
+        }
 
     @RequiresApi(Build.VERSION_CODES.Q)
     private fun deleteMediaStoreDestination(
@@ -208,6 +247,17 @@ internal class DownloadStorage(context: Context) {
     ) {
         synchronized(MEDIA_STORE_LOCK) {
             runCatching { context.contentResolver.delete(uri, null, null) }
+            context
+                .getSharedPreferences(MEDIA_STORE_JOURNAL, Context.MODE_PRIVATE)
+                .edit()
+                .remove(operationKey(operationId))
+                .commit()
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun forgetMediaStoreDestination(operationId: String) {
+        synchronized(MEDIA_STORE_LOCK) {
             context
                 .getSharedPreferences(MEDIA_STORE_JOURNAL, Context.MODE_PRIVATE)
                 .edit()
@@ -285,15 +335,59 @@ internal class DownloadStorage(context: Context) {
         }
     }
 
+    private fun acquireSaveLock(
+        name: String,
+        shouldAbort: () -> Boolean,
+    ): SaveLock? {
+        if (shouldAbort()) return null
+        val saveLock =
+            synchronized(SAVE_LOCK_REGISTRY_LOCK) {
+                SAVE_LOCKS.getOrPut(name, ::SaveLock).also { it.users++ }
+            }
+        var acquired = false
+        var retained = false
+        try {
+            while (!acquired) {
+                if (shouldAbort()) return null
+                acquired =
+                    try {
+                        saveLock.lock.tryLock(SAVE_LOCK_POLL_INTERVAL_MS, TimeUnit.MILLISECONDS)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        return null
+                    }
+            }
+            if (shouldAbort()) return null
+            retained = true
+            return saveLock
+        } finally {
+            if (!retained) {
+                if (acquired) saveLock.lock.unlock()
+                releaseSaveLock(name, saveLock)
+            }
+        }
+    }
+
+    private fun releaseSaveLock(
+        name: String,
+        saveLock: SaveLock,
+    ) {
+        synchronized(SAVE_LOCK_REGISTRY_LOCK) {
+            saveLock.users--
+            if (saveLock.users == 0 && SAVE_LOCKS[name] === saveLock) {
+                SAVE_LOCKS.remove(name)
+            }
+        }
+    }
+
     private companion object {
         const val MEDIA_STORE_JOURNAL = "ai.omnigent.android.download_media_store"
-        private val SAVE_LOCKS = Array(32) { Any() }
+        private const val SAVE_LOCK_POLL_INTERVAL_MS = 100L
+        private val SAVE_LOCK_REGISTRY_LOCK = Any()
+        private val SAVE_LOCKS = mutableMapOf<String, SaveLock>()
         private val MEDIA_STORE_LOCK = Any()
         private val TEMPORARY_LOCK = Any()
         private val ACTIVE_TEMPORARIES = mutableSetOf<String>()
-
-        private fun saveLockFor(name: String): Any =
-            SAVE_LOCKS[Math.floorMod(name.hashCode(), SAVE_LOCKS.size)]
 
         private fun operationKey(operationId: String): String =
             MessageDigest
@@ -304,6 +398,11 @@ internal class DownloadStorage(context: Context) {
                 }
     }
 }
+
+private class SaveLock(
+    val lock: ReentrantLock = ReentrantLock(),
+    var users: Int = 0,
+)
 
 private data class MediaStoreDestination(
     val uri: Uri,
