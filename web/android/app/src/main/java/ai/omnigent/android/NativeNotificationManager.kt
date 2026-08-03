@@ -206,15 +206,9 @@ class NativeNotificationManager(
             val storedId =
                 notificationIds.getInt(KEY_NEXT_NOTIFICATION_ID, FIRST_NOTIFICATION_ID)
             val id = storedId.takeIf { it >= FIRST_NOTIFICATION_ID } ?: FIRST_NOTIFICATION_ID
-            val nextId =
-                if (id == Int.MAX_VALUE) {
-                    FIRST_NOTIFICATION_ID
-                } else {
-                    id + 1
-                }
             // apply(), not commit(): this runs on the UI thread with every
             // notification, and the in-memory value is updated synchronously.
-            notificationIds.edit().putInt(KEY_NEXT_NOTIFICATION_ID, nextId).apply()
+            notificationIds.edit().putInt(KEY_NEXT_NOTIFICATION_ID, id + 1).apply()
             id
         }
 
