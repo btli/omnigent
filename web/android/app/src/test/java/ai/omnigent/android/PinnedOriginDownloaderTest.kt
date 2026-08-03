@@ -626,6 +626,30 @@ class PinnedOriginDownloaderTest {
     }
 
     @Test
+    fun `a run past the lives bound fails terminally before another transfer`() {
+        val hits = AtomicInteger()
+        pinnedServer.createContext("/many-lives") { exchange ->
+            hits.incrementAndGet()
+            exchange.respond(200, DOWNLOAD_BODY)
+        }
+        val worker =
+            worker(
+                "$pinnedOrigin/many-lives",
+                "lives.txt",
+                runAttemptCount = PinnedOriginDownloadWorker.MAX_LIVES,
+            )
+
+        val result = worker.doWork()
+
+        assertEquals(ListenableWorker.Result.failure(), result)
+        assertEquals(0, hits.get())
+        assertEquals(
+            "Couldn't download lives.txt",
+            notificationFor(worker)!!.extras.getCharSequence(Notification.EXTRA_TEXT),
+        )
+    }
+
+    @Test
     fun `three WorkManager stops terminate the operation before another transfer`() {
         val hits = AtomicInteger()
         pinnedServer.createContext("/stop-limit") { exchange ->

@@ -4,6 +4,7 @@ import android.content.ContentResolver
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
+import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -117,7 +118,6 @@ internal class DownloadStorage(context: Context) {
             deleteMediaStoreDestination(operationId, uri)
             return false
         }
-        forgetMediaStoreDestination(operationId)
         return true
     }
 
@@ -131,14 +131,15 @@ internal class DownloadStorage(context: Context) {
         val journalKey = operationKey(operationId)
         val remembered = journal.getString(journalKey, null)?.let(Uri::parse)
         if (remembered != null) {
+            // The entry outlives publication: a stop can void this run's result
+            // after the row is published, and only the journal lets the rerun
+            // recognize that row instead of downloading a duplicate.
             when (mediaStoreRowState(remembered)) {
                 MediaStoreRowState.PENDING -> return MediaStoreDestination(remembered, false)
-                MediaStoreRowState.PUBLISHED -> {
-                    journal.edit().remove(journalKey).commit()
-                    return MediaStoreDestination(remembered, true)
-                }
+                MediaStoreRowState.PUBLISHED -> return MediaStoreDestination(remembered, true)
                 MediaStoreRowState.UNKNOWN -> return null
-                MediaStoreRowState.MISSING -> journal.edit().remove(journalKey).commit()
+                MediaStoreRowState.MISSING ->
+                    journal.edit().remove(journalKey).remove(SEQ_PREFIX + journalKey).commit()
             }
         }
 
@@ -155,11 +156,37 @@ internal class DownloadStorage(context: Context) {
                     pendingValues,
                 )
             }.getOrNull() ?: return null
-        if (!journal.edit().putString(journalKey, uri.toString()).commit()) {
+        if (!rememberMediaStoreDestination(journal, journalKey, uri)) {
             runCatching { context.contentResolver.delete(uri, null, null) }
             return null
         }
         return MediaStoreDestination(uri, false)
+    }
+
+    /** Journals the row with a sequence number, evicting the oldest entries past the cap. */
+    private fun rememberMediaStoreDestination(
+        journal: SharedPreferences,
+        journalKey: String,
+        uri: Uri,
+    ): Boolean {
+        val sequence = journal.getLong(KEY_JOURNAL_SEQ, 0L) + 1
+        val editor =
+            journal
+                .edit()
+                .putString(journalKey, uri.toString())
+                .putLong(SEQ_PREFIX + journalKey, sequence)
+                .putLong(KEY_JOURNAL_SEQ, sequence)
+        val entries = journal.all
+        val operationKeys =
+            entries.keys.filter { key -> key != KEY_JOURNAL_SEQ && !key.startsWith(SEQ_PREFIX) }
+        if (operationKeys.size + 1 > MAX_JOURNAL_ENTRIES) {
+            operationKeys
+                .filter { key -> key != journalKey }
+                .sortedBy { key -> entries[SEQ_PREFIX + key] as? Long ?: 0L }
+                .take(operationKeys.size + 1 - MAX_JOURNAL_ENTRIES)
+                .forEach { key -> editor.remove(key).remove(SEQ_PREFIX + key) }
+        }
+        return editor.commit()
     }
 
     @RequiresApi(Build.VERSION_CODES.Q)
@@ -247,21 +274,12 @@ internal class DownloadStorage(context: Context) {
     ) {
         synchronized(MEDIA_STORE_LOCK) {
             runCatching { context.contentResolver.delete(uri, null, null) }
+            val journalKey = operationKey(operationId)
             context
                 .getSharedPreferences(MEDIA_STORE_JOURNAL, Context.MODE_PRIVATE)
                 .edit()
-                .remove(operationKey(operationId))
-                .commit()
-        }
-    }
-
-    @RequiresApi(Build.VERSION_CODES.Q)
-    private fun forgetMediaStoreDestination(operationId: String) {
-        synchronized(MEDIA_STORE_LOCK) {
-            context
-                .getSharedPreferences(MEDIA_STORE_JOURNAL, Context.MODE_PRIVATE)
-                .edit()
-                .remove(operationKey(operationId))
+                .remove(journalKey)
+                .remove(SEQ_PREFIX + journalKey)
                 .commit()
         }
     }
@@ -382,6 +400,9 @@ internal class DownloadStorage(context: Context) {
 
     private companion object {
         const val MEDIA_STORE_JOURNAL = "ai.omnigent.android.download_media_store"
+        const val KEY_JOURNAL_SEQ = "seq"
+        const val SEQ_PREFIX = "seq."
+        const val MAX_JOURNAL_ENTRIES = 64
         private const val SAVE_LOCK_POLL_INTERVAL_MS = 100L
         private val SAVE_LOCK_REGISTRY_LOCK = Any()
         private val SAVE_LOCKS = mutableMapOf<String, SaveLock>()
