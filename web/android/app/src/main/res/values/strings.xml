@@ -2,6 +2,12 @@
 <resources>
     <string name="app_name">Omnigent</string>
     <string name="notification_channel_name">Sessions</string>
+    <string name="download_notification_channel_name">Downloads</string>
+    <string name="download_complete_title">Download complete</string>
+    <string name="download_complete_body_downloads">Saved %1$s to Downloads</string>
+    <string name="download_complete_body_app_storage">Saved %1$s to app storage</string>
+    <string name="download_failed_title">Download failed</string>
+    <string name="download_failed_body">Couldn\'t download %1$s</string>
     <string name="signed_in_title">Signed in to Omnigent</string>
     <string name="signed_in_body">Tap to return to the app.</string>
     <string name="login_failed_title">Sign-in failed</string>

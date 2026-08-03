@@ -160,7 +160,7 @@ class NativeNotificationManager(
 
     fun cancelAll() {
         lastBadge = null
-        manager.cancelAll()
+        cancelSessionNotifications()
     }
 
     /**
@@ -219,7 +219,7 @@ class NativeNotificationManager(
             if (notificationIds.contains(KEY_LAST_PINNED_ORIGIN) &&
                 notificationIds.getString(KEY_LAST_PINNED_ORIGIN, null) != origin
             ) {
-                manager.cancelAll()
+                cancelSessionNotifications()
             }
             rememberNotificationOriginLocked(origin)
         }
@@ -237,6 +237,15 @@ class NativeNotificationManager(
             editor.putString(KEY_LAST_PINNED_ORIGIN, origin)
         }
         editor.apply()
+    }
+
+    private fun cancelSessionNotifications() {
+        val platformManager =
+            context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        // Session notifications are untagged; download completion uses a dedicated tag.
+        platformManager.activeNotifications
+            .filter { notification -> notification.tag == null }
+            .forEach { notification -> manager.cancel(notification.id) }
     }
 
     companion object {
