@@ -1084,18 +1084,30 @@ describe("useRowSwipe — dnd coexistence", () => {
   // so control `isDragging` directly to prove the swipe yields to the drag.
   const ACTIONS = { left: "archive", right: "none" } as const;
 
-  function makePointer(over: { pointerId: number; clientX: number; clientY: number }) {
-    // Minimal ReactPointerEvent stand-in — only the fields useRowSwipe reads,
-    // plus pointer-capture no-ops (jsdom's are stubbed in test-setup).
+  // Row stand-in: pointer-capture no-ops (jsdom's are stubbed in test-setup)
+  // plus `contains`, which the hook uses to reject events bubbling out of a
+  // portal. Defaults to containing everything (the normal in-row case).
+  const PORTAL_ROW = {
+    setPointerCapture: () => {},
+    releasePointerCapture: () => {},
+    hasPointerCapture: () => false,
+    contains: () => true,
+  };
+
+  function makePointer(over: {
+    pointerId: number;
+    clientX: number;
+    clientY: number;
+    target?: unknown;
+    currentTarget?: unknown;
+  }) {
+    // Minimal ReactPointerEvent stand-in — only the fields useRowSwipe reads.
     return {
       pointerType: "touch",
       isPrimary: true,
       preventDefault: () => {},
-      currentTarget: {
-        setPointerCapture: () => {},
-        releasePointerCapture: () => {},
-        hasPointerCapture: () => false,
-      },
+      target: document.createElement("div"),
+      currentTarget: PORTAL_ROW,
       ...over,
     } as unknown as ReactPointerEvent;
   }
@@ -1151,6 +1163,79 @@ describe("useRowSwipe — dnd coexistence", () => {
     act(() => {
       result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 20, clientY: 100 }));
     });
+    expect(onAction).not.toHaveBeenCalled();
+  });
+
+  it("(c) commits a fast flick that releases before the last move renders", () => {
+    // A quick flick can lift the finger before React commits the render for the
+    // final pointermove. Release must decide on where the finger actually ended,
+    // so the move + up are dispatched inside ONE act() — no render in between.
+    const onAction = vi.fn();
+    const { result } = renderHook(() =>
+      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging: false, onAction }),
+    );
+
+    act(() => {
+      result.current.onPointerDown(makePointer({ pointerId: 1, clientX: 200, clientY: 100 }));
+      // Lock the gesture, then travel well past the 72px commit threshold and
+      // release — all before the hook re-renders with the final offset.
+      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 180, clientY: 100 }));
+      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
+      result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
+    });
+
+    // -100px past the threshold in the archive-configured direction.
+    expect(onAction).toHaveBeenCalledWith("archive");
+    expect(result.current.dx).toBe(0);
+  });
+
+  it("(d) does not commit a flick that snaps back under the threshold before release", () => {
+    // The mirror case: travel past the threshold, then return under it and
+    // release, again with no render between the moves. Nothing should fire.
+    const onAction = vi.fn();
+    const { result } = renderHook(() =>
+      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging: false, onAction }),
+    );
+
+    act(() => {
+      result.current.onPointerDown(makePointer({ pointerId: 1, clientX: 200, clientY: 100 }));
+      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
+      // Back to only -10px: under the commit threshold at the moment of release.
+      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 190, clientY: 100 }));
+      result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 190, clientY: 100 }));
+    });
+
+    expect(onAction).not.toHaveBeenCalled();
+  });
+
+  it("(e) ignores a pointerdown that bubbled out of a portal (open dialog)", () => {
+    // The row's dialogs render in portals but are React children, so their
+    // events bubble to the row's handlers. A drag inside the open delete dialog
+    // must not start a swipe on the row behind it.
+    const onAction = vi.fn();
+    const { result } = renderHook(() =>
+      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging: false, onAction }),
+    );
+
+    // currentTarget is the row; target is portal content it does NOT contain.
+    const outside = document.createElement("div");
+    act(() => {
+      result.current.onPointerDown(
+        makePointer({
+          pointerId: 1,
+          clientX: 200,
+          clientY: 100,
+          target: outside,
+          currentTarget: { ...PORTAL_ROW, contains: () => false },
+        }),
+      );
+    });
+    act(() => {
+      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
+      result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
+    });
+
+    expect(result.current.dx).toBe(0);
     expect(onAction).not.toHaveBeenCalled();
   });
 });

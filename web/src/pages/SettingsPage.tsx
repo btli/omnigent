@@ -144,6 +144,7 @@ import {
   writeHideUnconfiguredHarnesses,
 } from "@/lib/harnessVisibilityPreferences";
 import {
+  DEFAULT_SWIPE_ACTIONS,
   isSwipeAction,
   type SwipeAction,
   swipeActions as swipeActionOptions,
@@ -925,6 +926,8 @@ function AppearanceSection() {
 
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
 
+    writeSwipeActions(DEFAULT_SWIPE_ACTIONS);
+
     applyDesktopUiFontSize(UI_FONT_SIZE_DEFAULT);
     applyUiFontFamily(UI_FONT_FAMILY_DEFAULT);
 
@@ -947,6 +950,7 @@ function AppearanceSection() {
           "omnigent:custom-theme",
           "omnigent:default-workspace-panel",
           "omnigent:hide-unconfigured-harnesses",
+          "omnigent:swipe-actions",
         ]) {
           window.localStorage.removeItem(key);
         }
