@@ -3,7 +3,9 @@ package ai.omnigent.android
 import android.app.Application
 import android.content.ContentProvider
 import android.content.ContentValues
+import android.content.Context
 import android.database.Cursor
+import android.database.MatrixCursor
 import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
@@ -35,6 +37,11 @@ class DownloadStorageTest {
     @Before
     fun setUp() {
         context = ApplicationProvider.getApplicationContext()
+        context
+            .getSharedPreferences(MEDIA_STORE_JOURNAL, Context.MODE_PRIVATE)
+            .edit()
+            .clear()
+            .commit()
         provider = RecordingMediaProvider()
         output = ByteArrayOutputStream()
         ShadowContentResolver.registerProviderInternal("media", provider)
@@ -92,6 +99,44 @@ class DownloadStorageTest {
         assertEquals(0, provider.updatedValues?.getAsInteger(MediaStore.Downloads.IS_PENDING))
         assertEquals("report", output.toString(Charsets.UTF_8.name()))
         assertEquals(0, provider.deleteCalls)
+    }
+
+    @Test
+    fun `rerun of one operation reuses its published MediaStore row`() {
+        val storage = DownloadStorage(context)
+        var writes = 0
+
+        val first =
+            storage.save("report.txt", "text/plain", operationId = "same-work") { stream ->
+                writes++
+                stream.write("report".toByteArray())
+            }
+        val rerun =
+            storage.save("report.txt", "text/plain", operationId = "same-work") {
+                writes++
+            }
+
+        assertTrue(first.saved)
+        assertTrue(rerun.saved)
+        assertEquals(1, provider.insertCalls)
+        assertEquals(1, writes)
+    }
+
+    @Test
+    fun `orphaned pending MediaStore row is swept before the next save`() {
+        provider.orphanedPendingIds += 99L
+
+        val result =
+            DownloadStorage(context).save("report.txt", "text/plain") { stream ->
+                stream.write("report".toByteArray())
+            }
+
+        assertTrue(result.saved)
+        assertTrue(
+            provider.deletedUris.contains(
+                Uri.parse("content://media/external/downloads/99"),
+            ),
+        )
     }
 
     @Test
@@ -181,6 +226,33 @@ class DownloadStorageTest {
             target.delete()
         }
     }
+
+    @Test
+    @Config(sdk = [28])
+    fun `app storage save sweeps a stale temporary from a dead process`() {
+        val dir = checkNotNull(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS))
+        val stale = File(dir, ".omnigent-dead-process.tmp")
+        val target = File(dir, "fresh-download.txt")
+        stale.writeText("partial")
+
+        try {
+            val result =
+                DownloadStorage(context).save(target.name, "text/plain") { stream ->
+                    stream.write("complete".toByteArray())
+                }
+
+            assertTrue(result.saved)
+            assertFalse(stale.exists())
+            assertEquals("complete", target.readText())
+        } finally {
+            stale.delete()
+            target.delete()
+        }
+    }
+
+    private companion object {
+        const val MEDIA_STORE_JOURNAL = "ai.omnigent.android.download_media_store"
+    }
 }
 
 private fun File.isTemporaryDownload(): Boolean =
@@ -193,8 +265,13 @@ private class RecordingMediaProvider : ContentProvider() {
     var insertedValues: ContentValues? = null
     var updatedValues: ContentValues? = null
     var updateResult = 1
+    var insertCalls = 0
     var updateCalls = 0
     var deleteCalls = 0
+    var rowExists = false
+    var pending = 1
+    val orphanedPendingIds = mutableListOf<Long>()
+    val deletedUris = mutableListOf<Uri>()
 
     override fun onCreate(): Boolean = true
 
@@ -202,6 +279,9 @@ private class RecordingMediaProvider : ContentProvider() {
         uri: Uri,
         values: ContentValues?,
     ): Uri {
+        insertCalls++
+        rowExists = true
+        pending = 1
         insertedValues = values?.let { ContentValues(it) }
         return insertedUri
     }
@@ -214,6 +294,7 @@ private class RecordingMediaProvider : ContentProvider() {
     ): Int {
         updateCalls++
         updatedValues = values?.let { ContentValues(it) }
+        if (updateResult > 0) pending = values?.getAsInteger(MediaStore.Downloads.IS_PENDING) ?: 0
         return updateResult
     }
 
@@ -223,6 +304,9 @@ private class RecordingMediaProvider : ContentProvider() {
         selectionArgs: Array<out String>?,
     ): Int {
         deleteCalls++
+        deletedUris += uri
+        if (uri == insertedUri) rowExists = false
+        orphanedPendingIds.remove(uri.lastPathSegment?.toLongOrNull())
         return 1
     }
 
@@ -232,7 +316,35 @@ private class RecordingMediaProvider : ContentProvider() {
         selection: String?,
         selectionArgs: Array<out String>?,
         sortOrder: String?,
-    ): Cursor? = null
+    ): Cursor? {
+        val columns = projection ?: emptyArray()
+        val cursor = MatrixCursor(columns)
+        if (uri == insertedUri) {
+            if (rowExists) {
+                cursor.addRow(
+                    columns.map { column ->
+                        when (column) {
+                            MediaStore.Downloads.IS_PENDING -> pending
+                            MediaStore.Downloads._ID -> 42L
+                            else -> null
+                        }
+                    },
+                )
+            }
+            return cursor
+        }
+        if (uri == MediaStore.Downloads.EXTERNAL_CONTENT_URI) {
+            orphanedPendingIds.forEach { id ->
+                cursor.addRow(
+                    columns.map { column ->
+                        if (column == MediaStore.Downloads._ID) id else null
+                    },
+                )
+            }
+            return cursor
+        }
+        return cursor
+    }
 
     override fun getType(uri: Uri): String? = null
 }

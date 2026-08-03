@@ -1,7 +1,9 @@
 package ai.omnigent.android
 
+import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
+import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.os.Handler
@@ -14,6 +16,8 @@ import java.io.OutputStream
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
+import java.util.UUID
 
 internal data class DownloadSaveResult(
     val name: String,
@@ -28,15 +32,17 @@ internal class DownloadStorage(context: Context) {
     fun save(
         suggestedName: String,
         mimeType: String,
+        operationId: String = UUID.randomUUID().toString(),
+        shouldAbort: () -> Boolean = { false },
         write: (OutputStream) -> Unit,
     ): DownloadSaveResult {
         val name = safeFileName(suggestedName)
         val saved =
             synchronized(saveLockFor(name)) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    saveViaMediaStore(name, mimeType, write)
+                    saveViaMediaStore(name, mimeType, operationId, shouldAbort, write)
                 } else {
-                    saveToAppDownloads(name, write)
+                    saveToAppDownloads(name, operationId, shouldAbort, write)
                 }
             }
         return DownloadSaveResult(name, saved)
@@ -65,19 +71,19 @@ internal class DownloadStorage(context: Context) {
     private fun saveViaMediaStore(
         name: String,
         mimeType: String,
+        operationId: String,
+        shouldAbort: () -> Boolean,
         write: (OutputStream) -> Unit,
     ): Boolean {
         val resolver = context.contentResolver
-        val pendingValues =
-            ContentValues().apply {
-                put(MediaStore.Downloads.DISPLAY_NAME, name)
-                put(MediaStore.Downloads.MIME_TYPE, mimeType)
-                put(MediaStore.Downloads.IS_PENDING, 1)
-            }
-        val uri =
-            runCatching {
-                resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, pendingValues)
-            }.getOrNull() ?: return false
+        val destination =
+            synchronized(MEDIA_STORE_LOCK) {
+                sweepOrphanedMediaStoreRows()
+                mediaStoreDestination(operationId, name, mimeType)
+            } ?: return false
+        if (destination.published) return true
+        val uri = destination.uri
+        if (shouldAbort()) return false
 
         val wrote =
             runCatching {
@@ -85,7 +91,11 @@ internal class DownloadStorage(context: Context) {
                 output.use(write)
             }.isSuccess
         if (!wrote) {
-            runCatching { resolver.delete(uri, null, null) }
+            deleteMediaStoreDestination(operationId, uri)
+            return false
+        }
+        if (shouldAbort()) {
+            deleteMediaStoreDestination(operationId, uri)
             return false
         }
 
@@ -94,27 +104,149 @@ internal class DownloadStorage(context: Context) {
             runCatching {
                 resolver.update(uri, publishValues, null, null) > 0
             }.getOrDefault(false)
-        if (!published) runCatching { resolver.delete(uri, null, null) }
-        return published
+        if (!published || shouldAbort()) {
+            deleteMediaStoreDestination(operationId, uri)
+            return false
+        }
+        return true
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun mediaStoreDestination(
+        operationId: String,
+        name: String,
+        mimeType: String,
+    ): MediaStoreDestination? {
+        val journal = context.getSharedPreferences(MEDIA_STORE_JOURNAL, Context.MODE_PRIVATE)
+        val journalKey = operationKey(operationId)
+        val remembered = journal.getString(journalKey, null)?.let(Uri::parse)
+        if (remembered != null) {
+            when (mediaStoreRowState(remembered)) {
+                MediaStoreRowState.PENDING -> return MediaStoreDestination(remembered, false)
+                MediaStoreRowState.PUBLISHED -> return MediaStoreDestination(remembered, true)
+                MediaStoreRowState.UNKNOWN -> return null
+                MediaStoreRowState.MISSING -> journal.edit().remove(journalKey).commit()
+            }
+        }
+
+        val pendingValues =
+            ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, name)
+                put(MediaStore.Downloads.MIME_TYPE, mimeType)
+                put(MediaStore.Downloads.IS_PENDING, 1)
+            }
+        val uri =
+            runCatching {
+                context.contentResolver.insert(
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                    pendingValues,
+                )
+            }.getOrNull() ?: return null
+        if (!journal.edit().putString(journalKey, uri.toString()).commit()) {
+            runCatching { context.contentResolver.delete(uri, null, null) }
+            return null
+        }
+        return MediaStoreDestination(uri, false)
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun mediaStoreRowState(uri: Uri): MediaStoreRowState =
+        try {
+            context.contentResolver
+                .query(uri, arrayOf(MediaStore.Downloads.IS_PENDING), null, null, null)
+                ?.use { cursor ->
+                    if (!cursor.moveToFirst()) {
+                        MediaStoreRowState.MISSING
+                    } else if (cursor.getInt(0) == 0) {
+                        MediaStoreRowState.PUBLISHED
+                    } else {
+                        MediaStoreRowState.PENDING
+                    }
+                } ?: MediaStoreRowState.UNKNOWN
+        } catch (_: Throwable) {
+            MediaStoreRowState.UNKNOWN
+        }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun sweepOrphanedMediaStoreRows() {
+        val resolver = context.contentResolver
+        val journalUris =
+            context
+                .getSharedPreferences(MEDIA_STORE_JOURNAL, Context.MODE_PRIVATE)
+                .all
+                .values
+                .filterIsInstance<String>()
+                .toSet()
+        runCatching {
+            resolver
+                .query(
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                    arrayOf(MediaStore.Downloads._ID),
+                    "${MediaStore.Downloads.IS_PENDING} = ? AND " +
+                        "${MediaStore.MediaColumns.OWNER_PACKAGE_NAME} = ?",
+                    arrayOf("1", context.packageName),
+                    null,
+                )?.use { cursor ->
+                    while (cursor.moveToNext()) {
+                        val uri =
+                            ContentUris.withAppendedId(
+                                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                                cursor.getLong(0),
+                            )
+                        if (uri.toString() !in journalUris) {
+                            runCatching { resolver.delete(uri, null, null) }
+                        }
+                    }
+                }
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun deleteMediaStoreDestination(
+        operationId: String,
+        uri: Uri,
+    ) {
+        synchronized(MEDIA_STORE_LOCK) {
+            runCatching { context.contentResolver.delete(uri, null, null) }
+            context
+                .getSharedPreferences(MEDIA_STORE_JOURNAL, Context.MODE_PRIVATE)
+                .edit()
+                .remove(operationKey(operationId))
+                .commit()
+        }
     }
 
     private fun saveToAppDownloads(
         name: String,
+        operationId: String,
+        shouldAbort: () -> Boolean,
         write: (OutputStream) -> Unit,
     ): Boolean {
         val dir =
             context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
                 ?: context.filesDir
-        var temporary: File? = null
+        val temporary = File(dir, ".omnigent-${operationKey(operationId)}.tmp")
+        synchronized(TEMPORARY_LOCK) {
+            dir
+                .listFiles()
+                .orEmpty()
+                .filter(File::isTemporaryDownload)
+                .filterNot { file -> file.absolutePath in ACTIVE_TEMPORARIES }
+                .forEach(File::delete)
+            ACTIVE_TEMPORARIES += temporary.absolutePath
+        }
         return try {
-            temporary = File.createTempFile(".omnigent-", ".tmp", dir)
             temporary.outputStream().use(write)
+            if (shouldAbort()) return false
             replaceFile(temporary, File(dir, name))
             true
         } catch (_: Throwable) {
             false
         } finally {
-            temporary?.delete()
+            temporary.delete()
+            synchronized(TEMPORARY_LOCK) {
+                ACTIVE_TEMPORARIES -= temporary.absolutePath
+            }
         }
     }
 
@@ -154,9 +286,36 @@ internal class DownloadStorage(context: Context) {
     }
 
     private companion object {
+        const val MEDIA_STORE_JOURNAL = "ai.omnigent.android.download_media_store"
         private val SAVE_LOCKS = Array(32) { Any() }
+        private val MEDIA_STORE_LOCK = Any()
+        private val TEMPORARY_LOCK = Any()
+        private val ACTIVE_TEMPORARIES = mutableSetOf<String>()
 
         private fun saveLockFor(name: String): Any =
             SAVE_LOCKS[Math.floorMod(name.hashCode(), SAVE_LOCKS.size)]
+
+        private fun operationKey(operationId: String): String =
+            MessageDigest
+                .getInstance("SHA-256")
+                .digest(operationId.toByteArray(Charsets.UTF_8))
+                .joinToString(separator = "") { byte ->
+                    Integer.toHexString(byte.toInt() and 0xff).padStart(2, '0')
+                }
     }
 }
+
+private data class MediaStoreDestination(
+    val uri: Uri,
+    val published: Boolean,
+)
+
+private enum class MediaStoreRowState {
+    PENDING,
+    PUBLISHED,
+    MISSING,
+    UNKNOWN,
+}
+
+private fun File.isTemporaryDownload(): Boolean =
+    name.startsWith(".omnigent-") && name.endsWith(".tmp")
