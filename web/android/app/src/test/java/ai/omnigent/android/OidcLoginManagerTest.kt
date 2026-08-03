@@ -234,6 +234,110 @@ class OidcLoginManagerTest {
     }
 
     @Test
+    fun `result completed while detached is delivered to a matching attachment`() {
+        val pollEntered = CountDownLatch(1)
+        val releasePoll = CountDownLatch(1)
+        server.createContext("/auth/cli-login") { exchange ->
+            exchange.respond(200, ticketBody())
+        }
+        server.createContext("/auth/cli-poll") { exchange ->
+            pollEntered.countDown()
+            releasePoll.await(5, TimeUnit.SECONDS)
+            exchange.respond(200, tokenBody())
+        }
+        val manager = manager()
+        val detachedCalls = AtomicInteger()
+        val result = AtomicReference<LoginResult?>()
+        val firstAttachment =
+            manager.attach(origin) { _, _ ->
+                detachedCalls.incrementAndGet()
+            }
+
+        assertTrue(manager.start(activity(), origin))
+        assertTrue(pollEntered.await(5, TimeUnit.SECONDS))
+        manager.detach(firstAttachment)
+        releasePoll.countDown()
+        awaitFlowCompletion(manager)
+        ShadowLooper.idleMainLooper()
+
+        assertEquals(0, detachedCalls.get())
+        assertTrue(manager.hasHeldResultForTest())
+
+        manager.attach(origin) { deliveredOrigin, deliveredResult ->
+            assertEquals(origin, deliveredOrigin)
+            result.set(deliveredResult)
+        }
+
+        assertEquals(LoginResult.Success(TOKEN), result.get())
+        assertEquals(0, detachedCalls.get())
+        assertFalse(manager.hasHeldResultForTest())
+    }
+
+    @Test
+    fun `held result is discarded when a different origin attaches`() {
+        val pollEntered = CountDownLatch(1)
+        val releasePoll = CountDownLatch(1)
+        server.createContext("/auth/cli-login") { exchange ->
+            exchange.respond(200, ticketBody())
+        }
+        server.createContext("/auth/cli-poll") { exchange ->
+            pollEntered.countDown()
+            releasePoll.await(5, TimeUnit.SECONDS)
+            exchange.respond(200, tokenBody())
+        }
+        val manager = manager()
+        val firstAttachment = manager.attach(origin) { _, _ -> }
+
+        assertTrue(manager.start(activity(), origin))
+        assertTrue(pollEntered.await(5, TimeUnit.SECONDS))
+        manager.detach(firstAttachment)
+        releasePoll.countDown()
+        awaitFlowCompletion(manager)
+        ShadowLooper.idleMainLooper()
+
+        assertTrue(manager.hasHeldResultForTest())
+        val staleOriginCalls = AtomicInteger()
+        val originalOriginCalls = AtomicInteger()
+        manager.attach("https://other.example") { _, _ -> staleOriginCalls.incrementAndGet() }
+        manager.attach(origin) { _, _ -> originalOriginCalls.incrementAndGet() }
+
+        assertEquals(0, staleOriginCalls.get())
+        assertEquals(0, originalOriginCalls.get())
+        assertFalse(manager.hasHeldResultForTest())
+    }
+
+    @Test
+    fun `cancel discards a result held while detached`() {
+        val pollEntered = CountDownLatch(1)
+        val releasePoll = CountDownLatch(1)
+        server.createContext("/auth/cli-login") { exchange ->
+            exchange.respond(200, ticketBody())
+        }
+        server.createContext("/auth/cli-poll") { exchange ->
+            pollEntered.countDown()
+            releasePoll.await(5, TimeUnit.SECONDS)
+            exchange.respond(200, tokenBody())
+        }
+        val manager = manager()
+        val firstAttachment = manager.attach(origin) { _, _ -> }
+
+        assertTrue(manager.start(activity(), origin))
+        assertTrue(pollEntered.await(5, TimeUnit.SECONDS))
+        manager.detach(firstAttachment)
+        releasePoll.countDown()
+        awaitFlowCompletion(manager)
+        ShadowLooper.idleMainLooper()
+
+        assertTrue(manager.hasHeldResultForTest())
+        manager.cancel()
+        assertFalse(manager.hasHeldResultForTest())
+        val delivered = AtomicInteger()
+        manager.attach(origin) { _, _ -> delivered.incrementAndGet() }
+
+        assertEquals(0, delivered.get())
+    }
+
+    @Test
     fun `cancel suppresses a result that completed before it`() {
         server.createContext("/auth/cli-login") { exchange ->
             exchange.respond(200, ticketBody())
