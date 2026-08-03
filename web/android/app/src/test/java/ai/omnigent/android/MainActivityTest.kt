@@ -1,6 +1,7 @@
 package ai.omnigent.android
 
 import android.app.AlertDialog
+import android.app.DownloadManager
 import android.app.Notification
 import android.app.NotificationManager
 import android.content.Context
@@ -14,6 +15,7 @@ import android.webkit.CookieManager
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.RoboCookieManager
 import android.webkit.ValueCallback
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import androidx.core.view.WindowInsetsControllerCompat
@@ -37,6 +39,8 @@ import org.robolectric.annotation.RealObject
 import org.robolectric.shadow.api.Shadow
 import org.robolectric.shadows.ShadowAlertDialog
 import org.robolectric.shadows.ShadowCookieManager
+import org.robolectric.shadows.ShadowDownloadManager
+import org.robolectric.shadows.ShadowLog
 import org.robolectric.shadows.ShadowLooper.idleMainLooper
 import org.robolectric.shadows.ShadowNotificationManager
 import org.robolectric.shadows.ShadowPopupMenu
@@ -56,6 +60,8 @@ class MainActivityTest {
     @After
     fun resetCookieManager() {
         ShadowCookieManager.resetCookies()
+        ShadowDownloadManager.reset()
+        ShadowLog.clear()
     }
 
     @Test
@@ -87,13 +93,14 @@ class MainActivityTest {
         )
         idleMainLooper()
         val thirdActivity = controller.get()
+        val thirdWebView = thirdActivity.webView()
 
         assertTrue(secondActivity.isDestroyed)
         assertNotSame(secondActivity, thirdActivity)
 
         assertTrue(
             thirdActivity.shellWebViewClient().onRenderProcessGone(
-                thirdActivity.webView(),
+                thirdWebView,
                 renderProcessGoneDetail(),
             ),
         )
@@ -106,12 +113,92 @@ class MainActivityTest {
         assertEquals(thirdActivity.getString(R.string.renderer_failed_body), shadowOf(dialog).message)
         assertTrue(shadowOf(dialog).title != thirdActivity.getString(R.string.login_failed_title))
         assertNull(thirdActivity.loginFailedDialog())
+        assertTrue(thirdActivity.webViewUnusable())
+        assertNull(thirdWebView.parent)
+        assertTrue(shadowOf(thirdWebView).wasDestroyCalled())
 
         dialog.getButton(AlertDialog.BUTTON_POSITIVE).performClick()
         idleMainLooper()
 
         assertTrue(thirdActivity.isDestroyed)
         assertNotSame(thirdActivity, controller.get())
+    }
+
+    @Test
+    fun `reload recreates after the exhausted renderer failure is dismissed`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect(PINNED_ORIGIN)
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        val deadWebView = activity.webView()
+        ReflectionHelpers.setField(activity, "rendererRecreationAttempts", 2)
+
+        assertTrue(
+            activity.shellWebViewClient().onRenderProcessGone(
+                deadWebView,
+                renderProcessGoneDetail(),
+            ),
+        )
+        idleMainLooper()
+        val dialog = checkNotNull(ShadowAlertDialog.getLatestAlertDialog())
+        dialog.getButton(AlertDialog.BUTTON_NEGATIVE).performClick()
+        idleMainLooper()
+
+        activity.selectReloadMenuItem()
+        idleMainLooper()
+
+        assertTrue(activity.isDestroyed)
+        assertNotSame(activity, controller.get())
+        assertEquals(0, shadowOf(deadWebView).reloadInvocations)
+    }
+
+    @Test
+    fun `server switch recreates and loads the persisted server after renderer exhaustion`() {
+        val store = ServerStore(ApplicationProvider.getApplicationContext())
+        store.connect(PINNED_ORIGIN)
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        ReflectionHelpers.setField(activity, "rendererRecreationAttempts", 2)
+
+        assertTrue(
+            activity.shellWebViewClient().onRenderProcessGone(
+                activity.webView(),
+                renderProcessGoneDetail(),
+            ),
+        )
+        idleMainLooper()
+        store.connect(NEW_SERVER_URL)
+
+        activity.reloadWithNewServer(NEW_SERVER_URL, NEW_ORIGIN)
+        idleMainLooper()
+
+        val recreatedActivity = controller.get()
+        assertTrue(activity.isDestroyed)
+        assertNotSame(activity, recreatedActivity)
+        assertEquals(NEW_SERVER_URL, shadowOf(recreatedActivity.webView()).lastLoadedUrl)
+    }
+
+    @Test
+    fun `back exits without evaluating javascript after renderer exhaustion`() {
+        val activity = activity()
+        val deadWebView = activity.webView()
+        ReflectionHelpers.setField(activity, "rendererRecreationAttempts", 2)
+
+        assertTrue(
+            activity.shellWebViewClient().onRenderProcessGone(
+                deadWebView,
+                renderProcessGoneDetail(),
+            ),
+        )
+        idleMainLooper()
+        val dialog = checkNotNull(ShadowAlertDialog.getLatestAlertDialog())
+        dialog.getButton(AlertDialog.BUTTON_NEGATIVE).performClick()
+        idleMainLooper()
+        val javascriptBeforeBack = shadowOf(deadWebView).lastEvaluatedJavascript
+
+        activity.onBackPressedDispatcher.onBackPressed()
+
+        assertTrue(activity.isFinishing)
+        assertEquals(javascriptBeforeBack, shadowOf(deadWebView).lastEvaluatedJavascript)
     }
 
     @Test
@@ -228,6 +315,78 @@ class MainActivityTest {
         activity.onConfigurationChanged(lightConfiguration)
         assertTrue(insetsController.isAppearanceLightStatusBars)
         assertTrue(insetsController.isAppearanceLightNavigationBars)
+    }
+
+    @Test
+    fun `downloads copy the webview session only for the pinned origin`() {
+        ShadowDownloadManager.reset()
+        val activity = activity()
+        val webView = activity.webView()
+        webView.settings.userAgentString = DOWNLOAD_USER_AGENT
+        CookieManager.getInstance().setCookie(PINNED_DOWNLOAD_URL, PINNED_DOWNLOAD_COOKIE)
+        CookieManager.getInstance().setCookie(OFF_ORIGIN_DOWNLOAD_URL, OFF_ORIGIN_DOWNLOAD_COOKIE)
+        val downloadManager =
+            activity.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+        val shadowDownloads = shadowOf(downloadManager)
+        val listener = checkNotNull(shadowOf(webView).downloadListener)
+
+        listener.onDownloadStart(
+            PINNED_DOWNLOAD_URL,
+            null,
+            "attachment; filename=pinned.pdf",
+            "application/pdf",
+            1L,
+        )
+        listener.onDownloadStart(
+            OFF_ORIGIN_DOWNLOAD_URL,
+            null,
+            "attachment; filename=foreign.pdf",
+            "application/pdf",
+            1L,
+        )
+
+        fun headersOf(id: Long): Map<String, String> =
+            shadowOf(checkNotNull(shadowDownloads.getRequest(id)))
+                .requestHeaders
+                .associate { header -> header.first to header.second }
+
+        val pinnedHeaders = headersOf(0L)
+        val offOriginHeaders = headersOf(1L)
+        assertEquals(PINNED_DOWNLOAD_COOKIE, pinnedHeaders["Cookie"])
+        assertEquals(DOWNLOAD_USER_AGENT, pinnedHeaders["User-Agent"])
+        assertFalse(offOriginHeaders.containsKey("Cookie"))
+        assertEquals(DOWNLOAD_USER_AGENT, offOriginHeaders["User-Agent"])
+    }
+
+    @Test
+    fun `off-origin proxy auth page cannot open the file chooser`() {
+        val activity = activity()
+        val webView = activity.webView()
+        activity.enterProxyAuth()
+        webView.loadUrl(OFF_ORIGIN_AUTH_URL)
+        ShadowLog.clear()
+        var callbackCalls = 0
+        var callbackValue: Array<Uri>? = arrayOf(Uri.EMPTY)
+
+        val handled =
+            checkNotNull(shadowOf(webView).webChromeClient).onShowFileChooser(
+                webView,
+                ValueCallback { value ->
+                    callbackCalls++
+                    callbackValue = value
+                },
+                fileChooserParams(),
+            )
+
+        assertTrue(handled)
+        assertEquals(1, callbackCalls)
+        assertNull(callbackValue)
+        assertNull(activity.pendingFileCallback())
+        assertTrue(
+            ShadowLog
+                .getLogsForTag("OmnigentAuth")
+                .any { item -> item.msg.contains("file chooser denied") },
+        )
     }
 
     @Test
@@ -935,6 +1094,17 @@ class MainActivityTest {
         assertTrue(checkNotNull(shadowOf(popup).onMenuItemClickListener).onMenuItemClick(item))
     }
 
+    private fun MainActivity.selectReloadMenuItem() {
+        switchButton().performClick()
+        val popup = checkNotNull(ShadowPopupMenu.getLatestPopupMenu())
+        val expectedTitle = getString(R.string.menu_reload)
+        val item =
+            (0 until popup.menu.size())
+                .map(popup.menu::getItem)
+                .single { it.title.toString() == expectedTitle }
+        assertTrue(checkNotNull(shadowOf(popup).onMenuItemClickListener).onMenuItemClick(item))
+    }
+
     private fun MainActivity.reloadWithNewServer(
         serverUrl: String,
         newOrigin: String,
@@ -969,6 +1139,12 @@ class MainActivityTest {
 
     private fun MainActivity.pendingNavigatePath(): String? =
         ReflectionHelpers.getField(this, "pendingNavigatePath")
+
+    private fun MainActivity.pendingFileCallback(): ValueCallback<Array<Uri>>? =
+        ReflectionHelpers.getField(this, "pendingFileCallback")
+
+    private fun MainActivity.webViewUnusable(): Boolean =
+        ReflectionHelpers.getField(this, "webViewUnusable")
 
     private fun MainActivity.notificationManager(): ShadowNotificationManager =
         shadowOf(getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
@@ -1037,6 +1213,21 @@ class MainActivityTest {
             override fun rendererPriorityAtExit(): Int = 0
         }
 
+    private fun fileChooserParams() =
+        object : WebChromeClient.FileChooserParams() {
+            override fun createIntent(): Intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+
+            override fun getAcceptTypes(): Array<String> = arrayOf("application/pdf")
+
+            override fun getFilenameHint(): String? = null
+
+            override fun getMode(): Int = WebChromeClient.FileChooserParams.MODE_OPEN
+
+            override fun getTitle(): CharSequence? = null
+
+            override fun isCaptureEnabled(): Boolean = false
+        }
+
     private fun browserProbe(): Intent =
         Intent(Intent.ACTION_VIEW, Uri.parse("http:"))
             .addCategory(Intent.CATEGORY_BROWSABLE)
@@ -1071,6 +1262,12 @@ class MainActivityTest {
         const val NEW_ORIGIN = "https://new.example.com"
         const val NEW_SERVER_URL = "$NEW_ORIGIN/app"
         const val OLD_LOADING_URL = "$PINNED_ORIGIN/old-loading"
+        const val PINNED_DOWNLOAD_URL = "$PINNED_ORIGIN/files/report.pdf"
+        const val OFF_ORIGIN_DOWNLOAD_URL = "https://files.example.net/report.pdf"
+        const val PINNED_DOWNLOAD_COOKIE = "__Host-ap_session=pinned"
+        const val OFF_ORIGIN_DOWNLOAD_COOKIE = "front_door=foreign"
+        const val DOWNLOAD_USER_AGENT = "OmnigentTest/1.0"
+        const val OFF_ORIGIN_AUTH_URL = "https://idp.example.com/login"
         const val REFUSAL_URL =
             "https://accounts.google.com/v3/signin/rejected?error=disallowed_useragent"
         const val SESSION_TOKEN = "header.payload.signature"

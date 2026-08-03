@@ -68,6 +68,7 @@ class MainActivity : AppCompatActivity() {
     private var bridgeScriptHandler: ScriptHandler? = null
     private var loginAttempts = 0 // capped browser-login retries; reset in onPageReady
     private var rendererRecreationAttempts = 0
+    private var webViewUnusable = false
     private var historyCleared = false // drop pre-auth/login-redirect history once
 
     // Floating server switcher — mirrors the iOS `ServerSwitcher`. Always
@@ -252,6 +253,10 @@ class MainActivity : AppCompatActivity() {
             this,
             object : OnBackPressedCallback(true) {
                 override fun handleOnBackPressed() {
+                    if (webViewUnusable) {
+                        finish()
+                        return
+                    }
                     // Ask the page to dismiss an open overlay first (drawer/dialog);
                     // only navigate WebView history / leave the app if there was
                     // nothing to dismiss. evaluateJavascript's result is JSON, so a
@@ -267,7 +272,11 @@ class MainActivity : AppCompatActivity() {
                     // If the host is already going away when a late callback/timer
                     // fires, don't touch the (possibly destroyed) WebView.
                     val navigate = {
-                        if (!isDestroyed && !isFinishing && ::webView.isInitialized) {
+                        if (!isDestroyed &&
+                            !isFinishing &&
+                            !webViewUnusable &&
+                            ::webView.isInitialized
+                        ) {
                             if (webView.canGoBack()) webView.goBack() else finish()
                         }
                     }
@@ -299,7 +308,7 @@ class MainActivity : AppCompatActivity() {
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         applySystemBarContrast(newConfig)
-        if (::webView.isInitialized) {
+        if (::webView.isInitialized && !webViewUnusable) {
             // Notify matchMedia listeners without reloading the SPA.
             webView.dispatchConfigurationChanged(newConfig)
         }
@@ -464,7 +473,7 @@ class MainActivity : AppCompatActivity() {
     ) {
         // The poll can land after the activity is gone (it ran on a background
         // thread up to 5 min) — never touch a destroyed WebView.
-        if (isDestroyed || isFinishing || !::webView.isInitialized) return
+        if (isDestroyed || isFinishing || webViewUnusable || !::webView.isInitialized) return
         // Defense-in-depth: the token is interpolated into the cookie string, so a
         // value carrying ';' or whitespace could smuggle in cookie attributes
         // (e.g. Domain=, defeating the __Host- prefix). A real session token is an
@@ -501,7 +510,7 @@ class MainActivity : AppCompatActivity() {
         origin: String,
         accepted: Boolean,
     ) {
-        if (isDestroyed || isFinishing || !::webView.isInitialized) return
+        if (isDestroyed || isFinishing || webViewUnusable || !::webView.isInitialized) return
         if (origin != pinnedOrigin) return
         authLog("setCookie accepted=$accepted")
         // A rejected cookie means the reload would land unauthenticated, bounce
@@ -575,8 +584,10 @@ class MainActivity : AppCompatActivity() {
         if (::webView.isInitialized) {
             shellWebViewClient.endProxyAuth()
             dismissEmbeddedSignInDialogWithoutReset()
-            removeBridge()
-            webView.destroy()
+            if (!webViewUnusable) {
+                removeBridge()
+                webView.destroy()
+            }
         }
         if (::blobSaver.isInitialized) blobSaver.shutdown()
         super.onDestroy()
@@ -585,6 +596,10 @@ class MainActivity : AppCompatActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        if (webViewUnusable) {
+            recreate()
+            return
+        }
 
         // Detect a server change: ConnectActivity re-enters us via
         // CLEAR_TOP|SINGLE_TOP after the user picks a different server. The
@@ -613,6 +628,10 @@ class MainActivity : AppCompatActivity() {
         serverUrl: String,
         newOrigin: String,
     ) {
+        if (webViewUnusable) {
+            recreate()
+            return
+        }
         removeBridge()
         loginManager.cancel()
         shellWebViewClient.endProxyAuth()
@@ -635,13 +654,26 @@ class MainActivity : AppCompatActivity() {
     private fun handleWebViewUnusable() {
         if (isFinishing || isDestroyed) return
         if (pinnedOrigin == null) return
+        if (webViewUnusable) return
         if (rendererRecreationAttempts >= MAX_WEBVIEW_RECREATIONS) {
             authLog("renderer recreation attempts exhausted ($rendererRecreationAttempts)")
+            destroyUnusableWebView()
             showRendererFailed()
             return
         }
         rendererRecreationAttempts++
         recreate()
+    }
+
+    private fun destroyUnusableWebView() {
+        webViewUnusable = true
+        pendingFileCallback?.onReceiveValue(null)
+        pendingFileCallback = null
+        pendingMicRequest?.deny()
+        pendingMicRequest = null
+        removeBridge()
+        (webView.parent as? ViewGroup)?.removeView(webView)
+        webView.destroy()
     }
 
     private fun showRendererFailed() {
@@ -709,7 +741,7 @@ class MainActivity : AppCompatActivity() {
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 3 -> {
-                    webView.reload()
+                    if (webViewUnusable) recreate() else webView.reload()
                     true
                 }
 
@@ -873,6 +905,7 @@ class MainActivity : AppCompatActivity() {
         pageLoaded = true
         loginAttempts = 0 // reached a pinned-origin page — we're past the login redirect
         rendererRecreationAttempts = 0
+        webViewUnusable = false
         flushPendingActivation()
         emitInsets()
     }
@@ -957,6 +990,13 @@ class MainActivity : AppCompatActivity() {
         acceptTypes: Array<String>,
     ): Boolean {
         pendingFileCallback?.onReceiveValue(null) // cancel any in-flight chooser
+        pendingFileCallback = null
+        val currentOrigin = if (webViewUnusable) null else originOf(webView.url)
+        if (currentOrigin != pinnedOrigin) {
+            authLog("file chooser denied for main-frame origin $currentOrigin")
+            callback.onReceiveValue(null)
+            return true
+        }
         pendingFileCallback = callback
         // Keep MIME types as-is; resolve ".pdf"-style extension tokens to MIME so
         // the declared accept constraint isn't silently widened to */*.
@@ -1034,6 +1074,14 @@ class MainActivity : AppCompatActivity() {
         if (!isHttpScheme(Uri.parse(url).scheme)) return
         val request =
             DownloadManager.Request(Uri.parse(url)).apply {
+                addRequestHeader("User-Agent", webView.settings.userAgentString)
+                if (originOf(url) == pinnedOrigin) {
+                    // DownloadManager may forward this header across redirects; a same-origin
+                    // endpoint that redirects off-origin can still expose the cookie.
+                    CookieManager.getInstance().getCookie(url)?.let { cookie ->
+                        addRequestHeader("Cookie", cookie)
+                    }
+                }
                 setMimeType(mimeType)
                 setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name)
                 setNotificationVisibility(
