@@ -2,11 +2,15 @@ package ai.omnigent.android
 
 import android.app.Application
 import android.content.ContentProvider
+import android.content.ContentResolver
 import android.content.ContentValues
 import android.content.Context
 import android.database.Cursor
 import android.database.MatrixCursor
 import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.CancellationSignal
 import android.os.Environment
 import android.provider.MediaStore
 import androidx.test.core.app.ApplicationProvider
@@ -23,9 +27,11 @@ import org.robolectric.annotation.Config
 import org.robolectric.shadows.ShadowContentResolver
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.security.MessageDigest
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -99,32 +105,60 @@ class DownloadStorageTest {
         assertEquals(0, provider.updatedValues?.getAsInteger(MediaStore.Downloads.IS_PENDING))
         assertEquals("report", output.toString(Charsets.UTF_8.name()))
         assertEquals(0, provider.deleteCalls)
+        assertTrue(mediaStoreJournal().all.isEmpty())
     }
 
     @Test
-    fun `rerun of one operation reuses its published MediaStore row`() {
+    fun `remembered published MediaStore row is reused and removed from the journal`() {
+        val operationId = "published-work"
+        insertMediaStoreRow(pending = false)
+        rememberMediaStoreRow(operationId, provider.insertedUri)
         val storage = DownloadStorage(context)
         var writes = 0
 
-        val first =
-            storage.save("report.txt", "text/plain", operationId = "same-work") { stream ->
-                writes++
-                stream.write("report".toByteArray())
-            }
-        val rerun =
-            storage.save("report.txt", "text/plain", operationId = "same-work") {
+        val result =
+            storage.save("report.txt", "text/plain", operationId = operationId) {
                 writes++
             }
 
-        assertTrue(first.saved)
-        assertTrue(rerun.saved)
+        assertTrue(result.saved)
         assertEquals(1, provider.insertCalls)
-        assertEquals(1, writes)
+        assertEquals(0, provider.updateCalls)
+        assertEquals(0, writes)
+        assertTrue(mediaStoreJournal().all.isEmpty())
+    }
+
+    @Test
+    @Config(sdk = [29, 35])
+    fun `rerun reuses a journaled pending MediaStore row`() {
+        val operationId = "pending-work"
+        insertMediaStoreRow(pending = true)
+        rememberMediaStoreRow(operationId, provider.insertedUri)
+
+        val result =
+            DownloadStorage(context).save(
+                "report.txt",
+                "text/plain",
+                operationId = operationId,
+            ) { stream ->
+                stream.write("report".toByteArray())
+            }
+
+        assertTrue(result.saved)
+        assertEquals(1, provider.insertCalls)
+        assertEquals(1, provider.updateCalls)
+        assertEquals("report", output.toString(Charsets.UTF_8.name()))
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            assertTrue(provider.bundleIncludePendingQueries > 0)
+        } else {
+            assertTrue(provider.uriIncludePendingQueries > 0)
+        }
+        assertTrue(mediaStoreJournal().all.isEmpty())
     }
 
     @Test
     fun `orphaned pending MediaStore row is swept before the next save`() {
-        provider.orphanedPendingIds += 99L
+        provider.addRow(99L, pending = true)
 
         val result =
             DownloadStorage(context).save("report.txt", "text/plain") { stream ->
@@ -137,6 +171,32 @@ class DownloadStorageTest {
                 Uri.parse("content://media/external/downloads/99"),
             ),
         )
+        assertTrue(provider.bundleIncludePendingQueries > 0)
+        assertTrue(
+            provider.queriedSelections.contains(
+                "${MediaStore.Downloads.IS_PENDING} = ? AND " +
+                    "${MediaStore.MediaColumns.OWNER_PACKAGE_NAME} = ?",
+            ),
+        )
+    }
+
+    @Test
+    fun `MediaStore abort after writing deletes the pending row without publishing`() {
+        val abort = AtomicBoolean()
+
+        val result =
+            DownloadStorage(context).save(
+                "aborted.txt",
+                "text/plain",
+                shouldAbort = abort::get,
+            ) { stream ->
+                stream.write("partial".toByteArray())
+                abort.set(true)
+            }
+
+        assertFalse(result.saved)
+        assertEquals(0, provider.updateCalls)
+        assertEquals(1, provider.deleteCalls)
     }
 
     @Test
@@ -229,6 +289,171 @@ class DownloadStorageTest {
 
     @Test
     @Config(sdk = [28])
+    fun `different colliding names save concurrently`() {
+        val dir = checkNotNull(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS))
+        val firstTarget = File(dir, "Aa.txt")
+        val secondTarget = File(dir, "BB.txt")
+        assertEquals(
+            Math.floorMod(firstTarget.name.hashCode(), 32),
+            Math.floorMod(secondTarget.name.hashCode(), 32),
+        )
+        val firstEntered = CountDownLatch(1)
+        val releaseFirst = CountDownLatch(1)
+        val secondEntered = CountDownLatch(1)
+        val executor = Executors.newFixedThreadPool(2)
+
+        try {
+            val first =
+                executor.submit<DownloadSaveResult> {
+                    DownloadStorage(context).save(firstTarget.name, "text/plain") { stream ->
+                        firstEntered.countDown()
+                        check(releaseFirst.await(5, TimeUnit.SECONDS))
+                        stream.write("first".toByteArray())
+                    }
+                }
+            assertTrue(firstEntered.await(5, TimeUnit.SECONDS))
+            val second =
+                executor.submit<DownloadSaveResult> {
+                    DownloadStorage(context).save(secondTarget.name, "text/plain") { stream ->
+                        secondEntered.countDown()
+                        stream.write("second".toByteArray())
+                    }
+                }
+
+            assertTrue(secondEntered.await(1, TimeUnit.SECONDS))
+            assertTrue(second.get(5, TimeUnit.SECONDS).saved)
+            releaseFirst.countDown()
+            assertTrue(first.get(5, TimeUnit.SECONDS).saved)
+            assertEquals("first", firstTarget.readText())
+            assertEquals("second", secondTarget.readText())
+        } finally {
+            releaseFirst.countDown()
+            executor.shutdownNow()
+            firstTarget.delete()
+            secondTarget.delete()
+        }
+    }
+
+    @Test
+    @Config(sdk = [28])
+    fun `exact name lock registry releases idle entries`() {
+        val target =
+            File(
+                checkNotNull(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)),
+                "registry-release.txt",
+            )
+
+        try {
+            val result =
+                DownloadStorage(context).save(target.name, "text/plain") { stream ->
+                    stream.write("complete".toByteArray())
+                }
+            val locks =
+                org.robolectric.util.ReflectionHelpers.getStaticField<Map<*, *>>(
+                    DownloadStorage::class.java,
+                    "SAVE_LOCKS",
+                )
+
+            assertTrue(result.saved)
+            assertTrue(locks.isEmpty())
+        } finally {
+            target.delete()
+        }
+    }
+
+    @Test
+    @Config(sdk = [28])
+    fun `waiting for a busy same name lock observes abort`() {
+        val dir = checkNotNull(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS))
+        val target = File(dir, "abort-while-waiting.txt")
+        val firstEntered = CountDownLatch(1)
+        val releaseFirst = CountDownLatch(1)
+        val secondEntered = CountDownLatch(1)
+        val abortSecond = AtomicBoolean()
+        val executor = Executors.newFixedThreadPool(2)
+
+        try {
+            val first =
+                executor.submit<DownloadSaveResult> {
+                    DownloadStorage(context).save(target.name, "text/plain") { stream ->
+                        firstEntered.countDown()
+                        check(releaseFirst.await(5, TimeUnit.SECONDS))
+                        stream.write("first".toByteArray())
+                    }
+                }
+            assertTrue(firstEntered.await(5, TimeUnit.SECONDS))
+            val second =
+                executor.submit<DownloadSaveResult> {
+                    DownloadStorage(context).save(
+                        target.name,
+                        "text/plain",
+                        shouldAbort = abortSecond::get,
+                    ) { stream ->
+                        secondEntered.countDown()
+                        stream.write("second".toByteArray())
+                    }
+                }
+
+            assertFalse(secondEntered.await(200, TimeUnit.MILLISECONDS))
+            abortSecond.set(true)
+            assertFalse(second.get(2, TimeUnit.SECONDS).saved)
+            assertEquals(1L, secondEntered.count)
+            releaseFirst.countDown()
+            assertTrue(first.get(5, TimeUnit.SECONDS).saved)
+        } finally {
+            releaseFirst.countDown()
+            executor.shutdownNow()
+            target.delete()
+        }
+    }
+
+    @Test
+    @Config(sdk = [28])
+    fun `temporary sweep preserves another active save`() {
+        val dir = checkNotNull(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS))
+        val firstTarget = File(dir, "live-first.txt")
+        val secondTarget =
+            generateSequence(0, Int::inc)
+                .map { index -> File(dir, "sweep-second-$index.txt") }
+                .first { target ->
+                    Math.floorMod(target.name.hashCode(), 32) !=
+                        Math.floorMod(firstTarget.name.hashCode(), 32)
+                }
+        val firstEntered = CountDownLatch(1)
+        val releaseFirst = CountDownLatch(1)
+        val executor = Executors.newSingleThreadExecutor()
+
+        try {
+            val first =
+                executor.submit<DownloadSaveResult> {
+                    DownloadStorage(context).save(firstTarget.name, "text/plain") { stream ->
+                        stream.write("still active".toByteArray())
+                        firstEntered.countDown()
+                        check(releaseFirst.await(5, TimeUnit.SECONDS))
+                    }
+                }
+            assertTrue(firstEntered.await(5, TimeUnit.SECONDS))
+
+            val second =
+                DownloadStorage(context).save(secondTarget.name, "text/plain") { stream ->
+                    stream.write("second".toByteArray())
+                }
+
+            assertTrue(second.saved)
+            releaseFirst.countDown()
+            assertTrue(first.get(5, TimeUnit.SECONDS).saved)
+            assertEquals("still active", firstTarget.readText())
+            assertEquals("second", secondTarget.readText())
+        } finally {
+            releaseFirst.countDown()
+            executor.shutdownNow()
+            firstTarget.delete()
+            secondTarget.delete()
+        }
+    }
+
+    @Test
+    @Config(sdk = [28])
     fun `app storage save sweeps a stale temporary from a dead process`() {
         val dir = checkNotNull(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS))
         val stale = File(dir, ".omnigent-dead-process.tmp")
@@ -253,6 +478,38 @@ class DownloadStorageTest {
     private companion object {
         const val MEDIA_STORE_JOURNAL = "ai.omnigent.android.download_media_store"
     }
+
+    private fun mediaStoreJournal() =
+        context.getSharedPreferences(MEDIA_STORE_JOURNAL, Context.MODE_PRIVATE)
+
+    private fun rememberMediaStoreRow(
+        operationId: String,
+        uri: Uri,
+    ) {
+        mediaStoreJournal()
+            .edit()
+            .putString(operationKey(operationId), uri.toString())
+            .commit()
+    }
+
+    private fun insertMediaStoreRow(pending: Boolean) {
+        val values =
+            ContentValues().apply {
+                put(MediaStore.Downloads.IS_PENDING, if (pending) 1 else 0)
+            }
+        assertEquals(
+            provider.insertedUri,
+            context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values),
+        )
+    }
+
+    private fun operationKey(operationId: String): String =
+        MessageDigest
+            .getInstance("SHA-256")
+            .digest(operationId.toByteArray(Charsets.UTF_8))
+            .joinToString(separator = "") { byte ->
+                Integer.toHexString(byte.toInt() and 0xff).padStart(2, '0')
+            }
 }
 
 private fun File.isTemporaryDownload(): Boolean =
@@ -268,20 +525,30 @@ private class RecordingMediaProvider : ContentProvider() {
     var insertCalls = 0
     var updateCalls = 0
     var deleteCalls = 0
-    var rowExists = false
-    var pending = 1
-    val orphanedPendingIds = mutableListOf<Long>()
+    var bundleIncludePendingQueries = 0
+    var uriIncludePendingQueries = 0
     val deletedUris = mutableListOf<Uri>()
+    val queriedSelections = mutableListOf<String?>()
+    private val rows = mutableMapOf<Long, MediaRow>()
 
     override fun onCreate(): Boolean = true
+
+    fun addRow(
+        id: Long,
+        pending: Boolean,
+    ) {
+        rows[id] = MediaRow(pending, context?.packageName ?: TEST_PACKAGE)
+    }
 
     override fun insert(
         uri: Uri,
         values: ContentValues?,
     ): Uri {
         insertCalls++
-        rowExists = true
-        pending = 1
+        addRow(
+            42L,
+            pending = (values?.getAsInteger(MediaStore.Downloads.IS_PENDING) ?: 1) != 0,
+        )
         insertedValues = values?.let { ContentValues(it) }
         return insertedUri
     }
@@ -294,7 +561,11 @@ private class RecordingMediaProvider : ContentProvider() {
     ): Int {
         updateCalls++
         updatedValues = values?.let { ContentValues(it) }
-        if (updateResult > 0) pending = values?.getAsInteger(MediaStore.Downloads.IS_PENDING) ?: 0
+        if (updateResult > 0) {
+            uri.rowId()?.let { id ->
+                rows[id]?.pending = values?.getAsInteger(MediaStore.Downloads.IS_PENDING) != 0
+            }
+        }
         return updateResult
     }
 
@@ -305,9 +576,26 @@ private class RecordingMediaProvider : ContentProvider() {
     ): Int {
         deleteCalls++
         deletedUris += uri
-        if (uri == insertedUri) rowExists = false
-        orphanedPendingIds.remove(uri.lastPathSegment?.toLongOrNull())
+        uri.rowId()?.let(rows::remove)
         return 1
+    }
+
+    override fun query(
+        uri: Uri,
+        projection: Array<out String>?,
+        queryArgs: Bundle?,
+        cancellationSignal: CancellationSignal?,
+    ): Cursor? {
+        val includePending =
+            queryArgs?.getInt(MediaStore.QUERY_ARG_MATCH_PENDING) == MediaStore.MATCH_INCLUDE
+        if (includePending) bundleIncludePendingQueries++
+        return queryRows(
+            uri,
+            projection,
+            queryArgs?.getString(ContentResolver.QUERY_ARG_SQL_SELECTION),
+            queryArgs?.getStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS),
+            includePending,
+        )
     }
 
     override fun query(
@@ -317,34 +605,70 @@ private class RecordingMediaProvider : ContentProvider() {
         selectionArgs: Array<out String>?,
         sortOrder: String?,
     ): Cursor? {
+        val includePending = uri.getQueryParameter(INCLUDE_PENDING_PARAMETER) == "1"
+        if (includePending) uriIncludePendingQueries++
+        return queryRows(uri, projection, selection, selectionArgs, includePending)
+    }
+
+    private fun queryRows(
+        uri: Uri,
+        projection: Array<out String>?,
+        selection: String?,
+        selectionArgs: Array<out String>?,
+        includePending: Boolean,
+    ): Cursor {
+        queriedSelections += selection
         val columns = projection ?: emptyArray()
         val cursor = MatrixCursor(columns)
-        if (uri == insertedUri) {
-            if (rowExists) {
+        val candidates =
+            uri.rowId()?.let { id -> rows[id]?.let { row -> listOf(id to row) }.orEmpty() }
+                ?: rows.toList()
+        candidates
+            .filter { (_, row) -> !row.pending || includePending }
+            .filter { (_, row) -> matchesSelection(row, selection, selectionArgs) }
+            .forEach { (id, row) ->
                 cursor.addRow(
                     columns.map { column ->
                         when (column) {
-                            MediaStore.Downloads.IS_PENDING -> pending
-                            MediaStore.Downloads._ID -> 42L
+                            MediaStore.Downloads.IS_PENDING -> if (row.pending) 1 else 0
+                            MediaStore.Downloads._ID -> id
+                            MediaStore.MediaColumns.OWNER_PACKAGE_NAME -> row.ownerPackageName
                             else -> null
                         }
                     },
                 )
             }
-            return cursor
-        }
-        if (uri == MediaStore.Downloads.EXTERNAL_CONTENT_URI) {
-            orphanedPendingIds.forEach { id ->
-                cursor.addRow(
-                    columns.map { column ->
-                        if (column == MediaStore.Downloads._ID) id else null
-                    },
-                )
-            }
-            return cursor
-        }
         return cursor
     }
 
+    private fun matchesSelection(
+        row: MediaRow,
+        selection: String?,
+        selectionArgs: Array<out String>?,
+    ): Boolean {
+        if (selection == null) return true
+        if (selection.contains(MediaStore.Downloads.IS_PENDING)) {
+            val expectedPending = selectionArgs?.firstOrNull() ?: return false
+            if ((if (row.pending) "1" else "0") != expectedPending) return false
+        }
+        if (selection.contains(MediaStore.MediaColumns.OWNER_PACKAGE_NAME)) {
+            val expectedOwner = selectionArgs?.lastOrNull() ?: return false
+            if (row.ownerPackageName != expectedOwner) return false
+        }
+        return true
+    }
+
     override fun getType(uri: Uri): String? = null
+
+    private fun Uri.rowId(): Long? = lastPathSegment?.toLongOrNull()
+
+    private data class MediaRow(
+        var pending: Boolean,
+        val ownerPackageName: String,
+    )
+
+    private companion object {
+        const val INCLUDE_PENDING_PARAMETER = "includePending"
+        const val TEST_PACKAGE = "ai.omnigent.android"
+    }
 }

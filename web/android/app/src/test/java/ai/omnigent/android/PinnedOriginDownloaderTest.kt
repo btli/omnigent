@@ -81,6 +81,14 @@ class PinnedOriginDownloaderTest {
             .edit()
             .clear()
             .commit()
+        context
+            .getSharedPreferences(
+                PinnedOriginDownloadWorker.STOP_COUNT_PREFERENCES,
+                Context.MODE_PRIVATE,
+            )
+            .edit()
+            .clear()
+            .commit()
         pinnedServer = server()
         otherServer = server()
         pinnedOrigin = originOf(pinnedServer)
@@ -191,6 +199,79 @@ class PinnedOriginDownloaderTest {
             "Couldn't download ${target.name}. Sign in again and retry.",
             notificationFor(worker)!!.extras.getCharSequence(Notification.EXTRA_TEXT),
         )
+    }
+
+    @Test
+    fun `terminal HTML is rejected when a non HTML file was requested`() {
+        val responseTypes = listOf("text/html; charset=utf-8", "application/xhtml+xml")
+        responseTypes.forEachIndexed { index, contentType ->
+            val path = "/expired-without-redirect-$index"
+            pinnedServer.createContext(path) { exchange ->
+                exchange.responseHeaders.add("Content-Type", contentType)
+                exchange.respond(200, "<html>sign in</html>")
+            }
+            val target = targetFile("expired-without-redirect-$index.pdf")
+            val worker =
+                worker(
+                    "$pinnedOrigin$path",
+                    target.name,
+                    mimeType = "application/pdf",
+                )
+
+            val result = worker.doWork()
+
+            assertEquals(ListenableWorker.Result.failure(), result)
+            assertFalse(target.exists())
+            assertEquals(
+                "Couldn't download ${target.name}. Sign in again and retry.",
+                notificationFor(worker)!!.extras.getCharSequence(Notification.EXTRA_TEXT),
+            )
+        }
+    }
+
+    @Test
+    fun `terminal HTML is allowed when caller type is absent blank or HTML`() {
+        val requestedTypes = listOf<String?>(null, "", "text/html", "application/xhtml+xml")
+        requestedTypes.forEachIndexed { index, mimeType ->
+            val path = "/legitimate-html-$index"
+            val body = "<html>report $index</html>"
+            pinnedServer.createContext(path) { exchange ->
+                exchange.responseHeaders.add("Content-Type", "text/html; charset=utf-8")
+                exchange.respond(200, body)
+            }
+            val target = targetFile("legitimate-html-$index.html")
+
+            val result = worker("$pinnedOrigin$path", target.name, mimeType = mimeType).doWork()
+
+            assertEquals(ListenableWorker.Result.success(), result)
+            assertEquals(body, target.readText())
+        }
+    }
+
+    @Test
+    fun `stop between redirect hops does not fetch the next hop`() {
+        val nextHopHits = AtomicInteger()
+        val workerReference = AtomicReference<PinnedOriginDownloadWorker>()
+        pinnedServer.createContext("/stop-after-hop") { exchange ->
+            exchange.responseHeaders.add("Location", "$pinnedOrigin/should-not-run")
+            exchange.sendResponseHeaders(302, -1)
+            workerReference.get().stop(WorkInfo.STOP_REASON_TIMEOUT)
+            exchange.close()
+        }
+        pinnedServer.createContext("/should-not-run") { exchange ->
+            nextHopHits.incrementAndGet()
+            exchange.respond(200, DOWNLOAD_BODY)
+        }
+        val target = targetFile("stopped-redirect.txt")
+        val worker = worker("$pinnedOrigin/stop-after-hop", target.name)
+        workerReference.set(worker)
+
+        val result = worker.doWork()
+
+        assertEquals(ListenableWorker.Result.retry(), result)
+        assertEquals(0, nextHopHits.get())
+        assertFalse(target.exists())
+        assertNull(notificationFor(worker))
     }
 
     @Test
@@ -516,6 +597,99 @@ class PinnedOriginDownloaderTest {
     }
 
     @Test
+    fun `foreground setup failure after a stop fails without another transfer`() {
+        val hits = AtomicInteger()
+        pinnedServer.createContext("/foreground-denied-after-stop") { exchange ->
+            hits.incrementAndGet()
+            exchange.respond(200, DOWNLOAD_BODY)
+        }
+        val workId = UUID.randomUUID()
+        worker("$pinnedOrigin/foreground-denied-after-stop", "prior-life.txt", id = workId)
+            .stop(WorkInfo.STOP_REASON_TIMEOUT)
+        val target = targetFile("foreground-denied-after-stop.txt")
+        val foreground = RecordingForegroundUpdater(SecurityException("denied"))
+        val worker =
+            worker(
+                "$pinnedOrigin/foreground-denied-after-stop",
+                target.name,
+                foreground = foreground,
+                id = workId,
+            )
+
+        val result = worker.doWork()
+
+        assertEquals(ListenableWorker.Result.failure(), result)
+        assertEquals(0, hits.get())
+        assertFalse(target.exists())
+        assertNotNull(notificationFor(worker))
+        assertFalse(stopCounts().contains(workId.toString()))
+    }
+
+    @Test
+    fun `three WorkManager stops terminate the operation before another transfer`() {
+        val hits = AtomicInteger()
+        pinnedServer.createContext("/stop-limit") { exchange ->
+            hits.incrementAndGet()
+            exchange.respond(200, DOWNLOAD_BODY)
+        }
+        val workId = UUID.randomUUID()
+        repeat(PinnedOriginDownloadWorker.MAX_STOPS) {
+            worker("$pinnedOrigin/stop-limit", "stop-limit.txt", id = workId)
+                .stop(WorkInfo.STOP_REASON_TIMEOUT)
+        }
+        assertEquals(
+            PinnedOriginDownloadWorker.MAX_STOPS,
+            stopCounts().getInt(workId.toString(), 0),
+        )
+        val worker = worker("$pinnedOrigin/stop-limit", "stop-limit.txt", id = workId)
+
+        val result = worker.doWork()
+
+        assertEquals(ListenableWorker.Result.failure(), result)
+        assertEquals(0, hits.get())
+        assertEquals(
+            "Couldn't download stop-limit.txt",
+            notificationFor(worker)!!.extras.getCharSequence(Notification.EXTRA_TEXT),
+        )
+        assertFalse(stopCounts().contains(workId.toString()))
+    }
+
+    @Test
+    fun `terminal success and failure clear persisted stop counts`() {
+        pinnedServer.createContext("/clear-stop-success") { exchange ->
+            exchange.respond(200, DOWNLOAD_BODY)
+        }
+        pinnedServer.createContext("/clear-stop-failure") { exchange ->
+            exchange.respond(404, "missing")
+        }
+        val successId = UUID.randomUUID()
+        val failureId = UUID.randomUUID()
+        stopCounts()
+            .edit()
+            .putInt(successId.toString(), 1)
+            .putInt(failureId.toString(), 2)
+            .commit()
+
+        val success =
+            worker(
+                "$pinnedOrigin/clear-stop-success",
+                targetFile("clear-stop-success.txt").name,
+                id = successId,
+            ).doWork()
+        val failure =
+            worker(
+                "$pinnedOrigin/clear-stop-failure",
+                "clear-stop-failure.txt",
+                id = failureId,
+            ).doWork()
+
+        assertEquals(ListenableWorker.Result.success(), success)
+        assertEquals(ListenableWorker.Result.failure(), failure)
+        assertFalse(stopCounts().contains(successId.toString()))
+        assertFalse(stopCounts().contains(failureId.toString()))
+    }
+
+    @Test
     fun `stopped copy refuses to write another byte`() {
         val worker = worker("$pinnedOrigin/file", "stopped-copy.txt")
         val output = ByteArrayOutputStream()
@@ -650,6 +824,8 @@ class PinnedOriginDownloaderTest {
         suggestedName: String,
         runAttemptCount: Int = 0,
         foreground: ForegroundUpdater? = null,
+        mimeType: String? = "text/plain",
+        id: UUID = UUID.randomUUID(),
     ): PinnedOriginDownloadWorker {
         val builder =
             TestListenableWorkerBuilder<PinnedOriginDownloadWorker>(
@@ -659,11 +835,11 @@ class PinnedOriginDownloaderTest {
                         url,
                         pinnedOrigin,
                         USER_AGENT,
-                        "text/plain",
+                        mimeType,
                         suggestedName,
                     ),
                 runAttemptCount = runAttemptCount,
-            )
+            ).setId(id)
         if (foreground != null) builder.setForegroundUpdater(foreground)
         return builder.build()
     }
@@ -693,6 +869,12 @@ class PinnedOriginDownloaderTest {
     private fun shadowNotificationManager() =
         shadowOf(
             context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager,
+        )
+
+    private fun stopCounts() =
+        context.getSharedPreferences(
+            PinnedOriginDownloadWorker.STOP_COUNT_PREFERENCES,
+            Context.MODE_PRIVATE,
         )
 
     private fun targetFile(name: String): File {

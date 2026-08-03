@@ -158,12 +158,26 @@ internal class PinnedOriginDownloadWorker(
     private var activeConnection: HttpURLConnection? = null
 
     override fun doWork(): Result {
-        establishForeground()
+        val suggestedName = inputData.getString(KEY_SUGGESTED_NAME) ?: FALLBACK_NAME
+        val stopCount = stopCount()
+        if (stopCount >= MAX_STOPS) {
+            return terminalFailure(
+                suggestedName,
+                TerminalDownloadException("Download stopped too many times"),
+            )
+        }
+        val foregroundEstablished = establishForeground()
         if (isStopped) return stoppedFailure()
+        if (!foregroundEstablished && stopCount > 0) {
+            return terminalFailure(
+                suggestedName,
+                TerminalDownloadException("Foreground execution unavailable after a stop"),
+            )
+        }
         val input = readInput()
         if (input == null) {
             return terminalFailure(
-                inputData.getString(KEY_SUGGESTED_NAME) ?: FALLBACK_NAME,
+                suggestedName,
                 TerminalDownloadException("Missing download input"),
             )
         }
@@ -204,6 +218,7 @@ internal class PinnedOriginDownloadWorker(
                     )
                 throwIfStopped()
                 if (saved.saved) {
+                    clearStopCount()
                     notifications.succeeded(saved.name, id)
                     return Result.success()
                 }
@@ -243,23 +258,27 @@ internal class PinnedOriginDownloadWorker(
         )
 
     override fun onStopped() {
+        incrementStopCount()
         activeConnection?.disconnect()
         super.onStopped()
     }
 
-    private fun establishForeground() {
+    private fun establishForeground(): Boolean =
         try {
             setForegroundAsync(getForegroundInfo()).get()
+            true
         } catch (failure: InterruptedException) {
             Thread.currentThread().interrupt()
             Log.w(TAG, "Foreground download setup was interrupted", failure)
+            false
         } catch (failure: ExecutionException) {
             Log.w(TAG, "Foreground download notification is unavailable", failure.cause)
+            false
         } catch (failure: RuntimeException) {
             // Notification permission or foreground-service state can change at runtime.
             Log.w(TAG, "Foreground download notification is unavailable", failure)
+            false
         }
-    }
 
     private fun readInput(): DownloadInput? {
         val url = inputData.getString(KEY_URL) ?: return null
@@ -293,6 +312,7 @@ internal class PinnedOriginDownloadWorker(
         failure: Throwable,
     ): Result {
         Log.e(TAG, "Download failed for $suggestedName", failure)
+        clearStopCount()
         if (failure is AuthenticationRequiredException) {
             notifications.authenticationRequired(suggestedName, id)
         } else {
@@ -304,6 +324,38 @@ internal class PinnedOriginDownloadWorker(
     private fun stoppedFailure(): Result {
         Log.w(TAG, "Download stopped; retrying from byte zero")
         return Result.retry()
+    }
+
+    private fun stopCount(): Int =
+        synchronized(STOP_COUNT_LOCK) {
+            applicationContext
+                .getSharedPreferences(STOP_COUNT_PREFERENCES, Context.MODE_PRIVATE)
+                .getInt(id.toString(), 0)
+        }
+
+    private fun incrementStopCount() {
+        synchronized(STOP_COUNT_LOCK) {
+            val preferences =
+                applicationContext.getSharedPreferences(
+                    STOP_COUNT_PREFERENCES,
+                    Context.MODE_PRIVATE,
+                )
+            preferences
+                .edit()
+                .putInt(id.toString(), preferences.getInt(id.toString(), 0) + 1)
+                .commit()
+        }
+    }
+
+    private fun clearStopCount() {
+        synchronized(STOP_COUNT_LOCK) {
+            if (isStopped) return
+            applicationContext
+                .getSharedPreferences(STOP_COUNT_PREFERENCES, Context.MODE_PRIVATE)
+                .edit()
+                .remove(id.toString())
+                .commit()
+        }
     }
 
     private fun throwIfStopped() {
@@ -397,12 +449,17 @@ internal class PinnedOriginDownloadWorker(
                     throw TerminalDownloadException("Download failed with HTTP $status")
                 }
 
+                val requestedMimeType = normalizedMimeType(mimeType)
+                val responseMimeType = normalizedMimeType(connection.contentType)
+                if (requestedMimeType != null &&
+                    !isHtmlMimeType(requestedMimeType) &&
+                    responseMimeType?.let(::isHtmlMimeType) == true
+                ) {
+                    throw AuthenticationRequiredException()
+                }
                 val resolvedMimeType =
                     mimeType?.takeIf(String::isNotBlank)
-                        ?: connection.contentType
-                            ?.substringBefore(';')
-                            ?.trim()
-                            ?.takeIf(String::isNotBlank)
+                        ?: responseMimeType
                         ?: DEFAULT_MIME_TYPE
                 return connection.inputStream.use { input ->
                     var streamFailure: Throwable? = null
@@ -477,6 +534,16 @@ internal class PinnedOriginDownloadWorker(
     private fun effectivePort(url: URL): Int =
         if (url.port == -1) url.defaultPort else url.port
 
+    private fun normalizedMimeType(mimeType: String?): String? =
+        mimeType
+            ?.substringBefore(';')
+            ?.trim()
+            ?.takeIf(String::isNotBlank)
+
+    private fun isHtmlMimeType(mimeType: String): Boolean =
+        mimeType.equals("text/html", ignoreCase = true) ||
+            mimeType.equals("application/xhtml+xml", ignoreCase = true)
+
     private data class DownloadInput(
         val url: String,
         val pinnedOrigin: String,
@@ -511,6 +578,8 @@ internal class PinnedOriginDownloadWorker(
         internal const val KEY_MIME_TYPE = "mime_type"
         internal const val KEY_SUGGESTED_NAME = "suggested_name"
         internal const val MAX_ATTEMPTS = 3
+        internal const val STOP_COUNT_PREFERENCES = "ai.omnigent.android.download_stop_counts"
+        internal const val MAX_STOPS = 3
         private const val WORK_TAG = "pinned-origin-download"
         private const val MAX_REDIRECTS = 10
         private const val CONNECT_TIMEOUT_MS = 15_000
@@ -521,6 +590,7 @@ internal class PinnedOriginDownloadWorker(
         private const val FALLBACK_NAME = "download"
         private const val BACKOFF_SECONDS = 45L
         private val REDIRECT_STATUS_CODES = setOf(301, 302, 303, 307, 308)
+        private val STOP_COUNT_LOCK = Any()
 
         internal fun request(
             url: String,

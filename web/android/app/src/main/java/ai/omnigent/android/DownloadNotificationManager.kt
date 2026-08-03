@@ -109,7 +109,10 @@ internal class DownloadNotificationManager(
         title: String,
         body: String,
     ) {
-        if (!manager.areNotificationsEnabled()) {
+        val channelBlocked =
+            manager.getNotificationChannelCompat(CHANNEL_ID)?.importance ==
+                NotificationManager.IMPORTANCE_NONE
+        if (!manager.areNotificationsEnabled() || channelBlocked) {
             DownloadOutcomeFallback.deliverOrRemember(context, workId, body)
             return
         }
