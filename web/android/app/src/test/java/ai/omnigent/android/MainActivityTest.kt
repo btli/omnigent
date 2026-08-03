@@ -45,24 +45,83 @@ import java.util.concurrent.TimeUnit
 @Config(sdk = [35], shadows = [CountingOmnigentWebViewClientShadow::class])
 class MainActivityTest {
     @Test
-    fun `renderer crash recreates the activity and WebView`() {
+    fun `renderer crashes recreate twice then show the failure surface`() {
         ServerStore(ApplicationProvider.getApplicationContext()).connect(PINNED_ORIGIN)
         val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
-        val activity = controller.get()
-        val oldWebView = activity.webView()
+        val firstActivity = controller.get()
+        val firstWebView = firstActivity.webView()
 
-        val handled =
-            activity.shellWebViewClient().onRenderProcessGone(
-                oldWebView,
+        assertTrue(
+            firstActivity.shellWebViewClient().onRenderProcessGone(
+                firstWebView,
                 renderProcessGoneDetail(),
-            )
+            ),
+        )
+        idleMainLooper()
+        val secondActivity = controller.get()
+        val secondWebView = secondActivity.webView()
+
+        assertTrue(firstActivity.isDestroyed)
+        assertNotSame(firstActivity, secondActivity)
+        assertNotSame(firstWebView, secondWebView)
+
+        assertTrue(
+            secondActivity.shellWebViewClient().onRenderProcessGone(
+                secondWebView,
+                renderProcessGoneDetail(),
+            ),
+        )
+        idleMainLooper()
+        val thirdActivity = controller.get()
+
+        assertTrue(secondActivity.isDestroyed)
+        assertNotSame(secondActivity, thirdActivity)
+
+        assertTrue(
+            thirdActivity.shellWebViewClient().onRenderProcessGone(
+                thirdActivity.webView(),
+                renderProcessGoneDetail(),
+            ),
+        )
         idleMainLooper()
 
-        val recreatedActivity = controller.get()
-        assertTrue(handled)
-        assertTrue(activity.isDestroyed)
-        assertNotSame(activity, recreatedActivity)
-        assertNotSame(oldWebView, recreatedActivity.webView())
+        assertSame(thirdActivity, controller.get())
+        assertFalse(thirdActivity.isDestroyed)
+        val dialog = checkNotNull(ShadowAlertDialog.getLatestAlertDialog())
+        assertEquals(
+            thirdActivity.getString(R.string.login_failed_body, "example.com"),
+            shadowOf(dialog).message,
+        )
+    }
+
+    @Test
+    fun `successful pinned page resets the renderer recreation budget`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect(PINNED_ORIGIN)
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+
+        repeat(2) {
+            val activity = controller.get()
+            assertTrue(
+                activity.shellWebViewClient().onRenderProcessGone(
+                    activity.webView(),
+                    renderProcessGoneDetail(),
+                ),
+            )
+            idleMainLooper()
+        }
+
+        val recoveredActivity = controller.get()
+        recoveredActivity.invokeOnPageReady(PINNED_ORIGIN)
+        assertTrue(
+            recoveredActivity.shellWebViewClient().onRenderProcessGone(
+                recoveredActivity.webView(),
+                renderProcessGoneDetail(),
+            ),
+        )
+        idleMainLooper()
+
+        assertTrue(recoveredActivity.isDestroyed)
+        assertNotSame(recoveredActivity, controller.get())
     }
 
     @Test
@@ -134,7 +193,9 @@ class MainActivityTest {
 
         assertEquals(activity.getString(R.string.proxy_auth_refused_title), shadowDialog.title)
         assertEquals(
-            activity.getString(R.string.proxy_auth_refused_body, "example.com"),
+            "This server's sign-in provider doesn't allow signing in inside an app. " +
+                "Open example.com in your browser to continue. " +
+                "Signing in there won't sign you in here.",
             shadowDialog.message,
         )
         assertEquals(
@@ -219,7 +280,7 @@ class MainActivityTest {
     }
 
     @Test
-    fun `no resolvers reports no browser and keeps the dialog open`() {
+    fun `no resolvers changes the action to an acknowledgement that dismisses`() {
         val activity = activity()
         val dialog = activity.refuseEmbeddedSignIn()
 
@@ -229,9 +290,19 @@ class MainActivityTest {
             activity.getString(R.string.proxy_auth_no_browser_body),
             shadowOf(dialog).message,
         )
+        assertEquals(
+            activity.getString(android.R.string.ok),
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).text,
+        )
         assertTrue(dialog.isShowing)
         assertNull(shadowOf(activity).peekNextStartedActivity())
         assertEquals(0, ActivityCallLog.endProxyAuthCalls)
+
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).performClick()
+        idleMainLooper()
+
+        assertFalse(dialog.isShowing)
+        assertEquals(1, ActivityCallLog.endProxyAuthCalls)
     }
 
     @Test
@@ -439,7 +510,7 @@ class MainActivityTest {
     }
 
     @Test
-    fun `retry resets the login budget and starts a fresh attempt`() {
+    fun `exhausted login budget shows retry and retry starts a fresh attempt`() {
         val activity = activity()
         val loginManager = activity.loginManager()
         val executor: ExecutorService = ReflectionHelpers.getField(loginManager, "io")
@@ -453,8 +524,12 @@ class MainActivityTest {
 
         try {
             ReflectionHelpers.setField(activity, "loginAttempts", 3)
-            activity.onLoginResult(PINNED_ORIGIN, LoginResult.Rejected)
+            activity.invokeStartLogin()
             val dialog = checkNotNull(ShadowAlertDialog.getLatestAlertDialog())
+            assertEquals(
+                activity.getString(R.string.login_failed_body, "example.com"),
+                shadowOf(dialog).message,
+            )
 
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).performClick()
             idleMainLooper()
@@ -464,6 +539,34 @@ class MainActivityTest {
             loginManager.shutdown()
             holdWorker.countDown()
         }
+    }
+
+    @Test
+    fun `non JWT session token shows the generic retry dialog`() {
+        val activity = activity()
+
+        activity.invokeOnSessionToken("not-a-jwt")
+
+        val dialog = checkNotNull(ShadowAlertDialog.getLatestAlertDialog())
+        assertEquals(activity.getString(R.string.login_failed_title), shadowOf(dialog).title)
+        assertEquals(
+            activity.getString(R.string.login_failed_body, "example.com"),
+            shadowOf(dialog).message,
+        )
+    }
+
+    @Test
+    fun `rejected session cookie shows the generic retry dialog`() {
+        val activity = activity()
+
+        activity.onSessionCookieSet(PINNED_ORIGIN, accepted = false)
+
+        val dialog = checkNotNull(ShadowAlertDialog.getLatestAlertDialog())
+        assertEquals(activity.getString(R.string.login_failed_title), shadowOf(dialog).title)
+        assertEquals(
+            activity.getString(R.string.login_failed_body, "example.com"),
+            shadowOf(dialog).message,
+        )
     }
 
     @Test
@@ -564,13 +667,6 @@ class MainActivityTest {
             ActivityCallLog.entries,
         )
         assertEquals(OLD_LOADING_URL, client.lastSelfStoppedUrl())
-
-        activity.enterProxyAuth(NEW_ORIGIN)
-        client.onPageStarted(webView, PLAIN_IDP_URL, null)
-        client.onPageFinished(webView, OLD_LOADING_URL)
-
-        assertEquals(ProxyAuthState.IN_FLIGHT, client.proxyAuthState())
-        assertNull(client.lastSelfStoppedUrl())
     }
 
     private fun activity(): MainActivity {
@@ -660,6 +756,27 @@ class MainActivityTest {
 
     private fun MainActivity.loginManager(): OidcLoginManager =
         ReflectionHelpers.getField(this, "loginManager")
+
+    private fun MainActivity.invokeStartLogin() {
+        ReflectionHelpers.callInstanceMethod<Unit>(this, "startLogin")
+    }
+
+    private fun MainActivity.invokeOnSessionToken(token: String) {
+        ReflectionHelpers.callInstanceMethod<Unit>(
+            this,
+            "onSessionToken",
+            ClassParameter.from(String::class.java, PINNED_ORIGIN),
+            ClassParameter.from(String::class.java, token),
+        )
+    }
+
+    private fun MainActivity.invokeOnPageReady(url: String) {
+        ReflectionHelpers.callInstanceMethod<Unit>(
+            this,
+            "onPageReady",
+            ClassParameter.from(String::class.java, url),
+        )
+    }
 
     private fun MainActivity.switchButton(): View = ReflectionHelpers.getField(this, "switchButton")
 

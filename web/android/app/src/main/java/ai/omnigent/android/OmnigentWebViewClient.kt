@@ -163,14 +163,15 @@ class OmnigentWebViewClient(
 
         val urlString = url.toString()
         val origin = originOf(urlString)
-        if (proxyAuthState == ProxyAuthState.REFUSED) {
-            return origin != pinnedOrigin()
-        }
 
         // Non-http(s) schemes must be handed to an installed system handler.
         if (!isHttpScheme(url.scheme)) {
             openExternally(view, url)
             return true
+        }
+
+        if (proxyAuthState == ProxyAuthState.REFUSED) {
+            return origin != pinnedOrigin()
         }
 
         if (origin == pinnedOrigin()) return false

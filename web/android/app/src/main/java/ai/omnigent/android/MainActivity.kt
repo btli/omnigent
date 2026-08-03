@@ -66,6 +66,7 @@ class MainActivity : AppCompatActivity() {
     private var bridgeTransportInstalled = false
     private var bridgeScriptHandler: ScriptHandler? = null
     private var loginAttempts = 0 // capped browser-login retries; reset in onPageReady
+    private var rendererRecreationAttempts = 0
     private var historyCleared = false // drop pre-auth/login-redirect history once
 
     // Floating server switcher — mirrors the iOS `ServerSwitcher`. Always
@@ -111,6 +112,8 @@ class MainActivity : AppCompatActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        rendererRecreationAttempts =
+            savedInstanceState?.getInt(RENDERER_RECREATION_ATTEMPTS_KEY) ?: 0
 
         // Edge-to-edge: the WebView spans system bars; insets are pushed to CSS
         // below. Display-cutout handling is set in the manifest theme.
@@ -301,6 +304,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putInt(RENDERER_RECREATION_ATTEMPTS_KEY, rendererRecreationAttempts)
+        super.onSaveInstanceState(outState)
+    }
+
     /**
      * Install the web -> native bridge as an origin-allowlisted web message
      * listener (NOT addJavascriptInterface): the transport object reaches only
@@ -370,6 +378,7 @@ class MainActivity : AppCompatActivity() {
         val origin = pinnedOrigin ?: return
         if (loginAttempts >= MAX_LOGIN_ATTEMPTS) {
             authLog("login attempts exhausted ($loginAttempts) — not retrying")
+            showLoginFailed(origin)
             return
         }
         // start() no-ops when a login is already in flight — a multi-hop OIDC
@@ -461,6 +470,7 @@ class MainActivity : AppCompatActivity() {
         // this only ever rejects a malformed/hostile value, never a valid login.
         if (!isJwtShaped(token)) {
             authLog("onSessionToken: token not JWT-shaped — rejecting")
+            showLoginFailed(origin)
             return
         }
         val secure = origin.startsWith("https://")
@@ -504,7 +514,10 @@ class MainActivity : AppCompatActivity() {
         // A rejected cookie means the reload would land unauthenticated, bounce
         // to login, and re-launch the browser — burning the retry budget on a
         // failure that retrying can't fix. Stay put instead.
-        if (!accepted) return
+        if (!accepted) {
+            showLoginFailed(origin)
+            return
+        }
         CookieManager.getInstance().flush()
         webView.loadUrl(origin)
     }
@@ -613,7 +626,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun handleWebViewUnusable() {
-        if (!isFinishing && !isDestroyed) recreate()
+        if (isFinishing || isDestroyed) return
+        val origin = pinnedOrigin ?: return
+        if (rendererRecreationAttempts >= MAX_WEBVIEW_RECREATIONS) {
+            authLog("renderer recreation attempts exhausted ($rendererRecreationAttempts)")
+            showLoginFailed(origin)
+            return
+        }
+        rendererRecreationAttempts++
+        recreate()
     }
 
     private fun removeBridge() {
@@ -790,6 +811,10 @@ class MainActivity : AppCompatActivity() {
         val dialog = embeddedSignInDialog?.takeIf { it.isShowing }
         if (dialog != null) {
             dialog.setMessage(getString(R.string.proxy_auth_no_browser_body))
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).apply {
+                setText(android.R.string.ok)
+                setOnClickListener { dialog.dismiss() }
+            }
         } else {
             Toast
                 .makeText(
@@ -817,6 +842,7 @@ class MainActivity : AppCompatActivity() {
         }
         pageLoaded = true
         loginAttempts = 0 // reached a pinned-origin page — we're past the login redirect
+        rendererRecreationAttempts = 0
         flushPendingActivation()
         emitInsets()
     }
@@ -986,6 +1012,8 @@ class MainActivity : AppCompatActivity() {
 
     private companion object {
         const val MAX_LOGIN_ATTEMPTS = 3
+        const val MAX_WEBVIEW_RECREATIONS = 2
+        const val RENDERER_RECREATION_ATTEMPTS_KEY = "rendererRecreationAttempts"
 
         // Back-press fallback: long enough that a healthy renderer's JS round-trip
         // (a few ms) always wins the race, short enough to not feel stuck if it

@@ -738,6 +738,19 @@ class OmnigentWebViewClientTest {
     }
 
     @Test
+    fun `while refused a mailto main-frame navigation is handed off externally`() {
+        val webView = webView()
+        val client = client()
+        refuse(client, webView)
+
+        assertTrue(client.shouldOverrideUrlLoading(webView, request(MAILTO_URL)))
+
+        val startedIntent = webView.startedActivities.single()
+        assertEquals(Intent.ACTION_VIEW, startedIntent.action)
+        assertEquals(MAILTO_URL, startedIntent.dataString)
+    }
+
+    @Test
     fun `while refused a same-origin navigation loads inline`() {
         val webView = webView()
         var loginRequired = false
@@ -995,6 +1008,7 @@ class OmnigentWebViewClientTest {
         const val OTHER_IDP_URL = "https://other-idp.example.net/login"
         const val GOOGLE_IDP_URL = "https://accounts.google.com/signin"
         const val STALE_IDP_URL = "https://stale-idp.example.net/login"
+        const val MAILTO_URL = "mailto:support@example.com"
 
         const val REJECTION_QUERY_URL =
             "https://accounts.google.com/v3/signin/rejected?error=disallowed_useragent"
