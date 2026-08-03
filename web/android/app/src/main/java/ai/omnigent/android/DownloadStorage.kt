@@ -417,6 +417,9 @@ internal class DownloadStorage(context: Context) {
         private val MEDIA_STORE_LOCK = Any()
         private val TEMPORARY_LOCK = Any()
         private val ACTIVE_TEMPORARIES = mutableSetOf<String>()
+        // A set, not a multiset: assumes at most one in-flight save per
+        // operationId. Overlapping saves sharing an id under different names
+        // would unshield the still-live sibling when the first one finishes.
         private val ACTIVE_MEDIA_OPERATIONS = mutableSetOf<String>()
 
         private fun operationKey(operationId: String): String =
