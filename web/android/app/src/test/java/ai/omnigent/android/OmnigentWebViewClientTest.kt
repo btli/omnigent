@@ -178,7 +178,7 @@ class OmnigentWebViewClientTest {
 
     @Test
     fun `deadline expiry ends the flow in shouldOverrideUrlLoading`() {
-        var now = 0L
+        var now = UPTIME_MILLIS
         val webView = webView()
         var loginRequired = false
         var flowEnded = 0
@@ -190,7 +190,7 @@ class OmnigentWebViewClientTest {
             )
         enterFlow(client, webView)
 
-        now = DEADLINE_MILLIS + 1
+        now = UPTIME_MILLIS + DEADLINE_MILLIS + 1
 
         assertTrue(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
         assertTrue(loginRequired)
@@ -199,13 +199,13 @@ class OmnigentWebViewClientTest {
 
     @Test
     fun `the flow survives just short of the deadline`() {
-        var now = 0L
+        var now = UPTIME_MILLIS
         val webView = webView()
         var loginRequired = false
         val client = client(clock = { now }, onLoginRequired = { loginRequired = true })
         enterFlow(client, webView)
 
-        now = DEADLINE_MILLIS - 1
+        now = UPTIME_MILLIS + DEADLINE_MILLIS - 1
 
         assertFalse(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
         assertFalse(loginRequired)
@@ -213,13 +213,13 @@ class OmnigentWebViewClientTest {
 
     @Test
     fun `deadline expiry is observed first in onPageStarted`() {
-        var now = 0L
+        var now = UPTIME_MILLIS
         val webView = webView()
         var loginRequired = false
         val client = client(clock = { now }, onLoginRequired = { loginRequired = true })
         enterFlow(client, webView)
 
-        now = DEADLINE_MILLIS + 1
+        now = UPTIME_MILLIS + DEADLINE_MILLIS + 1
         client.onPageStarted(webView, PLAIN_IDP_URL, null)
 
         assertEquals(1, webView.stopLoadingCalls)
@@ -358,6 +358,49 @@ class OmnigentWebViewClientTest {
         clearedClient.onPageFinished(clearedView, PINNED_URL)
 
         assertTrue(clearedClient.shouldOverrideUrlLoading(clearedView, request(PLAIN_IDP_URL)))
+        assertTrue(loginRequired)
+    }
+
+    @Test
+    fun `endProxyAuth clears the ledger slot but an error callback does not`() {
+        val clearedView = webView()
+        val clearedClient = client()
+        clearedClient.onPageStarted(clearedView, PINNED_URL, null)
+        clearedClient.stopLoadingAndLedger(clearedView)
+        clearedClient.endProxyAuth()
+
+        // The reset dropped the slot, so the stopped load's finish is ordinary
+        // again and ends a flow entered afterwards.
+        enterFlow(clearedClient, clearedView)
+        clearedClient.onPageStarted(clearedView, PLAIN_IDP_URL, null)
+        clearedClient.onPageFinished(clearedView, PINNED_URL)
+        assertTrue(clearedClient.shouldOverrideUrlLoading(clearedView, request(PLAIN_IDP_URL)))
+
+        val keptView = webView()
+        val keptClient = client()
+        keptClient.onPageStarted(keptView, PINNED_URL, null)
+        keptClient.stopLoadingAndLedger(keptView)
+        keptClient.handleReceivedError(request(OTHER_IDP_URL))
+
+        // An error for another URL must leave the slot alone.
+        enterFlow(keptClient, keptView)
+        keptClient.onPageStarted(keptView, PLAIN_IDP_URL, null)
+        keptClient.onPageFinished(keptView, PINNED_URL)
+        assertFalse(keptClient.shouldOverrideUrlLoading(keptView, request(PLAIN_IDP_URL)))
+    }
+
+    @Test
+    fun `a flow entered on page start tracks the url for its error exit`() {
+        val webView = webView()
+        var loginRequired = false
+        val client = client(onLoginRequired = { loginRequired = true })
+
+        // Heuristic entry must write the tracker in the same callback, or the
+        // error exit below meets an empty tracker and the flow never ends.
+        client.onPageStarted(webView, PROXY_AUTH_URL, null)
+        client.handleReceivedError(request(PROXY_AUTH_URL))
+
+        assertTrue(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
         assertTrue(loginRequired)
     }
 
@@ -934,7 +977,7 @@ class OmnigentWebViewClientTest {
         onLoginRequired: () -> Unit = {},
         onPageReady: (String?) -> Unit = {},
         onProxyAuthFlowEnded: () -> Unit = {},
-        clock: () -> Long = { 0L },
+        clock: () -> Long = { UPTIME_MILLIS },
         onEmbeddedSignInUnsupported: () -> Unit = {},
         onWebViewUnusable: () -> Unit = {},
     ) = OmnigentWebViewClient(
@@ -1014,6 +1057,10 @@ class OmnigentWebViewClientTest {
         const val NEW_PINNED_ORIGIN = "https://new.example.com"
         const val NEW_PINNED_URL = "$NEW_PINNED_ORIGIN/app"
         const val DEADLINE_MILLIS = 6 * 60_000L
+
+        // Device uptime is never zero; a zero-based fake clock would let the
+        // missing flow-start stamp pass as a flow that started at boot.
+        const val UPTIME_MILLIS = 9_000_000L
 
         const val PROXY_AUTH_URL =
             "https://idp.example.com/oidc/oauth2/v2.0/authorize?response_type=code" +
