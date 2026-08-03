@@ -57,6 +57,7 @@ class MainActivity : AppCompatActivity() {
     private var pinnedOrigin: String? = null
     private var embeddedSignInDialog: AlertDialog? = null
     private var loginFailedDialog: AlertDialog? = null
+    private var rendererFailedDialog: AlertDialog? = null
 
     // Bridge-dependent work deferred until the page (and its injected emit
     // callbacks) exist — see onPageReady.
@@ -419,6 +420,7 @@ class MainActivity : AppCompatActivity() {
     private fun showLoginFailed(origin: String) {
         if (isFinishing || isDestroyed) return
         if (embeddedSignInDialog?.isShowing == true) return
+        if (rendererFailedDialog?.isShowing == true) return
 
         val existingDialog = loginFailedDialog
         if (existingDialog?.isShowing == true) {
@@ -488,15 +490,6 @@ class MainActivity : AppCompatActivity() {
         cookies.setCookie(origin, cookie) { accepted ->
             onSessionCookieSet(origin, accepted)
         }
-        startActivity(
-            Intent(this, MainActivity::class.java)
-                .addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_SINGLE_TOP),
-        )
-        notifications.notify(
-            title = getString(R.string.signed_in_title),
-            body = getString(R.string.signed_in_body),
-            navigatePath = "/",
-        )
     }
 
     /**
@@ -508,7 +501,7 @@ class MainActivity : AppCompatActivity() {
         origin: String,
         accepted: Boolean,
     ) {
-        if (isDestroyed || !::webView.isInitialized) return
+        if (isDestroyed || isFinishing || !::webView.isInitialized) return
         if (origin != pinnedOrigin) return
         authLog("setCookie accepted=$accepted")
         // A rejected cookie means the reload would land unauthenticated, bounce
@@ -520,6 +513,15 @@ class MainActivity : AppCompatActivity() {
         }
         CookieManager.getInstance().flush()
         webView.loadUrl(origin)
+        startActivity(
+            Intent(this, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+        )
+        notifications.notify(
+            title = getString(R.string.signed_in_title),
+            body = getString(R.string.signed_in_body),
+            navigatePath = "/",
+        )
     }
 
     /**
@@ -568,6 +570,8 @@ class MainActivity : AppCompatActivity() {
         loginManager.shutdown()
         loginFailedDialog?.dismiss()
         loginFailedDialog = null
+        rendererFailedDialog?.dismiss()
+        rendererFailedDialog = null
         if (::blobSaver.isInitialized) blobSaver.shutdown()
         if (::webView.isInitialized) {
             shellWebViewClient.endProxyAuth()
@@ -627,14 +631,37 @@ class MainActivity : AppCompatActivity() {
 
     private fun handleWebViewUnusable() {
         if (isFinishing || isDestroyed) return
-        val origin = pinnedOrigin ?: return
+        if (pinnedOrigin == null) return
         if (rendererRecreationAttempts >= MAX_WEBVIEW_RECREATIONS) {
             authLog("renderer recreation attempts exhausted ($rendererRecreationAttempts)")
-            showLoginFailed(origin)
+            showRendererFailed()
             return
         }
         rendererRecreationAttempts++
         recreate()
+    }
+
+    private fun showRendererFailed() {
+        if (isFinishing || isDestroyed) return
+
+        dismissEmbeddedSignInDialogWithoutReset()
+        loginFailedDialog?.dismiss()
+        loginFailedDialog = null
+
+        if (rendererFailedDialog?.isShowing == true) return
+        val dialog =
+            AlertDialog
+                .Builder(this)
+                .setTitle(R.string.renderer_failed_title)
+                .setMessage(R.string.renderer_failed_body)
+                .setPositiveButton(R.string.renderer_failed_retry) { _, _ -> recreate() }
+                .setNegativeButton(R.string.proxy_auth_cancel, null)
+                .create()
+        rendererFailedDialog = dialog
+        dialog.setOnDismissListener {
+            if (rendererFailedDialog === dialog) rendererFailedDialog = null
+        }
+        dialog.show()
     }
 
     private fun removeBridge() {

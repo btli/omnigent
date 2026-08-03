@@ -1,6 +1,9 @@
 package ai.omnigent.android
 
 import android.app.AlertDialog
+import android.app.Notification
+import android.app.NotificationManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.ResolveInfo
@@ -9,10 +12,13 @@ import android.net.Uri
 import android.view.View
 import android.webkit.CookieManager
 import android.webkit.RenderProcessGoneDetail
+import android.webkit.RoboCookieManager
+import android.webkit.ValueCallback
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.test.core.app.ApplicationProvider
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotSame
@@ -32,6 +38,7 @@ import org.robolectric.shadow.api.Shadow
 import org.robolectric.shadows.ShadowAlertDialog
 import org.robolectric.shadows.ShadowCookieManager
 import org.robolectric.shadows.ShadowLooper.idleMainLooper
+import org.robolectric.shadows.ShadowNotificationManager
 import org.robolectric.shadows.ShadowPopupMenu
 import org.robolectric.shadows.ShadowToast
 import org.robolectric.shadows.ShadowWebView
@@ -44,8 +51,13 @@ import java.util.concurrent.TimeUnit
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35], shadows = [CountingOmnigentWebViewClientShadow::class])
 class MainActivityTest {
+    @After
+    fun resetCookieManager() {
+        ShadowCookieManager.resetCookies()
+    }
+
     @Test
-    fun `renderer crashes recreate twice then show the failure surface`() {
+    fun `renderer crashes recreate twice then user retry recreates from renderer failure`() {
         ServerStore(ApplicationProvider.getApplicationContext()).connect(PINNED_ORIGIN)
         val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
         val firstActivity = controller.get()
@@ -88,10 +100,42 @@ class MainActivityTest {
         assertSame(thirdActivity, controller.get())
         assertFalse(thirdActivity.isDestroyed)
         val dialog = checkNotNull(ShadowAlertDialog.getLatestAlertDialog())
-        assertEquals(
-            thirdActivity.getString(R.string.login_failed_body, "example.com"),
-            shadowOf(dialog).message,
+        assertEquals(thirdActivity.getString(R.string.renderer_failed_title), shadowOf(dialog).title)
+        assertEquals(thirdActivity.getString(R.string.renderer_failed_body), shadowOf(dialog).message)
+        assertTrue(shadowOf(dialog).title != thirdActivity.getString(R.string.login_failed_title))
+        assertNull(thirdActivity.loginFailedDialog())
+
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).performClick()
+        idleMainLooper()
+
+        assertTrue(thirdActivity.isDestroyed)
+        assertNotSame(thirdActivity, controller.get())
+    }
+
+    @Test
+    fun `renderer failure replaces a showing refusal dialog past the recreation cap`() {
+        val activity = activity()
+        val refusalDialog = activity.refuseEmbeddedSignIn()
+        ReflectionHelpers.setField(activity, "rendererRecreationAttempts", 2)
+        ActivityCallLog.clear()
+
+        assertTrue(
+            activity.shellWebViewClient().onRenderProcessGone(
+                activity.webView(),
+                renderProcessGoneDetail(),
+            ),
         )
+        idleMainLooper()
+
+        val rendererDialog = checkNotNull(ShadowAlertDialog.getLatestAlertDialog())
+        assertFalse(refusalDialog.isShowing)
+        assertNull(activity.embeddedSignInDialog())
+        assertTrue(rendererDialog.isShowing)
+        assertEquals(
+            activity.getString(R.string.renderer_failed_title),
+            shadowOf(rendererDialog).title,
+        )
+        assertEquals(1, ActivityCallLog.endProxyAuthCalls)
     }
 
     @Test
@@ -556,10 +600,16 @@ class MainActivityTest {
     }
 
     @Test
-    fun `rejected session cookie shows the generic retry dialog`() {
+    fun `rejected session cookie shows failure without announcing sign in`() {
+        ShadowNotificationManager.reset()
+        ReflectionHelpers.setStaticField(
+            ShadowCookieManager::class.java,
+            "cookieManager",
+            RejectingCookieManager(),
+        )
         val activity = activity()
 
-        activity.onSessionCookieSet(PINNED_ORIGIN, accepted = false)
+        activity.invokeOnSessionToken(SESSION_TOKEN)
 
         val dialog = checkNotNull(ShadowAlertDialog.getLatestAlertDialog())
         assertEquals(activity.getString(R.string.login_failed_title), shadowOf(dialog).title)
@@ -567,6 +617,48 @@ class MainActivityTest {
             activity.getString(R.string.login_failed_body, "example.com"),
             shadowOf(dialog).message,
         )
+        assertTrue(activity.notificationManager().allNotifications.isEmpty())
+        assertNull(shadowOf(activity).peekNextStartedActivity())
+    }
+
+    @Test
+    @Config(
+        sdk = [35],
+        shadows = [CountingOmnigentWebViewClientShadow::class, RecordingWebViewShadow::class],
+    )
+    fun `accepted session cookie reloads then announces sign in`() {
+        ShadowNotificationManager.reset()
+        val activity = activity()
+
+        activity.onSessionCookieSet(PINNED_ORIGIN, accepted = true)
+
+        assertTrue(ActivityCallLog.entries.contains("loadUrl:$PINNED_ORIGIN"))
+        val notification = activity.notificationManager().allNotifications.single()
+        assertEquals(
+            activity.getString(R.string.signed_in_title),
+            notification.extras.getCharSequence(Notification.EXTRA_TITLE),
+        )
+        val reorderIntent = checkNotNull(shadowOf(activity).nextStartedActivity)
+        assertEquals(MainActivity::class.java.name, reorderIntent.component?.className)
+        assertTrue(reorderIntent.flags and Intent.FLAG_ACTIVITY_REORDER_TO_FRONT != 0)
+    }
+
+    @Test
+    @Config(
+        sdk = [35],
+        shadows = [CountingOmnigentWebViewClientShadow::class, RecordingWebViewShadow::class],
+    )
+    fun `session cookie callback is dropped while activity is finishing`() {
+        ShadowNotificationManager.reset()
+        val activity = activity()
+        activity.finish()
+        ActivityCallLog.clear()
+
+        activity.onSessionCookieSet(PINNED_ORIGIN, accepted = true)
+
+        assertTrue(ActivityCallLog.entries.isEmpty())
+        assertTrue(activity.notificationManager().allNotifications.isEmpty())
+        assertNull(shadowOf(activity).peekNextStartedActivity())
     }
 
     @Test
@@ -757,6 +849,9 @@ class MainActivityTest {
     private fun MainActivity.loginManager(): OidcLoginManager =
         ReflectionHelpers.getField(this, "loginManager")
 
+    private fun MainActivity.notificationManager(): ShadowNotificationManager =
+        shadowOf(getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
+
     private fun MainActivity.invokeStartLogin() {
         ReflectionHelpers.callInstanceMethod<Unit>(this, "startLogin")
     }
@@ -821,12 +916,21 @@ class MainActivityTest {
         "https://idp.example.com/oidc/oauth2/v2.0/authorize?response_type=code" +
             "&redirect_uri=" + Uri.encode("$origin/.auth/callback")
 
+    private class RejectingCookieManager : RoboCookieManager() {
+        override fun setCookie(
+            url: String,
+            value: String,
+            callback: ValueCallback<Boolean>?,
+        ) {
+            callback?.onReceiveValue(false)
+        }
+    }
+
     private companion object {
         const val PINNED_ORIGIN = "https://example.com"
         const val NEW_ORIGIN = "https://new.example.com"
         const val NEW_SERVER_URL = "$NEW_ORIGIN/app"
         const val OLD_LOADING_URL = "$PINNED_ORIGIN/old-loading"
-        const val PLAIN_IDP_URL = "https://idp.example.com/login/sso"
         const val REFUSAL_URL =
             "https://accounts.google.com/v3/signin/rejected?error=disallowed_useragent"
         const val SESSION_TOKEN = "header.payload.signature"

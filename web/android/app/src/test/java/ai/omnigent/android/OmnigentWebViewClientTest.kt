@@ -8,6 +8,7 @@ import android.net.http.SslCertificate
 import android.net.http.SslError
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.SslErrorHandler
+import android.webkit.TestWebResourceError
 import android.webkit.ValueCallback
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -504,6 +505,24 @@ class OmnigentWebViewClientTest {
         client.onPageStarted(webView, PLAIN_IDP_URL, null)
 
         client.handleReceivedError(request(PLAIN_IDP_URL))
+
+        assertTrue(client.shouldOverrideUrlLoading(webView, request(OTHER_IDP_URL)))
+        assertTrue(loginRequired)
+    }
+
+    @Test
+    fun `onReceivedError override delegates current main-frame failure`() {
+        val webView = webView()
+        var loginRequired = false
+        val client = client(onLoginRequired = { loginRequired = true })
+        enterFlow(client, webView)
+        client.onPageStarted(webView, PLAIN_IDP_URL, null)
+
+        client.onReceivedError(
+            webView,
+            request(PLAIN_IDP_URL),
+            TestWebResourceError(),
+        )
 
         assertTrue(client.shouldOverrideUrlLoading(webView, request(OTHER_IDP_URL)))
         assertTrue(loginRequired)
