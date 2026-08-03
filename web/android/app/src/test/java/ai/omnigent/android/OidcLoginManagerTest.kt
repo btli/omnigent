@@ -148,6 +148,33 @@ class OidcLoginManagerTest {
     }
 
     @Test
+    fun `poll deadline uses the injected monotonic clock`() {
+        val clockReads = AtomicInteger()
+        val pollHits = AtomicInteger()
+        server.createContext("/auth/cli-login") { exchange ->
+            exchange.respond(200, ticketBody())
+        }
+        server.createContext("/auth/cli-poll") { exchange ->
+            pollHits.incrementAndGet()
+            exchange.respond(202)
+        }
+
+        val result =
+            runLogin(
+                manager(
+                    pollTimeoutMs = 1_000,
+                    clock = {
+                        if (clockReads.incrementAndGet() < 3) 10_000L else 11_000L
+                    },
+                ),
+            )
+
+        assertEquals(LoginResult.TimedOut, result)
+        assertTrue(clockReads.get() >= 3)
+        assertEquals(0, pollHits.get())
+    }
+
+    @Test
     fun `malformed poll payload is rejected without another poll`() {
         val pollHits = AtomicInteger()
         server.createContext("/auth/cli-login") { exchange ->
@@ -285,10 +312,12 @@ class OidcLoginManagerTest {
     private fun manager(
         pollIntervalMs: Long = 1,
         pollTimeoutMs: Long = 1_000,
+        clock: () -> Long = { System.nanoTime() / 1_000_000L },
     ): OidcLoginManager =
         OidcLoginManager(
             pollIntervalMs = pollIntervalMs,
             pollTimeoutMs = pollTimeoutMs,
+            clock = clock,
         ).also(managers::add)
 
     private fun runLogin(
