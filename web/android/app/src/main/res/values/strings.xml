@@ -7,6 +7,9 @@
     <string name="login_failed_title">Sign-in failed</string>
     <string name="login_failed_body">Couldn\'t sign in to %1$s</string>
     <string name="login_failed_retry">Retry</string>
+    <string name="renderer_failed_title">Something went wrong</string>
+    <string name="renderer_failed_body">The app\'s browser engine stopped responding.</string>
+    <string name="renderer_failed_retry">Try again</string>
     <plurals name="badge_text">
         <item quantity="one">%1$d pending</item>
         <item quantity="other">%1$d pending</item>
