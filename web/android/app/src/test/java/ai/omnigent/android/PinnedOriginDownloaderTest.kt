@@ -24,6 +24,7 @@ import org.robolectric.shadows.ShadowToast
 import org.robolectric.util.ReflectionHelpers
 import java.io.File
 import java.net.InetSocketAddress
+import java.net.URL
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.ExecutorService
@@ -109,7 +110,58 @@ class PinnedOriginDownloaderTest {
         assertNull(returnedCookie.get())
         assertEquals(listOf(USER_AGENT, USER_AGENT, USER_AGENT, USER_AGENT), userAgents.toList())
         assertEquals(DOWNLOAD_BODY, target.readText())
-        assertEquals("Saved ${target.name} to Downloads", ShadowToast.getTextOfLatestToast())
+        assertEquals("Saved ${target.name} to app storage", ShadowToast.getTextOfLatestToast())
+    }
+
+    @Test
+    fun `cookie is dropped when a redirect changes only the host string`() {
+        val redirectedCookie = AtomicReference<String?>()
+        pinnedServer.createContext("/host-start") { exchange ->
+            exchange.redirect("http://localhost:${pinnedServer.address.port}/host-final")
+        }
+        pinnedServer.createContext("/host-final") { exchange ->
+            redirectedCookie.set(exchange.requestHeaders.getFirst("Cookie"))
+            exchange.respond(200, DOWNLOAD_BODY)
+        }
+        CookieManager.getInstance().setCookie(pinnedOrigin, SESSION_COOKIE)
+        val target = targetFile("different-host.txt")
+        val downloader = downloader()
+
+        downloader.download(
+            "$pinnedOrigin/host-start",
+            pinnedOrigin,
+            USER_AGENT,
+            "text/plain",
+            target.name,
+        )
+        await(downloader)
+
+        assertNull(redirectedCookie.get())
+        assertEquals(DOWNLOAD_BODY, target.readText())
+    }
+
+    @Test
+    fun `pinned origin rejects a protocol change when host and port match`() {
+        val downloader = downloader()
+
+        assertFalse(
+            downloader.hasPinnedOrigin(
+                URL("https://pinned.example:8443/file"),
+                "http://pinned.example:8443",
+            ),
+        )
+    }
+
+    @Test
+    fun `pinned origin rejects a port change when protocol and host match`() {
+        val downloader = downloader()
+
+        assertFalse(
+            downloader.hasPinnedOrigin(
+                URL("https://pinned.example:8444/file"),
+                "https://pinned.example:8443",
+            ),
+        )
     }
 
     @Test
@@ -139,6 +191,9 @@ class PinnedOriginDownloaderTest {
         assertEquals(11, hits.get())
         assertFalse(target.exists())
         assertEquals("Couldn't save ${target.name}", ShadowToast.getTextOfLatestToast())
+        val error = ShadowLog.getLogsForTag("PinnedOriginDownloader").single()
+        assertEquals(Log.ERROR, error.type)
+        assertEquals("Too many redirects", error.throwable.message)
     }
 
     @Test

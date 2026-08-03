@@ -7,6 +7,7 @@ import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -141,6 +142,17 @@ class NativeNotificationManagerTest {
         NativeNotificationManager(context, ORIGIN).notify("second", null, "/c/second")
 
         assertEquals(2, shadow.allNotifications.size)
+    }
+
+    @Test
+    fun `a new manager on a different origin cancels existing notifications`() {
+        manager.setBadgeCount(2, navigatePath = "/inbox")
+        manager.notify("first", null, "/c/first")
+        assertEquals(2, shadow.allNotifications.size)
+
+        NativeNotificationManager(context, NEW_ORIGIN)
+
+        assertTrue(shadow.allNotifications.isEmpty())
     }
 
     @Test
