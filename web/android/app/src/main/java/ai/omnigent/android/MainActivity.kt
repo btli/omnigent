@@ -53,7 +53,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var shellWebViewClient: OmnigentWebViewClient
     private lateinit var notifications: NativeNotificationManager
     private lateinit var blobSaver: BlobSaver
-    private val loginManager = OidcLoginManager()
+    // The process owns the worker; only this detachable callback can retain the Activity.
+    private val loginManager = OidcLoginManager.processInstance
+    private var loginAttachment: OidcLoginManager.Attachment? = null
     private var pinnedOrigin: String? = null
     private var embeddedSignInDialog: AlertDialog? = null
     private var loginFailedDialog: AlertDialog? = null
@@ -301,6 +303,7 @@ class MainActivity : AppCompatActivity() {
             },
         )
 
+        loginAttachment = pinnedOrigin?.let { loginManager.attach(it, ::onLoginResult) }
         ensureNotificationPermission()
         webView.loadUrl(serverUrl)
     }
@@ -396,7 +399,7 @@ class MainActivity : AppCompatActivity() {
         // Count (and re-arm the history clear for) only a call that actually
         // launches a flow, so re-entrant redirects can't burn the retry budget
         // without ever relaunching and suppress a legitimate later retry.
-        if (!loginManager.start(this, origin) { result -> onLoginResult(origin, result) }) return
+        if (!loginManager.start(this, origin)) return
         loginAttempts++
         // A re-login (session expired mid-use) bounces through the IdP again,
         // leaving a stopped off-origin entry + stale pre-expiry pages on the back
@@ -571,12 +574,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        // Unblock a pending file input / mic request, then release WebView + worker.
+        // Unblock pending host work, then release Activity-owned resources.
         pendingFileCallback?.onReceiveValue(null)
         pendingFileCallback = null
         pendingMicRequest?.deny()
         pendingMicRequest = null
-        loginManager.shutdown()
+        // Leaving for good abandons the flow; a recreation keeps it polling so a
+        // login finished in the browser still lands. Without this an exit mid-login
+        // holds the eventual timeout and replays it as a failure on the next launch.
+        if (isFinishing) loginManager.cancel()
+        loginAttachment?.let(loginManager::detach)
+        loginAttachment = null
         loginFailedDialog?.dismiss()
         loginFailedDialog = null
         rendererFailedDialog?.dismiss()
@@ -642,6 +650,8 @@ class MainActivity : AppCompatActivity() {
         notifications.cancelAll()
         pendingNavigatePath = null
         pinnedOrigin = newOrigin
+        loginAttachment?.let(loginManager::detach)
+        loginAttachment = loginManager.attach(newOrigin, ::onLoginResult)
         notifications.setOrigin(newOrigin)
         pageLoaded = false
         historyCleared = false

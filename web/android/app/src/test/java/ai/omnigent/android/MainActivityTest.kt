@@ -59,6 +59,7 @@ import java.util.concurrent.TimeUnit
 class MainActivityTest {
     @After
     fun resetCookieManager() {
+        OidcLoginManager.resetProcessInstanceForTest()
         ShadowCookieManager.resetCookies()
         ShadowDownloadManager.reset()
         ShadowLog.clear()
@@ -667,6 +668,30 @@ class MainActivityTest {
     }
 
     @Test
+    fun `recreation keeps the process login manager and replaces its attachment`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect(PINNED_ORIGIN)
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val firstActivity = controller.get()
+        val manager = firstActivity.loginManager()
+        val firstAttachment = checkNotNull(firstActivity.loginAttachment())
+
+        firstActivity.recreate()
+        idleMainLooper()
+
+        val recreatedActivity = controller.get()
+        assertTrue(firstActivity.isDestroyed)
+        assertSame(manager, recreatedActivity.loginManager())
+        assertFalse(manager.isShutDownForTest())
+        assertNull(firstActivity.loginAttachment())
+        assertNotSame(firstAttachment, checkNotNull(recreatedActivity.loginAttachment()))
+
+        controller.destroy()
+
+        assertFalse(manager.hasAttachmentForTest())
+        assertFalse(manager.isShutDownForTest())
+    }
+
+    @Test
     fun `server reload cancels an in-flight native login`() {
         val activity = activity()
         val loginManager = activity.loginManager()
@@ -694,6 +719,80 @@ class MainActivityTest {
             holdWorker.countDown()
             loginManager.shutdown()
         }
+    }
+
+    @Test
+    fun `leaving the app for good abandons an in-flight login`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect(PINNED_ORIGIN)
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        val loginManager = activity.loginManager()
+        val executor: ExecutorService = ReflectionHelpers.getField(loginManager, "io")
+        val workerStarted = CountDownLatch(1)
+        val holdWorker = CountDownLatch(1)
+        executor.execute {
+            workerStarted.countDown()
+            runCatching { holdWorker.await() }
+        }
+        assertTrue(workerStarted.await(5, TimeUnit.SECONDS))
+
+        try {
+            assertTrue(loginManager.start(activity, PINNED_ORIGIN))
+            assertTrue(loginManager.isInFlightForTest())
+
+            activity.finish()
+            controller.destroy()
+
+            // Otherwise the flow polls on unattached, and its eventual timeout is
+            // held and replayed as a sign-in failure on the next launch.
+            assertFalse(loginManager.isInFlightForTest())
+            assertFalse(loginManager.hasHeldResultForTest())
+        } finally {
+            holdWorker.countDown()
+        }
+    }
+
+    @Test
+    fun `recreation leaves an in-flight login polling`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect(PINNED_ORIGIN)
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        val loginManager = activity.loginManager()
+        val executor: ExecutorService = ReflectionHelpers.getField(loginManager, "io")
+        val workerStarted = CountDownLatch(1)
+        val holdWorker = CountDownLatch(1)
+        executor.execute {
+            workerStarted.countDown()
+            runCatching { holdWorker.await() }
+        }
+        assertTrue(workerStarted.await(5, TimeUnit.SECONDS))
+
+        try {
+            assertTrue(loginManager.start(activity, PINNED_ORIGIN))
+            assertTrue(loginManager.isInFlightForTest())
+
+            activity.recreate()
+            idleMainLooper()
+
+            // The whole point of process-scoping: a browser login finished during a
+            // renderer-crash recovery must still land.
+            assertTrue(loginManager.isInFlightForTest())
+        } finally {
+            holdWorker.countDown()
+        }
+    }
+
+    @Test
+    fun `server reload rebinds login result delivery to the new origin`() {
+        val activity = activity()
+        val firstAttachment = checkNotNull(activity.loginAttachment())
+
+        activity.reloadWithNewServer(NEW_SERVER_URL, NEW_ORIGIN)
+
+        val reboundAttachment = checkNotNull(activity.loginAttachment())
+        assertNotSame(firstAttachment, reboundAttachment)
+        assertNull(firstAttachment.callback)
+        assertEquals(NEW_ORIGIN, reboundAttachment.origin)
     }
 
     @Test
@@ -1131,6 +1230,9 @@ class MainActivityTest {
 
     private fun MainActivity.loginManager(): OidcLoginManager =
         ReflectionHelpers.getField(this, "loginManager")
+
+    private fun MainActivity.loginAttachment(): OidcLoginManager.Attachment? =
+        ReflectionHelpers.getField(this, "loginAttachment")
 
     private fun MainActivity.notifications(): NativeNotificationManager =
         ReflectionHelpers.getField(this, "notifications")

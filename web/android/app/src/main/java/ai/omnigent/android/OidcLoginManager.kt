@@ -1,6 +1,7 @@
 package ai.omnigent.android
 
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Handler
@@ -51,13 +52,44 @@ class OidcLoginManager(
     private val main = Handler(Looper.getMainLooper())
     private val stateLock = Any()
     private var activeFlow: Flow? = null
+    private var attachment: Attachment? = null
+    private var heldResult: HeldResult? = null
     private var cancellationGeneration = 0L
     private var shutDown = false
 
+    class Attachment internal constructor(
+        internal val origin: String,
+        internal var callback: ((String, LoginResult) -> Unit)?,
+    )
+
+    /** Attach the current main-thread host and replay a result completed while detached. */
+    fun attach(
+        origin: String,
+        onResult: (String, LoginResult) -> Unit,
+    ): Attachment {
+        val newAttachment = Attachment(origin, onResult)
+        val held =
+            synchronized(stateLock) {
+                attachment?.callback = null
+                attachment = newAttachment
+                heldResult?.also { heldResult = null }
+            }
+        held?.let { it.flow.callback(it.result) }
+        return newAttachment
+    }
+
+    /** Detach a host without interrupting its process-scoped login flow. */
+    fun detach(attachment: Attachment) {
+        synchronized(stateLock) {
+            attachment.callback = null
+            if (this.attachment === attachment) this.attachment = null
+        }
+    }
+
     /**
      * Begin a login against [origin] (the pinned server). Opens the browser and
-     * polls in the background; [onResult] is invoked on the main thread when the
-     * flow succeeds, is rejected, or reaches its deadline.
+     * polls in the background; the attached host receives the result on the main
+     * thread when the flow succeeds, is rejected, or reaches its deadline.
      *
      * Returns true if this call started a flow, or false if one was already in
      * flight (a second concurrent call is ignored). The caller uses the result so
@@ -66,18 +98,31 @@ class OidcLoginManager(
     fun start(
         activity: Activity,
         origin: String,
+    ): Boolean = startFlow(activity, origin, null)
+
+    /** Start with a flow-local receiver that is never rebound to another flow. */
+    internal fun start(
+        activity: Activity,
+        origin: String,
         onResult: (LoginResult) -> Unit,
+    ): Boolean = startFlow(activity, origin, onResult)
+
+    private fun startFlow(
+        activity: Activity,
+        origin: String,
+        callbackOverride: ((LoginResult) -> Unit)?,
     ): Boolean =
         synchronized(stateLock) {
             if (shutDown || activeFlow != null) return@synchronized false
 
-            val flow = Flow(cancellationGeneration)
-            val callback = onResult
+            val flow = Flow(cancellationGeneration, origin)
+            val callback = callbackOverride ?: flow.callback
+            val context = activity.applicationContext
             activeFlow = flow
             try {
                 flow.future =
                     io.submit {
-                        val result = runFlow(activity, origin, flow)
+                        val result = runFlow(context, origin, flow)
                         synchronized(stateLock) {
                             if (activeFlow === flow) activeFlow = null
                         }
@@ -98,7 +143,7 @@ class OidcLoginManager(
 
     /** Run one flow off the main thread, or return null once it is interrupted. */
     private fun runFlow(
-        activity: Activity,
+        context: Context,
         origin: String,
         flow: Flow,
     ): LoginResult? =
@@ -109,7 +154,7 @@ class OidcLoginManager(
                 LoginResult.Rejected
             } else {
                 main.post {
-                    if (canDeliver(flow)) launchTab(activity, origin + ticket.loginUrl)
+                    if (canDeliver(flow)) launchTab(context, origin + ticket.loginUrl)
                 }
                 pollForToken(origin, ticket.id).also(::logPollResult)
             }
@@ -133,11 +178,19 @@ class OidcLoginManager(
 
     internal fun isInFlightForTest(): Boolean = synchronized(stateLock) { activeFlow != null }
 
+    internal fun hasAttachmentForTest(): Boolean =
+        synchronized(stateLock) { attachment?.callback != null }
+
+    internal fun hasHeldResultForTest(): Boolean = synchronized(stateLock) { heldResult != null }
+
+    internal fun isShutDownForTest(): Boolean = synchronized(stateLock) { shutDown }
+
     /** Abandon the current flow while keeping the worker available for another login. */
     fun cancel() {
         val future =
             synchronized(stateLock) {
                 cancellationGeneration++
+                heldResult = null
                 val flow = activeFlow
                 activeFlow = null
                 flow?.future
@@ -145,12 +198,19 @@ class OidcLoginManager(
         future?.cancel(true)
     }
 
-    /** Cancel an in-flight login and release the host. Call from onDestroy. */
+    /**
+     * Retire this manager permanently. One-way: nothing clears [shutDown], so on
+     * the process instance this disables login for the rest of the process. An
+     * Activity going away wants [cancel] + [detach], not this.
+     */
     fun shutdown() {
         val future =
             synchronized(stateLock) {
                 shutDown = true
                 cancellationGeneration++
+                attachment?.callback = null
+                attachment = null
+                heldResult = null
                 val flow = activeFlow
                 activeFlow = null
                 flow?.future
@@ -164,11 +224,42 @@ class OidcLoginManager(
             !shutDown && cancellationGeneration == flow.generation
         }
 
-    private class Flow(
-        val generation: Long,
+    private fun deliverOrHold(
+        flow: Flow,
+        result: LoginResult,
     ) {
+        val callback =
+            synchronized(stateLock) {
+                if (!canDeliverLocked(flow)) return
+                val currentAttachment = attachment
+                if (currentAttachment == null) {
+                    heldResult = HeldResult(flow, result)
+                    return
+                }
+                if (currentAttachment.origin != flow.origin) {
+                    authLog("dropping login result from stale origin ${flow.origin}")
+                    return
+                }
+                currentAttachment.callback
+            }
+        callback?.invoke(flow.origin, result)
+    }
+
+    private fun canDeliverLocked(flow: Flow): Boolean =
+        !shutDown && cancellationGeneration == flow.generation
+
+    private inner class Flow(
+        val generation: Long,
+        val origin: String,
+    ) {
+        val callback: (LoginResult) -> Unit = { result -> deliverOrHold(this, result) }
         var future: Future<*>? = null
     }
+
+    private data class HeldResult(
+        val flow: Flow,
+        val result: LoginResult,
+    )
 
     private data class Ticket(
         val id: String,
@@ -215,7 +306,7 @@ class OidcLoginManager(
     }
 
     private fun launchTab(
-        activity: Activity,
+        context: Context,
         url: String,
     ) {
         // Full system browser (not a Custom Tab): the IdP flow page renders blank
@@ -227,7 +318,8 @@ class OidcLoginManager(
                 Intent.ACTION_VIEW,
                 Uri.parse(url),
             ).addCategory(Intent.CATEGORY_BROWSABLE)
-        runCatching { activity.startActivity(intent) }
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        runCatching { context.startActivity(intent) }
     }
 
     private fun pollForToken(
@@ -292,9 +384,26 @@ class OidcLoginManager(
         return LoginResult.TimedOut
     }
 
-    private companion object {
-        const val DEFAULT_POLL_INTERVAL_MS = 2_000L
-        const val DEFAULT_POLL_TIMEOUT_MS = 5 * 60 * 1_000L // mirrors the CLI's window
-        const val HTTP_TIMEOUT_MS = 10_000 // connect + read timeout for the login endpoints
+    companion object {
+        private val processLock = Any()
+        private var processManager: OidcLoginManager? = null
+
+        internal val processInstance: OidcLoginManager
+            get() =
+                synchronized(processLock) {
+                    processManager ?: OidcLoginManager().also { processManager = it }
+                }
+
+        internal fun resetProcessInstanceForTest() {
+            val manager =
+                synchronized(processLock) {
+                    processManager.also { processManager = null }
+                }
+            manager?.shutdown()
+        }
+
+        private const val DEFAULT_POLL_INTERVAL_MS = 2_000L
+        private const val DEFAULT_POLL_TIMEOUT_MS = 5 * 60 * 1_000L // mirrors the CLI's window
+        private const val HTTP_TIMEOUT_MS = 10_000 // connect + read timeout for the login endpoints
     }
 }
