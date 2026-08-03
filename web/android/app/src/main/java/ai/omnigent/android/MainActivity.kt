@@ -53,6 +53,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var shellWebViewClient: OmnigentWebViewClient
     private lateinit var notifications: NativeNotificationManager
     private lateinit var blobSaver: BlobSaver
+    private lateinit var pinnedOriginDownloader: PinnedOriginDownloadHandler
     // The process owns the worker; only this detachable callback can retain the Activity.
     private val loginManager = OidcLoginManager.processInstance
     private var loginAttachment: OidcLoginManager.Attachment? = null
@@ -137,6 +138,7 @@ class MainActivity : AppCompatActivity() {
         // reference chain can't pin this Activity.
         notifications = NativeNotificationManager(applicationContext, pinnedOrigin)
         blobSaver = BlobSaver(applicationContext)
+        pinnedOriginDownloader = PinnedOriginDownloader(applicationContext)
 
         // Capture (don't replay yet) a notification tap that cold-started us.
         pendingNavigatePath = takeNavigatePathOf(intent)
@@ -598,6 +600,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
         if (::blobSaver.isInitialized) blobSaver.shutdown()
+        if (::pinnedOriginDownloader.isInitialized) pinnedOriginDownloader.shutdown()
         super.onDestroy()
     }
 
@@ -1001,6 +1004,8 @@ class MainActivity : AppCompatActivity() {
     ): Boolean {
         pendingFileCallback?.onReceiveValue(null) // cancel any in-flight chooser
         pendingFileCallback = null
+        // FileChooserParams omits the requesting frame, so cross-origin iframes pass this gate.
+        // Microphone requests expose request.origin and do not have this residual.
         val currentOrigin = if (webViewUnusable) null else originOf(webView.url)
         if (currentOrigin != pinnedOrigin) {
             authLog("file chooser denied for main-frame origin $currentOrigin")
@@ -1068,11 +1073,11 @@ class MainActivity : AppCompatActivity() {
         contentDisposition: String?,
         mimeType: String?,
     ) {
+        if (isDestroyed || isFinishing || webViewUnusable || !::webView.isInitialized) return
         val name = URLUtil.guessFileName(url, contentDisposition, mimeType)
 
-        // Agent-generated files arrive as blob:/data: URLs, which DownloadManager
-        // can't handle — fetch them in page context and save via the blob bridge
-        // (fixes omnigent-ai/omnigent#969, which the iOS shell leaves broken).
+        // Blob/data URLs cannot use DownloadManager, so fetch them in page context
+        // and save them through the blob bridge.
         if (url.startsWith("blob:") || url.startsWith("data:")) {
             webView.evaluateJavascript(BlobDownloadScript.fetchAsBase64(url, name), null)
             return
@@ -1082,16 +1087,19 @@ class MainActivity : AppCompatActivity() {
         // ("HTTPS://") and rejects non-http lookalikes ("httpfoo:"), which
         // DownloadManager.Request would otherwise throw on.
         if (!isHttpScheme(Uri.parse(url).scheme)) return
+        val downloadOrigin = originOf(url)
+        if (downloadOrigin != null && downloadOrigin == pinnedOrigin) {
+            pinnedOriginDownloader.download(
+                url,
+                downloadOrigin,
+                webView.settings.userAgentString,
+                mimeType,
+                name,
+            )
+            return
+        }
         val request =
             DownloadManager.Request(Uri.parse(url)).apply {
-                addRequestHeader("User-Agent", webView.settings.userAgentString)
-                if (originOf(url) == pinnedOrigin) {
-                    // DownloadManager may forward this header across redirects; a same-origin
-                    // endpoint that redirects off-origin can still expose the cookie.
-                    CookieManager.getInstance().getCookie(url)?.let { cookie ->
-                        addRequestHeader("Cookie", cookie)
-                    }
-                }
                 setMimeType(mimeType)
                 setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name)
                 setNotificationVisibility(

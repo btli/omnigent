@@ -319,13 +319,14 @@ class MainActivityTest {
     }
 
     @Test
-    fun `downloads copy the webview session only for the pinned origin`() {
+    fun `pinned downloads use the native downloader and cross-origin downloads have no headers`() {
         ShadowDownloadManager.reset()
         val activity = activity()
         val webView = activity.webView()
         webView.settings.userAgentString = DOWNLOAD_USER_AGENT
-        CookieManager.getInstance().setCookie(PINNED_DOWNLOAD_URL, PINNED_DOWNLOAD_COOKIE)
         CookieManager.getInstance().setCookie(OFF_ORIGIN_DOWNLOAD_URL, OFF_ORIGIN_DOWNLOAD_COOKIE)
+        val downloader = RecordingPinnedOriginDownloader()
+        activity.replacePinnedOriginDownloader(downloader)
         val downloadManager =
             activity.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
         val shadowDownloads = shadowOf(downloadManager)
@@ -346,17 +347,55 @@ class MainActivityTest {
             1L,
         )
 
-        fun headersOf(id: Long): Map<String, String> =
-            shadowOf(checkNotNull(shadowDownloads.getRequest(id)))
+        assertEquals(
+            listOf(
+                RecordedDownload(
+                    PINNED_DOWNLOAD_URL,
+                    PINNED_ORIGIN,
+                    DOWNLOAD_USER_AGENT,
+                    "application/pdf",
+                    "pinned.pdf",
+                ),
+            ),
+            downloader.downloads,
+        )
+        val offOriginHeaders =
+            shadowOf(checkNotNull(shadowDownloads.getRequest(0L)))
                 .requestHeaders
                 .associate { header -> header.first to header.second }
-
-        val pinnedHeaders = headersOf(0L)
-        val offOriginHeaders = headersOf(1L)
-        assertEquals(PINNED_DOWNLOAD_COOKIE, pinnedHeaders["Cookie"])
-        assertEquals(DOWNLOAD_USER_AGENT, pinnedHeaders["User-Agent"])
         assertFalse(offOriginHeaders.containsKey("Cookie"))
-        assertEquals(DOWNLOAD_USER_AGENT, offOriginHeaders["User-Agent"])
+        assertFalse(offOriginHeaders.containsKey("User-Agent"))
+        assertNull(shadowDownloads.getRequest(1L))
+    }
+
+    @Test
+    fun `queued downloads are dropped after the WebView becomes unusable`() {
+        val activity = activity()
+        val webView = activity.webView()
+        val listener = checkNotNull(shadowOf(webView).downloadListener)
+        val downloader = RecordingPinnedOriginDownloader()
+        activity.replacePinnedOriginDownloader(downloader)
+        ReflectionHelpers.setField(activity, "webViewUnusable", true)
+
+        listener.onDownloadStart(
+            "blob:$PINNED_ORIGIN/blob-id",
+            null,
+            null,
+            "application/octet-stream",
+            1L,
+        )
+        listener.onDownloadStart(
+            PINNED_DOWNLOAD_URL,
+            null,
+            "attachment; filename=pinned.pdf",
+            "application/pdf",
+            1L,
+        )
+
+        assertTrue(downloader.downloads.isEmpty())
+        val downloadManager =
+            activity.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+        assertNull(shadowOf(downloadManager).getRequest(0L))
     }
 
     @Test
@@ -1239,6 +1278,15 @@ class MainActivityTest {
 
     private fun MainActivity.blobSaver(): BlobSaver = ReflectionHelpers.getField(this, "blobSaver")
 
+    private fun MainActivity.replacePinnedOriginDownloader(
+        replacement: PinnedOriginDownloadHandler,
+    ) {
+        val original: PinnedOriginDownloadHandler =
+            ReflectionHelpers.getField(this, "pinnedOriginDownloader")
+        original.shutdown()
+        ReflectionHelpers.setField(this, "pinnedOriginDownloader", replacement)
+    }
+
     private fun MainActivity.pendingNavigatePath(): String? =
         ReflectionHelpers.getField(this, "pendingNavigatePath")
 
@@ -1366,7 +1414,6 @@ class MainActivityTest {
         const val OLD_LOADING_URL = "$PINNED_ORIGIN/old-loading"
         const val PINNED_DOWNLOAD_URL = "$PINNED_ORIGIN/files/report.pdf"
         const val OFF_ORIGIN_DOWNLOAD_URL = "https://files.example.net/report.pdf"
-        const val PINNED_DOWNLOAD_COOKIE = "__Host-ap_session=pinned"
         const val OFF_ORIGIN_DOWNLOAD_COOKIE = "front_door=foreign"
         const val DOWNLOAD_USER_AGENT = "OmnigentTest/1.0"
         const val OFF_ORIGIN_AUTH_URL = "https://idp.example.com/login"
@@ -1380,6 +1427,33 @@ class MainActivityTest {
         const val SECOND_BROWSER_ACTIVITY = "org.example.browser.BrowserActivity"
         const val DEEP_LINK_PACKAGE = "com.example.deep-link"
         const val DEEP_LINK_ACTIVITY = "com.example.deep-link.DeepLinkActivity"
+    }
+}
+
+private data class RecordedDownload(
+    val url: String,
+    val pinnedOrigin: String,
+    val userAgent: String,
+    val mimeType: String?,
+    val suggestedName: String,
+)
+
+private class RecordingPinnedOriginDownloader : PinnedOriginDownloadHandler {
+    val downloads = mutableListOf<RecordedDownload>()
+    var shutDown = false
+
+    override fun download(
+        url: String,
+        pinnedOrigin: String,
+        userAgent: String,
+        mimeType: String?,
+        suggestedName: String,
+    ) {
+        downloads += RecordedDownload(url, pinnedOrigin, userAgent, mimeType, suggestedName)
+    }
+
+    override fun shutdown() {
+        shutDown = true
     }
 }
 
