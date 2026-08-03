@@ -635,6 +635,26 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * Finish a session injection once the cookie store acknowledges the write.
+     * The acknowledgement is asynchronous, so the host may have been torn down
+     * or switched servers in the meantime — either way, drop it.
+     */
+    internal fun onSessionCookieSet(
+        origin: String,
+        accepted: Boolean,
+    ) {
+        if (isDestroyed || !::webView.isInitialized) return
+        if (origin != pinnedOrigin) return
+        authLog("setCookie accepted=$accepted")
+        // A rejected cookie means the reload would land unauthenticated, bounce
+        // to login, and re-launch the browser — burning the retry budget on a
+        // failure that retrying can't fix. Stay put instead.
+        if (!accepted) return
+        CookieManager.getInstance().flush()
+        webView.loadUrl(origin)
+    }
+
+    /**
      * True if [token] is shaped like a JWT — three non-empty base64url segments
      * (`header.payload.signature`). base64url is `[A-Za-z0-9_-]`, so a JWT can
      * never carry the `;`, whitespace, or control chars that would let a value
