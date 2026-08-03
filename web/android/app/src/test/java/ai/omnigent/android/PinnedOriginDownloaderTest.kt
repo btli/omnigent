@@ -3,18 +3,29 @@
 package ai.omnigent.android
 
 import android.app.Application
+import android.app.Notification
 import android.app.NotificationManager
+import android.content.ContentProvider
+import android.content.ContentValues
 import android.content.Context
+import android.database.Cursor
+import android.database.MatrixCursor
+import android.net.Uri
 import android.os.Environment
+import android.provider.MediaStore
 import android.util.Log
 import android.webkit.CookieManager
+import androidx.concurrent.futures.ResolvableFuture
 import androidx.test.core.app.ApplicationProvider
-import androidx.work.BackoffPolicy
 import androidx.work.ExistingWorkPolicy
+import androidx.work.ForegroundInfo
+import androidx.work.ForegroundUpdater
 import androidx.work.ListenableWorker
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequest
+import androidx.work.WorkInfo
 import androidx.work.testing.TestListenableWorkerBuilder
+import com.google.common.util.concurrent.ListenableFuture
 import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
 import org.junit.After
@@ -29,14 +40,22 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import org.robolectric.shadows.ShadowContentResolver
 import org.robolectric.shadows.ShadowCookieManager
 import org.robolectric.shadows.ShadowLog
 import org.robolectric.shadows.ShadowNotificationManager
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.IOException
+import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.URL
 import java.nio.charset.StandardCharsets
+import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
@@ -57,6 +76,11 @@ class PinnedOriginDownloaderTest {
         ShadowCookieManager.resetCookies()
         ShadowLog.clear()
         ShadowNotificationManager.reset()
+        context
+            .getSharedPreferences(MEDIA_STORE_JOURNAL, Context.MODE_PRIVATE)
+            .edit()
+            .clear()
+            .commit()
         pinnedServer = server()
         otherServer = server()
         pinnedOrigin = originOf(pinnedServer)
@@ -71,6 +95,7 @@ class PinnedOriginDownloaderTest {
         ShadowCookieManager.resetCookies()
         ShadowLog.clear()
         ShadowNotificationManager.reset()
+        ShadowContentResolver.reset()
     }
 
     @Test
@@ -142,6 +167,33 @@ class PinnedOriginDownloaderTest {
     }
 
     @Test
+    fun `proxy auth redirect is rejected with a sign in again outcome`() {
+        val idpHits = AtomicInteger()
+        pinnedServer.createContext("/expired") { exchange ->
+            exchange.redirect(
+                "$otherOrigin/authorize?redirect_uri=" +
+                    Uri.encode("$pinnedOrigin/after-login"),
+            )
+        }
+        otherServer.createContext("/authorize") { exchange ->
+            idpHits.incrementAndGet()
+            exchange.respond(200, "login page")
+        }
+        val target = targetFile("expired-session.pdf")
+        val worker = worker("$pinnedOrigin/expired", target.name)
+
+        val result = worker.doWork()
+
+        assertEquals(ListenableWorker.Result.failure(), result)
+        assertEquals(0, idpHits.get())
+        assertFalse(target.exists())
+        assertEquals(
+            "Couldn't download ${target.name}. Sign in again and retry.",
+            notificationFor(worker)!!.extras.getCharSequence(Notification.EXTRA_TEXT),
+        )
+    }
+
+    @Test
     fun `pinned origin rejects a protocol change when host and port match`() {
         val worker = worker("$pinnedOrigin/file", "protocol.txt")
 
@@ -192,7 +244,7 @@ class PinnedOriginDownloaderTest {
     }
 
     @Test
-    fun `enqueued work requires connected network and exponential backoff`() {
+    fun `enqueued work requires connected network and configured backoff`() {
         val calls = mutableListOf<EnqueueCall>()
         val downloader = recordingDownloader(calls)
 
@@ -206,8 +258,7 @@ class PinnedOriginDownloaderTest {
 
         val workSpec = calls.single().request.workSpec
         assertEquals(NetworkType.CONNECTED, workSpec.constraints.requiredNetworkType)
-        assertEquals(BackoffPolicy.EXPONENTIAL, workSpec.backoffPolicy)
-        assertEquals(TimeUnit.SECONDS.toMillis(30), workSpec.backoffDelayDuration)
+        assertEquals(TimeUnit.SECONDS.toMillis(45), workSpec.backoffDelayDuration)
     }
 
     @Test
@@ -261,6 +312,52 @@ class PinnedOriginDownloaderTest {
             "Download failed with HTTP 404",
             ShadowLog.getLogsForTag("PinnedOriginDownloader").single().throwable.message,
         )
+    }
+
+    @Test
+    fun `HTTP 408 and 429 are transient`() {
+        listOf(408, 429).forEach { status ->
+            val path = "/transient-$status"
+            pinnedServer.createContext(path) { exchange ->
+                exchange.respond(status, "try later")
+            }
+
+            val result = worker("$pinnedOrigin$path", "$status.txt").doWork()
+
+            assertEquals(ListenableWorker.Result.retry(), result)
+        }
+    }
+
+    @Test
+    fun `sane Retry-After is used before WorkManager backoff`() {
+        val hits = AtomicInteger()
+        pinnedServer.createContext("/throttled") { exchange ->
+            hits.incrementAndGet()
+            exchange.responseHeaders.add("Retry-After", "0")
+            exchange.respond(429, "try later")
+        }
+
+        val result = worker("$pinnedOrigin/throttled", "throttled.txt").doWork()
+
+        assertEquals(ListenableWorker.Result.retry(), result)
+        assertEquals(2, hits.get())
+    }
+
+    @Test
+    fun `absurd Retry-After is ignored`() {
+        val worker = worker("$pinnedOrigin/file", "absurd-retry-after.txt")
+
+        val delay =
+            org.robolectric.util.ReflectionHelpers.callInstanceMethod<Long?>(
+                worker,
+                "retryAfterMillis",
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(
+                    String::class.java,
+                    "9999999",
+                ),
+            )
+
+        assertNull(delay)
     }
 
     @Test
@@ -344,23 +441,232 @@ class PinnedOriginDownloaderTest {
         assertEquals("Dropping download because the worker is shut down", warning.msg)
     }
 
+    @Test
+    fun `oversized WorkManager input is surfaced without enqueueing`() {
+        val calls = mutableListOf<EnqueueCall>()
+        val downloader = recordingDownloader(calls)
+        val longUrl = "$pinnedOrigin/file?token=${"x".repeat(11_000)}"
+
+        downloader.download(
+            longUrl,
+            pinnedOrigin,
+            USER_AGENT,
+            "text/plain",
+            "too-large.txt",
+        )
+
+        assertTrue(calls.isEmpty())
+        val notification = shadowNotificationManager().allNotifications.single()
+        assertEquals(
+            "Download failed",
+            notification.extras.getCharSequence(Notification.EXTRA_TITLE),
+        )
+    }
+
+    @Test
+    fun `missing input fails after requesting foreground execution`() {
+        val foreground = RecordingForegroundUpdater()
+        val worker =
+            TestListenableWorkerBuilder<PinnedOriginDownloadWorker>(context = context)
+                .setForegroundUpdater(foreground)
+                .build()
+
+        val result = worker.doWork()
+
+        assertEquals(ListenableWorker.Result.failure(), result)
+        assertEquals(listOf(worker.id), foreground.workIds)
+        assertEquals(
+            "Missing download input",
+            ShadowLog.getLogsForTag(PinnedOriginDownloadWorker.TAG).single().throwable.message,
+        )
+    }
+
+    @Test
+    @Config(sdk = [35])
+    fun `foreground download declares the data sync service type`() {
+        val info = worker("$pinnedOrigin/file", "foreground.txt").getForegroundInfo()
+
+        assertEquals(
+            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+            info.foregroundServiceType,
+        )
+        assertTrue(info.notification.flags and Notification.FLAG_ONGOING_EVENT != 0)
+    }
+
+    @Test
+    fun `pre Q foreground download omits a service type`() {
+        val info = worker("$pinnedOrigin/file", "foreground.txt").getForegroundInfo()
+
+        assertEquals(0, info.foregroundServiceType)
+    }
+
+    @Test
+    fun `foreground setup failure degrades to a working download`() {
+        pinnedServer.createContext("/foreground-denied") { exchange ->
+            exchange.respond(200, DOWNLOAD_BODY)
+        }
+        val target = targetFile("foreground-denied.txt")
+        val foreground = RecordingForegroundUpdater(SecurityException("denied"))
+        val worker = worker("$pinnedOrigin/foreground-denied", target.name, foreground = foreground)
+
+        val result = worker.doWork()
+
+        assertEquals(ListenableWorker.Result.success(), result)
+        assertEquals(DOWNLOAD_BODY, target.readText())
+    }
+
+    @Test
+    fun `stopped copy refuses to write another byte`() {
+        val worker = worker("$pinnedOrigin/file", "stopped-copy.txt")
+        val output = ByteArrayOutputStream()
+        worker.stop(WorkInfo.STOP_REASON_TIMEOUT)
+
+        val failure =
+            runCatching {
+                org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(
+                    worker,
+                    "copyUntilStopped",
+                    org.robolectric.util.ReflectionHelpers.ClassParameter.from(
+                        java.io.InputStream::class.java,
+                        ByteArrayInputStream("should not be written".toByteArray()),
+                    ),
+                    org.robolectric.util.ReflectionHelpers.ClassParameter.from(
+                        OutputStream::class.java,
+                        output,
+                    ),
+                )
+            }.exceptionOrNull()
+
+        assertNotNull(failure)
+        assertEquals(0, output.size())
+    }
+
+    @Test
+    fun `stopping a blocked response disconnects promptly without publishing`() {
+        val firstChunkSent = CountDownLatch(1)
+        val releaseServer = CountDownLatch(1)
+        pinnedServer.createContext("/blocked") { exchange ->
+            exchange.sendResponseHeaders(200, 16_384)
+            exchange.responseBody.use { body ->
+                body.write(ByteArray(8_192))
+                body.flush()
+                firstChunkSent.countDown()
+                check(releaseServer.await(5, TimeUnit.SECONDS))
+                runCatching { body.write(ByteArray(8_192)) }
+            }
+        }
+        val target = targetFile("stopped-response.txt")
+        val worker = worker("$pinnedOrigin/blocked", target.name)
+        val executor = Executors.newSingleThreadExecutor()
+
+        try {
+            val future = executor.submit<ListenableWorker.Result> { worker.doWork() }
+            assertTrue(firstChunkSent.await(5, TimeUnit.SECONDS))
+
+            worker.stop(WorkInfo.STOP_REASON_TIMEOUT)
+
+            assertEquals(ListenableWorker.Result.retry(), future.get(2, TimeUnit.SECONDS))
+            assertFalse(target.exists())
+            assertNull(notificationFor(worker))
+        } finally {
+            releaseServer.countDown()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    @Config(sdk = [35])
+    fun `worker publishes a successful MediaStore download and reports Downloads`() {
+        pinnedServer.createContext("/media-success") { exchange ->
+            exchange.respond(200, DOWNLOAD_BODY)
+        }
+        val provider = WorkerMediaProvider()
+        val output = ByteArrayOutputStream()
+        registerMediaProvider(provider, output)
+        val worker = worker("$pinnedOrigin/media-success", "media-success.txt")
+
+        val result = worker.doWork()
+
+        assertEquals(ListenableWorker.Result.success(), result)
+        assertEquals(1, provider.insertCalls)
+        assertEquals(
+            1,
+            provider.insertedValues?.getAsInteger(MediaStore.Downloads.IS_PENDING),
+        )
+        assertEquals(1, provider.updateCalls)
+        assertEquals(0, provider.deleteCalls)
+        assertEquals(0, provider.updatedValues?.getAsInteger(MediaStore.Downloads.IS_PENDING))
+        assertEquals(DOWNLOAD_BODY, output.toString(Charsets.UTF_8.name()))
+        assertEquals(
+            "Saved media-success.txt to Downloads",
+            notificationFor(worker)!!.extras.getCharSequence(Notification.EXTRA_TEXT),
+        )
+    }
+
+    @Test
+    @Config(sdk = [35])
+    fun `worker deletes pending MediaStore row after a mid stream failure`() {
+        pinnedServer.createContext("/media-failure") { exchange ->
+            exchange.respond(200, DOWNLOAD_BODY)
+        }
+        val provider = WorkerMediaProvider()
+        registerMediaProvider(provider, FailingOutputStream())
+        val worker = worker("$pinnedOrigin/media-failure", "media-failure.txt")
+
+        val result = worker.doWork()
+
+        assertEquals(ListenableWorker.Result.retry(), result)
+        assertEquals(1, provider.insertCalls)
+        assertEquals(0, provider.updateCalls)
+        assertEquals(1, provider.deleteCalls)
+        assertNull(notificationFor(worker))
+    }
+
+    @Test
+    @Config(sdk = [35])
+    fun `worker treats a rejected MediaStore insert as a terminal save failure`() {
+        pinnedServer.createContext("/media-rejected") { exchange ->
+            exchange.respond(200, DOWNLOAD_BODY)
+        }
+        val provider = WorkerMediaProvider(insertResult = null)
+        registerMediaProvider(provider, ByteArrayOutputStream())
+        val worker = worker("$pinnedOrigin/media-rejected", "media-rejected.txt")
+
+        val result = worker.doWork()
+
+        assertEquals(ListenableWorker.Result.failure(), result)
+        assertEquals(1, provider.insertCalls)
+        assertEquals(0, provider.updateCalls)
+        assertEquals(0, provider.deleteCalls)
+        assertNotNull(notificationFor(worker))
+        assertEquals(
+            "Couldn't save download",
+            ShadowLog.getLogsForTag(PinnedOriginDownloadWorker.TAG).single().throwable.message,
+        )
+    }
+
     private fun worker(
         url: String,
         suggestedName: String,
         runAttemptCount: Int = 0,
-    ): PinnedOriginDownloadWorker =
-        TestListenableWorkerBuilder<PinnedOriginDownloadWorker>(
-            context = context,
-            inputData =
-                PinnedOriginDownloadWorker.inputData(
-                    url,
-                    pinnedOrigin,
-                    USER_AGENT,
-                    "text/plain",
-                    suggestedName,
-                ),
-            runAttemptCount = runAttemptCount,
-        ).build()
+        foreground: ForegroundUpdater? = null,
+    ): PinnedOriginDownloadWorker {
+        val builder =
+            TestListenableWorkerBuilder<PinnedOriginDownloadWorker>(
+                context = context,
+                inputData =
+                    PinnedOriginDownloadWorker.inputData(
+                        url,
+                        pinnedOrigin,
+                        USER_AGENT,
+                        "text/plain",
+                        suggestedName,
+                    ),
+                runAttemptCount = runAttemptCount,
+            )
+        if (foreground != null) builder.setForegroundUpdater(foreground)
+        return builder.build()
+    }
 
     private fun recordingDownloader(calls: MutableList<EnqueueCall>): PinnedOriginDownloader =
         PinnedOriginDownloader(
@@ -369,6 +675,14 @@ class PinnedOriginDownloaderTest {
                 calls += EnqueueCall(uniqueName, policy, request)
             },
         )
+
+    private fun registerMediaProvider(
+        provider: WorkerMediaProvider,
+        output: OutputStream,
+    ) {
+        ShadowContentResolver.registerProviderInternal("media", provider)
+        shadowOf(context.contentResolver).registerOutputStream(provider.insertedUri, output)
+    }
 
     private fun notificationFor(worker: PinnedOriginDownloadWorker) =
         shadowNotificationManager().getNotification(
@@ -417,8 +731,91 @@ class PinnedOriginDownloaderTest {
     )
 
     private companion object {
+        const val MEDIA_STORE_JOURNAL = "ai.omnigent.android.download_media_store"
         const val SESSION_COOKIE = "front_door=pinned"
         const val USER_AGENT = "OmnigentTest/1.0"
         const val DOWNLOAD_BODY = "download body"
+    }
+}
+
+private class RecordingForegroundUpdater(
+    private val failure: Throwable? = null,
+) : ForegroundUpdater {
+    val workIds = mutableListOf<UUID>()
+
+    override fun setForegroundAsync(
+        context: Context,
+        id: UUID,
+        foregroundInfo: ForegroundInfo,
+    ): ListenableFuture<Void> =
+        ResolvableFuture.create<Void>().apply {
+            workIds += id
+            if (failure == null) set(null) else setException(failure)
+        }
+}
+
+private class WorkerMediaProvider(
+    private val insertResult: Uri? = Uri.parse("content://media/external/downloads/73"),
+) : ContentProvider() {
+    val insertedUri: Uri = Uri.parse("content://media/external/downloads/73")
+    var insertedValues: ContentValues? = null
+    var updatedValues: ContentValues? = null
+    var insertCalls = 0
+    var updateCalls = 0
+    var deleteCalls = 0
+
+    override fun onCreate(): Boolean = true
+
+    override fun insert(
+        uri: Uri,
+        values: ContentValues?,
+    ): Uri? {
+        insertCalls++
+        insertedValues = values?.let { ContentValues(it) }
+        return insertResult
+    }
+
+    override fun update(
+        uri: Uri,
+        values: ContentValues?,
+        selection: String?,
+        selectionArgs: Array<out String>?,
+    ): Int {
+        updateCalls++
+        updatedValues = values?.let { ContentValues(it) }
+        return 1
+    }
+
+    override fun delete(
+        uri: Uri,
+        selection: String?,
+        selectionArgs: Array<out String>?,
+    ): Int {
+        deleteCalls++
+        return 1
+    }
+
+    override fun query(
+        uri: Uri,
+        projection: Array<out String>?,
+        selection: String?,
+        selectionArgs: Array<out String>?,
+        sortOrder: String?,
+    ): Cursor = MatrixCursor(projection ?: emptyArray())
+
+    override fun getType(uri: Uri): String? = null
+}
+
+private class FailingOutputStream : OutputStream() {
+    override fun write(value: Int) {
+        throw IOException("write failed")
+    }
+
+    override fun write(
+        bytes: ByteArray,
+        offset: Int,
+        length: Int,
+    ) {
+        if (length > 0) throw IOException("write failed after bytes arrived")
     }
 }

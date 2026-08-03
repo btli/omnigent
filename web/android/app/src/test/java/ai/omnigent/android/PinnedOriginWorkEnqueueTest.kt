@@ -102,6 +102,27 @@ class PinnedOriginWorkEnqueueTest {
         )
     }
 
+    @Test
+    fun `different download URLs enqueue distinct pending transfers`() {
+        val downloader = PinnedOriginDownloader(context)
+        downloader.download(
+            "$PINNED_ORIGIN/first",
+            PINNED_ORIGIN,
+            USER_AGENT,
+            "text/plain",
+            "first.txt",
+        )
+        downloader.download(
+            "$PINNED_ORIGIN/second",
+            PINNED_ORIGIN,
+            USER_AGENT,
+            "text/plain",
+            "second.txt",
+        )
+
+        assertEquals(2, workManager.workDatabase.workSpecDao().getAllWorkSpecIds().size)
+    }
+
     private companion object {
         const val PINNED_ORIGIN = "https://example.com"
         const val SESSION_COOKIE = "__Host-ap_session=secret"
