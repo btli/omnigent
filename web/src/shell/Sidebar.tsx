@@ -189,6 +189,23 @@ const SWIPE_COMMIT_PX = 72;
 // Cap the visual translate a little past the commit point so the row can't be
 // dragged clear across the panel.
 const SWIPE_MAX_PX = 96;
+// Past the commit point the row only keeps a third of further travel, so the
+// gesture resists instead of dragging the title out of the panel — the action is
+// already armed there, so extra movement carries no meaning.
+const SWIPE_RESIST = 1 / 3;
+
+/**
+ * Map raw finger travel to the row's visual offset: 1:1 up to the commit point,
+ * then damped and hard-capped at {@link SWIPE_MAX_PX}. Keeps the title inside
+ * the panel while still acknowledging a longer drag.
+ */
+function swipeOffset(deltaX: number): number {
+  const dir = Math.sign(deltaX);
+  const travel = Math.abs(deltaX);
+  if (travel <= SWIPE_COMMIT_PX) return deltaX;
+  const damped = SWIPE_COMMIT_PX + (travel - SWIPE_COMMIT_PX) * SWIPE_RESIST;
+  return dir * Math.min(damped, SWIPE_MAX_PX);
+}
 
 /**
  * Touch swipe gesture for a session row. Tracks a horizontal drag and, on
@@ -295,9 +312,9 @@ export function useRowSwipe({
         e.currentTarget.setPointerCapture(e.pointerId);
       }
       e.preventDefault();
-      const clamped = Math.max(-SWIPE_MAX_PX, Math.min(SWIPE_MAX_PX, deltaX));
-      s.offset = clamped;
-      setDx(clamped);
+      const offset = swipeOffset(deltaX);
+      s.offset = offset;
+      setDx(offset);
     },
     [actions.left, actions.right, isDragging],
   );
@@ -3422,27 +3439,32 @@ function ConversationRow({
       {/* Swipe reveal hint: sits behind the moving surface, showing the
           configured action's icon on the side being revealed. Inert (no pointer
           events) and only rendered mid-swipe, so at rest the row markup is
-          exactly what it was before the gesture existed. Passing the commit
-          threshold scales the glyph up as well as tinting it, so the "will
-          fire on release" state isn't carried by color alone. */}
+          exactly what it was before the gesture existed.
+          Archive uses the accent pair (blue in both modes) rather than
+          `--primary`, which is near-black in light mode and reads as a flat grey
+          button instead of a revealed surface. Passing the commit threshold
+          deepens the tint and scales the glyph, so "will fire on release" isn't
+          carried by color alone. */}
       {isSwiping && (
         <div
           aria-hidden
           className={cn(
             "pointer-events-none absolute inset-0 flex items-center rounded-[var(--radius-otto-sm)] px-4",
             swipe.dx > 0 ? "justify-start" : "justify-end",
-            swipingAction === "delete" ? "bg-destructive/15" : "bg-primary/15",
-            swipeCommitted
-              ? swipingAction === "delete"
-                ? "text-destructive"
-                : "text-primary"
-              : "text-muted-foreground",
+            "transition-colors",
+            swipingAction === "delete"
+              ? swipeCommitted
+                ? "bg-destructive/20 text-destructive"
+                : "bg-destructive/10 text-destructive/70"
+              : swipeCommitted
+                ? "bg-accent text-accent-foreground"
+                : "bg-accent/50 text-accent-foreground/70",
           )}
         >
           <span
             className={cn(
               "flex items-center transition-transform",
-              swipeCommitted ? "scale-125" : "scale-100",
+              swipeCommitted ? "scale-110" : "scale-100",
             )}
           >
             {swipingAction === "delete" ? (
@@ -3454,21 +3476,30 @@ function ConversationRow({
         </div>
       )}
       {/* Moving surface: the WHOLE row — link, session-state badge, and the
-          pin/kebab controls — translates together, so the trailing icons travel
-          with the text instead of the text sliding out from under them. The
-          box is layout-neutral (a plain block the height of the row), and it
-          only paints `bg-sidebar` while mid-swipe: an unconditional background
-          would plate every row and cover the sidebar canvas. Eases back to rest
-          when the gesture ends (dx → 0). */}
+          pin/kebab controls — moves together, so the trailing icons travel with
+          the text instead of the text sliding out from under them.
+          It INSETS from the swiped edge rather than translating: a translate
+          would push the title past the panel boundary and cut it mid-word (the
+          hint needs ~48px of gap, but the title only has ~18px of slack). An
+          inset re-truncates the title with its existing ellipsis instead, and
+          keeps every row control inside the panel.
+          `bg-sidebar` only while mid-swipe: an unconditional background would
+          plate every row and cover the sidebar canvas. */}
       <div
         className={cn(
           "relative",
           isSwiping && "rounded-[var(--radius-otto-sm)] bg-sidebar",
           // Transition only at rest, so the row eases back when the gesture
           // ends but tracks the finger 1:1 while swiping.
-          swipe.dx === 0 && "transition-transform duration-200",
+          swipe.dx === 0 && "transition-[margin] duration-200",
         )}
-        style={swipe.dx !== 0 ? { transform: `translateX(${swipe.dx}px)` } : undefined}
+        style={
+          swipe.dx !== 0
+            ? swipe.dx < 0
+              ? { marginRight: -swipe.dx }
+              : { marginLeft: swipe.dx }
+            : undefined
+        }
       >
         {/* Right-click anywhere on the row opens the same actions as the kebab.
           Suppressed in selection mode (bulk-select owns the row), where the
