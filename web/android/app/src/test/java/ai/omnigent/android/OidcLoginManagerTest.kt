@@ -8,6 +8,7 @@ import com.sun.net.httpserver.HttpServer
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -164,6 +165,91 @@ class OidcLoginManagerTest {
     }
 
     @Test
+    fun `completed flow delivers to its own callback after a second start`() {
+        val pollHits = AtomicInteger()
+        server.createContext("/auth/cli-login") { exchange ->
+            exchange.respond(200, ticketBody())
+        }
+        server.createContext("/auth/cli-poll") { exchange ->
+            if (pollHits.incrementAndGet() == 1) {
+                exchange.respond(200, tokenBody())
+            } else {
+                exchange.respond(202)
+            }
+        }
+        val manager = manager(pollTimeoutMs = 30_000)
+        val firstResult = AtomicReference<LoginResult?>()
+        val firstCalls = AtomicInteger()
+        val secondResult = AtomicReference<LoginResult?>()
+        val secondCalls = AtomicInteger()
+
+        assertTrue(
+            manager.start(activity(), origin) { result ->
+                firstResult.set(result)
+                firstCalls.incrementAndGet()
+            },
+        )
+        awaitFlowCompletion(manager)
+        assertTrue(
+            manager.start(activity(), origin) { result ->
+                secondResult.set(result)
+                secondCalls.incrementAndGet()
+            },
+        )
+
+        ShadowLooper.idleMainLooper()
+
+        assertEquals(LoginResult.Success(TOKEN), firstResult.get())
+        assertEquals(1, firstCalls.get())
+        assertNull(secondResult.get())
+        assertEquals(0, secondCalls.get())
+        manager.cancel()
+    }
+
+    @Test
+    fun `cancel permits a new start and suppresses the abandoned callback`() {
+        val loginAttempts = AtomicInteger()
+        val firstPollCompleted = CountDownLatch(1)
+        server.createContext("/auth/cli-login") { exchange ->
+            val attempt = loginAttempts.incrementAndGet()
+            exchange.respond(200, ticketBody(ticket = "ticket-$attempt"))
+        }
+        server.createContext("/auth/cli-poll") { exchange ->
+            if (exchange.requestURI.query == "ticket=ticket-1") {
+                exchange.respond(202)
+                firstPollCompleted.countDown()
+            } else {
+                exchange.respond(200, tokenBody())
+            }
+        }
+        val manager = manager(pollTimeoutMs = 30_000)
+        val abandonedCalls = AtomicInteger()
+        val secondResult = AtomicReference<LoginResult?>()
+        val secondDelivered = CountDownLatch(1)
+
+        assertTrue(
+            manager.start(activity(), origin) {
+                abandonedCalls.incrementAndGet()
+            },
+        )
+        assertTrue(firstPollCompleted.await(5, TimeUnit.SECONDS))
+
+        manager.cancel()
+
+        assertFalse(manager.isInFlightForTest())
+        assertTrue(
+            manager.start(activity(), origin) { result ->
+                secondResult.set(result)
+                secondDelivered.countDown()
+            },
+        )
+        awaitCallback(manager, secondDelivered)
+
+        assertEquals(LoginResult.Success(TOKEN), secondResult.get())
+        assertEquals(0, abandonedCalls.get())
+    }
+
+    @Test
     fun `start after shutdown does not throw or leave inFlight set`() {
         val manager = manager()
         manager.shutdown()
@@ -235,14 +321,24 @@ class OidcLoginManagerTest {
         assertTrue("login callback was not delivered", delivered.await(0, TimeUnit.MILLISECONDS))
     }
 
+    private fun awaitFlowCompletion(manager: OidcLoginManager) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (manager.isInFlightForTest() && System.nanoTime() < deadline) {
+            Thread.yield()
+        }
+        assertFalse("login flow did not complete", manager.isInFlightForTest())
+    }
+
     private fun activity(): Activity =
         Robolectric
             .buildActivity(Activity::class.java)
             .setup()
             .get()
 
-    private fun ticketBody(loginUrl: String = "/browser-login"): String =
-        """{"ticket":"ticket-1","login_url":"$loginUrl"}"""
+    private fun ticketBody(
+        loginUrl: String = "/browser-login",
+        ticket: String = "ticket-1",
+    ): String = """{"ticket":"$ticket","login_url":"$loginUrl"}"""
 
     private fun tokenBody(): String = """{"token":"$TOKEN"}"""
 
