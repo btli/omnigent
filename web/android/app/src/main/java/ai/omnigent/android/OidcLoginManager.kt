@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.webkit.CookieManager
 import org.json.JSONObject
 import java.net.HttpURLConnection
@@ -44,6 +45,7 @@ sealed interface LoginResult {
 class OidcLoginManager(
     private val pollIntervalMs: Long = DEFAULT_POLL_INTERVAL_MS,
     private val pollTimeoutMs: Long = DEFAULT_POLL_TIMEOUT_MS,
+    private val clock: () -> Long = { SystemClock.elapsedRealtime() },
 ) {
     private val io = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
@@ -190,9 +192,6 @@ class OidcLoginManager(
     private fun requestTicket(origin: String): Ticket? {
         val conn = (URL("$origin/auth/cli-login").openConnection() as HttpURLConnection)
         conn.requestMethod = "POST"
-        // Bodyless POST — set Content-Length explicitly; some servers/WAFs reject
-        // a POST without it (411 Length Required).
-        conn.setRequestProperty("Content-Length", "0")
         // A front-door auth proxy 302s this endpoint to its IdP's HTML login
         // page; following it would "succeed" with unparseable HTML. Fail fast.
         conn.instanceFollowRedirects = false
@@ -235,11 +234,11 @@ class OidcLoginManager(
         origin: String,
         ticket: String,
     ): LoginResult {
-        val deadline = System.currentTimeMillis() + pollTimeoutMs
+        val deadline = clock() + pollTimeoutMs
         val encoded = Uri.encode(ticket)
-        while (System.currentTimeMillis() < deadline) {
+        while (clock() < deadline) {
             Thread.sleep(pollIntervalMs) // throws InterruptedException on shutdownNow()
-            if (System.currentTimeMillis() >= deadline) break
+            if (clock() >= deadline) break
 
             var conn: HttpURLConnection? = null
             val body =
