@@ -159,6 +159,15 @@ internal class PinnedOriginDownloadWorker(
 
     override fun doWork(): Result {
         val suggestedName = inputData.getString(KEY_SUGGESTED_NAME) ?: FALLBACK_NAME
+        // Every run start increments runAttemptCount — retries, stops, and crash
+        // recoveries alike — so this gate bounds restart loops the stop counter
+        // cannot see, like repeated process deaths mid-transfer.
+        if (runAttemptCount >= MAX_LIVES) {
+            return terminalFailure(
+                suggestedName,
+                TerminalDownloadException("Download restarted too many times"),
+            )
+        }
         val stopCount = stopCount()
         if (stopCount >= MAX_STOPS) {
             return terminalFailure(
@@ -300,8 +309,9 @@ internal class PinnedOriginDownloadWorker(
     ): Result {
         Log.w(TAG, "Transient download failure for $suggestedName", failure)
         if (runAttemptCount < MAX_ATTEMPTS - 1) {
-            // WorkManager retries start at byte zero; this downloader has no partial-file
-            // resumption.
+            // Retries restart from byte zero (no partial-file resumption). Stopped
+            // runs also advanced runAttemptCount, so a much-stopped download
+            // exhausts this budget early — deliberately tight, never unbounded.
             return Result.retry()
         }
         return terminalFailure(suggestedName, failure)
@@ -579,7 +589,12 @@ internal class PinnedOriginDownloadWorker(
         internal const val KEY_SUGGESTED_NAME = "suggested_name"
         internal const val MAX_ATTEMPTS = 3
         internal const val STOP_COUNT_PREFERENCES = "ai.omnigent.android.download_stop_counts"
+
+        // Stops advance runAttemptCount too, but conflated with transient retries;
+        // this counter tracks stops precisely, while MAX_LIVES backstops restart
+        // paths that never run onStopped, such as process death.
         internal const val MAX_STOPS = 3
+        internal const val MAX_LIVES = 8
         private const val WORK_TAG = "pinned-origin-download"
         private const val MAX_REDIRECTS = 10
         private const val CONNECT_TIMEOUT_MS = 15_000
