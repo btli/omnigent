@@ -9,9 +9,12 @@ import {
   SearchIcon,
 } from "lucide-react";
 import { describe, expect, it } from "vitest";
+import { AntigravityIcon } from "@/components/icons/AntigravityIcon";
 import { CodexIcon } from "@/components/icons/CodexIcon";
 import { ClaudeIcon } from "@/components/icons/ClaudeIcon";
 import { HermesIcon } from "@/components/icons/HermesIcon";
+import { NessieIcon } from "@/components/icons/NessieIcon";
+import { OpenCodeIcon } from "@/components/icons/OpenCodeIcon";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { PiIcon } from "@/components/icons/PiIcon";
 import { resolveAgentIcon } from "./subagentIcons";
@@ -45,27 +48,55 @@ describe("resolveAgentIcon", () => {
     ).toBe(HermesIcon);
   });
 
-  it("prefers a Pi wrapper over a Hermes harness for roots", () => {
-    expect(
-      resolveAgentIcon({
-        kind: "root",
-        wrapper: "pi-native-ui",
-        harness: "hermes-native",
-        agentName: "pi-native-ui",
-      }),
-    ).toBe(PiIcon);
-  });
-
-  it("prefers an exact Pi harness over a Hermes wrapper for roots", () => {
-    expect(
-      resolveAgentIcon({
-        kind: "root",
-        wrapper: "hermes-native-ui",
-        harness: "pi",
-        agentName: "hermes-native-ui",
-      }),
-    ).toBe(PiIcon);
-  });
+  it.each([
+    {
+      earlier: "claude",
+      later: "codex",
+      signals: "Claude harness and Codex wrapper",
+      wrapper: "codex-native-ui",
+      harness: "claude-native",
+      expected: ClaudeIcon,
+    },
+    {
+      earlier: "codex",
+      later: "antigravity",
+      signals: "Codex harness and Antigravity wrapper",
+      wrapper: "antigravity-native-ui",
+      harness: "codex-native",
+      expected: CodexIcon,
+    },
+    {
+      earlier: "antigravity",
+      later: "pi",
+      signals: "Antigravity harness and Pi wrapper",
+      wrapper: "pi-native-ui",
+      harness: "antigravity-native",
+      expected: AntigravityIcon,
+    },
+    {
+      earlier: "pi",
+      later: "hermes",
+      signals: "Hermes harness and Pi wrapper",
+      wrapper: "pi-native-ui",
+      harness: "hermes-native",
+      expected: PiIcon,
+    },
+    {
+      earlier: "pi",
+      later: "hermes",
+      signals: "Pi harness and Hermes wrapper",
+      wrapper: "hermes-native-ui",
+      harness: "pi",
+      expected: PiIcon,
+    },
+  ])(
+    "prefers $earlier over $later for mixed root signals: $signals",
+    ({ wrapper, harness, expected }) => {
+      expect(resolveAgentIcon({ kind: "root", wrapper, harness, agentName: "mixed-signals" })).toBe(
+        expected,
+      );
+    },
+  );
 
   it("matches the Pi root harness exactly", () => {
     expect(resolveAgentIcon({ kind: "root", wrapper: null, harness: "pi", agentName: "pi" })).toBe(
@@ -90,6 +121,43 @@ describe("resolveAgentIcon", () => {
         agentName: "nessie",
       }),
     ).toBe(ClaudeIcon);
+  });
+
+  it("matches OpenCode substrings for root harnesses", () => {
+    expect(
+      resolveAgentIcon({
+        kind: "root",
+        wrapper: null,
+        harness: "custom-opencode-harness",
+        agentName: "custom-agent",
+      }),
+    ).toBe(OpenCodeIcon);
+  });
+
+  it("prefers Nessie by name over its Claude catalog harness", () => {
+    expect(resolveAgentIcon({ kind: "catalog", name: "nessie", harness: "claude-sdk" })).toBe(
+      NessieIcon,
+    );
+  });
+
+  it("prefers Codex over Claude for a hybrid catalog harness", () => {
+    expect(
+      resolveAgentIcon({
+        kind: "catalog",
+        name: "custom-agent",
+        harness: "claude-codex-hybrid",
+      }),
+    ).toBe(CodexIcon);
+  });
+
+  it("excludes unregistered OpenCode substrings from catalog harness matching", () => {
+    expect(
+      resolveAgentIcon({
+        kind: "catalog",
+        name: "custom-agent",
+        harness: "custom-opencode-harness",
+      }),
+    ).toBe(BotIcon);
   });
 
   it.each([
