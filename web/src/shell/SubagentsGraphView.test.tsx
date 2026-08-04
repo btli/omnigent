@@ -126,6 +126,11 @@ function leaf(id: string, overrides: Partial<TreeNode> = {}): TreeNode {
     activity: "idle",
     statusLabel: "Idle",
     preview: null,
+    nodeKind: "root",
+    wrapper: null,
+    tool: null,
+    harness: null,
+    agentName: null,
     children: [],
     ...overrides,
   };
@@ -499,6 +504,11 @@ describe("buildTree", () => {
       activity: "idle",
       statusLabel: "Idle",
       preview: null,
+      nodeKind: "root",
+      wrapper: null,
+      tool: null,
+      harness: null,
+      agentName: null,
       children: [],
     });
   });
@@ -570,6 +580,39 @@ describe("buildTree", () => {
     const tree = buildTree("root", "main", "idle", "Idle", null, map, 0);
 
     expect(tree.children[0].preview).toBe("Searching for auth...");
+  });
+
+  it("carries raw root and child identity fields into layout data", () => {
+    const map = new Map<string, ChildSessionInfo[]>();
+    map.set("root", [
+      childInfo({
+        id: "c1",
+        tool: "Explore",
+        labels: { "omnigent.wrapper": "codex-native-ui-subagent" },
+      }),
+    ]);
+
+    const tree = buildTree("root", "Codex", "idle", "Idle", null, map, 0, new Set(), {
+      wrapper: "codex-native-ui",
+      harness: "codex-native",
+      agentName: "codex-native-ui",
+    });
+    const { nodes } = layoutTree(tree, "root");
+
+    expect(nodes.find((node) => node.id === "root")?.data).toMatchObject({
+      nodeKind: "root",
+      wrapper: "codex-native-ui",
+      tool: null,
+      harness: "codex-native",
+      agentName: "codex-native-ui",
+    });
+    expect(nodes.find((node) => node.id === "c1")?.data).toMatchObject({
+      nodeKind: "child",
+      wrapper: "codex-native-ui-subagent",
+      tool: "Explore",
+      harness: null,
+      agentName: null,
+    });
   });
 });
 
