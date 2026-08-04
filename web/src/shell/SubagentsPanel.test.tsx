@@ -208,6 +208,7 @@ describe("SubagentsPanel", () => {
     const main = screen.getByTestId("subagent-main-row");
     expect(main).toHaveTextContent("Claude Code");
     expect(main).not.toHaveTextContent("claude-native-ui");
+    expect(main.querySelector('[data-icon="claude"]')).toHaveAttribute("aria-hidden", "true");
   });
 
   it("labels Pi native-wrapper main rows with the product name", () => {
@@ -573,7 +574,7 @@ describe("SubagentsPanel", () => {
     const { container } = renderPanel({ rootSessionId: "conv_root" });
 
     const codexRow = childRow(container, "conv_codex");
-    expect(codexRow.querySelector('[data-icon="codex"]')).not.toBeNull();
+    expect(codexRow.querySelector('[data-icon="codex"]')).toHaveAttribute("aria-hidden", "true");
     expect(codexRow.querySelector(".lucide-code-2")).toBeNull();
 
     const opencodeRow = childRow(container, "conv_opencode");

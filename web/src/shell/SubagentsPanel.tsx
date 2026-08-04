@@ -440,7 +440,7 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
         )}
       >
         <div className="flex w-full items-center gap-1">
-          <Icon className="size-3.5 shrink-0 text-muted-foreground" />
+          <Icon aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
           <span className="shrink-0 truncate text-sm font-medium">{label}</span>
           <span className="flex-1" />
           <StatusIndicator {...sessionStatus(session?.status, session?.lastTaskError)} />
@@ -551,7 +551,7 @@ function SubagentRow({
                 className="-ml-3 size-3 shrink-0 text-muted-foreground/60"
               />
             )}
-            <Icon className="size-3.5 shrink-0 text-muted-foreground" />
+            <Icon aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
             <span className="shrink-0 truncate text-sm font-medium">{primary}</span>
             {child.routed_model ? (
               // Model the intelligent router picked for this sub-agent — the
