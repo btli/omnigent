@@ -6,6 +6,7 @@
 // are no longer listed here — they live on the Settings page.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { Collision } from "@dnd-kit/core";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useEffect } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
@@ -156,7 +157,8 @@ vi.mock("@/lib/serverOrigin", () => ({
 
 import { useConversations } from "@/hooks/useConversations";
 import { useChatStore } from "@/store/chatStore";
-import { Sidebar } from "./Sidebar";
+import { prioritizeSidebarUngroupCollision, Sidebar } from "./Sidebar";
+import { EXPANDED_PROJECT_SECTIONS_STORAGE_KEY } from "./sidebarNav";
 
 const useConvMock = vi.mocked(useConversations);
 
@@ -241,7 +243,6 @@ function mockOverlappingUngroupTargets(): void {
     this: Element,
   ): DOMRect {
     const testId = this.getAttribute("data-testid");
-    if (testId === "sidebar-conversation-scroll-region") return dndRect(0, 400);
     if (testId === "sidebar-chats-drop-zone") return dndRect(100, 220);
     if (testId === "sidebar-ungroup-drop-zone") return dndRect(260, 40);
     if (this.tagName === "LI") return dndRect(20, 32);
@@ -254,7 +255,6 @@ function mockProjectStealLayout(): void {
     this: Element,
   ): DOMRect {
     const testId = this.getAttribute("data-testid");
-    if (testId === "sidebar-conversation-scroll-region") return dndRect(0, 320);
     if (
       testId === "sidebar-project-drop-zone" &&
       this.getAttribute("data-project-name") === "Sprint 42"
@@ -331,23 +331,32 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe("Sidebar collision precedence", () => {
+  it("prioritizes the ungroup strip without changing unrelated collision order", () => {
+    const project: Collision = { id: "project:Sprint 42" };
+    const chats: Collision = { id: "chats-ungroup" };
+    const ungroup: Collision = { id: "__ungroup__" };
+
+    expect(prioritizeSidebarUngroupCollision([project, chats, ungroup])).toEqual([
+      ungroup,
+      project,
+      chats,
+    ]);
+
+    const unrelated = [project, chats];
+    expect(prioritizeSidebarUngroupCollision(unrelated)).toBe(unrelated);
+  });
+});
+
 describe("Sidebar session list", () => {
   it("keeps the session list scrollable without visible scrollbar chrome", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
 
     const scroller = screen.getByLabelText("Conversations").querySelector("nav")!;
-    expect(scroller).toHaveClass(
-      "overflow-y-auto",
-      "max-md:overflow-hidden",
-      "[scrollbar-width:none]",
-    );
+    expect(scroller).toHaveClass("overflow-y-auto", "[scrollbar-width:none]");
     expect(scroller.className).toContain("[&::-webkit-scrollbar]:hidden");
     expect(scroller.className).not.toContain("scrollbar-gutter");
-    expect(screen.getByTestId("sidebar-conversation-scroll-region")).toHaveClass(
-      "overflow-y-auto",
-      "md:overflow-visible",
-    );
   });
 
   it("uses balanced title padding until row actions are revealed", () => {
@@ -1632,7 +1641,6 @@ describe("Sidebar ungroup drag target", () => {
     expect(list.lastElementChild).toBe(dropZone);
     expect(Array.from(list.children).slice(0, -1)).toEqual(childrenBefore);
     expect(Array.from(list.querySelectorAll("li"))).toEqual(rowsBefore);
-    expect(dropZone).toHaveClass("max-md:sticky", "max-md:bottom-0", "max-md:z-10");
 
     fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
   });
@@ -1666,13 +1674,13 @@ describe("Sidebar ungroup drag target", () => {
   it("resolves an overlap with the live Chats target to one ungroup action", async () => {
     mockOverlappingUngroupTargets();
     projectsMock.push("Sprint 42");
+    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(["Sprint 42"]));
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Sprint 42" } }),
       conv("conv_flat", "Codex"),
     ]);
     renderSidebar();
 
-    fireEvent.click(screen.getByRole("button", { name: "Sprint 42" }));
     const filedRow = screen.getByRole("link", { name: "conv_filed" }).closest("li")!;
     const chatsDropZone = screen.getByTestId("sidebar-chats-drop-zone");
     startMouseDrag(filedRow);
@@ -1691,39 +1699,30 @@ describe("Sidebar ungroup drag target", () => {
     });
   });
 
-  it("does not let a collapsed project beneath the strip steal an ungroup drop", async () => {
+  it("does not let an overlapping collapsed project steal an ungroup drop", async () => {
     mockProjectStealLayout();
     projectsMock.push("Source", "Sprint 42");
+    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(["Source"]));
     mockConversations([conv("conv_filed", "Claude Code", { labels: { omni_project: "Source" } })]);
     renderSidebar();
 
-    fireEvent.click(screen.getByRole("button", { name: "Source" }));
     const filedRow = screen.getByRole("link", { name: "conv_filed" }).closest("li")!;
     startMouseDrag(filedRow);
     const strip = await screen.findByTestId("sidebar-ungroup-drop-zone");
     const project = screen
       .getAllByTestId("sidebar-project-drop-zone")
       .find((element) => element.getAttribute("data-project-name") === "Sprint 42")!;
-    const scrollRegion = screen.getByTestId("sidebar-conversation-scroll-region");
 
     expect(project.getBoundingClientRect().bottom).toBeGreaterThan(
       strip.getBoundingClientRect().top,
     );
-    expect(scrollRegion.getBoundingClientRect().bottom).toBeLessThanOrEqual(
-      strip.getBoundingClientRect().top,
-    );
+    expect(project.getBoundingClientRect().top).toBeLessThan(strip.getBoundingClientRect().bottom);
 
     moveMouseOverProjectOverlap();
-    await waitFor(() => {
-      expect(strip).toHaveClass("bg-[var(--sidebar-active)]");
-      expect(project).not.toHaveClass("bg-[var(--sidebar-active)]");
-    });
     fireEvent.mouseUp(document, { button: 0, clientX: 120, clientY: 360 });
 
-    await waitFor(() => {
-      expect(moveToProjectSpy).toHaveBeenCalledTimes(1);
-      expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_filed", project: "" });
-    });
+    await waitFor(() => expect(moveToProjectSpy).toHaveBeenCalledTimes(1));
+    expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_filed", project: "" });
     expect(moveToProjectSpy).not.toHaveBeenCalledWith({ id: "conv_filed", project: "Sprint 42" });
   });
 });
