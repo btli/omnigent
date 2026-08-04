@@ -38,11 +38,33 @@ describe("resolveAgentIcon", () => {
     expect(
       resolveAgentIcon({
         kind: "root",
-        wrapper: null,
+        wrapper: "hermes-native-ui",
         harness: "hermes-native",
         agentName: "hermes-native-ui",
       }),
     ).toBe(HermesIcon);
+  });
+
+  it("prefers a Pi wrapper over a Hermes harness for roots", () => {
+    expect(
+      resolveAgentIcon({
+        kind: "root",
+        wrapper: "pi-native-ui",
+        harness: "hermes-native",
+        agentName: "pi-native-ui",
+      }),
+    ).toBe(PiIcon);
+  });
+
+  it("prefers an exact Pi harness over a Hermes wrapper for roots", () => {
+    expect(
+      resolveAgentIcon({
+        kind: "root",
+        wrapper: "hermes-native-ui",
+        harness: "pi",
+        agentName: "hermes-native-ui",
+      }),
+    ).toBe(PiIcon);
   });
 
   it("matches the Pi root harness exactly", () => {
