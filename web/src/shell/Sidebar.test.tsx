@@ -241,8 +241,27 @@ function mockOverlappingUngroupTargets(): void {
     this: Element,
   ): DOMRect {
     const testId = this.getAttribute("data-testid");
+    if (testId === "sidebar-conversation-scroll-region") return dndRect(0, 400);
     if (testId === "sidebar-chats-drop-zone") return dndRect(100, 220);
     if (testId === "sidebar-ungroup-drop-zone") return dndRect(260, 40);
+    if (this.tagName === "LI") return dndRect(20, 32);
+    return dndRect(-1_000, 1);
+  });
+}
+
+function mockProjectStealLayout(): void {
+  vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
+    this: Element,
+  ): DOMRect {
+    const testId = this.getAttribute("data-testid");
+    if (testId === "sidebar-conversation-scroll-region") return dndRect(0, 320);
+    if (
+      testId === "sidebar-project-drop-zone" &&
+      this.getAttribute("data-project-name") === "Sprint 42"
+    ) {
+      return dndRect(345, 40);
+    }
+    if (testId === "sidebar-ungroup-drop-zone") return dndRect(350, 40);
     if (this.tagName === "LI") return dndRect(20, 32);
     return dndRect(-1_000, 1);
   });
@@ -256,6 +275,11 @@ function startMouseDrag(row: HTMLElement): void {
 function moveMouseOverUngroupTarget(): void {
   fireEvent.mouseMove(document, { buttons: 1, clientX: 120, clientY: 279 });
   fireEvent.mouseMove(document, { buttons: 1, clientX: 120, clientY: 280 });
+}
+
+function moveMouseOverProjectOverlap(): void {
+  fireEvent.mouseMove(document, { buttons: 1, clientX: 120, clientY: 359 });
+  fireEvent.mouseMove(document, { buttons: 1, clientX: 120, clientY: 360 });
 }
 
 // "Shared with me" sessions live on their own sidebar tab now; click it to
@@ -313,9 +337,17 @@ describe("Sidebar session list", () => {
     renderSidebar();
 
     const scroller = screen.getByLabelText("Conversations").querySelector("nav")!;
-    expect(scroller).toHaveClass("overflow-y-auto", "[scrollbar-width:none]");
+    expect(scroller).toHaveClass(
+      "overflow-y-auto",
+      "max-md:overflow-hidden",
+      "[scrollbar-width:none]",
+    );
     expect(scroller.className).toContain("[&::-webkit-scrollbar]:hidden");
     expect(scroller.className).not.toContain("scrollbar-gutter");
+    expect(screen.getByTestId("sidebar-conversation-scroll-region")).toHaveClass(
+      "overflow-y-auto",
+      "md:overflow-visible",
+    );
   });
 
   it("uses balanced title padding until row actions are revealed", () => {
@@ -1657,6 +1689,42 @@ describe("Sidebar ungroup drag target", () => {
       expect(moveToProjectSpy).toHaveBeenCalledTimes(1);
       expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_filed", project: "" });
     });
+  });
+
+  it("does not let a collapsed project beneath the strip steal an ungroup drop", async () => {
+    mockProjectStealLayout();
+    projectsMock.push("Source", "Sprint 42");
+    mockConversations([conv("conv_filed", "Claude Code", { labels: { omni_project: "Source" } })]);
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: "Source" }));
+    const filedRow = screen.getByRole("link", { name: "conv_filed" }).closest("li")!;
+    startMouseDrag(filedRow);
+    const strip = await screen.findByTestId("sidebar-ungroup-drop-zone");
+    const project = screen
+      .getAllByTestId("sidebar-project-drop-zone")
+      .find((element) => element.getAttribute("data-project-name") === "Sprint 42")!;
+    const scrollRegion = screen.getByTestId("sidebar-conversation-scroll-region");
+
+    expect(project.getBoundingClientRect().bottom).toBeGreaterThan(
+      strip.getBoundingClientRect().top,
+    );
+    expect(scrollRegion.getBoundingClientRect().bottom).toBeLessThanOrEqual(
+      strip.getBoundingClientRect().top,
+    );
+
+    moveMouseOverProjectOverlap();
+    await waitFor(() => {
+      expect(strip).toHaveClass("bg-[var(--sidebar-active)]");
+      expect(project).not.toHaveClass("bg-[var(--sidebar-active)]");
+    });
+    fireEvent.mouseUp(document, { button: 0, clientX: 120, clientY: 360 });
+
+    await waitFor(() => {
+      expect(moveToProjectSpy).toHaveBeenCalledTimes(1);
+      expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_filed", project: "" });
+    });
+    expect(moveToProjectSpy).not.toHaveBeenCalledWith({ id: "conv_filed", project: "Sprint 42" });
   });
 });
 
