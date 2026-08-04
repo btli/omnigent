@@ -40,6 +40,21 @@ export interface RootAgentIdentity {
   agentName: string | null;
 }
 
+type NodeIdentity =
+  | {
+      nodeKind: "root";
+      wrapper: string | null;
+      harness: string | null;
+      agentName: string | null;
+    }
+  | {
+      nodeKind: "child";
+      wrapper: string | null;
+      tool: string | null;
+      harness: null;
+      agentName: null;
+    };
+
 interface LayoutNode {
   id: string;
   type: string;
@@ -158,12 +173,8 @@ export function buildTree(
   rootPreview: string | null,
   childrenMap: Map<string, ChildSessionInfo[]>,
   depth: number,
+  identity: NodeIdentity,
   visited = new Set<string>(),
-  identity: RootAgentIdentity & { nodeKind?: "root" | "child"; tool?: string | null } = {
-    wrapper: null,
-    harness: null,
-    agentName: null,
-  },
 ): TreeNode {
   visited.add(rootId);
   const children = childrenMap.get(rootId) ?? [];
@@ -173,9 +184,9 @@ export function buildTree(
     activity: rootActivity,
     statusLabel: rootStatusLabel,
     preview: rootPreview,
-    nodeKind: identity.nodeKind ?? "root",
+    nodeKind: identity.nodeKind,
     wrapper: identity.wrapper,
-    tool: identity.tool ?? null,
+    tool: identity.nodeKind === "child" ? identity.tool : null,
     harness: identity.harness,
     agentName: identity.agentName,
     children:
@@ -195,7 +206,6 @@ export function buildTree(
                 child.last_message_preview,
                 childrenMap,
                 depth + 1,
-                visited,
                 {
                   nodeKind: "child",
                   wrapper: child.labels?.[WRAPPER_LABEL_KEY] ?? null,
@@ -203,6 +213,7 @@ export function buildTree(
                   harness: null,
                   agentName: null,
                 },
+                visited,
               );
             }),
   };
@@ -226,8 +237,7 @@ export function buildGraphLayout(
     rootPreview,
     childrenMap,
     0,
-    new Set<string>(),
-    rootIdentity,
+    { nodeKind: "root", ...rootIdentity },
   );
   return layoutTree(tree, activeId);
 }

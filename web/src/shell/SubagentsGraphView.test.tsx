@@ -497,8 +497,15 @@ describe("layoutTree", () => {
 // ===========================================================================
 
 describe("buildTree", () => {
+  const rootIdentity = {
+    nodeKind: "root" as const,
+    wrapper: null,
+    harness: null,
+    agentName: null,
+  };
+
   it("creates a leaf when no children exist in the map", () => {
-    const tree = buildTree("root", "main", "idle", "Idle", null, new Map(), 0);
+    const tree = buildTree("root", "main", "idle", "Idle", null, new Map(), 0, rootIdentity);
     expect(tree).toEqual({
       id: "root",
       label: "main",
@@ -527,7 +534,7 @@ describe("buildTree", () => {
     ]);
     map.set("c1", [childInfo({ id: "c1a", session_name: "search", tool: "Explore" })]);
 
-    const tree = buildTree("root", "main", "working", "Working", null, map, 0);
+    const tree = buildTree("root", "main", "working", "Working", null, map, 0, rootIdentity);
 
     expect(tree.children).toHaveLength(2);
     expect(tree.children[0].id).toBe("c1");
@@ -547,7 +554,7 @@ describe("buildTree", () => {
     map.set("c2", [childInfo({ id: "c3", tool: "c" })]);
     map.set("c3", [childInfo({ id: "c4", tool: "d" })]);
 
-    const tree = buildTree("root", "main", "idle", "Idle", null, map, 0);
+    const tree = buildTree("root", "main", "idle", "Idle", null, map, 0, rootIdentity);
 
     expect(tree.children).toHaveLength(1);
     expect(tree.children[0].children).toHaveLength(1);
@@ -564,7 +571,7 @@ describe("buildTree", () => {
       childInfo({ id: "c4" }),
     ]);
 
-    const tree = buildTree("root", "main", "idle", "Idle", null, map, 0);
+    const tree = buildTree("root", "main", "idle", "Idle", null, map, 0, rootIdentity);
 
     expect(tree.children[0].label).toBe("named");
     expect(tree.children[1].label).toBe("titled");
@@ -578,7 +585,7 @@ describe("buildTree", () => {
       childInfo({ id: "c1", tool: "a", last_message_preview: "Searching for auth..." }),
     ]);
 
-    const tree = buildTree("root", "main", "idle", "Idle", null, map, 0);
+    const tree = buildTree("root", "main", "idle", "Idle", null, map, 0, rootIdentity);
 
     expect(tree.children[0].preview).toBe("Searching for auth...");
   });
@@ -593,7 +600,8 @@ describe("buildTree", () => {
       }),
     ]);
 
-    const tree = buildTree("root", "Codex", "idle", "Idle", null, map, 0, new Set(), {
+    const tree = buildTree("root", "Codex", "idle", "Idle", null, map, 0, {
+      nodeKind: "root",
       wrapper: "codex-native-ui",
       harness: "codex-native",
       agentName: "codex-native-ui",

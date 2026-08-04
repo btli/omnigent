@@ -47,7 +47,7 @@ export function AgentCard({
         selected ? "border-primary bg-primary/5" : "border-border hover:border-muted-foreground/30"
       } cursor-pointer`}
     >
-      <Icon className="size-4 shrink-0 text-muted-foreground" />
+      <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
       <div className="min-w-0 flex-1">
         <span className="text-sm font-semibold">{agent.display_name}</span>
         {!compact && agent.description && (
