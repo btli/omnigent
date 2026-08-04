@@ -541,8 +541,7 @@ internal class PinnedOriginDownloadWorker(
             effectivePort(url) == effectivePort(pinnedUrl)
     }
 
-    private fun effectivePort(url: URL): Int =
-        if (url.port == -1) url.defaultPort else url.port
+    private fun effectivePort(url: URL): Int = if (url.port == -1) url.defaultPort else url.port
 
     private fun normalizedMimeType(mimeType: String?): String? =
         mimeType

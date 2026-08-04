@@ -175,8 +175,11 @@ class DownloadStorageTest {
 
         (0..cap).forEach { index ->
             val saved =
-                storage.save("evict-$index.txt", "text/plain", operationId = "op-$index") {
-                        stream ->
+                storage.save(
+                    "evict-$index.txt",
+                    "text/plain",
+                    operationId = "op-$index",
+                ) { stream ->
                     stream.write(byteArrayOf(1))
                 }
             assertTrue(saved.saved)
@@ -302,7 +305,12 @@ class DownloadStorageTest {
         val dir = checkNotNull(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS))
         val target = File(dir, "existing-download.txt")
         val temporaryFilesBefore =
-            dir.listFiles().orEmpty().filter(File::isTemporaryDownload).map(File::getName).toSet()
+            dir
+                .listFiles()
+                .orEmpty()
+                .filter(File::isTemporaryDownload)
+                .map(File::getName)
+                .toSet()
         target.writeText("complete original")
 
         try {
