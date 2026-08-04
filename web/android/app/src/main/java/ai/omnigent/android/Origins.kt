@@ -37,6 +37,32 @@ fun isHttpScheme(scheme: String?): Boolean {
 }
 
 /**
+ * True when [url] is a front-door auth-proxy authorize page for [pinnedOrigin]:
+ * it carries a `redirect_uri` query parameter that returns to the pinned origin
+ * on a path other than the server's own OIDC callback (`/auth/callback`).
+ *
+ * Deployments fronted by a hosting proxy (e.g. Databricks Apps) intercept every
+ * request — including the login endpoints — and bounce unauthenticated visitors
+ * to the host's IdP. That flow must complete inside the WebView so the proxy's
+ * session cookie lands in the WebView's cookie store; the server's own IdP
+ * bounce (redirect_uri path `/auth/callback`) still runs in the system browser
+ * (RFC 8252 — Google blocks WebView sign-in).
+ */
+fun isProxyAuthUrl(
+    url: String?,
+    pinnedOrigin: String?,
+): Boolean {
+    if (pinnedOrigin == null) return false
+    val uri = url?.let(Uri::parse) ?: return false
+    // getQueryParameter throws on opaque (non-hierarchical) URIs like mailto:.
+    if (uri.isOpaque) return false
+    val redirect = uri.getQueryParameter("redirect_uri") ?: return false
+    if (originOf(redirect) != pinnedOrigin) return false
+    // Trailing-slash-insensitive: `/auth/callback/` is still the server's own.
+    return Uri.parse(redirect).path?.trimEnd('/') != "/auth/callback"
+}
+
+/**
  * Normalize user-entered server text into a loadable URL, or null if it isn't a
  * usable http(s) address. Adds a default `https://` scheme when omitted and
  * trims a trailing slash.

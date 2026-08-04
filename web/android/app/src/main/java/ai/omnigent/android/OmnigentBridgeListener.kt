@@ -25,6 +25,7 @@ internal class OmnigentBridgeListener(
     private val blobSaver: BlobSaver,
     /** Relays validated bounds without retaining the Activity-owned view. */
     private val onServerSwitcherBand: (ServerSwitcherBand) -> Unit,
+    private val pinnedOrigin: () -> String?,
 ) : WebViewCompat.WebMessageListener {
     override fun onPostMessage(
         view: WebView,
@@ -33,9 +34,17 @@ internal class OmnigentBridgeListener(
         isMainFrame: Boolean,
         replyProxy: JavaScriptReplyProxy,
     ) {
+        handle(message.data, sourceOrigin, isMainFrame)
+    }
+
+    internal fun handle(
+        data: String?,
+        sourceOrigin: Uri,
+        isMainFrame: Boolean,
+    ) {
         if (!isMainFrame) return // origin allowlist already gates; defense in depth.
-        val data = message.data ?: return
-        handle(data)
+        if (originOf(sourceOrigin.toString()) != pinnedOrigin()) return
+        handle(data ?: return)
     }
 
     /** Parse and dispatch one bridge message; malformed input is dropped. */
