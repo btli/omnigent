@@ -110,7 +110,7 @@ lint-ts:
 normalize-locks: _ensure-uv
     uv run scripts/normalize_uv_lock_registry.py uv.lock || true
 
-# ─── homelab test env (test.omnigent.bryanli.net) ── NOT upstream ─────────────
+# ─── homelab test env (omni-test.bryanli.net) ── NOT upstream ─────────────
 # Stages a worktree to server0 NFS and bounces the omnigent-test pod (k3s-infra
 # k8s/omnigent-test). Spec: homelab docs/superpowers/specs/2026-08-04-*.md
 
@@ -126,7 +126,7 @@ test-sync:
       ./ {{ TEST_STAGE }}
     {{ TEST_KUBECTL }} rollout restart deploy/omnigent-test
     {{ TEST_KUBECTL }} rollout status deploy/omnigent-test --timeout=30m
-    @echo "→ https://test.omnigent.bryanli.net"
+    @echo "→ https://omni-test.bryanli.net"
 
 # Build a fresh worktree from upstream {{ TEST_BASE }} + the given PR numbers
 # (upstream GitHub PRs), then deploy it. Aborts loudly on merge conflicts.
@@ -151,7 +151,7 @@ test-up +prs:
       ./ {{ TEST_STAGE }}
     {{ TEST_KUBECTL }} rollout restart deploy/omnigent-test
     {{ TEST_KUBECTL }} rollout status deploy/omnigent-test --timeout=30m
-    echo "→ https://test.omnigent.bryanli.net"
+    echo "→ https://omni-test.bryanli.net"
 
 # Stop the test env (staged tree stays; test-sync or a restart revives it).
 [group('test-env')]
