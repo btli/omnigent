@@ -197,8 +197,10 @@ class MainActivity : AppCompatActivity() {
         container.addView(switchButton)
         // The pill's own bounds can stay unchanged when only its parent resizes,
         // so observe both views.
-        container.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> positionServerSwitcher() }
-        switchButton.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> positionServerSwitcher() }
+        val repositionOnLayout =
+            View.OnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> positionServerSwitcher() }
+        container.addOnLayoutChangeListener(repositionOnLayout)
+        switchButton.addOnLayoutChangeListener(repositionOnLayout)
         setContentView(container)
         applySystemBarContrast()
         installBridge()
