@@ -12,6 +12,7 @@ import {
   type ReactNode,
   useSyncExternalStore,
 } from "react";
+import type * as DndKitCore from "@dnd-kit/core";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   act,
@@ -62,6 +63,7 @@ const mocks = vi.hoisted(() => {
     projects: [] as string[],
     moveToProject: { mutate: vi.fn() },
     conversations: [] as unknown[],
+    isDragging: false,
     pinnedStore,
     // Archive + stop mutations, so the swipe tests can assert the swipe→archive
     // path drives the same stop→archive handler the kebab uses.
@@ -70,6 +72,17 @@ const mocks = vi.hoisted(() => {
     // Stop-and-delete, so the swipe→delete test can assert the row deletes only
     // after the confirm dialog is accepted.
     del: { mutate: vi.fn(), reset: vi.fn() },
+  };
+});
+
+vi.mock("@dnd-kit/core", async (importOriginal) => {
+  const actual = await importOriginal<typeof DndKitCore>();
+  return {
+    ...actual,
+    useDraggable: (args: Parameters<typeof actual.useDraggable>[0]) => ({
+      ...actual.useDraggable(args),
+      isDragging: mocks.isDragging,
+    }),
   };
 });
 
@@ -344,6 +357,7 @@ beforeEach(() => {
   mocks.del.mutate.mockReset();
   mocks.del.reset.mockReset();
   mocks.projects = [];
+  mocks.isDragging = false;
   // Default to a desktop viewport with no coarse pointer; cases opt in independently.
   mocks.isMobile = false;
   mocks.hasCoarsePointer = false;
@@ -874,6 +888,35 @@ describe("mark as unread", () => {
 });
 
 describe("right-click context menu", () => {
+  it("suppresses an open request only while the session row is dragging", () => {
+    mocks.isMobile = true;
+    mocks.isDragging = true;
+    const view = renderSidebar();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    expect(screen.queryByTestId("rename-conversation")).toBeNull();
+
+    // Live drag state clears with the gesture; no suppression flag survives to
+    // swallow the next legitimate right-click.
+    mocks.isDragging = false;
+    view.rerenderSidebar();
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+  });
+
+  it("opens the context menu from the keyboard after a drag ends", () => {
+    mocks.isMobile = true;
+    mocks.isDragging = true;
+    const view = renderSidebar();
+
+    mocks.isDragging = false;
+    view.rerenderSidebar();
+
+    // Shift+F10 / Menu key emit contextmenu with no preceding pointerdown.
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+  });
+
   it("opens the same action items as the kebab and drives the same handlers", () => {
     renderSidebar();
 
