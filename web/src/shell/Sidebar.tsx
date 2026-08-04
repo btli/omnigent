@@ -52,11 +52,12 @@ import {
   XIcon,
 } from "lucide-react";
 import {
+  type Collision,
+  type CollisionDetection,
   DndContext,
   DragOverlay,
   type DragEndEvent,
   type DragStartEvent,
-  getClientRect,
   MeasuringStrategy,
   MouseSensor,
   pointerWithin,
@@ -188,28 +189,17 @@ const SIDEBAR_HOVER_HIGHLIGHT =
 const SIDEBAR_ACTIVE_HIGHLIGHT =
   "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)]";
 const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
-const SIDEBAR_DROP_SCROLL_REGION_SELECTOR = "[data-sidebar-drop-scroll-region]";
+const UNGROUP_DROP_ZONE_ID = "__ungroup__";
 
-/** Clip droppable geometry to the mobile list viewport. The ungroup rail sits
-    outside that viewport, so scrolled project rects cannot extend beneath it. */
-function measureVisibleSidebarDroppable(node: HTMLElement): ReturnType<typeof getClientRect> {
-  const rect = getClientRect(node);
-  const scrollRegion = node.closest<HTMLElement>(SIDEBAR_DROP_SCROLL_REGION_SELECTOR);
-  if (!scrollRegion) return rect;
+/** Prefer the visible ungroup strip when it overlaps another drop target. */
+export function prioritizeSidebarUngroupCollision(collisions: Collision[]): Collision[] {
+  const ungroup = collisions.find((collision) => collision.id === UNGROUP_DROP_ZONE_ID);
+  if (!ungroup || collisions[0]?.id === UNGROUP_DROP_ZONE_ID) return collisions;
+  return [ungroup, ...collisions.filter((collision) => collision.id !== UNGROUP_DROP_ZONE_ID)];
+}
 
-  const clip = getClientRect(scrollRegion);
-  const left = Math.max(rect.left, clip.left);
-  const right = Math.max(left, Math.min(rect.right, clip.right));
-  const top = Math.max(rect.top, clip.top);
-  const bottom = Math.max(top, Math.min(rect.bottom, clip.bottom));
-  return {
-    left,
-    right,
-    top,
-    bottom,
-    width: right - left,
-    height: bottom - top,
-  };
+function sidebarCollisionDetection(args: Parameters<CollisionDetection>[0]): Collision[] {
+  return prioritizeSidebarUngroupCollision(pointerWithin(args));
 }
 
 // Maps a first-class project id → its name, provided once at the list level so
@@ -907,7 +897,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             ref={scrollContainerRef}
             // Keep wheel/touch scrolling without letting classic-scrollbar
             // platforms reserve a wide, permanently visible Sidebar gutter.
-            className="relative flex min-h-0 flex-1 flex-col overflow-y-auto px-2 pt-4 pb-3 [scrollbar-width:none] max-md:overflow-hidden [&::-webkit-scrollbar]:hidden"
+            className="relative flex-1 overflow-y-auto px-2 pt-4 pb-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           >
             <ConversationList
               conversationsQuery={conversationsQuery}
@@ -1229,9 +1219,6 @@ function ConversationList({
 }: ConversationListProps) {
   // Viewer id for the owner-based My/Shared split below.
   const viewerId = useViewerId();
-  const isMobile = useIsMobileViewport();
-  const mobileScrollContainerRef = useRef<HTMLDivElement>(null);
-  const effectiveScrollContainerRef = isMobile ? mobileScrollContainerRef : scrollContainerRef;
   // Host metadata is shared by every row tooltip. Resolve it once at the list
   // owner so ordinary rows do not each create their own polling observer.
   const { data: hosts = [] } = useHosts({ includeSandbox: true });
@@ -1754,22 +1741,17 @@ function ConversationList({
     <SidebarRowDataProvider projectNamesById={projectNamesById} hostsById={hostsById}>
       <DndContext
         sensors={sensors}
-        collisionDetection={pointerWithin}
+        collisionDetection={sidebarCollisionDetection}
         // Always-measure so the transient "remove from project" zone (mounted at
         // drag start) is registered as a drop target without a stale layout cache.
-        measuring={{
-          droppable: {
-            strategy: MeasuringStrategy.Always,
-            measure: measureVisibleSidebarDroppable,
-          },
-        }}
+        measuring={{ droppable: { strategy: MeasuringStrategy.Always } }}
         onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
         onDragCancel={() => setActiveDrag(null)}
       >
         <RowEditHoldContext.Provider value={reportRowEditing}>
           <div
-            className="flex min-h-0 flex-1 flex-col gap-4 md:contents md:gap-0"
+            className="flex flex-col gap-4 pr-1"
             data-testid="sidebar-conversation-list"
             // Freeze the sort order while the pointer is over the list so rows
             // never move under the cursor. The frozen-keys map is cleared by the
@@ -1777,199 +1759,190 @@ function ConversationList({
             onMouseEnter={() => setPointerInside(true)}
             onMouseLeave={() => setPointerInside(false)}
           >
-            <div
-              ref={mobileScrollContainerRef}
-              data-sidebar-drop-scroll-region=""
-              data-testid="sidebar-conversation-scroll-region"
-              className="min-h-0 flex-1 overflow-y-auto pr-1 [scrollbar-width:none] md:overflow-visible [&::-webkit-scrollbar]:hidden"
-            >
-              <div className="flex flex-col gap-4">
-                {totalVisible === 0 ? (
-                  <>
-                    <p className="px-2 py-1 text-muted-foreground text-xs">{emptyMessage}</p>
-                    {/* The list is one paginated stream ordered by updated_at across
+            {totalVisible === 0 ? (
+              <>
+                <p className="px-2 py-1 text-muted-foreground text-xs">{emptyMessage}</p>
+                {/* The list is one paginated stream ordered by updated_at across
               owned + shared sessions, so the current tab can be empty on the
               loaded window while its sessions live on a later page. Keep the
               sentinel mounted so pagination continues instead of stranding the
               user on a false "empty" state. */}
-                    {hasMorePages && (
-                      <InfiniteScrollSentinel
-                        hasMore={hasMorePages}
-                        isFetching={isFetchingNextPage}
-                        fetchMore={fetchNextPage}
-                        scrollRoot={effectiveScrollContainerRef}
-                      />
-                    )}
-                  </>
-                ) : (
-                  <>
-                    {sections.pinned.length > 0 && (
-                      // Drop a session here to pin it — pin-precedence then floats it
-                      // out of any project into this section. Active only while dragging
-                      // an unpinned session; outline-only highlight.
-                      <PinDropZone active={activeDrag != null && !activeDrag.isPinned}>
-                        <ConversationSection
-                          title="Pinned"
-                          conversations={sections.pinned}
-                          pinnedConversationIds={pinnedConversationIds}
-                          collapsed={effectiveCollapsedSections.includes("Pinned")}
-                          onToggleCollapsed={() => effectiveToggleSectionCollapsed("Pinned")}
-                          onRowClick={onRowClick}
-                          onTogglePinned={onTogglePinned}
-                          selectionMode={false}
-                          selectedIds={selectedIds}
-                          onToggleSelected={onToggleSelected}
-                          onProjectAssigned={expandProject}
-                        />
-                      </PinDropZone>
-                    )}
-                    {/* Projects: a "Projects" group header, with each project rendered as
+                {hasMorePages && (
+                  <InfiniteScrollSentinel
+                    hasMore={hasMorePages}
+                    isFetching={isFetchingNextPage}
+                    fetchMore={fetchNextPage}
+                    scrollRoot={scrollContainerRef}
+                  />
+                )}
+              </>
+            ) : (
+              <>
+                {sections.pinned.length > 0 && (
+                  // Drop a session here to pin it — pin-precedence then floats it
+                  // out of any project into this section. Active only while dragging
+                  // an unpinned session; outline-only highlight.
+                  <PinDropZone active={activeDrag != null && !activeDrag.isPinned}>
+                    <ConversationSection
+                      title="Pinned"
+                      conversations={sections.pinned}
+                      pinnedConversationIds={pinnedConversationIds}
+                      collapsed={effectiveCollapsedSections.includes("Pinned")}
+                      onToggleCollapsed={() => effectiveToggleSectionCollapsed("Pinned")}
+                      onRowClick={onRowClick}
+                      onTogglePinned={onTogglePinned}
+                      selectionMode={false}
+                      selectedIds={selectedIds}
+                      onToggleSelected={onToggleSelected}
+                      onProjectAssigned={expandProject}
+                    />
+                  </PinDropZone>
+                )}
+                {/* Projects: a "Projects" group header, with each project rendered as
               a collapsible folder row nested beneath it. Folders default
               collapsed; an empty folder shows "No sessions". The folder icon marks
               a project row; the group/section headers carry no icon or count.
               Shown on the "mine" tab even with zero projects, so "New project"
               (create-empty) is discoverable — projects are a My-sessions tool. */}
-                    {activeTab !== "shared" && (
-                      <SectionGroup
-                        title="Projects"
-                        collapsed={effectiveCollapsedSections.includes("Projects")}
-                        onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
-                        afterHeader={
-                          projectsSelecting ? (
-                            <BulkActionBar
-                              selectedIds={selectedIds}
-                              allConversations={projectSessionPool}
-                              onDeselectAll={onDeselectAll}
-                              onExit={onExitSelectionMode}
-                            />
-                          ) : undefined
-                        }
-                        headerAction={
-                          !selectionMode ? (
-                            <ProjectHeaderActions
-                              projectNames={sections.projectGroups.map((group) => group.name)}
-                              collapsed={effectiveCollapsedSections.includes("Projects")}
-                              expandedProjects={expandedProjects}
-                              hasProjectSessions={sections.projectGroups.some(
-                                (group) => group.conversations.length > 0,
-                              )}
-                              onExpandAll={expandAllProjects}
-                              onRevert={revertProjects}
-                              onProjectCreated={expandProject}
-                              onEnterSelectionMode={() => onEnterSelectionMode("projects")}
-                            />
-                          ) : undefined
-                        }
-                      >
-                        {sections.projectGroups.map((group) => (
-                          <ProjectFolder
-                            key={group.name}
-                            name={group.name}
-                            projectId={group.id}
-                            windowConversations={group.conversations}
-                            expanded={expandedProjects.includes(group.name)}
-                            // Best-effort marker from the globally-loaded window: a
-                            // collapsed folder hasn't fetched its own sessions yet.
-                            marker={projectMarkerState(group.conversations)}
-                            onToggleCollapsed={() => toggleProjectExpanded(group.name)}
-                            pinnedConversationIds={pinnedConversationIds}
-                            activeOverride={activeOverride}
-                            frozenSortKeys={frozenKeys}
-                            scrollRoot={effectiveScrollContainerRef}
-                            onRowClick={onRowClick}
-                            onTogglePinned={onTogglePinned}
-                            selectionMode={projectsSelecting}
-                            selectedIds={selectedIds}
-                            onToggleSelected={onToggleSelected}
-                            onProjectAssigned={expandProject}
-                            onConversationsLoaded={handleFolderConversationsLoaded}
-                          />
-                        ))}
-                        {sections.projectGroups.length === 0 &&
-                          !effectiveCollapsedSections.includes("Projects") && (
-                            <p className="px-3 py-1.5 text-xs text-muted-foreground">
-                              No projects yet. Create one to group your sessions.
-                            </p>
-                          )}
-                      </SectionGroup>
-                    )}
-                    {sections.sessions.length > 0 && (
-                      // Drop a session here to send it to the flat "Chats" list — where
-                      // unfiled, unpinned sessions live. Active while dragging a filed
-                      // session (removes it from its project) or a pinned one (unpins
-                      // it), since both have somewhere to land here.
-                      <ChatsDropZone
-                        active={
-                          activeDrag != null && (activeDrag.project != null || activeDrag.isPinned)
-                        }
-                      >
-                        <ConversationSection
-                          title="Sessions"
-                          conversations={sections.sessions}
-                          pinnedConversationIds={pinnedConversationIds}
-                          collapsed={effectiveCollapsedSections.includes("Chats")}
-                          onToggleCollapsed={() => effectiveToggleSectionCollapsed("Chats")}
-                          onRowClick={onRowClick}
-                          onTogglePinned={onTogglePinned}
-                          selectionMode={sessionsSelecting}
+                {activeTab !== "shared" && (
+                  <SectionGroup
+                    title="Projects"
+                    collapsed={effectiveCollapsedSections.includes("Projects")}
+                    onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
+                    afterHeader={
+                      projectsSelecting ? (
+                        <BulkActionBar
                           selectedIds={selectedIds}
-                          onToggleSelected={onToggleSelected}
-                          onProjectAssigned={expandProject}
-                          afterHeader={
-                            sessionsSelecting ? (
-                              <BulkActionBar
-                                selectedIds={selectedIds}
-                                allConversations={sections.sessions}
-                                onDeselectAll={onDeselectAll}
-                                onExit={onExitSelectionMode}
-                              />
-                            ) : undefined
-                          }
-                          headerAction={
-                            !selectionMode ? (
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <Button
-                                    type="button"
-                                    variant="ghost"
-                                    size="icon-xs"
-                                    aria-label="Select sessions"
-                                    data-testid="toggle-selection-mode"
-                                    onClick={(event) => {
-                                      event.stopPropagation();
-                                      onEnterSelectionMode("sessions");
-                                    }}
-                                  >
-                                    <ListChecksIcon className="size-3.5" />
-                                  </Button>
-                                </TooltipTrigger>
-                                <TooltipContent side="bottom">Select sessions</TooltipContent>
-                              </Tooltip>
-                            ) : undefined
-                          }
+                          allConversations={projectSessionPool}
+                          onDeselectAll={onDeselectAll}
+                          onExit={onExitSelectionMode}
                         />
-                      </ChatsDropZone>
-                    )}
-                    {/* Both tabs render this same Pinned / Projects / Sessions tree;
+                      ) : undefined
+                    }
+                    headerAction={
+                      !selectionMode ? (
+                        <ProjectHeaderActions
+                          projectNames={sections.projectGroups.map((group) => group.name)}
+                          collapsed={effectiveCollapsedSections.includes("Projects")}
+                          expandedProjects={expandedProjects}
+                          hasProjectSessions={sections.projectGroups.some(
+                            (group) => group.conversations.length > 0,
+                          )}
+                          onExpandAll={expandAllProjects}
+                          onRevert={revertProjects}
+                          onProjectCreated={expandProject}
+                          onEnterSelectionMode={() => onEnterSelectionMode("projects")}
+                        />
+                      ) : undefined
+                    }
+                  >
+                    {sections.projectGroups.map((group) => (
+                      <ProjectFolder
+                        key={group.name}
+                        name={group.name}
+                        projectId={group.id}
+                        windowConversations={group.conversations}
+                        expanded={expandedProjects.includes(group.name)}
+                        // Best-effort marker from the globally-loaded window: a
+                        // collapsed folder hasn't fetched its own sessions yet.
+                        marker={projectMarkerState(group.conversations)}
+                        onToggleCollapsed={() => toggleProjectExpanded(group.name)}
+                        pinnedConversationIds={pinnedConversationIds}
+                        activeOverride={activeOverride}
+                        frozenSortKeys={frozenKeys}
+                        scrollRoot={scrollContainerRef}
+                        onRowClick={onRowClick}
+                        onTogglePinned={onTogglePinned}
+                        selectionMode={projectsSelecting}
+                        selectedIds={selectedIds}
+                        onToggleSelected={onToggleSelected}
+                        onProjectAssigned={expandProject}
+                        onConversationsLoaded={handleFolderConversationsLoaded}
+                      />
+                    ))}
+                    {sections.projectGroups.length === 0 &&
+                      !effectiveCollapsedSections.includes("Projects") && (
+                        <p className="px-3 py-1.5 text-xs text-muted-foreground">
+                          No projects yet. Create one to group your sessions.
+                        </p>
+                      )}
+                  </SectionGroup>
+                )}
+                {sections.sessions.length > 0 && (
+                  // Drop a session here to send it to the flat "Chats" list — where
+                  // unfiled, unpinned sessions live. Active while dragging a filed
+                  // session (removes it from its project) or a pinned one (unpins
+                  // it), since both have somewhere to land here.
+                  <ChatsDropZone
+                    active={
+                      activeDrag != null && (activeDrag.project != null || activeDrag.isPinned)
+                    }
+                  >
+                    <ConversationSection
+                      title="Sessions"
+                      conversations={sections.sessions}
+                      pinnedConversationIds={pinnedConversationIds}
+                      collapsed={effectiveCollapsedSections.includes("Chats")}
+                      onToggleCollapsed={() => effectiveToggleSectionCollapsed("Chats")}
+                      onRowClick={onRowClick}
+                      onTogglePinned={onTogglePinned}
+                      selectionMode={sessionsSelecting}
+                      selectedIds={selectedIds}
+                      onToggleSelected={onToggleSelected}
+                      onProjectAssigned={expandProject}
+                      afterHeader={
+                        sessionsSelecting ? (
+                          <BulkActionBar
+                            selectedIds={selectedIds}
+                            allConversations={sections.sessions}
+                            onDeselectAll={onDeselectAll}
+                            onExit={onExitSelectionMode}
+                          />
+                        ) : undefined
+                      }
+                      headerAction={
+                        !selectionMode ? (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon-xs"
+                                aria-label="Select sessions"
+                                data-testid="toggle-selection-mode"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  onEnterSelectionMode("sessions");
+                                }}
+                              >
+                                <ListChecksIcon className="size-3.5" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent side="bottom">Select sessions</TooltipContent>
+                          </Tooltip>
+                        ) : undefined
+                      }
+                    />
+                  </ChatsDropZone>
+                )}
+                {/* Both tabs render this same Pinned / Projects / Sessions tree;
               `sections` is scoped to the active tab's conversations (owned vs.
               shared), and Projects is empty on the Shared tab. */}
-                    {/* Archived sessions are no longer listed here — they live on the
+                {/* Archived sessions are no longer listed here — they live on the
               Settings page ("Archived chats"), reachable from the footer. */}
-                    {/* Infinite-scroll sentinel for the global list. Pagination extends
+                {/* Infinite-scroll sentinel for the global list. Pagination extends
               the Chats list, so it hides with a collapsed Chats group — a loader
               under a collapsed group reads orphaned. */}
-                    {!effectiveCollapsedSections.includes("Chats") && (
-                      <InfiniteScrollSentinel
-                        hasMore={hasMorePages}
-                        isFetching={isFetchingNextPage}
-                        fetchMore={fetchNextPage}
-                        scrollRoot={effectiveScrollContainerRef}
-                      />
-                    )}
-                  </>
+                {!effectiveCollapsedSections.includes("Chats") && (
+                  <InfiniteScrollSentinel
+                    hasMore={hasMorePages}
+                    isFetching={isFetchingNextPage}
+                    fetchMore={fetchNextPage}
+                    scrollRoot={scrollContainerRef}
+                  />
                 )}
-              </div>
-            </div>
+              </>
+            )}
             {/* Keep the transient strip last so mounting it never shifts a row
             under the pointer that is already dragging it. */}
             {!showShared && activeDrag?.project != null && <UngroupDropZone />}
@@ -2041,18 +2014,18 @@ function PinDropZone({ active, children }: { active: boolean; children: ReactNod
   );
 }
 
-/** Bottom ungroup target shown while dragging a filed session. Its mobile rail
-    stays outside the scrolling list so content cannot pass beneath it. */
+/** Bottom ungroup target shown while dragging a filed session. */
 function UngroupDropZone() {
-  const { setNodeRef, isOver } = useDroppable({ id: "__ungroup__", data: { type: "ungroup" } });
+  const { setNodeRef, isOver } = useDroppable({
+    id: UNGROUP_DROP_ZONE_ID,
+    data: { type: "ungroup" },
+  });
   return (
     <div
       ref={setNodeRef}
       data-testid="sidebar-ungroup-drop-zone"
       className={cn(
-        "mr-1 flex items-center gap-1.5 rounded-md border border-dashed border-border px-2 py-1.5 text-muted-foreground text-xs transition-colors md:mt-4",
-        // The mobile flex rail reserves this target's space below the scroller.
-        "max-md:sticky max-md:bottom-0 max-md:z-10 max-md:bg-[var(--sidebar)]/90 max-md:backdrop-blur-sm",
+        "flex items-center gap-1.5 rounded-md border border-dashed border-border px-2 py-1.5 text-muted-foreground text-xs transition-colors",
         isOver && cn(DROP_TARGET_HIGHLIGHT, "text-foreground"),
       )}
     >
