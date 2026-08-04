@@ -65,12 +65,12 @@ const BRAND_ICONS = [
   { kind: "cursor", icon: CursorIcon, harnessMatch: "substring", catalogPriority: 2 },
   { kind: "kiro", icon: KiroIcon, harnessMatch: "substring", catalogPriority: 4 },
   { kind: "goose", icon: GooseIcon, harnessMatch: "substring", catalogPriority: 5 },
-  { kind: "kimi", icon: KimiIcon, harnessMatch: "substring", catalogPriority: 6 },
-  { kind: "antigravity", icon: AntigravityIcon, harnessMatch: "substring", catalogPriority: 8 },
-  { kind: "hermes", icon: HermesIcon, harnessMatch: "substring", catalogPriority: 3 },
-  { kind: "devin", icon: DevinIcon, harnessMatch: "substring", catalogPriority: 9 },
+  { kind: "kimi", icon: KimiIcon, harnessMatch: "substring", catalogPriority: 7 },
+  { kind: "antigravity", icon: AntigravityIcon, harnessMatch: "substring", catalogPriority: 9 },
+  { kind: "devin", icon: DevinIcon, harnessMatch: "substring", catalogPriority: 6 },
   // Exact match avoids false positives such as "openapi".
-  { kind: "pi", icon: PiIcon, harnessMatch: "exact", catalogPriority: 7 },
+  { kind: "pi", icon: PiIcon, harnessMatch: "exact", catalogPriority: 8 },
+  { kind: "hermes", icon: HermesIcon, harnessMatch: "substring", catalogPriority: 3 },
 ] as const satisfies readonly BrandIconDefinition[];
 
 const CATALOG_HARNESS_BRANDS = BRAND_ICONS.filter((brand) => brand.catalogPriority !== null).sort(
