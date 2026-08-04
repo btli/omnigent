@@ -2991,6 +2991,16 @@ function ConversationRow({
     data: { type: "session", label, project: currentProject, isPinned },
     disabled: !isOwner || selectionMode || isArchived || isEditing,
   });
+  // Radix and dnd-kit run independent long-press timers. Once this row's
+  // touch drag is active, reject Radix's later open request for that gesture.
+  // The ref mirrors live drag state, so a later right-click is unaffected.
+  const [contextMenuOpen, setContextMenuOpen] = useState(false);
+  const isDraggingRef = useRef(isDragging);
+  isDraggingRef.current = isDragging;
+  const handleContextMenuOpenChange = useCallback((open: boolean) => {
+    if (open && isDraggingRef.current) return;
+    setContextMenuOpen(open);
+  }, []);
   // A drag ends with a synthetic click on the row's <Link> (mousedown + mouseup
   // on the same anchor still fires a click); swallow that one click so a drag
   // doesn't also navigate into the session. Flagged when a drag finishes,
@@ -3255,7 +3265,7 @@ function ConversationRow({
         )
       ) : projectFlyoutName ? (
         <HoverCard openDelay={150} closeDelay={0}>
-          <ContextMenu>
+          <ContextMenu open={contextMenuOpen} onOpenChange={handleContextMenuOpenChange}>
             <ContextMenuTrigger asChild>
               <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
             </ContextMenuTrigger>
@@ -3274,7 +3284,7 @@ function ConversationRow({
           />
         </HoverCard>
       ) : isMobile ? (
-        <ContextMenu>
+        <ContextMenu open={contextMenuOpen} onOpenChange={handleContextMenuOpenChange}>
           <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
           <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-xs">
             <ConversationMenuItems
@@ -3286,7 +3296,7 @@ function ConversationRow({
         </ContextMenu>
       ) : (
         <Tooltip>
-          <ContextMenu>
+          <ContextMenu open={contextMenuOpen} onOpenChange={handleContextMenuOpenChange}>
             <ContextMenuTrigger asChild>
               <div className="w-full">
                 <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
