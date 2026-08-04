@@ -1743,14 +1743,6 @@ function ConversationList({
             onMouseEnter={() => setPointerInside(true)}
             onMouseLeave={() => setPointerInside(false)}
           >
-            {/* Removing a filed session from its project means dropping it back
-            onto the flat "Chats" list — so the Chats section itself is the
-            ungroup target (wrapped below). This top strip is only a FALLBACK
-            for when there are no ungrouped chats yet, so the Chats section
-            isn't rendered and there'd otherwise be nowhere to drop. */}
-            {!showShared && activeDrag?.project != null && sections.sessions.length === 0 && (
-              <UngroupDropZone />
-            )}
             {totalVisible === 0 ? (
               <>
                 <p className="px-2 py-1 text-muted-foreground text-xs">{emptyMessage}</p>
@@ -1935,6 +1927,9 @@ function ConversationList({
                 )}
               </>
             )}
+            {/* Keep the transient strip last so mounting it never shifts a row
+            under the pointer that is already dragging it. */}
+            {!showShared && activeDrag?.project != null && <UngroupDropZone />}
           </div>
         </RowEditHoldContext.Provider>
         {/* The dragged row's preview follows the pointer (rendered in a portal),
@@ -2003,12 +1998,8 @@ function PinDropZone({ active, children }: { active: boolean; children: ReactNod
   );
 }
 
-/** Fallback ungroup target: a dashed strip shown at the top of the list ONLY
-    while dragging a filed session when there are no ungrouped chats (so the
-    {@link ChatsDropZone}-wrapped "Chats" section isn't rendered and there'd
-    otherwise be nowhere to drop). Releasing on it removes the session from its
-    project. The dashed border is the strip's own placeholder identity; the
-    drag-over highlight is the shared subtle background tint. */
+/** Bottom ungroup target shown while dragging a filed session. It stays sticky
+    on mobile so a one-finger drag can always reach it without scrolling. */
 function UngroupDropZone() {
   const { setNodeRef, isOver } = useDroppable({ id: "__ungroup__", data: { type: "ungroup" } });
   return (
@@ -2017,6 +2008,9 @@ function UngroupDropZone() {
       data-testid="sidebar-ungroup-drop-zone"
       className={cn(
         "flex items-center gap-1.5 rounded-md border border-dashed border-border px-2 py-1.5 text-muted-foreground text-xs transition-colors",
+        // Keep the target reachable during a mobile drag while rows remain
+        // legible as they scroll beneath it.
+        "max-md:sticky max-md:bottom-0 max-md:z-10 max-md:bg-[var(--sidebar)]/90 max-md:backdrop-blur-sm",
         isOver && cn(DROP_TARGET_HIGHLIGHT, "text-foreground"),
       )}
     >

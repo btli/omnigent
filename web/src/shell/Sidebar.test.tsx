@@ -222,6 +222,42 @@ function renderSidebar(open = true, initialEntry = "/", onOpenSearch?: () => voi
   );
 }
 
+function dndRect(top: number, height: number): DOMRect {
+  return {
+    x: 0,
+    y: top,
+    width: 240,
+    height,
+    top,
+    right: 240,
+    bottom: top + height,
+    left: 0,
+    toJSON: () => ({}),
+  } as DOMRect;
+}
+
+function mockOverlappingUngroupTargets(): void {
+  vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
+    this: Element,
+  ): DOMRect {
+    const testId = this.getAttribute("data-testid");
+    if (testId === "sidebar-chats-drop-zone") return dndRect(100, 220);
+    if (testId === "sidebar-ungroup-drop-zone") return dndRect(260, 40);
+    if (this.tagName === "LI") return dndRect(20, 32);
+    return dndRect(-1_000, 1);
+  });
+}
+
+function startMouseDrag(row: HTMLElement): void {
+  fireEvent.mouseDown(row, { button: 0, buttons: 1, clientX: 10, clientY: 20 });
+  fireEvent.mouseMove(document, { buttons: 1, clientX: 20, clientY: 30 });
+}
+
+function moveMouseOverUngroupTarget(): void {
+  fireEvent.mouseMove(document, { buttons: 1, clientX: 120, clientY: 279 });
+  fireEvent.mouseMove(document, { buttons: 1, clientX: 120, clientY: 280 });
+}
+
 // "Shared with me" sessions live on their own sidebar tab now; click it to
 // reveal the flat shared list (the default tab is "My sessions").
 function showSharedTab() {
@@ -266,7 +302,10 @@ beforeEach(() => {
 function seedPins(ids: string[]) {
   pinnedIdsRef.current = ids;
 }
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 describe("Sidebar session list", () => {
   it("keeps the session list scrollable without visible scrollbar chrome", () => {
@@ -1537,6 +1576,87 @@ describe("Sidebar move-to-project action", () => {
       expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_filed", project: "" }),
     );
     expect(screen.queryByText(/the project will be removed as well/i)).toBeNull();
+  });
+});
+
+describe("Sidebar ungroup drag target", () => {
+  it("mounts last without reordering the project and session rows above it", async () => {
+    projectsMock.push("Sprint 42");
+    mockConversations([
+      conv("conv_filed", "Claude Code", { labels: { omni_project: "Sprint 42" } }),
+      conv("conv_flat", "Codex"),
+    ]);
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: "Sprint 42" }));
+    const list = screen.getByTestId("sidebar-conversation-list");
+    const childrenBefore = Array.from(list.children);
+    const rowsBefore = Array.from(list.querySelectorAll("li"));
+    const filedRow = screen.getByRole("link", { name: "conv_filed" }).closest("li")!;
+
+    startMouseDrag(filedRow);
+
+    const dropZone = await screen.findByTestId("sidebar-ungroup-drop-zone");
+    expect(list.lastElementChild).toBe(dropZone);
+    expect(Array.from(list.children).slice(0, -1)).toEqual(childrenBefore);
+    expect(Array.from(list.querySelectorAll("li"))).toEqual(rowsBefore);
+    expect(dropZone).toHaveClass("max-md:sticky", "max-md:bottom-0", "max-md:z-10");
+
+    fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
+  });
+
+  it("ungroups and unpins a pinned project session dropped on the bottom strip", async () => {
+    mockOverlappingUngroupTargets();
+    projectsMock.push("Sprint 42");
+    seedPins(["conv_pinned_filed"]);
+    mockConversations([
+      conv("conv_pinned_filed", "Claude Code", {
+        labels: { omni_project: "Sprint 42" },
+      }),
+    ]);
+    renderSidebar();
+
+    const pinnedRow = screen.getByRole("link", { name: "conv_pinned_filed" }).closest("li")!;
+    startMouseDrag(pinnedRow);
+    const dropZone = await screen.findByTestId("sidebar-ungroup-drop-zone");
+
+    moveMouseOverUngroupTarget();
+    await waitFor(() => expect(dropZone).toHaveClass("bg-[var(--sidebar-active)]"));
+    fireEvent.mouseUp(document, { button: 0, clientX: 120, clientY: 280 });
+
+    await waitFor(() => {
+      expect(moveToProjectSpy).toHaveBeenCalledTimes(1);
+      expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_pinned_filed", project: "" });
+    });
+    expect(pinnedIdsRef.current).toEqual([]);
+  });
+
+  it("resolves an overlap with the live Chats target to one ungroup action", async () => {
+    mockOverlappingUngroupTargets();
+    projectsMock.push("Sprint 42");
+    mockConversations([
+      conv("conv_filed", "Claude Code", { labels: { omni_project: "Sprint 42" } }),
+      conv("conv_flat", "Codex"),
+    ]);
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: "Sprint 42" }));
+    const filedRow = screen.getByRole("link", { name: "conv_filed" }).closest("li")!;
+    const chatsDropZone = screen.getByTestId("sidebar-chats-drop-zone");
+    startMouseDrag(filedRow);
+    const bottomDropZone = await screen.findByTestId("sidebar-ungroup-drop-zone");
+
+    moveMouseOverUngroupTarget();
+    await waitFor(() => {
+      expect(bottomDropZone).toHaveClass("bg-[var(--sidebar-active)]");
+      expect(chatsDropZone).not.toHaveClass("bg-[var(--sidebar-active)]");
+    });
+    fireEvent.mouseUp(document, { button: 0, clientX: 120, clientY: 280 });
+
+    await waitFor(() => {
+      expect(moveToProjectSpy).toHaveBeenCalledTimes(1);
+      expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_filed", project: "" });
+    });
   });
 });
 
