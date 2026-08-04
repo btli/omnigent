@@ -7,6 +7,7 @@
 // See ConversationRow / ConversationEditRow in Sidebar.tsx.
 
 import { type PointerEvent as ReactPointerEvent, useSyncExternalStore } from "react";
+import type * as DndKitCore from "@dnd-kit/core";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   act,
@@ -59,6 +60,7 @@ const mocks = vi.hoisted(() => {
     projects: [] as string[],
     moveToProject: { mutate: vi.fn() },
     conversations: [] as unknown[],
+    isDragging: false,
     pinnedStore,
     // Archive + stop mutations, so the swipe tests can assert the swipe→archive
     // path drives the same stop→archive handler the kebab uses.
@@ -67,6 +69,17 @@ const mocks = vi.hoisted(() => {
     // Stop-and-delete, so the swipe→delete test can assert the row deletes only
     // after the confirm dialog is accepted.
     del: { mutate: vi.fn(), reset: vi.fn() },
+  };
+});
+
+vi.mock("@dnd-kit/core", async (importOriginal) => {
+  const actual = await importOriginal<typeof DndKitCore>();
+  return {
+    ...actual,
+    useDraggable: (args: Parameters<typeof actual.useDraggable>[0]) => ({
+      ...actual.useDraggable(args),
+      isDragging: mocks.isDragging,
+    }),
   };
 });
 
@@ -216,11 +229,12 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
 // server sharing policy via CapabilitiesProvider (default "loading" → on).
 function renderSidebar(activeId?: string, info?: ServerInfo) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const onClose = vi.fn();
   // Build a FRESH element tree per render: re-rendering the identical element
   // reference lets React bail out without re-invoking the sidebar, which
   // would swallow a `mockConversations` swap applied mid-test.
   const makeUi = () => {
-    const sidebar = <Sidebar open={true} onClose={vi.fn()} />;
+    const sidebar = <Sidebar open={true} onClose={onClose} />;
     const tree = (
       <QueryClientProvider client={qc}>
         <TooltipProvider>
@@ -243,7 +257,10 @@ function renderSidebar(activeId?: string, info?: ServerInfo) {
   const view = render(makeUi());
   // Re-render so a test can apply a new `mockConversations` list mid-flight
   // (e.g. simulating a reorder pushed between user clicks).
-  return Object.assign(view, { rerenderSidebar: () => view.rerender(makeUi()) });
+  return Object.assign(view, {
+    onClose,
+    rerenderSidebar: () => view.rerender(makeUi()),
+  });
 }
 
 beforeEach(() => {
@@ -268,6 +285,7 @@ beforeEach(() => {
   mocks.del.mutate.mockReset();
   mocks.del.reset.mockReset();
   mocks.projects = [];
+  mocks.isDragging = false;
   // Default every test to the desktop viewport; the mobile flyout test opts in.
   mocks.isMobile = false;
   useConvMock.mockReset();
@@ -779,6 +797,42 @@ describe("mark as unread", () => {
 });
 
 describe("right-click context menu", () => {
+  it("suppresses an open request only while the session row is dragging", () => {
+    mocks.isMobile = true;
+    mocks.isDragging = true;
+    const view = renderSidebar();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    expect(screen.queryByTestId("rename-conversation")).toBeNull();
+
+    // Live drag state clears with the gesture; no suppression flag survives to
+    // swallow the next legitimate right-click.
+    mocks.isDragging = false;
+    view.rerenderSidebar();
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+  });
+
+  it("leaves keyboard link activation untouched after a drag ends", async () => {
+    mocks.isMobile = true;
+    mocks.isDragging = true;
+    const view = renderSidebar();
+
+    mocks.isDragging = false;
+    view.rerenderSidebar();
+    await act(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 0);
+        }),
+    );
+
+    // Enter/Space activation reaches a link as a click with no pointerdown.
+    // The drag guard must not require or consume a preceding pointer gesture.
+    fireEvent.click(screen.getByRole("link", { name: /My Session/ }), { detail: 0 });
+    expect(view.onClose).toHaveBeenCalledOnce();
+  });
+
   it("opens the same action items as the kebab and drives the same handlers", () => {
     renderSidebar();
 
