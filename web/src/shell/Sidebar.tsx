@@ -53,6 +53,8 @@ import {
   XIcon,
 } from "lucide-react";
 import {
+  type Collision,
+  type CollisionDetection,
   DndContext,
   DragOverlay,
   type DragEndEvent,
@@ -348,6 +350,18 @@ const SIDEBAR_HOVER_HIGHLIGHT =
 const SIDEBAR_ACTIVE_HIGHLIGHT =
   "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)]";
 const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
+const UNGROUP_DROP_ZONE_ID = "__ungroup__";
+
+/** Prefer the visible ungroup strip when it overlaps another drop target. */
+export function prioritizeSidebarUngroupCollision(collisions: Collision[]): Collision[] {
+  const ungroup = collisions.find((collision) => collision.id === UNGROUP_DROP_ZONE_ID);
+  if (!ungroup || collisions[0]?.id === UNGROUP_DROP_ZONE_ID) return collisions;
+  return [ungroup, ...collisions.filter((collision) => collision.id !== UNGROUP_DROP_ZONE_ID)];
+}
+
+function sidebarCollisionDetection(args: Parameters<CollisionDetection>[0]): Collision[] {
+  return prioritizeSidebarUngroupCollision(pointerWithin(args));
+}
 
 // Maps a first-class project id → its name, provided once at the list level so
 // each row resolves its ``project_id`` to a folder name without its own
@@ -1231,6 +1245,8 @@ function ProjectFolder({
   return (
     <div
       ref={setNodeRef}
+      data-testid="sidebar-project-drop-zone"
+      data-project-name={name}
       className={cn(
         "rounded-[var(--radius-otto-sm)] transition-colors duration-200 ease-[var(--ease-otto)]",
         // Subtle background tint on drag-over — no border, no shadow.
@@ -1900,7 +1916,7 @@ function ConversationList({
     <SidebarRowDataProvider projectNamesById={projectNamesById} hostsById={hostsById}>
       <DndContext
         sensors={sensors}
-        collisionDetection={pointerWithin}
+        collisionDetection={sidebarCollisionDetection}
         // Always-measure so the transient "remove from project" zone (mounted at
         // drag start) is registered as a drop target without a stale layout cache.
         measuring={{ droppable: { strategy: MeasuringStrategy.Always } }}
@@ -1918,14 +1934,6 @@ function ConversationList({
             onMouseEnter={() => setPointerInside(true)}
             onMouseLeave={() => setPointerInside(false)}
           >
-            {/* Removing a filed session from its project means dropping it back
-            onto the flat "Chats" list — so the Chats section itself is the
-            ungroup target (wrapped below). This top strip is only a FALLBACK
-            for when there are no ungrouped chats yet, so the Chats section
-            isn't rendered and there'd otherwise be nowhere to drop. */}
-            {!showShared && activeDrag?.project != null && sections.sessions.length === 0 && (
-              <UngroupDropZone />
-            )}
             {totalVisible === 0 ? (
               <>
                 <p className="px-2 py-1 text-muted-foreground text-xs">{emptyMessage}</p>
@@ -2110,6 +2118,9 @@ function ConversationList({
                 )}
               </>
             )}
+            {/* Keep the transient strip last so mounting it never shifts a row
+            under the pointer that is already dragging it. */}
+            {!showShared && activeDrag?.project != null && <UngroupDropZone />}
           </div>
         </RowEditHoldContext.Provider>
         {/* The dragged row's preview follows the pointer (rendered in a portal),
@@ -2178,14 +2189,12 @@ function PinDropZone({ active, children }: { active: boolean; children: ReactNod
   );
 }
 
-/** Fallback ungroup target: a dashed strip shown at the top of the list ONLY
-    while dragging a filed session when there are no ungrouped chats (so the
-    {@link ChatsDropZone}-wrapped "Chats" section isn't rendered and there'd
-    otherwise be nowhere to drop). Releasing on it removes the session from its
-    project. The dashed border is the strip's own placeholder identity; the
-    drag-over highlight is the shared subtle background tint. */
+/** Bottom ungroup target shown while dragging a filed session. */
 function UngroupDropZone() {
-  const { setNodeRef, isOver } = useDroppable({ id: "__ungroup__", data: { type: "ungroup" } });
+  const { setNodeRef, isOver } = useDroppable({
+    id: UNGROUP_DROP_ZONE_ID,
+    data: { type: "ungroup" },
+  });
   return (
     <div
       ref={setNodeRef}
