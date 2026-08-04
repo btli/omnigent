@@ -30,7 +30,9 @@ internal data class DownloadSaveResult(
 )
 
 /** Shared destination, filename, and user-notification handling for downloaded files. */
-internal class DownloadStorage(context: Context) {
+internal class DownloadStorage(
+    context: Context,
+) {
     private val context = context.applicationContext ?: context
     private val main = Handler(Looper.getMainLooper())
 
@@ -143,11 +145,25 @@ internal class DownloadStorage(context: Context) {
             // after the row is published, and only the journal lets the rerun
             // recognize that row instead of downloading a duplicate.
             when (mediaStoreRowState(remembered)) {
-                MediaStoreRowState.PENDING -> return MediaStoreDestination(remembered, false)
-                MediaStoreRowState.PUBLISHED -> return MediaStoreDestination(remembered, true)
-                MediaStoreRowState.UNKNOWN -> return null
-                MediaStoreRowState.MISSING ->
-                    journal.edit().remove(journalKey).remove(SEQ_PREFIX + journalKey).commit()
+                MediaStoreRowState.PENDING -> {
+                    return MediaStoreDestination(remembered, false)
+                }
+
+                MediaStoreRowState.PUBLISHED -> {
+                    return MediaStoreDestination(remembered, true)
+                }
+
+                MediaStoreRowState.UNKNOWN -> {
+                    return null
+                }
+
+                MediaStoreRowState.MISSING -> {
+                    journal
+                        .edit()
+                        .remove(journalKey)
+                        .remove(SEQ_PREFIX + journalKey)
+                        .commit()
+                }
             }
         }
 
@@ -254,26 +270,25 @@ internal class DownloadStorage(context: Context) {
         projection: Array<String>,
         selection: String? = null,
         selectionArgs: Array<String>? = null,
-    ) =
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val queryArgs =
-                Bundle().apply {
-                    selection?.let { putString(ContentResolver.QUERY_ARG_SQL_SELECTION, it) }
-                    selectionArgs?.let {
-                        putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, it)
-                    }
-                    putInt(MediaStore.QUERY_ARG_MATCH_PENDING, MediaStore.MATCH_INCLUDE)
+    ) = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        val queryArgs =
+            Bundle().apply {
+                selection?.let { putString(ContentResolver.QUERY_ARG_SQL_SELECTION, it) }
+                selectionArgs?.let {
+                    putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, it)
                 }
-            context.contentResolver.query(uri, projection, queryArgs, null)
-        } else {
-            context.contentResolver.query(
-                MediaStore.setIncludePending(uri),
-                projection,
-                selection,
-                selectionArgs,
-                null,
-            )
-        }
+                putInt(MediaStore.QUERY_ARG_MATCH_PENDING, MediaStore.MATCH_INCLUDE)
+            }
+        context.contentResolver.query(uri, projection, queryArgs, null)
+    } else {
+        context.contentResolver.query(
+            MediaStore.setIncludePending(uri),
+            projection,
+            selection,
+            selectionArgs,
+            null,
+        )
+    }
 
     @RequiresApi(Build.VERSION_CODES.Q)
     private fun deleteMediaStoreDestination(
@@ -417,6 +432,7 @@ internal class DownloadStorage(context: Context) {
         private val MEDIA_STORE_LOCK = Any()
         private val TEMPORARY_LOCK = Any()
         private val ACTIVE_TEMPORARIES = mutableSetOf<String>()
+
         // A set, not a multiset: assumes at most one in-flight save per
         // operationId. Overlapping saves sharing an id under different names
         // would unshield the still-live sibling when the first one finishes.

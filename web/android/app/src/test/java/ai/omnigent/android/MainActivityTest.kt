@@ -112,8 +112,14 @@ class MainActivityTest {
         assertSame(thirdActivity, controller.get())
         assertFalse(thirdActivity.isDestroyed)
         val dialog = checkNotNull(ShadowAlertDialog.getLatestAlertDialog())
-        assertEquals(thirdActivity.getString(R.string.renderer_failed_title), shadowOf(dialog).title)
-        assertEquals(thirdActivity.getString(R.string.renderer_failed_body), shadowOf(dialog).message)
+        assertEquals(
+            thirdActivity.getString(R.string.renderer_failed_title),
+            shadowOf(dialog).title,
+        )
+        assertEquals(
+            thirdActivity.getString(R.string.renderer_failed_body),
+            shadowOf(dialog).message,
+        )
         assertTrue(shadowOf(dialog).title != thirdActivity.getString(R.string.login_failed_title))
         assertNull(thirdActivity.loginFailedDialog())
         assertTrue(thirdActivity.webViewUnusable())

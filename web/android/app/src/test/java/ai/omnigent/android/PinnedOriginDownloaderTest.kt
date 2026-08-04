@@ -85,8 +85,7 @@ class PinnedOriginDownloaderTest {
             .getSharedPreferences(
                 PinnedOriginDownloadWorker.STOP_COUNT_PREFERENCES,
                 Context.MODE_PRIVATE,
-            )
-            .edit()
+            ).edit()
             .clear()
             .commit()
         pinnedServer = server()
@@ -303,7 +302,10 @@ class PinnedOriginDownloaderTest {
         val hits = AtomicInteger()
         pinnedServer.createContext("/loop") { exchange ->
             hits.incrementAndGet()
-            val step = exchange.requestURI.query?.substringAfter("step=")?.toInt() ?: 0
+            val step =
+                exchange.requestURI.query
+                    ?.substringAfter("step=")
+                    ?.toInt() ?: 0
             if (step < 11) {
                 exchange.redirect("$pinnedOrigin/loop?step=${step + 1}")
             } else {
@@ -391,7 +393,10 @@ class PinnedOriginDownloaderTest {
         assertNotNull(notificationFor(worker))
         assertEquals(
             "Download failed with HTTP 404",
-            ShadowLog.getLogsForTag("PinnedOriginDownloader").single().throwable.message,
+            ShadowLog
+                .getLogsForTag("PinnedOriginDownloader")
+                .single()
+                .throwable.message,
         )
     }
 
@@ -463,7 +468,10 @@ class PinnedOriginDownloaderTest {
         assertNotNull(notificationFor(worker))
         assertEquals(
             "Rejected download origin",
-            ShadowLog.getLogsForTag("PinnedOriginDownloader").single().throwable.message,
+            ShadowLog
+                .getLogsForTag("PinnedOriginDownloader")
+                .single()
+                .throwable.message,
         )
     }
 
@@ -481,7 +489,10 @@ class PinnedOriginDownloaderTest {
         assertNotNull(notificationFor(worker))
         assertEquals(
             "Redirect missing Location",
-            ShadowLog.getLogsForTag("PinnedOriginDownloader").single().throwable.message,
+            ShadowLog
+                .getLogsForTag("PinnedOriginDownloader")
+                .single()
+                .throwable.message,
         )
     }
 
@@ -498,7 +509,10 @@ class PinnedOriginDownloaderTest {
         assertNotNull(notificationFor(worker))
         assertEquals(
             "Unsupported redirect scheme",
-            ShadowLog.getLogsForTag("PinnedOriginDownloader").single().throwable.message,
+            ShadowLog
+                .getLogsForTag("PinnedOriginDownloader")
+                .single()
+                .throwable.message,
         )
     }
 
@@ -558,7 +572,10 @@ class PinnedOriginDownloaderTest {
         assertEquals(listOf(worker.id), foreground.workIds)
         assertEquals(
             "Missing download input",
-            ShadowLog.getLogsForTag(PinnedOriginDownloadWorker.TAG).single().throwable.message,
+            ShadowLog
+                .getLogsForTag(PinnedOriginDownloadWorker.TAG)
+                .single()
+                .throwable.message,
         )
     }
 
@@ -839,7 +856,10 @@ class PinnedOriginDownloaderTest {
         assertNotNull(notificationFor(worker))
         assertEquals(
             "Couldn't save download",
-            ShadowLog.getLogsForTag(PinnedOriginDownloadWorker.TAG).single().throwable.message,
+            ShadowLog
+                .getLogsForTag(PinnedOriginDownloadWorker.TAG)
+                .single()
+                .throwable.message,
         )
     }
 
@@ -912,8 +932,7 @@ class PinnedOriginDownloaderTest {
     private fun server(): HttpServer =
         HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply { start() }
 
-    private fun originOf(server: HttpServer): String =
-        "http://127.0.0.1:${server.address.port}"
+    private fun originOf(server: HttpServer): String = "http://127.0.0.1:${server.address.port}"
 
     private fun HttpExchange.redirect(location: String) {
         responseHeaders.add("Location", location)
@@ -1013,9 +1032,7 @@ private class WorkerMediaProvider(
 }
 
 private class FailingOutputStream : OutputStream() {
-    override fun write(value: Int) {
-        throw IOException("write failed")
-    }
+    override fun write(value: Int): Unit = throw IOException("write failed")
 
     override fun write(
         bytes: ByteArray,

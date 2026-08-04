@@ -54,6 +54,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var notifications: NativeNotificationManager
     private lateinit var blobSaver: BlobSaver
     private lateinit var pinnedOriginDownloader: PinnedOriginDownloadHandler
+
     // The process owns the worker; only this detachable callback can retain the Activity.
     private val loginManager = OidcLoginManager.processInstance
     private var loginAttachment: OidcLoginManager.Attachment? = null
