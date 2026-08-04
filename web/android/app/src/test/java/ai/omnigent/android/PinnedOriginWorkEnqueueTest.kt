@@ -86,7 +86,11 @@ class PinnedOriginWorkEnqueueTest {
             "text/plain",
             "report.txt",
         )
-        val firstId = workManager.workDatabase.workSpecDao().getAllWorkSpecIds().single()
+        val firstId =
+            workManager.workDatabase
+                .workSpecDao()
+                .getAllWorkSpecIds()
+                .single()
 
         downloader.download(
             "$PINNED_ORIGIN/report",
@@ -120,7 +124,13 @@ class PinnedOriginWorkEnqueueTest {
             "second.txt",
         )
 
-        assertEquals(2, workManager.workDatabase.workSpecDao().getAllWorkSpecIds().size)
+        assertEquals(
+            2,
+            workManager.workDatabase
+                .workSpecDao()
+                .getAllWorkSpecIds()
+                .size,
+        )
     }
 
     private companion object {

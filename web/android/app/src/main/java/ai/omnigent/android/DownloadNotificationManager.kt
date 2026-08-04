@@ -173,11 +173,13 @@ private object DownloadOutcomeFallback {
                         .values
                         .filterIsInstance<String>()
                 if (messages.isNotEmpty()) {
-                    preferences.edit().apply {
-                        preferences.all.keys
-                            .filter { key -> key.startsWith(KEY_PREFIX) }
-                            .forEach { key -> remove(key) }
-                    }.commit()
+                    preferences
+                        .edit()
+                        .apply {
+                            preferences.all.keys
+                                .filter { key -> key.startsWith(KEY_PREFIX) }
+                                .forEach { key -> remove(key) }
+                        }.commit()
                 }
                 messages
             }
