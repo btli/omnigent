@@ -11,7 +11,9 @@ import {
 import { describe, expect, it } from "vitest";
 import { CodexIcon } from "@/components/icons/CodexIcon";
 import { ClaudeIcon } from "@/components/icons/ClaudeIcon";
+import { HermesIcon } from "@/components/icons/HermesIcon";
 import { OttoIcon } from "@/components/icons/OttoIcon";
+import { PiIcon } from "@/components/icons/PiIcon";
 import { resolveAgentIcon } from "./subagentIcons";
 
 describe("resolveAgentIcon", () => {
@@ -30,6 +32,42 @@ describe("resolveAgentIcon", () => {
         agentName: "custom-agent",
       }),
     ).toBe(BotIcon);
+  });
+
+  it("uses HermesIcon for a Hermes root", () => {
+    expect(
+      resolveAgentIcon({
+        kind: "root",
+        wrapper: null,
+        harness: "hermes-native",
+        agentName: "hermes-native-ui",
+      }),
+    ).toBe(HermesIcon);
+  });
+
+  it("matches the Pi root harness exactly", () => {
+    expect(resolveAgentIcon({ kind: "root", wrapper: null, harness: "pi", agentName: "pi" })).toBe(
+      PiIcon,
+    );
+    expect(
+      resolveAgentIcon({
+        kind: "root",
+        wrapper: null,
+        harness: "openapi",
+        agentName: "spec-generator",
+      }),
+    ).toBe(BotIcon);
+  });
+
+  it("checks root harness brands before the Nessie name", () => {
+    expect(
+      resolveAgentIcon({
+        kind: "root",
+        wrapper: null,
+        harness: "claude-sdk",
+        agentName: "nessie",
+      }),
+    ).toBe(ClaudeIcon);
   });
 
   it.each([
