@@ -965,13 +965,13 @@ describe("touch swipe actions", () => {
 
     swipeRow(-90);
 
-    // runArchive stops the runner first, then flips the archive flag — the same
-    // stop→archive handler the kebab's Archive item uses.
-    expect(mocks.stopSession.mutate).toHaveBeenCalledWith("conv_1", expect.anything());
+    // Archiving is a single PATCH — the server stops the runner once the flag
+    // commits, so a client-side stop would race it (see runArchive).
     expect(mocks.archive.mutate).toHaveBeenCalledWith(
       { id: "conv_1", archived: true },
       expect.anything(),
     );
+    expect(mocks.stopSession.mutate).not.toHaveBeenCalled();
     // Archive never routes through delete.
     expect(mocks.del.mutate).not.toHaveBeenCalled();
   });
