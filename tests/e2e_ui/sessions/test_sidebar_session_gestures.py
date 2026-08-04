@@ -13,7 +13,6 @@ import uuid
 import httpx
 from playwright.sync_api import Browser, Locator, Page, expect
 
-
 _MOBILE_VIEWPORT = {"width": 390, "height": 844}
 
 
@@ -40,9 +39,7 @@ def _row_link(page: Page, session_id: str) -> Locator:
 
 def _section(page: Page, title: str) -> Locator:
     """Locate the sidebar section headed by ``title``."""
-    return page.locator("section").filter(
-        has=page.get_by_role("button", name=title, exact=True)
-    )
+    return page.locator("section").filter(has=page.get_by_role("button", name=title, exact=True))
 
 
 def test_touch_drag_does_not_open_session_context_menu(
@@ -145,6 +142,7 @@ def test_vertical_touch_scroll_still_works_on_session_row(
         page.wait_for_function(
             "element => element.scrollTop > 20",
             arg=scroll_area.element_handle(),
+            timeout=3_000,
         )
         assert "opacity-40" not in (row.get_attribute("class") or "")
         expect(page.get_by_test_id("rename-conversation")).to_have_count(0)
@@ -212,10 +210,28 @@ def test_touch_drag_moves_session_into_project(
                     },
                 )
                 page.wait_for_timeout(20)
-            cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+            with page.expect_response(
+                lambda response: (
+                    response.request.method == "PATCH"
+                    and response.url.endswith(f"/v1/sessions/{session_id}")
+                ),
+                timeout=5_000,
+            ) as move_response:
+                cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+            assert move_response.value.ok, "server rejected the project membership update"
         finally:
             cdp.detach()
 
+        expect(_section(page, project).locator(f'a[href="/c/{session_id}"]')).to_be_visible()
+        expect(_section(page, "Sessions").locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
+
+        # A full navigation drops the optimistic React Query state. Re-checking
+        # after reload proves the server persisted the project membership.
+        page.goto(f"{base_url}/c/{session_id}?sidebar=open")
+        reloaded_header = page.get_by_role("button", name=project, exact=True)
+        expect(reloaded_header).to_be_visible()
+        if reloaded_header.get_attribute("aria-expanded") != "true":
+            reloaded_header.click()
         expect(_section(page, project).locator(f'a[href="/c/{session_id}"]')).to_be_visible()
         expect(_section(page, "Sessions").locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
     finally:

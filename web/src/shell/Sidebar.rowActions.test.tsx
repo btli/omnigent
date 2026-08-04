@@ -9,7 +9,7 @@
 import { useSyncExternalStore } from "react";
 import type * as DndKitCore from "@dnd-kit/core";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -213,12 +213,11 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
 // server sharing policy via CapabilitiesProvider (default "loading" → on).
 function renderSidebar(activeId?: string, info?: ServerInfo) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  const onClose = vi.fn();
   // Build a FRESH element tree per render: re-rendering the identical element
   // reference lets React bail out without re-invoking the sidebar, which
   // would swallow a `mockConversations` swap applied mid-test.
   const makeUi = () => {
-    const sidebar = <Sidebar open={true} onClose={onClose} />;
+    const sidebar = <Sidebar open={true} onClose={vi.fn()} />;
     const tree = (
       <QueryClientProvider client={qc}>
         <TooltipProvider>
@@ -241,10 +240,7 @@ function renderSidebar(activeId?: string, info?: ServerInfo) {
   const view = render(makeUi());
   // Re-render so a test can apply a new `mockConversations` list mid-flight
   // (e.g. simulating a reorder pushed between user clicks).
-  return Object.assign(view, {
-    onClose,
-    rerenderSidebar: () => view.rerender(makeUi()),
-  });
+  return Object.assign(view, { rerenderSidebar: () => view.rerender(makeUi()) });
 }
 
 beforeEach(() => {
@@ -779,24 +775,17 @@ describe("right-click context menu", () => {
     expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
   });
 
-  it("leaves keyboard link activation untouched after a drag ends", async () => {
+  it("opens the context menu from the keyboard after a drag ends", () => {
     mocks.isMobile = true;
     mocks.isDragging = true;
     const view = renderSidebar();
 
     mocks.isDragging = false;
     view.rerenderSidebar();
-    await act(
-      () =>
-        new Promise<void>((resolve) => {
-          setTimeout(resolve, 0);
-        }),
-    );
 
-    // Enter/Space activation reaches a link as a click with no pointerdown.
-    // The drag guard must not require or consume a preceding pointer gesture.
-    fireEvent.click(screen.getByRole("link", { name: /My Session/ }), { detail: 0 });
-    expect(view.onClose).toHaveBeenCalledOnce();
+    // Shift+F10 / Menu key emit contextmenu with no preceding pointerdown.
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
   });
 
   it("opens the same action items as the kebab and drives the same handlers", () => {
