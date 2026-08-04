@@ -167,9 +167,9 @@ export const NATIVE_CODING_AGENTS = [
     sortRank: 70,
   },
   {
-    // Hermes uses the local caduceus glyph selected in subagentIcons.
-    // Auth/approval surface in the embedded terminal, so no capability flags
-    // are declared here.
+    // Hermes uses the local caduceus glyph selected in subagentIcons for
+    // catalog cards, roots, and branded child sessions. Auth/approval surface
+    // in the embedded terminal, so no capability flags are declared here.
     key: "hermes",
     agentName: "hermes-native-ui",
     harness: "hermes-native",
