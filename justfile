@@ -109,3 +109,52 @@ lint-ts:
 [group('lint')]
 normalize-locks: _ensure-uv
     uv run scripts/normalize_uv_lock_registry.py uv.lock || true
+
+# ─── homelab test env (test.omnigent.bryanli.net) ── NOT upstream ─────────────
+# Stages a worktree to server0 NFS and bounces the omnigent-test pod (k3s-infra
+# k8s/omnigent-test). Spec: homelab docs/superpowers/specs/2026-08-04-*.md
+
+TEST_STAGE := "bli@server0.joyful.house:/srv/k3s/omnigent-test/src/"
+TEST_KUBECTL := "ssh bli@host.k3s.joyful.house kubectl -n omnigent-test"
+TEST_BASE := env("OMNIGENT_TEST_BASE", "master")
+
+# Deploy the CURRENT worktree (whatever state it's in) to the test env.
+[group('test-env')]
+test-sync:
+    rsync -a --delete --exclude .venv --exclude node_modules \
+      --exclude .git --exclude dev/omnidev/target \
+      ./ {{ TEST_STAGE }}
+    {{ TEST_KUBECTL }} rollout restart deploy/omnigent-test
+    {{ TEST_KUBECTL }} rollout status deploy/omnigent-test --timeout=30m
+    @echo "→ https://test.omnigent.bryanli.net"
+
+# Build a fresh worktree from upstream {{ TEST_BASE }} + the given PR numbers
+# (upstream GitHub PRs), then deploy it. Aborts loudly on merge conflicts.
+[group('test-env')]
+test-up +prs:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ids="$(echo "{{ prs }}" | tr ' ' '-')"
+    wt="$(git rev-parse --show-toplevel)/../omnigent-worktrees/test-${ids}"
+    git fetch upstream {{ TEST_BASE }}
+    rm -rf "$wt" && git worktree prune
+    git worktree add --detach "$wt" "upstream/{{ TEST_BASE }}"
+    cd "$wt"
+    for pr in {{ prs }}; do
+      echo "── merging upstream PR #$pr"
+      git fetch upstream "pull/${pr}/head"
+      git merge --no-edit FETCH_HEAD \
+        || { echo "CONFLICT merging PR #$pr — resolve in $wt"; exit 1; }
+    done
+    rsync -a --delete --exclude .venv --exclude node_modules \
+      --exclude .git --exclude dev/omnidev/target \
+      ./ {{ TEST_STAGE }}
+    {{ TEST_KUBECTL }} rollout restart deploy/omnigent-test
+    {{ TEST_KUBECTL }} rollout status deploy/omnigent-test --timeout=30m
+    echo "→ https://test.omnigent.bryanli.net"
+
+# Stop the test env (staged tree stays; test-sync or a restart revives it).
+[group('test-env')]
+test-down:
+    {{ TEST_KUBECTL }} scale deploy/omnigent-test --replicas=0
+# ─── end homelab test env ─────────────────────────────────────────────────────
