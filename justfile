@@ -116,7 +116,7 @@ normalize-locks: _ensure-uv
 
 TEST_STAGE := "bli@server0.joyful.house:/srv/k3s/omnigent-test/src/"
 TEST_KUBECTL := "ssh bli@host.k3s.joyful.house kubectl -n omnigent-test"
-TEST_BASE := env("OMNIGENT_TEST_BASE", "master")
+TEST_BASE := env("OMNIGENT_TEST_BASE", "main")
 
 # Deploy the CURRENT worktree (whatever state it's in) to the test env.
 [group('test-env')]
