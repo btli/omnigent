@@ -131,6 +131,93 @@ describe("index.css bg-card glass rule selector", () => {
   });
 });
 
+/* The Workspace rail only renders at md+, so its native safe-area rule must
+ * stay at the top level and cover both native shells. */
+describe("index.css Workspace rail safe-area rule", () => {
+  // Match on the rail's aria-label rather than the exact selector text, so an
+  // equivalently-spelled selector cannot introduce a margin the checks miss.
+  // Shorthand `margin:` counts too, as do the logical `margin-block` forms —
+  // each overrides the block-start/end edges this rule sets.
+  const marginDeclaration = /(?<![-\w])margin(?:-(?:top|bottom|block(?:-(?:start|end))?))?\s*:/;
+  // Any quoting or spacing of the attribute selector counts — an equivalently
+  // spelled one would otherwise slip past the checks below.
+  const workspaceAttribute = /\[\s*aria-label\s*=\s*("Workspace"|'Workspace'|Workspace)\s*\]/;
+  const ruleMatches = [...cssSource.matchAll(/[^{}]+\{[^{}]*\}/g)].filter(
+    ([block]) => workspaceAttribute.test(block) && marginDeclaration.test(block),
+  );
+  const rule = ruleMatches[0]?.[0];
+  const selector = (rule ?? "")
+    .slice(0, rule ? rule.indexOf("{") : 0)
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .trim();
+
+  /** Brace nesting depth at a source index; 0 is top level. */
+  function braceDepthAt(sourceIndex: number): number {
+    let depth = 0;
+    let quote: '"' | "'" | undefined;
+
+    for (let index = 0; index < sourceIndex; index += 1) {
+      const character = cssSource[index];
+
+      if (quote) {
+        if (character === "\\") index += 1;
+        else if (character === quote) quote = undefined;
+      } else if (character === "/" && cssSource[index + 1] === "*") {
+        const commentEnd = cssSource.indexOf("*/", index + 2);
+        index = commentEnd === -1 ? sourceIndex : commentEnd + 1;
+      } else if (character === '"' || character === "'") {
+        quote = character;
+      } else if (character === "{") {
+        depth += 1;
+      } else if (character === "}") {
+        depth -= 1;
+      }
+    }
+
+    return depth;
+  }
+
+  it("stays at the top level", () => {
+    expect(rule, "the Workspace safe-area rule is gone from index.css").toBeDefined();
+    if (!rule) return;
+    // Exactly one rule may set the rail's margins; a second could override the
+    // safe area without tripping any of the value checks below.
+    expect(ruleMatches).toHaveLength(1);
+
+    for (const match of ruleMatches) {
+      expect(
+        braceDepthAt(match.index),
+        "the Workspace margin rule must stay at the top level",
+      ).toBe(0);
+    }
+  });
+
+  it.each(["android", "ios"])("matches the Workspace rail in the %s native shell", (platform) => {
+    expect(selector, "the Workspace safe-area selector is gone from index.css").not.toBe("");
+    if (!selector) return;
+
+    const shell = document.createElement("div");
+    shell.setAttribute(`data-${platform}-native`, "");
+    const workspace = document.createElement("aside");
+    workspace.setAttribute("aria-label", "Workspace");
+    shell.appendChild(workspace);
+    document.body.appendChild(shell);
+
+    expect(workspace.matches(selector)).toBe(true);
+    shell.remove();
+  });
+
+  it("uses safe-area margins on both edges", () => {
+    expect(rule).toMatch(/margin-top\s*:\s*calc\(0\.5rem \+ var\(--omnigent-safe-top\)\)/);
+    expect(rule).toMatch(/margin-bottom\s*:\s*calc\(0\.5rem \+ var\(--omnigent-safe-bottom\)\)/);
+    // Every margin rule, not just the first: a later one could re-introduce the
+    // inset vars and double-count the native bottom bar.
+    for (const [block] of ruleMatches) {
+      expect(block).not.toMatch(/--omnigent-(?:inset|native)-/);
+    }
+  });
+});
+
 /* Regression test for the "table link column collapses to ~2ch" bug.
  *
  * Streamdown styles links with `wrap-anywhere`, which also drops the
