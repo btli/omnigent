@@ -223,6 +223,10 @@ object NativeBridgeScript {
                 body: options && typeof options.body === "string" ? options.body : "",
               });
             },
+            setServerSwitcherBand(leftFraction, rightFraction) {
+              if (!Number.isFinite(leftFraction) || !Number.isFinite(rightFraction)) return;
+              post({ method: "setServerSwitcherBand", leftFraction, rightFraction });
+            },
             notify(params) {
               post({
                 method: "notify",
@@ -252,6 +256,7 @@ object NativeBridgeScript {
               return () => insetCallbacks.delete(callback);
             },
           });
+          window.dispatchEvent(new Event("omnigent:native-ready"));
         })();
         """.trimIndent()
 }

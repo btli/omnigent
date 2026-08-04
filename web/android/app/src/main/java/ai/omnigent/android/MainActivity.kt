@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.text.TextUtils
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -36,6 +37,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.webkit.ScriptHandler
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import java.lang.ref.WeakReference
 
 /**
  * The single WebView host. Mirrors the iOS `WebShellView` + `OmnigentWebView`:
@@ -65,7 +67,10 @@ class MainActivity : AppCompatActivity() {
     // Floating server switcher — mirrors the iOS `ServerSwitcher`. Always
     // visible so it's always available as a recovery path (backward compatible
     // with older web builds). Theme-aware via brand colors (light/dark XML).
-    private lateinit var switchButton: View
+    private lateinit var switchButton: TextView
+
+    // Null before each page publishes, preserving whole-window centring.
+    private var switcherBand: ServerSwitcherBand? = null
 
     // WebChromeClient affordances that need Activity-scoped result launchers.
     // Transient by design: rotation is covered by configChanges (no recreation),
@@ -144,6 +149,7 @@ class MainActivity : AppCompatActivity() {
                         },
                         onPageReady = ::onPageReady,
                         onLoginRequired = ::startLogin,
+                        onNavigationStarted = ::clearServerSwitcherBand,
                     )
                 webChromeClient =
                     OmnigentWebChromeClient(
@@ -162,7 +168,7 @@ class MainActivity : AppCompatActivity() {
         val dp = resources.displayMetrics.density
         switchButton =
             TextView(this).apply {
-                text = hostLabelOf(serverUrl)
+                applyHostLabel(serverUrl)
                 background =
                     ContextCompat.getDrawable(this@MainActivity, R.drawable.bg_floating_switch)
                 setTextColor(ContextCompat.getColor(this@MainActivity, R.color.brand_foreground))
@@ -171,8 +177,12 @@ class MainActivity : AppCompatActivity() {
                 elevation = 6 * dp
                 isClickable = true
                 isFocusable = true
+                isSingleLine = true
+                ellipsize = TextUtils.TruncateAt.MIDDLE
                 setOnClickListener { showServerSwitcherMenu(it) }
             }
+        // Same helper the runtime path uses, so the no-band defaults agree.
+        applyServerSwitcherWidthBounds(containerWidth = 0, band = null)
         switchButton.layoutParams =
             FrameLayout
                 .LayoutParams(
@@ -185,6 +195,10 @@ class MainActivity : AppCompatActivity() {
                     topMargin = (8 * dp).toInt()
                 }
         container.addView(switchButton)
+        // The pill's own bounds can stay unchanged when only its parent resizes,
+        // so observe both views.
+        container.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> positionServerSwitcher() }
+        switchButton.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> positionServerSwitcher() }
         setContentView(container)
         applySystemBarContrast()
         installBridge()
@@ -228,6 +242,7 @@ class MainActivity : AppCompatActivity() {
                 lp.topMargin = bars.top + (8 * dp).toInt()
                 switchButton.layoutParams = lp
             }
+            positionServerSwitcher()
             emitInsets()
             insets
         }
@@ -282,10 +297,11 @@ class MainActivity : AppCompatActivity() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        applySystemBarContrast()
+        applySystemBarContrast(newConfig)
         if (::webView.isInitialized) {
             // Notify matchMedia listeners without reloading the SPA.
             webView.dispatchConfigurationChanged(newConfig)
+            webView.post(::positionServerSwitcher)
         }
     }
 
@@ -299,6 +315,8 @@ class MainActivity : AppCompatActivity() {
      */
     private fun installBridge() {
         val origin = pinnedOrigin ?: return
+        // Weak so the long-lived listener cannot pin this Activity.
+        val host = WeakReference(this)
         if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) return
         try {
             WebViewCompat.addWebMessageListener(
@@ -308,6 +326,7 @@ class MainActivity : AppCompatActivity() {
                 OmnigentBridgeListener(
                     notifications = notifications,
                     blobSaver = blobSaver,
+                    onServerSwitcherBand = { band -> host.get()?.receiveServerSwitcherBand(band) },
                 ),
             )
         } catch (_: IllegalArgumentException) {
@@ -329,9 +348,10 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun applySystemBarContrast() {
+    /** Reads the config the framework hands us; `resources` lags a change. */
+    private fun applySystemBarContrast(config: Configuration = resources.configuration) {
         val isLightMode =
-            resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK !=
+            config.uiMode and Configuration.UI_MODE_NIGHT_MASK !=
                 Configuration.UI_MODE_NIGHT_YES
         WindowInsetsControllerCompat(window, window.decorView).apply {
             isAppearanceLightStatusBars = isLightMode
@@ -453,6 +473,77 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** The visible text is middle-ellipsized, so the description carries the full host. */
+    private fun TextView.applyHostLabel(url: String) {
+        val label = hostLabelOf(url)
+        text = label
+        contentDescription = label
+    }
+
+    private fun receiveServerSwitcherBand(band: ServerSwitcherBand) {
+        runOnUiThread {
+            if (isDestroyed || isFinishing) return@runOnUiThread
+            switcherBand = band
+            positionServerSwitcher()
+        }
+    }
+
+    /** Forget the web-published band; the pill returns to the window centre. */
+    private fun clearServerSwitcherBand() {
+        if (switcherBand == null) return
+        switcherBand = null
+        positionServerSwitcher()
+    }
+
+    /** Centre in the latest band, or in the whole window before publication. */
+    private fun positionServerSwitcher() {
+        if (!::switchButton.isInitialized) return
+        val lp = switchButton.layoutParams as? FrameLayout.LayoutParams ?: return
+        val band = switcherBand
+        // The pill's leftMargin is relative to its parent, so the band fraction
+        // must resolve against the parent's width.
+        val containerWidth = (switchButton.parent as? View)?.width ?: 0
+        applyServerSwitcherWidthBounds(containerWidth, band)
+        val switcherWidth = switchButton.width
+
+        val gravity: Int
+        val leftMargin: Int
+        if (band == null || containerWidth <= 0 || switcherWidth <= 0) {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            leftMargin = 0
+        } else {
+            // The band uses physical viewport coordinates, so it must not mirror in RTL.
+            gravity = Gravity.TOP or Gravity.LEFT
+            leftMargin = serverSwitcherLeftMargin(containerWidth, switcherWidth, band)
+        }
+        if (lp.gravity == gravity && lp.leftMargin == leftMargin) return
+        lp.gravity = gravity
+        lp.leftMargin = leftMargin
+        switchButton.layoutParams = lp
+    }
+
+    private fun applyServerSwitcherWidthBounds(
+        containerWidth: Int,
+        band: ServerSwitcherBand?,
+    ) {
+        val dp = resources.displayMetrics.density
+        val defaultMax = (SWITCHER_MAX_WIDTH_DP * dp).toInt()
+        val defaultMin = (SWITCHER_MIN_WIDTH_DP * dp).toInt()
+        val max =
+            if (band == null || containerWidth <= 0) {
+                defaultMax
+            } else {
+                maxOf(
+                    defaultMin,
+                    minOf(defaultMax, serverSwitcherBandWidth(containerWidth, band)),
+                )
+            }
+        // Floors the WIDTH only — the height stays the text's — so this bounds how
+        // far a label can shrink, not the full touch target.
+        if (switchButton.minWidth != defaultMin) switchButton.minWidth = defaultMin
+        if (switchButton.maxWidth != max) switchButton.maxWidth = max
+    }
+
     /**
      * Extract a short host[:port] label from a URL for the server switcher pill.
      * Mirrors the iOS `URL.omnigentHostLabel` in `URL+Omnigent.swift`.
@@ -524,7 +615,7 @@ class MainActivity : AppCompatActivity() {
         pageLoaded = false
         historyCleared = false
         loginAttempts = 0
-        (switchButton as? TextView)?.text = hostLabelOf(serverUrl)
+        switchButton.applyHostLabel(serverUrl)
         installBridge()
         webView.loadUrl(serverUrl)
     }
@@ -781,6 +872,10 @@ class MainActivity : AppCompatActivity() {
 
     private companion object {
         const val MAX_LOGIN_ATTEMPTS = 3
+
+        // The 48dp floor is tap safety, not the iOS 120dp visual floor.
+        const val SWITCHER_MAX_WIDTH_DP = 172
+        const val SWITCHER_MIN_WIDTH_DP = 48
 
         // Back-press fallback: long enough that a healthy renderer's JS round-trip
         // (a few ms) always wins the race, short enough to not feel stuck if it
