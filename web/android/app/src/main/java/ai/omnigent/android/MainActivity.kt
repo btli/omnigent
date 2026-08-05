@@ -650,10 +650,17 @@ class MainActivity : AppCompatActivity() {
      * rules, so we both attempt a reorder-to-front (works within the grace
      * period) AND post a "tap to return" notification as the reliable path back.
      */
-    private fun onSessionToken(
+    internal fun onSessionToken(
         loginOrigin: String,
         token: String,
     ) {
+        // A server switch can land between starting a login and its poll
+        // completing; a token minted for another origin must never be
+        // injected into the current one.
+        if (loginOrigin != pinnedOrigin) {
+            authLog("onSessionToken: origin changed since login started — dropping token")
+            return
+        }
         // The poll can land after the activity is gone (it ran on a background
         // thread up to 5 min) — never touch a destroyed WebView.
         if (isDestroyed || isFinishing || !::webView.isInitialized) return
@@ -801,6 +808,7 @@ class MainActivity : AppCompatActivity() {
         serverUrl: String,
         newOrigin: String,
     ) {
+        loginManager.cancel() // a login for the old origin must not outlive the switch
         val previousOrigin = pinnedOrigin
         removeBridge()
         pinnedOrigin = newOrigin
