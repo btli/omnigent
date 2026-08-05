@@ -62,6 +62,7 @@ class MainActivity : AppCompatActivity() {
     // dialog and a pending path can never belong to different links.
     private val deepLinkQueue = ArrayDeque<DeepLink>()
     private var processingDeepLink = false
+    private var deepLinkAwaitingNavigation = false
 
     // Origin the pending path belongs to, captured when the path is set. A
     // pending path never flushes cross-origin; null means nothing is pending.
@@ -503,12 +504,7 @@ class MainActivity : AppCompatActivity() {
         val uri = Uri.parse(url)
         val host = uri.host ?: return url
         val port = uri.port
-        return if (port != -1 &&
-            !(
-                (uri.scheme?.lowercase() == "https" && port == 443) ||
-                    (uri.scheme?.lowercase() == "http" && port == 80)
-            )
-        ) {
+        return if (port != -1 && !isDefaultPort(uri.scheme, port)) {
             "$host:$port"
         } else {
             host
@@ -519,7 +515,7 @@ class MainActivity : AppCompatActivity() {
         // Dismiss an open consent dialog first: it holds a window tied to this
         // Activity, and no listener fires on dismiss() (only setOnCancelListener
         // does), so the link is simply left unanswered — no accept path, no
-        // second finishDeepLink() call (moot anyway; this instance is dying).
+        // second queue-resume call (moot anyway; this instance is dying).
         deepLinkDialog?.dismiss()
         deepLinkDialog = null
         // Unblock a pending file input / mic request, then release WebView + worker.
@@ -653,6 +649,7 @@ class MainActivity : AppCompatActivity() {
     private fun onPageReady(
         url: String?,
         mainFrameLoadFailed: Boolean,
+        mainFramePersistenceFailed: Boolean,
     ) {
         // Only a real pinned-origin load carries the injected facade — an error
         // page (chrome-error://) or a foreign redirect must NOT drain
@@ -666,44 +663,46 @@ class MainActivity : AppCompatActivity() {
             historyCleared = true
             webView.clearHistory()
         }
-        pageLoaded = true
         if (mainFrameLoadFailed) {
-            // The pinned origin itself failed to load (DNS/TLS/connection
-            // error) — WebView reports this onPageFinished with the ORIGINAL
-            // url, not a chrome-error:// one, so it can't be told from `url`
-            // alone. A server that never actually loaded must never become a
-            // trusted recent, and a pending path aimed at it is stale — drop
-            // both rather than silently persist or replay against a broken
-            // origin. A retry of the same origin must succeed on its own
-            // merits before either is set again.
+            // Keep the path queued for a successful retry; this callback carries
+            // the original URL even though WebView rendered an error page.
+            pageLoaded = false
             pendingPersistUrl = null
-            if (pendingNavigateOrigin == pinnedOrigin) clearPendingNavigate()
         } else {
+            pageLoaded = true
             // First successful load of a consent-approved server: only now does it
             // become the stored current server / a trusted recent.
-            pendingPersistUrl?.takeIf { originOf(it) == pinnedOrigin }?.let {
-                ServerStore(this).connect(it)
-                (switchButton as? TextView)?.text = hostLabelOf(it)
+            if (!mainFramePersistenceFailed) {
+                pendingPersistUrl?.takeIf { originOf(it) == pinnedOrigin }?.let {
+                    ServerStore(this).connect(it)
+                    (switchButton as? TextView)?.text = hostLabelOf(it)
+                }
             }
             pendingPersistUrl = null
         }
         loginAttempts = 0 // reached a pinned-origin page — we're past the login redirect
-        flushPendingActivation()
+        val delivered = pageLoaded && flushPendingActivation()
         emitInsets()
+        if (delivered && deepLinkAwaitingNavigation) {
+            deepLinkAwaitingNavigation = false
+            resumeDeepLinkQueue()
+        }
     }
 
-    private fun flushPendingActivation() {
+    private fun flushPendingActivation(): Boolean {
         // Parked off-origin (e.g. mid re-login): keep the path pending; the
         // next pinned-origin onPageReady flushes it.
-        if (originOf(webView.url) != pinnedOrigin) return
+        if (originOf(webView.url) != pinnedOrigin) return false
         // A path bound to another origin is stale (a later switch superseded
         // it) — drop it rather than navigate the wrong server.
         if (pendingNavigateOrigin != pinnedOrigin) {
             clearPendingNavigate()
-            return
+            return false
         }
+        if (pendingNavigatePath == null) return false
         emitNotificationActivation(pendingNavigatePath)
         clearPendingNavigate()
+        return true
     }
 
     private fun clearPendingNavigate() {
@@ -724,22 +723,23 @@ class MainActivity : AppCompatActivity() {
 
     private fun processNextDeepLink() {
         if (processingDeepLink) return
-        val link = deepLinkQueue.removeFirstOrNull() ?: return
         processingDeepLink = true
-        // Defaults to true so a throw from inside the `when` below (before its
-        // result assigns) still finishes synchronously in the `finally` —
-        // exception-safety must never depend on how far the branch got.
-        var synchronous = true
-        // Recursion, not a loop: finishDeepLink() re-enters processNextDeepLink()
-        // once this item resolves, so stack depth tracks queue depth — fine for
-        // the realistic (tiny, human-tap-driven) burst sizes here.
         try {
-            synchronous =
+            while (true) {
+                val link = deepLinkQueue.removeFirstOrNull()
+                if (link == null) {
+                    processingDeepLink = false
+                    return
+                }
                 if (link.origin == pinnedOrigin) {
                     pendingNavigatePath = link.path
                     pendingNavigateOrigin = link.origin
-                    if (pageLoaded) flushPendingActivation()
-                    true
+                    deepLinkAwaitingNavigation = true
+                    if (pageLoaded && flushPendingActivation()) {
+                        deepLinkAwaitingNavigation = false
+                        continue
+                    }
+                    return
                 } else {
                     val store = ServerStore(this)
                     val known = store.knownServers().firstOrNull { originOf(it) == link.origin }
@@ -747,22 +747,23 @@ class MainActivity : AppCompatActivity() {
                         store.connect(known)
                         pendingNavigatePath = link.path
                         pendingNavigateOrigin = link.origin
+                        deepLinkAwaitingNavigation = true
                         reloadWithNewServer(known, link.origin)
-                        true
+                        return
                     } else {
-                        // Unknown server: async consent dialog. It calls
-                        // finishDeepLink() itself once answered, so the queue
-                        // must not advance here.
                         showDeepLinkConsent(link)
-                        false
+                        return
                     }
                 }
-        } finally {
-            if (synchronous) finishDeepLink()
+            }
+        } catch (t: Throwable) {
+            processingDeepLink = false
+            deepLinkAwaitingNavigation = false
+            throw t
         }
     }
 
-    private fun finishDeepLink() {
+    private fun resumeDeepLinkQueue() {
         processingDeepLink = false
         processNextDeepLink()
     }
@@ -776,9 +777,7 @@ class MainActivity : AppCompatActivity() {
             if (!answered) {
                 answered = true
                 deepLinkDialog = null
-                // finishDeepLink() must run even if a step below throws (an
-                // unexpected reload/store failure), or processingDeepLink stays
-                // stuck true and wedges every later queued link forever.
+                var awaitingNavigation = false
                 try {
                     if (accepted) {
                         // reload first: it clears any superseded pendingPersistUrl,
@@ -787,13 +786,15 @@ class MainActivity : AppCompatActivity() {
                         pendingNavigatePath = link.path
                         pendingNavigateOrigin = link.origin
                         pendingPersistUrl = link.origin
+                        deepLinkAwaitingNavigation = true
+                        awaitingNavigation = true
                     } else if (!ServerStore(this).hasServer()) {
                         // Cold-start link was the only way in; fall back to setup.
                         startActivity(Intent(this, ConnectActivity::class.java))
                         finish()
                     }
                 } finally {
-                    finishDeepLink()
+                    if (!awaitingNavigation) resumeDeepLinkQueue()
                 }
             }
         }
