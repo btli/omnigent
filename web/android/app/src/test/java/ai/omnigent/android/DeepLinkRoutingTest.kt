@@ -4,6 +4,7 @@ import android.content.Intent
 import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -90,6 +91,22 @@ class DeepLinkRoutingTest {
         val activity = controller.get()
         controller.newIntent(viewIntent("omnigent://h.example/c/$hex"))
         assertEquals("/c/$hex", activity.privateField("pendingNavigatePath"))
+    }
+
+    @Test
+    fun `same-origin link after a failed load waits for a successful retry`() {
+        store().connect("https://h.example")
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        activity.invokeOnPageReady("https://h.example", mainFrameLoadFailed = true)
+
+        controller.newIntent(viewIntent("omnigent://h.example/c/$hex"))
+
+        assertFalse(activity.privateField("pageLoaded") as Boolean)
+        assertEquals("/c/$hex", activity.privateField("pendingNavigatePath"))
+
+        activity.invokeOnPageReady("https://h.example")
+        assertNull(activity.privateField("pendingNavigatePath"))
     }
 
     @Test
