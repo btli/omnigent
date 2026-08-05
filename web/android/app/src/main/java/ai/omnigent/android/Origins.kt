@@ -11,9 +11,14 @@ import java.net.IDN
 fun originOf(url: String?): String? {
     val uri = url?.let(Uri::parse) ?: return null
     val scheme = uri.scheme?.lowercase() ?: return null
+    val rawHost = uri.host ?: return null
+    // A malformed port ("host:notaport") survives inside Uri's host instead of
+    // failing the parse. WHATWG treats a non-numeric port as an invalid URL —
+    // reject it, allowing the colons of a bracketed IPv6 literal.
+    if (rawHost.lastIndexOf(':') > rawHost.lastIndexOf(']')) return null
     val host =
         try {
-            uri.host?.let(IDN::toASCII)?.lowercase()
+            IDN.toASCII(rawHost).lowercase()
         } catch (_: IllegalArgumentException) {
             null
         } ?: return null
