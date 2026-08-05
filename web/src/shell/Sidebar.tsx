@@ -152,7 +152,12 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
-import { ROW_SWIPE_COMMIT_PX, RowGestureTouchSensor, useRowGesture } from "@/hooks/useRowGesture";
+import {
+  finishActiveRowGesture,
+  ROW_SWIPE_COMMIT_PX,
+  RowGestureTouchSensor,
+  useRowGesture,
+} from "@/hooks/useRowGesture";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { NewProjectButton } from "./NewProjectButton";
 import { SettingsSidebarBody, useSettingsRoute, useTrackSettingsReturn } from "./settingsNav";
@@ -1517,6 +1522,7 @@ function ConversationList({
   const handleDragEnd = useCallback(
     (event: DragEndEvent) => {
       const dragged = activeDrag;
+      finishActiveRowGesture();
       setActiveDrag(null);
       if (!dragged) return;
       const target = (event.over?.data.current as SidebarDropTarget | undefined) ?? null;
@@ -1761,7 +1767,10 @@ function ConversationList({
         measuring={{ droppable: { strategy: MeasuringStrategy.Always } }}
         onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
-        onDragCancel={() => setActiveDrag(null)}
+        onDragCancel={() => {
+          finishActiveRowGesture();
+          setActiveDrag(null);
+        }}
       >
         <RowEditHoldContext.Provider value={reportRowEditing}>
           <div
@@ -3059,10 +3068,12 @@ function ConversationRow({
   // changing Settings updates open rows without a remount.
   const swipeActions = useSwipeActions();
   const swipeActionRef = useRef<(action: Exclude<SwipeAction, "none">) => void>(() => {});
-  swipeActionRef.current = (action: Exclude<SwipeAction, "none">) => {
-    if (action === "archive") runArchive();
-    else setDeleteOpen(true);
-  };
+  useEffect(() => {
+    swipeActionRef.current = (action: Exclude<SwipeAction, "none">) => {
+      if (action === "archive") runArchive();
+      else setDeleteOpen(true);
+    };
+  });
   const onSwipeAction = useCallback((action: Exclude<SwipeAction, "none">) => {
     swipeActionRef.current(action);
   }, []);
@@ -3277,6 +3288,9 @@ function ConversationRow({
       onPointerDown={(e) => {
         if (e.pointerType === "touch") e.preventDefault();
       }}
+      onContextMenu={(e) => {
+        if (isDragging) e.preventDefault();
+      }}
       className={cn(
         "sidebar-compact-text relative flex h-8 flex-col justify-center rounded-[var(--radius-otto-sm)] py-1 pl-2 text-left text-foreground transition-colors",
         SIDEBAR_HOVER_HIGHLIGHT,
@@ -3364,7 +3378,8 @@ function ConversationRow({
         // the swipe: without this the browser can take the horizontal pan (or
         // back-navigation gesture) and cancel the gesture mid-drag. Only where
         // a swipe can actually fire, so rows without one keep default behavior.
-        swipeEnabled && "touch-pan-y",
+        swipeEnabled && gesture.phase !== "armed" && gesture.phase !== "drag" && "touch-pan-y",
+        (gesture.phase === "armed" || gesture.phase === "drag") && "touch-none",
       )}
     >
       {/* Swipe reveal hint: sits behind the moving surface, showing the

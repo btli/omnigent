@@ -36,6 +36,7 @@ interface ActiveRowGesture {
   lastY: number;
   phase: Exclude<RowGesturePhase, "idle">;
   target: Element;
+  sensorTarget: Element;
   offset: number;
 }
 
@@ -49,6 +50,31 @@ export interface RowGestureDndData {
 
 interface RowGestureActivationContext {
   active: { data: { current?: unknown } };
+}
+
+type RowGestureReset = (cancelDrag: boolean) => void;
+
+const rowGestureResets = new Set<RowGestureReset>();
+
+function handleGlobalTouchStart(event: TouchEvent) {
+  if (event.touches.length <= 1) return;
+  for (const reset of rowGestureResets) reset(true);
+}
+
+function registerRowGestureReset(reset: RowGestureReset) {
+  if (rowGestureResets.size === 0) document.addEventListener("touchstart", handleGlobalTouchStart);
+  rowGestureResets.add(reset);
+  return () => {
+    rowGestureResets.delete(reset);
+    if (rowGestureResets.size === 0) {
+      document.removeEventListener("touchstart", handleGlobalTouchStart);
+    }
+  };
+}
+
+/** Clears the recognizer after dnd-kit has ended or cancelled its drag. */
+export function finishActiveRowGesture() {
+  for (const reset of rowGestureResets) reset(false);
 }
 
 const rowGestureActivators = [
@@ -130,13 +156,23 @@ export function useRowGesture({
     }
   }, []);
 
-  const reset = useCallback(() => {
-    clearHoldTimer();
-    releaseCapture(state.current);
-    state.current = null;
-    setDx(0);
-    setPhase("idle");
-  }, [clearHoldTimer, releaseCapture]);
+  const reset = useCallback(
+    (cancelDrag = false) => {
+      const gesture = state.current;
+      if (!gesture) return;
+      clearHoldTimer();
+      releaseCapture(gesture);
+      state.current = null;
+      setDx(0);
+      setPhase("idle");
+      if (cancelDrag && gesture?.phase === "drag") {
+        gesture.sensorTarget.dispatchEvent(
+          new Event("touchcancel", { bubbles: true, cancelable: true }),
+        );
+      }
+    },
+    [clearHoldTimer, releaseCapture],
+  );
 
   // Armed until the trailing click arrives or the next press clears it. A timer
   // would race the click: the browser does not guarantee dispatch inside the
@@ -169,9 +205,10 @@ export function useRowGesture({
 
   const onPointerDown = useCallback(
     (event: ReactPointerEvent) => {
+      suppressClick.current = false;
       if (event.pointerType !== "touch") return;
       if (!event.isPrimary) {
-        if (state.current) reset();
+        if (state.current) reset(true);
         return;
       }
       if (!enabled) return;
@@ -179,7 +216,6 @@ export function useRowGesture({
       if (target instanceof Node && !event.currentTarget.contains(target)) return;
 
       reset();
-      suppressClick.current = false;
       const gesture: ActiveRowGesture = {
         pointerId: event.pointerId,
         startX: event.clientX,
@@ -188,6 +224,7 @@ export function useRowGesture({
         lastY: event.clientY,
         phase: "pending",
         target: event.currentTarget,
+        sensorTarget: target instanceof Element ? target : event.currentTarget,
         offset: 0,
       };
       state.current = gesture;
@@ -311,14 +348,14 @@ export function useRowGesture({
   const onPointerCancel = useCallback(
     (event: ReactPointerEvent) => {
       if (state.current?.pointerId !== event.pointerId) return;
-      reset();
+      reset(true);
     },
     [reset],
   );
 
   const onTouchStart = useCallback(
     (event: ReactTouchEvent) => {
-      if (event.touches.length > 1 && state.current) reset();
+      if (event.touches.length > 1 && state.current) reset(true);
     },
     [reset],
   );
@@ -344,8 +381,10 @@ export function useRowGesture({
   );
 
   useEffect(() => {
-    if (!enabled && state.current) reset();
+    if (!enabled && state.current) reset(true);
   }, [enabled, reset]);
+
+  useEffect(() => registerRowGestureReset(reset), [reset]);
 
   useEffect(
     () => () => {

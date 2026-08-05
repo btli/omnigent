@@ -6,7 +6,7 @@
 //      `onDoubleClick`), gated on edit permission.
 // See ConversationRow / ConversationEditRow in Sidebar.tsx.
 
-import { useSyncExternalStore } from "react";
+import { Suspense, startTransition, useSyncExternalStore } from "react";
 import type * as DndKitCore from "@dnd-kit/core";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
@@ -53,10 +53,13 @@ const mocks = vi.hoisted(() => {
     moveToProject: { mutate: vi.fn() },
     conversations: [] as unknown[],
     isDragging: null as boolean | null,
+    suspendDraggable: false,
+    suspendedRender: new Promise<never>(() => {}),
     pinnedStore,
     // Archive + stop mutations, so the swipe tests can assert the swipe→archive
     // path drives the same stop→archive handler the kebab uses.
     archive: { mutate: vi.fn() },
+    archiveOverride: null as null | { mutate: ReturnType<typeof vi.fn> },
     stopSession: { mutate: vi.fn() },
     // Stop-and-delete, so the swipe→delete test can assert the row deletes only
     // after the confirm dialog is accepted.
@@ -70,6 +73,7 @@ vi.mock("@dnd-kit/core", async (importOriginal) => {
     ...actual,
     useDraggable: (args: Parameters<typeof actual.useDraggable>[0]) => {
       const draggable = actual.useDraggable(args);
+      if (mocks.suspendDraggable) throw mocks.suspendedRender;
       return {
         ...draggable,
         isDragging: mocks.isDragging ?? draggable.isDragging,
@@ -115,7 +119,7 @@ vi.mock("@/hooks/useConversations", () => ({
   setConversationPinned: vi.fn(() => Promise.resolve({})),
   PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
   useRenameConversation: () => mocks.rename,
-  useArchiveConversation: () => mocks.archive,
+  useArchiveConversation: () => mocks.archiveOverride ?? mocks.archive,
   useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
@@ -230,7 +234,11 @@ function renderSidebar(activeId?: string, info?: ServerInfo) {
   // reference lets React bail out without re-invoking the sidebar, which
   // would swallow a `mockConversations` swap applied mid-test.
   const makeUi = () => {
-    const sidebar = <Sidebar open={true} onClose={onClose} />;
+    const sidebar = (
+      <Suspense fallback={<div data-testid="suspended-sidebar" />}>
+        <Sidebar open={true} onClose={onClose} />
+      </Suspense>
+    );
     const tree = (
       <QueryClientProvider client={qc}>
         <TooltipProvider>
@@ -282,6 +290,8 @@ beforeEach(() => {
   mocks.del.reset.mockReset();
   mocks.projects = [];
   mocks.isDragging = null;
+  mocks.suspendDraggable = false;
+  mocks.archiveOverride = null;
   // Default every test to the desktop viewport; the mobile flyout test opts in.
   mocks.isMobile = false;
   useConvMock.mockReset();
@@ -798,6 +808,15 @@ describe("mark as unread", () => {
 });
 
 describe("right-click context menu", () => {
+  it("does not open while the row is being dragged", () => {
+    mocks.isDragging = true;
+    renderSidebar();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.queryByTestId("rename-conversation")).toBeNull();
+  });
+
   it("leaves keyboard link activation untouched after a drag ends", async () => {
     mocks.isMobile = true;
     mocks.isDragging = true;
@@ -1086,11 +1105,67 @@ describe("touch gesture arbitration", () => {
     startTouch();
     advanceHold();
     expect(row).not.toHaveClass("opacity-40");
+    expect(row).toHaveClass("touch-none");
+    expect(row).not.toHaveClass("touch-pan-y");
 
     moveTouch(101, 100);
     expect(row).toHaveClass("opacity-40");
+    expect(row).toHaveClass("touch-none");
     expect(screen.queryByTestId("rename-conversation")).toBeNull();
     endTouch(101, 100);
+  });
+
+  it("does not restart a drag after viewport resize cancels the sensor", () => {
+    vi.useFakeTimers();
+    mocks.isMobile = true;
+    renderSidebar();
+    const { row } = touchTarget();
+
+    startTouch();
+    advanceHold();
+    moveTouch(101, 100);
+    expect(row).toHaveClass("opacity-40");
+
+    act(() => window.dispatchEvent(new Event("resize")));
+    expect(row).not.toHaveClass("opacity-40");
+
+    moveTouch(102, 100);
+    expect(row).not.toHaveClass("opacity-40");
+    endTouch(102, 100);
+  });
+
+  it("resets the recognizer when dnd-kit ends the drag", () => {
+    vi.useFakeTimers();
+    mocks.isMobile = true;
+    renderSidebar();
+    const { link, row } = touchTarget();
+
+    startTouch();
+    advanceHold();
+    moveTouch(101, 100);
+    expect(row).toHaveClass("opacity-40");
+
+    const touch = touchPoint(link, 101, 100);
+    fireEvent.touchEnd(link, { touches: [], changedTouches: [touch] });
+
+    expect(row).not.toHaveClass("opacity-40");
+    expect(row).not.toHaveClass("touch-none");
+    moveTouch(102, 100);
+    expect(row).not.toHaveClass("opacity-40");
+  });
+
+  it("arms after ordinary four-pixel hold drift", () => {
+    vi.useFakeTimers();
+    mocks.isMobile = true;
+    renderSidebar();
+    const { row } = touchTarget();
+
+    startTouch();
+    moveTouch(104, 100);
+    advanceHold();
+
+    expect(row).toHaveClass("scale-[1.01]");
+    endTouch(104, 100);
   });
 
   it("does not arm a hold on a finger that is still creeping", () => {
@@ -1279,6 +1354,40 @@ describe("touch gesture arbitration", () => {
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
   });
 
+  it("does not swallow a mouse click after a desktop touch scroll gesture", () => {
+    vi.useFakeTimers();
+    const view = renderSidebar();
+    const { link } = touchTarget();
+
+    startTouch();
+    moveTouch(80, 100);
+    endTouch(80, 100);
+    fireEvent.pointerDown(link, {
+      pointerType: "mouse",
+      button: 0,
+      isPrimary: true,
+      pointerId: 9,
+    });
+    fireEvent.click(link);
+
+    expect(view.onClose).toHaveBeenCalledOnce();
+  });
+
+  it("selects a row on the first tap after a short swipe", () => {
+    vi.useFakeTimers();
+    mocks.isMobile = true;
+    renderSidebar();
+    startTouch();
+    moveTouch(80, 100);
+    endTouch(80, 100);
+    fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
+    const { link } = touchTarget();
+    fireEvent.pointerDown(link, { ...TOUCH_POINTER, clientX: 100, clientY: 100 });
+    fireEvent.click(link);
+
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
+  });
+
   it("fully resets when the pointer is cancelled", () => {
     vi.useFakeTimers();
     mocks.isMobile = true;
@@ -1321,6 +1430,104 @@ describe("touch gesture arbitration", () => {
     expect(row).not.toHaveClass("opacity-40");
     expect(screen.queryByTestId("rename-conversation")).toBeNull();
     fireEvent.pointerCancel(link, { ...TOUCH_POINTER, clientX: 120, clientY: 100 });
+  });
+
+  it("cancels the first row when a second touch starts on another row", () => {
+    vi.useFakeTimers();
+    mocks.isMobile = true;
+    mockConversations([
+      { ...CONV, id: "conv_a", title: "Session A" },
+      { ...CONV, id: "conv_b", title: "Session B" },
+    ]);
+    renderSidebar();
+    const linkA = screen.getByRole("link", { name: /Session A/ });
+    const linkB = screen.getByRole("link", { name: /Session B/ });
+    const first = touchPoint(linkA, 100, 100);
+    const second = touchPoint(linkB, 104, 104, 1);
+
+    fireEvent.pointerDown(linkA, { ...TOUCH_POINTER, clientX: 100, clientY: 100 });
+    fireEvent.touchStart(linkA, { touches: [first], changedTouches: [first] });
+    fireEvent.pointerDown(linkB, {
+      pointerId: 2,
+      isPrimary: false,
+      pointerType: "touch",
+      clientX: 104,
+      clientY: 104,
+    });
+    fireEvent.touchStart(linkB, {
+      touches: [first, second],
+      changedTouches: [second],
+    });
+
+    advanceHold(ROW_GESTURE_HOLD_MS + 1);
+    expect(linkA.closest("li")).not.toHaveClass("scale-[1.01]");
+    fireEvent.pointerMove(linkA, { ...TOUCH_POINTER, clientX: 10, clientY: 100 });
+    fireEvent.pointerUp(linkA, { ...TOUCH_POINTER, clientX: 10, clientY: 100 });
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(linkA.closest("li")).not.toHaveClass("scale-[1.01]");
+  });
+
+  it("cancels dnd-kit when a second touch starts on another row mid-drag", () => {
+    vi.useFakeTimers();
+    mocks.isMobile = true;
+    mockConversations([
+      { ...CONV, id: "conv_a", title: "Session A" },
+      { ...CONV, id: "conv_b", title: "Session B" },
+    ]);
+    renderSidebar();
+    const linkA = screen.getByRole("link", { name: /Session A/ });
+    const linkB = screen.getByRole("link", { name: /Session B/ });
+    const rowA = linkA.closest("li")!;
+    const first = touchPoint(linkA, 100, 100);
+    const moved = touchPoint(linkA, 101, 100);
+
+    fireEvent.pointerDown(linkA, { ...TOUCH_POINTER, clientX: 100, clientY: 100 });
+    fireEvent.touchStart(linkA, { touches: [first], changedTouches: [first] });
+    advanceHold();
+    fireEvent.pointerMove(linkA, { ...TOUCH_POINTER, clientX: 101, clientY: 100 });
+    fireEvent.touchMove(linkA, { touches: [moved], changedTouches: [moved] });
+    expect(rowA).toHaveClass("opacity-40");
+
+    const second = touchPoint(linkB, 104, 104, 1);
+    fireEvent.pointerDown(linkB, {
+      pointerId: 2,
+      isPrimary: false,
+      pointerType: "touch",
+      clientX: 104,
+      clientY: 104,
+    });
+    fireEvent.touchStart(linkB, {
+      touches: [moved, second],
+      changedTouches: [second],
+    });
+
+    expect(rowA).not.toHaveClass("opacity-40");
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  it("cancels dnd-kit when a second touch joins the active row", () => {
+    vi.useFakeTimers();
+    mocks.isMobile = true;
+    renderSidebar();
+    const { link, row } = touchTarget();
+
+    startTouch();
+    advanceHold();
+    moveTouch(101, 100);
+    expect(row).toHaveClass("opacity-40");
+
+    fireEvent.pointerDown(link, {
+      pointerId: 2,
+      isPrimary: false,
+      pointerType: "touch",
+      clientX: 104,
+      clientY: 104,
+    });
+
+    expect(row).not.toHaveClass("opacity-40");
+    expect(screen.queryByRole("menu")).toBeNull();
   });
 });
 
@@ -1430,6 +1637,37 @@ describe("touch swipe actions", () => {
     );
   });
 
+  it("keeps the committed swipe action when a concurrent render is abandoned", () => {
+    mocks.isMobile = true;
+    const view = renderSidebar();
+    const abandonedArchive = { mutate: vi.fn() };
+    const { link } = touchTarget();
+    startTouch(200, 100);
+
+    mocks.archiveOverride = abandonedArchive;
+    mocks.suspendDraggable = true;
+    act(() => {
+      startTransition(() => view.rerenderSidebar());
+    });
+    expect(screen.queryByTestId("suspended-sidebar")).toBeNull();
+
+    for (const x of [180, 100]) {
+      const touch = touchPoint(link, x, 100);
+      fireEvent.pointerMove(link, { ...TOUCH_POINTER, clientX: x, clientY: 100 });
+      fireEvent.touchMove(link, { touches: [touch], changedTouches: [touch] });
+    }
+    const touch = touchPoint(link, 100, 100);
+    fireEvent.pointerUp(link, { ...TOUCH_POINTER, clientX: 100, clientY: 100 });
+    fireEvent.touchEnd(link, { touches: [], changedTouches: [touch] });
+    mocks.suspendDraggable = false;
+
+    expect(mocks.archive.mutate).toHaveBeenCalledWith(
+      { id: "conv_1", archived: true },
+      expect.anything(),
+    );
+    expect(abandonedArchive.mutate).not.toHaveBeenCalled();
+  });
+
   it("does not commit after a flick returns below the threshold before release", () => {
     mocks.isMobile = true;
     renderSidebar();
@@ -1470,6 +1708,19 @@ describe("touch swipe actions", () => {
     );
   });
 
+  it("applies one-third resistance immediately past the commit distance", () => {
+    mocks.isMobile = true;
+    renderSidebar();
+    const { row } = touchTarget();
+    const surface = row.querySelector<HTMLElement>("div.relative")!;
+
+    startTouch(100, 100);
+    moveTouch(10, 100);
+
+    expect(surface.style.marginRight).toBe("78px");
+    endTouch(10, 100);
+  });
+
   it("ignores touch gestures that bubble from a portalled dialog", () => {
     mocks.isMobile = true;
     renderSidebar();
@@ -1496,6 +1747,20 @@ describe("touch swipe actions", () => {
     // Past the activation lock (20px) but short of the commit distance (72px).
     swipeRow(-40);
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  });
+
+  it("commits at exactly 72px but not at 71px", () => {
+    mocks.isMobile = true;
+    renderSidebar();
+
+    swipeRow(-71);
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+
+    swipeRow(-72);
+    expect(mocks.archive.mutate).toHaveBeenCalledWith(
+      { id: "conv_1", archived: true },
+      expect.anything(),
+    );
   });
 
   it("ignores swipes on desktop (non-touch viewport)", () => {
