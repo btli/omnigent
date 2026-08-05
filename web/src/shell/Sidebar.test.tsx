@@ -274,12 +274,13 @@ function startMouseDrag(row: HTMLElement): void {
   fireEvent.mouseMove(document, { buttons: 1, clientX: 20, clientY: 30 });
 }
 
-function moveMouseOverUngroupTarget(): void {
-  fireEvent.mouseMove(document, { buttons: 1, clientX: 120, clientY: 279 });
-  fireEvent.mouseMove(document, { buttons: 1, clientX: 120, clientY: 280 });
+/** Drag to `y` in two steps: dnd-kit needs a move to measure before it collides. */
+function moveMouseTo(y: number): void {
+  fireEvent.mouseMove(document, { buttons: 1, clientX: 120, clientY: y - 1 });
+  fireEvent.mouseMove(document, { buttons: 1, clientX: 120, clientY: y });
 }
 
-function touchAt(target: Element, y: number) {
+function touchAt(target: Element, y: number): TouchInit {
   return {
     identifier: 1,
     target,
@@ -1613,6 +1614,15 @@ describe("Sidebar move-to-project action", () => {
   });
 });
 
+/** Render a single pinned session filed under `project` and return its row. */
+function renderPinnedFiledSession(id: string, project = "Sprint 42"): HTMLElement {
+  projectsMock.push(project);
+  seedPins([id]);
+  mockConversations([conv(id, "Claude Code", { labels: { omni_project: project } })]);
+  renderSidebar();
+  return screen.getByRole("link", { name: id }).closest("li")!;
+}
+
 describe("Sidebar ungroup drag target", () => {
   beforeEach(() => setMockViewportWidth(375));
 
@@ -1642,18 +1652,9 @@ describe("Sidebar ungroup drag target", () => {
 
   it("does not mount the mobile strip during a desktop drag", async () => {
     setMockViewportWidth(1024);
-    projectsMock.push("Sprint 42");
-    seedPins(["conv_desktop_filed"]);
-    mockConversations([
-      conv("conv_desktop_filed", "Claude Code", {
-        labels: { omni_project: "Sprint 42" },
-      }),
-    ]);
-    renderSidebar();
+    const row = renderPinnedFiledSession("conv_desktop_filed");
 
-    const row = screen.getByRole("link", { name: "conv_desktop_filed" }).closest("li")!;
     startMouseDrag(row);
-
     await waitFor(() => expect(screen.getAllByText("conv_desktop_filed")).toHaveLength(2));
     expect(screen.queryByTestId("sidebar-ungroup-drop-zone")).toBeNull();
 
@@ -1661,38 +1662,21 @@ describe("Sidebar ungroup drag target", () => {
   });
 
   it("mounts the strip during a mobile filed-session drag", async () => {
-    projectsMock.push("Sprint 42");
-    seedPins(["conv_mobile_filed"]);
-    mockConversations([
-      conv("conv_mobile_filed", "Claude Code", {
-        labels: { omni_project: "Sprint 42" },
-      }),
-    ]);
-    renderSidebar();
+    const row = renderPinnedFiledSession("conv_mobile_filed");
 
-    const row = screen.getByRole("link", { name: "conv_mobile_filed" }).closest("li")!;
     startMouseDrag(row);
-
     expect(await screen.findByTestId("sidebar-ungroup-drop-zone")).toBeInTheDocument();
     fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
   });
 
   it("ungroups and unpins a pinned project session dropped on the bottom strip", async () => {
     mockSidebarDropLayout();
-    projectsMock.push("Sprint 42");
-    seedPins(["conv_pinned_filed"]);
-    mockConversations([
-      conv("conv_pinned_filed", "Claude Code", {
-        labels: { omni_project: "Sprint 42" },
-      }),
-    ]);
-    renderSidebar();
+    const pinnedRow = renderPinnedFiledSession("conv_pinned_filed");
 
-    const pinnedRow = screen.getByRole("link", { name: "conv_pinned_filed" }).closest("li")!;
     startMouseDrag(pinnedRow);
     const dropZone = await screen.findByTestId("sidebar-ungroup-drop-zone");
 
-    moveMouseOverUngroupTarget();
+    moveMouseTo(280);
     await waitFor(() => expect(dropZone).toHaveClass("bg-[var(--sidebar-active)]"));
     fireEvent.mouseUp(document, { button: 0, clientX: 120, clientY: 280 });
 
@@ -1705,14 +1689,8 @@ describe("Sidebar ungroup drag target", () => {
 
   it("remeasures a strip that moves without resizing", async () => {
     const layout = mockShiftingUngroupLayout();
-    projectsMock.push("Source");
-    seedPins(["conv_shifted"]);
-    mockConversations([
-      conv("conv_shifted", "Claude Code", { labels: { omni_project: "Source" } }),
-    ]);
-    renderSidebar();
+    const row = renderPinnedFiledSession("conv_shifted", "Source");
 
-    const row = screen.getByRole("link", { name: "conv_shifted" }).closest("li")!;
     startMouseDrag(row);
     const strip = await screen.findByTestId("sidebar-ungroup-drop-zone");
     const project = screen.getByTestId("sidebar-project-drop-zone");
@@ -1720,13 +1698,13 @@ describe("Sidebar ungroup drag target", () => {
     await act(async () => {
       layout.shift();
       notifyResizeObservers(project);
+      // dnd-kit debounces its resize-driven remeasure by 25ms.
       await new Promise((resolve) => {
         setTimeout(resolve, 35);
       });
     });
 
-    fireEvent.mouseMove(document, { buttons: 1, clientX: 120, clientY: 379 });
-    fireEvent.mouseMove(document, { buttons: 1, clientX: 120, clientY: 380 });
+    moveMouseTo(380);
     await waitFor(() => expect(strip).toHaveClass("bg-[var(--sidebar-active)]"));
     fireEvent.mouseUp(document, { button: 0, clientX: 120, clientY: 380 });
 
@@ -1736,16 +1714,7 @@ describe("Sidebar ungroup drag target", () => {
 
   it("completes an ungroup drop through the touch sensor", async () => {
     mockSidebarDropLayout();
-    projectsMock.push("Sprint 42");
-    seedPins(["conv_touch_filed"]);
-    mockConversations([
-      conv("conv_touch_filed", "Claude Code", {
-        labels: { omni_project: "Sprint 42" },
-      }),
-    ]);
-    renderSidebar();
-
-    const row = screen.getByRole("link", { name: "conv_touch_filed" }).closest("li")!;
+    const row = renderPinnedFiledSession("conv_touch_filed");
     const start = touchAt(row, 20);
     fireEvent.touchStart(row, {
       touches: [start],
