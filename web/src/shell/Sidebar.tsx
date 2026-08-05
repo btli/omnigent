@@ -2102,19 +2102,28 @@ function SectionHeader({
   /** Suppresses the context menu (bulk-selection mode owns the rows). */
   contextMenuDisabled?: boolean;
 }) {
-  // A long-press opens the context menu off Radix's pointerdown timer, but the
-  // trailing pointerup still produces a click — which would collapse/expand the
-  // folder under the just-opened menu. Swallow exactly that click: arm on open,
-  // and re-clear on the next pointerdown so a later plain click still toggles.
+  // A long-press opens the menu mid-gesture and its trailing click would toggle
+  // the folder; a mouse right-click or keyboard Shift+F10 leaves no such click.
   const swallowClickRef = useRef(false);
+  // True while a pointer that could still long-press is down. The non-mouse gate
+  // and the move/up/cancel clears below mirror Radix's own long-press timer.
+  const longPressPointerRef = useRef(false);
+
+  function clearLongPressPointer() {
+    longPressPointerRef.current = false;
+  }
 
   const button = (
     <button
       type="button"
       aria-expanded={!collapsed}
-      onPointerDown={() => {
+      onPointerDown={(event) => {
         swallowClickRef.current = false;
+        longPressPointerRef.current = event.pointerType !== "mouse";
       }}
+      onPointerMove={clearLongPressPointer}
+      onPointerUp={clearLongPressPointer}
+      onPointerCancel={clearLongPressPointer}
       onClick={() => {
         if (swallowClickRef.current) {
           swallowClickRef.current = false;
@@ -2192,9 +2201,10 @@ function SectionHeader({
       {contextMenu && !contextMenuDisabled ? (
         <ContextMenu
           onOpenChange={(open) => {
-            // Long-press opens mid-gesture; swallow the trailing click so the
-            // folder doesn't also toggle. Mouse right-click never clicks.
-            if (open) swallowClickRef.current = true;
+            if (open) {
+              swallowClickRef.current = longPressPointerRef.current;
+              longPressPointerRef.current = false;
+            }
           }}
         >
           <ContextMenuTrigger asChild>{button}</ContextMenuTrigger>
