@@ -17,10 +17,9 @@ import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 
 // Controllable rename mutation so the double-click test can assert the
-// committed title was forwarded to the PATCH. `isMobile` toggles the mocked
-// `useIsMobileViewport` so a test can render the row on a mobile viewport (the
-// project flyout is disabled there). Declared via vi.hoisted so the vi.mock
-// factories (hoisted above imports) can reference them.
+// committed title was forwarded to the PATCH. The media-query hooks use
+// separate flags so viewport layout and touch capability can vary independently.
+// Declared via vi.hoisted so their mock factories can reference them.
 const mocks = vi.hoisted(() => {
   // Tiny reactive store for the server-authoritative pinned set, so a quick-pin
   // click re-renders the sidebar (mirrors the real query's refetch). Holds ids;
@@ -47,6 +46,7 @@ const mocks = vi.hoisted(() => {
   return {
     rename: { mutate: vi.fn() },
     isMobile: false,
+    hasCoarsePointer: false,
     // Projects surfaced by the picker + the move-to-project mutation, so the
     // mobile in-place project view test can assert both the list and the pick.
     projects: [] as string[],
@@ -87,6 +87,10 @@ vi.mock("@dnd-kit/core", async (importOriginal) => {
 // flips `mocks.isMobile` for the duration of that case.
 vi.mock("@/hooks/useIsMobileViewport", () => ({
   useIsMobileViewport: () => mocks.isMobile,
+}));
+
+vi.mock("@/hooks/useCoarsePointer", () => ({
+  useCoarsePointer: () => mocks.hasCoarsePointer,
 }));
 
 vi.mock("@/hooks/useConversations", () => ({
@@ -294,6 +298,7 @@ beforeEach(() => {
   mocks.archiveOverride = null;
   // Default every test to the desktop viewport; the mobile flyout test opts in.
   mocks.isMobile = false;
+  mocks.hasCoarsePointer = false;
   useConvMock.mockReset();
   localStorage.clear();
   // Reset the server pinned set between tests.
@@ -1032,6 +1037,10 @@ function endTouch(x = 100, y = 100) {
 }
 
 describe("touch gesture arbitration", () => {
+  beforeEach(() => {
+    mocks.hasCoarsePointer = true;
+  });
+
   function advanceHold(ms = ROW_GESTURE_HOLD_MS) {
     act(() => vi.advanceTimersByTime(ms));
   }
@@ -1156,22 +1165,35 @@ describe("touch gesture arbitration", () => {
     expect(row).not.toHaveClass("opacity-40");
   });
 
-  it("arms after ordinary four-pixel hold drift", () => {
+  it("arms after ordinary sixteen-pixel hold drift", () => {
     vi.useFakeTimers();
     mocks.isMobile = true;
     renderSidebar();
     const { row } = touchTarget();
 
     startTouch();
-    moveTouch(104, 100);
+    moveTouch(100, 116);
     advanceHold();
 
     expect(row).toHaveClass("scale-[1.01]");
-    endTouch(104, 100);
+    endTouch(100, 116);
   });
 
-  it("does not arm a hold on a finger that is still creeping", () => {
-    // A slow scroll drifts under the 12px scroll threshold but is not holding
+  it("arms at exactly 20px of hold drift", () => {
+    vi.useFakeTimers();
+    renderSidebar();
+    const { row } = touchTarget();
+
+    startTouch();
+    moveTouch(112, 116);
+    advanceHold();
+
+    expect(row).toHaveClass("scale-[1.01]");
+    endTouch(112, 116);
+  });
+
+  it("rejects 21px of hold drift below the scroll boundary", () => {
+    // A slow scroll drifts under the 25px scroll threshold but is not holding
     // still. Arming here would capture the pointer and hand the gesture to
     // dnd-kit, which preventDefaults the scroll away for the rest of the touch.
     vi.useFakeTimers();
@@ -1180,22 +1202,22 @@ describe("touch gesture arbitration", () => {
     const { row } = touchTarget();
 
     startTouch();
-    // 3px per 100ms: past the 8px hold tolerance by the 400ms mark, but still
-    // under the 12px that would have resolved it to scroll outright.
-    for (let step = 1; step <= 4; step += 1) {
-      advanceHold(100);
-      moveTouch(100, 100 + step * 3);
+    // Reach 21px before the timer: past hold tolerance, still short of scroll.
+    for (let step = 1; step <= 3; step += 1) {
+      advanceHold(90);
+      moveTouch(100, 100 + step * 7);
     }
+    advanceHold(130);
 
     expect(row).not.toHaveClass("scale-[1.01]");
     expect(row).not.toHaveClass("opacity-40");
-    endTouch(100, 112);
+    endTouch(100, 121);
     expect(screen.queryByTestId("rename-conversation")).toBeNull();
   });
 
   it("leaves a normal-speed vertical flick to the list scroller", () => {
     // Scrolling must stay native even though the finger starts on a row: the
-    // flick clears 12px within a frame, long before the hold could arm.
+    // flick clears 25px within a frame, long before the hold could arm.
     vi.useFakeTimers();
     mocks.isMobile = true;
     renderSidebar();
@@ -1203,12 +1225,12 @@ describe("touch gesture arbitration", () => {
 
     startTouch();
     advanceHold(16);
-    expect(moveTouch(100, 116)).toBe(true);
+    expect(moveTouch(100, 125)).toBe(true);
     advanceHold(600);
 
     expect(row).not.toHaveClass("scale-[1.01]");
     expect(row).not.toHaveClass("opacity-40");
-    endTouch(100, 116);
+    endTouch(100, 125);
     expect(screen.queryByTestId("rename-conversation")).toBeNull();
   });
 
@@ -1242,34 +1264,33 @@ describe("touch gesture arbitration", () => {
     const { row } = touchTarget();
 
     startTouch();
-    expect(moveTouch(100, 120)).toBe(true);
+    expect(moveTouch(100, 125)).toBe(true);
     advanceHold(ROW_GESTURE_HOLD_MS + 1);
-    endTouch(100, 120);
+    endTouch(100, 125);
 
     expect(row).not.toHaveClass("opacity-40");
     expect(screen.queryByTestId("rename-conversation")).toBeNull();
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
   });
 
-  it("assigns vertical-dominant travel exactly at the Euclidean boundary to scroll", () => {
+  it("assigns vertical-dominant travel exactly at the 25px boundary to scroll", () => {
     vi.useFakeTimers();
     mocks.isMobile = true;
     renderSidebar();
     const { row } = touchTarget();
 
-    // Exactly 12px of travel, so it sits on the activation boundary itself
-    // rather than safely past it. Integer deltas keep it off a float edge.
+    // The 15-20-25 triangle pins the Euclidean boundary with integer deltas.
     startTouch();
-    expect(moveTouch(100, 112)).toBe(true);
+    expect(moveTouch(115, 120)).toBe(true);
 
     // Decided here, at move time — not later by the hold's drift check. Turning
     // back onto the horizontal axis must stay inert, which it only does if the
     // gesture already resolved to scroll.
-    moveTouch(60, 112);
+    moveTouch(60, 120);
     expect(row.querySelector<HTMLElement>("div.relative")?.style.marginRight).toBe("");
 
     advanceHold(ROW_GESTURE_HOLD_MS + 1);
-    endTouch(60, 112);
+    endTouch(60, 120);
 
     expect(row).not.toHaveClass("opacity-40");
     expect(screen.queryByTestId("rename-conversation")).toBeNull();
@@ -1299,7 +1320,7 @@ describe("touch gesture arbitration", () => {
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
   });
 
-  it("hands travel to the swipe as soon as the horizontal axis clears 12px", () => {
+  it("keeps 24px below the explicit scroll boundary pending", () => {
     vi.useFakeTimers();
     writeSwipeActions({ left: "archive", right: "archive" });
     mocks.isMobile = true;
@@ -1307,17 +1328,34 @@ describe("touch gesture arbitration", () => {
     const { row } = touchTarget();
     const surface = row.querySelector<HTMLElement>("div.relative");
 
-    // (10,8) is 12.8px of travel but only 10px horizontally, so it is scroll,
-    // not swipe: the axis threshold governs, not the Euclidean length. Pairs
-    // with the boundary case above to pin both halves of the rule.
+    // The browser normally claims this through pan-y. Without pointercancel,
+    // the explicit fallback must remain pending until the exact 25px boundary.
     startTouch();
-    moveTouch(110, 108);
+    moveTouch(100, 124);
     expect(surface?.style.marginRight).toBe("");
-    advanceHold(ROW_GESTURE_HOLD_MS + 1);
-    endTouch(110, 108);
+    moveTouch(10, 100);
+    expect(surface?.style.marginRight).not.toBe("");
+    endTouch(10, 100);
 
-    expect(mocks.archive.mutate).not.toHaveBeenCalled();
-    expect(row).not.toHaveClass("opacity-40");
+    expect(mocks.archive.mutate).toHaveBeenCalledWith(
+      { id: "conv_1", archived: true },
+      expect.anything(),
+    );
+  });
+
+  it("keeps 11px horizontal travel below swipe activation", () => {
+    vi.useFakeTimers();
+    writeSwipeActions({ left: "archive", right: "archive" });
+    renderSidebar();
+    const { row } = touchTarget();
+
+    startTouch();
+    moveTouch(111, 100);
+    const surface = row.querySelector<HTMLElement>("div.relative");
+    expect(surface?.style.marginLeft).toBe("");
+    advanceHold();
+    expect(row).toHaveClass("scale-[1.01]");
+    endTouch(111, 100);
   });
 
   it("assigns exactly 12px horizontal travel to swipe", () => {
@@ -1337,6 +1375,21 @@ describe("touch gesture arbitration", () => {
 
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
     expect(screen.queryByTestId("rename-conversation")).toBeNull();
+  });
+
+  it("arms touch drag on a wide viewport with a coarse pointer", () => {
+    vi.useFakeTimers();
+    mocks.isMobile = false;
+    renderSidebar();
+    const { row } = touchTarget();
+
+    startTouch();
+    advanceHold();
+    expect(row).toHaveClass("scale-[1.01]");
+    moveTouch(101, 100);
+
+    expect(row).toHaveClass("opacity-40");
+    endTouch(101, 100);
   });
 
   it("leaves a short still press as plain link activation", () => {
@@ -1516,6 +1569,10 @@ describe("touch gesture arbitration", () => {
 });
 
 describe("touch swipe actions", () => {
+  beforeEach(() => {
+    mocks.hasCoarsePointer = true;
+  });
+
   // jsdom has no real touch, so drive the gesture with pointer events. The row
   // recognizer gates on a primary touch pointer; pair each pointer event with
   // its touch event so the real dnd-kit activator also sees the sequence.
@@ -1544,6 +1601,18 @@ describe("touch swipe actions", () => {
     expect(mocks.stopSession.mutate).not.toHaveBeenCalled();
     // Archive never routes through delete.
     expect(mocks.del.mutate).not.toHaveBeenCalled();
+  });
+
+  it("commits on a wide viewport with a coarse pointer", () => {
+    mocks.isMobile = false;
+    renderSidebar();
+
+    swipeRow(-90);
+
+    expect(mocks.archive.mutate).toHaveBeenCalledWith(
+      { id: "conv_1", archived: true },
+      expect.anything(),
+    );
   });
 
   it("opens the delete confirm dialog (no immediate delete) when swiping the delete direction", () => {
@@ -1747,12 +1816,21 @@ describe("touch swipe actions", () => {
     );
   });
 
-  it("ignores swipes on desktop (non-touch viewport)", () => {
-    // Desktop (default isMobile=false) leaves the gesture disabled entirely.
+  it("ignores touch gestures without a coarse pointer", () => {
+    vi.useFakeTimers();
+    mocks.hasCoarsePointer = false;
     renderSidebar();
 
     swipeRow(-90);
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
+
+    const { row } = touchTarget();
+    startTouch();
+    act(() => vi.advanceTimersByTime(ROW_GESTURE_HOLD_MS));
+    moveTouch(101, 100);
+    expect(row).not.toHaveClass("scale-[1.01]");
+    expect(row).not.toHaveClass("opacity-40");
+    endTouch(101, 100);
   });
 
   it("ignores non-touch pointers (pen/stylus/mouse) on mobile", () => {
