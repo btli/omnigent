@@ -15,6 +15,10 @@ import type { Conversation } from "@/hooks/useConversations";
 import { ROW_GESTURE_HOLD_MS } from "@/hooks/useRowGesture";
 import { notifyResizeObservers, resetMockViewportWidth, setMockViewportWidth } from "@/test-setup";
 
+// Row gestures gate on a coarse pointer; the global matchMedia stub reports
+// none, which would leave the touch-drop tests with a disabled recognizer.
+vi.mock("@/hooks/useCoarsePointer", () => ({ useCoarsePointer: () => true }));
+
 // Project mocks are declared via vi.hoisted so they exist before the hoisted
 // vi.mock factory runs. projectsMock is mutated per-test to drive project
 // sections; moveToProjectSpy captures kebab-menu "Change project" calls.
