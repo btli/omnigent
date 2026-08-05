@@ -79,7 +79,9 @@ class OidcLoginManager {
                 val ticket = requestTicket(origin)
                 authLog("cli-login -> ${if (ticket != null) "ticket ok" else "FAILED"}")
                 if (ticket != null) {
-                    main.post { launchTab(activity, origin + ticket.loginUrl) }
+                    main.post {
+                        if (!current.cancelled.get()) launchTab(activity, origin + ticket.loginUrl)
+                    }
                     token = pollForToken(origin, ticket.id)
                     authLog(
                         "poll -> ${if (token != null) "token (len=${token.length})" else "no token"}",

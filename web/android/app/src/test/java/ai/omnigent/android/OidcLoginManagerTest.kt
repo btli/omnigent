@@ -98,4 +98,26 @@ class OidcLoginManagerTest {
 
         assertNull(delivered)
     }
+
+    @Test
+    fun `cancel before posted browser launch suppresses the stale login page`() {
+        val activity = activity()
+        val manager = OidcLoginManager()
+        val polling = CountDownLatch(1)
+        val releasePoll = CountDownLatch(1)
+        manager.requestTicket = { OidcLoginManager.Ticket("ticket-1", "/auth/login?t=1") }
+        manager.pollForToken = { _, _ ->
+            polling.countDown()
+            runCatching { releasePoll.await(2, TimeUnit.SECONDS) }
+            null
+        }
+
+        assertTrue(manager.start(activity, origin) { _, _ -> })
+        assertTrue(polling.await(2, TimeUnit.SECONDS))
+        manager.cancel()
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertNull(shadowOf(activity).nextStartedActivity)
+        releasePoll.countDown()
+    }
 }
