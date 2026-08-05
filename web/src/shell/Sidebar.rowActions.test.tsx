@@ -1197,6 +1197,16 @@ describe("touch gesture arbitration", () => {
     expect(afterRelease.defaultPrevented).toBe(false);
   });
 
+  it("renders the row link non-draggable so a stationary long-press survives", () => {
+    // Links are natively draggable; Chrome Android hands a stationary
+    // long-press on one to native drag with an unconditional pointercancel —
+    // fired before the contextmenu event, so no preventDefault can save the
+    // pointer stream. draggable=false removes that claimant entirely.
+    renderSidebar();
+    const rowLink = screen.getByRole("link", { name: /My Session/ });
+    expect(rowLink).toHaveAttribute("draggable", "false");
+  });
+
   it("leaves the contextmenu alone when no gesture owns the touch", () => {
     // Desktop right-click arrives with the recognizer idle — it must reach
     // Radix untouched or the mouse context menu dies.
