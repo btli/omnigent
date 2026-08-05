@@ -156,8 +156,7 @@ export function AppShell() {
   const [sidebarOpen, setSidebarOpen] = useState(initialSidebarOpen);
   // Callback refs (not useRef): the band effect must re-run once the layout attaches.
   const [chatColumn, setChatColumn] = useState<HTMLElement | null>(null);
-  const [contentRegion, setContentRegion] = useState<HTMLElement | null>(null);
-  useNativeServerSwitcherBand(chatColumn, contentRegion);
+  useNativeServerSwitcherBand(chatColumn, sidebarOpen && isMobileViewport());
   // ?sidebar=open surfaces the session list on phone-width shells where the
   // sidebar is closed by default — the destination for a "N sessions need
   // your attention" notification tap, which would otherwise land on a bare
@@ -1279,7 +1278,7 @@ export function AppShell() {
             {/* Content region (everything right of the sidebar): a relative
           flex row holding the chat+workspace group and the push panels
           as siblings. */}
-            <div ref={setContentRegion} className="relative flex min-h-0 min-w-0 flex-1">
+            <div className="relative flex min-h-0 min-w-0 flex-1">
               {/* Chat + workspace group. The full-width header overlay is
             scoped to this group, so it spans the chat *and* the right
             workspace card but never reaches over the push panels (which
