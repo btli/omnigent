@@ -145,6 +145,7 @@ import {
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
 import { cn } from "@/lib/utils";
+import { useCoarsePointer } from "@/hooks/useCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
@@ -1207,6 +1208,7 @@ function ConversationList({
   getVisibleIdsRef,
 }: ConversationListProps) {
   const isMobile = useIsMobileViewport();
+  const hasCoarsePointer = useCoarsePointer();
   // Viewer id for the owner-based My/Shared split below.
   const viewerId = useViewerId();
   // Host metadata is shared by every row tooltip. Resolve it once at the list
@@ -1931,8 +1933,12 @@ function ConversationList({
               </>
             )}
             {/* Keep the transient strip last so mounting it never shifts a row
-            under the pointer that is already dragging it. */}
-            {isMobile && !showShared && activeDrag?.project != null && <UngroupDropZone />}
+            under the pointer that is already dragging it. Mounted for narrow
+            viewports AND any coarse-pointer device: a wide touch layout has
+            ChatsDropZone too, but no hover to advertise it as a target. */}
+            {(isMobile || hasCoarsePointer) && !showShared && activeDrag?.project != null && (
+              <UngroupDropZone />
+            )}
           </div>
         </RowEditHoldContext.Provider>
         {/* The dragged row's preview follows the pointer (rendered in a portal),
@@ -2013,8 +2019,11 @@ function UngroupDropZone() {
     <div
       ref={setNodeRef}
       data-testid="sidebar-ungroup-drop-zone"
+      // Sticky, not inline: as the list's last child it would sit below the
+      // fold on any screenful of sessions — pinned to the scroll viewport's
+      // bottom it stays reachable for the whole drag.
       className={cn(
-        "flex items-center gap-1.5 rounded-md border border-dashed border-border px-2 py-1.5 text-muted-foreground text-xs transition-colors",
+        "sticky bottom-0 z-10 flex items-center gap-1.5 rounded-md border border-dashed border-border bg-card-solid px-2 py-1.5 text-muted-foreground text-xs transition-colors",
         isOver && cn(DROP_TARGET_HIGHLIGHT, "text-foreground"),
       )}
     >

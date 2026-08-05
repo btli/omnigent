@@ -14,6 +14,13 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import { notifyResizeObservers, resetMockViewportWidth, setMockViewportWidth } from "@/test-setup";
 
+// Controllable coarse-pointer capability; the global matchMedia stub answers
+// false for non-width queries, so tests default to a fine pointer.
+const coarsePointer = vi.hoisted(() => ({ current: false }));
+vi.mock("@/hooks/useCoarsePointer", () => ({
+  useCoarsePointer: () => coarsePointer.current,
+}));
+
 // Project mocks are declared via vi.hoisted so they exist before the hoisted
 // vi.mock factory runs. projectsMock is mutated per-test to drive project
 // sections; moveToProjectSpy captures kebab-menu "Change project" calls.
@@ -1665,8 +1672,27 @@ describe("Sidebar ungroup drag target", () => {
     const row = renderPinnedFiledSession("conv_mobile_filed");
 
     startMouseDrag(row);
-    expect(await screen.findByTestId("sidebar-ungroup-drop-zone")).toBeInTheDocument();
+    const strip = await screen.findByTestId("sidebar-ungroup-drop-zone");
+    // Pinned to the scroll viewport's bottom — inline at the list end it sits
+    // below the fold on any screenful of sessions.
+    expect(strip).toHaveClass("sticky", "bottom-0");
     fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
+  });
+
+  it("mounts the strip during a wide-viewport drag on a coarse-pointer device", async () => {
+    // A wide touch layout has ChatsDropZone too, but no hover to advertise it
+    // as a target — the strip must still appear there.
+    coarsePointer.current = true;
+    try {
+      setMockViewportWidth(1024);
+      const row = renderPinnedFiledSession("conv_wide_touch_filed");
+
+      startMouseDrag(row);
+      expect(await screen.findByTestId("sidebar-ungroup-drop-zone")).toBeInTheDocument();
+      fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
+    } finally {
+      coarsePointer.current = false;
+    }
   });
 
   it("ungroups and unpins a pinned project session dropped on the bottom strip", async () => {
