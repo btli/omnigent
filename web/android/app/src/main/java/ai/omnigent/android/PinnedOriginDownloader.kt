@@ -153,12 +153,15 @@ internal class PinnedOriginDownloadWorker(
 ) : Worker(context, workerParameters) {
     private val storage = DownloadStorage(applicationContext)
     private val notifications = DownloadNotificationManager(applicationContext)
+    private val safeSuggestedName by lazy {
+        storage.failed(inputData.getString(KEY_SUGGESTED_NAME) ?: FALLBACK_NAME).name
+    }
 
     @Volatile
     private var activeConnection: HttpURLConnection? = null
 
     override fun doWork(): Result {
-        val suggestedName = inputData.getString(KEY_SUGGESTED_NAME) ?: FALLBACK_NAME
+        val suggestedName = safeSuggestedName
         // Every run start increments runAttemptCount — retries, stops, and crash
         // recoveries alike — so this gate bounds restart loops the stop counter
         // cannot see, like repeated process deaths mid-transfer.
@@ -262,7 +265,7 @@ internal class PinnedOriginDownloadWorker(
 
     override fun getForegroundInfo(): ForegroundInfo =
         notifications.foregroundInfo(
-            inputData.getString(KEY_SUGGESTED_NAME) ?: FALLBACK_NAME,
+            safeSuggestedName,
             id,
         )
 
@@ -293,7 +296,8 @@ internal class PinnedOriginDownloadWorker(
         val url = inputData.getString(KEY_URL) ?: return null
         val pinnedOrigin = inputData.getString(KEY_PINNED_ORIGIN) ?: return null
         val userAgent = inputData.getString(KEY_USER_AGENT) ?: return null
-        val suggestedName = inputData.getString(KEY_SUGGESTED_NAME) ?: return null
+        inputData.getString(KEY_SUGGESTED_NAME) ?: return null
+        val suggestedName = safeSuggestedName
         return DownloadInput(
             url,
             pinnedOrigin,
@@ -359,7 +363,6 @@ internal class PinnedOriginDownloadWorker(
 
     private fun clearStopCount() {
         synchronized(STOP_COUNT_LOCK) {
-            if (isStopped) return
             applicationContext
                 .getSharedPreferences(STOP_COUNT_PREFERENCES, Context.MODE_PRIVATE)
                 .edit()
