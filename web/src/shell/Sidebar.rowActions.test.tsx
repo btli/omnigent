@@ -355,6 +355,22 @@ describe("quick pin/unpin hover button", () => {
     expect(rowLink).toHaveClass("md:pr-14");
   });
 
+  it("keeps the menu Pin item at desktop widths when a coarse pointer exists", () => {
+    // Desktop hides the menu Pin item behind the hover-revealed quick-pin
+    // button, but a touch device has no hover at any width — the menu must
+    // keep carrying Pin there or wide touch devices cannot pin at all.
+    mocks.hasCoarsePointer = true;
+    renderSidebar();
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    expect(screen.getByTestId("pin-conversation")).not.toHaveClass("md:hidden");
+  });
+
+  it("hides the menu Pin item at desktop widths without a coarse pointer", () => {
+    renderSidebar();
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    expect(screen.getByTestId("pin-conversation")).toHaveClass("md:hidden");
+  });
+
   it("sizes the project-folder header controls to match the session-row kebab", () => {
     // The folder-header pencil + kebab share the right-edge column with the
     // session-row kebab, so they must be the same compact `icon-xs` (size-6)
