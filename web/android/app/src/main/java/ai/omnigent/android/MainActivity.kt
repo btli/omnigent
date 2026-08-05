@@ -24,6 +24,7 @@ import android.widget.PopupMenu
 import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
@@ -65,6 +66,15 @@ class MainActivity : AppCompatActivity() {
     // Origin the pending path belongs to; null = the pinned origin (the
     // notification-tap path). A pending path never flushes cross-origin.
     private var pendingNavigateOrigin: String? = null
+
+    // Consent-approved server URL awaiting its first successful load; only
+    // then does it become a trusted recent (an unreachable or hostile link
+    // target must never be remembered).
+    private var pendingPersistUrl: String? = null
+
+    // The currently showing unknown-server consent dialog, if any — dismissed
+    // in onDestroy so a destroyed Activity never leaks its window.
+    private var deepLinkDialog: AlertDialog? = null
     private var lastInsets: Insets? = null
     private var pageLoaded = false
     private var bridgeTransportInstalled = false
@@ -125,7 +135,10 @@ class MainActivity : AppCompatActivity() {
         // unparseable link must NOT bypass the connect-screen gate, or a
         // fresh install with a malformed link loads nothing and never
         // routes anywhere.
-        val coldDeepLink = intent?.takeIf { it.action == Intent.ACTION_VIEW }?.data?.let(DeepLink::parse)
+        val coldDeepLink =
+            intent?.takeIf { it.action == Intent.ACTION_VIEW }?.data?.let(
+                DeepLink::parse,
+            )
         if (!store.hasServer() && coldDeepLink == null) {
             // No server configured yet — send the user to the connect screen first.
             startActivity(Intent(this, ConnectActivity::class.java))
@@ -500,6 +513,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        // Dismiss an open consent dialog first: it holds a window tied to this
+        // Activity, and no listener fires on dismiss() (only setOnCancelListener
+        // does), so the link is simply left unanswered — no accept path, no
+        // second finishDeepLink() call (moot anyway; this instance is dying).
+        deepLinkDialog?.dismiss()
+        deepLinkDialog = null
         // Unblock a pending file input / mic request, then release WebView + worker.
         pendingFileCallback?.onReceiveValue(null)
         pendingFileCallback = null
@@ -548,6 +567,7 @@ class MainActivity : AppCompatActivity() {
         serverUrl: String,
         newOrigin: String,
     ) {
+        pendingPersistUrl = null // superseded: a newer switch owns persistence now
         loginManager.cancel() // a login for the old origin must not outlive the switch
         removeBridge()
         pinnedOrigin = newOrigin
@@ -640,6 +660,13 @@ class MainActivity : AppCompatActivity() {
             webView.clearHistory()
         }
         pageLoaded = true
+        // First successful load of a consent-approved server: only now does it
+        // become the stored current server / a trusted recent.
+        pendingPersistUrl?.takeIf { originOf(it) == pinnedOrigin }?.let {
+            ServerStore(this).connect(it)
+            (switchButton as? TextView)?.text = hostLabelOf(it)
+        }
+        pendingPersistUrl = null
         loginAttempts = 0 // reached a pinned-origin page — we're past the login redirect
         flushPendingActivation()
         emitInsets()
@@ -676,42 +703,94 @@ class MainActivity : AppCompatActivity() {
         if (processingDeepLink) return
         val link = deepLinkQueue.removeFirstOrNull() ?: return
         processingDeepLink = true
+        // Defaults to true so a throw from inside the `when` below (before its
+        // result assigns) still finishes synchronously in the `finally` —
+        // exception-safety must never depend on how far the branch got.
+        var synchronous = true
         // Recursion, not a loop: finishDeepLink() re-enters processNextDeepLink()
         // once this item resolves, so stack depth tracks queue depth — fine for
         // the realistic (tiny, human-tap-driven) burst sizes here.
         try {
             val store = ServerStore(this)
             val known =
-                (listOf(store.currentServerUrl()).filter { store.hasServer() } + store.recentServers())
-                    .firstOrNull { originOf(it) == link.origin }
-            when {
-                link.origin == pinnedOrigin -> {
-                    pendingNavigatePath = link.path
-                    pendingNavigateOrigin = link.origin
-                    if (pageLoaded) flushPendingActivation()
-                }
+                (
+                    listOf(store.currentServerUrl()).filter { store.hasServer() } +
+                        store.recentServers()
+                ).firstOrNull { originOf(it) == link.origin }
+            synchronous =
+                when {
+                    link.origin == pinnedOrigin -> {
+                        pendingNavigatePath = link.path
+                        pendingNavigateOrigin = link.origin
+                        if (pageLoaded) flushPendingActivation()
+                        true
+                    }
 
-                known != null -> {
-                    store.connect(known)
-                    pendingNavigatePath = link.path
-                    pendingNavigateOrigin = link.origin
-                    reloadWithNewServer(known, link.origin)
-                }
+                    known != null -> {
+                        store.connect(known)
+                        pendingNavigatePath = link.path
+                        pendingNavigateOrigin = link.origin
+                        reloadWithNewServer(known, link.origin)
+                        true
+                    }
 
-                else -> {
-                    // Unknown server: consent lands in the next change; drop for now.
+                    else -> {
+                        // Unknown server: async consent dialog. It calls
+                        // finishDeepLink() itself once answered, so the queue
+                        // must not advance here.
+                        showDeepLinkConsent(link)
+                        false
+                    }
                 }
-            }
         } finally {
-            // Always resets and advances, even if a branch above threw — a stuck
-            // `true` here would silently strand every later queued link.
-            finishDeepLink()
+            if (synchronous) finishDeepLink()
         }
     }
 
     private fun finishDeepLink() {
         processingDeepLink = false
         processNextDeepLink()
+    }
+
+    /** Consent gate for a link to a never-connected server: pinning a new
+     *  origin grants it the bridge and notifications, so it needs an explicit
+     *  yes. No network request or persistence happens before Open. */
+    private fun showDeepLinkConsent(link: DeepLink) {
+        var answered = false
+        val resolve = { accepted: Boolean ->
+            if (!answered) {
+                answered = true
+                deepLinkDialog = null
+                // finishDeepLink() must run even if a step below throws (an
+                // unexpected reload/store failure), or processingDeepLink stays
+                // stuck true and wedges every later queued link forever.
+                try {
+                    if (accepted) {
+                        // reload first: it clears any superseded pendingPersistUrl,
+                        // then this link's own pending state is installed.
+                        reloadWithNewServer(link.origin, link.origin)
+                        pendingNavigatePath = link.path
+                        pendingNavigateOrigin = link.origin
+                        pendingPersistUrl = link.origin
+                    } else if (!ServerStore(this).hasServer()) {
+                        // Cold-start link was the only way in; fall back to setup.
+                        startActivity(Intent(this, ConnectActivity::class.java))
+                        finish()
+                    }
+                } finally {
+                    finishDeepLink()
+                }
+            }
+        }
+        deepLinkDialog =
+            AlertDialog
+                .Builder(this)
+                .setTitle(R.string.deep_link_consent_title)
+                .setMessage(getString(R.string.deep_link_consent_body, hostLabelOf(link.origin)))
+                .setPositiveButton(R.string.deep_link_consent_open) { _, _ -> resolve(true) }
+                .setNegativeButton(android.R.string.cancel) { _, _ -> resolve(false) }
+                .setOnCancelListener { resolve(false) } // Back key = Cancel
+                .show()
     }
 
     private fun navigatePathOf(intent: Intent?): String? =
