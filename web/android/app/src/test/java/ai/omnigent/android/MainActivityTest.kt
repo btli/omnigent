@@ -26,7 +26,9 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.widget.FrameLayout
 import android.widget.TextView
+import androidx.core.graphics.Insets
 import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.test.core.app.ApplicationProvider
 import org.junit.After
@@ -351,6 +353,26 @@ class MainActivityTest {
 
         assertTrue(recoveredActivity.isDestroyed)
         assertNotSame(recoveredActivity, controller.get())
+    }
+
+    @Test
+    fun `cutout-only safe area is published on every edge`() {
+        val cutout = Insets.of(11, 23, 31, 0)
+        val insets =
+            WindowInsetsCompat
+                .Builder()
+                .setInsets(WindowInsetsCompat.Type.displayCutout(), cutout)
+                .build()
+
+        val safeArea = systemSafeAreaInsets(insets)
+        assertEquals(cutout, safeArea)
+
+        val script = androidSafeAreaScript(safeArea, 1f)
+        assertTrue(script.contains("const top = '23.0px'"))
+        assertTrue(script.contains("const left = '11.0px'"))
+        assertTrue(script.contains("const right = '31.0px'"))
+        assertTrue(script.contains("setProperty('--omnigent-safe-left', left)"))
+        assertTrue(script.contains("setProperty('--omnigent-safe-right', right)"))
     }
 
     @Test
@@ -1880,7 +1902,8 @@ class MainActivityTest {
         return manager to releaseWorker
     }
 
-    private fun MainActivity.switchButton(): TextView = ReflectionHelpers.getField(this, "switchButton")
+    private fun MainActivity.switchButton(): TextView =
+        ReflectionHelpers.getField(this, "switchButton")
 
     private fun MainActivity.webView(): WebView = ReflectionHelpers.getField(this, "webView")
 
