@@ -165,7 +165,7 @@ export function useRowGesture({
       state.current = null;
       setDx(0);
       setPhase("idle");
-      if (cancelDrag && gesture?.phase === "drag") {
+      if (cancelDrag && gesture.phase === "drag") {
         gesture.sensorTarget.dispatchEvent(
           new Event("touchcancel", { bubbles: true, cancelable: true }),
         );
@@ -208,7 +208,7 @@ export function useRowGesture({
       suppressClick.current = false;
       if (event.pointerType !== "touch") return;
       if (!event.isPrimary) {
-        if (state.current) reset(true);
+        reset(true);
         return;
       }
       if (!enabled) return;
@@ -355,7 +355,7 @@ export function useRowGesture({
 
   const onTouchStart = useCallback(
     (event: ReactTouchEvent) => {
-      if (event.touches.length > 1 && state.current) reset(true);
+      if (event.touches.length > 1) reset(true);
     },
     [reset],
   );
@@ -381,7 +381,7 @@ export function useRowGesture({
   );
 
   useEffect(() => {
-    if (!enabled && state.current) reset(true);
+    if (!enabled) reset(true);
   }, [enabled, reset]);
 
   useEffect(() => registerRowGestureReset(reset), [reset]);
