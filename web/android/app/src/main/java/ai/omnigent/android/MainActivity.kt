@@ -646,7 +646,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** Run bridge-dependent work once a pinned-origin page has finished loading. */
-    private fun onPageReady(url: String?) {
+    private fun onPageReady(
+        url: String?,
+        mainFrameLoadFailed: Boolean,
+    ) {
         // Only a real pinned-origin load carries the injected facade — an error
         // page (chrome-error://) or a foreign redirect must NOT drain
         // pendingNavigatePath or push insets into a page that can't consume them.
@@ -660,13 +663,29 @@ class MainActivity : AppCompatActivity() {
             webView.clearHistory()
         }
         pageLoaded = true
-        // First successful load of a consent-approved server: only now does it
-        // become the stored current server / a trusted recent.
-        pendingPersistUrl?.takeIf { originOf(it) == pinnedOrigin }?.let {
-            ServerStore(this).connect(it)
-            (switchButton as? TextView)?.text = hostLabelOf(it)
+        if (mainFrameLoadFailed) {
+            // The pinned origin itself failed to load (DNS/TLS/connection
+            // error) — WebView reports this onPageFinished with the ORIGINAL
+            // url, not a chrome-error:// one, so it can't be told from `url`
+            // alone. A server that never actually loaded must never become a
+            // trusted recent, and a pending path aimed at it is stale — drop
+            // both rather than silently persist or replay against a broken
+            // origin. A retry of the same origin must succeed on its own
+            // merits before either is set again.
+            pendingPersistUrl = null
+            if (pendingNavigateOrigin == null || pendingNavigateOrigin == pinnedOrigin) {
+                pendingNavigatePath = null
+                pendingNavigateOrigin = null
+            }
+        } else {
+            // First successful load of a consent-approved server: only now does it
+            // become the stored current server / a trusted recent.
+            pendingPersistUrl?.takeIf { originOf(it) == pinnedOrigin }?.let {
+                ServerStore(this).connect(it)
+                (switchButton as? TextView)?.text = hostLabelOf(it)
+            }
+            pendingPersistUrl = null
         }
-        pendingPersistUrl = null
         loginAttempts = 0 // reached a pinned-origin page — we're past the login redirect
         flushPendingActivation()
         emitInsets()
