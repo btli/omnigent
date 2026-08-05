@@ -49,15 +49,14 @@ export function isSwipeAction(value: unknown): value is SwipeAction {
  */
 export function normalizeSwipeActions(value: unknown): SwipeActionPreferences {
   const obj = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
-  const normalizeDirection = (direction: SwipeDirection): SwipeAction => {
+  // A direction set to something unrecognized goes inert rather than inheriting
+  // the default, which would silently arm archive on a swipe meant to be safe.
+  function actionFor(direction: SwipeDirection): SwipeAction {
     const action = obj[direction];
     if (isSwipeAction(action)) return action;
     return Object.hasOwn(obj, direction) ? "none" : DEFAULT_SWIPE_ACTIONS[direction];
-  };
-  return {
-    left: normalizeDirection("left"),
-    right: normalizeDirection("right"),
-  };
+  }
+  return { left: actionFor("left"), right: actionFor("right") };
 }
 
 /**
