@@ -6,6 +6,7 @@ import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.webkit.RenderProcessGoneDetail
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -31,7 +32,7 @@ import android.webkit.WebViewClient
 class OmnigentWebViewClient(
     private val pinnedOrigin: () -> String?,
     private val shouldInjectBridgeAtPageReady: () -> Boolean,
-    private val onPageReady: (url: String?) -> Unit,
+    private val onPageReady: (url: String?, mainFrameLoadFailed: Boolean) -> Unit,
     private val onLoginRequired: () -> Unit,
     private val onRendererGone: (view: WebView, didCrash: Boolean) -> Unit,
     private val onNavigationStarted: () -> Unit = {},
@@ -42,12 +43,20 @@ class OmnigentWebViewClient(
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    // Set when the main frame's current load errors out (DNS/TLS/connection
+    // failure, etc.); reset on the next navigation. WebView still calls
+    // onPageFinished with the ORIGINAL url after such an error — never a
+    // chrome-error:// one — so callers can't tell success from failure from
+    // the url alone; this flag is the only signal.
+    private var mainFrameLoadFailed = false
+
     override fun onPageStarted(
         view: WebView,
         url: String?,
         favicon: Bitmap?,
     ) {
         super.onPageStarted(view, url, favicon)
+        mainFrameLoadFailed = false
 
         val origin = originOf(url)
         val scheme = url?.let { Uri.parse(it).scheme?.lowercase() }
@@ -104,6 +113,18 @@ class OmnigentWebViewClient(
         bounce(view, target)
     }
 
+    // request.isForMainFrame is only meaningful on this (API 23+, our floor
+    // is 28) overload — the deprecated int/String one can't distinguish a
+    // subframe (an embedded image, an iframe) failure from the page's own.
+    override fun onReceivedError(
+        view: WebView,
+        request: WebResourceRequest,
+        error: WebResourceError,
+    ) {
+        super.onReceivedError(view, request, error)
+        if (request.isForMainFrame) mainFrameLoadFailed = true
+    }
+
     override fun onPageFinished(
         view: WebView,
         url: String?,
@@ -124,10 +145,12 @@ class OmnigentWebViewClient(
             view.evaluateJavascript(WorkspaceChromeScript.source, null)
         }
         if (onPinnedOrigin && shouldInjectBridgeAtPageReady()) {
-            view.evaluateJavascript(NativeBridgeScript.source) { onPageReady(url) }
+            view.evaluateJavascript(
+                NativeBridgeScript.source,
+            ) { onPageReady(url, mainFrameLoadFailed) }
             return
         }
-        onPageReady(url)
+        onPageReady(url, mainFrameLoadFailed)
     }
 
     override fun shouldOverrideUrlLoading(
