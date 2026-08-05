@@ -19,10 +19,8 @@ export const ROW_GESTURE_HOLD_MS = 400;
 export const ROW_SWIPE_ACTIVATE_PX = 12;
 export const ROW_SWIPE_COMMIT_PX = 72;
 
-const ROW_SCROLL_ACTIVATE_PX = ROW_SWIPE_ACTIVATE_PX;
-// How far the finger may drift and still count as holding still. Mirrors the
-// tolerance dnd-kit's own delay constraint applied before we owned activation.
-const ROW_HOLD_TOLERANCE_PX = 8;
+const ROW_SCROLL_ACTIVATE_PX = 25;
+const ROW_HOLD_TOLERANCE_PX = 20;
 const ROW_SWIPE_MAX_PX = 96;
 const ROW_SWIPE_RESIST = 1 / 3;
 
@@ -287,8 +285,8 @@ export function useRowGesture({
 
       const horizontal = Math.abs(deltaX);
       const vertical = Math.abs(deltaY);
-      // At >=12px, horizontal-dominant travel is swipe; every other vector at
-      // the same Euclidean boundary is scroll. Thus (12,0) and (10,8) cannot overlap.
+      // Horizontal-dominant travel locks swipe at 12px; other travel waits for
+      // the 25px scroll circle. Since 25/sqrt(2) > 12, (12,0) and (15,20) cannot overlap.
       if (horizontal >= ROW_SWIPE_ACTIVATE_PX && horizontal > vertical) {
         const action = deltaX < 0 ? actions.left : actions.right;
         if (!swipeEnabled || action === "none") {
