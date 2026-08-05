@@ -1069,6 +1069,49 @@ describe("right-click context menu", () => {
   });
 });
 
+describe("row context menus render non-modally", () => {
+  // react-remove-scroll's modal lock hit-tests through the sidebar overlay to
+  // the chat behind it (pointer-events: none on body only blocks the sidebar's
+  // own subtree from taking the hit, not the underlying page). modal={false}
+  // must be set on all three row variants so a touch continuing past the menu
+  // never reaches native text selection in the chat.
+  it("does not lock body pointer-events for the desktop context menu", () => {
+    renderSidebar();
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+    expect(document.body).not.toHaveAttribute("data-scroll-locked");
+    expect(document.body.style.pointerEvents).not.toBe("none");
+  });
+
+  it("does not lock body pointer-events for the mobile context menu", () => {
+    mocks.isMobile = true;
+    renderSidebar();
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+    expect(document.body).not.toHaveAttribute("data-scroll-locked");
+    expect(document.body.style.pointerEvents).not.toBe("none");
+  });
+
+  it("does not lock body pointer-events for a pinned row's project-flyout context menu", () => {
+    mocks.pinnedStore.set(["conv_1"]);
+    mockConversations([{ ...CONV, labels: { omni_project: "Moonshot" } }]);
+    renderSidebar();
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+    expect(document.body).not.toHaveAttribute("data-scroll-locked");
+    expect(document.body.style.pointerEvents).not.toBe("none");
+  });
+
+  it("marks the menu content select-none with a scrollable, page-safe touch-action", () => {
+    renderSidebar();
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    const menu = screen.getByRole("menu");
+    expect(menu).toHaveClass("select-none");
+    expect(menu).toHaveClass("touch-pan-y");
+    expect(menu).not.toHaveClass("touch-none");
+  });
+});
+
 const TOUCH_POINTER = { pointerId: 1, isPrimary: true, pointerType: "touch" as const };
 // A second finger: non-primary, so the recognizer cancels the gesture in flight.
 const SECOND_TOUCH_POINTER = { pointerId: 2, isPrimary: false, pointerType: "touch" as const };
@@ -1715,6 +1758,103 @@ describe("touch gesture arbitration", () => {
 
     expect(row).not.toHaveClass("opacity-40");
     expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  // Chrome samples touch-action at touchstart; the armed-state touch-none
+  // class swap can't retroactively stop an in-flight pan. Only a real native
+  // non-passive touchmove listener, held from arm to full reset, forestalls it.
+  describe("native touchmove guard", () => {
+    function nativeTouchMove() {
+      const event = new Event("touchmove", { bubbles: true, cancelable: true });
+      document.dispatchEvent(event);
+      return event;
+    }
+
+    it("does not guard before the hold arms", () => {
+      vi.useFakeTimers();
+      mocks.isMobile = true;
+      renderSidebar();
+      const addSpy = vi.spyOn(document, "addEventListener");
+
+      startTouch();
+      expect(addSpy).not.toHaveBeenCalledWith("touchmove", expect.any(Function), {
+        passive: false,
+      });
+      expect(nativeTouchMove().defaultPrevented).toBe(false);
+      endTouch();
+      addSpy.mockRestore();
+    });
+
+    it("registers the guard exactly when armed and removes it on release", () => {
+      vi.useFakeTimers();
+      mocks.isMobile = true;
+      renderSidebar();
+      const addSpy = vi.spyOn(document, "addEventListener");
+      const removeSpy = vi.spyOn(document, "removeEventListener");
+
+      startTouch();
+      advanceHold();
+      expect(addSpy).toHaveBeenCalledWith("touchmove", expect.any(Function), { passive: false });
+      const touchmoveAdds = addSpy.mock.calls.filter((call) => call[0] === "touchmove");
+      expect(touchmoveAdds).toHaveLength(1);
+      expect(removeSpy).not.toHaveBeenCalledWith(
+        "touchmove",
+        expect.any(Function),
+        expect.anything(),
+      );
+
+      endTouch();
+      expect(removeSpy).toHaveBeenCalledWith("touchmove", expect.any(Function), { passive: false });
+      addSpy.mockRestore();
+      removeSpy.mockRestore();
+    });
+
+    it("preventDefaults a cancelable touchmove while armed and through drag", () => {
+      vi.useFakeTimers();
+      mocks.isMobile = true;
+      renderSidebar();
+
+      startTouch();
+      advanceHold();
+      expect(nativeTouchMove().defaultPrevented).toBe(true);
+
+      moveTouch(100 + ROW_DRAG_ACTIVATE_PX, 100);
+      expect(nativeTouchMove().defaultPrevented).toBe(true);
+      endTouch(100 + ROW_DRAG_ACTIVATE_PX, 100);
+    });
+
+    it("removes the guard on pointercancel", () => {
+      vi.useFakeTimers();
+      mocks.isMobile = true;
+      renderSidebar();
+      const { link } = touchTarget();
+
+      startTouch();
+      advanceHold();
+      const removeSpy = vi.spyOn(document, "removeEventListener");
+      fireEvent.pointerCancel(link, { ...TOUCH_POINTER, clientX: 100, clientY: 100 });
+      fireEvent.touchCancel(link, { touches: [], changedTouches: [touchPoint(link, 100, 100)] });
+
+      expect(removeSpy).toHaveBeenCalledWith("touchmove", expect.any(Function), { passive: false });
+      expect(nativeTouchMove().defaultPrevented).toBe(false);
+      removeSpy.mockRestore();
+    });
+
+    it("removes the guard when a second touch cancels the gesture", () => {
+      vi.useFakeTimers();
+      mocks.isMobile = true;
+      renderSidebar();
+      const { link } = touchTarget();
+
+      startTouch();
+      advanceHold();
+      const removeSpy = vi.spyOn(document, "removeEventListener");
+      fireEvent.pointerDown(link, { ...SECOND_TOUCH_POINTER, clientX: 104, clientY: 104 });
+
+      expect(removeSpy).toHaveBeenCalledWith("touchmove", expect.any(Function), { passive: false });
+      expect(nativeTouchMove().defaultPrevented).toBe(false);
+      removeSpy.mockRestore();
+    });
   });
 });
 

@@ -2213,6 +2213,7 @@ function SectionHeader({
     <h2>
       {contextMenu && !contextMenuDisabled ? (
         <ContextMenu
+          modal={false}
           onOpenChange={(open) => {
             if (open) {
               swallowClickRef.current = longPressPointerRef.current;
@@ -3508,7 +3509,7 @@ function ConversationRow({
           )
         ) : projectFlyoutName ? (
           <HoverCard openDelay={150} closeDelay={0}>
-            <ContextMenu onOpenChange={onContextMenuOpenChange}>
+            <ContextMenu modal={false} onOpenChange={onContextMenuOpenChange}>
               <ContextMenuTrigger asChild>
                 <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
               </ContextMenuTrigger>
@@ -3527,7 +3528,7 @@ function ConversationRow({
             />
           </HoverCard>
         ) : isMobile ? (
-          <ContextMenu onOpenChange={onContextMenuOpenChange}>
+          <ContextMenu modal={false} onOpenChange={onContextMenuOpenChange}>
             <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
             <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-xs">
               <ConversationMenuItems
@@ -3539,7 +3540,7 @@ function ConversationRow({
           </ContextMenu>
         ) : (
           <Tooltip>
-            <ContextMenu onOpenChange={onContextMenuOpenChange}>
+            <ContextMenu modal={false} onOpenChange={onContextMenuOpenChange}>
               <ContextMenuTrigger asChild>
                 <div className="w-full">
                   <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
