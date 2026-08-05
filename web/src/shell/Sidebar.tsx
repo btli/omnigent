@@ -145,7 +145,6 @@ import {
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
 import { cn } from "@/lib/utils";
-import { useCoarsePointer } from "@/hooks/useCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
@@ -1207,8 +1206,6 @@ function ConversationList({
   onExitSelectionMode,
   getVisibleIdsRef,
 }: ConversationListProps) {
-  const isMobile = useIsMobileViewport();
-  const hasCoarsePointer = useCoarsePointer();
   // Viewer id for the owner-based My/Shared split below.
   const viewerId = useViewerId();
   // Host metadata is shared by every row tooltip. Resolve it once at the list
@@ -1932,12 +1929,11 @@ function ConversationList({
                 )}
               </>
             )}
-            {/* Keep the transient strip last so mounting it never shifts a row
-            under the pointer that is already dragging it. Mounted for narrow
-            viewports AND any coarse-pointer device: a wide touch layout has
-            ChatsDropZone too, but no hover to advertise it as a target. */}
-            {(isMobile || hasCoarsePointer) && !showShared && activeDrag?.project != null && (
-              <UngroupDropZone />
+            {/* Mounted during any filed-session drag; fixed positioning keeps
+            it out of the document flow, so mounting never shifts a row under
+            the pointer that is already dragging it. */}
+            {!showShared && activeDrag?.project != null && (
+              <UngroupDropZone scrollFrameRef={scrollContainerRef} />
             )}
           </div>
         </RowEditHoldContext.Provider>
@@ -2010,20 +2006,33 @@ function PinDropZone({ active, children }: { active: boolean; children: ReactNod
 }
 
 /** Bottom ungroup target shown while dragging a filed session. */
-function UngroupDropZone() {
+function UngroupDropZone({ scrollFrameRef }: { scrollFrameRef: RefObject<HTMLElement | null> }) {
   const { setNodeRef, isOver } = useDroppable({
     id: UNGROUP_DROP_ZONE_ID,
     data: { type: "ungroup" },
   });
+  // Fixed to the list frame's bottom edge, measured once at drag start (the
+  // sidebar frame cannot move mid-drag). Fixed — not sticky or inline — so the
+  // strip stays reachable on a long list AND dnd-kit skips scroll-ancestor
+  // compensation for it: a stuck sticky element doesn't move with the scroll,
+  // but dnd still shifted its stored rect, drifting the hit area.
+  const [frame, setFrame] = useState<{ left: number; width: number; bottom: number } | null>(null);
+  useLayoutEffect(() => {
+    const rect = scrollFrameRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    setFrame({
+      left: rect.left + 8,
+      width: rect.width - 16,
+      bottom: window.innerHeight - rect.bottom + 8,
+    });
+  }, [scrollFrameRef]);
   return (
     <div
       ref={setNodeRef}
       data-testid="sidebar-ungroup-drop-zone"
-      // Sticky, not inline: as the list's last child it would sit below the
-      // fold on any screenful of sessions — pinned to the scroll viewport's
-      // bottom it stays reachable for the whole drag.
+      style={frame ? { left: frame.left, width: frame.width, bottom: frame.bottom } : undefined}
       className={cn(
-        "sticky bottom-0 z-10 flex items-center gap-1.5 rounded-md border border-dashed border-border bg-card-solid px-2 py-1.5 text-muted-foreground text-xs transition-colors",
+        "fixed z-30 flex items-center gap-1.5 rounded-md border border-dashed border-border bg-card-solid px-2 py-1.5 text-muted-foreground text-xs transition-colors",
         isOver && cn(DROP_TARGET_HIGHLIGHT, "text-foreground"),
       )}
     >
