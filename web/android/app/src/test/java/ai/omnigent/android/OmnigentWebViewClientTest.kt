@@ -248,6 +248,66 @@ class OmnigentWebViewClientTest {
     }
 
     @Test
+    fun `a stale page start after an origin change does not launch login`() {
+        var currentOrigin = OLD_PINNED_ORIGIN
+        var loginCallbacks = 0
+        val webView = webView()
+        val client =
+            client(
+                pinnedOrigin = { currentOrigin },
+                onLoginRequired = { loginCallbacks++ },
+            )
+        client.onPageStarted(webView, OLD_PINNED_URL, null)
+
+        currentOrigin = NEW_PINNED_ORIGIN
+        client.resetForOriginChange(NEW_PINNED_ORIGIN)
+        client.stopLoadingAndLedger(webView)
+        client.onPageStarted(webView, STALE_IDP_URL, null)
+
+        assertEquals(0, loginCallbacks)
+        client.onPageStarted(webView, NEW_PINNED_URL, null)
+        assertEquals(0, loginCallbacks)
+    }
+
+    @Test
+    fun `page start is ignored when no origin is pinned`() {
+        var loginCallbacks = 0
+        val client =
+            client(
+                pinnedOrigin = { null },
+                onLoginRequired = { loginCallbacks++ },
+            )
+
+        client.onPageStarted(webView(), PLAIN_IDP_URL, null)
+
+        assertEquals(0, loginCallbacks)
+    }
+
+    @Test
+    fun `page finish is ignored when no origin is pinned`() {
+        var pageReadyCallbacks = 0
+        val webView = webView()
+        val client =
+            client(
+                pinnedOrigin = { null },
+                shouldInjectBridgeAtPageReady = true,
+                onPageReady = { pageReadyCallbacks++ },
+            )
+
+        client.onPageFinished(webView, null)
+
+        assertNull(webView.evaluatedScript)
+        assertEquals(0, pageReadyCallbacks)
+    }
+
+    @Test
+    fun `opaque https navigation is blocked when no origin is pinned`() {
+        val client = client(pinnedOrigin = { null })
+
+        assertTrue(client.shouldOverrideUrlLoading(webView(), request("https:opaque")))
+    }
+
+    @Test
     fun `a ledgered pinned-origin finish does not end a new same-server flow`() {
         val webView = webView()
         var flowEnded = 0

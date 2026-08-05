@@ -527,6 +527,7 @@ class MainActivity : AppCompatActivity() {
             buildString {
                 append(name).append('=').append(token).append("; Path=/")
                 if (secure) append("; Secure")
+                append("; HttpOnly")
                 append("; SameSite=Lax")
             }
         val cookies = CookieManager.getInstance()
@@ -693,7 +694,8 @@ class MainActivity : AppCompatActivity() {
         }
         removeBridge()
         loginManager.cancel()
-        shellWebViewClient.endProxyAuth()
+        pinnedOrigin = newOrigin
+        shellWebViewClient.resetForOriginChange(newOrigin)
         dismissEmbeddedSignInDialogWithoutReset()
         loginFailedDialog?.dismiss()
         loginFailedDialog = null
@@ -701,7 +703,6 @@ class MainActivity : AppCompatActivity() {
         notifications.cancelAll()
         pendingNavigatePath = null
         pendingNavigateOrigin = null
-        pinnedOrigin = newOrigin
         loginAttachment?.let(loginManager::detach)
         loginAttachment = loginManager.attach(newOrigin, ::onLoginResult)
         notifications.setOrigin(newOrigin)
@@ -956,7 +957,8 @@ class MainActivity : AppCompatActivity() {
         // Only a real pinned-origin load carries the injected facade — an error
         // page (chrome-error://) or a foreign redirect must NOT drain
         // pendingNavigatePath or push insets into a page that can't consume them.
-        if (originOf(url) != pinnedOrigin) return
+        val pin = pinnedOrigin ?: return
+        if (originOf(url) != pin) return
         // First authenticated app page: drop everything before it from the
         // back/forward list. Otherwise Back walks into the pre-auth root and the
         // login-redirect reload (the `loadUrl(origin)` after the cookie injection),
@@ -979,7 +981,8 @@ class MainActivity : AppCompatActivity() {
         // e.g. mid re-login — where the bridge facade doesn't exist, so emitting
         // would silently drop the path. Keep it pending; the next pinned-origin
         // onPageReady flushes it.
-        if (originOf(webView.url) != pinnedOrigin) return
+        val pin = pinnedOrigin ?: return
+        if (originOf(webView.url) != pin) return
         emitNotificationActivation(pendingNavigatePath)
         pendingNavigatePath = null
         pendingNavigateOrigin = null
@@ -1063,7 +1066,8 @@ class MainActivity : AppCompatActivity() {
         // FileChooserParams omits the requesting frame, so cross-origin iframes pass this gate.
         // Microphone requests expose request.origin and do not have this residual.
         val currentOrigin = if (webViewUnusable) null else originOf(webView.url)
-        if (currentOrigin != pinnedOrigin) {
+        val pin = pinnedOrigin
+        if (pin == null || currentOrigin != pin) {
             authLog("file chooser denied for main-frame origin $currentOrigin")
             callback.onReceiveValue(null)
             return true
@@ -1111,7 +1115,8 @@ class MainActivity : AppCompatActivity() {
     /** Back [OmnigentWebChromeClient.onPermissionRequest] — grant mic to the pinned origin only. */
     private fun handlePermissionRequest(request: PermissionRequest) {
         val wantsAudio = request.resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE)
-        if (!wantsAudio || originOf(request.origin?.toString()) != pinnedOrigin) {
+        val pin = pinnedOrigin
+        if (!wantsAudio || pin == null || originOf(request.origin?.toString()) != pin) {
             request.deny()
             return
         }
@@ -1139,30 +1144,39 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // Same normalization as the navigation gate: accepts odd casing
-        // ("HTTPS://") and rejects non-http lookalikes ("httpfoo:"), which
-        // DownloadManager.Request would otherwise throw on.
+        // Real WebView URLs have lowercase schemes. Reject non-http lookalikes;
+        // malformed callback input is handled by the failure path below.
         if (!isHttpScheme(Uri.parse(url).scheme)) return
         val downloadOrigin = originOf(url)
-        if (downloadOrigin != null && downloadOrigin == pinnedOrigin) {
+        val pin = pinnedOrigin
+        if (downloadOrigin != null && pin != null && downloadOrigin == pin) {
             pinnedOriginDownloader.download(
                 url,
-                downloadOrigin,
+                pin,
                 webView.settings.userAgentString,
                 mimeType,
                 name,
             )
             return
         }
-        val request =
-            DownloadManager.Request(Uri.parse(url)).apply {
-                setMimeType(mimeType)
-                setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name)
-                setNotificationVisibility(
-                    DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED,
-                )
+        val enqueued =
+            try {
+                val request =
+                    DownloadManager.Request(Uri.parse(url)).apply {
+                        setMimeType(mimeType)
+                        setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name)
+                        setNotificationVisibility(
+                            DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED,
+                        )
+                    }
+                getSystemService<DownloadManager>()?.enqueue(request) != null
+            } catch (_: RuntimeException) {
+                false
             }
-        getSystemService<DownloadManager>()?.enqueue(request)
+        if (!enqueued) {
+            val storage = DownloadStorage(applicationContext)
+            storage.report(storage.failed(name))
+        }
     }
 
     private companion object {
