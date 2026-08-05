@@ -62,13 +62,16 @@ describe("normalizeSwipeActions", () => {
     });
   });
 
-  it("fills missing/unknown directions from the defaults", () => {
+  it("fills absent directions from the defaults", () => {
     expect(normalizeSwipeActions({ left: "delete" })).toEqual({
       left: "delete",
       right: DEFAULT_SWIPE_ACTIONS.right,
     });
-    expect(normalizeSwipeActions({ left: "bogus", right: "archive" })).toEqual({
-      left: DEFAULT_SWIPE_ACTIONS.left,
+  });
+
+  it("makes a present but unrecognized action inert", () => {
+    expect(normalizeSwipeActions({ left: "trash", right: "archive" })).toEqual({
+      left: "none",
       right: "archive",
     });
   });
@@ -82,6 +85,22 @@ describe("normalizeSwipeActions", () => {
 });
 
 describe("readSwipeActions — corrupt storage", () => {
+  it("returns the safe defaults when localStorage access throws", () => {
+    const descriptor = Object.getOwnPropertyDescriptor(window, "localStorage")!;
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      get: () => {
+        throw new DOMException("Storage is unavailable", "SecurityError");
+      },
+    });
+
+    try {
+      expect(readSwipeActions()).toEqual(DEFAULT_SWIPE_ACTIONS);
+    } finally {
+      Object.defineProperty(window, "localStorage", descriptor);
+    }
+  });
+
   it("falls back to the defaults on unparseable JSON", () => {
     localStorage.setItem(STORAGE_KEY, "{not json");
     expect(readSwipeActions()).toEqual(DEFAULT_SWIPE_ACTIONS);
@@ -90,6 +109,11 @@ describe("readSwipeActions — corrupt storage", () => {
   it("normalizes a partially-valid stored object", () => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ left: "delete", right: "bogus" }));
     expect(readSwipeActions()).toEqual({ left: "delete", right: DEFAULT_SWIPE_ACTIONS.right });
+  });
+
+  it("makes an unrecognized stored action inert", () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ left: "trash", right: "archive" }));
+    expect(readSwipeActions()).toEqual({ left: "none", right: "archive" });
   });
 });
 
