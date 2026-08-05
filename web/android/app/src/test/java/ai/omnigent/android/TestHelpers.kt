@@ -32,10 +32,15 @@ fun MainActivity.testWebView(): WebView = privateField("webView") as WebView
 fun MainActivity.invokeOnPageReady(
     url: String,
     mainFrameLoadFailed: Boolean = false,
+    mainFramePersistenceFailed: Boolean = false,
 ) {
     MainActivity::class
         .java
-        .getDeclaredMethod("onPageReady", String::class.java, Boolean::class.java)
-        .apply { isAccessible = true }
-        .invoke(this, url, mainFrameLoadFailed)
+        .getDeclaredMethod(
+            "onPageReady",
+            String::class.java,
+            Boolean::class.java,
+            Boolean::class.java,
+        ).apply { isAccessible = true }
+        .invoke(this, url, mainFrameLoadFailed, mainFramePersistenceFailed)
 }

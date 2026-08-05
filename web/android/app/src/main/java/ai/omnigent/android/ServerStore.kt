@@ -46,7 +46,7 @@ class ServerStore(
 
     /** Every server the user has connected to: the current one (when set) plus recents. */
     fun knownServers(): List<String> =
-        listOfNotNull(currentServerUrl().takeIf { hasServer() }) + recentServers()
+        (listOfNotNull(currentServerUrl().takeIf { hasServer() }) + recentServers()).distinct()
 
     /** Recently-connected servers, most recent first. */
     fun recentServers(): List<String> =

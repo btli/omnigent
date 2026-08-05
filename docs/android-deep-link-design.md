@@ -181,10 +181,9 @@ iOS prompt copy.
   rejection reason, never the full untrusted URI. A malformed cold-start
   link opens the app normally with no error surface.
 - **Post-consent load failure** (DNS/TLS/HTTP error): the failed origin is
-  never persisted (persistence is load-success-gated), the pending path for
-  it is dropped, and the WebView shows its error page with the server
-  switcher available as the recovery path — same as any failed manual
-  connect today.
+  never persisted (persistence is load-success-gated). A DNS/TLS failure keeps
+  its path queued for the next successful retry, while the WebView shows its
+  error page with the server switcher available as the recovery path.
 - **Pending-path hygiene**: a pending deep-link path is bound to its target
   origin; it flushes only on a pinned-origin `onPageReady` for that origin
   and is discarded when a later server switch or newer link supersedes it —

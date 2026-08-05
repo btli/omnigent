@@ -8,6 +8,7 @@ import android.os.Looper
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 
@@ -32,7 +33,11 @@ import android.webkit.WebViewClient
 class OmnigentWebViewClient(
     private val pinnedOrigin: () -> String?,
     private val shouldInjectBridgeAtPageReady: () -> Boolean,
-    private val onPageReady: (url: String?, mainFrameLoadFailed: Boolean) -> Unit,
+    private val onPageReady: (
+        url: String?,
+        mainFrameLoadFailed: Boolean,
+        mainFramePersistenceFailed: Boolean,
+    ) -> Unit,
     private val onLoginRequired: () -> Unit,
     private val onRendererGone: (view: WebView, didCrash: Boolean) -> Unit,
     private val onNavigationStarted: () -> Unit = {},
@@ -49,6 +54,7 @@ class OmnigentWebViewClient(
     // chrome-error:// one — so callers can't tell success from failure from
     // the url alone; this flag is the only signal.
     private var mainFrameLoadFailed = false
+    private var mainFramePersistenceFailed = false
 
     override fun onPageStarted(
         view: WebView,
@@ -57,6 +63,7 @@ class OmnigentWebViewClient(
     ) {
         super.onPageStarted(view, url, favicon)
         mainFrameLoadFailed = false
+        mainFramePersistenceFailed = false
 
         val origin = originOf(url)
         val scheme = url?.let { Uri.parse(it).scheme?.lowercase() }
@@ -125,6 +132,15 @@ class OmnigentWebViewClient(
         if (request.isForMainFrame) mainFrameLoadFailed = true
     }
 
+    override fun onReceivedHttpError(
+        view: WebView,
+        request: WebResourceRequest,
+        errorResponse: WebResourceResponse,
+    ) {
+        super.onReceivedHttpError(view, request, errorResponse)
+        if (request.isForMainFrame) mainFramePersistenceFailed = true
+    }
+
     override fun onPageFinished(
         view: WebView,
         url: String?,
@@ -147,10 +163,10 @@ class OmnigentWebViewClient(
         if (onPinnedOrigin && shouldInjectBridgeAtPageReady()) {
             view.evaluateJavascript(
                 NativeBridgeScript.source,
-            ) { onPageReady(url, mainFrameLoadFailed) }
+            ) { onPageReady(url, mainFrameLoadFailed, mainFramePersistenceFailed) }
             return
         }
-        onPageReady(url, mainFrameLoadFailed)
+        onPageReady(url, mainFrameLoadFailed, mainFramePersistenceFailed)
     }
 
     override fun shouldOverrideUrlLoading(

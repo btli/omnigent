@@ -41,7 +41,7 @@ class OmnigentWebViewClientTest {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
         var readyUrl: String? = null
         val client =
-            client(shouldInjectBridgeAtPageReady = true) { url, _ ->
+            client(shouldInjectBridgeAtPageReady = true) { url, _, _ ->
                 readyUrl = url
             }
 
@@ -334,7 +334,7 @@ class OmnigentWebViewClientTest {
         pinnedOrigin: String = PINNED_ORIGIN,
         onLoginRequired: () -> Unit = {},
         onRendererGone: (WebView, Boolean) -> Unit = { _, _ -> },
-        onPageReady: (String?, Boolean) -> Unit = { _, _ -> },
+        onPageReady: (String?, Boolean, Boolean) -> Unit = { _, _, _ -> },
         onNavigationStarted: () -> Unit = {},
     ) = OmnigentWebViewClient(
         pinnedOrigin = { pinnedOrigin },
