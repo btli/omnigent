@@ -6,18 +6,10 @@
 //      `onDoubleClick`), gated on edit permission.
 // See ConversationRow / ConversationEditRow in Sidebar.tsx.
 
-import { type PointerEvent as ReactPointerEvent, useSyncExternalStore } from "react";
+import { useSyncExternalStore } from "react";
 import type * as DndKitCore from "@dnd-kit/core";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import {
-  act,
-  cleanup,
-  fireEvent,
-  render,
-  renderHook,
-  screen,
-  within,
-} from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -60,7 +52,7 @@ const mocks = vi.hoisted(() => {
     projects: [] as string[],
     moveToProject: { mutate: vi.fn() },
     conversations: [] as unknown[],
-    isDragging: false,
+    isDragging: null as boolean | null,
     pinnedStore,
     // Archive + stop mutations, so the swipe tests can assert the swipe→archive
     // path drives the same stop→archive handler the kebab uses.
@@ -76,10 +68,13 @@ vi.mock("@dnd-kit/core", async (importOriginal) => {
   const actual = await importOriginal<typeof DndKitCore>();
   return {
     ...actual,
-    useDraggable: (args: Parameters<typeof actual.useDraggable>[0]) => ({
-      ...actual.useDraggable(args),
-      isDragging: mocks.isDragging,
-    }),
+    useDraggable: (args: Parameters<typeof actual.useDraggable>[0]) => {
+      const draggable = actual.useDraggable(args);
+      return {
+        ...draggable,
+        isDragging: mocks.isDragging ?? draggable.isDragging,
+      };
+    },
   };
 });
 
@@ -160,8 +155,9 @@ vi.mock("@/lib/serverOrigin", () => ({ isCurrentServerLocal: () => false }));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { resetReadStateForTests, seedReadState } from "@/hooks/useUnseenConversations";
+import { ROW_GESTURE_HOLD_MS } from "@/hooks/useRowGesture";
 import { writeSwipeActions } from "@/lib/swipeActionPreferences";
-import { Sidebar, useRowSwipe } from "./Sidebar";
+import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
 
@@ -285,7 +281,7 @@ beforeEach(() => {
   mocks.del.mutate.mockReset();
   mocks.del.reset.mockReset();
   mocks.projects = [];
-  mocks.isDragging = false;
+  mocks.isDragging = null;
   // Default every test to the desktop viewport; the mobile flyout test opts in.
   mocks.isMobile = false;
   useConvMock.mockReset();
@@ -298,7 +294,12 @@ beforeEach(() => {
   mockConversations([CONV]);
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  // dnd-kit removes its capture-phase click blocker on a delayed timer.
+  if (vi.isFakeTimers()) vi.runOnlyPendingTimers();
+  vi.useRealTimers();
+});
 
 describe("quick pin/unpin hover button", () => {
   it("keeps the row full-width and the trailing controls inset from the right edge", () => {
@@ -797,22 +798,6 @@ describe("mark as unread", () => {
 });
 
 describe("right-click context menu", () => {
-  it("suppresses an open request only while the session row is dragging", () => {
-    mocks.isMobile = true;
-    mocks.isDragging = true;
-    const view = renderSidebar();
-
-    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
-    expect(screen.queryByTestId("rename-conversation")).toBeNull();
-
-    // Live drag state clears with the gesture; no suppression flag survives to
-    // swallow the next legitimate right-click.
-    mocks.isDragging = false;
-    view.rerenderSidebar();
-    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
-    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
-  });
-
   it("leaves keyboard link activation untouched after a drag ends", async () => {
     mocks.isMobile = true;
     mocks.isDragging = true;
@@ -977,20 +962,379 @@ describe("right-click context menu", () => {
   });
 });
 
+const TOUCH_POINTER = { pointerId: 1, isPrimary: true, pointerType: "touch" as const };
+
+function touchTarget() {
+  const link = screen.getByRole("link", { name: /My Session/ });
+  return { link, row: link.closest("li")! };
+}
+
+function touchPoint(target: Element, x: number, y: number, identifier = 0) {
+  return {
+    identifier,
+    target,
+    clientX: x,
+    clientY: y,
+    pageX: x,
+    pageY: y,
+    screenX: x,
+    screenY: y,
+  };
+}
+
+function startTouch(x = 100, y = 100) {
+  const { link } = touchTarget();
+  const touch = touchPoint(link, x, y);
+  fireEvent.pointerDown(link, { ...TOUCH_POINTER, clientX: x, clientY: y });
+  fireEvent.touchStart(link, { touches: [touch], changedTouches: [touch] });
+}
+
+function moveTouch(x: number, y: number, touches = 1) {
+  const { link } = touchTarget();
+  const points = Array.from({ length: touches }, (_, index) =>
+    touchPoint(link, x + index, y + index, index),
+  );
+  const allowsNativeScroll = fireEvent.pointerMove(link, {
+    ...TOUCH_POINTER,
+    clientX: x,
+    clientY: y,
+  });
+  fireEvent.touchMove(link, { touches: points, changedTouches: points });
+  return allowsNativeScroll;
+}
+
+function endTouch(x = 100, y = 100) {
+  const { link } = touchTarget();
+  const touch = touchPoint(link, x, y);
+  fireEvent.pointerUp(link, { ...TOUCH_POINTER, clientX: x, clientY: y });
+  fireEvent.touchEnd(link, { touches: [], changedTouches: [touch] });
+}
+
+describe("touch gesture arbitration", () => {
+  function advanceHold(ms = ROW_GESTURE_HOLD_MS) {
+    act(() => vi.advanceTimersByTime(ms));
+  }
+
+  it("keeps a hold past Radix's own long-press from opening a second menu", () => {
+    vi.useFakeTimers();
+    mocks.isMobile = true;
+    renderSidebar();
+    const { link, row } = touchTarget();
+    const contextMenus: MouseEvent[] = [];
+    link.addEventListener("contextmenu", (event) => contextMenus.push(event));
+
+    // Radix's trigger arms its own 700ms touch long-press. Holding past it must
+    // not open a menu mid-gesture — the recognizer owns the only open path, on
+    // release — or a hold-then-drag would drag underneath an open menu.
+    startTouch(140, 220);
+    advanceHold(900);
+    expect(document.querySelectorAll('[role="menu"]')).toHaveLength(0);
+    expect(contextMenus).toHaveLength(0);
+    expect(row).toHaveClass("scale-[1.01]");
+
+    endTouch(140, 220);
+    expect(document.querySelectorAll('[role="menu"]')).toHaveLength(1);
+    expect(contextMenus).toHaveLength(1);
+  });
+
+  it("leaves a pen long-press to Radix, which the recognizer never claims", () => {
+    // The recognizer is touch-only, so suppressing Radix for pen would strip
+    // stylus users of the long-press menu they had before.
+    vi.useFakeTimers();
+    mocks.isMobile = true;
+    renderSidebar();
+    const { link } = touchTarget();
+    const pen = { pointerId: 1, isPrimary: true, pointerType: "pen" as const };
+
+    fireEvent.pointerDown(link, { ...pen, clientX: 140, clientY: 220 });
+    act(() => vi.advanceTimersByTime(900));
+
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+  });
+
+  it("opens the positioned context menu when a still hold is released without dragging", () => {
+    vi.useFakeTimers();
+    mocks.isMobile = true;
+    renderSidebar();
+    const { link, row } = touchTarget();
+    const contextMenus: MouseEvent[] = [];
+    link.addEventListener("contextmenu", (event) => contextMenus.push(event));
+
+    startTouch(140, 220);
+    advanceHold();
+    expect(row).toHaveClass("scale-[1.01]");
+    expect(row).not.toHaveClass("opacity-40");
+
+    endTouch(140, 220);
+    expect(screen.getByTestId("archive-conversation")).toBeInTheDocument();
+    expect(row).not.toHaveClass("opacity-40");
+    expect(contextMenus.at(-1)).toMatchObject({ clientX: 140, clientY: 220 });
+
+    fireEvent.click(screen.getByTestId("archive-conversation"));
+    expect(mocks.archive.mutate).toHaveBeenCalledWith(
+      { id: "conv_1", archived: true },
+      expect.anything(),
+    );
+  });
+
+  it("starts dnd-kit only when an armed hold moves, without opening the menu", () => {
+    vi.useFakeTimers();
+    mocks.isMobile = true;
+    renderSidebar();
+    const { row } = touchTarget();
+
+    startTouch();
+    advanceHold();
+    expect(row).not.toHaveClass("opacity-40");
+
+    moveTouch(101, 100);
+    expect(row).toHaveClass("opacity-40");
+    expect(screen.queryByTestId("rename-conversation")).toBeNull();
+    endTouch(101, 100);
+  });
+
+  it("does not arm a hold on a finger that is still creeping", () => {
+    // A slow scroll drifts under the 12px scroll threshold but is not holding
+    // still. Arming here would capture the pointer and hand the gesture to
+    // dnd-kit, which preventDefaults the scroll away for the rest of the touch.
+    vi.useFakeTimers();
+    mocks.isMobile = true;
+    renderSidebar();
+    const { row } = touchTarget();
+
+    startTouch();
+    // 3px per 100ms: past the 8px hold tolerance by the 400ms mark, but still
+    // under the 12px that would have resolved it to scroll outright.
+    for (let step = 1; step <= 4; step += 1) {
+      advanceHold(100);
+      moveTouch(100, 100 + step * 3);
+    }
+
+    expect(row).not.toHaveClass("scale-[1.01]");
+    expect(row).not.toHaveClass("opacity-40");
+    endTouch(100, 112);
+    expect(screen.queryByTestId("rename-conversation")).toBeNull();
+  });
+
+  it("leaves a normal-speed vertical flick to the list scroller", () => {
+    // Scrolling must stay native even though the finger starts on a row: the
+    // flick clears 12px within a frame, long before the hold could arm.
+    vi.useFakeTimers();
+    mocks.isMobile = true;
+    renderSidebar();
+    const { row } = touchTarget();
+
+    startTouch();
+    advanceHold(16);
+    expect(moveTouch(100, 116)).toBe(true);
+    advanceHold(600);
+
+    expect(row).not.toHaveClass("scale-[1.01]");
+    expect(row).not.toHaveClass("opacity-40");
+    endTouch(100, 116);
+    expect(screen.queryByTestId("rename-conversation")).toBeNull();
+  });
+
+  it("keeps a slow pre-hold horizontal gesture as a swipe", () => {
+    vi.useFakeTimers();
+    mocks.isMobile = true;
+    renderSidebar();
+    const { row } = touchTarget();
+
+    startTouch();
+    advanceHold(260);
+    moveTouch(94, 100);
+    advanceHold(80);
+    moveTouch(80, 100);
+    expect(row).not.toHaveClass("opacity-40");
+    moveTouch(10, 100);
+    expect(row.querySelector<HTMLElement>("div.relative")?.style.marginRight).not.toBe("");
+    endTouch(10, 100);
+
+    expect(mocks.archive.mutate).toHaveBeenCalledWith(
+      { id: "conv_1", archived: true },
+      expect.anything(),
+    );
+    expect(screen.queryByTestId("rename-conversation")).toBeNull();
+  });
+
+  it("yields vertical travel to native scroll with no other outcome", () => {
+    vi.useFakeTimers();
+    mocks.isMobile = true;
+    renderSidebar();
+    const { row } = touchTarget();
+
+    startTouch();
+    expect(moveTouch(100, 120)).toBe(true);
+    advanceHold(ROW_GESTURE_HOLD_MS + 1);
+    endTouch(100, 120);
+
+    expect(row).not.toHaveClass("opacity-40");
+    expect(screen.queryByTestId("rename-conversation")).toBeNull();
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  });
+
+  it("assigns vertical-dominant travel exactly at the Euclidean boundary to scroll", () => {
+    vi.useFakeTimers();
+    mocks.isMobile = true;
+    renderSidebar();
+    const { row } = touchTarget();
+
+    // Exactly 12px of travel, so it sits on the activation boundary itself
+    // rather than safely past it. Integer deltas keep it off a float edge.
+    startTouch();
+    expect(moveTouch(100, 112)).toBe(true);
+
+    // Decided here, at move time — not later by the hold's drift check. Turning
+    // back onto the horizontal axis must stay inert, which it only does if the
+    // gesture already resolved to scroll.
+    moveTouch(60, 112);
+    expect(row.querySelector<HTMLElement>("div.relative")?.style.marginRight).toBe("");
+
+    advanceHold(ROW_GESTURE_HOLD_MS + 1);
+    endTouch(60, 112);
+
+    expect(row).not.toHaveClass("opacity-40");
+    expect(screen.queryByTestId("rename-conversation")).toBeNull();
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  });
+
+  it("stops tracking when a locked swipe reverses into an inert direction", () => {
+    vi.useFakeTimers();
+    // Left archives; right is inert. Locking left then dragging back past the
+    // origin crosses into "none", which must not translate the row with an
+    // empty reveal behind it.
+    writeSwipeActions({ left: "archive", right: "none" });
+    mocks.isMobile = true;
+    renderSidebar();
+    const { row } = touchTarget();
+    const surface = row.querySelector<HTMLElement>("div.relative");
+
+    startTouch();
+    moveTouch(80, 100);
+    expect(surface?.style.marginRight).toBe("20px");
+
+    moveTouch(190, 100);
+    expect(surface?.style.marginLeft).toBe("");
+    expect(surface?.style.marginRight).toBe("");
+
+    endTouch(190, 100);
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  });
+
+  it("hands travel to the swipe as soon as the horizontal axis clears 12px", () => {
+    vi.useFakeTimers();
+    writeSwipeActions({ left: "archive", right: "archive" });
+    mocks.isMobile = true;
+    renderSidebar();
+    const { row } = touchTarget();
+    const surface = row.querySelector<HTMLElement>("div.relative");
+
+    // (10,8) is 12.8px of travel but only 10px horizontally, so it is scroll,
+    // not swipe: the axis threshold governs, not the Euclidean length. Pairs
+    // with the boundary case above to pin both halves of the rule.
+    startTouch();
+    moveTouch(110, 108);
+    expect(surface?.style.marginRight).toBe("");
+    advanceHold(ROW_GESTURE_HOLD_MS + 1);
+    endTouch(110, 108);
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(row).not.toHaveClass("opacity-40");
+  });
+
+  it("assigns exactly 12px horizontal travel to swipe", () => {
+    vi.useFakeTimers();
+    writeSwipeActions({ left: "archive", right: "archive" });
+    mocks.isMobile = true;
+    renderSidebar();
+    const { row } = touchTarget();
+
+    startTouch();
+    moveTouch(112, 100);
+    const surface = row.querySelector<HTMLElement>("div.relative");
+    expect(surface?.style.marginLeft).toBe("12px");
+    advanceHold(ROW_GESTURE_HOLD_MS + 1);
+    expect(row).not.toHaveClass("opacity-40");
+    endTouch(112, 100);
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("rename-conversation")).toBeNull();
+  });
+
+  it("leaves a short still press as plain link activation", () => {
+    vi.useFakeTimers();
+    mocks.isMobile = true;
+    const view = renderSidebar();
+    const { link, row } = touchTarget();
+
+    startTouch();
+    advanceHold(ROW_GESTURE_HOLD_MS - 1);
+    endTouch();
+    fireEvent.click(link);
+
+    expect(view.onClose).toHaveBeenCalledOnce();
+    expect(row).not.toHaveClass("opacity-40");
+    expect(screen.queryByTestId("rename-conversation")).toBeNull();
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  });
+
+  it("fully resets when the pointer is cancelled", () => {
+    vi.useFakeTimers();
+    mocks.isMobile = true;
+    renderSidebar();
+    const { link, row } = touchTarget();
+
+    startTouch();
+    moveTouch(80, 100);
+    const surface = row.querySelector<HTMLElement>("div.relative");
+    expect(surface?.style.marginRight).toBe("20px");
+    fireEvent.pointerCancel(link, { ...TOUCH_POINTER, clientX: 80, clientY: 100 });
+    fireEvent.touchCancel(link, { touches: [], changedTouches: [touchPoint(link, 80, 100)] });
+    advanceHold(ROW_GESTURE_HOLD_MS + 1);
+
+    expect(surface?.style.marginRight).toBe("");
+    expect(row).not.toHaveClass("opacity-40");
+    expect(screen.queryByTestId("rename-conversation")).toBeNull();
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  });
+
+  it("rejects a second touch before drag activation", () => {
+    vi.useFakeTimers();
+    mocks.isMobile = true;
+    renderSidebar();
+    const { link, row } = touchTarget();
+
+    startTouch();
+    fireEvent.pointerDown(link, {
+      pointerId: 2,
+      isPrimary: false,
+      pointerType: "touch",
+      clientX: 104,
+      clientY: 104,
+    });
+    const touches = [touchPoint(link, 100, 100), touchPoint(link, 104, 104, 1)];
+    fireEvent.touchStart(link, { touches, changedTouches: [touches[1]] });
+    advanceHold(ROW_GESTURE_HOLD_MS + 1);
+    moveTouch(120, 100, 2);
+
+    expect(row).not.toHaveClass("opacity-40");
+    expect(screen.queryByTestId("rename-conversation")).toBeNull();
+    fireEvent.pointerCancel(link, { ...TOUCH_POINTER, clientX: 120, clientY: 100 });
+  });
+});
+
 describe("touch swipe actions", () => {
   // jsdom has no real touch, so drive the gesture with pointer events. The row
-  // handlers gate on a primary, non-mouse pointer (see useRowSwipe); default
-  // jsdom PointerEvents omit those, so set them explicitly. A swipe is a
-  // down → horizontal move past the commit threshold → up on the row's <li>.
-  const POINTER = { pointerId: 1, isPrimary: true, pointerType: "touch" as const };
+  // recognizer gates on a primary touch pointer; pair each pointer event with
+  // its touch event so the real dnd-kit activator also sees the sequence.
 
   function swipeRow(dx: number) {
-    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
-    fireEvent.pointerDown(li, { ...POINTER, clientX: 100, clientY: 100 });
+    startTouch();
     // First move locks the axis; the second carries it past the commit point.
-    fireEvent.pointerMove(li, { ...POINTER, clientX: 100 + Math.sign(dx) * 20, clientY: 100 });
-    fireEvent.pointerMove(li, { ...POINTER, clientX: 100 + dx, clientY: 100 });
-    fireEvent.pointerUp(li, { ...POINTER, clientX: 100 + dx, clientY: 100 });
+    moveTouch(100 + Math.sign(dx) * 20, 100);
+    moveTouch(100 + dx, 100);
+    endTouch(100 + dx, 100);
   }
 
   it("runs the archive path when swiping the archive-configured direction", () => {
@@ -1063,6 +1407,88 @@ describe("touch swipe actions", () => {
     );
   });
 
+  it("commits a fast flick from the release position before React renders", () => {
+    mocks.isMobile = true;
+    renderSidebar();
+    const { link } = touchTarget();
+    startTouch(200, 100);
+
+    act(() => {
+      for (const x of [180, 100]) {
+        const touch = touchPoint(link, x, 100);
+        fireEvent.pointerMove(link, { ...TOUCH_POINTER, clientX: x, clientY: 100 });
+        fireEvent.touchMove(link, { touches: [touch], changedTouches: [touch] });
+      }
+      const touch = touchPoint(link, 100, 100);
+      fireEvent.pointerUp(link, { ...TOUCH_POINTER, clientX: 100, clientY: 100 });
+      fireEvent.touchEnd(link, { touches: [], changedTouches: [touch] });
+    });
+
+    expect(mocks.archive.mutate).toHaveBeenCalledWith(
+      { id: "conv_1", archived: true },
+      expect.anything(),
+    );
+  });
+
+  it("does not commit after a flick returns below the threshold before release", () => {
+    mocks.isMobile = true;
+    renderSidebar();
+    const { link } = touchTarget();
+    startTouch(200, 100);
+
+    act(() => {
+      for (const x of [100, 190]) {
+        const touch = touchPoint(link, x, 100);
+        fireEvent.pointerMove(link, { ...TOUCH_POINTER, clientX: x, clientY: 100 });
+        fireEvent.touchMove(link, { touches: [touch], changedTouches: [touch] });
+      }
+      const touch = touchPoint(link, 190, 100);
+      fireEvent.pointerUp(link, { ...TOUCH_POINTER, clientX: 190, clientY: 100 });
+      fireEvent.touchEnd(link, { touches: [], changedTouches: [touch] });
+    });
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
+  });
+
+  it("resists travel past commit and caps the row offset", () => {
+    mocks.isMobile = true;
+    renderSidebar();
+    const { row } = touchTarget();
+    const surface = row.querySelector<HTMLElement>("div.relative")!;
+
+    startTouch(400, 100);
+    moveTouch(340, 100);
+    expect(surface.style.marginRight).toBe("60px");
+    moveTouch(100, 100);
+    expect(surface.style.marginRight).toBe("96px");
+    endTouch(100, 100);
+
+    expect(mocks.archive.mutate).toHaveBeenCalledWith(
+      { id: "conv_1", archived: true },
+      expect.anything(),
+    );
+  });
+
+  it("ignores touch gestures that bubble from a portalled dialog", () => {
+    mocks.isMobile = true;
+    renderSidebar();
+    const { row } = touchTarget();
+    const surface = row.querySelector<HTMLElement>("div.relative")!;
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("delete-conversation"));
+    const confirm = screen.getByRole("button", { name: "Delete" });
+    fireEvent.pointerDown(confirm, { ...TOUCH_POINTER, clientX: 100, clientY: 100 });
+    fireEvent.pointerMove(confirm, { ...TOUCH_POINTER, clientX: 10, clientY: 100 });
+    fireEvent.pointerUp(confirm, { ...TOUCH_POINTER, clientX: 10, clientY: 100 });
+
+    expect(surface.style.marginLeft).toBe("");
+    expect(surface.style.marginRight).toBe("");
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
+  });
+
   it("does not fire the action for a short swipe below the commit threshold", () => {
     mocks.isMobile = true;
     renderSidebar();
@@ -1081,19 +1507,32 @@ describe("touch swipe actions", () => {
   });
 
   it("ignores non-touch pointers (pen/stylus/mouse) on mobile", () => {
-    // The gesture is touch-only; a pen swipe past the threshold must not fire.
+    // The gesture is touch-only. Swipe LEFT, which is configured to archive, so
+    // the direction itself can't be what makes this inert — and assert the row
+    // never moves, not just that no mutation fired.
+    vi.useFakeTimers();
+    writeSwipeActions({ left: "archive", right: "archive" });
     mocks.isMobile = true;
     renderSidebar();
 
-    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    const link = screen.getByRole("link", { name: /My Session/ });
+    const li = link.closest("li")!;
+    const surface = li.querySelector<HTMLElement>("div.relative");
     const pen = { pointerId: 1, isPrimary: true, pointerType: "pen" as const };
     fireEvent.pointerDown(li, { ...pen, clientX: 100, clientY: 100 });
-    fireEvent.pointerMove(li, { ...pen, clientX: 120, clientY: 100 });
-    fireEvent.pointerMove(li, { ...pen, clientX: 190, clientY: 100 });
-    fireEvent.pointerUp(li, { ...pen, clientX: 190, clientY: 100 });
+    fireEvent.pointerMove(li, { ...pen, clientX: 80, clientY: 100 });
+    fireEvent.pointerMove(li, { ...pen, clientX: 10, clientY: 100 });
+
+    // No translate, and holding a pen still never arms the long-press.
+    expect(surface?.style.marginRight).toBe("");
+    act(() => vi.advanceTimersByTime(ROW_GESTURE_HOLD_MS + 1));
+    expect(li).not.toHaveClass("scale-[1.01]");
+
+    fireEvent.pointerUp(li, { ...pen, clientX: 10, clientY: 100 });
 
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
     expect(mocks.del.mutate).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("rename-conversation")).toBeNull();
   });
 
   it("yields a primarily-vertical drag to scroll (no action)", () => {
@@ -1103,211 +1542,14 @@ describe("touch swipe actions", () => {
     renderSidebar();
 
     const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
-    fireEvent.pointerDown(li, { ...POINTER, clientX: 100, clientY: 100 });
+    fireEvent.pointerDown(li, { ...TOUCH_POINTER, clientX: 100, clientY: 100 });
     // First move is dominated by the vertical axis → decided="other".
-    fireEvent.pointerMove(li, { ...POINTER, clientX: 105, clientY: 140 });
-    fireEvent.pointerMove(li, { ...POINTER, clientX: 10, clientY: 180 });
-    fireEvent.pointerUp(li, { ...POINTER, clientX: 10, clientY: 180 });
+    fireEvent.pointerMove(li, { ...TOUCH_POINTER, clientX: 105, clientY: 140 });
+    fireEvent.pointerMove(li, { ...TOUCH_POINTER, clientX: 10, clientY: 180 });
+    fireEvent.pointerUp(li, { ...TOUCH_POINTER, clientX: 10, clientY: 180 });
 
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
     expect(mocks.del.mutate).not.toHaveBeenCalled();
-  });
-});
-
-describe("useRowSwipe — dnd coexistence", () => {
-  // Focused hook tests: driving real dnd-kit dragging in jsdom is unreliable,
-  // so control `isDragging` directly to prove the swipe yields to the drag.
-  const ACTIONS = { left: "archive", right: "none" } as const;
-
-  // Row stand-in: pointer-capture no-ops (jsdom's are stubbed in test-setup)
-  // plus `contains`, which the hook uses to reject events bubbling out of a
-  // portal. Defaults to containing everything (the normal in-row case).
-  const PORTAL_ROW = {
-    setPointerCapture: () => {},
-    releasePointerCapture: () => {},
-    hasPointerCapture: () => false,
-    contains: () => true,
-  };
-
-  function makePointer(over: {
-    pointerId: number;
-    clientX: number;
-    clientY: number;
-    target?: unknown;
-    currentTarget?: unknown;
-  }) {
-    // Minimal ReactPointerEvent stand-in — only the fields useRowSwipe reads.
-    return {
-      pointerType: "touch",
-      isPrimary: true,
-      preventDefault: () => {},
-      target: document.createElement("div"),
-      currentTarget: PORTAL_ROW,
-      ...over,
-    } as unknown as ReactPointerEvent;
-  }
-
-  it("(a) yields a primarily-vertical move: decided=other, no translate, no action", () => {
-    const onAction = vi.fn();
-    const { result } = renderHook(() =>
-      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging: false, onAction }),
-    );
-
-    act(() => {
-      result.current.onPointerDown(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
-    });
-    act(() => {
-      // Vertical dominates → the gesture hands off to scroll/drag.
-      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 105, clientY: 140 }));
-    });
-    // No translate offset accumulated.
-    expect(result.current.dx).toBe(0);
-
-    act(() => {
-      result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 105, clientY: 140 }));
-    });
-    expect(onAction).not.toHaveBeenCalled();
-  });
-
-  it("(b) bails once a dnd-kit drag begins mid-gesture: dx resets, no action on release", () => {
-    const onAction = vi.fn();
-    let isDragging = false;
-    const { result, rerender } = renderHook(() =>
-      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging, onAction }),
-    );
-
-    act(() => {
-      result.current.onPointerDown(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
-    });
-    act(() => {
-      // A real horizontal swipe left (the archive-configured direction) locks
-      // in and translates the row.
-      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 70, clientY: 100 }));
-    });
-    expect(result.current.dx).not.toBe(0);
-
-    // dnd-kit's long-press drag activates; re-render with isDragging=true.
-    isDragging = true;
-    rerender();
-    act(() => {
-      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 20, clientY: 100 }));
-    });
-    // The swipe bailed: translate snaps back to rest.
-    expect(result.current.dx).toBe(0);
-
-    act(() => {
-      result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 20, clientY: 100 }));
-    });
-    expect(onAction).not.toHaveBeenCalled();
-  });
-
-  it("(c) commits a fast flick that releases before the last move renders", () => {
-    // A quick flick can lift the finger before React commits the render for the
-    // final pointermove. Release must decide on where the finger actually ended,
-    // so the move + up are dispatched inside ONE act() — no render in between.
-    const onAction = vi.fn();
-    const { result } = renderHook(() =>
-      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging: false, onAction }),
-    );
-
-    act(() => {
-      result.current.onPointerDown(makePointer({ pointerId: 1, clientX: 200, clientY: 100 }));
-      // Lock the gesture, then travel well past the 72px commit threshold and
-      // release — all before the hook re-renders with the final offset.
-      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 180, clientY: 100 }));
-      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
-      result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
-    });
-
-    // -100px past the threshold in the archive-configured direction.
-    expect(onAction).toHaveBeenCalledWith("archive");
-    expect(result.current.dx).toBe(0);
-  });
-
-  it("(d) does not commit a flick that snaps back under the threshold before release", () => {
-    // The mirror case: travel past the threshold, then return under it and
-    // release, again with no render between the moves. Nothing should fire.
-    const onAction = vi.fn();
-    const { result } = renderHook(() =>
-      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging: false, onAction }),
-    );
-
-    act(() => {
-      result.current.onPointerDown(makePointer({ pointerId: 1, clientX: 200, clientY: 100 }));
-      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
-      // Back to only -10px: under the commit threshold at the moment of release.
-      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 190, clientY: 100 }));
-      result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 190, clientY: 100 }));
-    });
-
-    expect(onAction).not.toHaveBeenCalled();
-  });
-
-  it("(f) tracks 1:1 to the commit point, then resists so the title stays in panel", () => {
-    const onAction = vi.fn();
-    const { result } = renderHook(() =>
-      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging: false, onAction }),
-    );
-
-    act(() => {
-      result.current.onPointerDown(makePointer({ pointerId: 1, clientX: 400, clientY: 100 }));
-    });
-    // Up to the threshold the row follows the finger exactly.
-    act(() => {
-      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 340, clientY: 100 }));
-    });
-    expect(result.current.dx).toBe(-60);
-
-    // Well past it, travel is damped and never exceeds the cap — so the row
-    // can't be dragged far enough to push its title out of the panel.
-    act(() => {
-      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
-    });
-    expect(Math.abs(result.current.dx)).toBeLessThanOrEqual(96);
-    expect(Math.abs(result.current.dx)).toBeGreaterThanOrEqual(72);
-
-    // A 300px drag is still capped at 96.
-    act(() => {
-      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
-    });
-    expect(result.current.dx).toBe(-96);
-
-    // Still commits — damping is visual only.
-    act(() => {
-      result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
-    });
-    expect(onAction).toHaveBeenCalledWith("archive");
-  });
-
-  it("(e) ignores a pointerdown that bubbled out of a portal (open dialog)", () => {
-    // The row's dialogs render in portals but are React children, so their
-    // events bubble to the row's handlers. A drag inside the open delete dialog
-    // must not start a swipe on the row behind it.
-    const onAction = vi.fn();
-    const { result } = renderHook(() =>
-      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging: false, onAction }),
-    );
-
-    // currentTarget is the row; target is portal content it does NOT contain.
-    const outside = document.createElement("div");
-    act(() => {
-      result.current.onPointerDown(
-        makePointer({
-          pointerId: 1,
-          clientX: 200,
-          clientY: 100,
-          target: outside,
-          currentTarget: { ...PORTAL_ROW, contains: () => false },
-        }),
-      );
-    });
-    act(() => {
-      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
-      result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
-    });
-
-    expect(result.current.dx).toBe(0);
-    expect(onAction).not.toHaveBeenCalled();
   });
 });
 

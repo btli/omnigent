@@ -45,13 +45,13 @@ def _section(page: Page, title: str) -> Locator:
     )
 
 
-def test_touch_drag_does_not_open_session_context_menu(
+def test_still_touch_opens_session_context_menu_without_dragging(
     browser: Browser,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A still touch activates drag without opening Radix's menu over it."""
+    """A still touch opens the context menu; only a moving finger drags."""
     base_url, session_id = seeded_session
-    title = f"e2e-touch-drag-{uuid.uuid4().hex[:8]}"
+    title = f"e2e-touch-hold-{uuid.uuid4().hex[:8]}"
     _set_title(base_url, session_id, title)
 
     context = browser.new_context(
@@ -78,13 +78,14 @@ def test_touch_drag_does_not_open_session_context_menu(
                 {"type": "touchStart", "touchPoints": [{"x": x, "y": y}]},
             )
 
-            # dnd-kit's unchanged 250ms delay must activate the row first.
-            expect(row).to_have_class(re.compile(r"\bopacity-40\b"), timeout=600)
+            # The hold arms and lifts the row; the menu itself waits for release,
+            # so a finger that never moves is never picked up as a drag.
+            expect(row).to_have_class(re.compile(r"\bscale-\[1\.01\]"), timeout=2000)
+            expect(row).not_to_have_class(re.compile(r"\bopacity-40\b"))
 
-            # Hold past Radix's ~700ms timer while the drag remains active.
-            page.wait_for_timeout(550)
-            expect(row).to_have_class(re.compile(r"\bopacity-40\b"))
-            expect(page.get_by_test_id("rename-conversation")).to_have_count(0)
+            cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+            expect(page.get_by_test_id("rename-conversation")).to_have_count(1, timeout=2000)
+            expect(row).not_to_have_class(re.compile(r"\bopacity-40\b"))
         finally:
             cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
             cdp.detach()
@@ -195,7 +196,8 @@ def test_touch_drag_moves_session_into_project(
                     "touchPoints": [{"x": start_x, "y": start_y}],
                 },
             )
-            expect(row).to_have_class(re.compile(r"\bopacity-40\b"), timeout=600)
+            # Hold until the row lifts, then the first move picks it up as a drag.
+            expect(row).to_have_class(re.compile(r"\bscale-\[1\.01\]"), timeout=2000)
 
             for step in range(1, 6):
                 progress = step / 5
@@ -212,6 +214,9 @@ def test_touch_drag_moves_session_into_project(
                     },
                 )
                 page.wait_for_timeout(20)
+                if step == 1:
+                    # Moving out of the armed hold is what hands the row to dnd-kit.
+                    expect(row).to_have_class(re.compile(r"\bopacity-40\b"), timeout=1000)
             cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
         finally:
             cdp.detach()
