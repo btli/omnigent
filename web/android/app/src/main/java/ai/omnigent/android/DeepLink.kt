@@ -97,9 +97,7 @@ data class DeepLink(
 
             val host = canonicalHost(rawHost) ?: return null
             val scheme = if (host in LOCAL_HOSTS) "http" else "https"
-            val hostPart = bracketIfIpv6(host)
-            val rebuilt = if (port != -1) "$scheme://$hostPart:$port" else "$scheme://$hostPart"
-            val origin = originOf(rebuilt) ?: return null
+            val origin = canonicalOrigin(scheme, host, port)
             return DeepLink(origin, "/c/$id")
         }
 
