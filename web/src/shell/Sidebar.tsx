@@ -152,6 +152,7 @@ import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
 import {
   finishActiveRowGesture,
+  ROW_MENU_SYNTHETIC,
   ROW_SWIPE_COMMIT_PX,
   RowGestureTouchSensor,
   useRowGesture,
@@ -196,9 +197,6 @@ const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 const UNGROUP_DROP_ZONE_ID = "__ungroup__";
 // A resized section can move later drop zones without resizing them.
 const SIDEBAR_RESIZE_OBSERVER_CONFIG = { updateMeasurementsFor: [] };
-// Marks the recognizer's own contextmenu dispatch so the row root can suppress
-// the OS long-press contextmenu mid-gesture without eating its own.
-const ROW_MENU_SYNTHETIC = Symbol("row-menu-synthetic");
 
 // Maps a first-class project id → its name, provided once at the list level so
 // each row resolves its ``project_id`` to a folder name without its own

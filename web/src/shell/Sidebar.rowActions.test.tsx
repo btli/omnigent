@@ -1261,7 +1261,23 @@ describe("touch gesture arbitration", () => {
     const nativeLongPress = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
     row.dispatchEvent(nativeLongPress);
     expect(nativeLongPress.defaultPrevented).toBe(true);
+
+    // The OS hit-tests the element under the finger — once the menu opens
+    // there, that's the menu portal, far from the row. The document-level
+    // guard must still catch it.
+    const offRowLongPress = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+    document.body.dispatchEvent(offRowLongPress);
+    expect(offRowLongPress.defaultPrevented).toBe(true);
+
+    const selection = new Event("selectstart", { bubbles: true, cancelable: true });
+    document.body.dispatchEvent(selection);
+    expect(selection.defaultPrevented).toBe(true);
     endTouch();
+
+    // Released: the guards are gone.
+    const afterRelease = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+    document.body.dispatchEvent(afterRelease);
+    expect(afterRelease.defaultPrevented).toBe(false);
   });
 
   it("leaves the contextmenu alone when no gesture owns the touch", () => {
