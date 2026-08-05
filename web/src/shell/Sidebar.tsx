@@ -148,6 +148,7 @@ import {
 } from "@/hooks/useUnseenConversations";
 import { cn } from "@/lib/utils";
 import { type SwipeAction, useSwipeActions } from "@/lib/swipeActionPreferences";
+import { useCoarsePointer } from "@/hooks/useCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
@@ -2928,6 +2929,7 @@ function ConversationRow({
   // project flyout's HoverCard and leave it lingering over the chat. Gate the
   // flyout off below the `md` breakpoint (see `projectFlyoutName`).
   const isMobile = useIsMobileViewport();
+  const hasCoarsePointer = useCoarsePointer();
   // Track the *live* active conversation id. Delete is fire-and-forget,
   // so the user can navigate to another conversation before the mutation
   // resolves — the onSuccess redirect must key off where they are now,
@@ -3077,7 +3079,8 @@ function ConversationRow({
   const onSwipeAction = useCallback((action: Exclude<SwipeAction, "none">) => {
     swipeActionRef.current(action);
   }, []);
-  const swipeEnabled = isMobile && !selectionMode && isOwner && !isEditing;
+  const gestureEnabled = hasCoarsePointer && !selectionMode && !isEditing;
+  const swipeEnabled = gestureEnabled && isOwner;
   const dragEnabled = isOwner && !selectionMode && !isArchived && !isEditing;
   const openContextMenuAt = useCallback((point: { clientX: number; clientY: number }) => {
     rowLinkRef.current?.dispatchEvent(
@@ -3091,9 +3094,9 @@ function ConversationRow({
     );
   }, []);
   const gesture = useRowGesture({
-    enabled: !selectionMode && !isEditing,
+    enabled: gestureEnabled,
     swipeEnabled,
-    dragEnabled,
+    dragEnabled: hasCoarsePointer && dragEnabled,
     actions: swipeActions,
     onAction: onSwipeAction,
     onLongPress: openContextMenuAt,
