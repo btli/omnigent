@@ -11,8 +11,7 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class DeepLinkTest {
-    // A bare 32-hex uuid — the id form the API emits today.
-    private val hex = "e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9"
+    private val hex = TEST_CONVERSATION_ID
 
     private fun parse(link: String) = DeepLink.parse(Uri.parse(link))
 

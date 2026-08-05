@@ -11,11 +11,7 @@ fun originOf(url: String?): String? {
     val uri = url?.let(Uri::parse) ?: return null
     val scheme = uri.scheme?.lowercase() ?: return null
     val host = (uri.host ?: "").lowercase().ifBlank { return null }
-    // Uri.getHost strips IPv6 brackets; restore them or the rebuilt origin
-    // is unparseable ("https://::1:8000"). Strip any existing brackets first
-    // in case Uri doesn't strip them (edge case in some Android versions).
-    val hostWithoutBrackets = host.removeSurrounding("[", "]")
-    val hostPart = if (":" in hostWithoutBrackets) "[$hostWithoutBrackets]" else hostWithoutBrackets
+    val hostPart = bracketIfIpv6(host.removeSurrounding("[", "]"))
     // Canonicalize like a browser origin (WHATWG): lowercase scheme + host and
     // omit the default port — so an explicit `https://host:443` (or odd casing)
     // the user typed compares equal to the WebView's normalized `https://host`.
@@ -28,6 +24,15 @@ fun originOf(url: String?): String? {
             !(scheme == "http" && port == 80)
     return if (hasExplicitPort) "$scheme://$hostPart:$port" else "$scheme://$hostPart"
 }
+
+/**
+ * Re-wrap a bare IPv6 literal in the brackets a URL authority requires —
+ * without them a rebuilt origin is unparseable ("https://::1:8000"). Callers
+ * strip any existing brackets first: `Uri.getHost` usually strips them but has
+ * been observed returning them intact (Robolectric SDK 35), so neither shape
+ * can be assumed.
+ */
+fun bracketIfIpv6(host: String): String = if (":" in host) "[$host]" else host
 
 /**
  * True for the only two schemes the WebView loads inline (http/https). This

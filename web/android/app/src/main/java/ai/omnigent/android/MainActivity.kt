@@ -63,8 +63,8 @@ class MainActivity : AppCompatActivity() {
     private val deepLinkQueue = ArrayDeque<DeepLink>()
     private var processingDeepLink = false
 
-    // Origin the pending path belongs to; null = the pinned origin (the
-    // notification-tap path). A pending path never flushes cross-origin.
+    // Origin the pending path belongs to, captured when the path is set. A
+    // pending path never flushes cross-origin; null means nothing is pending.
     private var pendingNavigateOrigin: String? = null
 
     // Consent-approved server URL awaiting its first successful load; only
@@ -154,7 +154,10 @@ class MainActivity : AppCompatActivity() {
         blobSaver = BlobSaver(applicationContext)
 
         // Capture (don't replay yet) a notification tap that cold-started us.
-        pendingNavigatePath = navigatePathOf(intent)
+        navigatePathOf(intent)?.let {
+            pendingNavigatePath = it
+            pendingNavigateOrigin = pinnedOrigin
+        }
 
         if (BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true) // chrome://inspect
 
@@ -551,6 +554,7 @@ class MainActivity : AppCompatActivity() {
         val path = navigatePathOf(intent)
         if (path != null) {
             pendingNavigatePath = path
+            pendingNavigateOrigin = pinnedOrigin
             // Replay now if the page is up; otherwise onPageReady will flush it.
             if (pageLoaded) flushPendingActivation()
         }
@@ -673,10 +677,7 @@ class MainActivity : AppCompatActivity() {
             // origin. A retry of the same origin must succeed on its own
             // merits before either is set again.
             pendingPersistUrl = null
-            if (pendingNavigateOrigin == null || pendingNavigateOrigin == pinnedOrigin) {
-                pendingNavigatePath = null
-                pendingNavigateOrigin = null
-            }
+            if (pendingNavigateOrigin == pinnedOrigin) clearPendingNavigate()
         } else {
             // First successful load of a consent-approved server: only now does it
             // become the stored current server / a trusted recent.
@@ -697,12 +698,15 @@ class MainActivity : AppCompatActivity() {
         if (originOf(webView.url) != pinnedOrigin) return
         // A path bound to another origin is stale (a later switch superseded
         // it) — drop it rather than navigate the wrong server.
-        if (pendingNavigateOrigin != null && pendingNavigateOrigin != pinnedOrigin) {
-            pendingNavigatePath = null
-            pendingNavigateOrigin = null
+        if (pendingNavigateOrigin != pinnedOrigin) {
+            clearPendingNavigate()
             return
         }
         emitNotificationActivation(pendingNavigatePath)
+        clearPendingNavigate()
+    }
+
+    private fun clearPendingNavigate() {
         pendingNavigatePath = null
         pendingNavigateOrigin = null
     }
@@ -730,30 +734,22 @@ class MainActivity : AppCompatActivity() {
         // once this item resolves, so stack depth tracks queue depth — fine for
         // the realistic (tiny, human-tap-driven) burst sizes here.
         try {
-            val store = ServerStore(this)
-            val known =
-                (
-                    listOf(store.currentServerUrl()).filter { store.hasServer() } +
-                        store.recentServers()
-                ).firstOrNull { originOf(it) == link.origin }
             synchronous =
-                when {
-                    link.origin == pinnedOrigin -> {
-                        pendingNavigatePath = link.path
-                        pendingNavigateOrigin = link.origin
-                        if (pageLoaded) flushPendingActivation()
-                        true
-                    }
-
-                    known != null -> {
+                if (link.origin == pinnedOrigin) {
+                    pendingNavigatePath = link.path
+                    pendingNavigateOrigin = link.origin
+                    if (pageLoaded) flushPendingActivation()
+                    true
+                } else {
+                    val store = ServerStore(this)
+                    val known = store.knownServers().firstOrNull { originOf(it) == link.origin }
+                    if (known != null) {
                         store.connect(known)
                         pendingNavigatePath = link.path
                         pendingNavigateOrigin = link.origin
                         reloadWithNewServer(known, link.origin)
                         true
-                    }
-
-                    else -> {
+                    } else {
                         // Unknown server: async consent dialog. It calls
                         // finishDeepLink() itself once answered, so the queue
                         // must not advance here.

@@ -2,7 +2,6 @@ package ai.omnigent.android
 
 import android.content.Intent
 import android.net.Uri
-import android.webkit.WebView
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -18,17 +17,9 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class DeepLinkRoutingTest {
-    private val hex = "e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9"
+    private val hex = TEST_CONVERSATION_ID
 
-    private fun store() = ServerStore(ApplicationProvider.getApplicationContext())
-
-    private fun viewIntent(link: String) =
-        Intent(Intent.ACTION_VIEW, Uri.parse(link)).addCategory(Intent.CATEGORY_BROWSABLE)
-
-    private fun MainActivity.field(name: String): Any? =
-        MainActivity::class.java.getDeclaredField(name).apply { isAccessible = true }.get(this)
-
-    private fun MainActivity.webView(): WebView = field("webView") as WebView
+    private fun store() = testStore()
 
     @Test
     fun `manifest resolves omnigent view intents to the DeepLinkActivity trampoline`() {
@@ -39,11 +30,13 @@ class DeepLinkRoutingTest {
     }
 
     @Test
-    fun `DeepLinkActivity forwards to MainActivity with NEW_TASK, CLEAR_TOP, and SINGLE_TOP, then finishes`() {
+    fun `DeepLinkActivity forwards to MainActivity with NEW_TASK, CLEAR_TOP, SINGLE_TOP`() {
         val activity =
             Robolectric
-                .buildActivity(DeepLinkActivity::class.java, viewIntent("omnigent://h.example/c/$hex"))
-                .setup()
+                .buildActivity(
+                    DeepLinkActivity::class.java,
+                    viewIntent("omnigent://h.example/c/$hex"),
+                ).setup()
                 .get()
         assertTrue(activity.isFinishing)
         val next = shadowOf(activity).nextStartedActivity
@@ -52,7 +45,8 @@ class DeepLinkRoutingTest {
         assertEquals(Intent.ACTION_VIEW, next.action)
         assertEquals(Uri.parse("omnigent://h.example/c/$hex"), next.data)
         val expectedFlags =
-            Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                Intent.FLAG_ACTIVITY_SINGLE_TOP
         assertEquals(expectedFlags, next.flags and expectedFlags)
     }
 
@@ -64,10 +58,10 @@ class DeepLinkRoutingTest {
                 .buildActivity(MainActivity::class.java, viewIntent("omnigent://h.example/c/$hex"))
                 .setup()
                 .get()
-        assertEquals("/c/$hex", activity.field("pendingNavigatePath"))
-        assertEquals("https://h.example", activity.field("pendingNavigateOrigin"))
+        assertEquals("/c/$hex", activity.privateField("pendingNavigatePath"))
+        assertEquals("https://h.example", activity.privateField("pendingNavigateOrigin"))
         // Same origin: no reload away from the stored server.
-        assertEquals("https://h.example", originOf(shadowOf(activity.webView()).lastLoadedUrl))
+        assertEquals("https://h.example", originOf(shadowOf(activity.testWebView()).lastLoadedUrl))
     }
 
     @Test
@@ -80,9 +74,12 @@ class DeepLinkRoutingTest {
                 .setup()
                 .get()
         // Switched: pinned to the link's origin, loading the stored (mounted) URL.
-        assertEquals("https://ws.example", activity.field("pinnedOrigin"))
-        assertEquals("https://ws.example/ml/omnigents", shadowOf(activity.webView()).lastLoadedUrl)
-        assertEquals("/c/$hex", activity.field("pendingNavigatePath"))
+        assertEquals("https://ws.example", activity.privateField("pinnedOrigin"))
+        assertEquals(
+            "https://ws.example/ml/omnigents",
+            shadowOf(activity.testWebView()).lastLoadedUrl,
+        )
+        assertEquals("/c/$hex", activity.privateField("pendingNavigatePath"))
         assertEquals("https://ws.example/ml/omnigents", store().currentServerUrl())
     }
 
@@ -92,7 +89,7 @@ class DeepLinkRoutingTest {
         val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
         val activity = controller.get()
         controller.newIntent(viewIntent("omnigent://h.example/c/$hex"))
-        assertEquals("/c/$hex", activity.field("pendingNavigatePath"))
+        assertEquals("/c/$hex", activity.privateField("pendingNavigatePath"))
     }
 
     @Test
@@ -105,7 +102,7 @@ class DeepLinkRoutingTest {
                     viewIntent("omnigent://h.example/c/$hex?view=terminal"),
                 ).setup()
                 .get()
-        assertNull(activity.field("pendingNavigatePath"))
+        assertNull(activity.privateField("pendingNavigatePath"))
     }
 
     @Test
