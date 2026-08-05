@@ -79,11 +79,32 @@ class DeepLinkConsentTest {
         // chrome-error:// one — so this is the only way the shell finds out.
         activity.invokeOnPageReady("https://new.example/", mainFrameLoadFailed = true)
 
-        // Never became a trusted recent, and the stale pending path is dropped
-        // rather than replayed against a server that never actually loaded.
+        // Never became a trusted recent, but the activation remains queued for
+        // a successful retry of the same origin.
         assertEquals("https://current.example", store().currentServerUrl())
         assertFalse(store().recentServers().any { it.contains("new.example") })
+        assertEquals("/c/$hex", activity.privateField("pendingNavigatePath"))
+        assertNull(activity.privateField("pendingPersistUrl"))
+        assertFalse(activity.privateField("pageLoaded") as Boolean)
+
+        activity.invokeOnPageReady("https://new.example/", mainFrameLoadFailed = false)
         assertNull(activity.privateField("pendingNavigatePath"))
+        assertFalse(store().recentServers().any { it.contains("new.example") })
+    }
+
+    @Test
+    fun `main frame HTTP error does not persist a consented server`() {
+        val activity = launchWithLink("omnigent://new.example/c/$hex")
+        latestDialog().getButton(DialogInterface.BUTTON_POSITIVE).performClick()
+        idle()
+
+        activity.invokeOnPageReady(
+            "https://new.example/",
+            mainFramePersistenceFailed = true,
+        )
+
+        assertEquals("https://current.example", store().currentServerUrl())
+        assertFalse(store().recentServers().any { it.contains("new.example") })
         assertNull(activity.privateField("pendingPersistUrl"))
     }
 
@@ -157,8 +178,7 @@ class DeepLinkConsentTest {
             // the exception surfaces here rather than from performClick().
             idle()
         } catch (_: RuntimeException) {
-            // Expected: propagates from loadUrl through resolve() — the
-            // finally must have already run finishDeepLink() by this point.
+            // Expected: the queue must already be released by this point.
         }
 
         assertFalse(activity.privateField("processingDeepLink") as Boolean)
@@ -172,6 +192,33 @@ class DeepLinkConsentTest {
         idle()
         val dialog = ShadowDialog.getLatestDialog() as AlertDialog
         assertTrue(dialog.isShowing)
+    }
+
+    @Test
+    fun `accepted link path flushes before a queued same-origin path`() {
+        val firstId = "first-$hex"
+        val secondId = "second-$hex"
+        store().connect("https://current.example")
+        val controller =
+            Robolectric.buildActivity(
+                MainActivity::class.java,
+                viewIntent("omnigent://new.example/c/$firstId"),
+            )
+        val activity = controller.setup().get()
+        controller.newIntent(viewIntent("omnigent://new.example/c/$secondId"))
+
+        latestDialog().getButton(DialogInterface.BUTTON_POSITIVE).performClick()
+        idle()
+
+        assertEquals("/c/$firstId", activity.privateField("pendingNavigatePath"))
+        assertEquals(1, (activity.privateField("deepLinkQueue") as ArrayDeque<*>).size)
+
+        activity.invokeOnPageReady("https://new.example/")
+
+        assertNull(activity.privateField("pendingNavigatePath"))
+        assertTrue((activity.privateField("deepLinkQueue") as ArrayDeque<*>).isEmpty())
+        assertFalse(activity.privateField("processingDeepLink") as Boolean)
+        assertTrue(shadowOf(activity.testWebView()).lastEvaluatedJavascript.contains(secondId))
     }
 
     @Test
