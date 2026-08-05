@@ -1337,7 +1337,7 @@ def create_app(
         :returns: A JSON response with the error code and message.
         """
         if exc.http_status >= 500:
-            _logger.error("Internal error: %s", exc.message, exc_info=True)
+            _logger.error("Internal error: %s", exc.message, exc_info=exc)
         elif exc.http_status == 400 and request.url.path.endswith("/policies/evaluate"):
             _logger.warning(
                 "Policy evaluate rejected 400 on %s: %s", request.url.path, exc.message
@@ -1375,7 +1375,7 @@ def create_app(
                 status_code=404,
                 content={"error": {"code": ErrorCode.NOT_FOUND, "message": "Not found."}},
             )
-        _logger.error("Database error: %s", exc, exc_info=True)
+        _logger.error("Database error: %s", exc, exc_info=exc)
         return JSONResponse(
             status_code=500,
             content={
@@ -1400,7 +1400,7 @@ def create_app(
         :param exc: The unhandled exception.
         :returns: A 500 JSON response with ``internal_error`` code.
         """
-        _logger.error("Unhandled exception: %s", exc, exc_info=True)
+        _logger.error("Unhandled exception: %s", exc, exc_info=exc)
         return JSONResponse(
             status_code=500,
             content={
@@ -1654,8 +1654,13 @@ def create_app(
         # Missing ids default to reachable / no-host, matching the bulk
         # lookup's own missing-row terminal.
         _missing = SessionLiveness(runner_online=True, host_online=None)
+
+        def _liveness_or_missing(sid: str) -> SessionLiveness:
+            found = liveness.get(sid)
+            return found if found is not None else _missing
+
         if session_id is not None:
-            single = liveness.get(session_id, _missing)
+            single = _liveness_or_missing(session_id)
             result["session"] = {
                 "id": session_id,
                 "runner_online": single.runner_online,
@@ -1665,7 +1670,7 @@ def create_app(
         if session_ids is not None:
             result["sessions"] = {
                 sid: {
-                    "runner_online": (sl := liveness.get(sid, _missing)).runner_online,
+                    "runner_online": (sl := _liveness_or_missing(sid)).runner_online,
                     "host_online": sl.host_online,
                     "host_version": sl.host_version,
                 }
@@ -1686,7 +1691,7 @@ def create_app(
         return {"version": _server_version()}
 
     @app.get("/v1/info")
-    async def info() -> dict[str, bool | str | list[str] | None]:
+    async def info() -> dict[str, bool | str | list[str] | dict[str, bool] | None]:
         """Runtime capabilities probe for the SPA + CLI.
 
         Returned at app boot by the frontend (and by ``omnigent
@@ -1772,19 +1777,26 @@ def create_app(
         # server_version is the installed omnigent package version (same
         # source as /api/version), surfaced so the web UI can show it in the
         # session info popover alongside the per-session host version.
-        # smart_routing_enabled: true when the server can route — either
-        # a RoutingClient is configured (a server llm: block, or a
-        # routing.provider=external block) or the managed deployment registered
-        # a policy_llm_connection_factory (which means it has LLM capability
-        # and will supply its own RoutingClient).
+        # smart_routing_enabled: true when the server can route from ANY source
+        # — a configured RoutingClient (a server llm: block, routing.provider=
+        # external, or an explicit routing_backends pair) or a managed
+        # deployment's policy_llm_connection_factory.
+        # smart_routing_sources names WHICH router can answer: "external" is the
+        # workspace AI-Gateway task_v1 client, "oss" the built-in judge. A
+        # harness whose inference is not gateway-backed can only be served by
+        # the built-in one, so the SPA and the CLI read this to pick a source
+        # instead of hiding the surface.
+        # Both come from one helper, so the flag can never claim routing is off
+        # for a deployment whose sources say a router would answer.
         try:
             from omnigent.runtime._globals import _caps
+            from omnigent.server.routing_backend import routing_available, routing_sources
 
-            smart_routing_enabled = _caps is not None and (
-                _caps.routing_client is not None or _caps.policy_llm_connection_factory is not None
-            )
+            smart_routing_enabled = routing_available(_caps)
+            smart_routing_sources = routing_sources(_caps)
         except ImportError:
             smart_routing_enabled = False
+            smart_routing_sources = {"external": False, "oss": False}
         # harness_install_enabled gates the web UI's "Install" action for a
         # missing, npm-installable harness on a connected host. Off by default
         # (OMNIGENT_HARNESS_INSTALL_ENABLED=1 opts in) while the feature rolls
@@ -1825,6 +1837,7 @@ def create_app(
             "public_sharing_enabled": public_sharing_enabled,
             "server_version": _server_version(),
             "smart_routing_enabled": smart_routing_enabled,
+            "smart_routing_sources": smart_routing_sources,
             "harness_install_enabled": harness_install_enabled,
             "installable_harnesses": installable_harnesses,
             "dictation_available": dictation_available,
@@ -2359,7 +2372,7 @@ def create_app(
                 prefix="/auth",
                 tags=["auth"],
             )
-        else:
+        elif isinstance(auth_provider, UnifiedAuthProvider):
             from omnigent.server.routes.auth import create_auth_router
 
             # OIDC invites are opt-in (OMNIGENT_OIDC_ALLOW_INVITES) and
@@ -2388,6 +2401,11 @@ def create_app(
                 ),
                 prefix="/auth",
                 tags=["auth"],
+            )
+        else:
+            _logger.debug(
+                "Skipping built-in auth routes for custom provider %s",
+                type(auth_provider).__name__,
             )
 
         # Device Authorization Grant (RFC 8628): opt-in, default-off via
@@ -2451,7 +2469,7 @@ def create_app(
     all_extra_routers = list(extra_routers or [])
     all_extra_routers.extend(_load_debug_routers(debug_router_modules))
     for router, prefix, tags in all_extra_routers:
-        app.include_router(router, prefix=prefix, tags=tags)
+        app.include_router(router, prefix=prefix, tags=[*tags])
 
     web_ui_dist = _WEB_UI_DIST
     web_ui_present = web_ui_dist.is_dir() and (web_ui_dist / "index.html").is_file()

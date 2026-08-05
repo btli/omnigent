@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 import secrets
 import time
 import urllib.parse
@@ -66,6 +67,7 @@ from omnigent.runner.identity import (
     token_bound_runner_id,
 )
 from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runtime import (
     get_policy_store,
@@ -108,17 +110,88 @@ from omnigent.server.routes._session_create_validation import (
 # Shared constants, state, and small dataclasses live in the _sessions.common
 # leaf module; import them here so this module and its re-exporters see the same
 # objects. The mutable caches are shared by reference across the package.
-from omnigent.server.routes._sessions.common import *
-
 # Runtime bindings that tests patch on the historical ``sessions`` facade are
-# imported from common as facade-delegating proxies (kept out of common's
-# ``__all__`` so the star import above never overwrites them). Resolving them
-# here means a facade-level monkeypatch is honoured in this module too.
+# imported from common as facade-delegating proxies. They stay out of common's
+# ``__all__`` and the facade's explicit re-exports, preserving its real runtime
+# bindings so a facade-level monkeypatch is honoured in this module too.
 from omnigent.server.routes._sessions.common import (  # noqa: F401
+    _APPROVAL_TYPE,
+    _CHILD_PREVIEW_LIMIT,
+    _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY,
+    _CLAUDE_NATIVE_EDIT_TOOLS,
+    _CLAUDE_NATIVE_HARNESS,
+    _CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS,
+    _CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY,
+    _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
+    _CLAUDE_NATIVE_TOOL_USE_ID_LABEL_KEY,
+    _CLAUDE_NATIVE_UI_LABEL_KEY,
+    _CLAUDE_NATIVE_UI_LABEL_VALUE,
+    _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
+    _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
+    _CODEX_NATIVE_COLLABORATION_MODES,
+    _CODEX_NATIVE_HARNESS,
+    _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK,
+    _CODEX_NATIVE_SUBAGENT_NICKNAME_LABEL_KEY,
+    _CODEX_NATIVE_SUBAGENT_PARENT_THREAD_ID_LABEL_KEY,
+    _CODEX_NATIVE_SUBAGENT_PROMPT_LABEL_KEY,
+    _CODEX_NATIVE_SUBAGENT_ROLE_LABEL_KEY,
+    _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY,
+    _CODEX_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY,
+    _CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
+    _COMPACT_LOCKS,
+    _CURSOR_FORK_HISTORY_HARNESSES,
+    _CURSOR_NATIVE_HARNESS,
+    _DENY_SENTINEL_PREFIX,
     _ELICITATION_MODE,
+    _EXTERNAL_STATUS_ASSISTANT_SCAN_LIMIT,
+    _FORK_HISTORY_NATIVE_HARNESSES,
+    _HOOK_ELICITATION_ID_RE,
+    _HOST_LAUNCH_RESULT_TIMEOUT_S,
+    _LABEL_VALUE_MAX_LEN,
+    _LAST_TASK_ERROR_CODE_LABEL_KEY,
+    _LAST_TASK_ERROR_MESSAGE_LABEL_KEY,
+    _MAX_TERMINAL_LAUNCH_ARG_LEN,
+    _MAX_TERMINAL_LAUNCH_ARGS,
+    _MODEL_TOKEN_KEYS,
+    _NATIVE_POLICY_NOT_ENFORCED_CODE,
+    _NATIVE_TERMINAL_ENSURE_FAILED_CODE,
+    _PI_NATIVE_WRAPPER_LABEL_VALUE,
+    _RUNNER_CONVICTION_POLL_S,
+    _RUNNER_FORWARD_TIMEOUT,
+    _SERVER_STREAM_EVENT_ADAPTER,
+    _SESSION_STREAM_HEARTBEAT_INTERVAL_S,
+    _SHARED_DISCOVERY_KEY,
+    _SLASH_COMMAND_TYPE,
+    _STOP_RUNNER_RESULT_TIMEOUT_S,
+    _STOP_SESSION_TYPE,
+    _TURN_ACTOR_LABEL,
+    _UI_ADDED_AGENT_TITLE_PREFIX,
+    _UPLOAD_READ_CHUNK_BYTES,
+    COST_CONTROL_OVERRIDE_VALUES,
+    SUBAGENT_ROUTING_OVERRIDE_VALUES,
+    _logger,
+    _managed_launch_tasks,
+    _model_options_cache,
+    _model_options_inflight,
+    _model_options_stale,
+    _native_ask_gate_locks,
+    _pending_policy_ask_writes,
+    _pushed_model_options_cache,
+    _read_explicit_unread,
+    _read_last_seen,
+    _runner_skills_cache,
+    _runner_skills_inflight,
+    _session_active_response_cache,
+    _session_background_task_count_cache,
+    _session_mcp_startup_cache,
+    _session_sandbox_status_cache,
+    _session_status_cache,
+    _session_terminal_pending_cache,
+    _session_todos_cache,
     build_policy_engine,
     get_agent_cache,
     get_caps,
+    get_server_host_registry,
     get_server_runner_router,
     session_stream,
     set_server_runner_router,
@@ -139,6 +212,7 @@ from omnigent.server.schemas import (
     ReasoningStartedEvent,
     ReasoningTextDeltaEvent,
     ResponseObject,
+    RetryErrorDetail,
     SandboxStatus,
     SessionCollaborationModeEvent,
     SessionCreatedEvent,
@@ -1706,6 +1780,53 @@ def _validated_harness_override_executor_type(agent: Agent) -> None:
         )
 
 
+#: ``executor.config`` key by which a spec hands its brain harness to Smart
+#: Routing. ``auto`` is the only accepted value.
+SMART_ROUTING_HARNESS_CONFIG_KEY = "smart_routing_harness"
+
+#: The ``harness_override`` sentinel meaning "the router picks the harness".
+AUTO_HARNESS_SENTINEL = "auto"
+
+
+def _validated_spec_smart_routing_harness(spec: AgentSpec) -> str | None:
+    """
+    Read a spec's opt-in for routing its own brain harness.
+
+    A spec that pins ``executor.config.harness`` also pins the family every
+    sub-agent is routed within, so a cross-family sub-agent cannot stay on its
+    declared harness. ``smart_routing_harness: auto`` lets such a spec keep its
+    pin for a normal session and hand the harness to the router when Smart
+    Routing is on.
+
+    Validated on the same rules as :func:`_validated_harness_override`: the
+    value must be the ``"auto"`` sentinel, and only an ``executor.type:
+    omnigent`` spec has a swappable brain harness to give away.
+
+    :param spec: The bound agent's parsed spec.
+    :returns: ``"auto"`` when the spec opts in, else ``None``.
+    :raises OmnigentError: ``invalid_input`` for any other value, or for the
+        key on a non-omnigent executor type.
+    """
+    from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
+
+    value = spec.executor.config.get(SMART_ROUTING_HARNESS_CONFIG_KEY)
+    if value is None:
+        return None
+    key = f"executor.config.{SMART_ROUTING_HARNESS_CONFIG_KEY}"
+    if value != AUTO_HARNESS_SENTINEL:
+        raise OmnigentError(
+            f"invalid {key}: must be {AUTO_HARNESS_SENTINEL!r}, got {value!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if spec.executor.type != OMNIGENT_EXECUTOR_TYPE:
+        raise OmnigentError(
+            f"{key} only applies to executor.type {OMNIGENT_EXECUTOR_TYPE!r} "
+            f"agents; this spec declares executor.type {spec.executor.type!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return AUTO_HARNESS_SENTINEL
+
+
 def _utc_day(epoch_seconds: int) -> str:
     """
     Convert a Unix epoch timestamp to its UTC calendar day.
@@ -1807,8 +1928,16 @@ def _model_usage_bucket(usage: dict[str, Any], model: str) -> dict[str, float]:
         ``"databricks-gpt-5-5"``.
     :returns: The mutable per-model bucket, e.g. ``{"input_tokens": 1200}``.
     """
-    by_model = usage.setdefault("by_model", {})
-    return by_model.setdefault(model, {})
+    raw_by_model = usage.setdefault("by_model", {})
+    if not isinstance(raw_by_model, dict):
+        raw_by_model = {}
+        usage["by_model"] = raw_by_model
+    by_model = cast(dict[str, Any], raw_by_model)
+    raw_bucket = by_model.setdefault(model, {})
+    if not isinstance(raw_bucket, dict):
+        raw_bucket = {}
+        by_model[model] = raw_bucket
+    return cast(dict[str, float], raw_bucket)
 
 
 def _add_model_usage_delta(
@@ -1898,10 +2027,13 @@ def _coerce_cumulative_field(
     value = data.get(key)
     if value is None:
         return None
-    ok = (
-        isinstance(value, (int, float)) if numeric else isinstance(value, int)
-    ) and not isinstance(value, bool)
-    if not ok or value < 0:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise OmnigentError(
+            f"external_session_usage data.{key} must be a non-negative "
+            f"{'number' if numeric else 'int'}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if (not numeric and not isinstance(value, int)) or value < 0:
         raise OmnigentError(
             f"external_session_usage data.{key} must be a non-negative "
             f"{'number' if numeric else 'int'}",
@@ -3096,6 +3228,52 @@ def _is_kiro_native_session(conv: Conversation) -> bool:
     return conv.labels.get("omnigent.wrapper") == "kiro-native-ui"
 
 
+# Claude Code writes this record into its own transcript when a turn is
+# interrupted (Escape, or steering while a tool is in flight). Anchored so a
+# user's bracketed question such as "[Request interrupted by user?]" stays a
+# real message. Kept in sync with `INTERRUPT_RE` in web/src/lib/systemMessage.ts,
+# which re-classifies the mirrored record as a muted "Interrupted" marker.
+_CLAUDE_INTERRUPT_RECORD_RE = re.compile(r"^\[Request interrupted by user(?: for tool use)?\]$")
+
+
+def _is_native_interrupt_record(data: MessageData) -> bool:
+    """
+    Whether a mirrored user item is the vendor CLI's own interrupt record.
+
+    The transcript forwarder mirrors every user-role record back, but this
+    one is synthesized by Claude itself — it is not the round-trip of a web
+    message, so no :mod:`omnigent.runtime.pending_inputs` entry exists for
+    it. Draining one anyway shifts the FIFO by a slot: the marker absorbs
+    the queued message's uploads and the real message persists with none.
+
+    Runtime ``[System: ...]`` notices are deliberately NOT matched here.
+    Those are posted through ``POST /v1/sessions/{id}/events`` and record a
+    pending entry of their own (see
+    :func:`_dispatch_session_event_to_runner`), so their mirror-back must
+    keep draining normally.
+
+    Matched on the first line only, exactly as ``parseSystemMessage`` does
+    web-side. The two predicates must agree: a record the web hides as a
+    marker but the server drains for would put the bug straight back.
+
+    :param data: The mirrored user message's data, whose ``content`` is a
+        list of block dicts, e.g. ``[{"type": "input_text", "text":
+        "[Request interrupted by user]"}]``.
+    :returns: ``True`` for an interrupt record, ``False`` for a real
+        user message.
+    """
+    if any(
+        isinstance(block, dict) and block.get("type") in ("input_image", "input_file")
+        for block in data.content
+    ):
+        return False
+    text = _message_text(data.content)
+    if text is None:
+        return False
+    first_line = text.strip().split("\n", 1)[0]
+    return _CLAUDE_INTERRUPT_RECORD_RE.match(first_line) is not None
+
+
 def _merge_pending_file_blocks(
     item: NewConversationItem,
     pending_content: list[dict[str, Any]],
@@ -3477,7 +3655,7 @@ async def _persist_session_status_error_labels(
     )
     try:
         await asyncio.to_thread(conversation_store.set_labels, session_id, updates)
-    except Exception:
+    except Exception:  # noqa: BLE001
         _logger.exception(
             "Failed to persist session status error labels for %s",
             session_id,
@@ -3575,15 +3753,16 @@ def _publish_sandbox_status_impl(session_id: str, stage: str, error: str | None 
     # host-bound session and the snapshot carries no launch state.
     # Failures stay cached (mirroring ManagedLaunchTracker retention)
     # so a reload after a dead launch still shows the reason.
-    if stage == "ready":
+    status = SandboxStatus.model_validate({"stage": stage, "error": error})
+    if status.stage == "ready":
         _session_sandbox_status_cache.pop(session_id, None)
     else:
-        _session_sandbox_status_cache[session_id] = SandboxStatus(stage=stage, error=error)
+        _session_sandbox_status_cache[session_id] = status
     event = SessionSandboxStatusEvent(
         type="session.sandbox_status",
         conversation_id=session_id,
-        stage=stage,
-        error=error,
+        stage=status.stage,
+        error=status.error,
     )
     session_stream.publish(session_id, event.model_dump())
 
@@ -4257,7 +4436,7 @@ async def _provision_managed_sandbox(
         tracker.fail(session_id, str(exc.detail))
         _publish_sandbox_status(session_id, "failed", str(exc.detail))
         return None
-    except Exception:
+    except Exception:  # noqa: BLE001
         # Broad on purpose: this is a fire-and-forget task — an
         # unexpected error must settle the tracker (or a waiting
         # message POST hangs until its timeout) and must not escape
@@ -4661,7 +4840,7 @@ class _NativeTerminalEnsureOutcome:
     """
 
     error: ErrorData | None
-    policy_notice: str | None
+    policy_notice: str | None = None
 
 
 def _policy_notice_from_ensure_response(resp: httpx.Response) -> str | None:
@@ -4698,9 +4877,74 @@ def _publish_error_event(session_id: str, error: ErrorData) -> None:
     event = ErrorEvent(
         type="response.error",
         source=error.source,
-        error={"code": error.code, "message": error.message},
+        error=RetryErrorDetail(code=error.code, message=error.message),
     )
     session_stream.publish(session_id, event.model_dump())
+
+
+#: Error code for a model change the terminal never applied.
+_MODEL_CHANGE_NOT_APPLIED_CODE = "model_change_not_applied"
+
+
+def _surface_model_change_forward_failure(
+    session_id: str,
+    model: str | None,
+    runner_result: _RunnerForwardResult | None,
+) -> None:
+    """
+    Publish a visible notice when a native pane never took a model change.
+
+    A PATCH persists ``model_override`` and then forwards the change to the
+    runner, which types ``/model`` into the terminal. On a native terminal that
+    injection is the ONLY thing that moves the model, so a dropped forward left
+    the row (and the picker) claiming a model the pane was never on, silently.
+    This does not roll the row back — it makes the divergence visible.
+
+    Call only for native terminal sessions: every other harness re-reads the
+    persisted value at its next turn boundary, so a dropped forward there is
+    genuinely benign.
+
+    Silent when no runner answered at all. That session is stopped or detached,
+    and its relaunch reads ``model_override`` off the row, so nothing has
+    diverged — the notice is for a session whose runner IS reachable and still
+    did not switch the pane.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param model: The model that was persisted, or ``None`` when cleared.
+    :param runner_result: HTTP result from the forward, or ``None`` when no
+        runner was reachable.
+    :returns: None.
+    """
+    if runner_result is None:
+        _logger.info(
+            "Model change for session=%s model=%r reached no runner; the launch will read it "
+            "off the row",
+            session_id,
+            model,
+        )
+        return
+    if 200 <= runner_result.status_code < 300:
+        return
+    reason = f"the runner returned status {runner_result.status_code}"
+    _logger.warning(
+        "Model change not applied to the terminal for session=%s model=%r: %s (body=%s)",
+        session_id,
+        model,
+        reason,
+        runner_result.body,
+    )
+    target = model or "its default model"
+    _publish_error_event(
+        session_id,
+        ErrorData(
+            source="execution",
+            code=_MODEL_CHANGE_NOT_APPLIED_CODE,
+            message=(
+                f"The terminal was not switched to {target}: {reason}. "
+                "It is still running on its previous model."
+            ),
+        ),
+    )
 
 
 async def _persist_native_policy_notice(
@@ -4803,10 +5047,19 @@ async def _forward_session_change_to_runner(
     return await _facade._forward_session_change_to_runner(*args, **kwargs)
 
 
+#: Forward budget for a control event the runner answers by driving the TUI.
+#: The claude-native ``/model`` and ``/effort`` injectors wait up to 1s for the
+#: tmux advertisement and then up to 4s for the confirmation dialog, so the
+#: default 5s budget could time out on a legitimately-still-working injection
+#: and report a failure that did not happen.
+_TUI_INJECT_FORWARD_TIMEOUT_S = 20.0
+
+
 async def _forward_session_change_to_runner_impl(
     session_id: str,
     runner_router: Any,
     event: dict[str, Any],
+    timeout_s: float = 5.0,
 ) -> _RunnerForwardResult | None:
     """
     Best-effort POST a control event to the bound runner.
@@ -4846,6 +5099,9 @@ async def _forward_session_change_to_runner_impl(
         ``{"type": "effort_change", "effort": "high"}``,
         ``{"type": "model_change", "model": "claude-opus-4-7"}``, or
         ``{"type": "compact"}``.
+    :param timeout_s: Request budget, e.g. ``5.0``. Callers whose event the
+        runner answers by driving the TUI pass
+        :data:`_TUI_INJECT_FORWARD_TIMEOUT_S`.
     :returns: The runner's HTTP status/body, or ``None`` when no
         runner client could be resolved or the POST failed at the
         transport layer (in both cases the AP-side persisted value /
@@ -4862,7 +5118,7 @@ async def _forward_session_change_to_runner_impl(
         resp = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
             json=event,
-            timeout=5.0,
+            timeout=timeout_s,
         )
     except (httpx.HTTPError, ConnectionError):
         _logger.exception(
@@ -5500,7 +5756,11 @@ async def _emit_server_routing_decision(
     verdict: dict[str, Any],
     *,
     agent: str | None = None,
-) -> None:
+    scope: str = "turn",
+    harness: str | None = None,
+    decision_id: str | None = None,
+    attempted_override: str | None = None,
+) -> str | None:
     """Persist and publish a ``routing_decision`` transcript chip.
 
     Called by the server-side routing path before the turn is forwarded
@@ -5510,15 +5770,38 @@ async def _emit_server_routing_decision(
 
     :param agent: Sub-agent name to include when mirroring a child
         session's routing decision into the parent's transcript.
+    :param scope: What the decision governs, e.g. ``"child_session"``.
+    :param harness: Harness the decision applies to, when it picked one.
+    :param decision_id: Decision identity shared with the child-sessions
+        API. ``None`` mints one.
+    :param attempted_override: Model the spawning agent asked for and the
+        router overrode — an LLM-supplied ``args.model``, or a native
+        spawn's own ``requested_model``. ``None`` when nothing was asked
+        for, or when the pick names the same arm as the ask.
+    :returns: The decision id, so callers can join it onto the session
+        row, or ``None`` when the payload failed validation and no chip
+        was recorded.
     """
     import uuid
 
     rationale = verdict.get("rationale", "")
     applied = verdict.get("applied", True)
+    resolved_decision_id = decision_id or str(uuid.uuid4())
+    raw_model = verdict.get("raw_model")
+    # Which router answered, so the chip can mark an AI-Gateway-routed decision.
+    router_source = verdict.get("router_source")
     item_data: dict[str, Any] = {
         "model": model,
         "applied": bool(applied),
         "rationale": rationale if isinstance(rationale, str) else "",
+        "scope": scope,
+        "harness": harness,
+        "decision_id": resolved_decision_id,
+        "raw_model": raw_model if isinstance(raw_model, str) and raw_model else None,
+        "attempted_override": attempted_override,
+        "router_source": (
+            router_source if isinstance(router_source, str) and router_source else None
+        ),
     }
     if agent is not None:
         item_data["agent"] = agent
@@ -5526,7 +5809,7 @@ async def _emit_server_routing_decision(
         parsed_data = parse_item_data("routing_decision", item_data)
     except (ValueError, TypeError):
         _logger.warning("Server routing: failed to parse routing_decision data")
-        return
+        return None
 
     routing_item = NewConversationItem(
         type="routing_decision",
@@ -5536,7 +5819,7 @@ async def _emit_server_routing_decision(
     try:
         persisted = await asyncio.to_thread(conversation_store.append, session_id, [routing_item])
         persisted_id: str | None = persisted[0].id if persisted else None
-    except Exception:
+    except Exception:  # noqa: BLE001
         _logger.exception(
             "Server routing: routing_decision persist failed for session=%s",
             session_id,
@@ -5555,6 +5838,7 @@ async def _emit_server_routing_decision(
             },
         },
     )
+    return resolved_decision_id
 
 
 @dataclass
@@ -5880,7 +6164,7 @@ async def _relay_persist_error_once(
             [item],
         )
         return "persisted"
-    except Exception:
+    except Exception:  # noqa: BLE001
         _logger.exception(
             "Relay error persist failed for session=%s",
             session_id,
@@ -5908,7 +6192,7 @@ async def _relay_persist(
             session_id,
             [item],
         )
-    except Exception:
+    except Exception:  # noqa: BLE001
         _logger.exception(
             "Relay persist failed for session=%s",
             session_id,
@@ -5991,7 +6275,7 @@ async def _flush_relay_text(
             ),
         )
         persisted = await asyncio.to_thread(conversation_store.append, session_id, [item])
-    except Exception:
+    except Exception:  # noqa: BLE001
         # Keep text_acc + the in-flight buffer so the narration isn't lost:
         # it still replays on reconnect and is retried at the next flush.
         _logger.exception(
@@ -6334,11 +6618,12 @@ def _load_agent_spec_for_session_impl(
     agent = agent_store.get(conv.agent_id)
     if agent is None:
         return None
-    return (
-        get_agent_cache()
-        .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
-        .spec
-    )
+    agent_cache = cast(AgentCache, get_agent_cache())
+    return agent_cache.load(
+        agent.id,
+        agent.bundle_location,
+        expand_env=agent.session_id is None,
+    ).spec
 
 
 def _build_policy_engine_from_spec(*args: Any, **kwargs: Any) -> PolicyEngine:
@@ -6357,14 +6642,17 @@ def _build_policy_engine_from_spec_impl(
     host_connection = (
         caps.policy_llm_connection_factory() if caps.policy_llm_connection_factory else None
     )
-    return build_policy_engine(
-        spec=spec,
-        conversation_id=session_id,
-        conversation_store=conversation_store,
-        default_policies=caps.default_policies,
-        policy_store=get_policy_store(),
-        server_llm=caps.llm,
-        host_connection=host_connection,
+    return cast(
+        PolicyEngine,
+        build_policy_engine(
+            spec=spec,
+            conversation_id=session_id,
+            conversation_store=conversation_store,
+            default_policies=caps.default_policies,
+            policy_store=get_policy_store(),
+            server_llm=caps.llm,
+            host_connection=host_connection,
+        ),
     )
 
 
@@ -6483,7 +6771,8 @@ def _build_evaluation_context(
     # source of truth for an in-TUI ``/model`` selection). When present, this
     # wins over the engine's server-resolved model (see
     # ``PolicyEngine._inject_model``); ``None`` falls back to that resolution.
-    raw_context = event.get("context") or {}
+    raw_context_value = event.get("context")
+    raw_context = raw_context_value if isinstance(raw_context_value, dict) else {}
     supplied_model = raw_context.get("model")
     hook_model = supplied_model if isinstance(supplied_model, str) and supplied_model else None
     # The harness, when a native hook stamped it (e.g. the codex hook), so
@@ -6494,9 +6783,12 @@ def _build_evaluation_context(
     hook_harness = (
         supplied_harness if isinstance(supplied_harness, str) and supplied_harness else None
     )
+    structured_data = data if isinstance(data, dict) else {}
     if phase == Phase.TOOL_CALL:
-        tool_name = data.get("name") or ""
-        args = data.get("arguments") or {}
+        raw_tool_name = structured_data.get("name")
+        tool_name = raw_tool_name if isinstance(raw_tool_name, str) else ""
+        raw_args = structured_data.get("arguments")
+        args = raw_args if isinstance(raw_args, dict) else {}
         return EvaluationContext(
             phase=phase,
             content={"name": tool_name, "arguments": args},
@@ -6506,17 +6798,19 @@ def _build_evaluation_context(
             harness=hook_harness,
         )
     if phase == Phase.TOOL_RESULT:
-        tool_result = data.get("result", "")
-        request_data = event.get("request_data")
-        tool_name = None
-        if isinstance(request_data, dict):
-            tool_name = request_data.get("name")
+        tool_result = structured_data.get("result", "")
+        raw_request_data = event.get("request_data")
+        request_data = raw_request_data if isinstance(raw_request_data, dict) else None
+        result_tool_name = None
+        if request_data is not None:
+            raw_tool_name = request_data.get("name")
+            result_tool_name = raw_tool_name if isinstance(raw_tool_name, str) else None
         return EvaluationContext(
             phase=phase,
             content={
                 "result": tool_result if isinstance(tool_result, str) else json.dumps(tool_result),
             },
-            tool_name=tool_name,
+            tool_name=result_tool_name,
             request_data=request_data,
             actor=actor,
             model=hook_model,
@@ -7038,6 +7332,28 @@ def _validated_cost_control_mode_override(value: str | None) -> str | None:
     )
 
 
+def _validated_subagent_routing_override(value: str | None) -> str | None:
+    """
+    Validate a caller-supplied per-session subagent-routing switch.
+
+    Two-state: ``"on"`` routes subagent spawns and ``"off"`` / unset both
+    read as Default. ``None`` from a PATCH clears the stored value, which
+    lands the session on Default rather than inheriting anything.
+
+    :param value: The candidate value, e.g. ``"on"``, or ``None`` when
+        the caller did not set / wants to clear the override.
+    :returns: The value unchanged when valid, or ``None``.
+    :raises OmnigentError: 400 (``invalid_input``) when *value* is
+        anything other than ``"on"``, ``"off"``, or ``None``.
+    """
+    if value is None or value in SUBAGENT_ROUTING_OVERRIDE_VALUES:
+        return value
+    raise OmnigentError(
+        f"invalid subagent_routing_override: {value!r} (expected 'on', 'off', or null to clear)",
+        code=ErrorCode.INVALID_INPUT,
+    )
+
+
 def _parse_session_create_metadata(metadata: str) -> SessionCreateMetadata:
     """
     Parse the JSON metadata part from bundled session creation.
@@ -7098,7 +7414,7 @@ def _require_host_conn_for_worktree(host_id: str | None, request: Request) -> Ho
             "git worktree creation requires host_id",
             code=ErrorCode.INVALID_INPUT,
         )
-    host_registry = getattr(request.app.state, "host_registry", None)
+    host_registry = cast(HostRegistry | None, getattr(request.app.state, "host_registry", None))
     if host_registry is None:
         # Server misconfiguration, not bad client input — mirror
         # _validate_session_workspace, which also returns internal_error.
@@ -8001,6 +8317,7 @@ def _child_session_summary_from_conversation(
             collapsed = " ".join(raw_prompt.split())
             last_message_preview = collapsed[:_CHILD_PREVIEW_LIMIT] or None
 
+    routing_decision_id = conv.labels.get(ROUTING_DECISION_LABEL_KEY)
     return ChildSessionSummary(
         id=conv.id,
         parent_session_id=parent_session_id,
@@ -8023,6 +8340,13 @@ def _child_session_summary_from_conversation(
         # in-memory index that feeds the sidebar badge, so the Agents
         # rail can flag a child that's awaiting user input.
         pending_elicitations_count=pending_elicitations.count_for(conv.id),
+        # The model routing picked for this child, reported only when a
+        # decision actually produced it: a user-pinned model_override is not a
+        # routed model, and reporting one with a null decision id makes the
+        # two fields contradict each other. The decision is joined through a
+        # conversation label rather than a new column.
+        routed_model=conv.model_override if routing_decision_id is not None else None,
+        routing_decision_id=routing_decision_id,
     )
 
 
@@ -8054,8 +8378,8 @@ async def _handle_advise_models_mcp(
     """
     Server-side handler for ``sys_advise_models`` MCP tool calls.
 
-    Intercepts the call before the runner forward because
-    ``RuntimeCaps.routing_client`` lives in the server process.
+    Intercepts the call before the runner forward because the deployment's
+    routing backends live in the server process.
 
     :param rpc_id: The JSON-RPC request id.
     :param conv: The :class:`Conversation` for this session.
@@ -8069,13 +8393,15 @@ async def _handle_advise_models_mcp(
             rpc_id, json.dumps({"error": "tasks must be a list", "router_on": False})
         )
 
+    from omnigent.server.routing_backend import backends_from_caps
+
     caps = get_caps()
-    routing_client = caps.routing_client
+    routing_client = backends_from_caps(caps).any()
     if routing_client is None:
         return _mcp_tool_result(rpc_id, json.dumps({"router_on": False, "recommendations": []}))
 
     from omnigent.model_catalog import spec_harness
-    from omnigent.server.smart_routing import fetch_runner_models
+    from omnigent.server.smart_routing import _WORKER_NAME_TO_HARNESS, fetch_runner_models
 
     # Fetch live model catalog from the runner once; used below to populate
     # per-agent model lists when the caller omits explicit models.
@@ -8107,12 +8433,6 @@ async def _handle_advise_models_mcp(
                     "_handle_advise_models_mcp: failed to load spec for agent=%s", conv.agent_id
                 )
 
-    _WORKER_HARNESS: dict[str, str] = {
-        "claude_code": "claude-sdk",
-        "codex": "codex",
-        "pi": "pi",
-    }
-
     def _resolve_harness_for_worker(agent: str) -> str | None:
         if spec is not None:
             sub_agents = getattr(spec, "sub_agents", None) or []
@@ -8122,7 +8442,7 @@ async def _handle_advise_models_mcp(
                     if h:
                         return h
                     break
-        return _WORKER_HARNESS.get(agent)
+        return _WORKER_NAME_TO_HARNESS.get(agent)
 
     recommendations: list[dict[str, Any]] = []
     for task in tasks:
@@ -8176,7 +8496,7 @@ async def _handle_advise_models_mcp(
             continue
         try:
             verdict = await routing_client.route(task_text, harness_models)
-        except Exception:  # routing failures must not crash the advisor
+        except Exception:  # noqa: BLE001  # routing failures must not crash the advisor
             _logger.exception("_handle_advise_models_mcp: route failed task=%r", title)
             verdict = None
         if verdict is None:
@@ -8814,6 +9134,8 @@ __all__ = [
     "_validated_cost_control_mode_override",
     "_validated_harness_override",
     "_validated_harness_override_executor_type",
+    "_validated_spec_smart_routing_harness",
+    "_validated_subagent_routing_override",
     "_wait_for_managed_runner_tunnel",
     "_wait_for_runner_client",
     "announce_hosts_changed",

@@ -96,13 +96,69 @@ from omnigent.server.routes._content_type import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._origin import require_trusted_origin
-from omnigent.server.routes._sessions.common import *
 from omnigent.server.routes._sessions.common import (
+    _CLAUDE_NATIVE_UI_LABEL_KEY,
+    _CLAUDE_NATIVE_UI_LABEL_VALUE,
+    _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
+    _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
+    _CODEX_NATIVE_COLLABORATION_MODES,
+    _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+    _logger,
+    _managed_launch_tasks,
     get_server_runner_router,
     set_server_runner_router,
 )
-from omnigent.server.routes._sessions.helpers import *
-from omnigent.server.routes._sessions.orchestration import *
+from omnigent.server.routes._sessions.helpers import (
+    _TUI_INJECT_FORWARD_TIMEOUT_S,
+    SessionLiveness,
+    _agent_carries_cursor_fork_history,
+    _agent_carries_native_fork_history,
+    _announce_session_added,
+    _apply_liveness_to_items,
+    _authorize_bundled_parent_and_inherit_runner,
+    _codex_plan_mode_enabled,
+    _discovery_key,
+    _forward_session_change_to_runner,
+    _get_runner_client,
+    _invalidate_runner_backed_snapshot_state,
+    _multipart_missing_detail,
+    _notify_runner_of_bundled_child,
+    _parse_session_create_metadata,
+    _permission_level_from_grants,
+    _presentation_labels_for_agent,
+    _prune_session_read_state,
+    _publish_collaboration_mode,
+    _publish_sandbox_status,
+    _publish_terminal_pending,
+    _reject_reserved_cost_control_label_seed,
+    _reject_server_reserved_label_seed,
+    _require_collaboration_mode_forward,
+    _require_cost_control_label_authority,
+    _reset_runner_resources_after_switch,
+    _same_provider_family,
+    _session_status_from_cache,
+    _set_read_state,
+    _surface_model_change_forward_failure,
+    _title_content_from_item,
+    _validate_terminal_launch_args,
+    _validated_cost_control_mode_override,
+    _validated_subagent_routing_override,
+)
+from omnigent.server.routes._sessions.orchestration import (
+    _best_effort_stop,
+    _build_session_list_item,
+    _build_session_response,
+    _create_session_from_bundle,
+    _create_session_from_existing_agent,
+    _ensure_runner_relay_ready,
+    _get_session_snapshot,
+    _is_native_terminal_session,
+    _labels_for_viewer,
+    _persist_model_change_note,
+    _publish_runner_recovered_status,
+    _run_managed_launch,
+    _spawn_archive_stop,
+)
 from omnigent.server.schemas import (
     AutomaticSessionRenameRequest,
     AutomaticSessionRenameResponse,
@@ -580,7 +636,7 @@ def register_core_routes(
             # First-class first so its id wins when a name exists in both.
             by_name: dict[str, SessionProjectSummary] = {}
             if project_store is not None:
-                for proj in project_store.list(owner_user_id=user_id):
+                for proj in project_store.list(user_id=user_id):
                     by_name[proj.name] = SessionProjectSummary(id=proj.id, name=proj.name)
             # Legacy path: label-derived projects (id=None unless already first-class).
             for name in conversation_store.list_projects(owned_by=user_id):
@@ -1429,7 +1485,10 @@ def register_core_routes(
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
         :param body: The validated :class:`UpdateSessionRequest`.
-        :returns: The updated :class:`SessionResponse` snapshot.
+        :returns: The updated :class:`SessionResponse` snapshot, with
+            ``items`` always empty — PATCH callers use only scalar
+            fields, and transcripts are served by
+            ``GET /sessions/{id}/items``.
         :raises OmnigentError: 400 if the runner is not
             registered; 404 if no session exists.
         """
@@ -1466,8 +1525,6 @@ def register_core_routes(
         await _require_access(
             user_id, session_id, required_level, permission_store, conversation_store
         )
-        if body.archived is True:
-            await _best_effort_stop(session_id, conversation_store, runner_router)
         if body.runner_id is not None and permission_store is not None:
             if not check_session_access(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
@@ -1591,6 +1648,17 @@ def register_core_routes(
             body.cost_control_mode_override
         )
 
+        # Same presence-is-the-clear-signal rule for the subagent-routing
+        # switch: an explicit null returns the session to inheriting its
+        # main routing state.
+        clear_subagent_routing = (
+            "subagent_routing_override" in body.model_fields_set
+            and body.subagent_routing_override is None
+        )
+        subagent_routing_override = _validated_subagent_routing_override(
+            body.subagent_routing_override
+        )
+
         # Native-terminal pass-through args: ``None`` leaves them
         # unchanged; a provided list (including ``[]``) replaces the
         # stored value wholesale (resume is last-write-wins, never an
@@ -1696,6 +1764,10 @@ def register_core_routes(
             _unset_model_override=clear_model,
             cost_control_mode_override=None if clear_cost_control else cost_control_mode_override,
             _unset_cost_control_mode_override=clear_cost_control,
+            subagent_routing_override=(
+                None if clear_subagent_routing else subagent_routing_override
+            ),
+            _unset_subagent_routing_override=clear_subagent_routing,
             terminal_launch_args=terminal_launch_args,
             archived=body.archived,
         )
@@ -1706,6 +1778,18 @@ def register_core_routes(
         # Only on archive→true; unarchiving leaves it pruned (reads as seen).
         if body.archived is True:
             _prune_session_read_state(session_id)
+            # Stop the session now that the flag is committed, so a request
+            # rejected after this point can't leave a stopped-but-unarchived
+            # session. Detached, not awaited: the response must not wait out
+            # the stop's per-runner timeouts (seconds against a wedged or
+            # asleep runner). Archive has no client-side stop, so this also
+            # carries the host-runner teardown.
+            _spawn_archive_stop(
+                session_id,
+                conversation_store,
+                runner_router,
+                getattr(request.app.state, "host_registry", None),
+            )
         # Notify the runner of effort / model changes so harnesses
         # that can't re-read these from store at turn boundaries
         # (today: claude-native, whose ``claude`` binary has
@@ -1726,12 +1810,19 @@ def register_core_routes(
                 session_id,
                 runner_router,
                 {"type": "effort_change", "effort": updated.reasoning_effort},
+                # Same TUI injection budget as the model change below: the
+                # ``/effort`` confirm dialog can render seconds after the
+                # command.
+                timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
             )
         if live_forward and (model_override is not None or clear_model):
-            await _forward_session_change_to_runner(
+            _model_forward = await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
                 {"type": "model_change", "model": updated.model_override},
+                # The runner answers this by typing ``/model`` into the pane and
+                # confirming the dialog, which outlasts the default budget.
+                timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
             )
             # Append a durable [System: model changed to X] note for sessions
             # whose history Omnigent writes. Gate on the wrapper label (NOT
@@ -1739,7 +1830,17 @@ def register_core_routes(
             # polly/debby also carry) — see _persist_model_change_note for the
             # full rationale. live_forward (== not silent) already excludes
             # bind-time auto-applies, so only an explicit /model lands a note.
-            if not _is_native_terminal_session(updated):
+            if _is_native_terminal_session(updated):
+                # The injection is the only thing that moves a LIVE native
+                # pane's model, so a forward its runner refused must not pass as
+                # applied. A stopped session reaches no runner and stays quiet —
+                # its relaunch reads the override off the row.
+                _surface_model_change_forward_failure(
+                    session_id,
+                    updated.model_override,
+                    _model_forward,
+                )
+            else:
                 await _persist_model_change_note(
                     session_id,
                     updated.model_override,
@@ -1827,7 +1928,7 @@ def register_core_routes(
                         code=ErrorCode.INVALID_INPUT,
                     )
                 owned = await asyncio.to_thread(
-                    project_store.get, target_project_id, owner_user_id=user_id
+                    project_store.get, target_project_id, user_id=user_id
                 )
                 if owned is None:
                     raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
@@ -1847,6 +1948,9 @@ def register_core_routes(
                 conversation_store,
             ),
         )
+        # PATCH callers consume only the snapshot's scalar fields (clients
+        # hydrate transcripts via GET /sessions/{id}/items), so skip the
+        # items read — it dominated this response's size and build time.
         return await _get_session_snapshot(
             conversation_store,
             session_id,
@@ -1855,6 +1959,7 @@ def register_core_routes(
             agent_store,
             agent_cache,
             liveness_lookup=liveness_lookup,
+            include_items=False,
             runner_exit_reports=runner_exit_reports,
             viewer_id=user_id,
         )
@@ -1944,12 +2049,13 @@ def register_core_routes(
         # agent belongs to one conversation (possibly another user's) and
         # must never be cloned across sessions.
         base_agent = source_agent
-        switching_agent = body.agent_id is not None and body.agent_id != source.agent_id
-        if switching_agent:
-            target_agent = await asyncio.to_thread(agent_store.get, body.agent_id)
+        target_agent_id = body.agent_id
+        switching_agent = target_agent_id is not None and target_agent_id != source.agent_id
+        if target_agent_id is not None and switching_agent:
+            target_agent = await asyncio.to_thread(agent_store.get, target_agent_id)
             if target_agent is None or target_agent.session_id is not None:
                 raise OmnigentError(
-                    f"Agent not found or not bindable: {body.agent_id!r}",
+                    f"Agent not found or not bindable: {target_agent_id!r}",
                     code=ErrorCode.NOT_FOUND,
                 )
             base_agent = target_agent
@@ -2015,6 +2121,16 @@ def register_core_routes(
             else None
         )
 
+        # Keep the fork filed in the source's first-class project, but only
+        # when the forker owns that project — projects are owner-private, so
+        # a fork of a shared session filed in someone else's project stays
+        # unfiled (a foreign project id would show in no folder view).
+        fork_project_id = None
+        if source.project_id is not None and project_store is not None:
+            owned = await asyncio.to_thread(project_store.get, source.project_id, user_id=user_id)
+            if owned is not None:
+                fork_project_id = source.project_id
+
         try:
             new_conv = await asyncio.to_thread(
                 conversation_store.fork_conversation,
@@ -2035,6 +2151,7 @@ def register_core_routes(
                 resume_source_native_session=resume_source_native_session,
                 presentation_labels=presentation_labels,
                 up_to_response_id=body.up_to_response_id,
+                project_id=fork_project_id,
             )
         except LookupError as exc:
             raise OmnigentError(
