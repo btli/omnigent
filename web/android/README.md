@@ -18,8 +18,10 @@ debug-only posture.
 
 ## Deep links
 
-The app handles `omnigent://<host>[:port]/c/<id>` links (`DeepLink.kt`,
-routed in `MainActivity`; design: `docs/android-deep-link-design.md`):
+The app handles `omnigent://<host>[:port]/c/<id>` links. The manifest's
+intent filter lives on `DeepLinkActivity`, a trampoline that forwards to
+`MainActivity`; `DeepLink.kt` parses and `MainActivity` routes (design:
+`docs/android-deep-link-design.md`):
 same-origin links navigate in place, previously-connected servers switch
 directly, and never-connected servers require a consent dialog before any
 network request — the server is remembered only after its first successful

@@ -31,11 +31,29 @@ class DeepLinkRoutingTest {
     private fun MainActivity.webView(): WebView = field("webView") as WebView
 
     @Test
-    fun `manifest resolves omnigent view intents to MainActivity`() {
+    fun `manifest resolves omnigent view intents to the DeepLinkActivity trampoline`() {
         val pm = ApplicationProvider.getApplicationContext<android.content.Context>().packageManager
         val resolved = viewIntent("omnigent://h.example/c/$hex").resolveActivity(pm)
         assertNotNull(resolved)
-        assertEquals(MainActivity::class.java.name, resolved.className)
+        assertEquals(DeepLinkActivity::class.java.name, resolved.className)
+    }
+
+    @Test
+    fun `DeepLinkActivity forwards to MainActivity with NEW_TASK, CLEAR_TOP, and SINGLE_TOP, then finishes`() {
+        val activity =
+            Robolectric
+                .buildActivity(DeepLinkActivity::class.java, viewIntent("omnigent://h.example/c/$hex"))
+                .setup()
+                .get()
+        assertTrue(activity.isFinishing)
+        val next = shadowOf(activity).nextStartedActivity
+        assertNotNull(next)
+        assertEquals(MainActivity::class.java.name, next.component?.className)
+        assertEquals(Intent.ACTION_VIEW, next.action)
+        assertEquals(Uri.parse("omnigent://h.example/c/$hex"), next.data)
+        val expectedFlags =
+            Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+        assertEquals(expectedFlags, next.flags and expectedFlags)
     }
 
     @Test
