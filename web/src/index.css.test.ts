@@ -4,26 +4,8 @@
 import { readFileSync } from "node:fs";
 // lightningcss is the minifier @tailwindcss/vite runs during `vite build`
 // (resolved from its dependency tree, so we test the version the build uses).
-import { createElement } from "react";
-import { cleanup, render, screen } from "@testing-library/react";
 import { transform } from "lightningcss";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { TooltipProvider } from "@/components/ui/tooltip";
-import type { ChangedSort } from "./shell/FlatFileList";
-import { WorkspacePanel } from "./shell/WorkspacePanel";
-
-vi.mock("./shell/FileViewer", () => ({ FileViewer: () => null }));
-vi.mock("./shell/FilesPanel", () => ({ FilesPanel: () => null }));
-vi.mock("./shell/InlineTerminalsSection", () => ({
-  InlineTerminalsSection: () => null,
-}));
-vi.mock("./shell/SubagentsPanel", () => ({ SubagentsPanel: () => null }));
-vi.mock("./shell/TodoPanel", () => ({ TodoPanel: () => null }));
-vi.mock("@/components/BrowserPane/BrowserPane", () => ({
-  BrowserPane: () => null,
-}));
-
-afterEach(cleanup);
+import { describe, expect, it } from "vitest";
 
 import { UI_FONT_SIZE_DEFAULT, UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN } from "./lib/uiFontPreferences";
 
@@ -195,6 +177,9 @@ const nativeInsetMatch = nativeBridgeSource.match(
   /internal val insetStyles: String\s*=\s*"""([\s\S]*?)"""\.trimIndent\(\)/,
 );
 const nativeInsetCss = trimIndent(nativeInsetMatch?.[1] ?? "");
+// Test DOMs don't evaluate media queries, so the padding assertions run on
+// the flattened rules; the phone-width guard is asserted structurally below.
+const nativeInsetFlatCss = nativeInsetCss.replace(/@media[^{]*\{((?:[^{}]*\{[^{}]*\})*)\}/g, "$1");
 
 const FULL_HEIGHT_PANEL_TARGETS = [
   { className: "conversations-sidebar" },
@@ -218,50 +203,18 @@ function trimIndent(value: string): string {
   return lines.map((line) => line.slice(indent)).join("\n");
 }
 
+/* The Workspace rules key on `aria-label="Workspace"`, so a stub <aside>
+ * carries the selector⇄DOM contract; the source assertion in the suite below
+ * pins the real component to the same label without coupling a CSS test to
+ * the component's full prop surface and data hooks. */
 function renderWorkspace(platform: "android" | "ios"): HTMLElement {
-  render(
-    createElement(
-      "div",
-      { [`data-${platform}-native`]: "" },
-      createElement(
-        TooltipProvider,
-        { delayDuration: 0 },
-        createElement(WorkspacePanel, {
-          conversationId: "safe-area-test",
-          width: 360,
-          handleProps: { tabIndex: 0 },
-          rightRailTab: "files",
-          onRightRailTabChange: vi.fn(),
-          showFilesPanel: true,
-          showBrowserTab: false,
-          changedCount: 0,
-          showShellsTab: false,
-          terminalsLength: 0,
-          subagentsWorking: 0,
-          agentCount: 1,
-          todosSupported: false,
-          todosCompleted: 0,
-          todosTotal: 0,
-          rootSessionId: null,
-          selectedFilePath: null,
-          openFiles: [],
-          openFileViewer: vi.fn(),
-          onCloseFile: vi.fn(),
-          onShowScopeView: vi.fn(),
-          onCommentsOpenChange: vi.fn(),
-          openTerminalsPanel: vi.fn(),
-          permissionLevel: null,
-          filesPanelSort: "recent" as ChangedSort,
-          onSortChange: vi.fn(),
-          filesPanelFlatView: false,
-          onFlatViewChange: vi.fn(),
-          filesPanelShowHidden: false,
-          onShowHiddenChange: vi.fn(),
-        }),
-      ),
-    ),
-  );
-  return screen.getByRole("complementary", { name: "Workspace" });
+  const shell = document.createElement("div");
+  shell.setAttribute(`data-${platform}-native`, "");
+  const aside = document.createElement("aside");
+  aside.setAttribute("aria-label", "Workspace");
+  shell.appendChild(aside);
+  document.body.appendChild(shell);
+  return aside;
 }
 
 /** Runs `assertions` with `css` applied to the document, then removes it. */
@@ -291,10 +244,11 @@ function assertWorkspacePadding(
   variableFallback = "",
 ): void {
   withStyle(css, () => {
+    const aside = renderWorkspace(platform);
     try {
-      expectSafeAreaPadding(renderWorkspace(platform), variableFallback);
+      expectSafeAreaPadding(aside, variableFallback);
     } finally {
-      cleanup();
+      aside.parentElement?.remove();
     }
   });
 }
@@ -318,25 +272,17 @@ function assertFullHeightPanelPadding(css: string, variableFallback = ""): void 
   });
 }
 
+// Comments and quoted strings blanked out (index-preserving), so brace
+// counting can't be fooled by braces inside string or comment text.
+const cssDepthSource = cssSource.replace(
+  /\/\*[\s\S]*?\*\/|"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'/g,
+  (match) => " ".repeat(match.length),
+);
+
 /** Brace nesting depth at a source index; 0 is top level. */
 function braceDepthAt(sourceIndex: number): number {
-  let depth = 0;
-  let quote: '"' | "'" | undefined;
-
-  for (let index = 0; index < sourceIndex; index += 1) {
-    const character = cssSource[index];
-    if (quote) {
-      if (character === "\\") index += 1;
-      else if (character === quote) quote = undefined;
-    } else if (character === "/" && cssSource[index + 1] === "*") {
-      const commentEnd = cssSource.indexOf("*/", index + 2);
-      index = commentEnd === -1 ? sourceIndex : commentEnd + 1;
-    } else if (character === '"' || character === "'") {
-      quote = character;
-    } else if (character === "{") depth += 1;
-    else if (character === "}") depth -= 1;
-  }
-  return depth;
+  const prefix = cssDepthSource.slice(0, sourceIndex);
+  return (prefix.match(/\{/g)?.length ?? 0) - (prefix.match(/\}/g)?.length ?? 0);
 }
 
 describe("index.css native safe-area layout", () => {
@@ -359,9 +305,16 @@ describe("index.css native safe-area layout", () => {
   });
 
   it.each(["android", "ios"] as const)(
-    "computes four-edge padding on the real Workspace panel in the %s shell",
+    "computes four-edge padding on the Workspace rail in the %s shell",
     (platform) => assertWorkspacePadding(workspaceCss, platform),
   );
+
+  it("keeps the Workspace aria-label on the rail component", () => {
+    // The stub <aside> in renderWorkspace stands in for WorkspacePanel; this
+    // pins the real component to the label the CSS selector keys on.
+    const source = readFileSync("src/shell/WorkspacePanel.tsx", "utf8");
+    expect(source).toMatch(/<aside[\s\S]{0,600}?aria-label="Workspace"/);
+  });
 
   it("computes four-edge padding on every full-height native panel", () => {
     assertFullHeightPanelPadding(fullHeightPanelRule);
@@ -385,12 +338,23 @@ describe("Android injected safe-area layout", () => {
     expect(nativeInsetCss).not.toBe("");
   });
 
-  it("computes four-edge padding on the real Workspace panel", () => {
-    assertWorkspacePadding(nativeInsetCss, "android", ", 0px");
+  it("computes four-edge padding on the Workspace rail", () => {
+    assertWorkspacePadding(nativeInsetFlatCss, "android", ", 0px");
   });
 
   it("computes four-edge padding on every full-height panel", () => {
-    assertFullHeightPanelPadding(nativeInsetCss, ", 0px");
+    assertFullHeightPanelPadding(nativeInsetFlatCss, ", 0px");
+  });
+
+  it("scopes the panel rule to phone widths but keeps the Workspace rule global", () => {
+    // Mirrors index.css: the full-height panels are phone drawers, while the
+    // Workspace rail only exists at md+ — an unscoped panel rule would
+    // double-pad panels docked inside the already-padded rail.
+    const media = nativeInsetCss.match(/^@media \(width < 48rem\)\{(.*)\}$/m);
+    expect(media?.[1], "panel rule lost its phone-width media guard").toContain(
+      ".conversations-sidebar",
+    );
+    expect(nativeInsetCss).toMatch(/^aside\[aria-label="Workspace"\]/m);
   });
 });
 
