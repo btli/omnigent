@@ -12,7 +12,16 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
+import { ROW_GESTURE_HOLD_MS } from "@/hooks/useRowGesture";
 import { notifyResizeObservers, resetMockViewportWidth, setMockViewportWidth } from "@/test-setup";
+
+// Controllable coarse-pointer capability, defaulting to true: the recognizer
+// touch tests need it (the global matchMedia stub reports no coarse pointer),
+// and fine-pointer cases opt out explicitly.
+const coarsePointer = vi.hoisted(() => ({ current: true }));
+vi.mock("@/hooks/useCoarsePointer", () => ({
+  useCoarsePointer: () => coarsePointer.current,
+}));
 
 // Project mocks are declared via vi.hoisted so they exist before the hoisted
 // vi.mock factory runs. projectsMock is mutated per-test to drive project
@@ -1624,14 +1633,15 @@ describe("Sidebar project sections", () => {
     // Pencil stays in the tree but is hidden below the md breakpoint.
     expect(screen.getByTestId("project-new-session")).toHaveClass("max-md:hidden");
 
-    // Open the kebab → a mobile-only "New session" item linking to the same
-    // pre-filed composer.
+    // Open the kebab → a "New session" item linking to the same pre-filed
+    // composer. This file mocks a coarse pointer, so the item stays visible
+    // at every width — hover can't reveal the pencil there.
     fireEvent.pointerDown(screen.getByRole("button", { name: "Project actions for Customer X" }), {
       button: 0,
       ctrlKey: false,
     });
     const menuItem = await screen.findByTestId("project-new-session-menu");
-    expect(menuItem).toHaveClass("md:hidden");
+    expect(menuItem).not.toHaveClass("md:hidden");
     expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
   });
 });
@@ -2021,29 +2031,40 @@ describe("Sidebar ungroup drag target", () => {
     expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_shifted", project: "" });
   });
 
-  it("completes an ungroup drop through the touch sensor", async () => {
-    mockSidebarDropLayout();
-    const row = renderPinnedFiledSession("conv_touch_filed");
-    const start = touchAt(row, 20);
-    fireEvent.touchStart(row, {
-      touches: [start],
-      targetTouches: [start],
-      changedTouches: [start],
-    });
+  it("completes an ungroup drop through the touch sensor", () => {
+    // The unified row recognizer owns touch drags: a press must hold still for
+    // ROW_GESTURE_HOLD_MS to arm, and only then does movement start the drag.
+    vi.useFakeTimers();
+    try {
+      mockSidebarDropLayout();
+      const row = renderPinnedFiledSession("conv_touch_filed");
+      const touch = { pointerId: 1, isPrimary: true, pointerType: "touch" as const };
+      const start = touchAt(row, 20);
+      fireEvent.pointerDown(row, { ...touch, clientX: 120, clientY: 20 });
+      fireEvent.touchStart(row, {
+        touches: [start],
+        targetTouches: [start],
+        changedTouches: [start],
+      });
+      act(() => vi.advanceTimersByTime(ROW_GESTURE_HOLD_MS + 1));
 
-    const strip = await screen.findByTestId("sidebar-ungroup-drop-zone", {}, { timeout: 1_000 });
-    const approaching = touchAt(row, 279);
-    const destination = touchAt(row, 280);
-    fireEvent.touchMove(row, { touches: [approaching], changedTouches: [approaching] });
-    fireEvent.touchMove(row, { touches: [destination], changedTouches: [destination] });
-    await waitFor(() => expect(strip).toHaveClass("bg-[var(--sidebar-active)]"));
-    fireEvent.touchEnd(row, { touches: [], targetTouches: [], changedTouches: [destination] });
+      const approaching = touchAt(row, 279);
+      const destination = touchAt(row, 280);
+      fireEvent.pointerMove(row, { ...touch, clientX: 120, clientY: 279 });
+      fireEvent.touchMove(row, { touches: [approaching], changedTouches: [approaching] });
+      const strip = screen.getByTestId("sidebar-ungroup-drop-zone");
+      fireEvent.pointerMove(row, { ...touch, clientX: 120, clientY: 280 });
+      fireEvent.touchMove(row, { touches: [destination], changedTouches: [destination] });
+      expect(strip).toHaveClass("bg-[var(--sidebar-active)]");
+      fireEvent.pointerUp(row, { ...touch, clientX: 120, clientY: 280 });
+      fireEvent.touchEnd(row, { touches: [], targetTouches: [], changedTouches: [destination] });
 
-    await waitFor(() => {
       expect(moveToProjectSpy).toHaveBeenCalledTimes(1);
       expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_touch_filed", project: "" });
-    });
-    expect(pinnedIdsRef.current).toEqual([]);
+      expect(pinnedIdsRef.current).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
