@@ -175,6 +175,11 @@ function longPressHeader() {
   });
 }
 
+/** Dismiss the open menu with Escape, aimed at whatever the menu focused. */
+function dismissMenu() {
+  fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+}
+
 beforeEach(() => {
   mocks.isMobile = false;
   mocks.renameProject.mutate.mockReset();
@@ -323,7 +328,7 @@ describe("project folder header context menu", () => {
     expect(screen.getByTestId("rename-project")).toBeInTheDocument();
     expect(folderHeader()).toHaveAttribute("aria-expanded", "false");
 
-    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    dismissMenu();
     fireEvent.click(folderHeader());
     expect(folderHeader()).toHaveAttribute("aria-expanded", "true");
   });
@@ -340,7 +345,7 @@ describe("project folder header context menu", () => {
     fireEvent.contextMenu(header);
     expect(screen.getByTestId("rename-project")).toBeInTheDocument();
 
-    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    dismissMenu();
     await waitFor(() => expect(header).toHaveFocus());
 
     fireEvent.click(header, { detail: 0 });
