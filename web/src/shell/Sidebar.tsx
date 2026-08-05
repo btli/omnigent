@@ -52,13 +52,10 @@ import {
   XIcon,
 } from "lucide-react";
 import {
-  type Collision,
-  type CollisionDetection,
   DndContext,
   DragOverlay,
   type DragEndEvent,
   type DragStartEvent,
-  MeasuringStrategy,
   MouseSensor,
   pointerWithin,
   useDraggable,
@@ -196,17 +193,8 @@ const SIDEBAR_ACTIVE_HIGHLIGHT =
   "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)]";
 const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 const UNGROUP_DROP_ZONE_ID = "__ungroup__";
-
-/** Prefer the visible ungroup strip when it overlaps another drop target. */
-export function prioritizeSidebarUngroupCollision(collisions: Collision[]): Collision[] {
-  const ungroup = collisions.find((collision) => collision.id === UNGROUP_DROP_ZONE_ID);
-  if (!ungroup || collisions[0]?.id === UNGROUP_DROP_ZONE_ID) return collisions;
-  return [ungroup, ...collisions.filter((collision) => collision.id !== UNGROUP_DROP_ZONE_ID)];
-}
-
-function sidebarCollisionDetection(args: Parameters<CollisionDetection>[0]): Collision[] {
-  return prioritizeSidebarUngroupCollision(pointerWithin(args));
-}
+// A resized section can move later drop zones without resizing them.
+const SIDEBAR_RESIZE_OBSERVER_CONFIG = { updateMeasurementsFor: [] };
 
 // Maps a first-class project id → its name, provided once at the list level so
 // each row resolves its ``project_id`` to a folder name without its own
@@ -1081,6 +1069,7 @@ function ProjectFolder({
   const { setNodeRef, isOver } = useDroppable({
     id: `project:${name}`,
     data: { type: "project", name },
+    resizeObserverConfig: SIDEBAR_RESIZE_OBSERVER_CONFIG,
   });
 
   // One set of rename / settings / delete dialogs, driven by both the header
@@ -1237,6 +1226,7 @@ function ConversationList({
   onExitSelectionMode,
   getVisibleIdsRef,
 }: ConversationListProps) {
+  const isMobile = useIsMobileViewport();
   // Viewer id for the owner-based My/Shared split below.
   const viewerId = useViewerId();
   // Host metadata is shared by every row tooltip. Resolve it once at the list
@@ -1761,10 +1751,7 @@ function ConversationList({
     <SidebarRowDataProvider projectNamesById={projectNamesById} hostsById={hostsById}>
       <DndContext
         sensors={sensors}
-        collisionDetection={sidebarCollisionDetection}
-        // Always-measure so the transient "remove from project" zone (mounted at
-        // drag start) is registered as a drop target without a stale layout cache.
-        measuring={{ droppable: { strategy: MeasuringStrategy.Always } }}
+        collisionDetection={pointerWithin}
         onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
         onDragCancel={() => {
@@ -1968,7 +1955,7 @@ function ConversationList({
             )}
             {/* Keep the transient strip last so mounting it never shifts a row
             under the pointer that is already dragging it. */}
-            {!showShared && activeDrag?.project != null && <UngroupDropZone />}
+            {isMobile && !showShared && activeDrag?.project != null && <UngroupDropZone />}
           </div>
         </RowEditHoldContext.Provider>
         {/* The dragged row's preview follows the pointer (rendered in a portal),
@@ -1996,6 +1983,7 @@ function ChatsDropZone({ active, children }: { active: boolean; children: ReactN
     id: "chats-ungroup",
     data: { type: "ungroup" },
     disabled: !active,
+    resizeObserverConfig: SIDEBAR_RESIZE_OBSERVER_CONFIG,
   });
   return (
     <div
@@ -2022,6 +2010,7 @@ function PinDropZone({ active, children }: { active: boolean; children: ReactNod
     id: "pinned-pin",
     data: { type: "pin" },
     disabled: !active,
+    resizeObserverConfig: SIDEBAR_RESIZE_OBSERVER_CONFIG,
   });
   return (
     <div

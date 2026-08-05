@@ -6,13 +6,13 @@
 // are no longer listed here — they live on the Settings page.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { Collision } from "@dnd-kit/core";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useEffect } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
+import { notifyResizeObservers, resetMockViewportWidth, setMockViewportWidth } from "@/test-setup";
 
 // Project mocks are declared via vi.hoisted so they exist before the hoisted
 // vi.mock factory runs. projectsMock is mutated per-test to drive project
@@ -157,8 +157,7 @@ vi.mock("@/lib/serverOrigin", () => ({
 
 import { useConversations } from "@/hooks/useConversations";
 import { useChatStore } from "@/store/chatStore";
-import { prioritizeSidebarUngroupCollision, Sidebar } from "./Sidebar";
-import { EXPANDED_PROJECT_SECTIONS_STORAGE_KEY } from "./sidebarNav";
+import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
 
@@ -238,33 +237,36 @@ function dndRect(top: number, height: number): DOMRect {
   } as DOMRect;
 }
 
-function mockOverlappingUngroupTargets(): void {
+function mockSidebarDropLayout(): void {
   vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
     this: Element,
   ): DOMRect {
     const testId = this.getAttribute("data-testid");
-    if (testId === "sidebar-chats-drop-zone") return dndRect(100, 220);
+    if (testId === "sidebar-chats-drop-zone") return dndRect(100, 120);
     if (testId === "sidebar-ungroup-drop-zone") return dndRect(260, 40);
     if (this.tagName === "LI") return dndRect(20, 32);
     return dndRect(-1_000, 1);
   });
 }
 
-function mockProjectStealLayout(): void {
+function mockShiftingUngroupLayout(): { shift: () => void } {
+  let projectHeight = 120;
+  let stripTop = 260;
   vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
     this: Element,
   ): DOMRect {
     const testId = this.getAttribute("data-testid");
-    if (
-      testId === "sidebar-project-drop-zone" &&
-      this.getAttribute("data-project-name") === "Sprint 42"
-    ) {
-      return dndRect(345, 40);
-    }
-    if (testId === "sidebar-ungroup-drop-zone") return dndRect(350, 40);
+    if (testId === "sidebar-project-drop-zone") return dndRect(100, projectHeight);
+    if (testId === "sidebar-ungroup-drop-zone") return dndRect(stripTop, 40);
     if (this.tagName === "LI") return dndRect(20, 32);
     return dndRect(-1_000, 1);
   });
+  return {
+    shift: () => {
+      projectHeight = 220;
+      stripTop = 360;
+    },
+  };
 }
 
 function startMouseDrag(row: HTMLElement): void {
@@ -272,14 +274,23 @@ function startMouseDrag(row: HTMLElement): void {
   fireEvent.mouseMove(document, { buttons: 1, clientX: 20, clientY: 30 });
 }
 
-function moveMouseOverUngroupTarget(): void {
-  fireEvent.mouseMove(document, { buttons: 1, clientX: 120, clientY: 279 });
-  fireEvent.mouseMove(document, { buttons: 1, clientX: 120, clientY: 280 });
+/** Drag to `y` in two steps: dnd-kit needs a move to measure before it collides. */
+function moveMouseTo(y: number): void {
+  fireEvent.mouseMove(document, { buttons: 1, clientX: 120, clientY: y - 1 });
+  fireEvent.mouseMove(document, { buttons: 1, clientX: 120, clientY: y });
 }
 
-function moveMouseOverProjectOverlap(): void {
-  fireEvent.mouseMove(document, { buttons: 1, clientX: 120, clientY: 359 });
-  fireEvent.mouseMove(document, { buttons: 1, clientX: 120, clientY: 360 });
+function touchAt(target: Element, y: number): TouchInit {
+  return {
+    identifier: 1,
+    target,
+    clientX: 120,
+    clientY: y,
+    pageX: 120,
+    pageY: y,
+    screenX: 120,
+    screenY: y,
+  };
 }
 
 // "Shared with me" sessions live on their own sidebar tab now; click it to
@@ -304,6 +315,7 @@ function closeProjectsMenu() {
 }
 
 beforeEach(() => {
+  resetMockViewportWidth();
   useConvMock.mockReset();
   useHostsMock.mockReset();
   useHostsMock.mockReturnValue({ data: [] });
@@ -328,24 +340,8 @@ function seedPins(ids: string[]) {
 }
 afterEach(() => {
   cleanup();
+  resetMockViewportWidth();
   vi.restoreAllMocks();
-});
-
-describe("Sidebar collision precedence", () => {
-  it("prioritizes the ungroup strip without changing unrelated collision order", () => {
-    const project: Collision = { id: "project:Sprint 42" };
-    const chats: Collision = { id: "chats-ungroup" };
-    const ungroup: Collision = { id: "__ungroup__" };
-
-    expect(prioritizeSidebarUngroupCollision([project, chats, ungroup])).toEqual([
-      ungroup,
-      project,
-      chats,
-    ]);
-
-    const unrelated = [project, chats];
-    expect(prioritizeSidebarUngroupCollision(unrelated)).toBe(unrelated);
-  });
 });
 
 describe("Sidebar session list", () => {
@@ -1143,9 +1139,7 @@ describe("Sidebar project sections", () => {
   });
 
   it("closes the mobile overlay when the project pencil is tapped", () => {
-    // jsdom's matchMedia mock reports non-desktop, so isMobileViewport() is
-    // true: a plain pencil tap must close the full-screen sidebar overlay,
-    // otherwise the pre-filed new-session page is left hidden behind it.
+    setMockViewportWidth(375);
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
@@ -1620,7 +1614,18 @@ describe("Sidebar move-to-project action", () => {
   });
 });
 
+/** Render a single pinned session filed under `project` and return its row. */
+function renderPinnedFiledSession(id: string, project = "Sprint 42"): HTMLElement {
+  projectsMock.push(project);
+  seedPins([id]);
+  mockConversations([conv(id, "Claude Code", { labels: { omni_project: project } })]);
+  renderSidebar();
+  return screen.getByRole("link", { name: id }).closest("li")!;
+}
+
 describe("Sidebar ungroup drag target", () => {
+  beforeEach(() => setMockViewportWidth(375));
+
   it("mounts last without reordering the project and session rows above it", async () => {
     projectsMock.push("Sprint 42");
     mockConversations([
@@ -1645,22 +1650,33 @@ describe("Sidebar ungroup drag target", () => {
     fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
   });
 
-  it("ungroups and unpins a pinned project session dropped on the bottom strip", async () => {
-    mockOverlappingUngroupTargets();
-    projectsMock.push("Sprint 42");
-    seedPins(["conv_pinned_filed"]);
-    mockConversations([
-      conv("conv_pinned_filed", "Claude Code", {
-        labels: { omni_project: "Sprint 42" },
-      }),
-    ]);
-    renderSidebar();
+  it("does not mount the mobile strip during a desktop drag", async () => {
+    setMockViewportWidth(1024);
+    const row = renderPinnedFiledSession("conv_desktop_filed");
 
-    const pinnedRow = screen.getByRole("link", { name: "conv_pinned_filed" }).closest("li")!;
+    startMouseDrag(row);
+    await waitFor(() => expect(screen.getAllByText("conv_desktop_filed")).toHaveLength(2));
+    expect(screen.queryByTestId("sidebar-ungroup-drop-zone")).toBeNull();
+
+    fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
+  });
+
+  it("mounts the strip during a mobile filed-session drag", async () => {
+    const row = renderPinnedFiledSession("conv_mobile_filed");
+
+    startMouseDrag(row);
+    expect(await screen.findByTestId("sidebar-ungroup-drop-zone")).toBeInTheDocument();
+    fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
+  });
+
+  it("ungroups and unpins a pinned project session dropped on the bottom strip", async () => {
+    mockSidebarDropLayout();
+    const pinnedRow = renderPinnedFiledSession("conv_pinned_filed");
+
     startMouseDrag(pinnedRow);
     const dropZone = await screen.findByTestId("sidebar-ungroup-drop-zone");
 
-    moveMouseOverUngroupTarget();
+    moveMouseTo(280);
     await waitFor(() => expect(dropZone).toHaveClass("bg-[var(--sidebar-active)]"));
     fireEvent.mouseUp(document, { button: 0, clientX: 120, clientY: 280 });
 
@@ -1671,59 +1687,54 @@ describe("Sidebar ungroup drag target", () => {
     expect(pinnedIdsRef.current).toEqual([]);
   });
 
-  it("resolves an overlap with the live Chats target to one ungroup action", async () => {
-    mockOverlappingUngroupTargets();
-    projectsMock.push("Sprint 42");
-    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(["Sprint 42"]));
-    mockConversations([
-      conv("conv_filed", "Claude Code", { labels: { omni_project: "Sprint 42" } }),
-      conv("conv_flat", "Codex"),
-    ]);
-    renderSidebar();
+  it("remeasures a strip that moves without resizing", async () => {
+    const layout = mockShiftingUngroupLayout();
+    const row = renderPinnedFiledSession("conv_shifted", "Source");
 
-    const filedRow = screen.getByRole("link", { name: "conv_filed" }).closest("li")!;
-    const chatsDropZone = screen.getByTestId("sidebar-chats-drop-zone");
-    startMouseDrag(filedRow);
-    const bottomDropZone = await screen.findByTestId("sidebar-ungroup-drop-zone");
+    startMouseDrag(row);
+    const strip = await screen.findByTestId("sidebar-ungroup-drop-zone");
+    const project = screen.getByTestId("sidebar-project-drop-zone");
 
-    moveMouseOverUngroupTarget();
-    await waitFor(() => {
-      expect(bottomDropZone).toHaveClass("bg-[var(--sidebar-active)]");
-      expect(chatsDropZone).not.toHaveClass("bg-[var(--sidebar-active)]");
+    await act(async () => {
+      layout.shift();
+      notifyResizeObservers(project);
+      // dnd-kit debounces its resize-driven remeasure by 25ms.
+      await new Promise((resolve) => {
+        setTimeout(resolve, 35);
+      });
     });
-    fireEvent.mouseUp(document, { button: 0, clientX: 120, clientY: 280 });
+
+    moveMouseTo(380);
+    await waitFor(() => expect(strip).toHaveClass("bg-[var(--sidebar-active)]"));
+    fireEvent.mouseUp(document, { button: 0, clientX: 120, clientY: 380 });
+
+    await waitFor(() => expect(moveToProjectSpy).toHaveBeenCalledTimes(1));
+    expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_shifted", project: "" });
+  });
+
+  it("completes an ungroup drop through the touch sensor", async () => {
+    mockSidebarDropLayout();
+    const row = renderPinnedFiledSession("conv_touch_filed");
+    const start = touchAt(row, 20);
+    fireEvent.touchStart(row, {
+      touches: [start],
+      targetTouches: [start],
+      changedTouches: [start],
+    });
+
+    const strip = await screen.findByTestId("sidebar-ungroup-drop-zone", {}, { timeout: 1_000 });
+    const approaching = touchAt(row, 279);
+    const destination = touchAt(row, 280);
+    fireEvent.touchMove(row, { touches: [approaching], changedTouches: [approaching] });
+    fireEvent.touchMove(row, { touches: [destination], changedTouches: [destination] });
+    await waitFor(() => expect(strip).toHaveClass("bg-[var(--sidebar-active)]"));
+    fireEvent.touchEnd(row, { touches: [], targetTouches: [], changedTouches: [destination] });
 
     await waitFor(() => {
       expect(moveToProjectSpy).toHaveBeenCalledTimes(1);
-      expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_filed", project: "" });
+      expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_touch_filed", project: "" });
     });
-  });
-
-  it("does not let an overlapping collapsed project steal an ungroup drop", async () => {
-    mockProjectStealLayout();
-    projectsMock.push("Source", "Sprint 42");
-    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(["Source"]));
-    mockConversations([conv("conv_filed", "Claude Code", { labels: { omni_project: "Source" } })]);
-    renderSidebar();
-
-    const filedRow = screen.getByRole("link", { name: "conv_filed" }).closest("li")!;
-    startMouseDrag(filedRow);
-    const strip = await screen.findByTestId("sidebar-ungroup-drop-zone");
-    const project = screen
-      .getAllByTestId("sidebar-project-drop-zone")
-      .find((element) => element.getAttribute("data-project-name") === "Sprint 42")!;
-
-    expect(project.getBoundingClientRect().bottom).toBeGreaterThan(
-      strip.getBoundingClientRect().top,
-    );
-    expect(project.getBoundingClientRect().top).toBeLessThan(strip.getBoundingClientRect().bottom);
-
-    moveMouseOverProjectOverlap();
-    fireEvent.mouseUp(document, { button: 0, clientX: 120, clientY: 360 });
-
-    await waitFor(() => expect(moveToProjectSpy).toHaveBeenCalledTimes(1));
-    expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_filed", project: "" });
-    expect(moveToProjectSpy).not.toHaveBeenCalledWith({ id: "conv_filed", project: "Sprint 42" });
+    expect(pinnedIdsRef.current).toEqual([]);
   });
 });
 
