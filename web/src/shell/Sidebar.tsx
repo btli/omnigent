@@ -156,6 +156,7 @@ import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
 import {
   finishActiveRowGesture,
+  ROW_MENU_SYNTHETIC,
   ROW_SWIPE_COMMIT_PX,
   RowGestureTouchSensor,
   useRowGesture,
@@ -194,9 +195,6 @@ const SIDEBAR_HOVER_HIGHLIGHT = "hover:bg-muted hover:text-foreground dark:hover
 const SIDEBAR_ACTIVE_HIGHLIGHT =
   "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)] dark:hover:bg-[var(--sidebar-active)] dark:hover:text-[var(--sidebar-active-foreground)]";
 const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
-// Marks the recognizer's own contextmenu dispatch so the row root can suppress
-// the OS long-press contextmenu mid-gesture without eating its own.
-const ROW_MENU_SYNTHETIC = Symbol("row-menu-synthetic");
 
 // Maps a first-class project id → its name, provided once at the list level so
 // each row resolves its ``project_id`` to a folder name without its own
