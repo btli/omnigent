@@ -41,11 +41,14 @@ class OmnigentWebViewClient(
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    // Set when the main frame's current load errors out (DNS/TLS/connection
-    // failure, etc.); reset on the next navigation. WebView still calls
+    // Set when the main frame's current load errors out (network/TLS, or an
+    // HTTP >=400 respectively); consumed by onPageFinished. WebView calls
     // onPageFinished with the ORIGINAL url after such an error — never a
     // chrome-error:// one — so callers can't tell success from failure from
-    // the url alone; this flag is the only signal.
+    // the url alone; these flags are the only signal. They must NOT be reset
+    // in onPageStarted: Chromium delivers a main-frame onReceivedHttpError
+    // BEFORE onPageStarted (observed on device), so a start-time reset would
+    // erase the error before the load it belongs to finishes.
     private var mainFrameLoadFailed = false
     private var mainFramePersistenceFailed = false
 
@@ -55,8 +58,6 @@ class OmnigentWebViewClient(
         favicon: Bitmap?,
     ) {
         super.onPageStarted(view, url, favicon)
-        mainFrameLoadFailed = false
-        mainFramePersistenceFailed = false
 
         val origin = originOf(url)
         val scheme = url?.let { Uri.parse(it).scheme?.lowercase() }
@@ -137,6 +138,13 @@ class OmnigentWebViewClient(
         url: String?,
     ) {
         super.onPageFinished(view, url)
+        // Consume the error flags for the load that just finished. A stopped
+        // load (no onPageFinished) can leave a flag armed for the NEXT finish;
+        // that fails safe — it can only skip one persist, never allow one.
+        val loadFailed = mainFrameLoadFailed
+        val persistenceFailed = mainFramePersistenceFailed
+        mainFrameLoadFailed = false
+        mainFramePersistenceFailed = false
         val onPinnedOrigin = originOf(url) == pinnedOrigin()
         // An app page loaded, so the mount works: re-arm the bounce budget for
         // the next time the user lands back on the workspace root.
@@ -154,10 +162,10 @@ class OmnigentWebViewClient(
         if (onPinnedOrigin && shouldInjectBridgeAtPageReady()) {
             view.evaluateJavascript(
                 NativeBridgeScript.source,
-            ) { onPageReady(url, mainFrameLoadFailed, mainFramePersistenceFailed) }
+            ) { onPageReady(url, loadFailed, persistenceFailed) }
             return
         }
-        onPageReady(url, mainFrameLoadFailed, mainFramePersistenceFailed)
+        onPageReady(url, loadFailed, persistenceFailed)
     }
 
     override fun shouldOverrideUrlLoading(
