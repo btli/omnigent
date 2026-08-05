@@ -8,6 +8,7 @@
 
 import {
   type PointerEvent as ReactPointerEvent,
+  type ReactElement,
   type ReactNode,
   useSyncExternalStore,
 } from "react";
@@ -154,6 +155,10 @@ vi.mock("@/lib/serverOrigin", () => ({ isCurrentServerLocal: () => false }));
 vi.mock("@/components/ui/select", async () => {
   const { Children, isValidElement } = await import("react");
   const SelectTrigger = ({ children }: { children?: ReactNode }) => children;
+  // The trigger carries the data-testid the tests query for; lift it onto the
+  // native <select> and keep the trigger itself out of the option list.
+  const isTrigger = (child: ReactNode): child is ReactElement<{ "data-testid"?: string }> =>
+    isValidElement(child) && child.type === SelectTrigger;
   const Select = ({
     value,
     onValueChange,
@@ -164,18 +169,13 @@ vi.mock("@/components/ui/select", async () => {
     children: ReactNode;
   }) => {
     const kids = Children.toArray(children);
-    const trigger = kids.find((child) => isValidElement(child) && child.type === SelectTrigger);
-    const testId =
-      isValidElement(trigger) && trigger.props && typeof trigger.props === "object"
-        ? (trigger.props as Record<string, unknown>)["data-testid"]
-        : undefined;
     return (
       <select
-        data-testid={typeof testId === "string" ? testId : undefined}
+        data-testid={kids.find(isTrigger)?.props["data-testid"]}
         value={value}
         onChange={(event) => onValueChange(event.target.value)}
       >
-        {kids.filter((child) => !(isValidElement(child) && child.type === SelectTrigger))}
+        {kids.filter((child) => !isTrigger(child))}
       </select>
     );
   };
@@ -192,7 +192,12 @@ vi.mock("@/components/ui/select", async () => {
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { resetReadStateForTests, seedReadState } from "@/hooks/useUnseenConversations";
-import { readSwipeActions, writeSwipeActions } from "@/lib/swipeActionPreferences";
+import {
+  readSwipeActions,
+  type SwipeAction,
+  type SwipeDirection,
+  writeSwipeActions,
+} from "@/lib/swipeActionPreferences";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { Sidebar, useRowSwipe } from "./Sidebar";
 
@@ -293,14 +298,19 @@ function renderSidebar(activeId?: string, info?: ServerInfo) {
   return Object.assign(view, { rerenderSidebar: () => view.rerender(makeUi()) });
 }
 
-function renderAppearanceSettings() {
-  return render(
+// Pick an action for one direction through the real Appearance settings control
+// (the Radix Select is mocked to a native <select> above), then unmount so the
+// sidebar can render against the preference the page just wrote.
+function chooseSwipeActionInSettings(direction: SwipeDirection, action: SwipeAction) {
+  render(
     <TooltipProvider>
       <MemoryRouter initialEntries={["/settings/appearance"]}>
         <SettingsPage />
       </MemoryRouter>
     </TooltipProvider>,
   );
+  fireEvent.change(screen.getByTestId(`swipe-action-${direction}`), { target: { value: action } });
+  cleanup();
 }
 
 beforeEach(() => {
@@ -1005,6 +1015,8 @@ describe("touch swipe actions", () => {
   // down → horizontal move past the commit threshold → up on the row's <li>.
   const POINTER = { pointerId: 1, isPrimary: true, pointerType: "touch" as const };
 
+  // Drag the row and hold at `dx`, so a test can inspect the reveal mid-gesture.
+  // `release` finishes it, carrying the same dx the drag ended on.
   function moveSwipeRow(dx: number) {
     const link = screen.getByRole("link", { name: /My Session/ });
     const li = link.closest("li")!;
@@ -1012,31 +1024,35 @@ describe("touch swipe actions", () => {
     // First move locks the axis; the second carries it past the commit point.
     fireEvent.pointerMove(li, { ...POINTER, clientX: 100 + Math.sign(dx) * 20, clientY: 100 });
     fireEvent.pointerMove(li, { ...POINTER, clientX: 100 + dx, clientY: 100 });
-    return { li, link };
-  }
-
-  function releaseSwipeRow(dx: number, row: ReturnType<typeof moveSwipeRow>) {
-    const { li, link } = row;
-    fireEvent.pointerUp(li, { ...POINTER, clientX: 100 + dx, clientY: 100 });
-    // Include the browser's trailing click so gesture and row click paths
-    // cannot double-dispatch; prevent navigation while exercising the handler.
-    link.addEventListener("click", (event) => event.preventDefault(), { once: true });
-    fireEvent.click(link);
+    return {
+      li,
+      release() {
+        fireEvent.pointerUp(li, { ...POINTER, clientX: 100 + dx, clientY: 100 });
+        // Include the browser's trailing click so gesture and row click paths
+        // cannot double-dispatch; prevent navigation while exercising the handler.
+        link.addEventListener("click", (event) => event.preventDefault(), { once: true });
+        fireEvent.click(link);
+      },
+    };
   }
 
   function swipeRow(dx: number) {
-    const row = moveSwipeRow(dx);
-    releaseSwipeRow(dx, row);
+    moveSwipeRow(dx).release();
+  }
+
+  // The reveal sitting behind the row is inert and shows only the icon for the
+  // action that direction commits to.
+  function expectRevealIcons(li: Element, icons: { shows: string; hides: string }) {
+    const reveal = li.firstElementChild!;
+    expect(reveal).toHaveClass("pointer-events-none");
+    expect(reveal.querySelector(icons.shows)).not.toBeNull();
+    expect(reveal.querySelector(icons.hides)).toBeNull();
   }
 
   it("maps the Settings swipe-left selection to the row's left-swipe action", () => {
-    renderAppearanceSettings();
-    fireEvent.change(screen.getByTestId("swipe-action-left"), {
-      target: { value: "delete" },
-    });
+    chooseSwipeActionInSettings("left", "delete");
     expect(readSwipeActions()).toEqual({ left: "delete", right: "none" });
 
-    cleanup();
     mocks.isMobile = true;
     renderSidebar();
     swipeRow(-90);
@@ -1048,13 +1064,9 @@ describe("touch swipe actions", () => {
   });
 
   it("maps the Settings swipe-right selection to the row's right-swipe action", () => {
-    renderAppearanceSettings();
-    fireEvent.change(screen.getByTestId("swipe-action-right"), {
-      target: { value: "archive" },
-    });
+    chooseSwipeActionInSettings("right", "archive");
     expect(readSwipeActions()).toEqual({ left: "archive", right: "archive" });
 
-    cleanup();
     mocks.isMobile = true;
     renderSidebar();
     swipeRow(90);
@@ -1070,21 +1082,15 @@ describe("touch swipe actions", () => {
     renderSidebar();
 
     const leftSwipe = moveSwipeRow(-90);
-    const leftReveal = leftSwipe.li.firstElementChild!;
-    expect(leftReveal).toHaveClass("pointer-events-none");
-    expect(leftReveal.querySelector(".lucide-trash-2")).not.toBeNull();
-    expect(leftReveal.querySelector(".lucide-archive")).toBeNull();
-    releaseSwipeRow(-90, leftSwipe);
+    expectRevealIcons(leftSwipe.li, { shows: ".lucide-trash-2", hides: ".lucide-archive" });
+    leftSwipe.release();
     expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
 
     const rightSwipe = moveSwipeRow(90);
-    const rightReveal = rightSwipe.li.firstElementChild!;
-    expect(rightReveal).toHaveClass("pointer-events-none");
-    expect(rightReveal.querySelector(".lucide-archive")).not.toBeNull();
-    expect(rightReveal.querySelector(".lucide-trash-2")).toBeNull();
-    releaseSwipeRow(90, rightSwipe);
+    expectRevealIcons(rightSwipe.li, { shows: ".lucide-archive", hides: ".lucide-trash-2" });
+    rightSwipe.release();
     expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
     expect(screen.queryByText("Delete conversation?")).toBeNull();
   });
