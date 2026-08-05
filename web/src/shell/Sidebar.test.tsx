@@ -1657,42 +1657,30 @@ describe("Sidebar ungroup drag target", () => {
     fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
   });
 
-  it("does not mount the mobile strip during a desktop drag", async () => {
+  it("mounts the strip during a desktop drag", async () => {
+    // The strip is the advertised ungroup target at every width and pointer
+    // type; ChatsDropZone remains an additional desktop target.
     setMockViewportWidth(1024);
     const row = renderPinnedFiledSession("conv_desktop_filed");
 
     startMouseDrag(row);
     await waitFor(() => expect(screen.getAllByText("conv_desktop_filed")).toHaveLength(2));
-    expect(screen.queryByTestId("sidebar-ungroup-drop-zone")).toBeNull();
+    expect(screen.getByTestId("sidebar-ungroup-drop-zone")).toBeInTheDocument();
 
     fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
   });
 
-  it("mounts the strip during a mobile filed-session drag", async () => {
+  it("mounts the strip fixed to the list frame during a mobile filed-session drag", async () => {
     const row = renderPinnedFiledSession("conv_mobile_filed");
 
     startMouseDrag(row);
     const strip = await screen.findByTestId("sidebar-ungroup-drop-zone");
-    // Pinned to the scroll viewport's bottom — inline at the list end it sits
-    // below the fold on any screenful of sessions.
-    expect(strip).toHaveClass("sticky", "bottom-0");
+    // Fixed, not sticky or inline: inline sits below the fold on a long list,
+    // and a stuck sticky element doesn't move with the scroll while dnd-kit
+    // still shifts its stored rect — drifting the drop target off the visual.
+    expect(strip).toHaveClass("fixed");
+    expect(strip).not.toHaveClass("sticky");
     fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
-  });
-
-  it("mounts the strip during a wide-viewport drag on a coarse-pointer device", async () => {
-    // A wide touch layout has ChatsDropZone too, but no hover to advertise it
-    // as a target — the strip must still appear there.
-    coarsePointer.current = true;
-    try {
-      setMockViewportWidth(1024);
-      const row = renderPinnedFiledSession("conv_wide_touch_filed");
-
-      startMouseDrag(row);
-      expect(await screen.findByTestId("sidebar-ungroup-drop-zone")).toBeInTheDocument();
-      fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
-    } finally {
-      coarsePointer.current = false;
-    }
   });
 
   it("ungroups and unpins a pinned project session dropped on the bottom strip", async () => {
