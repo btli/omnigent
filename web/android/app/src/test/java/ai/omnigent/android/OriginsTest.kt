@@ -1,6 +1,8 @@
 package ai.omnigent.android
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -8,6 +10,50 @@ import org.robolectric.RobolectricTestRunner
 
 @RunWith(RobolectricTestRunner::class)
 class OriginsTest {
+    @Test
+    fun `origin strips credentials and canonicalizes case and ports`() {
+        val cases =
+            mapOf(
+                "https://pin@evil.com/x" to "https://evil.com",
+                "https://good.com:443/x" to "https://good.com",
+                "http://good.com:80/x" to "http://good.com",
+                "HTTPS://GOOD.com/x" to "https://good.com",
+                "https://a:b@good.com:8443" to "https://good.com:8443",
+                "https://good.com:notaport" to "https://good.com",
+                "https://good.com./x" to "https://good.com.",
+            )
+
+        cases.forEach { (url, expected) -> assertEquals(url, expected, originOf(url)) }
+        assertNull(originOf("https:foo"))
+    }
+
+    @Test
+    fun `unicode and punycode hosts have the same origin`() {
+        assertEquals(
+            originOf("https://xn--r8jz45g.jp"),
+            originOf("https://例え.jp"),
+        )
+    }
+
+    @Test
+    fun `server input is normalized or rejected`() {
+        assertEquals("https://example.com", normalizeServerUrl("  example.com/  "))
+        assertEquals("HTTP://GOOD.com/path", normalizeServerUrl("HTTP://GOOD.com/path/"))
+        assertNull(normalizeServerUrl(""))
+        assertNull(normalizeServerUrl("ftp://example.com"))
+        assertNull(normalizeServerUrl("https://good.com/bad path"))
+        assertNull(normalizeServerUrl("https:///missing-host"))
+    }
+
+    @Test
+    fun `http scheme matching is case insensitive and exact`() {
+        assertTrue(isHttpScheme("HTTP"))
+        assertTrue(isHttpScheme("Https"))
+        assertFalse(isHttpScheme("httpfoo"))
+        assertFalse(isHttpScheme("mailto"))
+        assertFalse(isHttpScheme(null))
+    }
+
     @Test
     fun `front-door proxy authorize url is detected`() {
         // Databricks-Apps-style: every path is intercepted and bounced to the

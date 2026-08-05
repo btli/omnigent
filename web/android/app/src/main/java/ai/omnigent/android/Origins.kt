@@ -1,6 +1,7 @@
 package ai.omnigent.android
 
 import android.net.Uri
+import java.net.IDN
 
 /**
  * Normalizes a URL to its origin (`scheme://host[:port]`), the unit of trust
@@ -10,7 +11,12 @@ import android.net.Uri
 fun originOf(url: String?): String? {
     val uri = url?.let(Uri::parse) ?: return null
     val scheme = uri.scheme?.lowercase() ?: return null
-    val host = uri.host?.lowercase() ?: return null
+    val host =
+        try {
+            uri.host?.let(IDN::toASCII)?.lowercase()
+        } catch (_: IllegalArgumentException) {
+            null
+        } ?: return null
     // Canonicalize like a browser origin (WHATWG): lowercase scheme + host and
     // omit the default port — so an explicit `https://host:443` (or odd casing)
     // the user typed compares equal to the WebView's normalized `https://host`.

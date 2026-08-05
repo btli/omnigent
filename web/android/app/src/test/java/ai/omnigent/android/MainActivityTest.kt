@@ -1,5 +1,6 @@
 package ai.omnigent.android
 
+import android.Manifest
 import android.app.AlertDialog
 import android.app.DownloadManager
 import android.app.Notification
@@ -16,6 +17,7 @@ import android.text.TextUtils
 import android.view.Gravity
 import android.view.View
 import android.webkit.CookieManager
+import android.webkit.PermissionRequest
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.RoboCookieManager
 import android.webkit.ValueCallback
@@ -639,6 +641,7 @@ class MainActivityTest {
             ),
             downloader.downloads,
         )
+        assertSame(activity.pinnedOrigin(), downloader.downloads.single().pinnedOrigin)
         val offOriginHeaders =
             shadowOf(checkNotNull(shadowDownloads.getRequest(0L)))
                 .requestHeaders
@@ -646,6 +649,28 @@ class MainActivityTest {
         assertFalse(offOriginHeaders.containsKey("Cookie"))
         assertFalse(offOriginHeaders.containsKey("User-Agent"))
         assertNull(shadowDownloads.getRequest(1L))
+    }
+
+    @Test
+    @Config(shadows = [ThrowingDownloadManagerShadow::class])
+    fun `cross-origin download enqueue failure is reported without crashing`() {
+        val activity = activity()
+        val listener = checkNotNull(shadowOf(activity.webView()).downloadListener)
+
+        val result =
+            runCatching {
+                listener.onDownloadStart(
+                    OFF_ORIGIN_DOWNLOAD_URL,
+                    null,
+                    "attachment; filename=foreign.pdf",
+                    "application/pdf",
+                    1L,
+                )
+            }
+        idleMainLooper()
+
+        assertTrue(result.isSuccess)
+        assertEquals("Couldn't save foreign.pdf", ShadowToast.getTextOfLatestToast())
     }
 
     @Test
@@ -707,6 +732,68 @@ class MainActivityTest {
                 .getLogsForTag("OmnigentAuth")
                 .any { item -> item.msg.contains("file chooser denied") },
         )
+    }
+
+    @Test
+    fun `file chooser is denied when no origin is pinned`() {
+        val activity = activity()
+        val webView = activity.webView()
+        webView.loadUrl("about:blank")
+        ReflectionHelpers.setField(activity, "pinnedOrigin", null)
+        var callbackCalls = 0
+        var callbackValue: Array<Uri>? = arrayOf(Uri.EMPTY)
+
+        val handled =
+            checkNotNull(shadowOf(webView).webChromeClient).onShowFileChooser(
+                webView,
+                ValueCallback { value ->
+                    callbackCalls++
+                    callbackValue = value
+                },
+                fileChooserParams(),
+            )
+
+        assertTrue(handled)
+        assertEquals(1, callbackCalls)
+        assertNull(callbackValue)
+        assertNull(activity.pendingFileCallback())
+    }
+
+    @Test
+    fun `null origin microphone request is denied when no origin is pinned`() {
+        val activity = activity()
+        shadowOf(activity).grantPermissions(Manifest.permission.RECORD_AUDIO)
+        ReflectionHelpers.setField(activity, "pinnedOrigin", null)
+        val request = RecordingPermissionRequest(null)
+
+        checkNotNull(shadowOf(activity.webView()).webChromeClient).onPermissionRequest(request)
+
+        assertEquals(1, request.denyCalls)
+        assertEquals(0, request.grantCalls)
+    }
+
+    @Test
+    fun `page readiness is ignored when no origin is pinned`() {
+        val activity = activity()
+        ReflectionHelpers.setField(activity, "pinnedOrigin", null)
+        ReflectionHelpers.setField(activity, "loginAttempts", 2)
+
+        activity.invokeOnPageReady("about:blank")
+
+        assertFalse(activity.pageLoaded())
+        assertEquals(2, activity.loginAttempts())
+    }
+
+    @Test
+    fun `pending activation is retained when no origin is pinned`() {
+        val activity = activity()
+        activity.webView().loadUrl("about:blank")
+        ReflectionHelpers.setField(activity, "pinnedOrigin", null)
+        ReflectionHelpers.setField(activity, "pendingNavigatePath", "/c/pending")
+
+        activity.invokeFlushPendingActivation()
+
+        assertEquals("/c/pending", activity.pendingNavigatePath())
     }
 
     @Test
@@ -1436,12 +1523,22 @@ class MainActivityTest {
         sdk = [35],
         shadows = [CountingOmnigentWebViewClientShadow::class, RecordingWebViewShadow::class],
     )
-    fun `accepted session cookie reloads then announces sign in`() {
+    fun `accepted secure session cookie is hardened then reloads and announces sign in`() {
         ShadowNotificationManager.reset()
+        val cookieManager = RecordingCookieManager(accepted = true)
+        ReflectionHelpers.setStaticField(
+            ShadowCookieManager::class.java,
+            "cookieManager",
+            cookieManager,
+        )
         val activity = activity()
 
-        activity.onSessionCookieSet(PINNED_ORIGIN, accepted = true)
+        activity.invokeOnSessionToken(SESSION_TOKEN)
 
+        assertEquals(PINNED_ORIGIN, cookieManager.writtenUrl)
+        assertTrue(checkNotNull(cookieManager.writtenCookie).contains("; HttpOnly"))
+        assertTrue(checkNotNull(cookieManager.writtenCookie).contains("; Secure"))
+        assertTrue(checkNotNull(cookieManager.writtenCookie).contains("; SameSite=Lax"))
         assertTrue(ActivityCallLog.entries.contains("loadUrl:$PINNED_ORIGIN"))
         val notification = activity.notificationManager().allNotifications.single()
         assertEquals(
@@ -1451,6 +1548,24 @@ class MainActivityTest {
         val reorderIntent = checkNotNull(shadowOf(activity).nextStartedActivity)
         assertEquals(MainActivity::class.java.name, reorderIntent.component?.className)
         assertTrue(reorderIntent.flags and Intent.FLAG_ACTIVITY_REORDER_TO_FRONT != 0)
+    }
+
+    @Test
+    fun `http session cookie is HttpOnly without Secure`() {
+        val cookieManager = RecordingCookieManager(accepted = null)
+        ReflectionHelpers.setStaticField(
+            ShadowCookieManager::class.java,
+            "cookieManager",
+            cookieManager,
+        )
+        val activity = activity()
+
+        activity.invokeOnSessionToken(SESSION_TOKEN, "http://example.com")
+
+        val cookie = checkNotNull(cookieManager.writtenCookie)
+        assertTrue(cookie.contains("; HttpOnly"))
+        assertTrue(cookie.contains("; SameSite=Lax"))
+        assertFalse(cookie.contains("; Secure"))
     }
 
     @Test
@@ -1667,6 +1782,11 @@ class MainActivityTest {
     private fun MainActivity.loginAttempts(): Int =
         ReflectionHelpers.getField(this, "loginAttempts")
 
+    private fun MainActivity.pageLoaded(): Boolean = ReflectionHelpers.getField(this, "pageLoaded")
+
+    private fun MainActivity.pinnedOrigin(): String? =
+        ReflectionHelpers.getField(this, "pinnedOrigin")
+
     private fun MainActivity.loginManager(): OidcLoginManager =
         ReflectionHelpers.getField(this, "loginManager")
 
@@ -1714,11 +1834,14 @@ class MainActivityTest {
         ReflectionHelpers.callInstanceMethod<Unit>(this, "startLogin")
     }
 
-    private fun MainActivity.invokeOnSessionToken(token: String) {
+    private fun MainActivity.invokeOnSessionToken(
+        token: String,
+        origin: String = PINNED_ORIGIN,
+    ) {
         ReflectionHelpers.callInstanceMethod<Unit>(
             this,
             "onSessionToken",
-            ClassParameter.from(String::class.java, PINNED_ORIGIN),
+            ClassParameter.from(String::class.java, origin),
             ClassParameter.from(String::class.java, token),
         )
     }
@@ -1729,6 +1852,10 @@ class MainActivityTest {
             "onPageReady",
             ClassParameter.from(String::class.java, url),
         )
+    }
+
+    private fun MainActivity.invokeFlushPendingActivation() {
+        ReflectionHelpers.callInstanceMethod<Unit>(this, "flushPendingActivation")
     }
 
     private fun MainActivity.invokeOnNewIntent(intent: Intent) {
@@ -1880,6 +2007,42 @@ class MainActivityTest {
         }
     }
 
+    private class RecordingCookieManager(
+        private val accepted: Boolean?,
+    ) : RoboCookieManager() {
+        var writtenUrl: String? = null
+        var writtenCookie: String? = null
+
+        override fun setCookie(
+            url: String,
+            value: String,
+            callback: ValueCallback<Boolean>?,
+        ) {
+            writtenUrl = url
+            writtenCookie = value
+            accepted?.let { callback?.onReceiveValue(it) }
+        }
+    }
+
+    private class RecordingPermissionRequest(
+        private val requestOrigin: Uri?,
+    ) : PermissionRequest() {
+        var denyCalls = 0
+        var grantCalls = 0
+
+        override fun getOrigin(): Uri? = requestOrigin
+
+        override fun getResources(): Array<String> = arrayOf(RESOURCE_AUDIO_CAPTURE)
+
+        override fun grant(resources: Array<out String>) {
+            grantCalls++
+        }
+
+        override fun deny() {
+            denyCalls++
+        }
+    }
+
     private companion object {
         const val PINNED_ORIGIN = "https://example.com"
         const val NEW_ORIGIN = "https://new.example.com"
@@ -1994,4 +2157,11 @@ class RecordingWebViewShadow : ShadowWebView() {
     fun stopLoading() {
         ActivityCallLog.entries += "stopLoading"
     }
+}
+
+@Implements(DownloadManager::class)
+class ThrowingDownloadManagerShadow {
+    @Implementation
+    fun enqueue(request: DownloadManager.Request): Long =
+        throw SecurityException("destination rejected")
 }

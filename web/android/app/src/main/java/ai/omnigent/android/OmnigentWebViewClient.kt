@@ -49,11 +49,18 @@ class OmnigentWebViewClient(
     private var activeMainFrameUrl: String? = null
     private var isLoading = false
     private var lastSelfStoppedUrl: String? = null
+    private var awaitedPageOrigin: String? = null
 
     /** Stop the current load while owning the compatibility finish it causes. */
     fun stopLoadingAndLedger(view: WebView) {
         if (isLoading) lastSelfStoppedUrl = activeMainFrameUrl
         view.stopLoading()
+    }
+
+    /** Ignore callbacks from the previous navigation until the new server starts. */
+    fun resetForOriginChange(newOrigin: String) {
+        endProxyAuth()
+        awaitedPageOrigin = newOrigin
     }
 
     private fun enterProxyAuth() {
@@ -87,6 +94,13 @@ class OmnigentWebViewClient(
         onNavigationStarted()
         expireProxyAuthIfNeeded()
 
+        val pin = pinnedOrigin() ?: return
+        val awaitedOrigin = awaitedPageOrigin
+        if (awaitedOrigin != null) {
+            if (originOf(url) != awaitedOrigin) return
+            awaitedPageOrigin = null
+        }
+
         activeMainFrameUrl = url
         isLoading = true
 
@@ -94,11 +108,11 @@ class OmnigentWebViewClient(
 
         val origin = originOf(url)
         val isOffOrigin =
-            isHttpScheme(url?.let { Uri.parse(it).scheme }) && origin != pinnedOrigin()
+            isHttpScheme(url?.let { Uri.parse(it).scheme }) && origin != pin
 
         if (proxyAuthState == ProxyAuthState.IDLE &&
             isOffOrigin &&
-            isProxyAuthUrl(url, pinnedOrigin())
+            isProxyAuthUrl(url, pin)
         ) {
             enterProxyAuth()
         }
@@ -137,15 +151,16 @@ class OmnigentWebViewClient(
         // consumed — it must not end the flow the shell's own stop preceded.
         val consumesSelfStoppedFinish = lastSelfStoppedUrl != null && lastSelfStoppedUrl == url
         lastSelfStoppedUrl = null
+        val pin = pinnedOrigin() ?: return
         if (!consumesSelfStoppedFinish &&
             proxyAuthState == ProxyAuthState.IN_FLIGHT &&
-            originOf(url) == pinnedOrigin()
+            originOf(url) == pin
         ) {
             endProxyAuth()
             onProxyAuthFlowEnded()
         }
 
-        if (originOf(url) == pinnedOrigin() && shouldInjectBridgeAtPageReady()) {
+        if (originOf(url) == pin && shouldInjectBridgeAtPageReady()) {
             view.evaluateJavascript(NativeBridgeScript.source) { onPageReady(url) }
             return
         }
@@ -172,18 +187,20 @@ class OmnigentWebViewClient(
             return true
         }
 
+        val pin = pinnedOrigin() ?: return true
+
         if (proxyAuthState == ProxyAuthState.REFUSED) {
-            return origin != pinnedOrigin()
+            return origin != pin
         }
 
-        if (origin == pinnedOrigin()) return false
+        if (origin == pin) return false
 
         if (proxyAuthState == ProxyAuthState.IN_FLIGHT) {
             authLog("proxy-auth nav $origin — loading inline")
             return false
         }
 
-        if (isProxyAuthUrl(urlString, pinnedOrigin())) {
+        if (isProxyAuthUrl(urlString, pin)) {
             if (request.isRedirect) {
                 enterProxyAuth()
                 authLog("proxy-auth nav $origin — loading inline")

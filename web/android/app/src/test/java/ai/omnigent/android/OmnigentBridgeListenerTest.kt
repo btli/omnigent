@@ -27,7 +27,7 @@ class OmnigentBridgeListenerTest {
     private lateinit var listener: OmnigentBridgeListener
     private lateinit var notifications: NativeNotificationManager
     private lateinit var shadow: ShadowNotificationManager
-    private var pinnedOrigin = ORIGIN
+    private var pinnedOrigin: String? = ORIGIN
     private val receivedBands = mutableListOf<ServerSwitcherBand>()
 
     private val badgeId = 1
@@ -141,6 +141,19 @@ class OmnigentBridgeListenerTest {
         listener.handle(
             """{"method":"notify","params":{"title":"stale","navigatePath":"/c/a"}}""",
             Uri.parse(ORIGIN),
+            true,
+        )
+
+        assertEquals(0, shadow.allNotifications.size)
+    }
+
+    @Test
+    fun `opaque message is dropped when no origin is pinned`() {
+        pinnedOrigin = null
+
+        listener.handle(
+            """{"method":"notify","params":{"title":"opaque"}}""",
+            Uri.parse("about:blank"),
             true,
         )
 
