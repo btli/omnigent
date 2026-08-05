@@ -3354,6 +3354,8 @@ function ConversationRow({
     gesture.dx < 0 ? swipeActions.left : gesture.dx > 0 ? swipeActions.right : "none";
   const isSwiping = gesture.dx !== 0 && swipingAction !== "none";
   const swipeCommitted = Math.abs(gesture.dx) >= ROW_SWIPE_COMMIT_PX;
+  // A held or dragging row owns the pointer outright, so no axis stays native.
+  const ownsPointer = gesture.phase === "armed" || gesture.phase === "drag";
 
   return (
     // Drag props on the <li> so the whole row is grabbable; `isDragging` dims
@@ -3369,8 +3371,8 @@ function ConversationRow({
         // the swipe: without this the browser can take the horizontal pan (or
         // back-navigation gesture) and cancel the gesture mid-drag. Only where
         // a swipe can actually fire, so rows without one keep default behavior.
-        swipeEnabled && gesture.phase !== "armed" && gesture.phase !== "drag" && "touch-pan-y",
-        (gesture.phase === "armed" || gesture.phase === "drag") && "touch-none",
+        swipeEnabled && !ownsPointer && "touch-pan-y",
+        ownsPointer && "touch-none",
       )}
     >
       {/* Swipe reveal hint: sits behind the moving surface, showing the
