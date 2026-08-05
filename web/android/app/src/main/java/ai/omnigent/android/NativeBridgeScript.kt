@@ -26,7 +26,7 @@ object NativeBridgeScript {
         .chat-composer-form.terminal-first-composer-form{padding-bottom:0.25rem !important}
         .terminal-first-switcher-container{padding-bottom:calc(0.35rem + var(--omnigent-safe-bottom, 0px)) !important}
         aside[aria-label="Workspace"]{padding-top:var(--omnigent-safe-top, 0px) !important;padding-bottom:var(--omnigent-safe-bottom, 0px) !important;padding-left:var(--omnigent-safe-left, 0px) !important;padding-right:var(--omnigent-safe-right, 0px) !important}
-        :is(.conversations-sidebar,[data-testid="execution-logs-panel"],[data-testid="file-viewer"],[data-testid="files-panel-drawer"],[data-testid="terminals-panel"],[data-testid="subagents-panel-drawer"],[data-testid="todos-panel-drawer"]){padding-top:var(--omnigent-safe-top, 0px) !important;padding-bottom:var(--omnigent-safe-bottom, 0px) !important;padding-left:var(--omnigent-safe-left, 0px) !important;padding-right:var(--omnigent-safe-right, 0px) !important}
+        @media (width < 48rem){:is(.conversations-sidebar,[data-testid="execution-logs-panel"],[data-testid="file-viewer"],[data-testid="files-panel-drawer"],[data-testid="terminals-panel"],[data-testid="subagents-panel-drawer"],[data-testid="todos-panel-drawer"]){padding-top:var(--omnigent-safe-top, 0px) !important;padding-bottom:var(--omnigent-safe-bottom, 0px) !important;padding-left:var(--omnigent-safe-left, 0px) !important;padding-right:var(--omnigent-safe-right, 0px) !important}}
         """.trimIndent()
 
     val source: String =
