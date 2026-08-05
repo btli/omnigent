@@ -1,0 +1,365 @@
+import {
+  type PointerEvent as ReactPointerEvent,
+  type SyntheticEvent,
+  type TouchEvent as ReactTouchEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import {
+  type DraggableSyntheticListeners,
+  TouchSensor,
+  type TouchSensorOptions,
+} from "@dnd-kit/core";
+import type { SwipeAction, SwipeActionPreferences } from "@/lib/swipeActionPreferences";
+
+export const ROW_GESTURE_HOLD_MS = 400;
+export const ROW_SWIPE_ACTIVATE_PX = 12;
+export const ROW_SWIPE_COMMIT_PX = 72;
+
+const ROW_SCROLL_ACTIVATE_PX = ROW_SWIPE_ACTIVATE_PX;
+// How far the finger may drift and still count as holding still. Mirrors the
+// tolerance dnd-kit's own delay constraint applied before we owned activation.
+const ROW_HOLD_TOLERANCE_PX = 8;
+const ROW_SWIPE_MAX_PX = 96;
+const ROW_SWIPE_RESIST = 1 / 3;
+
+export type RowGesturePhase = "idle" | "pending" | "swipe" | "scroll" | "armed" | "drag";
+
+interface ActiveRowGesture {
+  pointerId: number;
+  startX: number;
+  startY: number;
+  lastX: number;
+  lastY: number;
+  phase: Exclude<RowGesturePhase, "idle">;
+  target: Element;
+  offset: number;
+}
+
+interface RowGestureDndState {
+  shouldStartDrag: () => boolean;
+}
+
+export interface RowGestureDndData {
+  rowGesture: RowGestureDndState;
+}
+
+interface RowGestureActivationContext {
+  active: { data: { current?: unknown } };
+}
+
+const rowGestureActivators = [
+  {
+    eventName: "onTouchMove",
+    handler: (
+      { nativeEvent: event }: ReactTouchEvent,
+      { onActivation }: TouchSensorOptions,
+      { active }: RowGestureActivationContext,
+    ) => {
+      if (event.touches.length !== 1) return false;
+      const data = active.data.current as Partial<RowGestureDndData> | undefined;
+      if (!data?.rowGesture?.shouldStartDrag()) return false;
+      onActivation?.({ event });
+      return true;
+    },
+  },
+];
+
+/** A touch sensor that is instantiated only after the row recognizer chooses drag. */
+export class RowGestureTouchSensor extends TouchSensor {
+  static override activators = rowGestureActivators as unknown as typeof TouchSensor.activators;
+}
+
+function swipeOffset(deltaX: number): number {
+  const direction = Math.sign(deltaX);
+  const travel = Math.abs(deltaX);
+  if (travel <= ROW_SWIPE_COMMIT_PX) return deltaX;
+  const damped = ROW_SWIPE_COMMIT_PX + (travel - ROW_SWIPE_COMMIT_PX) * ROW_SWIPE_RESIST;
+  return direction * Math.min(damped, ROW_SWIPE_MAX_PX);
+}
+
+function callDndListener(
+  listeners: DraggableSyntheticListeners,
+  name: string,
+  event: SyntheticEvent,
+) {
+  const listener = listeners?.[name] as ((event: SyntheticEvent) => void) | undefined;
+  listener?.(event);
+}
+
+export function useRowGesture({
+  enabled,
+  swipeEnabled,
+  dragEnabled,
+  actions,
+  onAction,
+  onLongPress,
+  onPickUp,
+}: {
+  enabled: boolean;
+  swipeEnabled: boolean;
+  dragEnabled: boolean;
+  actions: SwipeActionPreferences;
+  onAction: (action: Exclude<SwipeAction, "none">) => void;
+  onLongPress: (point: { clientX: number; clientY: number }) => void;
+  onPickUp?: () => void;
+}) {
+  const [dx, setDx] = useState(0);
+  const [phase, setPhase] = useState<RowGesturePhase>("idle");
+  const state = useRef<ActiveRowGesture | null>(null);
+  const holdTimer = useRef<number | null>(null);
+  const suppressClick = useRef(false);
+
+  const clearHoldTimer = useCallback(() => {
+    if (holdTimer.current === null) return;
+    window.clearTimeout(holdTimer.current);
+    holdTimer.current = null;
+  }, []);
+
+  const releaseCapture = useCallback((gesture: ActiveRowGesture | null) => {
+    if (!gesture) return;
+    try {
+      if (gesture.target.hasPointerCapture(gesture.pointerId)) {
+        gesture.target.releasePointerCapture(gesture.pointerId);
+      }
+    } catch {
+      // The browser may have released capture during pointer cancellation.
+    }
+  }, []);
+
+  const reset = useCallback(() => {
+    clearHoldTimer();
+    releaseCapture(state.current);
+    state.current = null;
+    setDx(0);
+    setPhase("idle");
+  }, [clearHoldTimer, releaseCapture]);
+
+  // Armed until the trailing click arrives or the next press clears it. A timer
+  // would race the click: the browser does not guarantee dispatch inside the
+  // same task, and losing that race navigates into the row just swiped away.
+  const suppressTrailingClick = useCallback(() => {
+    suppressClick.current = true;
+  }, []);
+
+  const consumeClick = useCallback(() => {
+    if (!suppressClick.current) return false;
+    suppressClick.current = false;
+    return true;
+  }, []);
+
+  const setGesturePhase = useCallback(
+    (gesture: ActiveRowGesture, next: ActiveRowGesture["phase"]) => {
+      gesture.phase = next;
+      setPhase(next);
+    },
+    [],
+  );
+
+  const capturePointer = useCallback((gesture: ActiveRowGesture) => {
+    try {
+      gesture.target.setPointerCapture(gesture.pointerId);
+    } catch {
+      // Capture can fail if the pointer ended in the timer callback's turn.
+    }
+  }, []);
+
+  const onPointerDown = useCallback(
+    (event: ReactPointerEvent) => {
+      if (event.pointerType !== "touch") return;
+      if (!event.isPrimary) {
+        if (state.current) reset();
+        return;
+      }
+      if (!enabled) return;
+      const target = event.target;
+      if (target instanceof Node && !event.currentTarget.contains(target)) return;
+
+      reset();
+      suppressClick.current = false;
+      const gesture: ActiveRowGesture = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        lastX: event.clientX,
+        lastY: event.clientY,
+        phase: "pending",
+        target: event.currentTarget,
+        offset: 0,
+      };
+      state.current = gesture;
+      setPhase("pending");
+      holdTimer.current = window.setTimeout(() => {
+        if (state.current !== gesture || gesture.phase !== "pending") return;
+        // A finger still creeping hasn't held still, it's scrolling slowly — and
+        // arming would capture the pointer and take the scroll away.
+        const drift = Math.hypot(gesture.lastX - gesture.startX, gesture.lastY - gesture.startY);
+        if (drift > ROW_HOLD_TOLERANCE_PX) {
+          holdTimer.current = null;
+          setGesturePhase(gesture, "scroll");
+          return;
+        }
+        holdTimer.current = null;
+        setGesturePhase(gesture, "armed");
+        capturePointer(gesture);
+        if (typeof navigator.vibrate === "function") navigator.vibrate(10);
+        onPickUp?.();
+      }, ROW_GESTURE_HOLD_MS);
+    },
+    [capturePointer, enabled, onPickUp, reset, setGesturePhase],
+  );
+
+  const onPointerMove = useCallback(
+    (event: ReactPointerEvent) => {
+      const gesture = state.current;
+      if (!gesture || gesture.pointerId !== event.pointerId) return;
+      const deltaX = event.clientX - gesture.startX;
+      const deltaY = event.clientY - gesture.startY;
+      const moved = event.clientX !== gesture.lastX || event.clientY !== gesture.lastY;
+      gesture.lastX = event.clientX;
+      gesture.lastY = event.clientY;
+
+      if (gesture.phase === "armed") {
+        if (!moved) return;
+        if (dragEnabled) setGesturePhase(gesture, "drag");
+        else {
+          setGesturePhase(gesture, "scroll");
+          releaseCapture(gesture);
+        }
+        return;
+      }
+      if (gesture.phase === "drag" || gesture.phase === "scroll") return;
+      if (gesture.phase === "swipe") {
+        // Reversing past the origin crosses into the other direction, which may
+        // be configured inert. Rest the row there and stop claiming the gesture,
+        // rather than translating with nothing revealed behind it.
+        const reversedInto = deltaX < 0 ? actions.left : actions.right;
+        if (reversedInto === "none") {
+          gesture.offset = 0;
+          setDx(0);
+          return;
+        }
+        event.preventDefault();
+        gesture.offset = swipeOffset(deltaX);
+        setDx(gesture.offset);
+        return;
+      }
+
+      const horizontal = Math.abs(deltaX);
+      const vertical = Math.abs(deltaY);
+      // At >=12px, horizontal-dominant travel is swipe; every other vector at
+      // the same Euclidean boundary is scroll. Thus (12,0) and (10,8) cannot overlap.
+      if (horizontal >= ROW_SWIPE_ACTIVATE_PX && horizontal > vertical) {
+        const action = deltaX < 0 ? actions.left : actions.right;
+        if (!swipeEnabled || action === "none") {
+          clearHoldTimer();
+          setGesturePhase(gesture, "scroll");
+          return;
+        }
+        clearHoldTimer();
+        setGesturePhase(gesture, "swipe");
+        capturePointer(gesture);
+        event.preventDefault();
+        gesture.offset = swipeOffset(deltaX);
+        setDx(gesture.offset);
+        return;
+      }
+      if (Math.hypot(deltaX, deltaY) >= ROW_SCROLL_ACTIVATE_PX) {
+        clearHoldTimer();
+        setGesturePhase(gesture, "scroll");
+      }
+    },
+    [
+      actions.left,
+      actions.right,
+      capturePointer,
+      clearHoldTimer,
+      dragEnabled,
+      releaseCapture,
+      setGesturePhase,
+      swipeEnabled,
+    ],
+  );
+
+  const onPointerUp = useCallback(
+    (event: ReactPointerEvent) => {
+      const gesture = state.current;
+      if (!gesture || gesture.pointerId !== event.pointerId) return;
+      const resolvedPhase = gesture.phase;
+      const offset = gesture.offset;
+      const action = offset < 0 ? actions.left : actions.right;
+      const point = { clientX: event.clientX, clientY: event.clientY };
+      reset();
+
+      if (resolvedPhase !== "pending") suppressTrailingClick();
+      if (resolvedPhase === "armed") {
+        onLongPress(point);
+      } else if (
+        resolvedPhase === "swipe" &&
+        Math.abs(offset) >= ROW_SWIPE_COMMIT_PX &&
+        action !== "none"
+      ) {
+        onAction(action);
+      }
+    },
+    [actions.left, actions.right, onAction, onLongPress, reset, suppressTrailingClick],
+  );
+
+  const onPointerCancel = useCallback(
+    (event: ReactPointerEvent) => {
+      if (state.current?.pointerId !== event.pointerId) return;
+      reset();
+    },
+    [reset],
+  );
+
+  const onTouchStart = useCallback(
+    (event: ReactTouchEvent) => {
+      if (event.touches.length > 1 && state.current) reset();
+    },
+    [reset],
+  );
+
+  const dndData = useMemo<RowGestureDndState>(
+    () => ({ shouldStartDrag: () => state.current?.phase === "drag" }),
+    [],
+  );
+
+  const bindListeners = useCallback(
+    (dragListeners: DraggableSyntheticListeners) => ({
+      ...dragListeners,
+      onPointerDown,
+      onPointerMove,
+      onPointerUp,
+      onPointerCancel,
+      onTouchStart: (event: ReactTouchEvent) => {
+        onTouchStart(event);
+        callDndListener(dragListeners, "onTouchStart", event);
+      },
+    }),
+    [onPointerCancel, onPointerDown, onPointerMove, onPointerUp, onTouchStart],
+  );
+
+  useEffect(() => {
+    if (!enabled && state.current) reset();
+  }, [enabled, reset]);
+
+  useEffect(
+    () => () => {
+      clearHoldTimer();
+      releaseCapture(state.current);
+    },
+    [clearHoldTimer, releaseCapture],
+  );
+
+  return {
+    dx,
+    phase,
+    listeners: bindListeners,
+    dndData,
+    consumeClick,
+  };
+}
