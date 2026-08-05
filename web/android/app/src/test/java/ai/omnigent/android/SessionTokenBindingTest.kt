@@ -1,7 +1,6 @@
 package ai.omnigent.android
 
 import android.webkit.CookieManager
-import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -18,7 +17,7 @@ class SessionTokenBindingTest {
     private val pinned = "https://example.com"
 
     private fun launch(): MainActivity {
-        ServerStore(ApplicationProvider.getApplicationContext()).connect(pinned)
+        testStore().connect(pinned)
         return Robolectric.buildActivity(MainActivity::class.java).setup().get()
     }
 

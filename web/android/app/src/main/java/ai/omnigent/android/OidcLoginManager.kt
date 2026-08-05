@@ -50,12 +50,10 @@ class OidcLoginManager {
     // The flow's two network steps, substitutable so tests can drive a token
     // through the completion path without a server.
     @VisibleForTesting
-    internal var requestTicket: (origin: String) -> Ticket? = { httpRequestTicket(it) }
+    internal var requestTicket: (origin: String) -> Ticket? = ::httpRequestTicket
 
     @VisibleForTesting
-    internal var pollForToken: (origin: String, ticket: String) -> String? = { origin, ticket ->
-        httpPollForToken(origin, ticket)
-    }
+    internal var pollForToken: (origin: String, ticket: String) -> String? = ::httpPollForToken
 
     /**
      * Begin a login against [origin] (the pinned server). Opens the browser and
