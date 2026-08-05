@@ -40,6 +40,16 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
+            <!-- omnigent://<host>/c/<id> deep links; see docs/android-deep-link-design.md.
+                 Custom schemes are unverified — any co-installed app can also
+                 claim this one — so DeepLink.parse treats the URI as untrusted. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="omnigent" />
+            </intent-filter>
         </activity>
 
         <activity
