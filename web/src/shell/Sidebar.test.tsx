@@ -15,9 +15,13 @@ import type { Conversation } from "@/hooks/useConversations";
 import { ROW_GESTURE_HOLD_MS } from "@/hooks/useRowGesture";
 import { notifyResizeObservers, resetMockViewportWidth, setMockViewportWidth } from "@/test-setup";
 
-// Row gestures gate on a coarse pointer; the global matchMedia stub reports
-// none, which would leave the touch-drop tests with a disabled recognizer.
-vi.mock("@/hooks/useCoarsePointer", () => ({ useCoarsePointer: () => true }));
+// Controllable coarse-pointer capability, defaulting to true: the recognizer
+// touch tests need it (the global matchMedia stub reports no coarse pointer),
+// and fine-pointer cases opt out explicitly.
+const coarsePointer = vi.hoisted(() => ({ current: true }));
+vi.mock("@/hooks/useCoarsePointer", () => ({
+  useCoarsePointer: () => coarsePointer.current,
+}));
 
 // Project mocks are declared via vi.hoisted so they exist before the hoisted
 // vi.mock factory runs. projectsMock is mutated per-test to drive project
@@ -1654,23 +1658,49 @@ describe("Sidebar ungroup drag target", () => {
     fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
   });
 
-  it("does not mount the mobile strip during a desktop drag", async () => {
-    setMockViewportWidth(1024);
-    const row = renderPinnedFiledSession("conv_desktop_filed");
+  it("does not mount the strip during a fine-pointer desktop drag", async () => {
+    // Wide viewport AND no touch: desktop mice have hover, so ChatsDropZone
+    // is the advertised ungroup target and the strip stays out.
+    coarsePointer.current = false;
+    try {
+      setMockViewportWidth(1024);
+      const row = renderPinnedFiledSession("conv_desktop_filed");
 
-    startMouseDrag(row);
-    await waitFor(() => expect(screen.getAllByText("conv_desktop_filed")).toHaveLength(2));
-    expect(screen.queryByTestId("sidebar-ungroup-drop-zone")).toBeNull();
+      startMouseDrag(row);
+      await waitFor(() => expect(screen.getAllByText("conv_desktop_filed")).toHaveLength(2));
+      expect(screen.queryByTestId("sidebar-ungroup-drop-zone")).toBeNull();
 
-    fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
+      fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
+    } finally {
+      coarsePointer.current = true;
+    }
   });
 
   it("mounts the strip during a mobile filed-session drag", async () => {
     const row = renderPinnedFiledSession("conv_mobile_filed");
 
     startMouseDrag(row);
-    expect(await screen.findByTestId("sidebar-ungroup-drop-zone")).toBeInTheDocument();
+    const strip = await screen.findByTestId("sidebar-ungroup-drop-zone");
+    // Pinned to the scroll viewport's bottom — inline at the list end it sits
+    // below the fold on any screenful of sessions.
+    expect(strip).toHaveClass("sticky", "bottom-0");
     fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
+  });
+
+  it("mounts the strip during a wide-viewport drag on a coarse-pointer device", async () => {
+    // A wide touch layout has ChatsDropZone too, but no hover to advertise it
+    // as a target — the strip must still appear there.
+    coarsePointer.current = true;
+    try {
+      setMockViewportWidth(1024);
+      const row = renderPinnedFiledSession("conv_wide_touch_filed");
+
+      startMouseDrag(row);
+      expect(await screen.findByTestId("sidebar-ungroup-drop-zone")).toBeInTheDocument();
+      fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
+    } finally {
+      coarsePointer.current = true;
+    }
   });
 
   it("ungroups and unpins a pinned project session dropped on the bottom strip", async () => {
