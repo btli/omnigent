@@ -155,6 +155,7 @@ import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
 import {
   finishActiveRowGesture,
+  ROW_MENU_SYNTHETIC,
   ROW_SWIPE_COMMIT_PX,
   RowGestureTouchSensor,
   useRowGesture,
@@ -197,9 +198,6 @@ const SIDEBAR_ACTIVE_HIGHLIGHT =
   "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)]";
 const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 const UNGROUP_DROP_ZONE_ID = "__ungroup__";
-// Marks the recognizer's own contextmenu dispatch so the row root can suppress
-// the OS long-press contextmenu mid-gesture without eating its own.
-const ROW_MENU_SYNTHETIC = Symbol("row-menu-synthetic");
 
 /** Prefer the visible ungroup strip when it overlaps another drop target. */
 export function prioritizeSidebarUngroupCollision(collisions: Collision[]): Collision[] {
