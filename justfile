@@ -111,31 +111,24 @@ normalize-locks: _ensure-uv
     uv run scripts/normalize_uv_lock_registry.py uv.lock || true
 
 # ─── homelab test env (omni-test.bryanli.net) ── NOT upstream ─────────────
-# Stages a worktree to server0 NFS and bounces the omnigent-test pod (k3s-infra
-# k8s/omnigent-test). Spec: homelab docs/superpowers/specs/2026-08-04-*.md
+# The `testing` branch on origin (btli/omnigent) IS the deployment: any push
+# to it fires a GitHub webhook -> hooks.bryanli.net -> the omnigent-test pod
+# redeploys from source (k3s-infra k8s/omnigent-test + k8s/webhooks). These
+# recipes just compose and push that branch — no SSH needed to deploy.
+# Spec: homelab docs/superpowers/specs/2026-08-04-*.md
 
-TEST_STAGE := "bli@server0.joyful.house:/srv/k3s/omnigent-test/src/"
 TEST_KUBECTL := "ssh bli@host.k3s.joyful.house kubectl -n omnigent-test"
 TEST_BASE := env("OMNIGENT_TEST_BASE", "main")
 
-# Deploy the CURRENT worktree (whatever state it's in) to the test env.
+# Compose upstream {{ TEST_BASE }} + the given PR numbers (upstream GitHub
+# PRs; none = plain upstream HEAD) and force-push it to `testing`, which
+# auto-deploys. Aborts loudly on merge conflicts.
 [group('test-env')]
-test-sync:
-    rsync -a --delete --exclude .venv --exclude node_modules \
-      --exclude .git --exclude dev/omnidev/target \
-      ./ {{ TEST_STAGE }}
-    {{ TEST_KUBECTL }} rollout restart deploy/omnigent-test
-    {{ TEST_KUBECTL }} rollout status deploy/omnigent-test --timeout=30m
-    @echo "→ https://omni-test.bryanli.net"
-
-# Build a fresh worktree from upstream {{ TEST_BASE }} + the given PR numbers
-# (upstream GitHub PRs), then deploy it. Aborts loudly on merge conflicts.
-[group('test-env')]
-test-up +prs:
+test-branch *prs:
     #!/usr/bin/env bash
     set -euo pipefail
     ids="$(echo "{{ prs }}" | tr ' ' '-')"
-    wt="$(git rev-parse --show-toplevel)/../omnigent-worktrees/test-${ids}"
+    wt="$(git rev-parse --show-toplevel)/../omnigent-worktrees/testing${ids:+-$ids}"
     git fetch upstream {{ TEST_BASE }}
     rm -rf "$wt" && git worktree prune
     git worktree add --detach "$wt" "upstream/{{ TEST_BASE }}"
@@ -146,14 +139,23 @@ test-up +prs:
       git merge --no-edit FETCH_HEAD \
         || { echo "CONFLICT merging PR #$pr — resolve in $wt"; exit 1; }
     done
-    rsync -a --delete --exclude .venv --exclude node_modules \
-      --exclude .git --exclude dev/omnidev/target \
-      ./ {{ TEST_STAGE }}
-    {{ TEST_KUBECTL }} rollout restart deploy/omnigent-test
-    {{ TEST_KUBECTL }} rollout status deploy/omnigent-test --timeout=30m
-    echo "→ https://omni-test.bryanli.net"
+    git push -f origin HEAD:refs/heads/testing
+    echo "pushed $(git rev-parse --short HEAD) → testing; deploying → https://omni-test.bryanli.net"
 
-# Stop the test env (staged tree stays; test-sync or a restart revives it).
+# Deploy the CURRENT tree, uncommitted changes included, via a throwaway
+# snapshot commit (`git stash create` — leaves your working tree untouched;
+# brand-new files must be `git add`ed to ride along).
+[group('test-env')]
+test-sync:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    sha="$(git stash create || true)"
+    sha="${sha:-$(git rev-parse HEAD)}"
+    git push -f origin "$sha":refs/heads/testing
+    echo "pushed snapshot ${sha:0:8} → testing; deploying → https://omni-test.bryanli.net"
+
+# Park the test env (any later push to `testing` wakes it back up — the
+# webhook patches replicas back to 1).
 [group('test-env')]
 test-down:
     {{ TEST_KUBECTL }} scale deploy/omnigent-test --replicas=0
