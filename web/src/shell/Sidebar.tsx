@@ -2975,6 +2975,7 @@ function ConversationRow({
   // The kebab menu is controlled so the project submenu can close the whole
   // menu after a pick (a plain click inside the submenu wouldn't otherwise).
   const [menuOpen, setMenuOpen] = useState(false);
+  const contextMenuOpenRef = useRef(false);
   // Opt-in "delete local branch" checkbox (worktree sessions only).
   const [deleteBranch, setDeleteBranch] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
@@ -3093,6 +3094,19 @@ function ConversationRow({
       }),
     );
   }, []);
+  const onContextMenuOpenChange = useCallback((open: boolean) => {
+    contextMenuOpenRef.current = open;
+  }, []);
+  const dismissContextMenu = useCallback(() => {
+    if (!contextMenuOpenRef.current) return;
+    (document.activeElement ?? document.body).dispatchEvent(
+      new globalThis.KeyboardEvent("keydown", {
+        key: "Escape",
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+  }, []);
   const gesture = useRowGesture({
     enabled: gestureEnabled,
     swipeEnabled,
@@ -3100,6 +3114,7 @@ function ConversationRow({
     actions: swipeActions,
     onAction: onSwipeAction,
     onLongPress: openContextMenuAt,
+    onDragStart: dismissContextMenu,
   });
 
   // The recognizer state travels with this draggable, so the static touch
@@ -3481,7 +3496,7 @@ function ConversationRow({
           )
         ) : projectFlyoutName ? (
           <HoverCard openDelay={150} closeDelay={0}>
-            <ContextMenu>
+            <ContextMenu onOpenChange={onContextMenuOpenChange}>
               <ContextMenuTrigger asChild>
                 <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
               </ContextMenuTrigger>
@@ -3500,7 +3515,7 @@ function ConversationRow({
             />
           </HoverCard>
         ) : isMobile ? (
-          <ContextMenu>
+          <ContextMenu onOpenChange={onContextMenuOpenChange}>
             <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
             <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-xs">
               <ConversationMenuItems
@@ -3512,7 +3527,7 @@ function ConversationRow({
           </ContextMenu>
         ) : (
           <Tooltip>
-            <ContextMenu>
+            <ContextMenu onOpenChange={onContextMenuOpenChange}>
               <ContextMenuTrigger asChild>
                 <div className="w-full">
                   <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
