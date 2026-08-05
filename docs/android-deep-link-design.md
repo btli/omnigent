@@ -62,12 +62,19 @@ servers.
 
 ### 1. Manifest registration
 
-A second `<intent-filter>` on `MainActivity` (which already uses
+An `<intent-filter>` on `MainActivity` (which already uses
 `launchMode="singleTop"`):
 
 - `android.intent.action.VIEW`
 - categories `DEFAULT` + `BROWSABLE` (required for links tapped in a browser)
 - `<data android:scheme="omnigent" />`
+
+Device testing found this filter can't live on `MainActivity` itself:
+Android's task-fronting silently swallows a VIEW intent when another
+activity (e.g. `ConnectActivity`) is on top of the same task. The filter
+instead lives on `DeepLinkActivity`, a `noHistory` trampoline that always
+forwards to `MainActivity` via `FLAG_ACTIVITY_CLEAR_TOP |
+FLAG_ACTIVITY_SINGLE_TOP` and finishes.
 
 Intent delivery is *not* assumed to arrive only via `onNewIntent`:
 `singleTop` routes there only when this instance is top-of-task. Cold starts,
