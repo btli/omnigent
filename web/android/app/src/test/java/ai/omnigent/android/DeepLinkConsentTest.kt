@@ -1,12 +1,9 @@
 package ai.omnigent.android
 
 import android.content.DialogInterface
-import android.content.Intent
-import android.net.Uri
 import android.os.Looper
 import android.webkit.WebView
 import androidx.appcompat.app.AlertDialog
-import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -23,28 +20,9 @@ import org.robolectric.shadows.ShadowDialog
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class DeepLinkConsentTest {
-    private val hex = "e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9"
+    private val hex = TEST_CONVERSATION_ID
 
-    private fun store() = ServerStore(ApplicationProvider.getApplicationContext())
-
-    private fun viewIntent(link: String) =
-        Intent(Intent.ACTION_VIEW, Uri.parse(link)).addCategory(Intent.CATEGORY_BROWSABLE)
-
-    private fun MainActivity.field(name: String): Any? =
-        MainActivity::class.java
-            .getDeclaredField(name)
-            .apply { isAccessible = true }
-            .get(this)
-
-    private fun MainActivity.setField(
-        name: String,
-        value: Any?,
-    ) = MainActivity::class.java
-        .getDeclaredField(name)
-        .apply { isAccessible = true }
-        .set(this, value)
-
-    private fun MainActivity.webView(): WebView = field("webView") as WebView
+    private fun store() = testStore()
 
     private fun latestDialog(): AlertDialog = ShadowDialog.getLatestDialog() as AlertDialog
 
@@ -66,7 +44,7 @@ class DeepLinkConsentTest {
         val activity = launchWithLink("omnigent://new.example/c/$hex")
         assertTrue(latestDialog().isShowing)
         // Nothing loaded, pinned, or persisted pre-consent.
-        assertEquals("https://current.example", activity.field("pinnedOrigin"))
+        assertEquals("https://current.example", activity.privateField("pinnedOrigin"))
         assertFalse(store().recentServers().any { it.contains("new.example") })
     }
 
@@ -76,15 +54,15 @@ class DeepLinkConsentTest {
         latestDialog().getButton(DialogInterface.BUTTON_POSITIVE).performClick()
         idle()
 
-        assertEquals("https://new.example", activity.field("pinnedOrigin"))
-        assertEquals("https://new.example", shadowOf(activity.webView()).lastLoadedUrl)
-        assertEquals("/c/$hex", activity.field("pendingNavigatePath"))
+        assertEquals("https://new.example", activity.privateField("pinnedOrigin"))
+        assertEquals("https://new.example", shadowOf(activity.testWebView()).lastLoadedUrl)
+        assertEquals("/c/$hex", activity.privateField("pendingNavigatePath"))
         // Not yet a trusted recent: the load hasn't succeeded.
         assertFalse(store().recentServers().any { it.contains("new.example") })
         assertEquals("https://current.example", store().currentServerUrl())
 
         // Simulate the first successful pinned-origin load.
-        invokeOnPageReady(activity, "https://new.example/", mainFrameLoadFailed = false)
+        activity.invokeOnPageReady("https://new.example/", mainFrameLoadFailed = false)
         assertEquals("https://new.example", store().currentServerUrl())
         assertTrue(store().recentServers().contains("https://new.example"))
     }
@@ -94,19 +72,19 @@ class DeepLinkConsentTest {
         val activity = launchWithLink("omnigent://new.example/c/$hex")
         latestDialog().getButton(DialogInterface.BUTTON_POSITIVE).performClick()
         idle()
-        assertEquals("/c/$hex", activity.field("pendingNavigatePath"))
+        assertEquals("/c/$hex", activity.privateField("pendingNavigatePath"))
 
         // WebView calls onPageFinished with the ORIGINAL url after a main-frame
         // load error (e.g. net::ERR_SSL_PROTOCOL_ERROR) — never a
         // chrome-error:// one — so this is the only way the shell finds out.
-        invokeOnPageReady(activity, "https://new.example/", mainFrameLoadFailed = true)
+        activity.invokeOnPageReady("https://new.example/", mainFrameLoadFailed = true)
 
         // Never became a trusted recent, and the stale pending path is dropped
         // rather than replayed against a server that never actually loaded.
         assertEquals("https://current.example", store().currentServerUrl())
         assertFalse(store().recentServers().any { it.contains("new.example") })
-        assertNull(activity.field("pendingNavigatePath"))
-        assertNull(activity.field("pendingPersistUrl"))
+        assertNull(activity.privateField("pendingNavigatePath"))
+        assertNull(activity.privateField("pendingPersistUrl"))
     }
 
     @Test
@@ -115,8 +93,8 @@ class DeepLinkConsentTest {
         latestDialog().getButton(DialogInterface.BUTTON_NEGATIVE).performClick()
         idle()
 
-        assertEquals("https://current.example", activity.field("pinnedOrigin"))
-        assertNull(activity.field("pendingNavigatePath"))
+        assertEquals("https://current.example", activity.privateField("pinnedOrigin"))
+        assertNull(activity.privateField("pendingNavigatePath"))
         assertFalse(store().recentServers().any { it.contains("new.example") })
     }
 
@@ -164,14 +142,14 @@ class DeepLinkConsentTest {
                 viewIntent("omnigent://new.example/c/$hex"),
             )
         val activity = controller.setup().get()
-        val realWebView = activity.webView()
+        val realWebView = activity.testWebView()
         // Force reloadWithNewServer's webView.loadUrl to throw, simulating an
         // unexpected failure partway through accepting consent.
         val throwingWebView =
             object : WebView(activity) {
                 override fun loadUrl(url: String): Unit = throw RuntimeException("boom")
             }
-        activity.setField("webView", throwingWebView)
+        activity.setPrivateField("webView", throwingWebView)
 
         latestDialog().getButton(DialogInterface.BUTTON_POSITIVE).performClick()
         try {
@@ -183,11 +161,11 @@ class DeepLinkConsentTest {
             // finally must have already run finishDeepLink() by this point.
         }
 
-        assertFalse(activity.field("processingDeepLink") as Boolean)
+        assertFalse(activity.privateField("processingDeepLink") as Boolean)
 
         // Restore a working WebView before continuing — the forced failure
         // above already proved its point; a real load must not also throw.
-        activity.setField("webView", realWebView)
+        activity.setPrivateField("webView", realWebView)
 
         // Queue isn't wedged: a later link still gets asked, not silently dropped.
         controller.newIntent(viewIntent("omnigent://another.example/c/$hex"))
@@ -212,17 +190,5 @@ class DeepLinkConsentTest {
         assertFalse(dialog.isShowing)
         // Dismissal is not an accept: no persistence, no reload was triggered.
         assertFalse(store().recentServers().any { it.contains("new.example") })
-    }
-
-    private fun invokeOnPageReady(
-        activity: MainActivity,
-        url: String,
-        mainFrameLoadFailed: Boolean,
-    ) {
-        MainActivity::class
-            .java
-            .getDeclaredMethod("onPageReady", String::class.java, Boolean::class.java)
-            .apply { isAccessible = true }
-            .invoke(activity, url, mainFrameLoadFailed)
     }
 }
