@@ -2095,13 +2095,16 @@ function SectionHeader({
   /** Suppresses the context menu (bulk-selection mode owns the rows). */
   contextMenuDisabled?: boolean;
 }) {
-  // Only touch/pen long-presses need their trailing click swallowed.
+  // A long-press opens the menu mid-gesture and its trailing click would toggle
+  // the folder; a mouse right-click or keyboard Shift+F10 leaves no such click.
   const swallowClickRef = useRef(false);
+  // True while a pointer that could still long-press is down. The non-mouse gate
+  // and the move/up/cancel clears below mirror Radix's own long-press timer.
   const longPressPointerRef = useRef(false);
 
-  const clearLongPressPointer = () => {
+  function clearLongPressPointer() {
     longPressPointerRef.current = false;
-  };
+  }
 
   const button = (
     <button
@@ -2109,7 +2112,7 @@ function SectionHeader({
       aria-expanded={!collapsed}
       onPointerDown={(event) => {
         swallowClickRef.current = false;
-        longPressPointerRef.current = event.pointerType === "touch" || event.pointerType === "pen";
+        longPressPointerRef.current = event.pointerType !== "mouse";
       }}
       onPointerMove={clearLongPressPointer}
       onPointerUp={clearLongPressPointer}
