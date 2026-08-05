@@ -11,19 +11,31 @@ fun originOf(url: String?): String? {
     val uri = url?.let(Uri::parse) ?: return null
     val scheme = uri.scheme?.lowercase() ?: return null
     val host = (uri.host ?: "").lowercase().ifBlank { return null }
-    val hostPart = bracketIfIpv6(host.removeSurrounding("[", "]"))
-    // Canonicalize like a browser origin (WHATWG): lowercase scheme + host and
-    // omit the default port — so an explicit `https://host:443` (or odd casing)
-    // the user typed compares equal to the WebView's normalized `https://host`.
-    // The pinned origin and every page URL both flow through here, so they
-    // canonicalize identically.
-    val port = uri.port
-    val hasExplicitPort =
-        port != -1 &&
-            !(scheme == "https" && port == 443) &&
-            !(scheme == "http" && port == 80)
-    return if (hasExplicitPort) "$scheme://$hostPart:$port" else "$scheme://$hostPart"
+    return canonicalOrigin(scheme, host, uri.port)
 }
+
+/** Build the canonical browser-style origin for already-validated components. */
+fun canonicalOrigin(
+    scheme: String,
+    host: String,
+    port: Int = -1,
+): String {
+    val normalizedScheme = scheme.lowercase()
+    val hostPart = bracketIfIpv6(host.lowercase().removeSurrounding("[", "]"))
+    return if (port != -1 && !isDefaultPort(normalizedScheme, port)) {
+        "$normalizedScheme://$hostPart:$port"
+    } else {
+        "$normalizedScheme://$hostPart"
+    }
+}
+
+/** Whether [port] is implicit for an HTTP(S) [scheme]. */
+fun isDefaultPort(
+    scheme: String?,
+    port: Int,
+): Boolean =
+    (scheme.equals("https", ignoreCase = true) && port == 443) ||
+        (scheme.equals("http", ignoreCase = true) && port == 80)
 
 /**
  * Re-wrap a bare IPv6 literal in the brackets a URL authority requires —
