@@ -43,15 +43,20 @@ export function isSwipeAction(value: unknown): value is SwipeAction {
 }
 
 /**
- * Normalize an arbitrary parsed value to a valid preferences object, filling
- * each missing/unknown direction from {@link DEFAULT_SWIPE_ACTIONS}. Used both
- * on read (localStorage drift / manual edits) and to sanitize writes.
+ * Normalize an arbitrary parsed value to a valid preferences object. Missing
+ * directions use the defaults; present but unknown actions become inert.
+ * Used both on read (localStorage drift / manual edits) and to sanitize writes.
  */
 export function normalizeSwipeActions(value: unknown): SwipeActionPreferences {
   const obj = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
+  const normalizeDirection = (direction: SwipeDirection): SwipeAction => {
+    const action = obj[direction];
+    if (isSwipeAction(action)) return action;
+    return Object.hasOwn(obj, direction) ? "none" : DEFAULT_SWIPE_ACTIONS[direction];
+  };
   return {
-    left: isSwipeAction(obj.left) ? obj.left : DEFAULT_SWIPE_ACTIONS.left,
-    right: isSwipeAction(obj.right) ? obj.right : DEFAULT_SWIPE_ACTIONS.right,
+    left: normalizeDirection("left"),
+    right: normalizeDirection("right"),
   };
 }
 
