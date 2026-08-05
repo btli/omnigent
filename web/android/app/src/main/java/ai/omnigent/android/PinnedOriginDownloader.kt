@@ -296,14 +296,14 @@ internal class PinnedOriginDownloadWorker(
         val url = inputData.getString(KEY_URL) ?: return null
         val pinnedOrigin = inputData.getString(KEY_PINNED_ORIGIN) ?: return null
         val userAgent = inputData.getString(KEY_USER_AGENT) ?: return null
-        inputData.getString(KEY_SUGGESTED_NAME) ?: return null
-        val suggestedName = safeSuggestedName
+        // The name is required input, but only ever used sanitized.
+        if (inputData.getString(KEY_SUGGESTED_NAME) == null) return null
         return DownloadInput(
             url,
             pinnedOrigin,
             userAgent,
             inputData.getString(KEY_MIME_TYPE),
-            suggestedName,
+            safeSuggestedName,
         )
     }
 
