@@ -84,9 +84,29 @@ class DeepLinkConsentTest {
         assertEquals("https://current.example", store().currentServerUrl())
 
         // Simulate the first successful pinned-origin load.
-        invokeOnPageReady(activity, "https://new.example/")
+        invokeOnPageReady(activity, "https://new.example/", mainFrameLoadFailed = false)
         assertEquals("https://new.example", store().currentServerUrl())
         assertTrue(store().recentServers().contains("https://new.example"))
+    }
+
+    @Test
+    fun `consent open whose load fails never persists the server`() {
+        val activity = launchWithLink("omnigent://new.example/c/$hex")
+        latestDialog().getButton(DialogInterface.BUTTON_POSITIVE).performClick()
+        idle()
+        assertEquals("/c/$hex", activity.field("pendingNavigatePath"))
+
+        // WebView calls onPageFinished with the ORIGINAL url after a main-frame
+        // load error (e.g. net::ERR_SSL_PROTOCOL_ERROR) — never a
+        // chrome-error:// one — so this is the only way the shell finds out.
+        invokeOnPageReady(activity, "https://new.example/", mainFrameLoadFailed = true)
+
+        // Never became a trusted recent, and the stale pending path is dropped
+        // rather than replayed against a server that never actually loaded.
+        assertEquals("https://current.example", store().currentServerUrl())
+        assertFalse(store().recentServers().any { it.contains("new.example") })
+        assertNull(activity.field("pendingNavigatePath"))
+        assertNull(activity.field("pendingPersistUrl"))
     }
 
     @Test
@@ -197,11 +217,12 @@ class DeepLinkConsentTest {
     private fun invokeOnPageReady(
         activity: MainActivity,
         url: String,
+        mainFrameLoadFailed: Boolean,
     ) {
         MainActivity::class
             .java
-            .getDeclaredMethod("onPageReady", String::class.java)
+            .getDeclaredMethod("onPageReady", String::class.java, Boolean::class.java)
             .apply { isAccessible = true }
-            .invoke(activity, url)
+            .invoke(activity, url, mainFrameLoadFailed)
     }
 }
