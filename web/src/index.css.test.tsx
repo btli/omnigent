@@ -4,7 +4,7 @@
 import { readFileSync } from "node:fs";
 // lightningcss is the minifier @tailwindcss/vite runs during `vite build`
 // (resolved from its dependency tree, so we test the version the build uses).
-import { createElement } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen } from "@testing-library/react";
 import { transform } from "lightningcss";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -168,7 +168,9 @@ const workspaceSelector = selectorOf(workspaceSafeAreaRule);
 const workspaceCss = workspaceRules.map(([block]) => block).join("\n");
 const fullHeightPanelRule =
   cssBlocks.find(
-    ([block]) => block.includes(".conversations-sidebar") && block.includes("--omnigent-safe-top"),
+    ([block]) =>
+      selectorOf(block).includes(".conversations-sidebar") &&
+      block.includes("padding-top: var(--omnigent-safe-top)"),
   )?.[0] ?? "";
 const rootSafeAreaRule =
   cssBlocks.find(
@@ -204,46 +206,49 @@ function trimIndent(value: string): string {
 
 function renderWorkspace(platform: "android" | "ios"): HTMLElement {
   render(
-    createElement(
-      "div",
-      { [`data-${platform}-native`]: "" },
-      createElement(
-        TooltipProvider,
-        { delayDuration: 0 },
-        createElement(WorkspacePanel, {
-          conversationId: "safe-area-test",
-          width: 360,
-          handleProps: { tabIndex: 0 },
-          rightRailTab: "files",
-          onRightRailTabChange: vi.fn(),
-          showFilesPanel: true,
-          showBrowserTab: false,
-          changedCount: 0,
-          showShellsTab: false,
-          terminalsLength: 0,
-          subagentsWorking: 0,
-          agentCount: 1,
-          todosSupported: false,
-          todosCompleted: 0,
-          todosTotal: 0,
-          rootSessionId: null,
-          selectedFilePath: null,
-          openFiles: [],
-          openFileViewer: vi.fn(),
-          onCloseFile: vi.fn(),
-          onShowScopeView: vi.fn(),
-          onCommentsOpenChange: vi.fn(),
-          openTerminalsPanel: vi.fn(),
-          permissionLevel: null,
-          filesPanelSort: "recent" as ChangedSort,
-          onSortChange: vi.fn(),
-          filesPanelFlatView: false,
-          onFlatViewChange: vi.fn(),
-          filesPanelShowHidden: false,
-          onShowHiddenChange: vi.fn(),
-        }),
-      ),
-    ),
+    <div {...{ [`data-${platform}-native`]: "" }}>
+      <QueryClientProvider client={new QueryClient()}>
+        <TooltipProvider delayDuration={0}>
+          <WorkspacePanel
+            conversationId="safe-area-test"
+            width={360}
+            handleProps={{ tabIndex: 0 }}
+            rightRailTab="files"
+            onRightRailTabChange={vi.fn()}
+            showFilesPanel
+            showBrowserTab={false}
+            changedCount={0}
+            showShellsTab={false}
+            terminalsLength={0}
+            subagentsWorking={0}
+            agentCount={1}
+            todosSupported={false}
+            todosCompleted={0}
+            todosTotal={0}
+            rootSessionId={null}
+            selectedFilePath={null}
+            openFiles={[]}
+            openFileViewer={vi.fn()}
+            onCloseFile={vi.fn()}
+            onShowScopeView={vi.fn()}
+            onCommentsOpenChange={vi.fn()}
+            openTerminalTab={vi.fn()}
+            openTerminals={[]}
+            selectedTerminalKey={null}
+            onCloseTerminal={vi.fn()}
+            maximized={false}
+            onToggleMaximized={vi.fn()}
+            permissionLevel={null}
+            filesPanelSort={"recent" as ChangedSort}
+            onSortChange={vi.fn()}
+            filesPanelFlatView={false}
+            onFlatViewChange={vi.fn()}
+            filesPanelShowHidden={false}
+            onShowHiddenChange={vi.fn()}
+          />
+        </TooltipProvider>
+      </QueryClientProvider>
+    </div>,
   );
   return screen.getByRole("complementary", { name: "Workspace" });
 }

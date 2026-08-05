@@ -12,6 +12,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
+import { ROW_GESTURE_HOLD_MS } from "@/hooks/useRowGesture";
 import { notifyResizeObservers, resetMockViewportWidth, setMockViewportWidth } from "@/test-setup";
 
 // Project mocks are declared via vi.hoisted so they exist before the hoisted
@@ -1712,29 +1713,40 @@ describe("Sidebar ungroup drag target", () => {
     expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_shifted", project: "" });
   });
 
-  it("completes an ungroup drop through the touch sensor", async () => {
-    mockSidebarDropLayout();
-    const row = renderPinnedFiledSession("conv_touch_filed");
-    const start = touchAt(row, 20);
-    fireEvent.touchStart(row, {
-      touches: [start],
-      targetTouches: [start],
-      changedTouches: [start],
-    });
+  it("completes an ungroup drop through the touch sensor", () => {
+    // The unified row recognizer owns touch drags: a press must hold still for
+    // ROW_GESTURE_HOLD_MS to arm, and only then does movement start the drag.
+    vi.useFakeTimers();
+    try {
+      mockSidebarDropLayout();
+      const row = renderPinnedFiledSession("conv_touch_filed");
+      const touch = { pointerId: 1, isPrimary: true, pointerType: "touch" as const };
+      const start = touchAt(row, 20);
+      fireEvent.pointerDown(row, { ...touch, clientX: 120, clientY: 20 });
+      fireEvent.touchStart(row, {
+        touches: [start],
+        targetTouches: [start],
+        changedTouches: [start],
+      });
+      act(() => vi.advanceTimersByTime(ROW_GESTURE_HOLD_MS + 1));
 
-    const strip = await screen.findByTestId("sidebar-ungroup-drop-zone", {}, { timeout: 1_000 });
-    const approaching = touchAt(row, 279);
-    const destination = touchAt(row, 280);
-    fireEvent.touchMove(row, { touches: [approaching], changedTouches: [approaching] });
-    fireEvent.touchMove(row, { touches: [destination], changedTouches: [destination] });
-    await waitFor(() => expect(strip).toHaveClass("bg-[var(--sidebar-active)]"));
-    fireEvent.touchEnd(row, { touches: [], targetTouches: [], changedTouches: [destination] });
+      const approaching = touchAt(row, 279);
+      const destination = touchAt(row, 280);
+      fireEvent.pointerMove(row, { ...touch, clientX: 120, clientY: 279 });
+      fireEvent.touchMove(row, { touches: [approaching], changedTouches: [approaching] });
+      const strip = screen.getByTestId("sidebar-ungroup-drop-zone");
+      fireEvent.pointerMove(row, { ...touch, clientX: 120, clientY: 280 });
+      fireEvent.touchMove(row, { touches: [destination], changedTouches: [destination] });
+      expect(strip).toHaveClass("bg-[var(--sidebar-active)]");
+      fireEvent.pointerUp(row, { ...touch, clientX: 120, clientY: 280 });
+      fireEvent.touchEnd(row, { touches: [], targetTouches: [], changedTouches: [destination] });
 
-    await waitFor(() => {
       expect(moveToProjectSpy).toHaveBeenCalledTimes(1);
       expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_touch_filed", project: "" });
-    });
-    expect(pinnedIdsRef.current).toEqual([]);
+      expect(pinnedIdsRef.current).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -1813,7 +1825,7 @@ describe("Sidebar collapsed marker", () => {
   // :not([data-collapsed]) — NOT on aria-hidden, which Radix also toggles
   // on the open sidebar while a modal menu is up (that coupling made every
   // row reflow 2px wider when the session kebab menu opened). The panel
-  // must set data-collapsed exactly when closed; index.css.test.ts pins
+  // must set data-collapsed exactly when closed; index.css.test.tsx pins
   // the selector side of this contract.
   it("sets data-collapsed only while closed", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
