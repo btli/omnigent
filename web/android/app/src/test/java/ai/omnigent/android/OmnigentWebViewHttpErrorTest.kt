@@ -56,6 +56,51 @@ class OmnigentWebViewHttpErrorTest {
     }
 
     @Test
+    fun `main frame HTTP error arriving before onPageStarted still fails persistence`() {
+        // Chromium delivers a main-frame onReceivedHttpError BEFORE onPageStarted
+        // (observed on device) — a start-time flag reset would erase it.
+        val webView = WebView(ApplicationProvider.getApplicationContext())
+        var persistenceFailed = false
+        val client = client { _, _, persistence -> persistenceFailed = persistence }
+
+        client.onReceivedHttpError(
+            webView,
+            request(PINNED_URL, mainFrame = true),
+            WebResourceResponse("text/html", "UTF-8", null),
+        )
+        client.onPageStarted(webView, PINNED_URL, null)
+        client.onPageFinished(webView, PINNED_URL)
+
+        assertTrue(persistenceFailed)
+    }
+
+    @Test
+    fun `error flags are consumed by onPageFinished so a retry reports clean`() {
+        val webView = WebView(ApplicationProvider.getApplicationContext())
+        var loadFailed = true
+        var persistenceFailed = true
+        val client =
+            client { _, load, persistence ->
+                loadFailed = load
+                persistenceFailed = persistence
+            }
+
+        client.onReceivedHttpError(
+            webView,
+            request(PINNED_URL, mainFrame = true),
+            WebResourceResponse("text/html", "UTF-8", null),
+        )
+        client.onPageStarted(webView, PINNED_URL, null)
+        client.onPageFinished(webView, PINNED_URL)
+        // Retry succeeds: the consumed flags must not leak into this load.
+        client.onPageStarted(webView, PINNED_URL, null)
+        client.onPageFinished(webView, PINNED_URL)
+
+        assertFalse(loadFailed)
+        assertFalse(persistenceFailed)
+    }
+
+    @Test
     fun `HTTP error tracking does not block a login redirect`() {
         val webView = WebView(ApplicationProvider.getApplicationContext())
         var loginRequired = false
