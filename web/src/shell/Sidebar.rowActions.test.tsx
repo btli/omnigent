@@ -163,7 +163,7 @@ vi.mock("@/lib/serverOrigin", () => ({ isCurrentServerLocal: () => false }));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { resetReadStateForTests, seedReadState } from "@/hooks/useUnseenConversations";
-import { ROW_GESTURE_HOLD_MS } from "@/hooks/useRowGesture";
+import { ROW_DRAG_ACTIVATE_PX, ROW_GESTURE_HOLD_MS } from "@/hooks/useRowGesture";
 import { writeSwipeActions } from "@/lib/swipeActionPreferences";
 import { Sidebar } from "./Sidebar";
 
@@ -991,7 +991,9 @@ const TOUCH_POINTER = { pointerId: 1, isPrimary: true, pointerType: "touch" as c
 const SECOND_TOUCH_POINTER = { pointerId: 2, isPrimary: false, pointerType: "touch" as const };
 
 function touchTarget() {
-  const link = screen.getByRole("link", { name: /My Session/ });
+  // ContextMenu marks the app tree aria-hidden while portalled; pointer capture
+  // still routes the held touch to this same row underneath it.
+  const link = screen.getByRole("link", { name: /My Session/, hidden: true });
   return { link, row: link.closest("li")! };
 }
 
@@ -1045,7 +1047,7 @@ describe("touch gesture arbitration", () => {
     act(() => vi.advanceTimersByTime(ms));
   }
 
-  it("keeps a hold past Radix's own long-press from opening a second menu", () => {
+  it("opens once at hold fire without Radix adding a second menu", () => {
     vi.useFakeTimers();
     mocks.isMobile = true;
     renderSidebar();
@@ -1053,15 +1055,17 @@ describe("touch gesture arbitration", () => {
     const contextMenus: MouseEvent[] = [];
     link.addEventListener("contextmenu", (event) => contextMenus.push(event));
 
-    // Radix's trigger arms its own 700ms touch long-press. Holding past it must
-    // not open a menu mid-gesture — the recognizer owns the only open path, on
-    // release — or a hold-then-drag would drag underneath an open menu.
+    // The recognizer opens first; holding past Radix's 700ms timer must not
+    // add a second menu or dispatch another contextmenu event.
     startTouch(140, 220);
-    advanceHold(900);
-    expect(document.querySelectorAll('[role="menu"]')).toHaveLength(0);
-    expect(contextMenus).toHaveLength(0);
+    advanceHold();
+    expect(document.querySelectorAll('[role="menu"]')).toHaveLength(1);
+    expect(contextMenus).toHaveLength(1);
     expect(row).toHaveClass("scale-[1.01]");
 
+    advanceHold(500);
+    expect(document.querySelectorAll('[role="menu"]')).toHaveLength(1);
+    expect(contextMenus).toHaveLength(1);
     endTouch(140, 220);
     expect(document.querySelectorAll('[role="menu"]')).toHaveLength(1);
     expect(contextMenus).toHaveLength(1);
@@ -1082,23 +1086,28 @@ describe("touch gesture arbitration", () => {
     expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
   });
 
-  it("opens the positioned context menu when a still hold is released without dragging", () => {
+  it("opens at the current finger point and stays open through release and trailing click", () => {
     vi.useFakeTimers();
     mocks.isMobile = true;
-    renderSidebar();
+    const view = renderSidebar();
     const { link, row } = touchTarget();
     const contextMenus: MouseEvent[] = [];
     link.addEventListener("contextmenu", (event) => contextMenus.push(event));
 
     startTouch(140, 220);
+    moveTouch(145, 224);
     advanceHold();
     expect(row).toHaveClass("scale-[1.01]");
     expect(row).not.toHaveClass("opacity-40");
+    expect(screen.getByTestId("archive-conversation")).toBeInTheDocument();
+    expect(contextMenus.at(-1)).toMatchObject({ clientX: 145, clientY: 224 });
 
-    endTouch(140, 220);
+    endTouch(145, 224);
+    fireEvent.click(link);
     expect(screen.getByTestId("archive-conversation")).toBeInTheDocument();
     expect(row).not.toHaveClass("opacity-40");
-    expect(contextMenus.at(-1)).toMatchObject({ clientX: 140, clientY: 220 });
+    expect(contextMenus).toHaveLength(1);
+    expect(view.onClose).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByTestId("archive-conversation"));
     expect(mocks.archive.mutate).toHaveBeenCalledWith(
@@ -1107,7 +1116,7 @@ describe("touch gesture arbitration", () => {
     );
   });
 
-  it("starts dnd-kit only when an armed hold moves, without opening the menu", () => {
+  it("keeps a threshold-minus-one wiggle armed with the menu open", () => {
     vi.useFakeTimers();
     mocks.isMobile = true;
     renderSidebar();
@@ -1118,12 +1127,66 @@ describe("touch gesture arbitration", () => {
     expect(row).not.toHaveClass("opacity-40");
     expect(row).toHaveClass("touch-none");
     expect(row).not.toHaveClass("touch-pan-y");
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
 
-    moveTouch(101, 100);
+    moveTouch(104, 104);
+    moveTouch(100 + ROW_DRAG_ACTIVATE_PX - 1, 100);
+    expect(row).not.toHaveClass("opacity-40");
+    expect(row).toHaveClass("touch-none");
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+    endTouch(100 + ROW_DRAG_ACTIVATE_PX - 1, 100);
+  });
+
+  it("measures the drag threshold from the arm point, not the press origin", () => {
+    // A press may legally drift up to the hold tolerance before the timer
+    // fires; that drift must not pre-spend the drag budget, or the first
+    // post-arm tremble would dismiss the fresh menu into a drag.
+    vi.useFakeTimers();
+    mocks.isMobile = true;
+    renderSidebar();
+    const { row } = touchTarget();
+
+    startTouch();
+    // Vertical-dominant 15px drift: inside the 20px hold tolerance, outside
+    // the swipe wedge, under the 25px scroll circle.
+    moveTouch(100, 115);
+    advanceHold();
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+
+    // ~3px wiggle from the ARM point (but ~17px from the press origin).
+    moveTouch(102, 117);
+    expect(row).not.toHaveClass("opacity-40");
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+
+    // A deliberate pull measured from the arm point still drags.
+    moveTouch(100, 115 + ROW_DRAG_ACTIVATE_PX);
+    expect(row).toHaveClass("opacity-40");
+    expect(screen.queryByTestId("rename-conversation")).toBeNull();
+    endTouch(100, 115 + ROW_DRAG_ACTIVATE_PX);
+  });
+
+  it("starts drag at the threshold and dismisses the menu exactly once", () => {
+    vi.useFakeTimers();
+    mocks.isMobile = true;
+    renderSidebar();
+    const { row } = touchTarget();
+    const escapeKeydowns = vi.fn((event: KeyboardEvent) => event.key);
+    document.addEventListener("keydown", escapeKeydowns, { capture: true });
+
+    startTouch();
+    advanceHold();
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+
+    moveTouch(100 + ROW_DRAG_ACTIVATE_PX, 100);
     expect(row).toHaveClass("opacity-40");
     expect(row).toHaveClass("touch-none");
     expect(screen.queryByTestId("rename-conversation")).toBeNull();
-    endTouch(101, 100);
+
+    moveTouch(100 + ROW_DRAG_ACTIVATE_PX + 10, 100);
+    document.removeEventListener("keydown", escapeKeydowns, { capture: true });
+    expect(escapeKeydowns).toHaveBeenCalledOnce();
+    expect(escapeKeydowns.mock.results[0]?.value).toBe("Escape");
+    endTouch(100 + ROW_DRAG_ACTIVATE_PX + 10, 100);
   });
 
   it("does not restart a drag after viewport resize cancels the sensor", () => {
@@ -1134,15 +1197,15 @@ describe("touch gesture arbitration", () => {
 
     startTouch();
     advanceHold();
-    moveTouch(101, 100);
+    moveTouch(100 + ROW_DRAG_ACTIVATE_PX, 100);
     expect(row).toHaveClass("opacity-40");
 
     act(() => window.dispatchEvent(new Event("resize")));
     expect(row).not.toHaveClass("opacity-40");
 
-    moveTouch(102, 100);
+    moveTouch(100 + ROW_DRAG_ACTIVATE_PX + 1, 100);
     expect(row).not.toHaveClass("opacity-40");
-    endTouch(102, 100);
+    endTouch(100 + ROW_DRAG_ACTIVATE_PX + 1, 100);
   });
 
   it("resets the recognizer when dnd-kit ends the drag", () => {
@@ -1153,15 +1216,15 @@ describe("touch gesture arbitration", () => {
 
     startTouch();
     advanceHold();
-    moveTouch(101, 100);
+    moveTouch(100 + ROW_DRAG_ACTIVATE_PX, 100);
     expect(row).toHaveClass("opacity-40");
 
-    const touch = touchPoint(link, 101, 100);
+    const touch = touchPoint(link, 100 + ROW_DRAG_ACTIVATE_PX, 100);
     fireEvent.touchEnd(link, { touches: [], changedTouches: [touch] });
 
     expect(row).not.toHaveClass("opacity-40");
     expect(row).not.toHaveClass("touch-none");
-    moveTouch(102, 100);
+    moveTouch(100 + ROW_DRAG_ACTIVATE_PX + 1, 100);
     expect(row).not.toHaveClass("opacity-40");
   });
 
@@ -1386,10 +1449,10 @@ describe("touch gesture arbitration", () => {
     startTouch();
     advanceHold();
     expect(row).toHaveClass("scale-[1.01]");
-    moveTouch(101, 100);
+    moveTouch(100 + ROW_DRAG_ACTIVATE_PX, 100);
 
     expect(row).toHaveClass("opacity-40");
-    endTouch(101, 100);
+    endTouch(100 + ROW_DRAG_ACTIVATE_PX, 100);
   });
 
   it("leaves a short still press as plain link activation", () => {
@@ -1530,12 +1593,16 @@ describe("touch gesture arbitration", () => {
     const linkB = screen.getByRole("link", { name: /Session B/ });
     const rowA = linkA.closest("li")!;
     const first = touchPoint(linkA, 100, 100);
-    const moved = touchPoint(linkA, 101, 100);
+    const moved = touchPoint(linkA, 100 + ROW_DRAG_ACTIVATE_PX, 100);
 
     fireEvent.pointerDown(linkA, { ...TOUCH_POINTER, clientX: 100, clientY: 100 });
     fireEvent.touchStart(linkA, { touches: [first], changedTouches: [first] });
     advanceHold();
-    fireEvent.pointerMove(linkA, { ...TOUCH_POINTER, clientX: 101, clientY: 100 });
+    fireEvent.pointerMove(linkA, {
+      ...TOUCH_POINTER,
+      clientX: 100 + ROW_DRAG_ACTIVATE_PX,
+      clientY: 100,
+    });
     fireEvent.touchMove(linkA, { touches: [moved], changedTouches: [moved] });
     expect(rowA).toHaveClass("opacity-40");
 
@@ -1558,7 +1625,7 @@ describe("touch gesture arbitration", () => {
 
     startTouch();
     advanceHold();
-    moveTouch(101, 100);
+    moveTouch(100 + ROW_DRAG_ACTIVATE_PX, 100);
     expect(row).toHaveClass("opacity-40");
 
     fireEvent.pointerDown(link, { ...SECOND_TOUCH_POINTER, clientX: 104, clientY: 104 });
