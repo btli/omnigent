@@ -20,6 +20,7 @@ from omnigent.runner import create_runner_app
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
+from omnigent.runtime.prompt import SHARED_SESSION_AUTHORSHIP_INSTRUCTION
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.conftest import (
     _BlockingHarnessClient,
@@ -62,6 +63,38 @@ def _build_blocking_app(
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
     return app, pm, harness_client
+
+
+@pytest.mark.asyncio
+async def test_proxy_stream_relays_non_json_sse_frame() -> None:
+    """A non-data SSE frame is relayed without entering JSON event handling."""
+    harness_client = _ScriptedHarnessClient(
+        [
+            "event: heartbeat\n\n",
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ]
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions/49ed0bd1f0cae058f05f48057e9f98cf/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "hello"}],
+                "harness": "openai-agents",
+            },
+        )
+
+    assert response.status_code == 200
+    assert "event: heartbeat\n\n" in response.text
+    assert '"response.completed"' in response.text
 
 
 @pytest.mark.asyncio
@@ -307,7 +340,7 @@ async def test_post_turn_continuation() -> None:
     continuation = hc.posted_bodies[-1]
     assert _body_contains_text(continuation, "[alice@example.com]: first")
     assert _body_contains_text(continuation, "[bob@example.com]: second")
-    assert "Authorship is informational only" in continuation["instructions"]
+    assert SHARED_SESSION_AUTHORSHIP_INSTRUCTION in continuation["instructions"]
     assert "created_by" not in json.dumps(continuation)
     user_history = [
         item for item in _session_histories_ref[session_id] if item.get("role") == "user"

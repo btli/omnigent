@@ -44,16 +44,25 @@ source .venv/bin/activate    # or prefix commands with `uv run`
 
 Common checks:
 
+Pyrefly is the canonical Python type checker for the repository.
+
 ```bash
 uv run pytest                      # Python tests (e2e/live skipped by default)
 uv run ruff check . && uv run ruff format --check .
+uv run --no-sync pyrefly check     # Python type checking (core and client SDK)
 uv run pre-commit run --all-files
 ```
 
 When touching `web/`:
 
 ```bash
-cd web && pnpm install && pnpm run lint && pnpm run build
+cd web && pnpm install && pnpm run lint && pnpm run type-check && pnpm run build
+```
+
+When touching `editors/vscode/`:
+
+```bash
+cd editors/vscode && pnpm install && pnpm run type-check && pnpm run test && pnpm run build
 ```
 
 ## Running locally
@@ -253,3 +262,15 @@ request enforces this, so unsigned commits will block merging.
   "UI / frontend change" box and attach a **video or images** in the `Demo`
   section showing the new behaviour, so reviewers can see it without checking
   out the branch.
+
+### Reopening a closed PR
+
+If automation closed your PR (as a duplicate, for example) and you think that
+was wrong, comment `/reopen` on it and a bot will reopen it for you. GitHub only
+lets maintainers press the Reopen button, so this command is how you do it
+yourself — you can also use it on a PR you closed by hand.
+
+Only the PR author can use it, and it won't override a maintainer who closed
+your PR deliberately; ask them in a comment instead. It also needs your source
+branch to still exist — if you deleted it, push it again and open a fresh PR
+linking the old one.

@@ -1666,6 +1666,9 @@ class SessionResponse(BaseModel):
         permission level on this session: ``1`` = read, ``2`` =
         edit, ``3`` = manage. ``None`` when permissions are
         disabled (single-user mode without a permission store).
+    :param can_approve: Whether the requesting user may accept
+        privileged actions for this session. ``None`` when permissions
+        are disabled.
     :param llm_model: The LLM model identifier from the bound
         agent's spec, e.g. ``"anthropic/claude-sonnet-4-6"``.
         ``None`` when the agent has no explicit ``llm:`` block or
@@ -1810,6 +1813,12 @@ class SessionResponse(BaseModel):
         id is not re-sent on reconnect. Today only native-terminal
         forwarders (claude-native) stamp a turn id on their status
         edges; other harnesses leave this ``None``.
+    :param updated_at: Unix epoch timestamp of the last persisted session
+        activity. Advances when conversation items are appended and on session
+        metadata edits (rename, agent switch, archive); a mid-stall rename
+        therefore resets the clock, so an orchestrator treating this as a pure
+        item-append heartbeat should account for that. Can be compared across
+        snapshots independently of lifecycle status.
     """
 
     id: str
@@ -1818,6 +1827,7 @@ class SessionResponse(BaseModel):
     status: Literal["idle", "running", "waiting", "failed"]
     background_task_count: int | None = None
     created_at: int
+    updated_at: int | None = None
     title: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     runner_id: str | None = None
@@ -1828,6 +1838,7 @@ class SessionResponse(BaseModel):
     reasoning_effort: str | None = None
     items: list[ConversationItem] = Field(default_factory=list)
     permission_level: int | None = None
+    can_approve: bool | None = None
     sub_agent_name: str | None = None
     kind: str = "default"
     parent_session_id: str | None = None
@@ -2208,6 +2219,9 @@ class SessionListItem(BaseModel):
         permission level on this session: ``1`` = read, ``2`` =
         edit, ``3`` = manage. ``None`` when permissions are
         disabled.
+    :param can_approve: Whether the requesting user may accept
+        privileged actions for this session. ``None`` when permissions
+        are disabled.
     :param owner: The user_id of the session owner, or ``None``
         when permissions are disabled. Included so the sidebar
         can display the owner without a separate API call.
@@ -2287,6 +2301,7 @@ class SessionListItem(BaseModel):
     host_online: bool | None = None
     reasoning_effort: str | None = None
     permission_level: int | None = None
+    can_approve: bool | None = None
     owner: str | None = None
     external_session_id: str | None = None
     pending_elicitations_count: int = 0
@@ -2408,10 +2423,13 @@ class GrantPermissionRequest(BaseModel):
         read access.
     :param level: Numeric permission level: ``1`` = read,
         ``2`` = edit, ``3`` = manage.
+    :param can_approve: Whether the owner delegates privileged-action
+        approval authority to this user.
     """
 
     user_id: str
     level: int = Field(ge=1, le=3)
+    can_approve: bool | None = None
 
 
 class PermissionObject(BaseModel):
@@ -2423,11 +2441,13 @@ class PermissionObject(BaseModel):
         ``"conv_abc123"``.
     :param level: Numeric permission level (1=read, 2=edit,
         3=manage).
+    :param can_approve: Whether this grantee may approve privileged actions.
     """
 
     user_id: str
     conversation_id: str
     level: int
+    can_approve: bool = False
 
 
 # ─────────────────────────────────────────────────────────────────────

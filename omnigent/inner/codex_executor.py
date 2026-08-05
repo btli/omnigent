@@ -16,7 +16,7 @@ import re
 import shutil
 import tempfile
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, MutableMapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,9 +24,9 @@ from typing import Any, Protocol, TypeAlias
 
 from omnigent import model_catalog
 from omnigent._platform import resolve_cli_binary
+from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
-from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.spec.types import RetryPolicy
 
 from . import _proc
@@ -120,6 +120,7 @@ _CODEX_HOME_COPY_FILES = ("config.toml",)
 # shared cache exactly as they would without the private home.
 _CODEX_HOME_SYMLINK_DIRS = (Path("plugins") / "cache",)
 _CODEX_MINIMAL_CONFIG_ENV = "HARNESS_CODEX_MINIMAL_CONFIG"
+_CODEX_PROVIDER_CONFIG_PREFIX = "model_providers."
 
 # Environment variables explicitly excluded from the codex subprocess even
 # when their prefix is in the allowlist. ``OPENAI_API_KEY`` is stripped so
@@ -128,7 +129,7 @@ _CODEX_MINIMAL_CONFIG_ENV = "HARNESS_CODEX_MINIMAL_CONFIG"
 _CODEX_ENV_DENY_EXACT: frozenset[str] = frozenset({"OPENAI_API_KEY"})
 
 
-def _extract_codex_last_turn_usage(params: object, model: str) -> dict[str, Any] | None:
+def _extract_codex_last_turn_usage(params: object, model: str | None) -> dict[str, object] | None:
     """Map a ``thread/tokenUsage/updated`` payload's ``last`` breakdown
     onto the wire shape that :class:`TurnComplete` consumes.
 
@@ -161,7 +162,7 @@ def _extract_codex_last_turn_usage(params: object, model: str) -> dict[str, Any]
     input_total = int(last.get("inputTokens") or 0)
     # Clamp so a malformed cached > total never makes input_tokens negative.
     cached = min(int(last.get("cachedInputTokens") or 0), input_total)
-    usage: dict[str, Any] = {
+    usage: dict[str, object] = {
         "input_tokens": input_total - cached,  # non-cached portion
         "output_tokens": int(last.get("outputTokens") or 0),
         "total_tokens": int(last.get("totalTokens") or 0),
@@ -351,83 +352,57 @@ async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
     return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
 
 
-async def _create_subprocess_exec(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
-    """
-    Indirection point for ``asyncio.create_subprocess_exec``.
+_ProcessPath: TypeAlias = str | bytes | os.PathLike[str] | os.PathLike[bytes]
 
-    Exists so tests can stub the subprocess creation without
-    patching ``asyncio.create_subprocess_exec`` globally (patching
-    ``omnigent.inner.codex_executor.asyncio.create_subprocess_exec``
-    walks the dotted path into the real ``asyncio`` module
-    singleton and leaks the mock into every other test in the
-    process).
 
-    :param args: Positional argv components forwarded to
-        ``asyncio.create_subprocess_exec``.
-    :param kwargs: Keyword args (``stdin``, ``stdout``, ``stderr``,
-        ``env``, ``cwd``, ...) forwarded as-is.
-    :returns: The spawned subprocess handle.
-    """
-    return await asyncio.create_subprocess_exec(*args, **kwargs)
+async def _create_subprocess_exec(
+    program: _ProcessPath,
+    *args: _ProcessPath,
+    stdin: int | None = None,
+    stdout: int | None = None,
+    stderr: int | None = None,
+    env: Mapping[str, str] | Mapping[bytes, bytes] | None = None,
+    cwd: _ProcessPath | None = None,
+    start_new_session: bool = False,
+    creationflags: int = 0,
+) -> asyncio.subprocess.Process:
+    """Start a subprocess through the module-local test seam."""
+    return await asyncio.create_subprocess_exec(
+        program,
+        *args,
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
+        env=env,
+        cwd=cwd,
+        start_new_session=start_new_session,
+        creationflags=creationflags,
+    )
 
 
 def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
     """
     Build a filtered copy of ``os.environ`` for the codex subprocess.
 
-    Uses a prefix allowlist so only known-safe categories pass through
-    (proxy settings, locale, OpenAI retry knobs, etc.). Keys in
-    :data:`_CODEX_ENV_DENY_EXACT` are excluded even when their prefix
-    matches; ``OPENAI_API_KEY`` is stripped so the codex CLI falls
-    back to subscription auth (``auth.json``) rather than a developer
-    API key that would charge separately.
+    Thin wrapper over :func:`omnigent.inner.agent_env.clean_agent_env`; the
+    families below are codex's own on top of the shared safe base. Keys in
+    :data:`_CODEX_ENV_DENY_EXACT` are excluded even when their prefix matches;
+    ``OPENAI_API_KEY`` is stripped so the codex CLI falls back to subscription
+    auth (``auth.json``) rather than a developer API key that would charge
+    separately.
 
     :returns: Filtered environment dict.
     """
-    env: dict[str, str] = {}
-    allow_prefixes = (
-        "OPENAI_",
-        "HTTP_",
-        "HTTPS_",
-        "ALL_PROXY",
-        "NO_PROXY",
-        "SSL_",
-        "REQUESTS_",
-        "CODEX_HOME",
-        "XDG_",
-        "LANG",
-        "LC_",
+    return clean_agent_env(
+        allow_prefixes=("OPENAI_", "REQUESTS_", "CODEX_HOME"),
+        allow_exact=(
+            "PYTHONUTF8",
+            "DATABRICKS_BEARER",  # explicit CI/integration bearer used by auth.command
+            "DATABRICKS_CODEX_TOKEN",  # env_key in ~/.codex/config.toml's DB provider
+        ),
+        deny_exact=_CODEX_ENV_DENY_EXACT,
+        extra_allowed=extra_allow,
     )
-    allow_exact = {
-        "HOME",
-        "PATH",
-        "TERM",
-        "TMPDIR",
-        "TMP",
-        "TEMP",
-        "PYTHONUTF8",
-        "DATABRICKS_BEARER",  # explicit CI/integration bearer used by auth.command
-        "DATABRICKS_CODEX_TOKEN",  # env_key referenced by ~/.codex/config.toml's DB provider
-        OMNIGENT_SESSION_ENV_VAR,  # "inside Omnigent" marker (CLAUDE_CODE/CODEX analog)
-    } | set(extra_allow)
-    for key, value in os.environ.items():
-        if key in _CODEX_ENV_DENY_EXACT:
-            continue
-        if key in allow_exact or key.startswith(allow_prefixes):
-            env[key] = value
-    return env
-
-
-def _declared_passthrough(os_env: OSEnvSpec | None) -> tuple[str, ...]:
-    """Env-var names an agent declared for tool passthrough.
-
-    Lives on ``os_env.sandbox.env_passthrough`` (an
-    :class:`OSEnvSandboxSpec` field), not on ``OSEnvSpec`` directly.
-    Returns an empty tuple when any link in that chain is absent.
-    """
-    if os_env is not None and os_env.sandbox is not None and os_env.sandbox.env_passthrough:
-        return tuple(os_env.sandbox.env_passthrough)
-    return ()
 
 
 def codex_skill_sources(bundle_dir: Path | None, home: Path) -> list[Path]:
@@ -749,7 +724,7 @@ def _populate_codex_home_config(
             "true",
             "yes",
         }
-    symlink_files = _CODEX_HOME_SYMLINK_FILES
+    symlink_files: tuple[str, ...] = _CODEX_HOME_SYMLINK_FILES
     if not minimal_config:
         symlink_files += _CODEX_HOME_GLOBAL_INSTRUCTION_FILES
     for filename in symlink_files:
@@ -815,6 +790,69 @@ def _populate_codex_home_config(
         shutil.copy2(source_file, dest_path)
         if filename == "config.toml":
             _normalize_copied_codex_effort(dest_path)
+
+
+def materialize_codex_provider_config(
+    codex_home: Path,
+    config_overrides: Iterable[str],
+) -> list[str]:
+    """Move generated provider definitions into a private Codex config.
+
+    Codex accepts provider tables through ``-c``/``--config``, but those
+    tables can contain static credentials or credential-bearing auth
+    commands. Persist them in the session-owned ``config.toml`` instead so
+    process arguments contain only non-secret routing and behavior overrides.
+
+    :param codex_home: Private session ``CODEX_HOME`` directory.
+    :param config_overrides: Pending Codex config override strings.
+    :returns: Overrides safe to retain in subprocess arguments.
+    """
+    codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(codex_home, 0o700)
+    config_path = codex_home / "config.toml"
+
+    provider_overrides: list[str] = []
+    argv_overrides: list[str] = []
+    for override in config_overrides:
+        if override.lstrip().startswith(_CODEX_PROVIDER_CONFIG_PREFIX):
+            provider_overrides.append(override)
+        else:
+            argv_overrides.append(override)
+    if not provider_overrides:
+        if config_path.is_file() and not config_path.is_symlink():
+            os.chmod(config_path, 0o600)
+        return argv_overrides
+
+    import tomlkit
+
+    existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    document = tomlkit.parse(existing) if existing else tomlkit.document()
+    providers = document.get("model_providers")
+    if providers is None:
+        document["model_providers"] = tomlkit.table()
+        providers = document["model_providers"]
+    if not isinstance(providers, MutableMapping):
+        raise ValueError("Codex model_providers config must be a TOML table")
+
+    for override in provider_overrides:
+        fragment = tomlkit.parse(override)
+        generated = fragment.get("model_providers")
+        if not isinstance(generated, MutableMapping) or not generated:
+            raise ValueError("Codex provider override must define model_providers")
+        for provider_name, provider_config in generated.items():
+            providers[provider_name] = provider_config
+
+    fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(codex_home))
+    try:
+        os.chmod(tmp_name, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(tomlkit.dumps(document))
+        os.replace(tmp_name, config_path)
+        os.chmod(config_path, 0o600)
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(tmp_name)
+    return argv_overrides
 
 
 # Top-level ``model_reasoning_effort = "<value>"`` assignment, tolerating
@@ -1068,7 +1106,7 @@ def _session_key(messages: list[Message]) -> str:
 
 def _extract_latest_user_content(
     messages: list[Message],
-) -> str | list[dict[str, Any]]:
+) -> str | list[CodexParams]:
     """
     Extract the latest user message content.
 
@@ -1095,7 +1133,7 @@ def _extract_latest_user_content(
 
 def _build_initial_prompt(
     messages: list[Message],
-) -> str | list[dict[str, Any]]:
+) -> str | list[CodexParams]:
     """
     Build the initial prompt for a fresh Codex thread.
 
@@ -1127,9 +1165,7 @@ def _build_initial_prompt(
     return "\n".join(lines)
 
 
-def _prompt_for_turn(
-    messages: list[Message], *, is_new_thread: bool
-) -> str | list[dict[str, Any]]:
+def _prompt_for_turn(messages: list[Message], *, is_new_thread: bool) -> str | list[CodexParams]:
     """
     Choose the prompt payload for a Codex turn.
 
@@ -1149,8 +1185,8 @@ def _prompt_for_turn(
 
 
 def _to_codex_input_items(
-    blocks: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
+    blocks: list[CodexParams],
+) -> list[CodexParams]:
     """
     Convert Responses API content blocks to Codex app-server
     ``turn/start`` input items.
@@ -1164,7 +1200,7 @@ def _to_codex_input_items(
         ``input_text``, ``input_image``, ``input_file``).
     :returns: Codex input item dicts.
     """
-    items: list[dict[str, Any]] = []
+    items: list[CodexParams] = []
     for block in blocks:
         block_type = block.get("type")
         if block_type in ("input_text", "output_text", "text"):
@@ -1354,7 +1390,7 @@ class _CodexAppServerSession:
         # turn breakdown, mapped to the wire shape. Consumed (and cleared)
         # on the next ``turn/completed`` so each TurnComplete carries the
         # usage for the turn that just finished.
-        self._last_turn_usage: dict[str, int] | None = None
+        self._last_turn_usage: dict[str, object] | None = None
 
     async def start(self) -> None:
         if self._started:
@@ -1395,6 +1431,10 @@ class _CodexAppServerSession:
         _populate_codex_home_config(
             self._codex_home_dir,
             _codex_home_config_source_from_env(),
+        )
+        self._codex_config_overrides = materialize_codex_provider_config(
+            self._codex_home_dir,
+            self._codex_config_overrides,
         )
         # Override CODEX_HOME so Codex stores its data (including conversation
         # history) in a private temp directory rather than the user's ~/.codex/.
@@ -1461,10 +1501,8 @@ class _CodexAppServerSession:
         if stdin is not None:
             with suppress(Exception):
                 stdin.close()
-            wait_closed = getattr(stdin, "wait_closed", None)
-            if callable(wait_closed):
-                with suppress(Exception):
-                    await wait_closed()
+            with suppress(Exception):
+                await stdin.wait_closed()
         for task in (self._reader_task, self._stderr_task):
             if task is not None:
                 task.cancel()
@@ -1585,7 +1623,7 @@ class _CodexAppServerSession:
         messages: list[Message],
         tools: list[ToolSpec],
         system_prompt: str,
-        model: str,
+        model: str | None,
         cwd: str,
         sandbox: str,
         reasoning_effort: str | None = None,
@@ -2166,7 +2204,7 @@ class _CodexAppServerSession:
 @dataclass
 class _CodexSessionState:
     app_session: _CodexAppServerSession | None = None
-    signature: tuple[str, str, str, str] | None = None
+    signature: tuple[str | None, str, str, str] | None = None
 
 
 class _AppSessionFactory(Protocol):
@@ -2312,6 +2350,7 @@ class CodexExecutor(Executor):
         self._cwd = cwd
         self._os_env_spec = os_env
         self._model_override = model
+        self._model_provider_override = model_provider_override
         self._gateway = gateway
         self._databricks_profile = databricks_profile
         self._gateway_host = gateway_host.rstrip("/") if gateway_host else None
@@ -2333,7 +2372,7 @@ class CodexExecutor(Executor):
                 f"nvm-managed bin dir), set {_CODEX_PATH_ENV}=/path/to/codex."
             )
         self._codex_path = resolved_codex
-        self._env = _clean_codex_env(_declared_passthrough(self._os_env_spec))
+        self._env = _clean_codex_env(declared_passthrough(self._os_env_spec))
         # Retry policy → OpenAI SDK env vars (Codex uses the OpenAI
         # SDK internally). Speculative — empirical audit pending.
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
@@ -2514,7 +2553,7 @@ class CodexExecutor(Executor):
         self,
         state: _CodexSessionState,
         *,
-        signature: tuple[str, str, str, str],
+        signature: tuple[str | None, str, str, str],
         effective_cwd: str,
     ) -> _CodexAppServerSession:
         if state.signature == signature and state.app_session is not None:
@@ -2547,8 +2586,15 @@ class CodexExecutor(Executor):
         state = self._session_states.setdefault(session_key, _CodexSessionState())
         # cfg.model (per-request /model override) wins over the spec default.
         # An unresolved default comes from the active provider catalog.
+        # On the cli-config path (model_provider_override set) the codex binary
+        # owns its own model list via its config.toml — omnigent does not pass a
+        # model override to thread/create, letting the binary use its configured
+        # default. Passing an unresolvable alias (e.g. gpt-5.6) would cause the
+        # binary to call UC and get a validation error.
         model = cfg.model or self._model_override
-        if model is None:
+        if self._model_provider_override is not None:
+            model = None
+        elif model is None:
             provider_name = "databricks" if self._gateway_uses_databricks_profile else "openai"
             resolution = await run_sync_on_thread(
                 model_catalog.resolve_catalog_model,
