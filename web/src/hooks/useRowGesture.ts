@@ -18,6 +18,9 @@ import type { SwipeAction, SwipeActionPreferences } from "@/lib/swipeActionPrefe
 export const ROW_GESTURE_HOLD_MS = 400;
 export const ROW_SWIPE_ACTIVATE_PX = 12;
 export const ROW_SWIPE_COMMIT_PX = 72;
+// Native touch slop is typically 8-10dp; 10px filters hold tremble while
+// keeping a deliberate pull immediate.
+export const ROW_DRAG_ACTIVATE_PX = 10;
 
 const ROW_SCROLL_ACTIVATE_PX = 25;
 const ROW_HOLD_TOLERANCE_PX = 20;
@@ -32,6 +35,8 @@ interface ActiveRowGesture {
   startY: number;
   lastX: number;
   lastY: number;
+  armX: number;
+  armY: number;
   phase: Exclude<RowGesturePhase, "idle">;
   target: Element;
   sensorTarget: Element;
@@ -121,6 +126,7 @@ export function useRowGesture({
   actions,
   onAction,
   onLongPress,
+  onDragStart,
   onPickUp,
 }: {
   enabled: boolean;
@@ -129,6 +135,7 @@ export function useRowGesture({
   actions: SwipeActionPreferences;
   onAction: (action: Exclude<SwipeAction, "none">) => void;
   onLongPress: (point: { clientX: number; clientY: number }) => void;
+  onDragStart?: () => void;
   onPickUp?: () => void;
 }) {
   const [dx, setDx] = useState(0);
@@ -220,6 +227,8 @@ export function useRowGesture({
         startY: event.clientY,
         lastX: event.clientX,
         lastY: event.clientY,
+        armX: event.clientX,
+        armY: event.clientY,
         phase: "pending",
         target: event.currentTarget,
         sensorTarget: target instanceof Element ? target : event.currentTarget,
@@ -238,13 +247,16 @@ export function useRowGesture({
           return;
         }
         holdTimer.current = null;
+        gesture.armX = gesture.lastX;
+        gesture.armY = gesture.lastY;
         setGesturePhase(gesture, "armed");
         capturePointer(gesture);
         if (typeof navigator.vibrate === "function") navigator.vibrate(10);
         onPickUp?.();
+        onLongPress({ clientX: gesture.lastX, clientY: gesture.lastY });
       }, ROW_GESTURE_HOLD_MS);
     },
-    [capturePointer, enabled, onPickUp, reset, setGesturePhase],
+    [capturePointer, enabled, onLongPress, onPickUp, reset, setGesturePhase],
   );
 
   const onPointerMove = useCallback(
@@ -258,9 +270,17 @@ export function useRowGesture({
       gesture.lastY = event.clientY;
 
       if (gesture.phase === "armed") {
-        if (!moved) return;
-        if (dragEnabled) setGesturePhase(gesture, "drag");
-        else {
+        if (
+          !moved ||
+          Math.hypot(event.clientX - gesture.armX, event.clientY - gesture.armY) <
+            ROW_DRAG_ACTIVATE_PX
+        ) {
+          return;
+        }
+        if (dragEnabled) {
+          onDragStart?.();
+          setGesturePhase(gesture, "drag");
+        } else {
           setGesturePhase(gesture, "scroll");
           releaseCapture(gesture);
         }
@@ -285,8 +305,9 @@ export function useRowGesture({
 
       const horizontal = Math.abs(deltaX);
       const vertical = Math.abs(deltaY);
-      // Horizontal-dominant travel locks swipe at 12px; other travel waits for
-      // the 25px scroll circle. Since 25/sqrt(2) > 12, (12,0) and (15,20) cannot overlap.
+      // Horizontal-dominant travel locks swipe at 12px. The regions overlap
+      // (e.g. 18,17.5 satisfies both) — this check running first is what gives
+      // swipe precedence; everything it declines waits for the 25px circle.
       if (horizontal >= ROW_SWIPE_ACTIVATE_PX && horizontal > vertical) {
         const action = deltaX < 0 ? actions.left : actions.right;
         if (!swipeEnabled || action === "none") {
@@ -313,6 +334,7 @@ export function useRowGesture({
       capturePointer,
       clearHoldTimer,
       dragEnabled,
+      onDragStart,
       releaseCapture,
       setGesturePhase,
       swipeEnabled,
@@ -326,13 +348,10 @@ export function useRowGesture({
       const resolvedPhase = gesture.phase;
       const offset = gesture.offset;
       const action = offset < 0 ? actions.left : actions.right;
-      const point = { clientX: event.clientX, clientY: event.clientY };
       reset();
 
       if (resolvedPhase !== "pending") suppressTrailingClick();
-      if (resolvedPhase === "armed") {
-        onLongPress(point);
-      } else if (
+      if (
         resolvedPhase === "swipe" &&
         Math.abs(offset) >= ROW_SWIPE_COMMIT_PX &&
         action !== "none"
@@ -340,7 +359,7 @@ export function useRowGesture({
         onAction(action);
       }
     },
-    [actions.left, actions.right, onAction, onLongPress, reset, suppressTrailingClick],
+    [actions.left, actions.right, onAction, reset, suppressTrailingClick],
   );
 
   const onPointerCancel = useCallback(

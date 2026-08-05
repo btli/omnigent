@@ -2579,6 +2579,7 @@ function ConversationMenuItems({
   // to the side. `view` swaps between the main actions and that sub-view;
   // desktop always renders the native side-flyout submenu regardless.
   const isMobile = useIsMobileViewport();
+  const hasCoarsePointer = useCoarsePointer();
   const [view, setView] = useState<"main" | "projects">("main");
 
   // The project pick / create / remove flow — shared verbatim by the desktop
@@ -2631,13 +2632,13 @@ function ConversationMenuItems({
 
   return (
     <>
-      {/* Pin/Unpin — mobile-only (md:hidden); desktop uses the
-          hover-revealed quick-pin button. Archived rows omit it (archive
-          outranks pin). */}
+      {/* Pin/Unpin — desktop uses the hover-revealed quick-pin button, but a
+          coarse-pointer device has no hover at any width, so the menu keeps
+          the item there. Archived rows omit it (archive outranks pin). */}
       {!isArchived && (
         <C.Item
           data-testid="pin-conversation"
-          className="md:hidden"
+          className={hasCoarsePointer ? undefined : "md:hidden"}
           onSelect={() => onTogglePinned(conversation.id)}
         >
           {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
@@ -2978,6 +2979,7 @@ function ConversationRow({
   // The kebab menu is controlled so the project submenu can close the whole
   // menu after a pick (a plain click inside the submenu wouldn't otherwise).
   const [menuOpen, setMenuOpen] = useState(false);
+  const contextMenuOpenRef = useRef(false);
   // Opt-in "delete local branch" checkbox (worktree sessions only).
   const [deleteBranch, setDeleteBranch] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
@@ -3096,6 +3098,19 @@ function ConversationRow({
       }),
     );
   }, []);
+  const onContextMenuOpenChange = useCallback((open: boolean) => {
+    contextMenuOpenRef.current = open;
+  }, []);
+  const dismissContextMenu = useCallback(() => {
+    if (!contextMenuOpenRef.current) return;
+    (document.activeElement ?? document.body).dispatchEvent(
+      new globalThis.KeyboardEvent("keydown", {
+        key: "Escape",
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+  }, []);
   const gesture = useRowGesture({
     enabled: gestureEnabled,
     swipeEnabled,
@@ -3103,6 +3118,7 @@ function ConversationRow({
     actions: swipeActions,
     onAction: onSwipeAction,
     onLongPress: openContextMenuAt,
+    onDragStart: dismissContextMenu,
   });
 
   // The recognizer state travels with this draggable, so the static touch
@@ -3484,7 +3500,7 @@ function ConversationRow({
           )
         ) : projectFlyoutName ? (
           <HoverCard openDelay={150} closeDelay={0}>
-            <ContextMenu>
+            <ContextMenu onOpenChange={onContextMenuOpenChange}>
               <ContextMenuTrigger asChild>
                 <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
               </ContextMenuTrigger>
@@ -3503,7 +3519,7 @@ function ConversationRow({
             />
           </HoverCard>
         ) : isMobile ? (
-          <ContextMenu>
+          <ContextMenu onOpenChange={onContextMenuOpenChange}>
             <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
             <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-xs">
               <ConversationMenuItems
@@ -3515,7 +3531,7 @@ function ConversationRow({
           </ContextMenu>
         ) : (
           <Tooltip>
-            <ContextMenu>
+            <ContextMenu onOpenChange={onContextMenuOpenChange}>
               <ContextMenuTrigger asChild>
                 <div className="w-full">
                   <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
@@ -3967,11 +3983,17 @@ function ProjectFolderMenuItems({
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   actions: ProjectFolderMenuActions;
 }) {
+  const hasCoarsePointer = useCoarsePointer();
   return (
     <>
-      {/* New session — mobile-only (md:hidden); desktop uses the
-          hover-revealed pencil on the folder header. */}
-      <C.Item asChild className="md:hidden" data-testid="project-new-session-menu">
+      {/* New session — desktop uses the hover-revealed pencil on the folder
+          header, but a coarse-pointer device has no hover at any width, so
+          the menu keeps the item there. */}
+      <C.Item
+        asChild
+        className={hasCoarsePointer ? undefined : "md:hidden"}
+        data-testid="project-new-session-menu"
+      >
         <Link
           to={`/?project=${encodeURIComponent(projectName)}`}
           onClick={(e) => {
