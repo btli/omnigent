@@ -1350,7 +1350,7 @@ describe("touch gesture arbitration", () => {
     endTouch(100, 115 + ROW_DRAG_ACTIVATE_PX);
   });
 
-  it("starts drag at the threshold and dismisses the menu exactly once", () => {
+  it("starts drag at the threshold without a menu-dismissal keydown", () => {
     vi.useFakeTimers();
     mocks.isMobile = true;
     renderSidebar();
@@ -1368,9 +1368,9 @@ describe("touch gesture arbitration", () => {
     expect(screen.queryByTestId("rename-conversation")).toBeNull();
 
     moveTouch(100 + ROW_DRAG_ACTIVATE_PX + 10, 100);
+    expect(row).toHaveClass("opacity-40");
     document.removeEventListener("keydown", escapeKeydowns, { capture: true });
-    expect(escapeKeydowns).toHaveBeenCalledOnce();
-    expect(escapeKeydowns.mock.results[0]?.value).toBe("Escape");
+    expect(escapeKeydowns).not.toHaveBeenCalled();
     endTouch(100 + ROW_DRAG_ACTIVATE_PX + 10, 100);
   });
 
