@@ -143,11 +143,34 @@ export function useRowGesture({
   const state = useRef<ActiveRowGesture | null>(null);
   const holdTimer = useRef<number | null>(null);
   const suppressClick = useRef(false);
+  const touchMoveGuard = useRef<((event: TouchEvent) => void) | null>(null);
 
   const clearHoldTimer = useCallback(() => {
     if (holdTimer.current === null) return;
     window.clearTimeout(holdTimer.current);
     holdTimer.current = null;
+  }, []);
+
+  // Chrome samples touch-action at touchstart, so the armed-state class swap
+  // to touch-none can't stop an in-flight touch from being claimed as a native
+  // pan. A held finger hasn't started a scroll yet, so its touchmoves are
+  // still cancelable — preventDefault here forestalls the pan until the
+  // gesture resolves to drag or resets. React's delegated listeners are
+  // passive, so this has to be a real native listener.
+  const armTouchMoveGuard = useCallback(() => {
+    if (touchMoveGuard.current) return;
+    const handler = (event: TouchEvent) => {
+      if (event.cancelable) event.preventDefault();
+    };
+    touchMoveGuard.current = handler;
+    document.addEventListener("touchmove", handler, { passive: false });
+  }, []);
+
+  const disarmTouchMoveGuard = useCallback(() => {
+    const handler = touchMoveGuard.current;
+    if (!handler) return;
+    touchMoveGuard.current = null;
+    document.removeEventListener("touchmove", handler, { passive: false } as EventListenerOptions);
   }, []);
 
   const releaseCapture = useCallback((gesture: ActiveRowGesture | null) => {
@@ -167,6 +190,7 @@ export function useRowGesture({
       if (!gesture) return;
       clearHoldTimer();
       releaseCapture(gesture);
+      disarmTouchMoveGuard();
       state.current = null;
       setDx(0);
       setPhase("idle");
@@ -176,7 +200,7 @@ export function useRowGesture({
         );
       }
     },
-    [clearHoldTimer, releaseCapture],
+    [clearHoldTimer, disarmTouchMoveGuard, releaseCapture],
   );
 
   // Armed until the trailing click arrives or the next press clears it. A timer
@@ -251,12 +275,13 @@ export function useRowGesture({
         gesture.armY = gesture.lastY;
         setGesturePhase(gesture, "armed");
         capturePointer(gesture);
+        armTouchMoveGuard();
         if (typeof navigator.vibrate === "function") navigator.vibrate(10);
         onPickUp?.();
         onLongPress({ clientX: gesture.lastX, clientY: gesture.lastY });
       }, ROW_GESTURE_HOLD_MS);
     },
-    [capturePointer, enabled, onLongPress, onPickUp, reset, setGesturePhase],
+    [armTouchMoveGuard, capturePointer, enabled, onLongPress, onPickUp, reset, setGesturePhase],
   );
 
   const onPointerMove = useCallback(
@@ -406,8 +431,9 @@ export function useRowGesture({
     () => () => {
       clearHoldTimer();
       releaseCapture(state.current);
+      disarmTouchMoveGuard();
     },
-    [clearHoldTimer, releaseCapture],
+    [clearHoldTimer, disarmTouchMoveGuard, releaseCapture],
   );
 
   return {
