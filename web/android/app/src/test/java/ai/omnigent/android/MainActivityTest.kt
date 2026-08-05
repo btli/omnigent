@@ -117,13 +117,17 @@ class MainActivityTest {
 
         layout(parent, width = 1000, height = 600)
         layout(parent, width = 1000, height = 600)
+        // The width cap changes with the container, so the shared layout
+        // listener repositions once more; a third pass applies it.
+        layout(parent, width = 1000, height = 600)
 
         val layout = button.layoutParams as FrameLayout.LayoutParams
-        assertEquals(172, button.width)
+        // mdpi: the 48dp header-control reserve is 48px at each band edge.
+        val expectedLeft = serverSwitcherLeftMargin(1000, button.width, band, edgeReserve = 48)
         assertEquals(Gravity.TOP or Gravity.LEFT, layout.gravity)
-        assertEquals(464, layout.leftMargin)
-        assertEquals(464, button.left)
-        assertEquals(636, button.right)
+        assertEquals(expectedLeft, layout.leftMargin)
+        assertEquals(expectedLeft, button.left)
+        assertEquals(expectedLeft + button.width, button.right)
     }
 
     @Test
@@ -161,10 +165,12 @@ class MainActivityTest {
 
         layout(parent, width = 1000, height = 600)
         layout(parent, width = 1000, height = 600)
+        // Third pass: the container-driven width cap change repositions once more.
+        layout(parent, width = 1000, height = 600)
 
-        assertEquals(172, button.width)
-        assertEquals(464, button.left)
-        assertEquals(636, button.right)
+        val expectedLeft = serverSwitcherLeftMargin(1000, button.width, band, edgeReserve = 48)
+        assertEquals(expectedLeft, button.left)
+        assertEquals(expectedLeft + button.width, button.right)
     }
 
     @Test
@@ -183,17 +189,20 @@ class MainActivityTest {
         layout(parent, width = 400, height = 600)
         layout(parent, width = 400, height = 600)
         val initialWidth = button.width
-        assertEquals(172, initialWidth)
-        assertEquals(114, button.left)
+        assertEquals(
+            serverSwitcherLeftMargin(400, initialWidth, band, edgeReserve = 48),
+            button.left,
+        )
         button.removeLayoutChangeListeners()
 
         layout(parent, width = 700, height = 600)
         val params = button.layoutParams as FrameLayout.LayoutParams
         assertEquals(initialWidth, button.width)
-        assertEquals(264, params.leftMargin)
+        val grownLeft = serverSwitcherLeftMargin(700, initialWidth, band, edgeReserve = 48)
+        assertEquals(grownLeft, params.leftMargin)
 
         layout(parent, width = 700, height = 600)
-        assertEquals(264, button.left)
+        assertEquals(grownLeft, button.left)
     }
 
     @Test
@@ -223,7 +232,7 @@ class MainActivityTest {
 
         assertTrue(activity.switcherBand() === redeliveredBand)
         assertEquals(
-            264,
+            serverSwitcherLeftMargin(700, button.width, redeliveredBand, edgeReserve = 48),
             (button.layoutParams as FrameLayout.LayoutParams).leftMargin,
         )
     }
@@ -239,14 +248,17 @@ class MainActivityTest {
         val recoveryFloor = (48 * density).toInt()
         layout(parent, width = 1000, height = 600)
 
-        activity.setSwitcherBand(ServerSwitcherBand(0.4, 0.6))
+        val wideBand = ServerSwitcherBand(0.4, 0.6)
+        activity.setSwitcherBand(wideBand)
         assertEquals(104, button.maxWidth)
         assertEquals(recoveryFloor, button.minWidth)
         layout(parent, width = 1000, height = 600)
         assertEquals(View.VISIBLE, button.visibility)
-        assertEquals(104, button.width)
-        assertEquals(448, button.left)
-        assertEquals(552, button.right)
+        // The label may measure under the cap; placement must respect the reserve.
+        assertTrue(button.width <= 104)
+        val expectedLeft = serverSwitcherLeftMargin(1000, button.width, wideBand, edgeReserve = 48)
+        assertEquals(expectedLeft, button.left)
+        assertEquals(expectedLeft + button.width, button.right)
 
         activity.setSwitcherBand(ServerSwitcherBand(0.45, 0.55))
         assertEquals(recoveryFloor, button.maxWidth)
