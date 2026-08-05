@@ -25,6 +25,7 @@ internal class OmnigentBridgeListener(
     private val blobSaver: BlobSaver,
     /** Relays validated bounds without retaining the Activity-owned view. */
     private val onServerSwitcherBand: (ServerSwitcherBand) -> Unit,
+    private val onServerSwitcherHidden: (Boolean) -> Unit,
 ) : WebViewCompat.WebMessageListener {
     override fun onPostMessage(
         view: WebView,
@@ -97,6 +98,11 @@ internal class OmnigentBridgeListener(
                 val right = json.optDouble("rightFraction", Double.NaN)
                 val band = ServerSwitcherBand.from(left, right) ?: return
                 onServerSwitcherBand(band)
+            }
+
+            "setServerSwitcherHidden" -> {
+                val hidden = json.opt("hidden") as? Boolean ?: return
+                onServerSwitcherHidden(hidden)
             }
 
             "blobBase64" -> {
