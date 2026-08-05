@@ -28,11 +28,8 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 
-// Controllable rename mutation so the double-click test can assert the
-// committed title was forwarded to the PATCH. `isMobile` toggles the mocked
-// `useIsMobileViewport` so a test can render the row on a mobile viewport (the
-// project flyout is disabled there). Declared via vi.hoisted so the vi.mock
-// factories (hoisted above imports) can reference them.
+// Hoisted controls drive row mutations, viewport layout, and coarse-pointer
+// capability independently inside mock factories.
 const mocks = vi.hoisted(() => {
   // Tiny reactive store for the server-authoritative pinned set, so a quick-pin
   // click re-renders the sidebar (mirrors the real query's refetch). Holds ids;
@@ -59,6 +56,7 @@ const mocks = vi.hoisted(() => {
   return {
     rename: { mutate: vi.fn() },
     isMobile: false,
+    hasCoarsePointer: false,
     // Projects surfaced by the picker + the move-to-project mutation, so the
     // mobile in-place project view test can assert both the list and the pick.
     projects: [] as string[],
@@ -80,6 +78,10 @@ const mocks = vi.hoisted(() => {
 // flips `mocks.isMobile` for the duration of that case.
 vi.mock("@/hooks/useIsMobileViewport", () => ({
   useIsMobileViewport: () => mocks.isMobile,
+}));
+
+vi.mock("@/hooks/useCoarsePointer", () => ({
+  useCoarsePointer: () => mocks.hasCoarsePointer,
 }));
 
 vi.mock("@/hooks/useConversations", () => ({
@@ -334,8 +336,9 @@ beforeEach(() => {
   mocks.del.mutate.mockReset();
   mocks.del.reset.mockReset();
   mocks.projects = [];
-  // Default every test to the desktop viewport; the mobile flyout test opts in.
+  // Default to a desktop viewport with no coarse pointer; cases opt in independently.
   mocks.isMobile = false;
+  mocks.hasCoarsePointer = false;
   useConvMock.mockReset();
   localStorage.clear();
   // Reset the server pinned set between tests.
@@ -996,6 +999,10 @@ describe("touch swipe actions", () => {
   // down → horizontal move past the commit threshold → up on the row's <li>.
   const POINTER = { pointerId: 1, isPrimary: true, pointerType: "touch" as const };
 
+  beforeEach(() => {
+    mocks.hasCoarsePointer = true;
+  });
+
   // Drag the row and hold at `dx`, so a test can inspect the reveal mid-gesture.
   // `release` finishes it, carrying the same dx the drag ended on.
   function moveSwipeRow(dx: number) {
@@ -1034,7 +1041,6 @@ describe("touch swipe actions", () => {
     chooseSwipeActionInSettings("left", "delete");
     expect(readSwipeActions()).toEqual({ left: "delete", right: "none" });
 
-    mocks.isMobile = true;
     renderSidebar();
     swipeRow(-90);
 
@@ -1048,7 +1054,6 @@ describe("touch swipe actions", () => {
     chooseSwipeActionInSettings("right", "archive");
     expect(readSwipeActions()).toEqual({ left: "archive", right: "archive" });
 
-    mocks.isMobile = true;
     renderSidebar();
     swipeRow(90);
 
@@ -1059,7 +1064,6 @@ describe("touch swipe actions", () => {
 
   it("reveals the same action that fires in both configured directions", () => {
     writeSwipeActions({ left: "delete", right: "archive" });
-    mocks.isMobile = true;
     renderSidebar();
 
     const leftSwipe = moveSwipeRow(-90);
@@ -1078,7 +1082,6 @@ describe("touch swipe actions", () => {
 
   it("runs the archive path when swiping the archive-configured direction", () => {
     // Default: swipe-left → archive. Swipe left past the commit threshold.
-    mocks.isMobile = true;
     renderSidebar();
 
     swipeRow(-90);
@@ -1098,7 +1101,6 @@ describe("touch swipe actions", () => {
   it("opens the delete confirm dialog (no immediate delete) when swiping the delete direction", () => {
     // Map swipe-right → delete, then swipe right.
     writeSwipeActions({ left: "archive", right: "delete" });
-    mocks.isMobile = true;
     renderSidebar();
 
     swipeRow(90);
@@ -1118,7 +1120,6 @@ describe("touch swipe actions", () => {
 
   it("does nothing when swiping a direction mapped to none", () => {
     // Default: swipe-right → none. Swipe right; nothing should fire.
-    mocks.isMobile = true;
     renderSidebar();
 
     swipeRow(90);
@@ -1131,7 +1132,6 @@ describe("touch swipe actions", () => {
   it("supports both directions mapped to the same action", () => {
     // Both directions archive — a swipe either way runs the archive path.
     writeSwipeActions({ left: "archive", right: "archive" });
-    mocks.isMobile = true;
     renderSidebar();
 
     swipeRow(90);
@@ -1149,7 +1149,6 @@ describe("touch swipe actions", () => {
   });
 
   it("does not fire the action for a short swipe below the commit threshold", () => {
-    mocks.isMobile = true;
     renderSidebar();
 
     // Past the activation lock (20px) but short of the commit distance (72px).
@@ -1158,7 +1157,6 @@ describe("touch swipe actions", () => {
   });
 
   it("does not fire at 71px, immediately below the commit boundary", () => {
-    mocks.isMobile = true;
     renderSidebar();
 
     swipeRow(-71);
@@ -1167,7 +1165,6 @@ describe("touch swipe actions", () => {
   });
 
   it("fires exactly once at the 72px commit boundary", () => {
-    mocks.isMobile = true;
     renderSidebar();
 
     swipeRow(-72);
@@ -1175,25 +1172,35 @@ describe("touch swipe actions", () => {
     expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
   });
 
-  it("ignores swipes on desktop (non-touch viewport)", () => {
-    // Desktop (default isMobile=false) leaves the gesture disabled entirely.
+  it("commits the configured action on a wide viewport with a coarse pointer", () => {
+    expect(mocks.isMobile).toBe(false);
+    expect(mocks.hasCoarsePointer).toBe(true);
+    renderSidebar();
+
+    swipeRow(-90);
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores touch swipes when only fine pointers are available", () => {
+    mocks.hasCoarsePointer = false;
     renderSidebar();
 
     swipeRow(-90);
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
   });
 
-  it("ignores non-touch pointers (pen/stylus/mouse) on mobile", () => {
-    // The gesture is touch-only; a pen swipe past the threshold must not fire.
-    mocks.isMobile = true;
+  it("ignores non-touch pointers when a coarse pointer also exists", () => {
+    // A touchscreen laptop's pen and mouse paths remain inert.
     renderSidebar();
 
     const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
-    const pen = { pointerId: 1, isPrimary: true, pointerType: "pen" as const };
-    fireEvent.pointerDown(li, { ...pen, clientX: 100, clientY: 100 });
-    fireEvent.pointerMove(li, { ...pen, clientX: 120, clientY: 100 });
-    fireEvent.pointerMove(li, { ...pen, clientX: 190, clientY: 100 });
-    fireEvent.pointerUp(li, { ...pen, clientX: 190, clientY: 100 });
+    for (const [pointerId, pointerType] of ["pen", "mouse"].entries()) {
+      const pointer = { pointerId, isPrimary: true, pointerType };
+      fireEvent.pointerDown(li, { ...pointer, clientX: 100, clientY: 100 });
+      fireEvent.pointerMove(li, { ...pointer, clientX: 120, clientY: 100 });
+      fireEvent.pointerMove(li, { ...pointer, clientX: 190, clientY: 100 });
+      fireEvent.pointerUp(li, { ...pointer, clientX: 190, clientY: 100 });
+    }
 
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
     expect(mocks.del.mutate).not.toHaveBeenCalled();
@@ -1202,7 +1209,6 @@ describe("touch swipe actions", () => {
   it("yields a primarily-vertical drag to scroll (no action)", () => {
     // A mostly-vertical move is scroll intent — the gesture bails and never
     // fires, even though it travels well past the commit distance horizontally.
-    mocks.isMobile = true;
     renderSidebar();
 
     const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;

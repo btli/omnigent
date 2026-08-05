@@ -152,6 +152,7 @@ import {
   type SwipeActionPreferences,
   useSwipeActions,
 } from "@/lib/swipeActionPreferences";
+import { useCoarsePointer } from "@/hooks/useCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
@@ -3003,6 +3004,7 @@ function ConversationRow({
   // project flyout's HoverCard and leave it lingering over the chat. Gate the
   // flyout off below the `md` breakpoint (see `projectFlyoutName`).
   const isMobile = useIsMobileViewport();
+  const hasCoarsePointer = useCoarsePointer();
   // Track the *live* active conversation id. Delete is fire-and-forget,
   // so the user can navigate to another conversation before the mutation
   // resolves — the onSuccess redirect must key off where they are now,
@@ -3185,8 +3187,8 @@ function ConversationRow({
 
   // Touch swipe → archive/delete. `useSwipeActions` is a live subscription, so
   // changing the Settings selects updates open rows in the same session (no
-  // remount needed). Gated to mobile and to editable, non-selection rows so it
-  // can't fight desktop hover controls or bulk-select. Swipe→archive reuses
+  // remount needed). Gated to a coarse pointer and to editable, non-selection
+  // rows so it can't fight bulk-select. Swipe→archive reuses
   // runArchive; swipe→delete opens the same confirm dialog the kebab uses
   // (never an immediate delete).
   const swipeActions = useSwipeActions();
@@ -3202,7 +3204,8 @@ function ConversationRow({
   const onSwipeAction = useCallback((action: Exclude<SwipeAction, "none">) => {
     swipeActionRef.current(action);
   }, []);
-  const swipeEnabled = isMobile && !selectionMode && isOwner && !isEditing;
+  // useRowSwipe accepts only touch pointers, so a touchscreen laptop's mouse path stays untouched.
+  const swipeEnabled = hasCoarsePointer && !selectionMode && isOwner && !isEditing;
   const swipe = useRowSwipe({
     enabled: swipeEnabled,
     actions: swipeActions,
