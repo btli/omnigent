@@ -383,7 +383,10 @@ class MainActivity : AppCompatActivity() {
      * rules, so we both attempt a reorder-to-front (works within the grace
      * period) AND post a "tap to return" notification as the reliable path back.
      */
-    private fun onSessionToken(token: String) {
+    private fun onSessionToken(
+        loginOrigin: String,
+        token: String,
+    ) {
         // The poll can land after the activity is gone (it ran on a background
         // thread up to 5 min) — never touch a destroyed WebView.
         if (isDestroyed || isFinishing || !::webView.isInitialized) return
