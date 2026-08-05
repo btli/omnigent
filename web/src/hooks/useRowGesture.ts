@@ -21,6 +21,9 @@ export const ROW_SWIPE_COMMIT_PX = 72;
 // Native touch slop is typically 8-10dp; 10px filters hold tremble while
 // keeping a deliberate pull immediate.
 export const ROW_DRAG_ACTIVATE_PX = 10;
+// Marks the recognizer's own contextmenu dispatch so the mid-gesture guards
+// can suppress the OS long-press contextmenu without eating their own.
+export const ROW_MENU_SYNTHETIC = Symbol("row-menu-synthetic");
 
 const ROW_SCROLL_ACTIVATE_PX = 25;
 const ROW_HOLD_TOLERANCE_PX = 20;
@@ -143,7 +146,7 @@ export function useRowGesture({
   const state = useRef<ActiveRowGesture | null>(null);
   const holdTimer = useRef<number | null>(null);
   const suppressClick = useRef(false);
-  const touchMoveGuard = useRef<((event: TouchEvent) => void) | null>(null);
+  const touchMoveGuard = useRef<(() => void) | null>(null);
 
   const clearHoldTimer = useCallback(() => {
     if (holdTimer.current === null) return;
@@ -162,15 +165,33 @@ export function useRowGesture({
     const handler = (event: TouchEvent) => {
       if (event.cancelable) event.preventDefault();
     };
-    touchMoveGuard.current = handler;
+    // The OS long-press contextmenu hit-tests the element under the finger —
+    // once the row menu opens there, that is the menu itself, past every
+    // row-level guard. Unprevented it starts text selection and cancels the
+    // pointer stream, so suppress it document-wide while the gesture owns the
+    // touch. The recognizer's own tagged dispatch passes through.
+    const contextMenuHandler = (event: Event) => {
+      if (ROW_MENU_SYNTHETIC in event) return;
+      event.preventDefault();
+    };
+    const selectStartHandler = (event: Event) => event.preventDefault();
+    touchMoveGuard.current = () => {
+      document.removeEventListener("touchmove", handler, {
+        passive: false,
+      } as EventListenerOptions);
+      document.removeEventListener("contextmenu", contextMenuHandler, true);
+      document.removeEventListener("selectstart", selectStartHandler, true);
+    };
     document.addEventListener("touchmove", handler, { passive: false });
+    document.addEventListener("contextmenu", contextMenuHandler, true);
+    document.addEventListener("selectstart", selectStartHandler, true);
   }, []);
 
   const disarmTouchMoveGuard = useCallback(() => {
-    const handler = touchMoveGuard.current;
-    if (!handler) return;
+    const teardown = touchMoveGuard.current;
+    if (!teardown) return;
     touchMoveGuard.current = null;
-    document.removeEventListener("touchmove", handler, { passive: false } as EventListenerOptions);
+    teardown();
   }, []);
 
   const releaseCapture = useCallback((gesture: ActiveRowGesture | null) => {
