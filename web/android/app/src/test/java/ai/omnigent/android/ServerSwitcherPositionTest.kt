@@ -1,6 +1,7 @@
 package ai.omnigent.android
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -112,6 +113,53 @@ class ServerSwitcherPositionTest {
                 band = band,
             ),
         )
+    }
+
+    @Test
+    fun `header control reserves reduce the usable band`() {
+        assertEquals(
+            104,
+            serverSwitcherUsableWidth(
+                containerWidth = 1000,
+                band = ServerSwitcherBand(0.4, 0.6),
+                edgeReserve = 48,
+            ),
+        )
+        assertEquals(
+            4,
+            serverSwitcherUsableWidth(
+                containerWidth = 1000,
+                band = ServerSwitcherBand(0.45, 0.55),
+                edgeReserve = 48,
+            ),
+        )
+        assertFalse(
+            serverSwitcherBandCanFit(
+                containerWidth = 1000,
+                band = ServerSwitcherBand(0.45, 0.55),
+                edgeReserve = 48,
+                minimumWidth = 48,
+            ),
+        )
+    }
+
+    @Test
+    fun `pill stays between reserved header controls`() {
+        assertEquals(
+            448,
+            serverSwitcherLeftMargin(
+                containerWidth = 1000,
+                switcherWidth = 104,
+                band = ServerSwitcherBand(0.4, 0.6),
+                edgeReserve = 48,
+            ),
+        )
+    }
+
+    @Test
+    fun `unchanged top margin has no layout update`() {
+        assertNull(serverSwitcherTopMarginUpdate(current = 32, desired = 32))
+        assertEquals(40, serverSwitcherTopMarginUpdate(current = 32, desired = 40))
     }
 
     @Test
