@@ -4,8 +4,26 @@
 import { readFileSync } from "node:fs";
 // lightningcss is the minifier @tailwindcss/vite runs during `vite build`
 // (resolved from its dependency tree, so we test the version the build uses).
+import { createElement } from "react";
+import { cleanup, render, screen } from "@testing-library/react";
 import { transform } from "lightningcss";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import type { ChangedSort } from "./shell/FlatFileList";
+import { WorkspacePanel } from "./shell/WorkspacePanel";
+
+vi.mock("./shell/FileViewer", () => ({ FileViewer: () => null }));
+vi.mock("./shell/FilesPanel", () => ({ FilesPanel: () => null }));
+vi.mock("./shell/InlineTerminalsSection", () => ({
+  InlineTerminalsSection: () => null,
+}));
+vi.mock("./shell/SubagentsPanel", () => ({ SubagentsPanel: () => null }));
+vi.mock("./shell/TodoPanel", () => ({ TodoPanel: () => null }));
+vi.mock("@/components/BrowserPane/BrowserPane", () => ({
+  BrowserPane: () => null,
+}));
+
+afterEach(cleanup);
 
 import { UI_FONT_SIZE_DEFAULT, UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN } from "./lib/uiFontPreferences";
 
@@ -14,6 +32,10 @@ import { UI_FONT_SIZE_DEFAULT, UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN } from "./lib/
 const indexCssSource = readFileSync("src/index.css", "utf8");
 const generatedPaletteCssSource = readFileSync("src/themePalettes.generated.css", "utf8");
 const cssSource = `${generatedPaletteCssSource}\n${indexCssSource}`;
+const nativeBridgeSource = readFileSync(
+  "android/app/src/main/java/ai/omnigent/android/NativeBridgeScript.kt",
+  "utf8",
+);
 
 /* Regression test for the "transparent dropdown in prod" bug.
  *
@@ -147,90 +169,223 @@ describe("index.css app-shell viewport lock", () => {
   });
 });
 
-/* The Workspace rail only renders at md+, so its native safe-area rule must
- * stay at the top level and cover both native shells. */
-describe("index.css Workspace rail safe-area rule", () => {
-  // Match on the rail's aria-label rather than the exact selector text, so an
-  // equivalently-spelled selector cannot introduce a margin the checks miss.
-  // Shorthand `margin:` counts too, as do the logical `margin-block` forms —
-  // each overrides the block-start/end edges this rule sets.
-  const marginDeclaration = /(?<![-\w])margin(?:-(?:top|bottom|block(?:-(?:start|end))?))?\s*:/;
-  // Any quoting or spacing of the attribute selector counts — an equivalently
-  // spelled one would otherwise slip past the checks below.
-  const workspaceAttribute = /\[\s*aria-label\s*=\s*("Workspace"|'Workspace'|Workspace)\s*\]/;
-  const ruleMatches = [...cssSource.matchAll(/[^{}]+\{[^{}]*\}/g)].filter(
-    ([block]) => workspaceAttribute.test(block) && marginDeclaration.test(block),
+const cssBlocks = [...cssSource.matchAll(/[^{}]+\{[^{}]*\}/g)];
+const workspaceAttribute = /\[\s*aria-label\s*=\s*("Workspace"|'Workspace'|Workspace)\s*\]/;
+const workspaceRules = cssBlocks.filter(([block]) => workspaceAttribute.test(block));
+const workspaceSafeAreaRules = workspaceRules.filter(([block]) =>
+  block.includes("--omnigent-safe-top"),
+);
+const workspaceSafeAreaRule = workspaceSafeAreaRules[0]?.[0] ?? "";
+const workspaceSelector = workspaceSafeAreaRule
+  .slice(0, workspaceSafeAreaRule.indexOf("{"))
+  .replace(/\/\*[\s\S]*?\*\//g, "")
+  .trim();
+const workspaceCss = workspaceRules.map(([block]) => block).join("\n");
+const fullHeightPanelRule =
+  cssBlocks.find(
+    ([block]) => block.includes(".conversations-sidebar") && block.includes("--omnigent-safe-top"),
+  )?.[0] ?? "";
+const rootSafeAreaRule =
+  cssBlocks.find(
+    ([block]) => block.includes(":root") && block.includes("--omnigent-safe-top"),
+  )?.[0] ?? "";
+
+const nativeInsetMatch = nativeBridgeSource.match(
+  /internal val insetStyles: String\s*=\s*"""([\s\S]*?)"""\.trimIndent\(\)/,
+);
+const nativeInsetCss = trimIndent(nativeInsetMatch?.[1] ?? "");
+
+const FULL_HEIGHT_PANEL_TARGETS = [
+  { className: "conversations-sidebar" },
+  { testId: "execution-logs-panel" },
+  { testId: "file-viewer" },
+  { testId: "files-panel-drawer" },
+  { testId: "terminals-panel" },
+  { testId: "subagents-panel-drawer" },
+  { testId: "todos-panel-drawer" },
+] as const;
+
+function trimIndent(value: string): string {
+  const lines = value
+    .replace(/^\n/, "")
+    .replace(/\n\s*$/, "")
+    .split("\n");
+  const indents = lines
+    .filter((line) => line.trim())
+    .map((line) => line.match(/^\s*/)?.[0].length ?? 0);
+  const indent = Math.min(...indents);
+  return lines.map((line) => line.slice(indent)).join("\n");
+}
+
+function renderWorkspace(platform: "android" | "ios"): HTMLElement {
+  render(
+    createElement(
+      "div",
+      { [`data-${platform}-native`]: "" },
+      createElement(
+        TooltipProvider,
+        { delayDuration: 0 },
+        createElement(WorkspacePanel, {
+          conversationId: "safe-area-test",
+          width: 360,
+          handleProps: { tabIndex: 0 },
+          rightRailTab: "files",
+          onRightRailTabChange: vi.fn(),
+          showFilesPanel: true,
+          showBrowserTab: false,
+          changedCount: 0,
+          showShellsTab: false,
+          terminalsLength: 0,
+          subagentsWorking: 0,
+          agentCount: 1,
+          todosSupported: false,
+          todosCompleted: 0,
+          todosTotal: 0,
+          rootSessionId: null,
+          selectedFilePath: null,
+          openFiles: [],
+          openFileViewer: vi.fn(),
+          onCloseFile: vi.fn(),
+          onShowScopeView: vi.fn(),
+          onCommentsOpenChange: vi.fn(),
+          openTerminalsPanel: vi.fn(),
+          permissionLevel: null,
+          filesPanelSort: "recent" as ChangedSort,
+          onSortChange: vi.fn(),
+          filesPanelFlatView: false,
+          onFlatViewChange: vi.fn(),
+          filesPanelShowHidden: false,
+          onShowHiddenChange: vi.fn(),
+        }),
+      ),
+    ),
   );
-  const rule = ruleMatches[0]?.[0];
-  const selector = (rule ?? "")
-    .slice(0, rule ? rule.indexOf("{") : 0)
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .trim();
+  return screen.getByRole("complementary", { name: "Workspace" });
+}
 
-  /** Brace nesting depth at a source index; 0 is top level. */
-  function braceDepthAt(sourceIndex: number): number {
-    let depth = 0;
-    let quote: '"' | "'" | undefined;
-
-    for (let index = 0; index < sourceIndex; index += 1) {
-      const character = cssSource[index];
-
-      if (quote) {
-        if (character === "\\") index += 1;
-        else if (character === quote) quote = undefined;
-      } else if (character === "/" && cssSource[index + 1] === "*") {
-        const commentEnd = cssSource.indexOf("*/", index + 2);
-        index = commentEnd === -1 ? sourceIndex : commentEnd + 1;
-      } else if (character === '"' || character === "'") {
-        quote = character;
-      } else if (character === "{") {
-        depth += 1;
-      } else if (character === "}") {
-        depth -= 1;
-      }
-    }
-
-    return depth;
+function assertWorkspacePadding(
+  css: string,
+  platform: "android" | "ios",
+  variableFallback = "",
+): void {
+  const style = document.createElement("style");
+  style.textContent = css;
+  document.head.appendChild(style);
+  try {
+    const computed = getComputedStyle(renderWorkspace(platform));
+    expect(computed.paddingTop).toBe(`var(--omnigent-safe-top${variableFallback})`);
+    expect(computed.paddingBottom).toBe(`var(--omnigent-safe-bottom${variableFallback})`);
+    expect(computed.paddingLeft).toBe(`var(--omnigent-safe-left${variableFallback})`);
+    expect(computed.paddingRight).toBe(`var(--omnigent-safe-right${variableFallback})`);
+  } finally {
+    style.remove();
+    cleanup();
   }
+}
 
-  it("stays at the top level", () => {
-    expect(rule, "the Workspace safe-area rule is gone from index.css").toBeDefined();
-    if (!rule) return;
-    // Exactly one rule may set the rail's margins; a second could override the
-    // safe area without tripping any of the value checks below.
-    expect(ruleMatches).toHaveLength(1);
-
-    for (const match of ruleMatches) {
-      expect(
-        braceDepthAt(match.index),
-        "the Workspace margin rule must stay at the top level",
-      ).toBe(0);
+function assertFullHeightPanelPadding(css: string, variableFallback = ""): void {
+  const style = document.createElement("style");
+  style.textContent = css;
+  const shell = document.createElement("div");
+  shell.setAttribute("data-android-native", "");
+  document.head.appendChild(style);
+  document.body.appendChild(shell);
+  try {
+    for (const target of FULL_HEIGHT_PANEL_TARGETS) {
+      const panel = document.createElement("div");
+      if ("className" in target) panel.className = target.className;
+      if ("testId" in target) panel.dataset.testid = target.testId;
+      shell.appendChild(panel);
+      const computed = getComputedStyle(panel);
+      expect(computed.paddingTop).toBe(`var(--omnigent-safe-top${variableFallback})`);
+      expect(computed.paddingBottom).toBe(`var(--omnigent-safe-bottom${variableFallback})`);
+      expect(computed.paddingLeft).toBe(`var(--omnigent-safe-left${variableFallback})`);
+      expect(computed.paddingRight).toBe(`var(--omnigent-safe-right${variableFallback})`);
     }
-  });
-
-  it.each(["android", "ios"])("matches the Workspace rail in the %s native shell", (platform) => {
-    expect(selector, "the Workspace safe-area selector is gone from index.css").not.toBe("");
-    if (!selector) return;
-
-    const shell = document.createElement("div");
-    shell.setAttribute(`data-${platform}-native`, "");
-    const workspace = document.createElement("aside");
-    workspace.setAttribute("aria-label", "Workspace");
-    shell.appendChild(workspace);
-    document.body.appendChild(shell);
-
-    expect(workspace.matches(selector)).toBe(true);
+  } finally {
     shell.remove();
+    style.remove();
+  }
+}
+
+/** Brace nesting depth at a source index; 0 is top level. */
+function braceDepthAt(sourceIndex: number): number {
+  let depth = 0;
+  let quote: '"' | "'" | undefined;
+
+  for (let index = 0; index < sourceIndex; index += 1) {
+    const character = cssSource[index];
+    if (quote) {
+      if (character === "\\") index += 1;
+      else if (character === quote) quote = undefined;
+    } else if (character === "/" && cssSource[index + 1] === "*") {
+      const commentEnd = cssSource.indexOf("*/", index + 2);
+      index = commentEnd === -1 ? sourceIndex : commentEnd + 1;
+    } else if (character === '"' || character === "'") {
+      quote = character;
+    } else if (character === "{") depth += 1;
+    else if (character === "}") depth -= 1;
+  }
+  return depth;
+}
+
+describe("index.css native safe-area layout", () => {
+  it("folds Android and browser safe areas on both lateral edges", () => {
+    const style = document.createElement("style");
+    style.textContent = rootSafeAreaRule;
+    document.head.appendChild(style);
+    try {
+      const computed = getComputedStyle(document.documentElement);
+      expect(computed.getPropertyValue("--omnigent-safe-left")).toContain(
+        "--omnigent-android-safe-area-left",
+      );
+      expect(computed.getPropertyValue("--omnigent-safe-right")).toContain(
+        "--omnigent-android-safe-area-right",
+      );
+    } finally {
+      style.remove();
+    }
   });
 
-  it("uses safe-area margins on both edges", () => {
-    expect(rule).toMatch(/margin-top\s*:\s*calc\(0\.5rem \+ var\(--omnigent-safe-top\)\)/);
-    expect(rule).toMatch(/margin-bottom\s*:\s*calc\(0\.5rem \+ var\(--omnigent-safe-bottom\)\)/);
-    // Every margin rule, not just the first: a later one could re-introduce the
-    // inset vars and double-count the native bottom bar.
-    for (const [block] of ruleMatches) {
-      expect(block).not.toMatch(/--omnigent-(?:inset|native)-/);
-    }
+  it("keeps the Workspace rule at the top level", () => {
+    expect(workspaceSafeAreaRule, "the Workspace safe-area rule is gone").not.toBe("");
+    expect(workspaceSafeAreaRules).toHaveLength(1);
+    expect(braceDepthAt(workspaceSafeAreaRules[0]?.index ?? -1)).toBe(0);
+  });
+
+  it.each(["android", "ios"] as const)(
+    "computes four-edge padding on the real Workspace panel in the %s shell",
+    (platform) => assertWorkspacePadding(workspaceCss, platform),
+  );
+
+  it("computes four-edge padding on every full-height native panel", () => {
+    assertFullHeightPanelPadding(fullHeightPanelRule);
+  });
+
+  it("fails its layout contract when a later padding shorthand wins", () => {
+    expect(workspaceSelector).not.toBe("");
+    expect(() =>
+      assertWorkspacePadding(`${workspaceCss}\n${workspaceSelector}{padding:0}`, "android"),
+    ).toThrow();
+  });
+
+  it("does not double-count app-owned bar footprints", () => {
+    expect(workspaceSafeAreaRule).not.toMatch(/--omnigent-(?:inset|native)-/);
+  });
+});
+
+describe("Android injected safe-area layout", () => {
+  it("exposes the production inset stylesheet to the layout test", () => {
+    expect(nativeInsetMatch, "NativeBridgeScript.insetStyles is gone").not.toBeNull();
+    expect(nativeInsetCss).not.toBe("");
+  });
+
+  it("computes four-edge padding on the real Workspace panel", () => {
+    assertWorkspacePadding(nativeInsetCss, "android", ", 0px");
+  });
+
+  it("computes four-edge padding on every full-height panel", () => {
+    assertFullHeightPanelPadding(nativeInsetCss, ", 0px");
   });
 });
 

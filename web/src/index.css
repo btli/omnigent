@@ -195,6 +195,14 @@
     env(safe-area-inset-bottom, 0px),
     var(--omnigent-android-safe-area-bottom, 0px)
   );
+  --omnigent-safe-left: max(
+    env(safe-area-inset-left, 0px),
+    var(--omnigent-android-safe-area-left, 0px)
+  );
+  --omnigent-safe-right: max(
+    env(safe-area-inset-right, 0px),
+    var(--omnigent-android-safe-area-right, 0px)
+  );
   --omnigent-native-top-bar: 0px; /* set by native bridge (px) */
   --omnigent-native-bottom-bar: 0px; /* set by native bridge (px) */
   --omnigent-top-bar-visible: 0; /* web-owned 0|1 */
@@ -799,14 +807,18 @@ aside[aria-label="Workspace"][data-maximized] {
     ) {
     padding-top: var(--omnigent-safe-top);
     padding-bottom: var(--omnigent-safe-bottom);
+    padding-left: var(--omnigent-safe-left);
+    padding-right: var(--omnigent-safe-right);
   }
 }
 
 /* The Workspace rail only exists at md+, outside the mobile-only inset rules
  * above. It is already hidden below md, so no media wrapper is needed. */
 :is([data-ios-native], [data-android-native]) aside[aria-label="Workspace"] {
-  margin-top: calc(0.5rem + var(--omnigent-safe-top));
-  margin-bottom: calc(0.5rem + var(--omnigent-safe-bottom));
+  padding-top: var(--omnigent-safe-top);
+  padding-bottom: var(--omnigent-safe-bottom);
+  padding-left: var(--omnigent-safe-left);
+  padding-right: var(--omnigent-safe-right);
 }
 
 @media (width < 48rem) and (prefers-reduced-motion: reduce) {
