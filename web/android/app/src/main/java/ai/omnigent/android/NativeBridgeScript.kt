@@ -15,6 +15,8 @@ package ai.omnigent.android
  * `evaluateJavascript` into the `window.__omnigentNativeEmit*` functions here.
  */
 object NativeBridgeScript {
+    // Interpolated into a JS template literal in [source], so this CSS must stay
+    // free of backticks and of the `${` sequence.
     internal val insetStyles: String =
         """
         .chat-header{top:max(0px, calc(var(--omnigent-safe-top, 0px) - 0.5rem)) !important}
