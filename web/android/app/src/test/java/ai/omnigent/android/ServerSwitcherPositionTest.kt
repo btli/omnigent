@@ -154,6 +154,17 @@ class ServerSwitcherPositionTest {
                 edgeReserve = 48,
             ),
         )
+        // A stale (wider) pill anchors at the reserved edge, not the raw band
+        // edge — centring without the reserve would land at 428 here.
+        assertEquals(
+            448,
+            serverSwitcherLeftMargin(
+                containerWidth = 1000,
+                switcherWidth = 104,
+                band = ServerSwitcherBand(0.4, 0.56),
+                edgeReserve = 48,
+            ),
+        )
     }
 
     @Test
