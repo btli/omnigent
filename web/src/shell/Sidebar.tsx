@@ -2131,13 +2131,17 @@ function SectionHeader({
         }
         onToggleCollapsed();
       }}
+      // select-none: a long-press must open the context menu, not start a
+      // native text selection of the header title. The header cannot suppress
+      // it the way session rows do (preventDefault on touch pointerdown) —
+      // that would also cancel Radix's composed long-press timer.
       className={
         icon
           ? `${cn(
-              "group flex w-full items-center gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 py-[3px] text-left transition-colors",
+              "group flex w-full select-none items-center gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 py-[3px] text-left transition-colors",
               SIDEBAR_HOVER_HIGHLIGHT,
             )} sidebar-compact-text text-foreground`
-          : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-2 pl-2 text-left text-xs leading-4 text-muted-foreground transition-colors hover:text-foreground"
+          : "group flex w-full select-none items-center gap-1 border-0 pt-0 pr-0 pb-2 pl-2 text-left text-xs leading-4 text-muted-foreground transition-colors hover:text-foreground"
       }
     >
       {icon ? (
