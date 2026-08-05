@@ -41,7 +41,8 @@ class OmnigentBridgeListener(
         isMainFrame: Boolean,
     ) {
         if (!isMainFrame) return // origin allowlist already gates; defense in depth.
-        if (originOf(sourceOrigin.toString()) != pinnedOrigin()) return
+        val pin = pinnedOrigin() ?: return
+        if (originOf(sourceOrigin.toString()) != pin) return
         handle(data ?: return)
     }
 

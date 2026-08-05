@@ -345,6 +345,22 @@ class PinnedOriginDownloaderTest {
     }
 
     @Test
+    fun `off-origin work is rejected before enqueue`() {
+        val calls = mutableListOf<EnqueueCall>()
+        val downloader = recordingDownloader(calls)
+
+        downloader.download(
+            "$otherOrigin/report",
+            pinnedOrigin,
+            USER_AGENT,
+            "text/plain",
+            "report.txt",
+        )
+
+        assertTrue(calls.isEmpty())
+    }
+
+    @Test
     fun `HTTP 500 is retried before the attempt cap`() {
         pinnedServer.createContext("/unavailable") { exchange ->
             exchange.respond(503, "try later")
@@ -592,6 +608,16 @@ class PinnedOriginDownloaderTest {
     }
 
     @Test
+    fun `foreground notification sanitizes the persisted filename`() {
+        val info = worker("$pinnedOrigin/file", "../../secret report.txt").getForegroundInfo()
+
+        assertEquals(
+            "Downloading secret_report.txt",
+            info.notification.extras.getCharSequence(Notification.EXTRA_TITLE),
+        )
+    }
+
+    @Test
     fun `pre Q foreground download omits a service type`() {
         val info = worker("$pinnedOrigin/file", "foreground.txt").getForegroundInfo()
 
@@ -664,6 +690,43 @@ class PinnedOriginDownloaderTest {
             "Couldn't download lives.txt",
             notificationFor(worker)!!.extras.getCharSequence(Notification.EXTRA_TEXT),
         )
+    }
+
+    @Test
+    fun `early terminal failure sanitizes the persisted filename`() {
+        val worker =
+            worker(
+                "$pinnedOrigin/many-lives",
+                "../../secret report.txt",
+                runAttemptCount = PinnedOriginDownloadWorker.MAX_LIVES,
+            )
+
+        val result = worker.doWork()
+
+        assertEquals(ListenableWorker.Result.failure(), result)
+        assertEquals(
+            "Couldn't download secret_report.txt",
+            notificationFor(worker)!!.extras.getCharSequence(Notification.EXTRA_TEXT),
+        )
+    }
+
+    @Test
+    fun `stopped terminal failure clears its persisted stop count`() {
+        val workId = UUID.randomUUID()
+        val worker =
+            worker(
+                "$pinnedOrigin/many-lives",
+                "stopped-lives.txt",
+                runAttemptCount = PinnedOriginDownloadWorker.MAX_LIVES,
+                id = workId,
+            )
+        worker.stop(WorkInfo.STOP_REASON_TIMEOUT)
+        assertTrue(stopCounts().contains(workId.toString()))
+
+        val result = worker.doWork()
+
+        assertEquals(ListenableWorker.Result.failure(), result)
+        assertFalse(stopCounts().contains(workId.toString()))
     }
 
     @Test
