@@ -197,6 +197,9 @@ const SIDEBAR_ACTIVE_HIGHLIGHT =
   "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)]";
 const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 const UNGROUP_DROP_ZONE_ID = "__ungroup__";
+// Marks the recognizer's own contextmenu dispatch so the row root can suppress
+// the OS long-press contextmenu mid-gesture without eating its own.
+const ROW_MENU_SYNTHETIC = Symbol("row-menu-synthetic");
 
 /** Prefer the visible ungroup strip when it overlaps another drop target. */
 export function prioritizeSidebarUngroupCollision(collisions: Collision[]): Collision[] {
@@ -3086,15 +3089,17 @@ function ConversationRow({
   const swipeEnabled = gestureEnabled && isOwner;
   const dragEnabled = isOwner && !selectionMode && !isArchived && !isEditing;
   const openContextMenuAt = useCallback((point: { clientX: number; clientY: number }) => {
-    rowLinkRef.current?.dispatchEvent(
-      new globalThis.MouseEvent("contextmenu", {
-        bubbles: true,
-        cancelable: true,
-        button: 2,
-        clientX: point.clientX,
-        clientY: point.clientY,
-      }),
-    );
+    const event = new globalThis.MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+      button: 2,
+      clientX: point.clientX,
+      clientY: point.clientY,
+    });
+    // Tagged so the row root can tell this dispatch apart from the OS's own
+    // long-press contextmenu, which it must suppress mid-gesture.
+    Object.assign(event, { [ROW_MENU_SYNTHETIC]: true });
+    rowLinkRef.current?.dispatchEvent(event);
   }, []);
   const onContextMenuOpenChange = useCallback((open: boolean) => {
     contextMenuOpenRef.current = open;
@@ -3392,6 +3397,15 @@ function ConversationRow({
     <li
       ref={setRowRef}
       {...rowGestureListeners}
+      // Android's own ~500ms long-press fires a native contextmenu even while
+      // the recognizer holds the pointer — capture retargets it to this li,
+      // bypassing Radix's trigger on the link. Unprevented it starts text
+      // selection and cancels the pointer stream, killing the pending drag.
+      // The recognizer's own tagged re-dispatch passes through.
+      onContextMenu={(e) => {
+        if (ROW_MENU_SYNTHETIC in e.nativeEvent) return;
+        if (ownsPointer || isDragging) e.preventDefault();
+      }}
       className={cn(
         "group relative",
         isDragging && "opacity-40",
