@@ -1159,6 +1159,39 @@ describe("touch gesture arbitration", () => {
     );
   });
 
+  it("suppresses the OS's native contextmenu while the recognizer owns the touch", () => {
+    // Android fires its own contextmenu at ~500ms — after the 400ms arm
+    // already opened the menu. Capture retargets it to the row root,
+    // bypassing Radix's trigger; unprevented it starts text selection and
+    // cancels the pointer stream, killing the pending drag. The recognizer's
+    // own dispatch carries a tag; the OS's does not.
+    vi.useFakeTimers();
+    mocks.isMobile = true;
+    renderSidebar();
+    const { row } = touchTarget();
+
+    startTouch();
+    advanceHold();
+    // The tagged synthetic dispatch got through: the menu is open.
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+
+    const nativeLongPress = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+    row.dispatchEvent(nativeLongPress);
+    expect(nativeLongPress.defaultPrevented).toBe(true);
+    endTouch();
+  });
+
+  it("leaves the contextmenu alone when no gesture owns the touch", () => {
+    // Desktop right-click arrives with the recognizer idle — it must reach
+    // Radix untouched or the mouse context menu dies.
+    renderSidebar();
+    const { row } = touchTarget();
+
+    const rightClick = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+    row.dispatchEvent(rightClick);
+    expect(rightClick.defaultPrevented).toBe(false);
+  });
+
   it("keeps a threshold-minus-one wiggle armed with the menu open", () => {
     vi.useFakeTimers();
     mocks.isMobile = true;
