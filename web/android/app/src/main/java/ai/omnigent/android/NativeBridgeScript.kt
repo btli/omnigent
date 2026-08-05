@@ -226,6 +226,10 @@ object NativeBridgeScript {
               if (!Number.isFinite(leftFraction) || !Number.isFinite(rightFraction)) return;
               post({ method: "setServerSwitcherBand", leftFraction, rightFraction });
             },
+            setServerSwitcherHidden(hidden) {
+              if (typeof hidden !== "boolean") return;
+              post({ method: "setServerSwitcherHidden", hidden });
+            },
             notify(params) {
               post({
                 method: "notify",

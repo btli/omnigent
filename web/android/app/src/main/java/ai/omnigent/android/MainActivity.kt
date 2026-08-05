@@ -112,6 +112,7 @@ class MainActivity : AppCompatActivity() {
 
     // Null before each page publishes, preserving whole-window centring.
     private var switcherBand: ServerSwitcherBand? = null
+    private var switcherHidden = false
 
     // WebChromeClient affordances that need Activity-scoped result launchers.
     // Transient by design: rotation is covered by configChanges (no recreation),
@@ -313,8 +314,11 @@ class MainActivity : AppCompatActivity() {
             // Push the floating switch button below the status bar so it doesn't
             // disappear under the notch/status icons on edge-to-edge layouts.
             (switchButton.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
-                lp.topMargin = bars.top + (8 * dp).toInt()
-                switchButton.layoutParams = lp
+                val topMargin = bars.top + (8 * dp).toInt()
+                serverSwitcherTopMarginUpdate(lp.topMargin, topMargin)?.let { updated ->
+                    lp.topMargin = updated
+                    switchButton.layoutParams = lp
+                }
             }
             positionServerSwitcher()
             emitInsets()
@@ -421,6 +425,9 @@ class MainActivity : AppCompatActivity() {
                     notifications = notifications,
                     blobSaver = blobSaver,
                     onServerSwitcherBand = { band -> host.get()?.receiveServerSwitcherBand(band) },
+                    onServerSwitcherHidden = { hidden ->
+                        host.get()?.receiveServerSwitcherHidden(hidden)
+                    },
                     pinnedOrigin = { host.get()?.pinnedOrigin },
                 ),
             )
@@ -648,10 +655,20 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun receiveServerSwitcherHidden(hidden: Boolean) {
+        runOnUiThread {
+            if (isDestroyed || isFinishing) return@runOnUiThread
+            switcherHidden = hidden
+            if (hidden) switcherBand = null
+            positionServerSwitcher()
+        }
+    }
+
     /** Forget the web-published band; the pill returns to the window centre. */
     private fun clearServerSwitcherBand() {
-        if (switcherBand == null) return
+        if (switcherBand == null && !switcherHidden) return
         switcherBand = null
+        switcherHidden = false
         positionServerSwitcher()
     }
 
@@ -663,7 +680,9 @@ class MainActivity : AppCompatActivity() {
         // The pill's leftMargin is relative to its parent, so the band fraction
         // must resolve against the parent's width.
         val containerWidth = (switchButton.parent as? View)?.width ?: 0
-        applyServerSwitcherWidthBounds(containerWidth, band)
+        val bandCanFit = applyServerSwitcherWidthBounds(containerWidth, band)
+        val visibility = if (!switcherHidden && bandCanFit) View.VISIBLE else View.INVISIBLE
+        if (switchButton.visibility != visibility) switchButton.visibility = visibility
         val switcherWidth = switchButton.width
 
         val gravity: Int
@@ -674,7 +693,11 @@ class MainActivity : AppCompatActivity() {
         } else {
             // The band uses physical viewport coordinates, so it must not mirror in RTL.
             gravity = Gravity.TOP or Gravity.LEFT
-            leftMargin = serverSwitcherLeftMargin(containerWidth, switcherWidth, band)
+            val controlReserve =
+                (SWITCHER_CONTROL_RESERVE_DP * resources.displayMetrics.density)
+                    .toInt()
+            leftMargin =
+                serverSwitcherLeftMargin(containerWidth, switcherWidth, band, controlReserve)
         }
         if (lp.gravity == gravity && lp.leftMargin == leftMargin) return
         lp.gravity = gravity
@@ -685,23 +708,32 @@ class MainActivity : AppCompatActivity() {
     private fun applyServerSwitcherWidthBounds(
         containerWidth: Int,
         band: ServerSwitcherBand?,
-    ) {
+    ): Boolean {
         val dp = resources.displayMetrics.density
         val defaultMax = (SWITCHER_MAX_WIDTH_DP * dp).toInt()
         val defaultMin = (SWITCHER_MIN_WIDTH_DP * dp).toInt()
+        val controlReserve = (SWITCHER_CONTROL_RESERVE_DP * dp).toInt()
+        val usableWidth =
+            if (band == null || containerWidth <= 0) {
+                defaultMax
+            } else {
+                serverSwitcherUsableWidth(containerWidth, band, controlReserve)
+            }
         val max =
             if (band == null || containerWidth <= 0) {
                 defaultMax
             } else {
                 maxOf(
                     defaultMin,
-                    minOf(defaultMax, serverSwitcherBandWidth(containerWidth, band)),
+                    minOf(defaultMax, usableWidth),
                 )
             }
         // Floors the WIDTH only — the height stays the text's — so this bounds how
         // far a label can shrink, not the full touch target.
         if (switchButton.minWidth != defaultMin) switchButton.minWidth = defaultMin
         if (switchButton.maxWidth != max) switchButton.maxWidth = max
+        return band == null ||
+            serverSwitcherBandCanFit(containerWidth, band, controlReserve, defaultMin)
     }
 
     /**
@@ -1292,6 +1324,7 @@ class MainActivity : AppCompatActivity() {
         // The 48dp floor is tap safety, not the iOS 120dp visual floor.
         const val SWITCHER_MAX_WIDTH_DP = 172
         const val SWITCHER_MIN_WIDTH_DP = 48
+        const val SWITCHER_CONTROL_RESERVE_DP = 48
 
         // Back-press fallback: long enough that a healthy renderer's JS round-trip
         // (a few ms) always wins the race, short enough to not feel stuck if it

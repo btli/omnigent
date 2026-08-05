@@ -5,6 +5,7 @@ import {
   isIOSShell,
   onNativeInsets,
   setNativeServerSwitcherBand,
+  setNativeServerSwitcherHidden,
 } from "@/lib/nativeBridge";
 
 const NATIVE_READY_EVENT = "omnigent:native-ready";
@@ -15,19 +16,18 @@ const MIN_USABLE_BAND_PX = 64;
  * centre itself there instead of over the whole window.
  *
  * The switcher is a native view stacked above the web view, so wherever it
- * lands it swallows taps. Centred on the window it can cover the conversations
- * rail's header controls on one side or the workspace rail's tabs on the other;
- * the column between them is the only band that is always free, and only the
- * web knows where it is.
+ * lands it swallows taps. The chat column keeps it off adjacent rails, while
+ * native reserves the column's header controls at both edges. Obscured or
+ * collapsed columns hide the switcher instead of borrowing another surface.
  *
  * No-op outside the native shells.
  */
-export function useNativeServerSwitcherBand(
-  column: HTMLElement | null,
-  contentRegion: HTMLElement | null,
-): void {
+export function useNativeServerSwitcherBand(column: HTMLElement | null, obscured = false): void {
   useEffect(() => {
-    if (!column && !contentRegion) return;
+    if (!column) {
+      if (isAndroidShell() || isIOSShell()) setNativeServerSwitcherHidden(true);
+      return;
+    }
 
     // `pending` is deliberately separate from `frame`: it is set before
     // requestAnimationFrame returns, so a callback that runs re-entrantly cannot
@@ -39,17 +39,29 @@ export function useNativeServerSwitcherBand(
       pending = false;
       frame = 0;
       if (!isAndroidShell() && !isIOSShell()) return;
+      if (obscured) {
+        setNativeServerSwitcherHidden(true);
+        return;
+      }
       const viewport = window.innerWidth;
-      if (viewport <= 0) return;
-      const columnRect = column?.getBoundingClientRect();
-      // Preserve a usable recovery control: the content region is clear of rail controls.
-      // This assumes push-panel titles and controls stay at their horizontal edges.
-      const rect =
-        columnRect && columnRect.width >= MIN_USABLE_BAND_PX
-          ? columnRect
-          : contentRegion?.getBoundingClientRect();
-      if (!rect || rect.width <= 0) return;
-      setNativeServerSwitcherBand(rect.left / viewport, rect.right / viewport);
+      if (viewport <= 0) {
+        setNativeServerSwitcherHidden(true);
+        return;
+      }
+      const columnRect = column.getBoundingClientRect();
+      // Adjacent workspace and sidebar surfaces have their own top-row controls.
+      if (columnRect.width < MIN_USABLE_BAND_PX) {
+        setNativeServerSwitcherHidden(true);
+        return;
+      }
+      const left = Math.max(0, Math.min(1, columnRect.left / viewport));
+      const right = Math.max(0, Math.min(1, columnRect.right / viewport));
+      if (left >= right) {
+        setNativeServerSwitcherHidden(true);
+        return;
+      }
+      setNativeServerSwitcherBand(left, right);
+      setNativeServerSwitcherHidden(false);
     };
     // Coalesce to one frame so a drag-resize does not post per pointer event.
     const schedule = () => {
@@ -68,18 +80,18 @@ export function useNativeServerSwitcherBand(
 
     const observer = typeof ResizeObserver !== "undefined" ? new ResizeObserver(schedule) : null;
     if (column) observer?.observe(column);
-    if (contentRegion) observer?.observe(contentRegion);
     window.addEventListener("resize", schedule);
     window.addEventListener("orientationchange", schedule);
     window.addEventListener(NATIVE_READY_EVENT, handleNativeReady);
 
     return () => {
       if (frame !== 0) cancelAnimationFrame(frame);
+      if (isAndroidShell() || isIOSShell()) setNativeServerSwitcherHidden(true);
       unsubscribeInsets();
       observer?.disconnect();
       window.removeEventListener("resize", schedule);
       window.removeEventListener("orientationchange", schedule);
       window.removeEventListener(NATIVE_READY_EVENT, handleNativeReady);
     };
-  }, [column, contentRegion]);
+  }, [column, obscured]);
 }

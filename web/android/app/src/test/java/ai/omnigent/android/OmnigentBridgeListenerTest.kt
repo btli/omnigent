@@ -29,6 +29,7 @@ class OmnigentBridgeListenerTest {
     private lateinit var shadow: ShadowNotificationManager
     private var pinnedOrigin: String? = ORIGIN
     private val receivedBands = mutableListOf<ServerSwitcherBand>()
+    private val receivedSwitcherVisibility = mutableListOf<Boolean>()
 
     private val badgeId = 1
 
@@ -43,6 +44,7 @@ class OmnigentBridgeListenerTest {
                 notifications = notifications,
                 blobSaver = BlobSaver(context),
                 onServerSwitcherBand = { receivedBands += it },
+                onServerSwitcherHidden = { receivedSwitcherVisibility += it },
                 pinnedOrigin = { pinnedOrigin },
             )
         shadow =
@@ -209,6 +211,24 @@ class OmnigentBridgeListenerTest {
         )
 
         assertEquals(emptyList<ServerSwitcherBand>(), receivedBands)
+    }
+
+    @Test
+    fun `setServerSwitcherHidden dispatches booleans`() {
+        listener.handle("""{"method":"setServerSwitcherHidden","hidden":true}""")
+        listener.handle("""{"method":"setServerSwitcherHidden","hidden":false}""")
+
+        assertEquals(listOf(true, false), receivedSwitcherVisibility)
+    }
+
+    @Test
+    fun `setServerSwitcherHidden rejects missing and non-boolean values`() {
+        listener.handle("""{"method":"setServerSwitcherHidden"}""")
+        listener.handle("""{"method":"setServerSwitcherHidden","hidden":"true"}""")
+        listener.handle("""{"method":"setServerSwitcherHidden","hidden":1}""")
+        listener.handle("""{"method":"setServerSwitcherHidden","hidden":null}""")
+
+        assertEquals(emptyList<Boolean>(), receivedSwitcherVisibility)
     }
 
     private companion object {

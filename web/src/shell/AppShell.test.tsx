@@ -73,6 +73,7 @@ vi.mock("./Sidebar", () => ({
   Sidebar: ({ open }: { open: boolean }) => (
     <div data-testid="sidebar" data-open={open ? "true" : "false"} />
   ),
+  isMobileViewport: () => true,
 }));
 vi.mock("./FilesPanel", () => ({
   // Scope-only stand-in matching the real FilesPanel after the open-file tabs
@@ -516,7 +517,11 @@ describe("native server switcher band", () => {
     }
   }
 
-  function installShell(kind: "android" | "ios" | null, setter: ReturnType<typeof vi.fn>) {
+  function installShell(
+    kind: "android" | "ios" | null,
+    setter: ReturnType<typeof vi.fn>,
+    hiddenSetter = vi.fn(),
+  ) {
     if (kind === null) {
       delete (window as unknown as Record<string, unknown>).omnigentNative;
       return;
@@ -526,6 +531,7 @@ describe("native server switcher band", () => {
       setBadgeCount: vi.fn(),
       notify: vi.fn().mockResolvedValue(true),
       setServerSwitcherBand: setter,
+      setServerSwitcherHidden: hiddenSetter,
     };
   }
 
@@ -618,43 +624,53 @@ describe("native server switcher band", () => {
     expect(setBand).not.toHaveBeenCalled();
   });
 
-  it("publishes the content region when the main column is only one pixel wide", () => {
+  it("hides when the main column is only one pixel wide", () => {
     const setBand = vi.fn();
-    installShell("android", setBand);
+    const setHidden = vi.fn();
+    installShell("android", setBand, setHidden);
     installLayoutRects(1);
     mockConversations([]);
 
     renderShell("/");
 
-    expect(setBand).toHaveBeenCalledWith(0.32, 1);
+    expect(setBand).not.toHaveBeenCalled();
+    expect(setHidden).toHaveBeenLastCalledWith(true);
   });
 
-  it.each([
-    // Just below the usable-band threshold: hand over to the content region.
-    [63, 0.32, 1],
-    // Exactly at it: the column itself is wide enough to host the pill.
-    [64, 0.32, 0.384],
-  ])("picks the band source at a %ipx main column", (mainWidth, left, right) => {
+  it("does not borrow the workspace region below the usable-band threshold", () => {
     const setBand = vi.fn();
-    installShell("android", setBand);
-    installLayoutRects(mainWidth);
+    const setHidden = vi.fn();
+    installShell("android", setBand, setHidden);
+    installLayoutRects(63);
     mockConversations([]);
 
     renderShell("/");
 
-    expect(setBand).toHaveBeenCalledWith(left, right);
+    expect(setBand).not.toHaveBeenCalled();
+    expect(setHidden).toHaveBeenLastCalledWith(true);
+  });
+
+  it("publishes the chat column at the usable-band threshold", () => {
+    const setBand = vi.fn();
+    installShell("android", setBand);
+    installLayoutRects(64);
+    mockConversations([]);
+
+    renderShell("/");
+
+    expect(setBand).toHaveBeenCalledWith(0.32, 0.384);
   });
 
   it("does not publish when both observed elements are absent", () => {
     const setBand = vi.fn();
     installShell("android", setBand);
 
-    renderHook(() => useNativeServerSwitcherBand(null, null));
+    renderHook(() => useNativeServerSwitcherBand(null));
 
     expect(setBand).not.toHaveBeenCalled();
   });
 
-  it("observes both layout elements and republishes changed main fractions", () => {
+  it("observes the chat column and republishes changed fractions", () => {
     const setBand = vi.fn();
     installShell("android", setBand);
     const rects = installLayoutRects(400);
@@ -663,10 +679,9 @@ describe("native server switcher band", () => {
     renderShell("/");
 
     const main = document.querySelector("main");
-    const contentRegion = main?.parentElement?.parentElement;
     const observer = TestResizeObserver.instances[0];
     expect(observer.observe).toHaveBeenCalledWith(main);
-    expect(observer.observe).toHaveBeenCalledWith(contentRegion);
+    expect(observer.observe).toHaveBeenCalledOnce();
 
     rects.mainLeft = 400;
     rects.mainWidth = 300;
@@ -675,9 +690,10 @@ describe("native server switcher band", () => {
     expect(setBand).toHaveBeenLastCalledWith(0.4, 0.7);
   });
 
-  it("republishes changed content-region fractions while main is collapsed", () => {
+  it("keeps a collapsed chat column hidden when surrounding content changes", () => {
     const setBand = vi.fn();
-    installShell("android", setBand);
+    const setHidden = vi.fn();
+    installShell("android", setBand, setHidden);
     const rects = installLayoutRects(0);
     mockConversations([]);
     renderShell("/");
@@ -687,7 +703,20 @@ describe("native server switcher band", () => {
     rects.contentWidth = 500;
     act(() => TestResizeObserver.instances[0].trigger());
 
-    expect(setBand).toHaveBeenCalledWith(0.5, 1);
+    expect(setBand).not.toHaveBeenCalled();
+    expect(setHidden).toHaveBeenLastCalledWith(true);
+  });
+
+  it("hides the band while the mobile sidebar overlay is open", () => {
+    const setBand = vi.fn();
+    const setHidden = vi.fn();
+    installShell("android", setBand, setHidden);
+    installLayoutRects(400);
+    mockConversations([]);
+
+    renderShell("/?sidebar=open");
+
+    expect(setHidden).toHaveBeenLastCalledWith(true);
   });
 
   it("disconnects the layout observer on unmount", () => {
@@ -2079,9 +2108,7 @@ describe("Right workspace card visibility", () => {
     const panelWidth = Number.parseFloat(panel.style.width);
     const headerGroup = panel.parentElement;
     expect(headerGroup?.querySelector("header")).not.toBeNull();
-    expect(headerGroup?.style.getPropertyValue("--workspace-panel-offset")).toBe(
-      `${panelWidth}px`,
-    );
+    expect(headerGroup?.style.getPropertyValue("--workspace-panel-offset")).toBe(`${panelWidth}px`);
 
     fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
     expect(headerGroup?.style.getPropertyValue("--workspace-panel-offset")).toBe("0px");

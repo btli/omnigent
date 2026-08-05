@@ -453,8 +453,10 @@ class MainActivityTest {
     }
 
     @Test
+    @Config(qualifiers = "mdpi")
     fun `server switcher band uses an absolute left margin`() {
-        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        val host = "a-very-long-server-hostname-that-needs-truncation.example.com"
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://$host")
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
         val button = activity.switchButton()
         val parent = button.parent as View
@@ -463,9 +465,13 @@ class MainActivityTest {
 
         layout(parent, width = 1000, height = 600)
         layout(parent, width = 1000, height = 600)
+        // The width cap changes with the container, so the shared layout
+        // listener repositions once more; a third pass applies it.
+        layout(parent, width = 1000, height = 600)
 
         val layout = button.layoutParams as FrameLayout.LayoutParams
-        val expectedLeft = serverSwitcherLeftMargin(1000, button.width, band)
+        // mdpi: the 48dp header-control reserve is 48px at each band edge.
+        val expectedLeft = serverSwitcherLeftMargin(1000, button.width, band, edgeReserve = 48)
         assertEquals(Gravity.TOP or Gravity.LEFT, layout.gravity)
         assertEquals(expectedLeft, layout.leftMargin)
         assertEquals(expectedLeft, button.left)
@@ -473,7 +479,7 @@ class MainActivityTest {
     }
 
     @Test
-    fun `server switcher remains fully visible beside a narrow right edge band`() {
+    fun `server switcher hides beside a narrow right edge band`() {
         val host = "a-very-long-server-hostname-that-needs-truncation.example.com"
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://$host")
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
@@ -486,6 +492,7 @@ class MainActivityTest {
         layout(parent, width = 1000, height = 600)
 
         val visibleWidth = minOf(button.right, parent.width) - maxOf(button.left, 0)
+        assertEquals(View.INVISIBLE, button.visibility)
         assertTrue(button.width > serverSwitcherBandWidth(parent.width, band))
         assertTrue(button.left >= 0)
         assertTrue(button.right <= parent.width)
@@ -493,8 +500,10 @@ class MainActivityTest {
     }
 
     @Test
+    @Config(qualifiers = "mdpi")
     fun `server switcher absolute left margin does not mirror in RTL`() {
-        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        val host = "a-very-long-server-hostname-that-needs-truncation.example.com"
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://$host")
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
         val button = activity.switchButton()
         val parent = button.parent as View
@@ -504,8 +513,10 @@ class MainActivityTest {
 
         layout(parent, width = 1000, height = 600)
         layout(parent, width = 1000, height = 600)
+        // Third pass: the container-driven width cap change repositions once more.
+        layout(parent, width = 1000, height = 600)
 
-        val expectedLeft = serverSwitcherLeftMargin(1000, button.width, band)
+        val expectedLeft = serverSwitcherLeftMargin(1000, button.width, band, edgeReserve = 48)
         assertEquals(expectedLeft, button.left)
         assertEquals(expectedLeft + button.width, button.right)
     }
@@ -526,18 +537,20 @@ class MainActivityTest {
         layout(parent, width = 400, height = 600)
         layout(parent, width = 400, height = 600)
         val initialWidth = button.width
-        val initialLeft = serverSwitcherLeftMargin(400, initialWidth, band)
-        assertEquals(initialLeft, button.left)
+        assertEquals(
+            serverSwitcherLeftMargin(400, initialWidth, band, edgeReserve = 48),
+            button.left,
+        )
         button.removeLayoutChangeListeners()
 
         layout(parent, width = 700, height = 600)
-        val expectedLeft = serverSwitcherLeftMargin(700, button.width, band)
         val params = button.layoutParams as FrameLayout.LayoutParams
         assertEquals(initialWidth, button.width)
-        assertEquals(expectedLeft, params.leftMargin)
+        val grownLeft = serverSwitcherLeftMargin(700, initialWidth, band, edgeReserve = 48)
+        assertEquals(grownLeft, params.leftMargin)
 
         layout(parent, width = 700, height = 600)
-        assertEquals(expectedLeft, button.left)
+        assertEquals(grownLeft, button.left)
     }
 
     @Test
@@ -565,10 +578,9 @@ class MainActivityTest {
         val redeliveredBand = ServerSwitcherBand(0.0, 1.0)
         activity.receiveSwitcherBand(redeliveredBand)
 
-        val expectedLeft = serverSwitcherLeftMargin(700, button.width, band)
         assertTrue(activity.switcherBand() === redeliveredBand)
         assertEquals(
-            expectedLeft,
+            serverSwitcherLeftMargin(700, button.width, redeliveredBand, edgeReserve = 48),
             (button.layoutParams as FrameLayout.LayoutParams).leftMargin,
         )
     }
@@ -581,30 +593,69 @@ class MainActivityTest {
         val button = activity.switchButton()
         val parent = button.parent as View
         val density = activity.resources.displayMetrics.density
-        val defaultMax = (172 * density).toInt()
         val recoveryFloor = (48 * density).toInt()
         layout(parent, width = 1000, height = 600)
 
-        activity.setSwitcherBand(ServerSwitcherBand(0.45, 0.55))
-        val expectedWideBandWidth = maxOf(recoveryFloor, minOf(defaultMax, 100))
-        assertEquals(expectedWideBandWidth, button.maxWidth)
+        val wideBand = ServerSwitcherBand(0.4, 0.6)
+        activity.setSwitcherBand(wideBand)
+        assertEquals(104, button.maxWidth)
         assertEquals(recoveryFloor, button.minWidth)
         layout(parent, width = 1000, height = 600)
-        // The pill may measure narrower than the cap; what matters is that it
-        // stays inside the band it was given.
-        assertTrue(button.width <= expectedWideBandWidth)
-        assertTrue(button.left >= 450)
-        assertTrue(button.right <= 550)
+        assertEquals(View.VISIBLE, button.visibility)
+        // The label may measure under the cap; placement must respect the reserve.
+        assertTrue(button.width <= 104)
+        val expectedLeft = serverSwitcherLeftMargin(1000, button.width, wideBand, edgeReserve = 48)
+        assertEquals(expectedLeft, button.left)
+        assertEquals(expectedLeft + button.width, button.right)
 
-        activity.setSwitcherBand(ServerSwitcherBand(0.49, 0.51))
+        activity.setSwitcherBand(ServerSwitcherBand(0.45, 0.55))
         assertEquals(recoveryFloor, button.maxWidth)
         assertEquals(recoveryFloor, button.minWidth)
         layout(parent, width = 1000, height = 600)
-        // Band narrower than the recovery floor: keep the pill tappable and
-        // anchored at the band's left edge, accepting bounded overflow.
-        assertEquals(recoveryFloor, button.width)
-        assertEquals(490, button.left)
-        assertEquals(490 + button.width, button.right)
+        assertEquals(View.INVISIBLE, button.visibility)
+    }
+
+    @Test
+    @Config(qualifiers = "mdpi")
+    fun `hidden state clears stale placement until a fresh band is shown`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        val button = activity.switchButton()
+        val parent = button.parent as View
+        layout(parent, width = 1000, height = 600)
+        activity.receiveSwitcherBand(ServerSwitcherBand(0.2, 0.8))
+
+        activity.receiveSwitcherHidden(true)
+
+        assertEquals(View.INVISIBLE, button.visibility)
+        assertNull(activity.switcherBandOrNull())
+
+        activity.receiveSwitcherBand(ServerSwitcherBand(0.2, 0.8))
+        assertEquals(View.INVISIBLE, button.visibility)
+        activity.receiveSwitcherHidden(false)
+        assertEquals(View.VISIBLE, button.visibility)
+    }
+
+    @Test
+    @Config(qualifiers = "mdpi")
+    fun `unchanged insets do not request another switcher layout`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        val button = activity.switchButton()
+        val parent = button.parent as View
+        val insets =
+            WindowInsetsCompat
+                .Builder()
+                .setInsets(WindowInsetsCompat.Type.systemBars(), Insets.of(0, 24, 0, 0))
+                .build()
+
+        ViewCompat.dispatchApplyWindowInsets(activity.webView(), insets)
+        layout(parent, width = 1000, height = 600)
+        assertFalse(button.isLayoutRequested)
+
+        ViewCompat.dispatchApplyWindowInsets(activity.webView(), insets)
+
+        assertFalse(button.isLayoutRequested)
     }
 
     private fun layout(
@@ -1927,6 +1978,13 @@ class MainActivityTest {
             .apply { isAccessible = true }
             .get(this) as ServerSwitcherBand
 
+    private fun MainActivity.switcherBandOrNull(): ServerSwitcherBand? =
+        MainActivity::class
+            .java
+            .getDeclaredField("switcherBand")
+            .apply { isAccessible = true }
+            .get(this) as? ServerSwitcherBand
+
     private fun View.removeLayoutChangeListeners() {
         val listenerInfo =
             View::class
@@ -1953,6 +2011,15 @@ class MainActivityTest {
                 .getDeclaredMethod("receiveServerSwitcherBand", ServerSwitcherBand::class.java)
                 .apply { isAccessible = true }
         shadowOf(Looper.getMainLooper()).runPaused { method.invoke(this, band) }
+    }
+
+    private fun MainActivity.receiveSwitcherHidden(hidden: Boolean) {
+        val method =
+            MainActivity::class
+                .java
+                .getDeclaredMethod("receiveServerSwitcherHidden", Boolean::class.javaPrimitiveType)
+                .apply { isAccessible = true }
+        shadowOf(Looper.getMainLooper()).runPaused { method.invoke(this, hidden) }
     }
 
     private fun OmnigentWebViewClient.proxyAuthState(): ProxyAuthState =
