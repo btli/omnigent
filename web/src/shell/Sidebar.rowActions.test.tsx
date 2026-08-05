@@ -1034,6 +1034,8 @@ describe("right-click context menu", () => {
 });
 
 const TOUCH_POINTER = { pointerId: 1, isPrimary: true, pointerType: "touch" as const };
+// A second finger: non-primary, so the recognizer cancels the gesture in flight.
+const SECOND_TOUCH_POINTER = { pointerId: 2, isPrimary: false, pointerType: "touch" as const };
 
 function touchTarget() {
   const link = screen.getByRole("link", { name: /My Session/ });
@@ -1499,13 +1501,7 @@ describe("touch gesture arbitration", () => {
 
     fireEvent.pointerDown(linkA, { ...TOUCH_POINTER, clientX: 100, clientY: 100 });
     fireEvent.touchStart(linkA, { touches: [first], changedTouches: [first] });
-    fireEvent.pointerDown(linkB, {
-      pointerId: 2,
-      isPrimary: false,
-      pointerType: "touch",
-      clientX: 104,
-      clientY: 104,
-    });
+    fireEvent.pointerDown(linkB, { ...SECOND_TOUCH_POINTER, clientX: 104, clientY: 104 });
     fireEvent.touchStart(linkB, {
       touches: [first, second],
       changedTouches: [second],
@@ -1543,13 +1539,7 @@ describe("touch gesture arbitration", () => {
     expect(rowA).toHaveClass("opacity-40");
 
     const second = touchPoint(linkB, 104, 104, 1);
-    fireEvent.pointerDown(linkB, {
-      pointerId: 2,
-      isPrimary: false,
-      pointerType: "touch",
-      clientX: 104,
-      clientY: 104,
-    });
+    fireEvent.pointerDown(linkB, { ...SECOND_TOUCH_POINTER, clientX: 104, clientY: 104 });
     fireEvent.touchStart(linkB, {
       touches: [moved, second],
       changedTouches: [second],
@@ -1570,13 +1560,7 @@ describe("touch gesture arbitration", () => {
     moveTouch(101, 100);
     expect(row).toHaveClass("opacity-40");
 
-    fireEvent.pointerDown(link, {
-      pointerId: 2,
-      isPrimary: false,
-      pointerType: "touch",
-      clientX: 104,
-      clientY: 104,
-    });
+    fireEvent.pointerDown(link, { ...SECOND_TOUCH_POINTER, clientX: 104, clientY: 104 });
 
     expect(row).not.toHaveClass("opacity-40");
     expect(screen.queryByRole("menu")).toBeNull();
