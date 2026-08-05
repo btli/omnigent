@@ -23,7 +23,7 @@
 //   5. Bulk-selection mode suppresses the header context menu, matching rows.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -310,17 +310,41 @@ describe("project folder header context menu", () => {
     expect(folderHeader()).toHaveAttribute("aria-expanded", "false");
   });
 
-  it("does not toggle the folder when the context menu opens on right-click", () => {
+  it("toggles on the first left-click after the mouse context menu is dismissed", () => {
     renderSidebar();
 
     expect(folderHeader()).toHaveAttribute("aria-expanded", "false");
 
+    fireEvent.pointerDown(folderHeader(), { pointerType: "mouse", button: 2 });
     fireEvent.contextMenu(folderHeader());
 
     // The menu is open and the folder stayed collapsed — Radix preventDefaults
     // the native contextmenu, so no click reaches the collapse toggle.
     expect(screen.getByTestId("rename-project")).toBeInTheDocument();
     expect(folderHeader()).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    fireEvent.click(folderHeader());
+    expect(folderHeader()).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("toggles on the first keyboard activation after its context menu is dismissed", async () => {
+    renderSidebar();
+
+    const header = folderHeader();
+    header.focus();
+
+    // jsdom does not synthesize contextmenu or click from keyboard keys, so
+    // dispatch the browser-generated events explicitly without pointer events.
+    fireEvent.keyDown(header, { key: "F10", shiftKey: true });
+    fireEvent.contextMenu(header);
+    expect(screen.getByTestId("rename-project")).toBeInTheDocument();
+
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    await waitFor(() => expect(header).toHaveFocus());
+
+    fireEvent.click(header, { detail: 0 });
+    expect(folderHeader()).toHaveAttribute("aria-expanded", "true");
   });
 
   it("does not toggle the folder when a long-press opens the menu", () => {

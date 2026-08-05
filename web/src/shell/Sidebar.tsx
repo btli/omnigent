@@ -2095,19 +2095,25 @@ function SectionHeader({
   /** Suppresses the context menu (bulk-selection mode owns the rows). */
   contextMenuDisabled?: boolean;
 }) {
-  // A long-press opens the context menu off Radix's pointerdown timer, but the
-  // trailing pointerup still produces a click — which would collapse/expand the
-  // folder under the just-opened menu. Swallow exactly that click: arm on open,
-  // and re-clear on the next pointerdown so a later plain click still toggles.
+  // Only touch/pen long-presses need their trailing click swallowed.
   const swallowClickRef = useRef(false);
+  const longPressPointerRef = useRef(false);
+
+  const clearLongPressPointer = () => {
+    longPressPointerRef.current = false;
+  };
 
   const button = (
     <button
       type="button"
       aria-expanded={!collapsed}
-      onPointerDown={() => {
+      onPointerDown={(event) => {
         swallowClickRef.current = false;
+        longPressPointerRef.current = event.pointerType === "touch" || event.pointerType === "pen";
       }}
+      onPointerMove={clearLongPressPointer}
+      onPointerUp={clearLongPressPointer}
+      onPointerCancel={clearLongPressPointer}
       onClick={() => {
         if (swallowClickRef.current) {
           swallowClickRef.current = false;
@@ -2185,9 +2191,10 @@ function SectionHeader({
       {contextMenu && !contextMenuDisabled ? (
         <ContextMenu
           onOpenChange={(open) => {
-            // Long-press opens mid-gesture; swallow the trailing click so the
-            // folder doesn't also toggle. Mouse right-click never clicks.
-            if (open) swallowClickRef.current = true;
+            if (open) {
+              swallowClickRef.current = longPressPointerRef.current;
+              longPressPointerRef.current = false;
+            }
           }}
         >
           <ContextMenuTrigger asChild>{button}</ContextMenuTrigger>
