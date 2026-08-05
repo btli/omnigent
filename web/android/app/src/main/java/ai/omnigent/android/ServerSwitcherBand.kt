@@ -36,13 +36,39 @@ fun serverSwitcherBandWidth(
     return bandRight - bandLeft
 }
 
+fun serverSwitcherUsableWidth(
+    containerWidth: Int,
+    band: ServerSwitcherBand,
+    edgeReserve: Int,
+): Int =
+    (serverSwitcherBandWidth(containerWidth, band) - 2 * edgeReserve.coerceAtLeast(0))
+        .coerceAtLeast(0)
+
+fun serverSwitcherBandCanFit(
+    containerWidth: Int,
+    band: ServerSwitcherBand,
+    edgeReserve: Int,
+    minimumWidth: Int,
+): Boolean =
+    containerWidth > 0 &&
+        serverSwitcherUsableWidth(containerWidth, band, edgeReserve) >= minimumWidth
+
+fun serverSwitcherTopMarginUpdate(
+    current: Int,
+    desired: Int,
+): Int? = desired.takeUnless { it == current }
+
 /** Centre within [band], preferring its edge when the supplied pill cannot fit. */
 fun serverSwitcherLeftMargin(
     containerWidth: Int,
     switcherWidth: Int,
     band: ServerSwitcherBand,
+    edgeReserve: Int = 0,
 ): Int {
-    val (bandLeft, bandRight) = band.pixelBounds(containerWidth)
+    val (rawLeft, rawRight) = band.pixelBounds(containerWidth)
+    val reserve = edgeReserve.coerceAtLeast(0)
+    val bandLeft = (rawLeft + reserve).coerceAtMost(rawRight)
+    val bandRight = (rawRight - reserve).coerceAtLeast(bandLeft)
     val centered = (bandLeft + bandRight) / 2.0 - switcherWidth / 2.0
     val maxLeft = bandRight - switcherWidth
     val bandAnchoredLeft =
