@@ -2999,7 +2999,9 @@ function ConversationRow({
   // The kebab menu is controlled so the project submenu can close the whole
   // menu after a pick (a plain click inside the submenu wouldn't otherwise).
   const [menuOpen, setMenuOpen] = useState(false);
-  const contextMenuOpenRef = useRef(false);
+  // Close the row menu directly so an armed touch never sends Escape through
+  // dnd-kit's document-level sensor listeners.
+  const [contextMenuOpen, setContextMenuOpen] = useState(false);
   // Opt-in "delete local branch" checkbox (worktree sessions only).
   const [deleteBranch, setDeleteBranch] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
@@ -3120,18 +3122,8 @@ function ConversationRow({
     Object.assign(event, { [ROW_MENU_SYNTHETIC]: true });
     rowLinkRef.current?.dispatchEvent(event);
   }, []);
-  const onContextMenuOpenChange = useCallback((open: boolean) => {
-    contextMenuOpenRef.current = open;
-  }, []);
   const dismissContextMenu = useCallback(() => {
-    if (!contextMenuOpenRef.current) return;
-    (document.activeElement ?? document.body).dispatchEvent(
-      new globalThis.KeyboardEvent("keydown", {
-        key: "Escape",
-        bubbles: true,
-        cancelable: true,
-      }),
-    );
+    setContextMenuOpen(false);
   }, []);
   const gesture = useRowGesture({
     enabled: gestureEnabled,
@@ -3531,7 +3523,7 @@ function ConversationRow({
           )
         ) : projectFlyoutName ? (
           <HoverCard openDelay={150} closeDelay={0}>
-            <ContextMenu modal={false} onOpenChange={onContextMenuOpenChange}>
+            <ContextMenu modal={false} open={contextMenuOpen} onOpenChange={setContextMenuOpen}>
               <ContextMenuTrigger asChild>
                 <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
               </ContextMenuTrigger>
@@ -3550,7 +3542,7 @@ function ConversationRow({
             />
           </HoverCard>
         ) : isMobile ? (
-          <ContextMenu modal={false} onOpenChange={onContextMenuOpenChange}>
+          <ContextMenu modal={false} open={contextMenuOpen} onOpenChange={setContextMenuOpen}>
             <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
             <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-xs">
               <ConversationMenuItems
@@ -3562,7 +3554,7 @@ function ConversationRow({
           </ContextMenu>
         ) : (
           <Tooltip>
-            <ContextMenu modal={false} onOpenChange={onContextMenuOpenChange}>
+            <ContextMenu modal={false} open={contextMenuOpen} onOpenChange={setContextMenuOpen}>
               <ContextMenuTrigger asChild>
                 <div className="w-full">
                   <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
