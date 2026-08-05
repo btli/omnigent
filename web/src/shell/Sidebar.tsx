@@ -3304,6 +3304,10 @@ function ConversationRow({
       ref={rowLinkRef}
       to={selectionMode ? "#" : `/c/${conversation.id}`}
       componentId="sidebar.conversation_switcher"
+      // Links are natively draggable, and Chrome Android hands a stationary
+      // long-press on one to its native drag machinery — an unconditional
+      // pointercancel that kills the row gesture. Not draggable, not claimed.
+      draggable={false}
       // The recognizer owns touch long-press, so stop the trigger's own 700ms
       // timer from opening a second menu mid-hold; Radix skips its handler once
       // this event is defaultPrevented. Scoped to touch because the recognizer
