@@ -10,7 +10,12 @@ import android.net.Uri
 fun originOf(url: String?): String? {
     val uri = url?.let(Uri::parse) ?: return null
     val scheme = uri.scheme?.lowercase() ?: return null
-    val host = uri.host?.lowercase() ?: return null
+    val host = (uri.host ?: "").lowercase().ifBlank { return null }
+    // Uri.getHost strips IPv6 brackets; restore them or the rebuilt origin
+    // is unparseable ("https://::1:8000"). Strip any existing brackets first
+    // in case Uri doesn't strip them (edge case in some Android versions).
+    val hostWithoutBrackets = host.removeSurrounding("[", "]")
+    val hostPart = if (":" in hostWithoutBrackets) "[$hostWithoutBrackets]" else hostWithoutBrackets
     // Canonicalize like a browser origin (WHATWG): lowercase scheme + host and
     // omit the default port — so an explicit `https://host:443` (or odd casing)
     // the user typed compares equal to the WebView's normalized `https://host`.
@@ -21,7 +26,7 @@ fun originOf(url: String?): String? {
         port != -1 &&
             !(scheme == "https" && port == 443) &&
             !(scheme == "http" && port == 80)
-    return if (hasExplicitPort) "$scheme://$host:$port" else "$scheme://$host"
+    return if (hasExplicitPort) "$scheme://$hostPart:$port" else "$scheme://$hostPart"
 }
 
 /**
