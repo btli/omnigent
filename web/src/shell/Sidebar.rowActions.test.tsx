@@ -220,6 +220,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     public_sharing_enabled: true,
     server_version: null,
     smart_routing_enabled: false,
+    smart_routing_sources: { external: false, oss: false },
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -600,7 +601,12 @@ describe("double-click to rename", () => {
     mockConversations([{ ...CONV, owner: "other@example.com" }]);
     renderSidebar();
     // Radix Tabs triggers activate on mousedown (primary button), not click.
-    fireEvent.mouseDown(screen.getByTestId("sidebar-tab-shared"), { button: 0 });
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-shared"));
 
     fireEvent.dblClick(screen.getByRole("link", { name: /My Session/ }));
 
@@ -1267,7 +1273,7 @@ describe("touch gesture arbitration", () => {
     endTouch(100, 115 + ROW_DRAG_ACTIVATE_PX);
   });
 
-  it("starts drag at the threshold and dismisses the menu exactly once", () => {
+  it("starts drag at the threshold without a menu-dismissal keydown", () => {
     vi.useFakeTimers();
     mocks.isMobile = true;
     renderSidebar();
@@ -1285,9 +1291,9 @@ describe("touch gesture arbitration", () => {
     expect(screen.queryByTestId("rename-conversation")).toBeNull();
 
     moveTouch(100 + ROW_DRAG_ACTIVATE_PX + 10, 100);
+    expect(row).toHaveClass("opacity-40");
     document.removeEventListener("keydown", escapeKeydowns, { capture: true });
-    expect(escapeKeydowns).toHaveBeenCalledOnce();
-    expect(escapeKeydowns.mock.results[0]?.value).toBe("Escape");
+    expect(escapeKeydowns).not.toHaveBeenCalled();
     endTouch(100 + ROW_DRAG_ACTIVATE_PX + 10, 100);
   });
 
