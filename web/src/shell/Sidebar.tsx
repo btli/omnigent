@@ -2576,6 +2576,7 @@ function ConversationMenuItems({
   // to the side. `view` swaps between the main actions and that sub-view;
   // desktop always renders the native side-flyout submenu regardless.
   const isMobile = useIsMobileViewport();
+  const hasCoarsePointer = useCoarsePointer();
   const [view, setView] = useState<"main" | "projects">("main");
 
   // The project pick / create / remove flow — shared verbatim by the desktop
@@ -2628,13 +2629,13 @@ function ConversationMenuItems({
 
   return (
     <>
-      {/* Pin/Unpin — mobile-only (md:hidden); desktop uses the
-          hover-revealed quick-pin button. Archived rows omit it (archive
-          outranks pin). */}
+      {/* Pin/Unpin — desktop uses the hover-revealed quick-pin button, but a
+          coarse-pointer device has no hover at any width, so the menu keeps
+          the item there. Archived rows omit it (archive outranks pin). */}
       {!isArchived && (
         <C.Item
           data-testid="pin-conversation"
-          className="md:hidden"
+          className={hasCoarsePointer ? undefined : "md:hidden"}
           onSelect={() => onTogglePinned(conversation.id)}
         >
           {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
@@ -3979,11 +3980,17 @@ function ProjectFolderMenuItems({
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   actions: ProjectFolderMenuActions;
 }) {
+  const hasCoarsePointer = useCoarsePointer();
   return (
     <>
-      {/* New session — mobile-only (md:hidden); desktop uses the
-          hover-revealed pencil on the folder header. */}
-      <C.Item asChild className="md:hidden" data-testid="project-new-session-menu">
+      {/* New session — desktop uses the hover-revealed pencil on the folder
+          header, but a coarse-pointer device has no hover at any width, so
+          the menu keeps the item there. */}
+      <C.Item
+        asChild
+        className={hasCoarsePointer ? undefined : "md:hidden"}
+        data-testid="project-new-session-menu"
+      >
         <Link
           to={`/?project=${encodeURIComponent(projectName)}`}
           onClick={(e) => {

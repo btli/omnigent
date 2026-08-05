@@ -305,8 +305,9 @@ export function useRowGesture({
 
       const horizontal = Math.abs(deltaX);
       const vertical = Math.abs(deltaY);
-      // Horizontal-dominant travel locks swipe at 12px; other travel waits for
-      // the 25px scroll circle. Since 25/sqrt(2) > 12, (12,0) and (15,20) cannot overlap.
+      // Horizontal-dominant travel locks swipe at 12px. The regions overlap
+      // (e.g. 18,17.5 satisfies both) — this check running first is what gives
+      // swipe precedence; everything it declines waits for the 25px circle.
       if (horizontal >= ROW_SWIPE_ACTIVATE_PX && horizontal > vertical) {
         const action = deltaX < 0 ? actions.left : actions.right;
         if (!swipeEnabled || action === "none") {
