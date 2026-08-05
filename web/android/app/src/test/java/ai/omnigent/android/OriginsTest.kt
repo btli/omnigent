@@ -19,12 +19,13 @@ class OriginsTest {
                 "http://good.com:80/x" to "http://good.com",
                 "HTTPS://GOOD.com/x" to "https://good.com",
                 "https://a:b@good.com:8443" to "https://good.com:8443",
-                "https://good.com:notaport" to "https://good.com",
                 "https://good.com./x" to "https://good.com.",
             )
 
         cases.forEach { (url, expected) -> assertEquals(url, expected, originOf(url)) }
         assertNull(originOf("https:foo"))
+        // WHATWG: a non-numeric port is a parse failure, not a strippable extra.
+        assertNull(originOf("https://good.com:notaport"))
     }
 
     @Test
