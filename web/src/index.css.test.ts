@@ -64,6 +64,14 @@ const TARGETS = {
 const UNPREFIXED_DECL = /(?<![-\w])backdrop-filter\s*:/;
 const WEBKIT_DECL = /-webkit-backdrop-filter\s*:/;
 
+/** The selector text of an extracted rule block, minus any leading comment. */
+function selectorOf(rule: string): string {
+  return rule
+    .slice(0, rule.indexOf("{"))
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .trim();
+}
+
 /** Innermost `selector { ... }` blocks that declare backdrop-filter. */
 function extractBackdropFilterRules(css: string): string[] {
   const blocks = css.match(/[^{}]+\{[^{}]*\}/g) ?? [];
@@ -118,11 +126,7 @@ describe("index.css backdrop-filter glass rules", () => {
 describe("index.css bg-card glass rule selector", () => {
   // The selector of the rule declaring the bg-card glass border/blur.
   const cardRule = extractBackdropFilterRules(cssSource).find((rule) => rule.includes(".bg-card"))!;
-  // Strip comments preceding the selector in the extracted block.
-  const selector = cardRule
-    .slice(0, cardRule.indexOf("{"))
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .trim();
+  const selector = selectorOf(cardRule);
 
   function makeAside(): HTMLElement {
     const dark = document.createElement("div");
@@ -176,10 +180,7 @@ const workspaceSafeAreaRules = workspaceRules.filter(([block]) =>
   block.includes("--omnigent-safe-top"),
 );
 const workspaceSafeAreaRule = workspaceSafeAreaRules[0]?.[0] ?? "";
-const workspaceSelector = workspaceSafeAreaRule
-  .slice(0, workspaceSafeAreaRule.indexOf("{"))
-  .replace(/\/\*[\s\S]*?\*\//g, "")
-  .trim();
+const workspaceSelector = selectorOf(workspaceSafeAreaRule);
 const workspaceCss = workspaceRules.map(([block]) => block).join("\n");
 const fullHeightPanelRule =
   cssBlocks.find(
@@ -263,49 +264,58 @@ function renderWorkspace(platform: "android" | "ios"): HTMLElement {
   return screen.getByRole("complementary", { name: "Workspace" });
 }
 
+/** Runs `assertions` with `css` applied to the document, then removes it. */
+function withStyle(css: string, assertions: () => void): void {
+  const style = document.createElement("style");
+  style.textContent = css;
+  document.head.appendChild(style);
+  try {
+    assertions();
+  } finally {
+    style.remove();
+  }
+}
+
+/** The four safe-area vars must land on the element's padding, edge for edge. */
+function expectSafeAreaPadding(element: HTMLElement, variableFallback: string): void {
+  const computed = getComputedStyle(element);
+  expect(computed.paddingTop).toBe(`var(--omnigent-safe-top${variableFallback})`);
+  expect(computed.paddingBottom).toBe(`var(--omnigent-safe-bottom${variableFallback})`);
+  expect(computed.paddingLeft).toBe(`var(--omnigent-safe-left${variableFallback})`);
+  expect(computed.paddingRight).toBe(`var(--omnigent-safe-right${variableFallback})`);
+}
+
 function assertWorkspacePadding(
   css: string,
   platform: "android" | "ios",
   variableFallback = "",
 ): void {
-  const style = document.createElement("style");
-  style.textContent = css;
-  document.head.appendChild(style);
-  try {
-    const computed = getComputedStyle(renderWorkspace(platform));
-    expect(computed.paddingTop).toBe(`var(--omnigent-safe-top${variableFallback})`);
-    expect(computed.paddingBottom).toBe(`var(--omnigent-safe-bottom${variableFallback})`);
-    expect(computed.paddingLeft).toBe(`var(--omnigent-safe-left${variableFallback})`);
-    expect(computed.paddingRight).toBe(`var(--omnigent-safe-right${variableFallback})`);
-  } finally {
-    style.remove();
-    cleanup();
-  }
+  withStyle(css, () => {
+    try {
+      expectSafeAreaPadding(renderWorkspace(platform), variableFallback);
+    } finally {
+      cleanup();
+    }
+  });
 }
 
 function assertFullHeightPanelPadding(css: string, variableFallback = ""): void {
-  const style = document.createElement("style");
-  style.textContent = css;
-  const shell = document.createElement("div");
-  shell.setAttribute("data-android-native", "");
-  document.head.appendChild(style);
-  document.body.appendChild(shell);
-  try {
-    for (const target of FULL_HEIGHT_PANEL_TARGETS) {
-      const panel = document.createElement("div");
-      if ("className" in target) panel.className = target.className;
-      if ("testId" in target) panel.dataset.testid = target.testId;
-      shell.appendChild(panel);
-      const computed = getComputedStyle(panel);
-      expect(computed.paddingTop).toBe(`var(--omnigent-safe-top${variableFallback})`);
-      expect(computed.paddingBottom).toBe(`var(--omnigent-safe-bottom${variableFallback})`);
-      expect(computed.paddingLeft).toBe(`var(--omnigent-safe-left${variableFallback})`);
-      expect(computed.paddingRight).toBe(`var(--omnigent-safe-right${variableFallback})`);
+  withStyle(css, () => {
+    const shell = document.createElement("div");
+    shell.setAttribute("data-android-native", "");
+    document.body.appendChild(shell);
+    try {
+      for (const target of FULL_HEIGHT_PANEL_TARGETS) {
+        const panel = document.createElement("div");
+        if ("className" in target) panel.className = target.className;
+        if ("testId" in target) panel.dataset.testid = target.testId;
+        shell.appendChild(panel);
+        expectSafeAreaPadding(panel, variableFallback);
+      }
+    } finally {
+      shell.remove();
     }
-  } finally {
-    shell.remove();
-    style.remove();
-  }
+  });
 }
 
 /** Brace nesting depth at a source index; 0 is top level. */
@@ -331,10 +341,7 @@ function braceDepthAt(sourceIndex: number): number {
 
 describe("index.css native safe-area layout", () => {
   it("folds Android and browser safe areas on both lateral edges", () => {
-    const style = document.createElement("style");
-    style.textContent = rootSafeAreaRule;
-    document.head.appendChild(style);
-    try {
+    withStyle(rootSafeAreaRule, () => {
       const computed = getComputedStyle(document.documentElement);
       expect(computed.getPropertyValue("--omnigent-safe-left")).toContain(
         "--omnigent-android-safe-area-left",
@@ -342,9 +349,7 @@ describe("index.css native safe-area layout", () => {
       expect(computed.getPropertyValue("--omnigent-safe-right")).toContain(
         "--omnigent-android-safe-area-right",
       );
-    } finally {
-      style.remove();
-    }
+    });
   });
 
   it("keeps the Workspace rule at the top level", () => {
@@ -399,16 +404,14 @@ describe("Android injected safe-area layout", () => {
  * applying to cells only, and never leaks into prose links.
  */
 describe("index.css table link wrapping rule", () => {
-  const rule = (cssSource.match(/[^{}]+\{[^{}]*\}/g) ?? []).find(
-    (block) => block.includes('[data-streamdown="table-cell"]') && /overflow-wrap\s*:/.test(block),
-  );
+  const rule = cssBlocks.find(
+    ([block]) =>
+      block.includes('[data-streamdown="table-cell"]') && /overflow-wrap\s*:/.test(block),
+  )?.[0];
 
   // Derived lazily: a missing rule must fail the assertions below with a
   // readable message, not crash at collection time.
-  const selector = (rule ?? "")
-    .slice(0, rule ? rule.indexOf("{") : 0)
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .trim();
+  const selector = selectorOf(rule ?? "");
 
   it("has the rule this test exists to protect", () => {
     expect(rule, "the table-cell link wrapping rule is gone from index.css").toBeDefined();
