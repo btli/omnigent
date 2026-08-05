@@ -352,6 +352,16 @@ describe("project folder header context menu", () => {
     expect(folderHeader()).toHaveAttribute("aria-expanded", "true");
   });
 
+  it("suppresses native text selection of the header title", () => {
+    // A long-press must open the menu, not select the project name. Session
+    // rows suppress selection by preventDefault-ing touch pointerdown, but on
+    // this trigger that would also cancel Radix's composed long-press timer —
+    // so the header relies on user-select: none instead. jsdom cannot run a
+    // real selection, so pin the class that carries the behavior.
+    renderSidebar();
+    expect(folderHeader()).toHaveClass("select-none");
+  });
+
   it("does not toggle the folder when a long-press opens the menu", () => {
     // The gotcha this PR had to solve: the long-press fires mid-gesture off
     // Radix's pointerdown timer, but the trailing pointerup still produces a
