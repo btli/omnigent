@@ -1861,10 +1861,6 @@ class MainActivityTest {
         return manager to releaseWorker
     }
 
-    private fun MainActivity.switchButton(): View = ReflectionHelpers.getField(this, "switchButton")
-
-    private fun MainActivity.webView(): WebView = ReflectionHelpers.getField(this, "webView")
-
     private fun OmnigentWebViewClient.proxyAuthState(): ProxyAuthState =
         ReflectionHelpers.getField(this, "proxyAuthState")
 

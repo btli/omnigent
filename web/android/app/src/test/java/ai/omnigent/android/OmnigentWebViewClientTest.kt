@@ -39,7 +39,7 @@ class OmnigentWebViewClientTest {
 
     @Test
     fun `page start resets native layout before the new page finishes`() {
-        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val webView = webView()
         var navigationStarts = 0
         val client =
             client(
