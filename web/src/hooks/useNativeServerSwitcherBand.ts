@@ -1,13 +1,12 @@
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 
 import {
   isAndroidShell,
-  NATIVE_READY_EVENT,
   setNativeServerSwitcherBand,
   setNativeServerSwitcherHidden,
 } from "@/lib/nativeBridge";
 
-import { useSurfaceFrontmost } from "./useNativeServerSwitcher";
+import { useShellReady, useSurfaceFrontmost } from "./useNativeServerSwitcher";
 
 /**
  * Publish the chat column's horizontal extent so the native server switcher can
@@ -25,15 +24,7 @@ import { useSurfaceFrontmost } from "./useNativeServerSwitcher";
  * clobber. No-op outside the Android shell.
  */
 export function useNativeServerSwitcherBand(column: HTMLElement | null): void {
-  // The shell's bridge can attach after mount (Android's page-finished
-  // fallback), so an off-shell answer is re-checked once the shell announces.
-  const [shellReady, setShellReady] = useState(isAndroidShell);
-  useEffect(() => {
-    if (shellReady) return;
-    const handleReady = () => setShellReady(isAndroidShell());
-    window.addEventListener(NATIVE_READY_EVENT, handleReady);
-    return () => window.removeEventListener(NATIVE_READY_EVENT, handleReady);
-  }, [shellReady]);
+  const shellReady = useShellReady(isAndroidShell);
 
   // Sole Android owner of the switcher's visibility: any overlay covering the
   // column (drawer, sidebar, sheet, maximized rail) drops frontmost and hides
