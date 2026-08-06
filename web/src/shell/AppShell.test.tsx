@@ -635,20 +635,9 @@ describe("native server switcher band", () => {
     expect(setBand).not.toHaveBeenCalled();
   });
 
-  it("hides when the main column is only one pixel wide", () => {
-    const setBand = vi.fn();
-    const setHidden = vi.fn();
-    installShell("android", setBand, setHidden);
-    installLayoutRects(1);
-    mockConversations([]);
-
-    renderShell("/");
-
-    expect(setBand).not.toHaveBeenCalled();
-    expect(setHidden).toHaveBeenLastCalledWith(true);
-  });
-
-  it("does not borrow the workspace region below the usable-band threshold", () => {
+  it("publishes even a sliver column; native owns the too-small-to-fit policy", () => {
+    // The shell's control reserve + minimum pill width decide "too narrow";
+    // the web layer publishes the geometry as-is so the policy lives once.
     const setBand = vi.fn();
     const setHidden = vi.fn();
     installShell("android", setBand, setHidden);
@@ -657,19 +646,8 @@ describe("native server switcher band", () => {
 
     renderShell("/");
 
-    expect(setBand).not.toHaveBeenCalled();
-    expect(setHidden).toHaveBeenLastCalledWith(true);
-  });
-
-  it("publishes the chat column at the usable-band threshold", () => {
-    const setBand = vi.fn();
-    installShell("android", setBand);
-    installLayoutRects(64);
-    mockConversations([]);
-
-    renderShell("/");
-
-    expect(setBand).toHaveBeenCalledWith(0.32, 0.384);
+    expect(setBand).toHaveBeenCalledWith(0.32, 0.383);
+    expect(setHidden).toHaveBeenLastCalledWith(false);
   });
 
   it("does not publish when both observed elements are absent", () => {
@@ -769,16 +747,23 @@ describe("native server switcher band", () => {
   });
 
   it("coalesces each window resize source through an animation frame", () => {
-    const callbacks: FrameRequestCallback[] = [];
+    // Honor cancellation: schedule() replaces a pending frame, so the mock
+    // must drop cancelled callbacks or coalescing can't be observed.
+    const callbacks = new Map<number, FrameRequestCallback>();
+    let nextFrameId = 1;
     vi.mocked(window.requestAnimationFrame).mockImplementation((callback) => {
-      callbacks.push(callback);
-      return callbacks.length;
+      callbacks.set(nextFrameId, callback);
+      return nextFrameId++;
+    });
+    vi.spyOn(window, "cancelAnimationFrame").mockImplementation((handle) => {
+      callbacks.delete(handle);
     });
     // Frontmost tracking schedules frames of its own, so drain the queue (new
     // frames can be enqueued by flushed ones) and assert on publish counts.
     const flushFrames = () => {
-      while (callbacks.length > 0) {
-        const callback = callbacks.shift()!;
+      while (callbacks.size > 0) {
+        const [handle, callback] = callbacks.entries().next().value!;
+        callbacks.delete(handle);
         act(() => callback(0));
       }
     };
