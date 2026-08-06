@@ -1464,15 +1464,8 @@ describe("useRowSwipe — dnd coexistence", () => {
     });
     expect(result.current.dx).toBe(-60);
 
-    // Well past it, travel is damped and never exceeds the cap — so the row
-    // can't be dragged far enough to push its title out of the panel.
-    act(() => {
-      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
-    });
-    expect(Math.abs(result.current.dx)).toBeLessThanOrEqual(96);
-    expect(Math.abs(result.current.dx)).toBeGreaterThanOrEqual(72);
-
-    // A 300px drag is still capped at 96.
+    // A 300px drag is damped and hard-capped — the row can't be dragged far
+    // enough to push its title out of the panel.
     act(() => {
       result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
     });

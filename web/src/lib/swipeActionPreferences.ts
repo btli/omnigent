@@ -107,22 +107,33 @@ function getSnapshot(): SwipeActionPreferences {
   return snapshot;
 }
 
+// One module-level window listener pair fanning out to a shared set (the
+// useMediaQuery shape): N mounted rows cost one registration, not 2N.
+const listeners = new Set<() => void>();
+
+function handleChange(e: Event): void {
+  // Ignore unrelated `storage` events; refresh on our key or the same-tab ping.
+  if (e instanceof StorageEvent && e.key !== null && e.key !== STORAGE_KEY) return;
+  refreshSnapshot();
+  for (const listener of listeners) listener();
+}
+
 function subscribe(onChange: () => void): () => void {
   if (typeof window === "undefined") return () => {};
-  const handler = (e: Event) => {
-    // Ignore unrelated `storage` events; refresh on our key or the same-tab ping.
-    if (e instanceof StorageEvent && e.key !== null && e.key !== STORAGE_KEY) return;
+  if (listeners.size === 0) {
+    window.addEventListener("storage", handleChange);
+    window.addEventListener(SWIPE_ACTIONS_EVENT, handleChange);
+    // Catch up on writes made while no subscriber was mounted (React re-checks
+    // the snapshot right after subscribing, so a change here still renders).
     refreshSnapshot();
-    onChange();
-  };
-  // Catch up on writes made while no subscriber was mounted (React re-checks
-  // the snapshot right after subscribing, so a change here still renders).
-  refreshSnapshot();
-  window.addEventListener("storage", handler);
-  window.addEventListener(SWIPE_ACTIONS_EVENT, handler);
+  }
+  listeners.add(onChange);
   return () => {
-    window.removeEventListener("storage", handler);
-    window.removeEventListener(SWIPE_ACTIONS_EVENT, handler);
+    listeners.delete(onChange);
+    if (listeners.size === 0) {
+      window.removeEventListener("storage", handleChange);
+      window.removeEventListener(SWIPE_ACTIONS_EVENT, handleChange);
+    }
   };
 }
 
