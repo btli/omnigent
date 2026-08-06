@@ -133,6 +133,10 @@ private fun parseIpv4Number(part: String): Long? {
             }
         }
     if (digits.isEmpty()) return 0L // "0x" alone parses as zero per WHATWG
+    // WHATWG IPv4 numbers are bare radix digits — toLong would accept a
+    // leading sign, letting host "+1" pin as 0.0.0.1 while Chromium treats
+    // it as a domain.
+    if (digits.any { it.digitToIntOrNull(radix) == null }) return null
     val significant = digits.trimStart('0').ifEmpty { "0" }
     if (significant.length > 12) return null // already beyond 32 bits in any radix
     return try {
@@ -178,6 +182,9 @@ fun originOf(url: String?): String? {
     // The pinned origin and every page URL both flow through here, so they
     // canonicalize identically.
     val port = uri.port
+    // WHATWG rejects ports beyond the 16-bit range; letting one through would
+    // persist a server the WebView can never load.
+    if (port > 0xffff) return null
     val hasExplicitPort =
         port != -1 &&
             !(scheme == "https" && port == 443) &&
