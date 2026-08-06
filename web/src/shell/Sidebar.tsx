@@ -3003,7 +3003,8 @@ function ConversationRow({
   );
   // The menu render branches below are mutually exclusive; switching branches
   // remounts the ContextMenu, and a stale open=true would reopen the fresh
-  // menu anchored at the viewport corner. Close it when the branch changes.
+  // menu anchored at the viewport corner. Reset during render (not in an
+  // effect) so the remounted menu never paints open.
   const menuBranch = selectionMode
     ? "none"
     : projectFlyoutName
@@ -3011,9 +3012,11 @@ function ConversationRow({
       : isMobile
         ? "mobile"
         : "desktop";
-  useEffect(() => {
-    setContextMenuOpen(false);
-  }, [menuBranch]);
+  const [prevMenuBranch, setPrevMenuBranch] = useState(menuBranch);
+  if (prevMenuBranch !== menuBranch) {
+    setPrevMenuBranch(menuBranch);
+    if (contextMenuOpen) setContextMenuOpen(false);
+  }
   // A drag ends with a synthetic click on the row's <Link> (mousedown + mouseup
   // on the same anchor still fires a click); swallow that one click so a drag
   // doesn't also navigate into the session. Flagged when a drag finishes,
