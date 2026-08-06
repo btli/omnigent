@@ -334,7 +334,7 @@ export function useRowSwipe({
       s.offset = offset;
       setDx(offset);
     },
-    [actions.left, actions.right, isDragging],
+    [actions, isDragging],
   );
 
   const onPointerUp = useCallback(
@@ -354,7 +354,7 @@ export function useRowSwipe({
       reset();
       if (committed && action !== "none") onAction(action);
     },
-    [actions.left, actions.right, onAction, reset],
+    [actions, onAction, reset],
   );
 
   const onClickCapture = useCallback((e: MouseEvent) => {
