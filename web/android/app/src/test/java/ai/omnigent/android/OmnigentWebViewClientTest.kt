@@ -678,10 +678,28 @@ class OmnigentWebViewClientTest {
     }
 
     @Test
-    fun `main-frame onReceivedHttpError for the current URL ends the flow`() {
+    fun `main-frame onReceivedHttpError for an uncommitted hop ends the flow`() {
         val webView = webView()
         var loginRequired = false
         val client = client(onLoginRequired = { loginRequired = true })
+        enterFlow(client, webView)
+
+        client.onReceivedHttpError(
+            webView,
+            request(PROXY_AUTH_URL),
+            httpErrorResponse(),
+        )
+
+        assertTrue(client.shouldOverrideUrlLoading(webView, request(OTHER_IDP_URL)))
+        assertTrue(loginRequired)
+    }
+
+    @Test
+    fun `main-frame onReceivedHttpError for a committed IdP page keeps the flow alive`() {
+        // An IdP can serve its interactive login form with a 401/403 status;
+        // the user is still authenticating, so the flow must stay in flight.
+        val webView = webView()
+        val client = client()
         enterFlow(client, webView)
         client.onPageStarted(webView, PLAIN_IDP_URL, null)
 
@@ -691,8 +709,7 @@ class OmnigentWebViewClientTest {
             httpErrorResponse(),
         )
 
-        assertTrue(client.shouldOverrideUrlLoading(webView, request(OTHER_IDP_URL)))
-        assertTrue(loginRequired)
+        assertFalse(client.shouldOverrideUrlLoading(webView, request(OTHER_IDP_URL)))
     }
 
     @Test
@@ -1007,6 +1024,20 @@ class OmnigentWebViewClientTest {
         assertFalse(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
     }
 
+    @Test
+    fun `a benign parameter carrying the token is not a refusal`() {
+        val webView = webView()
+        var unsupported = 0
+        val client = client(onEmbeddedSignInUnsupported = { unsupported++ })
+        enterFlow(client, webView)
+
+        client.onPageStarted(webView, REJECTION_LOOKALIKE_URL, null)
+
+        assertEquals(0, unsupported)
+        assertEquals(0, webView.stopLoadingCalls)
+        assertFalse(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
+    }
+
     private fun enterFlow(
         client: OmnigentWebViewClient,
         webView: RecordingWebView,
@@ -1179,6 +1210,9 @@ class OmnigentWebViewClientTest {
                 "%2Frejected%3Ferror%3Ddisallowed%5Fuseragent"
         const val REJECTION_PATH_URL =
             "https://accounts.google.com/help/disallowed_useragent/details"
+        const val REJECTION_LOOKALIKE_URL =
+            "https://idp.example.com/authorize?state=disallowed_useragent" +
+                "&note=error%3Ddisallowed" // an error mention that is not the error param
 
         const val WEBVIEW_USER_AGENT =
             "Mozilla/5.0 (Linux; Android 14; Pixel Build/X; wv) AppleWebKit/537.36 " +

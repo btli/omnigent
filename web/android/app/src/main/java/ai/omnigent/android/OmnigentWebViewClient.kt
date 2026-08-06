@@ -44,6 +44,11 @@ class OmnigentWebViewClient(
     // URL last started while the current flow was in flight.
     private var trackedMainFrameUrl: String? = null
 
+    // Whether the tracked hop reached onPageStarted. A committed hop renders
+    // its response even on an error status (an IdP's 401 login form), so only
+    // an HTTP error on a hop that never committed may end the flow.
+    private var trackedMainFrameCommitted = false
+
     // The self-stop ledger describes WebView loading, independently of auth.
     private var activeMainFrameUrl: String? = null
     private var isLoading = false
@@ -73,6 +78,7 @@ class OmnigentWebViewClient(
         proxyAuthState = ProxyAuthState.IDLE
         flowStartedAt = 0L
         trackedMainFrameUrl = null
+        trackedMainFrameCommitted = false
         lastSelfStoppedUrl = null
     }
 
@@ -122,6 +128,7 @@ class OmnigentWebViewClient(
 
         if (proxyAuthState == ProxyAuthState.IN_FLIGHT) {
             trackedMainFrameUrl = url
+            trackedMainFrameCommitted = true
             if (isEmbeddedSignInUnsupported(url)) {
                 proxyAuthState = ProxyAuthState.REFUSED
                 stopLoadingAndLedger(view)
@@ -202,6 +209,7 @@ class OmnigentWebViewClient(
         // to handleReceivedError without any onPageStarted) still exits the flow.
         if (proxyAuthState == ProxyAuthState.IN_FLIGHT) {
             trackedMainFrameUrl = urlString
+            trackedMainFrameCommitted = false
             authLog("proxy-auth nav $origin — loading inline")
             return false
         }
@@ -210,6 +218,7 @@ class OmnigentWebViewClient(
             if (request.isRedirect) {
                 enterProxyAuth()
                 trackedMainFrameUrl = urlString
+                trackedMainFrameCommitted = false
                 authLog("proxy-auth nav $origin — loading inline")
                 return false
             }
@@ -244,7 +253,7 @@ class OmnigentWebViewClient(
         errorResponse: WebResourceResponse,
     ) {
         super.onReceivedHttpError(view, request, errorResponse)
-        handleReceivedError(request)
+        handleReceivedError(request, httpError = true)
     }
 
     override fun onReceivedSslError(
@@ -272,11 +281,18 @@ class OmnigentWebViewClient(
      * either error callback. `internal` because [WebResourceError] has no
      * constructor tests can reach.
      */
-    internal fun handleReceivedError(request: WebResourceRequest) {
+    internal fun handleReceivedError(
+        request: WebResourceRequest,
+        httpError: Boolean = false,
+    ) {
         if (!request.isForMainFrame) return
 
         val requestUrl = request.url.toString()
         if (activeMainFrameUrl == requestUrl) isLoading = false
+        // A committed hop renders its body even on an error status — an IdP's
+        // 401/403 interactive login page — so only a hop that never reached
+        // onPageStarted lets an HTTP error end the flow.
+        if (httpError && trackedMainFrameCommitted) return
         if (proxyAuthState == ProxyAuthState.IN_FLIGHT && trackedMainFrameUrl == requestUrl) {
             endProxyAuth()
         }
@@ -292,18 +308,41 @@ class OmnigentWebViewClient(
 
     private fun isEmbeddedSignInUnsupported(url: String?): Boolean {
         val uri = url?.let(Uri::parse) ?: return false
-        return containsEmbeddedRejection(uri.encodedQuery) ||
-            containsEmbeddedRejection(uri.encodedFragment)
+        if (uri.isOpaque) return false
+        return hasEmbeddedRejectionParam(uri.encodedQuery) ||
+            hasEmbeddedRejectionParam(uri.encodedFragment)
     }
 
-    private fun containsEmbeddedRejection(component: String?): Boolean {
-        if (component == null) return false
-        return component.contains(EMBEDDED_REJECTION) ||
-            Uri.decode(component).contains(EMBEDDED_REJECTION)
+    /**
+     * True when [component] carries the rejection as an error parameter's
+     * value, directly or inside a redirect parameter one encoding level deep.
+     * A benign parameter that merely mentions the token (`state=...`) must not
+     * abort authentication.
+     */
+    private fun hasEmbeddedRejectionParam(
+        component: String?,
+        depth: Int = 0,
+    ): Boolean {
+        if (component.isNullOrEmpty()) return false
+        for (pair in component.split('&')) {
+            val key = Uri.decode(pair.substringBefore('='))
+            val value = Uri.decode(pair.substringAfter('=', missingDelimiterValue = ""))
+            if (key in EMBEDDED_REJECTION_KEYS && value == EMBEDDED_REJECTION) return true
+            if (depth > 0) continue
+            val nested = runCatching { Uri.parse(value) }.getOrNull() ?: continue
+            if (nested.isOpaque) continue
+            if (hasEmbeddedRejectionParam(nested.encodedQuery, depth + 1) ||
+                hasEmbeddedRejectionParam(nested.encodedFragment, depth + 1)
+            ) {
+                return true
+            }
+        }
+        return false
     }
 
     private companion object {
         const val EMBEDDED_REJECTION = "disallowed_useragent"
+        val EMBEDDED_REJECTION_KEYS = setOf("error", "error_subtype")
         const val PROXY_AUTH_DEADLINE_MILLIS = 6 * 60_000L
     }
 }

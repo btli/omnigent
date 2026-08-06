@@ -36,6 +36,33 @@ class OriginsTest {
     }
 
     @Test
+    fun `ipv6 literals collapse to the form the WebView reports`() {
+        // Chromium serializes the shortest RFC 5952 form; an uncompressed pin
+        // must compare equal to it or a healthy server can never log in.
+        assertEquals("https://[::1]:8000", originOf("https://[0:0:0:0:0:0:0:1]:8000/x"))
+        assertEquals("https://[2001:db8::1]", originOf("https://[2001:0db8:0:0:0:0:0:1]/x"))
+        assertEquals(
+            "https://[2001:db8:0:1:1:1:1:1]",
+            originOf("https://[2001:db8:0:1:1:1:1:1]/x"),
+        )
+        assertEquals("https://[::ffff:7f00:1]", originOf("https://[::ffff:127.0.0.1]/x"))
+        assertNull(originOf("https://[not-an-address]/x"))
+        assertNull(originOf("https://[::1%25eth0]/x"))
+    }
+
+    @Test
+    fun `ipv4 shorthand literals expand like Chromium`() {
+        assertEquals("https://127.0.0.1", originOf("https://127.1/x"))
+        assertEquals("https://127.0.0.1", originOf("https://0x7f.0.0.1/x"))
+        assertEquals("https://127.0.0.1:8000", originOf("https://2130706433:8000/x"))
+        assertEquals("https://127.0.0.1", originOf("https://127.0.0.1/x"))
+        // WHATWG: a host ending in a number must fully parse as IPv4.
+        assertNull(originOf("https://1.2.3.4.5/x"))
+        assertNull(originOf("https://127.0.0.999/x"))
+        assertNull(originOf("https://foo.0x1/x"))
+    }
+
+    @Test
     fun `hosts canonicalize like Chromium's UTS-46, not IDNA2003`() {
         // java.net.IDN (IDNA2003) maps faß.de to fass.de — a different
         // registrable domain than the xn--fa-hia.de the WebView loads.
@@ -59,6 +86,17 @@ class OriginsTest {
         assertNull(normalizeServerUrl("ftp://example.com"))
         assertNull(normalizeServerUrl("https://good.com/bad path"))
         assertNull(normalizeServerUrl("https:///missing-host"))
+    }
+
+    @Test
+    fun `server input the pinned-origin gate cannot canonicalize is rejected`() {
+        // Persisting one of these would pin a null origin, and the fail-closed
+        // page gate would then silently stop every load — surface the error at
+        // connect time instead.
+        assertNull(normalizeServerUrl("https://a..b"))
+        assertNull(normalizeServerUrl("https://good.com:notaport"))
+        assertNull(normalizeServerUrl("https://[not-an-address]"))
+        assertNull(normalizeServerUrl("https://1.2.3.4.5"))
     }
 
     @Test

@@ -693,16 +693,13 @@ class MainActivity : AppCompatActivity() {
             return
         }
         removeBridge()
-        loginManager.cancel()
+        clearCrossServerState()
         pinnedOrigin = newOrigin
         shellWebViewClient.resetForOriginChange(newOrigin)
         dismissEmbeddedSignInDialogWithoutReset()
         loginFailedDialog?.dismiss()
         loginFailedDialog = null
         shellWebViewClient.stopLoadingAndLedger(webView)
-        notifications.cancelAll()
-        pendingNavigatePath = null
-        pendingNavigateOrigin = null
         loginAttachment?.let(loginManager::detach)
         loginAttachment = loginManager.attach(newOrigin, ::onLoginResult)
         notifications.setOrigin(newOrigin)
@@ -1143,7 +1140,7 @@ class MainActivity : AppCompatActivity() {
         if (!isHttpScheme(Uri.parse(url).scheme)) return
         val downloadOrigin = originOf(url)
         val pin = pinnedOrigin
-        if (downloadOrigin != null && pin != null && downloadOrigin == pin) {
+        if (pin != null && downloadOrigin == pin) {
             pinnedOriginDownloader.download(
                 url,
                 pin,
