@@ -56,6 +56,7 @@ import {
   DragOverlay,
   type DragEndEvent,
   type DragStartEvent,
+  MeasuringStrategy,
   MouseSensor,
   pointerWithin,
   useDraggable,
@@ -195,8 +196,17 @@ const SIDEBAR_ACTIVE_HIGHLIGHT =
   "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)]";
 const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 const UNGROUP_DROP_ZONE_ID = "__ungroup__";
+const UNGROUP_FLOATING_ZONE_ID = "__ungroup_floating__";
 // A resized section can move later drop zones without resizing them.
 const SIDEBAR_RESIZE_OBSERVER_CONFIG = { updateMeasurementsFor: [] };
+// The inline ungroup slot mounts mid-drag at the seam between projects and
+// unfiled sessions, shifting everything below it — remeasure droppables on
+// registry changes so their stored rects track the shifted layout.
+const SIDEBAR_DND_MEASURING = { droppable: { strategy: MeasuringStrategy.Always } };
+// Where the inline ungroup slot sits relative to the list viewport, reported
+// by the slot itself. "unmounted" (slot not rendered, e.g. search results)
+// falls back to the floating strip at the bottom edge.
+type UngroupSlotPlacement = "inline" | "above" | "below" | "unmounted";
 
 // Maps a first-class project id → its name, provided once at the list level so
 // each row resolves its ``project_id`` to a folder name without its own
@@ -890,6 +900,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
 
           <nav
             ref={scrollContainerRef}
+            data-testid="sidebar-scroll-frame"
             // Keep wheel/touch scrolling without letting classic-scrollbar
             // platforms reserve a wide, permanently visible Sidebar gutter.
             className="relative flex-1 overflow-y-auto px-2 pt-4 pb-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
@@ -1494,6 +1505,8 @@ function ConversationList({
     project: string | null;
     isPinned: boolean;
   } | null>(null);
+  const [ungroupSlotPlacement, setUngroupSlotPlacement] =
+    useState<UngroupSlotPlacement>("unmounted");
   // Mouse keeps its click-safe distance. Touch is activated only after the row
   // recognizer resolves a held-and-moved finger to drag.
   const sensors = useSensors(
@@ -1753,6 +1766,7 @@ function ConversationList({
       <DndContext
         sensors={sensors}
         collisionDetection={pointerWithin}
+        measuring={SIDEBAR_DND_MEASURING}
         onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
         onDragCancel={() => {
@@ -1879,6 +1893,16 @@ function ConversationList({
                       )}
                   </SectionGroup>
                 )}
+                {/* The natural ungroup target: the seam where unfiled sessions
+                begin. Mounted only while a filed session drags; reports its
+                own on-screen placement so the floating fallback can cover it
+                while the seam is scrolled away. */}
+                {!showShared && activeDrag?.project != null && (
+                  <UngroupDropSlot
+                    scrollFrameRef={scrollContainerRef}
+                    onPlacementChange={setUngroupSlotPlacement}
+                  />
+                )}
                 {sections.sessions.length > 0 && (
                   // Drop a session here to send it to the flat "Chats" list — where
                   // unfiled, unpinned sessions live. Active while dragging a filed
@@ -1954,11 +1978,14 @@ function ConversationList({
                 )}
               </>
             )}
-            {/* Mounted during any filed-session drag; fixed positioning keeps
-            it out of the document flow, so mounting never shifts a row under
-            the pointer that is already dragging it. */}
-            {!showShared && activeDrag?.project != null && (
-              <UngroupDropZone scrollFrameRef={scrollContainerRef} />
+            {/* Floating stand-in while the inline seam is off-screen (or not
+            rendered at all, as in search results): pinned to the list edge
+            nearest the seam until scrolling latches the real slot into view. */}
+            {!showShared && activeDrag?.project != null && ungroupSlotPlacement !== "inline" && (
+              <UngroupFloatingStrip
+                scrollFrameRef={scrollContainerRef}
+                edge={ungroupSlotPlacement === "above" ? "top" : "bottom"}
+              />
             )}
           </div>
         </RowEditHoldContext.Provider>
@@ -2030,32 +2057,102 @@ function PinDropZone({ active, children }: { active: boolean; children: ReactNod
   );
 }
 
-/** Bottom ungroup target shown while dragging a filed session. */
-function UngroupDropZone({ scrollFrameRef }: { scrollFrameRef: RefObject<HTMLElement | null> }) {
+/** The in-flow ungroup target at the seam between the project folders and the
+    unfiled sessions — a filed session dropped here lands right where it will
+    appear. Reports its placement relative to the list viewport so the
+    floating fallback can cover it while the seam is scrolled away. */
+function UngroupDropSlot({
+  scrollFrameRef,
+  onPlacementChange,
+}: {
+  scrollFrameRef: RefObject<HTMLElement | null>;
+  onPlacementChange: (placement: UngroupSlotPlacement) => void;
+}) {
   const { setNodeRef, isOver } = useDroppable({
     id: UNGROUP_DROP_ZONE_ID,
     data: { type: "ungroup" },
+    resizeObserverConfig: SIDEBAR_RESIZE_OBSERVER_CONFIG,
   });
-  // Fixed to the list frame's bottom edge, measured once at drag start (the
-  // sidebar frame cannot move mid-drag). Fixed — not sticky or inline — so the
-  // strip stays reachable on a long list AND dnd-kit skips scroll-ancestor
-  // compensation for it: a stuck sticky element doesn't move with the scroll,
-  // but dnd still shifted its stored rect, drifting the hit area.
-  const [frame, setFrame] = useState<{ left: number; width: number; bottom: number } | null>(null);
+  const slotRef = useRef<HTMLDivElement | null>(null);
+  const setRefs = useCallback(
+    (node: HTMLDivElement | null) => {
+      slotRef.current = node;
+      setNodeRef(node);
+    },
+    [setNodeRef],
+  );
+  useLayoutEffect(() => {
+    const frame = scrollFrameRef.current;
+    if (!frame) return undefined;
+    const measure = () => {
+      const slot = slotRef.current?.getBoundingClientRect();
+      if (!slot) return;
+      const view = frame.getBoundingClientRect();
+      onPlacementChange(
+        slot.bottom < view.top ? "above" : slot.top > view.bottom ? "below" : "inline",
+      );
+    };
+    measure();
+    frame.addEventListener("scroll", measure, { passive: true });
+    return () => {
+      frame.removeEventListener("scroll", measure);
+      onPlacementChange("unmounted");
+    };
+  }, [onPlacementChange, scrollFrameRef]);
+  return (
+    <div
+      ref={setRefs}
+      data-testid="sidebar-ungroup-drop-zone"
+      className={cn(
+        "flex items-center gap-1.5 rounded-md border border-dashed border-border bg-card-solid px-2 py-1.5 text-muted-foreground text-xs transition-colors",
+        isOver && cn(DROP_TARGET_HIGHLIGHT, "text-foreground"),
+      )}
+    >
+      <FolderMinusIcon className="size-3.5 shrink-0" />
+      Drop here to remove from project
+    </div>
+  );
+}
+
+/** Floating stand-in for {@link UngroupDropSlot} while its seam is off-screen:
+    pinned to the list frame's edge nearest the seam, measured once at mount
+    (the frame cannot move mid-drag). Fixed — not sticky or inline — so dnd-kit
+    skips scroll-ancestor compensation for it: a stuck sticky element doesn't
+    move with the scroll, but dnd still shifted its stored rect, drifting the
+    hit area. */
+function UngroupFloatingStrip({
+  scrollFrameRef,
+  edge,
+}: {
+  scrollFrameRef: RefObject<HTMLElement | null>;
+  edge: "top" | "bottom";
+}) {
+  const { setNodeRef, isOver } = useDroppable({
+    id: UNGROUP_FLOATING_ZONE_ID,
+    data: { type: "ungroup" },
+  });
+  const [frame, setFrame] = useState<{
+    left: number;
+    width: number;
+    top?: number;
+    bottom?: number;
+  } | null>(null);
   useLayoutEffect(() => {
     const rect = scrollFrameRef.current?.getBoundingClientRect();
     if (!rect) return;
     setFrame({
       left: rect.left + 8,
       width: rect.width - 16,
-      bottom: window.innerHeight - rect.bottom + 8,
+      ...(edge === "top"
+        ? { top: rect.top + 8 }
+        : { bottom: window.innerHeight - rect.bottom + 8 }),
     });
-  }, [scrollFrameRef]);
+  }, [edge, scrollFrameRef]);
   return (
     <div
       ref={setNodeRef}
-      data-testid="sidebar-ungroup-drop-zone"
-      style={frame ? { left: frame.left, width: frame.width, bottom: frame.bottom } : undefined}
+      data-testid="sidebar-ungroup-floating-strip"
+      style={frame ?? undefined}
       className={cn(
         "fixed z-30 flex items-center gap-1.5 rounded-md border border-dashed border-border bg-card-solid px-2 py-1.5 text-muted-foreground text-xs transition-colors",
         isOver && cn(DROP_TARGET_HIGHLIGHT, "text-foreground"),
