@@ -11,14 +11,12 @@ import { isIOSShell, NATIVE_READY_EVENT, setNativeServerSwitcherHidden } from "@
  * Chat/Terminal bar hide off this signal so neither floats over an opened
  * panel.
  */
-export function useSurfaceFrontmost(
-  surface: HTMLElement | null,
-  active: boolean,
-  onShell: () => boolean = isIOSShell,
-): boolean {
-  const [frontmost, setFrontmost] = useState(false);
-  // The shell's bridge can attach after mount (Android's page-finished
-  // fallback), so an off-shell answer is re-checked once the shell announces.
+/**
+ * Whether `onShell` reports the native shell as present. The shell's bridge
+ * can attach after mount (Android's page-finished fallback), so an off-shell
+ * answer is re-checked once the shell announces itself.
+ */
+export function useShellReady(onShell: () => boolean): boolean {
   const [shellReady, setShellReady] = useState(onShell);
   useEffect(() => {
     if (shellReady) return;
@@ -26,6 +24,16 @@ export function useSurfaceFrontmost(
     window.addEventListener(NATIVE_READY_EVENT, handleReady);
     return () => window.removeEventListener(NATIVE_READY_EVENT, handleReady);
   }, [shellReady, onShell]);
+  return shellReady;
+}
+
+export function useSurfaceFrontmost(
+  surface: HTMLElement | null,
+  active: boolean,
+  onShell: () => boolean = isIOSShell,
+): boolean {
+  const [frontmost, setFrontmost] = useState(false);
+  const shellReady = useShellReady(onShell);
   useEffect(() => {
     if (!shellReady || !active) {
       setFrontmost(false);
