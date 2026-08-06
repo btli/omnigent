@@ -15,6 +15,8 @@
 // Session metadata and item pages are shimmed through `seedSession`
 // helpers so tests can model capped snapshots and full transcripts.
 
+import type * as IdentityModule from "@/lib/identity";
+
 import { type InfiniteData, QueryClient } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
@@ -48,6 +50,7 @@ import { type ChildSessionInfo, childSessionsQueryKey } from "@/hooks/useChildSe
 import {
   consumePendingInitialPrompt,
   handleSessionEvent,
+  reviveStrayCompletedResponse,
   initChatStore,
   pumpStreamEvents,
   setPendingInitialPrompt,
@@ -70,7 +73,7 @@ const realSend = useChatStore.getState().send;
 // per-test `mockReturnValue` works; reset in afterEach so a stubbed
 // identity never leaks across tests.
 vi.mock("@/lib/identity", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/lib/identity")>();
+  const actual = await importOriginal<typeof IdentityModule>();
   return { ...actual, getCurrentAuthorId: vi.fn<() => string | null>(() => null) };
 });
 
@@ -174,10 +177,10 @@ let client: QueryClient;
 const fetchMock = vi.fn();
 let sessionSnapshots: Map<string, ConversationItem[]>;
 let sessionItems: Map<string, ConversationItem[]>;
-let sessionPendingElicitations: Map<string, Array<Record<string, unknown>>>;
+let sessionPendingElicitations: Map<string, Record<string, unknown>[]>;
 let sessionPendingInputs: Map<
   string,
-  Array<{ pending_id: string; content: unknown[]; created_by?: string }>
+  { pending_id: string; content: unknown[]; created_by?: string }[]
 >;
 // Per-session cost-control switch the snapshot/PATCH handlers serve;
 // absent key = unset (the wire field comes back null).
@@ -408,13 +411,13 @@ function seedSessionItems(id: string, items: ConversationItem[] = []): void {
   sessionItems.set(id, items);
 }
 
-function seedPendingElicitations(id: string, events: Array<Record<string, unknown>>): void {
+function seedPendingElicitations(id: string, events: Record<string, unknown>[]): void {
   sessionPendingElicitations.set(id, events);
 }
 
 function seedPendingInputs(
   id: string,
-  inputs: Array<{ pending_id: string; content: unknown[]; created_by?: string }>,
+  inputs: { pending_id: string; content: unknown[]; created_by?: string }[],
 ): void {
   sessionPendingInputs.set(id, inputs);
 }
@@ -1559,7 +1562,7 @@ describe("chatStore — send (first-send ordering)", () => {
     // Control /events resolution: each POST returns a deferred promise so the
     // test can hold the first one open and observe whether the next fires.
     const eventBodies: string[] = [];
-    const resolvers: Array<() => void> = [];
+    const resolvers: (() => void)[] = [];
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       if (url === "/v1/sessions/conv_x/events" && init?.method === "POST") {
@@ -2284,15 +2287,16 @@ describe("chatStore — send while streaming (queueing)", () => {
       error: null,
     });
 
-    // Accepted trade-off: the server's deny short-circuit still publishes a
-    // session-level running→idle pair for the denied out-of-band input, and
-    // the client now trusts `session.status` 1:1 (the guard that used to
-    // suppress this stray idle was removed to fix the fresh-session
-    // "Working…" persists bug). So this idle DOES flip `sessionStatus` to
-    // idle mid-stream. The bubble lifecycle is unaffected — `status` /
-    // `activeResponse` still defer to the streaming turn's own response_end —
-    // and the next real status edge re-asserts running, so the effect is a
-    // brief indicator blip confined to the rare deny-while-streaming case.
+    // The server's deny short-circuit still publishes a session-level
+    // running→idle pair for the denied out-of-band input, and the client
+    // trusts `session.status` 1:1 — so this stray idle flips
+    // `sessionStatus` AND finalizes the streaming turn (a bare terminal
+    // edge is the NORMAL turn-end shape for id-less emitters like the
+    // PTY-activity relay, so it must settle the bubble; see the bare-idle
+    // tests below). The deny corner is healed by the live-delta revive:
+    // the still-streaming turn's next delta reopens it
+    // (reviveStrayCompletedResponse), so the misread is a brief flicker,
+    // not a mid-turn fold.
     handleSessionEvent({
       type: "session_status",
       conversationId: "conv_abc",
@@ -2300,12 +2304,100 @@ describe("chatStore — send while streaming (queueing)", () => {
     });
     const afterIdle = useChatStore.getState();
     expect(afterIdle.sessionStatus).toBe("idle");
-    expect(afterIdle.status).toBe("streaming");
+    expect(afterIdle.status).toBe("idle");
     expect(afterIdle.activeResponse).toEqual({
+      responseId: "resp_in_flight",
+      state: "completed",
+      error: null,
+    });
+
+    // The turn was actually still live — its next delta revives it, and
+    // the session's busy signal comes back with it: leaving
+    // sessionStatus "idle" let a mid-turn send bypass shouldQueueSend's
+    // queue gate. Local `status` stays "idle" — this client sent
+    // nothing, so no local send is in flight.
+    reviveStrayCompletedResponse(useChatStore.setState);
+    expect(useChatStore.getState().activeResponse).toEqual({
       responseId: "resp_in_flight",
       state: "streaming",
       error: null,
     });
+    expect(useChatStore.getState().sessionStatus).toBe("running");
+    expect(useChatStore.getState().status).toBe("idle");
+  });
+
+  it("finalizes a streaming turn on a bare idle edge (no response id)", () => {
+    // Most idle publishes carry no response_id (the PTY-activity relay,
+    // orchestration teardown). Leaving the turn "streaming" hid the
+    // settled turn's "Worked for" fold and Fork action until a reload.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      status: "streaming",
+      sessionStatus: "running",
+      activeResponse: { responseId: "resp_a", state: "streaming", error: null },
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "idle",
+    });
+    const state = useChatStore.getState();
+    expect(state.status).toBe("idle");
+    expect(state.activeResponse).toEqual({
+      responseId: "resp_a",
+      state: "completed",
+      error: null,
+    });
+  });
+
+  it("finalizes a streaming turn to failed on a bare failed edge", () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      status: "streaming",
+      sessionStatus: "running",
+      activeResponse: { responseId: "resp_a", state: "streaming", error: null },
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "failed",
+    });
+    expect(useChatStore.getState().activeResponse?.state).toBe("failed");
+  });
+
+  it("preserves a cancelled turn across a bare idle edge", () => {
+    // The user's interrupt verdict must survive the trailing idle the
+    // teardown publishes — and the revive must never resurrect it.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      status: "idle",
+      sessionStatus: "running",
+      activeResponse: { responseId: "resp_a", state: "cancelled", error: null },
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "idle",
+    });
+    expect(useChatStore.getState().activeResponse?.state).toBe("cancelled");
+    reviveStrayCompletedResponse(useChatStore.setState);
+    expect(useChatStore.getState().activeResponse?.state).toBe("cancelled");
+  });
+
+  it("revive is a no-op for failed and absent responses", () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      sessionStatus: "idle",
+      activeResponse: { responseId: "resp_a", state: "failed", error: "boom" },
+    });
+    reviveStrayCompletedResponse(useChatStore.setState);
+    expect(useChatStore.getState().activeResponse?.state).toBe("failed");
+    expect(useChatStore.getState().sessionStatus).toBe("idle");
+
+    useChatStore.setState({ activeResponse: null });
+    reviveStrayCompletedResponse(useChatStore.setState);
+    expect(useChatStore.getState().activeResponse).toBeNull();
+    expect(useChatStore.getState().sessionStatus).toBe("idle");
   });
 });
 
@@ -3061,7 +3153,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       ]);
     });
 
-    it("idle settles sessionStatus but preserves a still-streaming bubble until response_end", () => {
+    it("idle settles sessionStatus AND finalizes a still-streaming bubble", () => {
       useChatStore.setState({
         status: "streaming",
         sessionStatus: "running",
@@ -3077,16 +3169,18 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       const state = useChatStore.getState();
       // sessionStatus tracks the server's session-level status 1:1 — a server
       // idle means idle, and the "Working…" indicator (which reads only
-      // sessionStatus) must turn off. The bubble lifecycle is separate: a real
-      // response bubble is still closed by response_end, not by the coarser
-      // session.status signal, so the local `status`/`activeResponse` stay
-      // streaming until response_end lands (dropping the guard that used to
-      // strand sessionStatus at "running" — the "Working…" persists bug).
+      // sessionStatus) must turn off. The bubble lifecycle settles on the
+      // same edge: a bare (id-less) idle is the NORMAL turn-end shape for
+      // the PTY-activity relay and orchestration teardown, and leaving the
+      // turn "streaming" hid its "Worked for" fold and Fork action until a
+      // reload. A stray idle for a turn that is actually still live (the
+      // policy-deny short-circuit) is healed by the live-delta revive —
+      // see reviveStrayCompletedResponse.
       expect(state.sessionStatus).toBe("idle");
-      expect(state.status).toBe("streaming");
+      expect(state.status).toBe("idle");
       expect(state.activeResponse).toEqual({
         responseId: "resp_live",
-        state: "streaming",
+        state: "completed",
         error: null,
       });
     });
@@ -3578,7 +3672,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
      */
     function seedSnapshotSkills(
       seedId: string,
-      skills: Array<{ name: string; description: string }>,
+      skills: { name: string; description: string }[],
     ): void {
       fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
         const url = typeof input === "string" ? input : input.toString();
@@ -5147,7 +5241,7 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     model_override?: string | null;
     cost_control_mode_override?: "on" | "off" | null;
     parent_session_id?: string | null;
-    model_options?: Array<Record<string, unknown>>;
+    model_options?: Record<string, unknown>[];
   }
 
   /** Override the snapshot GET so a test can inject labels + overrides. */
@@ -5174,7 +5268,7 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     });
   }
 
-  function patchCallsFor(id: string): Array<Record<string, unknown>> {
+  function patchCallsFor(id: string): Record<string, unknown>[] {
     return fetchMock.mock.calls
       .filter(([u, init]) => {
         const url = typeof u === "string" ? u : u.toString();
@@ -7075,7 +7169,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
   }
 
   /** The `live:<messageId>` provisional preview blocks currently rendered. */
-  function livePreviews(): Array<Extract<AnyBlock, { type: "text_done" }>> {
+  function livePreviews(): Extract<AnyBlock, { type: "text_done" }>[] {
     return useChatStore
       .getState()
       .blocks.filter(
@@ -7321,6 +7415,54 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     expect(prov?.ctx.itemId).toBe("live:m1");
     expect(prov?.fullText).toBe("Hello world");
     expect(useChatStore.getState().blocks.filter((b) => b.type === "text_chunk")).toEqual([]);
+
+    controller.abort();
+  });
+
+  it("gives the provisional the LIVE TURN's response id so it shares that bubble", async () => {
+    // `walkBubbles` groups by response id, so a synthetic preview id split
+    // one native turn into several fragment bubbles while streaming that
+    // merged back into one on reload — the turn rendered differently live
+    // vs. reloaded, and the shifting fragment boundaries made the "Worked
+    // for" fold flicker on codex. The preview must join the live turn.
+    useChatStore.setState({
+      conversationId: "conv_live_rid",
+      blocks: [],
+      isNativeTerminalSession: true,
+      activeResponse: { responseId: "codex_turn_1", state: "streaming", error: null },
+    });
+    const { sink, controller } = startPump("conv_live_rid");
+
+    sink.push(nativeDelta("m1", 0, "Checking the CLI", true));
+    await tick();
+
+    const prov = provisional();
+    expect(prov?.ctx.itemId).toBe("live:m1");
+    expect(prov?.ctx.responseId).toBe("codex_turn_1");
+
+    controller.abort();
+  });
+
+  it("keeps the synthetic response id when no turn is tracked", async () => {
+    // A preview that lands before any turn id is known keeps its own id, so
+    // it can't be grouped into an unrelated bubble. (A `completed` turn does
+    // NOT hit this path: a live delta proves that turn is still running, so
+    // `reviveStrayCompletedResponse` reopens it first and the preview
+    // correctly joins it.)
+    useChatStore.setState({
+      conversationId: "conv_live_norid",
+      blocks: [],
+      isNativeTerminalSession: true,
+      activeResponse: null,
+    });
+    const { sink, controller } = startPump("conv_live_norid");
+
+    sink.push(nativeDelta("m9", 0, "early chunk", true));
+    await tick();
+
+    const prov = provisional();
+    expect(prov?.ctx.itemId).toBe("live:m9");
+    expect(prov?.ctx.responseId).toBe("live:m9");
 
     controller.abort();
   });
@@ -8627,7 +8769,7 @@ describe("chatStore — client-side message queue", () => {
 
 describe("chatStore — background cross-session flush", () => {
   /** /events POSTs the flush fired, as (conversationId, text) pairs. */
-  const eventPosts = (): Array<{ id: string; text: string }> =>
+  const eventPosts = (): { id: string; text: string }[] =>
     fetchMock.mock.calls
       .filter(
         ([u, init]) =>
@@ -8967,5 +9109,77 @@ describe("chatStore — background cross-session flush", () => {
     await tick();
     await tick();
     expect(delivered).toEqual(["foreground", "background"]);
+  });
+});
+
+describe("chatStore — attributing pre-turn blocks to the turn", () => {
+  const block = (itemId: string | null, responseId: string, text: string): AnyBlock => ({
+    type: "text_done",
+    ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId, itemId },
+    fullText: text,
+    hasCodeBlocks: false,
+  });
+
+  it("adopts the trailing turn-id-less run when the turn is named", () => {
+    // Codex opens its reasoning block ~2s before the `running` edge that
+    // carries the turn id, so those blocks are stamped with an empty id
+    // and would render as a bubble of their own beside the turn.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      activeResponse: null,
+      blocks: [
+        block("m_old", "codex_prev", "previous turn answer"),
+        block(null, "", "Thinking…"),
+        block(null, "", "…still thinking"),
+      ],
+    });
+
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "running",
+      responseId: "codex_now",
+    });
+
+    const rids = useChatStore.getState().blocks.map((b) => b.ctx.responseId);
+    // The prior turn is untouched; both pre-turn blocks join the new turn.
+    expect(rids).toEqual(["codex_prev", "codex_now", "codex_now"]);
+  });
+
+  it("leaves blocks alone when none are unattributed", () => {
+    const blocks = [block("m1", "codex_prev", "answer")];
+    useChatStore.setState({ conversationId: "conv_abc", activeResponse: null, blocks });
+
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "running",
+      responseId: "codex_now",
+    });
+
+    // Same array identity — no needless rebuild (bubble memoization).
+    expect(useChatStore.getState().blocks).toBe(blocks);
+  });
+
+  it("does not reach past an attributed block into older history", () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      activeResponse: null,
+      blocks: [
+        block(null, "", "orphan from an older turn"),
+        block("m_old", "codex_prev", "previous turn answer"),
+        block(null, "", "Thinking…"),
+      ],
+    });
+
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "running",
+      responseId: "codex_now",
+    });
+
+    const rids = useChatStore.getState().blocks.map((b) => b.ctx.responseId);
+    expect(rids).toEqual(["", "codex_prev", "codex_now"]);
   });
 });

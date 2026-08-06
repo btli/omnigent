@@ -100,8 +100,7 @@ import {
   type ProjectPrefillConfig,
   type ProjectPrefillState,
 } from "./projectPrefill";
-import { getCliServerUrl } from "@/lib/host";
-import { getOmnigentHostConfig } from "@/lib/host";
+import { getCliServerUrl, getOmnigentHostConfig } from "@/lib/host";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
 import {
   readLastHostChoice,
@@ -117,7 +116,9 @@ import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { partitionAgentsByKind, sortAgentsForDisplay } from "@/lib/agentGrouping";
 import { cn } from "@/lib/utils";
 import {
+  isFullySupportedNativeCodingAgent,
   isNativeCodingAgent,
+  isRecentHarness,
   nativeAgentHasCapability,
   nativeCodingAgentForAvailableAgent,
   nativeWrapperLabelsForAgent,
@@ -137,6 +138,7 @@ import {
 } from "@/hooks/useAvailableAgents";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
+import { useRecentHarnesses } from "@/hooks/useRecentHarnesses";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
@@ -145,7 +147,13 @@ import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSwitcher";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
-import { useProjectConfig, useProjects, moveConversationToProject } from "@/hooks/useConversations";
+import type { NativeModelOption } from "@/lib/types";
+import {
+  useProjectConfig,
+  useProjects,
+  moveConversationToProject,
+  PROJECT_LABEL_KEY,
+} from "@/hooks/useConversations";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import {
@@ -159,7 +167,7 @@ import {
 import { OttoEyes } from "@/components/OttoEyes";
 import { SkillPills } from "@/components/SkillPills";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
-import { type CostControlMode } from "@/components/CostRoutingControl";
+import type { CostControlMode } from "@/components/CostRoutingControl";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { AgentRowTooltip } from "@/components/AgentHoverCard";
 import { CreateAgentDialog } from "./CreateAgentDialog";
@@ -305,6 +313,22 @@ const CODEX_NATIVE_BYPASS_APPROVAL_OPTION = {
   args: [] as string[],
 };
 
+function displayModelId(option: Pick<NativeModelOption, "id">): string {
+  return option.id;
+}
+
+function displayModelName(option: Pick<NativeModelOption, "id" | "displayName">): string {
+  return option.displayName ?? option.id;
+}
+
+function defaultModelLabel(
+  options: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[],
+  display: (option: Pick<NativeModelOption, "id" | "displayName">) => string,
+): string {
+  const dflt = options.find((option) => option.isDefault);
+  return dflt ? `Default (${display(dflt)})` : "Default";
+}
+
 function HostOption({ host, subtitle }: { host: Host; subtitle?: string }) {
   const isOnline = host.status === "online";
   return (
@@ -316,7 +340,7 @@ function HostOption({ host, subtitle }: { host: Host; subtitle?: string }) {
       )}
       <span className="flex min-w-0 flex-col">
         <span className="flex items-center gap-2">
-          <span className="truncate text-xs">{host.name}</span>
+          <span className="truncate text-sm">{host.name}</span>
           <span
             className={`inline-flex shrink-0 items-center gap-1 text-[10px] font-semibold uppercase tracking-wider ${isOnline ? "text-green-600" : "text-muted-foreground"}`}
           >
@@ -350,14 +374,14 @@ export function ConnectHostInstructions({
   const databricksFeatures = info !== "loading" && info.databricks_features;
   return (
     <div className="flex flex-col gap-4 rounded-lg border border-dashed border-border p-4">
-      {label && <p className="text-xs text-muted-foreground">{label}</p>}
+      {label && <p className="text-sm text-muted-foreground">{label}</p>}
       {databricksFeatures ? (
         <Tabs defaultValue="local">
           <TabsList className="w-full">
-            <TabsTrigger value="local" className="text-xs">
+            <TabsTrigger value="local" className="text-sm">
               Local machine
             </TabsTrigger>
-            <TabsTrigger value="lakebox" className="text-xs">
+            <TabsTrigger value="lakebox" className="text-sm">
               Databricks Lakebox
             </TabsTrigger>
           </TabsList>
@@ -613,7 +637,7 @@ function HarnessSetupNotice({
     <p
       // pl-2 lines the icon up with the chips tray directly above (which has
       // pl-2), so the notice reads as part of the composer, not indented left.
-      className="flex items-center gap-2 pl-2 text-xs text-amber-600 dark:text-amber-500"
+      className="flex items-center gap-2 pl-2 text-sm text-amber-600 dark:text-amber-500"
       data-testid="new-chat-landing-harness-warning"
     >
       <TriangleAlertIcon className="size-3.5 shrink-0" />
@@ -623,11 +647,11 @@ function HarnessSetupNotice({
             {agentName} isn&apos;t ready on {hostName}.
           </span>
           {/* Compact bordered chip — small enough to sit on the sentence's line
-              (h-5, text-xs), so it reads as part of the notice. */}
+              (h-5, text-sm), so it reads as part of the notice. */}
           <button
             type="button"
             data-testid="new-chat-landing-harness-setup"
-            className="inline-flex h-5 shrink-0 items-center rounded-md border border-amber-300 px-2 text-xs font-medium text-amber-700 hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400 dark:border-amber-500/40 dark:text-amber-400 dark:hover:bg-amber-500/20"
+            className="inline-flex h-5 shrink-0 items-center rounded-md border border-amber-300 px-2 text-sm font-medium text-amber-700 hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400 dark:border-amber-500/40 dark:text-amber-400 dark:hover:bg-amber-500/20"
             onClick={onSetup}
           >
             Set up {agentName}
@@ -738,7 +762,7 @@ export function deriveRepoName(url: string): string | null {
  */
 export function matchSkillInvocation(
   text: string,
-  skills: ReadonlyArray<{ name: string }>,
+  skills: readonly { name: string }[],
 ): { name: string; args: string } | null {
   const trimmed = text.trim();
   if (!isSlashCommandText(trimmed)) return null;
@@ -780,9 +804,7 @@ export function deriveHomeDir(entries: HostFilesystemEntry[]): string | null {
  * doesn't claim roving focus for it — mirrors the in-session picker). */
 function PickerSectionHeader({ children }: { children: ReactNode }) {
   return (
-    <div className="px-2 pt-1.5 pb-0.5 text-[11px] font-medium text-muted-foreground">
-      {children}
-    </div>
+    <div className="px-2 pt-1.5 pb-0.5 text-sm font-medium text-muted-foreground">{children}</div>
   );
 }
 
@@ -896,7 +918,7 @@ export function AgentHarnessPicker({
     const inner = (
       <div className="flex min-w-0 flex-1 items-baseline gap-2.5">
         <span className="truncate">{agent.display_name}</span>
-        {blurb && <span className="truncate text-[11px] text-muted-foreground/70">{blurb}</span>}
+        {blurb && <span className="truncate text-sm text-muted-foreground/70">{blurb}</span>}
       </div>
     );
     return withTooltip ? <AgentRowTooltip agent={agent}>{inner}</AgentRowTooltip> : inner;
@@ -906,7 +928,7 @@ export function AgentHarnessPicker({
     harnessUnconfiguredOnHost(agent.harness, host) ? (
       <Badge
         variant="outline"
-        className="ml-auto self-center border-amber-300 bg-amber-50 text-[11px] text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
+        className="ml-auto self-center border-amber-300 bg-amber-50 text-sm text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
         data-testid={`new-chat-landing-agent-warning-${agent.id}`}
       >
         {harnessWarningBadgeText(
@@ -926,7 +948,7 @@ export function AgentHarnessPicker({
         data-testid={`new-chat-landing-agent-${agent.id}`}
         data-active={active ? "true" : undefined}
         onSelect={() => onSelectAgent(agent)}
-        className="items-start gap-2 rounded-sm px-2 py-1.5 text-13 data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
+        className="items-start gap-2 rounded-sm px-2 py-1.5 text-ui data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
       >
         {renderRowInner(agent, true)}
         {renderBadge(agent)}
@@ -939,21 +961,26 @@ export function AgentHarnessPicker({
   // harnessUnconfiguredOnHost returns false with no host / no readiness map, so
   // nothing is hidden in those cases, and unrecognized harnesses stay visible.
   const hideUnconfigured = useMemo(() => readHideUnconfiguredHarnesses(), []);
-  // Split harnesses so the ready-to-use ones lead and the "needs setup" ones
-  // fold into a "More" submenu (kept discoverable, out of the primary list).
-  // The currently-selected harness always stays inline even when unconfigured,
-  // so the active pick is never buried. With the hide-unconfigured preference
-  // on, unconfigured harnesses are dropped entirely (no "More").
+  const { recentHarnesses } = useRecentHarnesses();
+  // Split harnesses by support level: the fully supported ones lead the primary
+  // list, and every other harness folds into "More" whether or not it is
+  // configured here. Also promoted out of "More": the selected harness (never
+  // bury the active pick) and any the user has launched before, so a regular
+  // Pi / Cursor user gets theirs one click away instead of one hover.
   const { readyHarnessEntries, moreHarnessEntries } = useMemo(() => {
     const ready: AvailableAgent[] = [];
     const more: AvailableAgent[] = [];
     for (const a of harnessEntries) {
-      const unconfigured = harnessUnconfiguredOnHost(a.harness, host);
-      if (!unconfigured || a.id === effectiveAgentId) ready.push(a);
-      else if (!hideUnconfigured) more.push(a);
+      const selected = a.id === effectiveAgentId;
+      // The preference hides harnesses that can't launch here — it outranks
+      // both support level and recency, but never buries the active pick.
+      if (!selected && hideUnconfigured && harnessUnconfiguredOnHost(a.harness, host)) continue;
+      if (selected || isFullySupportedNativeCodingAgent(a) || isRecentHarness(a, recentHarnesses)) {
+        ready.push(a);
+      } else more.push(a);
     }
     return { readyHarnessEntries: ready, moreHarnessEntries: more };
-  }, [harnessEntries, host, hideUnconfigured, effectiveAgentId]);
+  }, [harnessEntries, host, hideUnconfigured, effectiveAgentId, recentHarnesses]);
 
   // Split the agents group: built-in bundle agents (Polly / Debby) stay inline
   // in the main list; user-registered custom agents fold into a "Custom agents"
@@ -978,7 +1005,7 @@ export function AgentHarnessPicker({
     <DropdownMenuItem
       data-testid="new-chat-landing-create-agent"
       onSelect={onCreateCustomAgent}
-      className="gap-2 rounded-sm px-2 py-1.5 text-13 text-muted-foreground"
+      className="gap-2 rounded-sm px-2 py-1.5 text-ui text-muted-foreground"
     >
       <PlusIcon className="size-3.5" />
       Create custom agent
@@ -996,11 +1023,11 @@ export function AgentHarnessPicker({
           data-testid="new-chat-landing-agent-pending"
           data-active={effectiveAgentId === pendingAgentId ? "true" : undefined}
           onSelect={onSelectPending}
-          className="items-start gap-2 rounded-sm px-2 py-1.5 text-13 data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
+          className="items-start gap-2 rounded-sm px-2 py-1.5 text-ui data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
         >
           <div className="flex min-w-0 flex-1 items-baseline gap-2.5">
             <span className="truncate">{pendingAgent.name}</span>
-            <span className="truncate text-[11px] text-muted-foreground/70">Custom</span>
+            <span className="truncate text-sm text-muted-foreground/70">Custom</span>
           </div>
         </DropdownMenuItem>
       )}
@@ -1057,7 +1084,7 @@ export function AgentHarnessPicker({
           )}
         >
           <span
-            className={cn("max-w-[12rem] truncate text-xs text-foreground", triggerLabelClassName)}
+            className={cn("max-w-[12rem] truncate text-ui text-foreground", triggerLabelClassName)}
           >
             {hasAgents ? agentLabel : "No agents"}
           </span>
@@ -1088,7 +1115,7 @@ export function AgentHarnessPicker({
                 e.preventDefault();
                 setMobilePage(null);
               }}
-              className="items-center gap-1.5 rounded-sm px-2 py-1.5 text-13 font-medium"
+              className="items-center gap-1.5 rounded-sm px-2 py-1.5 text-ui font-medium"
             >
               <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
               <span className="truncate">More</span>
@@ -1105,7 +1132,7 @@ export function AgentHarnessPicker({
                 e.preventDefault();
                 setMobilePage(null);
               }}
-              className="items-center gap-1.5 rounded-sm px-2 py-1.5 text-13 font-medium"
+              className="items-center gap-1.5 rounded-sm px-2 py-1.5 text-ui font-medium"
             >
               <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
               <span className="truncate">Custom agents</span>
@@ -1131,7 +1158,7 @@ export function AgentHarnessPicker({
                         e.preventDefault();
                         setMobilePage("more");
                       }}
-                      className="items-center gap-2 rounded-sm px-2 py-1.5 text-13"
+                      className="items-center gap-2 rounded-sm px-2 py-1.5 text-ui"
                     >
                       <span className="flex-1">More</span>
                       <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
@@ -1141,7 +1168,7 @@ export function AgentHarnessPicker({
                     <DropdownMenuSub>
                       <DropdownMenuSubTrigger
                         data-testid="new-chat-landing-harness-more"
-                        className="items-center gap-2 rounded-sm px-2 py-1.5 text-13"
+                        className="items-center gap-2 rounded-sm px-2 py-1.5 text-ui"
                       >
                         <span className="flex-1">More</span>
                       </DropdownMenuSubTrigger>
@@ -1170,7 +1197,7 @@ export function AgentHarnessPicker({
                     e.preventDefault();
                     setMobilePage("custom");
                   }}
-                  className="items-center gap-2 rounded-sm px-2 py-1.5 text-13"
+                  className="items-center gap-2 rounded-sm px-2 py-1.5 text-ui"
                 >
                   <span className="flex-1">Custom agents</span>
                   <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
@@ -1180,7 +1207,7 @@ export function AgentHarnessPicker({
                 <DropdownMenuSub>
                   <DropdownMenuSubTrigger
                     data-testid="new-chat-landing-custom-agents"
-                    className="items-center gap-2 rounded-sm px-2 py-1.5 text-13"
+                    className="items-center gap-2 rounded-sm px-2 py-1.5 text-ui"
                   >
                     <span className="flex-1">Custom agents</span>
                   </DropdownMenuSubTrigger>
@@ -1225,6 +1252,8 @@ function HarnessConfigModal({
   pickedModel,
   claudeModelOptions,
   claudeModelsLoading,
+  codexModelOptions,
+  codexModelsLoading,
   pickedEffort,
   pickedHarness,
   costControlMode,
@@ -1249,8 +1278,10 @@ function HarnessConfigModal({
   cursorExecMode: string;
   bypassSandbox: boolean;
   pickedModel: string;
-  claudeModelOptions: readonly { id: string; displayName: string }[];
+  claudeModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
   claudeModelsLoading: boolean;
+  codexModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
+  codexModelsLoading: boolean;
   pickedEffort: string;
   pickedHarness: string | null;
   costControlMode: CostControlMode;
@@ -1271,6 +1302,9 @@ function HarnessConfigModal({
   const hasApproval = nativeAgentHasCapability(agent, "approvalMode");
   const hasCursor = nativeAgentHasCapability(agent, "cursorMode");
   const isCodex = entryHarness === "codex-native";
+  const modelOptions = isCodex ? codexModelOptions : claudeModelOptions;
+  const modelsLoading = isCodex ? codexModelsLoading : claudeModelsLoading;
+  const modelDisplay = isCodex ? displayModelId : displayModelName;
   const brainDefault =
     agent.harness != null && agent.harness in brainHarnessLabels ? agent.harness : null;
 
@@ -1338,9 +1372,14 @@ function HarnessConfigModal({
           mode: draftPermission,
         });
     } else if (hasApproval) {
+      if (isCodex) setPickedModel(draftModel);
       setApprovalMode(draftApproval);
       setBypassSandbox(draftBypass);
-      if (entryHarness) writeHarnessOption(entryHarness, { mode: draftApproval });
+      if (entryHarness)
+        writeHarnessOption(entryHarness, {
+          mode: draftApproval,
+          ...(isCodex ? { model: draftModel } : {}),
+        });
     } else if (hasCursor) {
       setCursorExecMode(draftCursor);
       if (entryHarness) writeHarnessOption(entryHarness, { mode: draftCursor });
@@ -1417,12 +1456,12 @@ function HarnessConfigModal({
                       </SelectItem>
                     ))}
                     {claudeModelsLoading && (
-                      <div className="px-2.5 py-1 text-xs text-muted-foreground">
+                      <div className="px-2.5 py-1 text-sm text-muted-foreground">
                         Loading models…
                       </div>
                     )}
                     {!claudeModelsLoading && claudeModelOptions.length === 0 && (
-                      <div className="px-2.5 py-1 text-xs text-muted-foreground">
+                      <div className="px-2.5 py-1 text-sm text-muted-foreground">
                         Models unavailable
                       </div>
                     )}
@@ -1472,6 +1511,42 @@ function HarnessConfigModal({
             </>
           )}
 
+          {hasApproval && isCodex && (
+            <ConfigRow label="Model" description="Underlying LLM">
+              <Select value={modelValue} onValueChange={onModelChange}>
+                <SelectTrigger
+                  className="w-full"
+                  data-testid="new-chat-landing-config-model"
+                  aria-label="Model"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent
+                  position="popper"
+                  align="start"
+                  className="[&_[data-slot=select-item]]:pl-2.5"
+                >
+                  <SelectItem value={MODEL_SELECT_DEFAULT}>
+                    {defaultModelLabel(modelOptions, modelDisplay)}
+                  </SelectItem>
+                  {modelOptions.map((m) => (
+                    <SelectItem key={m.id} value={m.id}>
+                      {displayModelId(m)}
+                    </SelectItem>
+                  ))}
+                  {modelsLoading && (
+                    <div className="px-2.5 py-1 text-sm text-muted-foreground">Loading models…</div>
+                  )}
+                  {!modelsLoading && modelOptions.length === 0 && (
+                    <div className="px-2.5 py-1 text-sm text-muted-foreground">
+                      Models unavailable
+                    </div>
+                  )}
+                </SelectContent>
+              </Select>
+            </ConfigRow>
+          )}
+
           {hasApproval && (
             <>
               <ConfigRow label="Approval" description="What the agent can do without asking">
@@ -1503,7 +1578,7 @@ function HarnessConfigModal({
                 <div
                   role="alert"
                   data-testid="new-chat-landing-bypass-sandbox-banner"
-                  className="flex items-start gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-xs font-medium leading-relaxed text-destructive"
+                  className="flex items-start gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-sm font-medium leading-relaxed text-destructive"
                 >
                   <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
                   <span>
@@ -1549,7 +1624,7 @@ function HarnessConfigModal({
                         {harnessUnconfiguredOnHost(id, host) && (
                           <Badge
                             variant="outline"
-                            className="border-amber-300 bg-amber-50 text-[11px] text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
+                            className="border-amber-300 bg-amber-50 text-sm text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
                             data-testid={`new-chat-landing-harness-warning-${id}`}
                           >
                             {harnessWarningBadgeText(
@@ -1589,7 +1664,7 @@ function HarnessConfigModal({
 // message, attachments and picker selections survive the unmount that happens
 // when the user navigates into an existing session and back. Module-scoped,
 // not persisted to storage (a page refresh starts clean); cleared on create.
-type LandingDraft = {
+interface LandingDraft {
   message: string;
   files: File[];
   pickedAgentId: string | null;
@@ -1608,7 +1683,7 @@ type LandingDraft = {
   pickedModel: string;
   pickedEffort: string;
   costControlMode: CostControlMode;
-};
+}
 
 let landingDraft: LandingDraft | null = null;
 
@@ -1766,6 +1841,11 @@ export function NewChatLandingScreen() {
     "claude-native",
     !sandboxSelected,
   );
+  const { data: hostCodexModelOptions, isLoading: hostCodexModelsLoading } = useHostModelOptions(
+    selectedHostId,
+    "codex-native",
+    !sandboxSelected,
+  );
   const claudeModelOptions = useMemo(
     () =>
       sandboxSelected
@@ -1778,6 +1858,10 @@ export function NewChatLandingScreen() {
             displayName: option.displayName ?? option.id,
           })),
     [hostClaudeModelOptions, sandboxSelected],
+  );
+  const codexModelOptions = useMemo(
+    () => (sandboxSelected ? [] : (hostCodexModelOptions ?? [])),
+    [hostCodexModelOptions, sandboxSelected],
   );
   // Desktop-shell host status for THIS machine (null outside Electron), so the
   // picker can tag the current machine and offer to auto-connect it.
@@ -1816,8 +1900,9 @@ export function NewChatLandingScreen() {
   const [prefilledBranch, setPrefilledBranch] = useState<string>(
     () => landingDraft?.prefilledBranch ?? "",
   );
-  // Project to file the new session under (an implicit collection stored as a
-  // conversation_labels row). Empty = unfiled. Applied right after create.
+  // Project to file the new session under. Empty = unfiled. Stamped as the
+  // `omni_project` label at create (so the row is filed from its first sidebar
+  // appearance), then promoted to first-class `project_id` right after.
   // Pre-filled from the `?project=` param so the sidebar's per-project
   // "new session" pencil lands here with the project already selected.
   const [selectedProject, setSelectedProject] = useState<string>(() => projectParam);
@@ -1935,6 +2020,7 @@ export function NewChatLandingScreen() {
   }, []);
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
+  const { addRecentHarness } = useRecentHarnesses();
 
   const allHosts = hosts ?? [];
   const onlineHosts = allHosts.filter((h) => h.status === "online");
@@ -2024,12 +2110,31 @@ export function NewChatLandingScreen() {
   // once per settled workspace (and can't loop once it sets a branch name).
   const worktreeSeededForRef = useRef<string | null>(null);
 
+  // Signature of the stored config the machine last settled from. Lets a later
+  // save be noticed even when the pencil re-opens the SAME project — the config
+  // content changes while `projectParam` does not. `null` = not yet seeded.
+  const seededConfigSigRef = useRef<string | null>(null);
+  const prefillConfigSig = useMemo(
+    () => (prefillConfig === undefined ? null : JSON.stringify(prefillConfig)),
+    [prefillConfig],
+  );
+
   // The landing screen stays mounted while `?project=` changes (clicking
   // another project's pencil), so re-create a fresh visit by hand: clear
   // every seedable slot and restart the machine. Values the user set are
-  // reset too — a pencil click means "set me up for this project".
+  // reset too — a pencil click means "set me up for this project". Also
+  // restart when the SAME project's stored defaults change (the user edited
+  // its settings, then re-opened its composer): `projectParam` stays put, so
+  // without this the already-settled machine would keep the stale seeds.
   useEffect(() => {
-    if (prefill.project === projectParam) return;
+    const projectChanged = prefill.project !== projectParam;
+    const configChanged =
+      !projectChanged &&
+      projectParam !== "" &&
+      prefillConfigSig !== null &&
+      seededConfigSigRef.current !== null &&
+      prefillConfigSig !== seededConfigSigRef.current;
+    if (!projectChanged && !configChanged) return;
     setSandboxSelected(false);
     setSelectedHostId(null);
     setPickedAgentId(projectParam !== "" ? null : readLastAgentId());
@@ -2037,8 +2142,19 @@ export function NewChatLandingScreen() {
     setBranchName("");
     seededHostRef.current = null;
     worktreeSeededForRef.current = null;
+    seededConfigSigRef.current = prefillConfigSig;
     setPrefill(initialPrefillState(projectParam));
-  }, [projectParam, prefill.project]);
+  }, [projectParam, prefill.project, prefillConfigSig]);
+
+  // Record the config the machine settled from, once it's loaded and the
+  // machine is done, so the reseed effect above can spot a later change to it
+  // (the reseed on a project switch runs before the config has loaded, leaving
+  // the signature `null` until this fills it in).
+  useEffect(() => {
+    if (prefill.project !== projectParam) return;
+    if (prefillConfigSig === null || !prefillDone(prefill)) return;
+    seededConfigSigRef.current = prefillConfigSig;
+  }, [prefill, projectParam, prefillConfigSig]);
 
   // Auto-select an option so a session can be started without an explicit
   // pick. Prefer the user's last explicit choice (persisted across visits);
@@ -2218,7 +2334,17 @@ export function NewChatLandingScreen() {
           ? CODEX_NATIVE_BYPASS_APPROVAL_OPTION.label
           : (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.label ??
             approvalMode);
-      return [{ label: "Approval", value: approvalValue }, ...routingRow];
+      const modelRows = isCodex
+        ? [
+            {
+              label: "Model",
+              value:
+                codexModelOptions.find((m) => m.id === pickedModel)?.id ??
+                defaultModelLabel(codexModelOptions, displayModelId),
+            },
+          ]
+        : [];
+      return [...modelRows, { label: "Approval", value: approvalValue }, ...routingRow];
     }
     if (supportsCursorMode) {
       const modeValue =
@@ -2243,6 +2369,7 @@ export function NewChatLandingScreen() {
     routingOn,
     pickedModel,
     claudeModelOptions,
+    codexModelOptions,
     pickedEffort,
     permissionMode,
     approvalMode,
@@ -2309,13 +2436,20 @@ export function NewChatLandingScreen() {
       );
     } else if (supportsApprovalMode) {
       setApprovalMode(resolve(CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_DEFAULT_APPROVAL_MODE));
+      setPickedModel(
+        selectedNativeHarness === "codex-native" &&
+          stored.model != null &&
+          codexModelOptions.some((m) => m.id === stored.model)
+          ? stored.model
+          : "",
+      );
     } else if (supportsCursorMode) {
       setCursorExecMode(resolve(CURSOR_NATIVE_EXEC_MODES, CURSOR_NATIVE_DEFAULT_EXEC_MODE));
     }
     // Reseed on harness changes and when the selected host's catalog resolves;
     // capability flags are derived from the same harness and stay omitted.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedNativeHarness, claudeModelOptions]);
+  }, [selectedNativeHarness, claudeModelOptions, codexModelOptions]);
   // Native-terminal agents interpret slash commands inside their own CLI
   // (the runner injects the text verbatim), so the landing composer must
   // not intercept them — no skills menu, no slash_command routing.
@@ -2805,10 +2939,33 @@ export function NewChatLandingScreen() {
       // straight to that dir, which also sidesteps the "branch already
       // exists" guard.
       const agent = agentList.find((a) => a.id === effectiveAgentId);
+      const nativeAgent = nativeCodingAgentForAvailableAgent(agent);
       const nativeLabels = nativeWrapperLabelsForAgent(agent);
       const agentSupportsPermissionMode = nativeAgentHasCapability(agent, "permissionMode");
       const agentSupportsApprovalMode = nativeAgentHasCapability(agent, "approvalMode");
       const agentSupportsCursorMode = nativeAgentHasCapability(agent, "cursorMode");
+
+      // Native terminal agents open terminal-first: `omnigent.ui: terminal`
+      // tells the UI to render the terminal wrapper, and `omnigent.wrapper`
+      // selects which CLI bridge the runner launches — the values are the
+      // registered wrapper ids the runner keys off, not the display name. The
+      // DANGEROUS codex full-bypass opt-in rides along as an extra label (only
+      // when the toggle is armed for a codex-native agent) so the runner
+      // launches with --dangerously-bypass-approvals-and-sandbox and the choice
+      // survives reload.
+      const baseLabels =
+        agentSupportsApprovalMode && bypassSandbox
+          ? { ...(nativeLabels ?? {}), [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
+          : nativeLabels;
+      // When filing into a project, stamp its legacy `omni_project` label at
+      // create so the session is BORN FILED. The sidebar dual-reads project
+      // membership from this label OR the first-class `project_id` the follow-up
+      // move sets, so the row groups under its project from its very first
+      // sidebar appearance instead of flashing through the ungrouped "Sessions"
+      // section while the search-indexed session list catches up to the move.
+      const createLabels = selectedProject
+        ? { ...(baseLabels ?? {}), [PROJECT_LABEL_KEY]: selectedProject }
+        : baseLabels;
 
       let data: { id: string };
 
@@ -2821,6 +2978,10 @@ export function NewChatLandingScreen() {
         const bundle = await buildAgentBundle(pendingAgent);
         const metadata: Record<string, unknown> = {};
         if (workspaceTrimmed) metadata.workspace = workspaceTrimmed;
+        // Born-filed: stamp the project's `omni_project` label so a bundled
+        // session groups under its project from its first sidebar appearance,
+        // same as the JSON path (see `createLabels`).
+        if (selectedProject) metadata.labels = { [PROJECT_LABEL_KEY]: selectedProject };
         data = await createBundledSession(
           bundle,
           metadata as Parameters<typeof createBundledSession>[1],
@@ -2864,19 +3025,9 @@ export function NewChatLandingScreen() {
                       ? { branch_name: trimmedBranch, existing_worktree: true }
                       : undefined,
                 }),
-            // Native terminal agents open terminal-first: `omnigent.ui:
-            // terminal` tells the UI to render the terminal wrapper, and
-            // `omnigent.wrapper` selects which CLI bridge the runner launches.
-            // The values are the registered wrapper ids the runner keys off —
-            // they must match the wrapper registry, not the agent display name.
-            // The DANGEROUS codex full-bypass opt-in rides along as an extra
-            // label (only when the toggle is armed for a codex-native agent)
-            // so the runner launches with --dangerously-bypass-approvals-and-
-            // sandbox and the choice survives reload.
-            labels:
-              agentSupportsApprovalMode && bypassSandbox
-                ? { ...(nativeLabels ?? {}), [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
-                : nativeLabels,
+            // Native-wrapper labels + codex bypass + the born-filed project
+            // label (see `createLabels` above).
+            labels: createLabels,
             // Permission / approval / cursor mode → CLI flag pair, persisted as
             // terminal_launch_args. Omitted for the default and non-native agents.
             terminal_launch_args:
@@ -2889,11 +3040,14 @@ export function NewChatLandingScreen() {
                     ? (CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.args ?? [])
                     : undefined,
             // Model + reasoning effort, persisted on the session row before
-            // the runner launches. Only claude-native surfaces the picker, so
-            // only its agents carry the choice; the runner reads them as
-            // `--model` / `--effort` at terminal launch. An unselected ("")
-            // knob is omitted so Claude Code keeps its own configured model.
-            model_override: agentSupportsPermissionMode && pickedModel ? pickedModel : undefined,
+            // the runner launches. Claude and Codex read model_override at
+            // terminal launch; an unselected ("") knob is omitted so the
+            // harness keeps its own configured/default model.
+            model_override:
+              (agentSupportsPermissionMode || nativeAgent?.harness === "codex-native") &&
+              pickedModel
+                ? pickedModel
+                : undefined,
             reasoning_effort:
               agentSupportsPermissionMode && pickedEffort ? pickedEffort : undefined,
             // Smart routing toggle — server-side. The "Auto" harness always
@@ -2916,9 +3070,12 @@ export function NewChatLandingScreen() {
         }
         data = (await res.json()) as { id: string };
       }
-      // File the new session under the chosen project (first-class membership).
-      // Awaited so the conversations refetch below already reflects it;
-      // non-fatal if it fails — the session is created either way, just unfiled.
+      // Promote the born-filed session to first-class project membership. The
+      // create above already stamped the `omni_project` label (so the row
+      // groups under its project immediately); this move sets the first-class
+      // `project_id` and clears that label — the single source of truth after
+      // the dual-read transition. Non-fatal if it fails: the session stays
+      // filed by its label, so it still shows under the project either way.
       if (selectedProject) {
         try {
           // File via first-class project_id; the helper resolves the picked
@@ -2931,11 +3088,18 @@ export function NewChatLandingScreen() {
           // useProjectSessions, separate from the global conversations list).
           void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
         } catch {
-          // Leave the session unfiled; the user can file it from the sidebar.
+          // Non-fatal: the create already stamped the `omni_project` label, so
+          // the session stays filed under its project by label even if this
+          // `project_id` promotion fails — the sidebar's dual-read grouping
+          // still shows it under the project.
         }
       }
       // Sandbox creates have no user-picked workspace to remember.
       if (!sandboxSelected) addRecent(workspaceTrimmed);
+      // Remember the launched harness so the picker promotes it out of "More"
+      // next time. Recorded only on a successful create, so a harness the user
+      // merely browsed past never earns a primary slot.
+      if (selectedNativeHarness !== null) addRecentHarness(selectedNativeHarness);
       // Fire-and-forget: don't block navigation on the sidebar list refresh.
       // The background refetch (or the WS session_added push) backfills the
       // new session's row within ~1s of landing in the chat; the chat itself
@@ -2978,16 +3142,20 @@ export function NewChatLandingScreen() {
     }
   }
 
+  const placeholderText = selectedProject
+    ? `Start a new session in ${selectedProject}`
+    : "Describe a task to start a new session…";
+
   // The working-directory chip — a single Popover trigger button that opens
   // the file browser. The directory-conflict warning lives inside the browser
   // (a banner on the occupied folder), not on the chip.
   const workspaceChip = (
     <button
       type="button"
-      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
+      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
       data-testid="new-chat-landing-workspace-chip"
     >
-      <FolderIcon className="size-4 shrink-0" />
+      <FolderIcon className="ui-icon" />
       {/* Label collapses to icon-only on narrow viewports (mobile). Capped
           tight so a long working-directory path truncates instead of pushing
           the chip row onto a second line. */}
@@ -3013,20 +3181,22 @@ export function NewChatLandingScreen() {
           keeps the composer from feeling cramped against the viewport
           edges; widens to the full px-10 at the md breakpoint and up. */}
       <div className="flex w-full max-w-[840px] flex-col items-center gap-8 px-4 pt-8 pb-16 md:select-none md:px-10">
-        <div className="flex w-full flex-col items-center justify-center gap-3.5 sm:flex-row">
+        <div className="flex w-full flex-col items-center justify-center gap-3.5 font-display-alt">
           {selectedProject ? (
             // Landing inside a project: swap Otto's eyes for the same folder
             // icon the sidebar uses for a project, and name the project. Sized
             // to Otto's h-18 box so the centered composer doesn't shift when
             // toggling between the two landings.
             <span className="flex h-18 shrink-0 items-center">
-              <FolderIcon className="size-12 text-muted-foreground" />
+              <div className="w-14 h-14 flex rounded-xl bg-tag-pink items-center justify-center">
+                <FolderIcon className="size-6 text-brand-accent" />
+              </div>
             </span>
           ) : (
             <OttoEyes className="h-18 w-auto shrink-0" />
           )}
-          <h1 className="min-w-0 break-words text-center text-3xl font-medium tracking-[-0.03em] text-foreground line-clamp-2 sm:text-left">
-            {selectedProject || "What should we do?"}
+          <h1 className="min-w-0 break-words text-center text-[1.75em] font-normal tracking-[-0.03em] text-foreground line-clamp-2 sm:text-left">
+            {selectedProject || "What should we build?"}
           </h1>
         </div>
         <div className="relative flex w-full flex-col gap-3">
@@ -3055,7 +3225,7 @@ export function NewChatLandingScreen() {
           >
             {isDragActive && (
               <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-card/80">
-                <span className="text-sm font-medium text-ring">Drop files here</span>
+                <span className="text-ui font-medium text-ring">Drop files here</span>
               </div>
             )}
             {/* Skill suggestions — floats above the composer box. */}
@@ -3170,8 +3340,8 @@ export function NewChatLandingScreen() {
               }}
               // Suppress the native placeholder when the overlay supplies its
               // own prompt text; aria-label preserves the accessible name.
-              placeholder={pillSkills.length > 0 ? "" : "Describe a task to start a new session…"}
-              aria-label="Describe a task to start a new session"
+              placeholder={pillSkills.length > 0 ? "" : placeholderText}
+              aria-label={placeholderText}
               rows={1}
               autoFocus
               data-testid="new-chat-landing-input"
@@ -3179,17 +3349,16 @@ export function NewChatLandingScreen() {
               // 14px/20px. (Note: sub-16px inputs make mobile Safari
               // auto-zoom on focus — accepted tradeoff per the design.)
               // Heights are border-box (16px top + 4px bottom padding lives
-              // inside them): min 60px = one 20px line + a spare line of
-              // breathing room; max 200px = the spec's 180px of content.
+              // inside them): max 200px = the spec's 180px of content.
               // useAutoGrowTextarea drives the height between the two.
-              className="max-h-[200px] min-h-[60px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-4 pb-1 font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-sm leading-5 text-foreground outline-none placeholder:text-muted-foreground md:select-text"
+              className="max-h-[200px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-4 pb-1 font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-ui leading-5 text-foreground outline-none placeholder:text-muted-foreground md:select-text"
             />
             {/* Gated on an empty draft so it reads as the placeholder.
                 pointer-events-none lets clicks fall through to focus the
                 textarea; the pills themselves opt back in. */}
             {pillSkills.length > 0 && message.length === 0 && (
               <div className="pointer-events-none absolute inset-x-4 top-4 flex flex-wrap items-center gap-2">
-                <span className="font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-sm leading-5 text-muted-foreground">
+                <span className="font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-ui leading-5 text-muted-foreground">
                   Describe a task, or try a skill
                 </span>
                 <SkillPills skills={pillSkills} onPick={applySkillPill} />
@@ -3219,7 +3388,7 @@ export function NewChatLandingScreen() {
                 {mentionedItems.map((item, i) => (
                   <span
                     key={mentionItemPath(item)}
-                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
                   >
                     {item.isDir ? (
                       <FolderIcon className="size-3 shrink-0" />
@@ -3248,7 +3417,7 @@ export function NewChatLandingScreen() {
                 {files.map((file, i) => (
                   <span
                     key={attachmentKey(file)}
-                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
                   >
                     {file.type.startsWith("image/") ? (
                       <ImageIcon className="size-3 shrink-0" />
@@ -3284,7 +3453,7 @@ export function NewChatLandingScreen() {
                   title="Attach files"
                   data-testid="new-chat-landing-attach"
                 >
-                  <PaperclipIcon className="size-4" />
+                  <PaperclipIcon className="size-4" data-icon-size="16" />
                   <span className="sr-only">Attach files</span>
                 </Button>
                 <ComposerMicButton
@@ -3298,62 +3467,78 @@ export function NewChatLandingScreen() {
                   onInterim={dictation.replaceInterim}
                 />
               </div>
-              <div className="flex items-center gap-0.5">
-                {/* Agent / harness picker — selects the agent or harness only.
-                  Its run-config knobs (model / effort / permission mode for
-                  Claude Code, approval mode for Codex/OpenCode, exec mode for
-                  Cursor, brain-harness override for bundle agents) live in the
-                  gear-icon config modal beside it. */}
-                <AgentHarnessPicker
-                  agentEntries={agentEntries}
-                  harnessEntries={harnessEntries}
-                  effectiveAgentId={effectiveAgentId}
-                  agentLabel={agentLabel}
-                  hasAgents={agentList.length > 0}
-                  host={harnessWarningHost}
-                  onSelectAgent={handleSelectAgent}
-                  pendingAgent={pendingAgentAllowedOnTarget ? pendingAgent : null}
-                  pendingAgentId={PENDING_AGENT_ID}
-                  onSelectPending={handleSelectPending}
-                  onCreateCustomAgent={() => setCreateAgentOpen(true)}
-                  sandboxSelected={sandboxSelected}
-                />
-                {/* Gear — opens the selected agent's run-config modal. Hidden
-                  when the selected agent has no knobs to configure. Hovering
-                  shows the current settings so they're readable without
-                  opening the modal. */}
-                {selectedAgent && selectedAgentHasKnobs && (
-                  <TooltipProvider>
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <Button
-                          type="button"
-                          size="icon"
-                          variant="ghost"
-                          className="size-9 text-muted-foreground md:size-8"
-                          disabled={creating}
-                          onClick={() => setConfigOpen(true)}
-                          data-testid="new-chat-landing-config-gear"
-                        >
-                          <SettingsIcon className="size-4" />
-                          <span className="sr-only">Configure {selectedAgent.display_name}</span>
-                        </Button>
-                      </TooltipTrigger>
-                      <TooltipContent
-                        side="top"
-                        className="flex-col items-start gap-0.5 px-3 py-2"
-                        data-testid="new-chat-landing-config-gear-tooltip"
-                      >
-                        {configSummary.map((row) => (
-                          <span key={row.label} className="text-muted-foreground">
-                            {row.label}:{" "}
-                            <span className="text-popover-foreground">{row.value}</span>
-                          </span>
-                        ))}
-                      </TooltipContent>
-                    </Tooltip>
-                  </TooltipProvider>
-                )}
+              <div className="flex items-center gap-0.5 md:gap-2">
+                <div className="flex items-center rounded-lg transition-colors has-[button:not(:disabled)]:hover:bg-muted dark:has-[button:not(:disabled)]:hover:bg-muted/50 has-aria-expanded:bg-muted dark:has-aria-expanded:bg-muted/50 [&>button]:bg-transparent!">
+                  {/* Agent / harness picker — selects the agent or harness only.
+                    Its run-config knobs (model / effort / permission mode for
+                    Claude Code, approval mode for Codex/OpenCode, exec mode for
+                    Cursor, brain-harness override for bundle agents) live in the
+                    gear-icon config modal beside it. */}
+                  <AgentHarnessPicker
+                    agentEntries={agentEntries}
+                    harnessEntries={harnessEntries}
+                    effectiveAgentId={effectiveAgentId}
+                    agentLabel={agentLabel}
+                    hasAgents={agentList.length > 0}
+                    host={harnessWarningHost}
+                    onSelectAgent={handleSelectAgent}
+                    pendingAgent={pendingAgentAllowedOnTarget ? pendingAgent : null}
+                    pendingAgentId={PENDING_AGENT_ID}
+                    onSelectPending={handleSelectPending}
+                    onCreateCustomAgent={() => setCreateAgentOpen(true)}
+                    sandboxSelected={sandboxSelected}
+                    // Match the gear's touch-target height so both halves fill
+                    // the shared pill; pr-2 equals the gear icon's own centering
+                    // inset (8px) so the divider sits evenly between them.
+                    triggerClassName="h-9 pr-2 md:h-8"
+                  />
+                  {/* Gear — opens the selected agent's run-config modal, behind
+                    a hairline divider. Both are hidden when the selected agent
+                    has no knobs to configure, leaving a plain single-segment
+                    pill. Hovering shows the current settings so they're readable
+                    without opening the modal. */}
+                  {selectedAgent && selectedAgentHasKnobs && (
+                    <>
+                      {/* The segments' own padding (trigger pr-2, gear icon
+                        centering) supplies the gap on either side. */}
+                      <span aria-hidden className="h-4 w-px shrink-0 bg-border" />
+                      <TooltipProvider>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              type="button"
+                              size="icon"
+                              variant="ghost"
+                              className="size-9 text-muted-foreground md:size-8"
+                              disabled={creating}
+                              onClick={() => setConfigOpen(true)}
+                              data-testid="new-chat-landing-config-gear"
+                            >
+                              <SettingsIcon className="size-4" data-icon-size="16" />
+                              <span className="sr-only">
+                                Configure {selectedAgent.display_name}
+                              </span>
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent
+                            side="top"
+                            className="flex-col items-start gap-0.5 px-3 py-2"
+                            data-testid="new-chat-landing-config-gear-tooltip"
+                          >
+                            {configSummary.map((row) => (
+                              <span key={row.label} className="text-muted-foreground">
+                                {row.label}:{" "}
+                                <span className="text-background dark:text-popover-foreground">
+                                  {row.value}
+                                </span>
+                              </span>
+                            ))}
+                          </TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
+                    </>
+                  )}
+                </div>
                 {selectedAgent && selectedAgentHasKnobs && (
                   <HarnessConfigModal
                     open={configOpen}
@@ -3371,6 +3556,10 @@ export function NewChatLandingScreen() {
                     claudeModelOptions={claudeModelOptions}
                     claudeModelsLoading={
                       !sandboxSelected && selectedHostId !== null && hostClaudeModelsLoading
+                    }
+                    codexModelOptions={codexModelOptions}
+                    codexModelsLoading={
+                      !sandboxSelected && selectedHostId !== null && hostCodexModelsLoading
                     }
                     pickedEffort={pickedEffort}
                     pickedHarness={pickedHarness}
@@ -3399,12 +3588,12 @@ export function NewChatLandingScreen() {
                           aria-label={creating ? "Starting session" : "Start session"}
                           aria-busy={creating}
                           data-testid="new-chat-landing-submit"
-                          className="size-8 rounded-full bg-foreground text-card transition-opacity hover:opacity-80 disabled:opacity-50"
+                          className="size-8 rounded-lg bg-foreground disabled:bg-muted disabled:text-muted-foreground transition-opacity hover:opacity-80 disabled:opacity-100 "
                         >
                           {creating ? (
                             <Loader2Icon className="size-4 animate-spin" />
                           ) : (
-                            <ArrowUpIcon className="size-4" />
+                            <ArrowUpIcon className="size-4" viewBox="4 4 16 16" />
                           )}
                         </Button>
                       </span>
@@ -3442,13 +3631,13 @@ export function NewChatLandingScreen() {
                 <DropdownMenuTrigger asChild>
                   <button
                     type="button"
-                    className="flex h-6 items-center gap-1 rounded-full px-2.5 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
+                    className="flex h-6 items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
                     data-testid="new-chat-landing-host-chip"
                   >
                     {isCloudHost ? (
-                      <MonitorCloudIcon className="size-4 shrink-0" />
+                      <MonitorCloudIcon className="ui-icon" />
                     ) : (
-                      <MonitorIcon className="size-4 shrink-0" />
+                      <MonitorIcon className="ui-icon" />
                     )}
                     <span
                       className={`hidden max-w-32 truncate sm:block ${sandboxSelected || selectedHost != null || connectingThisMachine ? "text-foreground" : ""}`}
@@ -3469,23 +3658,23 @@ export function NewChatLandingScreen() {
                           onSelect={selectSandbox}
                           data-testid="new-chat-landing-sandbox-option"
                           data-active={sandboxSelected ? "true" : undefined}
-                          className="text-xs data-[active=true]:bg-accent/60"
+                          className="text-sm data-[active=true]:bg-accent/60"
                         >
                           <span className="flex items-center gap-2">
                             <MonitorCloudIcon className="size-4 text-muted-foreground" />
-                            <span className="text-xs">{sandboxLabel}</span>
+                            <span className="text-sm">{sandboxLabel}</span>
                           </span>
                         </DropdownMenuItem>
                       ) : (
                         <DropdownMenuItem
                           aria-disabled="true"
                           onSelect={(e) => e.preventDefault()}
-                          className="flex items-center justify-between px-2 py-1.5 text-xs text-muted-foreground opacity-60"
+                          className="flex items-center justify-between px-2 py-1.5 text-sm text-muted-foreground opacity-60"
                           data-testid="new-chat-landing-sandbox-option-disabled"
                         >
                           <span className="flex items-center gap-2">
                             <MonitorCloudIcon className="size-4 text-muted-foreground" />
-                            <span className="text-xs">New Sandbox</span>
+                            <span className="text-sm">New Sandbox</span>
                           </span>
                           <Tooltip>
                             <TooltipTrigger asChild>
@@ -3511,7 +3700,7 @@ export function NewChatLandingScreen() {
                     </>
                   )}
                   {allHosts.length === 0 && !showConnectThisMachine && (
-                    <div className="px-2 py-1.5 text-xs text-muted-foreground">
+                    <div className="px-2 py-1.5 text-sm text-muted-foreground">
                       No hosts connected yet.
                     </div>
                   )}
@@ -3521,7 +3710,7 @@ export function NewChatLandingScreen() {
                       onSelect={() => selectHost(host.host_id)}
                       data-testid={`new-chat-landing-host-${host.host_id}`}
                       data-active={host.host_id === selectedHostId ? "true" : undefined}
-                      className="text-xs data-[active=true]:bg-accent/60"
+                      className="text-sm data-[active=true]:bg-accent/60"
                     >
                       <HostOption
                         host={host}
@@ -3542,7 +3731,7 @@ export function NewChatLandingScreen() {
                           }}
                           disabled={connectingThisMachine}
                           data-testid="new-chat-landing-run-on-this-machine"
-                          className="text-xs"
+                          className="text-sm"
                         >
                           <HostOption
                             host={host}
@@ -3556,7 +3745,7 @@ export function NewChatLandingScreen() {
                       );
                     }
                     return (
-                      <DropdownMenuItem key={host.host_id} disabled className="text-xs">
+                      <DropdownMenuItem key={host.host_id} disabled className="text-sm">
                         <HostOption
                           host={host}
                           subtitle={host.host_id === thisMachineHostId ? "this machine" : undefined}
@@ -3573,10 +3762,10 @@ export function NewChatLandingScreen() {
                       }}
                       disabled={connectingThisMachine}
                       data-testid="new-chat-landing-run-on-this-machine"
-                      className="gap-2 text-xs"
+                      className="gap-2 text-sm"
                     >
                       <MonitorIcon className="size-4 shrink-0 text-muted-foreground" />
-                      <span className="text-xs">
+                      <span className="text-sm">
                         {connectingThisMachine ? "Connecting this machine…" : "Run on this machine"}
                       </span>
                     </DropdownMenuItem>
@@ -3588,7 +3777,7 @@ export function NewChatLandingScreen() {
                   <DropdownMenuItem
                     onSelect={() => setConnectOpen(true)}
                     data-testid="new-chat-landing-connect-host"
-                    className="gap-2 text-xs text-muted-foreground"
+                    className="gap-2 text-ui text-muted-foreground"
                   >
                     <PlusIcon className="size-3.5" />
                     Connect new host
@@ -3606,10 +3795,10 @@ export function NewChatLandingScreen() {
                   <PopoverTrigger asChild>
                     <button
                       type="button"
-                      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
+                      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
                       data-testid="new-chat-landing-repo-chip"
                     >
-                      <GitBranchIcon className="size-4 shrink-0" />
+                      <GitBranchIcon className="ui-icon" />
                       <span
                         className={`hidden max-w-40 truncate sm:block ${sandboxRepoName ? "text-foreground" : "text-muted-foreground"}`}
                       >
@@ -3623,7 +3812,7 @@ export function NewChatLandingScreen() {
                       <div className="flex items-center gap-1.5">
                         <label
                           htmlFor="landing-repo-url"
-                          className="text-xs font-medium text-foreground"
+                          className="text-sm font-medium text-foreground"
                         >
                           Repository (optional)
                         </label>
@@ -3650,7 +3839,7 @@ export function NewChatLandingScreen() {
                         value={sandboxRepoUrl}
                         onChange={(e) => setSandboxRepoUrl(e.target.value)}
                         placeholder="https://github.com/org/repo"
-                        className="rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
+                        className="rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
                         data-testid="new-chat-landing-repo-input"
                       />
                       <input
@@ -3659,10 +3848,10 @@ export function NewChatLandingScreen() {
                         onChange={(e) => setSandboxRepoBranch(e.target.value)}
                         placeholder="Branch (defaults to the repo's default)"
                         aria-label="Repository branch"
-                        className="rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
+                        className="rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
                         data-testid="new-chat-landing-repo-branch-input"
                       />
-                      <p className="text-xs text-muted-foreground">
+                      <p className="text-sm text-muted-foreground">
                         Cloned into the sandbox as the session's working directory. Leave blank to
                         start in an empty workspace.
                       </p>
@@ -3703,7 +3892,7 @@ export function NewChatLandingScreen() {
                         }
                       />
                     ) : (
-                      <p className="p-3 text-xs text-muted-foreground">Select a host first.</p>
+                      <p className="p-3 text-sm text-muted-foreground">Select a host first.</p>
                     )}
                   </PopoverContent>
                 </Popover>
@@ -3716,10 +3905,10 @@ export function NewChatLandingScreen() {
                   <PopoverTrigger asChild>
                     <button
                       type="button"
-                      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
+                      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
                       data-testid="new-chat-landing-branch-chip"
                     >
-                      <GitBranchIcon className="size-4 shrink-0" />
+                      <GitBranchIcon className="ui-icon" />
                       <span
                         className={`hidden max-w-32 truncate sm:block ${branchName.trim() ? "text-foreground" : ""}`}
                       >
@@ -3739,14 +3928,14 @@ export function NewChatLandingScreen() {
                     <div className="flex flex-col gap-2">
                       <label
                         htmlFor="landing-branch-name"
-                        className="text-xs font-medium text-foreground"
+                        className="text-sm font-medium text-foreground"
                       >
                         Git worktree branch (optional)
                       </label>
                       {/* Help text sits above the field. The warning for a picked
                         existing worktree stays below the input (contextual to the
                         selection). */}
-                      <p className="text-xs text-muted-foreground">
+                      <p className="text-sm text-muted-foreground">
                         New branch name, or pick an existing worktree. Leave blank to start directly
                         in the working directory.
                       </p>
@@ -3779,7 +3968,7 @@ export function NewChatLandingScreen() {
                           name="omnigent-worktree-branch"
                           // pr-9 leaves room for the generate button overlaid at
                           // the right edge.
-                          className="rounded-md border border-input bg-background py-2 pr-9 pl-3 text-xs outline-none transition-colors focus-visible:border-ring"
+                          className="rounded-md border border-input bg-background py-2 pr-9 pl-3 text-sm outline-none transition-colors focus-visible:border-ring"
                           data-testid="new-chat-landing-branch-input"
                         />
                         {/* Fill a unique branch name for a throwaway worktree.
@@ -3807,7 +3996,7 @@ export function NewChatLandingScreen() {
                             className="absolute top-full right-0 left-0 z-20 mt-1 flex max-h-40 flex-col overflow-y-auto rounded-md border border-input bg-popover p-1 shadow-md"
                             data-testid="new-chat-landing-worktree-dropdown"
                           >
-                            <span className="px-2 pt-1 pb-0.5 text-[11px] font-medium tracking-wide text-muted-foreground uppercase">
+                            <span className="px-2 pt-1 pb-0.5 text-sm font-medium tracking-wide text-muted-foreground uppercase">
                               Existing worktrees
                             </span>
                             <ul className="flex flex-col gap-0.5">
@@ -3828,7 +4017,7 @@ export function NewChatLandingScreen() {
                                         setBranchInputFocused(false);
                                         setWorktreePopoverOpen(false);
                                       }}
-                                      className={`flex w-full flex-col items-start gap-0.5 rounded-md px-2 py-1 text-left text-xs transition-colors hover:bg-accent ${
+                                      className={`flex w-full flex-col items-start gap-0.5 rounded-md px-2 py-1 text-left text-sm transition-colors hover:bg-accent ${
                                         selected ? "bg-accent" : ""
                                       }`}
                                       data-testid="new-chat-landing-worktree-option"
@@ -3863,13 +4052,13 @@ export function NewChatLandingScreen() {
                           onChange={(e) => setBaseBranch(e.target.value)}
                           placeholder="Base branch (defaults to current)"
                           aria-label="Base branch"
-                          className="rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
+                          className="rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
                           data-testid="new-chat-landing-base-branch-input"
                         />
                       )}
                       {startInExistingWorktree && (
                         <p
-                          className="text-xs text-amber-600 dark:text-amber-500"
+                          className="text-sm text-amber-600 dark:text-amber-500"
                           data-testid="new-chat-landing-existing-worktree-warning"
                         >
                           Starts in existing worktree, edit the name to create a new one.
@@ -3920,7 +4109,7 @@ export function NewChatLandingScreen() {
           {supportsApprovalMode && bypassSandbox && (
             <p
               role="alert"
-              className="flex items-center gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-xs font-medium text-destructive"
+              className="flex items-center gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-sm font-medium text-destructive"
               data-testid="new-chat-landing-bypass-sandbox-active-banner"
             >
               <TriangleAlertIcon className="size-3.5 shrink-0" />
@@ -3932,7 +4121,7 @@ export function NewChatLandingScreen() {
           )}
 
           {createError && (
-            <p className="text-xs text-destructive" data-testid="new-chat-landing-error">
+            <p className="text-sm text-destructive" data-testid="new-chat-landing-error">
               {createError}
             </p>
           )}
