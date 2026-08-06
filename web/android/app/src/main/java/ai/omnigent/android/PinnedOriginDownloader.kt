@@ -20,7 +20,6 @@ import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.MalformedURLException
 import java.net.URL
-import java.security.MessageDigest
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import java.time.format.DateTimeParseException
@@ -92,7 +91,7 @@ internal class PinnedOriginDownloader(
                 ExistingWorkPolicy.KEEP,
                 request,
             )
-            notifications.queued(DownloadStorage(context).failed(suggestedName).name)
+            notifications.queued(safeFileName(suggestedName))
         } catch (failure: RuntimeException) {
             reportEnqueueFailure(url, pinnedOrigin, suggestedName, failure)
         }
@@ -110,14 +109,15 @@ internal class PinnedOriginDownloader(
         failure: RuntimeException,
     ) {
         Log.e(TAG, "Couldn't enqueue download for $suggestedName", failure)
-        val name = DownloadStorage(context).failed(suggestedName).name
         val failureId =
-            UUID.nameUUIDFromBytes("$pinnedOrigin\u0000$url\u0000$suggestedName".toByteArray())
-        notifications.failed(name, failureId)
+            UUID.nameUUIDFromBytes(
+                downloadIdentity(url, pinnedOrigin, suggestedName).toByteArray(),
+            )
+        notifications.failed(safeFileName(suggestedName), failureId)
     }
 
     private companion object {
-        const val TAG = "PinnedOriginDownloader"
+        const val TAG = PinnedOriginDownloadWorker.TAG
         const val UNIQUE_WORK_PREFIX = "pinned-origin-download:"
 
         fun defaultWorkEnqueuer(context: Context): PinnedOriginWorkEnqueuer {
@@ -129,20 +129,19 @@ internal class PinnedOriginDownloader(
             }
         }
 
+        /** One download's identity: the tuple behind both its work name and failure id. */
+        fun downloadIdentity(
+            url: String,
+            pinnedOrigin: String,
+            suggestedName: String,
+        ): String = "$pinnedOrigin\u0000$url\u0000$suggestedName"
+
         fun uniqueWorkName(
             url: String,
             pinnedOrigin: String,
             suggestedName: String,
-        ): String {
-            val identity = "$pinnedOrigin\u0000$url\u0000$suggestedName"
-            val digest =
-                MessageDigest.getInstance("SHA-256").digest(identity.toByteArray(Charsets.UTF_8))
-            val encoded =
-                digest.joinToString(separator = "") { byte ->
-                    Integer.toHexString(byte.toInt() and 0xff).padStart(2, '0')
-                }
-            return UNIQUE_WORK_PREFIX + encoded
-        }
+        ): String =
+            UNIQUE_WORK_PREFIX + sha256Hex(downloadIdentity(url, pinnedOrigin, suggestedName))
     }
 }
 
@@ -154,7 +153,7 @@ internal class PinnedOriginDownloadWorker(
     private val storage = DownloadStorage(applicationContext)
     private val notifications = DownloadNotificationManager(applicationContext)
     private val safeSuggestedName by lazy {
-        storage.failed(inputData.getString(KEY_SUGGESTED_NAME) ?: FALLBACK_NAME).name
+        safeFileName(inputData.getString(KEY_SUGGESTED_NAME) ?: FALLBACK_NAME)
     }
 
     @Volatile
@@ -212,9 +211,6 @@ internal class PinnedOriginDownloadWorker(
             )
         }
 
-        // WorkManager persists input Data, so fetch the live cookie only when execution starts.
-        // This keeps session credentials out of WorkManager's on-disk database.
-        val cookie = CookieManager.getInstance().getCookie(input.url)
         var usedRetryAfter = false
         while (true) {
             try {
@@ -223,7 +219,6 @@ internal class PinnedOriginDownloadWorker(
                     downloadFollowingRedirects(
                         initialUrl,
                         input.pinnedOrigin,
-                        cookie,
                         input.userAgent,
                         input.mimeType,
                         input.suggestedName,
@@ -390,10 +385,23 @@ internal class PinnedOriginDownloadWorker(
         }
     }
 
+    /**
+     * Fetch the live WebView cookie for one request URL. Queried per hop so
+     * Path-scoped cookies match each hop's own path — never fetched at enqueue
+     * time, which keeps session credentials out of WorkManager's on-disk
+     * database. The WebView provider itself can be unavailable (mid-update) —
+     * fail like any transient error so the user still gets a notification.
+     */
+    private fun cookieFor(url: URL): String? =
+        try {
+            CookieManager.getInstance().getCookie(url.toString())
+        } catch (failure: Throwable) {
+            throw TransientDownloadException("WebView cookie store unavailable", failure)
+        }
+
     private fun downloadFollowingRedirects(
         initialUrl: URL,
         pinnedOrigin: String,
-        cookie: String?,
         userAgent: String,
         mimeType: String?,
         suggestedName: String,
@@ -413,8 +421,11 @@ internal class PinnedOriginDownloadWorker(
                 connection.readTimeout = READ_TIMEOUT_MS
                 connection.requestMethod = "GET"
                 if (userAgent.isNotBlank()) connection.setRequestProperty("User-Agent", userAgent)
-                if (cookieAllowed && cookie != null) {
-                    connection.setRequestProperty("Cookie", cookie)
+                if (cookieAllowed) {
+                    val cookie = cookieFor(currentUrl)
+                    if (!cookie.isNullOrBlank()) {
+                        connection.setRequestProperty("Cookie", cookie)
+                    }
                 }
 
                 val status = connection.responseCode
@@ -462,12 +473,16 @@ internal class PinnedOriginDownloadWorker(
                     throw TerminalDownloadException("Download failed with HTTP $status")
                 }
 
+                // A 200 HTML response where something else was expected is a
+                // front-door login page, not the file. When no MIME type was
+                // requested (common from onDownloadStart), infer intent from
+                // the file name so a login page can't be saved as `report.pdf`.
                 val requestedMimeType = normalizedMimeType(mimeType)
                 val responseMimeType = normalizedMimeType(connection.contentType)
-                if (requestedMimeType != null &&
-                    !isHtmlMimeType(requestedMimeType) &&
-                    responseMimeType?.let(::isHtmlMimeType) == true
-                ) {
+                val expectsHtml =
+                    requestedMimeType?.let(::isHtmlMimeType)
+                        ?: hasHtmlExtension(suggestedName)
+                if (!expectsHtml && responseMimeType?.let(::isHtmlMimeType) == true) {
                     throw AuthenticationRequiredException()
                 }
                 val resolvedMimeType =
@@ -534,17 +549,11 @@ internal class PinnedOriginDownloadWorker(
         return delayMillis.takeIf { it <= TimeUnit.SECONDS.toMillis(MAX_RETRY_AFTER_SECONDS) }
     }
 
+    // Same canonicalization as the enqueue-side gate, so both sides agree.
     internal fun hasPinnedOrigin(
         url: URL,
         pinnedOrigin: String,
-    ): Boolean {
-        val pinnedUrl = runCatching { URL(pinnedOrigin) }.getOrNull() ?: return false
-        return url.protocol.equals(pinnedUrl.protocol, ignoreCase = true) &&
-            url.host.equals(pinnedUrl.host, ignoreCase = true) &&
-            effectivePort(url) == effectivePort(pinnedUrl)
-    }
-
-    private fun effectivePort(url: URL): Int = if (url.port == -1) url.defaultPort else url.port
+    ): Boolean = originOf(url.toString()) == pinnedOrigin
 
     private fun normalizedMimeType(mimeType: String?): String? =
         mimeType
@@ -556,6 +565,9 @@ internal class PinnedOriginDownloadWorker(
         mimeType.equals("text/html", ignoreCase = true) ||
             mimeType.equals("application/xhtml+xml", ignoreCase = true)
 
+    private fun hasHtmlExtension(name: String): Boolean =
+        name.substringAfterLast('.', "").lowercase() in HTML_EXTENSIONS
+
     private data class DownloadInput(
         val url: String,
         val pinnedOrigin: String,
@@ -566,7 +578,8 @@ internal class PinnedOriginDownloadWorker(
 
     private class TransientDownloadException(
         message: String,
-    ) : Exception(message)
+        cause: Throwable? = null,
+    ) : Exception(message, cause)
 
     private class RetryAfterDownloadException(
         status: Int,
@@ -607,6 +620,7 @@ internal class PinnedOriginDownloadWorker(
         private const val FALLBACK_NAME = "download"
         private const val BACKOFF_SECONDS = 45L
         private val REDIRECT_STATUS_CODES = setOf(301, 302, 303, 307, 308)
+        private val HTML_EXTENSIONS = setOf("html", "htm", "xhtml")
         private val STOP_COUNT_LOCK = Any()
 
         internal fun request(

@@ -83,7 +83,7 @@ class OidcLoginManager(
                     .also { heldResult = null }
             }
         abandonedFuture?.cancel(true)
-        held?.let { it.flow.callback(it.result) }
+        held?.let { deliverOrHold(it.flow, it.result) }
         return newAttachment
     }
 
@@ -107,40 +107,35 @@ class OidcLoginManager(
     fun start(
         activity: Activity,
         origin: String,
-    ): Boolean = startFlow(activity, origin, null)
-
-    /** Start with a flow-local receiver that is never rebound to another flow. */
-    internal fun start(
-        activity: Activity,
-        origin: String,
-        onResult: (LoginResult) -> Unit,
-    ): Boolean = startFlow(activity, origin, onResult)
-
-    private fun startFlow(
-        activity: Activity,
-        origin: String,
-        callbackOverride: ((LoginResult) -> Unit)?,
     ): Boolean =
         synchronized(stateLock) {
             if (shutDown || activeFlow != null) return@synchronized false
 
             val flow = Flow(cancellationGeneration, origin)
-            val callback = callbackOverride ?: flow.callback
             val context = activity.applicationContext
             activeFlow = flow
             try {
                 flow.future =
                     io.submit {
                         val result = runFlow(context, origin, flow)
-                        synchronized(stateLock) {
-                            if (activeFlow === flow) activeFlow = null
-                        }
-                        if (result != null) {
-                            main.post {
-                                // New starts keep the generation; only cancel/shutdown
-                                // invalidate captured callbacks.
-                                if (canDeliver(flow)) callback(result)
+                        if (result == null) {
+                            // Interrupted — the canceller already vacated the slot.
+                            synchronized(stateLock) {
+                                if (activeFlow === flow) activeFlow = null
                             }
+                            return@submit
+                        }
+                        flow.completed = true
+                        // The slot stays occupied until the result lands on the main
+                        // thread, so a queued login trigger can't open a second
+                        // concurrent browser flow ahead of this delivery.
+                        main.post {
+                            synchronized(stateLock) {
+                                if (activeFlow === flow) activeFlow = null
+                            }
+                            // New starts keep the generation; only cancel/shutdown
+                            // invalidate captured callbacks.
+                            if (canDeliver(flow)) deliverOrHold(flow, result)
                         }
                     }
                 true
@@ -187,6 +182,10 @@ class OidcLoginManager(
 
     internal fun isInFlightForTest(): Boolean = synchronized(stateLock) { activeFlow != null }
 
+    /** True while a finished flow still occupies the slot pending main-thread delivery. */
+    internal fun isAwaitingDeliveryForTest(): Boolean =
+        synchronized(stateLock) { activeFlow?.completed == true }
+
     internal fun hasAttachmentForTest(): Boolean =
         synchronized(stateLock) { attachment?.callback != null }
 
@@ -228,10 +227,7 @@ class OidcLoginManager(
         io.shutdownNow() // interrupts the polling sleep so the task exits promptly
     }
 
-    private fun canDeliver(flow: Flow): Boolean =
-        synchronized(stateLock) {
-            !shutDown && cancellationGeneration == flow.generation
-        }
+    private fun canDeliver(flow: Flow): Boolean = synchronized(stateLock) { canDeliverLocked(flow) }
 
     private fun deliverOrHold(
         flow: Flow,
@@ -265,7 +261,8 @@ class OidcLoginManager(
         val generation: Long,
         val origin: String,
     ) {
-        val callback: (LoginResult) -> Unit = { result -> deliverOrHold(this, result) }
+        @Volatile
+        var completed = false
         var future: Future<*>? = null
     }
 
@@ -280,26 +277,28 @@ class OidcLoginManager(
     )
 
     /**
-     * Carry the WebView's cookies for [origin] on a login-endpoint request.
+     * Carry the WebView's cookies for [url] on a login-endpoint request.
      * HttpURLConnection has its own (empty) cookie store, so without this a
      * server behind a front-door auth proxy would 302 these endpoints to its
-     * IdP even after the WebView already holds the proxy's session.
+     * IdP even after the WebView already holds the proxy's session. Queried
+     * per endpoint URL so Path-scoped cookies (e.g. Path=/auth) still match.
      */
     private fun attachWebViewCookies(
         conn: HttpURLConnection,
-        origin: String,
+        url: String,
     ) {
-        val cookies = runCatching { CookieManager.getInstance().getCookie(origin) }.getOrNull()
+        val cookies = runCatching { CookieManager.getInstance().getCookie(url) }.getOrNull()
         if (!cookies.isNullOrBlank()) conn.setRequestProperty("Cookie", cookies)
     }
 
     private fun requestTicket(origin: String): Ticket? {
-        val conn = (URL("$origin/auth/cli-login").openConnection() as HttpURLConnection)
+        val url = "$origin/auth/cli-login"
+        val conn = (URL(url).openConnection() as HttpURLConnection)
         conn.requestMethod = "POST"
         // A front-door auth proxy 302s this endpoint to its IdP's HTML login
         // page; following it would "succeed" with unparseable HTML. Fail fast.
         conn.instanceFollowRedirects = false
-        attachWebViewCookies(conn, origin)
+        attachWebViewCookies(conn, url)
         conn.connectTimeout = HTTP_TIMEOUT_MS
         conn.readTimeout = HTTP_TIMEOUT_MS
         return try {
@@ -340,7 +339,7 @@ class OidcLoginManager(
         ticket: String,
     ): LoginResult {
         val deadline = clock() + pollTimeoutMs
-        val encoded = Uri.encode(ticket)
+        val pollUrl = "$origin/auth/cli-poll?ticket=${Uri.encode(ticket)}"
         while (clock() < deadline) {
             Thread.sleep(pollIntervalMs) // throws InterruptedException on shutdownNow()
             if (clock() >= deadline) break
@@ -348,15 +347,11 @@ class OidcLoginManager(
             var conn: HttpURLConnection? = null
             val body =
                 try {
-                    conn = (
-                        URL(
-                            "$origin/auth/cli-poll?ticket=$encoded",
-                        ).openConnection() as HttpURLConnection
-                    )
+                    conn = URL(pollUrl).openConnection() as HttpURLConnection
                     conn.requestMethod = "GET"
                     // A proxied 302 is a terminal rejection, never redirect HTML.
                     conn.instanceFollowRedirects = false
-                    attachWebViewCookies(conn, origin)
+                    attachWebViewCookies(conn, pollUrl)
                     conn.connectTimeout = HTTP_TIMEOUT_MS
                     conn.readTimeout = HTTP_TIMEOUT_MS
                     when (conn.responseCode) {

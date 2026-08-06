@@ -286,6 +286,28 @@ class DownloadStorageTest {
     }
 
     @Test
+    fun `MediaStore abort right after row creation deletes the pending row`() {
+        // Cancelled work is never retried, so bailing out here without a
+        // delete would leave a journaled row pending forever.
+        val result =
+            DownloadStorage(context).save(
+                "cancelled.txt",
+                "text/plain",
+                shouldAbort = { provider.insertCalls > 0 },
+            ) { stream ->
+                stream.write("never".toByteArray())
+            }
+
+        assertFalse(result.saved)
+        assertEquals(1, provider.insertCalls)
+        assertEquals(0, provider.updateCalls)
+        assertEquals(1, provider.deleteCalls)
+        assertFalse(
+            mediaStoreJournal().all.values.contains(provider.insertedUri.toString()),
+        )
+    }
+
+    @Test
     fun `safe file names strip paths replace illegal characters and fall back for dots`() {
         val storage = DownloadStorage(context)
 

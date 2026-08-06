@@ -23,6 +23,7 @@ import org.json.JSONObject
 internal class OmnigentBridgeListener(
     private val notifications: NativeNotificationManager,
     private val blobSaver: BlobSaver,
+    private val pinnedOrigin: () -> String?,
     /** Relays validated bounds without retaining the Activity-owned view. */
     private val onServerSwitcherBand: (ServerSwitcherBand) -> Unit,
     private val onServerSwitcherHidden: (Boolean) -> Unit,
@@ -34,9 +35,18 @@ internal class OmnigentBridgeListener(
         isMainFrame: Boolean,
         replyProxy: JavaScriptReplyProxy,
     ) {
+        handle(message.data, sourceOrigin, isMainFrame)
+    }
+
+    internal fun handle(
+        data: String?,
+        sourceOrigin: Uri,
+        isMainFrame: Boolean,
+    ) {
         if (!isMainFrame) return // origin allowlist already gates; defense in depth.
-        val data = message.data ?: return
-        handle(data)
+        val pin = pinnedOrigin() ?: return
+        if (originOf(sourceOrigin.toString()) != pin) return
+        handle(data ?: return)
     }
 
     /** Parse and dispatch one bridge message; malformed input is dropped. */
