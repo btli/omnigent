@@ -2089,6 +2089,7 @@ function SectionHeader({
   collapsed,
   onToggleCollapsed,
   contextMenu,
+  contextMenuDisabled,
 }: {
   title: string;
   icon?: ReactNode;
@@ -2103,6 +2104,8 @@ function SectionHeader({
       long-pressing (touch) the header button — the folder-menu parity path.
       Radix's own trigger supplies both gestures, so no gesture code lives here. */
   contextMenu?: ReactNode;
+  /** Suppresses the context menu (bulk-selection mode owns the rows). */
+  contextMenuDisabled?: boolean;
 }) {
   // A long-press opens the menu mid-gesture and its trailing click would toggle
   // the folder; a mouse right-click or keyboard Shift+F10 leaves no such click.
@@ -2205,8 +2208,9 @@ function SectionHeader({
   // which would clobber its WebkitTouchCallout.
   return (
     <h2>
-      {contextMenu ? (
+      {contextMenu && !contextMenuDisabled ? (
         <ContextMenu
+          modal={false}
           onOpenChange={(open) => {
             if (open) {
               swallowClickRef.current = longPressPointerRef.current;
@@ -2487,8 +2491,9 @@ function ConversationSection({
             hasAction={headerAction != null}
             collapsed={isCollapsed}
             onToggleCollapsed={onToggleCollapsed}
+            contextMenu={headerContextMenu}
             // Selection mode owns the rows, so the header menu is suppressed.
-            contextMenu={selectionMode ? undefined : headerContextMenu}
+            contextMenuDisabled={selectionMode}
           />
           {headerAction && (
             <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity md:opacity-0 md:group-focus-within/header:opacity-100 md:group-hover/header:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100 md:has-[[aria-expanded=true]]:opacity-100">

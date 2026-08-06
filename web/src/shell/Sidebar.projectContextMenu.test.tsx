@@ -157,8 +157,9 @@ function folderHeader(): HTMLElement {
   return header as HTMLElement;
 }
 
-/** Radix's ContextMenuTrigger renders a wrapping span around the `asChild`
- *  header button; the pointer handlers that arm the long-press live on it. */
+/** With `asChild`, Radix's ContextMenuTrigger renders no wrapper — its props
+ *  (data-slot, the long-press pointer handlers) merge onto the header button
+ *  itself, so `closest` matches the button and this equals folderHeader(). */
 function contextTrigger(): HTMLElement {
   const trigger = folderHeader().closest('[data-slot="context-menu-trigger"]');
   if (trigger === null) throw new Error("folder header has no context-menu trigger");
@@ -404,6 +405,24 @@ describe("project folder header context menu", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("does not swallow a keyboard toggle after a clickless non-mouse open", () => {
+    // A pen barrel-button right-click (or a touch release over the portaled
+    // menu) arms the swallow but never delivers a trailing click. Closing the
+    // menu must disarm it, or the next keyboard Enter is silently eaten.
+    renderSidebar();
+    expect(folderHeader()).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.pointerDown(contextTrigger(), { pointerType: "pen", button: 2 });
+    fireEvent.contextMenu(folderHeader());
+    expect(screen.getByTestId("rename-project")).toBeInTheDocument();
+
+    dismissMenu();
+
+    // Keyboard activation (click with no preceding pointerdown) still toggles.
+    fireEvent.click(folderHeader(), { detail: 0 });
+    expect(folderHeader()).toHaveAttribute("aria-expanded", "true");
   });
 
   it("scopes the header trigger to the header button, clear of the nested rows", () => {
