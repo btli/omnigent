@@ -32,11 +32,11 @@ class OmnigentWebViewClient(
     private val shouldInjectBridgeAtPageReady: () -> Boolean,
     private val onPageReady: (url: String?) -> Unit,
     private val onLoginRequired: () -> Unit,
+    private val onNavigationStarted: () -> Unit,
     private val onProxyAuthFlowEnded: () -> Unit,
     private val clock: () -> Long = { SystemClock.elapsedRealtime() },
     private val onEmbeddedSignInUnsupported: () -> Unit,
     private val onWebViewUnusable: () -> Unit,
-    private val onNavigationStarted: () -> Unit,
 ) : WebViewClient() {
     private var proxyAuthState = ProxyAuthState.IDLE
     private var flowStartedAt = 0L

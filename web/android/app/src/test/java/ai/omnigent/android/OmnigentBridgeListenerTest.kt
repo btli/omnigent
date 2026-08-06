@@ -27,9 +27,9 @@ class OmnigentBridgeListenerTest {
     private lateinit var listener: OmnigentBridgeListener
     private lateinit var notifications: NativeNotificationManager
     private lateinit var shadow: ShadowNotificationManager
-    private var pinnedOrigin: String? = ORIGIN
     private val receivedBands = mutableListOf<ServerSwitcherBand>()
     private val receivedSwitcherVisibility = mutableListOf<Boolean>()
+    private var pinnedOrigin: String? = ORIGIN
 
     private val badgeId = 1
 
@@ -43,9 +43,9 @@ class OmnigentBridgeListenerTest {
             OmnigentBridgeListener(
                 notifications = notifications,
                 blobSaver = BlobSaver(context),
-                pinnedOrigin = { pinnedOrigin },
                 onServerSwitcherBand = { receivedBands += it },
                 onServerSwitcherHidden = { receivedSwitcherVisibility += it },
+                pinnedOrigin = { pinnedOrigin },
             )
         shadow =
             shadowOf(

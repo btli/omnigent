@@ -217,12 +217,12 @@ class MainActivity : AppCompatActivity() {
                         },
                         onPageReady = ::onPageReady,
                         onLoginRequired = ::startLogin,
+                        onNavigationStarted = ::clearServerSwitcherBand,
                         // Drop the IdP hops a completed proxy flow left on the
                         // back stack once the next pinned page is ready.
                         onProxyAuthFlowEnded = { historyCleared = false },
                         onEmbeddedSignInUnsupported = ::showEmbeddedSignInUnsupported,
                         onWebViewUnusable = ::handleWebViewUnusable,
-                        onNavigationStarted = ::clearServerSwitcherBand,
                     )
                 webViewClient = shellWebViewClient
                 webChromeClient =
@@ -425,11 +425,11 @@ class MainActivity : AppCompatActivity() {
                 OmnigentBridgeListener(
                     notifications = notifications,
                     blobSaver = blobSaver,
-                    pinnedOrigin = { pinnedOrigin },
                     onServerSwitcherBand = { band -> host.get()?.receiveServerSwitcherBand(band) },
                     onServerSwitcherHidden = { hidden ->
                         host.get()?.receiveServerSwitcherHidden(hidden)
                     },
+                    pinnedOrigin = { pinnedOrigin },
                 ),
             )
         } catch (_: IllegalArgumentException) {
@@ -451,8 +451,9 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** Reads the config the framework hands us; `resources` lags a change. */
-    private fun applySystemBarContrast(config: Configuration = resources.configuration) {
+    // Takes the Configuration the framework hands us: onConfigurationChanged
+    // already holds the new one, and resources.configuration may lag it.
+    private fun applySystemBarContrast(config: Configuration) {
         val isLightMode =
             config.uiMode and Configuration.UI_MODE_NIGHT_MASK !=
                 Configuration.UI_MODE_NIGHT_YES

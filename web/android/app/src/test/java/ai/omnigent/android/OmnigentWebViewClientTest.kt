@@ -1134,6 +1134,7 @@ class OmnigentWebViewClientTest {
             override fun rendererPriorityAtExit(): Int = 0
         }
 
+    // onPageReady stays last so callers can pass it as a trailing lambda.
     private fun client(
         pinnedOrigin: () -> String? = { PINNED_ORIGIN },
         shouldInjectBridgeAtPageReady: Boolean = false,
@@ -1149,11 +1150,11 @@ class OmnigentWebViewClientTest {
         shouldInjectBridgeAtPageReady = { shouldInjectBridgeAtPageReady },
         onPageReady = onPageReady,
         onLoginRequired = onLoginRequired,
+        onNavigationStarted = onNavigationStarted,
         onProxyAuthFlowEnded = onProxyAuthFlowEnded,
         clock = clock,
         onEmbeddedSignInUnsupported = onEmbeddedSignInUnsupported,
         onWebViewUnusable = onWebViewUnusable,
-        onNavigationStarted = onNavigationStarted,
     )
 
     private fun webView(): RecordingWebView =
