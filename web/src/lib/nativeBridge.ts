@@ -334,6 +334,14 @@ export function isMacElectronShell(): boolean {
   return isElectronShell() && navigator.userAgent.includes("Macintosh");
 }
 
+/**
+ * Dispatched on `window` by a native shell once its bridge object is installed.
+ * The Android bridge can attach after the app mounts (an injected-script
+ * fallback runs at page-finished), so shell checks made at mount can go stale
+ * until this fires.
+ */
+export const NATIVE_READY_EVENT = "omnigent:native-ready";
+
 /** True when running inside the iOS WKWebView native shell. */
 export function isIOSShell(): boolean {
   return nativeApi()?.kind === "ios";

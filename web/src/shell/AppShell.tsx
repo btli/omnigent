@@ -156,7 +156,7 @@ export function AppShell() {
   const [sidebarOpen, setSidebarOpen] = useState(initialSidebarOpen);
   // Callback refs (not useRef): the band effect must re-run once the layout attaches.
   const [chatColumn, setChatColumn] = useState<HTMLElement | null>(null);
-  useNativeServerSwitcherBand(chatColumn, sidebarOpen && isMobileViewport());
+  useNativeServerSwitcherBand(chatColumn);
   // ?sidebar=open surfaces the session list on phone-width shells where the
   // sidebar is closed by default — the destination for a "N sessions need
   // your attention" notification tap, which would otherwise land on a bare

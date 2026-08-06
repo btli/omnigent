@@ -2,13 +2,13 @@ import { useEffect } from "react";
 
 import {
   isAndroidShell,
-  isIOSShell,
-  onNativeInsets,
+  NATIVE_READY_EVENT,
   setNativeServerSwitcherBand,
   setNativeServerSwitcherHidden,
 } from "@/lib/nativeBridge";
 
-const NATIVE_READY_EVENT = "omnigent:native-ready";
+import { useSurfaceFrontmost } from "./useNativeServerSwitcher";
+
 const MIN_USABLE_BAND_PX = 64;
 
 /**
@@ -20,12 +20,18 @@ const MIN_USABLE_BAND_PX = 64;
  * native reserves the column's header controls at both edges. Obscured or
  * collapsed columns hide the switcher instead of borrowing another surface.
  *
- * No-op outside the native shells.
+ * Android-only: the iOS shell has no band setter and owns the switcher's
+ * visibility from its own frontmost tracking, which a publish here would
+ * clobber. No-op outside the Android shell.
  */
-export function useNativeServerSwitcherBand(column: HTMLElement | null, obscured = false): void {
+export function useNativeServerSwitcherBand(column: HTMLElement | null): void {
+  // Sole Android owner of the switcher's visibility: any overlay covering the
+  // column (drawer, sidebar, sheet, maximized rail) drops frontmost and hides
+  // the switcher, so a band republish can never re-show it over an overlay.
+  const frontmost = useSurfaceFrontmost(column, column !== null, isAndroidShell);
   useEffect(() => {
     if (!column) {
-      if (isAndroidShell() || isIOSShell()) setNativeServerSwitcherHidden(true);
+      if (isAndroidShell()) setNativeServerSwitcherHidden(true);
       return;
     }
 
@@ -34,12 +40,11 @@ export function useNativeServerSwitcherBand(column: HTMLElement | null, obscured
     // be overwritten by the handle and wedge scheduling.
     let pending = false;
     let frame = 0;
-    let unsubscribeInsets = () => {};
     const publish = () => {
       pending = false;
       frame = 0;
-      if (!isAndroidShell() && !isIOSShell()) return;
-      if (obscured) {
+      if (!isAndroidShell()) return;
+      if (!frontmost) {
         setNativeServerSwitcherHidden(true);
         return;
       }
@@ -69,29 +74,22 @@ export function useNativeServerSwitcherBand(column: HTMLElement | null, obscured
       pending = true;
       frame = requestAnimationFrame(publish);
     };
-    const handleNativeReady = () => {
-      unsubscribeInsets();
-      unsubscribeInsets = onNativeInsets(schedule);
-      schedule();
-    };
 
     schedule();
-    unsubscribeInsets = onNativeInsets(schedule);
 
     const observer = typeof ResizeObserver !== "undefined" ? new ResizeObserver(schedule) : null;
-    if (column) observer?.observe(column);
+    observer?.observe(column);
     window.addEventListener("resize", schedule);
     window.addEventListener("orientationchange", schedule);
-    window.addEventListener(NATIVE_READY_EVENT, handleNativeReady);
+    window.addEventListener(NATIVE_READY_EVENT, schedule);
 
     return () => {
       if (frame !== 0) cancelAnimationFrame(frame);
-      if (isAndroidShell() || isIOSShell()) setNativeServerSwitcherHidden(true);
-      unsubscribeInsets();
+      if (isAndroidShell()) setNativeServerSwitcherHidden(true);
       observer?.disconnect();
       window.removeEventListener("resize", schedule);
       window.removeEventListener("orientationchange", schedule);
-      window.removeEventListener(NATIVE_READY_EVENT, handleNativeReady);
+      window.removeEventListener(NATIVE_READY_EVENT, schedule);
     };
-  }, [column, obscured]);
+  }, [column, frontmost]);
 }
