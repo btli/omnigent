@@ -92,7 +92,12 @@ class OmnigentWebViewClient(
         super.onPageStarted(view, url, favicon)
         expireProxyAuthIfNeeded()
 
-        val pin = pinnedOrigin() ?: return
+        // No pin means no trust decision is possible — never load inline.
+        val pin = pinnedOrigin()
+        if (pin == null) {
+            stopLoadingAndLedger(view)
+            return
+        }
         val awaitedOrigin = awaitedPageOrigin
         if (awaitedOrigin != null) {
             if (originOf(url) != awaitedOrigin) return
@@ -193,7 +198,10 @@ class OmnigentWebViewClient(
 
         if (origin == pin) return false
 
+        // Track each hop allowed to proceed so a pre-commit failure (delivered
+        // to handleReceivedError without any onPageStarted) still exits the flow.
         if (proxyAuthState == ProxyAuthState.IN_FLIGHT) {
+            trackedMainFrameUrl = urlString
             authLog("proxy-auth nav $origin — loading inline")
             return false
         }
@@ -201,6 +209,7 @@ class OmnigentWebViewClient(
         if (isProxyAuthUrl(urlString, pin)) {
             if (request.isRedirect) {
                 enterProxyAuth()
+                trackedMainFrameUrl = urlString
                 authLog("proxy-auth nav $origin — loading inline")
                 return false
             }

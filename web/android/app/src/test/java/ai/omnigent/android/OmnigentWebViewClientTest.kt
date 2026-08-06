@@ -270,16 +270,20 @@ class OmnigentWebViewClientTest {
     }
 
     @Test
-    fun `page start is ignored when no origin is pinned`() {
+    fun `page start is stopped without login when no origin is pinned`() {
         var loginCallbacks = 0
+        val webView = webView()
         val client =
             client(
                 pinnedOrigin = { null },
                 onLoginRequired = { loginCallbacks++ },
             )
 
-        client.onPageStarted(webView(), PLAIN_IDP_URL, null)
+        client.onPageStarted(webView, PLAIN_IDP_URL, null)
 
+        // Fail closed: with no pin there is no trust decision, so nothing may
+        // load inline — and login against an unknown origin makes no sense.
+        assertEquals(1, webView.stopLoadingCalls)
         assertEquals(0, loginCallbacks)
     }
 
@@ -496,14 +500,44 @@ class OmnigentWebViewClientTest {
     }
 
     @Test
-    fun `an error before any page start does not exit the flow`() {
+    fun `an entry-hop error before any page start exits the flow`() {
+        val webView = webView()
+        var loginRequired = false
+        val client = client(onLoginRequired = { loginRequired = true })
+
+        // The IdP hop failed before it committed (no onPageStarted) — the flow
+        // must not sit in flight until the deadline.
+        enterFlow(client, webView)
+        client.handleReceivedError(request(PROXY_AUTH_URL))
+
+        assertTrue(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
+        assertTrue(loginRequired)
+    }
+
+    @Test
+    fun `an unrelated error before any page start does not exit the flow`() {
         val webView = webView()
         val client = client()
 
         enterFlow(client, webView)
-        client.handleReceivedError(request(PROXY_AUTH_URL))
+        client.handleReceivedError(request(OTHER_IDP_URL))
 
         assertFalse(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
+    }
+
+    @Test
+    fun `a mid-flow hop error before it commits exits the flow`() {
+        val webView = webView()
+        var loginRequired = false
+        val client = client(onLoginRequired = { loginRequired = true })
+        enterFlow(client, webView)
+        client.onPageStarted(webView, PLAIN_IDP_URL, null)
+
+        assertFalse(client.shouldOverrideUrlLoading(webView, request(OTHER_IDP_URL)))
+        client.handleReceivedError(request(OTHER_IDP_URL))
+
+        assertTrue(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
+        assertTrue(loginRequired)
     }
 
     @Test
