@@ -1,7 +1,28 @@
 package ai.omnigent.android
 
+import android.icu.text.IDNA
 import android.net.Uri
-import java.net.IDN
+
+// Chromium canonicalizes hosts with UTS-46 (non-transitional), so the pin must
+// too: java.net.IDN is IDNA2003 and maps e.g. faß.de to fass.de — a different
+// registrable domain than the xn--fa-hia.de the WebView actually loads.
+private val uts46: IDNA =
+    IDNA.getUTS46Instance(
+        IDNA.NONTRANSITIONAL_TO_ASCII or IDNA.CHECK_BIDI or IDNA.CHECK_CONTEXTJ,
+    )
+
+// Bracketed IPv6 literals are not domain names — pass them through unmapped.
+private fun toAsciiHost(rawHost: String): String? {
+    if (rawHost.startsWith("[")) return rawHost
+    val info = IDNA.Info()
+    val ascii = StringBuilder()
+    return try {
+        uts46.nameToASCII(rawHost, ascii, info)
+        if (info.hasErrors()) null else ascii.toString()
+    } catch (_: RuntimeException) {
+        null
+    }
+}
 
 /**
  * Normalizes a URL to its origin (`scheme://host[:port]`), the unit of trust
@@ -16,12 +37,7 @@ fun originOf(url: String?): String? {
     // failing the parse. WHATWG treats a non-numeric port as an invalid URL —
     // reject it, allowing the colons of a bracketed IPv6 literal.
     if (rawHost.lastIndexOf(':') > rawHost.lastIndexOf(']')) return null
-    val host =
-        try {
-            IDN.toASCII(rawHost).lowercase()
-        } catch (_: IllegalArgumentException) {
-            null
-        } ?: return null
+    val host = toAsciiHost(rawHost)?.lowercase() ?: return null
     // Canonicalize like a browser origin (WHATWG): lowercase scheme + host and
     // omit the default port — so an explicit `https://host:443` (or odd casing)
     // the user typed compares equal to the WebView's normalized `https://host`.
