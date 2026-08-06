@@ -2,6 +2,7 @@ package ai.omnigent.android
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -60,6 +61,16 @@ class OriginsTest {
         assertNull(originOf("https://1.2.3.4.5/x"))
         assertNull(originOf("https://127.0.0.999/x"))
         assertNull(originOf("https://foo.0x1/x"))
+        // An all-digit last label forces the IPv4 path even when the number
+        // parse fails — Chromium treats these as invalid URLs, not domains.
+        assertNull(originOf("https://foo.09/x"))
+        assertNull(originOf("https://foo.1234567890123/x"))
+        // Only ONE trailing empty label is ignored: `1.2.3.` is the address
+        // 1.2.0.3, while `1.2.3..` is a (never resolvable) Chromium domain —
+        // it must not collapse onto that same pin.
+        assertEquals("https://1.2.3.4", originOf("https://1.2.3.4./x"))
+        assertEquals("https://1.2.0.3", originOf("https://1.2.3./x"))
+        assertNotEquals("https://1.2.0.3", originOf("https://1.2.3../x"))
     }
 
     @Test
