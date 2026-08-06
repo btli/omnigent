@@ -2,9 +2,7 @@ package ai.omnigent.android
 
 import android.Manifest
 import android.annotation.SuppressLint
-import android.app.AlertDialog
 import android.app.DownloadManager
-import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
@@ -25,7 +23,6 @@ import android.webkit.WebView
 import android.widget.FrameLayout
 import android.widget.PopupMenu
 import android.widget.TextView
-import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -69,33 +66,6 @@ internal fun androidSafeAreaScript(
     })();
     """.trimIndent()
 
-internal fun systemSafeAreaInsets(insets: WindowInsetsCompat): Insets =
-    insets.getInsets(
-        WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout(),
-    )
-
-internal fun androidSafeAreaScript(
-    insets: Insets,
-    density: Float,
-): String =
-    """
-    (() => {
-      const s = document.documentElement.style;
-      const top = '${insets.top / density}px';
-      const bottom = '${insets.bottom / density}px';
-      const left = '${insets.left / density}px';
-      const right = '${insets.right / density}px';
-      s.setProperty('--omnigent-safe-top', top);
-      s.setProperty('--omnigent-safe-bottom', bottom);
-      s.setProperty('--omnigent-safe-left', left);
-      s.setProperty('--omnigent-safe-right', right);
-      s.setProperty('--omnigent-android-safe-area-top', top);
-      s.setProperty('--omnigent-android-safe-area-bottom', bottom);
-      s.setProperty('--omnigent-android-safe-area-left', left);
-      s.setProperty('--omnigent-android-safe-area-right', right);
-    })();
-    """.trimIndent()
-
 /**
  * The single WebView host. Mirrors the iOS `WebShellView` + `OmnigentWebView`:
  * loads the server-served SPA, installs the `window.omnigentNative` bridge, and
@@ -106,30 +76,19 @@ internal fun androidSafeAreaScript(
  */
 class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
-    private lateinit var shellWebViewClient: OmnigentWebViewClient
     private lateinit var notifications: NativeNotificationManager
     private lateinit var blobSaver: BlobSaver
-    private lateinit var pinnedOriginDownloader: PinnedOriginDownloadHandler
-
-    // The process owns the worker; only this detachable callback can retain the Activity.
-    private val loginManager = OidcLoginManager.processInstance
-    private var loginAttachment: OidcLoginManager.Attachment? = null
+    private val loginManager = OidcLoginManager()
     private var pinnedOrigin: String? = null
-    private var embeddedSignInDialog: AlertDialog? = null
-    private var loginFailedDialog: AlertDialog? = null
-    private var rendererFailedDialog: AlertDialog? = null
 
     // Bridge-dependent work deferred until the page (and its injected emit
     // callbacks) exist — see onPageReady.
     private var pendingNavigatePath: String? = null
-    private var pendingNavigateOrigin: String? = null
     private var lastInsets: Insets? = null
     private var pageLoaded = false
     private var bridgeTransportInstalled = false
     private var bridgeScriptHandler: ScriptHandler? = null
     private var loginAttempts = 0 // capped browser-login retries; reset in onPageReady
-    private var rendererRecreationAttempts = 0
-    private var webViewUnusable = false
     private var historyCleared = false // drop pre-auth/login-redirect history once
 
     // Floating server switcher — mirrors the iOS `ServerSwitcher`. Always
@@ -169,16 +128,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-    override fun onStart() {
-        super.onStart()
-        DownloadNotificationManager.activityStarted(this)
-    }
-
-    override fun onStop() {
-        DownloadNotificationManager.activityStopped(this)
-        super.onStop()
-    }
-
     private val pickFiles =
         registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
             val callback = pendingFileCallback
@@ -189,8 +138,6 @@ class MainActivity : AppCompatActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        rendererRecreationAttempts =
-            savedInstanceState?.getInt(RENDERER_RECREATION_ATTEMPTS_KEY) ?: 0
 
         // Edge-to-edge: the WebView spans system bars; insets are pushed to CSS
         // below. Display-cutout handling is set in the manifest theme.
@@ -208,24 +155,11 @@ class MainActivity : AppCompatActivity() {
 
         // Application context for the long-lived helpers so the WebView's bridge
         // reference chain can't pin this Activity.
-        notifications = NativeNotificationManager(applicationContext, pinnedOrigin)
+        notifications = NativeNotificationManager(applicationContext)
         blobSaver = BlobSaver(applicationContext)
-        pinnedOriginDownloader = PinnedOriginDownloader(applicationContext)
 
-        // Consume the launch intent even when saved state already owns a tap.
-        val launchedNavigatePath = takeNavigatePathOf(intent)
-        if (savedInstanceState == null) {
-            pendingNavigatePath = launchedNavigatePath
-            pendingNavigateOrigin = pinnedOrigin.takeIf { launchedNavigatePath != null }
-        } else {
-            val restoredPath = savedInstanceState.getString(PENDING_NAVIGATE_PATH_KEY)
-            val restoredOrigin = savedInstanceState.getString(PENDING_NAVIGATE_ORIGIN_KEY)
-            pendingNavigatePath =
-                restoredPath?.takeIf {
-                    it.startsWith("/") && restoredOrigin == pinnedOrigin
-                }
-            pendingNavigateOrigin = restoredOrigin.takeIf { pendingNavigatePath != null }
-        }
+        // Capture (don't replay yet) a notification tap that cold-started us.
+        pendingNavigatePath = navigatePathOf(intent)
 
         if (BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true) // chrome://inspect
 
@@ -235,7 +169,7 @@ class MainActivity : AppCompatActivity() {
                 settings.domStorageEnabled = true
                 settings.mediaPlaybackRequiresUserGesture = false
 
-                shellWebViewClient =
+                webViewClient =
                     OmnigentWebViewClient(
                         pinnedOrigin = { pinnedOrigin },
                         shouldInjectBridgeAtPageReady = {
@@ -244,13 +178,7 @@ class MainActivity : AppCompatActivity() {
                         onPageReady = ::onPageReady,
                         onLoginRequired = ::startLogin,
                         onNavigationStarted = ::clearServerSwitcherBand,
-                        // Drop the IdP hops a completed proxy flow left on the
-                        // back stack once the next pinned page is ready.
-                        onProxyAuthFlowEnded = { historyCleared = false },
-                        onEmbeddedSignInUnsupported = ::showEmbeddedSignInUnsupported,
-                        onWebViewUnusable = ::handleWebViewUnusable,
                     )
-                webViewClient = shellWebViewClient
                 webChromeClient =
                     OmnigentWebChromeClient(
                         onChooseFiles = ::chooseFiles,
@@ -302,7 +230,7 @@ class MainActivity : AppCompatActivity() {
         container.addOnLayoutChangeListener(repositionOnLayout)
         switchButton.addOnLayoutChangeListener(repositionOnLayout)
         setContentView(container)
-        applySystemBarContrast(resources.configuration)
+        applySystemBarContrast()
         installBridge()
 
         // Measure the OS safe area and push it into the page as CSS custom
@@ -342,8 +270,8 @@ class MainActivity : AppCompatActivity() {
             // disappear under the notch/status icons on edge-to-edge layouts.
             (switchButton.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
                 val topMargin = bars.top + (8 * dp).toInt()
-                serverSwitcherTopMarginUpdate(lp.topMargin, topMargin)?.let { updated ->
-                    lp.topMargin = updated
+                if (lp.topMargin != topMargin) {
+                    lp.topMargin = topMargin
                     switchButton.layoutParams = lp
                 }
             }
@@ -356,10 +284,6 @@ class MainActivity : AppCompatActivity() {
             this,
             object : OnBackPressedCallback(true) {
                 override fun handleOnBackPressed() {
-                    if (webViewUnusable) {
-                        finish()
-                        return
-                    }
                     // Ask the page to dismiss an open overlay first (drawer/dialog);
                     // only navigate WebView history / leave the app if there was
                     // nothing to dismiss. evaluateJavascript's result is JSON, so a
@@ -375,11 +299,7 @@ class MainActivity : AppCompatActivity() {
                     // If the host is already going away when a late callback/timer
                     // fires, don't touch the (possibly destroyed) WebView.
                     val navigate = {
-                        if (!isDestroyed &&
-                            !isFinishing &&
-                            !webViewUnusable &&
-                            ::webView.isInitialized
-                        ) {
+                        if (!isDestroyed && !isFinishing && ::webView.isInitialized) {
                             if (webView.canGoBack()) webView.goBack() else finish()
                         }
                     }
@@ -404,7 +324,6 @@ class MainActivity : AppCompatActivity() {
             },
         )
 
-        loginAttachment = pinnedOrigin?.let { loginManager.attach(it, ::onLoginResult) }
         ensureNotificationPermission()
         webView.loadUrl(serverUrl)
     }
@@ -412,22 +331,11 @@ class MainActivity : AppCompatActivity() {
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         applySystemBarContrast(newConfig)
-        if (::webView.isInitialized && !webViewUnusable) {
+        if (::webView.isInitialized) {
             // Notify matchMedia listeners without reloading the SPA.
             webView.dispatchConfigurationChanged(newConfig)
             webView.post(::positionServerSwitcher)
         }
-    }
-
-    override fun onSaveInstanceState(outState: Bundle) {
-        outState.putInt(RENDERER_RECREATION_ATTEMPTS_KEY, rendererRecreationAttempts)
-        pendingNavigatePath?.let { path ->
-            pendingNavigateOrigin?.let { origin ->
-                outState.putString(PENDING_NAVIGATE_PATH_KEY, path)
-                outState.putString(PENDING_NAVIGATE_ORIGIN_KEY, origin)
-            }
-        }
-        super.onSaveInstanceState(outState)
     }
 
     /**
@@ -455,7 +363,6 @@ class MainActivity : AppCompatActivity() {
                     onServerSwitcherHidden = { hidden ->
                         host.get()?.receiveServerSwitcherHidden(hidden)
                     },
-                    pinnedOrigin = { host.get()?.pinnedOrigin },
                 ),
             )
         } catch (_: IllegalArgumentException) {
@@ -504,7 +411,6 @@ class MainActivity : AppCompatActivity() {
         val origin = pinnedOrigin ?: return
         if (loginAttempts >= MAX_LOGIN_ATTEMPTS) {
             authLog("login attempts exhausted ($loginAttempts) — not retrying")
-            showLoginFailed(origin)
             return
         }
         // start() no-ops when a login is already in flight — a multi-hop OIDC
@@ -512,7 +418,7 @@ class MainActivity : AppCompatActivity() {
         // Count (and re-arm the history clear for) only a call that actually
         // launches a flow, so re-entrant redirects can't burn the retry budget
         // without ever relaunching and suppress a legitimate later retry.
-        if (!loginManager.start(this, origin)) return
+        if (!loginManager.start(this, origin, ::onSessionToken)) return
         loginAttempts++
         // A re-login (session expired mid-use) bounces through the IdP again,
         // leaving a stopped off-origin entry + stale pre-expiry pages on the back
@@ -520,56 +426,6 @@ class MainActivity : AppCompatActivity() {
         // page-ready purges them — otherwise Back walks into the stopped IdP entry
         // and re-pops the login browser.
         historyCleared = false
-    }
-
-    internal fun onLoginResult(
-        origin: String,
-        result: LoginResult,
-    ) {
-        if (origin != pinnedOrigin) {
-            authLog("dropping login result from stale origin $origin")
-            return
-        }
-
-        when (result) {
-            is LoginResult.Success -> {
-                onSessionToken(origin, result.token)
-            }
-
-            LoginResult.Rejected, LoginResult.TimedOut -> {
-                showLoginFailed(origin)
-            }
-        }
-    }
-
-    private fun showLoginFailed(origin: String) {
-        if (isFinishing || isDestroyed) return
-        if (embeddedSignInDialog?.isShowing == true) return
-        if (rendererFailedDialog?.isShowing == true) return
-
-        val existingDialog = loginFailedDialog
-        if (existingDialog?.isShowing == true) {
-            existingDialog.setMessage(
-                getString(R.string.login_failed_body, hostLabelOf(origin)),
-            )
-            return
-        }
-
-        val dialog =
-            AlertDialog
-                .Builder(this)
-                .setTitle(R.string.login_failed_title)
-                .setMessage(getString(R.string.login_failed_body, hostLabelOf(origin)))
-                .setPositiveButton(R.string.login_failed_retry) { _, _ ->
-                    loginAttempts = 0
-                    startLogin()
-                }.setNegativeButton(R.string.proxy_auth_cancel, null)
-                .create()
-        loginFailedDialog = dialog
-        dialog.setOnDismissListener {
-            if (loginFailedDialog === dialog) loginFailedDialog = null
-        }
-        dialog.show()
     }
 
     /**
@@ -583,13 +439,10 @@ class MainActivity : AppCompatActivity() {
      * rules, so we both attempt a reorder-to-front (works within the grace
      * period) AND post a "tap to return" notification as the reliable path back.
      */
-    private fun onSessionToken(
-        origin: String,
-        token: String,
-    ) {
+    private fun onSessionToken(token: String) {
         // The poll can land after the activity is gone (it ran on a background
         // thread up to 5 min) — never touch a destroyed WebView.
-        if (isDestroyed || isFinishing || webViewUnusable || !::webView.isInitialized) return
+        if (isDestroyed || isFinishing || !::webView.isInitialized) return
         // Defense-in-depth: the token is interpolated into the cookie string, so a
         // value carrying ';' or whitespace could smuggle in cookie attributes
         // (e.g. Domain=, defeating the __Host- prefix). A real session token is an
@@ -597,9 +450,9 @@ class MainActivity : AppCompatActivity() {
         // this only ever rejects a malformed/hostile value, never a valid login.
         if (!isJwtShaped(token)) {
             authLog("onSessionToken: token not JWT-shaped — rejecting")
-            showLoginFailed(origin)
             return
         }
+        val origin = pinnedOrigin ?: return
         val secure = origin.startsWith("https://")
         // Matches the server's session_cookie_name: __Host- prefix on HTTPS.
         val name = if (secure) "__Host-ap_session" else "ap_session"
@@ -607,38 +460,27 @@ class MainActivity : AppCompatActivity() {
             buildString {
                 append(name).append('=').append(token).append("; Path=/")
                 if (secure) append("; Secure")
-                append("; HttpOnly")
                 append("; SameSite=Lax")
             }
         val cookies = CookieManager.getInstance()
         cookies.setAcceptCookie(true)
         authLog("onSessionToken: injecting $name (token len=${token.length})")
         cookies.setCookie(origin, cookie) { accepted ->
-            onSessionCookieSet(origin, accepted)
+            // setCookie's callback is async — re-check the WebView is still alive.
+            if (isDestroyed || !::webView.isInitialized) return@setCookie
+            authLog(
+                "setCookie accepted=$accepted present=${cookies
+                    .getCookie(
+                        origin,
+                    )?.contains(name) == true}",
+            )
+            // A rejected cookie means the reload would land unauthenticated,
+            // bounce to login, and re-launch the browser — burning the retry
+            // budget on a failure that retrying can't fix. Stay put instead.
+            if (!accepted) return@setCookie
+            cookies.flush()
+            webView.loadUrl(origin)
         }
-    }
-
-    /**
-     * Finish a session injection once the cookie store acknowledges the write.
-     * The acknowledgement is asynchronous, so the host may have been torn down
-     * or switched servers in the meantime — either way, drop it.
-     */
-    internal fun onSessionCookieSet(
-        origin: String,
-        accepted: Boolean,
-    ) {
-        if (isDestroyed || isFinishing || webViewUnusable || !::webView.isInitialized) return
-        if (origin != pinnedOrigin) return
-        authLog("setCookie accepted=$accepted")
-        // A rejected cookie means the reload would land unauthenticated, bounce
-        // to login, and re-launch the browser — burning the retry budget on a
-        // failure that retrying can't fix. Stay put instead.
-        if (!accepted) {
-            showLoginFailed(origin)
-            return
-        }
-        CookieManager.getInstance().flush()
-        webView.loadUrl(origin)
         startActivity(
             Intent(this, MainActivity::class.java)
                 .addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_SINGLE_TOP),
@@ -720,17 +562,23 @@ class MainActivity : AppCompatActivity() {
         } else {
             // The band uses physical viewport coordinates, so it must not mirror in RTL.
             gravity = Gravity.TOP or Gravity.LEFT
-            val controlReserve =
-                (SWITCHER_CONTROL_RESERVE_DP * resources.displayMetrics.density)
-                    .toInt()
             leftMargin =
-                serverSwitcherLeftMargin(containerWidth, switcherWidth, band, controlReserve)
+                serverSwitcherLeftMargin(
+                    containerWidth,
+                    switcherWidth,
+                    band,
+                    switcherControlReservePx(),
+                )
         }
         if (lp.gravity == gravity && lp.leftMargin == leftMargin) return
         lp.gravity = gravity
         lp.leftMargin = leftMargin
         switchButton.layoutParams = lp
     }
+
+    /** Shared dp→px conversion so the fit test and margin math can't drift. */
+    private fun switcherControlReservePx(): Int =
+        (SWITCHER_CONTROL_RESERVE_DP * resources.displayMetrics.density).toInt()
 
     private fun applyServerSwitcherWidthBounds(
         containerWidth: Int,
@@ -739,21 +587,13 @@ class MainActivity : AppCompatActivity() {
         val dp = resources.displayMetrics.density
         val defaultMax = (SWITCHER_MAX_WIDTH_DP * dp).toInt()
         val defaultMin = (SWITCHER_MIN_WIDTH_DP * dp).toInt()
-        val controlReserve = (SWITCHER_CONTROL_RESERVE_DP * dp).toInt()
-        val usableWidth =
-            if (band == null || containerWidth <= 0) {
-                defaultMax
-            } else {
-                serverSwitcherUsableWidth(containerWidth, band, controlReserve)
-            }
+        val controlReserve = switcherControlReservePx()
         val max =
             if (band == null || containerWidth <= 0) {
                 defaultMax
             } else {
-                maxOf(
-                    defaultMin,
-                    minOf(defaultMax, usableWidth),
-                )
+                val usableWidth = serverSwitcherUsableWidth(containerWidth, band, controlReserve)
+                maxOf(defaultMin, minOf(defaultMax, usableWidth))
             }
         // Floors the WIDTH only — the height stays the text's — so this bounds how
         // far a label can shrink, not the full touch target.
@@ -784,66 +624,37 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        // Unblock pending host work, then release Activity-owned resources.
+        // Unblock a pending file input / mic request, then release WebView + worker.
         pendingFileCallback?.onReceiveValue(null)
         pendingFileCallback = null
         pendingMicRequest?.deny()
         pendingMicRequest = null
-        // Leaving for good abandons the flow; a recreation keeps it polling so a
-        // successful login finished in the browser still lands.
-        if (isFinishing) loginManager.cancel()
-        loginAttachment?.let(loginManager::detach)
-        loginAttachment = null
-        loginFailedDialog?.dismiss()
-        loginFailedDialog = null
-        rendererFailedDialog?.dismiss()
-        rendererFailedDialog = null
-        if (::webView.isInitialized) {
-            shellWebViewClient.endProxyAuth()
-            dismissEmbeddedSignInDialogWithoutReset()
-            if (!webViewUnusable) {
-                removeBridge()
-                webView.destroy()
-            }
-        }
+        loginManager.shutdown()
         if (::blobSaver.isInitialized) blobSaver.shutdown()
-        if (::pinnedOriginDownloader.isInitialized) pinnedOriginDownloader.shutdown()
+        if (::webView.isInitialized) {
+            removeBridge()
+            webView.destroy()
+        }
         super.onDestroy()
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        val store = ServerStore(this)
-        val newServerUrl = store.currentServerUrl()
-        val newOrigin = originOf(newServerUrl)
-        val activationOrigin = newOrigin ?: pinnedOrigin
-        val deliveredNavigatePath = takeNavigatePathOf(intent, activationOrigin)
-        if (webViewUnusable) {
-            if (newOrigin != null && newOrigin != pinnedOrigin) {
-                loginManager.cancel()
-                notifications.cancelAll()
-                pendingNavigatePath = null
-                pendingNavigateOrigin = null
-            }
-            if (deliveredNavigatePath != null) {
-                pendingNavigatePath = deliveredNavigatePath
-                pendingNavigateOrigin = activationOrigin
-            }
-            recreate()
-            return
-        }
+        setIntent(intent)
 
         // Detect a server change: ConnectActivity re-enters us via
         // CLEAR_TOP|SINGLE_TOP after the user picks a different server. The
         // bridge is origin-allowlisted, so a server switch without re-registering
         // leaves the bridge dead for the new origin.
+        val store = ServerStore(this)
+        val newServerUrl = store.currentServerUrl()
+        val newOrigin = originOf(newServerUrl)
         if (newOrigin != null && newOrigin != pinnedOrigin) {
             reloadWithNewServer(newServerUrl, newOrigin)
         }
 
-        if (deliveredNavigatePath == null) return
-        pendingNavigatePath = deliveredNavigatePath
-        pendingNavigateOrigin = activationOrigin
+        val path = navigatePathOf(intent) ?: return
+        pendingNavigatePath = path
         // Replay now if the page is up; otherwise onPageReady will flush it.
         if (pageLoaded) flushPendingActivation()
     }
@@ -858,86 +669,14 @@ class MainActivity : AppCompatActivity() {
         serverUrl: String,
         newOrigin: String,
     ) {
-        if (webViewUnusable) {
-            if (newOrigin != pinnedOrigin) {
-                loginManager.cancel()
-                notifications.cancelAll()
-                pendingNavigatePath = null
-                pendingNavigateOrigin = null
-            }
-            recreate()
-            return
-        }
         removeBridge()
-        loginManager.cancel()
         pinnedOrigin = newOrigin
-        shellWebViewClient.resetForOriginChange(newOrigin)
-        dismissEmbeddedSignInDialogWithoutReset()
-        loginFailedDialog?.dismiss()
-        loginFailedDialog = null
-        shellWebViewClient.stopLoadingAndLedger(webView)
-        notifications.cancelAll()
-        pendingNavigatePath = null
-        pendingNavigateOrigin = null
-        loginAttachment?.let(loginManager::detach)
-        loginAttachment = loginManager.attach(newOrigin, ::onLoginResult)
-        notifications.setOrigin(newOrigin)
         pageLoaded = false
         historyCleared = false
         loginAttempts = 0
         switchButton.applyHostLabel(serverUrl)
         installBridge()
         webView.loadUrl(serverUrl)
-    }
-
-    private fun handleWebViewUnusable() {
-        if (isFinishing || isDestroyed) return
-        if (pinnedOrigin == null) return
-        if (webViewUnusable) return
-        if (rendererRecreationAttempts >= MAX_WEBVIEW_RECREATIONS) {
-            authLog("renderer recreation attempts exhausted ($rendererRecreationAttempts)")
-            destroyUnusableWebView()
-            showRendererFailed()
-            return
-        }
-        rendererRecreationAttempts++
-        recreate()
-    }
-
-    private fun destroyUnusableWebView() {
-        webViewUnusable = true
-        pendingFileCallback?.onReceiveValue(null)
-        pendingFileCallback = null
-        pendingMicRequest?.deny()
-        pendingMicRequest = null
-        loginAttachment?.let(loginManager::detach)
-        loginAttachment = null
-        removeBridge()
-        (webView.parent as? ViewGroup)?.removeView(webView)
-        webView.destroy()
-    }
-
-    private fun showRendererFailed() {
-        if (isFinishing || isDestroyed) return
-
-        dismissEmbeddedSignInDialogWithoutReset()
-        loginFailedDialog?.dismiss()
-        loginFailedDialog = null
-
-        if (rendererFailedDialog?.isShowing == true) return
-        val dialog =
-            AlertDialog
-                .Builder(this)
-                .setTitle(R.string.renderer_failed_title)
-                .setMessage(R.string.renderer_failed_body)
-                .setPositiveButton(R.string.renderer_failed_retry) { _, _ -> recreate() }
-                .setNegativeButton(R.string.proxy_auth_cancel, null)
-                .create()
-        rendererFailedDialog = dialog
-        dialog.setOnDismissListener {
-            if (rendererFailedDialog === dialog) rendererFailedDialog = null
-        }
-        dialog.show()
     }
 
     private fun removeBridge() {
@@ -957,8 +696,9 @@ class MainActivity : AppCompatActivity() {
     /**
      * Show the server-switcher dropdown menu, mirroring the iOS `ServerSwitcher`
      * `Menu`. Lists the current server (disabled header), other recent servers,
-     * Reload, the browser escape hatch, and Connect to New Server. Tapping a
-     * recent server switches directly without leaving the app.
+     * Reload, and Connect to New Server. Tapping a recent server switches
+     * directly without leaving the app; "Connect to New Server" opens
+     * [ConnectActivity] for manual URL entry.
      */
     private fun showServerSwitcherMenu(anchor: View) {
         val store = ServerStore(this)
@@ -976,25 +716,17 @@ class MainActivity : AppCompatActivity() {
             }
             // Group 2: actions (divider before this group).
             add(2, 3, 0, getString(R.string.menu_reload))
-            add(2, 5, 1, getString(R.string.menu_open_in_browser))
-            add(2, 4, 2, getString(R.string.menu_connect_new))
+            add(2, 4, 0, getString(R.string.menu_connect_new))
         }
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 3 -> {
-                    if (webViewUnusable) recreate() else webView.reload()
+                    webView.reload()
                     true
                 }
 
                 4 -> {
                     startActivity(Intent(this@MainActivity, ConnectActivity::class.java))
-                    true
-                }
-
-                5 -> {
-                    shellWebViewClient.endProxyAuth()
-                    dismissEmbeddedSignInDialogWithoutReset()
-                    openPinnedOriginInBrowser()
                     true
                 }
 
@@ -1013,128 +745,12 @@ class MainActivity : AppCompatActivity() {
         popup.show()
     }
 
-    private fun showEmbeddedSignInUnsupported() {
-        if (isFinishing || isDestroyed) {
-            shellWebViewClient.endProxyAuth()
-            return
-        }
-        if (embeddedSignInDialog?.isShowing == true) return
-
-        loginFailedDialog?.dismiss()
-        loginFailedDialog = null
-
-        val origin = pinnedOrigin
-        if (origin == null) {
-            shellWebViewClient.endProxyAuth()
-            return
-        }
-
-        var dismissalHandled = false
-        val dialog =
-            AlertDialog
-                .Builder(this)
-                .setTitle(R.string.proxy_auth_refused_title)
-                .setMessage(
-                    getString(
-                        R.string.proxy_auth_refused_body,
-                        hostLabelOf(origin),
-                    ),
-                ).setPositiveButton(R.string.proxy_auth_open_browser, null)
-                .setNegativeButton(R.string.proxy_auth_cancel, null)
-                .create()
-        dialog.setCanceledOnTouchOutside(true)
-        embeddedSignInDialog = dialog
-        dialog.setOnDismissListener {
-            if (dismissalHandled) return@setOnDismissListener
-            dismissalHandled = true
-            if (embeddedSignInDialog === dialog) embeddedSignInDialog = null
-            if (!isFinishing && !isDestroyed) {
-                shellWebViewClient.endProxyAuth()
-            }
-        }
-        dialog.show()
-        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-            if (openPinnedOriginInBrowser()) dialog.dismiss()
-        }
-    }
-
-    private fun dismissEmbeddedSignInDialogWithoutReset() {
-        val dialog = embeddedSignInDialog ?: return
-        dialog.setOnDismissListener(null)
-        embeddedSignInDialog = null
-        dialog.dismiss()
-    }
-
-    private fun openPinnedOriginInBrowser(): Boolean {
-        val origin = pinnedOrigin
-        if (origin == null) {
-            showNoBrowserAvailable()
-            return false
-        }
-        val browserProbe =
-            Intent(Intent.ACTION_VIEW, Uri.parse("http:"))
-                .addCategory(Intent.CATEGORY_BROWSABLE)
-        val components =
-            packageManager
-                .queryIntentActivities(browserProbe, PackageManager.MATCH_DEFAULT_ONLY)
-                .mapNotNull { result ->
-                    val activityInfo = result.activityInfo ?: return@mapNotNull null
-                    if (activityInfo.packageName == packageName) return@mapNotNull null
-                    ComponentName(activityInfo.packageName, activityInfo.name)
-                }.distinct()
-
-        if (components.isEmpty()) {
-            showNoBrowserAvailable()
-            return false
-        }
-
-        val browserIntents =
-            components.map { component ->
-                Intent(Intent.ACTION_VIEW, Uri.parse(origin))
-                    .addCategory(Intent.CATEGORY_BROWSABLE)
-                    .setComponent(component)
-            }
-        val launchIntent =
-            if (browserIntents.size == 1) {
-                browserIntents.single()
-            } else {
-                Intent
-                    .createChooser(browserIntents.first(), null)
-                    .putExtra(
-                        Intent.EXTRA_INITIAL_INTENTS,
-                        browserIntents.drop(1).toTypedArray(),
-                    )
-            }
-        return runCatching { startActivity(launchIntent) }
-            .onFailure { showNoBrowserAvailable() }
-            .isSuccess
-    }
-
-    private fun showNoBrowserAvailable() {
-        val dialog = embeddedSignInDialog?.takeIf { it.isShowing }
-        if (dialog != null) {
-            dialog.setMessage(getString(R.string.proxy_auth_no_browser_body))
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE).apply {
-                setText(android.R.string.ok)
-                setOnClickListener { dialog.dismiss() }
-            }
-        } else {
-            Toast
-                .makeText(
-                    this,
-                    R.string.proxy_auth_no_browser_toast,
-                    Toast.LENGTH_LONG,
-                ).show()
-        }
-    }
-
     /** Run bridge-dependent work once a pinned-origin page has finished loading. */
     private fun onPageReady(url: String?) {
         // Only a real pinned-origin load carries the injected facade — an error
         // page (chrome-error://) or a foreign redirect must NOT drain
         // pendingNavigatePath or push insets into a page that can't consume them.
-        val pin = pinnedOrigin ?: return
-        if (originOf(url) != pin) return
+        if (originOf(url) != pinnedOrigin) return
         // First authenticated app page: drop everything before it from the
         // back/forward list. Otherwise Back walks into the pre-auth root and the
         // login-redirect reload (the `loadUrl(origin)` after the cookie injection),
@@ -1146,8 +762,6 @@ class MainActivity : AppCompatActivity() {
         }
         pageLoaded = true
         loginAttempts = 0 // reached a pinned-origin page — we're past the login redirect
-        rendererRecreationAttempts = 0
-        webViewUnusable = false
         flushPendingActivation()
         emitInsets()
     }
@@ -1157,24 +771,15 @@ class MainActivity : AppCompatActivity() {
         // e.g. mid re-login — where the bridge facade doesn't exist, so emitting
         // would silently drop the path. Keep it pending; the next pinned-origin
         // onPageReady flushes it.
-        val pin = pinnedOrigin ?: return
-        if (originOf(webView.url) != pin) return
+        if (originOf(webView.url) != pinnedOrigin) return
         emitNotificationActivation(pendingNavigatePath)
         pendingNavigatePath = null
-        pendingNavigateOrigin = null
     }
 
-    private fun takeNavigatePathOf(
-        intent: Intent?,
-        expectedOrigin: String? = pinnedOrigin,
-    ): String? {
-        val path = intent?.getStringExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH)
-        val origin = intent?.getStringExtra(NativeNotificationManager.EXTRA_NOTIFICATION_ORIGIN)
-        intent?.removeExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH)
-        intent?.removeExtra(NativeNotificationManager.EXTRA_NOTIFICATION_ORIGIN)
-        val trustedOrigin = expectedOrigin ?: return null
-        return path?.takeIf { it.startsWith("/") && origin == trustedOrigin }
-    }
+    private fun navigatePathOf(intent: Intent?): String? =
+        intent
+            ?.getStringExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH)
+            ?.takeIf { it.startsWith("/") }
 
     private fun emitNotificationActivation(path: String?) {
         if (path == null) return
@@ -1224,16 +829,6 @@ class MainActivity : AppCompatActivity() {
         acceptTypes: Array<String>,
     ): Boolean {
         pendingFileCallback?.onReceiveValue(null) // cancel any in-flight chooser
-        pendingFileCallback = null
-        // FileChooserParams omits the requesting frame, so cross-origin iframes pass this gate.
-        // Microphone requests expose request.origin and do not have this residual.
-        val currentOrigin = if (webViewUnusable) null else originOf(webView.url)
-        val pin = pinnedOrigin
-        if (pin == null || currentOrigin != pin) {
-            authLog("file chooser denied for main-frame origin $currentOrigin")
-            callback.onReceiveValue(null)
-            return true
-        }
         pendingFileCallback = callback
         // Keep MIME types as-is; resolve ".pdf"-style extension tokens to MIME so
         // the declared accept constraint isn't silently widened to */*.
@@ -1277,8 +872,7 @@ class MainActivity : AppCompatActivity() {
     /** Back [OmnigentWebChromeClient.onPermissionRequest] — grant mic to the pinned origin only. */
     private fun handlePermissionRequest(request: PermissionRequest) {
         val wantsAudio = request.resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE)
-        val pin = pinnedOrigin
-        if (!wantsAudio || pin == null || originOf(request.origin?.toString()) != pin) {
+        if (!wantsAudio || originOf(request.origin?.toString()) != pinnedOrigin) {
             request.deny()
             return
         }
@@ -1296,57 +890,33 @@ class MainActivity : AppCompatActivity() {
         contentDisposition: String?,
         mimeType: String?,
     ) {
-        if (isDestroyed || isFinishing || webViewUnusable || !::webView.isInitialized) return
         val name = URLUtil.guessFileName(url, contentDisposition, mimeType)
 
-        // Blob/data URLs cannot use DownloadManager, so fetch them in page context
-        // and save them through the blob bridge.
+        // Agent-generated files arrive as blob:/data: URLs, which DownloadManager
+        // can't handle — fetch them in page context and save via the blob bridge
+        // (fixes omnigent-ai/omnigent#969, which the iOS shell leaves broken).
         if (url.startsWith("blob:") || url.startsWith("data:")) {
             webView.evaluateJavascript(BlobDownloadScript.fetchAsBase64(url, name), null)
             return
         }
 
-        // Real WebView URLs have lowercase schemes. Reject non-http lookalikes;
-        // malformed callback input is handled by the failure path below.
+        // Same normalization as the navigation gate: accepts odd casing
+        // ("HTTPS://") and rejects non-http lookalikes ("httpfoo:"), which
+        // DownloadManager.Request would otherwise throw on.
         if (!isHttpScheme(Uri.parse(url).scheme)) return
-        val downloadOrigin = originOf(url)
-        val pin = pinnedOrigin
-        if (downloadOrigin != null && pin != null && downloadOrigin == pin) {
-            pinnedOriginDownloader.download(
-                url,
-                pin,
-                webView.settings.userAgentString,
-                mimeType,
-                name,
-            )
-            return
-        }
-        val enqueued =
-            try {
-                val request =
-                    DownloadManager.Request(Uri.parse(url)).apply {
-                        setMimeType(mimeType)
-                        setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name)
-                        setNotificationVisibility(
-                            DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED,
-                        )
-                    }
-                getSystemService<DownloadManager>()?.enqueue(request) != null
-            } catch (_: RuntimeException) {
-                false
+        val request =
+            DownloadManager.Request(Uri.parse(url)).apply {
+                setMimeType(mimeType)
+                setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name)
+                setNotificationVisibility(
+                    DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED,
+                )
             }
-        if (!enqueued) {
-            val storage = DownloadStorage(applicationContext)
-            storage.report(storage.failed(name))
-        }
+        getSystemService<DownloadManager>()?.enqueue(request)
     }
 
     private companion object {
         const val MAX_LOGIN_ATTEMPTS = 3
-        const val MAX_WEBVIEW_RECREATIONS = 2
-        const val RENDERER_RECREATION_ATTEMPTS_KEY = "rendererRecreationAttempts"
-        const val PENDING_NAVIGATE_PATH_KEY = "pendingNavigatePath"
-        const val PENDING_NAVIGATE_ORIGIN_KEY = "pendingNavigateOrigin"
 
         // The 48dp floor is tap safety, not the iOS 120dp visual floor.
         const val SWITCHER_MAX_WIDTH_DP = 172

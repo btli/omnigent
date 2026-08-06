@@ -595,10 +595,20 @@ describe("native server switcher band", () => {
       return 1;
     });
     Object.defineProperty(window, "innerWidth", { configurable: true, value: 1000 });
+    // jsdom has no elementFromPoint; frontmost tracking probes it. Report the
+    // sidebar mock while it's open (it overlays the column), else the column.
+    (
+      document as unknown as { elementFromPoint: (x: number, y: number) => Element | null }
+    ).elementFromPoint = () => {
+      const sidebar = document.querySelector('[data-testid="sidebar"]');
+      if (sidebar?.getAttribute("data-open") === "true") return sidebar;
+      return document.querySelector("main");
+    };
   });
 
   afterEach(() => {
     delete (window as unknown as Record<string, unknown>).omnigentNative;
+    delete (document as unknown as Record<string, unknown>).elementFromPoint;
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
@@ -625,20 +635,9 @@ describe("native server switcher band", () => {
     expect(setBand).not.toHaveBeenCalled();
   });
 
-  it("hides when the main column is only one pixel wide", () => {
-    const setBand = vi.fn();
-    const setHidden = vi.fn();
-    installShell("android", setBand, setHidden);
-    installLayoutRects(1);
-    mockConversations([]);
-
-    renderShell("/");
-
-    expect(setBand).not.toHaveBeenCalled();
-    expect(setHidden).toHaveBeenLastCalledWith(true);
-  });
-
-  it("does not borrow the workspace region below the usable-band threshold", () => {
+  it("publishes even a sliver column; native owns the too-small-to-fit policy", () => {
+    // The shell's control reserve + minimum pill width decide "too narrow";
+    // the web layer publishes the geometry as-is so the policy lives once.
     const setBand = vi.fn();
     const setHidden = vi.fn();
     installShell("android", setBand, setHidden);
@@ -647,19 +646,8 @@ describe("native server switcher band", () => {
 
     renderShell("/");
 
-    expect(setBand).not.toHaveBeenCalled();
-    expect(setHidden).toHaveBeenLastCalledWith(true);
-  });
-
-  it("publishes the chat column at the usable-band threshold", () => {
-    const setBand = vi.fn();
-    installShell("android", setBand);
-    installLayoutRects(64);
-    mockConversations([]);
-
-    renderShell("/");
-
-    expect(setBand).toHaveBeenCalledWith(0.32, 0.384);
+    expect(setBand).toHaveBeenCalledWith(0.32, 0.383);
+    expect(setHidden).toHaveBeenLastCalledWith(false);
   });
 
   it("does not publish when both observed elements are absent", () => {
@@ -680,7 +668,9 @@ describe("native server switcher band", () => {
     renderShell("/");
 
     const main = document.querySelector("main");
-    const observer = TestResizeObserver.instances[0];
+    // The live observer is the latest instance — the effect re-ran once
+    // frontmost tracking settled and replaced its first observer.
+    const observer = TestResizeObserver.instances.at(-1)!;
     expect(observer.observe).toHaveBeenCalledWith(main);
     expect(observer.observe).toHaveBeenCalledOnce();
 
@@ -708,7 +698,7 @@ describe("native server switcher band", () => {
     expect(setHidden).toHaveBeenLastCalledWith(true);
   });
 
-  it("hides the band while the mobile sidebar overlay is open", () => {
+  it("hides the band while the mobile sidebar overlay is open", async () => {
     const setBand = vi.fn();
     const setHidden = vi.fn();
     installShell("android", setBand, setHidden);
@@ -716,6 +706,9 @@ describe("native server switcher band", () => {
     mockConversations([]);
 
     renderShell("/?sidebar=open");
+    // The sidebar opens in an effect; frontmost tracking re-checks on the DOM
+    // mutation, which is delivered on a microtask — flush it before asserting.
+    await act(async () => {});
 
     expect(setHidden).toHaveBeenLastCalledWith(true);
   });
@@ -726,7 +719,8 @@ describe("native server switcher band", () => {
     installLayoutRects(400);
     mockConversations([]);
     const { unmount } = renderShell("/");
-    const observer = TestResizeObserver.instances[0];
+    const observer = TestResizeObserver.instances.at(-1)!;
+    expect(observer.disconnect).not.toHaveBeenCalled();
 
     unmount();
 
@@ -741,43 +735,45 @@ describe("native server switcher band", () => {
     renderShell("/");
     expect(setBand).not.toHaveBeenCalled();
 
-    let emitInsets: ((insets: { topBar: number; bottomBar: number }) => void) | undefined;
-    (window as unknown as Record<string, unknown>).omnigentNative = {
-      kind: "android",
-      setBadgeCount: vi.fn(),
-      notify: vi.fn().mockResolvedValue(true),
-      setServerSwitcherBand: setBand,
-      onNativeInsets: (callback: typeof emitInsets) => {
-        emitInsets = callback;
-        return () => {
-          emitInsets = undefined;
-        };
-      },
-    };
+    installShell("android", setBand);
 
     act(() => window.dispatchEvent(new Event("omnigent:native-ready")));
     expect(setBand).toHaveBeenLastCalledWith(0.32, 0.72);
 
     rects.mainLeft = 400;
     rects.mainWidth = 300;
-    act(() => emitInsets?.({ topBar: 0, bottomBar: 0 }));
+    act(() => window.dispatchEvent(new Event("resize")));
     expect(setBand).toHaveBeenLastCalledWith(0.4, 0.7);
   });
 
   it("coalesces each window resize source through an animation frame", () => {
-    const callbacks: FrameRequestCallback[] = [];
+    // Honor cancellation: schedule() replaces a pending frame, so the mock
+    // must drop cancelled callbacks or coalescing can't be observed.
+    const callbacks = new Map<number, FrameRequestCallback>();
+    let nextFrameId = 1;
     vi.mocked(window.requestAnimationFrame).mockImplementation((callback) => {
-      callbacks.push(callback);
-      return callbacks.length;
+      callbacks.set(nextFrameId, callback);
+      return nextFrameId++;
     });
+    vi.spyOn(window, "cancelAnimationFrame").mockImplementation((handle) => {
+      callbacks.delete(handle);
+    });
+    // Frontmost tracking schedules frames of its own, so drain the queue (new
+    // frames can be enqueued by flushed ones) and assert on publish counts.
+    const flushFrames = () => {
+      while (callbacks.size > 0) {
+        const [handle, callback] = callbacks.entries().next().value!;
+        callbacks.delete(handle);
+        act(() => callback(0));
+      }
+    };
     const setBand = vi.fn();
     installShell("android", setBand);
     installLayoutRects(400);
     mockConversations([]);
     renderShell("/");
 
-    expect(callbacks).toHaveLength(1);
-    act(() => callbacks[0](0));
+    flushFrames();
     expect(setBand).toHaveBeenCalledTimes(1);
     expect(setBand).toHaveBeenLastCalledWith(0.32, 0.72);
 
@@ -786,15 +782,13 @@ describe("native server switcher band", () => {
       window.dispatchEvent(new Event("resize"));
     });
 
-    expect(callbacks).toHaveLength(2);
-    act(() => callbacks[1](0));
+    flushFrames();
     expect(setBand).toHaveBeenCalledTimes(2);
     expect(setBand).toHaveBeenLastCalledWith(0.32, 0.72);
 
     act(() => window.dispatchEvent(new Event("orientationchange")));
 
-    expect(callbacks).toHaveLength(3);
-    act(() => callbacks[2](0));
+    flushFrames();
     expect(setBand).toHaveBeenCalledTimes(3);
     expect(setBand).toHaveBeenLastCalledWith(0.32, 0.72);
   });

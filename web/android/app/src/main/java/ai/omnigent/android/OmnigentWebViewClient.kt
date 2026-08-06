@@ -3,21 +3,9 @@ package ai.omnigent.android
 import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
-import android.net.http.SslError
-import android.os.SystemClock
-import android.webkit.RenderProcessGoneDetail
-import android.webkit.SslErrorHandler
-import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
-
-enum class ProxyAuthState {
-    IDLE,
-    IN_FLIGHT,
-    REFUSED,
-}
 
 /**
  * Signals [onPageReady] once a pinned-origin page finishes loading and routes
@@ -33,58 +21,7 @@ class OmnigentWebViewClient(
     private val onPageReady: (url: String?) -> Unit,
     private val onLoginRequired: () -> Unit,
     private val onNavigationStarted: () -> Unit,
-    private val onProxyAuthFlowEnded: () -> Unit,
-    private val clock: () -> Long = { SystemClock.elapsedRealtime() },
-    private val onEmbeddedSignInUnsupported: () -> Unit,
-    private val onWebViewUnusable: () -> Unit,
 ) : WebViewClient() {
-    private var proxyAuthState = ProxyAuthState.IDLE
-    private var flowStartedAt = 0L
-
-    // Error callbacks may arrive after a server switch, so exits require the
-    // URL last started while the current flow was in flight.
-    private var trackedMainFrameUrl: String? = null
-
-    // The self-stop ledger describes WebView loading, independently of auth.
-    private var activeMainFrameUrl: String? = null
-    private var isLoading = false
-    private var lastSelfStoppedUrl: String? = null
-    private var awaitedPageOrigin: String? = null
-
-    /** Stop the current load while owning the compatibility finish it causes. */
-    fun stopLoadingAndLedger(view: WebView) {
-        if (isLoading) lastSelfStoppedUrl = activeMainFrameUrl
-        view.stopLoading()
-    }
-
-    /** Ignore callbacks from the previous navigation until the new server starts. */
-    fun resetForOriginChange(newOrigin: String) {
-        endProxyAuth()
-        awaitedPageOrigin = newOrigin
-    }
-
-    private fun enterProxyAuth() {
-        if (proxyAuthState != ProxyAuthState.IDLE) return
-        proxyAuthState = ProxyAuthState.IN_FLIGHT
-        flowStartedAt = clock()
-    }
-
-    /** End any flow silently — the reset for server switches, expiry, and teardown. */
-    fun endProxyAuth() {
-        proxyAuthState = ProxyAuthState.IDLE
-        flowStartedAt = 0L
-        trackedMainFrameUrl = null
-        lastSelfStoppedUrl = null
-    }
-
-    private fun expireProxyAuthIfNeeded() {
-        if (proxyAuthState == ProxyAuthState.IN_FLIGHT &&
-            clock() - flowStartedAt > PROXY_AUTH_DEADLINE_MILLIS
-        ) {
-            endProxyAuth()
-        }
-    }
-
     override fun onPageStarted(
         view: WebView,
         url: String?,
@@ -92,50 +29,27 @@ class OmnigentWebViewClient(
     ) {
         super.onPageStarted(view, url, favicon)
         onNavigationStarted()
-        expireProxyAuthIfNeeded()
-
-        val pin = pinnedOrigin() ?: return
-        val awaitedOrigin = awaitedPageOrigin
-        if (awaitedOrigin != null) {
-            if (originOf(url) != awaitedOrigin) return
-            awaitedPageOrigin = null
-        }
-
-        activeMainFrameUrl = url
-        isLoading = true
-
-        if (proxyAuthState == ProxyAuthState.REFUSED) return
 
         val origin = originOf(url)
-        val isOffOrigin =
-            isHttpScheme(url?.let { Uri.parse(it).scheme }) && origin != pin
+        val scheme = url?.let { Uri.parse(it).scheme?.lowercase() }
 
-        if (proxyAuthState == ProxyAuthState.IDLE &&
-            isOffOrigin &&
-            isProxyAuthUrl(url, pin)
-        ) {
-            enterProxyAuth()
-        }
-
-        if (proxyAuthState == ProxyAuthState.IN_FLIGHT) {
-            trackedMainFrameUrl = url
-            if (isEmbeddedSignInUnsupported(url)) {
-                proxyAuthState = ProxyAuthState.REFUSED
-                stopLoadingAndLedger(view)
-                onEmbeddedSignInUnsupported()
-                return
-            }
-        }
-
-        if (isOffOrigin) {
-            if (proxyAuthState == ProxyAuthState.IN_FLIGHT) {
-                authLog("proxy-auth landing $origin — loading inline")
-                return
-            }
-
+        // A real http(s) navigation to a foreign origin means the server bounced
+        // us to the OIDC IdP and shouldOverrideUrlLoading didn't catch the
+        // redirect. Stop and run native system-browser login (RFC 8252: never
+        // authenticate in an embedded WebView; Google blocks it and passkeys don't
+        // work). Idempotent: the login manager ignores a second start while one is
+        // in flight.
+        //
+        // A null / about:blank / chrome-error:// URL is a failed or transitional
+        // load of the pinned server (e.g. it's offline), NOT an IdP redirect —
+        // don't misread it as a bounce and pop the browser. Mirror the http(s)
+        // gate in shouldOverrideUrlLoading.
+        if (isHttpScheme(scheme) && origin != pinnedOrigin()) {
+            // Log origin only, never the full URL (carries OAuth state/PKCE).
             authLog("off-origin landing $origin -> login")
-            stopLoadingAndLedger(view)
+            view.stopLoading()
             onLoginRequired()
+            return
         }
     }
 
@@ -144,23 +58,7 @@ class OmnigentWebViewClient(
         url: String?,
     ) {
         super.onPageFinished(view, url)
-
-        if (isLoading && activeMainFrameUrl == url) isLoading = false
-
-        // Any main-frame finish clears the ledger; a matching one is also
-        // consumed — it must not end the flow the shell's own stop preceded.
-        val consumesSelfStoppedFinish = lastSelfStoppedUrl != null && lastSelfStoppedUrl == url
-        lastSelfStoppedUrl = null
-        val pin = pinnedOrigin() ?: return
-        if (!consumesSelfStoppedFinish &&
-            proxyAuthState == ProxyAuthState.IN_FLIGHT &&
-            originOf(url) == pin
-        ) {
-            endProxyAuth()
-            onProxyAuthFlowEnded()
-        }
-
-        if (originOf(url) == pin && shouldInjectBridgeAtPageReady()) {
+        if (originOf(url) == pinnedOrigin() && shouldInjectBridgeAtPageReady()) {
             view.evaluateJavascript(NativeBridgeScript.source) { onPageReady(url) }
             return
         }
@@ -172,131 +70,33 @@ class OmnigentWebViewClient(
         request: WebResourceRequest,
     ): Boolean {
         val url = request.url
+        val scheme = url.scheme?.lowercase()
 
         // Subframes (cross-origin iframes: web previews, embeds) load inline.
         if (!request.isForMainFrame) return false
 
-        expireProxyAuthIfNeeded()
-
-        val urlString = url.toString()
-        val origin = originOf(urlString)
-
-        // Non-http(s) schemes must be handed to an installed system handler.
-        if (!isHttpScheme(url.scheme)) {
-            openExternally(view, url)
+        // Non-http(s) schemes (mailto:, tel:, intent:, custom links) can't load in
+        // the WebView — hand to the system, fail-closed if nothing handles them.
+        if (!isHttpScheme(scheme)) {
+            runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
             return true
         }
 
-        val pin = pinnedOrigin() ?: return true
+        // Same-origin app pages load in the WebView.
+        val origin = originOf(url.toString())
+        if (origin == pinnedOrigin()) return false
 
-        if (proxyAuthState == ProxyAuthState.REFUSED) {
-            return origin != pin
-        }
-
-        if (origin == pin) return false
-
-        if (proxyAuthState == ProxyAuthState.IN_FLIGHT) {
-            authLog("proxy-auth nav $origin — loading inline")
-            return false
-        }
-
-        if (isProxyAuthUrl(urlString, pin)) {
-            if (request.isRedirect) {
-                enterProxyAuth()
-                authLog("proxy-auth nav $origin — loading inline")
-                return false
-            }
-            if (!request.hasGesture()) return false
-
-            authLog("proxy-shaped external nav $origin")
-            openExternally(view, url)
-            return true
-        }
-
+        // Off-origin top-level navigation. A server redirect (no user gesture) is
+        // the OIDC flow bouncing to the IdP -> run native system-browser login. A
+        // user gesture is an external link -> hand to the system browser. Either
+        // way the foreign page never loads in this WebView (which holds the
+        // native bridge).
         authLog("off-origin nav $origin gesture=${request.hasGesture()}")
         if (request.hasGesture()) {
-            openExternally(view, url)
+            runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
         } else {
             onLoginRequired()
         }
         return true
-    }
-
-    override fun onReceivedError(
-        view: WebView,
-        request: WebResourceRequest,
-        error: WebResourceError,
-    ) {
-        super.onReceivedError(view, request, error)
-        handleReceivedError(request)
-    }
-
-    override fun onReceivedHttpError(
-        view: WebView,
-        request: WebResourceRequest,
-        errorResponse: WebResourceResponse,
-    ) {
-        super.onReceivedHttpError(view, request, errorResponse)
-        handleReceivedError(request)
-    }
-
-    override fun onReceivedSslError(
-        view: WebView,
-        handler: SslErrorHandler,
-        error: SslError,
-    ) {
-        super.onReceivedSslError(view, handler, error)
-        if (proxyAuthState == ProxyAuthState.IN_FLIGHT) endProxyAuth()
-    }
-
-    override fun onRenderProcessGone(
-        view: WebView,
-        detail: RenderProcessGoneDetail,
-    ): Boolean {
-        activeMainFrameUrl = null
-        isLoading = false
-        endProxyAuth()
-        onWebViewUnusable()
-        return true
-    }
-
-    /**
-     * Settle the trackers for a main-frame load that ended in an error, from
-     * either error callback. `internal` because [WebResourceError] has no
-     * constructor tests can reach.
-     */
-    internal fun handleReceivedError(request: WebResourceRequest) {
-        if (!request.isForMainFrame) return
-
-        val requestUrl = request.url.toString()
-        if (activeMainFrameUrl == requestUrl) isLoading = false
-        if (proxyAuthState == ProxyAuthState.IN_FLIGHT && trackedMainFrameUrl == requestUrl) {
-            endProxyAuth()
-        }
-    }
-
-    // Hand a URL to the system, fail-closed if nothing handles it.
-    private fun openExternally(
-        view: WebView,
-        url: Uri,
-    ) {
-        runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
-    }
-
-    private fun isEmbeddedSignInUnsupported(url: String?): Boolean {
-        val uri = url?.let(Uri::parse) ?: return false
-        return containsEmbeddedRejection(uri.encodedQuery) ||
-            containsEmbeddedRejection(uri.encodedFragment)
-    }
-
-    private fun containsEmbeddedRejection(component: String?): Boolean {
-        if (component == null) return false
-        return component.contains(EMBEDDED_REJECTION) ||
-            Uri.decode(component).contains(EMBEDDED_REJECTION)
-    }
-
-    private companion object {
-        const val EMBEDDED_REJECTION = "disallowed_useragent"
-        const val PROXY_AUTH_DEADLINE_MILLIS = 6 * 60_000L
     }
 }

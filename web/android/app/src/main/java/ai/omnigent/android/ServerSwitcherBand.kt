@@ -53,11 +53,6 @@ fun serverSwitcherBandCanFit(
     containerWidth > 0 &&
         serverSwitcherUsableWidth(containerWidth, band, edgeReserve) >= minimumWidth
 
-fun serverSwitcherTopMarginUpdate(
-    current: Int,
-    desired: Int,
-): Int? = desired.takeUnless { it == current }
-
 /** Centre within [band], preferring its edge when the supplied pill cannot fit. */
 fun serverSwitcherLeftMargin(
     containerWidth: Int,

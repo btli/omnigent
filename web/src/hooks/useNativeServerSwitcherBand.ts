@@ -2,44 +2,45 @@ import { useEffect } from "react";
 
 import {
   isAndroidShell,
-  isIOSShell,
-  onNativeInsets,
   setNativeServerSwitcherBand,
   setNativeServerSwitcherHidden,
 } from "@/lib/nativeBridge";
 
-const NATIVE_READY_EVENT = "omnigent:native-ready";
-const MIN_USABLE_BAND_PX = 64;
+import { useShellReady, useSurfaceFrontmost } from "./useNativeServerSwitcher";
 
 /**
  * Publish the chat column's horizontal extent so the native server switcher can
  * centre itself there instead of over the whole window.
  *
  * The switcher is a native view stacked above the web view, so wherever it
- * lands it swallows taps. The chat column keeps it off adjacent rails, while
- * native reserves the column's header controls at both edges. Obscured or
- * collapsed columns hide the switcher instead of borrowing another surface.
+ * lands it swallows taps. The chat column keeps it off adjacent rails; native
+ * owns the "band too narrow to fit the pill" policy (its control reserve +
+ * minimum width), so degenerate bands are published as-is and hidden there.
+ * Obscured or collapsed columns hide the switcher instead of borrowing another
+ * surface.
  *
- * No-op outside the native shells.
+ * Android-only: the iOS shell has no band setter and owns the switcher's
+ * visibility from its own frontmost tracking, which a publish here would
+ * clobber. No-op outside the Android shell.
  */
-export function useNativeServerSwitcherBand(column: HTMLElement | null, obscured = false): void {
+export function useNativeServerSwitcherBand(column: HTMLElement | null): void {
+  const shellReady = useShellReady(isAndroidShell);
+
+  // Sole Android owner of the switcher's visibility: any overlay covering the
+  // column (drawer, sidebar, sheet, maximized rail) drops frontmost and hides
+  // the switcher, so a band republish can never re-show it over an overlay.
+  const frontmost = useSurfaceFrontmost(column, column !== null, isAndroidShell);
   useEffect(() => {
+    if (!shellReady) return;
     if (!column) {
-      if (isAndroidShell() || isIOSShell()) setNativeServerSwitcherHidden(true);
+      setNativeServerSwitcherHidden(true);
       return;
     }
 
-    // `pending` is deliberately separate from `frame`: it is set before
-    // requestAnimationFrame returns, so a callback that runs re-entrantly cannot
-    // be overwritten by the handle and wedge scheduling.
-    let pending = false;
     let frame = 0;
-    let unsubscribeInsets = () => {};
     const publish = () => {
-      pending = false;
       frame = 0;
-      if (!isAndroidShell() && !isIOSShell()) return;
-      if (obscured) {
+      if (!frontmost) {
         setNativeServerSwitcherHidden(true);
         return;
       }
@@ -49,11 +50,6 @@ export function useNativeServerSwitcherBand(column: HTMLElement | null, obscured
         return;
       }
       const columnRect = column.getBoundingClientRect();
-      // Adjacent workspace and sidebar surfaces have their own top-row controls.
-      if (columnRect.width < MIN_USABLE_BAND_PX) {
-        setNativeServerSwitcherHidden(true);
-        return;
-      }
       const left = Math.max(0, Math.min(1, columnRect.left / viewport));
       const right = Math.max(0, Math.min(1, columnRect.right / viewport));
       if (left >= right) {
@@ -65,33 +61,23 @@ export function useNativeServerSwitcherBand(column: HTMLElement | null, obscured
     };
     // Coalesce to one frame so a drag-resize does not post per pointer event.
     const schedule = () => {
-      if (pending) return;
-      pending = true;
+      if (frame !== 0) cancelAnimationFrame(frame);
       frame = requestAnimationFrame(publish);
-    };
-    const handleNativeReady = () => {
-      unsubscribeInsets();
-      unsubscribeInsets = onNativeInsets(schedule);
-      schedule();
     };
 
     schedule();
-    unsubscribeInsets = onNativeInsets(schedule);
 
     const observer = typeof ResizeObserver !== "undefined" ? new ResizeObserver(schedule) : null;
-    if (column) observer?.observe(column);
+    observer?.observe(column);
     window.addEventListener("resize", schedule);
     window.addEventListener("orientationchange", schedule);
-    window.addEventListener(NATIVE_READY_EVENT, handleNativeReady);
 
     return () => {
       if (frame !== 0) cancelAnimationFrame(frame);
-      if (isAndroidShell() || isIOSShell()) setNativeServerSwitcherHidden(true);
-      unsubscribeInsets();
+      setNativeServerSwitcherHidden(true);
       observer?.disconnect();
       window.removeEventListener("resize", schedule);
       window.removeEventListener("orientationchange", schedule);
-      window.removeEventListener(NATIVE_READY_EVENT, handleNativeReady);
     };
-  }, [column, obscured]);
+  }, [column, frontmost, shellReady]);
 }

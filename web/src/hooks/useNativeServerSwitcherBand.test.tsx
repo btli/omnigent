@@ -25,6 +25,13 @@ function makeColumn(left: number, right: number): HTMLElement {
   return column;
 }
 
+// jsdom doesn't implement elementFromPoint; frontmost tracking probes it.
+function stubTopElement(resolve: () => Element | null) {
+  (
+    document as unknown as { elementFromPoint: (x: number, y: number) => Element | null }
+  ).elementFromPoint = resolve;
+}
+
 function installAndroidBridge() {
   const setServerSwitcherBand = vi.fn();
   const setServerSwitcherHidden = vi.fn();
@@ -55,6 +62,7 @@ beforeEach(() => {
 
 afterEach(() => {
   delete (window as unknown as Record<string, unknown>).omnigentNative;
+  delete (document as unknown as Record<string, unknown>).elementFromPoint;
   document.documentElement.removeAttribute("dir");
   document.documentElement.style.removeProperty("--omnigent-top-bar-visible");
   vi.unstubAllGlobals();
@@ -64,8 +72,10 @@ afterEach(() => {
 describe("useNativeServerSwitcherBand", () => {
   it("clamps transformed bounds to the viewport", () => {
     const { setServerSwitcherBand } = installAndroidBridge();
+    const column = makeColumn(-0.5, 1000.5);
+    stubTopElement(() => column);
 
-    renderHook(() => useNativeServerSwitcherBand(makeColumn(-0.5, 1000.5)));
+    renderHook(() => useNativeServerSwitcherBand(column));
 
     expect(setServerSwitcherBand).toHaveBeenCalledWith(0, 1);
   });
@@ -73,16 +83,23 @@ describe("useNativeServerSwitcherBand", () => {
   it("publishes physical bounds unchanged in RTL", () => {
     document.documentElement.dir = "rtl";
     const { setServerSwitcherBand } = installAndroidBridge();
+    const column = makeColumn(100, 700);
+    stubTopElement(() => column);
 
-    renderHook(() => useNativeServerSwitcherBand(makeColumn(100, 700)));
+    renderHook(() => useNativeServerSwitcherBand(column));
 
     expect(setServerSwitcherBand).toHaveBeenCalledWith(0.1, 0.7);
   });
 
-  it("hides instead of publishing the content beneath a full-screen overlay", () => {
+  it("hides instead of publishing the content beneath a covering overlay", () => {
     const { setServerSwitcherBand, setServerSwitcherHidden } = installAndroidBridge();
+    const column = makeColumn(0, 1000);
+    // A drawer owns the probe point, so the column is never frontmost.
+    const overlay = document.createElement("div");
+    document.body.appendChild(overlay);
+    stubTopElement(() => overlay);
 
-    renderHook(() => useNativeServerSwitcherBand(makeColumn(0, 1000), true));
+    renderHook(() => useNativeServerSwitcherBand(column));
 
     expect(setServerSwitcherBand).not.toHaveBeenCalled();
     expect(setServerSwitcherHidden).toHaveBeenLastCalledWith(true);
@@ -90,16 +107,30 @@ describe("useNativeServerSwitcherBand", () => {
 
   it("hides instead of borrowing an adjacent region for a collapsed chat column", () => {
     const { setServerSwitcherBand, setServerSwitcherHidden } = installAndroidBridge();
+    const column = makeColumn(320, 320);
+    stubTopElement(() => column);
 
-    renderHook(() => useNativeServerSwitcherBand(makeColumn(320, 383)));
+    renderHook(() => useNativeServerSwitcherBand(column));
 
     expect(setServerSwitcherBand).not.toHaveBeenCalled();
     expect(setServerSwitcherHidden).toHaveBeenLastCalledWith(true);
   });
 
+  it("publishes a narrow band as-is; native owns the too-small-to-fit policy", () => {
+    const { setServerSwitcherBand } = installAndroidBridge();
+    const column = makeColumn(320, 383);
+    stubTopElement(() => column);
+
+    renderHook(() => useNativeServerSwitcherBand(column));
+
+    expect(setServerSwitcherBand).toHaveBeenCalledWith(0.32, 0.383);
+  });
+
   it("clears the native placement when the tracked UI unmounts", () => {
     const { setServerSwitcherHidden } = installAndroidBridge();
-    const { unmount } = renderHook(() => useNativeServerSwitcherBand(makeColumn(100, 700)));
+    const column = makeColumn(100, 700);
+    stubTopElement(() => column);
+    const { unmount } = renderHook(() => useNativeServerSwitcherBand(column));
     setServerSwitcherHidden.mockClear();
 
     unmount();
@@ -115,5 +146,25 @@ describe("useNativeServerSwitcherBand", () => {
 
     expect(setServerSwitcherBand).not.toHaveBeenCalled();
     expect(setServerSwitcherHidden).toHaveBeenLastCalledWith(true);
+  });
+
+  it("does not drive the switcher in the iOS shell, which owns its own visibility", () => {
+    const setServerSwitcherBand = vi.fn();
+    const setServerSwitcherHidden = vi.fn();
+    (window as unknown as Record<string, unknown>).omnigentNative = {
+      kind: "ios",
+      setBadgeCount: vi.fn(),
+      notify: vi.fn().mockResolvedValue(true),
+      setServerSwitcherBand,
+      setServerSwitcherHidden,
+    };
+    const column = makeColumn(100, 700);
+    stubTopElement(() => column);
+
+    const { unmount } = renderHook(() => useNativeServerSwitcherBand(column));
+    unmount();
+
+    expect(setServerSwitcherBand).not.toHaveBeenCalled();
+    expect(setServerSwitcherHidden).not.toHaveBeenCalled();
   });
 });
