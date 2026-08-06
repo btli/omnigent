@@ -380,6 +380,18 @@ const SIDEBAR_ACTIVE_HIGHLIGHT =
 const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 // Shared sizing for the sidebar's dropdown / context menus so they can't drift.
 const SIDEBAR_MENU_CONTENT_CLASS = "min-w-40";
+const UNGROUP_DROP_ZONE_ID = "__ungroup__";
+const UNGROUP_FLOATING_ZONE_ID = "__ungroup_floating__";
+// A resized section can move later drop zones without resizing them.
+const SIDEBAR_RESIZE_OBSERVER_CONFIG = { updateMeasurementsFor: [] };
+// The inline ungroup slot mounts mid-drag at the seam between projects and
+// unfiled sessions, shifting everything below it — remeasure droppables on
+// registry changes so their stored rects track the shifted layout.
+const SIDEBAR_DND_MEASURING = { droppable: { strategy: MeasuringStrategy.Always } };
+// Where the inline ungroup slot sits relative to the list viewport, reported
+// by the slot itself. "unmounted" (slot not rendered, e.g. search results)
+// falls back to the floating strip at the bottom edge.
+type UngroupSlotPlacement = "inline" | "above" | "below" | "unmounted";
 
 // Maps a first-class project id → its name, provided once at the list level so
 // each row resolves its ``project_id`` to a folder name without its own
@@ -1074,6 +1086,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
 
           <nav
             ref={scrollContainerRef}
+            data-testid="sidebar-scroll-frame"
             // Keep wheel/touch scrolling without letting classic-scrollbar
             // platforms reserve a wide, permanently visible Sidebar gutter.
             className="relative flex-1 overflow-y-auto px-2 pt-4 pb-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
@@ -1257,6 +1270,7 @@ function ProjectFolder({
   const { setNodeRef, isOver } = useDroppable({
     id: `project:${name}`,
     data: { type: "project", name },
+    resizeObserverConfig: SIDEBAR_RESIZE_OBSERVER_CONFIG,
   });
 
   // One set of rename / settings / delete dialogs, driven by both the header
@@ -1266,6 +1280,8 @@ function ProjectFolder({
   return (
     <div
       ref={setNodeRef}
+      data-testid="sidebar-project-drop-zone"
+      data-project-name={name}
       className={cn(
         "rounded-[var(--radius-otto-sm)] transition-colors duration-200 ease-[var(--ease-otto)]",
         // Subtle background tint on drag-over — no border, no shadow.
@@ -1678,6 +1694,8 @@ function ConversationList({
     project: string | null;
     isPinned: boolean;
   } | null>(null);
+  const [ungroupSlotPlacement, setUngroupSlotPlacement] =
+    useState<UngroupSlotPlacement>("unmounted");
   // Mouse: a small drag threshold so a plain click still navigates / opens the
   // kebab. Touch: a press-and-hold delay so scrolling the list isn't hijacked
   // into a drag. Keyboard users use the kebab menu instead (no KeyboardSensor).
@@ -1920,9 +1938,7 @@ function ConversationList({
       <DndContext
         sensors={sensors}
         collisionDetection={pointerWithin}
-        // Always-measure so the transient "remove from project" zone (mounted at
-        // drag start) is registered as a drop target without a stale layout cache.
-        measuring={{ droppable: { strategy: MeasuringStrategy.Always } }}
+        measuring={SIDEBAR_DND_MEASURING}
         onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
         onDragCancel={() => setActiveDrag(null)}
@@ -1937,14 +1953,6 @@ function ConversationList({
             onMouseEnter={() => setPointerInside(true)}
             onMouseLeave={() => setPointerInside(false)}
           >
-            {/* Removing a filed session from its project means dropping it back
-            onto the flat "Chats" list — so the Chats section itself is the
-            ungroup target (wrapped below). This top strip is only a FALLBACK
-            for when there are no ungrouped chats yet, so the Chats section
-            isn't rendered and there'd otherwise be nowhere to drop. */}
-            {!showShared && activeDrag?.project != null && sections.sessions.length === 0 && (
-              <UngroupDropZone />
-            )}
             {totalVisible === 0 && searchQuery ? (
               <>
                 <p className="px-2 py-1 text-ui text-muted-foreground">{emptyMessage}</p>
@@ -2051,6 +2059,16 @@ function ConversationList({
                       <p className="px-2 py-1 text-ui text-muted-foreground">No projects</p>
                     )}
                 </SectionGroup>
+                {/* The natural ungroup target: the seam where unfiled sessions
+                begin. Mounted only while a filed session drags; reports its
+                own on-screen placement so the floating fallback can cover it
+                while the seam is scrolled away. */}
+                {!showShared && activeDrag?.project != null && (
+                  <UngroupDropSlot
+                    scrollFrameRef={scrollContainerRef}
+                    onPlacementChange={setUngroupSlotPlacement}
+                  />
+                )}
                 {/* Always rendered, even with no rows: the header carries the
                     filter menu, so hiding it on an empty slice would strand the
                     viewer with no way to pick another filter. */}
@@ -2141,6 +2159,15 @@ function ConversationList({
                 )}
               </>
             )}
+            {/* Floating stand-in while the inline seam is off-screen (or not
+            rendered at all, as in search results): pinned to the list edge
+            nearest the seam until scrolling latches the real slot into view. */}
+            {!showShared && activeDrag?.project != null && ungroupSlotPlacement !== "inline" && (
+              <UngroupFloatingStrip
+                scrollFrameRef={scrollContainerRef}
+                edge={ungroupSlotPlacement === "above" ? "top" : "bottom"}
+              />
+            )}
           </div>
         </RowEditHoldContext.Provider>
         {/* The dragged row's preview follows the pointer (rendered in a portal),
@@ -2168,6 +2195,7 @@ function ChatsDropZone({ active, children }: { active: boolean; children: ReactN
     id: "chats-ungroup",
     data: { type: "ungroup" },
     disabled: !active,
+    resizeObserverConfig: SIDEBAR_RESIZE_OBSERVER_CONFIG,
   });
   return (
     <div
@@ -2194,6 +2222,7 @@ function PinDropZone({ active, children }: { active: boolean; children: ReactNod
     id: "pinned-pin",
     data: { type: "pin" },
     disabled: !active,
+    resizeObserverConfig: SIDEBAR_RESIZE_OBSERVER_CONFIG,
   });
   return (
     <div
@@ -2209,25 +2238,159 @@ function PinDropZone({ active, children }: { active: boolean; children: ReactNod
   );
 }
 
-/** Fallback ungroup target: a dashed strip shown at the top of the list ONLY
-    while dragging a filed session when there are no ungrouped chats (so the
-    {@link ChatsDropZone}-wrapped "Chats" section isn't rendered and there'd
-    otherwise be nowhere to drop). Releasing on it removes the session from its
-    project. The dashed border is the strip's own placeholder identity; the
-    drag-over highlight is the shared subtle background tint. */
-function UngroupDropZone() {
-  const { setNodeRef, isOver } = useDroppable({ id: "__ungroup__", data: { type: "ungroup" } });
+/** Shared chrome for the two ungroup targets ({@link UngroupDropSlot} and its
+    floating stand-in) so they can't drift apart visually. */
+function ungroupTargetClass(isOver: boolean, extra?: string): string {
+  return cn(
+    extra,
+    "flex items-center gap-1.5 rounded-md border border-dashed border-border bg-card-solid px-2 py-1.5 text-muted-foreground text-xs transition-colors",
+    isOver && cn(DROP_TARGET_HIGHLIGHT, "text-foreground"),
+  );
+}
+
+const UNGROUP_TARGET_LABEL = (
+  <>
+    <FolderMinusIcon className="size-3.5 shrink-0" />
+    Drop here to remove from project
+  </>
+);
+
+/** The in-flow ungroup target at the seam between the project folders and the
+    unfiled sessions — a filed session dropped here lands right where it will
+    appear. Reports its placement relative to the list viewport so the
+    floating fallback can cover it while the seam is scrolled away. */
+function UngroupDropSlot({
+  scrollFrameRef,
+  onPlacementChange,
+}: {
+  scrollFrameRef: RefObject<HTMLElement | null>;
+  onPlacementChange: (placement: UngroupSlotPlacement) => void;
+}) {
+  const { setNodeRef, isOver } = useDroppable({
+    id: UNGROUP_DROP_ZONE_ID,
+    data: { type: "ungroup" },
+    resizeObserverConfig: SIDEBAR_RESIZE_OBSERVER_CONFIG,
+  });
+  const slotRef = useRef<HTMLDivElement | null>(null);
+  const setRefs = useCallback(
+    (node: HTMLDivElement | null) => {
+      slotRef.current = node;
+      setNodeRef(node);
+    },
+    [setNodeRef],
+  );
+  useLayoutEffect(() => {
+    const frame = scrollFrameRef.current;
+    if (!frame) return undefined;
+    const measure = () => {
+      const slot = slotRef.current?.getBoundingClientRect();
+      if (!slot) return;
+      const view = frame.getBoundingClientRect();
+      onPlacementChange(
+        slot.bottom < view.top ? "above" : slot.top > view.bottom ? "below" : "inline",
+      );
+    };
+    measure();
+    frame.addEventListener("scroll", measure, { passive: true });
+    // Layout can shift the seam without a scroll (rows inserted above it as a
+    // folder's sessions load, viewport resize); watch the list and frame too.
+    const observer = new ResizeObserver(measure);
+    observer.observe(frame);
+    const list = slotRef.current?.parentElement;
+    if (list) observer.observe(list);
+    return () => {
+      observer.disconnect();
+      frame.removeEventListener("scroll", measure);
+      onPlacementChange("unmounted");
+    };
+  }, [onPlacementChange, scrollFrameRef]);
   return (
     <div
-      ref={setNodeRef}
+      ref={setRefs}
       data-testid="sidebar-ungroup-drop-zone"
-      className={cn(
-        "flex items-center gap-1.5 rounded-md border border-dashed border-border px-2 py-1.5 text-muted-foreground text-sm transition-colors",
-        isOver && cn(DROP_TARGET_HIGHLIGHT, "text-foreground"),
-      )}
+      className={ungroupTargetClass(isOver)}
     >
-      <FolderMinusIcon className="size-3.5 shrink-0" />
-      Drop here to remove from project
+      {UNGROUP_TARGET_LABEL}
+    </div>
+  );
+}
+
+/** Offsets of a fixed-position element's containing block: the nearest
+    transformed ancestor — the sidebar <aside> always carries a translate, so
+    on desktop `fixed` resolves against its padding box, not the viewport.
+    Falls back to viewport edges when no ancestor is transformed. */
+function fixedPositionOrigin(node: HTMLElement): { left: number; top: number; bottom: number } {
+  for (let el = node.parentElement; el; el = el.parentElement) {
+    const { transform, translate } = getComputedStyle(el);
+    if ((transform && transform !== "none") || (translate && translate !== "none")) {
+      const rect = el.getBoundingClientRect();
+      const top = rect.top + el.clientTop;
+      return { left: rect.left + el.clientLeft, top, bottom: top + el.clientHeight };
+    }
+  }
+  return { left: 0, top: 0, bottom: window.innerHeight };
+}
+
+/** Floating stand-in for {@link UngroupDropSlot} while its seam is off-screen:
+    pinned to the list frame's edge nearest the seam, remeasured when the
+    frame resizes mid-drag (orientation change). Fixed — not sticky or inline —
+    so dnd-kit skips scroll-ancestor compensation for it: a stuck sticky
+    element doesn't move with the scroll, but dnd still shifted its stored
+    rect, drifting the hit area. */
+function UngroupFloatingStrip({
+  scrollFrameRef,
+  edge,
+}: {
+  scrollFrameRef: RefObject<HTMLElement | null>;
+  edge: "top" | "bottom";
+}) {
+  const { setNodeRef, isOver } = useDroppable({
+    id: UNGROUP_FLOATING_ZONE_ID,
+    data: { type: "ungroup" },
+  });
+  const stripRef = useRef<HTMLDivElement | null>(null);
+  const setRefs = useCallback(
+    (node: HTMLDivElement | null) => {
+      stripRef.current = node;
+      setNodeRef(node);
+    },
+    [setNodeRef],
+  );
+  const [frame, setFrame] = useState<{
+    left: number;
+    width: number;
+    top?: number;
+    bottom?: number;
+  } | null>(null);
+  useLayoutEffect(() => {
+    const frameEl = scrollFrameRef.current;
+    if (!frameEl) return undefined;
+    const measure = () => {
+      const strip = stripRef.current;
+      if (!strip) return;
+      const rect = frameEl.getBoundingClientRect();
+      const origin = fixedPositionOrigin(strip);
+      setFrame({
+        left: rect.left + 8 - origin.left,
+        width: rect.width - 16,
+        ...(edge === "top"
+          ? { top: rect.top + 8 - origin.top }
+          : { bottom: origin.bottom - rect.bottom + 8 }),
+      });
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(frameEl);
+    return () => observer.disconnect();
+  }, [edge, scrollFrameRef]);
+  return (
+    <div
+      ref={setRefs}
+      data-testid="sidebar-ungroup-floating-strip"
+      style={frame ?? undefined}
+      className={ungroupTargetClass(isOver, "fixed z-30")}
+    >
+      {UNGROUP_TARGET_LABEL}
     </div>
   );
 }
