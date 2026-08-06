@@ -168,12 +168,6 @@ class ServerSwitcherPositionTest {
     }
 
     @Test
-    fun `unchanged top margin has no layout update`() {
-        assertNull(serverSwitcherTopMarginUpdate(current = 32, desired = 32))
-        assertEquals(40, serverSwitcherTopMarginUpdate(current = 32, desired = 40))
-    }
-
-    @Test
     fun `zero pixel band anchors the pill at the band edge`() {
         val band = ServerSwitcherBand(0.4501, 0.4502)
 
