@@ -212,6 +212,12 @@ function swipeOffset(deltaX: number): number {
   return dir * Math.min(damped, SWIPE_MAX_PX);
 }
 
+/** The configured action for a horizontal offset's direction (0 → "none"). */
+function actionFor(deltaX: number, actions: SwipeActionPreferences): SwipeAction {
+  if (deltaX === 0) return "none";
+  return deltaX < 0 ? actions.left : actions.right;
+}
+
 /**
  * Touch swipe gesture for a session row. Tracks a horizontal drag and, on
  * release past {@link SWIPE_COMMIT_PX}, invokes the action configured for that
@@ -313,8 +319,7 @@ export function useRowSwipe({
         }
         if (Math.abs(deltaX) < SWIPE_ACTIVATE_PX || Math.abs(deltaX) <= Math.abs(deltaY)) return;
         // A direction mapped to "none" is inert — hand back to scroll/drag.
-        const action = deltaX < 0 ? actions.left : actions.right;
-        if (action === "none") {
+        if (actionFor(deltaX, actions) === "none") {
           s.decided = "other";
           return;
         }
@@ -325,8 +330,7 @@ export function useRowSwipe({
       e.preventDefault();
       // A reversal into a direction mapped to "none" rests at 0 instead of
       // sliding the row over bare canvas with no hint behind it.
-      const action = deltaX < 0 ? actions.left : actions.right;
-      const offset = action === "none" ? 0 : swipeOffset(deltaX);
+      const offset = actionFor(deltaX, actions) === "none" ? 0 : swipeOffset(deltaX);
       s.offset = offset;
       setDx(offset);
     },
@@ -340,7 +344,7 @@ export function useRowSwipe({
       // Commit off the synchronous offset, not the rendered `dx`.
       const offset = s.offset;
       const committed = s.decided === "swipe" && Math.abs(offset) >= SWIPE_COMMIT_PX;
-      const action = offset < 0 ? actions.left : actions.right;
+      const action = actionFor(offset, actions);
       if (s.decided === "swipe") {
         justSwipedRef.current = true;
         setTimeout(() => {
@@ -3498,8 +3502,7 @@ function ConversationRow({
   // swiped, and whether the drag has passed the commit point (drives the hint's
   // icon and tint). `isSwiping` gates every bit of swipe-only markup/styling, so
   // a row at rest renders exactly as it did before the gesture existed.
-  const swipingAction: SwipeAction =
-    swipe.dx < 0 ? swipeActions.left : swipe.dx > 0 ? swipeActions.right : "none";
+  const swipingAction: SwipeAction = actionFor(swipe.dx, swipeActions);
   const isSwiping = swipe.dx !== 0 && swipingAction !== "none";
   const swipeCommitted = Math.abs(swipe.dx) >= SWIPE_COMMIT_PX;
 
