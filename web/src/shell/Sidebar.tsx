@@ -3,7 +3,6 @@ import {
   type CSSProperties,
   type KeyboardEvent,
   type MouseEvent,
-  type PointerEvent as ReactPointerEvent,
   type ReactNode,
   type RefObject,
   createContext,
@@ -61,7 +60,6 @@ import {
   MeasuringStrategy,
   MouseSensor,
   pointerWithin,
-  TouchSensor,
   useDraggable,
   useDroppable,
   useSensor,
@@ -150,16 +148,19 @@ import {
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
 import { cn } from "@/lib/utils";
-import {
-  type SwipeAction,
-  type SwipeActionPreferences,
-  useSwipeActions,
-} from "@/lib/swipeActionPreferences";
+import { type SwipeAction, useSwipeActions } from "@/lib/swipeActionPreferences";
 import { useCoarsePointer } from "@/hooks/useCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
+import {
+  finishActiveRowGesture,
+  ROW_MENU_SYNTHETIC,
+  ROW_SWIPE_COMMIT_PX,
+  RowGestureTouchSensor,
+  useRowGesture,
+} from "@/hooks/useRowGesture";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { NewProjectButton } from "./NewProjectButton";
 import { SettingsSidebarBody, useSettingsRoute, useTrackSettingsReturn } from "./settingsNav";
@@ -185,190 +186,6 @@ import { SIDEBAR_ROW } from "./sidebarStyles";
 // place; on mobile it sits left of the always-visible controls.
 const SESSION_STATE_SLOT_CLASS =
   "-translate-y-1/2 pointer-events-none absolute top-1/2 right-[4.5rem] flex h-5 items-center transition-opacity md:right-1 md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
-
-// Horizontal-swipe thresholds for the mobile row gesture (see useRowSwipe).
-// ACTIVATE locks the gesture to a swipe once horizontal travel dominates;
-// COMMIT is how far the row must be dragged to fire the action on release.
-const SWIPE_ACTIVATE_PX = 12;
-const SWIPE_COMMIT_PX = 72;
-// Cap the visual translate a little past the commit point so the row can't be
-// dragged clear across the panel.
-const SWIPE_MAX_PX = 96;
-// Past the commit point the row only keeps a third of further travel, so the
-// gesture resists instead of dragging the title out of the panel — the action is
-// already armed there, so extra movement carries no meaning.
-const SWIPE_RESIST = 1 / 3;
-
-/**
- * Map raw finger travel to the row's visual offset: 1:1 up to the commit point,
- * then damped and hard-capped at {@link SWIPE_MAX_PX}. Keeps the title inside
- * the panel while still acknowledging a longer drag.
- */
-function swipeOffset(deltaX: number): number {
-  const dir = Math.sign(deltaX);
-  const travel = Math.abs(deltaX);
-  if (travel <= SWIPE_COMMIT_PX) return deltaX;
-  const damped = SWIPE_COMMIT_PX + (travel - SWIPE_COMMIT_PX) * SWIPE_RESIST;
-  return dir * Math.min(damped, SWIPE_MAX_PX);
-}
-
-/** The configured action for a horizontal offset's direction (0 → "none"). */
-function actionFor(deltaX: number, actions: SwipeActionPreferences): SwipeAction {
-  if (deltaX === 0) return "none";
-  return deltaX < 0 ? actions.left : actions.right;
-}
-
-/**
- * Touch swipe gesture for a session row. Tracks a horizontal drag and, on
- * release past {@link SWIPE_COMMIT_PX}, invokes the action configured for that
- * direction (see swipeActionPreferences). Disambiguates from dnd-kit's
- * drag-to-project by axis (vertical movement yields to scroll/drag) and by
- * bailing once a dnd-kit drag is active. A direction mapped to "none" is inert.
- *
- * Returns the live translate offset (for the row transform + reveal hint) and
- * pointer/click handlers to spread on the row element. The click-capture
- * handler swallows the click some browsers still synthesize after the drag, so
- * a swipe never also navigates into the session.
- */
-export function useRowSwipe({
-  enabled,
-  actions,
-  isDragging,
-  onAction,
-}: {
-  enabled: boolean;
-  actions: SwipeActionPreferences;
-  isDragging: boolean;
-  onAction: (action: Exclude<SwipeAction, "none">) => void;
-}) {
-  const [dx, setDx] = useState(0);
-  // `decided` is null until the first qualifying move locks the gesture to a
-  // horizontal swipe ("swipe") or hands it back to scroll/drag ("other").
-  // `target` holds the element we called setPointerCapture on, so reset() can
-  // release it (capture lives on the translating row surface; a leak would
-  // interfere with adjacent rows and the dnd-kit handoff).
-  // `offset` mirrors the rendered `dx` but updates synchronously, so release
-  // commits on where the finger actually ended rather than on whatever render
-  // last landed — a fast flick can otherwise lift before React commits the
-  // final move, and the action would be decided from a stale offset.
-  const state = useRef<{
-    pointerId: number;
-    startX: number;
-    startY: number;
-    decided: "swipe" | "other" | null;
-    target: Element | null;
-    offset: number;
-  } | null>(null);
-  // True for the tick after a beyond-slop swipe released, so the click-capture
-  // handler can swallow the trailing click (pointer-capture + preventDefault
-  // behavior varies across mobile browsers — don't rely on it).
-  const justSwipedRef = useRef(false);
-
-  const reset = useCallback(() => {
-    const s = state.current;
-    // Release pointer capture if we took it — guarded so it's safe when we
-    // never captured (vertical/none gestures) or the element is already gone.
-    if (s?.target && s.target.hasPointerCapture(s.pointerId)) {
-      s.target.releasePointerCapture(s.pointerId);
-    }
-    state.current = null;
-    setDx(0);
-  }, []);
-
-  const onPointerDown = useCallback(
-    (e: ReactPointerEvent) => {
-      // Touch-only: pen/stylus/mouse never trigger a swipe.
-      if (!enabled || e.pointerType !== "touch" || !e.isPrimary) return;
-      // The row's dialogs/menus are React children but render into portals, and
-      // React bubbles portal events up the component tree — so a drag inside the
-      // open delete dialog would otherwise start a swipe on the row behind it.
-      // Portal content is not a DOM descendant, so containment rejects it.
-      const target = e.target;
-      if (target instanceof Node && !e.currentTarget.contains(target)) return;
-      state.current = {
-        pointerId: e.pointerId,
-        startX: e.clientX,
-        startY: e.clientY,
-        decided: null,
-        target: null,
-        offset: 0,
-      };
-    },
-    [enabled],
-  );
-
-  const onPointerMove = useCallback(
-    (e: ReactPointerEvent) => {
-      const s = state.current;
-      if (!s || s.pointerId !== e.pointerId) return;
-      // Once dnd-kit takes over (long-press drag), the swipe yields entirely.
-      if (isDragging) {
-        s.decided = "other";
-        s.offset = 0;
-        setDx(0);
-        return;
-      }
-      if (s.decided === "other") return;
-      const deltaX = e.clientX - s.startX;
-      const deltaY = e.clientY - s.startY;
-      if (s.decided === null) {
-        // Vertical intent → let the list scroll; horizontal → lock to a swipe.
-        if (Math.abs(deltaY) > Math.abs(deltaX) && Math.abs(deltaY) > SWIPE_ACTIVATE_PX) {
-          s.decided = "other";
-          return;
-        }
-        if (Math.abs(deltaX) < SWIPE_ACTIVATE_PX || Math.abs(deltaX) <= Math.abs(deltaY)) return;
-        // A direction mapped to "none" is inert — hand back to scroll/drag.
-        if (actionFor(deltaX, actions) === "none") {
-          s.decided = "other";
-          return;
-        }
-        s.decided = "swipe";
-        s.target = e.currentTarget;
-        e.currentTarget.setPointerCapture(e.pointerId);
-      }
-      e.preventDefault();
-      // A reversal into a direction mapped to "none" rests at 0 instead of
-      // sliding the row over bare canvas with no hint behind it.
-      const offset = actionFor(deltaX, actions) === "none" ? 0 : swipeOffset(deltaX);
-      s.offset = offset;
-      setDx(offset);
-    },
-    [actions, isDragging],
-  );
-
-  const onPointerUp = useCallback(
-    (e: ReactPointerEvent) => {
-      const s = state.current;
-      if (!s || s.pointerId !== e.pointerId) return;
-      // Commit off the synchronous offset, not the rendered `dx`.
-      const offset = s.offset;
-      const committed = s.decided === "swipe" && Math.abs(offset) >= SWIPE_COMMIT_PX;
-      const action = actionFor(offset, actions);
-      if (s.decided === "swipe") {
-        justSwipedRef.current = true;
-        setTimeout(() => {
-          justSwipedRef.current = false;
-        }, 0);
-      }
-      reset();
-      if (committed && action !== "none") onAction(action);
-    },
-    [actions, onAction, reset],
-  );
-
-  const onClickCapture = useCallback((e: MouseEvent) => {
-    if (!justSwipedRef.current) return;
-    // Only the trailing click on the row itself — clicks bubbling out of the
-    // row's portalled dialogs/menus are not descendants and pass through.
-    const target = e.target;
-    if (target instanceof Node && !e.currentTarget.contains(target)) return;
-    e.preventDefault();
-    e.stopPropagation();
-  }, []);
-
-  return { dx, onPointerDown, onPointerMove, onPointerUp, onPointerCancel: reset, onClickCapture };
-}
 
 // Match the Settings sidebar's ghost-button hover treatment across every home
 // sidebar row.
@@ -1696,12 +1513,11 @@ function ConversationList({
   } | null>(null);
   const [ungroupSlotPlacement, setUngroupSlotPlacement] =
     useState<UngroupSlotPlacement>("unmounted");
-  // Mouse: a small drag threshold so a plain click still navigates / opens the
-  // kebab. Touch: a press-and-hold delay so scrolling the list isn't hijacked
-  // into a drag. Keyboard users use the kebab menu instead (no KeyboardSensor).
+  // Mouse keeps its click-safe distance. Touch is activated only after the row
+  // recognizer resolves a held-and-moved finger to drag.
   const sensors = useSensors(
     useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
-    useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 8 } }),
+    useSensor(RowGestureTouchSensor),
   );
   const handleDragStart = useCallback((event: DragStartEvent) => {
     const data = event.active.data.current as
@@ -1716,6 +1532,7 @@ function ConversationList({
   const handleDragEnd = useCallback(
     (event: DragEndEvent) => {
       const dragged = activeDrag;
+      finishActiveRowGesture();
       setActiveDrag(null);
       if (!dragged) return;
       const target = (event.over?.data.current as SidebarDropTarget | undefined) ?? null;
@@ -1941,7 +1758,10 @@ function ConversationList({
         measuring={SIDEBAR_DND_MEASURING}
         onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
-        onDragCancel={() => setActiveDrag(null)}
+        onDragCancel={() => {
+          finishActiveRowGesture();
+          setActiveDrag(null);
+        }}
       >
         <RowEditHoldContext.Provider value={reportRowEditing}>
           <div
@@ -2243,7 +2063,7 @@ function PinDropZone({ active, children }: { active: boolean; children: ReactNod
 function ungroupTargetClass(isOver: boolean, extra?: string): string {
   return cn(
     extra,
-    "flex items-center gap-1.5 rounded-md border border-dashed border-border bg-card-solid px-2 py-1.5 text-muted-foreground text-xs transition-colors",
+    "flex items-center gap-1.5 rounded-md border border-dashed border-border bg-card-solid px-2 py-1.5 text-muted-foreground text-sm transition-colors",
     isOver && cn(DROP_TARGET_HIGHLIGHT, "text-foreground"),
   );
 }
@@ -2432,6 +2252,7 @@ function SectionHeader({
   collapsed,
   onToggleCollapsed,
   contextMenu,
+  contextMenuDisabled,
 }: {
   title: string;
   icon?: ReactNode;
@@ -2446,6 +2267,8 @@ function SectionHeader({
       long-pressing (touch) the header button — the folder-menu parity path.
       Radix's own trigger supplies both gestures, so no gesture code lives here. */
   contextMenu?: ReactNode;
+  /** Suppresses the context menu (bulk-selection mode owns the rows). */
+  contextMenuDisabled?: boolean;
 }) {
   // A long-press opens the menu mid-gesture and its trailing click would toggle
   // the folder; a mouse right-click or keyboard Shift+F10 leaves no such click.
@@ -2548,8 +2371,9 @@ function SectionHeader({
   // which would clobber its WebkitTouchCallout.
   return (
     <h2>
-      {contextMenu ? (
+      {contextMenu && !contextMenuDisabled ? (
         <ContextMenu
+          modal={false}
           onOpenChange={(open) => {
             if (open) {
               swallowClickRef.current = longPressPointerRef.current;
@@ -2673,7 +2497,7 @@ function ProjectHeaderActions({
               <MoreHorizontalIcon className="size-3.5" />
             </Button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="min-w-40">
+          <DropdownMenuContent align="end" className={SIDEBAR_MENU_CONTENT_CLASS}>
             {/* Gated independently: each hides only when it would be a no-op, so
                 a mixed set offers both. */}
             {showExpandControls && !allExpanded && (
@@ -2830,8 +2654,9 @@ function ConversationSection({
             hasAction={headerAction != null}
             collapsed={isCollapsed}
             onToggleCollapsed={onToggleCollapsed}
+            contextMenu={headerContextMenu}
             // Selection mode owns the rows, so the header menu is suppressed.
-            contextMenu={selectionMode ? undefined : headerContextMenu}
+            contextMenuDisabled={selectionMode}
           />
           {headerAction && (
             <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity md:opacity-0 md:group-focus-within/header:opacity-100 md:group-hover/header:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100 md:has-[[aria-expanded=true]]:opacity-100">
@@ -2997,6 +2822,7 @@ function ConversationMenuItems({
   // to the side. `view` swaps between the main actions and that sub-view;
   // desktop always renders the native side-flyout submenu regardless.
   const isMobile = useIsMobileViewport();
+  const hasCoarsePointer = useCoarsePointer();
   const [view, setView] = useState<"main" | "projects">("main");
 
   // The project pick / create / remove flow — shared verbatim by the desktop
@@ -3049,13 +2875,13 @@ function ConversationMenuItems({
 
   return (
     <>
-      {/* Pin/Unpin — mobile-only (md:hidden); desktop uses the
-          hover-revealed quick-pin button. Archived rows omit it (archive
-          outranks pin). */}
+      {/* Pin/Unpin — desktop uses the hover-revealed quick-pin button, but a
+          coarse-pointer device has no hover at any width, so the menu keeps
+          the item there. Archived rows omit it (archive outranks pin). */}
       {!isArchived && (
         <C.Item
           data-testid="pin-conversation"
-          className="md:hidden"
+          className={hasCoarsePointer ? undefined : "md:hidden"}
           onSelect={() => onTogglePinned(conversation.id)}
         >
           {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
@@ -3363,6 +3189,7 @@ function ConversationRow({
   // session navigated to via `/c/:id`), scroll it toward the center of the
   // sidebar so it's comfortably in view rather than pinned to an edge.
   const rowRef = useRef<HTMLLIElement>(null);
+  const rowLinkRef = useRef<HTMLAnchorElement>(null);
   useEffect(() => {
     if (!isActive) return;
     rowRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -3395,6 +3222,9 @@ function ConversationRow({
   // The kebab menu is controlled so the project submenu can close the whole
   // menu after a pick (a plain click inside the submenu wouldn't otherwise).
   const [menuOpen, setMenuOpen] = useState(false);
+  // Close the row menu directly so an armed touch never sends Escape through
+  // dnd-kit's document-level sensor listeners.
+  const [contextMenuOpen, setContextMenuOpen] = useState(false);
   // Opt-in "delete local branch" checkbox (worktree sessions only).
   const [deleteBranch, setDeleteBranch] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
@@ -3486,31 +3316,66 @@ function ConversationRow({
         ? { kind: "unseen" as const }
         : (derivedState ?? (isStartingUp ? { kind: "starting" as const } : null));
 
-  // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
-  // owner-only, like the Move-to-project kebab item), outside selection /
-  // archive / rename modes. Dragging it onto a project folder files it there;
-  // onto "Chats" unfiles it; onto "Pinned" pins it. The list-level <DndContext>
-  // routes the drop; the row only advertises itself and its source project +
-  // pinned state via the draggable `data`.
+  // Touch swipe → archive/delete. `useSwipeActions` is a live subscription, so
+  // changing Settings updates open rows without a remount.
+  const swipeActions = useSwipeActions();
+  const swipeActionRef = useRef<(action: Exclude<SwipeAction, "none">) => void>(() => {});
+  useEffect(() => {
+    swipeActionRef.current = (action: Exclude<SwipeAction, "none">) => {
+      if (action === "archive") runArchive();
+      else setDeleteOpen(true);
+    };
+  });
+  const onSwipeAction = useCallback((action: Exclude<SwipeAction, "none">) => {
+    swipeActionRef.current(action);
+  }, []);
+  const gestureEnabled = hasCoarsePointer && !selectionMode && !isEditing;
+  const swipeEnabled = gestureEnabled && isOwner;
+  const dragEnabled = isOwner && !selectionMode && !isArchived && !isEditing;
+  const openContextMenuAt = useCallback((point: { clientX: number; clientY: number }) => {
+    const event = new globalThis.MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+      button: 2,
+      clientX: point.clientX,
+      clientY: point.clientY,
+    });
+    // Tagged so the row root can tell this dispatch apart from the OS's own
+    // long-press contextmenu, which it must suppress mid-gesture.
+    Object.assign(event, { [ROW_MENU_SYNTHETIC]: true });
+    rowLinkRef.current?.dispatchEvent(event);
+  }, []);
+  const dismissContextMenu = useCallback(() => {
+    setContextMenuOpen(false);
+  }, []);
+  const gesture = useRowGesture({
+    enabled: gestureEnabled,
+    swipeEnabled,
+    dragEnabled: hasCoarsePointer && dragEnabled,
+    actions: swipeActions,
+    onAction: onSwipeAction,
+    onLongPress: openContextMenuAt,
+    onDragStart: dismissContextMenu,
+  });
+
+  // The recognizer state travels with this draggable, so the static touch
+  // activator can make the decision for the row that received the event.
   const {
     listeners: dragListeners,
     setNodeRef: setDragNodeRef,
     isDragging,
   } = useDraggable({
     id: conversation.id,
-    data: { type: "session", label, project: currentProject, isPinned },
-    disabled: !isOwner || selectionMode || isArchived || isEditing,
-  });
-  // Radix and dnd-kit run independent long-press timers. Once this row's
-  // touch drag is active, reject Radix's later open request for that gesture.
-  const [contextMenuOpen, setContextMenuOpen] = useState(false);
-  const handleContextMenuOpenChange = useCallback(
-    (open: boolean) => {
-      if (open && isDragging) return;
-      setContextMenuOpen(open);
+    data: {
+      type: "session",
+      label,
+      project: currentProject,
+      isPinned,
+      rowGesture: gesture.dndData,
     },
-    [isDragging],
-  );
+    disabled: !dragEnabled,
+  });
+  const rowGestureListeners = gesture.listeners(dragListeners);
   // The menu render branches below are mutually exclusive; switching branches
   // remounts the ContextMenu, and a stale open=true would reopen the fresh
   // menu anchored at the viewport corner. Reset during render (not in an
@@ -3556,33 +3421,6 @@ function ConversationRow({
   // double-click (an updated_at bump slides another row under the cursor),
   // and only a row that saw both clicks may enter rename.
   const recentClickTimesRef = useRef<number[]>([]);
-
-  // Touch swipe → archive/delete. `useSwipeActions` is a live subscription, so
-  // changing the Settings selects updates open rows in the same session (no
-  // remount needed). Gated to a coarse pointer and to editable, non-selection
-  // rows so it can't fight bulk-select. Swipe→archive reuses
-  // runArchive; swipe→delete opens the same confirm dialog the kebab uses
-  // (never an immediate delete).
-  const swipeActions = useSwipeActions();
-  // useRowSwipe accepts only touch pointers, so a touchscreen laptop's mouse
-  // path stays untouched. With both directions mapped to "none" the gesture is
-  // fully disarmed — no handlers fire and the touch-action override below is
-  // dropped, so the browser keeps its horizontal gestures.
-  const swipeEnabled =
-    hasCoarsePointer &&
-    !selectionMode &&
-    isOwner &&
-    !isEditing &&
-    (swipeActions.left !== "none" || swipeActions.right !== "none");
-  const swipe = useRowSwipe({
-    enabled: swipeEnabled,
-    actions: swipeActions,
-    isDragging,
-    onAction: (action) => {
-      if (action === "archive") runArchive();
-      else setDeleteOpen(true);
-    },
-  });
 
   if (isEditing) {
     return (
@@ -3715,8 +3553,23 @@ function ConversationRow({
   // mode) or wrapped in the right-click ContextMenuTrigger below.
   const rowLink = (
     <Link
+      ref={rowLinkRef}
       to={selectionMode ? "#" : `/c/${conversation.id}`}
       componentId="sidebar.conversation_switcher"
+      // Links are natively draggable, and Chrome Android hands a stationary
+      // long-press on one to its native drag machinery — an unconditional
+      // pointercancel that kills the row gesture. Not draggable, not claimed.
+      draggable={false}
+      // The recognizer owns touch long-press, so stop the trigger's own 700ms
+      // timer from opening a second menu mid-hold; Radix skips its handler once
+      // this event is defaultPrevented. Scoped to touch because the recognizer
+      // ignores pen, which would otherwise lose its long-press entirely.
+      onPointerDown={(e) => {
+        if (e.pointerType === "touch") e.preventDefault();
+      }}
+      onContextMenu={(e) => {
+        if (isDragging) e.preventDefault();
+      }}
       className={cn(
         SIDEBAR_ROW,
         "relative flex flex-col justify-center text-left text-foreground transition-colors",
@@ -3738,8 +3591,8 @@ function ConversationRow({
       )}
       onClick={(e) => {
         recentClickTimesRef.current = [...recentClickTimesRef.current.slice(-1), performance.now()];
-        // Swallow the click that trails a drag so it doesn't navigate.
-        if (justDraggedRef.current) {
+        // Swallow the click that trails a resolved touch gesture or drag.
+        if (gesture.consumeClick() || justDraggedRef.current) {
           e.preventDefault();
           return;
         }
@@ -3786,29 +3639,38 @@ function ConversationRow({
   // swiped, and whether the drag has passed the commit point (drives the hint's
   // icon and tint). `isSwiping` gates every bit of swipe-only markup/styling, so
   // a row at rest renders exactly as it did before the gesture existed.
-  const swipingAction: SwipeAction = actionFor(swipe.dx, swipeActions);
-  const isSwiping = swipe.dx !== 0 && swipingAction !== "none";
-  const swipeCommitted = Math.abs(swipe.dx) >= SWIPE_COMMIT_PX;
+  const swipingAction: SwipeAction =
+    gesture.dx < 0 ? swipeActions.left : gesture.dx > 0 ? swipeActions.right : "none";
+  const isSwiping = gesture.dx !== 0 && swipingAction !== "none";
+  const swipeCommitted = Math.abs(gesture.dx) >= ROW_SWIPE_COMMIT_PX;
+  // A held or dragging row owns the pointer outright, so no axis stays native.
+  const ownsPointer = gesture.phase === "armed" || gesture.phase === "drag";
 
   return (
     // Drag props on the <li> so the whole row is grabbable; `isDragging` dims
     // it. `setRowRef` merges the drag node ref with the scroll-into-view ref.
     <li
       ref={setRowRef}
-      {...dragListeners}
-      onPointerDown={swipe.onPointerDown}
-      onPointerMove={swipe.onPointerMove}
-      onPointerUp={swipe.onPointerUp}
-      onPointerCancel={swipe.onPointerCancel}
-      onClickCapture={swipe.onClickCapture}
+      {...rowGestureListeners}
+      // Android's own ~500ms long-press fires a native contextmenu even while
+      // the recognizer holds the pointer — capture retargets it to this li,
+      // bypassing Radix's trigger on the link. Unprevented it starts text
+      // selection and cancels the pointer stream, killing the pending drag.
+      // The recognizer's own tagged re-dispatch passes through.
+      onContextMenu={(e) => {
+        if (ROW_MENU_SYNTHETIC in e.nativeEvent) return;
+        if (ownsPointer || isDragging) e.preventDefault();
+      }}
       className={cn(
         "group relative",
         isDragging && "opacity-40",
+        gesture.phase === "armed" && "z-10 scale-[1.01] shadow-sm",
         // Keep vertical scrolling native while claiming the horizontal axis for
         // the swipe: without this the browser can take the horizontal pan (or
         // back-navigation gesture) and cancel the gesture mid-drag. Only where
         // a swipe can actually fire, so rows without one keep default behavior.
-        swipeEnabled && "touch-pan-y",
+        swipeEnabled && !ownsPointer && "touch-pan-y",
+        ownsPointer && "touch-none",
       )}
     >
       {/* Swipe reveal hint: sits behind the moving surface, showing the
@@ -3825,7 +3687,7 @@ function ConversationRow({
           aria-hidden
           className={cn(
             "pointer-events-none absolute inset-0 flex items-center rounded-[var(--radius-otto-sm)] px-4",
-            swipe.dx > 0 ? "justify-start" : "justify-end",
+            gesture.dx > 0 ? "justify-start" : "justify-end",
             "transition-colors",
             swipingAction === "delete"
               ? swipeCommitted
@@ -3870,13 +3732,13 @@ function ConversationRow({
           isSwiping && "rounded-[var(--radius-otto-sm)] bg-sidebar",
           // Transition only at rest, so the row eases back when the gesture
           // ends but tracks the finger 1:1 while swiping.
-          swipe.dx === 0 && "transition-[margin] duration-200",
+          gesture.dx === 0 && "transition-[margin] duration-200",
         )}
         style={
-          swipe.dx !== 0
-            ? swipe.dx < 0
-              ? { marginRight: -swipe.dx }
-              : { marginLeft: swipe.dx }
+          gesture.dx !== 0
+            ? gesture.dx < 0
+              ? { marginRight: -gesture.dx }
+              : { marginLeft: gesture.dx }
             : undefined
         }
       >
@@ -3909,11 +3771,11 @@ function ConversationRow({
           )
         ) : projectFlyoutName ? (
           <HoverCard openDelay={150} closeDelay={0}>
-            <ContextMenu open={contextMenuOpen} onOpenChange={handleContextMenuOpenChange}>
+            <ContextMenu modal={false} open={contextMenuOpen} onOpenChange={setContextMenuOpen}>
               <ContextMenuTrigger asChild>
                 <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
               </ContextMenuTrigger>
-              <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-sm">
+              <ContextMenuContent className="min-w-44">
                 <ConversationMenuItems
                   components={contextBundle}
                   setMenuOpen={() => {}}
@@ -3928,9 +3790,9 @@ function ConversationRow({
             />
           </HoverCard>
         ) : isMobile ? (
-          <ContextMenu open={contextMenuOpen} onOpenChange={handleContextMenuOpenChange}>
+          <ContextMenu modal={false} open={contextMenuOpen} onOpenChange={setContextMenuOpen}>
             <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
-            <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-sm">
+            <ContextMenuContent className="min-w-44">
               <ConversationMenuItems
                 components={contextBundle}
                 setMenuOpen={() => {}}
@@ -3940,13 +3802,13 @@ function ConversationRow({
           </ContextMenu>
         ) : (
           <Tooltip>
-            <ContextMenu open={contextMenuOpen} onOpenChange={handleContextMenuOpenChange}>
+            <ContextMenu modal={false} open={contextMenuOpen} onOpenChange={setContextMenuOpen}>
               <ContextMenuTrigger asChild>
                 <div className="w-full">
                   <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
                 </div>
               </ContextMenuTrigger>
-              <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-sm">
+              <ContextMenuContent className="min-w-44">
                 <ConversationMenuItems
                   components={contextBundle}
                   setMenuOpen={() => {}}
@@ -4392,11 +4254,17 @@ function ProjectFolderMenuItems({
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   actions: ProjectFolderMenuActions;
 }) {
+  const hasCoarsePointer = useCoarsePointer();
   return (
     <>
-      {/* New session — mobile-only (md:hidden); desktop uses the
-          hover-revealed pencil on the folder header. */}
-      <C.Item asChild className="md:hidden" data-testid="project-new-session-menu">
+      {/* New session — desktop uses the hover-revealed pencil on the folder
+          header, but a coarse-pointer device has no hover at any width, so
+          the menu keeps the item there. */}
+      <C.Item
+        asChild
+        className={hasCoarsePointer ? undefined : "md:hidden"}
+        data-testid="project-new-session-menu"
+      >
         <Link
           to={`/?project=${encodeURIComponent(projectName)}`}
           onClick={(e) => {
