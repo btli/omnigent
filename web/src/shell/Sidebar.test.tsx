@@ -278,6 +278,38 @@ function mockShiftingUngroupLayout(): { shift: () => void } {
   };
 }
 
+/** Rect mock for the seam-placement logic: a 400px-tall list frame with the
+    inline slot at a controllable offset, plus a floating strip parked at the
+    frame's bottom edge (360–390) for drop targeting. */
+function mockSeamLayout({ slotTop }: { slotTop: number }): {
+  frameTop: number;
+  frameBottom: number;
+  floatingCenterY: number;
+  setSlotTop: (top: number) => void;
+} {
+  const frameTop = 0;
+  const frameBottom = 400;
+  let currentSlotTop = slotTop;
+  vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
+    this: Element,
+  ): DOMRect {
+    const testId = this.getAttribute("data-testid");
+    if (testId === "sidebar-scroll-frame") return dndRect(frameTop, frameBottom - frameTop);
+    if (testId === "sidebar-ungroup-drop-zone") return dndRect(currentSlotTop, 30);
+    if (testId === "sidebar-ungroup-floating-strip") return dndRect(360, 30);
+    if (this.tagName === "LI") return dndRect(20, 32);
+    return dndRect(-1_000, 1);
+  });
+  return {
+    frameTop,
+    frameBottom,
+    floatingCenterY: 375,
+    setSlotTop: (top: number) => {
+      currentSlotTop = top;
+    },
+  };
+}
+
 function startMouseDrag(row: HTMLElement): void {
   fireEvent.mouseDown(row, { button: 0, buttons: 1, clientX: 10, clientY: 20 });
   fireEvent.mouseMove(document, { buttons: 1, clientX: 20, clientY: 30 });
@@ -1634,7 +1666,7 @@ function renderPinnedFiledSession(id: string, project = "Sprint 42"): HTMLElemen
 describe("Sidebar ungroup drag target", () => {
   beforeEach(() => setMockViewportWidth(375));
 
-  it("mounts last without reordering the project and session rows above it", async () => {
+  it("mounts at the seam: after the projects group, before the unfiled sessions", async () => {
     projectsMock.push("Sprint 42");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Sprint 42" } }),
@@ -1644,15 +1676,19 @@ describe("Sidebar ungroup drag target", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Sprint 42" }));
     const list = screen.getByTestId("sidebar-conversation-list");
-    const childrenBefore = Array.from(list.children);
     const rowsBefore = Array.from(list.querySelectorAll("li"));
     const filedRow = screen.getByRole("link", { name: "conv_filed" }).closest("li")!;
 
     startMouseDrag(filedRow);
 
     const dropZone = await screen.findByTestId("sidebar-ungroup-drop-zone");
-    expect(list.lastElementChild).toBe(dropZone);
-    expect(Array.from(list.children).slice(0, -1)).toEqual(childrenBefore);
+    // The slot lands where the drop will: below the projects, above the flat
+    // "Chats" list. Rows themselves must not reorder around it.
+    const projectsHeader = screen.getByRole("button", { name: "Sprint 42" });
+    expect(
+      dropZone.compareDocumentPosition(projectsHeader) & Node.DOCUMENT_POSITION_PRECEDING,
+    ).toBeTruthy();
+    expect(dropZone.nextElementSibling).toBe(screen.getByTestId("sidebar-chats-drop-zone"));
     expect(Array.from(list.querySelectorAll("li"))).toEqual(rowsBefore);
 
     fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
@@ -1671,17 +1707,74 @@ describe("Sidebar ungroup drag target", () => {
     fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
   });
 
-  it("mounts the strip fixed to the list frame during a mobile filed-session drag", async () => {
+  it("keeps the slot in flow with no floating fallback while the seam is visible", async () => {
     const row = renderPinnedFiledSession("conv_mobile_filed");
 
     startMouseDrag(row);
-    const strip = await screen.findByTestId("sidebar-ungroup-drop-zone");
-    // Fixed, not sticky or inline: inline sits below the fold on a long list,
-    // and a stuck sticky element doesn't move with the scroll while dnd-kit
-    // still shifts its stored rect — drifting the drop target off the visual.
-    expect(strip).toHaveClass("fixed");
-    expect(strip).not.toHaveClass("sticky");
+    const slot = await screen.findByTestId("sidebar-ungroup-drop-zone");
+    // In flow at the seam — the drop lands where the eye is told it will.
+    expect(slot).not.toHaveClass("fixed");
+    expect(slot).not.toHaveClass("sticky");
+    expect(screen.queryByTestId("sidebar-ungroup-floating-strip")).toBeNull();
     fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
+  });
+
+  it("floats a fixed strip at the bottom edge while the seam is below the fold", async () => {
+    const layout = mockSeamLayout({ slotTop: 900 });
+    const row = renderPinnedFiledSession("conv_below_fold");
+
+    startMouseDrag(row);
+    await screen.findByTestId("sidebar-ungroup-drop-zone");
+    const floating = await screen.findByTestId("sidebar-ungroup-floating-strip");
+    expect(floating).toHaveClass("fixed");
+    expect(floating.style.bottom).toBe(`${window.innerHeight - layout.frameBottom + 8}px`);
+    expect(floating.style.top).toBe("");
+    fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
+  });
+
+  it("floats the strip at the top edge when the seam is scrolled above the view", async () => {
+    const layout = mockSeamLayout({ slotTop: -200 });
+    const row = renderPinnedFiledSession("conv_above_view");
+
+    startMouseDrag(row);
+    const floating = await screen.findByTestId("sidebar-ungroup-floating-strip");
+    expect(floating).toHaveClass("fixed");
+    expect(floating.style.top).toBe(`${layout.frameTop + 8}px`);
+    expect(floating.style.bottom).toBe("");
+    fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
+  });
+
+  it("latches back to the inline slot once the seam scrolls into view", async () => {
+    const layout = mockSeamLayout({ slotTop: 900 });
+    const row = renderPinnedFiledSession("conv_latching");
+
+    startMouseDrag(row);
+    await screen.findByTestId("sidebar-ungroup-floating-strip");
+
+    layout.setSlotTop(200);
+    fireEvent.scroll(screen.getByTestId("sidebar-scroll-frame"));
+
+    await waitFor(() => expect(screen.queryByTestId("sidebar-ungroup-floating-strip")).toBeNull());
+    // The inline slot itself never unmounted — the fallback just stood down.
+    expect(screen.getByTestId("sidebar-ungroup-drop-zone")).toBeInTheDocument();
+    fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
+  });
+
+  it("resolves an ungroup drop on the floating strip", async () => {
+    const layout = mockSeamLayout({ slotTop: 900 });
+    const row = renderPinnedFiledSession("conv_floating_drop");
+
+    startMouseDrag(row);
+    const floating = await screen.findByTestId("sidebar-ungroup-floating-strip");
+
+    moveMouseTo(layout.floatingCenterY);
+    await waitFor(() => expect(floating).toHaveClass("bg-[var(--sidebar-active)]"));
+    fireEvent.mouseUp(document, { button: 0, clientX: 120, clientY: layout.floatingCenterY });
+
+    await waitFor(() => {
+      expect(moveToProjectSpy).toHaveBeenCalledTimes(1);
+      expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_floating_drop", project: "" });
+    });
   });
 
   it("ungroups and unpins a pinned project session dropped on the bottom strip", async () => {
