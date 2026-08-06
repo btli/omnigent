@@ -394,6 +394,10 @@ describe("Android injected safe-area layout", () => {
   it("exposes the production inset stylesheet to the layout test", () => {
     expect(nativeInsetMatch, "NativeBridgeScript.insetStyles is gone").not.toBeNull();
     expect(nativeInsetCss).not.toBe("");
+    // insetStyles is interpolated into a JS template literal at runtime;
+    // these characters would break the injected script, not these tests.
+    expect(nativeInsetCss).not.toContain("`");
+    expect(nativeInsetCss).not.toContain("${");
   });
 
   it("computes four-edge padding on the Workspace rail", () => {
