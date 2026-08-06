@@ -39,6 +39,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.webkit.ScriptHandler
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import kotlin.reflect.KMutableProperty0
 
 /**
  * The single WebView host. Mirrors the iOS `WebShellView` + `OmnigentWebView`:
@@ -475,21 +476,30 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        val dialog =
-            AlertDialog
-                .Builder(this)
-                .setTitle(R.string.login_failed_title)
+        showTrackedDialog(::loginFailedDialog) {
+            setTitle(R.string.login_failed_title)
                 .setMessage(getString(R.string.login_failed_body, hostLabelOf(origin)))
                 .setPositiveButton(R.string.login_failed_retry) { _, _ ->
                     loginAttempts = 0
                     startLogin()
                 }.setNegativeButton(R.string.proxy_auth_cancel, null)
-                .create()
-        loginFailedDialog = dialog
+        }
+    }
+
+    /** Create, show, and track a dialog in [slot], clearing it again on dismiss. */
+    private fun showTrackedDialog(
+        slot: KMutableProperty0<AlertDialog?>,
+        onDismiss: () -> Unit = {},
+        configure: AlertDialog.Builder.() -> Unit,
+    ): AlertDialog {
+        val dialog = AlertDialog.Builder(this).apply(configure).create()
+        slot.set(dialog)
         dialog.setOnDismissListener {
-            if (loginFailedDialog === dialog) loginFailedDialog = null
+            if (slot.get() === dialog) slot.set(null)
+            onDismiss()
         }
         dialog.show()
+        return dialog
     }
 
     /**
@@ -643,12 +653,7 @@ class MainActivity : AppCompatActivity() {
         val activationOrigin = newOrigin ?: pinnedOrigin
         val deliveredNavigatePath = takeNavigatePathOf(intent, activationOrigin)
         if (webViewUnusable) {
-            if (newOrigin != null && newOrigin != pinnedOrigin) {
-                loginManager.cancel()
-                notifications.cancelAll()
-                pendingNavigatePath = null
-                pendingNavigateOrigin = null
-            }
+            if (newOrigin != null && newOrigin != pinnedOrigin) clearCrossServerState()
             if (deliveredNavigatePath != null) {
                 pendingNavigatePath = deliveredNavigatePath
                 pendingNavigateOrigin = activationOrigin
@@ -683,12 +688,7 @@ class MainActivity : AppCompatActivity() {
         newOrigin: String,
     ) {
         if (webViewUnusable) {
-            if (newOrigin != pinnedOrigin) {
-                loginManager.cancel()
-                notifications.cancelAll()
-                pendingNavigatePath = null
-                pendingNavigateOrigin = null
-            }
+            if (newOrigin != pinnedOrigin) clearCrossServerState()
             recreate()
             return
         }
@@ -712,6 +712,14 @@ class MainActivity : AppCompatActivity() {
         (switchButton as? TextView)?.text = hostLabelOf(serverUrl)
         installBridge()
         webView.loadUrl(serverUrl)
+    }
+
+    /** Drop state that must not leak into a different server's session. */
+    private fun clearCrossServerState() {
+        loginManager.cancel()
+        notifications.cancelAll()
+        pendingNavigatePath = null
+        pendingNavigateOrigin = null
     }
 
     private fun handleWebViewUnusable() {
@@ -749,19 +757,12 @@ class MainActivity : AppCompatActivity() {
         loginFailedDialog = null
 
         if (rendererFailedDialog?.isShowing == true) return
-        val dialog =
-            AlertDialog
-                .Builder(this)
-                .setTitle(R.string.renderer_failed_title)
+        showTrackedDialog(::rendererFailedDialog) {
+            setTitle(R.string.renderer_failed_title)
                 .setMessage(R.string.renderer_failed_body)
                 .setPositiveButton(R.string.renderer_failed_retry) { _, _ -> recreate() }
                 .setNegativeButton(R.string.proxy_auth_cancel, null)
-                .create()
-        rendererFailedDialog = dialog
-        dialog.setOnDismissListener {
-            if (rendererFailedDialog === dialog) rendererFailedDialog = null
         }
-        dialog.show()
     }
 
     private fun removeBridge() {
@@ -853,30 +854,23 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        var dismissalHandled = false
         val dialog =
-            AlertDialog
-                .Builder(this)
-                .setTitle(R.string.proxy_auth_refused_title)
-                .setMessage(
-                    getString(
-                        R.string.proxy_auth_refused_body,
-                        hostLabelOf(origin),
-                    ),
-                ).setPositiveButton(R.string.proxy_auth_open_browser, null)
-                .setNegativeButton(R.string.proxy_auth_cancel, null)
-                .create()
-        dialog.setCanceledOnTouchOutside(true)
-        embeddedSignInDialog = dialog
-        dialog.setOnDismissListener {
-            if (dismissalHandled) return@setOnDismissListener
-            dismissalHandled = true
-            if (embeddedSignInDialog === dialog) embeddedSignInDialog = null
-            if (!isFinishing && !isDestroyed) {
-                shellWebViewClient.endProxyAuth()
+            showTrackedDialog(
+                ::embeddedSignInDialog,
+                onDismiss = {
+                    if (!isFinishing && !isDestroyed) shellWebViewClient.endProxyAuth()
+                },
+            ) {
+                setTitle(R.string.proxy_auth_refused_title)
+                    .setMessage(
+                        getString(
+                            R.string.proxy_auth_refused_body,
+                            hostLabelOf(origin),
+                        ),
+                    ).setPositiveButton(R.string.proxy_auth_open_browser, null)
+                    .setNegativeButton(R.string.proxy_auth_cancel, null)
             }
-        }
-        dialog.show()
+        dialog.setCanceledOnTouchOutside(true)
         dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
             if (openPinnedOriginInBrowser()) dialog.dismiss()
         }
