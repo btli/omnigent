@@ -90,15 +90,20 @@ export function writeSwipeActions(value: SwipeActionPreferences): void {
   window.dispatchEvent(new Event(SWIPE_ACTIONS_EVENT));
 }
 
-// Cached snapshot so useSyncExternalStore's getSnapshot returns a stable
-// reference between changes — a fresh object every call would loop it. Kept
-// current by getSnapshot (re-reads and swaps only on a real change), so it's
-// never stale even after a write that had no active subscriber.
+// Cached snapshot so useSyncExternalStore's getSnapshot is a cheap identity
+// read on every render — a fresh object every call would loop it, and a
+// re-parse every call would tax every row render. Refreshed on the change
+// events and when a subscriber attaches (covering writes that happened while
+// nothing was mounted); swapped only on a real change so the reference is
+// stable between changes.
 let snapshot: SwipeActionPreferences = readSwipeActions();
 
-function getSnapshot(): SwipeActionPreferences {
+function refreshSnapshot(): void {
   const next = readSwipeActions();
   if (next.left !== snapshot.left || next.right !== snapshot.right) snapshot = next;
+}
+
+function getSnapshot(): SwipeActionPreferences {
   return snapshot;
 }
 
@@ -107,8 +112,12 @@ function subscribe(onChange: () => void): () => void {
   const handler = (e: Event) => {
     // Ignore unrelated `storage` events; refresh on our key or the same-tab ping.
     if (e instanceof StorageEvent && e.key !== null && e.key !== STORAGE_KEY) return;
+    refreshSnapshot();
     onChange();
   };
+  // Catch up on writes made while no subscriber was mounted (React re-checks
+  // the snapshot right after subscribing, so a change here still renders).
+  refreshSnapshot();
   window.addEventListener("storage", handler);
   window.addEventListener(SWIPE_ACTIONS_EVENT, handler);
   return () => {
