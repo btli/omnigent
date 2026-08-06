@@ -14,13 +14,6 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import { notifyResizeObservers, resetMockViewportWidth, setMockViewportWidth } from "@/test-setup";
 
-// Controllable coarse-pointer capability; the global matchMedia stub answers
-// false for non-width queries, so tests default to a fine pointer.
-const coarsePointer = vi.hoisted(() => ({ current: false }));
-vi.mock("@/hooks/useCoarsePointer", () => ({
-  useCoarsePointer: () => coarsePointer.current,
-}));
-
 // Project mocks are declared via vi.hoisted so they exist before the hoisted
 // vi.mock factory runs. projectsMock is mutated per-test to drive project
 // sections; moveToProjectSpy captures kebab-menu "Change project" calls.
@@ -244,34 +237,37 @@ function dndRect(top: number, height: number): DOMRect {
   } as DOMRect;
 }
 
-function mockSidebarDropLayout(): void {
+/** Spy getBoundingClientRect, serving rects by data-testid from the returned
+    mutable table (mutate it to shift layout mid-test); LI rows share one rect
+    and everything else parks off-screen. */
+function mockRectsByTestId(rects: Record<string, DOMRect>): Record<string, DOMRect> {
   vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
     this: Element,
   ): DOMRect {
-    const testId = this.getAttribute("data-testid");
-    if (testId === "sidebar-chats-drop-zone") return dndRect(100, 120);
-    if (testId === "sidebar-ungroup-drop-zone") return dndRect(260, 40);
+    const rect = rects[this.getAttribute("data-testid") ?? ""];
+    if (rect) return rect;
     if (this.tagName === "LI") return dndRect(20, 32);
     return dndRect(-1_000, 1);
+  });
+  return rects;
+}
+
+function mockSidebarDropLayout(): void {
+  mockRectsByTestId({
+    "sidebar-chats-drop-zone": dndRect(100, 120),
+    "sidebar-ungroup-drop-zone": dndRect(260, 40),
   });
 }
 
 function mockShiftingUngroupLayout(): { shift: () => void } {
-  let projectHeight = 120;
-  let stripTop = 260;
-  vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
-    this: Element,
-  ): DOMRect {
-    const testId = this.getAttribute("data-testid");
-    if (testId === "sidebar-project-drop-zone") return dndRect(100, projectHeight);
-    if (testId === "sidebar-ungroup-drop-zone") return dndRect(stripTop, 40);
-    if (this.tagName === "LI") return dndRect(20, 32);
-    return dndRect(-1_000, 1);
+  const rects = mockRectsByTestId({
+    "sidebar-project-drop-zone": dndRect(100, 120),
+    "sidebar-ungroup-drop-zone": dndRect(260, 40),
   });
   return {
     shift: () => {
-      projectHeight = 220;
-      stripTop = 360;
+      rects["sidebar-project-drop-zone"] = dndRect(100, 220);
+      rects["sidebar-ungroup-drop-zone"] = dndRect(360, 40);
     },
   };
 }
@@ -287,23 +283,17 @@ function mockSeamLayout({ slotTop }: { slotTop: number }): {
 } {
   const frameTop = 0;
   const frameBottom = 400;
-  let currentSlotTop = slotTop;
-  vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
-    this: Element,
-  ): DOMRect {
-    const testId = this.getAttribute("data-testid");
-    if (testId === "sidebar-scroll-frame") return dndRect(frameTop, frameBottom - frameTop);
-    if (testId === "sidebar-ungroup-drop-zone") return dndRect(currentSlotTop, 30);
-    if (testId === "sidebar-ungroup-floating-strip") return dndRect(360, 30);
-    if (this.tagName === "LI") return dndRect(20, 32);
-    return dndRect(-1_000, 1);
+  const rects = mockRectsByTestId({
+    "sidebar-scroll-frame": dndRect(frameTop, frameBottom - frameTop),
+    "sidebar-ungroup-drop-zone": dndRect(slotTop, 30),
+    "sidebar-ungroup-floating-strip": dndRect(360, 30),
   });
   return {
     frameTop,
     frameBottom,
     floatingCenterY: 375,
     setSlotTop: (top: number) => {
-      currentSlotTop = top;
+      rects["sidebar-ungroup-drop-zone"] = dndRect(top, 30);
     },
   };
 }
@@ -354,7 +344,6 @@ function closeProjectsMenu() {
 }
 
 beforeEach(() => {
-  resetMockViewportWidth();
   useConvMock.mockReset();
   useHostsMock.mockReset();
   useHostsMock.mockReturnValue({ data: [] });
@@ -1756,6 +1745,22 @@ describe("Sidebar ungroup drag target", () => {
     await waitFor(() => expect(screen.queryByTestId("sidebar-ungroup-floating-strip")).toBeNull());
     // The inline slot itself never unmounted — the fallback just stood down.
     expect(screen.getByTestId("sidebar-ungroup-drop-zone")).toBeInTheDocument();
+    fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
+  });
+
+  it("promotes the floating strip when the seam moves off-screen without a scroll", async () => {
+    const layout = mockSeamLayout({ slotTop: 200 });
+    const row = renderPinnedFiledSession("conv_layout_shift");
+
+    startMouseDrag(row);
+    await screen.findByTestId("sidebar-ungroup-drop-zone");
+    expect(screen.queryByTestId("sidebar-ungroup-floating-strip")).toBeNull();
+
+    // Rows inserted above the seam push it below the fold with no scroll event.
+    layout.setSlotTop(900);
+    act(() => notifyResizeObservers(screen.getByTestId("sidebar-conversation-list")));
+
+    expect(await screen.findByTestId("sidebar-ungroup-floating-strip")).toBeInTheDocument();
     fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
   });
 
