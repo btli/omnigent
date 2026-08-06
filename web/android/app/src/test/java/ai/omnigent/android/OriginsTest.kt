@@ -81,6 +81,20 @@ class OriginsTest {
         assertNull(originOf("https://example.com:65536/x"))
         assertNull(normalizeServerUrl("https://example.com:65536"))
         assertEquals("https://example.com:65535", originOf("https://example.com:65535/x"))
+        // Uri.parsePort overflows Int-sized digit runs to -1; the written port
+        // must reject the URL rather than silently vanish.
+        assertNull(originOf("https://example.com:99999999999/x"))
+        // A bare trailing colon is an EMPTY port — valid per WHATWG.
+        assertEquals("https://example.com", originOf("https://example.com:/x"))
+    }
+
+    @Test
+    fun `over-long numeric labels stay on the IPv4 path and are rejected`() {
+        // WHATWG numbers are arbitrary precision: a 13-hex-digit label is a
+        // valid number that fails the 32-bit address range — an invalid URL in
+        // Chromium, never a domain.
+        assertNull(originOf("https://foo.0x1234567890123/x"))
+        assertNull(originOf("https://0xdeadbeefcafebabe/x"))
     }
 
     @Test
