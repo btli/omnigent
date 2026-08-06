@@ -837,6 +837,18 @@ aside[aria-label="Workspace"][data-maximized] {
   }
 }
 
+/* At md+ the conversations sidebar is a pinned column on the left screen
+ * edge, so it needs the safe-area treatment on its exposed edges — top,
+ * bottom, and left. Content sits at its right edge, so no right inset.
+ * Android-only: iOS md+ (iPad) keeps its current layout untouched. */
+@media (width >= 48rem) {
+  [data-android-native] .conversations-sidebar {
+    padding-top: var(--omnigent-safe-top);
+    padding-bottom: var(--omnigent-safe-bottom);
+    padding-left: var(--omnigent-safe-left);
+  }
+}
+
 @media (width < 48rem) and (prefers-reduced-motion: reduce) {
   [data-ios-native] .conversations-sidebar {
     transition-duration: 1ms;

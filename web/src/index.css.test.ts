@@ -429,6 +429,16 @@ describe("Android injected safe-area layout", () => {
     expect(media?.[1]).toContain(':not(aside[aria-label="Workspace"] *)');
     expect(media?.[1]).not.toContain("padding-left");
   });
+
+  it("pads the md+ conversations sidebar on every edge but the content side", () => {
+    // At md+ the sidebar is a pinned column at the left screen edge; its
+    // right edge faces content, so it gets top/bottom/left insets only.
+    const rules = nativeInsetCss.match(/^@media \(width >= 48rem\)\{.*\}$/gm);
+    const sidebar = rules?.find((rule) => rule.includes(".conversations-sidebar"));
+    expect(sidebar, "md+ sidebar rule lost from the injected sheet").toBeDefined();
+    expect(sidebar).toContain("padding-left");
+    expect(sidebar).not.toContain("padding-right");
+  });
 });
 
 /* Regression test for the "table link column collapses to ~2ch" bug.
