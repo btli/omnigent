@@ -108,6 +108,46 @@ class OidcLoginManagerTest {
     }
 
     @Test
+    @Config(sdk = [35], shadows = [RecordingCookieManagerShadow::class])
+    fun `cookies are queried per endpoint URL so path-scoped cookies match`() {
+        RecordingCookieManagerShadow.reset()
+        val handlerFailure = AtomicReference<Throwable?>()
+        val expectedCookie = "front_door=session"
+        // A proxy session cookie scoped Path=/auth exists only for /auth URLs,
+        // never for the bare origin the old lookup used.
+        RecordingCookieManagerShadow.cookieForUrl = { url ->
+            if (android.net.Uri
+                    .parse(url)
+                    .path
+                    .orEmpty()
+                    .startsWith("/auth")
+            ) {
+                expectedCookie
+            } else {
+                null
+            }
+        }
+        server.createContext("/auth/cli-login") { exchange ->
+            exchange.assertCookie(expectedCookie, handlerFailure)
+            exchange.respond(200, ticketBody())
+        }
+        server.createContext("/auth/cli-poll") { exchange ->
+            exchange.assertCookie(expectedCookie, handlerFailure)
+            exchange.respond(200, tokenBody())
+        }
+
+        val result =
+            try {
+                runLogin(manager())
+            } finally {
+                RecordingCookieManagerShadow.reset()
+            }
+
+        assertEquals(LoginResult.Success(TOKEN), result)
+        handlerFailure.get()?.let { throw it }
+    }
+
+    @Test
     fun `absolute and scheme-relative login urls are rejected`() {
         val loginUrls =
             ConcurrentLinkedQueue(

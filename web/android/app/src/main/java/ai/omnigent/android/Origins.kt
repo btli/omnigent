@@ -11,17 +11,142 @@ private val uts46: IDNA =
         IDNA.NONTRANSITIONAL_TO_ASCII or IDNA.CHECK_BIDI or IDNA.CHECK_CONTEXTJ,
     )
 
-// Bracketed IPv6 literals are not domain names — pass them through unmapped.
+// Bracketed IPv6 literals are not domain names — canonicalize them the way
+// Chromium serializes them (shortest RFC 5952 form) instead of running IDNA.
 private fun toAsciiHost(rawHost: String): String? {
-    if (rawHost.startsWith("[")) return rawHost
+    if (rawHost.startsWith("[")) return canonicalIpv6(rawHost)
     val info = IDNA.Info()
     val ascii = StringBuilder()
+    val mapped =
+        try {
+            uts46.nameToASCII(rawHost, ascii, info)
+            if (info.hasErrors()) null else ascii.toString()
+        } catch (_: RuntimeException) {
+            null
+        } ?: return null
+    // WHATWG: a host whose last label is a number is an IPv4 address — it must
+    // parse as one (shorthand like `127.1` included) or the URL is invalid.
+    return if (endsInIpv4Number(mapped)) canonicalIpv4(mapped) else mapped
+}
+
+// `[0:0:0:0:0:0:0:1]` and `[::1]` are the same address; the WebView reports
+// the canonical form, so the pin must collapse to it too.
+private fun canonicalIpv6(bracketed: String): String? {
+    if (!bracketed.endsWith("]")) return null
+    val literal = bracketed.substring(1, bracketed.length - 1)
+    // Zone ids (%eth0) are not valid in URLs.
+    if (literal.isEmpty() || literal.contains('%')) return null
+    // A literal with a colon can't be a DNS name, so this never resolves.
+    if (!literal.contains(':')) return null
+    val address =
+        try {
+            java.net.InetAddress.getByName(literal)
+        } catch (_: Exception) {
+            return null
+        }
+    val bytes =
+        when (address) {
+            is java.net.Inet6Address -> {
+                address.address
+            }
+
+            // Java collapses an IPv4-mapped literal (`::ffff:1.2.3.4`) to an
+            // Inet4Address — restore the 16-byte mapped form.
+            is java.net.Inet4Address -> {
+                ByteArray(16).also {
+                    it[10] = -1
+                    it[11] = -1
+                    address.address.copyInto(it, 12)
+                }
+            }
+
+            else -> {
+                return null
+            }
+        }
+    val groups =
+        IntArray(8) { i ->
+            ((bytes[2 * i].toInt() and 0xff) shl 8) or (bytes[2 * i + 1].toInt() and 0xff)
+        }
+    // RFC 5952: compress the leftmost longest run (length >= 2) of zero groups.
+    var bestStart = -1
+    var bestLength = 0
+    var start = -1
+    for (i in 0..8) {
+        if (i < 8 && groups[i] == 0) {
+            if (start == -1) start = i
+        } else {
+            if (start != -1 && i - start > bestLength) {
+                bestStart = start
+                bestLength = i - start
+            }
+            start = -1
+        }
+    }
+    if (bestLength < 2) bestStart = -1
+    val out = StringBuilder("[")
+    var i = 0
+    while (i < 8) {
+        if (i == bestStart) {
+            out.append("::")
+            i += bestLength
+            continue
+        }
+        out.append(groups[i].toString(16))
+        if (i + 1 < 8 && i + 1 != bestStart) out.append(':')
+        i++
+    }
+    out.append(']')
+    return out.toString()
+}
+
+// WHATWG "ends in a number": the final non-empty dot label is decimal, octal
+// (leading 0), or hex (0x prefix).
+private fun endsInIpv4Number(host: String): Boolean {
+    val last = host.split('.').dropLastWhile(String::isEmpty).lastOrNull() ?: return false
+    return parseIpv4Number(last) != null
+}
+
+private fun parseIpv4Number(part: String): Long? {
+    if (part.isEmpty()) return null
+    val (digits, radix) =
+        when {
+            part.length >= 2 && (part.startsWith("0x") || part.startsWith("0X")) -> {
+                part.substring(2) to 16
+            }
+
+            part.length >= 2 && part.startsWith("0") -> {
+                part.substring(1) to 8
+            }
+
+            else -> {
+                part to 10
+            }
+        }
+    if (digits.isEmpty()) return 0L // "0x" alone parses as zero per WHATWG
+    val significant = digits.trimStart('0').ifEmpty { "0" }
+    if (significant.length > 12) return null // already beyond 32 bits in any radix
     return try {
-        uts46.nameToASCII(rawHost, ascii, info)
-        if (info.hasErrors()) null else ascii.toString()
-    } catch (_: RuntimeException) {
+        significant.toLong(radix)
+    } catch (_: NumberFormatException) {
         null
     }
+}
+
+// WHATWG IPv4 parser: up to four numeric parts, the last covering the
+// remaining bytes, serialized to canonical dotted-decimal (`127.1` -> 127.0.0.1).
+private fun canonicalIpv4(host: String): String? {
+    val parts = host.split('.').dropLastWhile(String::isEmpty)
+    if (parts.isEmpty() || parts.size > 4) return null
+    val numbers = parts.map { parseIpv4Number(it) ?: return null }
+    if (numbers.dropLast(1).any { it > 0xff }) return null
+    val shift = (4 - numbers.size) * 8
+    if (numbers.last() shr shift > 0xff) return null
+    val value =
+        numbers.dropLast(1).foldIndexed(0L) { index, acc, number ->
+            acc or (number shl ((3 - index) * 8))
+        } or numbers.last()
+    return (3 downTo 0).joinToString(".") { ((value shr (it * 8)) and 0xff).toString() }
 }
 
 /**
@@ -104,5 +229,10 @@ fun normalizeServerUrl(input: String): String? {
     val scheme = uri.scheme?.lowercase() ?: return null
     if (!isHttpScheme(scheme)) return null
     if (uri.host.isNullOrBlank()) return null
-    return withScheme.trimEnd('/')
+    val normalized = withScheme.trimEnd('/')
+    // The pinned-origin gate fails closed on hosts originOf can't canonicalize
+    // (e.g. `a..b`); rejecting them here surfaces a connect-time error instead
+    // of persisting a server that can only ever render a blank page.
+    if (originOf(normalized) == null) return null
+    return normalized
 }

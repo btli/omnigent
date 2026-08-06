@@ -117,7 +117,7 @@ internal class PinnedOriginDownloader(
     }
 
     private companion object {
-        const val TAG = "PinnedOriginDownloader"
+        const val TAG = PinnedOriginDownloadWorker.TAG
         const val UNIQUE_WORK_PREFIX = "pinned-origin-download:"
 
         fun defaultWorkEnqueuer(context: Context): PinnedOriginWorkEnqueuer {
@@ -211,16 +211,6 @@ internal class PinnedOriginDownloadWorker(
             )
         }
 
-        // WorkManager persists input Data, so fetch the live cookie only when execution starts.
-        // This keeps session credentials out of WorkManager's on-disk database. The WebView
-        // provider itself can be unavailable (mid-update) — fail like any transient error so
-        // the user still gets a notification and the stop counter is cleaned up.
-        val cookie =
-            try {
-                CookieManager.getInstance().getCookie(input.url)
-            } catch (failure: Throwable) {
-                return transientFailure(input.suggestedName, failure)
-            }
         var usedRetryAfter = false
         while (true) {
             try {
@@ -229,7 +219,6 @@ internal class PinnedOriginDownloadWorker(
                     downloadFollowingRedirects(
                         initialUrl,
                         input.pinnedOrigin,
-                        cookie,
                         input.userAgent,
                         input.mimeType,
                         input.suggestedName,
@@ -396,10 +385,23 @@ internal class PinnedOriginDownloadWorker(
         }
     }
 
+    /**
+     * Fetch the live WebView cookie for one request URL. Queried per hop so
+     * Path-scoped cookies match each hop's own path — never fetched at enqueue
+     * time, which keeps session credentials out of WorkManager's on-disk
+     * database. The WebView provider itself can be unavailable (mid-update) —
+     * fail like any transient error so the user still gets a notification.
+     */
+    private fun cookieFor(url: URL): String? =
+        try {
+            CookieManager.getInstance().getCookie(url.toString())
+        } catch (failure: Throwable) {
+            throw TransientDownloadException("WebView cookie store unavailable", failure)
+        }
+
     private fun downloadFollowingRedirects(
         initialUrl: URL,
         pinnedOrigin: String,
-        cookie: String?,
         userAgent: String,
         mimeType: String?,
         suggestedName: String,
@@ -419,8 +421,11 @@ internal class PinnedOriginDownloadWorker(
                 connection.readTimeout = READ_TIMEOUT_MS
                 connection.requestMethod = "GET"
                 if (userAgent.isNotBlank()) connection.setRequestProperty("User-Agent", userAgent)
-                if (cookieAllowed && cookie != null) {
-                    connection.setRequestProperty("Cookie", cookie)
+                if (cookieAllowed) {
+                    val cookie = cookieFor(currentUrl)
+                    if (!cookie.isNullOrBlank()) {
+                        connection.setRequestProperty("Cookie", cookie)
+                    }
                 }
 
                 val status = connection.responseCode
@@ -573,7 +578,8 @@ internal class PinnedOriginDownloadWorker(
 
     private class TransientDownloadException(
         message: String,
-    ) : Exception(message)
+        cause: Throwable? = null,
+    ) : Exception(message, cause)
 
     private class RetryAfterDownloadException(
         status: Int,
