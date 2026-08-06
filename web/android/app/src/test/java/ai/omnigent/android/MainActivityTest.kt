@@ -356,6 +356,26 @@ class MainActivityTest {
     }
 
     @Test
+    fun `cutout-only safe area is published on every edge`() {
+        val cutout = Insets.of(11, 23, 31, 0)
+        val insets =
+            WindowInsetsCompat
+                .Builder()
+                .setInsets(WindowInsetsCompat.Type.displayCutout(), cutout)
+                .build()
+
+        val safeArea = systemSafeAreaInsets(insets)
+        assertEquals(cutout, safeArea)
+
+        val script = androidSafeAreaScript(safeArea, 1f)
+        assertTrue(script.contains("const top = '23.0px'"))
+        assertTrue(script.contains("const left = '11.0px'"))
+        assertTrue(script.contains("const right = '31.0px'"))
+        assertTrue(script.contains("setProperty('--omnigent-safe-left', left)"))
+        assertTrue(script.contains("setProperty('--omnigent-safe-right', right)"))
+    }
+
+    @Test
     fun `webview leaves algorithmic darkening disabled`() {
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
