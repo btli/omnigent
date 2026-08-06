@@ -2993,14 +2993,27 @@ function ConversationRow({
   });
   // Radix and dnd-kit run independent long-press timers. Once this row's
   // touch drag is active, reject Radix's later open request for that gesture.
-  // The ref mirrors live drag state, so a later right-click is unaffected.
   const [contextMenuOpen, setContextMenuOpen] = useState(false);
-  const isDraggingRef = useRef(isDragging);
-  isDraggingRef.current = isDragging;
-  const handleContextMenuOpenChange = useCallback((open: boolean) => {
-    if (open && isDraggingRef.current) return;
-    setContextMenuOpen(open);
-  }, []);
+  const handleContextMenuOpenChange = useCallback(
+    (open: boolean) => {
+      if (open && isDragging) return;
+      setContextMenuOpen(open);
+    },
+    [isDragging],
+  );
+  // The menu render branches below are mutually exclusive; switching branches
+  // remounts the ContextMenu, and a stale open=true would reopen the fresh
+  // menu anchored at the viewport corner. Close it when the branch changes.
+  const menuBranch = selectionMode
+    ? "none"
+    : projectFlyoutName
+      ? "flyout"
+      : isMobile
+        ? "mobile"
+        : "desktop";
+  useEffect(() => {
+    setContextMenuOpen(false);
+  }, [menuBranch]);
   // A drag ends with a synthetic click on the row's <Link> (mousedown + mouseup
   // on the same anchor still fires a click); swallow that one click so a drag
   // doesn't also navigate into the session. Flagged when a drag finishes,
