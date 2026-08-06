@@ -193,7 +193,7 @@ class OidcLoginManagerTest {
     }
 
     @Test
-    fun `completed flow delivers to its own callback after a second start`() {
+    fun `a delivered result is not replayed to a later start`() {
         val pollHits = AtomicInteger()
         server.createContext("/auth/cli-login") { exchange ->
             exchange.respond(200, ticketBody())
@@ -206,31 +206,45 @@ class OidcLoginManagerTest {
             }
         }
         val manager = manager(pollTimeoutMs = 30_000)
-        val firstResult = AtomicReference<LoginResult?>()
-        val firstCalls = AtomicInteger()
-        val secondResult = AtomicReference<LoginResult?>()
-        val secondCalls = AtomicInteger()
+        val results = mutableListOf<LoginResult>()
+        manager.attach(origin) { _, result -> results.add(result) }
 
-        assertTrue(
-            manager.start(activity(), origin) { result ->
-                firstResult.set(result)
-                firstCalls.incrementAndGet()
-            },
-        )
+        assertTrue(manager.start(activity(), origin))
         awaitFlowCompletion(manager)
-        assertTrue(
-            manager.start(activity(), origin) { result ->
-                secondResult.set(result)
-                secondCalls.incrementAndGet()
-            },
-        )
+        assertEquals(listOf<LoginResult>(LoginResult.Success(TOKEN)), results)
 
+        assertTrue(manager.start(activity(), origin))
         ShadowLooper.idleMainLooper()
 
-        assertEquals(LoginResult.Success(TOKEN), firstResult.get())
-        assertEquals(1, firstCalls.get())
-        assertNull(secondResult.get())
-        assertEquals(0, secondCalls.get())
+        // The second flow is still polling — the first result must not replay.
+        assertEquals(1, results.size)
+        manager.cancel()
+    }
+
+    @Test
+    fun `a queued start cannot open a second flow before the first delivers`() {
+        server.createContext("/auth/cli-login") { exchange ->
+            exchange.respond(200, ticketBody())
+        }
+        server.createContext("/auth/cli-poll") { exchange ->
+            exchange.respond(200, tokenBody())
+        }
+        val manager = manager()
+        val activity = activity() // built up front — setup() drains the main looper
+        val results = mutableListOf<LoginResult>()
+        manager.attach(origin) { _, result -> results.add(result) }
+
+        assertTrue(manager.start(activity, origin))
+        // The window where the flow has finished off-thread but its result has
+        // not yet crossed to the main thread — a second start used to slip in
+        // here and open a duplicate browser flow.
+        awaitOffMainThread { manager.isAwaitingDeliveryForTest() }
+        assertFalse(manager.start(activity, origin))
+
+        ShadowLooper.idleMainLooper()
+        assertEquals(listOf<LoginResult>(LoginResult.Success(TOKEN)), results)
+        // Once the result is delivered the slot is free again.
+        assertTrue(manager.start(activity, origin))
         manager.cancel()
     }
 
@@ -366,9 +380,7 @@ class OidcLoginManagerTest {
             manager.attach("http://localhost:${server.address.port}") { _, _ -> }
 
             assertFalse(manager.isInFlightForTest())
-            assertTrue(
-                manager.start(activity(), "http://localhost:${server.address.port}") { _ -> },
-            )
+            assertTrue(manager.start(activity(), "http://localhost:${server.address.port}"))
         } finally {
             manager.cancel()
             releaseRequest.countDown()
@@ -395,7 +407,7 @@ class OidcLoginManagerTest {
             manager.attach(origin) { _, _ -> }
 
             assertTrue(manager.isInFlightForTest())
-            assertFalse(manager.start(activity(), origin) { _ -> })
+            assertFalse(manager.start(activity(), origin))
         } finally {
             manager.cancel()
             releaseRequest.countDown()
@@ -443,13 +455,12 @@ class OidcLoginManagerTest {
         }
         val manager = manager()
         val delivered = AtomicInteger()
+        manager.attach(origin) { _, _ -> delivered.incrementAndGet() }
 
         // The flow finishes and posts its result; the cancel lands before the
         // main looper drains it, so the abandoned callback must never run.
-        assertTrue(manager.start(activity(), origin) { delivered.incrementAndGet() })
-        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
-        while (manager.isInFlightForTest() && System.nanoTime() < deadline) Thread.yield()
-        assertFalse(manager.isInFlightForTest())
+        assertTrue(manager.start(activity(), origin))
+        awaitOffMainThread { manager.isAwaitingDeliveryForTest() }
 
         manager.cancel()
         ShadowLooper.idleMainLooper()
@@ -474,44 +485,39 @@ class OidcLoginManagerTest {
             }
         }
         val manager = manager(pollTimeoutMs = 30_000)
-        val abandonedCalls = AtomicInteger()
-        val secondResult = AtomicReference<LoginResult?>()
-        val secondDelivered = CountDownLatch(1)
+        val results = mutableListOf<LoginResult>()
+        val delivered = CountDownLatch(1)
+        manager.attach(origin) { _, result ->
+            results.add(result)
+            delivered.countDown()
+        }
 
-        assertTrue(
-            manager.start(activity(), origin) {
-                abandonedCalls.incrementAndGet()
-            },
-        )
+        assertTrue(manager.start(activity(), origin))
         assertTrue(firstPollCompleted.await(5, TimeUnit.SECONDS))
 
         manager.cancel()
 
         assertFalse(manager.isInFlightForTest())
-        assertTrue(
-            manager.start(activity(), origin) { result ->
-                secondResult.set(result)
-                secondDelivered.countDown()
-            },
-        )
-        awaitCallback(manager, secondDelivered)
+        assertTrue(manager.start(activity(), origin))
+        awaitCallback(delivered)
 
-        assertEquals(LoginResult.Success(TOKEN), secondResult.get())
-        assertEquals(0, abandonedCalls.get())
+        // Only the second flow's token arrives; the abandoned flow stays silent.
+        assertEquals(listOf<LoginResult>(LoginResult.Success(TOKEN)), results)
     }
 
     @Test
     fun `start after shutdown does not throw or leave inFlight set`() {
         val manager = manager()
+        manager.attach(origin) { _, _ ->
+            throw AssertionError("shutdown manager delivered a callback")
+        }
         manager.shutdown()
 
-        val started =
-            manager.start(activity(), origin) {
-                throw AssertionError("shutdown manager delivered a callback")
-            }
+        val started = manager.start(activity(), origin)
 
         assertFalse(started)
         assertFalse(manager.isInFlightForTest())
+        ShadowLooper.idleMainLooper()
     }
 
     @Test
@@ -550,34 +556,26 @@ class OidcLoginManagerTest {
     ): LoginResult {
         val result = AtomicReference<LoginResult?>()
         val delivered = CountDownLatch(1)
-        assertTrue(
-            manager.start(activity(), origin) { loginResult ->
-                result.set(loginResult)
-                onResult(loginResult)
-                delivered.countDown()
-            },
-        )
-        awaitCallback(manager, delivered)
+        manager.attach(origin) { _, loginResult ->
+            result.set(loginResult)
+            onResult(loginResult)
+            delivered.countDown()
+        }
+        assertTrue(manager.start(activity(), origin))
+        awaitCallback(delivered)
         return checkNotNull(result.get())
     }
 
-    private fun awaitCallback(
-        manager: OidcLoginManager,
-        delivered: CountDownLatch,
-    ) {
+    private fun awaitCallback(delivered: CountDownLatch) {
         val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
         while (delivered.count > 0 && System.nanoTime() < deadline) {
-            if (!manager.isInFlightForTest()) ShadowLooper.idleMainLooper()
+            ShadowLooper.idleMainLooper()
             Thread.yield()
         }
-        ShadowLooper.idleMainLooper()
         assertTrue("login callback was not delivered", delivered.await(0, TimeUnit.MILLISECONDS))
     }
 
-    /**
-     * The worker clears the in-flight flag before it enqueues the result, so a
-     * single drain can race the post. Idle until the outcome is observable.
-     */
+    /** Idle until the worker's posted outcome is observable on the main thread. */
     private fun awaitMainThread(condition: () -> Boolean) {
         val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
         while (!condition() && System.nanoTime() < deadline) {
@@ -587,9 +585,20 @@ class OidcLoginManagerTest {
         ShadowLooper.idleMainLooper()
     }
 
+    /** Busy-wait for [condition] WITHOUT idling the main looper. */
+    private fun awaitOffMainThread(condition: () -> Boolean) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (!condition() && System.nanoTime() < deadline) {
+            Thread.yield()
+        }
+        assertTrue("condition was not reached", condition())
+    }
+
+    /** A finished flow vacates its slot on the main thread, so completion needs a drain. */
     private fun awaitFlowCompletion(manager: OidcLoginManager) {
         val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
         while (manager.isInFlightForTest() && System.nanoTime() < deadline) {
+            ShadowLooper.idleMainLooper()
             Thread.yield()
         }
         assertFalse("login flow did not complete", manager.isInFlightForTest())
