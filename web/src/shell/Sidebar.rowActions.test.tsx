@@ -22,7 +22,7 @@ import {
   screen,
   within,
 } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
@@ -264,6 +264,12 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
   };
 }
 
+// Exposes the router's current pathname so tests can assert whether a click on
+// a row link actually navigated (e.g. the swipe suite's trailing-click guard).
+function LocationProbe() {
+  return <div data-testid="location-probe">{useLocation().pathname}</div>;
+}
+
 // `activeId` mounts the sidebar at `/c/:conversationId` (via a matching
 // Route so `useParams` populates), making that row the active one — the
 // rest of the suite renders at `/` where no row is active. `info` pins the
@@ -286,6 +292,7 @@ function renderSidebar(activeId?: string, info?: ServerInfo) {
             ) : (
               sidebar
             )}
+            <LocationProbe />
           </MemoryRouter>
         </TooltipProvider>
       </QueryClientProvider>
@@ -1035,9 +1042,8 @@ describe("touch swipe actions", () => {
       li,
       release() {
         fireEvent.pointerUp(li, { ...POINTER, clientX: 100 + dx, clientY: 100 });
-        // Include the browser's trailing click so gesture and row click paths
-        // cannot double-dispatch; prevent navigation while exercising the handler.
-        link.addEventListener("click", (event) => event.preventDefault(), { once: true });
+        // Include the browser's trailing click, un-prevented: the row itself
+        // must suppress it (see the trailing-click tests) — never the test.
         fireEvent.click(link);
       },
     };
@@ -1135,6 +1141,77 @@ describe("touch swipe actions", () => {
       expect.anything(),
     );
     expect(mocks.del.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it("suppresses the trailing click after a committed swipe so it doesn't navigate", () => {
+    // Browsers can synthesize a click on the row link after the drag; the
+    // row's click-capture guard must swallow it (no test-side preventDefault),
+    // or a swipe-to-archive would also open the session it just archived.
+    renderSidebar();
+    expect(screen.getByTestId("location-probe")).toHaveTextContent("/");
+
+    swipeRow(-90);
+
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("location-probe")).toHaveTextContent(/^\/$/);
+  });
+
+  it("suppresses the trailing click after a below-threshold swipe as well", () => {
+    // Even an uncommitted (beyond-slop) swipe is a drag, not a tap — its
+    // trailing click must not navigate either.
+    renderSidebar();
+
+    swipeRow(-40);
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(screen.getByTestId("location-probe")).toHaveTextContent(/^\/$/);
+  });
+
+  it("keeps a plain tap navigating (the suppression is scoped to swipes)", () => {
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.getByTestId("location-probe")).toHaveTextContent("/c/conv_1");
+  });
+
+  it("shows the unarchive glyph when swiping an archived row", () => {
+    // runArchive toggles, so on an archived row the gesture restores the
+    // session — the reveal must mirror the kebab's Unarchive affordance, not
+    // promise a re-archive.
+    mockConversations([{ ...CONV, archived: true }]);
+    renderSidebar();
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-archived"));
+
+    const swipe = moveSwipeRow(-90);
+    expectRevealIcons(swipe.li, {
+      shows: ".lucide-archive-restore",
+      hides: ".lucide-archive",
+    });
+    swipe.release();
+
+    // Releasing runs the same toggle the kebab's Unarchive item uses.
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({ id: "conv_1", archived: false });
+  });
+
+  it("claims the horizontal touch axis only while a swipe action is configured", () => {
+    // With an action armed, the row must override touch-action so the browser
+    // doesn't take the horizontal pan mid-gesture...
+    const { unmount } = renderSidebar();
+    const li = () => screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    expect(li()).toHaveClass("touch-pan-y");
+    unmount();
+
+    // ...but with BOTH directions inert there is no gesture to protect, so the
+    // override is dropped and the browser keeps its own horizontal gestures.
+    writeSwipeActions({ left: "none", right: "none" });
+    renderSidebar();
+    expect(li()).not.toHaveClass("touch-pan-y");
   });
 
   it("does nothing when swiping a direction mapped to none", () => {
@@ -1406,6 +1483,36 @@ describe("useRowSwipe — dnd coexistence", () => {
       result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
     });
     expect(onAction).toHaveBeenCalledWith("archive");
+  });
+
+  it("(g) rests at 0 when a locked swipe reverses into a direction mapped to none", () => {
+    // ACTIONS maps right to "none": a swipe locked going left that overshoots
+    // back past its origin must clamp at rest, not slide the row rightward over
+    // bare canvas with no hint behind it (release there already no-ops).
+    const onAction = vi.fn();
+    const { result } = renderHook(() =>
+      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging: false, onAction }),
+    );
+
+    act(() => {
+      result.current.onPointerDown(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
+    });
+    act(() => {
+      // Lock the gesture leftward (the archive direction).
+      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 70, clientY: 100 }));
+    });
+    expect(result.current.dx).toBe(-30);
+
+    act(() => {
+      // Reverse well past the origin into the inert right direction.
+      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 150, clientY: 100 }));
+    });
+    expect(result.current.dx).toBe(0);
+
+    act(() => {
+      result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 150, clientY: 100 }));
+    });
+    expect(onAction).not.toHaveBeenCalled();
   });
 
   it("(e) ignores a pointerdown that bubbled out of a portal (open dialog)", () => {

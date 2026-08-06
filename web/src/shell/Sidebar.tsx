@@ -220,7 +220,9 @@ function swipeOffset(deltaX: number): number {
  * bailing once a dnd-kit drag is active. A direction mapped to "none" is inert.
  *
  * Returns the live translate offset (for the row transform + reveal hint) and
- * pointer handlers to spread on the row element.
+ * pointer/click handlers to spread on the row element. The click-capture
+ * handler swallows the click some browsers still synthesize after the drag, so
+ * a swipe never also navigates into the session.
  */
 export function useRowSwipe({
   enabled,
@@ -251,6 +253,10 @@ export function useRowSwipe({
     target: Element | null;
     offset: number;
   } | null>(null);
+  // True for the tick after a beyond-slop swipe released, so the click-capture
+  // handler can swallow the trailing click (pointer-capture + preventDefault
+  // behavior varies across mobile browsers — don't rely on it).
+  const justSwipedRef = useRef(false);
 
   const reset = useCallback(() => {
     const s = state.current;
@@ -317,7 +323,10 @@ export function useRowSwipe({
         e.currentTarget.setPointerCapture(e.pointerId);
       }
       e.preventDefault();
-      const offset = swipeOffset(deltaX);
+      // A reversal into a direction mapped to "none" rests at 0 instead of
+      // sliding the row over bare canvas with no hint behind it.
+      const action = deltaX < 0 ? actions.left : actions.right;
+      const offset = action === "none" ? 0 : swipeOffset(deltaX);
       s.offset = offset;
       setDx(offset);
     },
@@ -332,13 +341,29 @@ export function useRowSwipe({
       const offset = s.offset;
       const committed = s.decided === "swipe" && Math.abs(offset) >= SWIPE_COMMIT_PX;
       const action = offset < 0 ? actions.left : actions.right;
+      if (s.decided === "swipe") {
+        justSwipedRef.current = true;
+        setTimeout(() => {
+          justSwipedRef.current = false;
+        }, 0);
+      }
       reset();
       if (committed && action !== "none") onAction(action);
     },
     [actions.left, actions.right, onAction, reset],
   );
 
-  return { dx, onPointerDown, onPointerMove, onPointerUp, onPointerCancel: reset };
+  const onClickCapture = useCallback((e: MouseEvent) => {
+    if (!justSwipedRef.current) return;
+    // Only the trailing click on the row itself — clicks bubbling out of the
+    // row's portalled dialogs/menus are not descendants and pass through.
+    const target = e.target;
+    if (target instanceof Node && !e.currentTarget.contains(target)) return;
+    e.preventDefault();
+    e.stopPropagation();
+  }, []);
+
+  return { dx, onPointerDown, onPointerMove, onPointerUp, onPointerCancel: reset, onClickCapture };
 }
 
 // Match the Settings sidebar's ghost-button hover treatment across every home
@@ -3251,25 +3276,24 @@ function ConversationRow({
   // runArchive; swipe→delete opens the same confirm dialog the kebab uses
   // (never an immediate delete).
   const swipeActions = useSwipeActions();
-  // `runArchive` is re-created every render, so an empty-dep useCallback would
-  // capture a stale one. Keep the latest in a ref and hand the hook a stable
-  // wrapper: the callback identity never changes, but it always calls current
-  // code when the gesture releases.
-  const swipeActionRef = useRef<(action: Exclude<SwipeAction, "none">) => void>(() => {});
-  swipeActionRef.current = (action: Exclude<SwipeAction, "none">) => {
-    if (action === "archive") runArchive();
-    else setDeleteOpen(true);
-  };
-  const onSwipeAction = useCallback((action: Exclude<SwipeAction, "none">) => {
-    swipeActionRef.current(action);
-  }, []);
-  // useRowSwipe accepts only touch pointers, so a touchscreen laptop's mouse path stays untouched.
-  const swipeEnabled = hasCoarsePointer && !selectionMode && isOwner && !isEditing;
+  // useRowSwipe accepts only touch pointers, so a touchscreen laptop's mouse
+  // path stays untouched. With both directions mapped to "none" the gesture is
+  // fully disarmed — no handlers fire and the touch-action override below is
+  // dropped, so the browser keeps its horizontal gestures.
+  const swipeEnabled =
+    hasCoarsePointer &&
+    !selectionMode &&
+    isOwner &&
+    !isEditing &&
+    (swipeActions.left !== "none" || swipeActions.right !== "none");
   const swipe = useRowSwipe({
     enabled: swipeEnabled,
     actions: swipeActions,
     isDragging,
-    onAction: onSwipeAction,
+    onAction: (action) => {
+      if (action === "archive") runArchive();
+      else setDeleteOpen(true);
+    },
   });
 
   if (isEditing) {
@@ -3489,6 +3513,7 @@ function ConversationRow({
       onPointerMove={swipe.onPointerMove}
       onPointerUp={swipe.onPointerUp}
       onPointerCancel={swipe.onPointerCancel}
+      onClickCapture={swipe.onClickCapture}
       className={cn(
         "group relative",
         isDragging && "opacity-40",
@@ -3532,6 +3557,10 @@ function ConversationRow({
           >
             {swipingAction === "delete" ? (
               <Trash2Icon className="size-4" />
+            ) : isArchived ? (
+              // Archiving toggles, so on an archived row the gesture restores —
+              // mirror the kebab's Unarchive glyph rather than promising a re-archive.
+              <ArchiveRestoreIcon className="size-4" />
             ) : (
               <ArchiveIcon className="size-4" />
             )}
