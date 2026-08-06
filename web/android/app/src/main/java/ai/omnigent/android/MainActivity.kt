@@ -69,6 +69,33 @@ internal fun androidSafeAreaScript(
     })();
     """.trimIndent()
 
+internal fun systemSafeAreaInsets(insets: WindowInsetsCompat): Insets =
+    insets.getInsets(
+        WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout(),
+    )
+
+internal fun androidSafeAreaScript(
+    insets: Insets,
+    density: Float,
+): String =
+    """
+    (() => {
+      const s = document.documentElement.style;
+      const top = '${insets.top / density}px';
+      const bottom = '${insets.bottom / density}px';
+      const left = '${insets.left / density}px';
+      const right = '${insets.right / density}px';
+      s.setProperty('--omnigent-safe-top', top);
+      s.setProperty('--omnigent-safe-bottom', bottom);
+      s.setProperty('--omnigent-safe-left', left);
+      s.setProperty('--omnigent-safe-right', right);
+      s.setProperty('--omnigent-android-safe-area-top', top);
+      s.setProperty('--omnigent-android-safe-area-bottom', bottom);
+      s.setProperty('--omnigent-android-safe-area-left', left);
+      s.setProperty('--omnigent-android-safe-area-right', right);
+    })();
+    """.trimIndent()
+
 /**
  * The single WebView host. Mirrors the iOS `WebShellView` + `OmnigentWebView`:
  * loads the server-served SPA, installs the `window.omnigentNative` bridge, and
