@@ -125,7 +125,12 @@ internal class DownloadStorage(
         if (destination.published) return true
         try {
             val uri = destination.uri
-            if (shouldAbort()) return false
+            // Cancelled work is never retried, so an abandoned pending row
+            // would stay journaled and pending forever — delete it now.
+            if (shouldAbort()) {
+                deleteMediaStoreDestination(operationId, uri)
+                return false
+            }
 
             val wrote =
                 runCatching {

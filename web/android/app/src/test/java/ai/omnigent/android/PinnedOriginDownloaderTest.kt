@@ -177,6 +177,44 @@ class PinnedOriginDownloaderTest {
     }
 
     @Test
+    @Config(sdk = [28], shadows = [RecordingCookieManagerShadow::class])
+    fun `each same-origin redirect hop gets the cookie for its own URL`() {
+        RecordingCookieManagerShadow.reset()
+        // Path-scoped cookies differ per hop; reusing the initial URL's header
+        // would send /download's cookie to /protected/file.
+        RecordingCookieManagerShadow.cookieForUrl = { url ->
+            when (Uri.parse(url).path) {
+                "/download" -> "scoped=download"
+                "/protected/file" -> "scoped=protected"
+                else -> null
+            }
+        }
+        val downloadCookie = AtomicReference<String?>()
+        val protectedCookie = AtomicReference<String?>()
+        pinnedServer.createContext("/download") { exchange ->
+            downloadCookie.set(exchange.requestHeaders.getFirst("Cookie"))
+            exchange.redirect("/protected/file")
+        }
+        pinnedServer.createContext("/protected/file") { exchange ->
+            protectedCookie.set(exchange.requestHeaders.getFirst("Cookie"))
+            exchange.respond(200, DOWNLOAD_BODY)
+        }
+        val target = targetFile("scoped.txt")
+
+        val result =
+            try {
+                worker("$pinnedOrigin/download", target.name).doWork()
+            } finally {
+                RecordingCookieManagerShadow.reset()
+            }
+
+        assertEquals(ListenableWorker.Result.success(), result)
+        assertEquals("scoped=download", downloadCookie.get())
+        assertEquals("scoped=protected", protectedCookie.get())
+        assertEquals(DOWNLOAD_BODY, target.readText())
+    }
+
+    @Test
     fun `proxy auth redirect is rejected with a sign in again outcome`() {
         val idpHits = AtomicInteger()
         pinnedServer.createContext("/expired") { exchange ->
