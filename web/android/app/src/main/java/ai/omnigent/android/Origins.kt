@@ -100,10 +100,19 @@ private fun canonicalIpv6(bracketed: String): String? {
     return out.toString()
 }
 
-// WHATWG "ends in a number": the final non-empty dot label is decimal, octal
-// (leading 0), or hex (0x prefix).
+// WHATWG "ends in a number": at most ONE trailing empty label is ignored
+// (`1.2.3..` stays a domain), and an all-digit last label counts even when it
+// later fails IPv4 number parsing (`foo.09` must then be rejected, not treated
+// as a domain — matching Chromium's invalid-URL behavior).
+private fun ipv4CandidateLabels(host: String): List<String> {
+    val parts = host.split('.')
+    return if (parts.size > 1 && parts.last().isEmpty()) parts.dropLast(1) else parts
+}
+
 private fun endsInIpv4Number(host: String): Boolean {
-    val last = host.split('.').dropLastWhile(String::isEmpty).lastOrNull() ?: return false
+    val last = ipv4CandidateLabels(host).last()
+    if (last.isEmpty()) return false
+    if (last.all { it in '0'..'9' }) return true
     return parseIpv4Number(last) != null
 }
 
@@ -136,8 +145,8 @@ private fun parseIpv4Number(part: String): Long? {
 // WHATWG IPv4 parser: up to four numeric parts, the last covering the
 // remaining bytes, serialized to canonical dotted-decimal (`127.1` -> 127.0.0.1).
 private fun canonicalIpv4(host: String): String? {
-    val parts = host.split('.').dropLastWhile(String::isEmpty)
-    if (parts.isEmpty() || parts.size > 4) return null
+    val parts = ipv4CandidateLabels(host)
+    if (parts.any(String::isEmpty) || parts.size > 4) return null
     val numbers = parts.map { parseIpv4Number(it) ?: return null }
     if (numbers.dropLast(1).any { it > 0xff }) return null
     val shift = (4 - numbers.size) * 8
