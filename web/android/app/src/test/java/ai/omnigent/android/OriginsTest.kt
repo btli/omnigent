@@ -29,6 +29,21 @@ class OriginsTest {
     }
 
     @Test
+    fun `bracketed ipv6 literals canonicalize with their ports intact`() {
+        assertEquals("https://[::1]:8443", originOf("https://[::1]:8443/x"))
+        assertEquals("https://[::1]", originOf("https://[::1]:443/x"))
+        assertEquals("https://[2001:db8::1]:8443", originOf("https://[2001:DB8::1]:8443/x"))
+    }
+
+    @Test
+    fun `hosts canonicalize like Chromium's UTS-46, not IDNA2003`() {
+        // java.net.IDN (IDNA2003) maps faß.de to fass.de — a different
+        // registrable domain than the xn--fa-hia.de the WebView loads.
+        assertEquals("https://xn--fa-hia.de", originOf("https://faß.de/x"))
+        assertEquals(originOf("https://xn--fa-hia.de"), originOf("https://faß.de"))
+    }
+
+    @Test
     fun `unicode and punycode hosts have the same origin`() {
         assertEquals(
             originOf("https://xn--r8jz45g.jp"),
