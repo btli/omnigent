@@ -107,13 +107,23 @@ describe("useNativeServerSwitcherBand", () => {
 
   it("hides instead of borrowing an adjacent region for a collapsed chat column", () => {
     const { setServerSwitcherBand, setServerSwitcherHidden } = installAndroidBridge();
-    const column = makeColumn(320, 383);
+    const column = makeColumn(320, 320);
     stubTopElement(() => column);
 
     renderHook(() => useNativeServerSwitcherBand(column));
 
     expect(setServerSwitcherBand).not.toHaveBeenCalled();
     expect(setServerSwitcherHidden).toHaveBeenLastCalledWith(true);
+  });
+
+  it("publishes a narrow band as-is; native owns the too-small-to-fit policy", () => {
+    const { setServerSwitcherBand } = installAndroidBridge();
+    const column = makeColumn(320, 383);
+    stubTopElement(() => column);
+
+    renderHook(() => useNativeServerSwitcherBand(column));
+
+    expect(setServerSwitcherBand).toHaveBeenCalledWith(0.32, 0.383);
   });
 
   it("clears the native placement when the tracked UI unmounts", () => {
