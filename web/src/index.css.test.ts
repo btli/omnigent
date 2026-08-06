@@ -19,6 +19,10 @@ const nativeBridgeSource = readFileSync(
   "utf8",
 );
 
+// Innermost `selector { ... }` blocks with their match indices, shared by
+// every rule-extraction below so the block grammar lives in one place.
+const cssBlocks = [...cssSource.matchAll(/[^{}]+\{[^{}]*\}/g)];
+
 /* Regression test for the "transparent dropdown in prod" bug.
  *
  * Dark mode renders popovers/cards with a semi-transparent background that
@@ -55,15 +59,14 @@ function selectorOf(rule: string): string {
 }
 
 /** Innermost `selector { ... }` blocks that declare backdrop-filter. */
-function extractBackdropFilterRules(css: string): string[] {
-  const blocks = css.match(/[^{}]+\{[^{}]*\}/g) ?? [];
+function extractBackdropFilterRules(): string[] {
   // Require a `:` so blocks that merely mention backdrop-filter in a
   // comment (e.g. the dark-token block) are not treated as glass rules.
-  return blocks.filter((block) => UNPREFIXED_DECL.test(block));
+  return cssBlocks.map(([block]) => block).filter((block) => UNPREFIXED_DECL.test(block));
 }
 
 describe("index.css backdrop-filter glass rules", () => {
-  const rules = extractBackdropFilterRules(cssSource);
+  const rules = extractBackdropFilterRules();
 
   it("has the glass rules this test exists to protect", () => {
     // 2 today: the bg-card frosted surfaces and the popover/menu rule.
@@ -107,7 +110,7 @@ describe("index.css backdrop-filter glass rules", () => {
  */
 describe("index.css bg-card glass rule selector", () => {
   // The selector of the rule declaring the bg-card glass border/blur.
-  const cardRule = extractBackdropFilterRules(cssSource).find((rule) => rule.includes(".bg-card"))!;
+  const cardRule = extractBackdropFilterRules().find((rule) => rule.includes(".bg-card"))!;
   const selector = selectorOf(cardRule);
 
   function makeAside(): HTMLElement {
@@ -155,9 +158,19 @@ describe("index.css app-shell viewport lock", () => {
   });
 });
 
-const cssBlocks = [...cssSource.matchAll(/[^{}]+\{[^{}]*\}/g)];
 const workspaceAttribute = /\[\s*aria-label\s*=\s*("Workspace"|'Workspace'|Workspace)\s*\]/;
-const workspaceRules = cssBlocks.filter(([block]) => workspaceAttribute.test(block));
+// Rules that style the rail itself — the docked-panel rule mentions the rail
+// only inside :not(...) (to exempt nested panels), so strip those first.
+const workspaceRules = cssBlocks.filter(([block]) =>
+  workspaceAttribute.test(selectorOf(block).replace(/:not\([^)]*\)/g, "")),
+);
+const dockedPanelRule =
+  cssBlocks.find(
+    ([block]) =>
+      block.includes('[data-testid="execution-logs-panel"]') &&
+      block.includes("--omnigent-safe-top") &&
+      block.includes(":not("),
+  )?.[0] ?? "";
 const workspaceSafeAreaRules = workspaceRules.filter(([block]) =>
   block.includes("--omnigent-safe-top"),
 );
@@ -330,6 +343,51 @@ describe("index.css native safe-area layout", () => {
   it("does not double-count app-owned bar footprints", () => {
     expect(workspaceSafeAreaRule).not.toMatch(/--omnigent-(?:inset|native)-/);
   });
+
+  it("pads docked right-edge panels on every edge but the content side", () => {
+    // At md+ these panels replace the rail in the same slot: right edge at
+    // the window edge, content to their left — so no padding-left.
+    expect(dockedPanelRule, "the docked-panel safe-area rule is gone").not.toBe("");
+    expect(dockedPanelRule).not.toContain("padding-left");
+    withStyle(dockedPanelRule, () => {
+      const shell = document.createElement("div");
+      shell.setAttribute("data-android-native", "");
+      const panel = document.createElement("div");
+      panel.dataset.testid = "execution-logs-panel";
+      shell.appendChild(panel);
+      document.body.appendChild(shell);
+      try {
+        const computed = getComputedStyle(panel);
+        expect(computed.paddingTop).toBe("var(--omnigent-safe-top)");
+        expect(computed.paddingBottom).toBe("var(--omnigent-safe-bottom)");
+        expect(computed.paddingRight).toBe("var(--omnigent-safe-right)");
+        expect(computed.paddingLeft).toBe("0");
+      } finally {
+        shell.remove();
+      }
+    });
+  });
+
+  it("exempts panels nested inside the already-padded rail from the docked rule", () => {
+    withStyle(dockedPanelRule, () => {
+      const shell = document.createElement("div");
+      shell.setAttribute("data-android-native", "");
+      const rail = document.createElement("aside");
+      rail.setAttribute("aria-label", "Workspace");
+      const panel = document.createElement("div");
+      panel.dataset.testid = "file-viewer";
+      rail.appendChild(panel);
+      shell.appendChild(rail);
+      document.body.appendChild(shell);
+      try {
+        // The rail already pads all four edges; padding the nested viewer
+        // again would double the inset.
+        expect(getComputedStyle(panel).paddingTop).toBe("0");
+      } finally {
+        shell.remove();
+      }
+    });
+  });
 });
 
 describe("Android injected safe-area layout", () => {
@@ -355,6 +413,17 @@ describe("Android injected safe-area layout", () => {
       ".conversations-sidebar",
     );
     expect(nativeInsetCss).toMatch(/^aside\[aria-label="Workspace"\]/m);
+  });
+
+  it("pads docked md+ panels on every edge but the content side", () => {
+    // Mirrors the index.css docked-panel rule for pre-shell servers: right
+    // edge at the window edge, content to the left, rail descendants exempt.
+    const media = nativeInsetCss.match(/^@media \(width >= 48rem\)\{(.*)\}$/m);
+    expect(media?.[1], "docked-panel rule lost from the injected sheet").toContain(
+      "execution-logs-panel",
+    );
+    expect(media?.[1]).toContain(':not(aside[aria-label="Workspace"] *)');
+    expect(media?.[1]).not.toContain("padding-left");
   });
 });
 

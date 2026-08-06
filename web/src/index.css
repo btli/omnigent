@@ -821,6 +821,22 @@ aside[aria-label="Workspace"][data-maximized] {
   padding-right: var(--omnigent-safe-right);
 }
 
+/* Docked right-edge panels replace the rail in the same md+ slot, so they
+ * need the rail's safe-area treatment — except the left edge (content sits
+ * there) and panels nested inside the already-padded rail (double inset). */
+@media (width >= 48rem) {
+  :is([data-ios-native], [data-android-native])
+    :is(
+      [data-testid="execution-logs-panel"],
+      [data-testid="file-viewer"],
+      [data-testid="terminals-panel"]
+    ):not(aside[aria-label="Workspace"] *) {
+    padding-top: var(--omnigent-safe-top);
+    padding-bottom: var(--omnigent-safe-bottom);
+    padding-right: var(--omnigent-safe-right);
+  }
+}
+
 @media (width < 48rem) and (prefers-reduced-motion: reduce) {
   [data-ios-native] .conversations-sidebar {
     transition-duration: 1ms;
