@@ -243,8 +243,8 @@ class MainActivity : AppCompatActivity() {
             // disappear under the notch/status icons on edge-to-edge layouts.
             (switchButton.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
                 val topMargin = bars.top + (8 * dp).toInt()
-                serverSwitcherTopMarginUpdate(lp.topMargin, topMargin)?.let { updated ->
-                    lp.topMargin = updated
+                if (lp.topMargin != topMargin) {
+                    lp.topMargin = topMargin
                     switchButton.layoutParams = lp
                 }
             }
@@ -535,17 +535,23 @@ class MainActivity : AppCompatActivity() {
         } else {
             // The band uses physical viewport coordinates, so it must not mirror in RTL.
             gravity = Gravity.TOP or Gravity.LEFT
-            val controlReserve =
-                (SWITCHER_CONTROL_RESERVE_DP * resources.displayMetrics.density)
-                    .toInt()
             leftMargin =
-                serverSwitcherLeftMargin(containerWidth, switcherWidth, band, controlReserve)
+                serverSwitcherLeftMargin(
+                    containerWidth,
+                    switcherWidth,
+                    band,
+                    switcherControlReservePx(),
+                )
         }
         if (lp.gravity == gravity && lp.leftMargin == leftMargin) return
         lp.gravity = gravity
         lp.leftMargin = leftMargin
         switchButton.layoutParams = lp
     }
+
+    /** Shared dp→px conversion so the fit test and margin math can't drift. */
+    private fun switcherControlReservePx(): Int =
+        (SWITCHER_CONTROL_RESERVE_DP * resources.displayMetrics.density).toInt()
 
     private fun applyServerSwitcherWidthBounds(
         containerWidth: Int,
@@ -554,21 +560,13 @@ class MainActivity : AppCompatActivity() {
         val dp = resources.displayMetrics.density
         val defaultMax = (SWITCHER_MAX_WIDTH_DP * dp).toInt()
         val defaultMin = (SWITCHER_MIN_WIDTH_DP * dp).toInt()
-        val controlReserve = (SWITCHER_CONTROL_RESERVE_DP * dp).toInt()
-        val usableWidth =
-            if (band == null || containerWidth <= 0) {
-                defaultMax
-            } else {
-                serverSwitcherUsableWidth(containerWidth, band, controlReserve)
-            }
+        val controlReserve = switcherControlReservePx()
         val max =
             if (band == null || containerWidth <= 0) {
                 defaultMax
             } else {
-                maxOf(
-                    defaultMin,
-                    minOf(defaultMax, usableWidth),
-                )
+                val usableWidth = serverSwitcherUsableWidth(containerWidth, band, controlReserve)
+                maxOf(defaultMin, minOf(defaultMax, usableWidth))
             }
         // Floors the WIDTH only — the height stays the text's — so this bounds how
         // far a label can shrink, not the full touch target.
