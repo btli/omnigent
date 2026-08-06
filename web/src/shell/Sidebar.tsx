@@ -187,6 +187,8 @@ const SIDEBAR_HOVER_HIGHLIGHT =
 const SIDEBAR_ACTIVE_HIGHLIGHT =
   "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)]";
 const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
+// Shared sizing for the sidebar's dropdown / context menus so they can't drift.
+const SIDEBAR_MENU_CONTENT_CLASS = "min-w-40 [&_[role=menuitem]]:text-xs";
 
 // Maps a first-class project id → its name, provided once at the list level so
 // each row resolves its ``project_id`` to a folder name without its own
@@ -1103,7 +1105,7 @@ function ProjectFolder({
           <ProjectFolderActions projectName={name} onNavigate={onRowClick} actions={menuActions} />
         }
         headerContextMenu={
-          <ContextMenuContent className="min-w-40 [&_[role=menuitem]]:text-xs">
+          <ContextMenuContent className={SIDEBAR_MENU_CONTENT_CLASS}>
             <ProjectFolderMenuItems
               components={contextBundle}
               projectName={name}
@@ -2077,7 +2079,6 @@ function SectionHeader({
   collapsed,
   onToggleCollapsed,
   contextMenu,
-  contextMenuDisabled,
 }: {
   title: string;
   icon?: ReactNode;
@@ -2092,8 +2093,6 @@ function SectionHeader({
       long-pressing (touch) the header button — the folder-menu parity path.
       Radix's own trigger supplies both gestures, so no gesture code lives here. */
   contextMenu?: ReactNode;
-  /** Suppresses the context menu (bulk-selection mode owns the rows). */
-  contextMenuDisabled?: boolean;
 }) {
   // A long-press opens the menu mid-gesture and its trailing click would toggle
   // the folder; a mouse right-click or keyboard Shift+F10 leaves no such click.
@@ -2195,12 +2194,17 @@ function SectionHeader({
   // which would clobber its WebkitTouchCallout.
   return (
     <h2>
-      {contextMenu && !contextMenuDisabled ? (
+      {contextMenu ? (
         <ContextMenu
           onOpenChange={(open) => {
             if (open) {
               swallowClickRef.current = longPressPointerRef.current;
               longPressPointerRef.current = false;
+            } else {
+              // A long-press's trailing click lands while the menu is open; a
+              // gesture with no trailing click (pen right-click, touch release
+              // over the menu) must not strand the swallow past the close.
+              swallowClickRef.current = false;
             }
           }}
         >
@@ -2259,7 +2263,7 @@ function ProjectHeaderActions({
               <MoreHorizontalIcon className="size-3.5" />
             </Button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="min-w-40 [&_[role=menuitem]]:text-xs">
+          <DropdownMenuContent align="end" className={SIDEBAR_MENU_CONTENT_CLASS}>
             {showExpandControls &&
               (allExpanded ? (
                 <DropdownMenuItem data-testid="revert-projects" onSelect={() => onRevert()}>
@@ -2414,8 +2418,8 @@ function ConversationSection({
             hasAction={headerAction != null}
             collapsed={isCollapsed}
             onToggleCollapsed={onToggleCollapsed}
-            contextMenu={headerContextMenu}
-            contextMenuDisabled={selectionMode}
+            // Selection mode owns the rows, so the header menu is suppressed.
+            contextMenu={selectionMode ? undefined : headerContextMenu}
           />
           {headerAction && (
             <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity md:opacity-0 md:group-focus-within/header:opacity-100 md:group-hover/header:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100">
@@ -3883,17 +3887,14 @@ function useProjectFolderMenu(
   const deleteProject = useDeleteProject();
   const renameProject = useRenameProject();
 
-  const actions = useMemo<ProjectFolderMenuActions>(
-    () => ({
-      openRename: () => {
-        setRenameValue(projectName);
-        setRenameOpen(true);
-      },
-      openSettings: () => setSettingsOpen(true),
-      openDelete: () => setDeleteOpen(true),
-    }),
-    [projectName],
-  );
+  const actions: ProjectFolderMenuActions = {
+    openRename: () => {
+      setRenameValue(projectName);
+      setRenameOpen(true);
+    },
+    openSettings: () => setSettingsOpen(true),
+    openDelete: () => setDeleteOpen(true),
+  };
 
   const dialogs = (
     <>
@@ -4034,7 +4035,7 @@ function ProjectFolderMenu({
           <MoreHorizontalIcon className="size-3.5" />
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="min-w-40 [&_[role=menuitem]]:text-xs">
+      <DropdownMenuContent align="end" className={SIDEBAR_MENU_CONTENT_CLASS}>
         <ProjectFolderMenuItems
           components={dropdownBundle}
           projectName={projectName}
