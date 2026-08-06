@@ -90,30 +90,50 @@ export function writeSwipeActions(value: SwipeActionPreferences): void {
   window.dispatchEvent(new Event(SWIPE_ACTIONS_EVENT));
 }
 
-// Cached snapshot so useSyncExternalStore's getSnapshot returns a stable
-// reference between changes — a fresh object every call would loop it. Kept
-// current by getSnapshot (re-reads and swaps only on a real change), so it's
-// never stale even after a write that had no active subscriber.
+// Cached snapshot so useSyncExternalStore's getSnapshot is a cheap identity
+// read on every render — a fresh object every call would loop it, and a
+// re-parse every call would tax every row render. Refreshed on the change
+// events and when a subscriber attaches (covering writes that happened while
+// nothing was mounted); swapped only on a real change so the reference is
+// stable between changes.
 let snapshot: SwipeActionPreferences = readSwipeActions();
 
-function getSnapshot(): SwipeActionPreferences {
+function refreshSnapshot(): void {
   const next = readSwipeActions();
   if (next.left !== snapshot.left || next.right !== snapshot.right) snapshot = next;
+}
+
+function getSnapshot(): SwipeActionPreferences {
   return snapshot;
+}
+
+// One module-level window listener pair fanning out to a shared set (the
+// useMediaQuery shape): N mounted rows cost one registration, not 2N.
+const listeners = new Set<() => void>();
+
+function handleChange(e: Event): void {
+  // Ignore unrelated `storage` events; refresh on our key or the same-tab ping.
+  if (e instanceof StorageEvent && e.key !== null && e.key !== STORAGE_KEY) return;
+  refreshSnapshot();
+  for (const listener of listeners) listener();
 }
 
 function subscribe(onChange: () => void): () => void {
   if (typeof window === "undefined") return () => {};
-  const handler = (e: Event) => {
-    // Ignore unrelated `storage` events; refresh on our key or the same-tab ping.
-    if (e instanceof StorageEvent && e.key !== null && e.key !== STORAGE_KEY) return;
-    onChange();
-  };
-  window.addEventListener("storage", handler);
-  window.addEventListener(SWIPE_ACTIONS_EVENT, handler);
+  if (listeners.size === 0) {
+    window.addEventListener("storage", handleChange);
+    window.addEventListener(SWIPE_ACTIONS_EVENT, handleChange);
+    // Catch up on writes made while no subscriber was mounted (React re-checks
+    // the snapshot right after subscribing, so a change here still renders).
+    refreshSnapshot();
+  }
+  listeners.add(onChange);
   return () => {
-    window.removeEventListener("storage", handler);
-    window.removeEventListener(SWIPE_ACTIONS_EVENT, handler);
+    listeners.delete(onChange);
+    if (listeners.size === 0) {
+      window.removeEventListener("storage", handleChange);
+      window.removeEventListener(SWIPE_ACTIONS_EVENT, handleChange);
+    }
   };
 }
 
