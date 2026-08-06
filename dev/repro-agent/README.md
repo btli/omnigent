@@ -43,7 +43,12 @@ checkout, and runs the agent from there.
 python dev/repro.py                     # prompts for the bug URL
 python dev/repro.py https://github.com/omnigent-ai/omnigent/issues/1234
 python dev/repro.py OMNI-1234 --server http://localhost:6767
+python dev/repro.py <bug_url> --public  # share the session public-read at start
 ```
+
+`--public` shares the session read-only (anyone who can reach the server) right
+after it starts — useful for watching a live run or reproducing against a shared
+`--server`. Off by default.
 
 It always keeps the worktree and prints its path + branch at the end; remove it
 with `git worktree remove <path>` when done.
@@ -55,8 +60,10 @@ with `git worktree remove <path>` when done.
    `sys_session_*` / HTTP for backend bugs — until it observes the failure.
 3. Authors a durable e2e test (`tests/e2e_ui/` for UI, `tests/e2e/` for backend)
    keyed to the concrete failure, so a fix has a fail→pass regression guard.
-4. Emits a structured verdict (`reproduced` / `not_reproduced` / `already_fixed`
-   / `needs_more_info`) with the test path, session id, journey, and evidence.
+4. Emits a single fenced ```json block (the machine-readable handoff) whose
+   `verdict` is exactly one of `reproduced` / `not_reproduced` / `already_fixed`
+   / `needs_more_info`, alongside the per-facet breakdown, test path, session id,
+   journey, and evidence. Parse `verdict` from that block to label the issue.
 
 It does **not** fix the bug, merge, or push — it produces a live-confirmed
 reproduction plus the test and hands off. The authored test lands in your working

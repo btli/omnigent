@@ -26,8 +26,35 @@ session and logs are things you *produce*, not inputs:
 - `bug_url` (required) — a link to the bug report: a **GitHub issue URL** or a
   **Linear ticket URL** (e.g. `https://github.com/omnigent-ai/omnigent/issues/1234`
   or `https://linear.app/omnigent/issue/OMNI-1234`). Read the report to get the
-  bug description, steps, and version. Use `gh issue view` for GitHub or your
-  Linear tools for a Linear link.
+  bug description, steps, and version:
+  - **GitHub** → `gh issue view <url> --comments` (the CLI is on the machine).
+  - **Linear** → query the GraphQL API with `sys_os_shell`, using the Linear key
+    from your environment. It arrives as `LINEAR_API_KEY` locally or as
+    `DATABRICKS_LINEAR_API_KEY` under `--server` (the CLI→runner env strip only
+    forwards the `DATABRICKS_`-prefixed name), so read whichever is set. Endpoint
+    `https://api.linear.app/graphql`, header `Authorization: <key>` — **no**
+    `Bearer` prefix. Fetch the ticket by its identifier, e.g.:
+    ```bash
+    KEY="${LINEAR_API_KEY:-$DATABRICKS_LINEAR_API_KEY}"
+    curl -s https://api.linear.app/graphql \
+      -H "Authorization: $KEY" -H 'Content-Type: application/json' \
+      -d '{"query":"{ issue(id: \"OMNI-1234\") { identifier title description url state { name } comments(first: 50) { nodes { body } } attachments(first: 20) { nodes { url } } } }"}'
+    ```
+    If neither `LINEAR_API_KEY` nor `DATABRICKS_LINEAR_API_KEY` is set (or the
+    fetch fails auth), you cannot read the ticket body — stop with verdict
+    `needs_more_info` naming the missing key rather than guessing the bug from the
+    URL slug.
+  - **Linear → linked GitHub issue.** A Linear ticket often links a GitHub issue
+    (in its `attachments`, description, or comments). If you find one, **always
+    fetch that GitHub issue too** (`gh issue view <url> --comments`) and treat it
+    as authoritative for the journey — the GitHub thread usually carries the
+    concrete repro steps, stack traces, and version that the Linear card only
+    summarizes. Reconcile the two: if they disagree, prefer the GitHub issue for
+    the technical detail and note the discrepancy.
+- `public` (optional, boolean) — when `true`, share this session public-read as
+  the first thing you do in preflight (see Preflight). Off by default: locally
+  the session is already yours to browse; sharing is for watching a live run or
+  reproducing against a shared server.
 
 You always reproduce against the app you are connected to — the running build
 (latest `main`) — never an older checkout. So the reported version is context for
@@ -51,12 +78,25 @@ your omnigent checkout.)
 
 ## Preflight (first turn)
 
-After confirming the workspace above, confirm you can reach the app and your
-tooling with one `sys_os_shell` / tool check: the browser tools
-(`browser_navigate` / `browser_snapshot` / `browser_click` / `browser_type`) for
-UI journeys, and `sys_session_*` / HTTP for backend journeys. Confirm `gh` is
-available if `bug_url` is a GitHub issue. If you cannot reach the app at all,
-stop and say so. Don't narrate a clean preflight.
+Your first turn is a fixed checklist — do all of it before Step 1:
+
+1. **Share the session if `public: true`.** If — and only if — the input
+   contains `public: true`, call `sys_session_share` with no `session_id`
+   (shares the calling session), `user_id: "__public__"`, `level: "read"` **as
+   the first thing you do this turn**, so the session is browsable live while you
+   work. If it returns `access_denied` (public sharing disabled server-side),
+   note that and carry on — it is not a reproduction failure. When `public` is
+   absent or false (the default), skip this — do not call `sys_session_share`.
+2. **Confirm the workspace** (see above) and that you can reach the app and your
+   tooling with one `sys_os_shell` / tool check: the browser tools
+   (`browser_navigate` / `browser_snapshot` / `browser_click` / `browser_type`)
+   for UI journeys, and `sys_session_*` / HTTP for backend journeys. Confirm you
+   can read the report: `gh` is available for a GitHub issue, or a Linear key
+   (`LINEAR_API_KEY` or `DATABRICKS_LINEAR_API_KEY`) is set for a Linear ticket
+   (if it isn't, stop with `needs_more_info`).
+
+If you cannot reach the app at all, stop and say so. Don't narrate a clean
+preflight.
 
 ## Step 1 — Reconstruct the user journey
 
@@ -133,26 +173,68 @@ and verifies the same test goes fail→pass).
 
 ## Output — the reproduction artifacts
 
-End with a single structured verdict block — this is the handoff to the fix step,
-so make it self-contained. These are the artifacts you **produce**:
+The **last thing in your final message** must be exactly one fenced ```json code
+block — the machine-readable handoff to the fix step and to the caller that
+labels the issue. This block is parsed programmatically by taking the last
+```json fence in the message, so the format and its position are **not** your
+choice:
 
-- `bug_url` and the overall `verdict` (`reproduced` / `not_reproduced` /
-  `already_fixed` / `needs_more_info`), rolled up per the Step 2 rule (any live
-  sub-symptom ⇒ overall `reproduced`).
-- `facets` — the per-sub-symptom breakdown from Steps 1–2: each claimed symptom
-  with its own verdict and one line of evidence (e.g. `picker display: reproduced
-  (raw IDs shown)`, `catalog default: already_fixed (#3448)`). Always include
-  this, even for a single-symptom bug (then it's one row). This is what stops a
-  partially-landed fix from being averaged into a misleading single verdict.
-- `test_path` — the e2e test you authored (the durable regression test); when
-  multiple facets still reproduce, the test(s) should cover each live one.
-- `session_id` — **this session** (in the app), so the fix step can replay how
-  you reproduced it and you can browse it in the app UI at `<server>/c/<session_id>`.
-  Get it from `sys_session_get_info`.
-- `journey` — the reconstructed user journey, in brief.
+- You may write comprehensive prose above the block (a human-readable summary,
+  the journey, the per-facet notes) — that's fine and encouraged. But it is
+  **context, not the contract**: everything the parser needs lives *inside* the
+  JSON block, and the ```json block is the **last chunk** of the message, with
+  nothing after its closing fence.
+- Do **not** split the artifacts across separate sections or headers (no lone
+  "Reproduction Verdict" / "Journey" / "Facets" blocks standing in for the
+  handoff, and no second data block). Whatever you also say in prose, the single
+  ```json block below carries the complete, self-contained handoff.
+- Emit that block as **JSON**, never YAML. One ` ```json ` fence, one JSON
+  object.
+- Include **every** key below, always, even when a value is empty (`""`, `[]`) —
+  the parser expects a fixed shape.
+- `verdict` must be **exactly one** of the four string literals
+  `"reproduced"`, `"not_reproduced"`, `"already_fixed"`, `"needs_more_info"` —
+  lowercase, no other wording. This is the field the caller reads to label the
+  issue, so it must match verbatim.
+
+```json
+{
+  "bug_url": "https://github.com/omnigent-ai/omnigent/issues/1234",
+  "verdict": "reproduced",
+  "facets": [
+    {"symptom": "picker display", "verdict": "reproduced", "evidence": "raw IDs shown"},
+    {"symptom": "catalog default", "verdict": "already_fixed", "evidence": "#3448"}
+  ],
+  "test_path": "tests/e2e_ui/model_catalog/test_1234.py",
+  "session_id": "dc59e331-...",
+  "journey": "open model picker → select catalog → picker shows raw IDs",
+  "evidence": "snapshot ref / response / log excerpt, plus root-cause leads"
+}
+```
+
+Field meanings:
+
+- `bug_url` — the input bug link, echoed back.
+- `verdict` — the overall roll-up per the Step 2 rule (any live sub-symptom ⇒
+  overall `reproduced`; only when *every* sub-symptom is fixed is it
+  `already_fixed`).
+- `facets` — an array of the per-sub-symptom breakdown from Steps 1–2, each an
+  object with `symptom`, its own `verdict` (same four literals), and one line of
+  `evidence`. Always a list, even for a single-symptom bug (then it's one
+  element). This is what stops a partially-landed fix from being averaged into a
+  misleading single verdict.
+- `test_path` — the e2e test you authored (the durable regression test), repo-
+  relative. When multiple facets still reproduce, cover each live one; if you
+  authored more than one file, make this an array of paths. Empty string if you
+  authored none (e.g. `needs_more_info`).
+- `session_id` — **this session** (in the app), from `sys_session_get_info`, so
+  the fix step can replay how you reproduced it and you can browse it at
+  `<server>/c/<session_id>`.
+- `journey` — the reconstructed user journey, in brief (one line).
 - `evidence` — what you observed live (snapshot reference, response, or log
   excerpt), plus any root-cause leads you noticed while reproducing (hypotheses
   only — you do not fix).
 
-Be terse. You produce the live-confirmed reproduction + the test; the fix step
-takes it from here. You take no further action — no fix, no merge, no push.
+Keep the prose before the block terse. You produce the live-confirmed
+reproduction + the test; the fix step takes it from here. You take no further
+action — no fix, no merge, no push.
