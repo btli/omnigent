@@ -874,6 +874,35 @@ describe("mark as unread", () => {
 });
 
 describe("right-click context menu", () => {
+  it("suppresses an open request only while the session row is dragging", () => {
+    mocks.isMobile = true;
+    mocks.isDragging = true;
+    const view = renderSidebar();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    expect(screen.queryByTestId("rename-conversation")).toBeNull();
+
+    // Live drag state clears with the gesture; no suppression flag survives to
+    // swallow the next legitimate right-click.
+    mocks.isDragging = false;
+    view.rerenderSidebar();
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+  });
+
+  it("opens the context menu from the keyboard after a drag ends", () => {
+    mocks.isMobile = true;
+    mocks.isDragging = true;
+    const view = renderSidebar();
+
+    mocks.isDragging = false;
+    view.rerenderSidebar();
+
+    // Shift+F10 / Menu key emit contextmenu with no preceding pointerdown.
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+  });
+
   it("opens the same action items as the kebab and drives the same handlers", () => {
     renderSidebar();
 

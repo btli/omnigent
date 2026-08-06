@@ -3251,6 +3251,32 @@ function ConversationRow({
     data: { type: "session", label, project: currentProject, isPinned },
     disabled: !isOwner || selectionMode || isArchived || isEditing,
   });
+  // Radix and dnd-kit run independent long-press timers. Once this row's
+  // touch drag is active, reject Radix's later open request for that gesture.
+  const [contextMenuOpen, setContextMenuOpen] = useState(false);
+  const handleContextMenuOpenChange = useCallback(
+    (open: boolean) => {
+      if (open && isDragging) return;
+      setContextMenuOpen(open);
+    },
+    [isDragging],
+  );
+  // The menu render branches below are mutually exclusive; switching branches
+  // remounts the ContextMenu, and a stale open=true would reopen the fresh
+  // menu anchored at the viewport corner. Reset during render (not in an
+  // effect) so the remounted menu never paints open.
+  const menuBranch = selectionMode
+    ? "none"
+    : projectFlyoutName
+      ? "flyout"
+      : isMobile
+        ? "mobile"
+        : "desktop";
+  const [prevMenuBranch, setPrevMenuBranch] = useState(menuBranch);
+  if (prevMenuBranch !== menuBranch) {
+    setPrevMenuBranch(menuBranch);
+    if (contextMenuOpen) setContextMenuOpen(false);
+  }
   // A drag ends with a synthetic click on the row's <Link> (mousedown + mouseup
   // on the same anchor still fires a click); swallow that one click so a drag
   // doesn't also navigate into the session. Flagged when a drag finishes,
@@ -3633,7 +3659,7 @@ function ConversationRow({
           )
         ) : projectFlyoutName ? (
           <HoverCard openDelay={150} closeDelay={0}>
-            <ContextMenu>
+            <ContextMenu open={contextMenuOpen} onOpenChange={handleContextMenuOpenChange}>
               <ContextMenuTrigger asChild>
                 <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
               </ContextMenuTrigger>
@@ -3652,7 +3678,7 @@ function ConversationRow({
             />
           </HoverCard>
         ) : isMobile ? (
-          <ContextMenu>
+          <ContextMenu open={contextMenuOpen} onOpenChange={handleContextMenuOpenChange}>
             <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
             <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-sm">
               <ConversationMenuItems
@@ -3664,7 +3690,7 @@ function ConversationRow({
           </ContextMenu>
         ) : (
           <Tooltip>
-            <ContextMenu>
+            <ContextMenu open={contextMenuOpen} onOpenChange={handleContextMenuOpenChange}>
               <ContextMenuTrigger asChild>
                 <div className="w-full">
                   <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
