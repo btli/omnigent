@@ -4597,10 +4597,11 @@ function ProjectFolderMenu({
           size="icon-xs"
           aria-label={`Project actions for ${projectName}`}
           data-testid="project-actions"
+          className="text-muted-foreground"
           // Sits on the folder header; keep its click off the collapse toggle.
           onClick={(e) => e.stopPropagation()}
         >
-          <MoreHorizontalIcon className="size-3.5" />
+          <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className={SIDEBAR_MENU_CONTENT_CLASS}>
