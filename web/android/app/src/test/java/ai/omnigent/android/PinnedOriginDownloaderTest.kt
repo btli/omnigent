@@ -13,6 +13,7 @@ import android.database.MatrixCursor
 import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
+import android.util.AndroidRuntimeException
 import android.util.Log
 import android.webkit.CookieManager
 import androidx.concurrent.futures.ResolvableFuture
@@ -40,6 +41,8 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import org.robolectric.annotation.Implementation
+import org.robolectric.annotation.Implements
 import org.robolectric.shadows.ShadowContentResolver
 import org.robolectric.shadows.ShadowCookieManager
 import org.robolectric.shadows.ShadowLog
@@ -248,6 +251,58 @@ class PinnedOriginDownloaderTest {
     }
 
     @Test
+    fun `terminal HTML with no caller type is rejected for a non-HTML file name`() {
+        // onDownloadStart commonly supplies no MIME type; a proxy's 200 HTML
+        // login page must still not be saved as the requested report.pdf.
+        listOf<String?>(null, "").forEachIndexed { index, mimeType ->
+            val path = "/login-page-$index"
+            pinnedServer.createContext(path) { exchange ->
+                exchange.responseHeaders.add("Content-Type", "text/html; charset=utf-8")
+                exchange.respond(200, "<html>sign in</html>")
+            }
+            val target = targetFile("quarterly-report-$index.pdf")
+            val worker = worker("$pinnedOrigin$path", target.name, mimeType = mimeType)
+
+            val result = worker.doWork()
+
+            assertEquals(ListenableWorker.Result.failure(), result)
+            assertFalse(target.exists())
+            assertEquals(
+                "Couldn't download ${target.name}. Sign in again and retry.",
+                notificationFor(worker)!!.extras.getCharSequence(Notification.EXTRA_TEXT),
+            )
+        }
+    }
+
+    @Test
+    @Config(sdk = [28], shadows = [UnavailableCookieManagerShadow::class])
+    fun `an unavailable WebView provider still notifies and fails the download`() {
+        val target = targetFile("no-webview.txt")
+        val worker =
+            worker(
+                "$pinnedOrigin/file",
+                target.name,
+                runAttemptCount = PinnedOriginDownloadWorker.MAX_ATTEMPTS - 1,
+            )
+
+        val result = worker.doWork()
+
+        assertEquals(ListenableWorker.Result.failure(), result)
+        assertFalse(target.exists())
+        assertNotNull(notificationFor(worker))
+    }
+
+    @Test
+    @Config(sdk = [28], shadows = [UnavailableCookieManagerShadow::class])
+    fun `an unavailable WebView provider is retried like a transient failure`() {
+        val target = targetFile("no-webview-retry.txt")
+        val worker = worker("$pinnedOrigin/file", target.name)
+
+        assertEquals(ListenableWorker.Result.retry(), worker.doWork())
+        assertFalse(target.exists())
+    }
+
+    @Test
     fun `stop between redirect hops does not fetch the next hop`() {
         val nextHopHits = AtomicInteger()
         val workerReference = AtomicReference<PinnedOriginDownloadWorker>()
@@ -271,6 +326,26 @@ class PinnedOriginDownloaderTest {
         assertEquals(0, nextHopHits.get())
         assertFalse(target.exists())
         assertNull(notificationFor(worker))
+    }
+
+    @Test
+    fun `pinned origin canonicalizes hosts the same way as the enqueue-side gate`() {
+        val worker = worker("$pinnedOrigin/file", "unicode.txt")
+
+        // The redirect target arrives in its unicode form while the pin was
+        // canonicalized to punycode at enqueue — the worker must agree.
+        assertTrue(
+            worker.hasPinnedOrigin(
+                URL("https://faß.de/file"),
+                "https://xn--fa-hia.de",
+            ),
+        )
+        assertTrue(
+            worker.hasPinnedOrigin(
+                URL("https://pinned.example:443/file"),
+                "https://pinned.example",
+            ),
+        )
     }
 
     @Test
@@ -1103,5 +1178,16 @@ private class FailingOutputStream : OutputStream() {
         length: Int,
     ) {
         if (length > 0) throw IOException("write failed after bytes arrived")
+    }
+}
+
+/** Simulates the WebView provider being unavailable (e.g. mid-update). */
+@Implements(CookieManager::class)
+class UnavailableCookieManagerShadow {
+    companion object {
+        @JvmStatic
+        @Implementation
+        fun getInstance(): CookieManager =
+            throw AndroidRuntimeException("WebView provider unavailable")
     }
 }
