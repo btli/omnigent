@@ -29,6 +29,31 @@ internal data class DownloadSaveResult(
     val saved: Boolean,
 )
 
+/** Reduce a suggested download name to a safe, path-free leaf filename. */
+internal fun safeFileName(suggested: String): String {
+    // Treat both separator styles as paths before replacing unsafe characters.
+    val leaf =
+        suggested
+            .substringAfterLast('/')
+            .substringAfterLast('\\')
+    val cleaned = leaf.replace(Regex("[^A-Za-z0-9._-]"), "_")
+    // Dot paths resolve to directories on the pre-Q filesystem destination.
+    return if (leaf.isBlank() || cleaned == "." || cleaned == "..") {
+        "omnigent-${System.currentTimeMillis()}"
+    } else {
+        cleaned
+    }
+}
+
+/** SHA-256 of [value] as lowercase hex — a stable, filename/key-safe identity. */
+internal fun sha256Hex(value: String): String =
+    MessageDigest
+        .getInstance("SHA-256")
+        .digest(value.toByteArray(Charsets.UTF_8))
+        .joinToString(separator = "") { byte ->
+            Integer.toHexString(byte.toInt() and 0xff).padStart(2, '0')
+        }
+
 /** Shared destination, filename, and user-notification handling for downloaded files. */
 internal class DownloadStorage(
     context: Context,
@@ -361,21 +386,6 @@ internal class DownloadStorage(
         }
     }
 
-    private fun safeFileName(suggested: String): String {
-        // Treat both separator styles as paths before replacing unsafe characters.
-        val leaf =
-            suggested
-                .substringAfterLast('/')
-                .substringAfterLast('\\')
-        val cleaned = leaf.replace(Regex("[^A-Za-z0-9._-]"), "_")
-        // Dot paths resolve to directories on the pre-Q filesystem destination.
-        return if (leaf.isBlank() || cleaned == "." || cleaned == "..") {
-            "omnigent-${System.currentTimeMillis()}"
-        } else {
-            cleaned
-        }
-    }
-
     private fun acquireSaveLock(
         name: String,
         shouldAbort: () -> Boolean,
@@ -438,13 +448,7 @@ internal class DownloadStorage(
         // would unshield the still-live sibling when the first one finishes.
         private val ACTIVE_MEDIA_OPERATIONS = mutableSetOf<String>()
 
-        private fun operationKey(operationId: String): String =
-            MessageDigest
-                .getInstance("SHA-256")
-                .digest(operationId.toByteArray(Charsets.UTF_8))
-                .joinToString(separator = "") { byte ->
-                    Integer.toHexString(byte.toInt() and 0xff).padStart(2, '0')
-                }
+        private fun operationKey(operationId: String): String = sha256Hex(operationId)
     }
 }
 
