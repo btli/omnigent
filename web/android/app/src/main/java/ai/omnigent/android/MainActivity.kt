@@ -40,8 +40,8 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.webkit.ScriptHandler
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
-import kotlin.reflect.KMutableProperty0
 import java.lang.ref.WeakReference
+import kotlin.reflect.KMutableProperty0
 
 /**
  * The single WebView host. Mirrors the iOS `WebShellView` + `OmnigentWebView`:
