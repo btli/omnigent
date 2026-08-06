@@ -173,7 +173,7 @@ export function TerminalsPanel({
       )}
 
       <header className="flex shrink-0 items-center justify-between border-border border-b px-4 py-2">
-        <h2 className="font-medium text-sm">Shells</h2>
+        <h2 className="font-medium text-ui">Shells</h2>
         <div className="flex items-center gap-1">
           {/* Renders only when the agent's spec declares terminals. */}
           <NewTerminalButton
@@ -223,8 +223,8 @@ export function TerminalsPanel({
                 onClick={() => setActiveKey(isActive ? null : key)}
               >
                 <TerminalIcon className="size-3.5 shrink-0 text-muted-foreground" />
-                {t.session && <span className="shrink-0 text-xs font-medium">{t.session}</span>}
-                <span className="truncate text-xs text-muted-foreground/70">{t.name}</span>
+                {t.session && <span className="shrink-0 text-sm font-medium">{t.session}</span>}
+                <span className="truncate text-sm text-muted-foreground/70">{t.name}</span>
                 <span className="flex-1" />
                 <TerminalStatusBadge status={getStatus(t)} />
               </button>

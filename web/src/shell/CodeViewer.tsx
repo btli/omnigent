@@ -301,7 +301,7 @@ function ImageViewer({ data, path }: { data: FileContentResponse; path: string }
   const filename = path.split("/").pop() ?? path;
 
   const body = errored ? (
-    <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+    <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
       {data.truncated
         ? "Image is too large to preview (truncated by the server)."
         : "Unable to render image."}
@@ -658,14 +658,14 @@ export function CodeViewer({
 
   if (fileQuery.isLoading) {
     return (
-      <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+      <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
         Loading…
       </div>
     );
   }
   if (fileQuery.isError) {
     return (
-      <div className="p-8 text-destructive text-sm">
+      <div className="p-8 text-destructive text-ui">
         Error loading file:{" "}
         {fileQuery.error instanceof Error ? fileQuery.error.message : String(fileQuery.error)}
       </div>
@@ -678,7 +678,7 @@ export function CodeViewer({
     return (
       <Suspense
         fallback={
-          <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
             Loading…
           </div>
         }
@@ -697,7 +697,7 @@ export function CodeViewer({
     return (
       <Suspense
         fallback={
-          <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
             Loading 3D preview…
           </div>
         }
@@ -708,7 +708,7 @@ export function CodeViewer({
   }
   if (fileQuery.data?.encoding === "base64" || isBinaryPath(path)) {
     return (
-      <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+      <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
         Preview not available for binary files.
       </div>
     );
@@ -769,7 +769,7 @@ export function CodeViewer({
     return (
       <Suspense
         fallback={
-          <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
             Loading…
           </div>
         }
@@ -842,9 +842,9 @@ export function CodeViewer({
               }
             }}
             placeholder="Find…"
-            className="min-w-0 flex-1 bg-transparent text-xs outline-none"
+            className="min-w-0 flex-1 bg-transparent text-sm outline-none"
           />
-          <span className="shrink-0 text-xs text-muted-foreground">
+          <span className="shrink-0 text-sm text-muted-foreground">
             {searchQuery.trim()
               ? matches.length > 0
                 ? `${safeMatchIdx + 1} / ${matches.length}`
@@ -884,7 +884,7 @@ export function CodeViewer({
       )}
 
       {/* GitHub Light/Dark backgrounds match the shiki themes used by highlightCode */}
-      <div ref={codeContainerRef} className="font-mono text-xs bg-white dark:bg-[#0d1117]">
+      <div ref={codeContainerRef} className="font-mono text-sm bg-white dark:bg-[#0d1117]">
         {rawLines.map((rawLine, idx) => {
           const lineNum = idx + 1;
           const isMatchLine =
@@ -939,7 +939,7 @@ export function CodeViewer({
                 <div
                   data-gutter-comment={commentOnLine ? true : undefined}
                   className={cn(
-                    "relative w-12 shrink-0 select-none border-r border-border text-xs",
+                    "relative w-12 shrink-0 select-none border-r border-border text-sm",
                     "flex items-center justify-end px-2 py-0.5 leading-5",
                     commentOnLine
                       ? "cursor-pointer text-yellow-500 dark:text-yellow-400 hover:bg-muted/60"
@@ -1035,7 +1035,7 @@ export function CodeViewer({
             <button
               data-add-comment-btn
               type="button"
-              className="flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-xs font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+              className="flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-sm font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
               onClick={() => {
                 onSetActiveSelection({
                   start_index: selectionAnchor.start_index,
@@ -1053,7 +1053,7 @@ export function CodeViewer({
               <button
                 data-attach-agent-btn
                 type="button"
-                className="flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-xs font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+                className="flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-sm font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
                 onClick={() => {
                   // Convert the selection's char offsets to a 1-based inclusive
                   // line span. ``end_index`` is exclusive, so step back one char
