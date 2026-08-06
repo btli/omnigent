@@ -740,7 +740,7 @@ class OmnigentWebViewClientTest {
     }
 
     @Test
-    fun `onReceivedSslError ends the flow`() {
+    fun `onReceivedSslError on the tracked hop ends the flow`() {
         val webView = webView()
         var loginRequired = false
         val client = client(onLoginRequired = { loginRequired = true })
@@ -751,11 +751,32 @@ class OmnigentWebViewClientTest {
         client.onReceivedSslError(
             webView,
             handler,
-            SslError(SslError.SSL_UNTRUSTED, certificate, PLAIN_IDP_URL),
+            SslError(SslError.SSL_UNTRUSTED, certificate, PROXY_AUTH_URL),
         )
 
         assertTrue(client.shouldOverrideUrlLoading(webView, request(OTHER_IDP_URL)))
         assertTrue(loginRequired)
+    }
+
+    @Test
+    fun `onReceivedSslError on a subresource keeps the flow alive`() {
+        // A cert failure on an IdP subresource (or a stale prior navigation)
+        // must not misroute the flow's next redirect into native login.
+        val webView = webView()
+        var flowEnded = 0
+        val client = client(onProxyAuthFlowEnded = { flowEnded++ })
+        enterFlow(client, webView)
+
+        val handler = ReflectionHelpers.callConstructor(SslErrorHandler::class.java)
+        val certificate = SslCertificate("CN=subject", "CN=issuer", Date(0), Date(1))
+        client.onReceivedSslError(
+            webView,
+            handler,
+            SslError(SslError.SSL_UNTRUSTED, certificate, "https://cdn.idp.example.com/asset.js"),
+        )
+
+        assertEquals(0, flowEnded)
+        assertFalse(client.shouldOverrideUrlLoading(webView, request(PLAIN_IDP_URL)))
     }
 
     @Test

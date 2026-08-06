@@ -262,7 +262,12 @@ class OmnigentWebViewClient(
         error: SslError,
     ) {
         super.onReceivedSslError(view, handler, error)
-        if (proxyAuthState == ProxyAuthState.IN_FLIGHT) endProxyAuth()
+        // Only a certificate failure on the flow's own main-frame hop kills
+        // the flow; a subresource or stale-navigation error must not misroute
+        // the next off-origin redirect into native login.
+        if (proxyAuthState == ProxyAuthState.IN_FLIGHT && error.url == trackedMainFrameUrl) {
+            endProxyAuth()
+        }
     }
 
     override fun onRenderProcessGone(

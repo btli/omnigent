@@ -71,6 +71,16 @@ class OriginsTest {
         assertEquals("https://1.2.3.4", originOf("https://1.2.3.4./x"))
         assertEquals("https://1.2.0.3", originOf("https://1.2.3./x"))
         assertNotEquals("https://1.2.0.3", originOf("https://1.2.3../x"))
+        // WHATWG numbers carry no sign — "+1" is a Chromium domain, and must
+        // not pin as the address 0.0.0.1.
+        assertNotEquals("https://0.0.0.1", originOf("https://+1/x"))
+    }
+
+    @Test
+    fun `ports beyond the 16-bit range are rejected`() {
+        assertNull(originOf("https://example.com:65536/x"))
+        assertNull(normalizeServerUrl("https://example.com:65536"))
+        assertEquals("https://example.com:65535", originOf("https://example.com:65535/x"))
     }
 
     @Test
