@@ -138,7 +138,10 @@ private fun parseIpv4Number(part: String): Long? {
     // it as a domain.
     if (digits.any { it.digitToIntOrNull(radix) == null }) return null
     val significant = digits.trimStart('0').ifEmpty { "0" }
-    if (significant.length > 12) return null // already beyond 32 bits in any radix
+    // WHATWG numbers are arbitrary precision: an over-long digit run is a
+    // VALID number (so the host stays on the IPv4 path) that then fails the
+    // address's 32-bit range check — not a fall-through to the domain path.
+    if (significant.length > 12) return 0x1_0000_0000L
     return try {
         significant.toLong(radix)
     } catch (_: NumberFormatException) {
@@ -185,6 +188,13 @@ fun originOf(url: String?): String? {
     // WHATWG rejects ports beyond the 16-bit range; letting one through would
     // persist a server the WebView can never load.
     if (port > 0xffff) return null
+    // Uri.parsePort overflows Int-sized digit runs to -1 — a port that was
+    // written but failed to parse rejects the URL, it doesn't vanish.
+    if (port == -1) {
+        val hostPort = uri.encodedAuthority?.substringAfterLast('@') ?: ""
+        val colon = hostPort.lastIndexOf(':')
+        if (colon > hostPort.lastIndexOf(']') && colon < hostPort.length - 1) return null
+    }
     val hasExplicitPort =
         port != -1 &&
             !(scheme == "https" && port == 443) &&
