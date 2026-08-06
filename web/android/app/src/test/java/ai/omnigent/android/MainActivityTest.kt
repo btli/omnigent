@@ -1039,11 +1039,7 @@ class MainActivityTest {
         assertTrue(workerStarted.await(5, TimeUnit.SECONDS))
 
         try {
-            assertTrue(
-                loginManager.start(activity, PINNED_ORIGIN) {
-                    throw AssertionError("cancelled login delivered a callback")
-                },
-            )
+            assertTrue(loginManager.start(activity, PINNED_ORIGIN))
             assertTrue(loginManager.isInFlightForTest())
 
             activity.reloadWithNewServer(NEW_SERVER_URL, NEW_ORIGIN)

@@ -83,7 +83,7 @@ class OidcLoginManager(
                     .also { heldResult = null }
             }
         abandonedFuture?.cancel(true)
-        held?.let { it.flow.callback(it.result) }
+        held?.let { deliverOrHold(it.flow, it.result) }
         return newAttachment
     }
 
@@ -107,40 +107,35 @@ class OidcLoginManager(
     fun start(
         activity: Activity,
         origin: String,
-    ): Boolean = startFlow(activity, origin, null)
-
-    /** Start with a flow-local receiver that is never rebound to another flow. */
-    internal fun start(
-        activity: Activity,
-        origin: String,
-        onResult: (LoginResult) -> Unit,
-    ): Boolean = startFlow(activity, origin, onResult)
-
-    private fun startFlow(
-        activity: Activity,
-        origin: String,
-        callbackOverride: ((LoginResult) -> Unit)?,
     ): Boolean =
         synchronized(stateLock) {
             if (shutDown || activeFlow != null) return@synchronized false
 
             val flow = Flow(cancellationGeneration, origin)
-            val callback = callbackOverride ?: flow.callback
             val context = activity.applicationContext
             activeFlow = flow
             try {
                 flow.future =
                     io.submit {
                         val result = runFlow(context, origin, flow)
-                        synchronized(stateLock) {
-                            if (activeFlow === flow) activeFlow = null
-                        }
-                        if (result != null) {
-                            main.post {
-                                // New starts keep the generation; only cancel/shutdown
-                                // invalidate captured callbacks.
-                                if (canDeliver(flow)) callback(result)
+                        if (result == null) {
+                            // Interrupted — the canceller already vacated the slot.
+                            synchronized(stateLock) {
+                                if (activeFlow === flow) activeFlow = null
                             }
+                            return@submit
+                        }
+                        flow.completed = true
+                        // The slot stays occupied until the result lands on the main
+                        // thread, so a queued login trigger can't open a second
+                        // concurrent browser flow ahead of this delivery.
+                        main.post {
+                            synchronized(stateLock) {
+                                if (activeFlow === flow) activeFlow = null
+                            }
+                            // New starts keep the generation; only cancel/shutdown
+                            // invalidate captured callbacks.
+                            if (canDeliver(flow)) deliverOrHold(flow, result)
                         }
                     }
                 true
@@ -186,6 +181,10 @@ class OidcLoginManager(
     }
 
     internal fun isInFlightForTest(): Boolean = synchronized(stateLock) { activeFlow != null }
+
+    /** True while a finished flow still occupies the slot pending main-thread delivery. */
+    internal fun isAwaitingDeliveryForTest(): Boolean =
+        synchronized(stateLock) { activeFlow?.completed == true }
 
     internal fun hasAttachmentForTest(): Boolean =
         synchronized(stateLock) { attachment?.callback != null }
@@ -265,7 +264,8 @@ class OidcLoginManager(
         val generation: Long,
         val origin: String,
     ) {
-        val callback: (LoginResult) -> Unit = { result -> deliverOrHold(this, result) }
+        @Volatile
+        var completed = false
         var future: Future<*>? = null
     }
 
