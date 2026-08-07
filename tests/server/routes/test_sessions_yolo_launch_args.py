@@ -25,14 +25,16 @@ from omnigent.server.routes.sessions import _derive_terminal_launch_args_from_sp
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
 
-def _spec_with_config(config: dict[str, str]) -> AgentSpec:
+def _spec_with_config(config: dict[str, object]) -> AgentSpec:
     """
     Build a minimal sub-agent spec carrying a given ``executor.config``.
 
     :param config: The ``executor.config`` mapping, e.g.
         ``{"harness": "claude-native", "permission_mode": "bypassPermissions"}``.
-        Values are plain strings to mirror what the spec parser produces
-        (it coerces every config value to ``str``).
+        Values are usually plain strings to mirror what the spec parser
+        produces (it coerces every scalar config value to ``str``); real
+        bools exercise the programmatically-built-spec path the config's
+        ``dict[str, Any]`` type permits.
     :returns: An :class:`AgentSpec` whose executor carries *config*.
     """
     return AgentSpec(
@@ -232,6 +234,68 @@ def test_kimi_native_yolo_false_returns_none() -> None:
     """
     spec = _spec_with_config({"harness": "kimi-native", "yolo": "False"})
     assert _derive_terminal_launch_args_from_spec(spec) is None
+
+
+@pytest.mark.parametrize(
+    ("yolo", "expected"),
+    [
+        # Accepted spellings: real bool (programmatic spec) + the parser's
+        # stringified form, case/whitespace-insensitive (mirrors
+        # _spec_config_flag_explicitly_disabled).
+        (True, ["--yolo"]),
+        ("True", ["--yolo"]),
+        ("true", ["--yolo"]),
+        (" TRUE ", ["--yolo"]),
+        # Rejected: bool False, the parser's "False", and truthy-LOOKING
+        # spellings that are NOT part of the contract — they must silently
+        # (debug-logged) leave args unset rather than half-enable bypass.
+        (False, None),
+        ("False", None),
+        ("1", None),
+        ("yes", None),
+        ("on", None),
+        ("", None),
+    ],
+)
+def test_kimi_native_yolo_spelling_boundary(yolo: object, expected: list[str] | None) -> None:
+    """
+    Pin the accepted-vs-rejected spelling boundary for the kimi opt-in.
+
+    Only a real bool ``True`` or a case-insensitive ``"true"`` string
+    enables ``--yolo``; every other present value (including YAML-1.1-style
+    ``yes``/``on`` and numeric ``1``) leaves launch args unset. A failure
+    here means the opt-in boundary drifted — either silently enabling
+    bypass for a spelling the contract rejects, or dropping one it accepts.
+    """
+    spec = _spec_with_config({"harness": "kimi-native", "yolo": yolo})
+    assert _derive_terminal_launch_args_from_spec(spec) == expected
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        # permission_mode is matched exactly (modulo surrounding
+        # whitespace), mirroring the runner's should_skip_permissions
+        # comparison and claude-native's verbatim pass-through.
+        ("bypassPermissions", ["--dangerously-skip-permissions"]),
+        (" bypassPermissions ", ["--dangerously-skip-permissions"]),
+        ("bypasspermissions", None),
+        ("BYPASSPERMISSIONS", None),
+        ("acceptEdits", None),
+        ("", None),
+    ],
+)
+def test_antigravity_native_mode_spelling_boundary(mode: str, expected: list[str] | None) -> None:
+    """
+    Pin exact-match semantics for the agy ``permission_mode`` opt-in.
+
+    A wrong-case spelling must NOT enable the all-or-nothing bypass flag:
+    the runner's own ``should_skip_permissions`` compares the mode exactly,
+    so a lenient server-side match would create a mode string that bypasses
+    here but prompts on other agy paths.
+    """
+    spec = _spec_with_config({"harness": "antigravity-native", "permission_mode": mode})
+    assert _derive_terminal_launch_args_from_spec(spec) == expected
 
 
 def test_antigravity_native_bypass_permission_mode_translates_to_flag() -> None:
