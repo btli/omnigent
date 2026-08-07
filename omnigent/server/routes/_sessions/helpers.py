@@ -124,6 +124,7 @@ from omnigent.server.routes._session_create_validation import (
 # ``__all__`` and the facade's explicit re-exports, preserving its real runtime
 # bindings so a facade-level monkeypatch is honoured in this module too.
 from omnigent.server.routes._sessions.common import (  # noqa: F401
+    _ANTIGRAVITY_NATIVE_HARNESS,
     _APPROVAL_TYPE,
     _CHILD_PREVIEW_LIMIT,
     _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY,
@@ -156,6 +157,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _FORK_HISTORY_NATIVE_HARNESSES,
     _HOOK_ELICITATION_ID_RE,
     _HOST_LAUNCH_RESULT_TIMEOUT_S,
+    _KIMI_NATIVE_HARNESS,
     _LABEL_VALUE_MAX_LEN,
     _LAST_TASK_ERROR_CAUSE_LABEL_KEY,
     _LAST_TASK_ERROR_CODE_LABEL_KEY,
@@ -7846,6 +7848,22 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
       to ``auto`` or ``auto-review``, emit ``["--auto-review"]`` instead
       (Smart Auto) so a bundle can choose Claude-style auto without full
       yolo.
+    - kimi-native + ``executor.config.yolo: true`` -> ``["--yolo"]``
+      (kimi's auto-approve-tools flag; ``--auto`` full autonomy is NOT
+      mapped). Opt-IN: absent / false leaves args unset.
+    - antigravity-native + ``executor.config.permission_mode:
+      bypassPermissions`` -> ``["--dangerously-skip-permissions"]``, agy's
+      only pre-emptive permission control. Opt-IN like claude-native;
+      other / absent modes leave args unset.
+
+    Value-matching policy: flag-valued keys (``yolo``) accept a real bool
+    or the case-insensitive strings ``"true"`` / ``"false"``, mirroring
+    :func:`_spec_config_flag_explicitly_disabled`. Mode-valued keys
+    (``permission_mode``) are matched exactly, mirroring claude-native's
+    verbatim pass-through and the runner's exact ``bypassPermissions``
+    comparison (``should_skip_permissions`` in
+    :mod:`omnigent.antigravity_native_launch`). A present-but-unrecognized
+    value logs at debug and leaves args unset.
 
     Only those native harnesses are translated; for any other harness
     (e.g. ``claude-sdk`` / ``cursor``, whose bypass is set via the SDK
@@ -7894,6 +7912,41 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
         if _spec_config_flag_explicitly_disabled(sub_spec, "yolo"):
             return None
         return _validate_terminal_launch_args(["--yolo"])
+    if harness == _KIMI_NATIVE_HARNESS:
+        # Opt-IN (unlike codex/cursor's headless default-bypass): kimi's
+        # ``--yolo`` auto-approves regular tool calls — the same stance as
+        # cursor's ``--yolo`` / codex's bypass (``--auto`` would go fully
+        # autonomous, which is more than the analogue). The spec parser
+        # stringifies scalar config values (``yolo: true`` arrives as
+        # ``"True"``, see ``omnigent/spec/parser.py``); the bool arm covers
+        # programmatically built specs, mirroring
+        # :func:`_spec_config_flag_explicitly_disabled`.
+        yolo = sub_spec.executor.config.get("yolo")
+        if yolo is True or (isinstance(yolo, str) and yolo.strip().lower() == "true"):
+            return _validate_terminal_launch_args(["--yolo"])
+        if yolo is not None and not _spec_config_flag_explicitly_disabled(sub_spec, "yolo"):
+            _logger.debug(
+                "kimi-native sub-spec has unrecognized yolo=%r; launching without --yolo.",
+                yolo,
+            )
+        return None
+    if harness == _ANTIGRAVITY_NATIVE_HARNESS:
+        # agy's only pre-emptive permission control is the all-or-nothing
+        # ``--dangerously-skip-permissions`` flag (see
+        # :mod:`omnigent.antigravity_native_launch`). Mirror claude-native's
+        # opt-in shape: only ``permission_mode: bypassPermissions`` (matched
+        # exactly, like the runner's ``should_skip_permissions``) maps to
+        # the flag; other modes have no agy analogue and leave args unset.
+        mode = str(sub_spec.executor.config.get("permission_mode") or "").strip()
+        if mode == "bypassPermissions":
+            return _validate_terminal_launch_args(["--dangerously-skip-permissions"])
+        if mode:
+            _logger.debug(
+                "antigravity-native sub-spec permission_mode=%r has no agy analogue; "
+                "launching without --dangerously-skip-permissions.",
+                mode,
+            )
+        return None
     return None
 
 
