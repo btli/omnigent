@@ -196,3 +196,77 @@ def test_non_native_harness_with_bypass_fields_is_ignored(harness: str) -> None:
         {"harness": harness, "permission_mode": "bypassPermissions", "yolo": "True"}
     )
     assert _derive_terminal_launch_args_from_spec(spec) is None
+
+
+def test_kimi_native_yolo_true_translates_to_yolo_flag() -> None:
+    """
+    kimi-native + ``yolo: true`` (string ``"True"``) -> ``["--yolo"]``.
+
+    kimi's ``--yolo`` auto-approves regular tool calls, the same stance as
+    cursor's ``--yolo`` / codex's bypass (``--auto`` full autonomy is
+    deliberately NOT mapped). A failure means a YOLO kimi worker launches
+    with no flag and parks every risky tool call on a web approval card no
+    headless pane can answer.
+    """
+    spec = _spec_with_config({"harness": "kimi-native", "yolo": "True"})
+    assert _derive_terminal_launch_args_from_spec(spec) == ["--yolo"]
+
+
+def test_kimi_native_without_yolo_field_returns_none() -> None:
+    """
+    kimi-native bypass is opt-IN: an absent ``yolo`` leaves args unset.
+
+    Unlike codex/cursor's headless default-bypass, kimi keeps its current
+    prompting behavior unless the bundle explicitly declares ``yolo: true``.
+    ``None`` (not ``[]``) is the leave-unset contract.
+    """
+    spec = _spec_with_config({"harness": "kimi-native"})
+    assert _derive_terminal_launch_args_from_spec(spec) is None
+
+
+def test_kimi_native_yolo_false_returns_none() -> None:
+    """``yolo: false`` (string ``"False"``) must not read as enabled.
+
+    Guards the ``bool("False") is True`` trap on the parser's stringified
+    value.
+    """
+    spec = _spec_with_config({"harness": "kimi-native", "yolo": "False"})
+    assert _derive_terminal_launch_args_from_spec(spec) is None
+
+
+def test_antigravity_native_bypass_permission_mode_translates_to_flag() -> None:
+    """
+    antigravity-native + ``permission_mode: bypassPermissions`` ->
+    ``["--dangerously-skip-permissions"]``.
+
+    agy's only pre-emptive permission control is this all-or-nothing flag;
+    the runner-side spawn path appends the persisted
+    ``terminal_launch_args`` verbatim to the agy argv (build_agy_launch's
+    ``extra_args``), so this derived value is what reaches the CLI. A
+    failure means a bypass-declared agy worker still prompts per tool and
+    stalls headless.
+    """
+    spec = _spec_with_config(
+        {"harness": "antigravity-native", "permission_mode": "bypassPermissions"}
+    )
+    assert _derive_terminal_launch_args_from_spec(spec) == [
+        "--dangerously-skip-permissions",
+    ]
+
+
+def test_antigravity_native_without_permission_mode_returns_none() -> None:
+    """antigravity-native bypass is opt-IN: absent mode leaves args unset."""
+    spec = _spec_with_config({"harness": "antigravity-native"})
+    assert _derive_terminal_launch_args_from_spec(spec) is None
+
+
+def test_antigravity_native_non_bypass_mode_returns_none() -> None:
+    """
+    A non-bypass ``permission_mode`` maps to nothing for agy.
+
+    agy has no per-tool / acceptEdits analogue — only the all-or-nothing
+    bypass flag — so any mode other than ``bypassPermissions`` must leave
+    current behavior unchanged rather than emit a wrong flag.
+    """
+    spec = _spec_with_config({"harness": "antigravity-native", "permission_mode": "acceptEdits"})
+    assert _derive_terminal_launch_args_from_spec(spec) is None
