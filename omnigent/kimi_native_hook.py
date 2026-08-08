@@ -48,6 +48,7 @@ import httpx
 from omnigent.kimi_native_bridge import (
     APPROVE_KEY,
     DENY_KEY,
+    approval_prompt_visible,
     inject_approval_keystroke,
     read_active_session_id,
     read_hook_config,
@@ -70,11 +71,15 @@ _EVALUATE_POLICY_TIMEOUT_S = 70.0
 _SURFACE_TIMEOUT_S = 10.0
 # Kimi kills command hooks at 600s; reserve time for the final keystroke.
 _KIMI_HOOK_TIMEOUT_S = 600.0
-_PERMISSION_REQUEST_TIMEOUT_S = _KIMI_HOOK_TIMEOUT_S - 60.0
 _APPROVAL_SURFACE_BUDGET_S = 25.0
+_PERMISSION_DEADLINE_MARGIN_S = 2.0
 _PERMISSION_RETRY_WINDOW_S = (
-    _KIMI_HOOK_TIMEOUT_S - _SURFACE_TIMEOUT_S - _APPROVAL_SURFACE_BUDGET_S - 1.0
+    _KIMI_HOOK_TIMEOUT_S
+    - _SURFACE_TIMEOUT_S
+    - _APPROVAL_SURFACE_BUDGET_S
+    - _PERMISSION_DEADLINE_MARGIN_S
 )
+_PERMISSION_REQUEST_TIMEOUT_S = _PERMISSION_RETRY_WINDOW_S
 _HARNESS = "kimi-native"
 
 
@@ -240,7 +245,7 @@ def _main_permission_request(argv: list[str]) -> int:
         f"{ap_server_url.rstrip('/')}/v1/sessions/"
         f"{_url_component(session_id)}/hooks/permission-request"
     )
-    verdict = _request_web_approval(url, headers, body)
+    verdict = _request_web_approval(url, headers, body, bridge_dir=bridge_dir)
     if verdict is None:
         # No web verdict: leave kimi's own TUI prompt for manual approval.
         return 0
@@ -256,7 +261,11 @@ def _main_permission_request(argv: list[str]) -> int:
 
 
 def _request_web_approval(
-    url: str, headers: dict[str, str], body: dict[str, object]
+    url: str,
+    headers: dict[str, str],
+    body: dict[str, object],
+    *,
+    bridge_dir: Path | None = None,
 ) -> str | None:
     """POST the approval card and long-poll for the web verdict.
 
@@ -266,19 +275,24 @@ def _request_web_approval(
     deadline = time.monotonic() + _PERMISSION_RETRY_WINDOW_S
     while True:
         remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        if remaining <= _PERMISSION_DEADLINE_MARGIN_S:
             print(
                 "omnigent kimi permission-request hook: approval poll budget exhausted",
                 file=sys.stderr,
             )
             return None
-        timeout_s = min(_PERMISSION_REQUEST_TIMEOUT_S, remaining)
+        timeout_s = min(
+            _PERMISSION_REQUEST_TIMEOUT_S,
+            remaining - _PERMISSION_DEADLINE_MARGIN_S,
+        )
         timeout = httpx.Timeout(timeout_s, connect=min(_SURFACE_TIMEOUT_S, timeout_s))
         try:
             with httpx.Client(headers=headers, timeout=timeout) as client:
                 resp = client.post(url, json=body)
                 resp.raise_for_status()
         except httpx.TimeoutException as exc:
+            if bridge_dir is not None and not approval_prompt_visible(bridge_dir):
+                return None
             print(
                 f"omnigent kimi permission-request hook: approval poll ended; re-parking: {exc}",
                 file=sys.stderr,
@@ -291,6 +305,8 @@ def _request_web_approval(
             )
             return None
         if not resp.content:
+            if bridge_dir is not None and not approval_prompt_visible(bridge_dir):
+                return None
             print(
                 "omnigent kimi permission-request hook: empty approval response; re-parking",
                 file=sys.stderr,
