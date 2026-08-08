@@ -7835,7 +7835,7 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
       only pre-emptive permission control. Opt-IN like claude-native;
       other / absent modes leave args unset.
 
-    Value-matching policy: values are matched without whitespace
+    Value-matching policy: enabling values are matched without whitespace
     tolerance. Flag-valued keys (``yolo``) accept a real bool or the
     case-insensitive strings ``"true"`` / ``"false"``. Mode-valued keys
     (``permission_mode``) are matched exactly, mirroring claude-native's
@@ -7898,7 +7898,11 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
         yolo = sub_spec.executor.config.get("yolo")
         if yolo is True or (isinstance(yolo, str) and yolo.lower() == "true"):
             return _validate_terminal_launch_args(["--yolo"])
-        if yolo is not None and not _spec_config_flag_explicitly_disabled(sub_spec, "yolo"):
+        if (
+            yolo is not None
+            and yolo is not False
+            and not _spec_config_flag_explicitly_disabled(sub_spec, "yolo")
+        ):
             _logger.debug(
                 "kimi-native sub-spec has unrecognized yolo=%r; launching without --yolo.",
                 yolo,
@@ -7908,11 +7912,18 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
         # Opt-IN, matched exactly like the runner's should_skip_permissions;
         # other modes have no agy analogue and leave args unset.
         mode = sub_spec.executor.config.get("permission_mode")
-        if mode == "bypassPermissions":
-            return _validate_terminal_launch_args(["--dangerously-skip-permissions"])
-        if mode:
+        if isinstance(mode, str):
+            if mode == "bypassPermissions":
+                return _validate_terminal_launch_args(["--dangerously-skip-permissions"])
+            if mode:
+                _logger.debug(
+                    "antigravity-native sub-spec permission_mode=%r has no agy analogue; "
+                    "launching without --dangerously-skip-permissions.",
+                    mode,
+                )
+        elif mode is not None:
             _logger.debug(
-                "antigravity-native sub-spec permission_mode=%r has no agy analogue; "
+                "antigravity-native sub-spec has unrecognized permission_mode=%r; "
                 "launching without --dangerously-skip-permissions.",
                 mode,
             )

@@ -285,3 +285,22 @@ def test_antigravity_native_without_permission_mode_returns_none() -> None:
     """antigravity-native bypass is opt-IN: absent mode leaves args unset."""
     spec = _spec_with_config({"harness": "antigravity-native"})
     assert _derive_terminal_launch_args_from_spec(spec) is None
+
+
+def test_antigravity_native_non_string_mode_is_fail_closed() -> None:
+    """
+    A non-string ``permission_mode`` must never enable the bypass flag.
+
+    ``executor.config`` is ``dict[str, Any]``, so the value can be an
+    arbitrary object — including one whose ``__eq__`` answers True for any
+    comparison. Only a real string match may emit the all-or-nothing flag.
+    """
+
+    class _EqAnything:
+        def __eq__(self, other: object) -> bool:
+            return True
+
+        __hash__ = object.__hash__
+
+    spec = _spec_with_config({"harness": "antigravity-native", "permission_mode": _EqAnything()})
+    assert _derive_terminal_launch_args_from_spec(spec) is None
