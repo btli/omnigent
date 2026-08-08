@@ -342,12 +342,6 @@ async def test_on_runner_disconnect_fires_once_per_teardown() -> None:
     with contextlib.suppress(asyncio.TimeoutError):
         await communicator.wait(timeout=1.0)
 
-    # Give the route handler a tick to finish both teardown paths.
-    for _ in range(50):
-        if disconnect_calls:
-            break
-        await asyncio.sleep(0.01)
-
     assert disconnect_calls == [_RUNNER_ID]
     assert route_app.registry.get(_RUNNER_ID) is None
 

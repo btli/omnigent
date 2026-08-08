@@ -5411,27 +5411,6 @@ async def _dispatch_session_event_to_runner_impl(
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
 
 
-def _runner_tunnel_still_connected(
-    runner_client: httpx.AsyncClient,
-    runner_id: str | None,
-) -> bool:
-    """Return True when the runner's tunnel is still registered.
-
-    Session-stream HTTP errors can fire while the tunnel stays up; the
-    relay uses this to avoid stamping those as ``runner_disconnected``.
-    """
-    if runner_id is None:
-        return False
-    transport = getattr(runner_client, "_transport", None)
-    registry = getattr(transport, "_registry", None)
-    if registry is None:
-        return False
-    get = getattr(registry, "get", None)
-    if get is None:
-        return False
-    return get(runner_id) is not None
-
-
 async def _relay_runner_stream(
     session_id: str,
     runner_client: httpx.AsyncClient,
@@ -5917,20 +5896,26 @@ async def _relay_runner_stream(
         else:
             # Publish a failed status so the client's SSE stream sees a
             # clean error event instead of silent truncation (#1114).
-            # Tunnel loss deregisters the runner first; a stream timeout
-            # with the tunnel still registered is not runner disconnect.
-            relay_handle = _runner_relay_tasks.get(session_id)
-            runner_id = relay_handle.runner_id if relay_handle is not None else None
-            if _runner_tunnel_still_connected(runner_client, runner_id):
-                disconnect_error = ErrorDetail(
-                    code="session_stream_lost",
-                    message="Session stream lost unexpectedly.",
+            # Tunnel loss deregisters first; stream errors with a live
+            # tunnel are not runner disconnect.
+            transport = getattr(runner_client, "_transport", None)
+            registry = getattr(transport, "_registry", None)
+            runner_id = getattr(transport, "_runner_id", None)
+            if (
+                registry is not None
+                and runner_id is not None
+                and registry.get(runner_id) is not None
+            ):
+                code, message = (
+                    "session_stream_lost",
+                    "Session stream lost unexpectedly.",
                 )
             else:
-                disconnect_error = ErrorDetail(
-                    code="runner_disconnected",
-                    message="Runner disconnected unexpectedly.",
+                code, message = (
+                    "runner_disconnected",
+                    "Runner disconnected unexpectedly.",
                 )
+            disconnect_error = ErrorDetail(code=code, message=message)
             _publish_status(session_id, "failed", disconnect_error)
             # Persist the disconnect cause as durable labels so the
             # distinction survives into snapshots and child-session
