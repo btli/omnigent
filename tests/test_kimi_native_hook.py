@@ -176,7 +176,7 @@ def test_permission_request_injects_keystroke_for_verdict(
     monkeypatch.setattr(
         kimi_native_hook,
         "_request_web_approval",
-        lambda url, headers, body: posted.append({"url": url, "body": body}) or verdict,
+        lambda url, headers, body, **kwargs: posted.append({"url": url, "body": body}) or verdict,
     )
     keys = _capture_injection(monkeypatch)
 
@@ -316,6 +316,70 @@ def test_request_web_approval_reparks_empty_response(
     assert kimi_native_hook._request_web_approval("http://server", {}, body) == "allow"
     assert len(requests) == 2
     assert requests[0]["json"] == requests[1]["json"] == body
+
+
+def test_request_web_approval_does_not_repark_after_menu_is_gone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    response = httpx.Response(200, content=b"", request=httpx.Request("POST", "http://server"))
+    requests: list[dict[str, object]] = []
+
+    class _Client:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            requests.append({"url": url, "json": json})
+            return response
+
+    monkeypatch.setattr(kimi_native_hook.httpx, "Client", _Client)
+    monkeypatch.setattr(kimi_native_hook, "approval_prompt_visible", lambda _dir: False)
+
+    body = {"_omnigent_elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
+    assert (
+        kimi_native_hook._request_web_approval("http://server", {}, body, bridge_dir=tmp_path)
+        is None
+    )
+    assert len(requests) == 1
+
+
+def test_permission_read_timeout_leaves_global_deadline_margin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timeouts: list[httpx.Timeout] = []
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            timeouts.append(kwargs["timeout"])
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"hookSpecificOutput": {"decision": {"behavior": "allow"}}},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(kimi_native_hook.httpx, "Client", _Client)
+    monkeypatch.setattr(kimi_native_hook.time, "monotonic", lambda: 0.0)
+
+    body = {"_omnigent_elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
+    assert kimi_native_hook._request_web_approval("http://server", {}, body) == "allow"
+    assert timeouts[0].read == (
+        kimi_native_hook._PERMISSION_RETRY_WINDOW_S
+        - kimi_native_hook._PERMISSION_DEADLINE_MARGIN_S
+    )
 
 
 def test_permission_poll_budget_is_below_kimi_hook_ceiling() -> None:

@@ -53,7 +53,8 @@ _INPUT_BOX_SCAN_TAIL_LINES = 8
 _SUBMIT_VERIFY_TIMEOUT_S = 10.0
 _SUBMIT_RETRY_INTERVAL_S = 1.0
 _DRAFT_NEEDLE_MAX_CHARS = 24
-_TRUST_MARKER = "Trust this folder?"
+_TRUST_MARKER = "❯ Trust this folder"
+_PERMISSION_MENU_FOOTER_MARKER = "1/2/3/4 choose"
 _PERMISSION_PROMPT_MARKERS = (
     "Approve once",
     "Approve for this session",
@@ -73,6 +74,10 @@ class KimiTuiNotReadyError(RuntimeError):
 
 class KimiApprovalPromptNotFoundError(RuntimeError):
     """The Kimi permission menu was not visible when approval was injected."""
+
+
+class KimiApprovalPendingError(RuntimeError):
+    """A Kimi permission menu must be resolved before another message is sent."""
 
 
 def bridge_dir_for_session_id(session_id: str) -> Path:
@@ -295,8 +300,7 @@ def _submit_needle(content: str) -> str:
             if ord(character) < 0x20:
                 stripped = stripped[:char_index]
                 break
-        if len(stripped) >= 4:
-            return stripped[:_DRAFT_NEEDLE_MAX_CHARS]
+        return stripped[:_DRAFT_NEEDLE_MAX_CHARS] if len(stripped) >= 4 else ""
     return ""
 
 
@@ -307,8 +311,10 @@ def _input_box_lines(pane: str) -> list[str]:
 
 
 def _permission_prompt_visible(pane: str) -> bool:
-    visible_rows = 0
-    for line in pane.splitlines():
+    lines = pane.splitlines()
+    has_chrome = _PERMISSION_MENU_FOOTER_MARKER in pane
+    visible_rows: set[int] = set()
+    for line_index, line in enumerate(lines):
         marker_positions = [
             line.find(marker) for marker in _PERMISSION_PROMPT_MARKERS if marker in line
         ]
@@ -316,19 +322,31 @@ def _permission_prompt_visible(pane: str) -> bool:
             continue
         prefix = line[: min(marker_positions)].strip()
         if any(character.isdigit() for character in prefix) and "." in prefix:
-            visible_rows += 1
-    return visible_rows >= 2
+            visible_rows.add(line_index)
+            has_chrome |= "▶" in prefix
+    return has_chrome and len(visible_rows) >= 2
+
+
+def approval_prompt_visible(bridge_dir: Path) -> bool:
+    info = read_tmux_info(bridge_dir)
+    if info is None or not _session_alive(info["socket_path"], info["tmux_target"]):
+        return False
+    return _permission_prompt_visible(_capture_pane(info["socket_path"], info["tmux_target"]))
+
+
+def _trust_prompt_visible(pane: str) -> bool:
+    return any(line.strip().startswith(_TRUST_MARKER) for line in pane.splitlines())
 
 
 def _input_box_line(pane: str) -> str | None:
     """Return the latest framed line carrying a Kimi input marker."""
-    if _permission_prompt_visible(pane):
+    if _permission_prompt_visible(pane) or _trust_prompt_visible(pane):
         return None
-    for line in reversed(pane.splitlines()):
+    for line in reversed(_input_box_lines(pane)):
         stripped = line.strip()
         if not (stripped.startswith("│") and stripped.endswith("│")):
             continue
-        if any(marker in stripped[1:-1] for marker in _INPUT_BOX_MARKERS):
+        if any(stripped[1:-1].lstrip().startswith(marker) for marker in _INPUT_BOX_MARKERS):
             return line
     return None
 
@@ -424,11 +442,16 @@ def _settle_pane(
     while True:
         _raise_if_injection_cancelled(cancel_event)
         pane = _capture_pane(socket_path, tmux_target)
+        if _permission_prompt_visible(pane):
+            raise KimiApprovalPendingError(
+                "Kimi approval is pending; resolve it in the terminal before sending "
+                "another message"
+            )
         if _kimi_tui_ready(pane):
             return
         # One-shot, only when no input marker is up (so a later transcript that
         # merely echoes the phrase can't spray repeated keystrokes into the TUI).
-        if not trust_accepted and _TRUST_MARKER in pane:
+        if not trust_accepted and _trust_prompt_visible(pane):
             _raise_if_injection_cancelled(cancel_event)
             trust_accepted = True
             with contextlib.suppress(RuntimeError):
@@ -516,6 +539,13 @@ def inject_user_message(
         while time.monotonic() < deadline:
             _raise_if_injection_cancelled(cancellation)
             pane = _capture_pane(socket_path, tmux_target)
+            if _permission_prompt_visible(pane):
+                return
+            if _trust_prompt_visible(pane):
+                raise KimiTuiNotReadyError(
+                    "Kimi trust prompt appeared before the message could be submitted; "
+                    "resolve it in the terminal and retry."
+                )
             input_content = _input_box_content(pane)
             if input_content is not None and (
                 (needle and needle in input_content) or (not needle and input_content)
@@ -523,21 +553,58 @@ def inject_user_message(
                 draft_seen = True
                 break
             time.sleep(_POLL_INTERVAL_S)
+        if not draft_seen:
+            raise RuntimeError(
+                "Kimi TUI did not show the pasted message in the input box; "
+                "the message was not delivered"
+            )
         time.sleep(_PASTE_SETTLE_S)
+        deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
+        while time.monotonic() < deadline:
+            _raise_if_injection_cancelled(cancellation)
+            pane = _capture_pane(socket_path, tmux_target)
+            if _permission_prompt_visible(pane):
+                return
+            if _trust_prompt_visible(pane):
+                raise KimiTuiNotReadyError(
+                    "Kimi trust prompt appeared before the message could be submitted; "
+                    "resolve it in the terminal and retry."
+                )
+            input_content = _input_box_content(pane)
+            if input_content is not None and (
+                (needle and needle in input_content) or (not needle and input_content)
+            ):
+                break
+            time.sleep(_POLL_INTERVAL_S)
+        else:
+            raise RuntimeError(
+                "Kimi TUI input box disappeared before the message could be submitted; "
+                "the message was not delivered"
+            )
         _raise_if_injection_cancelled(cancellation)
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-        deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
         last_enter = time.monotonic()
         while time.monotonic() < deadline:
             time.sleep(_POLL_INTERVAL_S)
             _raise_if_injection_cancelled(cancellation)
-            input_content = _input_box_content(_capture_pane(socket_path, tmux_target))
+            pane = _capture_pane(socket_path, tmux_target)
+            if _permission_prompt_visible(pane):
+                return
+            if _trust_prompt_visible(pane):
+                raise KimiTuiNotReadyError(
+                    "Kimi trust prompt appeared while submitting the message; "
+                    "resolve it in the terminal and retry."
+                )
+            input_content = _input_box_content(pane)
             if input_content is not None and (
                 (needle and draft_seen and needle not in input_content)
                 or (not needle and draft_seen and not input_content)
             ):
                 return
-            if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
+            if (
+                input_content is not None
+                and time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S
+            ):
                 _raise_if_injection_cancelled(cancellation)
                 _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
                 last_enter = time.monotonic()
