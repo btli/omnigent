@@ -18,6 +18,7 @@ import logging
 import os
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -53,6 +54,13 @@ _SUBMIT_VERIFY_TIMEOUT_S = 10.0
 _SUBMIT_RETRY_INTERVAL_S = 1.0
 _DRAFT_NEEDLE_MAX_CHARS = 24
 _TRUST_MARKER = "Trust this workspace"
+# Menu labels proving Kimi's permission prompt is on screen.
+_PERMISSION_PROMPT_MARKERS = (
+    "Approve once",
+    "Approve for session",
+    "Reject with feedback",
+    "Reject",
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -283,7 +291,7 @@ def _submit_needle(content: str) -> str:
             if ord(character) < 0x20:
                 stripped = stripped[:char_index]
                 break
-        if stripped:
+        if len(stripped) >= 4:
             return stripped[:_DRAFT_NEEDLE_MAX_CHARS]
     return ""
 
@@ -294,10 +302,21 @@ def _input_box_lines(pane: str) -> list[str]:
     return lines[-_INPUT_BOX_SCAN_TAIL_LINES:]
 
 
+def _permission_prompt_visible(pane: str) -> bool:
+    markers = {marker for marker in _PERMISSION_PROMPT_MARKERS if marker in pane}
+    if "Reject with feedback" in markers:
+        markers.discard("Reject")
+    return len(markers) >= 2
+
+
 def _input_box_line(pane: str) -> str | None:
     """Return the latest line carrying a Kimi input marker."""
-    for line in reversed(_input_box_lines(pane)):
+    lines = _input_box_lines(pane)
+    for line_index in range(len(lines) - 1, -1, -1):
+        line = lines[line_index]
         if any(marker in line for marker in _INPUT_BOX_MARKERS):
+            if _permission_prompt_visible("\n".join(lines[line_index + 1 :])):
+                return None
             return line
     return None
 
@@ -316,13 +335,24 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
     if line is None:
         return False
     marker_matches = [
-        (line.rfind(marker), marker) for marker in _INPUT_BOX_MARKERS if marker in line
+        (line.find(marker), marker) for marker in _INPUT_BOX_MARKERS if marker in line
     ]
-    marker_position, marker = max(marker_matches)
+    marker_position, marker = min(marker_matches)
     return needle in line[marker_position + len(marker) :]
 
 
-def _settle_pane(socket_path: str, tmux_target: str, *, timeout_s: float) -> None:
+def _raise_if_injection_cancelled(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("Kimi native message injection was cancelled")
+
+
+def _settle_pane(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    timeout_s: float,
+    cancel_event: threading.Event | None = None,
+) -> None:
     """Wait until the Kimi input box is ready to receive a paste.
 
     Accepts the first-run "Trust this workspace" modal (sends ``a`` at most once)
@@ -331,12 +361,14 @@ def _settle_pane(socket_path: str, tmux_target: str, *, timeout_s: float) -> Non
     deadline = time.monotonic() + timeout_s
     trust_accepted = False
     while True:
+        _raise_if_injection_cancelled(cancel_event)
         pane = _capture_pane(socket_path, tmux_target)
         if _kimi_tui_ready(pane):
             return
         # One-shot, only when no input marker is up (so a later transcript that
         # merely echoes the phrase can't spray repeated keystrokes into the TUI).
         if not trust_accepted and _TRUST_MARKER in pane:
+            _raise_if_injection_cancelled(cancel_event)
             trust_accepted = True
             with contextlib.suppress(RuntimeError):
                 _run_tmux(socket_path, "send-keys", "-t", tmux_target, "a")
@@ -354,6 +386,7 @@ def inject_user_message(
     *,
     content: str,
     timeout_s: float = _KIMI_READY_TIMEOUT_S,
+    cancel_event: threading.Event | None = None,
 ) -> None:
     """Deliver a web-UI user message into the Kimi TUI via a tmux bracketed paste.
 
@@ -364,14 +397,17 @@ def inject_user_message(
     :param bridge_dir: The kimi-native bridge dir holding ``tmux.json``.
     :param content: User text (non-empty).
     :param timeout_s: Kimi TUI readiness timeout; override for slow boots.
+    :param cancel_event: Optional cancellation flag checked before delivery.
     :raises RuntimeError: If the tmux target is never advertised or a tmux
         command fails.
     """
     if not content:
         raise RuntimeError("kimi-native injection requires non-empty content")
+    _raise_if_injection_cancelled(cancel_event)
     info = _wait_for_tmux_info(bridge_dir, timeout_s=_TMUX_READY_TIMEOUT_S)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
+    _raise_if_injection_cancelled(cancel_event)
     # Fast-fail if the TUI already exited: otherwise _settle_pane polls a dead
     # pane for the full timeout and the web message is silently lost. A clear
     # error lets run_turn surface ExecutorError so the UI can say "restart".
@@ -379,10 +415,13 @@ def inject_user_message(
         raise RuntimeError(
             "kimi terminal is no longer running (the TUI exited); restart the session"
         )
-    _settle_pane(socket_path, tmux_target, timeout_s=timeout_s)
+    _settle_pane(socket_path, tmux_target, timeout_s=timeout_s, cancel_event=cancel_event)
     # Clear any leftover draft: Home (C-a) + kill-to-end (C-k).
+    _raise_if_injection_cancelled(cancel_event)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
+    _raise_if_injection_cancelled(cancel_event)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
+    _raise_if_injection_cancelled(cancel_event)
     with tempfile.NamedTemporaryFile(
         dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
     ) as paste_file:
@@ -390,7 +429,9 @@ def inject_user_message(
         paste_file.write(_paste_payload_bytes(content + "\n"))
         paste_path = paste_file.name
     try:
+        _raise_if_injection_cancelled(cancel_event)
         _run_tmux(socket_path, "load-buffer", "-b", _PASTE_BUFFER, paste_path)
+        _raise_if_injection_cancelled(cancel_event)
         _run_tmux(
             socket_path,
             "paste-buffer",
@@ -412,6 +453,7 @@ def inject_user_message(
         )
     deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
     while time.monotonic() < deadline:
+        _raise_if_injection_cancelled(cancel_event)
         if _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
             break
         time.sleep(_POLL_INTERVAL_S)
@@ -421,15 +463,18 @@ def inject_user_message(
             "the message was not delivered"
         )
     time.sleep(_PASTE_SETTLE_S)
+    _raise_if_injection_cancelled(cancel_event)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
     last_enter = time.monotonic()
     while time.monotonic() < deadline:
         time.sleep(_POLL_INTERVAL_S)
+        _raise_if_injection_cancelled(cancel_event)
         pane = _capture_pane(socket_path, tmux_target)
-        if not _draft_in_input_box(pane, needle):
+        if pane.strip() and not _draft_in_input_box(pane, needle):
             return
         if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
+            _raise_if_injection_cancelled(cancel_event)
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             last_enter = time.monotonic()
     raise RuntimeError(
@@ -452,14 +497,6 @@ def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT
     # No ``-l``: tmux must interpret ``Escape`` as a key name.
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Escape")
 
-
-#: Menu labels proving Kimi's permission prompt is on screen.
-_PERMISSION_PROMPT_MARKERS = (
-    "Approve once",
-    "Approve for session",
-    "Reject",
-    "Reject with feedback",
-)
 
 #: Web-UI approve/deny → option digit in kimi's fixed numbered menu
 #: (1=Approve once, 2=Approve for session, 3=Reject, 4=Reject with feedback).
@@ -493,7 +530,7 @@ def inject_approval_keystroke(
         _logger.warning(message)
         raise KimiApprovalPromptNotFoundError(message)
     pane = _capture_pane(socket_path, tmux_target)
-    if not any(marker in pane for marker in _PERMISSION_PROMPT_MARKERS):
+    if not _permission_prompt_visible(pane):
         message = "Kimi permission menu markers missing; approval keystroke was not sent"
         _logger.warning("%s; pane tail=%r", message, pane[-240:])
         raise KimiApprovalPromptNotFoundError(message)
