@@ -5822,17 +5822,42 @@ _RELAY_RETRY_INTERVAL_S: float = 0.5
 _MID_TURN_STATUSES = ("running", "waiting")
 
 
+def _runner_tunnel_still_connected(
+    runner_client: httpx.AsyncClient,
+    runner_id: str | None,
+) -> bool:
+    """Return True when the runner's tunnel is still registered.
+
+    Session-stream HTTP errors can fire while the tunnel stays up; the
+    relay uses this to avoid stamping those as ``runner_disconnected``.
+    """
+    if runner_id is None:
+        return False
+    transport = getattr(runner_client, "_transport", None)
+    registry = getattr(transport, "_registry", None)
+    if registry is None:
+        return False
+    get = getattr(registry, "get", None)
+    if get is None:
+        return False
+    return get(runner_id) is not None
+
+
 class _RelayTransportLost(Exception):
     """Runner stream transport dropped mid-relay.
 
     :param intentional: Whether the session carried the intentional-stop
         marker when the transport dropped, snapshotted before the relay
         teardown consumes it.
+    :param stream_lost: Whether the runner's tunnel was still registered
+        when the stream dropped — a live-tunnel stream loss, not a
+        runner disconnect.
     """
 
-    def __init__(self, *, intentional: bool) -> None:
+    def __init__(self, *, intentional: bool, stream_lost: bool = False) -> None:
         super().__init__("runner stream transport lost")
         self.intentional = intentional
+        self.stream_lost = stream_lost
 
 
 async def _runner_drop_interrupted_turn(
@@ -5986,10 +6011,19 @@ async def _relay_runner_stream(
             else:
                 # Publish a failed status so the client's SSE stream sees a
                 # clean error event instead of silent truncation (#1114).
-                disconnect_error = ErrorDetail(
-                    code="runner_disconnected",
-                    message="Runner disconnected unexpectedly.",
-                )
+                # Tunnel loss deregisters the runner first; a stream loss
+                # with the tunnel still registered (snapshotted on the last
+                # attempt) is not runner disconnect.
+                if lost.stream_lost:
+                    disconnect_error = ErrorDetail(
+                        code="session_stream_lost",
+                        message="Session stream lost unexpectedly.",
+                    )
+                else:
+                    disconnect_error = ErrorDetail(
+                        code="runner_disconnected",
+                        message="Runner disconnected unexpectedly.",
+                    )
                 _publish_status(session_id, "failed", disconnect_error)
                 # Persist the disconnect cause as durable labels so the
                 # distinction survives into snapshots and child-session
@@ -6535,7 +6569,16 @@ async def _relay_runner_stream_once(
         # treat the same as HTTPError. The finally below consumes the
         # intentional-stop marker, so snapshot it now for the supervisor's
         # retry-vs-quiet-exit decision.
-        raise _RelayTransportLost(intentional=session_id in _intentional_stop_sessions) from exc
+        # Tunnel loss deregisters the runner first; a stream timeout
+        # with the tunnel still registered is not runner disconnect —
+        # snapshot the tunnel state per attempt for the supervisor's
+        # terminal attribution.
+        relay_handle = _runner_relay_tasks.get(session_id)
+        runner_id = relay_handle.runner_id if relay_handle is not None else None
+        raise _RelayTransportLost(
+            intentional=session_id in _intentional_stop_sessions,
+            stream_lost=_runner_tunnel_still_connected(runner_client, runner_id),
+        ) from exc
     except asyncio.CancelledError:
         raise
     finally:
