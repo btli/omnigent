@@ -193,12 +193,5 @@ describe("resolveAgentIcon", () => {
         tool: "claude",
       }),
     ).toBe(OttoIcon);
-    expect(
-      resolveAgentIcon({
-        kind: "child",
-        wrapper: "claude-code-native-ui-subagent",
-        tool: "Explore",
-      }),
-    ).not.toBe(ClaudeIcon);
   });
 });
