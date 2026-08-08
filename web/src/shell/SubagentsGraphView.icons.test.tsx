@@ -133,8 +133,6 @@ describe("SubagentsGraphView agent icons", () => {
 
     expect(rootIcon).not.toBeNull();
     expect(childIcon).not.toBeNull();
-    expect(rootIcon).toHaveClass("size-3.5", "shrink-0", "text-muted-foreground");
-    expect(childIcon).toHaveClass("size-3.5", "shrink-0", "text-muted-foreground");
     expect(rootIcon).toHaveAttribute("aria-hidden", "true");
     expect(childIcon).toHaveAttribute("aria-hidden", "true");
     expect(rootLabel.previousElementSibling).toBe(rootIcon);

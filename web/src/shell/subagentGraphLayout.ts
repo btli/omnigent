@@ -219,7 +219,7 @@ export function buildGraphLayout(
   rootPreview: string | null,
   childrenMap: Map<string, ChildSessionInfo[]>,
   activeId: string,
-  rootIdentity: RootAgentIdentity = { wrapper: null, harness: null, agentName: null },
+  rootIdentity: RootAgentIdentity,
 ): { nodes: LayoutNode[]; edges: LayoutEdge[] } {
   const tree = buildTree(
     rootId,
