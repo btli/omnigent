@@ -46,23 +46,25 @@ _PASTE_BUFFER = "omnigent-kimi-paste"
 # sending Enter — submitting before the TUI commits the paste folds the Enter
 # into the paste as a newline and the message sits unsent.
 _PASTE_COMMIT_TIMEOUT_S = 5.0
-# Kimi renders an input symbol and a context footer after the TUI mounts.
-_INPUT_BOX_MARKERS = ("✨", "$ ")
+# Kimi renders the editor marker inside a box-drawing input row.
+_INPUT_BOX_MARKERS = ("> ", "! ")
 _FOOTER_MARKERS = ("context:",)
 _INPUT_BOX_SCAN_TAIL_LINES = 8
 _SUBMIT_VERIFY_TIMEOUT_S = 10.0
 _SUBMIT_RETRY_INTERVAL_S = 1.0
 _DRAFT_NEEDLE_MAX_CHARS = 24
-_TRUST_MARKER = "Trust this workspace"
-# Menu labels proving Kimi's permission prompt is on screen.
+_TRUST_MARKER = "Trust this folder?"
 _PERMISSION_PROMPT_MARKERS = (
     "Approve once",
-    "Approve for session",
+    "Approve for this session",
     "Reject with feedback",
     "Reject",
 )
+_INJECTION_CANCEL_FILE = "injection.cancelled"
 
 _logger = logging.getLogger(__name__)
+_ACTIVE_INJECTION_EVENTS: dict[Path, set[threading.Event]] = {}
+_ACTIVE_INJECTION_EVENTS_LOCK = threading.Lock()
 
 
 class KimiTuiNotReadyError(RuntimeError):
@@ -180,6 +182,8 @@ def write_tmux_target(
     tmp = bridge_dir / (_TMUX_FILE + ".tmp")
     tmp.write_text(json.dumps(payload), encoding="utf-8")
     os.replace(tmp, bridge_dir / _TMUX_FILE)
+    with contextlib.suppress(OSError):
+        (bridge_dir / _INJECTION_CANCEL_FILE).unlink()
 
 
 def read_tmux_info(bridge_dir: Path) -> dict[str, str] | None:
@@ -303,20 +307,28 @@ def _input_box_lines(pane: str) -> list[str]:
 
 
 def _permission_prompt_visible(pane: str) -> bool:
-    markers = {marker for marker in _PERMISSION_PROMPT_MARKERS if marker in pane}
-    if "Reject with feedback" in markers:
-        markers.discard("Reject")
-    return len(markers) >= 2
+    visible_rows = 0
+    for line in pane.splitlines():
+        marker_positions = [
+            line.find(marker) for marker in _PERMISSION_PROMPT_MARKERS if marker in line
+        ]
+        if not marker_positions:
+            continue
+        prefix = line[: min(marker_positions)].strip()
+        if any(character.isdigit() for character in prefix) and "." in prefix:
+            visible_rows += 1
+    return visible_rows >= 2
 
 
 def _input_box_line(pane: str) -> str | None:
-    """Return the latest line carrying a Kimi input marker."""
-    lines = _input_box_lines(pane)
-    for line_index in range(len(lines) - 1, -1, -1):
-        line = lines[line_index]
-        if any(marker in line for marker in _INPUT_BOX_MARKERS):
-            if _permission_prompt_visible("\n".join(lines[line_index + 1 :])):
-                return None
+    """Return the latest framed line carrying a Kimi input marker."""
+    if _permission_prompt_visible(pane):
+        return None
+    for line in reversed(pane.splitlines()):
+        stripped = line.strip()
+        if not (stripped.startswith("│") and stripped.endswith("│")):
+            continue
+        if any(marker in stripped[1:-1] for marker in _INPUT_BOX_MARKERS):
             return line
     return None
 
@@ -327,21 +339,70 @@ def _kimi_tui_ready(pane: str) -> bool:
     return _input_box_line(pane) is not None and any(marker in tail for marker in _FOOTER_MARKERS)
 
 
-def _draft_in_input_box(pane: str, needle: str) -> bool:
-    """Return whether the pasted draft is visible after Kimi's input marker."""
-    if not needle:
-        return False
+def _input_box_content(pane: str) -> str | None:
     line = _input_box_line(pane)
     if line is None:
-        return False
-    marker_matches = [
-        (line.find(marker), marker) for marker in _INPUT_BOX_MARKERS if marker in line
-    ]
-    marker_position, marker = min(marker_matches)
-    return needle in line[marker_position + len(marker) :]
+        return None
+    stripped = line.strip()
+    body = stripped[1:-1]
+    marker_position, marker = min(
+        (body.find(marker), marker) for marker in _INPUT_BOX_MARKERS if marker in body
+    )
+    return body[marker_position + len(marker) :].strip()
 
 
-def _raise_if_injection_cancelled(cancel_event: threading.Event | None) -> None:
+def _draft_in_input_box(pane: str, needle: str) -> bool:
+    """Return whether the pasted draft is visible after Kimi's input marker."""
+    content = _input_box_content(pane)
+    return bool(needle and content is not None and needle in content)
+
+
+class _InjectionCancellation:
+    def __init__(self, bridge_dir: Path, event: threading.Event) -> None:
+        self.event = event
+        self._cancel_file = bridge_dir / _INJECTION_CANCEL_FILE
+        self._started_at_ns = time.time_ns()
+
+    def is_set(self) -> bool:
+        if self.event.is_set():
+            return True
+        try:
+            return self._cancel_file.stat().st_mtime_ns >= self._started_at_ns
+        except OSError:
+            return False
+
+
+def _register_injection(bridge_dir: Path, event: threading.Event) -> None:
+    with _ACTIVE_INJECTION_EVENTS_LOCK:
+        _ACTIVE_INJECTION_EVENTS.setdefault(bridge_dir, set()).add(event)
+
+
+def _unregister_injection(bridge_dir: Path, event: threading.Event) -> None:
+    with _ACTIVE_INJECTION_EVENTS_LOCK:
+        events = _ACTIVE_INJECTION_EVENTS.get(bridge_dir)
+        if events is None:
+            return
+        events.discard(event)
+        if not events:
+            _ACTIVE_INJECTION_EVENTS.pop(bridge_dir, None)
+
+
+def _cancel_injections(bridge_dir: Path) -> None:
+    with _ACTIVE_INJECTION_EVENTS_LOCK:
+        for event in _ACTIVE_INJECTION_EVENTS.get(bridge_dir, ()):
+            event.set()
+    tmp = bridge_dir / f"{_INJECTION_CANCEL_FILE}.tmp"
+    try:
+        tmp.write_text("cancelled", encoding="utf-8")
+        os.replace(tmp, bridge_dir / _INJECTION_CANCEL_FILE)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+
+
+def _raise_if_injection_cancelled(
+    cancel_event: threading.Event | _InjectionCancellation | None,
+) -> None:
     if cancel_event is not None and cancel_event.is_set():
         raise RuntimeError("Kimi native message injection was cancelled")
 
@@ -351,11 +412,11 @@ def _settle_pane(
     tmux_target: str,
     *,
     timeout_s: float,
-    cancel_event: threading.Event | None = None,
+    cancel_event: threading.Event | _InjectionCancellation | None = None,
 ) -> None:
     """Wait until the Kimi input box is ready to receive a paste.
 
-    Accepts the first-run "Trust this workspace" modal (sends ``a`` at most once)
+    Accepts the first-run trust modal (sends ``Enter`` at most once)
     so the input box can mount, then returns when the input row and footer appear.
     """
     deadline = time.monotonic() + timeout_s
@@ -371,7 +432,7 @@ def _settle_pane(
             _raise_if_injection_cancelled(cancel_event)
             trust_accepted = True
             with contextlib.suppress(RuntimeError):
-                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "a")
+                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
         if time.monotonic() >= deadline:
             break
         time.sleep(_POLL_INTERVAL_S)
@@ -403,84 +464,89 @@ def inject_user_message(
     """
     if not content:
         raise RuntimeError("kimi-native injection requires non-empty content")
-    _raise_if_injection_cancelled(cancel_event)
-    info = _wait_for_tmux_info(bridge_dir, timeout_s=_TMUX_READY_TIMEOUT_S)
-    socket_path = info["socket_path"]
-    tmux_target = info["tmux_target"]
-    _raise_if_injection_cancelled(cancel_event)
-    # Fast-fail if the TUI already exited: otherwise _settle_pane polls a dead
-    # pane for the full timeout and the web message is silently lost. A clear
-    # error lets run_turn surface ExecutorError so the UI can say "restart".
-    if not _session_alive(socket_path, tmux_target):
-        raise RuntimeError(
-            "kimi terminal is no longer running (the TUI exited); restart the session"
-        )
-    _settle_pane(socket_path, tmux_target, timeout_s=timeout_s, cancel_event=cancel_event)
-    # Clear any leftover draft: Home (C-a) + kill-to-end (C-k).
-    _raise_if_injection_cancelled(cancel_event)
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
-    _raise_if_injection_cancelled(cancel_event)
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
-    _raise_if_injection_cancelled(cancel_event)
-    with tempfile.NamedTemporaryFile(
-        dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
-    ) as paste_file:
-        # Trailing newline absorbs any trailing backslash so it can't escape Enter.
-        paste_file.write(_paste_payload_bytes(content + "\n"))
-        paste_path = paste_file.name
+    event = cancel_event if isinstance(cancel_event, threading.Event) else threading.Event()
+    cancellation = _InjectionCancellation(bridge_dir, event)
+    _register_injection(bridge_dir, event)
     try:
-        _raise_if_injection_cancelled(cancel_event)
-        _run_tmux(socket_path, "load-buffer", "-b", _PASTE_BUFFER, paste_path)
-        _raise_if_injection_cancelled(cancel_event)
-        _run_tmux(
-            socket_path,
-            "paste-buffer",
-            "-p",  # bracketed-paste markers — the TUI keeps newlines as data
-            "-d",  # drop the buffer after pasting
-            "-b",
-            _PASTE_BUFFER,
-            "-t",
-            tmux_target,
-        )
-    finally:
-        with contextlib.suppress(OSError):
-            os.unlink(paste_path)
-    # Wait until the paste is visible before sending the submit key.
-    needle = _submit_needle(content)
-    if not needle:
+        _raise_if_injection_cancelled(cancellation)
+        info = _wait_for_tmux_info(bridge_dir, timeout_s=_TMUX_READY_TIMEOUT_S)
+        socket_path = info["socket_path"]
+        tmux_target = info["tmux_target"]
+        _raise_if_injection_cancelled(cancellation)
+        # Fast-fail if the TUI already exited: otherwise _settle_pane polls a dead
+        # pane for the full timeout and the web message is silently lost. A clear
+        # error lets run_turn surface ExecutorError so the UI can say "restart".
+        if not _session_alive(socket_path, tmux_target):
+            raise RuntimeError(
+                "kimi terminal is no longer running (the TUI exited); restart the session"
+            )
+        _settle_pane(socket_path, tmux_target, timeout_s=timeout_s, cancel_event=cancellation)
+        # Clear any leftover draft: Home (C-a) + kill-to-end (C-k).
+        _raise_if_injection_cancelled(cancellation)
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
+        _raise_if_injection_cancelled(cancellation)
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
+        _raise_if_injection_cancelled(cancellation)
+        with tempfile.NamedTemporaryFile(
+            dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
+        ) as paste_file:
+            # Trailing newline absorbs any trailing backslash so it can't escape Enter.
+            paste_file.write(_paste_payload_bytes(content + "\n"))
+            paste_path = paste_file.name
+        try:
+            _raise_if_injection_cancelled(cancellation)
+            _run_tmux(socket_path, "load-buffer", "-b", _PASTE_BUFFER, paste_path)
+            _raise_if_injection_cancelled(cancellation)
+            _run_tmux(
+                socket_path,
+                "paste-buffer",
+                "-p",  # bracketed-paste markers — the TUI keeps newlines as data
+                "-d",  # drop the buffer after pasting
+                "-b",
+                _PASTE_BUFFER,
+                "-t",
+                tmux_target,
+            )
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(paste_path)
+        needle = _submit_needle(content)
+        draft_seen = False
+        deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+        while time.monotonic() < deadline:
+            _raise_if_injection_cancelled(cancellation)
+            pane = _capture_pane(socket_path, tmux_target)
+            input_content = _input_box_content(pane)
+            if input_content is not None and (
+                (needle and needle in input_content) or (not needle and input_content)
+            ):
+                draft_seen = True
+                break
+            time.sleep(_POLL_INTERVAL_S)
+        time.sleep(_PASTE_SETTLE_S)
+        _raise_if_injection_cancelled(cancellation)
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+        deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
+        last_enter = time.monotonic()
+        while time.monotonic() < deadline:
+            time.sleep(_POLL_INTERVAL_S)
+            _raise_if_injection_cancelled(cancellation)
+            input_content = _input_box_content(_capture_pane(socket_path, tmux_target))
+            if input_content is not None and (
+                (needle and draft_seen and needle not in input_content)
+                or (not needle and draft_seen and not input_content)
+            ):
+                return
+            if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
+                _raise_if_injection_cancelled(cancellation)
+                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+                last_enter = time.monotonic()
         raise RuntimeError(
-            "Kimi could not identify the pasted draft; the message was not delivered"
-        )
-    deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
-    while time.monotonic() < deadline:
-        _raise_if_injection_cancelled(cancel_event)
-        if _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
-            break
-        time.sleep(_POLL_INTERVAL_S)
-    else:
-        raise RuntimeError(
-            f"Kimi TUI did not render the pasted message within {_PASTE_COMMIT_TIMEOUT_S}s; "
+            f"Kimi TUI did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s; "
             "the message was not delivered"
         )
-    time.sleep(_PASTE_SETTLE_S)
-    _raise_if_injection_cancelled(cancel_event)
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-    deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
-    last_enter = time.monotonic()
-    while time.monotonic() < deadline:
-        time.sleep(_POLL_INTERVAL_S)
-        _raise_if_injection_cancelled(cancel_event)
-        pane = _capture_pane(socket_path, tmux_target)
-        if pane.strip() and not _draft_in_input_box(pane, needle):
-            return
-        if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
-            _raise_if_injection_cancelled(cancel_event)
-            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-            last_enter = time.monotonic()
-    raise RuntimeError(
-        f"Kimi TUI did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s; "
-        "the draft is still in the input box and the message was not delivered"
-    )
+    finally:
+        _unregister_injection(bridge_dir, event)
 
 
 def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:
@@ -493,13 +559,14 @@ def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT
 
     :raises RuntimeError: If the tmux target is not advertised or send-keys fails.
     """
+    _cancel_injections(bridge_dir)
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     # No ``-l``: tmux must interpret ``Escape`` as a key name.
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Escape")
 
 
 #: Web-UI approve/deny → option digit in kimi's fixed numbered menu
-#: (1=Approve once, 2=Approve for session, 3=Reject, 4=Reject with feedback).
+#: (1=Approve once, 2=Approve for this session, 3=Reject, 4=Reject with feedback).
 #: "Approve once" re-prompts each call so Omnigent governs every one.
 APPROVE_KEY = "1"
 DENY_KEY = "3"

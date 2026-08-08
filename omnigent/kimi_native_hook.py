@@ -71,7 +71,10 @@ _SURFACE_TIMEOUT_S = 10.0
 # Kimi kills command hooks at 600s; reserve time for the final keystroke.
 _KIMI_HOOK_TIMEOUT_S = 600.0
 _PERMISSION_REQUEST_TIMEOUT_S = _KIMI_HOOK_TIMEOUT_S - 60.0
-_PERMISSION_RETRY_WINDOW_S = _KIMI_HOOK_TIMEOUT_S - _SURFACE_TIMEOUT_S - 10.0
+_APPROVAL_SURFACE_BUDGET_S = 25.0
+_PERMISSION_RETRY_WINDOW_S = (
+    _KIMI_HOOK_TIMEOUT_S - _SURFACE_TIMEOUT_S - _APPROVAL_SURFACE_BUDGET_S - 1.0
+)
 _HARNESS = "kimi-native"
 
 
@@ -289,10 +292,10 @@ def _request_web_approval(
             return None
         if not resp.content:
             print(
-                "omnigent kimi permission-request hook: approval resolved outside the web UI",
+                "omnigent kimi permission-request hook: empty approval response; re-parking",
                 file=sys.stderr,
             )
-            return None
+            continue
         try:
             data = resp.json()
         except json.JSONDecodeError:
