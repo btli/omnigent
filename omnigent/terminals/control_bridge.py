@@ -72,9 +72,11 @@ from omnigent.terminals.ws_bridge import (
     WS_CLOSE_INTERNAL_ERROR,
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
+    _ByteBoundedOutputQueue,
     _coalesce_limit_after_input,
     _forward_pty_to_ws,
     _monotonic,
+    _put_output_chunk,
 )
 
 _logger = logging.getLogger(__name__)
@@ -475,7 +477,9 @@ async def bridge_tmux_control_to_websocket(
     # (``None`` = EOF sentinel). The forwarder coalesces everything queued into
     # one bounded ``send_bytes``, so when the browser send lags tmux's firehose
     # a backlog of tiny per-line payloads collapses into a few large frames.
-    output_chunks: asyncio.Queue[bytes | None] = asyncio.Queue()
+    # Byte-bounded: past the cap the oldest chunks are dropped (lossy-safe —
+    # the next repaint restores the screen) instead of growing without bound.
+    output_chunks: asyncio.Queue[bytes | None] = _ByteBoundedOutputQueue()
     # Monotonic stamp of the last forwarded browser input; the forwarder reads
     # it to shrink the frame cap right after a keystroke (keeps the echo on
     # xterm's synchronous paint path — see the PTY bridge).
@@ -510,7 +514,7 @@ async def bridge_tmux_control_to_websocket(
             # %output %<pane-id> <escaped-bytes>
             parts = line.split(b" ", 2)
             if len(parts) == 3:
-                output_chunks.put_nowait(unescape_control_output(parts[2]))
+                _put_output_chunk(output_chunks, unescape_control_output(parts[2]))
             return True
         if line.startswith(b"%exit"):
             return False
@@ -547,8 +551,12 @@ async def bridge_tmux_control_to_websocket(
                 for raw_line in lines:
                     if not _handle_control_line(raw_line.rstrip(b"\r")):
                         return
+                # ``stdout.read`` returns buffered data without suspending, so
+                # under a flood this loop never yields on its own — give the
+                # event loop a turn after each parsed batch.
+                await asyncio.sleep(0)
         finally:
-            output_chunks.put_nowait(None)
+            _put_output_chunk(output_chunks, None)
             if reader_done is not None:
                 reader_done.set()
 
