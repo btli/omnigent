@@ -78,8 +78,7 @@ function defineBrandOrder<Kind extends string>() {
   return <const Order extends readonly Kind[]>(order: ExhaustiveOrder<Kind, Order>): Order => order;
 }
 
-// Mirrors iconForWrapperOrHarness in origin/main's SubagentsPanel.tsx.
-// Hermes must stay last to preserve the original root precedence.
+// Keep Hermes last so it remains the lowest-priority root brand.
 const ROOT_BRAND_ORDER = defineBrandOrder<BrandIconKind>()([
   "claude",
   "codex",
@@ -93,7 +92,6 @@ const ROOT_BRAND_ORDER = defineBrandOrder<BrandIconKind>()([
   "hermes",
 ]);
 
-// Mirrors iconForAgent in origin/main's AgentCard.tsx.
 // OpenCode deliberately has no catalog harness-substring fallback.
 const CATALOG_BRAND_ORDER = defineBrandOrder<CatalogBrandIconKind>()([
   "codex",
@@ -139,11 +137,10 @@ function iconForAgentType(tool: string | null): AgentIcon {
 
 function iconForRoot(source: Extract<AgentIconSource, { kind: "root" }>): AgentIcon {
   const nativeIconKind = nativeCodingAgentForWrapper(source.wrapper)?.iconKind;
-  for (const kind of ROOT_BRAND_ORDER) {
-    if (nativeIconKind === kind || harnessMatchesBrand(source.harness, kind)) {
-      return BRAND_ICONS[kind].icon;
-    }
-  }
+  const brand = ROOT_BRAND_ORDER.find(
+    (kind) => nativeIconKind === kind || harnessMatchesBrand(source.harness, kind),
+  );
+  if (brand !== undefined) return BRAND_ICONS[brand].icon;
   if (source.agentName === "nessie") return NessieIcon;
   return BotIcon;
 }
