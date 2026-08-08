@@ -76,7 +76,6 @@ from omnigent.terminals.ws_bridge import (
     _coalesce_limit_after_input,
     _forward_pty_to_ws,
     _monotonic,
-    _put_output_chunk,
 )
 
 _logger = logging.getLogger(__name__)
@@ -514,7 +513,7 @@ async def bridge_tmux_control_to_websocket(
             # %output %<pane-id> <escaped-bytes>
             parts = line.split(b" ", 2)
             if len(parts) == 3:
-                _put_output_chunk(output_chunks, unescape_control_output(parts[2]))
+                output_chunks.put_nowait(unescape_control_output(parts[2]))
             return True
         if line.startswith(b"%exit"):
             return False
@@ -556,7 +555,7 @@ async def bridge_tmux_control_to_websocket(
                 # event loop a turn after each parsed batch.
                 await asyncio.sleep(0)
         finally:
-            _put_output_chunk(output_chunks, None)
+            output_chunks.put_nowait(None)
             if reader_done is not None:
                 reader_done.set()
 
