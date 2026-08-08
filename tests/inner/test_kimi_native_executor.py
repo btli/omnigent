@@ -305,6 +305,10 @@ class TestSettlePaneReadiness:
     def test_rejects_input_box_when_approval_menu_is_active(self) -> None:
         assert not kimi_native_bridge._kimi_tui_ready(_fixture("approval_menu.txt"))
 
+    def test_rejects_editor_below_real_approval_menu(self) -> None:
+        pane = _fixture("approval_menu.txt") + "\n" + _fixture("first_boot_empty.txt")
+        assert not kimi_native_bridge._kimi_tui_ready(pane)
+
     def test_transcript_glyph_is_not_an_input_marker(self) -> None:
         pane = "✨ submitted transcript\ncontext: 0% (0/1M)"
         assert not kimi_native_bridge._kimi_tui_ready(pane)
