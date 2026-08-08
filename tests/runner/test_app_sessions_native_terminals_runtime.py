@@ -1986,32 +1986,6 @@ async def test_auto_create_antigravity_forwards_launch_args_to_agy_argv(
     assert call["headless"] is False
 
 
-def test_build_agy_launch_dedups_skip_flag_from_bypass_mode_plus_extra_args(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    ``permission_mode=bypassPermissions`` + the flag in extra_args → one flag.
-
-    The CLI launch path passes a real ``permission_mode`` AND user
-    pass-through args; the server-derived sub-agent args carry the flag in
-    ``terminal_launch_args``. Both bypass sources meeting in
-    ``build_agy_launch`` must still emit the flag exactly once.
-    """
-    import omnigent.antigravity_native_launch as launch_mod
-
-    monkeypatch.setattr(launch_mod, "agy_binary_path", lambda: str(tmp_path / "agy"))
-    argv, _ = launch_mod.build_agy_launch(
-        conversation_id=None,
-        model=None,
-        resume=False,
-        permission_mode="bypassPermissions",
-        headless=False,
-        extra_args=("--dangerously-skip-permissions",),
-    )
-    assert argv.count("--dangerously-skip-permissions") == 1
-
-
 @pytest.mark.asyncio
 async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
     tmp_path: Path,

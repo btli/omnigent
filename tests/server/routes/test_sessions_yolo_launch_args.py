@@ -217,15 +217,15 @@ def test_kimi_native_without_yolo_field_returns_none() -> None:
     ("yolo", "expected"),
     [
         # Accepted spellings: real bool (programmatic spec) + the parser's
-        # stringified form, case/whitespace-insensitive (mirrors
-        # _spec_config_flag_explicitly_disabled).
+        # stringified form, case-insensitive with no whitespace tolerance.
         (True, ["--yolo"]),
         ("True", ["--yolo"]),
         ("true", ["--yolo"]),
-        (" TRUE ", ["--yolo"]),
-        # Rejected: bool False, the parser's "False", and truthy-LOOKING
-        # spellings that are NOT part of the contract — they must silently
-        # (debug-logged) leave args unset rather than half-enable bypass.
+        # Rejected: padded strings, bool False, the parser's "False", and
+        # truthy-LOOKING spellings that are NOT part of the contract — they
+        # must silently (debug-logged) leave args unset rather than
+        # half-enable bypass.
+        (" TRUE ", None),
         (False, None),
         ("False", None),
         ("1", None),
@@ -238,9 +238,9 @@ def test_kimi_native_yolo_spelling_boundary(yolo: object, expected: list[str] | 
     """
     Pin the accepted-vs-rejected spelling boundary for the kimi opt-in.
 
-    Only a real bool ``True`` or a case-insensitive ``"true"`` string
-    enables ``--yolo`` (kimi's auto-approve-tools flag — ``--auto`` full
-    autonomy is deliberately NOT mapped); every other present value
+    Only a real bool ``True`` or a case-insensitive, unpadded ``"true"``
+    string enables ``--yolo`` (kimi's auto-approve-tools flag — ``--auto``
+    full autonomy is deliberately NOT mapped); every other present value
     (including YAML-1.1-style ``yes``/``on`` and numeric ``1``) leaves
     launch args unset. A failure here means the opt-in boundary drifted —
     either silently enabling bypass for a spelling the contract rejects, or
@@ -254,11 +254,11 @@ def test_kimi_native_yolo_spelling_boundary(yolo: object, expected: list[str] | 
 @pytest.mark.parametrize(
     ("mode", "expected"),
     [
-        # permission_mode is matched exactly (modulo surrounding
-        # whitespace), mirroring the runner's should_skip_permissions
-        # comparison and claude-native's verbatim pass-through.
+        # permission_mode is matched exactly (no whitespace tolerance),
+        # mirroring the runner's should_skip_permissions comparison and
+        # claude-native's verbatim pass-through.
         ("bypassPermissions", ["--dangerously-skip-permissions"]),
-        (" bypassPermissions ", ["--dangerously-skip-permissions"]),
+        (" bypassPermissions ", None),
         ("bypasspermissions", None),
         ("BYPASSPERMISSIONS", None),
         ("acceptEdits", None),
@@ -272,10 +272,10 @@ def test_antigravity_native_mode_spelling_boundary(mode: str, expected: list[str
     ``--dangerously-skip-permissions`` is agy's only pre-emptive permission
     control, so ``bypassPermissions`` is the only mode that maps to a flag —
     non-bypass modes (``acceptEdits``, ...) have no agy analogue and must
-    leave args unset. A wrong-case spelling must NOT enable the flag either:
-    the runner's own ``should_skip_permissions`` compares the mode exactly,
-    so a lenient server-side match would create a mode string that bypasses
-    here but prompts on other agy paths.
+    leave args unset. A wrong-case or padded spelling must NOT enable the
+    flag either: the runner's own ``should_skip_permissions`` compares the
+    mode exactly, so a lenient server-side match would create a mode string
+    that bypasses here but prompts on other agy paths.
     """
     spec = _spec_with_config({"harness": "antigravity-native", "permission_mode": mode})
     assert _derive_terminal_launch_args_from_spec(spec) == expected

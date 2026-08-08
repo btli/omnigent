@@ -7795,7 +7795,8 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
     """
     Derive native-terminal YOLO pass-through args from a trusted sub-spec.
 
-    polly's native workers (claude-native / codex-native / cursor-native)
+    polly's native workers (claude-native / codex-native / cursor-native /
+    kimi-native / antigravity-native)
     launch in a headless pane where no human can answer an ApprovalCard, so
     every Edit/Write/Bash that prompts stalls the worker. This translates a
     worker bundle's declared full-bypass intent into the per-session
@@ -7834,9 +7835,9 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
       only pre-emptive permission control. Opt-IN like claude-native;
       other / absent modes leave args unset.
 
-    Value-matching policy: flag-valued keys (``yolo``) accept a real bool
-    or the case-insensitive strings ``"true"`` / ``"false"``, mirroring
-    :func:`_spec_config_flag_explicitly_disabled`. Mode-valued keys
+    Value-matching policy: values are matched without whitespace
+    tolerance. Flag-valued keys (``yolo``) accept a real bool or the
+    case-insensitive strings ``"true"`` / ``"false"``. Mode-valued keys
     (``permission_mode``) are matched exactly, mirroring claude-native's
     verbatim pass-through and the runner's exact ``bypassPermissions``
     comparison (``should_skip_permissions`` in
@@ -7895,7 +7896,7 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
         # arm covers programmatically built specs; the string arm covers the
         # parser's stringified ``"True"`` (see the value-matching policy).
         yolo = sub_spec.executor.config.get("yolo")
-        if yolo is True or (isinstance(yolo, str) and yolo.strip().lower() == "true"):
+        if yolo is True or (isinstance(yolo, str) and yolo.lower() == "true"):
             return _validate_terminal_launch_args(["--yolo"])
         if yolo is not None and not _spec_config_flag_explicitly_disabled(sub_spec, "yolo"):
             _logger.debug(
@@ -7906,7 +7907,7 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
     if harness == _ANTIGRAVITY_NATIVE_HARNESS:
         # Opt-IN, matched exactly like the runner's should_skip_permissions;
         # other modes have no agy analogue and leave args unset.
-        mode = str(sub_spec.executor.config.get("permission_mode") or "").strip()
+        mode = sub_spec.executor.config.get("permission_mode")
         if mode == "bypassPermissions":
             return _validate_terminal_launch_args(["--dangerously-skip-permissions"])
         if mode:

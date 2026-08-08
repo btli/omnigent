@@ -519,9 +519,10 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
         sub-specs. Empty dict for other executor types.
 
         Native-harness autonomy pass-through: for server-spawned
-        sub-agents the session-create path reads ``"yolo"`` (bool or
-        the parser's stringified ``"True"``/``"False"``; enables
-        codex/cursor/kimi bypass flags, opt-out for codex/cursor and
+        sub-agents the session-create path reads ``"yolo"`` (bool or a
+        ``"true"``/``"false"`` string matched case-insensitively with no
+        whitespace tolerance; enables codex/cursor/kimi bypass flags,
+        opt-out for codex/cursor and
         opt-in for kimi) and ``"permission_mode"`` (exact-match string;
         ``bypassPermissions`` maps to the claude-native /
         antigravity-native skip flags) into the session's
