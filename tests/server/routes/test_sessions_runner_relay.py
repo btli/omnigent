@@ -9,7 +9,6 @@ from collections.abc import AsyncIterator
 from types import SimpleNamespace, TracebackType
 from typing import Any
 
-import httpx
 import pytest
 
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -430,47 +429,6 @@ class _AliveTunnelTransport:
         self._registry = SimpleNamespace(get=lambda rid: object() if rid == runner_id else None)
 
 
-class _StreamLostStreamResponse:
-    """Stream that raises ``httpx.ReadTimeout`` while the tunnel stays up."""
-
-    def __init__(self, gate: asyncio.Event) -> None:
-        self._gate = gate
-
-    async def __aenter__(self) -> _StreamLostStreamResponse:
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> None:
-        del exc_type, exc, traceback
-
-    async def aiter_text(self) -> AsyncIterator[str]:
-        yield 'data: {"type": "session.heartbeat"}\n\n'
-        await self._gate.wait()
-        raise httpx.ReadTimeout("session stream read timed out")
-
-
-class _StreamLostRunnerClient:
-    """Fake client that loses the session stream while the tunnel is alive."""
-
-    def __init__(self, gate: asyncio.Event, runner_id: str) -> None:
-        self._gate = gate
-        self._transport = _AliveTunnelTransport(runner_id)
-
-    def stream(
-        self,
-        method: str,
-        path: str,
-        *,
-        timeout: Any,
-    ) -> _StreamLostStreamResponse:
-        del method, path, timeout
-        return _StreamLostStreamResponse(self._gate)
-
-
 @pytest.mark.asyncio
 async def test_relay_publishes_failed_status_on_tunnel_close(
     monkeypatch: pytest.MonkeyPatch,
@@ -552,7 +510,8 @@ async def test_relay_publishes_session_stream_lost_when_runner_still_connected()
     sessions_module._runner_relay_tasks.clear()
     gate = asyncio.Event()
     runner_id = "runner_session_stream_lost"
-    fake_runner = _StreamLostRunnerClient(gate, runner_id)
+    fake_runner = _TunnelCloseRunnerClient(gate)
+    fake_runner._transport = _AliveTunnelTransport(runner_id)
     session_id = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
 
     collector = None

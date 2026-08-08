@@ -5668,27 +5668,6 @@ _RELAY_RETRY_INTERVAL_S: float = 0.5
 _MID_TURN_STATUSES = ("running", "waiting")
 
 
-def _runner_tunnel_still_connected(
-    runner_client: httpx.AsyncClient,
-    runner_id: str | None,
-) -> bool:
-    """Return True when the runner's tunnel is still registered.
-
-    Session-stream HTTP errors can fire while the tunnel stays up; the
-    relay uses this to avoid stamping those as ``runner_disconnected``.
-    """
-    if runner_id is None:
-        return False
-    transport = getattr(runner_client, "_transport", None)
-    registry = getattr(transport, "_registry", None)
-    if registry is None:
-        return False
-    get = getattr(registry, "get", None)
-    if get is None:
-        return False
-    return get(runner_id) is not None
-
-
 class _RelayTransportLost(Exception):
     """Runner stream transport dropped mid-relay.
 
@@ -6368,15 +6347,19 @@ async def _relay_runner_stream_once(
         # treat the same as HTTPError. The finally below consumes the
         # intentional-stop marker, so snapshot it now for the supervisor's
         # retry-vs-quiet-exit decision.
-        # Tunnel loss deregisters the runner first; a stream timeout
-        # with the tunnel still registered is not runner disconnect —
-        # snapshot the tunnel state per attempt for the supervisor's
-        # terminal attribution.
-        relay_handle = _runner_relay_tasks.get(session_id)
-        runner_id = relay_handle.runner_id if relay_handle is not None else None
+        # Tunnel loss deregisters first; stream errors with a live
+        # tunnel are not runner disconnect — snapshot the tunnel state
+        # per attempt for the supervisor's terminal attribution.
+        transport = getattr(runner_client, "_transport", None)
+        registry = getattr(transport, "_registry", None)
+        runner_id = getattr(transport, "_runner_id", None)
         raise _RelayTransportLost(
             intentional=session_id in _intentional_stop_sessions,
-            stream_lost=_runner_tunnel_still_connected(runner_client, runner_id),
+            stream_lost=(
+                registry is not None
+                and runner_id is not None
+                and registry.get(runner_id) is not None
+            ),
         ) from exc
     except asyncio.CancelledError:
         raise
