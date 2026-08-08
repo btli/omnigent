@@ -47,28 +47,22 @@ export type AgentIconSource =
       tool: string | null;
     };
 
-type HarnessMatchMode = "substring" | "exact";
 type BrandIconKind = Exclude<NativeCodingAgentIconKind, "qwen">;
 type CatalogBrandIconKind = Exclude<BrandIconKind, "opencode">;
 
-interface BrandIconDefinition {
-  icon: AgentIcon;
-  harnessMatch: HarnessMatchMode;
-}
-
 // Qwen has no glyph yet; see docs/QWEN_FOLLOWUPS.md.
-const BRAND_ICONS: Record<BrandIconKind, BrandIconDefinition> = {
-  antigravity: { icon: AntigravityIcon, harnessMatch: "substring" },
-  claude: { icon: ClaudeIcon, harnessMatch: "substring" },
-  codex: { icon: CodexIcon, harnessMatch: "substring" },
-  cursor: { icon: CursorIcon, harnessMatch: "substring" },
-  goose: { icon: GooseIcon, harnessMatch: "substring" },
-  hermes: { icon: HermesIcon, harnessMatch: "substring" },
-  kimi: { icon: KimiIcon, harnessMatch: "substring" },
-  kiro: { icon: KiroIcon, harnessMatch: "substring" },
-  opencode: { icon: OpenCodeIcon, harnessMatch: "substring" },
+const BRAND_ICONS: Record<BrandIconKind, AgentIcon> = {
+  antigravity: AntigravityIcon,
+  claude: ClaudeIcon,
+  codex: CodexIcon,
+  cursor: CursorIcon,
+  goose: GooseIcon,
+  hermes: HermesIcon,
+  kimi: KimiIcon,
+  kiro: KiroIcon,
+  opencode: OpenCodeIcon,
   // Exact match avoids false positives such as "openapi".
-  pi: { icon: PiIcon, harnessMatch: "exact" },
+  pi: PiIcon,
 };
 
 type ExhaustiveOrder<Kind extends string, Order extends readonly Kind[]> =
@@ -106,13 +100,11 @@ const CATALOG_BRAND_ORDER = defineBrandOrder<CatalogBrandIconKind>()([
 ]);
 
 function brandIconForKind(kind: NativeCodingAgentIconKind | undefined): AgentIcon | undefined {
-  return kind === undefined || kind === "qwen" ? undefined : BRAND_ICONS[kind].icon;
+  return kind === undefined || kind === "qwen" ? undefined : BRAND_ICONS[kind];
 }
 
 function harnessMatchesBrand(harness: string | null, kind: BrandIconKind): boolean {
-  return BRAND_ICONS[kind].harnessMatch === "exact"
-    ? harness === kind
-    : (harness?.includes(kind) ?? false);
+  return kind === "pi" ? harness === "pi" : (harness?.includes(kind) ?? false);
 }
 
 function iconForAgentType(tool: string | null): AgentIcon {
@@ -140,7 +132,7 @@ function iconForRoot(source: Extract<AgentIconSource, { kind: "root" }>): AgentI
   const brand = ROOT_BRAND_ORDER.find(
     (kind) => nativeIconKind === kind || harnessMatchesBrand(source.harness, kind),
   );
-  if (brand !== undefined) return BRAND_ICONS[brand].icon;
+  if (brand !== undefined) return BRAND_ICONS[brand];
   if (source.agentName === "nessie") return NessieIcon;
   return BotIcon;
 }
@@ -155,7 +147,7 @@ function iconForCatalog(source: Extract<AgentIconSource, { kind: "catalog" }>): 
   const harnessBrand = CATALOG_BRAND_ORDER.find((kind) =>
     harnessMatchesBrand(source.harness, kind),
   );
-  if (harnessBrand !== undefined) return BRAND_ICONS[harnessBrand].icon;
+  if (harnessBrand !== undefined) return BRAND_ICONS[harnessBrand];
   return BotIcon;
 }
 
