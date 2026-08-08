@@ -7878,11 +7878,8 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
             return None
         return _validate_terminal_launch_args(["--yolo"])
     if harness == _ANTIGRAVITY_NATIVE_HARNESS:
-        # agy's only pre-emptive permission control is the all-or-nothing
-        # ``--dangerously-skip-permissions`` flag (see
-        # :mod:`omnigent.antigravity_native_launch`). Mirror claude-native's
-        # opt-in shape: only ``permission_mode: bypassPermissions`` maps to
-        # the flag; other modes have no agy analogue and leave args unset.
+        # agy's only pre-emptive permission control; see
+        # :mod:`omnigent.antigravity_native_launch`.
         mode = str(sub_spec.executor.config.get("permission_mode") or "").strip()
         if mode == "bypassPermissions":
             return _validate_terminal_launch_args(["--dangerously-skip-permissions"])
