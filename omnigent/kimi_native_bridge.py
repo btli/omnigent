@@ -48,7 +48,6 @@ _PASTE_COMMIT_TIMEOUT_S = 5.0
 # Kimi renders an input symbol and a context footer after the TUI mounts.
 _INPUT_BOX_MARKERS = ("✨", "$ ")
 _FOOTER_MARKERS = ("context:",)
-_INPUT_READY_MARKERS = ("✨", "context:")
 _INPUT_BOX_SCAN_TAIL_LINES = 8
 _SUBMIT_VERIFY_TIMEOUT_S = 10.0
 _SUBMIT_RETRY_INTERVAL_S = 1.0
@@ -306,9 +305,7 @@ def _input_box_line(pane: str) -> str | None:
 def _kimi_tui_ready(pane: str) -> bool:
     """Return whether both the Kimi input row and context footer are visible."""
     tail = "\n".join(_input_box_lines(pane))
-    return _input_box_line(pane) is not None and all(
-        marker in tail for marker in _INPUT_READY_MARKERS
-    )
+    return _input_box_line(pane) is not None and any(marker in tail for marker in _FOOTER_MARKERS)
 
 
 def _draft_in_input_box(pane: str, needle: str) -> bool:
@@ -322,8 +319,6 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
         (line.rfind(marker), marker) for marker in _INPUT_BOX_MARKERS if marker in line
     ]
     marker_position, marker = max(marker_matches)
-    if marker_position < 0:
-        return False
     return needle in line[marker_position + len(marker) :]
 
 
@@ -415,14 +410,12 @@ def inject_user_message(
         raise RuntimeError(
             "Kimi could not identify the pasted draft; the message was not delivered"
         )
-    draft_seen = False
     deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
     while time.monotonic() < deadline:
         if _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
-            draft_seen = True
             break
         time.sleep(_POLL_INTERVAL_S)
-    if not draft_seen:
+    else:
         raise RuntimeError(
             f"Kimi TUI did not render the pasted message within {_PASTE_COMMIT_TIMEOUT_S}s; "
             "the message was not delivered"
