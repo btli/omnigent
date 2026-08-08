@@ -7794,8 +7794,9 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
     """
     Derive native-terminal YOLO pass-through args from a trusted sub-spec.
 
-    polly's native workers (claude-native / codex-native / cursor-native)
-    launch in a headless pane where no human can answer an ApprovalCard, so
+    polly's native workers (claude-native / codex-native / cursor-native /
+    antigravity-native) launch in a headless pane where no human can answer
+    an ApprovalCard, so
     every Edit/Write/Bash that prompts stalls the worker. This translates a
     worker bundle's declared full-bypass intent into the per-session
     ``terminal_launch_args`` the runner already appends to the native CLI
