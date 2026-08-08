@@ -166,7 +166,12 @@ export function buildTree(
   rootPreview: string | null,
   childrenMap: Map<string, ChildSessionInfo[]>,
   depth: number,
-  identity: NodeIdentity,
+  identity: NodeIdentity = {
+    nodeKind: "root",
+    wrapper: null,
+    harness: null,
+    agentName: null,
+  },
   visited = new Set<string>(),
 ): TreeNode {
   visited.add(rootId);
@@ -236,7 +241,7 @@ export function buildGraphLayout(
   rootPreview: string | null,
   childrenMap: Map<string, ChildSessionInfo[]>,
   activeId: string,
-  rootIdentity: RootAgentIdentity = { wrapper: null, harness: null, agentName: null },
+  rootIdentity: RootAgentIdentity,
 ): { nodes: LayoutNode[]; edges: LayoutEdge[] } {
   const tree = buildTree(
     rootId,

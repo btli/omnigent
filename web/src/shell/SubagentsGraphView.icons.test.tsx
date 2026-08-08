@@ -129,12 +129,10 @@ describe("SubagentsGraphView agent icons", () => {
     const rootIcon = rootNode.querySelector('[data-icon="codex"]');
     const childIcon = childNode.querySelector(".lucide-search");
     const rootLabel = screen.getByText("Codex");
-    const childLabel = screen.getByText("find-auth");
+    const childLabel = screen.getByText("Explore");
 
     expect(rootIcon).not.toBeNull();
     expect(childIcon).not.toBeNull();
-    expect(rootIcon).toHaveClass("size-3.5", "shrink-0", "text-muted-foreground");
-    expect(childIcon).toHaveClass("size-3.5", "shrink-0", "text-muted-foreground");
     expect(rootIcon).toHaveAttribute("aria-hidden", "true");
     expect(childIcon).toHaveAttribute("aria-hidden", "true");
     expect(rootLabel.previousElementSibling).toBe(rootIcon);

@@ -3,6 +3,10 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { AgentHoverCard } from "@/components/AgentHoverCard";
 import { resolveAgentIcon } from "@/shell/subagentIcons";
 
+export function iconForAgent(agent: Pick<AvailableAgent, "name" | "harness">) {
+  return resolveAgentIcon({ kind: "catalog", name: agent.name, harness: agent.harness });
+}
+
 /**
  * Selectable card for one available agent.
  *
@@ -37,7 +41,7 @@ export function AgentCard({
   compact?: boolean;
   hover?: boolean;
 }) {
-  const Icon = resolveAgentIcon({ kind: "catalog", name: agent.name, harness: agent.harness });
+  const Icon = iconForAgent(agent);
   const card = (
     <button
       type="button"
