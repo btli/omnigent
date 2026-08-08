@@ -5917,11 +5917,8 @@ async def _relay_runner_stream(
         else:
             # Publish a failed status so the client's SSE stream sees a
             # clean error event instead of silent truncation (#1114).
-            # Bare ConnectionError is tunnel close or newest-wins
-            # replacement (new tunnel already registered) — keep those
-            # as runner_disconnected so reconnect recovery can clear them.
-            # Only a non-connect HTTPError with the tunnel still up is
-            # session_stream_lost.
+            # Bare ConnectionError (close/replacement) stays
+            # runner_disconnected; only a live-tunnel HTTPError is stream loss.
             stream_lost = (
                 not _is_tunnel_transition_error(exc)
                 and not isinstance(exc, httpx.ConnectError)
@@ -5932,21 +5929,14 @@ async def _relay_runner_stream(
                     "session_stream_lost",
                     "Session stream lost unexpectedly.",
                 )
-                _logger.warning(
-                    "Relay: session stream lost for session=%s",
-                    session_id,
-                    exc_info=True,
-                )
+                log_msg = "Relay: session stream lost for session=%s"
             else:
                 code, message = (
                     "runner_disconnected",
                     "Runner disconnected unexpectedly.",
                 )
-                _logger.warning(
-                    "Relay: runner transport lost for session=%s",
-                    session_id,
-                    exc_info=True,
-                )
+                log_msg = "Relay: runner transport lost for session=%s"
+            _logger.warning(log_msg, session_id, exc_info=True)
             disconnect_error = ErrorDetail(code=code, message=message)
             _publish_status(session_id, "failed", disconnect_error)
             # Persist the disconnect cause as durable labels so the
