@@ -6015,25 +6015,19 @@ async def _relay_runner_stream(
                 # with the tunnel still registered (snapshotted on the last
                 # attempt) is not runner disconnect.
                 if lost.stream_lost:
-                    disconnect_error = ErrorDetail(
-                        code="session_stream_lost",
-                        message="Session stream lost unexpectedly.",
+                    code, message = (
+                        "session_stream_lost",
+                        "Session stream lost unexpectedly.",
                     )
-                    _logger.warning(
-                        "Relay: session stream lost for session=%s",
-                        session_id,
-                        exc_info=True,
-                    )
+                    log_msg = "Relay: session stream lost for session=%s"
                 else:
-                    disconnect_error = ErrorDetail(
-                        code="runner_disconnected",
-                        message="Runner disconnected unexpectedly.",
+                    code, message = (
+                        "runner_disconnected",
+                        "Runner disconnected unexpectedly.",
                     )
-                    _logger.warning(
-                        "Relay: runner transport lost for session=%s",
-                        session_id,
-                        exc_info=True,
-                    )
+                    log_msg = "Relay: runner transport lost for session=%s"
+                _logger.warning(log_msg, session_id, exc_info=True)
+                disconnect_error = ErrorDetail(code=code, message=message)
                 _publish_status(session_id, "failed", disconnect_error)
                 # Persist the disconnect cause as durable labels so the
                 # distinction survives into snapshots and child-session
@@ -6584,11 +6578,8 @@ async def _relay_runner_stream_once(
         # close/replacement; treat the same as HTTPError. The finally
         # below consumes the intentional-stop marker, so snapshot it now
         # for the supervisor's retry-vs-quiet-exit decision.
-        # Bare ConnectionError is tunnel close or newest-wins
-        # replacement (new tunnel already registered) — keep those
-        # as runner_disconnected so reconnect recovery can clear them.
-        # Only a non-connect HTTPError with the tunnel still up is
-        # session_stream_lost.
+        # Bare ConnectionError (close/replacement) stays
+        # runner_disconnected; only a live-tunnel HTTPError is stream loss.
         raise _RelayTransportLost(
             intentional=session_id in _intentional_stop_sessions,
             stream_lost=(
