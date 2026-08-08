@@ -68,11 +68,10 @@ from omnigent.native_policy_hook import (
 _EVALUATE_POLICY_TIMEOUT_S = 70.0
 # Short timeout for the keystroke-injection tmux round-trip; never delay the TUI.
 _SURFACE_TIMEOUT_S = 10.0
-# Kimi kills command hooks at 600s; leave room to re-park once.
+# Kimi kills command hooks at 600s; reserve time for the final keystroke.
 _KIMI_HOOK_TIMEOUT_S = 600.0
 _PERMISSION_REQUEST_TIMEOUT_S = _KIMI_HOOK_TIMEOUT_S - 60.0
-_PERMISSION_RETRY_WINDOW_S = _KIMI_HOOK_TIMEOUT_S - 10.0
-_PERMISSION_RETRY_DELAY_S = 0.1
+_PERMISSION_RETRY_WINDOW_S = _KIMI_HOOK_TIMEOUT_S - _SURFACE_TIMEOUT_S - 10.0
 _HARNESS = "kimi-native"
 
 
@@ -290,12 +289,10 @@ def _request_web_approval(
             return None
         if not resp.content:
             print(
-                "omnigent kimi permission-request hook: approval poll expired; re-parking",
+                "omnigent kimi permission-request hook: approval resolved outside the web UI",
                 file=sys.stderr,
             )
-            if _PERMISSION_RETRY_DELAY_S:
-                time.sleep(min(_PERMISSION_RETRY_DELAY_S, max(0.0, deadline - time.monotonic())))
-            continue
+            return None
         try:
             data = resp.json()
         except json.JSONDecodeError:

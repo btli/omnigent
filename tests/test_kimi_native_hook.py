@@ -245,7 +245,45 @@ def test_unknown_subcommand_returns_2(capsys: pytest.CaptureFixture[str]) -> Non
     assert kimi_native_hook.main(["bogus", "--bridge-dir", "/tmp/x"]) == 2
 
 
-def test_request_web_approval_reparks_after_poll_window(
+def test_request_web_approval_reparks_after_read_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = [
+        httpx.ReadTimeout("poll expired", request=httpx.Request("POST", "http://server")),
+        httpx.Response(
+            200,
+            json={"hookSpecificOutput": {"decision": {"behavior": "allow"}}},
+            request=httpx.Request("POST", "http://server"),
+        ),
+    ]
+    requests: list[dict[str, object]] = []
+
+    class _Client:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            requests.append({"url": url, "json": json})
+            response = responses.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+    monkeypatch.setattr(kimi_native_hook.httpx, "Client", _Client)
+
+    body = {"_omnigent_elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
+    assert kimi_native_hook._request_web_approval("http://server", {}, body) == "allow"
+    assert len(requests) == 2
+    assert requests[0]["json"] == requests[1]["json"] == body
+
+
+def test_request_web_approval_does_not_repark_empty_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     responses = [
@@ -273,13 +311,14 @@ def test_request_web_approval_reparks_after_poll_window(
             return responses.pop(0)
 
     monkeypatch.setattr(kimi_native_hook.httpx, "Client", _Client)
-    monkeypatch.setattr(kimi_native_hook, "_PERMISSION_RETRY_DELAY_S", 0.0)
 
     body = {"_omnigent_elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
-    assert kimi_native_hook._request_web_approval("http://server", {}, body) == "allow"
-    assert len(requests) == 2
-    assert requests[0]["json"] == requests[1]["json"] == body
+    assert kimi_native_hook._request_web_approval("http://server", {}, body) is None
+    assert len(requests) == 1
 
 
 def test_permission_poll_budget_is_below_kimi_hook_ceiling() -> None:
-    assert kimi_native_hook._PERMISSION_REQUEST_TIMEOUT_S < 600.0
+    assert (
+        kimi_native_hook._PERMISSION_RETRY_WINDOW_S + kimi_native_hook._SURFACE_TIMEOUT_S
+        < kimi_native_hook._KIMI_HOOK_TIMEOUT_S
+    )

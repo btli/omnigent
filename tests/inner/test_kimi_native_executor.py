@@ -11,6 +11,8 @@ per-spawn MCP config), so the MCP-config tests have no analogue here.
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from inspect import signature
 from pathlib import Path
 
@@ -105,7 +107,48 @@ async def test_run_turn_surfaces_injection_failure_as_actionable_error(
 
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
-    assert "retry the turn after the Kimi terminal is ready" in events[0].message
+    assert events[0].message == "Kimi TUI input box did not become ready"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_cancellation_stops_threaded_injection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    started = threading.Event()
+    cancelled_before_paste = threading.Event()
+    released = threading.Event()
+
+    def _inject(
+        *_args: object, cancel_event: threading.Event | None = None, **_kwargs: object
+    ) -> None:
+        started.set()
+        while not released.is_set():
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled_before_paste.set()
+                return
+            released.wait(0.001)
+
+    monkeypatch.setattr(kimi_native_executor, "inject_user_message", _inject)
+    events: list[object] = []
+
+    async def _consume() -> None:
+        async for event in KimiNativeExecutor(tmp_path).run_turn(
+            messages=[{"role": "user", "content": "hello"}],
+            tools=[],
+            system_prompt="ignored",
+        ):
+            events.append(event)
+
+    task = asyncio.create_task(_consume())
+    assert await asyncio.to_thread(started.wait, 1.0)
+    task.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert cancelled_before_paste.wait(1.0)
+        assert events == []
+    finally:
+        released.set()
 
 
 class TestPastePayload:
@@ -189,9 +232,24 @@ class TestApprovalKeystroke:
     def test_matches_alternate_menu_markers(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, marker: str
     ) -> None:
-        sent = self._stub_tmux(monkeypatch, pane=f"▶ 2. {marker}")
+        pane = f"▶ 2. {marker}\n  1. Approve once"
+        sent = self._stub_tmux(monkeypatch, pane=pane)
         assert inject_approval_keystroke(tmp_path, key=APPROVE_KEY) is True
         assert sent[-1] == ("send-keys", "-t", "main", "Enter")
+
+    @pytest.mark.parametrize("marker", ["Approve once", "Reject", "Reject with feedback"])
+    def test_raises_when_only_one_menu_marker_is_present(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        marker: str,
+    ) -> None:
+        sent = self._stub_tmux(monkeypatch, pane=f"▶ 1. {marker}")
+        with pytest.raises(kimi_native_bridge.KimiApprovalPromptNotFoundError):
+            inject_approval_keystroke(tmp_path, key=APPROVE_KEY)
+        assert sent == []
+        assert "permission menu markers missing" in caplog.text
 
     def test_raises_when_menu_absent(
         self,
@@ -230,6 +288,10 @@ class TestSettlePaneReadiness:
         assert "Plan, search, build" not in footer
         assert "Add a follow-up" not in footer
 
+    def test_rejects_input_box_when_approval_menu_is_active(self) -> None:
+        pane = "alice✨\ncontext: 6.5% (17.0k/262.1k)\n1. Approve once\n3. Reject"
+        assert not kimi_native_bridge._kimi_tui_ready(pane)
+
     def test_settle_waits_for_both_markers(self, monkeypatch: pytest.MonkeyPatch) -> None:
         captures = {"n": 0}
         panes = iter(["alice✨ ", "alice✨ \ncontext: 6.5% (17.0k/262.1k)"])
@@ -264,6 +326,10 @@ class TestSettlePaneReadiness:
             == kimi_native_bridge._TMUX_READY_TIMEOUT_S
         )
 
+    @pytest.mark.parametrize("content", ["a", "abc", "\n x"])
+    def test_submit_needle_requires_four_characters(self, content: str) -> None:
+        assert kimi_native_bridge._submit_needle(content) == ""
+
 
 class TestUserMessageInjection:
     def _stub_tui(
@@ -272,6 +338,8 @@ class TestUserMessageInjection:
         tmp_path: Path,
         *,
         submit_after_enters: int | None,
+        content: str = "fix the flaky test",
+        empty_captures_after_submit: int = 0,
     ) -> list[tuple[str, ...]]:
         bridge_dir = tmp_path / "bridge"
         bridge_dir.mkdir()
@@ -279,6 +347,7 @@ class TestUserMessageInjection:
         sent: list[tuple[str, ...]] = []
         tui = {"pane": "alice✨ "}
         enters = {"count": 0}
+        empty_captures = {"count": 0}
 
         monkeypatch.setattr(
             kimi_native_bridge,
@@ -289,8 +358,19 @@ class TestUserMessageInjection:
             },
         )
         monkeypatch.setattr(kimi_native_bridge, "_session_alive", lambda _s, _t: True)
-        monkeypatch.setattr(kimi_native_bridge, "_settle_pane", lambda _s, _t, *, timeout_s: None)
-        monkeypatch.setattr(kimi_native_bridge, "_capture_pane", lambda _s, _t: tui["pane"])
+        monkeypatch.setattr(
+            kimi_native_bridge,
+            "_settle_pane",
+            lambda _s, _t, *, timeout_s, cancel_event=None: None,
+        )
+
+        def _capture_pane(_socket_path: str, _tmux_target: str) -> str:
+            if empty_captures["count"]:
+                empty_captures["count"] -= 1
+                return ""
+            return tui["pane"]
+
+        monkeypatch.setattr(kimi_native_bridge, "_capture_pane", _capture_pane)
         monkeypatch.setattr(kimi_native_bridge, "_PASTE_SETTLE_S", 0.0)
         monkeypatch.setattr(kimi_native_bridge, "_POLL_INTERVAL_S", 0.001)
         monkeypatch.setattr(kimi_native_bridge, "_PASTE_COMMIT_TIMEOUT_S", 0.1)
@@ -300,11 +380,12 @@ class TestUserMessageInjection:
         def _run_tmux(_socket_path: str, *args: str) -> None:
             sent.append(args)
             if "paste-buffer" in args:
-                tui["pane"] = "alice✨ fix the flaky test"
+                tui["pane"] = f"alice✨ {content}"
             elif args[-1] == "Enter":
                 enters["count"] += 1
                 if submit_after_enters is not None and enters["count"] >= submit_after_enters:
                     tui["pane"] = "alice✨ "
+                    empty_captures["count"] = empty_captures_after_submit
 
         monkeypatch.setattr(kimi_native_bridge, "_run_tmux", _run_tmux)
         return sent
@@ -322,6 +403,46 @@ class TestUserMessageInjection:
         self._stub_tui(monkeypatch, tmp_path, submit_after_enters=None)
         with pytest.raises(RuntimeError, match="not delivered"):
             inject_user_message(tmp_path / "bridge", content="fix the flaky test")
+
+    def test_submits_draft_containing_prompt_markers(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        content = "literal $ prompt and ✨ marker"
+        sent = self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=1,
+            content=content,
+        )
+        inject_user_message(tmp_path / "bridge", content=content)
+        assert [args[-1] for args in sent if args[-1] == "Enter"] == ["Enter"]
+
+    def test_raises_when_submit_capture_stays_empty(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=1,
+            empty_captures_after_submit=1000,
+        )
+        monkeypatch.setattr(kimi_native_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.01)
+        with pytest.raises(RuntimeError, match="not delivered"):
+            inject_user_message(tmp_path / "bridge", content="fix the flaky test")
+
+    def test_cancelled_injection_does_not_paste(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        sent = self._stub_tui(monkeypatch, tmp_path, submit_after_enters=1)
+        cancel_event = threading.Event()
+        cancel_event.set()
+        with pytest.raises(RuntimeError, match="cancelled"):
+            inject_user_message(
+                tmp_path / "bridge",
+                content="fix the flaky test",
+                cancel_event=cancel_event,
+            )
+        assert not any("paste-buffer" in args for args in sent)
 
 
 class TestRegistration:

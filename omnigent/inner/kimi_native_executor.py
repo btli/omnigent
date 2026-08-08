@@ -15,8 +15,10 @@ stream-json`` per turn. This one types into a resident ``kimi`` TUI.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
+import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -88,9 +90,24 @@ class KimiNativeExecutor(Executor):
         if not text:
             yield ExecutorError(message="kimi native turn had no user text to send")
             return
+        cancel_event = threading.Event()
         try:
             async with self._inject_lock:
-                await asyncio.to_thread(inject_user_message, self._bridge_dir, content=text)
+                injection = asyncio.create_task(
+                    asyncio.to_thread(
+                        inject_user_message,
+                        self._bridge_dir,
+                        content=text,
+                        cancel_event=cancel_event,
+                    )
+                )
+                try:
+                    await asyncio.shield(injection)
+                except asyncio.CancelledError:
+                    cancel_event.set()
+                    with contextlib.suppress(BaseException):
+                        await injection
+                    raise
         except RuntimeError as exc:
             yield ExecutorError(
                 message=(
