@@ -527,6 +527,28 @@ async def forward_kimi_wire_to_session(
     poison_id: str | None = None
     poison_attempts = 0
     async with httpx.AsyncClient(timeout=15.0, auth=auth) as client:
+
+        def _persist() -> None:
+            _write_state(bridge_dir, _ForwardState(str(wire_path), last_line, offset))
+
+        async def _close_turn(status: str, edge: str) -> None:
+            """Post the terminal edge for a turn that will write no more wire rows."""
+            nonlocal turn_open, last_assistant_text
+            try:
+                await _post_external_session_status(
+                    client,
+                    base_url=base_url,
+                    headers=headers,
+                    session_id=session_id,
+                    status=status,
+                    output=last_assistant_text,
+                )
+            except httpx.HTTPError as exc:
+                _logger.warning("kimi forwarder: %s edge failed (will retry): %s", edge, exc)
+            else:
+                turn_open = False
+                last_assistant_text = ""
+
         while True:
             if wire_path is None or not wire_path.exists():
                 discovered = await asyncio.to_thread(
@@ -536,7 +558,7 @@ async def forward_kimi_wire_to_session(
                     wire_path = discovered
                     last_line = 0
                     offset = 0
-                    _write_state(bridge_dir, _ForwardState(str(wire_path), last_line, offset))
+                    _persist()
             if wire_path is not None and wire_path.exists():
                 if offset < 0:
                     # State persisted by a line-only build: derive the byte
@@ -615,9 +637,7 @@ async def forward_kimi_wire_to_session(
                                 poison_id, poison_attempts = None, 0
                                 offset = item.offset_after
                                 last_line = item.line_no + 1
-                                _write_state(
-                                    bridge_dir, _ForwardState(str(wire_path), last_line, offset)
-                                )
+                                _persist()
                                 continue
                         _logger.warning("kimi forwarder: POST failed (will retry): %s", exc)
                         all_posted = False
@@ -628,46 +648,20 @@ async def forward_kimi_wire_to_session(
                             poison_id, poison_attempts = None, 0
                         offset = item.offset_after
                         last_line = item.line_no + 1
-                        _write_state(bridge_dir, _ForwardState(str(wire_path), last_line, offset))
+                        _persist()
                 if all_posted and new_offset != offset:
                     # Consume trailing non-item lines so the next poll skips them.
                     offset = new_offset
                     last_line = new_line
-                    _write_state(bridge_dir, _ForwardState(str(wire_path), last_line, offset))
+                    _persist()
             if turn_open and pane_alive is not None and not pane_alive():
                 # The pane died mid-turn: no further wire rows are coming, so
                 # post the failed edge instead of stranding the session.
-                try:
-                    await _post_external_session_status(
-                        client,
-                        base_url=base_url,
-                        headers=headers,
-                        session_id=session_id,
-                        status="failed",
-                        output=last_assistant_text,
-                    )
-                except httpx.HTTPError as exc:
-                    _logger.warning("kimi forwarder: pane-death edge failed (will retry): %s", exc)
-                else:
-                    turn_open = False
-                    last_assistant_text = ""
+                await _close_turn("failed", "pane-death")
             elif turn_open and time.monotonic() - last_wire_activity > quiescence_s:
                 # Turns that end without any wire edge (interrupt, wedged kimi):
                 # a long-quiet wire means the turn is over; close it as idle.
-                try:
-                    await _post_external_session_status(
-                        client,
-                        base_url=base_url,
-                        headers=headers,
-                        session_id=session_id,
-                        status="idle",
-                        output=last_assistant_text,
-                    )
-                except httpx.HTTPError as exc:
-                    _logger.warning("kimi forwarder: quiescence edge failed (will retry): %s", exc)
-                else:
-                    turn_open = False
-                    last_assistant_text = ""
+                await _close_turn("idle", "quiescence")
             await asyncio.sleep(poll_interval_s)
 
 
