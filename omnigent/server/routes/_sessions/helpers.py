@@ -7891,14 +7891,9 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
             return None
         return _validate_terminal_launch_args(["--yolo"])
     if harness == _KIMI_NATIVE_HARNESS:
-        # Opt-IN (unlike codex/cursor's headless default-bypass): kimi's
-        # ``--yolo`` auto-approves regular tool calls — the same stance as
-        # cursor's ``--yolo`` / codex's bypass (``--auto`` would go fully
-        # autonomous, which is more than the analogue). The spec parser
-        # stringifies scalar config values (``yolo: true`` arrives as
-        # ``"True"``, see ``omnigent/spec/parser.py``); the bool arm covers
-        # programmatically built specs, mirroring
-        # :func:`_spec_config_flag_explicitly_disabled`.
+        # Opt-IN (unlike codex/cursor's headless default-bypass). The bool
+        # arm covers programmatically built specs; the string arm covers the
+        # parser's stringified ``"True"`` (see the value-matching policy).
         yolo = sub_spec.executor.config.get("yolo")
         if yolo is True or (isinstance(yolo, str) and yolo.strip().lower() == "true"):
             return _validate_terminal_launch_args(["--yolo"])
@@ -7909,12 +7904,8 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
             )
         return None
     if harness == _ANTIGRAVITY_NATIVE_HARNESS:
-        # agy's only pre-emptive permission control is the all-or-nothing
-        # ``--dangerously-skip-permissions`` flag (see
-        # :mod:`omnigent.antigravity_native_launch`). Mirror claude-native's
-        # opt-in shape: only ``permission_mode: bypassPermissions`` (matched
-        # exactly, like the runner's ``should_skip_permissions``) maps to
-        # the flag; other modes have no agy analogue and leave args unset.
+        # Opt-IN, matched exactly like the runner's should_skip_permissions;
+        # other modes have no agy analogue and leave args unset.
         mode = str(sub_spec.executor.config.get("permission_mode") or "").strip()
         if mode == "bypassPermissions":
             return _validate_terminal_launch_args(["--dangerously-skip-permissions"])
