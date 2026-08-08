@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator
 from types import SimpleNamespace, TracebackType
 from typing import Any
 
+import httpx
 import pytest
 
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -421,6 +422,55 @@ class _TunnelCloseRunnerClient:
         return _TunnelCloseStreamResponse(self._gate)
 
 
+class _AliveTunnelTransport:
+    """Minimal transport shape whose registry still lists the runner."""
+
+    def __init__(self, runner_id: str) -> None:
+        self._runner_id = runner_id
+        self._registry = SimpleNamespace(get=lambda rid: object() if rid == runner_id else None)
+
+
+class _StreamLostStreamResponse:
+    """Stream that raises ``httpx.ReadTimeout`` while the tunnel stays up."""
+
+    def __init__(self, gate: asyncio.Event) -> None:
+        self._gate = gate
+
+    async def __aenter__(self) -> _StreamLostStreamResponse:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, exc, traceback
+
+    async def aiter_text(self) -> AsyncIterator[str]:
+        yield 'data: {"type": "session.heartbeat"}\n\n'
+        await self._gate.wait()
+        raise httpx.ReadTimeout("session stream read timed out")
+
+
+class _StreamLostRunnerClient:
+    """Fake client that loses the session stream while the tunnel is alive."""
+
+    def __init__(self, gate: asyncio.Event, runner_id: str) -> None:
+        self._gate = gate
+        self._transport = _AliveTunnelTransport(runner_id)
+
+    def stream(
+        self,
+        method: str,
+        path: str,
+        *,
+        timeout: Any,
+    ) -> _StreamLostStreamResponse:
+        del method, path, timeout
+        return _StreamLostStreamResponse(self._gate)
+
+
 @pytest.mark.asyncio
 async def test_relay_publishes_failed_status_on_tunnel_close(
     monkeypatch: pytest.MonkeyPatch,
@@ -483,6 +533,57 @@ async def test_relay_publishes_failed_status_on_tunnel_close(
                 await asyncio.wait_for(handle.task, timeout=1.0)
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+async def test_relay_publishes_session_stream_lost_when_runner_still_connected() -> None:
+    """
+    A session-stream failure while the runner tunnel is up is not
+    ``runner_disconnected``.
+
+    Read timeouts / stream HTTP errors can fire with the tunnel still
+    registered; those must stamp ``session_stream_lost`` so clients do
+    not treat a live runner as disconnected.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    runner_id = "runner_session_stream_lost"
+    fake_runner = _StreamLostRunnerClient(gate, runner_id)
+    session_id = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            runner_id,
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=None,
+        )
+        assert handle is not None
+
+        collector = await start_session_stream_collector(session_id)
+        gate.set()
+
+        await asyncio.wait_for(handle.task, timeout=2.0)
+
+        event = await asyncio.wait_for(collector.queue.get(), timeout=2.0)
+        assert event.get("type") == "session.status"
+        assert event.get("status") == "failed"
+        assert event["error"]["code"] == "session_stream_lost"
+    finally:
+        gate.set()
+        if collector is not None:
+            await collector.stop()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=1.0)
+        sessions_module._runner_relay_tasks.clear()
         session_stream.close(session_id)
 
 
