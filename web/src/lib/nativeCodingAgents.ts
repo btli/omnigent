@@ -145,10 +145,10 @@ export const NATIVE_CODING_AGENTS = [
     sortRank: 60,
   },
   {
-    // qwen has no brand glyph yet, so it falls back to the generic bot icon
-    // (see subagentIcons) — the `iconKind: "qwen"`
-    // intentionally matches no icon branch. Auth/approval surface in the
-    // embedded terminal, so no capability flags are declared here.
+    // qwen has no brand glyph yet, so it falls back to the generic bot icon.
+    // Its `iconKind: "qwen"` intentionally matches no icon branch.
+    // Auth/approval surface in the embedded terminal, so no capability flags
+    // are declared here.
     key: "qwen",
     agentName: "qwen-native-ui",
     harness: "qwen-native",
@@ -167,9 +167,8 @@ export const NATIVE_CODING_AGENTS = [
     sortRank: 70,
   },
   {
-    // Hermes uses the local caduceus glyph selected in subagentIcons for
-    // catalog cards, roots, and branded child sessions. Auth/approval surface
-    // in the embedded terminal, so no capability flags are declared here.
+    // Hermes uses a local caduceus glyph. Auth/approval surface in the
+    // embedded terminal, so no capability flags are declared here.
     key: "hermes",
     agentName: "hermes-native-ui",
     harness: "hermes-native",

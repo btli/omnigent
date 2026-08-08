@@ -5,32 +5,30 @@ import { childStatus, type AgentActivity } from "./subagentStatus";
 
 export type { AgentActivity };
 
-export interface AgentNodeData {
+interface AgentIdentity {
+  nodeKind: "root" | "child";
+  wrapper: string | null;
+  tool: string | null;
+  harness: string | null;
+  agentName: string | null;
+}
+
+export interface AgentNodeData extends AgentIdentity {
   label: string;
   activity: AgentActivity;
   statusLabel: string;
   sessionId: string;
   isActive: boolean;
   preview: string | null;
-  nodeKind: "root" | "child";
-  wrapper: string | null;
-  tool: string | null;
-  harness: string | null;
-  agentName: string | null;
   [key: string]: unknown;
 }
 
-export interface TreeNode {
-  id: string;
+export interface TreeNode extends AgentIdentity {
   label: string;
   activity: AgentActivity;
   statusLabel: string;
   preview: string | null;
-  nodeKind: "root" | "child";
-  wrapper: string | null;
-  tool: string | null;
-  harness: string | null;
-  agentName: string | null;
+  id: string;
   children: TreeNode[];
 }
 
@@ -40,20 +38,13 @@ export interface RootAgentIdentity {
   agentName: string | null;
 }
 
-type NodeIdentity =
-  | {
-      nodeKind: "root";
-      wrapper: string | null;
-      harness: string | null;
-      agentName: string | null;
-    }
-  | {
-      nodeKind: "child";
-      wrapper: string | null;
-      tool: string | null;
-      harness: null;
-      agentName: null;
-    };
+interface ChildAgentIdentity extends Pick<AgentIdentity, "wrapper" | "tool"> {
+  nodeKind: "child";
+  harness: null;
+  agentName: null;
+}
+
+type NodeIdentity = ({ nodeKind: "root" } & RootAgentIdentity) | ChildAgentIdentity;
 
 interface LayoutNode {
   id: string;
@@ -96,8 +87,9 @@ export function computeSubtreeWidths(node: TreeNode): Map<string, number> {
     }
     const total =
       n.children.reduce((sum, c) => sum + walk(c), 0) + (n.children.length - 1) * HORIZONTAL_GAP;
-    widths.set(n.id, Math.max(NODE_WIDTH, total));
-    return Math.max(NODE_WIDTH, total);
+    const width = Math.max(NODE_WIDTH, total);
+    widths.set(n.id, width);
+    return width;
   }
   walk(node);
   return widths;
@@ -143,16 +135,17 @@ export function layoutTree(
     for (const child of node.children) {
       const childWidth = subtreeWidths.get(child.id) ?? NODE_WIDTH;
       const childCenterX = childX + childWidth / 2;
+      const isWorking = child.activity === "working";
 
       edges.push({
         id: `${node.id}->${child.id}`,
         source: node.id,
         target: child.id,
         ...edgeDefaults,
-        animated: child.activity === "working",
+        animated: isWorking,
         style: {
           ...edgeDefaults.style,
-          opacity: child.activity === "working" ? 0.6 : 0.3,
+          opacity: isWorking ? 0.6 : 0.3,
         },
       });
 
