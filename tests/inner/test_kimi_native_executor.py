@@ -39,6 +39,12 @@ from omnigent.kimi_native_bridge import (
     write_tmux_target,
 )
 
+_FIXTURE_DIR = Path(__file__).parents[1] / "fixtures" / "kimi_native"
+
+
+def _fixture(name: str) -> str:
+    return (_FIXTURE_DIR / name).read_text(encoding="utf-8")
+
 
 class TestContentExtraction:
     def test_string_content(self, tmp_path: Path) -> None:
@@ -151,6 +157,22 @@ async def test_run_turn_cancellation_stops_threaded_injection(
         released.set()
 
 
+@pytest.mark.asyncio
+async def test_steering_uses_short_readiness_budget_and_logs_drop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    seen: dict[str, object] = {}
+
+    def _fail(*_args: object, **kwargs: object) -> None:
+        seen.update(kwargs)
+        raise RuntimeError("Kimi TUI input box did not become ready")
+
+    monkeypatch.setattr(kimi_native_executor, "inject_user_message", _fail)
+    assert await KimiNativeExecutor(tmp_path).enqueue_session_message("session", "steer") is False
+    assert seen["timeout_s"] == 30.0
+    assert "steering message was not delivered" in caplog.text
+
+
 class TestPastePayload:
     def test_newlines_become_cr(self) -> None:
         assert _paste_payload_bytes("a\nb") == b"a\rb"
@@ -214,7 +236,7 @@ class TestApprovalKeystroke:
     def test_injects_digit_and_enter_when_menu_present(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        sent = self._stub_tmux(monkeypatch, pane="▶ 1. Approve once\n  3. Reject")
+        sent = self._stub_tmux(monkeypatch, pane=_fixture("approval_menu.txt"))
         assert inject_approval_keystroke(tmp_path, key=APPROVE_KEY) is True
         assert sent == [
             ("send-keys", "-t", "main", APPROVE_KEY),
@@ -224,11 +246,11 @@ class TestApprovalKeystroke:
     def test_deny_key_selects_reject(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        sent = self._stub_tmux(monkeypatch, pane="▶ 1. Approve once\n  3. Reject")
+        sent = self._stub_tmux(monkeypatch, pane=_fixture("approval_menu.txt"))
         assert inject_approval_keystroke(tmp_path, key=DENY_KEY) is True
         assert sent[0] == ("send-keys", "-t", "main", DENY_KEY)
 
-    @pytest.mark.parametrize("marker", ["Approve for session", "Reject with feedback"])
+    @pytest.mark.parametrize("marker", ["Approve for this session", "Reject with feedback"])
     def test_matches_alternate_menu_markers(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, marker: str
     ) -> None:
@@ -237,7 +259,9 @@ class TestApprovalKeystroke:
         assert inject_approval_keystroke(tmp_path, key=APPROVE_KEY) is True
         assert sent[-1] == ("send-keys", "-t", "main", "Enter")
 
-    @pytest.mark.parametrize("marker", ["Approve once", "Reject", "Reject with feedback"])
+    @pytest.mark.parametrize(
+        "marker", ["Approve once", "Approve for this session", "Reject", "Reject with feedback"]
+    )
     def test_raises_when_only_one_menu_marker_is_present(
         self,
         tmp_path: Path,
@@ -276,25 +300,24 @@ class TestSettlePaneReadiness:
     on every web→TUI injection (the original web→TUI latency bug)."""
 
     def test_requires_input_box_and_live_kimi_footer(self) -> None:
-        # Footer chrome captured verbatim from a live K2.7 session.
-        footer = (
-            " K2.7 Code thinking  ~/omnigent  pr521-kimi-native [+61 -8]"
-            '   ask Kimi to schedule tasks, e.g. "remind me at 5pm"\n'
-            "   context: 6.5% (17.0k/262.1k)"
-        )
-        pane = "alice✨ " + "\n" + footer
-        assert kimi_native_bridge._kimi_tui_ready(pane)
-        # The cursor-native strings carried over unverified never appeared.
-        assert "Plan, search, build" not in footer
-        assert "Add a follow-up" not in footer
+        assert kimi_native_bridge._kimi_tui_ready(_fixture("first_boot_empty.txt"))
 
     def test_rejects_input_box_when_approval_menu_is_active(self) -> None:
-        pane = "alice✨\ncontext: 6.5% (17.0k/262.1k)\n1. Approve once\n3. Reject"
+        assert not kimi_native_bridge._kimi_tui_ready(_fixture("approval_menu.txt"))
+
+    def test_transcript_glyph_is_not_an_input_marker(self) -> None:
+        pane = "✨ submitted transcript\ncontext: 0% (0/1M)"
         assert not kimi_native_bridge._kimi_tui_ready(pane)
+
+    def test_real_draft_and_submitted_fixtures_anchor_to_editor_row(self) -> None:
+        draft = _fixture("draft_pasted.txt")
+        submitted = _fixture("draft_submitted.txt")
+        assert kimi_native_bridge._draft_in_input_box(draft, "literal $ and ✨ marker")
+        assert not kimi_native_bridge._draft_in_input_box(submitted, "literal $ and ✨ marker")
 
     def test_settle_waits_for_both_markers(self, monkeypatch: pytest.MonkeyPatch) -> None:
         captures = {"n": 0}
-        panes = iter(["alice✨ ", "alice✨ \ncontext: 6.5% (17.0k/262.1k)"])
+        panes = iter(["│ > │", _fixture("first_boot_empty.txt")])
 
         def _capture(_s: str, _t: str) -> str:
             captures["n"] += 1
@@ -304,6 +327,21 @@ class TestSettlePaneReadiness:
         monkeypatch.setattr(kimi_native_bridge.time, "sleep", lambda _s: None)
         kimi_native_bridge._settle_pane("/s", "main", timeout_s=30.0)
         assert captures["n"] == 2
+
+    def test_settle_accepts_real_first_boot_trust_modal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        panes = iter([_fixture("trust_modal.txt"), _fixture("first_boot_empty.txt")])
+        sent: list[tuple[str, ...]] = []
+        monkeypatch.setattr(kimi_native_bridge, "_capture_pane", lambda _s, _t: next(panes))
+        monkeypatch.setattr(kimi_native_bridge.time, "sleep", lambda _s: None)
+        monkeypatch.setattr(
+            kimi_native_bridge,
+            "_run_tmux",
+            lambda _socket, *args: sent.append(args),
+        )
+        kimi_native_bridge._settle_pane("/s", "main", timeout_s=30.0)
+        assert sent == [("send-keys", "-t", "main", "Enter")]
 
     def test_settle_raises_when_tui_never_mounts(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(kimi_native_bridge, "_capture_pane", lambda _s, _t: "booting")
@@ -326,7 +364,7 @@ class TestSettlePaneReadiness:
             == kimi_native_bridge._TMUX_READY_TIMEOUT_S
         )
 
-    @pytest.mark.parametrize("content", ["a", "abc", "\n x"])
+    @pytest.mark.parametrize("content", ["a", "abc", "\n x", "ok", "yes", "go", "✨"])
     def test_submit_needle_requires_four_characters(self, content: str) -> None:
         assert kimi_native_bridge._submit_needle(content) == ""
 
@@ -340,6 +378,7 @@ class TestUserMessageInjection:
         submit_after_enters: int | None,
         content: str = "fix the flaky test",
         empty_captures_after_submit: int = 0,
+        post_submit_captures: tuple[str, ...] = (),
     ) -> list[tuple[str, ...]]:
         bridge_dir = tmp_path / "bridge"
         bridge_dir.mkdir()
@@ -348,6 +387,7 @@ class TestUserMessageInjection:
         tui = {"pane": "alice✨ "}
         enters = {"count": 0}
         empty_captures = {"count": 0}
+        transient_captures = list(post_submit_captures)
 
         monkeypatch.setattr(
             kimi_native_bridge,
@@ -365,6 +405,8 @@ class TestUserMessageInjection:
         )
 
         def _capture_pane(_socket_path: str, _tmux_target: str) -> str:
+            if transient_captures:
+                return transient_captures.pop(0)
             if empty_captures["count"]:
                 empty_captures["count"] -= 1
                 return ""
@@ -380,11 +422,11 @@ class TestUserMessageInjection:
         def _run_tmux(_socket_path: str, *args: str) -> None:
             sent.append(args)
             if "paste-buffer" in args:
-                tui["pane"] = f"alice✨ {content}"
+                tui["pane"] = f"│ > {content} │"
             elif args[-1] == "Enter":
                 enters["count"] += 1
                 if submit_after_enters is not None and enters["count"] >= submit_after_enters:
-                    tui["pane"] = "alice✨ "
+                    tui["pane"] = "│ > │"
                     empty_captures["count"] = empty_captures_after_submit
 
         monkeypatch.setattr(kimi_native_bridge, "_run_tmux", _run_tmux)
@@ -417,6 +459,19 @@ class TestUserMessageInjection:
         inject_user_message(tmp_path / "bridge", content=content)
         assert [args[-1] for args in sent if args[-1] == "Enter"] == ["Enter"]
 
+    @pytest.mark.parametrize("content", ["ok", "yes", "go", "✨"])
+    def test_submits_short_drafts_without_a_needle(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, content: str
+    ) -> None:
+        sent = self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=1,
+            content=content,
+        )
+        inject_user_message(tmp_path / "bridge", content=content)
+        assert [args[-1] for args in sent if args[-1] == "Enter"] == ["Enter"]
+
     def test_raises_when_submit_capture_stays_empty(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -429,6 +484,40 @@ class TestUserMessageInjection:
         monkeypatch.setattr(kimi_native_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.01)
         with pytest.raises(RuntimeError, match="not delivered"):
             inject_user_message(tmp_path / "bridge", content="fix the flaky test")
+
+    def test_nonempty_capture_without_input_row_is_unverified(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        sent = self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=1,
+            post_submit_captures=("spinner running",) * 100,
+        )
+        monkeypatch.setattr(kimi_native_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.01)
+        with pytest.raises(RuntimeError, match="not delivered"):
+            inject_user_message(tmp_path / "bridge", content="fix the flaky test")
+        assert len([args for args in sent if args[-1] == "Enter"]) >= 1
+
+    def test_interrupt_marks_active_injection_cancelled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        event = threading.Event()
+        kimi_native_bridge._register_injection(tmp_path, event)
+        sent: list[tuple[str, ...]] = []
+        monkeypatch.setattr(
+            kimi_native_bridge,
+            "_wait_for_tmux_info",
+            lambda _bridge_dir, *, timeout_s: {"socket_path": "/s", "tmux_target": "main"},
+        )
+        monkeypatch.setattr(kimi_native_bridge, "_run_tmux", lambda _s, *args: sent.append(args))
+        try:
+            kimi_native_bridge.inject_interrupt(tmp_path)
+        finally:
+            kimi_native_bridge._unregister_injection(tmp_path, event)
+        assert event.is_set()
+        assert sent[-1][-1] == "Escape"
+        assert (tmp_path / kimi_native_bridge._INJECTION_CANCEL_FILE).exists()
 
     def test_cancelled_injection_does_not_paste(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

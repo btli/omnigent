@@ -283,7 +283,7 @@ def test_request_web_approval_reparks_after_read_timeout(
     assert requests[0]["json"] == requests[1]["json"] == body
 
 
-def test_request_web_approval_does_not_repark_empty_response(
+def test_request_web_approval_reparks_empty_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     responses = [
@@ -313,12 +313,15 @@ def test_request_web_approval_does_not_repark_empty_response(
     monkeypatch.setattr(kimi_native_hook.httpx, "Client", _Client)
 
     body = {"_omnigent_elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
-    assert kimi_native_hook._request_web_approval("http://server", {}, body) is None
-    assert len(requests) == 1
+    assert kimi_native_hook._request_web_approval("http://server", {}, body) == "allow"
+    assert len(requests) == 2
+    assert requests[0]["json"] == requests[1]["json"] == body
 
 
 def test_permission_poll_budget_is_below_kimi_hook_ceiling() -> None:
     assert (
-        kimi_native_hook._PERMISSION_RETRY_WINDOW_S + kimi_native_hook._SURFACE_TIMEOUT_S
+        kimi_native_hook._PERMISSION_RETRY_WINDOW_S
+        + kimi_native_hook._SURFACE_TIMEOUT_S
+        + kimi_native_hook._APPROVAL_SURFACE_BUDGET_S
         < kimi_native_hook._KIMI_HOOK_TIMEOUT_S
     )

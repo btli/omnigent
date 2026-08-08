@@ -36,6 +36,7 @@ from omnigent.inner.executor import (
 from omnigent.kimi_native_bridge import BRIDGE_DIR_ENV_VAR, inject_user_message
 
 logger = logging.getLogger(__name__)
+_STEERING_READY_TIMEOUT_S = 30.0
 
 
 class KimiNativeExecutor(Executor):
@@ -71,9 +72,9 @@ class KimiNativeExecutor(Executor):
         if not text:
             return False
         try:
-            async with self._inject_lock:
-                await asyncio.to_thread(inject_user_message, self._bridge_dir, content=text)
-        except RuntimeError:
+            await self._inject_message(text, timeout_s=_STEERING_READY_TIMEOUT_S)
+        except RuntimeError as exc:
+            logger.warning("Kimi native steering message was not delivered: %s", exc)
             return False
         return True
 
@@ -90,24 +91,8 @@ class KimiNativeExecutor(Executor):
         if not text:
             yield ExecutorError(message="kimi native turn had no user text to send")
             return
-        cancel_event = threading.Event()
         try:
-            async with self._inject_lock:
-                injection = asyncio.create_task(
-                    asyncio.to_thread(
-                        inject_user_message,
-                        self._bridge_dir,
-                        content=text,
-                        cancel_event=cancel_event,
-                    )
-                )
-                try:
-                    await asyncio.shield(injection)
-                except asyncio.CancelledError:
-                    cancel_event.set()
-                    with contextlib.suppress(BaseException):
-                        await injection
-                    raise
+            await self._inject_message(text)
         except RuntimeError as exc:
             yield ExecutorError(
                 message=(
@@ -117,6 +102,26 @@ class KimiNativeExecutor(Executor):
             )
             return
         yield TurnComplete(response=None)
+
+    async def _inject_message(self, text: str, *, timeout_s: float | None = None) -> None:
+        cancel_event = threading.Event()
+        async with self._inject_lock:
+            injection = asyncio.create_task(
+                asyncio.to_thread(
+                    inject_user_message,
+                    self._bridge_dir,
+                    content=text,
+                    cancel_event=cancel_event,
+                    **({"timeout_s": timeout_s} if timeout_s is not None else {}),
+                )
+            )
+            try:
+                await asyncio.shield(injection)
+            except asyncio.CancelledError:
+                cancel_event.set()
+                with contextlib.suppress(BaseException):
+                    await injection
+                raise
 
 
 def _bridge_dir_from_env() -> Path:
