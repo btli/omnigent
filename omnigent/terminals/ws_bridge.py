@@ -426,12 +426,14 @@ async def _write_all_nonblocking(
 
 
 class _ByteBoundedOutputQueue(asyncio.Queue["bytes | None"]):
-    """Terminal-output queue that tracks queued bytes for the drop policy.
+    """Terminal-output queue whose ``put_nowait`` sheds backlog past a byte cap.
 
-    ``_put``/``_get`` are asyncio.Queue's documented subclass hooks (the
-    same ones ``PriorityQueue`` overrides); the item count stays unbounded
-    so ``put_nowait`` never raises — bounding happens by bytes in
-    :func:`_put_output_chunk`.
+    Drop policy: terminal bytes are lossy-safe — the pane's next repaint
+    restores the screen — so when the browser send is wedged and the backlog
+    exceeds the cap, the OLDEST chunks go (the freshest output wins). The
+    ``None`` EOF sentinel is never dropped. Item count stays unbounded, so
+    ``put_nowait`` never raises; ``_put``/``_get`` are asyncio.Queue's
+    subclass hooks (the same ones ``PriorityQueue`` overrides).
     """
 
     def __init__(self, max_bytes: int = _OUTPUT_QUEUE_MAX_BYTES) -> None:
@@ -450,31 +452,20 @@ class _ByteBoundedOutputQueue(asyncio.Queue["bytes | None"]):
             self.queued_bytes -= len(item)
         return item
 
-
-def _put_output_chunk(queue: asyncio.Queue[bytes | None], chunk: bytes | None) -> None:
-    """Enqueue terminal output, dropping the oldest backlog past the byte cap.
-
-    Drop policy: terminal bytes are lossy-safe — the pane's next repaint
-    restores the screen — so when the browser send is wedged and the backlog
-    exceeds the cap, the OLDEST chunks go (the freshest output wins). The
-    ``None`` EOF sentinel is never dropped. Plain (unbounded) queues pass
-    through untouched, keeping the policy opt-in per bridge.
-    """
-    queue.put_nowait(chunk)
-    if not isinstance(queue, _ByteBoundedOutputQueue):
-        return
-    while queue.queued_bytes > queue.max_bytes and queue.qsize() > 1:
-        dropped = queue.get_nowait()
-        if dropped is None:
-            # EOF sentinel must survive; re-queue it behind the remaining
-            # data (the consumer stops at None wherever it sits).
-            queue.put_nowait(None)
-            return
-        _logger.debug(
-            "terminal output queue saturated (%d queued bytes); dropped %d-byte chunk",
-            queue.queued_bytes,
-            len(dropped),
-        )
+    def put_nowait(self, item: bytes | None) -> None:
+        super().put_nowait(item)
+        while self.queued_bytes > self.max_bytes and self.qsize() > 1:
+            dropped = self.get_nowait()
+            if dropped is None:
+                # EOF sentinel must survive; re-queue it behind the remaining
+                # data (the consumer stops at None wherever it sits).
+                super().put_nowait(None)
+                return
+            _logger.debug(
+                "terminal output queue saturated (%d queued bytes); dropped %d-byte chunk",
+                self.queued_bytes,
+                len(dropped),
+            )
 
 
 def _pump_pty_chunks(
@@ -494,15 +485,15 @@ def _pump_pty_chunks(
             chunk = os.read(fd, _PTY_READ_CHUNK)
             if not chunk:
                 loop.remove_reader(fd)
-                _put_output_chunk(queue, None)
+                queue.put_nowait(None)
                 return
-            _put_output_chunk(queue, chunk)
+            queue.put_nowait(chunk)
     except BlockingIOError:
         return
     except OSError:
         with contextlib.suppress(ValueError):
             loop.remove_reader(fd)
-        _put_output_chunk(queue, None)
+        queue.put_nowait(None)
 
 
 async def _forward_pty_to_ws(

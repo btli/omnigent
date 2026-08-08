@@ -811,8 +811,7 @@ def _retire_session_writer(session: RunnerSession, *, code: int, reason: str) ->
         except asyncio.QueueFull:
             # A retired session's pending frames are already dead (in-flight
             # requests were aborted) — make room so the stop sentinel lands.
-            with contextlib.suppress(asyncio.QueueEmpty):
-                session.outbound_queue.get_nowait()
+            session.outbound_queue.get_nowait()
             session.outbound_queue.put_nowait(None)
         close = getattr(session.ws, "close", None)
         if close is not None:

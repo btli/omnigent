@@ -1598,19 +1598,19 @@ async def test_check_pane_dead_definitive_tri_state(
 # ── Output-queue backpressure ────────────────────────────
 
 
-def test_put_output_chunk_drops_oldest_past_byte_cap() -> None:
+def test_bounded_output_queue_drops_oldest_past_byte_cap() -> None:
     """A saturated bounded output queue sheds the OLDEST chunks.
 
     Terminal bytes are lossy-safe (the next repaint restores the screen),
     so when the browser send is wedged and the backlog passes the byte cap,
     the freshest output must win and total queued bytes must stay bounded.
     """
-    from omnigent.terminals.ws_bridge import _ByteBoundedOutputQueue, _put_output_chunk
+    from omnigent.terminals.ws_bridge import _ByteBoundedOutputQueue
 
     queue = _ByteBoundedOutputQueue(max_bytes=10)
-    _put_output_chunk(queue, b"aaaa")
-    _put_output_chunk(queue, b"bbbb")
-    _put_output_chunk(queue, b"cccc")  # 12 bytes queued -> oldest drops
+    queue.put_nowait(b"aaaa")
+    queue.put_nowait(b"bbbb")
+    queue.put_nowait(b"cccc")  # 12 bytes queued -> oldest drops
 
     assert queue.queued_bytes <= 10
     remaining = [queue.get_nowait() for _ in range(queue.qsize())]
@@ -1618,31 +1618,21 @@ def test_put_output_chunk_drops_oldest_past_byte_cap() -> None:
     assert queue.queued_bytes == 0  # _get accounting drains with the items
 
 
-def test_put_output_chunk_never_drops_eof_sentinel() -> None:
+def test_bounded_output_queue_never_drops_eof_sentinel() -> None:
     """The None EOF sentinel survives saturation (re-queued, not dropped).
 
     Losing the sentinel would leave the forwarder blocked on get() forever
     after the reader exits.
     """
-    from omnigent.terminals.ws_bridge import _ByteBoundedOutputQueue, _put_output_chunk
+    from omnigent.terminals.ws_bridge import _ByteBoundedOutputQueue
 
     queue = _ByteBoundedOutputQueue(max_bytes=4)
     queue.put_nowait(None)  # sentinel at the front of an over-cap backlog
-    _put_output_chunk(queue, b"xxxxxxxx")
+    queue.put_nowait(b"xxxxxxxx")
 
     remaining = [queue.get_nowait() for _ in range(queue.qsize())]
     assert None in remaining
     assert b"xxxxxxxx" in remaining
-
-
-def test_put_output_chunk_passthrough_for_plain_queue() -> None:
-    """Plain (unbounded) queues get no drop policy — every chunk lands."""
-    from omnigent.terminals.ws_bridge import _put_output_chunk
-
-    queue: asyncio.Queue[bytes | None] = asyncio.Queue()
-    for _ in range(64):
-        _put_output_chunk(queue, b"x" * 1024)
-    assert queue.qsize() == 64
 
 
 @pytest.mark.asyncio
