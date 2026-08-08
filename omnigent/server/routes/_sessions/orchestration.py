@@ -72,6 +72,7 @@ from omnigent.runner.subagent_routing import (
     subagent_routing_enabled,
 )
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.runtime import (
     get_policy_store,
     inflight_text,
@@ -5728,11 +5729,28 @@ async def _runner_drop_interrupted_turn(
     return conv.live_status in _MID_TURN_STATUSES
 
 
+def _is_tunnel_transition_error(exc: BaseException) -> bool:
+    """True for bare tunnel close/replacement ConnectionErrors (not httpx)."""
+    return isinstance(exc, ConnectionError) and not isinstance(exc, httpx.HTTPError)
+
+
+def _runner_tunnel_alive(runner_client: httpx.AsyncClient, runner_id: str | None) -> bool:
+    """True when ``runner_id`` is still registered on a WS tunnel transport."""
+    if runner_id is None:
+        return False
+    transport = runner_client._transport
+    if not isinstance(transport, WSTunnelTransport):
+        return False
+    return transport._registry.get(runner_id) is not None
+
+
 async def _relay_runner_stream(
     session_id: str,
     runner_client: httpx.AsyncClient,
     conversation_store: ConversationStore,
     ready: asyncio.Event | None = None,
+    *,
+    runner_id: str | None = None,
 ) -> None:
     """
     Run the runner-stream relay, riding out transient tunnel drops.
@@ -5759,6 +5777,9 @@ async def _relay_runner_stream(
         extracted from the runner's SSE stream.
     :param ready: Optional event set once the runner stream emits its
         ready heartbeat; see :func:`_relay_runner_stream_once`.
+    :param runner_id: Bound runner id used to distinguish a live-tunnel
+        stream loss from tunnel close/replacement, e.g.
+        ``"runner_abc123"``. ``None`` skips the live-tunnel check.
     """
     loop = asyncio.get_running_loop()
     deadline: float | None = None
@@ -5770,6 +5791,7 @@ async def _relay_runner_stream(
                 runner_client,
                 conversation_store,
                 ready,
+                runner_id=runner_id,
             )
             return
         except _RelayTransportLost as lost:
@@ -5787,13 +5809,12 @@ async def _relay_runner_stream(
                 )
                 await asyncio.sleep(_RELAY_RETRY_INTERVAL_S)
                 continue
-            _logger.warning(
-                "Relay: runner transport lost for session=%s",
-                session_id,
-                exc_info=True,
-                extra={"session_id": session_id},
-            )
             if lost.intentional:
+                _logger.warning(
+                    "Relay: runner transport lost for session=%s",
+                    session_id,
+                    exc_info=True,
+                )
                 # User clicked Stop: the Stop handler brought this runner's
                 # tunnel down on purpose (see _stop_session_host_runner), so
                 # the drop is expected — not a failure. Publish a quiet idle
@@ -5843,10 +5864,20 @@ async def _relay_runner_stream(
                         code="session_stream_lost",
                         message="Session stream lost unexpectedly.",
                     )
+                    _logger.warning(
+                        "Relay: session stream lost for session=%s",
+                        session_id,
+                        exc_info=True,
+                    )
                 else:
                     disconnect_error = ErrorDetail(
                         code="runner_disconnected",
                         message="Runner disconnected unexpectedly.",
+                    )
+                    _logger.warning(
+                        "Relay: runner transport lost for session=%s",
+                        session_id,
+                        exc_info=True,
                     )
                 _publish_status(session_id, "failed", disconnect_error)
                 # Persist the disconnect cause as durable labels so the
@@ -5871,6 +5902,8 @@ async def _relay_runner_stream_once(
     runner_client: httpx.AsyncClient,
     conversation_store: ConversationStore,
     ready: asyncio.Event | None = None,
+    *,
+    runner_id: str | None = None,
 ) -> None:
     """
     Subscribe to the runner's SSE stream and relay events locally.
@@ -5897,6 +5930,9 @@ async def _relay_runner_stream_once(
         slot is registered. ``None`` is accepted for direct unit tests
         that exercise relay parsing/persistence without asserting on
         startup readiness.
+    :param runner_id: Bound runner id used to distinguish a live-tunnel
+        stream loss from tunnel close/replacement, e.g.
+        ``"runner_abc123"``. ``None`` skips the live-tunnel check.
     """
     text_acc: list[str] = []
     current_response_id: str | None = None
@@ -6343,22 +6379,21 @@ async def _relay_runner_stream_once(
                     session_stream.publish(session_id, event)
 
     except (httpx.HTTPError, ConnectionError) as exc:
-        # WSTunnelTransport raises bare ConnectionError on tunnel close;
-        # treat the same as HTTPError. The finally below consumes the
-        # intentional-stop marker, so snapshot it now for the supervisor's
-        # retry-vs-quiet-exit decision.
-        # Tunnel loss deregisters first; stream errors with a live
-        # tunnel are not runner disconnect — snapshot the tunnel state
-        # per attempt for the supervisor's terminal attribution.
-        transport = getattr(runner_client, "_transport", None)
-        registry = getattr(transport, "_registry", None)
-        runner_id = getattr(transport, "_runner_id", None)
+        # WSTunnelTransport raises bare ConnectionError on tunnel
+        # close/replacement; treat the same as HTTPError. The finally
+        # below consumes the intentional-stop marker, so snapshot it now
+        # for the supervisor's retry-vs-quiet-exit decision.
+        # Bare ConnectionError is tunnel close or newest-wins
+        # replacement (new tunnel already registered) — keep those
+        # as runner_disconnected so reconnect recovery can clear them.
+        # Only a non-connect HTTPError with the tunnel still up is
+        # session_stream_lost.
         raise _RelayTransportLost(
             intentional=session_id in _intentional_stop_sessions,
             stream_lost=(
-                registry is not None
-                and runner_id is not None
-                and registry.get(runner_id) is not None
+                not _is_tunnel_transition_error(exc)
+                and not isinstance(exc, httpx.ConnectError)
+                and _runner_tunnel_alive(runner_client, runner_id)
             ),
         ) from exc
     except asyncio.CancelledError:
@@ -6460,6 +6495,7 @@ def _ensure_runner_relay(
             runner_client,
             relay_store,
             ready,
+            runner_id=runner_id,
         ),
         name=f"runner-relay-{session_id}",
     )
