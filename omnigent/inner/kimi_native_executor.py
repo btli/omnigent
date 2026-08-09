@@ -32,7 +32,11 @@ from omnigent.inner.executor import (
     ToolSpec,
     TurnComplete,
 )
-from omnigent.kimi_native_bridge import BRIDGE_DIR_ENV_VAR, inject_user_message
+from omnigent.kimi_native_bridge import (
+    BRIDGE_DIR_ENV_VAR,
+    KimiApprovalPendingError,
+    inject_user_message,
+)
 
 logger = logging.getLogger(__name__)
 _STEERING_READY_TIMEOUT_S = 30.0
@@ -71,7 +75,9 @@ class KimiNativeExecutor(Executor):
         if not text:
             return False
         try:
-            await self._inject_message(text, timeout_s=_STEERING_READY_TIMEOUT_S)
+            await self._inject_message(
+                text, timeout_s=_STEERING_READY_TIMEOUT_S, turn_streaming=True
+            )
         except RuntimeError as exc:
             logger.warning("Kimi native steering message was not delivered: %s", exc)
             return False
@@ -92,12 +98,21 @@ class KimiNativeExecutor(Executor):
             return
         try:
             await self._inject_message(text)
+        except KimiApprovalPendingError as exc:
+            yield ExecutorError(message=str(exc), retryable=True)
+            return
         except RuntimeError as exc:
             yield ExecutorError(message=str(exc))
             return
         yield TurnComplete(response=None)
 
-    async def _inject_message(self, text: str, *, timeout_s: float | None = None) -> None:
+    async def _inject_message(
+        self,
+        text: str,
+        *,
+        timeout_s: float | None = None,
+        turn_streaming: bool = False,
+    ) -> None:
         cancel_event = threading.Event()
         async with self._inject_lock:
             injection = asyncio.create_task(
@@ -106,6 +121,7 @@ class KimiNativeExecutor(Executor):
                     self._bridge_dir,
                     content=text,
                     cancel_event=cancel_event,
+                    turn_streaming=turn_streaming,
                     **({"timeout_s": timeout_s} if timeout_s is not None else {}),
                 )
             )

@@ -20,6 +20,8 @@ import subprocess
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 from omnigent._platform import stable_user_id
@@ -39,6 +41,7 @@ _HOOK_CONFIG_FILE = "hook_config.json"
 _TMUX_READY_TIMEOUT_S = 30.0
 _KIMI_READY_TIMEOUT_S = 120.0
 _TMUX_SEND_TIMEOUT_S = 5.0
+_CAPTURE_HISTORY_LINES = 200
 _POLL_INTERVAL_S = 0.15
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
 _PASTE_BUFFER = "omnigent-kimi-paste"
@@ -78,6 +81,35 @@ class KimiApprovalPromptNotFoundError(RuntimeError):
 
 class KimiApprovalPendingError(RuntimeError):
     """A Kimi permission menu must be resolved before another message is sent."""
+
+
+class _PaneRowKind(str, Enum):
+    INSIDE_EDITOR = "inside-editor"
+    MENU_CHROME = "menu-chrome"
+    TRANSCRIPT = "transcript"
+
+
+@dataclass(frozen=True)
+class _KimiPaneState:
+    lines: tuple[str, ...]
+    row_kinds: tuple[_PaneRowKind, ...]
+    editor_bounds: tuple[int, int] | None
+    input_line: str | None
+    input_content: str | None
+    footer_visible: bool
+    menu_visible: bool
+    menu_start: int | None
+    trust_visible: bool
+    exit_armed: bool
+    turn_streaming: bool
+
+    @property
+    def editor_present(self) -> bool:
+        return self.input_line is not None
+
+    @property
+    def ready(self) -> bool:
+        return self.editor_present and self.footer_visible and not self.menu_visible
 
 
 def bridge_dir_for_session_id(session_id: str) -> Path:
@@ -242,10 +274,20 @@ def _run_tmux(socket_path: str, *args: str) -> None:
 
 
 def _capture_pane(socket_path: str, tmux_target: str) -> str:
-    """Capture the visible pane contents; ``""`` on any failure (treat as not-ready)."""
+    """Capture the pane and recent history; ``""`` on any failure."""
     try:
         proc = subprocess.run(
-            ["tmux", "-S", socket_path, "capture-pane", "-p", "-t", tmux_target],
+            [
+                "tmux",
+                "-S",
+                socket_path,
+                "capture-pane",
+                "-p",
+                "-S",
+                f"-{_CAPTURE_HISTORY_LINES}",
+                "-t",
+                tmux_target,
+            ],
             check=False,
             capture_output=True,
             text=True,
@@ -291,6 +333,11 @@ def _session_alive(socket_path: str, tmux_target: str) -> bool:
 
 def _submit_needle(content: str) -> str:
     """A stable single-line substring used to confirm the paste rendered in the pane."""
+    first_line = _submit_first_line(content)
+    return first_line[:_DRAFT_NEEDLE_MAX_CHARS] if len(first_line) >= 4 else ""
+
+
+def _submit_first_line(content: str) -> str:
     normalized = content.replace("\r\n", "\n").replace("\r", "\n")
     for line in normalized.splitlines():
         stripped = line.strip()
@@ -300,8 +347,21 @@ def _submit_needle(content: str) -> str:
             if ord(character) < 0x20:
                 stripped = stripped[:char_index]
                 break
-        return stripped[:_DRAFT_NEEDLE_MAX_CHARS] if len(stripped) >= 4 else ""
+        return stripped
     return ""
+
+
+def _is_input_box_marker_line(line: str) -> bool:
+    stripped = line.strip()
+    if not (stripped.startswith("│") and stripped.endswith("│")):
+        return False
+    body = stripped[1:-1]
+    return any(body.startswith(f" {marker}") for marker in _INPUT_BOX_MARKERS)
+
+
+def _is_box_row(line: str) -> bool:
+    stripped = line.strip()
+    return stripped.startswith("│") and stripped.endswith("│")
 
 
 def _input_box_frame_bounds(pane: str) -> tuple[int, int] | None:
@@ -312,92 +372,161 @@ def _input_box_frame_bounds(pane: str) -> tuple[int, int] | None:
         stripped = line.strip()
         if stripped.startswith("╭") and stripped.endswith("╮"):
             frame_start = line_index
-        elif frame_start is not None and stripped.startswith("╰") and stripped.endswith("╯"):
-            frame = lines[frame_start : line_index + 1]
-            if any(_is_input_box_marker_line(frame_line) for frame_line in frame):
-                match = (frame_start, line_index)
-            frame_start = None
+            continue
+        if not (stripped.startswith("╰") and stripped.endswith("╯")):
+            continue
+        if frame_start is None:
+            frame_start = line_index
+            while frame_start > 0 and _is_box_row(lines[frame_start - 1]):
+                frame_start -= 1
+        frame = lines[frame_start : line_index + 1]
+        if any(_is_input_box_marker_line(frame_line) for frame_line in frame):
+            match = (frame_start, line_index)
+        frame_start = None
     return match
 
 
-def _input_box_lines(pane: str) -> list[str]:
-    bounds = _input_box_frame_bounds(pane)
-    if bounds is None:
-        return []
-    return pane.splitlines()[bounds[0] : bounds[1] + 1]
+def _input_content_from_line(line: str | None) -> str | None:
+    if line is None:
+        return None
+    body = line.strip()[1:-1]
+    for marker in _INPUT_BOX_MARKERS:
+        prefix = f" {marker}"
+        if body.startswith(prefix):
+            return body[len(prefix) :].strip()
+    return None
 
 
-def _is_input_box_marker_line(line: str) -> bool:
-    stripped = line.strip()
-    if not (stripped.startswith("│") and stripped.endswith("│")):
+def _permission_option_row(line: str) -> bool:
+    marker_positions = [
+        line.find(marker) for marker in _PERMISSION_PROMPT_MARKERS if marker in line
+    ]
+    if not marker_positions:
         return False
-    return any(stripped[1:-1].lstrip().startswith(marker) for marker in _INPUT_BOX_MARKERS)
+    prefix = line[: min(marker_positions)].strip().lstrip("▶").strip()
+    return any(prefix.startswith(f"{number}.") for number in range(1, 5))
+
+
+def _parse_pane(pane: str, *, turn_streaming: bool = False) -> _KimiPaneState:
+    lines = tuple(pane.splitlines())
+    bounds = _input_box_frame_bounds(pane)
+    editor_indices = set(range(bounds[0], bounds[1] + 1)) if bounds is not None else set()
+    option_indices = {
+        index
+        for index, line in enumerate(lines)
+        if index not in editor_indices and _permission_option_row(line)
+    }
+    footer_indices = {
+        index
+        for index, line in enumerate(lines)
+        if index not in editor_indices and _PERMISSION_MENU_FOOTER_MARKER in line
+    }
+    header_indices = {
+        index
+        for index, line in enumerate(lines)
+        if index not in editor_indices and "Run this command?" in line
+    }
+    menu_visible = bool((footer_indices or header_indices) and len(option_indices) >= 2)
+    menu_indices: set[int] = set()
+    menu_start: int | None = None
+    if menu_visible:
+        first_option = min(option_indices)
+        menu_start = (
+            max(index for index in header_indices if index < first_option)
+            if any(index < first_option for index in header_indices)
+            else first_option
+        )
+        menu_end = max(footer_indices or option_indices)
+        menu_indices = set(range(menu_start, menu_end + 1)) - editor_indices
+    row_kinds = tuple(
+        _PaneRowKind.INSIDE_EDITOR
+        if index in editor_indices
+        else _PaneRowKind.MENU_CHROME
+        if index in menu_indices
+        else _PaneRowKind.TRANSCRIPT
+        for index in range(len(lines))
+    )
+    input_line = None
+    if bounds is not None:
+        input_line = next(
+            (
+                lines[index]
+                for index in range(bounds[0], bounds[1] + 1)
+                if _is_input_box_marker_line(lines[index])
+            ),
+            None,
+        )
+    outside_lines = [
+        line for index, line in enumerate(lines) if row_kinds[index] != _PaneRowKind.INSIDE_EDITOR
+    ]
+    footer_visible = bool(
+        bounds is not None and any(_FOOTER_MARKERS[0] in line for line in lines[bounds[1] + 1 :])
+    )
+    trust_visible = any(_TRUST_HEADER in line for line in outside_lines) and any(
+        _TRUST_DESCRIPTION in line for line in outside_lines
+    )
+    exit_armed = any("Press Ctrl+C again to exit" in line for line in outside_lines)
+    return _KimiPaneState(
+        lines=lines,
+        row_kinds=row_kinds,
+        editor_bounds=bounds,
+        input_line=input_line,
+        input_content=_input_content_from_line(input_line),
+        footer_visible=footer_visible,
+        menu_visible=menu_visible,
+        menu_start=menu_start,
+        trust_visible=trust_visible,
+        exit_armed=exit_armed,
+        turn_streaming=turn_streaming,
+    )
 
 
 def _permission_prompt_visible(pane: str) -> bool:
-    lines = pane.splitlines()
-    has_chrome = _PERMISSION_MENU_FOOTER_MARKER in pane
-    visible_rows: set[int] = set()
-    for line_index, line in enumerate(lines):
-        marker_positions = [
-            line.find(marker) for marker in _PERMISSION_PROMPT_MARKERS if marker in line
-        ]
-        if not marker_positions:
-            continue
-        prefix = line[: min(marker_positions)].strip()
-        if any(character.isdigit() for character in prefix) and "." in prefix:
-            visible_rows.add(line_index)
-            has_chrome |= "▶" in prefix
-    return has_chrome and len(visible_rows) >= 2
+    return _parse_pane(pane).menu_visible
 
 
 def approval_prompt_visible(bridge_dir: Path) -> bool:
     info = read_tmux_info(bridge_dir)
     if info is None or not _session_alive(info["socket_path"], info["tmux_target"]):
         return False
-    return _permission_prompt_visible(_capture_pane(info["socket_path"], info["tmux_target"]))
+    pane = _capture_pane(info["socket_path"], info["tmux_target"])
+    return _parse_pane(pane).menu_visible
 
 
 def _trust_prompt_visible(pane: str) -> bool:
-    return _TRUST_HEADER in pane and _TRUST_DESCRIPTION in pane
+    return _parse_pane(pane).trust_visible
 
 
 def _input_box_line(pane: str) -> str | None:
-    """Return the latest framed line carrying a Kimi input marker."""
-    if _permission_prompt_visible(pane) or _trust_prompt_visible(pane):
-        return None
-    for line in reversed(_input_box_lines(pane)):
-        if _is_input_box_marker_line(line):
-            return line
-    return None
+    """Return the first framed line carrying a Kimi input marker."""
+    return _parse_pane(pane).input_line
 
 
 def _kimi_tui_ready(pane: str) -> bool:
     """Return whether both the Kimi input row and context footer are visible."""
-    bounds = _input_box_frame_bounds(pane)
-    if bounds is None or _input_box_line(pane) is None:
-        return False
-    return any(
-        marker in line for line in pane.splitlines()[bounds[1] + 1 :] for marker in _FOOTER_MARKERS
-    )
+    return _parse_pane(pane).ready
 
 
 def _input_box_content(pane: str) -> str | None:
-    line = _input_box_line(pane)
-    if line is None:
-        return None
-    stripped = line.strip()
-    body = stripped[1:-1]
-    marker_position, marker = min(
-        (body.find(marker), marker) for marker in _INPUT_BOX_MARKERS if marker in body
-    )
-    return body[marker_position + len(marker) :].strip()
+    return _parse_pane(pane).input_content
 
 
 def _draft_in_input_box(pane: str, needle: str) -> bool:
     """Return whether the pasted draft is visible after Kimi's input marker."""
-    content = _input_box_content(pane)
+    content = _parse_pane(pane).input_content
     return bool(needle and content is not None and needle in content)
+
+
+def _menu_matches_submission(state: _KimiPaneState, *, first_line: str) -> bool:
+    if state.input_line is not None:
+        if state.input_content == "":
+            return True
+    if state.menu_start is None or not first_line:
+        return False
+    return any(
+        state.row_kinds[index] == _PaneRowKind.TRANSCRIPT and first_line in line
+        for index, line in enumerate(state.lines[: state.menu_start])
+    )
 
 
 class _InjectionCancellation:
@@ -456,7 +585,7 @@ def _settle_pane(
     *,
     timeout_s: float,
     cancel_event: threading.Event | _InjectionCancellation | None = None,
-) -> None:
+) -> _KimiPaneState:
     """Wait until the Kimi input box is ready to receive a paste.
 
     Accepts the first-run trust modal (sends ``Enter`` at most once)
@@ -466,17 +595,17 @@ def _settle_pane(
     trust_accepted = False
     while True:
         _raise_if_injection_cancelled(cancel_event)
-        pane = _capture_pane(socket_path, tmux_target)
-        if _permission_prompt_visible(pane):
+        state = _parse_pane(_capture_pane(socket_path, tmux_target))
+        if state.menu_visible:
             raise KimiApprovalPendingError(
                 "Kimi approval is pending; resolve it in the terminal before sending "
                 "another message"
             )
-        if _kimi_tui_ready(pane):
-            return
+        if state.ready:
+            return state
         # One-shot, only when no input marker is up (so a later transcript that
         # merely echoes the phrase can't spray repeated keystrokes into the TUI).
-        if not trust_accepted and _trust_prompt_visible(pane):
+        if not trust_accepted and state.trust_visible:
             _raise_if_injection_cancelled(cancel_event)
             trust_accepted = True
             with contextlib.suppress(RuntimeError):
@@ -496,6 +625,7 @@ def inject_user_message(
     content: str,
     timeout_s: float = _KIMI_READY_TIMEOUT_S,
     cancel_event: threading.Event | None = None,
+    turn_streaming: bool = False,
 ) -> None:
     """Deliver a web-UI user message into the Kimi TUI via a tmux bracketed paste.
 
@@ -507,6 +637,7 @@ def inject_user_message(
     :param content: User text (non-empty).
     :param timeout_s: Kimi TUI readiness timeout; override for slow boots.
     :param cancel_event: Optional cancellation flag checked before delivery.
+    :param turn_streaming: True when Kimi is already streaming and queues input.
     :raises RuntimeError: If the tmux target is never advertised or a tmux
         command fails.
     """
@@ -528,11 +659,53 @@ def inject_user_message(
             raise RuntimeError(
                 "kimi terminal is no longer running (the TUI exited); restart the session"
             )
-        _settle_pane(socket_path, tmux_target, timeout_s=timeout_s, cancel_event=cancellation)
-        # Kimi clears an editor draft with one Ctrl-C; a second press is the exit path.
-        _raise_if_injection_cancelled(cancellation)
-        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-c")
-        _raise_if_injection_cancelled(cancellation)
+        _settle_pane(
+            socket_path,
+            tmux_target,
+            timeout_s=timeout_s,
+            cancel_event=cancellation,
+        )
+        state = _parse_pane(_capture_pane(socket_path, tmux_target), turn_streaming=turn_streaming)
+        if state.menu_visible:
+            raise KimiApprovalPendingError(
+                "Kimi approval is pending; resolve it in the terminal before sending "
+                "another message"
+            )
+        if state.trust_visible:
+            raise KimiTuiNotReadyError(
+                "Kimi trust prompt appeared before the message could be submitted; "
+                "resolve it in the terminal and retry."
+            )
+        if not state.editor_present:
+            raise KimiTuiNotReadyError(
+                "Kimi TUI input box disappeared before the message could be submitted; "
+                "the message was not delivered"
+            )
+        if state.input_content and state.exit_armed:
+            raise RuntimeError(
+                "Kimi terminal is exit-armed with an unsent draft; press Escape and retry"
+            )
+        if state.input_content and not state.turn_streaming:
+            _raise_if_injection_cancelled(cancellation)
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-c")
+            _raise_if_injection_cancelled(cancellation)
+            state = _parse_pane(
+                _capture_pane(socket_path, tmux_target), turn_streaming=turn_streaming
+            )
+            if state.menu_visible:
+                raise KimiApprovalPendingError(
+                    "Kimi approval is pending; resolve it in the terminal before sending "
+                    "another message"
+                )
+            if state.trust_visible:
+                raise KimiTuiNotReadyError(
+                    "Kimi trust prompt appeared while clearing the draft; "
+                    "resolve it in the terminal and retry."
+                )
+            if not state.editor_present or state.input_content != "":
+                raise RuntimeError(
+                    "Kimi TUI did not clear the existing draft; the message was not delivered"
+                )
         with tempfile.NamedTemporaryFile(
             dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
         ) as paste_file:
@@ -543,6 +716,19 @@ def inject_user_message(
             _raise_if_injection_cancelled(cancellation)
             _run_tmux(socket_path, "load-buffer", "-b", _PASTE_BUFFER, paste_path)
             _raise_if_injection_cancelled(cancellation)
+            state = _parse_pane(
+                _capture_pane(socket_path, tmux_target), turn_streaming=turn_streaming
+            )
+            if state.menu_visible:
+                raise KimiApprovalPendingError(
+                    "Kimi approval is pending; resolve it in the terminal before sending "
+                    "another message"
+                )
+            if state.trust_visible or not state.editor_present:
+                raise KimiTuiNotReadyError(
+                    "Kimi TUI input box disappeared before the message could be submitted; "
+                    "the message was not delivered"
+                )
             _run_tmux(
                 socket_path,
                 "paste-buffer",
@@ -557,24 +743,26 @@ def inject_user_message(
             with contextlib.suppress(OSError):
                 os.unlink(paste_path)
         needle = _submit_needle(content)
+        first_line = _submit_first_line(content)
         draft_seen = False
-        deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
-        while time.monotonic() < deadline:
+        paste_deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+        while time.monotonic() < paste_deadline:
             _raise_if_injection_cancelled(cancellation)
-            pane = _capture_pane(socket_path, tmux_target)
-            if _permission_prompt_visible(pane):
+            state = _parse_pane(
+                _capture_pane(socket_path, tmux_target), turn_streaming=turn_streaming
+            )
+            if state.menu_visible:
                 raise KimiApprovalPendingError(
                     "Kimi approval is pending; resolve it in the terminal before sending "
                     "another message"
                 )
-            if _trust_prompt_visible(pane):
+            if state.trust_visible:
                 raise KimiTuiNotReadyError(
                     "Kimi trust prompt appeared before the message could be submitted; "
                     "resolve it in the terminal and retry."
                 )
-            input_content = _input_box_content(pane)
-            if input_content is not None and (
-                (needle and needle in input_content) or (not needle and input_content)
+            if state.input_content is not None and (
+                (needle and needle in state.input_content) or (not needle and state.input_content)
             ):
                 draft_seen = True
                 break
@@ -585,41 +773,47 @@ def inject_user_message(
                 "the message was not delivered"
             )
         time.sleep(_PASTE_SETTLE_S)
-        deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
-        while time.monotonic() < deadline:
+        submit_deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
+        while time.monotonic() < submit_deadline:
             _raise_if_injection_cancelled(cancellation)
-            pane = _capture_pane(socket_path, tmux_target)
-            if _permission_prompt_visible(pane):
+            state = _parse_pane(
+                _capture_pane(socket_path, tmux_target), turn_streaming=turn_streaming
+            )
+            if state.menu_visible:
                 raise KimiApprovalPendingError(
                     "Kimi approval is pending; resolve it in the terminal before sending "
                     "another message"
                 )
-            if _trust_prompt_visible(pane):
+            if state.trust_visible:
                 raise KimiTuiNotReadyError(
                     "Kimi trust prompt appeared before the message could be submitted; "
                     "resolve it in the terminal and retry."
                 )
-            input_content = _input_box_content(pane)
-            if input_content is not None and (
-                (needle and needle in input_content) or (not needle and input_content)
+            if state.input_content is not None and (
+                (needle and needle in state.input_content) or (not needle and state.input_content)
             ):
                 _raise_if_injection_cancelled(cancellation)
-                pane = _capture_pane(socket_path, tmux_target)
-                if _permission_prompt_visible(pane):
+                state = _parse_pane(
+                    _capture_pane(socket_path, tmux_target), turn_streaming=turn_streaming
+                )
+                if state.menu_visible:
                     raise KimiApprovalPendingError(
                         "Kimi approval is pending; resolve it in the terminal before sending "
                         "another message"
                     )
-                if _trust_prompt_visible(pane):
+                if state.trust_visible:
                     raise KimiTuiNotReadyError(
                         "Kimi trust prompt appeared before the message could be submitted; "
                         "resolve it in the terminal and retry."
                     )
-                input_content = _input_box_content(pane)
-                if input_content is not None and (
-                    (needle and needle in input_content) or (not needle and input_content)
+                if (
+                    state.input_content is not None
+                    and (
+                        (needle and needle in state.input_content)
+                        or (not needle and state.input_content)
+                    )
+                    and not state.exit_armed
                 ):
-                    # The menu can replace the editor between polls, so recheck before Enter.
                     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
                     break
             time.sleep(_POLL_INTERVAL_S)
@@ -629,35 +823,52 @@ def inject_user_message(
                 "the message was not delivered"
             )
         last_enter = time.monotonic()
-        while time.monotonic() < deadline:
+        while time.monotonic() < submit_deadline:
             time.sleep(_POLL_INTERVAL_S)
             _raise_if_injection_cancelled(cancellation)
-            pane = _capture_pane(socket_path, tmux_target)
-            if _permission_prompt_visible(pane):
-                return
-            if _trust_prompt_visible(pane):
+            state = _parse_pane(
+                _capture_pane(socket_path, tmux_target), turn_streaming=turn_streaming
+            )
+            if state.menu_visible:
+                if _menu_matches_submission(state, first_line=first_line):
+                    return
+                raise KimiApprovalPendingError(
+                    "Kimi approval is pending before this message was submitted; "
+                    "resolve it in the terminal before sending another message"
+                )
+            if state.trust_visible:
                 raise KimiTuiNotReadyError(
                     "Kimi trust prompt appeared while submitting the message; "
                     "resolve it in the terminal and retry."
                 )
-            input_content = _input_box_content(pane)
-            if input_content is not None and (
-                (needle and draft_seen and needle not in input_content)
-                or (not needle and draft_seen and not input_content)
+            if state.exit_armed:
+                raise RuntimeError("Kimi terminal is exit-armed; press Escape and retry")
+            if state.input_content is not None and (
+                (needle and draft_seen and needle not in state.input_content)
+                or (not needle and draft_seen and not state.input_content)
             ):
                 return
             if time.monotonic() - last_enter < _SUBMIT_RETRY_INTERVAL_S:
                 continue
             _raise_if_injection_cancelled(cancellation)
-            pane = _capture_pane(socket_path, tmux_target)
-            if _permission_prompt_visible(pane):
-                return
-            if _trust_prompt_visible(pane):
+            state = _parse_pane(
+                _capture_pane(socket_path, tmux_target), turn_streaming=turn_streaming
+            )
+            if state.menu_visible:
+                if _menu_matches_submission(state, first_line=first_line):
+                    return
+                raise KimiApprovalPendingError(
+                    "Kimi approval is pending before this message was submitted; "
+                    "resolve it in the terminal before sending another message"
+                )
+            if state.trust_visible:
                 raise KimiTuiNotReadyError(
                     "Kimi trust prompt appeared while submitting the message; "
                     "resolve it in the terminal and retry."
                 )
-            if _input_box_content(pane) is None:
+            if state.exit_armed:
+                raise RuntimeError("Kimi terminal is exit-armed; press Escape and retry")
+            if not state.editor_present:
                 continue
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             last_enter = time.monotonic()
@@ -717,13 +928,17 @@ def inject_approval_keystroke(
         _logger.warning(message)
         raise KimiApprovalPromptNotFoundError(message)
     pane = _capture_pane(socket_path, tmux_target)
-    if not _permission_prompt_visible(pane):
+    if not _parse_pane(pane).menu_visible:
         message = "Kimi permission menu markers missing; approval keystroke was not sent"
         _logger.warning("%s; pane tail=%r", message, pane[-240:])
         raise KimiApprovalPromptNotFoundError(message)
     # ``key`` is a single documented option digit; Enter confirms (the footer
     # lists "choose" and "confirm" separately, so a digit selects and ↵ commits).
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, key)
+    if not _parse_pane(_capture_pane(socket_path, tmux_target)).menu_visible:
+        message = "Kimi permission menu disappeared before confirmation; Enter was not sent"
+        _logger.warning(message)
+        raise KimiApprovalPromptNotFoundError(message)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     return True
 

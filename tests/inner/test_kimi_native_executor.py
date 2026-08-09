@@ -170,7 +170,29 @@ async def test_steering_uses_short_readiness_budget_and_logs_drop(
     monkeypatch.setattr(kimi_native_executor, "inject_user_message", _fail)
     assert await KimiNativeExecutor(tmp_path).enqueue_session_message("session", "steer") is False
     assert seen["timeout_s"] == 30.0
+    assert seen["turn_streaming"] is True
     assert "steering message was not delivered" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_run_turn_marks_approval_pending_retryable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def _fail(*_args: object, **_kwargs: object) -> None:
+        raise kimi_native_bridge.KimiApprovalPendingError("resolve approval and retry")
+
+    monkeypatch.setattr(kimi_native_executor, "inject_user_message", _fail)
+    events = [
+        event
+        async for event in KimiNativeExecutor(tmp_path).run_turn(
+            messages=[{"role": "user", "content": "hello"}],
+            tools=[],
+            system_prompt="ignored",
+        )
+    ]
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert events[0].retryable is True
 
 
 class TestPastePayload:
@@ -216,16 +238,28 @@ class TestApprovalKeystroke:
     the permission-menu marker so a stray verdict can't leak a keystroke."""
 
     def _stub_tmux(
-        self, monkeypatch: pytest.MonkeyPatch, *, pane: str, alive: bool = True
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        pane: str,
+        alive: bool = True,
+        after_key_pane: str | None = None,
     ) -> list[tuple[str, ...]]:
         sent: list[tuple[str, ...]] = []
+        captures = [pane]
+        if after_key_pane is not None:
+            captures.append(after_key_pane)
         monkeypatch.setattr(
             kimi_native_bridge,
             "_wait_for_tmux_info",
             lambda bridge_dir, *, timeout_s: {"socket_path": "/s", "tmux_target": "main"},
         )
         monkeypatch.setattr(kimi_native_bridge, "_session_alive", lambda s, t: alive)
-        monkeypatch.setattr(kimi_native_bridge, "_capture_pane", lambda s, t: pane)
+        monkeypatch.setattr(
+            kimi_native_bridge,
+            "_capture_pane",
+            lambda s, t: captures.pop(0) if len(captures) > 1 else captures[0],
+        )
         monkeypatch.setattr(
             kimi_native_bridge,
             "_run_tmux",
@@ -254,10 +288,22 @@ class TestApprovalKeystroke:
     def test_matches_alternate_menu_markers(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, marker: str
     ) -> None:
-        pane = f"▶ 2. {marker}\n  1. Approve once"
+        pane = f"▶ 2. {marker}\n  1. Approve once\n↑/↓ select · 1/2/3/4 choose · ↵ confirm"
         sent = self._stub_tmux(monkeypatch, pane=pane)
         assert inject_approval_keystroke(tmp_path, key=APPROVE_KEY) is True
         assert sent[-1] == ("send-keys", "-t", "main", "Enter")
+
+    def test_does_not_confirm_after_menu_disappears(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sent = self._stub_tmux(
+            monkeypatch,
+            pane=_fixture("approval_menu.txt"),
+            after_key_pane="✨ approved transcript",
+        )
+        with pytest.raises(kimi_native_bridge.KimiApprovalPromptNotFoundError, match="Enter"):
+            inject_approval_keystroke(tmp_path, key=APPROVE_KEY)
+        assert sent == [("send-keys", "-t", "main", APPROVE_KEY)]
 
     @pytest.mark.parametrize(
         "marker", ["Approve once", "Approve for this session", "Reject", "Reject with feedback"]
@@ -332,6 +378,33 @@ class TestSettlePaneReadiness:
         submitted = _fixture("draft_submitted.txt")
         assert kimi_native_bridge._draft_in_input_box(draft, "literal $ and ✨ marker")
         assert not kimi_native_bridge._draft_in_input_box(submitted, "literal $ and ✨ marker")
+
+    def test_editor_frame_context_ignores_menu_text_and_anchors_first_marker(self) -> None:
+        pane = "\n".join(
+            [
+                " ╭────────────────────╮",
+                " │ > first draft line │",
+                " │   ▶ 1. Approve once │",
+                " │   2. Reject with feedback │",
+                " ╰────────────────────╯",
+                " context: 0%",
+            ]
+        )
+        state = kimi_native_bridge._parse_pane(pane)
+        assert state.ready
+        assert not state.menu_visible
+        assert state.input_content == "first draft line"
+
+    def test_editor_frame_without_top_border_remains_ready(self) -> None:
+        pane = "\n".join(
+            [
+                " │ > first draft line │",
+                " │   second line │",
+                " ╰────────────────────╯",
+                " context: 0%",
+            ]
+        )
+        assert kimi_native_bridge._kimi_tui_ready(pane)
 
     def test_settle_waits_for_both_markers(self, monkeypatch: pytest.MonkeyPatch) -> None:
         captures = {"n": 0}
@@ -430,10 +503,13 @@ class TestUserMessageInjection:
         *,
         submit_after_enters: int | None,
         content: str = "fix the flaky test",
+        initial_content: str = "",
         empty_captures_after_submit: int = 0,
         post_paste_captures: tuple[str, ...] = (),
         post_submit_captures: tuple[str, ...] = (),
         raise_on_enter: bool = False,
+        pre_clear_captures: tuple[str, ...] = (),
+        clear_verifies: bool = True,
     ) -> list[tuple[str, ...]]:
         def _editor_pane(text: str) -> str:
             rows = text.splitlines() or [""]
@@ -451,12 +527,13 @@ class TestUserMessageInjection:
         bridge_dir.mkdir()
         write_tmux_target(bridge_dir, socket_path=Path("/tmp/x/tmux.sock"), tmux_target="main")
         sent: list[tuple[str, ...]] = []
-        tui = {"pane": "alice✨ "}
+        tui = {"pane": _editor_pane(initial_content)}
         enters = {"count": 0}
         empty_captures = {"count": 0}
         pasted = {"value": False}
         post_paste = list(post_paste_captures)
         transient_captures = list(post_submit_captures)
+        pre_clear = list(pre_clear_captures)
 
         monkeypatch.setattr(
             kimi_native_bridge,
@@ -474,6 +551,8 @@ class TestUserMessageInjection:
         )
 
         def _capture_pane(_socket_path: str, _tmux_target: str) -> str:
+            if not pasted["value"] and pre_clear:
+                return pre_clear.pop(0)
             if pasted["value"] and enters["count"] == 0 and post_paste:
                 return post_paste.pop(0)
             if enters["count"] and transient_captures:
@@ -495,6 +574,8 @@ class TestUserMessageInjection:
             if "paste-buffer" in args:
                 pasted["value"] = True
                 tui["pane"] = _editor_pane(content)
+            elif args[-1] == "C-c":
+                tui["pane"] = _editor_pane("" if clear_verifies else "leftover draft")
             elif args[-1] == "Enter":
                 if raise_on_enter:
                     raise AssertionError("stale Enter reached the test menu")
@@ -563,15 +644,32 @@ class TestUserMessageInjection:
     def test_menu_after_enter_counts_as_submitted(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        menu_after_submit = "✨ run the command\n" + _fixture("menu_after_paste.txt")
         sent = self._stub_tui(
             monkeypatch,
             tmp_path,
             submit_after_enters=1,
             content="run the command",
-            post_submit_captures=(_fixture("menu_after_paste.txt"),),
+            post_submit_captures=(menu_after_submit,),
         )
         inject_user_message(tmp_path / "bridge", content="run the command")
         assert [args[-1] for args in sent if args[-1] == "Enter"] == ["Enter"]
+
+    def test_menu_after_enter_with_draft_still_visible_is_pending(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        menu_with_draft = _fixture("draft_pasted.txt") + "\n" + _fixture("approval_menu.txt")
+        self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=1,
+            content="run the command",
+            post_submit_captures=(menu_with_draft,),
+        )
+        with pytest.raises(
+            kimi_native_bridge.KimiApprovalPendingError, match="before this message"
+        ):
+            inject_user_message(tmp_path / "bridge", content="run the command")
 
     def test_final_pre_enter_capture_blocks_new_menu(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -620,10 +718,90 @@ class TestUserMessageInjection:
     def test_clears_draft_with_single_ctrl_c(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        sent = self._stub_tui(monkeypatch, tmp_path, submit_after_enters=1)
+        sent = self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=1,
+            initial_content="leftover draft",
+        )
         inject_user_message(tmp_path / "bridge", content="fix the flaky test")
         assert ("send-keys", "-t", "main", "C-c") in sent
         assert not any(args[-1] in {"C-a", "C-k"} for args in sent)
+
+    def test_does_not_clear_empty_editor(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        sent = self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=1,
+            content="new message",
+        )
+        inject_user_message(tmp_path / "bridge", content="new message")
+        assert not any(args[-1] == "C-c" for args in sent)
+
+    def test_streaming_injection_queues_without_clearing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        sent = self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=1,
+            content="steer now",
+            initial_content="leftover draft",
+        )
+        inject_user_message(tmp_path / "bridge", content="steer now", turn_streaming=True)
+        assert not any(args[-1] == "C-c" for args in sent)
+
+    def test_clear_must_be_verified_before_paste(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        sent = self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=1,
+            initial_content="leftover draft",
+            clear_verifies=False,
+        )
+        with pytest.raises(RuntimeError, match="did not clear"):
+            inject_user_message(tmp_path / "bridge", content="new message")
+        assert not any("paste-buffer" in args for args in sent)
+
+    def test_menu_race_before_clear_is_pending(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        sent = self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=1,
+            initial_content="leftover draft",
+            pre_clear_captures=(_fixture("approval_menu.txt"),),
+        )
+        with pytest.raises(kimi_native_bridge.KimiApprovalPendingError, match="approval"):
+            inject_user_message(tmp_path / "bridge", content="new message")
+        assert not any(args[-1] == "C-c" for args in sent)
+
+    def test_exit_armed_draft_is_not_cleared(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        pane = "\n".join(
+            [
+                " ╭────────────────────╮",
+                " │ > leftover draft │",
+                " ╰────────────────────╯",
+                " context: 0%",
+                " Press Ctrl+C again to exit",
+            ]
+        )
+        sent = self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=1,
+            pre_clear_captures=(pane,),
+        )
+        with pytest.raises(RuntimeError, match="exit-armed"):
+            inject_user_message(tmp_path / "bridge", content="new message")
+        assert not any(args[-1] == "C-c" for args in sent)
 
     def test_raises_when_submit_capture_stays_empty(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
