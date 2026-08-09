@@ -1651,27 +1651,41 @@ def test_bounded_output_queue_accounts_oversized_lone_chunk() -> None:
     assert queue.get_nowait() == b"xxxxxxxx"
 
 
-def test_bounded_output_queue_gap_close_resyncs_and_repaints() -> None:
-    """Closing a drop gap injects parser-resync bytes and fires on_gap_end.
+def test_bounded_output_queue_gap_close_injects_resync() -> None:
+    """Closing a drop gap injects parser-resync bytes before resuming output.
 
     The resync bytes (CAN + ST) unwedge a client parser left mid-escape by
-    the gap; the on_gap_end hook is how the bridge forces a full repaint.
+    the gap.
     """
     from omnigent.terminals.ws_bridge import _OUTPUT_GAP_RESYNC, _ByteBoundedOutputQueue
 
-    gap_ends: list[bool] = []
     queue = _ByteBoundedOutputQueue(max_bytes=8, max_items=100)
-    queue.on_gap_end = lambda: gap_ends.append(True)
     queue.put_nowait(b"aaaa")
     queue.put_nowait(b"bbbb")
     queue.put_nowait(b"cccc")  # dropped -> gap opens
-    assert gap_ends == []
 
     assert queue.get_nowait() == b"aaaa"  # consumer drains below budget
     assert queue.get_nowait() == b"bbbb"
     queue.put_nowait(b"dddd")  # gap closes: resync precedes resuming output
     assert [queue.get_nowait(), queue.get_nowait()] == [_OUTPUT_GAP_RESYNC, b"dddd"]
-    assert gap_ends == [True]
+
+
+def test_bounded_output_queue_requests_repaint_on_each_drop() -> None:
+    """The DROP itself fires the recovery hook, not a later accepted chunk.
+
+    A flood tail can be the last output for a long while; recovery waiting
+    on a future accepted chunk would leave the screen stale indefinitely.
+    """
+    from omnigent.terminals.ws_bridge import _ByteBoundedOutputQueue
+
+    drops: list[int] = []
+    queue = _ByteBoundedOutputQueue(max_bytes=4, max_items=100)
+    queue.on_drop = lambda: drops.append(1)
+    queue.put_nowait(b"aaaa")
+    queue.put_nowait(b"bbbb")  # dropped -> hook fires immediately
+    assert drops == [1]
+    queue.put_nowait(b"cc")  # dropped again -> fires again (repainter throttles)
+    assert drops == [1, 1]
 
 
 def test_bounded_output_queue_eof_sentinel_always_lands_last() -> None:
@@ -1754,6 +1768,68 @@ async def test_gap_repainter_cancel_drops_pending_repaint() -> None:
     repainter.cancel()
     await asyncio.sleep(0.15)
     assert len(runs) == 1, "cancelled pending repaint still fired"
+
+
+@pytest.mark.asyncio
+async def test_gap_repainter_parks_trailing_request_during_inflight_capture() -> None:
+    """A request while a capture is in flight parks ONE trailing run.
+
+    The in-flight capture may predate the event that requested it; skipping
+    the request would leave that gap stale forever if nothing else arrives.
+    """
+    from omnigent.terminals.ws_bridge import _GapRepainter
+
+    gate = asyncio.Event()
+    runs: list[int] = []
+
+    async def _repaint() -> None:
+        runs.append(1)
+        await gate.wait()
+
+    repainter = _GapRepainter(_repaint, min_interval_s=0.01)
+    repainter.request()
+    await asyncio.sleep(0.01)
+    assert runs == [1]  # capture 1 in flight, blocked on the gate
+
+    repainter.request()  # arrives mid-capture: must park, not vanish
+    gate.set()
+    await asyncio.sleep(0.1)
+    assert len(runs) == 2, "request during in-flight capture was lost"
+
+
+@pytest.mark.asyncio
+async def test_dropped_snapshot_leaves_a_parked_repaint() -> None:
+    """A recovery snapshot that is itself dropped re-requests recovery.
+
+    Otherwise the drop reopens the gap with nothing scheduled and the screen
+    stays stale until unrelated output happens to arrive.
+    """
+    from omnigent.terminals.ws_bridge import (
+        _OUTPUT_GAP_RESYNC,
+        _ByteBoundedOutputQueue,
+        _GapRepainter,
+    )
+
+    queue = _ByteBoundedOutputQueue(max_bytes=4, max_items=100)
+    runs: list[int] = []
+
+    async def _repaint() -> None:
+        runs.append(1)
+        queue.put_nowait(b"SNAPSHOT!")  # above the byte budget
+
+    repainter = _GapRepainter(_repaint, min_interval_s=0.05)
+    queue.on_drop = repainter.request
+
+    queue.put_nowait(b"aaaa")  # fills the budget
+    queue.put_nowait(b"bbbb")  # dropped -> repaint requested
+    await asyncio.sleep(0.01)
+    assert runs == [1]  # ran, but its snapshot was itself dropped
+
+    assert queue.get_nowait() == b"aaaa"  # consumer finally drains
+    await asyncio.sleep(0.1)  # the parked trailing repaint fires post-cooldown
+    assert len(runs) == 2, "dropped snapshot left no repaint behind"
+    assert queue.get_nowait() == _OUTPUT_GAP_RESYNC
+    assert queue.get_nowait() == b"SNAPSHOT!"
 
 
 @pytest.mark.asyncio

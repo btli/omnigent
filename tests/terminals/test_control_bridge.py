@@ -917,11 +917,11 @@ async def test_parse_control_stream_yields_while_discarding_oversized_line(
 async def test_control_bridge_wires_bounded_output_queue(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The %output queue is the bounded one, and a gap close truly repaints.
+    """The %output queue is the bounded one, and a drop truly repaints.
 
     Guards the saturation policy end to end: the bridge must instantiate the
-    byte/item-bounded queue (not a plain asyncio.Queue) and wire on_gap_end
-    so a drop gap re-emits a pane snapshot the browser actually receives —
+    byte/item-bounded queue (not a plain asyncio.Queue) and wire on_drop
+    so a DROP re-emits a pane snapshot the browser actually receives —
     a control-mode ``refresh-client`` re-emits nothing, so only snapshot
     bytes on the WebSocket prove recovery.
     """
@@ -945,19 +945,19 @@ async def test_control_bridge_wires_bounded_output_queue(
     await asyncio.sleep(1.0)
 
     assert created, "bridge did not use the bounded output queue"
-    assert created[0].on_gap_end is not None, "repaint hook not wired to the queue"
+    assert created[0].on_drop is not None, "repaint hook not wired to the queue"
 
     # The attach seed may itself contain clear+home bytes, so require NEW
-    # snapshot bytes to arrive after the simulated gap close.
+    # snapshot bytes to arrive after the simulated drop.
     baseline = b"".join(ws.sent).count(b"\x1b[H\x1b[2J")
-    created[0].on_gap_end()  # simulate a drop gap closing
+    created[0].on_drop()  # simulate a dropped chunk
     deadline = asyncio.get_running_loop().time() + 5.0
     while asyncio.get_running_loop().time() < deadline:
         if b"".join(ws.sent).count(b"\x1b[H\x1b[2J") > baseline:
             break
         await asyncio.sleep(0.05)
     else:
-        pytest.fail("gap close never delivered a repaint snapshot to the websocket")
+        pytest.fail("drop never delivered a repaint snapshot to the websocket")
 
     await _kill_and_join(sock, task)
 

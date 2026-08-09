@@ -765,12 +765,27 @@ class TunnelRegistry:
                 # must never be left awaiting an ack nothing will settle.
                 _resolve(_replaced_error())
 
+        def _finalize_enqueue(task: asyncio.Task[None]) -> None:
+            """Backstop: a task cancelled before its coroutine's first step
+            never enters the try/finally, so settle the ack from done()."""
+            if not task.cancelled():
+                _ = task.exception()
+            _resolve(_replaced_error())
+
         def _start_enqueue() -> None:
             """Run on the owner loop; task-ify the bounded-wait put."""
             task = asyncio.get_running_loop().create_task(_enqueue())
-            task.add_done_callback(_discard_task_exception)
+            task.add_done_callback(_finalize_enqueue)
 
-        _call_session_soon_threadsafe(session, _start_enqueue)
+        if not session.loop.is_running():
+            # A stopped owner loop never runs the scheduled callback (only
+            # expected at process shutdown) — fail loud, don't await forever.
+            raise ConnectionError(f"runner {session.runner_id!r} tunnel loop is not running")
+        try:
+            _call_session_soon_threadsafe(session, _start_enqueue)
+        except RuntimeError as exc:
+            # Loop closed between the check above and the schedule call.
+            raise ConnectionError(f"runner {session.runner_id!r} tunnel loop is closed") from exc
         await asyncio.wrap_future(ack)
 
     # ── Routing incoming frames ──────────────────────────

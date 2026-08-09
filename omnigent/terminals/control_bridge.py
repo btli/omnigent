@@ -209,6 +209,15 @@ async def _capture_pane_snapshot(socket_path: str, tmux_target: str) -> bytes | 
     with their escape sequences, then the cursor put back where tmux
     reports it.
 
+    Ordering vs interleaved %output: records the reader enqueues before the
+    snapshot almost always predate the capture (tmux emits before we parse),
+    so the snapshot repainting over them is a no-op; anything emitted after
+    the capture lands behind it in FIFO order and re-renders on top. The
+    screen capture runs LAST (after the cursor query) to keep the window in
+    which output can both postdate the capture and precede it in the queue
+    to single milliseconds. Mode state flipped inside the gap (alt-screen,
+    cursor visibility) is not recaptured — capture-pane reports content only.
+
     :param socket_path: Private tmux server socket path.
     :param tmux_target: Pane target, e.g. a session name.
     :returns: Snapshot bytes, or None when tmux is missing or the
@@ -233,10 +242,6 @@ async def _capture_pane_snapshot(socket_path: str, tmux_target: str) -> bytes | 
             return None
         return out if proc.returncode == 0 else None
 
-    screen = await _run("capture-pane", "-p", "-e", "-t", tmux_target)
-    if screen is None:
-        return None
-    body = screen.rstrip(b"\n").replace(b"\n", b"\r\n")
     cursor_home = b""
     cursor = await _run("display-message", "-p", "-t", tmux_target, "#{cursor_y} #{cursor_x}")
     if cursor is not None:
@@ -245,6 +250,10 @@ async def _capture_pane_snapshot(socket_path: str, tmux_target: str) -> bytes | 
             cursor_home = f"\x1b[{row + 1};{col + 1}H".encode()
         except ValueError:
             pass
+    screen = await _run("capture-pane", "-p", "-e", "-t", tmux_target)
+    if screen is None:
+        return None
+    body = screen.rstrip(b"\n").replace(b"\n", b"\r\n")
     return b"\x1b[H\x1b[2J" + body + cursor_home
 
 
@@ -683,9 +692,9 @@ async def bridge_tmux_control_to_websocket(
     # one bounded ``send_bytes``, so when the browser send lags tmux's firehose
     # a backlog of tiny per-line payloads collapses into a few large frames.
     # Byte/item-bounded: saturation drops whole incoming %output records (never
-    # already-queued ones contiguous with sent bytes); on gap close the queue
-    # injects parser-resync bytes and the hook below re-emits a captured pane
-    # snapshot (refresh-client is a no-op toward a control-mode client).
+    # already-queued ones contiguous with sent bytes); each drop requests a
+    # captured-pane re-emit via the hook below (refresh-client is a no-op
+    # toward a control-mode client) and gap close injects parser-resync bytes.
     output_chunks = _ByteBoundedOutputQueue()
     # Keep at most the newest pending clipboard buffer plus the EOF sentinel.
     # A noisy pane cannot build an unbounded queue of names/subprocess reads.
@@ -735,7 +744,7 @@ async def bridge_tmux_control_to_websocket(
             output_chunks.put_nowait(snapshot)
 
     repainter = _GapRepainter(_emit_pane_snapshot)
-    output_chunks.on_gap_end = repainter.request
+    output_chunks.on_drop = repainter.request
 
     def _handle_control_line(line: bytes) -> bool:
         """Route one protocol line; return ``True`` to keep reading.

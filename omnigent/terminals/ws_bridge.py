@@ -444,10 +444,12 @@ class _ByteBoundedOutputQueue(asyncio.Queue["bytes | None"]):
     Drop policy: evicting already-queued output could sever an escape sequence
     whose prefix was already sent, wedging the client terminal parser — so a
     saturated queue drops the INCOMING chunk whole instead, keeping delivered
-    bytes contiguous up to a single gap. When the gap closes, parser-resync
-    bytes precede the resuming output and ``on_gap_end`` (bridge-wired,
-    throttled) restores the lost screen content — an attach-client refresh for
-    the PTY bridge, a re-emitted capture-pane snapshot for the control bridge
+    bytes contiguous up to a single gap. Every drop fires ``on_drop``
+    (bridge-wired, throttled by :class:`_GapRepainter`) so recovery never
+    waits on a future accepted chunk that may not arrive (a flood tail can be
+    the last output for a while); when the gap closes, parser-resync bytes
+    precede the resuming output. Recovery is an attach-client refresh for the
+    PTY bridge and a re-emitted capture-pane snapshot for the control bridge
     (where ``refresh-client`` re-emits nothing). The ``None`` EOF sentinel
     is always accepted. A lone chunk is accepted even above the byte budget —
     producers bound single-chunk size — so the backlog never exceeds the
@@ -465,7 +467,7 @@ class _ByteBoundedOutputQueue(asyncio.Queue["bytes | None"]):
         self.queued_bytes = 0
         self.dropped_chunks = 0
         self.dropped_bytes = 0
-        self.on_gap_end: Callable[[], None] | None = None
+        self.on_drop: Callable[[], None] | None = None
         self._in_gap = False
         self._warned_at: float | None = None
 
@@ -500,12 +502,12 @@ class _ByteBoundedOutputQueue(asyncio.Queue["bytes | None"]):
                     self.dropped_chunks,
                     self.dropped_bytes,
                 )
+            if self.on_drop is not None:
+                self.on_drop()
             return
         if self._in_gap and item is not None:
             self._in_gap = False
             super().put_nowait(_OUTPUT_GAP_RESYNC)
-            if self.on_gap_end is not None:
-                self.on_gap_end()
         super().put_nowait(item)
 
 
@@ -515,8 +517,9 @@ class _GapRepainter:
     A slow-but-live consumer can cycle drop gaps at WebSocket send rate;
     running a repaint per gap would spawn a subprocess each time and every
     redraw amplifies the very flood that opened the gap. ``request`` is
-    trailing-edge: a gap closing inside the cooldown still gets exactly one
-    repaint once the cooldown expires, so the final gap is never left stale.
+    trailing-edge: a request inside the cooldown coalesces into the parked
+    run, and a request while a capture is IN FLIGHT parks one trailing run
+    (that capture may predate the event), so the final gap is never stale.
     """
 
     def __init__(
@@ -528,27 +531,40 @@ class _GapRepainter:
         self._min_interval_s = min_interval_s
         self._task: asyncio.Task[None] | None = None
         self._last_started_at: float | None = None
+        self._capturing = False
+        self._trailing = False
 
     def request(self) -> None:
-        """Schedule a repaint unless one is already pending or running."""
+        """Schedule a repaint; never lose a request, never stack more than one."""
         if self._task is not None and not self._task.done():
+            if self._capturing:
+                self._trailing = True
             return
-        delay = 0.0
-        if self._last_started_at is not None:
-            delay = max(0.0, self._last_started_at + self._min_interval_s - _monotonic())
-        self._task = asyncio.create_task(self._run(delay))
+        self._task = asyncio.create_task(self._run(self._cooldown()))
+
+    def _cooldown(self) -> float:
+        if self._last_started_at is None:
+            return 0.0
+        return max(0.0, self._last_started_at + self._min_interval_s - _monotonic())
 
     async def _run(self, delay: float) -> None:
         if delay > 0:
             await asyncio.sleep(delay)
+        self._capturing = True
         self._last_started_at = _monotonic()
         try:
             await self._repaint()
         except Exception:
             _logger.debug("gap repaint failed", exc_info=True)
+        finally:
+            self._capturing = False
+        if self._trailing:
+            self._trailing = False
+            self._task = asyncio.create_task(self._run(self._cooldown()))
 
     def cancel(self) -> None:
         """Teardown: drop any pending or in-flight repaint."""
+        self._trailing = False
         if self._task is not None:
             self._task.cancel()
             self._task = None
@@ -843,9 +859,9 @@ async def bridge_tmux_pty_to_websocket(
     pty_chunks = _ByteBoundedOutputQueue()
     last_client_input_at: float | None = None
     last_pane_check_at: float | None = None
-    # Drop gap closed: restore the screen content the gap lost (throttled).
+    # Every drop requests a (throttled) repaint of the content it lost.
     repainter = _GapRepainter(lambda: _refresh_attach_client(socket_path, pid))
-    pty_chunks.on_gap_end = repainter.request
+    pty_chunks.on_drop = repainter.request
 
     def _current_ws_coalesce_limit() -> int:
         """
