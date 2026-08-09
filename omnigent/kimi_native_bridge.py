@@ -91,6 +91,7 @@ class _KimiPaneState:
     editor_bounds: tuple[int, int] | None
     input_line: str | None
     input_content: str | None
+    editor_content: str | None
     footer_visible: bool
     menu_visible: bool
     menu_chrome_visible: bool
@@ -391,6 +392,28 @@ def _input_content_from_line(line: str | None) -> str | None:
     return None
 
 
+def _editor_content_from_frame(
+    lines: tuple[str, ...], bounds: tuple[int, int] | None
+) -> str | None:
+    if bounds is None:
+        return None
+    content: list[str] = []
+    for line in lines[bounds[0] : bounds[1] + 1]:
+        stripped = line.strip()
+        if not _is_box_row(stripped):
+            continue
+        body = stripped[1:-1]
+        for marker in _INPUT_BOX_MARKERS:
+            prefix = f" {marker}"
+            if body.startswith(prefix):
+                content.append(body[len(prefix) :].rstrip())
+                break
+        else:
+            if body.startswith("   "):
+                content.append(body[3:].rstrip())
+    return "\n".join(content).strip()
+
+
 def _permission_option_row(line: str) -> bool:
     normalized = line.strip().lstrip("▶").strip()
     options = (
@@ -502,6 +525,7 @@ def _parse_pane(pane: str, *, turn_streaming: bool = False) -> _KimiPaneState:
         editor_bounds=bounds,
         input_line=input_line,
         input_content=_input_content_from_line(input_line),
+        editor_content=_editor_content_from_frame(lines, bounds),
         footer_visible=footer_visible,
         menu_visible=menu_visible,
         menu_chrome_visible=menu_chrome_visible,
@@ -539,13 +563,24 @@ def _kimi_tui_ready(pane: str) -> bool:
 
 
 def _input_box_content(pane: str) -> str | None:
-    return _parse_pane(pane).input_content
+    return _parse_pane(pane).editor_content
 
 
 def _draft_in_input_box(pane: str, needle: str) -> bool:
     """Return whether the pasted draft is visible after Kimi's input marker."""
-    content = _parse_pane(pane).input_content
+    content = _parse_pane(pane).editor_content
     return bool(needle and content is not None and needle in content)
+
+
+def _draft_visible_in_editor(state: _KimiPaneState, needle: str) -> bool:
+    content = state.editor_content
+    if not content:
+        return False
+    return (
+        not needle
+        or needle in content
+        or (content.startswith("[paste #") and content.endswith("lines]"))
+    )
 
 
 def _approval_pending(state: _KimiPaneState) -> bool:
@@ -617,6 +652,31 @@ def _raise_if_injection_cancelled(
 ) -> None:
     if cancel_event is not None and cancel_event.is_set():
         raise RuntimeError("Kimi native message injection was cancelled")
+
+
+def _restore_editor_content(
+    socket_path: str, tmux_target: str, bridge_dir: Path, content: str
+) -> None:
+    with tempfile.NamedTemporaryFile(
+        dir=bridge_dir, prefix="restore_", suffix=".bin", delete=False
+    ) as restore_file:
+        restore_file.write(_paste_payload_bytes(content + "\n"))
+        restore_path = restore_file.name
+    try:
+        _run_tmux(socket_path, "load-buffer", "-b", _PASTE_BUFFER, restore_path)
+        _run_tmux(
+            socket_path,
+            "paste-buffer",
+            "-p",
+            "-d",
+            "-b",
+            _PASTE_BUFFER,
+            "-t",
+            tmux_target,
+        )
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(restore_path)
 
 
 def _settle_pane(
@@ -722,11 +782,11 @@ def inject_user_message(
                 "Kimi TUI input box disappeared before the message could be submitted; "
                 "the message was not delivered"
             )
-        if state.input_content and state.exit_armed:
+        if state.editor_content and state.exit_armed:
             raise RuntimeError(
                 "Kimi terminal is exit-armed with an unsent draft; press Escape and retry"
             )
-        if state.input_content and not state.turn_streaming:
+        if state.editor_content and not state.turn_streaming:
             _raise_if_injection_cancelled(cancellation)
             state = _parse_pane(
                 _capture_pane(socket_path, tmux_target), turn_streaming=turn_streaming
@@ -743,15 +803,21 @@ def inject_user_message(
                 )
             if state.exit_armed:
                 raise RuntimeError("Kimi terminal is exit-armed; press Escape and retry")
-            if state.input_content:
+            if state.editor_content:
                 _raise_if_injection_cancelled(cancellation)
+                draft_to_restore = state.editor_content
                 _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-c")
                 clear_deadline = time.monotonic() + _CLEAR_SETTLE_TIMEOUT_S
+                clear_confirmed = False
                 while time.monotonic() < clear_deadline:
-                    _raise_if_injection_cancelled(cancellation)
                     state = _parse_pane(
                         _capture_pane(socket_path, tmux_target), turn_streaming=turn_streaming
                     )
+                    if state.editor_present and state.editor_content == "":
+                        clear_confirmed = True
+                        break
+                    if cancellation.is_set():
+                        break
                     if _approval_pending(state):
                         raise KimiApprovalPendingError(
                             "Kimi approval is pending; resolve it in the terminal before sending "
@@ -762,15 +828,17 @@ def inject_user_message(
                             "Kimi trust prompt appeared while clearing the draft; "
                             "resolve it in the terminal and retry."
                         )
-                    if state.exit_armed:
-                        raise RuntimeError("Kimi terminal is exit-armed; press Escape and retry")
-                    if state.editor_present and state.input_content == "":
-                        break
                     time.sleep(_POLL_INTERVAL_S)
                 else:
                     raise RuntimeError(
                         "Kimi TUI did not clear the existing draft; the message was not delivered"
                     )
+                if cancellation.is_set():
+                    if clear_confirmed:
+                        _restore_editor_content(
+                            socket_path, tmux_target, bridge_dir, draft_to_restore
+                        )
+                    _raise_if_injection_cancelled(cancellation)
         with tempfile.NamedTemporaryFile(
             dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
         ) as paste_file:
@@ -827,9 +895,7 @@ def inject_user_message(
                     "Kimi trust prompt appeared before the message could be submitted; "
                     "resolve it in the terminal and retry."
                 )
-            if state.input_content is not None and (
-                (needle and needle in state.input_content) or (not needle and state.input_content)
-            ):
+            if _draft_visible_in_editor(state, needle):
                 draft_seen = True
                 break
             time.sleep(_POLL_INTERVAL_S)
@@ -855,9 +921,7 @@ def inject_user_message(
                     "Kimi trust prompt appeared before the message could be submitted; "
                     "resolve it in the terminal and retry."
                 )
-            if state.input_content is not None and (
-                (needle and needle in state.input_content) or (not needle and state.input_content)
-            ):
+            if _draft_visible_in_editor(state, needle):
                 _raise_if_injection_cancelled(cancellation)
                 state = _parse_pane(
                     _capture_pane(socket_path, tmux_target), turn_streaming=turn_streaming
@@ -872,14 +936,7 @@ def inject_user_message(
                         "Kimi trust prompt appeared before the message could be submitted; "
                         "resolve it in the terminal and retry."
                     )
-                if (
-                    state.input_content is not None
-                    and (
-                        (needle and needle in state.input_content)
-                        or (not needle and state.input_content)
-                    )
-                    and not state.exit_armed
-                ):
+                if _draft_visible_in_editor(state, needle) and not state.exit_armed:
                     _raise_if_injection_cancelled(cancellation)
                     # A menu can mount after this capture; the remaining gap is one tmux call.
                     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
@@ -912,18 +969,15 @@ def inject_user_message(
                     "Kimi trust prompt appeared while submitting the message; "
                     "resolve it in the terminal and retry."
                 )
-            if state.exit_armed:
-                raise RuntimeError("Kimi terminal is exit-armed; press Escape and retry")
             if _approval_pending(state):
                 raise KimiApprovalPendingError(
                     "Kimi approval is pending before this message was submitted; "
                     "resolve it in the terminal before sending another message"
                 )
-            if state.input_content is not None and (
-                (needle and draft_seen and needle not in state.input_content)
-                or (not needle and draft_seen and not state.input_content)
-            ):
+            if state.editor_content is not None and draft_seen and not state.editor_content:
                 return
+            if state.exit_armed and state.editor_content:
+                raise RuntimeError("Kimi terminal is exit-armed; press Escape and retry")
             if time.monotonic() - last_enter < _SUBMIT_RETRY_INTERVAL_S:
                 continue
             _raise_if_injection_cancelled(cancellation)
@@ -944,10 +998,12 @@ def inject_user_message(
                     "Kimi trust prompt appeared while submitting the message; "
                     "resolve it in the terminal and retry."
                 )
-            if state.exit_armed:
-                raise RuntimeError("Kimi terminal is exit-armed; press Escape and retry")
             if _approval_pending(state) or not state.editor_present:
                 continue
+            if state.editor_content is not None and draft_seen and not state.editor_content:
+                return
+            if state.exit_armed:
+                raise RuntimeError("Kimi terminal is exit-armed; press Escape and retry")
             _raise_if_injection_cancelled(cancellation)
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             last_enter = time.monotonic()

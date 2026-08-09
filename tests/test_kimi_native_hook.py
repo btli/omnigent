@@ -11,7 +11,12 @@ import httpx
 import pytest
 
 from omnigent import kimi_native_hook
-from omnigent.kimi_native_bridge import APPROVE_KEY, DENY_KEY, write_hook_config
+from omnigent.kimi_native_bridge import (
+    APPROVE_KEY,
+    DENY_KEY,
+    KimiApprovalPromptNotFoundError,
+    write_hook_config,
+)
 from omnigent.native_policy_hook import _EVAL_UNAVAILABLE_REASON
 
 
@@ -201,6 +206,39 @@ def test_permission_request_no_verdict_injects_nothing(
 
     assert kimi_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)]) == 0
     assert keys == []
+
+
+def test_permission_request_reparks_after_injection_miss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge_dir = _governed_bridge(tmp_path)
+    _feed_stdin(monkeypatch, {"hook_event_name": "PermissionRequest", "tool_name": "Bash"})
+    verdicts = iter(["allow", "deny"])
+    posted: list[dict[str, object]] = []
+    keys: list[str] = []
+
+    def _request(
+        url: str, headers: dict[str, str], body: dict[str, object], **kwargs: object
+    ) -> str:
+        del url, headers, kwargs
+        posted.append(body.copy())
+        return next(verdicts)
+
+    def _inject(bridge_dir: Path, *, key: str, timeout_s: float) -> bool:
+        del bridge_dir, timeout_s
+        keys.append(key)
+        if len(keys) == 1:
+            raise KimiApprovalPromptNotFoundError("menu moved")
+        return True
+
+    monkeypatch.setattr(kimi_native_hook, "_request_web_approval", _request)
+    monkeypatch.setattr(kimi_native_hook, "inject_approval_keystroke", _inject)
+    monkeypatch.setattr(kimi_native_hook, "_approval_still_pending", lambda _bridge: True)
+
+    assert kimi_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)]) == 0
+    assert keys == [APPROVE_KEY, DENY_KEY]
+    assert len(posted) == 2
+    assert posted[0]["_omnigent_elicitation_id"] == posted[1]["_omnigent_elicitation_id"]
 
 
 def test_permission_request_ungoverned_no_request(
