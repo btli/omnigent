@@ -48,6 +48,7 @@ import httpx
 from omnigent.kimi_native_bridge import (
     APPROVE_KEY,
     DENY_KEY,
+    KimiApprovalPromptNotFoundError,
     approval_prompt_visible,
     inject_approval_keystroke,
     read_active_session_id,
@@ -257,13 +258,33 @@ def _main_permission_request(argv: list[str]) -> int:
         # No web verdict: leave kimi's own TUI prompt for manual approval.
         return 0
     key = APPROVE_KEY if verdict == "allow" else DENY_KEY
-    try:
-        inject_approval_keystroke(bridge_dir, key=key, timeout_s=_SURFACE_TIMEOUT_S)
-    except RuntimeError as exc:
-        print(
-            f"omnigent kimi permission-request hook: keystroke inject failed: {exc}",
-            file=sys.stderr,
-        )
+    for attempt in range(2):
+        try:
+            inject_approval_keystroke(bridge_dir, key=key, timeout_s=_SURFACE_TIMEOUT_S)
+            break
+        except KimiApprovalPromptNotFoundError as exc:
+            if attempt == 0 and _approval_still_pending(bridge_dir):
+                print(
+                    "omnigent kimi permission-request hook: approval injection missed; "
+                    "re-parking the same request",
+                    file=sys.stderr,
+                )
+                verdict = _request_web_approval(url, headers, body, bridge_dir=bridge_dir)
+                if verdict is None:
+                    return 0
+                key = APPROVE_KEY if verdict == "allow" else DENY_KEY
+                continue
+            print(
+                f"omnigent kimi permission-request hook: keystroke inject failed: {exc}",
+                file=sys.stderr,
+            )
+            break
+        except RuntimeError as exc:
+            print(
+                f"omnigent kimi permission-request hook: keystroke inject failed: {exc}",
+                file=sys.stderr,
+            )
+            break
     return 0
 
 

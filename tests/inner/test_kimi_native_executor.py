@@ -568,6 +568,8 @@ class TestUserMessageInjection:
         raise_on_enter: bool = False,
         pre_clear_captures: tuple[str, ...] = (),
         clear_verifies: bool = True,
+        capture_log: list[tuple[int, str]] | None = None,
+        cancel_after_clear: threading.Event | None = None,
     ) -> list[tuple[str, ...]]:
         def _editor_pane(text: str) -> str:
             rows = text.splitlines() or [""]
@@ -610,15 +612,19 @@ class TestUserMessageInjection:
 
         def _capture_pane(_socket_path: str, _tmux_target: str) -> str:
             if not pasted["value"] and pre_clear:
-                return pre_clear.pop(0)
-            if pasted["value"] and enters["count"] == 0 and post_paste:
-                return post_paste.pop(0)
-            if enters["count"] and transient_captures:
-                return transient_captures.pop(0)
-            if empty_captures["count"]:
+                pane = pre_clear.pop(0)
+            elif pasted["value"] and enters["count"] == 0 and post_paste:
+                pane = post_paste.pop(0)
+            elif enters["count"] and transient_captures:
+                pane = transient_captures.pop(0)
+            elif empty_captures["count"]:
                 empty_captures["count"] -= 1
-                return ""
-            return tui["pane"]
+                pane = ""
+            else:
+                pane = tui["pane"]
+            if capture_log is not None:
+                capture_log.append((len(sent), pane))
+            return pane
 
         monkeypatch.setattr(kimi_native_bridge, "_capture_pane", _capture_pane)
         monkeypatch.setattr(kimi_native_bridge, "_PASTE_SETTLE_S", 0.0)
@@ -634,6 +640,8 @@ class TestUserMessageInjection:
                 tui["pane"] = _editor_pane(content)
             elif args[-1] == "C-c":
                 tui["pane"] = _editor_pane("" if clear_verifies else "leftover draft")
+                if cancel_after_clear is not None:
+                    cancel_after_clear.set()
             elif args[-1] == "Enter":
                 if raise_on_enter:
                     raise AssertionError("stale Enter reached the test menu")
@@ -774,6 +782,20 @@ class TestUserMessageInjection:
         inject_user_message(tmp_path / "bridge", content=content)
         assert [args[-1] for args in sent if args[-1] == "Enter"] == ["Enter"]
 
+    def test_submits_real_multiline_paste_placeholder(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        content = "\n".join(f"round7 line {index} with enough text" for index in range(1, 10))
+        sent = self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=1,
+            content=content,
+            post_paste_captures=(_fixture("paste_placeholder_11_lines.txt"),) * 100,
+        )
+        inject_user_message(tmp_path / "bridge", content=content)
+        assert [args[-1] for args in sent if args[-1] == "Enter"] == ["Enter"]
+
     def test_clears_draft_with_single_ctrl_c(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -804,8 +826,10 @@ class TestUserMessageInjection:
                 " │ > │",
                 " ╰────────────────────╯",
                 " context: 0%",
+                " Press Ctrl+C again to exit",
             ]
         )
+        capture_log: list[tuple[int, str]] = []
         sent = self._stub_tui(
             monkeypatch,
             tmp_path,
@@ -813,10 +837,55 @@ class TestUserMessageInjection:
             content="new message",
             initial_content="leftover draft",
             pre_clear_captures=(pane, pane, pane, empty),
+            capture_log=capture_log,
         )
         inject_user_message(tmp_path / "bridge", content="new message")
         assert ("send-keys", "-t", "main", "C-c") in sent
         assert any("paste-buffer" in args for args in sent)
+        assert any(sent_count >= 1 and captured == pane for sent_count, captured in capture_log)
+        assert any(sent_count == 1 and captured == empty for sent_count, captured in capture_log)
+
+    def test_exit_hint_after_submit_does_not_fail_delivery(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        submitted = "\n".join(
+            [
+                " ╭────────────────────╮",
+                " │ > │",
+                " ╰────────────────────╯",
+                " context: 0%",
+                " Press Ctrl+C again to exit",
+            ]
+        )
+        sent = self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=1,
+            content="new message",
+            post_submit_captures=(submitted,),
+        )
+        inject_user_message(tmp_path / "bridge", content="new message")
+        assert [args[-1] for args in sent if args[-1] == "Enter"] == ["Enter"]
+
+    def test_cancellation_during_clear_restores_existing_draft(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        cancel_event = threading.Event()
+        sent = self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=1,
+            initial_content="leftover draft",
+            cancel_after_clear=cancel_event,
+        )
+        with pytest.raises(RuntimeError, match="cancelled"):
+            inject_user_message(
+                tmp_path / "bridge",
+                content="new message",
+                cancel_event=cancel_event,
+            )
+        assert [args[0] for args in sent if args[0] == "load-buffer"] == ["load-buffer"]
+        assert not any(args[-1] == "Enter" for args in sent)
 
     def test_does_not_clear_empty_editor(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
