@@ -305,7 +305,7 @@ plus one `tools/mcp/*.yaml` server, no sub-agents.
 machine as a host:
 
 ```bash
-omnigent host --background   # starts the local server too, then returns
+omnigent start   # starts the local server and registers this machine as a host
 ```
 
 Open the server URL it prints, hit **New Chat**, pick your machine, and go.
@@ -424,11 +424,6 @@ and they're in. Signup is invite-only.
   ```bash
   omnigent run --fork <session_id>
   ```
-
-Shared sessions identify model-visible messages with `[account]:` labels by
-default. Set `OMNIGENT_SHARED_MESSAGE_ATTRIBUTION_ENABLED=0` to hide those
-labels. This does not change stored authors, UI avatars, or who may approve or
-run privileged actions.
 
 > [!TIP]
 > Want your team to sign in with the logins they already have (**Google,
