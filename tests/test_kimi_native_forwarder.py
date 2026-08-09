@@ -234,6 +234,8 @@ class TestState:
                 turn_open=True,
                 tools_in_flight=2,
                 last_edge_id="kimi:turn_end:5",
+                dropped_edge_status="failed",
+                last_activity_ts=1_700_000_000.5,
             ),
         )
         loaded = _read_state(tmp_path)
@@ -244,6 +246,8 @@ class TestState:
         assert loaded.turn_open is True
         assert loaded.tools_in_flight == 2
         assert loaded.last_edge_id == "kimi:turn_end:5"
+        assert loaded.dropped_edge_status == "failed"
+        assert loaded.last_activity_ts == 1_700_000_000.5
         clear_kimi_bridge_state(tmp_path)
         assert _read_state(tmp_path) is None
 
@@ -317,11 +321,17 @@ class TestReadNewIncremental:
 
 class TestDiscoverWire:
     def _make_session(
-        self, home: Path, session_dir_name: str, work_dir: str, *, mtime: float
+        self,
+        home: Path,
+        session_dir_name: str,
+        work_dir: str,
+        *,
+        mtime: float,
+        first_row: str = "{}",
     ) -> Path:
         wire = home / "sessions" / "wd_x" / session_dir_name / "agents" / "main" / "wire.jsonl"
         wire.parent.mkdir(parents=True, exist_ok=True)
-        wire.write_text("{}\n", encoding="utf-8")
+        wire.write_text(first_row + "\n", encoding="utf-8")
         import os
 
         os.utime(wire, (mtime, mtime))
@@ -374,10 +384,26 @@ class TestDiscoverWire:
         assert _discover_wire(home, "/ws", launch_epoch_ms=10_000_600) == wire
 
     def test_whole_second_mtime_within_launch_second_is_adopted(self, tmp_path: Path) -> None:
-        """A second-truncating filesystem only needs to reach the launch second."""
+        """A second-truncating filesystem only needs to reach the launch second
+        when the wire content offers no timestamp to break the tie."""
         home = tmp_path / "kimi-code-home"
         home.mkdir()
         wire = self._make_session(home, "session_fresh", "/ws", mtime=10_000.0)
+        assert _discover_wire(home, "/ws", launch_epoch_ms=10_000_600) == wire
+
+    def test_coarse_tie_rejected_when_header_predates_launch(self, tmp_path: Path) -> None:
+        """A same-second truncated mtime defers to the wire's metadata header."""
+        home = tmp_path / "kimi-code-home"
+        home.mkdir()
+        header = json.dumps({"type": "metadata", "created_at": 10_000_200})
+        self._make_session(home, "session_prior", "/ws", mtime=10_000.0, first_row=header)
+        assert _discover_wire(home, "/ws", launch_epoch_ms=10_000_600) is None
+
+    def test_coarse_tie_adopted_when_header_postdates_launch(self, tmp_path: Path) -> None:
+        home = tmp_path / "kimi-code-home"
+        home.mkdir()
+        header = json.dumps({"type": "metadata", "created_at": 10_000_650})
+        wire = self._make_session(home, "session_fresh", "/ws", mtime=10_000.0, first_row=header)
         assert _discover_wire(home, "/ws", launch_epoch_ms=10_000_600) == wire
 
 
@@ -621,6 +647,58 @@ class TestForwardLoopEdges:
         assert self.statuses == [("failed", "")]
         assert self.items == []
 
+    async def test_dropped_edge_status_persists_across_restart(self, tmp_path: Path) -> None:
+        """A restart must not soften a poison-dropped failure back to idle."""
+        rows = [_prompt_row()]
+
+        def _seed(bridge: Path, wire: Path) -> None:
+            _write_state(
+                bridge,
+                _ForwardState(
+                    wire_path=str(wire),
+                    last_line=1,
+                    offset=wire.stat().st_size,
+                    turn_open=True,
+                    dropped_edge_status="failed",
+                ),
+            )
+
+        await _drive_loop_until(
+            tmp_path, rows, lambda: bool(self.statuses), quiescence_s=0.05, prepare=_seed
+        )
+        assert self.statuses == [("failed", "")]
+
+    async def test_tool_silence_clock_survives_restart(self, tmp_path: Path) -> None:
+        """A restart resumes the tool-quiescence window instead of re-arming it,
+        so a crash-looping forwarder still fires the hung-tool watchdog."""
+        rows = [_prompt_row(), _tool_call_row()]
+
+        def _seed(bridge: Path, wire: Path) -> None:
+            import time as _time
+
+            _write_state(
+                bridge,
+                _ForwardState(
+                    wire_path=str(wire),
+                    last_line=2,
+                    offset=wire.stat().st_size,
+                    turn_open=True,
+                    tools_in_flight=1,
+                    last_activity_ts=_time.time() - 100.0,
+                ),
+            )
+
+        await _drive_loop_until(
+            tmp_path,
+            rows,
+            lambda: bool(self.statuses),
+            pane_alive=lambda: True,
+            quiescence_s=200.0,
+            tool_quiescence_s=50.0,
+            prepare=_seed,
+        )
+        assert self.statuses == [("failed", "")]
+
     async def test_replayed_turn_edge_is_deduped(self, tmp_path: Path) -> None:
         """A crash between an edge POST and the cursor persist must not double-post."""
         rows = [_prompt_row(), _turn_ended_row("completed")]
@@ -757,6 +835,99 @@ class TestForwardLoopPostFailures:
         await _drive_loop_until(tmp_path, rows, lambda: bool(posted), quiescence_s=0.05)
         assert edge_attempts == 4
         assert posted == [("failed", "")]
+
+    async def test_failed_redelivery_does_not_defer_quiescence(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Retries re-reading the same unposted tail must not refresh the
+        silence timers — under a permanent outage the fallback still fires."""
+        statuses: list[tuple[str, str]] = []
+
+        async def _failing_item(_client: object, **kwargs: object) -> None:
+            raise httpx.ConnectError("no route to host")
+
+        async def _fake_status(_client: object, **kwargs: object) -> None:
+            statuses.append((str(kwargs["status"]), str(kwargs["output"])))
+
+        monkeypatch.setattr(fwd, "_post_conversation_item", _failing_item)
+        monkeypatch.setattr(fwd, "_post_external_session_status", _fake_status)
+
+        await _drive_loop_until(
+            tmp_path, [_prompt_row()], lambda: bool(statuses), quiescence_s=0.05
+        )
+        assert statuses == [("idle", "")]
+        forwarder_health.clear()
+
+    async def test_persistent_edge_failure_alert_is_rate_limited(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Edge delivery failing continuously past the threshold logs an error."""
+        import logging
+
+        monkeypatch.setattr(fwd, "_EDGE_FAILURE_ALERT_S", 0.05)
+
+        async def _fake_item(_client: object, **kwargs: object) -> None:
+            return None
+
+        async def _failing_status(_client: object, **kwargs: object) -> None:
+            raise httpx.ConnectError("no route to host")
+
+        monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
+        monkeypatch.setattr(fwd, "_post_external_session_status", _failing_status)
+
+        def _alerted() -> bool:
+            return any("undelivered" in rec.message for rec in caplog.records)
+
+        with caplog.at_level(logging.ERROR, logger="omnigent.kimi_native_forwarder"):
+            await _drive_loop_until(tmp_path, [_prompt_row()], _alerted, pane_alive=lambda: False)
+        alerts = [rec for rec in caplog.records if "undelivered" in rec.message]
+        assert alerts and alerts[0].levelno == logging.ERROR
+        forwarder_health.clear()
+
+    async def test_supersede_over_dropped_failure_is_logged(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """One poll batch: turn A's failed edge poison-drops, prompt B supersedes.
+        Session status is single-valued, so B's outcome wins — but the swallowed
+        failure must leave a loud trace."""
+        import logging
+
+        posted: list[tuple[str, str]] = []
+        edge_attempts = 0
+
+        async def _fake_item(_client: object, **kwargs: object) -> None:
+            return None
+
+        async def _fake_status(_client: object, **kwargs: object) -> None:
+            nonlocal edge_attempts
+            edge_attempts += 1
+            if edge_attempts <= 3:
+                request = httpx.Request("POST", "http://test")
+                raise httpx.HTTPStatusError(
+                    "404", request=request, response=httpx.Response(404, request=request)
+                )
+            posted.append((str(kwargs["status"]), str(kwargs["output"])))
+
+        monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
+        monkeypatch.setattr(fwd, "_post_external_session_status", _fake_status)
+
+        rows = [
+            _prompt_row("A"),
+            _turn_ended_row("failed", error_message="boom"),
+            _prompt_row("B"),
+            _assistant_row("u1", "reply"),
+            _turn_ended_row("completed"),
+        ]
+        with caplog.at_level(logging.ERROR, logger="omnigent.kimi_native_forwarder"):
+            await _drive_loop_until(tmp_path, rows, lambda: bool(posted))
+        assert posted == [("idle", "reply")]
+        assert any("superseded" in rec.message for rec in caplog.records)
 
     async def test_transport_failure_is_recorded_and_retried(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
