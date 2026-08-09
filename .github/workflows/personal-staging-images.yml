@@ -20,6 +20,13 @@ jobs:
     if: github.repository == 'btli/omnigent'
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    strategy:
+      matrix:
+        include:
+          - image: server
+            target: runtime
+          - image: host
+            target: host
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -39,8 +46,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Compute image tags
-        id: tags
+      - name: Resolve source tag
+        id: source
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_REF: ${{ inputs.ref }}
@@ -63,33 +70,28 @@ jobs:
               ;;
           esac
 
-          short_sha="$(git rev-parse --short HEAD)"
-          server_image='ghcr.io/btli/omnigent-server'
-          host_image='ghcr.io/btli/omnigent-host'
-          echo "server_tags=${server_image}:sha-${short_sha},${server_image}:${tag_name},${server_image}:staging-nightly" >> "${GITHUB_OUTPUT}"
-          echo "host_tags=${host_image}:sha-${short_sha},${host_image}:${tag_name},${host_image}:staging-nightly" >> "${GITHUB_OUTPUT}"
+          echo "tag_name=${tag_name}" >> "${GITHUB_OUTPUT}"
 
-      - name: Build and push server image
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051  # v5.10.0
+        with:
+          context: git
+          images: ghcr.io/btli/omnigent-${{ matrix.image }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=${{ steps.source.outputs.tag_name }}
+            type=raw,value=staging-nightly
+
+      - name: Build and push ${{ matrix.image }} image
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
         with:
           context: .
           file: deploy/docker/Dockerfile
+          target: ${{ matrix.target }}
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.tags.outputs.server_tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: false
-
-      - name: Build and push host image
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
-        with:
-          context: .
-          file: deploy/docker/Dockerfile
-          target: host
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.tags.outputs.host_tags }}
+          tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
