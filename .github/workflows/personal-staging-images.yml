@@ -39,17 +39,9 @@ jobs:
           set -euo pipefail
 
           case "${INPUT_REF}" in
-            nightly-*) source_ref="refs/tags/${INPUT_REF}" ;;
+            nightly-*) tag_name="${INPUT_REF}" ;;
             *)
               echo "Dispatch ref must be a nightly-* tag name, got '${INPUT_REF}'." >&2
-              exit 1
-              ;;
-          esac
-
-          case "${source_ref}" in
-            refs/tags/nightly-*) tag_name="${source_ref#refs/tags/}" ;;
-            *)
-              echo "Ref must resolve strictly to a nightly-* tag, got '${source_ref}'." >&2
               exit 1
               ;;
           esac

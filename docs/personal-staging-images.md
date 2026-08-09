@@ -13,6 +13,12 @@ PR-modified workflow to execute privileged code. Only the trusted workflow
 definition on `main` may dispatch this build, with the nightly tag passed as a
 validated input.
 
+**Warning:** Only ever dispatch this workflow with `--ref main`. GitHub
+executes the workflow definition from the target ref, so dispatching at a tag
+would run that tag's merged-PR copy with privileged package access. This is
+risk-accepted only because `btli/omnigent` has a single writer and the
+automated chain hardcodes `--ref main`.
+
 Both images are multi-architecture manifests for `linux/amd64` and
 `linux/arm64`:
 
@@ -74,16 +80,17 @@ needs to verify a platform image directly.
 
 Use an existing `nightly-*` tag from `btli/omnigent` and dispatch the workflow
 against that tag. The workflow is dispatched from the default branch, with the
-tag passed through the required `ref` input. Snapshot existing run IDs first so
-the polling loop can select the new matching run rather than a concurrent run:
-
-The intended integration from the nightly staging workflow (PR #11's
-`personal-staging.yml`) is the same trusted-main chain:
+tag passed through the required `ref` input. The intended integration is the
+nightly staging workflow, `personal-staging.yml`, using the same trusted-main
+chain:
 
 ```bash
 TAG=nightly-20260809
 gh workflow run personal-staging-images.yml -R btli/omnigent --ref main -f ref="$TAG"
 ```
+
+Snapshot existing run IDs first so the polling loop can select the new matching
+run rather than a concurrent run:
 
 ```bash
 set -euo pipefail
