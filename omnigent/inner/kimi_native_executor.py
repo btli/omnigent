@@ -109,12 +109,7 @@ class KimiNativeExecutor(Executor):
             # Semantic Omnigent errors preserve retry classification through the adapter.
             raise RetryableLLMError(str(exc), code="connection_error") from exc
         except RuntimeError as exc:
-            yield ExecutorError(
-                message=(
-                    f"Kimi native turn injection failed: {describe_exception(exc)}; "
-                    "retry the turn after the Kimi terminal is ready"
-                )
-            )
+            yield ExecutorError(message=describe_exception(exc))
             return
         self._approval_pending_retries = 0
         yield TurnComplete(response=None)

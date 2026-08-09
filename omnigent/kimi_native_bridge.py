@@ -1184,20 +1184,15 @@ def inject_approval_keystroke(
     menu_identity = _approval_menu_identity(state)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, key)
     deadline = time.monotonic() + _APPROVAL_SETTLE_TIMEOUT_S
+    last_capture_empty = False
     while time.monotonic() < deadline:
         pane = _capture_pane(socket_path, tmux_target)
-        if not pane.strip():
+        last_capture_empty = not pane.strip()
+        if last_capture_empty:
             if not _session_alive(socket_path, tmux_target):
                 message = "Kimi permission menu unavailable because the TUI session is not running"
                 _logger.warning(message)
                 raise KimiApprovalSessionNotFoundError(message)
-            if time.monotonic() >= deadline:
-                message = (
-                    "Kimi permission menu state remained indeterminate after the "
-                    "approval keystroke"
-                )
-                _logger.warning(message)
-                raise KimiApprovalPromptAmbiguousError(message)
             time.sleep(_POLL_INTERVAL_S)
             continue
         state = _parse_pane(pane)
@@ -1206,7 +1201,11 @@ def inject_approval_keystroke(
         if _approval_menu_identity(state) != menu_identity:
             return True
         time.sleep(_POLL_INTERVAL_S)
-    message = "Kimi permission menu remained visible after the approval keystroke"
+    message = (
+        "Kimi permission menu state remained indeterminate after the approval keystroke"
+        if last_capture_empty
+        else "Kimi permission menu remained visible after the approval keystroke"
+    )
     _logger.warning(message)
     raise KimiApprovalPromptAmbiguousError(message)
 
