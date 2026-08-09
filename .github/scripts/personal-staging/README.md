@@ -17,6 +17,15 @@
    OMNIGENT_REPO=https://github.com/btli/omnigent bash scripts/update_nightly.sh
    ```
 
+   The version is read from the *upstream* commit's `pyproject.toml`, so a
+   merged PR can never control the tag. Unlike `nightly-release.yml`, no
+   version-stamped commit or `uv lock` refresh is produced — the tag points
+   at the raw staging commit, whose packages still claim `X.Y.Z.dev0`
+   (risk-accepted for a personal ring). Note the dev tag floats within a
+   UTC day: a same-day rerun repoints it silently, and `update_nightly.sh`
+   consumers who already installed that day's cut see the same version
+   string and won't pick up the repoint until the next day's tag.
+
 3. Builds a debug APK and an unsigned release AAB from that commit and
    publishes them on a `nightly-YYYYMMDD` prerelease together with
    `merge-report.json` and `SHA256SUMS`, then re-points the floating
@@ -51,6 +60,13 @@ gh secret set -R btli/omnigent OMNIGENT_DEBUG_KEYSTORE_PASSWORD --body CHANGE_ME
 gh secret set -R btli/omnigent OMNIGENT_DEBUG_KEY_ALIAS --body omnigent-debug
 gh secret set -R btli/omnigent OMNIGENT_DEBUG_KEY_PASSWORD --body CHANGE_ME
 ```
+
+The keystore only ever reaches the `android-sign` job, which never checks
+out or executes merged PR code (the build job is secretless).
+
+**If the keystore leaks:** regenerate it with the keytool one-liner above,
+replace all four secrets, and uninstall/reinstall the app once on each
+device — the next nightly's signature won't match the leaked one.
 
 ## Manual dispatch
 

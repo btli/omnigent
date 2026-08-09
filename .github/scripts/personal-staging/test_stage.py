@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -155,7 +156,9 @@ def test_dev_tag_mirrors_nightly_scheme(env):
     assert env.fork_ref(f"refs/tags/v1.2.3.dev{STAMP}") == second["staging_sha"]
 
 
-def test_never_touches_testing_branch(env):
+def test_only_allowed_refs_pushed(env):
+    """Allowlist: the run may only create staging, the nightly-* pin, and the
+    dev tag — any pre-existing ref (here the deploy branch) stays untouched."""
     git(env.seed, "checkout", "-q", "main")
     testing_sha = git(env.seed, "rev-parse", "HEAD").stdout.strip()
     git(env.seed, "push", str(env.fork), "main:refs/heads/testing")
@@ -163,6 +166,105 @@ def test_never_touches_testing_branch(env):
 
     env.run([env.add_pr(8, "g.txt", "g\n")])
     assert env.fork_ref("refs/heads/testing") == testing_sha
+
+    refs = [
+        line.split("\t")[1]
+        for line in git(env.work, "ls-remote", str(env.fork)).stdout.strip().splitlines()
+    ]
+    allowed = re.compile(
+        r"refs/heads/staging$"
+        r"|refs/(heads|tags)/nightly-\d{8}(-rerun\d+)?$"
+        r"|refs/tags/v\d+\.\d+\.\d+\.dev\d{8}$"
+    )
+    assert all(allowed.search(r) for r in refs if r != "refs/heads/testing"), refs
+
+
+def test_non_conflict_merge_failure_raises(env):
+    """A merge that fails without unmerged index entries (here: an untracked
+    file the PR would overwrite) is a broken workspace, not a skippable PR."""
+    pr = env.add_pr(12, "z.txt", "pr content\n")
+    (env.work / "z.txt").write_text("local droppings\n")
+    with pytest.raises(stage_mod.StageError, match="failed without conflicts"):
+        env.run([pr])
+
+
+def test_already_merged_pr_applies_without_commit(env):
+    git(env.seed, "checkout", "-q", "main")
+    head = git(env.seed, "rev-parse", "HEAD").stdout.strip()
+    git(env.seed, "push", str(env.upstream), "main:refs/pull/13/head")
+    pr = {"number": 13, "headRefName": "pr-13", "headRefOid": head}
+
+    report = env.run([pr])
+    assert [p["pr"] for p in report["applied"]] == [13]
+    # nothing to merge: staging is upstream HEAD itself, no merge commit minted
+    assert report["staging_sha"] == report["upstream_sha"]
+
+
+def test_notes_escape_untrusted_names_and_signed_variant():
+    report = {
+        "date": STAMP,
+        "upstream_sha": "u" * 40,
+        "staging_sha": "s" * 40,
+        "dev_tag": f"v1.2.3.dev{STAMP}",
+        "applied": [{"pr": 1, "branch": "evil`[link](https://x)`|", "oid": "a" * 40}],
+        "skipped": [{"pr": 2, "branch": "bad`name", "conflict_paths": ["web/`x`.ts"]}],
+    }
+    out = stage_mod.notes(report, signed=True)
+    assert "shared debug keystore" in out
+    assert "upgrade in place" in out
+    # untrusted backticks/pipes are neutralized inside code spans
+    assert "evil`" not in out and "`evil'[link](https://x)'/`" in out
+    assert "merge conflict:" in out and "`web/'x'.ts`" in out
+
+    report["pin_created"] = True
+    report["tag"] = f"nightly-{STAMP}"
+    summary = stage_mod.summarize(report)
+    assert "bad`name" not in summary
+    assert "| Skipped #2 |" in summary and "web/'x'.ts" in summary
+
+
+def test_summary_written_on_success_and_failure(env, tmp_path, monkeypatch, capsys):
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    prs_json = tmp_path / "prs.json"
+    prs_json.write_text("[]")
+
+    rc = stage_mod.main(
+        [
+            "stage",
+            "--workdir",
+            str(env.work),
+            "--date",
+            STAMP,
+            "--prs-json",
+            str(prs_json),
+            "--report",
+            str(tmp_path / "r.json"),
+        ]
+    )
+    assert rc == 0
+    text = summary.read_text()
+    assert "## Personal staging nightly" in text and f"nightly-{STAMP}" in text
+
+    # a broken remote must still leave a failure line in the summary
+    with pytest.raises(stage_mod.StageError):
+        stage_mod.main(
+            [
+                "stage",
+                "--workdir",
+                str(env.work),
+                "--date",
+                STAMP,
+                "--upstream-remote",
+                "nonexistent",
+                "--prs-json",
+                str(prs_json),
+                "--report",
+                str(tmp_path / "r2.json"),
+            ]
+        )
+    assert "**FAILED:**" in summary.read_text()
+    capsys.readouterr()
 
 
 def test_unreachable_pinned_head_is_skipped(env):
