@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -56,6 +57,7 @@ _SUBMIT_RETRY_INTERVAL_S = 1.0
 _APPROVAL_SETTLE_TIMEOUT_S = 0.5
 _CLEAR_SETTLE_TIMEOUT_S = 2.0
 _DRAFT_NEEDLE_MAX_CHARS = 24
+_PASTE_PLACEHOLDER_RE = re.compile(r"\[paste #(\d+) \+(\d+) lines?\]")
 _TRUST_HEADER = "Trust this folder?"
 _TRUST_DESCRIPTION = "Kimi Code loads project-level MCP servers"
 _PERMISSION_MENU_FOOTER_MARKER = "1/2/3/4 choose"
@@ -71,7 +73,15 @@ class KimiTuiNotReadyError(RuntimeError):
 
 
 class KimiApprovalPromptNotFoundError(RuntimeError):
-    """The Kimi permission menu was not visible when approval was injected."""
+    """The Kimi permission menu was absent before approval was injected."""
+
+
+class KimiApprovalPromptAmbiguousError(RuntimeError):
+    """The same Kimi permission menu remained visible after its option was typed."""
+
+
+class KimiApprovalSessionNotFoundError(RuntimeError):
+    """The Kimi session was not running when approval was injected."""
 
 
 class KimiApprovalPendingError(RuntimeError):
@@ -572,15 +582,38 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
     return bool(needle and content is not None and needle in content)
 
 
-def _draft_visible_in_editor(state: _KimiPaneState, needle: str) -> bool:
+def _paste_placeholder_counts(content: str | None) -> dict[str, int]:
+    if not content:
+        return {}
+    return {
+        match.group(0): int(match.group(2)) for match in _PASTE_PLACEHOLDER_RE.finditer(content)
+    }
+
+
+def _paste_line_count(content: str) -> int:
+    normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+    return normalized.count("\n") + 2
+
+
+def _draft_visible_in_editor(
+    state: _KimiPaneState,
+    needle: str,
+    *,
+    pre_paste_placeholders: frozenset[str] = frozenset(),
+    expected_line_count: int | None = None,
+) -> bool:
     content = state.editor_content
     if not content:
         return False
-    return (
-        not needle
-        or needle in content
-        or (content.startswith("[paste #") and content.endswith("lines]"))
-    )
+    placeholders = _paste_placeholder_counts(content)
+    if placeholders and content.strip() in placeholders:
+        return expected_line_count is not None and any(
+            token not in pre_paste_placeholders and line_count == expected_line_count
+            for token, line_count in placeholders.items()
+        )
+    if needle and needle in content:
+        return True
+    return not needle
 
 
 def _approval_pending(state: _KimiPaneState) -> bool:
@@ -602,6 +635,23 @@ def _menu_matches_submission(
     ):
         return True
     return draft_was_visible and not state.editor_present
+
+
+def _approval_menu_identity(state: _KimiPaneState) -> tuple[str, ...] | None:
+    if not state.menu_visible or state.menu_start is None:
+        return None
+    end = next(
+        (
+            index
+            for index in range(state.menu_start, len(state.lines))
+            if state.lines[index].strip().startswith("↑/↓ select")
+            and _PERMISSION_MENU_FOOTER_MARKER in state.lines[index]
+        ),
+        None,
+    )
+    if end is None:
+        return None
+    return tuple(line.strip() for line in state.lines[state.menu_start : end + 1])
 
 
 class _InjectionCancellation:
@@ -657,6 +707,10 @@ def _raise_if_injection_cancelled(
 def _restore_editor_content(
     socket_path: str, tmux_target: str, bridge_dir: Path, content: str
 ) -> None:
+    state = _parse_pane(_capture_pane(socket_path, tmux_target))
+    if not state.editor_present or _approval_pending(state):
+        _logger.warning("Kimi draft restore skipped; lost draft length=%d", len(content))
+        return
     with tempfile.NamedTemporaryFile(
         dir=bridge_dir, prefix="restore_", suffix=".bin", delete=False
     ) as restore_file:
@@ -839,6 +893,10 @@ def inject_user_message(
                             socket_path, tmux_target, bridge_dir, draft_to_restore
                         )
                     _raise_if_injection_cancelled(cancellation)
+        needle = _submit_needle(content)
+        first_line = _submit_first_line(content)
+        expected_line_count = _paste_line_count(content)
+        pre_paste_placeholders: frozenset[str] = frozenset()
         with tempfile.NamedTemporaryFile(
             dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
         ) as paste_file:
@@ -862,6 +920,7 @@ def inject_user_message(
                     "Kimi TUI input box disappeared before the message could be submitted; "
                     "the message was not delivered"
                 )
+            pre_paste_placeholders = frozenset(_paste_placeholder_counts(state.editor_content))
             _raise_if_injection_cancelled(cancellation)
             _run_tmux(
                 socket_path,
@@ -876,8 +935,6 @@ def inject_user_message(
         finally:
             with contextlib.suppress(OSError):
                 os.unlink(paste_path)
-        needle = _submit_needle(content)
-        first_line = _submit_first_line(content)
         draft_seen = False
         paste_deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
         while time.monotonic() < paste_deadline:
@@ -895,7 +952,12 @@ def inject_user_message(
                     "Kimi trust prompt appeared before the message could be submitted; "
                     "resolve it in the terminal and retry."
                 )
-            if _draft_visible_in_editor(state, needle):
+            if _draft_visible_in_editor(
+                state,
+                needle,
+                pre_paste_placeholders=pre_paste_placeholders,
+                expected_line_count=expected_line_count,
+            ):
                 draft_seen = True
                 break
             time.sleep(_POLL_INTERVAL_S)
@@ -921,7 +983,12 @@ def inject_user_message(
                     "Kimi trust prompt appeared before the message could be submitted; "
                     "resolve it in the terminal and retry."
                 )
-            if _draft_visible_in_editor(state, needle):
+            if _draft_visible_in_editor(
+                state,
+                needle,
+                pre_paste_placeholders=pre_paste_placeholders,
+                expected_line_count=expected_line_count,
+            ):
                 _raise_if_injection_cancelled(cancellation)
                 state = _parse_pane(
                     _capture_pane(socket_path, tmux_target), turn_streaming=turn_streaming
@@ -936,7 +1003,15 @@ def inject_user_message(
                         "Kimi trust prompt appeared before the message could be submitted; "
                         "resolve it in the terminal and retry."
                     )
-                if _draft_visible_in_editor(state, needle) and not state.exit_armed:
+                if (
+                    _draft_visible_in_editor(
+                        state,
+                        needle,
+                        pre_paste_placeholders=pre_paste_placeholders,
+                        expected_line_count=expected_line_count,
+                    )
+                    and not state.exit_armed
+                ):
                     _raise_if_injection_cancelled(cancellation)
                     # A menu can mount after this capture; the remaining gap is one tmux call.
                     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
@@ -1061,23 +1136,26 @@ def inject_approval_keystroke(
     if not _session_alive(socket_path, tmux_target):
         message = "Kimi permission menu unavailable because the TUI session is not running"
         _logger.warning(message)
-        raise KimiApprovalPromptNotFoundError(message)
+        raise KimiApprovalSessionNotFoundError(message)
     pane = _capture_pane(socket_path, tmux_target)
     state = _parse_pane(pane)
     if not state.menu_visible:
         message = "Kimi permission menu markers missing; approval keystroke was not sent"
         _logger.warning("%s; pane tail=%r", message, pane[-240:])
         raise KimiApprovalPromptNotFoundError(message)
+    menu_identity = _approval_menu_identity(state)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, key)
     deadline = time.monotonic() + _APPROVAL_SETTLE_TIMEOUT_S
     while time.monotonic() < deadline:
         state = _parse_pane(_capture_pane(socket_path, tmux_target))
         if not state.menu_visible:
             return True
+        if _approval_menu_identity(state) != menu_identity:
+            return True
         time.sleep(_POLL_INTERVAL_S)
     message = "Kimi permission menu remained visible after the approval keystroke"
     _logger.warning(message)
-    raise KimiApprovalPromptNotFoundError(message)
+    raise KimiApprovalPromptAmbiguousError(message)
 
 
 def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:

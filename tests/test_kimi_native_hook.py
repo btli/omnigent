@@ -14,6 +14,7 @@ from omnigent import kimi_native_hook
 from omnigent.kimi_native_bridge import (
     APPROVE_KEY,
     DENY_KEY,
+    KimiApprovalPromptAmbiguousError,
     KimiApprovalPromptNotFoundError,
     write_hook_config,
 )
@@ -239,6 +240,36 @@ def test_permission_request_reparks_after_injection_miss(
     assert keys == [APPROVE_KEY, DENY_KEY]
     assert len(posted) == 2
     assert posted[0]["_omnigent_elicitation_id"] == posted[1]["_omnigent_elicitation_id"]
+
+
+def test_permission_request_does_not_repark_ambiguous_injection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge_dir = _governed_bridge(tmp_path)
+    _feed_stdin(monkeypatch, {"hook_event_name": "PermissionRequest", "tool_name": "Bash"})
+    requests: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        kimi_native_hook,
+        "_request_web_approval",
+        lambda url, headers, body, **kwargs: requests.append(body.copy()) or "allow",
+    )
+    keys: list[str] = []
+
+    def _inject(bridge_dir: Path, *, key: str, timeout_s: float) -> bool:
+        del bridge_dir, timeout_s
+        keys.append(key)
+        raise KimiApprovalPromptAmbiguousError("same menu remained")
+
+    monkeypatch.setattr(kimi_native_hook, "inject_approval_keystroke", _inject)
+    monkeypatch.setattr(
+        kimi_native_hook,
+        "_approval_still_pending",
+        lambda _bridge: (_ for _ in ()).throw(AssertionError("must not re-park")),
+    )
+
+    assert kimi_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)]) == 0
+    assert len(requests) == 1
+    assert keys == [APPROVE_KEY]
 
 
 def test_permission_request_ungoverned_no_request(
