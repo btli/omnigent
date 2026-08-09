@@ -86,6 +86,14 @@ _TOOL_QUIESCENCE_S = 1800.0
 #: Continuous edge-delivery failure past this long logs an error (rate-limited
 #: to the same interval) so the outage is visible without extra plumbing.
 _EDGE_FAILURE_ALERT_S = 300.0
+#: Minimum silence window left after a restart re-seeds the activity clock
+#: (a few poll intervals): a forward wall-clock jump (sleep/wake, NTP step)
+#: must not read as elapsed silence and fire a watchdog before the resumed
+#: kimi has had a moment to write a row.
+_RESTART_GRACE_S = 1.0
+#: Sentinel: the wire's first line is partial or unparseable (mid-write) —
+#: defer adoption for this discovery cycle instead of trusting the coarse floor.
+_HEADER_UNREADABLE = object()
 
 
 @dataclass
@@ -108,6 +116,9 @@ class _ForwardState:
     # Wall-clock of the last genuine wire activity, so a restart resumes the
     # quiescence timers instead of re-arming their full windows.
     last_activity_ts: float | None = None
+    # High-water of wire bytes observed (>= the delivery cursor), so a crash
+    # loop replaying undelivered rows can't refresh the timers every restart.
+    last_seen_offset: int | None = None
 
 
 @dataclass
@@ -160,6 +171,7 @@ def _read_state(bridge_dir: Path) -> _ForwardState | None:
     tools_in_flight = data.get("tools_in_flight")
     dropped_edge_status = data.get("dropped_edge_status")
     last_activity_ts = data.get("last_activity_ts")
+    last_seen_offset = data.get("last_seen_offset")
     if isinstance(wire_path, str) and isinstance(last_line, int) and isinstance(offset, int):
         return _ForwardState(
             wire_path=wire_path,
@@ -174,6 +186,7 @@ def _read_state(bridge_dir: Path) -> _ForwardState | None:
             last_activity_ts=(
                 float(last_activity_ts) if isinstance(last_activity_ts, (int, float)) else None
             ),
+            last_seen_offset=last_seen_offset if isinstance(last_seen_offset, int) else None,
         )
     return None
 
@@ -188,6 +201,7 @@ def _write_state(bridge_dir: Path, state: _ForwardState) -> None:
         "last_edge_id": state.last_edge_id,
         "dropped_edge_status": state.dropped_edge_status,
         "last_activity_ts": state.last_activity_ts,
+        "last_seen_offset": state.last_seen_offset,
     }
     tmp = bridge_dir / (_STATE_FILE + ".tmp")
     with contextlib.suppress(OSError):
@@ -226,17 +240,25 @@ def workdirs_for_kimi_sessions(kimi_home: Path) -> dict[str, str]:
 _workdirs_for_sessions = workdirs_for_kimi_sessions
 
 
-def _wire_created_at_ms(wire: Path) -> int | None:
-    """``created_at`` (ms epoch) of the wire's first row — kimi's metadata header."""
+def _wire_created_at_ms(wire: Path) -> int | None | object:
+    """``created_at`` (ms epoch) of the wire's first row — kimi's metadata header.
+
+    Returns ``None`` only for a COMPLETE first line that carries no timestamp;
+    a partial or unparseable first line (mid-write) returns
+    :data:`_HEADER_UNREADABLE` so discovery retries next poll instead of
+    falling back to the coarse mtime floor.
+    """
     try:
         with open(wire, "rb") as fh:
             first = fh.readline(4096)
     except OSError:
-        return None
+        return _HEADER_UNREADABLE
+    if not first.endswith(b"\n"):
+        return _HEADER_UNREADABLE
     try:
         row = json.loads(first)
     except ValueError:
-        return None
+        return _HEADER_UNREADABLE
     if isinstance(row, dict):
         created_at = row.get("created_at")
         if isinstance(created_at, int):
@@ -282,9 +304,12 @@ def _discover_wire(kimi_home: Path, workspace: str, launch_epoch_ms: int) -> Pat
         if not precise and mtime_ns < floor_ns:
             # A truncated mtime in the launch second can't tell before from
             # after; let the wire's own metadata header break the tie, keeping
-            # the coarse floor only when the content has no timestamp.
+            # the coarse floor only when a COMPLETE first line has no timestamp.
             created_at = _wire_created_at_ms(wire)
-            if created_at is not None and created_at < launch_epoch_ms:
+            if created_at is _HEADER_UNREADABLE:
+                # Header mid-write: defer this candidate to the next poll.
+                continue
+            if isinstance(created_at, int) and created_at < launch_epoch_ms:
                 continue
         if best is None or mtime_ns > best[0]:
             best = (mtime_ns, wire)
@@ -624,13 +649,21 @@ async def forward_kimi_wire_to_session(
     last_wire_activity_wall = time.time()
     if state is not None and state.last_activity_ts is not None:
         # Resume the silence timers where the previous forwarder left them so
-        # a crash-looping forwarder can't re-arm the full windows forever.
+        # a crash-looping forwarder can't re-arm the full windows forever —
+        # but floor the remaining window at a short grace so a wall-clock jump
+        # (sleep/wake, NTP step) can't fire a watchdog on the spot.
         elapsed = max(0.0, time.time() - state.last_activity_ts)
+        window = tool_quiescence_s if tools_in_flight > 0 else quiescence_s
+        elapsed = min(elapsed, max(0.0, window - _RESTART_GRACE_S))
         last_wire_activity = time.monotonic() - elapsed
-        last_wire_activity_wall = state.last_activity_ts
-    # High-water of wire bytes actually observed: a redelivery retry re-reads
-    # the same tail and must not refresh the silence timers.
-    last_seen_offset = offset
+        last_wire_activity_wall = time.time() - elapsed
+    # High-water of wire bytes actually observed: a redelivery retry (in this
+    # run or a crash-loop replay) must not refresh the silence timers.
+    last_seen_offset = (
+        state.last_seen_offset
+        if state is not None and state.last_seen_offset is not None
+        else offset
+    )
     # Consecutive permanent-4xx rejections of the item at the head of the tail.
     poison_id: str | None = None
     poison_attempts = 0
@@ -653,6 +686,7 @@ async def forward_kimi_wire_to_session(
                     last_edge_id=last_edge_id,
                     dropped_edge_status=dropped_edge_status,
                     last_activity_ts=last_wire_activity_wall,
+                    last_seen_offset=last_seen_offset,
                 ),
             )
 
@@ -738,9 +772,12 @@ async def forward_kimi_wire_to_session(
                     # Genuinely new rows (or a truncated/recreated wire) refresh
                     # the silence timers; a redelivery retry re-reading the same
                     # unposted tail must NOT defer the quiescence fallbacks.
+                    # Persisted immediately (cursor untouched) so a crash loop
+                    # can't refresh the timers with the same rows every restart.
                     last_seen_offset = new_offset
                     last_wire_activity = time.monotonic()
                     last_wire_activity_wall = time.time()
+                    _persist()
                 for item in items:
                     if item.kind in ("tool_call", "tool_result"):
                         tools_in_flight = (

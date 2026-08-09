@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -236,6 +237,7 @@ class TestState:
                 last_edge_id="kimi:turn_end:5",
                 dropped_edge_status="failed",
                 last_activity_ts=1_700_000_000.5,
+                last_seen_offset=400,
             ),
         )
         loaded = _read_state(tmp_path)
@@ -248,6 +250,7 @@ class TestState:
         assert loaded.last_edge_id == "kimi:turn_end:5"
         assert loaded.dropped_edge_status == "failed"
         assert loaded.last_activity_ts == 1_700_000_000.5
+        assert loaded.last_seen_offset == 400
         clear_kimi_bridge_state(tmp_path)
         assert _read_state(tmp_path) is None
 
@@ -404,6 +407,28 @@ class TestDiscoverWire:
         home.mkdir()
         header = json.dumps({"type": "metadata", "created_at": 10_000_650})
         wire = self._make_session(home, "session_fresh", "/ws", mtime=10_000.0, first_row=header)
+        assert _discover_wire(home, "/ws", launch_epoch_ms=10_000_600) == wire
+
+    def test_coarse_tie_deferred_while_header_mid_write(self, tmp_path: Path) -> None:
+        """A partial/unparseable first line defers adoption to the next poll —
+        it must not fall through to the coarse mtime floor."""
+        import os
+
+        home = tmp_path / "kimi-code-home"
+        home.mkdir()
+        wire = self._make_session(home, "session_fresh", "/ws", mtime=10_000.0)
+        # Header truncated mid-write (no trailing newline yet).
+        wire.write_text('{"type": "metadata", "created_', encoding="utf-8")
+        os.utime(wire, (10_000.0, 10_000.0))
+        assert _discover_wire(home, "/ws", launch_epoch_ms=10_000_600) is None
+        # A complete-but-broken line is equally untrustworthy.
+        wire.write_text('{"broken json}\n', encoding="utf-8")
+        os.utime(wire, (10_000.0, 10_000.0))
+        assert _discover_wire(home, "/ws", launch_epoch_ms=10_000_600) is None
+        # Next poll the header is complete: the timestamp decides.
+        header = json.dumps({"type": "metadata", "created_at": 10_000_650})
+        wire.write_text(header + "\n", encoding="utf-8")
+        os.utime(wire, (10_000.0, 10_000.0))
         assert _discover_wire(home, "/ws", launch_epoch_ms=10_000_600) == wire
 
 
@@ -699,6 +724,57 @@ class TestForwardLoopEdges:
         )
         assert self.statuses == [("failed", "")]
 
+    async def test_wall_clock_jump_gets_restart_grace(self, tmp_path: Path) -> None:
+        """A huge apparent elapsed silence (sleep/wake, NTP step) must not fire
+        a watchdog on the spot — the restart grace gives the wire a moment."""
+        rows = [_prompt_row()]
+
+        def _seed(bridge: Path, wire: Path) -> None:
+            size = wire.stat().st_size
+            _write_state(
+                bridge,
+                _ForwardState(
+                    wire_path=str(wire),
+                    last_line=1,
+                    offset=size,
+                    turn_open=True,
+                    last_activity_ts=time.time() - 10_000.0,
+                    last_seen_offset=size,
+                ),
+            )
+
+        started = time.monotonic()
+        await _drive_loop_until(
+            tmp_path, rows, lambda: bool(self.statuses), quiescence_s=5.0, prepare=_seed
+        )
+        assert self.statuses == [("idle", "")]
+        assert time.monotonic() - started >= 0.8
+
+    async def test_near_expired_window_still_fires_promptly(self, tmp_path: Path) -> None:
+        """The grace floor must not re-arm the whole window for a crash loop."""
+        rows = [_prompt_row()]
+
+        def _seed(bridge: Path, wire: Path) -> None:
+            size = wire.stat().st_size
+            _write_state(
+                bridge,
+                _ForwardState(
+                    wire_path=str(wire),
+                    last_line=1,
+                    offset=size,
+                    turn_open=True,
+                    last_activity_ts=time.time() - 4.5,
+                    last_seen_offset=size,
+                ),
+            )
+
+        started = time.monotonic()
+        await _drive_loop_until(
+            tmp_path, rows, lambda: bool(self.statuses), quiescence_s=5.0, prepare=_seed
+        )
+        assert self.statuses == [("idle", "")]
+        assert time.monotonic() - started <= 2.5
+
     async def test_replayed_turn_edge_is_deduped(self, tmp_path: Path) -> None:
         """A crash between an edge POST and the cursor persist must not double-post."""
         rows = [_prompt_row(), _turn_ended_row("completed")]
@@ -835,6 +911,61 @@ class TestForwardLoopPostFailures:
         await _drive_loop_until(tmp_path, rows, lambda: bool(posted), quiescence_s=0.05)
         assert edge_attempts == 4
         assert posted == [("failed", "")]
+
+    async def test_high_water_persisted_without_cursor_advance(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Observed-tail state persists on advancement even while delivery fails,
+        so a crash loop can't replay the same rows into a fresh clock."""
+        bridge = tmp_path / "bridge"
+
+        async def _failing_item(_client: object, **kwargs: object) -> None:
+            raise httpx.ConnectError("no route to host")
+
+        monkeypatch.setattr(fwd, "_post_conversation_item", _failing_item)
+
+        def _persisted() -> bool:
+            state = _read_state(bridge)
+            return state is not None and (state.last_seen_offset or 0) > 0 and state.offset == 0
+
+        await _drive_loop_until(tmp_path, [_prompt_row()], _persisted)
+        forwarder_health.clear()
+
+    async def test_crash_loop_replay_does_not_rearm_silence(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A restart re-reading rows already observed (persisted high-water)
+        must resume the silence clock, not restart the full window."""
+        statuses: list[tuple[str, str]] = []
+
+        async def _failing_item(_client: object, **kwargs: object) -> None:
+            raise httpx.ConnectError("no route to host")
+
+        async def _fake_status(_client: object, **kwargs: object) -> None:
+            statuses.append((str(kwargs["status"]), str(kwargs["output"])))
+
+        monkeypatch.setattr(fwd, "_post_conversation_item", _failing_item)
+        monkeypatch.setattr(fwd, "_post_external_session_status", _fake_status)
+
+        def _seed(bridge: Path, wire: Path) -> None:
+            # A prior crashed run already observed the whole tail 100s ago but
+            # never delivered it (cursor still 0).
+            _write_state(
+                bridge,
+                _ForwardState(
+                    wire_path=str(wire),
+                    last_line=0,
+                    offset=0,
+                    last_activity_ts=time.time() - 100.0,
+                    last_seen_offset=wire.stat().st_size,
+                ),
+            )
+
+        await _drive_loop_until(
+            tmp_path, [_prompt_row()], lambda: bool(statuses), quiescence_s=50.0, prepare=_seed
+        )
+        assert statuses == [("idle", "")]
+        forwarder_health.clear()
 
     async def test_failed_redelivery_does_not_defer_quiescence(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
