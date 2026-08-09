@@ -22,6 +22,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Resolved and cached at module load, while sys.path[0] (this script's dir)
+# still holds only trusted files — a merged PR dropping a tomllib.py shadow
+# next to us mid-run must never be importable. Only the stage command needs
+# it; the notes entry point tolerates python < 3.11.
+try:
+    import tomllib
+except ImportError:
+    tomllib = None
+
 UPSTREAM_REPO = "omnigent-ai/omnigent"
 PR_AUTHOR = "btli"
 PR_LIST_LIMIT = 100
@@ -117,10 +126,8 @@ def conflict_paths(cwd: str | Path) -> list[str]:
 def dev_version(cwd: str | Path, upstream_sha: str, datestamp: str) -> str:
     """Mirror nightly-release.yml's scheme, but read the version from the
     UPSTREAM commit — a merged PR must not control the tag we mint."""
-    # Local import: the `notes` subcommand runs on whatever python3 the
-    # publish job has, and must not require tomllib (3.11+).
-    import tomllib
-
+    if tomllib is None:
+        raise StageError("the stage command requires python >= 3.11 (tomllib)")
     text = git(cwd, "show", f"{upstream_sha}:pyproject.toml").stdout
     version = tomllib.loads(text).get("project", {}).get("version", "")
     m = re.fullmatch(r"(\d+\.\d+\.\d+)\.dev0", version)
@@ -338,6 +345,9 @@ def main(argv: list[str] | None = None) -> int:
     else:
         date = dt.datetime.now(dt.timezone.utc).date()
     try:
+        # Fail the stage path before any fetch/merge if the parser is absent.
+        if tomllib is None:
+            raise StageError("the stage command requires python >= 3.11 (tomllib)")
         prs = (
             check_not_truncated(json.loads(Path(args.prs_json).read_text()))
             if args.prs_json

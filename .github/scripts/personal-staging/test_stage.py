@@ -10,7 +10,9 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -265,6 +267,53 @@ def test_truncation_guard(env, tmp_path):
                 str(tmp_path / "r.json"),
             ]
         )
+
+
+def test_hostile_tomllib_shadow_is_never_imported(env, tmp_path):
+    """A merged PR drops tomllib.py next to stage.py mid-run (sys.path[0]);
+    the parser must already be cached from module load, so the shadow module
+    never executes."""
+    script_dir_rel = ".github/scripts/personal-staging"
+    (env.seed / script_dir_rel).mkdir(parents=True)
+    shutil.copy(stage_mod.__file__, env.seed / script_dir_rel / "stage.py")
+    git(env.seed, "add", script_dir_rel)
+    git(env.seed, "commit", "--no-verify", "-m", "vendor composer")
+    git(env.seed, "push", str(env.upstream), "main")
+
+    canary = tmp_path / "canary"
+    pr = env.add_pr(
+        21,
+        f"{script_dir_rel}/tomllib.py",
+        f"open({str(canary)!r}, 'w').write('pwned')\nraise RuntimeError('pwned')\n",
+    )
+    prs_json = tmp_path / "prs.json"
+    prs_json.write_text(json.dumps([pr]))
+
+    # materialize the trusted checkout, then run the composer FROM the work
+    # tree so a shadow module merged next to it would win module resolution
+    git(env.work, "fetch", "upstream", "main")
+    git(env.work, "checkout", "--detach", "FETCH_HEAD")
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(env.work / script_dir_rel / "stage.py"),
+            "stage",
+            "--workdir",
+            str(env.work),
+            "--date",
+            STAMP,
+            "--prs-json",
+            str(prs_json),
+            "--report",
+            str(tmp_path / "r.json"),
+        ],
+        text=True,
+        capture_output=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert not canary.exists()
+    report = json.loads((tmp_path / "r.json").read_text())
+    assert [p["pr"] for p in report["applied"]] == [21]
 
 
 def test_summary_written_on_success_and_failure(env, tmp_path, monkeypatch, capsys):

@@ -187,24 +187,6 @@ jobs:
           ./gradlew assembleDebug bundleRelease --no-daemon --console=plain \
             -PversionCode="$VERSION_CODE"
 
-      # The release AAB must ship unsigned (no release keystore on this
-      # ring): its ZIP must carry no META-INF signature blocks at all.
-      - name: Verify release AAB is unsigned
-        run: |
-          python3 - <<'EOF'
-          import sys
-          import zipfile
-
-          names = zipfile.ZipFile("app/build/outputs/bundle/release/app-release.aab").namelist()
-          sigs = [
-              n
-              for n in names
-              if n.upper().startswith("META-INF/")
-              and n.upper().endswith((".RSA", ".DSA", ".EC", ".SF"))
-          ]
-          sys.exit(f"release AAB carries signature blocks: {sigs}" if sigs else 0)
-          EOF
-
       # Hand off exactly two named files from a freshly created dir — the
       # build must not be able to smuggle extra files across the boundary.
       - name: Stage build outputs
@@ -261,6 +243,27 @@ jobs:
             echo "unexpected artifact contents: $got"
             exit 1
           fi
+
+      # Verified HERE, on the downloaded artifact and before any keystore
+      # material exists in the job: the untrusted build job could shadow
+      # zipfile / swap the file under a check running in its own runner.
+      # The release AAB must ship unsigned (no release keystore on this
+      # ring): its ZIP must carry no META-INF signature blocks at all.
+      - name: Verify release AAB is unsigned
+        run: |
+          python3 - <<'EOF'
+          import sys
+          import zipfile
+
+          names = zipfile.ZipFile("unsigned/omnigent-staging-release-unsigned.aab").namelist()
+          sigs = [
+              n
+              for n in names
+              if n.upper().startswith("META-INF/")
+              and n.upper().endswith((".RSA", ".DSA", ".EC", ".SF"))
+          ]
+          sys.exit(f"release AAB carries signature blocks: {sigs}" if sigs else 0)
+          EOF
 
       - name: Prepare signing keystore
         id: keystore
@@ -414,14 +417,21 @@ jobs:
       - name: Dispatch image build for this nightly
         run: |
           set -euo pipefail
-          if gh api \
+          probe_rc=0
+          probe_err="$(gh api \
             "repos/$GITHUB_REPOSITORY/contents/.github/workflows/personal-staging-images.yml?ref=main" \
-            >/dev/null 2>&1; then
+            2>&1 >/dev/null)" || probe_rc=$?
+          if [ "$probe_rc" -eq 0 ]; then
             gh workflow run personal-staging-images.yml --ref main -f ref="$TAG"
             echo "Dispatched personal-staging-images.yml (main) with ref=$TAG" >> "$GITHUB_STEP_SUMMARY"
-          else
+          elif printf '%s' "$probe_err" | grep -q "(HTTP 404)"; then
+            # Only a definite not-found means "not merged yet"; auth,
+            # rate-limit, or network failures must fail the nightly loud.
             echo "> [!WARNING]" >> "$GITHUB_STEP_SUMMARY"
             echo "> Image build NOT dispatched: personal-staging-images.yml is not on main yet." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "workflow probe failed (exit $probe_rc): $probe_err"
+            exit 1
           fi
 
       - name: Report failure
