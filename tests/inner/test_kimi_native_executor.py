@@ -12,6 +12,7 @@ per-spawn MCP config), so the MCP-config tests have no analogue here.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from inspect import signature
 from pathlib import Path
@@ -353,6 +354,34 @@ class TestApprovalKeystroke:
         assert inject_approval_keystroke(tmp_path, key=APPROVE_KEY) is True
         assert sent == [("send-keys", "-t", "main", APPROVE_KEY)]
 
+    def test_same_menu_after_digit_is_ambiguous(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sent = self._stub_tmux(
+            monkeypatch,
+            pane=_fixture("approval_menu.txt"),
+            after_key_pane=_fixture("approval_menu.txt"),
+        )
+        monkeypatch.setattr(kimi_native_bridge, "_APPROVAL_SETTLE_TIMEOUT_S", 0.001)
+        monkeypatch.setattr(kimi_native_bridge, "_POLL_INTERVAL_S", 0.0)
+        with pytest.raises(kimi_native_bridge.KimiApprovalPromptAmbiguousError):
+            inject_approval_keystroke(tmp_path, key=APPROVE_KEY)
+        assert sent == [("send-keys", "-t", "main", APPROVE_KEY)]
+
+    def test_different_menu_after_digit_is_resolved(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        other_menu = _fixture("approval_menu.txt").replace(
+            "printf approval-fixture", "printf different-fixture"
+        )
+        sent = self._stub_tmux(
+            monkeypatch,
+            pane=_fixture("approval_menu.txt"),
+            after_key_pane=other_menu,
+        )
+        assert inject_approval_keystroke(tmp_path, key=APPROVE_KEY) is True
+        assert sent == [("send-keys", "-t", "main", APPROVE_KEY)]
+
     @pytest.mark.parametrize(
         "marker", ["Approve once", "Approve for this session", "Reject", "Reject with feedback"]
     )
@@ -403,7 +432,7 @@ class TestApprovalKeystroke:
 
     def test_raises_when_tui_exited(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         sent = self._stub_tmux(monkeypatch, pane="▶ 1. Approve once", alive=False)
-        with pytest.raises(kimi_native_bridge.KimiApprovalPromptNotFoundError):
+        with pytest.raises(kimi_native_bridge.KimiApprovalSessionNotFoundError):
             inject_approval_keystroke(tmp_path, key=APPROVE_KEY)
         assert sent == []
 
@@ -570,6 +599,7 @@ class TestUserMessageInjection:
         clear_verifies: bool = True,
         capture_log: list[tuple[int, str]] | None = None,
         cancel_after_clear: threading.Event | None = None,
+        sticky_post_paste: bool = False,
     ) -> list[tuple[str, ...]]:
         def _editor_pane(text: str) -> str:
             rows = text.splitlines() or [""]
@@ -614,7 +644,7 @@ class TestUserMessageInjection:
             if not pasted["value"] and pre_clear:
                 pane = pre_clear.pop(0)
             elif pasted["value"] and enters["count"] == 0 and post_paste:
-                pane = post_paste.pop(0)
+                pane = post_paste[0] if sticky_post_paste else post_paste.pop(0)
             elif enters["count"] and transient_captures:
                 pane = transient_captures.pop(0)
             elif empty_captures["count"]:
@@ -785,7 +815,7 @@ class TestUserMessageInjection:
     def test_submits_real_multiline_paste_placeholder(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        content = "\n".join(f"round7 line {index} with enough text" for index in range(1, 10))
+        content = "\n".join(f"round7 line {index} with enough text" for index in range(1, 11))
         sent = self._stub_tui(
             monkeypatch,
             tmp_path,
@@ -795,6 +825,41 @@ class TestUserMessageInjection:
         )
         inject_user_message(tmp_path / "bridge", content=content)
         assert [args[-1] for args in sent if args[-1] == "Enter"] == ["Enter"]
+
+    def test_stale_paste_placeholder_does_not_verify_new_paste(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        content = "\n".join(f"line {index}" for index in range(1, 11))
+        stale_placeholder = _fixture("paste_placeholder_11_lines.txt").replace(
+            "[paste #1 +11 lines]", "[paste #999 +11 lines]"
+        )
+        sent = self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=1,
+            content=content,
+            initial_content="[paste #999 +11 lines]",
+            post_paste_captures=(stale_placeholder,),
+            sticky_post_paste=True,
+        )
+        with pytest.raises(RuntimeError, match="not delivered"):
+            inject_user_message(tmp_path / "bridge", content=content, turn_streaming=True)
+        assert not any(args[-1] == "Enter" for args in sent)
+
+    def test_literal_paste_placeholder_text_is_draft_content(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        content = "[paste #999 +2 lines]"
+        sent = self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=1,
+            content=content,
+            initial_content=content,
+        )
+        with pytest.raises(RuntimeError, match="not delivered"):
+            inject_user_message(tmp_path / "bridge", content=content, turn_streaming=True)
+        assert not any(args[-1] == "Enter" for args in sent)
 
     def test_clears_draft_with_single_ctrl_c(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -886,6 +951,30 @@ class TestUserMessageInjection:
             )
         assert [args[0] for args in sent if args[0] == "load-buffer"] == ["load-buffer"]
         assert not any(args[-1] == "Enter" for args in sent)
+
+    def test_restore_skips_permission_menu_and_logs_lost_draft(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        sent: list[tuple[str, ...]] = []
+        monkeypatch.setattr(
+            kimi_native_bridge,
+            "_capture_pane",
+            lambda _socket, _target: _fixture("approval_menu.txt"),
+        )
+        monkeypatch.setattr(
+            kimi_native_bridge,
+            "_run_tmux",
+            lambda _socket, *args: sent.append(args),
+        )
+        with caplog.at_level(logging.WARNING, logger="omnigent.kimi_native_bridge"):
+            kimi_native_bridge._restore_editor_content(
+                "/s", "main", tmp_path, "draft that must not be lost silently"
+            )
+        assert sent == []
+        assert "lost draft length=36" in caplog.text
 
     def test_does_not_clear_empty_editor(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
