@@ -104,7 +104,12 @@ jobs:
     # when sync-main failed on a conflict (the ring stacks from upstream
     # HEAD, not fork main).
     needs: [sync-main, test-composer]
-    if: always() && needs.test-composer.result == 'success' && needs.sync-main.result != 'cancelled'
+    # The ref guard blocks accidental non-main dispatches of privileged jobs
+    # (schedule always runs main). It is accident prevention only: a
+    # dispatched ref executes its own workflow copy, so file-level guards
+    # can't stop a malicious ref — the keystore's real protection is the
+    # server-enforced staging-signing Environment on android-sign.
+    if: always() && needs.test-composer.result == 'success' && needs.sync-main.result != 'cancelled' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -217,8 +222,14 @@ jobs:
   # this job — so the untrusted build's own signature never survives.
   android-sign:
     needs: android-build
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Server-enforced gate for the keystore secrets: the staging-signing
+    # Environment carries the OMNIGENT_DEBUG_* secrets and a main-only
+    # deployment-branch rule, so a dispatched non-main workflow copy can
+    # never read them regardless of what its file says.
+    environment: staging-signing
     outputs:
       signed: ${{ steps.keystore.outputs.signed }}
     steps:
@@ -328,6 +339,7 @@ jobs:
 
   publish:
     needs: [integrate, android-sign]
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

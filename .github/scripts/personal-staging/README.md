@@ -52,19 +52,35 @@ https://github.com/btli/omnigent/releases/download/nightly-latest/omnigent-stagi
 
 The `android-sign` job always re-signs the APK (the untrusted build job's
 own signature never ships). Without a shared keystore it mints a fresh one
-per run, so in-place upgrades fail across nightlies (uninstall first). To
-make nightlies share one signature, generate a keystore once and store it
-as fork secrets — passwords go via prompts/stdin, never argv:
+per run, so in-place upgrades fail across nightlies (uninstall first).
+
+To make nightlies share one signature, the four keystore secrets live in a
+**`staging-signing` GitHub Environment with a main-only deployment-branch
+rule — not repo-level secrets**. A `workflow_dispatch` of a non-main ref
+executes that ref's own copy of the workflow, so nothing written in this
+file can stop a malicious ref from reading repo-level secrets; the
+Environment's branch rule is enforced server-side regardless of what the
+dispatched workflow file says.
+
+One-time setup — create the Environment, restrict it to `main`, then store
+the secrets there (passwords go via prompts/stdin, never argv):
 
 ```sh
+gh api -X PUT repos/btli/omnigent/environments/staging-signing \
+  --input - <<'JSON'
+{"deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}
+JSON
+gh api -X POST repos/btli/omnigent/environments/staging-signing/deployment-branch-policies \
+  -f name=main -f type=branch
+
 # keytool prompts for the store/key passwords interactively
 keytool -genkeypair -v -keystore debug.keystore -alias omnigent-debug \
   -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=omnigent staging"
 
-base64 -i debug.keystore | gh secret set -R btli/omnigent OMNIGENT_DEBUG_KEYSTORE_B64
-gh secret set -R btli/omnigent OMNIGENT_DEBUG_KEYSTORE_PASSWORD  # paste at the prompt
-gh secret set -R btli/omnigent OMNIGENT_DEBUG_KEY_ALIAS --body omnigent-debug
-gh secret set -R btli/omnigent OMNIGENT_DEBUG_KEY_PASSWORD       # paste at the prompt
+base64 -i debug.keystore | gh secret set -R btli/omnigent --env staging-signing OMNIGENT_DEBUG_KEYSTORE_B64
+gh secret set -R btli/omnigent --env staging-signing OMNIGENT_DEBUG_KEYSTORE_PASSWORD  # paste at the prompt
+gh secret set -R btli/omnigent --env staging-signing OMNIGENT_DEBUG_KEY_ALIAS --body omnigent-debug
+gh secret set -R btli/omnigent --env staging-signing OMNIGENT_DEBUG_KEY_PASSWORD       # paste at the prompt
 ```
 
 The keystore only ever reaches the `android-sign` job, which never checks
@@ -82,9 +98,20 @@ device — the next nightly's signature won't match the leaked one.
 
 ## Manual dispatch
 
+Always dispatch `main` — the privileged jobs (integrate, android-sign,
+publish) carry a `github.ref == 'refs/heads/main'` guard and skip on any
+other ref:
+
 ```sh
-gh workflow run personal-staging.yml -R btli/omnigent
+gh workflow run personal-staging.yml -R btli/omnigent --ref main
 ```
+
+Risk-accepted residual: the ref guard is accident prevention, not a
+security boundary — a dispatched ref runs its own workflow copy, and the
+integrate job's `GITHUB_TOKEN` write permission comes from that file, so a
+repo writer dispatching a hostile non-main ref could still push refs.
+Acceptable for a single-writer fork; the keystore (the only custom secret)
+is protected for real by the `staging-signing` Environment above.
 
 ## Tests
 
