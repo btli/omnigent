@@ -58,7 +58,6 @@ jobs:
           short_sha="$(git rev-parse HEAD | cut -c1-12)"
           server_image='ghcr.io/btli/omnigent-server'
           host_image='ghcr.io/btli/omnigent-host'
-          echo "tag_name=${tag_name}" >> "${GITHUB_OUTPUT}"
           echo "server_tags=${server_image}:sha-${short_sha},${server_image}:${tag_name}" >> "${GITHUB_OUTPUT}"
           echo "host_tags=${host_image}:sha-${short_sha},${host_image}:${tag_name}" >> "${GITHUB_OUTPUT}"
 
