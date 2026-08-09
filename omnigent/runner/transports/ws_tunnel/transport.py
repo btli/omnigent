@@ -42,6 +42,30 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 from omnigent.runner.transports.ws_tunnel.registry import RequestState, TunnelRegistry
 
 
+async def _send_cancel_frame(
+    registry: TunnelRegistry,
+    state: RequestState,
+    req_id: str,
+    reason: str,
+) -> None:
+    """Best-effort request.cancel so the runner stops its dispatch task.
+
+    Without it the runner's stream generator leaks and keeps consuming
+    from the session's shared event queue, starving a restarted stream.
+    Must run while the request is still open; send failures are ignored
+    (the tunnel may already be dying).
+    """
+    if not registry.request_is_open(state.session, req_id):
+        return
+    try:  # noqa: SIM105 — contextlib.suppress doesn't work with await
+        await registry.send_text(
+            state.session,
+            encode_frame(RequestCancelFrame(id=req_id, reason=reason)),
+        )
+    except Exception:  # noqa: BLE001 — best-effort cleanup
+        pass
+
+
 def _request_read_timeout(request: httpx.Request) -> float | None:
     """Return the request's httpx read timeout, or ``None`` for no limit."""
     timeouts = request.extensions.get("timeout")
@@ -82,6 +106,9 @@ class _TunneledByteStream(httpx.AsyncByteStream):
                     except TimeoutError:
                         # Silent stream on a live tunnel: surface a read
                         # timeout; the tunnel itself stays registered.
+                        await _send_cancel_frame(
+                            self._registry, state, self._req_id, "read_timeout"
+                        )
                         raise httpx.ReadTimeout(
                             f"tunneled response from runner {self._runner_id!r} "
                             f"stalled beyond {self._read_timeout}s read timeout"
@@ -107,19 +134,7 @@ class _TunneledByteStream(httpx.AsyncByteStream):
         # client disconnect). The transport translates this into a
         # request.cancel frame so the runner aborts.
         state = self._state
-        if self._registry.request_is_open(state.session, self._req_id):
-            try:  # noqa: SIM105 — contextlib.suppress doesn't work with await
-                await self._registry.send_text(
-                    state.session,
-                    encode_frame(
-                        RequestCancelFrame(
-                            id=self._req_id,
-                            reason="client_disconnected",
-                        )
-                    ),
-                )
-            except Exception:  # noqa: BLE001 — best-effort cleanup
-                pass
+        await _send_cancel_frame(self._registry, state, self._req_id, "client_disconnected")
         self._registry.close_request(
             self._runner_id,
             self._req_id,
@@ -192,6 +207,7 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
                 try:
                     head = await asyncio.wait_for(state.head_future, read_timeout)
                 except TimeoutError:
+                    await _send_cancel_frame(self._registry, state, req_id, "read_timeout")
                     raise httpx.ReadTimeout(
                         f"response head from runner {self._runner_id!r} "
                         f"stalled beyond {read_timeout}s read timeout",
