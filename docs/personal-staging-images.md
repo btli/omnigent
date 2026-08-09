@@ -12,9 +12,9 @@ Both images are multi-architecture manifests for `linux/amd64` and
 - `ghcr.io/btli/omnigent-server`
 - `ghcr.io/btli/omnigent-host`
 
-Each publish adds three tags to both images:
+Each successful publish exposes three consumer tags on both images:
 
-- `sha-<short>` — the short commit pin.
+- `sha-<short>` — a short commit label.
 - The triggering `nightly-*` tag, such as `nightly-20260809`.
 - `staging-nightly` — the floating staging tag.
 
@@ -25,10 +25,12 @@ builder can reuse layers. Both builds use QEMU and registry-backed caches at
 `ghcr.io/btli/omnigent-host:buildcache`. These `buildcache` tags are internal
 BuildKit cache refs, not deployment image pins.
 
-The server and host builds publish only their immutable `sha-<short>` and date
-tags. After both builds succeed, the workflow applies `staging-nightly` from
-each build's pushed manifest digest. A failed build therefore leaves the
-previous floating tag unchanged.
+The server and host builds publish only their `sha-<short>` and date labels.
+After both builds succeed, the workflow applies `staging-nightly` from each
+build's pushed manifest digest. A failed build therefore leaves the previous
+floating tag unchanged. Rerunning a build may repoint the named `sha-*` and
+date tags; only an image reference with an explicit `@sha256:...` digest is
+immutable.
 
 ## First package setup
 
@@ -41,7 +43,11 @@ and publish; it does not change package visibility.
 
 Inspect the manifest list for a date tag:
 
+The first publish creates private packages. Either flip both GHCR packages to
+public as described above, or authenticate before inspecting:
+
 ```bash
+docker login ghcr.io
 docker buildx imagetools inspect ghcr.io/btli/omnigent-server:nightly-20260809
 docker buildx imagetools inspect ghcr.io/btli/omnigent-host:nightly-20260809
 ```
@@ -60,9 +66,9 @@ needs to verify a platform image directly.
 ## Manual verification after merge
 
 Use an existing `nightly-*` tag from `btli/omnigent` and dispatch the workflow
-against that tag. The `--ref` flag makes the workflow run itself use the same
-tag as the required `ref` input, while the timestamp filter avoids watching an
-older dispatch run:
+against that tag. The workflow is dispatched from the default branch, with the
+tag passed through the required `ref` input. Snapshot existing run IDs first so
+the polling loop selects the new run rather than the latest run by timestamp:
 
 ```bash
 set -euo pipefail
@@ -70,12 +76,15 @@ set -euo pipefail
 TAG=nightly-20260809
 REPO=btli/omnigent
 WORKFLOW=personal-staging-images.yml
-DISPATCHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-gh workflow run "$WORKFLOW" -R "$REPO" --ref "$TAG" -f ref="$TAG"
+BEFORE_RUN_IDS="$(gh run list -R "$REPO" --workflow "$WORKFLOW" --event workflow_dispatch --limit 100 --json databaseId --jq '.[].databaseId' | sort -n)"
+gh workflow run "$WORKFLOW" -R "$REPO" -f ref="$TAG"
 
 RUN_ID=""
-for attempt in 1 2 3 4 5; do
-  RUN_ID="$(gh run list -R "$REPO" --workflow "$WORKFLOW" --event workflow_dispatch --limit 20 --json databaseId,createdAt --jq "[.[] | select(.createdAt >= \"${DISPATCHED_AT}\")] | sort_by([.createdAt, .databaseId]) | .[-1].databaseId // empty")"
+for attempt in $(seq 1 30); do
+  AFTER_RUN_IDS="$(gh run list -R "$REPO" --workflow "$WORKFLOW" --event workflow_dispatch --limit 100 --json databaseId --jq '.[].databaseId' | sort -n)"
+  RUN_ID="$(comm -13 \
+    <(printf '%s\n' "$BEFORE_RUN_IDS" | sed '/^$/d') \
+    <(printf '%s\n' "$AFTER_RUN_IDS" | sed '/^$/d') | tail -n 1)"
   if [ -n "$RUN_ID" ]; then
     break
   fi
@@ -94,8 +103,12 @@ manifest_digest() {
   printf '%s\n' "$digest"
 }
 
-HEAD_SHA="$(gh run view "$RUN_ID" -R "$REPO" --json headSha --jq '.headSha')"
-SHORT_SHA="${HEAD_SHA:0:7}"
+TAG_OBJECT_TYPE="$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq '.object.type')"
+TAG_SHA="$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq '.object.sha')"
+if [ "$TAG_OBJECT_TYPE" = "tag" ]; then
+  TAG_SHA="$(gh api "repos/${REPO}/git/tags/${TAG_SHA}" --jq '.object.sha')"
+fi
+SHORT_SHA="${TAG_SHA:0:12}"
 for image in ghcr.io/btli/omnigent-server ghcr.io/btli/omnigent-host; do
   date_digest="$(manifest_digest "${image}:${TAG}")"
   sha_digest="$(manifest_digest "${image}:sha-${SHORT_SHA}")"
