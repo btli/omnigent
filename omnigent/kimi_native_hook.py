@@ -96,6 +96,13 @@ def _headers_from_config(config: dict[str, object]) -> dict[str, str]:
     return {str(key): str(value) for key, value in raw.items()}
 
 
+def _approval_still_pending(bridge_dir: Path | None) -> bool:
+    if bridge_dir is None or approval_prompt_visible(bridge_dir):
+        return True
+    time.sleep(0.1)
+    return approval_prompt_visible(bridge_dir)
+
+
 def _read_stdin_payload() -> dict[str, object] | None:
     """Parse the hook event JSON from stdin; ``None`` when unusable."""
     raw = sys.stdin.read()
@@ -291,7 +298,7 @@ def _request_web_approval(
                 resp = client.post(url, json=body)
                 resp.raise_for_status()
         except httpx.TimeoutException as exc:
-            if bridge_dir is not None and not approval_prompt_visible(bridge_dir):
+            if not _approval_still_pending(bridge_dir):
                 return None
             print(
                 f"omnigent kimi permission-request hook: approval poll ended; re-parking: {exc}",
@@ -305,7 +312,7 @@ def _request_web_approval(
             )
             return None
         if not resp.content:
-            if bridge_dir is not None and not approval_prompt_visible(bridge_dir):
+            if not _approval_still_pending(bridge_dir):
                 return None
             print(
                 "omnigent kimi permission-request hook: empty approval response; re-parking",

@@ -323,6 +323,7 @@ def test_request_web_approval_does_not_repark_after_menu_is_gone(
 ) -> None:
     response = httpx.Response(200, content=b"", request=httpx.Request("POST", "http://server"))
     requests: list[dict[str, object]] = []
+    probes: list[Path] = []
 
     class _Client:
         def __init__(self, **_kwargs: object) -> None:
@@ -339,7 +340,11 @@ def test_request_web_approval_does_not_repark_after_menu_is_gone(
             return response
 
     monkeypatch.setattr(kimi_native_hook.httpx, "Client", _Client)
-    monkeypatch.setattr(kimi_native_hook, "approval_prompt_visible", lambda _dir: False)
+    monkeypatch.setattr(
+        kimi_native_hook,
+        "approval_prompt_visible",
+        lambda bridge_dir: probes.append(bridge_dir) or False,
+    )
 
     body = {"_omnigent_elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
     assert (
@@ -347,6 +352,7 @@ def test_request_web_approval_does_not_repark_after_menu_is_gone(
         is None
     )
     assert len(requests) == 1
+    assert probes == [tmp_path, tmp_path]
 
 
 def test_permission_read_timeout_leaves_global_deadline_margin(
