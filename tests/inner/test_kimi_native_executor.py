@@ -681,6 +681,7 @@ class TestUserMessageInjection:
             content="literal $ and ✨ marker",
             post_paste_captures=(
                 _fixture("draft_pasted.txt"),
+                _fixture("draft_pasted.txt"),
                 _fixture("menu_after_paste.txt"),
             ),
             raise_on_enter=True,
