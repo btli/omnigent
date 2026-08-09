@@ -1,7 +1,7 @@
 # Personal staging images
 
 `.github/workflows/personal-staging-images.yml` publishes the server and host
-images from `btli/omnigent` to GHCR. It runs for `testing-*` tag pushes and for
+images from `btli/omnigent` to GHCR. It runs for `nightly-*` tag pushes and for
 manual dispatches that provide an existing tag or ref through the `ref` input.
 The job is deliberately guarded to run only in the fork repository.
 
@@ -14,7 +14,7 @@ Both images are multi-architecture manifests for `linux/amd64` and
 Each publish adds three tags to both images:
 
 - `sha-<short>` — the short commit pin.
-- The triggering `testing-*` tag, such as `testing-20260809`.
+- The triggering `nightly-*` tag, such as `nightly-20260809`.
 - `staging-nightly` — the floating staging tag.
 
 The server build uses the Dockerfile's default `runtime` stage, as in the
@@ -33,8 +33,8 @@ and publish; it does not change package visibility.
 Inspect the manifest list for a date tag:
 
 ```bash
-docker buildx imagetools inspect ghcr.io/btli/omnigent-server:testing-20260809
-docker buildx imagetools inspect ghcr.io/btli/omnigent-host:testing-20260809
+docker buildx imagetools inspect ghcr.io/btli/omnigent-server:nightly-20260809
+docker buildx imagetools inspect ghcr.io/btli/omnigent-host:nightly-20260809
 ```
 
 Use the returned top-level `Digest` to pin a consumer, for example:
@@ -50,11 +50,11 @@ needs to verify a platform image directly.
 
 ## Manual verification after merge
 
-Use an existing `testing-*` tag from `btli/omnigent` and dispatch the workflow
+Use an existing `nightly-*` tag from `btli/omnigent` and dispatch the workflow
 against it:
 
 ```bash
-TAG=testing-20260809
+TAG=nightly-20260809
 gh workflow run personal-staging-images.yml -R btli/omnigent -f ref="$TAG"
 RUN_ID="$(gh run list -R btli/omnigent --workflow personal-staging-images.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
 gh run watch "$RUN_ID" -R btli/omnigent
@@ -62,7 +62,7 @@ docker buildx imagetools inspect "ghcr.io/btli/omnigent-server:$TAG"
 docker buildx imagetools inspect "ghcr.io/btli/omnigent-host:$TAG"
 ```
 
-Replace `testing-20260809` with a tag that exists in the fork. Confirm the run
+Replace `nightly-20260809` with a tag that exists in the fork. Confirm the run
 is successful and that each inspect command shows both `linux/amd64` and
 `linux/arm64` manifests.
 

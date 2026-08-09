@@ -3,11 +3,11 @@ name: Publish personal staging images
 on:
   push:
     tags:
-      - 'testing-*'
+      - 'nightly-*'
   workflow_dispatch:
     inputs:
       ref:
-        description: Git tag or ref to build; use an existing testing-* tag
+        description: Git tag or ref to build; use an existing nightly-* tag
         required: true
         type: string
 
@@ -56,9 +56,9 @@ jobs:
           tag_name="${source_ref##*/}"
 
           case "${tag_name}" in
-            testing-*) ;;
+            nightly-*) ;;
             *)
-              echo "Ref must resolve to a testing-* tag, got '${source_ref}'." >&2
+              echo "Ref must resolve to a nightly-* tag, got '${source_ref}'." >&2
               exit 1
               ;;
           esac
