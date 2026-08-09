@@ -57,7 +57,7 @@ _SUBMIT_RETRY_INTERVAL_S = 1.0
 _APPROVAL_SETTLE_TIMEOUT_S = 0.5
 _CLEAR_SETTLE_TIMEOUT_S = 2.0
 _DRAFT_NEEDLE_MAX_CHARS = 24
-_PASTE_PLACEHOLDER_RE = re.compile(r"\[paste #(\d+) \+(\d+) lines?\]")
+_PASTE_PLACEHOLDER_RE = re.compile(r"\[paste #(\d+) (?:(?:\+(\d+) lines?)|(?:(\d+) chars))\]")
 _TRUST_HEADER = "Trust this folder?"
 _TRUST_DESCRIPTION = "Kimi Code loads project-level MCP servers"
 _PERMISSION_MENU_FOOTER_MARKER = "1/2/3/4 choose"
@@ -582,11 +582,21 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
     return bool(needle and content is not None and needle in content)
 
 
-def _paste_placeholder_counts(content: str | None) -> dict[str, int]:
+def _normalize_screen_text(value: str) -> str:
+    return " ".join(value.split())
+
+
+def _paste_placeholder_counts(content: str | None) -> dict[str, tuple[str, int]]:
     if not content:
         return {}
     return {
-        match.group(0): int(match.group(2)) for match in _PASTE_PLACEHOLDER_RE.finditer(content)
+        match.group(0): (
+            "lines",
+            int(match.group(2)),
+        )
+        if match.group(2) is not None
+        else ("chars", int(match.group(3)))
+        for match in _PASTE_PLACEHOLDER_RE.finditer(content)
     }
 
 
@@ -595,24 +605,38 @@ def _paste_line_count(content: str) -> int:
     return normalized.count("\n") + 2
 
 
+def _paste_char_count(content: str) -> int:
+    payload = _paste_payload_bytes(content + "\n").decode("utf-8")
+    return len(payload.encode("utf-16-le")) // 2
+
+
 def _draft_visible_in_editor(
     state: _KimiPaneState,
     needle: str,
     *,
     pre_paste_placeholders: frozenset[str] = frozenset(),
     expected_line_count: int | None = None,
+    expected_char_count: int | None = None,
 ) -> bool:
     content = state.editor_content
     if not content:
         return False
     placeholders = _paste_placeholder_counts(content)
     if placeholders and content.strip() in placeholders:
-        return expected_line_count is not None and any(
-            token not in pre_paste_placeholders and line_count == expected_line_count
-            for token, line_count in placeholders.items()
+        return any(
+            token not in pre_paste_placeholders
+            and (
+                (kind == "lines" and count == expected_line_count)
+                or (kind == "chars" and count == expected_char_count)
+            )
+            for token, (kind, count) in placeholders.items()
         )
-    if needle and needle in content:
-        return True
+    if needle:
+        normalized_content = _normalize_screen_text(content)
+        normalized_needle = _normalize_screen_text(needle)
+        if normalized_needle in normalized_content:
+            return True
+        return normalized_needle.replace(" ", "") in normalized_content.replace(" ", "")
     return not needle
 
 
@@ -637,7 +661,7 @@ def _menu_matches_submission(
     return draft_was_visible and not state.editor_present
 
 
-def _approval_menu_identity(state: _KimiPaneState) -> tuple[str, ...] | None:
+def _approval_menu_identity(state: _KimiPaneState) -> str | None:
     if not state.menu_visible or state.menu_start is None:
         return None
     end = next(
@@ -651,7 +675,12 @@ def _approval_menu_identity(state: _KimiPaneState) -> tuple[str, ...] | None:
     )
     if end is None:
         return None
-    return tuple(line.strip() for line in state.lines[state.menu_start : end + 1])
+    identity_lines = []
+    for line in state.lines[state.menu_start : end + 1]:
+        text = re.sub(r"^[▶●]\s*", "", line.strip())
+        if text and set(text) != {"─"}:
+            identity_lines.append(text)
+    return _normalize_screen_text(" ".join(identity_lines))
 
 
 class _InjectionCancellation:
@@ -718,6 +747,11 @@ def _restore_editor_content(
         restore_path = restore_file.name
     try:
         _run_tmux(socket_path, "load-buffer", "-b", _PASTE_BUFFER, restore_path)
+        state = _parse_pane(_capture_pane(socket_path, tmux_target))
+        if not state.editor_present or _approval_pending(state):
+            _logger.warning("Kimi draft restore skipped; lost draft length=%d", len(content))
+            return
+        # A menu can mount after this capture; the remaining gap is sub-100ms.
         _run_tmux(
             socket_path,
             "paste-buffer",
@@ -896,6 +930,7 @@ def inject_user_message(
         needle = _submit_needle(content)
         first_line = _submit_first_line(content)
         expected_line_count = _paste_line_count(content)
+        expected_char_count = _paste_char_count(content)
         pre_paste_placeholders: frozenset[str] = frozenset()
         with tempfile.NamedTemporaryFile(
             dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
@@ -957,6 +992,7 @@ def inject_user_message(
                 needle,
                 pre_paste_placeholders=pre_paste_placeholders,
                 expected_line_count=expected_line_count,
+                expected_char_count=expected_char_count,
             ):
                 draft_seen = True
                 break
@@ -988,6 +1024,7 @@ def inject_user_message(
                 needle,
                 pre_paste_placeholders=pre_paste_placeholders,
                 expected_line_count=expected_line_count,
+                expected_char_count=expected_char_count,
             ):
                 _raise_if_injection_cancelled(cancellation)
                 state = _parse_pane(
@@ -1009,6 +1046,7 @@ def inject_user_message(
                         needle,
                         pre_paste_placeholders=pre_paste_placeholders,
                         expected_line_count=expected_line_count,
+                        expected_char_count=expected_char_count,
                     )
                     and not state.exit_armed
                 ):
@@ -1147,7 +1185,22 @@ def inject_approval_keystroke(
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, key)
     deadline = time.monotonic() + _APPROVAL_SETTLE_TIMEOUT_S
     while time.monotonic() < deadline:
-        state = _parse_pane(_capture_pane(socket_path, tmux_target))
+        pane = _capture_pane(socket_path, tmux_target)
+        if not pane.strip():
+            if not _session_alive(socket_path, tmux_target):
+                message = "Kimi permission menu unavailable because the TUI session is not running"
+                _logger.warning(message)
+                raise KimiApprovalSessionNotFoundError(message)
+            if time.monotonic() >= deadline:
+                message = (
+                    "Kimi permission menu state remained indeterminate after the "
+                    "approval keystroke"
+                )
+                _logger.warning(message)
+                raise KimiApprovalPromptAmbiguousError(message)
+            time.sleep(_POLL_INTERVAL_S)
+            continue
+        state = _parse_pane(pane)
         if not state.menu_visible:
             return True
         if _approval_menu_identity(state) != menu_identity:

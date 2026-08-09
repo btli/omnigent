@@ -278,10 +278,14 @@ class TestApprovalKeystroke:
         pane: str,
         alive: bool = True,
         after_key_pane: str | None = None,
+        after_key_panes: tuple[str, ...] = (),
+        capture_log: list[str] | None = None,
     ) -> list[tuple[str, ...]]:
         sent: list[tuple[str, ...]] = []
         captures = [pane]
-        if after_key_pane is not None:
+        if after_key_panes:
+            captures.extend(after_key_panes)
+        elif after_key_pane is not None:
             captures.append(after_key_pane)
         monkeypatch.setattr(
             kimi_native_bridge,
@@ -289,11 +293,14 @@ class TestApprovalKeystroke:
             lambda bridge_dir, *, timeout_s: {"socket_path": "/s", "tmux_target": "main"},
         )
         monkeypatch.setattr(kimi_native_bridge, "_session_alive", lambda s, t: alive)
-        monkeypatch.setattr(
-            kimi_native_bridge,
-            "_capture_pane",
-            lambda s, t: captures.pop(0) if len(captures) > 1 else captures[0],
-        )
+
+        def _capture(_socket_path: str, _tmux_target: str) -> str:
+            pane = captures.pop(0) if len(captures) > 1 else captures[0]
+            if capture_log is not None:
+                capture_log.append(pane)
+            return pane
+
+        monkeypatch.setattr(kimi_native_bridge, "_capture_pane", _capture)
         monkeypatch.setattr(
             kimi_native_bridge,
             "_run_tmux",
@@ -354,6 +361,48 @@ class TestApprovalKeystroke:
         assert inject_approval_keystroke(tmp_path, key=APPROVE_KEY) is True
         assert sent == [("send-keys", "-t", "main", APPROVE_KEY)]
 
+    def test_empty_capture_is_retried_before_menu_disappears(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captures: list[str] = []
+        sent = self._stub_tmux(
+            monkeypatch,
+            pane=_fixture("approval_menu.txt"),
+            after_key_panes=("", _fixture("approval_menu.txt"), _fixture("first_boot_empty.txt")),
+            capture_log=captures,
+        )
+        assert inject_approval_keystroke(tmp_path, key=APPROVE_KEY) is True
+        assert sent == [("send-keys", "-t", "main", APPROVE_KEY)]
+        assert captures[-1] == _fixture("first_boot_empty.txt")
+
+    def test_persistent_empty_capture_is_ambiguous(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sent = self._stub_tmux(
+            monkeypatch,
+            pane=_fixture("approval_menu.txt"),
+            after_key_pane="",
+        )
+        monkeypatch.setattr(kimi_native_bridge, "_APPROVAL_SETTLE_TIMEOUT_S", 0.001)
+        monkeypatch.setattr(kimi_native_bridge, "_POLL_INTERVAL_S", 0.0)
+        with pytest.raises(kimi_native_bridge.KimiApprovalPromptAmbiguousError):
+            inject_approval_keystroke(tmp_path, key=APPROVE_KEY)
+        assert sent == [("send-keys", "-t", "main", APPROVE_KEY)]
+
+    def test_empty_capture_after_session_exit_is_not_found(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sent = self._stub_tmux(
+            monkeypatch,
+            pane=_fixture("approval_menu.txt"),
+            after_key_pane="",
+        )
+        alive = iter((True, False))
+        monkeypatch.setattr(kimi_native_bridge, "_session_alive", lambda _s, _t: next(alive))
+        with pytest.raises(kimi_native_bridge.KimiApprovalSessionNotFoundError):
+            inject_approval_keystroke(tmp_path, key=APPROVE_KEY)
+        assert sent == [("send-keys", "-t", "main", APPROVE_KEY)]
+
     def test_same_menu_after_digit_is_ambiguous(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -361,6 +410,24 @@ class TestApprovalKeystroke:
             monkeypatch,
             pane=_fixture("approval_menu.txt"),
             after_key_pane=_fixture("approval_menu.txt"),
+        )
+        monkeypatch.setattr(kimi_native_bridge, "_APPROVAL_SETTLE_TIMEOUT_S", 0.001)
+        monkeypatch.setattr(kimi_native_bridge, "_POLL_INTERVAL_S", 0.0)
+        with pytest.raises(kimi_native_bridge.KimiApprovalPromptAmbiguousError):
+            inject_approval_keystroke(tmp_path, key=APPROVE_KEY)
+        assert sent == [("send-keys", "-t", "main", APPROVE_KEY)]
+
+    def test_wrapped_same_menu_after_digit_is_ambiguous(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        wrapped_menu = _fixture("approval_menu.txt").replace(
+            "printf approval-fixture", "printf\n   approval-fixture"
+        )
+        wrapped_menu = wrapped_menu.replace("▶ 1. Approve once", "  1. Approve once")
+        sent = self._stub_tmux(
+            monkeypatch,
+            pane=_fixture("approval_menu.txt"),
+            after_key_pane=wrapped_menu,
         )
         monkeypatch.setattr(kimi_native_bridge, "_APPROVAL_SETTLE_TIMEOUT_S", 0.001)
         monkeypatch.setattr(kimi_native_bridge, "_POLL_INTERVAL_S", 0.0)
@@ -580,6 +647,10 @@ class TestSettlePaneReadiness:
     )
     def test_submit_needle_requires_four_characters(self, content: str) -> None:
         assert kimi_native_bridge._submit_needle(content) == ""
+
+    def test_paste_char_count_matches_kimi_utf16_payload_chars(self) -> None:
+        content = "\n".join("😀" * 334 for _ in range(3))
+        assert kimi_native_bridge._paste_char_count(content) == 2007
 
 
 class TestUserMessageInjection:
@@ -826,6 +897,44 @@ class TestUserMessageInjection:
         inject_user_message(tmp_path / "bridge", content=content)
         assert [args[-1] for args in sent if args[-1] == "Enter"] == ["Enter"]
 
+    def test_submits_real_chars_paste_placeholder(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        content = "\n".join("A" * 419 for _ in range(3))
+        sent = self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=1,
+            content=content,
+            post_paste_captures=(_fixture("paste_placeholder_1260_chars.txt"),) * 100,
+        )
+        inject_user_message(tmp_path / "bridge", content=content)
+        assert [args[-1] for args in sent if args[-1] == "Enter"] == ["Enter"]
+
+    def test_submits_draft_when_wrap_splits_needle(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        content = "A" * 12 + "B" * 12 + "C" * 476
+        wrapped_pane = "\n".join(
+            [
+                " ╭────────────────────╮",
+                f" │ > {content[:12]} │",
+                f" │   {content[12:24]} │",
+                f" │   {content[24:]} │",
+                " ╰────────────────────╯",
+                " context: 0%",
+            ]
+        )
+        sent = self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=1,
+            content=content,
+            post_paste_captures=(wrapped_pane,) * 100,
+        )
+        inject_user_message(tmp_path / "bridge", content=content)
+        assert [args[-1] for args in sent if args[-1] == "Enter"] == ["Enter"]
+
     def test_stale_paste_placeholder_does_not_verify_new_paste(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -974,6 +1083,29 @@ class TestUserMessageInjection:
                 "/s", "main", tmp_path, "draft that must not be lost silently"
             )
         assert sent == []
+        assert "lost draft length=36" in caplog.text
+
+    def test_restore_rechecks_before_paste_buffer(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        captures = iter((_fixture("first_boot_empty.txt"), _fixture("approval_menu.txt")))
+        sent: list[tuple[str, ...]] = []
+        monkeypatch.setattr(
+            kimi_native_bridge, "_capture_pane", lambda _socket, _target: next(captures)
+        )
+        monkeypatch.setattr(
+            kimi_native_bridge,
+            "_run_tmux",
+            lambda _socket, *args: sent.append(args),
+        )
+        with caplog.at_level(logging.WARNING, logger="omnigent.kimi_native_bridge"):
+            kimi_native_bridge._restore_editor_content(
+                "/s", "main", tmp_path, "draft that must not be lost silently"
+            )
+        assert [args[0] for args in sent] == ["load-buffer"]
         assert "lost draft length=36" in caplog.text
 
     def test_does_not_clear_empty_editor(
