@@ -13,11 +13,13 @@ import pytest
 
 from omnigent.runner.transports.ws_tunnel.frames import (
     HelloFrame,
+    RequestCancelFrame,
     ResponseBodyFrame,
     ResponseEndFrame,
     ResponseHeadFrame,
+    decode_frame,
 )
-from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
 from omnigent.runner.transports.ws_tunnel.transport import (
     WSTunnelTransport,
     _TunneledByteStream,
@@ -204,6 +206,19 @@ async def test_transport_aclose_is_noop() -> None:
 # ── Read-timeout handling (request timeout extension) ──
 
 
+def _drain_cancel_frames(session: RunnerSession) -> list[RequestCancelFrame]:
+    """Pop the session's outbound queue and return its request.cancel frames."""
+    frames: list[RequestCancelFrame] = []
+    while not session.outbound_queue.empty():
+        item = session.outbound_queue.get_nowait()
+        if item is None:
+            continue
+        frame = decode_frame(item)
+        if isinstance(frame, RequestCancelFrame):
+            frames.append(frame)
+    return frames
+
+
 def _make_stream_request(read_timeout: float | None) -> httpx.Request:
     """Build a request carrying an httpx read timeout extension."""
     return httpx.Request(
@@ -246,6 +261,10 @@ async def test_stalled_body_raises_read_timeout_and_keeps_tunnel_registered() ->
 
     assert reg.get("r1") is session
     assert req_id not in session.in_flight
+    # The runner must be told to stop its dispatch task, or its stream
+    # generator leaks and keeps draining the session's shared event queue.
+    cancels = _drain_cancel_frames(session)
+    assert [frame.id for frame in cancels] == [req_id]
 
 
 @pytest.mark.asyncio
@@ -264,6 +283,7 @@ async def test_stalled_response_head_raises_read_timeout() -> None:
     session = reg.get("r1")
     assert session is not None
     assert not session.in_flight
+    assert len(_drain_cancel_frames(session)) == 1
 
 
 @pytest.mark.asyncio
