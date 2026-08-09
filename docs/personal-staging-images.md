@@ -43,8 +43,8 @@ and publish; it does not change package visibility.
 
 Inspect the manifest list for a date tag:
 
-The first publish creates private packages. Either flip both GHCR packages to
-public as described above, or authenticate before inspecting:
+The commands below require public packages or an authenticated GHCR session.
+If the packages remain private, authenticate before inspecting:
 
 ```bash
 docker login ghcr.io
@@ -68,7 +68,7 @@ needs to verify a platform image directly.
 Use an existing `nightly-*` tag from `btli/omnigent` and dispatch the workflow
 against that tag. The workflow is dispatched from the default branch, with the
 tag passed through the required `ref` input. Snapshot existing run IDs first so
-the polling loop selects the new run rather than the latest run by timestamp:
+the polling loop can select the new matching run rather than a concurrent run:
 
 ```bash
 set -euo pipefail
@@ -76,12 +76,19 @@ set -euo pipefail
 TAG=nightly-20260809
 REPO=btli/omnigent
 WORKFLOW=personal-staging-images.yml
-BEFORE_RUN_IDS="$(gh run list -R "$REPO" --workflow "$WORKFLOW" --event workflow_dispatch --limit 100 --json databaseId --jq '.[].databaseId' | sort -n)"
+ACTOR="$(gh api user --jq '.login')"
+RUN_NAME="Publish personal staging images (${TAG}) by @${ACTOR}"
+list_run_ids() {
+  gh api "repos/${REPO}/actions/runs?event=workflow_dispatch&per_page=100" \
+    --jq "[.workflow_runs[] | select(.display_title == \"${RUN_NAME}\" and .actor.login == \"${ACTOR}\") | .id] | .[]" | sort
+}
+
+BEFORE_RUN_IDS="$(list_run_ids)"
 gh workflow run "$WORKFLOW" -R "$REPO" -f ref="$TAG"
 
 RUN_ID=""
 for attempt in $(seq 1 30); do
-  AFTER_RUN_IDS="$(gh run list -R "$REPO" --workflow "$WORKFLOW" --event workflow_dispatch --limit 100 --json databaseId --jq '.[].databaseId' | sort -n)"
+  AFTER_RUN_IDS="$(list_run_ids)"
   RUN_ID="$(comm -13 \
     <(printf '%s\n' "$BEFORE_RUN_IDS" | sed '/^$/d') \
     <(printf '%s\n' "$AFTER_RUN_IDS" | sed '/^$/d') | tail -n 1)"
@@ -103,11 +110,7 @@ manifest_digest() {
   printf '%s\n' "$digest"
 }
 
-TAG_OBJECT_TYPE="$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq '.object.type')"
-TAG_SHA="$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq '.object.sha')"
-if [ "$TAG_OBJECT_TYPE" = "tag" ]; then
-  TAG_SHA="$(gh api "repos/${REPO}/git/tags/${TAG_SHA}" --jq '.object.sha')"
-fi
+TAG_SHA="$(gh api "repos/${REPO}/commits/${TAG}" --jq '.sha')"
 SHORT_SHA="${TAG_SHA:0:12}"
 for image in ghcr.io/btli/omnigent-server ghcr.io/btli/omnigent-host; do
   date_digest="$(manifest_digest "${image}:${TAG}")"
