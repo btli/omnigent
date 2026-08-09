@@ -37,9 +37,11 @@ from omnigent.kimi_native_bridge import (
     KimiApprovalPendingError,
     inject_user_message,
 )
+from omnigent.llms.errors import PermanentLLMError, RetryableLLMError
 
 logger = logging.getLogger(__name__)
 _STEERING_READY_TIMEOUT_S = 30.0
+_MAX_APPROVAL_PENDING_RETRIES = 3
 
 
 class KimiNativeExecutor(Executor):
@@ -59,6 +61,7 @@ class KimiNativeExecutor(Executor):
         # against one cached executor, and injection is multi-step (clear +
         # paste + Enter) — without the lock their keystrokes interleave.
         self._inject_lock = asyncio.Lock()
+        self._approval_pending_retries = 0
 
     def supports_streaming(self) -> bool:
         """:returns: ``False`` — output is shown by the embedded terminal, not this executor."""
@@ -99,11 +102,15 @@ class KimiNativeExecutor(Executor):
         try:
             await self._inject_message(text)
         except KimiApprovalPendingError as exc:
-            yield ExecutorError(message=str(exc), retryable=True)
-            return
+            self._approval_pending_retries += 1
+            if self._approval_pending_retries > _MAX_APPROVAL_PENDING_RETRIES:
+                raise PermanentLLMError(str(exc), code="kimi_approval_pending") from exc
+            # Semantic Omnigent errors preserve retry classification through the adapter.
+            raise RetryableLLMError(str(exc), code="connection_error") from exc
         except RuntimeError as exc:
             yield ExecutorError(message=str(exc))
             return
+        self._approval_pending_retries = 0
         yield TurnComplete(response=None)
 
     async def _inject_message(

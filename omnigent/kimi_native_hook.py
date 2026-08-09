@@ -26,7 +26,7 @@ stdin, and reads the decision back from stdout as
   gated tool to ``/v1/sessions/{id}/hooks/permission-request`` (the same
   endpoint claude-native uses — the server publishes the approval card and
   long-polls for the web verdict), then types the answer back into kimi's
-  prompt via ``inject_approval_keystroke`` (option digit + Enter:
+  prompt via ``inject_approval_keystroke`` (option digit:
   :data:`~omnigent.kimi_native_bridge.APPROVE_KEY` "Approve once" /
   :data:`~omnigent.kimi_native_bridge.DENY_KEY` "Reject"). Fail-safe: on no
   verdict (timeout / unreachable / already answered in the terminal) it injects
@@ -211,7 +211,7 @@ def _main_permission_request(argv: list[str]) -> int:
        approval card and long-polls for the web verdict (the very endpoint
        claude-native uses).
     2. On ``allow`` / ``deny``, inject the matching kimi permission-menu option
-       digit + Enter into the TUI pane via :func:`inject_approval_keystroke`
+       digit into the TUI pane via :func:`inject_approval_keystroke`
        (:data:`APPROVE_KEY` "Approve once" / :data:`DENY_KEY` "Reject").
 
     Fail-safe: on no verdict (timeout / server unreachable / the prompt was
