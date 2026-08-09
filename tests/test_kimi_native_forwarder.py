@@ -775,6 +775,40 @@ class TestForwardLoopEdges:
         assert self.statuses == [("idle", "")]
         assert time.monotonic() - started <= 2.5
 
+    async def test_same_path_wire_shrink_reseeds_high_water(self, tmp_path: Path) -> None:
+        """A wire recreated at the same path below the observed high-water must
+        refresh the activity clock and reseed the gate — not leave the stale
+        high-water blinding it while quiescence falsely closes the live turn."""
+        rows = [_prompt_row()]
+        bridge = tmp_path / "bridge"
+
+        def _seed(bridge_dir: Path, wire: Path) -> None:
+            # A prior run observed a 100kB wire (delivery stuck at 0) that kimi
+            # has since recreated as this much smaller one, 100s ago.
+            _write_state(
+                bridge_dir,
+                _ForwardState(
+                    wire_path=str(wire),
+                    last_line=0,
+                    offset=0,
+                    turn_open=True,
+                    last_activity_ts=time.time() - 100.0,
+                    last_seen_offset=100_000,
+                ),
+            )
+
+        def _reseeded() -> bool:
+            state = _read_state(bridge)
+            return (
+                state is not None
+                and state.last_seen_offset is not None
+                and 0 < state.last_seen_offset < 100_000
+                and state.offset == state.last_seen_offset
+            )
+
+        await _drive_loop_until(tmp_path, rows, _reseeded, quiescence_s=50.0, prepare=_seed)
+        assert self.statuses == []
+
     async def test_replayed_turn_edge_is_deduped(self, tmp_path: Path) -> None:
         """A crash between an edge POST and the cursor persist must not double-post."""
         rows = [_prompt_row(), _turn_ended_row("completed")]

@@ -778,6 +778,21 @@ async def forward_kimi_wire_to_session(
                     last_wire_activity = time.monotonic()
                     last_wire_activity_wall = time.time()
                     _persist()
+                elif new_offset < last_seen_offset:
+                    # The SAME wire path was recreated/compacted below the
+                    # observed high-water (delivery cursor still under the new
+                    # size, so the read didn't restart): the stale high-water
+                    # would blind the refresh gate and quiescence could falsely
+                    # close a live turn. Restart the tail like the truncation
+                    # branch does and re-read next poll.
+                    offset = 0
+                    last_line = 0
+                    last_seen_offset = 0
+                    last_wire_activity = time.monotonic()
+                    last_wire_activity_wall = time.time()
+                    _persist()
+                    await asyncio.sleep(poll_interval_s)
+                    continue
                 for item in items:
                     if item.kind in ("tool_call", "tool_result"):
                         tools_in_flight = (
