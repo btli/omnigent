@@ -1,10 +1,12 @@
 """Unit tests for the kimi-native transcript forwarder.
 
 Covers the pure parsing/discovery helpers against kimi's real ``wire.jsonl``
-event schema (turn.prompt + content.part), the byte-offset state round-trip,
-workspace/recency-based session discovery, and the forward loop's lifecycle
-edges (failed finish reasons, pane death, quiescence, poison-line drops) with
-the POST helpers stubbed out.
+event schema (including the sanitized real-session fixtures under
+``tests/fixtures/kimi_wire``), the byte-offset state round-trip, strict
+launch-epoch session discovery, and the forward loop's lifecycle edges
+(``turn.ended`` records, pane death, quiescence with in-flight tool
+suppression, transient-vs-poison POST rejections, edge dedupe across
+restarts) with the POST helpers stubbed out.
 """
 
 from __future__ import annotations
@@ -22,7 +24,6 @@ import omnigent.kimi_native_forwarder as fwd
 from omnigent.kimi_native_forwarder import (
     _discover_wire,
     _ForwardState,
-    _offset_for_line,
     _read_state,
     _row_to_item,
     _write_state,
@@ -31,6 +32,8 @@ from omnigent.kimi_native_forwarder import (
     read_kimi_wire_items,
     read_new_kimi_wire_items,
 )
+
+_FIXTURES = Path(__file__).parent / "fixtures" / "kimi_wire"
 
 
 class TestRowToItem:
@@ -79,65 +82,69 @@ class TestRowToItem:
         assert item.text == "Let me reason about this."
         assert item.response_id == "kimi:abc123"
 
-    def test_tool_call_and_metadata_skipped(self) -> None:
+    def test_metadata_rows_skipped(self) -> None:
         for row in (
-            {"type": "context.append_loop_event", "event": {"type": "tool.call", "name": "Read"}},
             {"type": "metadata", "protocol_version": 1},
             {"type": "usage.record", "usage": {}},
             {"type": "context.append_message", "message": {"role": "user", "content": []}},
+            {"type": "turn.cancel", "turnId": 0, "reason": "user_cancelled"},
         ):
             assert _row_to_item(0, row) is None
 
-    def test_step_end_with_end_turn_is_turn_end(self) -> None:
-        """``end_turn`` is the edge that reports terminal status to the parent."""
-        row = {
+    def test_tool_call_and_result_are_bookkeeping_items(self) -> None:
+        """Tool events are never posted but tracked for the quiescence gate."""
+        call = {
             "type": "context.append_loop_event",
-            "event": {
-                "type": "step.end",
-                "turnId": "0",
-                "step": 3,
-                "finishReason": "end_turn",
-            },
+            "event": {"type": "tool.call", "uuid": "t1", "name": "Read"},
         }
-        item = _row_to_item(28, row)
-        assert item is not None
-        assert item.kind == "turn_end"
-        assert item.response_id == "kimi:turn_end:28"
-
-    def test_step_end_with_tool_use_is_skipped(self) -> None:
-        """A step that stopped to call a tool is mid-turn, not a completion."""
-        row = {
+        result = {
             "type": "context.append_loop_event",
-            "event": {
-                "type": "step.end",
-                "turnId": "0",
-                "step": 1,
-                "finishReason": "tool_use",
-            },
+            "event": {"type": "tool.result", "parentUuid": "t1"},
         }
-        assert _row_to_item(12, row) is None
+        call_item = _row_to_item(7, call)
+        result_item = _row_to_item(8, result)
+        assert call_item is not None and call_item.kind == "tool_call"
+        assert result_item is not None and result_item.kind == "tool_result"
 
-    def test_step_end_with_failure_reason_is_turn_failed(self) -> None:
-        """error/abort steps end the turn abnormally → a failed edge, not a strand."""
-        for reason in ("error", "abort", "aborted"):
+    def test_step_end_never_drives_a_turn_edge(self) -> None:
+        """Edges come from turn.ended: failed/cancelled turns write no step.end."""
+        for reason in ("end_turn", "length", "tool_use", "error", "abort"):
             row = {
                 "type": "context.append_loop_event",
-                "event": {"type": "step.end", "turnId": "0", "step": 2, "finishReason": reason},
+                "event": {"type": "step.end", "turnId": "0", "step": 1, "finishReason": reason},
             }
-            item = _row_to_item(30, row)
-            assert item is not None, reason
-            assert item.kind == "turn_failed"
-            assert item.response_id == "kimi:turn_failed:30"
+            assert _row_to_item(16, row) is None, reason
 
-    def test_step_end_with_length_is_turn_end(self) -> None:
-        """A length-stopped step delivered (truncated) output — an idle edge."""
-        row = {
-            "type": "context.append_loop_event",
-            "event": {"type": "step.end", "turnId": "0", "step": 2, "finishReason": "length"},
-        }
+    def test_turn_ended_completed_is_turn_end(self) -> None:
+        row = {"type": "turn.ended", "turnId": 0, "reason": "completed", "durationMs": 174932}
         item = _row_to_item(31, row)
         assert item is not None
         assert item.kind == "turn_end"
+        assert item.response_id == "kimi:turn_end:31"
+
+    def test_turn_ended_cancelled_is_turn_end(self) -> None:
+        row = {"type": "turn.ended", "turnId": 0, "reason": "cancelled", "durationMs": 1112}
+        item = _row_to_item(10, row)
+        assert item is not None
+        assert item.kind == "turn_end"
+
+    def test_turn_ended_failed_is_turn_failed_with_error_message(self) -> None:
+        row = {
+            "type": "turn.ended",
+            "turnId": 0,
+            "reason": "failed",
+            "error": {"code": "provider.auth_error", "message": "401 Invalid Token"},
+        }
+        item = _row_to_item(9, row)
+        assert item is not None
+        assert item.kind == "turn_failed"
+        assert item.text == "401 Invalid Token"
+        assert item.response_id == "kimi:turn_failed:9"
+
+    def test_turn_ended_unknown_reason_keeps_turn_open(self) -> None:
+        """Unknown vocabulary never fails open to 'failed'; the fallbacks close it."""
+        row = {"type": "turn.ended", "turnId": 0, "reason": "paused"}
+        assert _row_to_item(9, row) is None
 
     def test_non_user_turn_prompt_skipped(self) -> None:
         row = {
@@ -146,6 +153,32 @@ class TestRowToItem:
             "origin": {"kind": "system"},
         }
         assert _row_to_item(0, row) is None
+
+
+class TestRealWireFixtures:
+    """Sanitized real kimi 0.34 wire logs are the ground truth for turn edges."""
+
+    def test_completed_turn_ends_with_single_idle_edge(self) -> None:
+        items = read_kimi_wire_items(_FIXTURES / "completed.jsonl", 0)
+        kinds = [i.kind for i in items]
+        assert kinds[-1] == "turn_end"
+        assert kinds.count("turn_end") == 1
+        assert "turn_failed" not in kinds
+        assert kinds.count("tool_call") == kinds.count("tool_result") == 3
+
+    def test_failed_turn_emits_failed_edge_without_any_step_end(self) -> None:
+        items = read_kimi_wire_items(_FIXTURES / "failed.jsonl", 0)
+        kinds = [i.kind for i in items]
+        assert kinds == ["message", "turn_failed"]
+        assert items[0].role == "user"
+        assert items[1].text == "401 Invalid Token"
+
+    def test_cancelled_turns_each_emit_an_idle_edge(self) -> None:
+        items = read_kimi_wire_items(_FIXTURES / "cancelled.jsonl", 0)
+        kinds = [i.kind for i in items]
+        assert kinds.count("turn_end") == 2
+        assert "turn_failed" not in kinds
+        assert sum(1 for i in items if i.kind == "message" and i.role == "user") == 2
 
 
 class TestReadNewItems:
@@ -192,23 +225,46 @@ class TestReadNewItems:
 class TestState:
     def test_round_trip_and_clear(self, tmp_path: Path) -> None:
         assert _read_state(tmp_path) is None
-        _write_state(tmp_path, _ForwardState(wire_path="/x/wire.jsonl", last_line=7, offset=345))
+        _write_state(
+            tmp_path,
+            _ForwardState(
+                wire_path="/x/wire.jsonl",
+                last_line=7,
+                offset=345,
+                turn_open=True,
+                tools_in_flight=2,
+                last_edge_id="kimi:turn_end:5",
+            ),
+        )
         loaded = _read_state(tmp_path)
         assert loaded is not None
         assert loaded.wire_path == "/x/wire.jsonl"
         assert loaded.last_line == 7
         assert loaded.offset == 345
+        assert loaded.turn_open is True
+        assert loaded.tools_in_flight == 2
+        assert loaded.last_edge_id == "kimi:turn_end:5"
         clear_kimi_bridge_state(tmp_path)
         assert _read_state(tmp_path) is None
 
-    def test_legacy_state_without_offset_marks_unknown(self, tmp_path: Path) -> None:
-        # State written by a line-only build: offset -1 → re-derived on first poll.
+    def test_state_without_offset_is_discarded(self, tmp_path: Path) -> None:
+        # No shipped build ever wrote line-only state; treat it as no state at
+        # all so the tail restarts cleanly instead of migrating.
         (tmp_path / "kimi_forwarder.json").write_text(
             json.dumps({"wire_path": "/x/wire.jsonl", "last_line": 3}), encoding="utf-8"
         )
+        assert _read_state(tmp_path) is None
+
+    def test_lifecycle_fields_default_when_absent(self, tmp_path: Path) -> None:
+        (tmp_path / "kimi_forwarder.json").write_text(
+            json.dumps({"wire_path": "/x/wire.jsonl", "last_line": 3, "offset": 10}),
+            encoding="utf-8",
+        )
         loaded = _read_state(tmp_path)
         assert loaded is not None
-        assert loaded.offset == -1
+        assert loaded.turn_open is False
+        assert loaded.tools_in_flight == 0
+        assert loaded.last_edge_id is None
 
 
 class TestReadNewIncremental:
@@ -258,14 +314,6 @@ class TestReadNewIncremental:
     def test_missing_file_is_noop(self, tmp_path: Path) -> None:
         assert read_new_kimi_wire_items(tmp_path / "nope.jsonl", 5, 1) == ([], 5, 1)
 
-    def test_offset_for_line_matches_line_starts(self, tmp_path: Path) -> None:
-        wire = tmp_path / "wire.jsonl"
-        wire.write_text('{"a":1}\n{"b":2}\n{"c":3}\n', encoding="utf-8")
-        assert _offset_for_line(wire, 0) == 0
-        assert _offset_for_line(wire, 1) == 8
-        assert _offset_for_line(wire, 3) == 24
-        assert _offset_for_line(wire, 99) == 24
-
 
 class TestDiscoverWire:
     def _make_session(
@@ -305,6 +353,20 @@ class TestDiscoverWire:
         # launch far in the future (ms) → the 1000s-mtime session is below the floor.
         assert _discover_wire(home, "/ws", launch_epoch_ms=9_000_000_000_000) is None
 
+    def test_wire_just_before_launch_is_not_adopted(self, tmp_path: Path) -> None:
+        """Adoption pins strictly to the launch epoch — no skew window."""
+        home = tmp_path / "kimi-code-home"
+        home.mkdir()
+        self._make_session(home, "session_prior", "/ws", mtime=9_995.0)
+        assert _discover_wire(home, "/ws", launch_epoch_ms=10_000_000) is None
+
+    def test_wire_within_launch_second_is_adopted(self, tmp_path: Path) -> None:
+        """Coarse-mtime filesystems truncate to the second; the floor allows that."""
+        home = tmp_path / "kimi-code-home"
+        home.mkdir()
+        wire = self._make_session(home, "session_fresh", "/ws", mtime=10_000.2)
+        assert _discover_wire(home, "/ws", launch_epoch_ms=10_000_600) == wire
+
 
 def _wire_home(tmp_path: Path, rows: list[dict[str, object]]) -> tuple[Path, Path]:
     """Build a kimi home holding one discoverable session wire with *rows*."""
@@ -330,11 +392,18 @@ def _assistant_row(uuid: str, text: str) -> dict[str, object]:
     }
 
 
-def _step_end_row(reason: str) -> dict[str, object]:
+def _tool_call_row(uuid: str = "t1") -> dict[str, object]:
     return {
         "type": "context.append_loop_event",
-        "event": {"type": "step.end", "turnId": "0", "step": 1, "finishReason": reason},
+        "event": {"type": "tool.call", "uuid": uuid, "turnId": "0", "name": "Bash"},
     }
+
+
+def _turn_ended_row(reason: str, *, error_message: str | None = None) -> dict[str, object]:
+    row: dict[str, object] = {"type": "turn.ended", "turnId": 0, "reason": reason}
+    if error_message is not None:
+        row["error"] = {"code": "provider.auth_error", "message": error_message}
+    return row
 
 
 async def _drive_loop_until(
@@ -344,11 +413,18 @@ async def _drive_loop_until(
     *,
     pane_alive: Callable[[], bool] | None = None,
     quiescence_s: float = 60.0,
+    prepare: Callable[[Path, Path], None] | None = None,
 ) -> None:
-    """Run the forward loop against a canned wire until *done* (then cancel)."""
+    """Run the forward loop against a canned wire until *done* (then cancel).
+
+    *prepare* runs with ``(bridge_dir, wire_path)`` before the loop starts, for
+    tests that seed persisted forwarder state.
+    """
     bridge = tmp_path / "bridge"
     bridge.mkdir(exist_ok=True)
-    home, _wire = _wire_home(tmp_path, rows)
+    home, wire = _wire_home(tmp_path, rows)
+    if prepare is not None:
+        prepare(bridge, wire)
     task = asyncio.create_task(
         forward_kimi_wire_to_session(
             base_url="http://test",
@@ -361,6 +437,7 @@ async def _drive_loop_until(
             pane_alive=pane_alive,
             quiescence_s=quiescence_s,
             poll_interval_s=0.01,
+            post_backoff_initial_s=0.01,
         )
     )
     try:
@@ -394,15 +471,28 @@ class TestForwardLoopEdges:
         monkeypatch.setattr(fwd, "_post_reasoning_item", _fake_item)
         monkeypatch.setattr(fwd, "_post_external_session_status", _fake_status)
 
-    async def test_error_finish_reason_posts_failed_edge(self, tmp_path: Path) -> None:
-        rows = [_prompt_row(), _assistant_row("u1", "partial"), _step_end_row("error")]
+    async def test_turn_ended_failed_posts_failed_edge(self, tmp_path: Path) -> None:
+        rows = [_prompt_row(), _assistant_row("u1", "partial"), _turn_ended_row("failed")]
         await _drive_loop_until(tmp_path, rows, lambda: bool(self.statuses))
         assert self.statuses == [("failed", "partial")]
 
-    async def test_end_turn_posts_idle_edge_with_output(self, tmp_path: Path) -> None:
-        rows = [_prompt_row(), _assistant_row("u1", "done!"), _step_end_row("end_turn")]
+    async def test_failed_turn_without_output_surfaces_provider_error(
+        self, tmp_path: Path
+    ) -> None:
+        # The failed fixture shape: prompt → turn.ended(failed), no assistant text.
+        rows = [_prompt_row(), _turn_ended_row("failed", error_message="401 Invalid Token")]
+        await _drive_loop_until(tmp_path, rows, lambda: bool(self.statuses))
+        assert self.statuses == [("failed", "401 Invalid Token")]
+
+    async def test_turn_ended_completed_posts_idle_edge_with_output(self, tmp_path: Path) -> None:
+        rows = [_prompt_row(), _assistant_row("u1", "done!"), _turn_ended_row("completed")]
         await _drive_loop_until(tmp_path, rows, lambda: bool(self.statuses))
         assert self.statuses == [("idle", "done!")]
+
+    async def test_turn_ended_cancelled_posts_idle_edge(self, tmp_path: Path) -> None:
+        rows = [_prompt_row(), _turn_ended_row("cancelled")]
+        await _drive_loop_until(tmp_path, rows, lambda: bool(self.statuses))
+        assert self.statuses == [("idle", "")]
 
     async def test_pane_death_mid_turn_posts_failed_edge(self, tmp_path: Path) -> None:
         # A prompt with no terminal edge and a dead pane: fail instead of strand.
@@ -413,17 +503,96 @@ class TestForwardLoopEdges:
         assert self.statuses == [("failed", "so far")]
 
     async def test_quiescence_closes_turn_without_edge_as_idle(self, tmp_path: Path) -> None:
-        # An interrupted turn writes no wire edge; the quiet-wire fallback closes it.
+        # A wedged turn writes no wire edge; the quiet-wire fallback closes it.
         rows = [_prompt_row(), _assistant_row("u1", "so far")]
         await _drive_loop_until(tmp_path, rows, lambda: bool(self.statuses), quiescence_s=0.05)
         assert self.statuses == [("idle", "so far")]
+
+    async def test_quiescence_suppressed_while_tool_in_flight(self, tmp_path: Path) -> None:
+        """A silent wire mid-tool is a long tool call; only pane death closes it."""
+        pane_up = True
+        rows = [_prompt_row(), _tool_call_row()]
+        checks = 0
+
+        def _done() -> bool:
+            nonlocal pane_up, checks
+            if self.statuses:
+                return True
+            checks += 1
+            # 20 checks ≈ 200ms with a 20ms quiescence window: staying edge-free
+            # this long proves suppression; then a pane death must close it.
+            if checks == 20:
+                pane_up = False
+            return False
+
+        await _drive_loop_until(
+            tmp_path,
+            rows,
+            _done,
+            pane_alive=lambda: pane_up,
+            quiescence_s=0.02,
+        )
+        assert self.statuses == [("failed", "")]
+
+    async def test_turn_open_persists_across_restart(self, tmp_path: Path) -> None:
+        """A restarted forwarder still fails a stranded turn it never observed."""
+        rows = [_prompt_row(), _assistant_row("u1", "so far")]
+
+        def _seed(bridge: Path, wire: Path) -> None:
+            # State a prior forwarder persisted mid-turn: wire fully consumed,
+            # turn still open.
+            _write_state(
+                bridge,
+                _ForwardState(
+                    wire_path=str(wire),
+                    last_line=2,
+                    offset=wire.stat().st_size,
+                    turn_open=True,
+                ),
+            )
+
+        await _drive_loop_until(
+            tmp_path,
+            rows,
+            lambda: bool(self.statuses),
+            pane_alive=lambda: False,
+            prepare=_seed,
+        )
+        assert self.statuses == [("failed", "")]
+        assert self.items == []
+
+    async def test_replayed_turn_edge_is_deduped(self, tmp_path: Path) -> None:
+        """A crash between an edge POST and the cursor persist must not double-post."""
+        rows = [_prompt_row(), _turn_ended_row("completed")]
+        bridge = tmp_path / "bridge"
+
+        def _seed(bridge_dir: Path, wire: Path) -> None:
+            # A prior forwarder posted the edge (line 1) but crashed before
+            # advancing the cursor past it.
+            _write_state(
+                bridge_dir,
+                _ForwardState(
+                    wire_path=str(wire),
+                    last_line=1,
+                    offset=len(json.dumps(rows[0])) + 1,
+                    turn_open=True,
+                    last_edge_id="kimi:turn_end:1",
+                ),
+            )
+
+        def _consumed() -> bool:
+            state = _read_state(bridge)
+            return state is not None and state.last_line >= 2 and not state.turn_open
+
+        await _drive_loop_until(tmp_path, rows, _consumed, prepare=_seed)
+        assert self.statuses == []
 
 
 class TestForwardLoopPostFailures:
     async def test_poison_item_dropped_after_bounded_retries(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A 4xx-rejected item is skipped after bounded retries; the tail moves on."""
+        """A permanent-4xx item is skipped after bounded retries; the tail moves on."""
         posted: list[str] = []
         statuses: list[str] = []
         rejections = 0
@@ -445,11 +614,37 @@ class TestForwardLoopPostFailures:
         monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
         monkeypatch.setattr(fwd, "_post_external_session_status", _fake_status)
 
-        rows = [_prompt_row("poison"), _assistant_row("u1", "ok"), _step_end_row("end_turn")]
+        rows = [_prompt_row("poison"), _assistant_row("u1", "ok"), _turn_ended_row("completed")]
         await _drive_loop_until(tmp_path, rows, lambda: bool(statuses))
         assert rejections == 3
         assert posted == ["kimi:u1"]
         assert statuses == ["idle"]
+
+    @pytest.mark.parametrize("status_code", [401, 403, 429])
+    async def test_auth_and_rate_limit_rejections_retry_and_never_drop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status_code: int
+    ) -> None:
+        """401/403/429 are transient outages, not poison: the item must survive."""
+        posted: list[str] = []
+        rejections = 0
+
+        async def _fake_item(_client: object, **kwargs: object) -> None:
+            nonlocal rejections
+            if rejections < 4:
+                rejections += 1
+                request = httpx.Request("POST", "http://test")
+                raise httpx.HTTPStatusError(
+                    str(status_code),
+                    request=request,
+                    response=httpx.Response(status_code, request=request),
+                )
+            posted.append(str(kwargs["item"].response_id))  # type: ignore[union-attr]
+
+        monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
+
+        await _drive_loop_until(tmp_path, [_prompt_row("edge")], lambda: bool(posted))
+        assert rejections == 4
+        assert posted == ["kimi:turn:0"]
 
     async def test_transport_failure_is_recorded_and_retried(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -467,4 +662,27 @@ class TestForwardLoopPostFailures:
 
         await _drive_loop_until(tmp_path, [_prompt_row()], lambda: attempts >= 3)
         assert forwarder_health.recent_post_failure(60.0) is not None
+        forwarder_health.clear()
+
+    async def test_fallback_edge_failure_is_attributed_to_health(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failing pane-death edge POST must show up in forwarder health."""
+        forwarder_health.clear()
+
+        async def _fake_item(_client: object, **kwargs: object) -> None:
+            return None
+
+        async def _failing_status(_client: object, **kwargs: object) -> None:
+            raise httpx.ConnectError("no route to host")
+
+        monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
+        monkeypatch.setattr(fwd, "_post_external_session_status", _failing_status)
+
+        await _drive_loop_until(
+            tmp_path,
+            [_prompt_row()],
+            lambda: forwarder_health.recent_post_failure(60.0) is not None,
+            pane_alive=lambda: False,
+        )
         forwarder_health.clear()
