@@ -854,6 +854,30 @@ async def test_parse_control_stream_bounds_partial_line_buffer(
 
 
 @pytest.mark.asyncio
+async def test_parse_control_stream_discards_oversized_complete_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A near-cap partial completed by the next read can't bypass the cap.
+
+    The partial-buffer check only sees line tails still awaiting a newline;
+    a read that completes the line must not hand the over-cap whole to the
+    handler.
+    """
+    monkeypatch.setattr(control_bridge, "_CONTROL_MAX_LINE_BYTES", 64)
+
+    seen: list[bytes] = []
+
+    def _handle(line: bytes) -> bool:
+        seen.append(line)
+        return True
+
+    stdout = _ScriptedStdout([b"x" * 60, b"x" * 20 + b"\nok\n"])
+    await control_bridge._parse_control_stream(stdout, _handle)  # type: ignore[arg-type]
+
+    assert seen == [b"ok"], f"oversized complete line leaked through: {seen!r}"
+
+
+@pytest.mark.asyncio
 async def test_parse_control_stream_yields_while_discarding_oversized_line(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -893,11 +917,13 @@ async def test_parse_control_stream_yields_while_discarding_oversized_line(
 async def test_control_bridge_wires_bounded_output_queue(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The %output queue is the bounded one, with the repaint hook attached.
+    """The %output queue is the bounded one, and a gap close truly repaints.
 
     Guards the saturation policy end to end: the bridge must instantiate the
-    byte/item-bounded queue (not a plain asyncio.Queue) and wire its
-    on_gap_end hook so a drop gap forces a tmux repaint.
+    byte/item-bounded queue (not a plain asyncio.Queue) and wire on_gap_end
+    so a drop gap re-emits a pane snapshot the browser actually receives —
+    a control-mode ``refresh-client`` re-emits nothing, so only snapshot
+    bytes on the WebSocket prove recovery.
     """
     created: list[ws_bridge._ByteBoundedOutputQueue] = []
 
@@ -921,4 +947,32 @@ async def test_control_bridge_wires_bounded_output_queue(
     assert created, "bridge did not use the bounded output queue"
     assert created[0].on_gap_end is not None, "repaint hook not wired to the queue"
 
+    # The attach seed may itself contain clear+home bytes, so require NEW
+    # snapshot bytes to arrive after the simulated gap close.
+    baseline = b"".join(ws.sent).count(b"\x1b[H\x1b[2J")
+    created[0].on_gap_end()  # simulate a drop gap closing
+    deadline = asyncio.get_running_loop().time() + 5.0
+    while asyncio.get_running_loop().time() < deadline:
+        if b"".join(ws.sent).count(b"\x1b[H\x1b[2J") > baseline:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        pytest.fail("gap close never delivered a repaint snapshot to the websocket")
+
     await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_capture_pane_snapshot_repaints_screen_content() -> None:
+    """The snapshot starts with clear+home and carries the pane's content."""
+    sock, target = await _new_private_tmux("printf 'SNAPMARK\\n'; sleep 30")
+    await asyncio.sleep(0.5)
+    try:
+        snapshot = await control_bridge._capture_pane_snapshot(str(sock), target)
+    finally:
+        await _kill_tmux(sock)
+
+    assert snapshot is not None
+    assert snapshot.startswith(b"\x1b[H\x1b[2J"), "snapshot must clear before repainting"
+    assert b"SNAPMARK" in snapshot

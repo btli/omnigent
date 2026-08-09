@@ -432,6 +432,65 @@ async def test_send_text_fails_loud_when_sender_stalled(
 
 
 @pytest.mark.asyncio
+async def test_send_text_reports_replaced_when_session_swapped_mid_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A send parked on a full queue resolves as 'replaced' after a swap.
+
+    Replacing the session retires the old queue (stop sentinel keeps it
+    full), so the parked put can't complete — the send must still resolve
+    within the stall deadline and name the replacement, not a stall.
+    """
+    import omnigent.runner.transports.ws_tunnel.registry as registry_mod
+    from omnigent.runner.transports.ws_tunnel.registry import _OUTBOUND_QUEUE_MAX_FRAMES
+
+    monkeypatch.setattr(registry_mod, "_OUTBOUND_SEND_STALL_S", 0.2)
+    reg = TunnelRegistry()
+    session = reg.register("r1", _NoopWS(), _hello())
+    for _ in range(_OUTBOUND_QUEUE_MAX_FRAMES):
+        session.outbound_queue.put_nowait("frame")
+
+    send = asyncio.create_task(reg.send_text(session, "parked-frame"))
+    await asyncio.sleep(0.01)
+    assert not send.done(), "send resolved before the sender freed any room"
+
+    reg.register("r1", _NoopWS(), _hello())  # replaces + retires the old session
+    with pytest.raises(ConnectionError, match="replaced"):
+        await asyncio.wait_for(send, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_send_text_resolves_when_enqueue_task_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling the owner-loop enqueue task must never orphan the caller.
+
+    Route teardown cancels pending tasks on the session loop; a send parked
+    in the bounded-wait put must surface ConnectionError, not hang forever
+    on an ack nothing will ever settle.
+    """
+    import omnigent.runner.transports.ws_tunnel.registry as registry_mod
+    from omnigent.runner.transports.ws_tunnel.registry import _OUTBOUND_QUEUE_MAX_FRAMES
+
+    monkeypatch.setattr(registry_mod, "_OUTBOUND_SEND_STALL_S", 30.0)
+    reg = TunnelRegistry()
+    session = reg.register("r1", _NoopWS(), _hello())
+    for _ in range(_OUTBOUND_QUEUE_MAX_FRAMES):
+        session.outbound_queue.put_nowait("frame")
+
+    before = asyncio.all_tasks()
+    send = asyncio.create_task(reg.send_text(session, "parked-frame"))
+    await asyncio.sleep(0.01)
+    enqueue_tasks = asyncio.all_tasks() - before - {send}
+    assert enqueue_tasks, "expected the owner-loop enqueue task to be running"
+    for task in enqueue_tasks:
+        task.cancel()
+
+    with pytest.raises(ConnectionError):
+        await asyncio.wait_for(send, timeout=2.0)
+
+
+@pytest.mark.asyncio
 async def test_retire_delivers_stop_sentinel_through_full_queue() -> None:
     """Retiring a session with a full outbound queue still stops its sender.
 

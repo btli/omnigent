@@ -1708,6 +1708,55 @@ def test_bounded_output_queue_saturation_warns_rate_limited(
 
 
 @pytest.mark.asyncio
+async def test_gap_repainter_coalesces_bursts_and_paces_repaints() -> None:
+    """A burst of gap closes runs ONE repaint; the next waits out the floor.
+
+    Unthrottled, a slow-but-live consumer cycling gaps at send rate would
+    spawn a repaint subprocess per gap and each redraw amplifies the flood.
+    The trailing-edge behavior still guarantees the final gap repaints.
+    """
+    from omnigent.terminals.ws_bridge import _GapRepainter
+
+    runs: list[int] = []
+
+    async def _repaint() -> None:
+        runs.append(1)
+
+    repainter = _GapRepainter(_repaint, min_interval_s=0.1)
+    for _ in range(5):
+        repainter.request()  # burst: one outstanding repaint, not five
+    await asyncio.sleep(0.02)
+    assert len(runs) == 1
+
+    repainter.request()  # inside the cooldown: parked, not run yet
+    repainter.request()  # coalesced into the parked one
+    await asyncio.sleep(0.02)
+    assert len(runs) == 1, "repaint ran inside the min-interval floor"
+    await asyncio.sleep(0.15)
+    assert len(runs) == 2, "trailing gap close never repainted"
+
+
+@pytest.mark.asyncio
+async def test_gap_repainter_cancel_drops_pending_repaint() -> None:
+    """Teardown cancel stops a parked repaint from firing later."""
+    from omnigent.terminals.ws_bridge import _GapRepainter
+
+    runs: list[int] = []
+
+    async def _repaint() -> None:
+        runs.append(1)
+
+    repainter = _GapRepainter(_repaint, min_interval_s=0.05)
+    repainter.request()
+    await asyncio.sleep(0.01)
+    assert len(runs) == 1
+    repainter.request()  # parked on the cooldown
+    repainter.cancel()
+    await asyncio.sleep(0.15)
+    assert len(runs) == 1, "cancelled pending repaint still fired"
+
+
+@pytest.mark.asyncio
 async def test_pump_pty_chunks_caps_reads_per_wakeup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

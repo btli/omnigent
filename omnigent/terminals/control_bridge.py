@@ -77,6 +77,7 @@ from omnigent.terminals.ws_bridge import (
     _ByteBoundedOutputQueue,
     _coalesce_limit_after_input,
     _forward_pty_to_ws,
+    _GapRepainter,
     _monotonic,
 )
 
@@ -178,6 +179,14 @@ async def _parse_control_stream(
         # Parse all COMPLETE lines; keep any trailing partial for next read.
         *lines, buffer = buffer.split(b"\n")
         for raw_line in lines:
+            if len(raw_line) > _CONTROL_MAX_LINE_BYTES:
+                # A near-cap partial completed by this read can exceed the
+                # cap as a whole line without ever tripping the partial check.
+                _logger.warning(
+                    "control line exceeded %d bytes; discarding it whole",
+                    _CONTROL_MAX_LINE_BYTES,
+                )
+                continue
             if not handle_line(raw_line.rstrip(b"\r")):
                 return
         if len(buffer) > _CONTROL_MAX_LINE_BYTES:
@@ -189,6 +198,54 @@ async def _parse_control_stream(
             discarding = True
         # Give the event loop a turn after each parsed batch.
         await asyncio.sleep(0)
+
+
+async def _capture_pane_snapshot(socket_path: str, tmux_target: str) -> bytes | None:
+    """Capture the pane's screen as bytes that repaint a client terminal.
+
+    Gap recovery for control mode: ``refresh-client`` re-emits nothing to a
+    control client, so screen content lost to a drop gap is restored by
+    re-painting from a ``capture-pane`` snapshot — clear+home, the pane rows
+    with their escape sequences, then the cursor put back where tmux
+    reports it.
+
+    :param socket_path: Private tmux server socket path.
+    :param tmux_target: Pane target, e.g. a session name.
+    :returns: Snapshot bytes, or None when tmux is missing or the
+        capture fails (pane gone, server down).
+    """
+    tmux = shutil.which("tmux")
+    if tmux is None:
+        return None
+
+    async def _run(*args: str) -> bytes | None:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                tmux,
+                "-S",
+                socket_path,
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await proc.communicate()
+        except OSError:
+            return None
+        return out if proc.returncode == 0 else None
+
+    screen = await _run("capture-pane", "-p", "-e", "-t", tmux_target)
+    if screen is None:
+        return None
+    body = screen.rstrip(b"\n").replace(b"\n", b"\r\n")
+    cursor_home = b""
+    cursor = await _run("display-message", "-p", "-t", tmux_target, "#{cursor_y} #{cursor_x}")
+    if cursor is not None:
+        try:
+            row, col = (int(v) for v in cursor.split())
+            cursor_home = f"\x1b[{row + 1};{col + 1}H".encode()
+        except ValueError:
+            pass
+    return b"\x1b[H\x1b[2J" + body + cursor_home
 
 
 def unescape_control_output(value: bytes) -> bytes:
@@ -627,7 +684,8 @@ async def bridge_tmux_control_to_websocket(
     # a backlog of tiny per-line payloads collapses into a few large frames.
     # Byte/item-bounded: saturation drops whole incoming %output records (never
     # already-queued ones contiguous with sent bytes); on gap close the queue
-    # injects parser-resync bytes and the hook below forces a full repaint.
+    # injects parser-resync bytes and the hook below re-emits a captured pane
+    # snapshot (refresh-client is a no-op toward a control-mode client).
     output_chunks = _ByteBoundedOutputQueue()
     # Keep at most the newest pending clipboard buffer plus the EOF sentinel.
     # A noisy pane cannot build an unbounded queue of names/subprocess reads.
@@ -670,15 +728,14 @@ async def bridge_tmux_control_to_websocket(
         except (ConnectionResetError, BrokenPipeError, OSError):
             return
 
-    repaint_tasks: set[asyncio.Task[None]] = set()
+    async def _emit_pane_snapshot() -> None:
+        """Drop gap closed: repaint from a pane snapshot, as synthetic output."""
+        snapshot = await _capture_pane_snapshot(socket_path, tmux_target)
+        if snapshot is not None:
+            output_chunks.put_nowait(snapshot)
 
-    def _repaint_after_gap() -> None:
-        """Drop gap closed: have tmux re-emit the screen as fresh %output."""
-        task = asyncio.create_task(_send_command(b"refresh-client\n"))
-        repaint_tasks.add(task)
-        task.add_done_callback(repaint_tasks.discard)
-
-    output_chunks.on_gap_end = _repaint_after_gap
+    repainter = _GapRepainter(_emit_pane_snapshot)
+    output_chunks.on_gap_end = repainter.request
 
     def _handle_control_line(line: bytes) -> bool:
         """Route one protocol line; return ``True`` to keep reading.
@@ -891,6 +948,7 @@ async def bridge_tmux_control_to_websocket(
         # Detach reflows the pane back to remaining clients — stamp it.
         if on_client_interaction is not None:
             on_client_interaction()
+        repainter.cancel()
         # Detach the control client: an empty command line detaches cleanly.
         await _send_command(b"\n")
         with contextlib.suppress(ProcessLookupError):

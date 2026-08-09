@@ -708,37 +708,62 @@ class TunnelRegistry:
         """
         ack: concurrent.futures.Future[None] = concurrent.futures.Future()
 
+        def _resolve(error: BaseException | None) -> None:
+            """Settle ``ack`` once; later resolutions are no-ops."""
+            if ack.done():
+                return
+            if error is None:
+                ack.set_result(None)
+            else:
+                ack.set_exception(error)
+
+        def _stale() -> bool:
+            with self._lock:
+                return self._sessions.get(session.runner_id) is not session
+
+        def _replaced_error() -> ConnectionError:
+            return ConnectionError(f"runner {session.runner_id!r} tunnel was replaced")
+
         async def _enqueue() -> None:
             """Run on ``session.loop``: bounded-wait enqueue of the frame."""
-            with self._lock:
-                stale = self._sessions.get(session.runner_id) is not session
-            if stale:
-                if not ack.done():
-                    ack.set_exception(
-                        ConnectionError(f"runner {session.runner_id!r} tunnel was replaced")
-                    )
-                return
             try:
-                # A full queue is backpressure, not failure: a burst can fill
-                # it faster than the sender wakes, so wait for drain and only
-                # treat a sender that frees no room in the deadline as stalled.
-                await asyncio.wait_for(
-                    session.outbound_queue.put(data), timeout=_OUTBOUND_SEND_STALL_S
-                )
-            except TimeoutError:
-                _logger.warning(
-                    "runner %s outbound queue freed no room in %.0fs (%d frames); failing send",
-                    session.runner_id,
-                    _OUTBOUND_SEND_STALL_S,
-                    session.outbound_queue.qsize(),
-                )
-                if not ack.done():
-                    ack.set_exception(
-                        ConnectionError(f"runner {session.runner_id!r} outbound tunnel stalled")
+                if _stale():
+                    _resolve(_replaced_error())
+                    return
+                try:
+                    # A full queue is backpressure, not failure: a burst can
+                    # fill it faster than the sender wakes, so wait for drain
+                    # and only treat no room freed in the deadline as failure.
+                    await asyncio.wait_for(
+                        session.outbound_queue.put(data), timeout=_OUTBOUND_SEND_STALL_S
                     )
-                return
-            if not ack.done():
-                ack.set_result(None)
+                except TimeoutError:
+                    if _stale():
+                        _resolve(_replaced_error())
+                        return
+                    _logger.warning(
+                        "runner %s outbound queue freed no room in %.0fs (%d frames); "
+                        "failing send (sender stalled, or outpaced by concurrent senders)",
+                        session.runner_id,
+                        _OUTBOUND_SEND_STALL_S,
+                        session.outbound_queue.qsize(),
+                    )
+                    _resolve(
+                        ConnectionError(
+                            f"runner {session.runner_id!r} outbound tunnel stalled "
+                            "(sender dead, or saturated by concurrent sends)"
+                        )
+                    )
+                    return
+                if _stale():
+                    # The frame landed in a retired queue no sender drains.
+                    _resolve(_replaced_error())
+                    return
+                _resolve(None)
+            finally:
+                # Route teardown can cancel this task mid-wait; the caller
+                # must never be left awaiting an ack nothing will settle.
+                _resolve(_replaced_error())
 
         def _start_enqueue() -> None:
             """Run on the owner loop; task-ify the bounded-wait put."""
