@@ -199,3 +199,97 @@ async def test_transport_aclose_is_noop() -> None:
     reg = TunnelRegistry()
     transport = WSTunnelTransport(reg, "r1")
     await transport.aclose()  # Should not raise.
+
+
+# ── Read-timeout handling (request timeout extension) ──
+
+
+def _make_stream_request(read_timeout: float | None) -> httpx.Request:
+    """Build a request carrying an httpx read timeout extension."""
+    return httpx.Request(
+        "GET",
+        "http://runner/v1/sessions/s1/stream",
+        extensions={"timeout": {"connect": 5.0, "read": read_timeout}},
+    )
+
+
+@pytest.mark.asyncio
+async def test_stalled_body_raises_read_timeout_and_keeps_tunnel_registered() -> None:
+    """A silent body stream on a live tunnel raises httpx.ReadTimeout.
+
+    The tunnel session must stay registered so disconnect attribution
+    can distinguish stream loss from tunnel loss.
+    """
+    reg = TunnelRegistry()
+    reg.register("r1", _NoopWS(), _hello())
+    transport = WSTunnelTransport(reg, "r1")
+
+    task = asyncio.create_task(transport.handle_async_request(_make_stream_request(0.05)))
+    await asyncio.sleep(0.01)
+
+    session = reg.get("r1")
+    assert session is not None
+    req_id = next(iter(session.in_flight))
+    reg.route_response_frame("r1", ResponseHeadFrame(id=req_id, status=200))
+    reg.route_response_frame("r1", ResponseBodyFrame(id=req_id, body="first", encoding="utf-8"))
+    # No end frame and no further chunks: the stream goes silent.
+
+    response = await task
+
+    async def _drain() -> list[bytes]:
+        return [chunk async for chunk in response.stream]
+
+    # The outer wait_for guards against a regression hanging forever:
+    # it converts a hang into a plain TimeoutError, failing the test.
+    with pytest.raises(httpx.ReadTimeout):
+        await asyncio.wait_for(_drain(), timeout=2.0)
+
+    assert reg.get("r1") is session
+    assert req_id not in session.in_flight
+
+
+@pytest.mark.asyncio
+async def test_stalled_response_head_raises_read_timeout() -> None:
+    """A response head that never arrives times out with httpx.ReadTimeout."""
+    reg = TunnelRegistry()
+    reg.register("r1", _NoopWS(), _hello())
+    transport = WSTunnelTransport(reg, "r1")
+
+    with pytest.raises(httpx.ReadTimeout):
+        await asyncio.wait_for(
+            transport.handle_async_request(_make_stream_request(0.05)),
+            timeout=2.0,
+        )
+
+    session = reg.get("r1")
+    assert session is not None
+    assert not session.in_flight
+
+
+@pytest.mark.asyncio
+async def test_read_timeout_none_waits_past_delay_for_body() -> None:
+    """``read=None`` (streaming clients) keeps waiting for late chunks."""
+    reg = TunnelRegistry()
+    reg.register("r1", _NoopWS(), _hello())
+    transport = WSTunnelTransport(reg, "r1")
+
+    task = asyncio.create_task(transport.handle_async_request(_make_stream_request(None)))
+    await asyncio.sleep(0.01)
+
+    session = reg.get("r1")
+    assert session is not None
+    req_id = next(iter(session.in_flight))
+    reg.route_response_frame("r1", ResponseHeadFrame(id=req_id, status=200))
+    response = await task
+
+    async def _feed_late() -> None:
+        await asyncio.sleep(0.15)
+        reg.route_response_frame("r1", ResponseBodyFrame(id=req_id, body="late", encoding="utf-8"))
+        reg.route_response_frame("r1", ResponseEndFrame(id=req_id))
+
+    feeder = asyncio.create_task(_feed_late())
+    body = b""
+    async for chunk in response.stream:
+        body += chunk
+    await feeder
+    assert body == b"late"

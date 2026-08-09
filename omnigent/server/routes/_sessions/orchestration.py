@@ -5421,6 +5421,13 @@ async def _dispatch_session_event_to_runner_impl(
 RUNNER_DISCONNECT_GRACE_S: float = 10.0
 # Delay between relay stream reconnect attempts inside the grace window.
 _RELAY_RETRY_INTERVAL_S: float = 0.5
+# Relay stream read timeout: 3x the runner's session-stream heartbeat
+# interval (15s). Between turns the runner emits ``session.heartbeat``
+# every 15s to keep proxies from dropping the idle connection. If 3
+# consecutive heartbeats are missed (45s), the stream is likely dead —
+# let the relay exit so ``_ensure_runner_relay`` can restart it on the
+# next ``POST /events``.
+_RELAY_STREAM_READ_TIMEOUT_S = 45.0
 
 
 def _is_tunnel_transition_error(exc: BaseException) -> bool:
@@ -5625,14 +5632,14 @@ async def _relay_runner_stream_once(
     tool_call_response_ids: dict[str, str] = {}
     _logger.info("Relay: connecting to runner GET /stream for session=%s", session_id)
 
-    # Read timeout: 3x the runner's session-stream heartbeat interval
-    # (15s). Between turns the runner emits ``session.heartbeat`` every
-    # 15s to keep proxies from dropping the idle connection. If 3
-    # consecutive heartbeats are missed (45s), the connection is likely
-    # dead — surface it so the supervising retry loop reconnects (or,
-    # past the grace, fails the session). ``connect`` stays at httpx's
-    # default (5s); ``write``/``pool`` are not rate-limiting here.
-    _relay_timeout = httpx.Timeout(connect=5.0, read=45.0, write=None, pool=None)
+    # ``connect`` stays at httpx's default (5s); ``write``/``pool`` are
+    # not rate-limiting here.
+    _relay_timeout = httpx.Timeout(
+        connect=5.0,
+        read=_RELAY_STREAM_READ_TIMEOUT_S,
+        write=None,
+        pool=None,
+    )
     try:
         async with runner_client.stream(
             "GET",
@@ -6046,12 +6053,8 @@ async def _relay_runner_stream_once(
 
     except (httpx.HTTPError, ConnectionError) as exc:
         # WSTunnelTransport raises bare ConnectionError on tunnel close;
-        # treat the same as HTTPError. The finally below consumes the
-        # intentional-stop marker, so snapshot it now for the supervisor's
-        # retry-vs-quiet-exit decision.
-        # Tunnel loss deregisters first; stream errors with a live tunnel are
-        # not runner disconnect. A replacement is a tunnel transition even
-        # though the new tunnel is already registered.
+        # treat the same as HTTPError. Snapshot tunnel state before the
+        # finally block consumes the intentional-stop marker.
         transport = getattr(runner_client, "_transport", None)
         relay_runner_id = runner_id or getattr(transport, "_runner_id", None)
         tunnel_alive = _runner_tunnel_alive(runner_client, relay_runner_id)
