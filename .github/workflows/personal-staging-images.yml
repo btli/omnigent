@@ -1,10 +1,7 @@
 name: Publish personal staging images
-run-name: Publish personal staging images (${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}) by @${{ github.actor }}
+run-name: Publish personal staging images (${{ inputs.ref }}) by @${{ github.actor }}
 
 on:
-  push:
-    tags:
-      - 'nightly-*'
   workflow_dispatch:
     inputs:
       ref:
@@ -32,28 +29,22 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           persist-credentials: false
-          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.ref) || github.ref }}
+          ref: ${{ format('refs/tags/{0}', inputs.ref) }}
 
       - name: Resolve source tag
         id: source
         env:
-          EVENT_NAME: ${{ github.event_name }}
           INPUT_REF: ${{ inputs.ref }}
-          GITHUB_REF_VALUE: ${{ github.ref }}
         run: |
           set -euo pipefail
 
-          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
-            case "${INPUT_REF}" in
-              nightly-*) source_ref="refs/tags/${INPUT_REF}" ;;
-              *)
-                echo "Dispatch ref must be a nightly-* tag name, got '${INPUT_REF}'." >&2
-                exit 1
-                ;;
-            esac
-          else
-            source_ref="${GITHUB_REF_VALUE}"
-          fi
+          case "${INPUT_REF}" in
+            nightly-*) source_ref="refs/tags/${INPUT_REF}" ;;
+            *)
+              echo "Dispatch ref must be a nightly-* tag name, got '${INPUT_REF}'." >&2
+              exit 1
+              ;;
+          esac
 
           case "${source_ref}" in
             refs/tags/nightly-*) tag_name="${source_ref#refs/tags/}" ;;

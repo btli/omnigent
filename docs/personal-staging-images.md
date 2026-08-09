@@ -1,10 +1,17 @@
 # Personal staging images
 
 `.github/workflows/personal-staging-images.yml` publishes the server and host
-images from `btli/omnigent` to GHCR. It runs for `nightly-*` tag pushes and for
-manual dispatches that provide an existing `nightly-*` tag name through the
-`ref` input. Branch refs are rejected.
+images from `btli/omnigent` to GHCR. It runs only through `workflow_dispatch`,
+with an existing `nightly-*` tag name supplied through the `ref` input. Branch
+refs are rejected.
 The job is deliberately guarded to run only in the fork repository.
+
+There is intentionally no push-of-tag trigger. A nightly tag points at a
+staging commit that can contain merged open-PR code; a tag trigger would run
+the workflow definition from that commit with `packages: write`, allowing a
+PR-modified workflow to execute privileged code. Only the trusted workflow
+definition on `main` may dispatch this build, with the nightly tag passed as a
+validated input.
 
 Both images are multi-architecture manifests for `linux/amd64` and
 `linux/arm64`:
@@ -70,6 +77,14 @@ against that tag. The workflow is dispatched from the default branch, with the
 tag passed through the required `ref` input. Snapshot existing run IDs first so
 the polling loop can select the new matching run rather than a concurrent run:
 
+The intended integration from the nightly staging workflow (PR #11's
+`personal-staging.yml`) is the same trusted-main chain:
+
+```bash
+TAG=nightly-20260809
+gh workflow run personal-staging-images.yml -R btli/omnigent --ref main -f ref="$TAG"
+```
+
 ```bash
 set -euo pipefail
 
@@ -84,7 +99,7 @@ list_run_ids() {
 }
 
 BEFORE_RUN_IDS="$(list_run_ids)"
-gh workflow run "$WORKFLOW" -R "$REPO" -f ref="$TAG"
+gh workflow run "$WORKFLOW" -R "$REPO" --ref main -f ref="$TAG"
 
 RUN_ID=""
 for attempt in $(seq 1 30); do
