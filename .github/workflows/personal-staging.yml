@@ -2,9 +2,9 @@
 #
 # Composes upstream main + every open btli PR (sequential merges, conflicts
 # skipped and reported) onto fork branch `staging`, pins an immutable
-# testing-YYYYMMDD branch + tag and a PEP 440 vX.Y.Z.devYYYYMMDD tag, builds
+# nightly-YYYYMMDD branch + tag and a PEP 440 vX.Y.Z.devYYYYMMDD tag, builds
 # Android debug APK + unsigned release AAB from that commit, and publishes a
-# prerelease (plus a floating `testing-latest` for a stable download URL).
+# prerelease (plus a floating `nightly-latest` for a stable download URL).
 #
 # Never touches branch `testing` — that stays the manually composed
 # webhook-deployed homelab branch (`just test-branch`).
@@ -23,10 +23,49 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  integrate:
-    # Fork-only, mirroring upstream's `if: github.repository == 'omnigent-ai/omnigent'`
-    # guards; downstream jobs inherit the skip through `needs`.
+  # Keep fork main tracking upstream with a plain merge commit (no force). A
+  # conflict fails THIS job with the paths in the summary — resolution is
+  # manual — but the staging ring below still runs: it stacks from upstream
+  # HEAD directly and never reads fork main.
+  sync-main:
+    # Fork-only, mirroring upstream's `if: github.repository == 'omnigent-ai/omnigent'` guards.
     if: github.repository == 'btli/omnigent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout fork main with full history
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge upstream main and push
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/omnigent-ai/omnigent.git
+          git fetch upstream main
+          if ! git merge --no-edit FETCH_HEAD; then
+            {
+              echo "## sync-main: merge conflict with upstream main"
+              echo ""
+              git diff --name-only --diff-filter=U | sed 's/^/- `/;s/$/`/'
+              echo ""
+              echo "Resolve manually; tonight's staging ring still ran from upstream HEAD."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          git push origin main
+
+  integrate:
+    # Runs even when sync-main failed on a conflict (the ring stacks from
+    # upstream HEAD, not fork main) — but not when sync-main was skipped
+    # (non-fork repo) or cancelled.
+    needs: sync-main
+    if: always() && github.repository == 'btli/omnigent' && needs.sync-main.result != 'cancelled'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -191,11 +230,11 @@ jobs:
           gh release upload "$TAG" dist/* --clobber
 
       # Floating prerelease: re-pointed every night so
-      # releases/download/testing-latest/<asset> stays a stable URL.
-      - name: Re-point testing-latest
+      # releases/download/nightly-latest/<asset> stays a stable URL.
+      - name: Re-point nightly-latest
         run: |
           set -euo pipefail
-          gh release delete testing-latest --cleanup-tag --yes || true
-          gh release create testing-latest --prerelease --target "$STAGING_SHA" \
+          gh release delete nightly-latest --cleanup-tag --yes || true
+          gh release create nightly-latest --prerelease --target "$STAGING_SHA" \
             --title "Personal staging (latest — $TAG)" --notes-file notes.md
-          gh release upload testing-latest dist/* --clobber
+          gh release upload nightly-latest dist/* --clobber

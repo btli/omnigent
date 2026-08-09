@@ -3,7 +3,7 @@
 
 Builds branch ``staging`` = upstream main + every open btli PR merged
 sequentially (ascending PR number; conflicting PRs are skipped and reported),
-then pins an immutable ``testing-YYYYMMDD`` branch + tag and a PEP 440
+then pins an immutable ``nightly-YYYYMMDD`` branch + tag and a PEP 440
 ``vX.Y.Z.devYYYYMMDD`` tag at the same commit. Never touches branch
 ``testing`` (the manually composed homelab deploy branch).
 
@@ -140,11 +140,11 @@ def merge_prs(cwd: str | Path, prs: list[dict], upstream: str) -> tuple[list[dic
 
 
 def pin_name(cwd: str | Path, fork: str, datestamp: str, sha: str) -> tuple[str, bool]:
-    """Immutable name for tonight's pin: testing-YYYYMMDD, -rerunN if the day
+    """Immutable name for tonight's pin: nightly-YYYYMMDD, -rerunN if the day
     already has a pin at a different commit, no-op if it already points here."""
     n = 0
     while True:
-        cand = f"testing-{datestamp}" + (f"-rerun{n}" if n else "")
+        cand = f"nightly-{datestamp}" + (f"-rerun{n}" if n else "")
         existing = remote_ref(cwd, fork, f"refs/tags/{cand}")
         if not existing:
             return cand, True

@@ -127,21 +127,21 @@ def test_all_prs_conflicting_is_not_a_failure(env):
 def test_same_day_rerun_noop_then_rerun_suffix(env):
     pr = env.add_pr(7, "c.txt", "7\n")
     first = env.run([pr])
-    assert first["tag"] == f"testing-{STAMP}"
+    assert first["tag"] == f"nightly-{STAMP}"
     assert first["pin_created"] is True
 
     # identical rerun: same commit, no new pin
     again = env.run([pr])
-    assert again["tag"] == f"testing-{STAMP}"
+    assert again["tag"] == f"nightly-{STAMP}"
     assert again["pin_created"] is False
     assert again["staging_sha"] == first["staging_sha"]
 
     # upstream moved: same-day rerun gets a -rerun1 pin, day tag stays immutable
     env.advance_main("d.txt", "new\n")
     third = env.run([pr])
-    assert third["tag"] == f"testing-{STAMP}-rerun1"
-    assert env.fork_ref(f"refs/tags/testing-{STAMP}") == first["staging_sha"]
-    assert env.fork_ref(f"refs/tags/testing-{STAMP}-rerun1") == third["staging_sha"]
+    assert third["tag"] == f"nightly-{STAMP}-rerun1"
+    assert env.fork_ref(f"refs/tags/nightly-{STAMP}") == first["staging_sha"]
+    assert env.fork_ref(f"refs/tags/nightly-{STAMP}-rerun1") == third["staging_sha"]
     assert env.fork_ref("refs/heads/staging") == third["staging_sha"]
 
 

@@ -8,7 +8,7 @@
    (`stage.py`). A conflicting PR is skipped — its conflict paths land in
    `merge-report.json` — and the run continues. All PRs conflicting is a
    reported outcome, not a failure.
-2. Pins an immutable `testing-YYYYMMDD` branch + tag at the staging commit
+2. Pins an immutable `nightly-YYYYMMDD` branch + tag at the staging commit
    (same-day rerun: no-op when nothing changed, else `-rerunN`), plus a
    PEP 440 `vX.Y.Z.devYYYYMMDD` tag mirroring `nightly-release.yml`'s
    scheme, so `scripts/update_nightly.sh` resolves it:
@@ -18,9 +18,9 @@
    ```
 
 3. Builds a debug APK and an unsigned release AAB from that commit and
-   publishes them on a `testing-YYYYMMDD` prerelease together with
+   publishes them on a `nightly-YYYYMMDD` prerelease together with
    `merge-report.json` and `SHA256SUMS`, then re-points the floating
-   `testing-latest` prerelease.
+   `nightly-latest` prerelease.
 
 **This never touches branch `testing`** — that remains the manually composed
 homelab deploy branch driven by `just test-branch`. Nothing here flips any
@@ -32,7 +32,7 @@ The floating prerelease keeps asset names fixed, so the newest nightly APK is
 always:
 
 ```
-https://github.com/btli/omnigent/releases/download/testing-latest/omnigent-staging-debug.apk
+https://github.com/btli/omnigent/releases/download/nightly-latest/omnigent-staging-debug.apk
 ```
 
 ## Debug keystore secret (optional, recommended)
