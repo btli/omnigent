@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import fcntl
 import json
+import logging
 import os
 import pty
 import shutil
@@ -1598,41 +1599,112 @@ async def test_check_pane_dead_definitive_tri_state(
 # ── Output-queue backpressure ────────────────────────────
 
 
-def test_bounded_output_queue_drops_oldest_past_byte_cap() -> None:
-    """A saturated bounded output queue sheds the OLDEST chunks.
+def test_bounded_output_queue_rejects_new_chunks_past_byte_cap() -> None:
+    """A saturated bounded output queue drops the INCOMING chunk whole.
 
-    Terminal bytes are lossy-safe (the next repaint restores the screen),
-    so when the browser send is wedged and the backlog passes the byte cap,
-    the freshest output must win and total queued bytes must stay bounded.
+    Evicting already-queued output could sever an escape sequence whose
+    prefix was already sent (wedging the client terminal parser), so the
+    queued backlog stays intact and the new chunk is shed instead.
     """
     from omnigent.terminals.ws_bridge import _ByteBoundedOutputQueue
 
-    queue = _ByteBoundedOutputQueue(max_bytes=10)
+    queue = _ByteBoundedOutputQueue(max_bytes=10, max_items=100)
     queue.put_nowait(b"aaaa")
     queue.put_nowait(b"bbbb")
-    queue.put_nowait(b"cccc")  # 12 bytes queued -> oldest drops
+    queue.put_nowait(b"cccc")  # would exceed 10 queued bytes -> dropped whole
 
     assert queue.queued_bytes <= 10
+    assert queue.dropped_chunks == 1
+    assert queue.dropped_bytes == 4
     remaining = [queue.get_nowait() for _ in range(queue.qsize())]
-    assert remaining == [b"bbbb", b"cccc"]
+    assert remaining == [b"aaaa", b"bbbb"]
     assert queue.queued_bytes == 0  # _get accounting drains with the items
 
 
-def test_bounded_output_queue_never_drops_eof_sentinel() -> None:
-    """The None EOF sentinel survives saturation (re-queued, not dropped).
+def test_bounded_output_queue_enforces_item_cap() -> None:
+    """The item cap bounds object memory even when chunks are tiny."""
+    from omnigent.terminals.ws_bridge import _ByteBoundedOutputQueue
 
-    Losing the sentinel would leave the forwarder blocked on get() forever
-    after the reader exits.
+    queue = _ByteBoundedOutputQueue(max_bytes=1_000_000, max_items=2)
+    queue.put_nowait(b"a")
+    queue.put_nowait(b"b")
+    queue.put_nowait(b"c")  # third item -> dropped
+
+    assert queue.qsize() == 2
+    assert queue.dropped_chunks == 1
+
+
+def test_bounded_output_queue_accounts_oversized_lone_chunk() -> None:
+    """A lone chunk above the byte budget is accepted at its REAL size.
+
+    Producers bound single-chunk size, so accepting one oversized chunk
+    into an empty queue keeps the backlog at most one chunk over budget —
+    and its real byte count must gate every subsequent put.
     """
     from omnigent.terminals.ws_bridge import _ByteBoundedOutputQueue
 
-    queue = _ByteBoundedOutputQueue(max_bytes=4)
-    queue.put_nowait(None)  # sentinel at the front of an over-cap backlog
-    queue.put_nowait(b"xxxxxxxx")
+    queue = _ByteBoundedOutputQueue(max_bytes=4, max_items=100)
+    queue.put_nowait(b"xxxxxxxx")  # alone: accepted despite exceeding budget
+    assert queue.queued_bytes == 8
+    queue.put_nowait(b"y")  # already over budget with company -> dropped
+    assert queue.dropped_chunks == 1
+    assert queue.get_nowait() == b"xxxxxxxx"
 
-    remaining = [queue.get_nowait() for _ in range(queue.qsize())]
-    assert None in remaining
-    assert b"xxxxxxxx" in remaining
+
+def test_bounded_output_queue_gap_close_resyncs_and_repaints() -> None:
+    """Closing a drop gap injects parser-resync bytes and fires on_gap_end.
+
+    The resync bytes (CAN + ST) unwedge a client parser left mid-escape by
+    the gap; the on_gap_end hook is how the bridge forces a full repaint.
+    """
+    from omnigent.terminals.ws_bridge import _OUTPUT_GAP_RESYNC, _ByteBoundedOutputQueue
+
+    gap_ends: list[bool] = []
+    queue = _ByteBoundedOutputQueue(max_bytes=8, max_items=100)
+    queue.on_gap_end = lambda: gap_ends.append(True)
+    queue.put_nowait(b"aaaa")
+    queue.put_nowait(b"bbbb")
+    queue.put_nowait(b"cccc")  # dropped -> gap opens
+    assert gap_ends == []
+
+    assert queue.get_nowait() == b"aaaa"  # consumer drains below budget
+    assert queue.get_nowait() == b"bbbb"
+    queue.put_nowait(b"dddd")  # gap closes: resync precedes resuming output
+    assert [queue.get_nowait(), queue.get_nowait()] == [_OUTPUT_GAP_RESYNC, b"dddd"]
+    assert gap_ends == [True]
+
+
+def test_bounded_output_queue_eof_sentinel_always_lands_last() -> None:
+    """The None EOF sentinel is accepted even when saturated, in order.
+
+    Losing the sentinel would leave the forwarder blocked on get() forever;
+    displacing queued data for it would drop a live final chunk.
+    """
+    from omnigent.terminals.ws_bridge import _ByteBoundedOutputQueue
+
+    queue = _ByteBoundedOutputQueue(max_bytes=4, max_items=1)
+    queue.put_nowait(b"aaaaaaaa")  # lone oversized final chunk survives
+    queue.put_nowait(b"bb")  # saturated -> dropped
+    queue.put_nowait(None)
+
+    drained = [queue.get_nowait() for _ in range(queue.qsize())]
+    assert drained == [b"aaaaaaaa", None]
+
+
+def test_bounded_output_queue_saturation_warns_rate_limited(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Saturation logs one WARNING with counters, not one per dropped chunk."""
+    from omnigent.terminals.ws_bridge import _ByteBoundedOutputQueue
+
+    queue = _ByteBoundedOutputQueue(max_bytes=4, max_items=100)
+    queue.put_nowait(b"xxxxxxxx")
+    with caplog.at_level(logging.WARNING, logger="omnigent.terminals.ws_bridge"):
+        for _ in range(50):
+            queue.put_nowait(b"flood")
+    saturation_warnings = [r for r in caplog.records if "saturated" in r.message]
+    assert len(saturation_warnings) == 1
+    assert queue.dropped_chunks == 50
 
 
 @pytest.mark.asyncio

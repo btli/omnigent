@@ -114,6 +114,11 @@ _CONTROL_READ_CHUNK: Final[int] = 256 * 1024
 # single read; raise it so a large burst can be pulled in one wakeup.
 _CONTROL_STDOUT_BUFFER_LIMIT: Final[int] = 16 * 1024 * 1024
 
+# Bound on one buffered partial control line; a line that outgrows it is
+# discarded whole (%output records are lossy-safe and the queue's gap
+# handling repaints) instead of accumulating without limit across reads.
+_CONTROL_MAX_LINE_BYTES: Final[int] = _CONTROL_STDOUT_BUFFER_LIMIT
+
 # When the control reader ends with a send backlog still queued (a
 # burst-then-exit program), how long to let the forwarder finish draining that
 # sentinel-terminated backlog before teardown cancels it. Bounds teardown so a
@@ -134,6 +139,56 @@ _CLIPBOARD_READ_TIMEOUT_S: Final[float] = 2.0
 # Correlating the notification with this client's recent input prevents one
 # attached browser from overwriting every other viewer's local clipboard.
 _CLIPBOARD_RECENT_INPUT_WINDOW_S: Final[float] = 5.0
+
+
+async def _parse_control_stream(
+    stdout: asyncio.StreamReader,
+    handle_line: Callable[[bytes], bool],
+) -> None:
+    """Parse raw control-stream reads into lines routed via *handle_line*.
+
+    Reads with ``read()`` rather than ``readline()`` so one wakeup can pull
+    many buffered ``%output`` lines at once and an oversized line can't raise
+    ``LimitOverrunError``. ``read`` returns buffered data without suspending,
+    so the loop yields explicitly after each parsed batch to keep the event
+    loop live under a flood; a partial line that outgrows
+    :data:`_CONTROL_MAX_LINE_BYTES` is discarded whole rather than buffered
+    without bound.
+
+    :param stdout: The control client's stdout stream.
+    :param handle_line: Per-line router; returns ``False`` to stop reading.
+    :returns: None on stream EOF or when *handle_line* stops the read.
+    """
+    buffer = b""
+    discarding = False
+    while True:
+        data = await stdout.read(_CONTROL_READ_CHUNK)
+        if not data:
+            # tmux control client closed its stdout — server/session gone.
+            return
+        buffer += data
+        if discarding:
+            # Skip the tail of an oversized line through its newline; fall
+            # through either way so every batch reaches the yield below.
+            _, newline, buffer = buffer.partition(b"\n")
+            if newline:
+                discarding = False
+            else:
+                buffer = b""
+        # Parse all COMPLETE lines; keep any trailing partial for next read.
+        *lines, buffer = buffer.split(b"\n")
+        for raw_line in lines:
+            if not handle_line(raw_line.rstrip(b"\r")):
+                return
+        if len(buffer) > _CONTROL_MAX_LINE_BYTES:
+            _logger.warning(
+                "control line exceeded %d bytes; discarding it whole",
+                _CONTROL_MAX_LINE_BYTES,
+            )
+            buffer = b""
+            discarding = True
+        # Give the event loop a turn after each parsed batch.
+        await asyncio.sleep(0)
 
 
 def unescape_control_output(value: bytes) -> bytes:
@@ -570,9 +625,10 @@ async def bridge_tmux_control_to_websocket(
     # (``None`` = EOF sentinel). The forwarder coalesces everything queued into
     # one bounded ``send_bytes``, so when the browser send lags tmux's firehose
     # a backlog of tiny per-line payloads collapses into a few large frames.
-    # Byte-bounded: past the cap the oldest chunks are dropped (lossy-safe —
-    # the next repaint restores the screen) instead of growing without bound.
-    output_chunks: asyncio.Queue[bytes | None] = _ByteBoundedOutputQueue()
+    # Byte/item-bounded: saturation drops whole incoming %output records (never
+    # already-queued ones contiguous with sent bytes); on gap close the queue
+    # injects parser-resync bytes and the hook below forces a full repaint.
+    output_chunks = _ByteBoundedOutputQueue()
     # Keep at most the newest pending clipboard buffer plus the EOF sentinel.
     # A noisy pane cannot build an unbounded queue of names/subprocess reads.
     clipboard_buffers: asyncio.Queue[str | None] = asyncio.Queue(maxsize=2)
@@ -614,6 +670,16 @@ async def bridge_tmux_control_to_websocket(
         except (ConnectionResetError, BrokenPipeError, OSError):
             return
 
+    repaint_tasks: set[asyncio.Task[None]] = set()
+
+    def _repaint_after_gap() -> None:
+        """Drop gap closed: have tmux re-emit the screen as fresh %output."""
+        task = asyncio.create_task(_send_command(b"refresh-client\n"))
+        repaint_tasks.add(task)
+        task.add_done_callback(repaint_tasks.discard)
+
+    output_chunks.on_gap_end = _repaint_after_gap
+
     def _handle_control_line(line: bytes) -> bool:
         """Route one protocol line; return ``True`` to keep reading.
 
@@ -654,31 +720,9 @@ async def bridge_tmux_control_to_websocket(
         return True
 
     async def _read_control() -> None:
-        """Read raw control-stream chunks, parse lines, queue %output.
-
-        Reads with ``stdout.read()`` rather than ``readline()`` so one wakeup
-        can pull many buffered ``%output`` lines at once — letting the
-        forwarder coalesce them — and so an oversized line can't raise
-        ``LimitOverrunError``. Always enqueues the ``None`` EOF sentinel on exit
-        so the forwarder terminates.
-        """
-        buffer = b""
+        """Parse the control stream, queueing %output; EOF sentinel on exit."""
         try:
-            while True:
-                data = await stdout.read(_CONTROL_READ_CHUNK)
-                if not data:
-                    # tmux control client closed its stdout — server/session gone.
-                    return
-                buffer += data
-                # Parse all COMPLETE lines; keep any trailing partial for next read.
-                *lines, buffer = buffer.split(b"\n")
-                for raw_line in lines:
-                    if not _handle_control_line(raw_line.rstrip(b"\r")):
-                        return
-                # ``stdout.read`` returns buffered data without suspending, so
-                # under a flood this loop never yields on its own — give the
-                # event loop a turn after each parsed batch.
-                await asyncio.sleep(0)
+            await _parse_control_stream(stdout, _handle_control_line)
         finally:
             output_chunks.put_nowait(None)
             clipboard_buffers.put_nowait(None)

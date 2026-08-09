@@ -387,12 +387,12 @@ async def test_wait_for_runner_zero_timeout_just_checks() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_text_fails_loud_when_outbound_queue_saturated() -> None:
-    """A saturated outbound queue fails the send instead of dropping the frame.
+async def test_send_text_waits_out_a_full_queue_instead_of_failing() -> None:
+    """A momentarily full outbound queue is backpressure, not an error.
 
-    Protocol frames must never be dropped silently — a lost frame strands its
-    RPC — so when the sender task stops draining the socket and the bounded
-    queue fills, send_text surfaces a ConnectionError to the caller.
+    A burst can fill the queue before the sender task wakes; the send must
+    wait for drain (never dropping or failing the frame) and complete once
+    the sender frees a slot.
     """
     from omnigent.runner.transports.ws_tunnel.registry import _OUTBOUND_QUEUE_MAX_FRAMES
 
@@ -401,8 +401,34 @@ async def test_send_text_fails_loud_when_outbound_queue_saturated() -> None:
     for _ in range(_OUTBOUND_QUEUE_MAX_FRAMES):
         session.outbound_queue.put_nowait("frame")
 
-    with pytest.raises(ConnectionError, match="queue is full"):
-        await reg.send_text(session, "one-too-many")
+    send = asyncio.create_task(reg.send_text(session, "tail-frame"))
+    await asyncio.sleep(0.01)
+    assert not send.done(), "send failed instead of waiting for the sender to drain"
+
+    session.outbound_queue.get_nowait()  # the sender drains one slot
+    await asyncio.wait_for(send, timeout=2.0)  # frame accepted, never dropped
+
+
+@pytest.mark.asyncio
+async def test_send_text_fails_loud_when_sender_stalled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sender that frees no room within the deadline fails the send loudly.
+
+    Protocol frames must never be dropped silently — a lost frame strands its
+    RPC — so a truly stalled socket surfaces ConnectionError to the caller.
+    """
+    import omnigent.runner.transports.ws_tunnel.registry as registry_mod
+    from omnigent.runner.transports.ws_tunnel.registry import _OUTBOUND_QUEUE_MAX_FRAMES
+
+    monkeypatch.setattr(registry_mod, "_OUTBOUND_SEND_STALL_S", 0.05)
+    reg = TunnelRegistry()
+    session = reg.register("r1", _NoopWS(), _hello())
+    for _ in range(_OUTBOUND_QUEUE_MAX_FRAMES):
+        session.outbound_queue.put_nowait("frame")
+
+    with pytest.raises(ConnectionError, match="stalled"):
+        await reg.send_text(session, "frame-behind-stalled-sender")
 
 
 @pytest.mark.asyncio

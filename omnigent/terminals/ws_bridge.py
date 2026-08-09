@@ -74,6 +74,16 @@ _PTY_READS_PER_WAKEUP: Final[int] = 16
 # (multi-MB build logs behind a slow browser send) still deliver in full;
 # only a pathological flood against a stuck consumer trips the drop path.
 _OUTPUT_QUEUE_MAX_BYTES: Final[int] = 16 * 1024 * 1024
+# Companion item cap: a flood of tiny chunks costs per-object memory long
+# before the byte budget trips.
+_OUTPUT_QUEUE_MAX_ITEMS: Final[int] = 32768
+# Minimum interval between saturation WARNINGs from one queue; each warning
+# carries cumulative drop counters, so repeats double as periodic summaries.
+_OUTPUT_DROP_WARN_INTERVAL_S: Final[float] = 30.0
+# Injected where dropped output resumes: CAN aborts a partial CSI/escape and
+# ST terminates a dangling OSC/DCS string, so a drop gap can never wedge the
+# client terminal parser mid-sequence.
+_OUTPUT_GAP_RESYNC: Final[bytes] = b"\x18\x1b\\"
 
 # Default per-frame cap: merge queued PTY chunks into bounded sends so
 # huge bursts stream.
@@ -426,20 +436,33 @@ async def _write_all_nonblocking(
 
 
 class _ByteBoundedOutputQueue(asyncio.Queue["bytes | None"]):
-    """Terminal-output queue whose ``put_nowait`` sheds backlog past a byte cap.
+    """Terminal-output queue that rejects NEW chunks past its byte/item budget.
 
-    Drop policy: terminal bytes are lossy-safe — the pane's next repaint
-    restores the screen — so when the browser send is wedged and the backlog
-    exceeds the cap, the OLDEST chunks go (the freshest output wins). The
-    ``None`` EOF sentinel is never dropped. Item count stays unbounded, so
-    ``put_nowait`` never raises; ``_put``/``_get`` are asyncio.Queue's
-    subclass hooks (the same ones ``PriorityQueue`` overrides).
+    Drop policy: evicting already-queued output could sever an escape sequence
+    whose prefix was already sent, wedging the client terminal parser — so a
+    saturated queue drops the INCOMING chunk whole instead, keeping delivered
+    bytes contiguous up to a single gap. When the gap closes, parser-resync
+    bytes precede the resuming output and ``on_gap_end`` (bridge-wired) forces
+    a full repaint so screen content recovers too. The ``None`` EOF sentinel
+    is always accepted. A lone chunk is accepted even above the byte budget —
+    producers bound single-chunk size — so the backlog never exceeds the
+    budget by more than one chunk.
     """
 
-    def __init__(self, max_bytes: int = _OUTPUT_QUEUE_MAX_BYTES) -> None:
+    def __init__(
+        self,
+        max_bytes: int = _OUTPUT_QUEUE_MAX_BYTES,
+        max_items: int = _OUTPUT_QUEUE_MAX_ITEMS,
+    ) -> None:
         super().__init__()
         self.max_bytes = max_bytes
+        self.max_items = max_items
         self.queued_bytes = 0
+        self.dropped_chunks = 0
+        self.dropped_bytes = 0
+        self.on_gap_end: Callable[[], None] | None = None
+        self._in_gap = False
+        self._warned_at: float | None = None
 
     def _put(self, item: bytes | None) -> None:
         super()._put(item)
@@ -453,19 +476,73 @@ class _ByteBoundedOutputQueue(asyncio.Queue["bytes | None"]):
         return item
 
     def put_nowait(self, item: bytes | None) -> None:
+        if (
+            item is not None
+            and self.qsize() > 0
+            and (self.queued_bytes + len(item) > self.max_bytes or self.qsize() >= self.max_items)
+        ):
+            self.dropped_chunks += 1
+            self.dropped_bytes += len(item)
+            self._in_gap = True
+            now = _monotonic()
+            if self._warned_at is None or now - self._warned_at >= _OUTPUT_DROP_WARN_INTERVAL_S:
+                self._warned_at = now
+                _logger.warning(
+                    "terminal output queue saturated (%d bytes / %d chunks queued); "
+                    "%d chunks (%d bytes) dropped so far",
+                    self.queued_bytes,
+                    self.qsize(),
+                    self.dropped_chunks,
+                    self.dropped_bytes,
+                )
+            return
+        if self._in_gap and item is not None:
+            self._in_gap = False
+            super().put_nowait(_OUTPUT_GAP_RESYNC)
+            if self.on_gap_end is not None:
+                self.on_gap_end()
         super().put_nowait(item)
-        while self.queued_bytes > self.max_bytes and self.qsize() > 1:
-            dropped = self.get_nowait()
-            if dropped is None:
-                # EOF sentinel must survive; re-queue it behind the remaining
-                # data (the consumer stops at None wherever it sits).
-                super().put_nowait(None)
+
+
+async def _refresh_attach_client(socket_path: str, client_pid: int) -> None:
+    """Force a full redraw of one tmux attach client after a drop gap.
+
+    Best-effort recovery for screen content the drop lost: resolve the client
+    by pid (each bridge owns exactly one attach child), then ``refresh-client``
+    makes tmux repaint it end to end.
+    """
+    tmux = shutil.which("tmux")
+    if tmux is None:
+        return
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            tmux,
+            "-S",
+            socket_path,
+            "list-clients",
+            "-F",
+            "#{client_pid} #{client_tty}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate()
+        for line in out.decode(errors="replace").splitlines():
+            pid_str, _, tty = line.partition(" ")
+            if pid_str == str(client_pid) and tty:
+                refresh = await asyncio.create_subprocess_exec(
+                    tmux,
+                    "-S",
+                    socket_path,
+                    "refresh-client",
+                    "-t",
+                    tty,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await refresh.wait()
                 return
-            _logger.debug(
-                "terminal output queue saturated (%d queued bytes); dropped %d-byte chunk",
-                self.queued_bytes,
-                len(dropped),
-            )
+    except OSError:
+        return
 
 
 def _pump_pty_chunks(
@@ -713,9 +790,18 @@ async def bridge_tmux_pty_to_websocket(
     fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
     loop = asyncio.get_running_loop()
-    pty_chunks: asyncio.Queue[bytes | None] = _ByteBoundedOutputQueue()
+    pty_chunks = _ByteBoundedOutputQueue()
     last_client_input_at: float | None = None
     last_pane_check_at: float | None = None
+    repaint_tasks: set[asyncio.Task[None]] = set()
+
+    def _repaint_after_gap() -> None:
+        """Drop gap closed: restore the screen content the gap lost."""
+        task = asyncio.create_task(_refresh_attach_client(socket_path, pid))
+        repaint_tasks.add(task)
+        task.add_done_callback(repaint_tasks.discard)
+
+    pty_chunks.on_gap_end = _repaint_after_gap
 
     def _current_ws_coalesce_limit() -> int:
         """

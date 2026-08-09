@@ -53,11 +53,14 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 
 _logger = logging.getLogger(__name__)
 
-# Cap on frames queued for a runner's sender task. Protocol frames are never
-# dropped or coalesced — a lost frame strands its RPC silently — so past the
-# cap ``send_text`` fails loudly with ConnectionError instead: a backlog this
-# deep means the tunnel socket has stopped draining.
+# Cap on frames queued for a runner's sender task (a count cap: individual
+# frames stay small because request/response bodies cross the tunnel as
+# chunked body frames). Protocol frames are never dropped or coalesced — a
+# lost frame strands its RPC silently — so a full queue makes ``send_text``
+# WAIT for the sender to drain, and only a sender that frees no room within
+# the stall deadline fails the send loudly with ConnectionError.
 _OUTBOUND_QUEUE_MAX_FRAMES = 1024
+_OUTBOUND_SEND_STALL_S = 10.0
 
 
 class WebSocketLike(Protocol):
@@ -700,39 +703,49 @@ class TunnelRegistry:
         :returns: None after the frame has been accepted into the
             route-loop outbound queue.
         :raises ConnectionError: If ``session`` is no longer the
-            registry's current generation for its runner id.
+            registry's current generation for its runner id, or its
+            sender freed no queue room within the stall deadline.
         """
         ack: concurrent.futures.Future[None] = concurrent.futures.Future()
 
-        def _enqueue() -> None:
-            """Run on ``session.loop`` and enqueue the outbound frame."""
-            error: ConnectionError | None = None
+        async def _enqueue() -> None:
+            """Run on ``session.loop``: bounded-wait enqueue of the frame."""
             with self._lock:
-                if self._sessions.get(session.runner_id) is not session:
-                    error = ConnectionError(f"runner {session.runner_id!r} tunnel was replaced")
-                else:
-                    try:
-                        session.outbound_queue.put_nowait(data)
-                    except asyncio.QueueFull:
-                        # The sender task has stopped draining the socket.
-                        # Frames must not be dropped silently (a lost frame
-                        # strands its RPC), so fail the send loudly.
-                        _logger.warning(
-                            "runner %s outbound queue saturated at %d frames; failing send",
-                            session.runner_id,
-                            session.outbound_queue.maxsize,
-                        )
-                        error = ConnectionError(
-                            f"runner {session.runner_id!r} outbound tunnel queue is full"
-                        )
-            if error is not None:
+                stale = self._sessions.get(session.runner_id) is not session
+            if stale:
                 if not ack.done():
-                    ack.set_exception(error)
-            else:
+                    ack.set_exception(
+                        ConnectionError(f"runner {session.runner_id!r} tunnel was replaced")
+                    )
+                return
+            try:
+                # A full queue is backpressure, not failure: a burst can fill
+                # it faster than the sender wakes, so wait for drain and only
+                # treat a sender that frees no room in the deadline as stalled.
+                await asyncio.wait_for(
+                    session.outbound_queue.put(data), timeout=_OUTBOUND_SEND_STALL_S
+                )
+            except TimeoutError:
+                _logger.warning(
+                    "runner %s outbound queue freed no room in %.0fs (%d frames); failing send",
+                    session.runner_id,
+                    _OUTBOUND_SEND_STALL_S,
+                    session.outbound_queue.qsize(),
+                )
                 if not ack.done():
-                    ack.set_result(None)
+                    ack.set_exception(
+                        ConnectionError(f"runner {session.runner_id!r} outbound tunnel stalled")
+                    )
+                return
+            if not ack.done():
+                ack.set_result(None)
 
-        _call_session_soon_threadsafe(session, _enqueue)
+        def _start_enqueue() -> None:
+            """Run on the owner loop; task-ify the bounded-wait put."""
+            task = asyncio.get_running_loop().create_task(_enqueue())
+            task.add_done_callback(_discard_task_exception)
+
+        _call_session_soon_threadsafe(session, _start_enqueue)
         await asyncio.wrap_future(ack)
 
     # ── Routing incoming frames ──────────────────────────

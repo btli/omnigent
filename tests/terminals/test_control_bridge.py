@@ -21,6 +21,8 @@ from pathlib import Path
 
 import pytest
 
+import omnigent.terminals.control_bridge as control_bridge
+import omnigent.terminals.ws_bridge as ws_bridge
 from omnigent.terminals.control_bridge import (
     _SEND_KEYS_HEX_BYTES_PER_CALL,
     _clipboard_buffer_name,
@@ -769,5 +771,154 @@ async def test_control_bridge_read_only_drops_input() -> None:
     await proc.communicate()
     await asyncio.sleep(0.2)
     assert ws.sent_text == []
+
+    await _kill_and_join(sock, task)
+
+
+# ── Reader backpressure ──────────────────────────────────
+
+
+class _ScriptedStdout:
+    """Stream stand-in whose ``read`` returns scripted batches, then EOF.
+
+    ``read`` never suspends (like a StreamReader with buffered data), so any
+    yielding the parser does must come from the parser itself.
+    """
+
+    def __init__(self, batches: list[bytes]) -> None:
+        self._batches = list(batches)
+
+    async def read(self, _n: int) -> bytes:
+        return self._batches.pop(0) if self._batches else b""
+
+
+@pytest.mark.asyncio
+async def test_parse_control_stream_yields_between_batches() -> None:
+    """The parser gives the event loop a turn after every parsed batch.
+
+    ``read`` returns buffered data without suspending during a flood, so
+    without an explicit yield a sibling task (heartbeats, other bridges)
+    would only run after the whole stream was parsed.
+    """
+    events: list[str] = []
+
+    async def _ticker() -> None:
+        for _ in range(6):
+            events.append("T")
+            await asyncio.sleep(0)
+
+    ticker = asyncio.create_task(_ticker())
+    await asyncio.sleep(0)  # let the ticker record its first turn
+
+    stdout = _ScriptedStdout([b"one\n", b"two\n", b"three\n"])
+
+    def _handle(_line: bytes) -> bool:
+        events.append("L")
+        return True
+
+    await control_bridge._parse_control_stream(stdout, _handle)  # type: ignore[arg-type]
+    await ticker
+
+    seq = "".join(events)
+    assert seq.count("L") == 3
+    # Ticker turns must interleave between batches — consecutive lines from
+    # different batches with no tick between them means the parser never
+    # yielded to the loop.
+    assert "LL" not in seq, f"parser starved the loop between batches: {seq}"
+
+
+@pytest.mark.asyncio
+async def test_parse_control_stream_bounds_partial_line_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A partial line that outgrows the cap is discarded whole, then parsing
+    resumes cleanly at the next newline instead of buffering without bound."""
+    monkeypatch.setattr(control_bridge, "_CONTROL_MAX_LINE_BYTES", 64)
+
+    seen: list[bytes] = []
+
+    def _handle(line: bytes) -> bool:
+        seen.append(line)
+        return True
+
+    stdout = _ScriptedStdout(
+        [
+            b"x" * 100,  # oversized partial line: no newline yet -> shed
+            b"y" * 100,  # continuation of the same line, still no newline
+            b"tail-of-giant-line\nok\n",  # its end is skipped; "ok" parses
+        ]
+    )
+    await control_bridge._parse_control_stream(stdout, _handle)  # type: ignore[arg-type]
+
+    assert seen == [b"ok"], f"oversized line leaked through: {seen!r}"
+
+
+@pytest.mark.asyncio
+async def test_parse_control_stream_yields_while_discarding_oversized_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even batches consumed by oversized-line discard yield to the loop.
+
+    A giant line arrives as many newline-free reads; skipping the yield on
+    those reads would starve sibling tasks for the whole discard stretch.
+    """
+    monkeypatch.setattr(control_bridge, "_CONTROL_MAX_LINE_BYTES", 64)
+    events: list[str] = []
+
+    class _RecordingStdout(_ScriptedStdout):
+        async def read(self, n: int) -> bytes:
+            events.append("R")
+            return await super().read(n)
+
+    async def _ticker() -> None:
+        for _ in range(8):
+            events.append("T")
+            await asyncio.sleep(0)
+
+    ticker = asyncio.create_task(_ticker())
+    await asyncio.sleep(0)
+
+    stdout = _RecordingStdout([b"x" * 100, b"y" * 100, b"z" * 100, b"end\nok\n"])
+    await control_bridge._parse_control_stream(stdout, lambda _line: True)  # type: ignore[arg-type]
+    await ticker
+
+    seq = "".join(events)
+    # Back-to-back reads with no ticker turn between them means the discard
+    # path skipped the yield and starved the loop.
+    assert "RR" not in seq, f"discard path starved the loop: {seq}"
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_control_bridge_wires_bounded_output_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The %output queue is the bounded one, with the repaint hook attached.
+
+    Guards the saturation policy end to end: the bridge must instantiate the
+    byte/item-bounded queue (not a plain asyncio.Queue) and wire its
+    on_gap_end hook so a drop gap forces a tmux repaint.
+    """
+    created: list[ws_bridge._ByteBoundedOutputQueue] = []
+
+    class _Recording(ws_bridge._ByteBoundedOutputQueue):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+            created.append(self)
+
+    monkeypatch.setattr(control_bridge, "_ByteBoundedOutputQueue", _Recording)
+
+    sock, target = await _new_private_tmux("printf 'hello\\n'; sleep 30")
+    await asyncio.sleep(0.3)
+    ws = _FakeWebSocket(inbound=[])
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+    )
+    await asyncio.sleep(1.0)
+
+    assert created, "bridge did not use the bounded output queue"
+    assert created[0].on_gap_end is not None, "repaint hook not wired to the queue"
 
     await _kill_and_join(sock, task)
