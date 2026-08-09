@@ -79,8 +79,13 @@ _TURN_QUIESCENCE_S = 300.0
 #: Ceiling on wire silence while a tool call is in flight. A tool may
 #: legitimately run for many minutes, but a wire with NO row of any kind for
 #: this long means the tool (or kimi itself) hung — fail the turn instead of
-#: suppressing quiescence forever against an alive-but-wedged pane.
+#: suppressing quiescence forever against an alive-but-wedged pane. Accepted
+#: tradeoff: a zero-row tool can strand a turn for up to this long; per-tool
+#: heartbeats/limits are deliberately not implemented.
 _TOOL_QUIESCENCE_S = 1800.0
+#: Continuous edge-delivery failure past this long logs an error (rate-limited
+#: to the same interval) so the outage is visible without extra plumbing.
+_EDGE_FAILURE_ALERT_S = 300.0
 
 
 @dataclass
@@ -99,6 +104,10 @@ class _ForwardState:
     turn_open: bool = False
     tools_in_flight: int = 0
     last_edge_id: str | None = None
+    dropped_edge_status: str | None = None
+    # Wall-clock of the last genuine wire activity, so a restart resumes the
+    # quiescence timers instead of re-arming their full windows.
+    last_activity_ts: float | None = None
 
 
 @dataclass
@@ -149,6 +158,8 @@ def _read_state(bridge_dir: Path) -> _ForwardState | None:
     offset = data.get("offset")
     last_edge_id = data.get("last_edge_id")
     tools_in_flight = data.get("tools_in_flight")
+    dropped_edge_status = data.get("dropped_edge_status")
+    last_activity_ts = data.get("last_activity_ts")
     if isinstance(wire_path, str) and isinstance(last_line, int) and isinstance(offset, int):
         return _ForwardState(
             wire_path=wire_path,
@@ -157,6 +168,12 @@ def _read_state(bridge_dir: Path) -> _ForwardState | None:
             turn_open=data.get("turn_open") is True,
             tools_in_flight=tools_in_flight if isinstance(tools_in_flight, int) else 0,
             last_edge_id=last_edge_id if isinstance(last_edge_id, str) else None,
+            dropped_edge_status=(
+                dropped_edge_status if isinstance(dropped_edge_status, str) else None
+            ),
+            last_activity_ts=(
+                float(last_activity_ts) if isinstance(last_activity_ts, (int, float)) else None
+            ),
         )
     return None
 
@@ -169,6 +186,8 @@ def _write_state(bridge_dir: Path, state: _ForwardState) -> None:
         "turn_open": state.turn_open,
         "tools_in_flight": state.tools_in_flight,
         "last_edge_id": state.last_edge_id,
+        "dropped_edge_status": state.dropped_edge_status,
+        "last_activity_ts": state.last_activity_ts,
     }
     tmp = bridge_dir / (_STATE_FILE + ".tmp")
     with contextlib.suppress(OSError):
@@ -207,6 +226,24 @@ def workdirs_for_kimi_sessions(kimi_home: Path) -> dict[str, str]:
 _workdirs_for_sessions = workdirs_for_kimi_sessions
 
 
+def _wire_created_at_ms(wire: Path) -> int | None:
+    """``created_at`` (ms epoch) of the wire's first row — kimi's metadata header."""
+    try:
+        with open(wire, "rb") as fh:
+            first = fh.readline(4096)
+    except OSError:
+        return None
+    try:
+        row = json.loads(first)
+    except ValueError:
+        return None
+    if isinstance(row, dict):
+        created_at = row.get("created_at")
+        if isinstance(created_at, int):
+            return created_at
+    return None
+
+
 def _discover_wire(kimi_home: Path, workspace: str, launch_epoch_ms: int) -> Path | None:
     """Locate the wire log for *workspace*'s newest session created at/after launch.
 
@@ -242,6 +279,13 @@ def _discover_wire(kimi_home: Path, workspace: str, launch_epoch_ms: int) -> Pat
         precise = mtime_ns % 1_000_000_000 != 0
         if mtime_ns < (floor_ns if precise else floor_coarse_ns):
             continue
+        if not precise and mtime_ns < floor_ns:
+            # A truncated mtime in the launch second can't tell before from
+            # after; let the wire's own metadata header break the tie, keeping
+            # the coarse floor only when the content has no timestamp.
+            created_at = _wire_created_at_ms(wire)
+            if created_at is not None and created_at < launch_epoch_ms:
+                continue
         if best is None or mtime_ns > best[0]:
             best = (mtime_ns, wire)
     return best[1] if best is not None else None
@@ -575,12 +619,26 @@ async def forward_kimi_wire_to_session(
     last_edge_id = state.last_edge_id if state is not None else None
     # Terminal status of an edge the server permanently rejected (poison-drop):
     # the fallback close posts THIS status so a failed turn isn't closed idle.
-    dropped_edge_status: str | None = None
+    dropped_edge_status = state.dropped_edge_status if state is not None else None
     last_wire_activity = time.monotonic()
+    last_wire_activity_wall = time.time()
+    if state is not None and state.last_activity_ts is not None:
+        # Resume the silence timers where the previous forwarder left them so
+        # a crash-looping forwarder can't re-arm the full windows forever.
+        elapsed = max(0.0, time.time() - state.last_activity_ts)
+        last_wire_activity = time.monotonic() - elapsed
+        last_wire_activity_wall = state.last_activity_ts
+    # High-water of wire bytes actually observed: a redelivery retry re-reads
+    # the same tail and must not refresh the silence timers.
+    last_seen_offset = offset
     # Consecutive permanent-4xx rejections of the item at the head of the tail.
     poison_id: str | None = None
     poison_attempts = 0
     post_backoff = post_backoff_initial_s
+    # Start of the current unbroken edge-delivery failure streak, and the last
+    # time it was alerted on (both monotonic).
+    edge_failing_since: float | None = None
+    last_edge_alert = 0.0
     async with httpx.AsyncClient(timeout=15.0, auth=auth) as client:
 
         def _persist() -> None:
@@ -593,6 +651,8 @@ async def forward_kimi_wire_to_session(
                     turn_open=turn_open,
                     tools_in_flight=tools_in_flight,
                     last_edge_id=last_edge_id,
+                    dropped_edge_status=dropped_edge_status,
+                    last_activity_ts=last_wire_activity_wall,
                 ),
             )
 
@@ -604,7 +664,7 @@ async def forward_kimi_wire_to_session(
         async def _close_turn(status: str, edge: str) -> None:
             """Post the terminal edge for a turn that will write no more wire rows."""
             nonlocal turn_open, last_assistant_text, tools_in_flight, last_edge_id, post_backoff
-            nonlocal dropped_edge_status
+            nonlocal dropped_edge_status, edge_failing_since, last_edge_alert
             # A wire edge the server permanently rejected already told us how
             # this turn ended; the fallback must not soften a failure to idle.
             status = dropped_edge_status or status
@@ -629,6 +689,20 @@ async def forward_kimi_wire_to_session(
                 # record it so the idle-turn watchdog can name it.
                 record_native_post_failure("external_session_status", exc)
                 _logger.warning("kimi forwarder: %s edge failed (will retry): %s", edge, exc)
+                now = time.monotonic()
+                if edge_failing_since is None:
+                    edge_failing_since = now
+                if (
+                    now - edge_failing_since >= _EDGE_FAILURE_ALERT_S
+                    and now - last_edge_alert >= _EDGE_FAILURE_ALERT_S
+                ):
+                    _logger.error(
+                        "kimi forwarder: %s edge undelivered for %.0fs (still retrying): %s",
+                        edge,
+                        now - edge_failing_since,
+                        exc,
+                    )
+                    last_edge_alert = now
                 await _backoff_after_post_failure()
             else:
                 note_native_post_success()
@@ -638,6 +712,7 @@ async def forward_kimi_wire_to_session(
                 last_assistant_text = ""
                 last_edge_id = edge_id
                 dropped_edge_status = None
+                edge_failing_since = None
                 _persist()
 
         while True:
@@ -649,6 +724,7 @@ async def forward_kimi_wire_to_session(
                     wire_path = discovered
                     last_line = 0
                     offset = 0
+                    last_seen_offset = 0
                     # A new wire restarts line numbering, so a stale edge id
                     # could silently dedupe the new wire's edge at the same line.
                     last_edge_id = None
@@ -658,8 +734,13 @@ async def forward_kimi_wire_to_session(
                 items, new_offset, new_line = await asyncio.to_thread(
                     read_new_kimi_wire_items, wire_path, offset, last_line
                 )
-                if new_offset != offset:
+                if new_offset > last_seen_offset or new_offset < offset:
+                    # Genuinely new rows (or a truncated/recreated wire) refresh
+                    # the silence timers; a redelivery retry re-reading the same
+                    # unposted tail must NOT defer the quiescence fallbacks.
+                    last_seen_offset = new_offset
                     last_wire_activity = time.monotonic()
+                    last_wire_activity_wall = time.time()
                 for item in items:
                     if item.kind in ("tool_call", "tool_result"):
                         tools_in_flight = (
@@ -672,6 +753,15 @@ async def forward_kimi_wire_to_session(
                         _persist()
                         continue
                     if item.kind == "message" and item.role == "user":
+                        if dropped_edge_status is not None:
+                            # Session status is single-valued: a new prompt
+                            # legitimately supersedes the prior turn's pending
+                            # status, but a swallowed FAILURE deserves a trace.
+                            _logger.error(
+                                "kimi forwarder: undeliverable %s edge superseded by a "
+                                "new prompt; the parent never saw it",
+                                dropped_edge_status,
+                            )
                         turn_open = True
                         tools_in_flight = 0
                         dropped_edge_status = None
@@ -683,7 +773,13 @@ async def forward_kimi_wire_to_session(
                         # (An ambiguous in-flight retry may still double-post,
                         # which is safe: the server treats a duplicate
                         # same-status terminal report as already delivered —
-                        # no second parent wake, no status flip.)
+                        # no second parent wake, no status flip. Across a
+                        # RUNNER restart the reconstructed work entry starts
+                        # undelivered, so a replay could deliver again — but
+                        # only the identical terminal status, and only when
+                        # the crash landed between the POST and this persist;
+                        # if the restart also lost the parent inbox, that
+                        # re-delivery repairs it rather than duplicating.)
                         turn_open = False
                         offset = item.offset_after
                         last_line = item.line_no + 1
