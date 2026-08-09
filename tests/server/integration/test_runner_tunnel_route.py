@@ -1265,3 +1265,31 @@ async def test_ping_loop_restamps_runner_liveness(
         with contextlib.suppress(asyncio.TimeoutError):
             await communicator.wait(timeout=1.0)
         session_live_state.configure(None)
+
+
+async def test_ws_tunnel_pre_hello_failure_keeps_live_generation_registered() -> None:
+    """A connection failing before hello must not pop a live tunnel.
+
+    A stale/broken handshake (e.g. malformed hello JSON) errors out
+    between ``accept()`` and ``registry.register()``; its teardown owns
+    no registration and must leave the other generation untouched.
+    """
+    route_app = _tunnel_route_app()
+    registry = route_app.registry
+
+    live = await _connect_route(route_app.app, _TUNNEL_PATH)
+    await _send_hello(live, registry)
+    live_session = registry.get(_RUNNER_ID)
+    assert live_session is not None
+
+    stale = await _connect_route(route_app.app, _TUNNEL_PATH)
+    try:
+        await stale.send_input({"type": "websocket.receive", "text": "not-json"})
+        with contextlib.suppress(asyncio.TimeoutError):
+            await stale.wait(timeout=1.0)
+
+        assert registry.get(_RUNNER_ID) is live_session
+    finally:
+        await live.send_input({"type": "websocket.disconnect", "code": 1000})
+        with contextlib.suppress(asyncio.TimeoutError):
+            await live.wait(timeout=1.0)
