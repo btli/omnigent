@@ -738,7 +738,7 @@ async def bridge_tmux_control_to_websocket(
             return
 
     async def _emit_pane_snapshot() -> None:
-        """Drop gap closed: repaint from a pane snapshot, as synthetic output."""
+        """Output was dropped: repaint from a pane snapshot, as synthetic output."""
         snapshot = await _capture_pane_snapshot(socket_path, tmux_target)
         if snapshot is not None:
             output_chunks.put_nowait(snapshot)
