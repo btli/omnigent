@@ -71,7 +71,6 @@ from omnigent.runner.subagent_routing import (
     subagent_routing_enabled,
 )
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
-from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.runtime import (
     get_policy_store,
     inflight_text,
@@ -5520,7 +5519,11 @@ async def _relay_runner_stream(
             # tunnel dropping anew — give the new outage a fresh window.
             if deadline is None or now - started > RUNNER_DISCONNECT_GRACE_S:
                 deadline = now + RUNNER_DISCONNECT_GRACE_S
-            if lost.retryable and now + _RELAY_RETRY_INTERVAL_S < deadline:
+            if (
+                not lost.intentional
+                and lost.retryable
+                and now + _RELAY_RETRY_INTERVAL_S < deadline
+            ):
                 _logger.info(
                     "Relay: runner transport lost for session=%s; retrying for %.1fs",
                     session_id,
@@ -6062,9 +6065,7 @@ async def _relay_runner_stream_once(
         raise _RelayTransportLost(
             intentional=session_id in _intentional_stop_sessions,
             stream_lost=(
-                not transition_error
-                and not isinstance(exc, httpx.ConnectError)
-                and tunnel_alive
+                not transition_error and not isinstance(exc, httpx.ConnectError) and tunnel_alive
             ),
             retryable=transition_error and not tunnel_alive,
         ) from exc
