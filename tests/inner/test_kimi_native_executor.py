@@ -383,9 +383,12 @@ class TestApprovalKeystroke:
             pane=_fixture("approval_menu.txt"),
             after_key_pane="",
         )
-        monkeypatch.setattr(kimi_native_bridge, "_APPROVAL_SETTLE_TIMEOUT_S", 0.001)
-        monkeypatch.setattr(kimi_native_bridge, "_POLL_INTERVAL_S", 0.0)
-        with pytest.raises(kimi_native_bridge.KimiApprovalPromptAmbiguousError):
+        monkeypatch.setattr(kimi_native_bridge, "_APPROVAL_SETTLE_TIMEOUT_S", 0.1)
+        monkeypatch.setattr(kimi_native_bridge, "_POLL_INTERVAL_S", 0.2)
+        with pytest.raises(
+            kimi_native_bridge.KimiApprovalPromptAmbiguousError,
+            match="state remained indeterminate",
+        ):
             inject_approval_keystroke(tmp_path, key=APPROVE_KEY)
         assert sent == [("send-keys", "-t", "main", APPROVE_KEY)]
 
