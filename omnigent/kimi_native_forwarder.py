@@ -690,6 +690,13 @@ async def forward_kimi_wire_to_session(
                 ),
             )
 
+        def _advance_past(item: KimiWireItem) -> None:
+            """Move the delivery cursor past *item* and persist."""
+            nonlocal offset, last_line
+            offset = item.offset_after
+            last_line = item.line_no + 1
+            _persist()
+
         async def _backoff_after_post_failure() -> None:
             nonlocal post_backoff
             await asyncio.sleep(post_backoff)
@@ -800,9 +807,7 @@ async def forward_kimi_wire_to_session(
                             if item.kind == "tool_call"
                             else max(0, tools_in_flight - 1)
                         )
-                        offset = item.offset_after
-                        last_line = item.line_no + 1
-                        _persist()
+                        _advance_past(item)
                         continue
                     if item.kind == "message" and item.role == "user":
                         if dropped_edge_status is not None:
@@ -833,9 +838,7 @@ async def forward_kimi_wire_to_session(
                         # if the restart also lost the parent inbox, that
                         # re-delivery repairs it rather than duplicating.)
                         turn_open = False
-                        offset = item.offset_after
-                        last_line = item.line_no + 1
-                        _persist()
+                        _advance_past(item)
                         continue
                     try:
                         if item.kind in ("turn_end", "turn_failed"):
@@ -920,9 +923,7 @@ async def forward_kimi_wire_to_session(
                                     )
                                     tools_in_flight = 0
                                 poison_id, poison_attempts = None, 0
-                                offset = item.offset_after
-                                last_line = item.line_no + 1
-                                _persist()
+                                _advance_past(item)
                                 continue
                         _logger.warning("kimi forwarder: POST failed (will retry): %s", exc)
                         all_posted = False
@@ -932,9 +933,7 @@ async def forward_kimi_wire_to_session(
                         post_backoff = post_backoff_initial_s
                         if poison_id == item.response_id:
                             poison_id, poison_attempts = None, 0
-                        offset = item.offset_after
-                        last_line = item.line_no + 1
-                        _persist()
+                        _advance_past(item)
                 if all_posted and new_offset != offset:
                     # Consume trailing non-item lines so the next poll skips them.
                     offset = new_offset
