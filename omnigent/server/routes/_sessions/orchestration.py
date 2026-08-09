@@ -5440,6 +5440,15 @@ class _RelayTransportLost(Exception):
         self.stream_lost = stream_lost
 
 
+# Relay stream read timeout: 3x the runner's session-stream heartbeat
+# interval (15s). Between turns the runner emits ``session.heartbeat``
+# every 15s to keep proxies from dropping the idle connection. If 3
+# consecutive heartbeats are missed (45s), the stream is likely dead —
+# surface it so the supervising retry loop reconnects (or, past the
+# grace, fails the session).
+_RELAY_STREAM_READ_TIMEOUT_S = 45.0
+
+
 def _is_tunnel_transition_error(exc: BaseException) -> bool:
     """True for bare tunnel close/replacement ConnectionErrors (not httpx)."""
     return isinstance(exc, ConnectionError) and not isinstance(exc, httpx.HTTPError)
@@ -5619,14 +5628,14 @@ async def _relay_runner_stream_once(
     tool_call_response_ids: dict[str, str] = {}
     _logger.info("Relay: connecting to runner GET /stream for session=%s", session_id)
 
-    # Read timeout: 3x the runner's session-stream heartbeat interval
-    # (15s). Between turns the runner emits ``session.heartbeat`` every
-    # 15s to keep proxies from dropping the idle connection. If 3
-    # consecutive heartbeats are missed (45s), the connection is likely
-    # dead — surface it so the supervising retry loop reconnects (or,
-    # past the grace, fails the session). ``connect`` stays at httpx's
-    # default (5s); ``write``/``pool`` are not rate-limiting here.
-    _relay_timeout = httpx.Timeout(connect=5.0, read=45.0, write=None, pool=None)
+    # ``connect`` stays at httpx's default (5s); ``write``/``pool`` are
+    # not rate-limiting here.
+    _relay_timeout = httpx.Timeout(
+        connect=5.0,
+        read=_RELAY_STREAM_READ_TIMEOUT_S,
+        write=None,
+        pool=None,
+    )
     try:
         async with runner_client.stream(
             "GET",
@@ -6045,6 +6054,8 @@ async def _relay_runner_stream_once(
         # for the supervisor's retry-vs-quiet-exit decision.
         # Bare ConnectionError (close/replacement) stays
         # runner_disconnected; only a live-tunnel HTTPError is stream loss.
+        # Non-tunnel clients (legacy fixed UDS transport) expose no cheap
+        # liveness signal, so their stream errors stay runner_disconnected.
         raise _RelayTransportLost(
             intentional=session_id in _intentional_stop_sessions,
             stream_lost=(
