@@ -615,10 +615,10 @@ def create_runner_tunnel_router(
                 runner_id,
                 extra=debug_event("runner_tunnel", phase="error", runner_id=runner_id),
             )
+            # Only deregister the generation this handler registered; a
+            # pre-hello failure must not pop another live tunnel's session.
             if session is not None:
                 registry.deregister(runner_id, session)
-            else:
-                registry.deregister(runner_id)
             await _notify_runner_disconnect()
 
     return router
