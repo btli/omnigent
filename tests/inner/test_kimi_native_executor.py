@@ -38,6 +38,7 @@ from omnigent.kimi_native_bridge import (
     read_tmux_info,
     write_tmux_target,
 )
+from omnigent.llms.errors import RetryableLLMError
 
 _FIXTURE_DIR = Path(__file__).parents[1] / "fixtures" / "kimi_native"
 
@@ -182,17 +183,50 @@ async def test_run_turn_marks_approval_pending_retryable(
         raise kimi_native_bridge.KimiApprovalPendingError("resolve approval and retry")
 
     monkeypatch.setattr(kimi_native_executor, "inject_user_message", _fail)
-    events = [
-        event
-        async for event in KimiNativeExecutor(tmp_path).run_turn(
-            messages=[{"role": "user", "content": "hello"}],
-            tools=[],
-            system_prompt="ignored",
-        )
-    ]
-    assert len(events) == 1
-    assert isinstance(events[0], ExecutorError)
-    assert events[0].retryable is True
+    with pytest.raises(RetryableLLMError, match="resolve approval") as error:
+        [
+            event
+            async for event in KimiNativeExecutor(tmp_path).run_turn(
+                messages=[{"role": "user", "content": "hello"}],
+                tools=[],
+                system_prompt="ignored",
+            )
+        ]
+    assert error.value.code == "connection_error"
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: KimiNativeExecutor(tmp_path))
+    assert adapter._build_error_detail(error.value).code == "connection_error"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_bounds_persistent_approval_pending(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def _fail(*_args: object, **_kwargs: object) -> None:
+        raise kimi_native_bridge.KimiApprovalPendingError("resolve approval and retry")
+
+    monkeypatch.setattr(kimi_native_executor, "inject_user_message", _fail)
+    executor = KimiNativeExecutor(tmp_path)
+    for _ in range(kimi_native_executor._MAX_APPROVAL_PENDING_RETRIES):
+        with pytest.raises(RetryableLLMError):
+            [
+                event
+                async for event in executor.run_turn(
+                    messages=[{"role": "user", "content": "hello"}],
+                    tools=[],
+                    system_prompt="ignored",
+                )
+            ]
+    with pytest.raises(kimi_native_executor.PermanentLLMError, match="resolve approval"):
+        [
+            event
+            async for event in executor.run_turn(
+                messages=[{"role": "user", "content": "hello"}],
+                tools=[],
+                system_prompt="ignored",
+            )
+        ]
 
 
 class TestPastePayload:
@@ -234,8 +268,7 @@ class TestBridge:
 
 
 class TestApprovalKeystroke:
-    """`inject_approval_keystroke` types the option digit + Enter, guarded by
-    the permission-menu marker so a stray verdict can't leak a keystroke."""
+    """`inject_approval_keystroke` types a digit only while a real menu is visible."""
 
     def _stub_tmux(
         self,
@@ -267,20 +300,25 @@ class TestApprovalKeystroke:
         )
         return sent
 
-    def test_injects_digit_and_enter_when_menu_present(
+    def test_injects_digit_when_menu_present(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        sent = self._stub_tmux(monkeypatch, pane=_fixture("approval_menu.txt"))
+        sent = self._stub_tmux(
+            monkeypatch,
+            pane=_fixture("approval_menu.txt"),
+            after_key_pane=_fixture("first_boot_empty.txt"),
+        )
         assert inject_approval_keystroke(tmp_path, key=APPROVE_KEY) is True
-        assert sent == [
-            ("send-keys", "-t", "main", APPROVE_KEY),
-            ("send-keys", "-t", "main", "Enter"),
-        ]
+        assert sent == [("send-keys", "-t", "main", APPROVE_KEY)]
 
     def test_deny_key_selects_reject(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        sent = self._stub_tmux(monkeypatch, pane=_fixture("approval_menu.txt"))
+        sent = self._stub_tmux(
+            monkeypatch,
+            pane=_fixture("approval_menu.txt"),
+            after_key_pane=_fixture("first_boot_empty.txt"),
+        )
         assert inject_approval_keystroke(tmp_path, key=DENY_KEY) is True
         assert sent[0] == ("send-keys", "-t", "main", DENY_KEY)
 
@@ -288,12 +326,23 @@ class TestApprovalKeystroke:
     def test_matches_alternate_menu_markers(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, marker: str
     ) -> None:
-        pane = f"▶ 2. {marker}\n  1. Approve once\n↑/↓ select · 1/2/3/4 choose · ↵ confirm"
-        sent = self._stub_tmux(monkeypatch, pane=pane)
+        pane = "\n".join(
+            [
+                "────────────────",
+                "▶ Run this command?",
+                f"▶ {2 if marker == 'Approve for this session' else 4}. {marker}",
+                "  1. Approve once",
+                "↑/↓ select · 1/2/3/4 choose · ↵ confirm",
+                "────────────────",
+            ]
+        )
+        sent = self._stub_tmux(
+            monkeypatch, pane=pane, after_key_pane=_fixture("first_boot_empty.txt")
+        )
         assert inject_approval_keystroke(tmp_path, key=APPROVE_KEY) is True
-        assert sent[-1] == ("send-keys", "-t", "main", "Enter")
+        assert sent[-1] == ("send-keys", "-t", "main", APPROVE_KEY)
 
-    def test_does_not_confirm_after_menu_disappears(
+    def test_confirms_when_menu_disappears_after_digit(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         sent = self._stub_tmux(
@@ -301,8 +350,7 @@ class TestApprovalKeystroke:
             pane=_fixture("approval_menu.txt"),
             after_key_pane="✨ approved transcript",
         )
-        with pytest.raises(kimi_native_bridge.KimiApprovalPromptNotFoundError, match="Enter"):
-            inject_approval_keystroke(tmp_path, key=APPROVE_KEY)
+        assert inject_approval_keystroke(tmp_path, key=APPROVE_KEY) is True
         assert sent == [("send-keys", "-t", "main", APPROVE_KEY)]
 
     @pytest.mark.parametrize(
@@ -344,6 +392,15 @@ class TestApprovalKeystroke:
             inject_approval_keystroke(tmp_path, key=APPROVE_KEY)
         assert sent == []
 
+    def test_refuses_menu_text_when_editor_is_visible(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pane = _fixture("approval_menu.txt") + "\n" + _fixture("first_boot_empty.txt")
+        sent = self._stub_tmux(monkeypatch, pane=pane)
+        with pytest.raises(kimi_native_bridge.KimiApprovalPromptNotFoundError):
+            inject_approval_keystroke(tmp_path, key=APPROVE_KEY)
+        assert sent == []
+
     def test_raises_when_tui_exited(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         sent = self._stub_tmux(monkeypatch, pane="▶ 1. Approve once", alive=False)
         with pytest.raises(kimi_native_bridge.KimiApprovalPromptNotFoundError):
@@ -364,7 +421,8 @@ class TestSettlePaneReadiness:
 
     def test_rejects_editor_below_real_approval_menu(self) -> None:
         pane = _fixture("approval_menu.txt") + "\n" + _fixture("first_boot_empty.txt")
-        assert not kimi_native_bridge._kimi_tui_ready(pane)
+        assert kimi_native_bridge._kimi_tui_ready(pane)
+        assert not kimi_native_bridge._permission_prompt_visible(pane)
 
     def test_rejects_welcome_banner_without_editor(self) -> None:
         assert not kimi_native_bridge._kimi_tui_ready(_fixture("banner_without_editor.txt"))
@@ -728,6 +786,37 @@ class TestUserMessageInjection:
         inject_user_message(tmp_path / "bridge", content="fix the flaky test")
         assert ("send-keys", "-t", "main", "C-c") in sent
         assert not any(args[-1] in {"C-a", "C-k"} for args in sent)
+
+    def test_waits_for_delayed_clear_redraw(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        pane = "\n".join(
+            [
+                " ╭────────────────────╮",
+                " │ > leftover draft │",
+                " ╰────────────────────╯",
+                " context: 0%",
+            ]
+        )
+        empty = "\n".join(
+            [
+                " ╭────────────────────╮",
+                " │ > │",
+                " ╰────────────────────╯",
+                " context: 0%",
+            ]
+        )
+        sent = self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=1,
+            content="new message",
+            initial_content="leftover draft",
+            pre_clear_captures=(pane, pane, pane, empty),
+        )
+        inject_user_message(tmp_path / "bridge", content="new message")
+        assert ("send-keys", "-t", "main", "C-c") in sent
+        assert any("paste-buffer" in args for args in sent)
 
     def test_does_not_clear_empty_editor(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
