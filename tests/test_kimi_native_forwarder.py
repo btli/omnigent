@@ -360,11 +360,24 @@ class TestDiscoverWire:
         self._make_session(home, "session_prior", "/ws", mtime=9_995.0)
         assert _discover_wire(home, "/ws", launch_epoch_ms=10_000_000) is None
 
-    def test_wire_within_launch_second_is_adopted(self, tmp_path: Path) -> None:
-        """Coarse-mtime filesystems truncate to the second; the floor allows that."""
+    def test_subsecond_wire_before_launch_ms_is_not_adopted(self, tmp_path: Path) -> None:
+        """A precise mtime 400ms before launch is a prior launch's wire, not ours."""
         home = tmp_path / "kimi-code-home"
         home.mkdir()
-        wire = self._make_session(home, "session_fresh", "/ws", mtime=10_000.2)
+        self._make_session(home, "session_prior", "/ws", mtime=10_000.2)
+        assert _discover_wire(home, "/ws", launch_epoch_ms=10_000_600) is None
+
+    def test_precise_wire_after_launch_ms_is_adopted(self, tmp_path: Path) -> None:
+        home = tmp_path / "kimi-code-home"
+        home.mkdir()
+        wire = self._make_session(home, "session_fresh", "/ws", mtime=10_000.75)
+        assert _discover_wire(home, "/ws", launch_epoch_ms=10_000_600) == wire
+
+    def test_whole_second_mtime_within_launch_second_is_adopted(self, tmp_path: Path) -> None:
+        """A second-truncating filesystem only needs to reach the launch second."""
+        home = tmp_path / "kimi-code-home"
+        home.mkdir()
+        wire = self._make_session(home, "session_fresh", "/ws", mtime=10_000.0)
         assert _discover_wire(home, "/ws", launch_epoch_ms=10_000_600) == wire
 
 
@@ -413,6 +426,7 @@ async def _drive_loop_until(
     *,
     pane_alive: Callable[[], bool] | None = None,
     quiescence_s: float = 60.0,
+    tool_quiescence_s: float = 60.0,
     prepare: Callable[[Path, Path], None] | None = None,
 ) -> None:
     """Run the forward loop against a canned wire until *done* (then cancel).
@@ -436,6 +450,7 @@ async def _drive_loop_until(
             launch_epoch_ms=0,
             pane_alive=pane_alive,
             quiescence_s=quiescence_s,
+            tool_quiescence_s=tool_quiescence_s,
             poll_interval_s=0.01,
             post_backoff_initial_s=0.01,
         )
@@ -533,6 +548,51 @@ class TestForwardLoopEdges:
             quiescence_s=0.02,
         )
         assert self.statuses == [("failed", "")]
+
+    async def test_hung_tool_watchdog_fails_turn_after_ceiling(self, tmp_path: Path) -> None:
+        """Crash-mid-tool replay: the real completed-turn wire cut right after its
+        first tool.call, then eternal silence in an alive pane. Suppression must
+        not last forever — the tool-quiescence ceiling fails the turn."""
+        fixture_rows = [
+            json.loads(line)
+            for line in (_FIXTURES / "completed.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        cut = next(
+            i
+            for i, row in enumerate(fixture_rows)
+            if row.get("type") == "context.append_loop_event"
+            and row.get("event", {}).get("type") == "tool.call"
+        )
+        rows = fixture_rows[: cut + 1]
+        await _drive_loop_until(
+            tmp_path,
+            rows,
+            lambda: bool(self.statuses),
+            pane_alive=lambda: True,
+            quiescence_s=0.02,
+            tool_quiescence_s=0.1,
+        )
+        assert self.statuses == [("failed", "sanitized text part")]
+
+    async def test_readopted_wire_ignores_stale_edge_dedupe(self, tmp_path: Path) -> None:
+        """A newly discovered wire restarts line numbering; a stale edge id from
+        the prior wire must not swallow the new wire's edge at the same line."""
+        rows = [_prompt_row(), _turn_ended_row("completed")]
+
+        def _seed(bridge: Path, wire: Path) -> None:
+            _write_state(
+                bridge,
+                _ForwardState(
+                    wire_path=str(wire.parent / "gone.jsonl"),
+                    last_line=5,
+                    offset=999,
+                    last_edge_id="kimi:turn_end:1",
+                ),
+            )
+
+        await _drive_loop_until(tmp_path, rows, lambda: bool(self.statuses), prepare=_seed)
+        assert self.statuses == [("idle", "")]
 
     async def test_turn_open_persists_across_restart(self, tmp_path: Path) -> None:
         """A restarted forwarder still fails a stranded turn it never observed."""
@@ -645,6 +705,58 @@ class TestForwardLoopPostFailures:
         await _drive_loop_until(tmp_path, [_prompt_row("edge")], lambda: bool(posted))
         assert rejections == 4
         assert posted == ["kimi:turn:0"]
+
+    async def test_endless_transient_rejection_degrades_health(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A revoked token's endless 401s must be visible to the idle-turn watchdog."""
+        forwarder_health.clear()
+        attempts = 0
+
+        async def _fake_item(_client: object, **kwargs: object) -> None:
+            nonlocal attempts
+            attempts += 1
+            request = httpx.Request("POST", "http://test")
+            raise httpx.HTTPStatusError(
+                "401", request=request, response=httpx.Response(401, request=request)
+            )
+
+        monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
+
+        await _drive_loop_until(
+            tmp_path,
+            [_prompt_row()],
+            lambda: attempts >= 2 and forwarder_health.recent_post_failure(60.0) is not None,
+        )
+        forwarder_health.clear()
+
+    async def test_poison_dropped_failed_edge_routes_failed_via_fallback(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A permanently rejected turn_failed edge must not be closed as idle later."""
+        posted: list[tuple[str, str]] = []
+        edge_attempts = 0
+
+        async def _fake_item(_client: object, **kwargs: object) -> None:
+            return None
+
+        async def _fake_status(_client: object, **kwargs: object) -> None:
+            nonlocal edge_attempts
+            edge_attempts += 1
+            if edge_attempts <= 3:
+                request = httpx.Request("POST", "http://test")
+                raise httpx.HTTPStatusError(
+                    "404", request=request, response=httpx.Response(404, request=request)
+                )
+            posted.append((str(kwargs["status"]), str(kwargs["output"])))
+
+        monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
+        monkeypatch.setattr(fwd, "_post_external_session_status", _fake_status)
+
+        rows = [_prompt_row(), _turn_ended_row("failed", error_message="boom")]
+        await _drive_loop_until(tmp_path, rows, lambda: bool(posted), quiescence_s=0.05)
+        assert edge_attempts == 4
+        assert posted == [("failed", "")]
 
     async def test_transport_failure_is_recorded_and_retried(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
