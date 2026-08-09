@@ -223,6 +223,50 @@ def test_notes_escape_untrusted_names_and_signed_variant():
     assert "| Skipped #2 |" in summary and "web/'x'.ts" in summary
 
 
+def test_pin_branch_repaired_and_mismatch_fails(env):
+    pr = env.add_pr(14, "j.txt", "j\n")
+    first = env.run([pr])
+    pin = f"refs/heads/nightly-{STAMP}"
+
+    # a missing twin branch is repaired on rerun (tag untouched, no new pin)
+    git(env.fork, "update-ref", "-d", pin)
+    again = env.run([pr])
+    assert again["pin_created"] is False
+    assert env.fork_ref(pin) == first["staging_sha"]
+
+    # a divergent pin branch means someone moved an immutable pin — fail,
+    # never clobber
+    git(env.fork, "update-ref", pin, first["upstream_sha"])
+    with pytest.raises(stage_mod.StageError, match="pin branch"):
+        env.run([pr])
+    assert env.fork_ref(pin) == first["upstream_sha"]
+
+
+def test_truncation_guard(env, tmp_path):
+    full = [{"number": i} for i in range(stage_mod.PR_LIST_LIMIT)]
+    assert stage_mod.check_not_truncated(full[:5]) == full[:5]
+    with pytest.raises(stage_mod.StageError, match="truncated"):
+        stage_mod.check_not_truncated(full)
+
+    # the --prs-json path runs through the same guard, before any git work
+    prs_json = tmp_path / "prs.json"
+    prs_json.write_text(json.dumps(full))
+    with pytest.raises(stage_mod.StageError, match="truncated"):
+        stage_mod.main(
+            [
+                "stage",
+                "--workdir",
+                str(env.work),
+                "--date",
+                STAMP,
+                "--prs-json",
+                str(prs_json),
+                "--report",
+                str(tmp_path / "r.json"),
+            ]
+        )
+
+
 def test_summary_written_on_success_and_failure(env, tmp_path, monkeypatch, capsys):
     summary = tmp_path / "summary.md"
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))

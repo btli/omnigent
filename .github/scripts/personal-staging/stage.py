@@ -22,8 +22,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import tomllib
-
 UPSTREAM_REPO = "omnigent-ai/omnigent"
 PR_AUTHOR = "btli"
 PR_LIST_LIMIT = 100
@@ -94,10 +92,13 @@ def list_prs() -> list[dict]:
         text=True,
         capture_output=True,
     ).stdout
-    prs = json.loads(out)
+    return check_not_truncated(json.loads(out))
+
+
+def check_not_truncated(prs: list[dict]) -> list[dict]:
     if len(prs) >= PR_LIST_LIMIT:
         raise StageError(
-            f"gh pr list returned {len(prs)} PRs (limit {PR_LIST_LIMIT}); "
+            f"PR list has {len(prs)} entries (limit {PR_LIST_LIMIT}); "
             "results may be truncated — raise the limit"
         )
     return prs
@@ -116,6 +117,10 @@ def conflict_paths(cwd: str | Path) -> list[str]:
 def dev_version(cwd: str | Path, upstream_sha: str, datestamp: str) -> str:
     """Mirror nightly-release.yml's scheme, but read the version from the
     UPSTREAM commit — a merged PR must not control the tag we mint."""
+    # Local import: the `notes` subcommand runs on whatever python3 the
+    # publish job has, and must not require tomllib (3.11+).
+    import tomllib
+
     text = git(cwd, "show", f"{upstream_sha}:pyproject.toml").stdout
     version = tomllib.loads(text).get("project", {}).get("version", "")
     m = re.fullmatch(r"(\d+\.\d+\.\d+)\.dev0", version)
@@ -219,6 +224,15 @@ def stage(
         leases.append(f"--force-with-lease=refs/heads/staging:{expected_staging}")
     if created:
         refspecs += [f"{staging_sha}:refs/heads/{name}", f"{staging_sha}:refs/tags/{name}"]
+    else:
+        # The tag already points here; the twin branch must agree. Repair a
+        # missing branch, but a divergent one means someone moved an
+        # immutable pin — fail rather than clobber.
+        branch_sha = remote_ref(cwd, fork, f"refs/heads/{name}")
+        if not branch_sha:
+            refspecs.append(f"{staging_sha}:refs/heads/{name}")
+        elif branch_sha != staging_sha:
+            raise StageError(f"pin branch {name} points at {branch_sha}, expected {staging_sha}")
     # The dev tag floats within the day: a rerun repoints it (fork-local tag,
     # nothing downstream pins to it mid-day).
     expected_dev = remote_ref(cwd, fork, f"refs/tags/{dev_tag}")
@@ -324,7 +338,11 @@ def main(argv: list[str] | None = None) -> int:
     else:
         date = dt.datetime.now(dt.timezone.utc).date()
     try:
-        prs = json.loads(Path(args.prs_json).read_text()) if args.prs_json else list_prs()
+        prs = (
+            check_not_truncated(json.loads(Path(args.prs_json).read_text()))
+            if args.prs_json
+            else list_prs()
+        )
         report = stage(
             args.workdir, prs, date, upstream=args.upstream_remote, fork=args.fork_remote
         )

@@ -50,25 +50,33 @@ https://github.com/btli/omnigent/releases/download/nightly-latest/omnigent-stagi
 
 ## Debug keystore secret (optional, recommended)
 
-Without it, each nightly APK is signed by a runner-ephemeral debug keystore
-and in-place upgrades fail across runs (uninstall first). To make nightlies
-share one signature, generate a keystore once and store it as fork secrets:
+The `android-sign` job always re-signs the APK (the untrusted build job's
+own signature never ships). Without a shared keystore it mints a fresh one
+per run, so in-place upgrades fail across nightlies (uninstall first). To
+make nightlies share one signature, generate a keystore once and store it
+as fork secrets — passwords go via prompts/stdin, never argv:
 
 ```sh
+# keytool prompts for the store/key passwords interactively
 keytool -genkeypair -v -keystore debug.keystore -alias omnigent-debug \
-  -keyalg RSA -keysize 2048 -validity 10000 -storepass CHANGE_ME \
-  -keypass CHANGE_ME -dname "CN=omnigent staging"
+  -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=omnigent staging"
 
-gh secret set -R btli/omnigent OMNIGENT_DEBUG_KEYSTORE_B64 --body "$(base64 -i debug.keystore)"
-gh secret set -R btli/omnigent OMNIGENT_DEBUG_KEYSTORE_PASSWORD --body CHANGE_ME
+base64 -i debug.keystore | gh secret set -R btli/omnigent OMNIGENT_DEBUG_KEYSTORE_B64
+gh secret set -R btli/omnigent OMNIGENT_DEBUG_KEYSTORE_PASSWORD  # paste at the prompt
 gh secret set -R btli/omnigent OMNIGENT_DEBUG_KEY_ALIAS --body omnigent-debug
-gh secret set -R btli/omnigent OMNIGENT_DEBUG_KEY_PASSWORD --body CHANGE_ME
+gh secret set -R btli/omnigent OMNIGENT_DEBUG_KEY_PASSWORD       # paste at the prompt
 ```
 
 The keystore only ever reaches the `android-sign` job, which never checks
-out or executes merged PR code (the build job is secretless).
+out or executes merged PR code (the build job is secretless and its gradle
+cache access is read-only; if staging runs ever wrote gradle caches before
+that lockdown, purge them once from the repo's Actions cache UI).
 
-**If the keystore leaks:** regenerate it with the keytool one-liner above,
+Each run's `android-sign` step summary prints the signing certificate's
+SHA-256 fingerprint — compare a device's installed cert against it
+(`apksigner verify --print-certs`) when a leak is suspected.
+
+**If the keystore leaks:** regenerate it with the keytool command above,
 replace all four secrets, and uninstall/reinstall the app once on each
 device — the next nightly's signature won't match the leaked one.
 
