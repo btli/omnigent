@@ -598,10 +598,10 @@ def create_runner_tunnel_router(
             await _notify_runner_disconnect()
         except Exception:
             _logger.exception("Tunnel error for runner %s", runner_id)
+            # Only deregister the generation this handler registered; a
+            # pre-hello failure must not pop another live tunnel's session.
             if session is not None:
                 registry.deregister(runner_id, session)
-            else:
-                registry.deregister(runner_id)
             await _notify_runner_disconnect()
 
     return router

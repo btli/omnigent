@@ -1608,3 +1608,93 @@ async def test_relay_does_not_fail_turn_during_server_shutdown(
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+async def test_relay_real_transport_read_timeout_stamps_session_stream_lost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stalled stream through the REAL transport stamps ``session_stream_lost``.
+
+    End-to-end reachability: the relay's per-request read timeout must be
+    honored by :class:`WSTunnelTransport` itself (no hand-injected error),
+    raise ``httpx.ReadTimeout`` on silence, and leave the tunnel registered
+    so attribution resolves to ``session_stream_lost``.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    monkeypatch.setattr(orchestration, "_RELAY_STREAM_READ_TIMEOUT_S", 0.5)
+    sessions_module._runner_relay_tasks.clear()
+    runner_id = "runner_stream_stall_real_transport"
+    registry = TunnelRegistry()
+    _register_test_runner(registry, runner_id)
+    client = httpx.AsyncClient(
+        transport=WSTunnelTransport(registry, runner_id),
+        base_url="http://runner",
+    )
+    session_id = "d4e5f60718293a4b5c6d7e8f90a1b2c3"
+    heartbeat_ready = asyncio.Event()
+
+    # Feed the head + one heartbeat through the real registry, then go
+    # silent — the transport's read timeout must fire on its own.
+    feeder = asyncio.create_task(
+        _feed_tunnel_sse_until(registry, runner_id, ready=heartbeat_ready)
+    )
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            runner_id,
+            client,
+            conversation_store=None,
+        )
+        assert handle is not None
+        collector = await start_session_stream_collector(session_id)
+
+        await asyncio.wait_for(handle.task, timeout=5.0)
+
+        event = await asyncio.wait_for(collector.queue.get(), timeout=2.0)
+        assert event.get("type") == "session.status"
+        assert event.get("status") == "failed"
+        assert event["error"]["code"] == "session_stream_lost"
+        # The tunnel itself never went down.
+        assert registry.get(runner_id) is not None
+    finally:
+        await _cleanup_relay_test(
+            session_id=session_id,
+            collector=collector,
+            client=client,
+            feeder=feeder,
+        )
+
+
+@pytest.mark.asyncio
+async def test_runner_tunnel_alive_resolves_on_real_routed_client() -> None:
+    """Pin the private attribute chain ``_runner_tunnel_alive`` reads.
+
+    The helper reaches into ``client._transport._registry`` on clients
+    built by :class:`RunnerRouter`; this test constructs a real routed
+    client so a transport/router refactor breaks loudly here instead of
+    silently misattributing disconnects.
+    """
+    from omnigent.runner.routing import RunnerRouter
+    from omnigent.server.routes._sessions.orchestration import _runner_tunnel_alive
+
+    runner_id = "runner_liveness_pin"
+    registry = TunnelRegistry()
+    _register_test_runner(registry, runner_id)
+    store = SimpleNamespace(
+        get_conversation=lambda conversation_id: SimpleNamespace(runner_id=runner_id)
+    )
+    router = RunnerRouter(registry=registry, conversation_store=store)  # type: ignore[arg-type]
+
+    try:
+        routed = router.client_for_existing_conversation("conv_liveness_pin")
+        assert routed is not None
+        assert _runner_tunnel_alive(routed.client, runner_id) is True
+
+        registry.deregister(runner_id)
+        assert _runner_tunnel_alive(routed.client, runner_id) is False
+    finally:
+        await router.aclose()
