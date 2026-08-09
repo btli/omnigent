@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import threading
 
 import pytest
 
@@ -488,6 +489,69 @@ async def test_send_text_resolves_when_enqueue_task_cancelled(
 
     with pytest.raises(ConnectionError):
         await asyncio.wait_for(send, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_send_text_resolves_when_enqueue_task_cancelled_before_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A task cancelled before its coroutine's FIRST step must settle the ack.
+
+    Such a cancel never enters the coroutine body, so its try/finally cannot
+    run — only the task-done backstop keeps the caller from hanging forever.
+    """
+    import omnigent.runner.transports.ws_tunnel.registry as registry_mod
+    from omnigent.runner.transports.ws_tunnel.registry import _OUTBOUND_QUEUE_MAX_FRAMES
+
+    monkeypatch.setattr(registry_mod, "_OUTBOUND_SEND_STALL_S", 30.0)
+    reg = TunnelRegistry()
+    session = reg.register("r1", _NoopWS(), _hello())
+    for _ in range(_OUTBOUND_QUEUE_MAX_FRAMES):
+        session.outbound_queue.put_nowait("frame")
+
+    before = asyncio.all_tasks()
+    send = asyncio.create_task(reg.send_text(session, "parked-frame"))
+    # ONE bare yield: send_text has created the enqueue task, but the loop
+    # has not stepped it yet — the cancel below lands pre-start.
+    await asyncio.sleep(0)
+    enqueue_tasks = asyncio.all_tasks() - before - {send}
+    assert enqueue_tasks, "expected the enqueue task to exist before its first step"
+    for task in enqueue_tasks:
+        task.cancel()
+
+    with pytest.raises(ConnectionError):
+        await asyncio.wait_for(send, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_send_text_fails_loud_when_owner_loop_stopped() -> None:
+    """A stopped owner loop never runs the enqueue callback — fail loud.
+
+    In-process the owner loop is the server loop and stops only at shutdown
+    (the stopped-loop hang is not reachable in normal operation), but the
+    guard is cheap and turns a would-be forever-await into ConnectionError.
+    """
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    try:
+        reg = TunnelRegistry()
+
+        async def _register() -> object:
+            return reg.register("r1", _NoopWS(), _hello())
+
+        session = asyncio.run_coroutine_threadsafe(_register(), loop).result(timeout=5)
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5)
+        assert not loop.is_running()
+
+        with pytest.raises(ConnectionError, match="not running"):
+            await asyncio.wait_for(reg.send_text(session, "frame"), timeout=2.0)  # type: ignore[arg-type]
+    finally:
+        if loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5)
+        loop.close()
 
 
 @pytest.mark.asyncio
