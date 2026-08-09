@@ -255,6 +255,8 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
+      # for chaining the image-build workflow_dispatch
+      actions: write
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ needs.integrate.outputs.tag }}
@@ -310,6 +312,23 @@ jobs:
               --title "Personal staging (latest — $TAG)" --notes-file notes.md
           fi
           gh release upload nightly-latest dist/* --clobber
+
+      # Chain the image build. It is dispatch-only and always runs main's
+      # trusted definition — nightly tags point at PR-merged code, so the
+      # tag's own workflow copy must never run privileged. The workflow may
+      # not exist on main yet; warn instead of failing the nightly.
+      - name: Dispatch image build for this nightly
+        run: |
+          set -euo pipefail
+          if err="$(gh workflow run personal-staging-images.yml --ref main -f ref="$TAG" 2>&1)"; then
+            echo "Dispatched personal-staging-images.yml (main) with ref=$TAG" >> "$GITHUB_STEP_SUMMARY"
+          elif echo "$err" | grep -qiE "could not find|no workflow|404"; then
+            echo "> [!WARNING]" >> "$GITHUB_STEP_SUMMARY"
+            echo "> Image build NOT dispatched: personal-staging-images.yml is not on main yet." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "$err"
+            exit 1
+          fi
 
       - name: Report failure
         if: failure()

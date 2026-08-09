@@ -30,6 +30,10 @@
    publishes them on a `nightly-YYYYMMDD` prerelease together with
    `merge-report.json` and `SHA256SUMS`, then re-points the floating
    `nightly-latest` prerelease.
+4. Dispatches `personal-staging-images.yml` (main's trusted definition,
+   dispatch-only) with the exact `nightly-YYYYMMDD[-rerunN]` tag; if that
+   workflow isn't on main yet, the run warns in the summary instead of
+   failing.
 
 **This never touches branch `testing`** — that remains the manually composed
 homelab deploy branch driven by `just test-branch`. Nothing here flips any
