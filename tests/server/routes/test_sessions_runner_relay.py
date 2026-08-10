@@ -1699,10 +1699,10 @@ async def test_relay_real_transport_read_timeout_stamps_session_stream_lost(
 
 @pytest.mark.asyncio
 async def test_runner_tunnel_alive_resolves_on_real_routed_client() -> None:
-    """Pin the private attribute chain ``_runner_tunnel_alive`` reads.
+    """Pin ``_runner_tunnel_alive`` against a real routed client.
 
-    The helper reaches into ``client._transport._registry`` on clients
-    built by :class:`RunnerRouter`; this test constructs a real routed
+    The helper resolves the client's transport and asks its public
+    ``runner_registered`` probe; this test constructs a real routed
     client so a transport/router refactor breaks loudly here instead of
     silently misattributing disconnects.
     """

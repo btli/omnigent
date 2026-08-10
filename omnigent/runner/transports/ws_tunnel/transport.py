@@ -115,11 +115,20 @@ class _TunneledByteStream(httpx.AsyncByteStream):
                     try:
                         item = await asyncio.wait_for(get, self._read_timeout)
                     except TimeoutError:
-                        # Silent stream on a live tunnel: surface a read
-                        # timeout; the tunnel itself stays registered.
                         await _send_cancel_frame(
                             self._registry, state, self._req_id, "read_timeout"
                         )
+                        # Replacement racing the stall: this request's
+                        # generation is gone even though a runner is
+                        # registered, so it's a tunnel transition, not a
+                        # live-stream loss.
+                        if self._registry.get(self._runner_id) is not state.session:
+                            raise ConnectionError(
+                                f"runner {self._runner_id!r} tunnel was replaced "
+                                "during a stalled read"
+                            ) from None
+                        # Silent stream on a live tunnel: surface a read
+                        # timeout; the tunnel itself stays registered.
                         raise httpx.ReadTimeout(
                             f"tunneled response from runner {self._runner_id!r} "
                             f"stalled beyond {self._read_timeout}s read timeout",
@@ -169,6 +178,20 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
     def __init__(self, registry: TunnelRegistry, runner_id: str) -> None:
         self._registry = registry
         self._runner_id = runner_id
+
+    def runner_registered(self, runner_id: str | None = None) -> bool:
+        """Return True when the runner has a live tunnel registered.
+
+        Public liveness probe for disconnect attribution: a stream error
+        while this is True is a live-tunnel stream loss, not a runner
+        disconnect. Stale-generation stalls never reach it — the timeout
+        paths classify those as tunnel transitions themselves.
+
+        :param runner_id: Runner to check, e.g. ``"runner_abc123"``.
+            Defaults to this transport's bound runner.
+        """
+        rid = self._runner_id if runner_id is None else runner_id
+        return self._registry.get(rid) is not None
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         session = self._registry.get(self._runner_id)
@@ -220,6 +243,13 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
                     head = await asyncio.wait_for(state.head_future, read_timeout)
                 except TimeoutError:
                     await _send_cancel_frame(self._registry, state, req_id, "read_timeout")
+                    # Replacement racing the stall: stale generation is a
+                    # tunnel transition, not a live-stream loss.
+                    if self._registry.get(self._runner_id) is not state.session:
+                        raise ConnectionError(
+                            f"runner {self._runner_id!r} tunnel was replaced "
+                            "during a stalled read"
+                        ) from None
                     raise httpx.ReadTimeout(
                         f"response head from runner {self._runner_id!r} "
                         f"stalled beyond {read_timeout}s read timeout",
