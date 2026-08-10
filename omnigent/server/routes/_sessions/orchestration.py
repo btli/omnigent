@@ -5424,8 +5424,8 @@ _RELAY_RETRY_INTERVAL_S: float = 0.5
 # interval (15s). Between turns the runner emits ``session.heartbeat``
 # every 15s to keep proxies from dropping the idle connection. If 3
 # consecutive heartbeats are missed (45s), the stream is likely dead —
-# let the relay exit so ``_ensure_runner_relay`` can restart it on the
-# next ``POST /events``.
+# surface it so the supervising retry loop reconnects (or, past the grace,
+# fails the session).
 _RELAY_STREAM_READ_TIMEOUT_S = 45.0
 
 
@@ -5519,6 +5519,8 @@ async def _relay_runner_stream(
             # tunnel dropping anew — give the new outage a fresh window.
             if deadline is None or now - started > RUNNER_DISCONNECT_GRACE_S:
                 deadline = now + RUNNER_DISCONNECT_GRACE_S
+            # A live tunnel with a transition error is newest-wins replacement;
+            # leave it non-retryable so recovery can clear runner_disconnected.
             if (
                 not lost.intentional
                 and lost.retryable
