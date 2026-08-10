@@ -297,11 +297,12 @@ class TestState:
             model="system.ai.kimi-k3",
             posted_model="system.ai.kimi-k3",
             context_tokens=150,
-            billed_through_ms=1786275843173,
+            billed_wire="/x/wire.jsonl",
             billed_line=42,
         )
         _write_usage_state(tmp_path, state)
-        loaded = _read_usage_state(tmp_path)
+        loaded, trusted = _read_usage_state(tmp_path)
+        assert trusted is True
         assert loaded == state
 
     def test_usage_state_survives_terminal_recreation(self, tmp_path: Path) -> None:
@@ -317,7 +318,7 @@ class TestState:
         clear_kimi_bridge_state(tmp_path)
 
         assert _read_state(tmp_path) is None
-        loaded = _read_usage_state(tmp_path)
+        loaded, _trusted = _read_usage_state(tmp_path)
         assert loaded is not None
         assert loaded.totals == {"input_other": 100}
 
@@ -413,9 +414,9 @@ class TestUsageSync:
         client = _RecordingClient()
         sync = _sync(tmp_path)
 
-        sync.record(_usage_item(1, input_other=20559, output=160))
+        sync.record(_usage_item(1, input_other=20559, output=160), wire="/w/a")
         await sync.sync(client)
-        sync.record(_usage_item(2, input_other=2975, output=76, cache_read=17920))
+        sync.record(_usage_item(2, input_other=2975, output=76, cache_read=17920), wire="/w/a")
         await sync.sync(client)
 
         posts = _usage_posts(client)
@@ -440,9 +441,9 @@ class TestUsageSync:
         sync = _sync(tmp_path)
         sync.note_model("system.ai.kimi-k3")
 
-        sync.record(_usage_item(1, input_other=10, output=1))
+        sync.record(_usage_item(1, input_other=10, output=1), wire="/w/a")
         await sync.sync(client)
-        sync.record(_usage_item(2, input_other=20, output=2))
+        sync.record(_usage_item(2, input_other=20, output=2), wire="/w/a")
         await sync.sync(client)
 
         posts = _usage_posts(client)
@@ -457,7 +458,9 @@ class TestUsageSync:
         client = _RecordingClient()
         sync = _sync(tmp_path)
 
-        sync.record(_usage_item(1, input_other=10, output=1, model="kimi-k3-databricks"))
+        sync.record(
+            _usage_item(1, input_other=10, output=1, model="kimi-k3-databricks"), wire="/w/a"
+        )
         await sync.sync(client)
 
         assert _usage_posts(client)[0]["data"]["model"] == "kimi-k3-databricks"
@@ -470,7 +473,7 @@ class TestUsageSync:
         client = _RecordingClient()
         sync = _sync(tmp_path)
 
-        sync.record(_usage_item(1, input_other=10, output=1))
+        sync.record(_usage_item(1, input_other=10, output=1), wire="/w/a")
         await sync.sync(client)
         await sync.sync(client)
 
@@ -538,7 +541,7 @@ class TestUsageSync:
         sync = _sync(tmp_path)
         sync.note_model("system.ai.kimi-k3")
 
-        sync.record(_usage_item(1, input_other=10, output=1))
+        sync.record(_usage_item(1, input_other=10, output=1), wire="/w/a")
         await sync.sync(client)
 
         assert _usage_posts(client)[-1]["data"]["context_window"] == 262_144
@@ -554,7 +557,7 @@ class TestUsageSync:
         sync = _sync(tmp_path)
         sync.note_model("system.ai.kimi-k3")
 
-        sync.record(_usage_item(1, input_other=10, output=1))
+        sync.record(_usage_item(1, input_other=10, output=1), wire="/w/a")
         await sync.sync(client)
 
         assert "context_window" not in _usage_posts(client)[-1]["data"]
@@ -571,7 +574,7 @@ class TestUsageSync:
         sync = _sync(tmp_path)
 
         sync.note_model("system.ai.kimi-k3")
-        sync.record(_usage_item(1, input_other=10, output=1))
+        sync.record(_usage_item(1, input_other=10, output=1), wire="/w/a")
         await sync.sync(client)
         assert client.posts == []
 
@@ -595,17 +598,20 @@ class TestUsageSync:
         client = _RecordingClient()
         first = _sync(tmp_path)
         first.note_model("system.ai.kimi-k3")
-        first.record(_usage_item(1, input_other=100, output=20, cache_read=50, cache_creation=5))
+        first.record(
+            _usage_item(1, input_other=100, output=20, cache_read=50, cache_creation=5),
+            wire="/w/a",
+        )
         await first.sync(client)
         client.posts.clear()
 
         # Restart: a fresh sync built from the persisted usage state.
-        sync = _sync(tmp_path, state=_read_usage_state(tmp_path))
+        sync = _sync(tmp_path, state=_read_usage_state(tmp_path)[0])
         await sync.sync(client)
         # Already-delivered model is not re-posted after restart.
         assert _model_posts(client) == []
 
-        sync.record(_usage_item(9, input_other=10, output=1, model="other-alias"))
+        sync.record(_usage_item(9, input_other=10, output=1, model="other-alias"), wire="/w/a")
         await sync.sync(client)
 
         data = _usage_posts(client)[-1]["data"]
@@ -617,24 +623,31 @@ class TestUsageSync:
 
     @pytest.mark.asyncio
     async def test_replayed_rows_after_stale_cursor_are_not_rebilled(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """Crash between the totals write and the cursor write must not
         double-bill: the billed high-water mark persists WITH the totals, so
         re-reading the same wire rows on restart is idempotent."""
+        import logging
+
+        caplog.set_level(logging.WARNING, logger="omnigent.kimi_native_forwarder")
         _no_window(monkeypatch)
         client = _RecordingClient()
         first = _sync(tmp_path)
-        first.record(_usage_item(3, input_other=100, output=10))
+        first.record(_usage_item(3, input_other=100, output=10), wire="/w/a")
         # Simulated hard kill: the wire cursor was NOT advanced, so a restart
         # replays line 3 into a sync rebuilt from the persisted usage state.
-        sync = _sync(tmp_path, state=_read_usage_state(tmp_path))
-        sync.record(_usage_item(3, input_other=100, output=10))
+        sync = _sync(tmp_path, state=_read_usage_state(tmp_path)[0])
+        sync.record(_usage_item(3, input_other=100, output=10), wire="/w/a")
         await sync.sync(client)
 
         data = _usage_posts(client)[-1]["data"]
         assert data["cumulative_input_tokens"] == 100
         assert data["cumulative_output_tokens"] == 10
+        assert any("already-billed" in r.message for r in caplog.records)
 
     @pytest.mark.asyncio
     async def test_same_millisecond_sibling_record_still_bills(
@@ -645,32 +658,47 @@ class TestUsageSync:
         _no_window(monkeypatch)
         client = _RecordingClient()
         sync = _sync(tmp_path)
-        sync.record(_usage_item(3, input_other=100, output=10, time_ms=777))
-        sync.record(_usage_item(4, input_other=50, output=5, time_ms=777))
+        sync.record(_usage_item(3, input_other=100, output=10, time_ms=777), wire="/w/a")
+        sync.record(_usage_item(4, input_other=50, output=5, time_ms=777), wire="/w/a")
         await sync.sync(client)
 
         assert _usage_posts(client)[-1]["data"]["cumulative_input_tokens"] == 150
 
     @pytest.mark.asyncio
     async def test_billing_floor_is_strictly_launch(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """Records stamped even 1ms (or 9s) before launch are a prior
-        session's history and never bill; the discovery mtime skew must not
-        leak into billing."""
+        session's history and never bill (the discovery mtime skew must not
+        leak into billing) — and each floor skip leaves a once-per-wire
+        diagnostic."""
+        import logging
+
+        caplog.set_level(logging.WARNING, logger="omnigent.kimi_native_forwarder")
         _no_window(monkeypatch)
         client = _RecordingClient()
         launch_ms = 1786275843173
         sync = _sync(tmp_path, billing_floor_ms=launch_ms)
 
-        sync.record(_usage_item(1, input_other=90000, output=9000, time_ms=launch_ms - 9_000))
-        sync.record(_usage_item(2, input_other=99999, output=9999, time_ms=launch_ms - 1))
-        sync.record(_usage_item(3, input_other=11, output=2, time_ms=launch_ms))
+        sync.record(
+            _usage_item(1, input_other=90000, output=9000, time_ms=launch_ms - 9_000),
+            wire="/w/a",
+        )
+        sync.record(
+            _usage_item(2, input_other=99999, output=9999, time_ms=launch_ms - 1),
+            wire="/w/a",
+        )
+        sync.record(_usage_item(3, input_other=11, output=2, time_ms=launch_ms), wire="/w/a")
         await sync.sync(client)
 
         data = _usage_posts(client)[-1]["data"]
         assert data["cumulative_input_tokens"] == 11
         assert data["cumulative_output_tokens"] == 2
+        floor_warnings = [r for r in caplog.records if "pre-launch usage.record" in r.message]
+        assert len(floor_warnings) == 1
 
     @pytest.mark.asyncio
     async def test_failed_post_retries_with_context_tokens_after_restart(
@@ -682,17 +710,141 @@ class TestUsageSync:
         client = _RecordingClient()
         client.fail_with = httpx.ConnectError("boom")
         first = _sync(tmp_path)
-        first.record(_usage_item(1, input_other=10, output=1, cache_read=30))
+        first.record(_usage_item(1, input_other=10, output=1, cache_read=30), wire="/w/a")
         await first.sync(client)
         assert client.posts == []
 
         client.fail_with = None
-        sync = _sync(tmp_path, state=_read_usage_state(tmp_path))
+        sync = _sync(tmp_path, state=_read_usage_state(tmp_path)[0])
         await sync.sync(client)
 
         data = _usage_posts(client)[0]["data"]
         assert data["context_tokens"] == 10 + 30
         assert data["cumulative_input_tokens"] == 40
+
+    @pytest.mark.asyncio
+    async def test_stale_mark_never_suppresses_a_different_wire(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The billed mark is scoped to its wire identity.
+
+        Crash right after a wire switch persisted the new cursor: on restart
+        the restored mark still names the OLD log, so the new log's rows —
+        with smaller line numbers AND earlier timestamps than the old log's
+        last-billed row — must still bill.
+        """
+        _no_window(monkeypatch)
+        client = _RecordingClient()
+        first = _sync(tmp_path)
+        first.record(_usage_item(5, input_other=100, output=10, time_ms=2_000), wire="/w/a")
+
+        sync = _sync(tmp_path, state=_read_usage_state(tmp_path)[0])
+        sync.record(_usage_item(0, input_other=50, output=5, time_ms=1_000), wire="/w/b")
+        await sync.sync(client)
+
+        data = _usage_posts(client)[-1]["data"]
+        assert data["cumulative_input_tokens"] == 150
+        assert data["cumulative_output_tokens"] == 15
+
+    @pytest.mark.asyncio
+    async def test_future_stamped_row_does_not_suppress_later_rows(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Timestamps gate only the launch floor: one future-stamped row
+        (misset clock, later corrected) must not suppress legitimate rows."""
+        _no_window(monkeypatch)
+        client = _RecordingClient()
+        sync = _sync(tmp_path)
+
+        far_future = int(time.time() * 1000) + 10_000_000_000
+        sync.record(_usage_item(1, input_other=100, output=10, time_ms=far_future), wire="/w/a")
+        sync.record(_usage_item(2, input_other=50, output=5, time_ms=1_000), wire="/w/a")
+        await sync.sync(client)
+
+        assert _usage_posts(client)[-1]["data"]["cumulative_input_tokens"] == 150
+
+    @pytest.mark.asyncio
+    async def test_state_write_failure_holds_cursor_then_recovers(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A failed usage-state write must gate the wire cursor.
+
+        record() returns False so the caller re-attempts the row; once the
+        write works the row is billed exactly once — including across a
+        crash-restart from the (stale) persisted state.
+        """
+        from omnigent import kimi_native_forwarder as fwd
+
+        _no_window(monkeypatch)
+        client = _RecordingClient()
+        sync = _sync(tmp_path)
+        real_write = fwd._write_usage_state
+        monkeypatch.setattr(fwd, "_write_usage_state", lambda _b, _s: False)
+
+        item = _usage_item(3, input_other=100, output=10)
+        assert sync.record(item, wire="/w/a") is False
+
+        # The write path recovers: the retried (replayed) row persists and
+        # the totals contain it exactly once.
+        monkeypatch.setattr(fwd, "_write_usage_state", real_write)
+        assert sync.record(item, wire="/w/a") is True
+        await sync.sync(client)
+        assert _usage_posts(client)[-1]["data"]["cumulative_input_tokens"] == 100
+
+        # Crash-restart from the now-persisted state: the replayed row is
+        # idempotent (no double-bill).
+        restarted = _sync(tmp_path, state=_read_usage_state(tmp_path)[0])
+        assert restarted.record(item, wire="/w/a") is True
+        await restarted.sync(client)
+        assert _usage_posts(client)[-1]["data"]["cumulative_input_tokens"] == 100
+
+    @pytest.mark.asyncio
+    async def test_unreadable_usage_state_suspends_billing_until_writable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A present-but-corrupt state file must not silently start fresh.
+
+        Billing stays suspended (rows hold the cursor) while the state is
+        unwritable; once writable again billing resumes fail-safe.
+        """
+        import logging
+
+        from omnigent import kimi_native_forwarder as fwd
+
+        caplog.set_level(logging.WARNING, logger="omnigent.kimi_native_forwarder")
+        _no_window(monkeypatch)
+        client = _RecordingClient()
+        (tmp_path / "kimi_usage_state.json").write_text("{corrupt", encoding="utf-8")
+        state, trusted = _read_usage_state(tmp_path)
+        assert state is None
+        assert trusted is False
+        assert any("billing suspended" in r.message for r in caplog.records)
+
+        sync = _KimiUsageSync(
+            base_url="http://ap",
+            headers={},
+            session_id="conv_k",
+            bridge_dir=tmp_path,
+            state=state,
+            trusted=trusted,
+        )
+        # While the state file cannot be rewritten, nothing bills and the
+        # cursor is held.
+        real_write = fwd._write_usage_state
+        monkeypatch.setattr(fwd, "_write_usage_state", lambda _b, _s: False)
+        item = _usage_item(1, input_other=100, output=10)
+        assert sync.record(item, wire="/w/a") is False
+        await sync.sync(client)
+        assert _usage_posts(client) == []
+
+        # Writable again: billing resumes and the held row bills once.
+        monkeypatch.setattr(fwd, "_write_usage_state", real_write)
+        assert sync.record(item, wire="/w/a") is True
+        await sync.sync(client)
+        assert _usage_posts(client)[-1]["data"]["cumulative_input_tokens"] == 100
 
     @pytest.mark.asyncio
     async def test_new_wire_keeps_cumulative_totals(
@@ -707,11 +859,11 @@ class TestUsageSync:
         _no_window(monkeypatch)
         client = _RecordingClient()
         sync = _sync(tmp_path)
-        sync.record(_usage_item(1, input_other=100, output=20))
+        sync.record(_usage_item(1, input_other=100, output=20), wire="/w/a")
         await sync.sync(client)
 
         sync.note_new_wire()
-        sync.record(_usage_item(1, input_other=7, output=3))
+        sync.record(_usage_item(1, input_other=7, output=3), wire="/w/b")
         await sync.sync(client)
 
         data = _usage_posts(client)[-1]["data"]

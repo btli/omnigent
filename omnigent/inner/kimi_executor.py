@@ -213,6 +213,13 @@ def _sum_wire_usage(
             continue
         row_type = row.get("type")
         if row_type == "llm.request":
+            # A resumed log's historical requests must not attribute this
+            # turn: on a first read, only turn-window requests count (usage
+            # rows are gated the same way below).
+            if first_read:
+                request_time = _token_count(row.get("time"))
+                if request_time is None or request_time < turn_start_ms:
+                    continue
             # Provider-resolved model id, falling back to the configured alias.
             candidate = row.get("model")
             if not (isinstance(candidate, str) and candidate):
