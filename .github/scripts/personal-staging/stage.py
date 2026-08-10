@@ -23,6 +23,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # Resolved and cached at module load, while sys.path[0] (this script's dir)
@@ -38,10 +39,16 @@ UPSTREAM_REPO = "omnigent-ai/omnigent"
 PR_AUTHOR = "btli"
 PR_LIST_LIMIT = 100
 EXTRAS_FILE = Path(__file__).resolve().parent / "extras.txt"
-EXTRA_UNFETCHABLE = "extra unfetchable (likely deleted; remove from extras.txt)"
+# Two different answers about a pinned extra: only a ref confirmed absent
+# invites editing the manifest, and only a failure to reach the remote blocks
+# the push (dropping a required pin would silently regress staging).
+EXTRA_MISSING = "extra unfetchable (likely deleted; remove from extras.txt)"
+EXTRA_FETCH_FAILED = "extra fetch failed (cannot reach upstream; pin kept, staging not advanced)"
+EXTRA_FETCH_ATTEMPTS = 3
+EXTRA_FETCH_BACKOFF_S = 2
 # Subject line minted below for every staging merge commit; also decoded to
 # diff two compositions (what changed between the old and new staging).
-STAGING_MERGE_RE = re.compile(r"staging: merge PR #(\d+) \(.+ @ ([0-9a-f]{12})\)")
+STAGING_MERGE_RE = re.compile(r"staging: merge PR #(\d+) \((.+) @ ([0-9a-f]{12})\)")
 # Fixed identity, no gpg signature: the merge commit must be byte-reproducible
 # so an unchanged same-day rerun lands on the identical sha (no-op detection).
 COMMIT_IDENT = [
@@ -140,6 +147,26 @@ def parse_extras(path: Path) -> list[int]:
     return numbers
 
 
+def fetch_extra(cwd: str | Path, upstream: str, num: int) -> tuple[str, str]:
+    """Resolve a pinned extra's frozen ``refs/pull/N/head`` to a commit oid,
+    returning ``(oid, "")`` on success and ``("", reason)`` otherwise. A
+    deleted ref and an unreachable remote are different answers: only
+    ls-remote reporting the ref absent proves deletion, so only that outcome
+    invites editing the manifest."""
+    ref = f"refs/pull/{num}/head"
+    for attempt in range(EXTRA_FETCH_ATTEMPTS):
+        if git(cwd, "fetch", upstream, ref, check=False).returncode == 0:
+            head = git(cwd, "rev-parse", "-q", "--verify", "FETCH_HEAD^{commit}", check=False)
+            if head.returncode == 0:
+                return head.stdout.strip(), ""
+        if attempt + 1 < EXTRA_FETCH_ATTEMPTS:
+            time.sleep(EXTRA_FETCH_BACKOFF_S)
+    probe = git(cwd, "ls-remote", upstream, ref, check=False)
+    if probe.returncode == 0 and not probe.stdout.strip():
+        return "", EXTRA_MISSING
+    return "", EXTRA_FETCH_FAILED
+
+
 def merge_stream(open_prs: list[dict], extras: list[int]) -> list[dict]:
     """Union of open PRs and extras, deduped by PR number (the open entry
     wins), ascending — the same ordering rule the composition always used."""
@@ -182,18 +209,16 @@ def merge_prs(cwd: str | Path, prs: list[dict], upstream: str) -> tuple[list[dic
         num, source = pr["number"], pr.get("source", "open")
         if source == "extra":
             # No pinned head for an extra: its refs/pull/N/head is frozen by
-            # GitHub after close. A deleted/garbage ref is a loud skip.
+            # GitHub after close, so the ref itself is the only pin.
             branch = f"pull/{num}/head"
-            fetch = git(cwd, "fetch", upstream, f"refs/pull/{num}/head", check=False)
-            head = git(cwd, "rev-parse", "-q", "--verify", "FETCH_HEAD^{commit}", check=False)
-            oid = head.stdout.strip() if fetch.returncode == 0 and head.returncode == 0 else ""
+            oid, reason = fetch_extra(cwd, upstream, num)
             if not oid:
                 skipped.append(
                     {
                         "pr": num,
                         "branch": branch,
                         "conflict_paths": [],
-                        "reason": EXTRA_UNFETCHABLE,
+                        "reason": reason,
                         "source": source,
                     }
                 )
@@ -247,45 +272,49 @@ def merge_prs(cwd: str | Path, prs: list[dict], upstream: str) -> tuple[list[dic
     return applied, skipped
 
 
-def composition_of(cwd: str | Path, sha: str) -> tuple[str, dict[int, str]] | None:
-    """Decode a staging commit into (upstream base sha, {pr: head12}) from
-    its first-parent merge subjects; None when the sha isn't readable or the
-    base isn't found within a sane window."""
+def composition_of(cwd: str | Path, sha: str) -> tuple[str, dict[int, tuple[str, str]]] | None:
+    """Decode a pushed staging commit into (upstream base sha, {pr: (branch,
+    head12)}) from its first-parent merge subjects, walking to the real base —
+    the merge count is unbounded. None when the sha isn't readable."""
     if not sha or git(cwd, "cat-file", "-e", f"{sha}^{{commit}}", check=False).returncode != 0:
         return None
-    window = str(PR_LIST_LIMIT * 2)
-    out = git(cwd, "log", "--first-parent", "-n", window, "--format=%H%x09%s", sha).stdout
-    merges: dict[int, str] = {}
+    merges: dict[int, tuple[str, str]] = {}
+    out = git(cwd, "log", "--first-parent", "--format=%H%x09%s", sha).stdout
     for line in out.splitlines():
         commit, _, subject = line.partition("\t")
         m = STAGING_MERGE_RE.fullmatch(subject)
         if not m:
             return commit, merges
-        merges[int(m.group(1))] = m.group(2)
+        merges[int(m.group(1))] = (m.group(2), m.group(3))
     return None
 
 
 def push_causes(
-    old: tuple[str, dict[int, str]] | None,
+    old: tuple[str, dict[int, tuple[str, str]]] | None,
     upstream_sha: str,
-    new_merges: dict[int, str],
-    extra_nums: set[int],
+    applied: list[dict],
 ) -> list[str]:
-    """Best-effort one-liner inputs for why staging moved: which of upstream
-    HEAD, the open PR set, or the extras changed since the old composition."""
+    """One-line answer to "why did staging move": which composition inputs
+    differ from the one the remote branch already carried."""
     if old is None:
         return ["no previous composition to compare"]
     old_base, old_merges = old
+    new = {p["pr"]: (p["branch"], str(p["oid"])[:12], p["source"]) for p in applied}
+    label = {"open": "open PR set", "extra": "extras"}
     causes: list[str] = []
     if old_base != upstream_sha:
         causes.append("upstream HEAD")
-    changed = {
-        n for n in old_merges.keys() | new_merges.keys() if old_merges.get(n) != new_merges.get(n)
-    }
-    if changed - extra_nums:
-        causes.append("open PR set")
-    if changed & extra_nums:
-        causes.append("extras")
+    dropped: list[str] = []
+    for num in sorted(old_merges.keys() | new.keys()):
+        entry = new.get(num)
+        if entry is None:
+            # No longer composed at all (unpinned extra, closed PR, skip) —
+            # say so rather than guessing which input it used to come from.
+            dropped.append(f"#{num}")
+        elif old_merges.get(num) != entry[:2] and label[entry[2]] not in causes:
+            causes.append(label[entry[2]])
+    if dropped:
+        causes.append("dropped PR " + ", ".join(dropped))
     return causes or ["composition changed (cause unknown)"]
 
 
@@ -320,6 +349,10 @@ def stage(
     applied, skipped = merge_prs(cwd, prs, upstream)
     staging_sha = git(cwd, "rev-parse", "HEAD").stdout.strip()
 
+    # An extra we could not even reach is an infrastructure failure, not a
+    # composition: publishing without it would silently regress staging.
+    blocked = [p["pr"] for p in skipped if p.get("reason") == EXTRA_FETCH_FAILED]
+
     if staging_only:
         # Hourly mode: only refs/heads/staging moves — no pins, no tags.
         # Composition is byte-reproducible, so an identical remote sha means
@@ -330,7 +363,8 @@ def stage(
             "upstream_sha": upstream_sha,
             "staging_sha": staging_sha,
             "staging_only": True,
-            "pushed": expected_staging != staging_sha,
+            "blocked": blocked,
+            "pushed": not blocked and expected_staging != staging_sha,
             "causes": [],
             "applied": applied,
             "skipped": skipped,
@@ -338,12 +372,8 @@ def stage(
         if not report["pushed"]:
             return report
         git(cwd, "fetch", fork, "refs/heads/staging", check=False)
-        new_comp = composition_of(cwd, staging_sha)
         report["causes"] = push_causes(
-            composition_of(cwd, expected_staging),
-            upstream_sha,
-            new_comp[1] if new_comp else {},
-            {p["number"] for p in prs if p.get("source") == "extra"},
+            composition_of(cwd, expected_staging), upstream_sha, applied
         )
         git(
             cwd,
@@ -353,6 +383,16 @@ def stage(
             f"{staging_sha}:refs/heads/staging",
         )
         return report
+
+    # The nightly publishes releases from this composition, and its downstream
+    # jobs consume the report's sha/tag — so refuse loudly before any ref moves
+    # rather than shipping artifacts that quietly omit a required pin.
+    if blocked:
+        raise StageError(
+            "extras unreachable due to infrastructure failure (not deleted): "
+            + ", ".join(f"#{n}" for n in blocked)
+            + "; refusing to publish a composition without them"
+        )
 
     dev_tag = dev_version(cwd, upstream_sha, datestamp)
     name, created = pin_name(cwd, fork, datestamp, staging_sha)
@@ -439,11 +479,16 @@ def notes(report: dict, signed: bool) -> str:
 
 def summarize(report: dict) -> str:
     if report.get("staging_only"):
-        result = (
-            f"pushed (changed: {', '.join(report['causes'])})"
-            if report["pushed"]
-            else "unchanged — push skipped"
-        )
+        if report["blocked"]:
+            result = (
+                "**NOT pushed** — extras unreachable: "
+                + ", ".join(f"#{n}" for n in report["blocked"])
+                + " (staging left at its previous commit)"
+            )
+        elif report["pushed"]:
+            result = f"pushed (changed: {', '.join(report['causes'])})"
+        else:
+            result = "unchanged — push skipped"
         rows = [
             "## Personal staging hourly",
             "",
@@ -537,6 +582,12 @@ def main(argv: list[str] | None = None) -> int:
         raise
     Path(args.report).write_text(json.dumps(report, indent=2) + "\n")
     append_summary(summarize(report))
+    if report.get("blocked"):
+        print(
+            "::warning::could not reach upstream for extras "
+            + ", ".join(f"#{n}" for n in report["blocked"])
+            + " — staging left unchanged; this is an infrastructure failure, not a deleted ref"
+        )
     print(json.dumps(report, indent=2))
     return 0
 

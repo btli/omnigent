@@ -70,6 +70,14 @@ class Env:
         git(self.seed, "push", str(self.upstream), f"{branch}:refs/pull/{number}/head")
         return {"number": number, "headRefName": branch, "headRefOid": oid}
 
+    def advance_pr(self, number: int, filename: str, content: str) -> dict:
+        """New head on an existing PR branch, force-pushed to its pull ref."""
+        branch = f"pr-{number}"
+        git(self.seed, "checkout", "-q", branch)
+        oid = commit_file(self.seed, filename, content, f"pr {number} update")
+        git(self.seed, "push", "-f", str(self.upstream), f"{branch}:refs/pull/{number}/head")
+        return {"number": number, "headRefName": branch, "headRefOid": oid}
+
     def advance_main(self, filename: str, content: str) -> str:
         git(self.seed, "checkout", "-q", "main")
         sha = commit_file(self.seed, filename, content, f"main: {filename}")
@@ -90,6 +98,28 @@ class Env:
 @pytest.fixture
 def env(tmp_path):
     return Env(tmp_path)
+
+
+@pytest.fixture
+def pushes(monkeypatch):
+    """Record the argv of every `git push` the composer issues (still running
+    them), so tests can assert exactly which refs and leases were used."""
+    recorded: list[tuple] = []
+    real_git = stage_mod.git
+
+    def spy(cwd, *args, **kwargs):
+        if args and args[0] == "push":
+            recorded.append(args)
+        return real_git(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(stage_mod, "git", spy)
+    return recorded
+
+
+@pytest.fixture(autouse=True)
+def no_backoff(monkeypatch):
+    """The extras fetch sleeps between retries in production; no test waits."""
+    monkeypatch.setattr(stage_mod, "EXTRA_FETCH_BACKOFF_S", 0)
 
 
 def test_merges_prs_ascending_and_pushes_staging(env):
@@ -405,7 +435,9 @@ def test_cli_writes_report_and_notes(env, tmp_path, capsys):
 def test_parse_extras_comments_blanks_and_missing(tmp_path):
     manifest = tmp_path / "extras.txt"
     manifest.write_text("# pinned fixes\n\n12  # trailing comment\n7\n12\n")
-    assert stage_mod.parse_extras(manifest) == [12, 7, 12]
+    # the contract is WHICH numbers are pinned — comments and blank lines are
+    # ignored; ordering and duplicates are normalized later by merge_stream
+    assert sorted(set(stage_mod.parse_extras(manifest))) == [7, 12]
     assert stage_mod.parse_extras(tmp_path / "missing.txt") == []
 
 
@@ -436,7 +468,9 @@ def test_extra_pr_merges_from_pull_ref_with_source(env):
     assert "merge PR #8 (pull/8/head" in env.fork_log("staging")
 
 
-def test_unfetchable_extra_is_loud_skip(env):
+def test_extra_confirmed_deleted_is_loud_advisory_skip(env):
+    """ls-remote proves the ref is gone: skip it, keep composing, and tell the
+    operator to edit the manifest."""
     ok = env.add_pr(2, "k.txt", "k\n")
     report = env.run(stage_mod.merge_stream([ok], [999]))
     assert [p["pr"] for p in report["applied"]] == [2]
@@ -445,7 +479,7 @@ def test_unfetchable_extra_is_loud_skip(env):
             "pr": 999,
             "branch": "pull/999/head",
             "conflict_paths": [],
-            "reason": "extra unfetchable (likely deleted; remove from extras.txt)",
+            "reason": stage_mod.EXTRA_MISSING,
             "source": "extra",
         }
     ]
@@ -455,17 +489,63 @@ def test_unfetchable_extra_is_loud_skip(env):
     assert "remove from extras.txt" in stage_mod.summarize(report)
 
 
-def test_staging_only_pushes_only_staging_with_lease(env, monkeypatch):
-    pr = env.add_pr(5, "s.txt", "s\n")
-    pushes = []
+def _break_ref(monkeypatch, ref_fragment: str, *, commands: tuple[str, ...], fail_times: int):
+    """Make the named git commands fail for one ref, like a transport blip."""
     real_git = stage_mod.git
+    seen: list[tuple] = []
 
-    def spy(cwd, *args, **kwargs):
-        if args and args[0] == "push":
-            pushes.append(args)
+    def flaky(cwd, *args, **kwargs):
+        if args[:1] in {(c,) for c in commands} and any(ref_fragment in a for a in args):
+            seen.append(args)
+            if len(seen) <= fail_times:
+                return subprocess.CompletedProcess(args, 128, "", "fatal: unable to access")
         return real_git(cwd, *args, **kwargs)
 
-    monkeypatch.setattr(stage_mod, "git", spy)
+    monkeypatch.setattr(stage_mod, "git", flaky)
+    return seen
+
+
+def test_extra_transport_failure_blocks_push_and_spares_the_manifest(env, monkeypatch):
+    """An unreachable upstream must not masquerade as a deleted ref: staging
+    keeps its previous content and nobody is told to delete a live pin."""
+    ok = env.add_pr(3, "t.txt", "t\n")
+    env.add_pr(4, "u.txt", "u\n")
+    stream = stage_mod.merge_stream([ok], [4])
+    first = env.run(stream, staging_only=True)
+    assert [p["pr"] for p in first["applied"]] == [3, 4]
+
+    _break_ref(monkeypatch, "pull/4/head", commands=("fetch", "ls-remote"), fail_times=99)
+    report = env.run(stream, staging_only=True)
+
+    skip = report["skipped"][0]
+    assert skip["reason"] == stage_mod.EXTRA_FETCH_FAILED
+    assert "extras.txt" not in skip["reason"]
+    assert report["blocked"] == [4]
+    assert report["pushed"] is False
+    # previous staging content preserved — no silent regression
+    assert env.fork_ref("refs/heads/staging") == first["staging_sha"]
+    assert "NOT pushed" in stage_mod.summarize(report)
+
+
+def test_extra_transport_failure_fails_the_nightly_before_publishing(env, monkeypatch):
+    env.add_pr(4, "u.txt", "u\n")
+    _break_ref(monkeypatch, "pull/4/head", commands=("fetch", "ls-remote"), fail_times=99)
+    with pytest.raises(stage_mod.StageError, match="infrastructure failure"):
+        env.run(stage_mod.merge_stream([], [4]))
+    assert env.fork_ref("refs/heads/staging") == ""
+
+
+def test_extra_fetch_succeeds_after_retry(env, monkeypatch):
+    env.add_pr(5, "r.txt", "r\n")
+    seen = _break_ref(monkeypatch, "pull/5/head", commands=("fetch",), fail_times=1)
+    report = env.run(stage_mod.merge_stream([], [5]), staging_only=True)
+    assert len(seen) == 2  # one blip, then the retry lands
+    assert [(p["pr"], p["source"]) for p in report["applied"]] == [(5, "extra")]
+    assert report["skipped"] == [] and report["blocked"] == []
+
+
+def test_staging_only_pushes_only_staging_with_lease(env, pushes):
+    pr = env.add_pr(5, "s.txt", "s\n")
     report = env.run([pr], staging_only=True)
 
     assert report["pushed"] is True
@@ -488,20 +568,31 @@ def test_staging_only_pushes_only_staging_with_lease(env, monkeypatch):
         assert key not in report
 
 
-def test_staging_only_noop_fast_path_skips_push(env, monkeypatch):
+def test_staging_only_lease_pins_the_previous_remote_sha(env, pushes):
+    """The repeat-run case: the lease must carry the sha staging actually had,
+    not the cold-start empty value."""
+    pr = env.add_pr(30, "l.txt", "l\n")
+    first = env.run([pr], staging_only=True)
+    pushes.clear()
+
+    env.advance_main("l2.txt", "l2\n")
+    second = env.run([pr], staging_only=True)
+    assert pushes == [
+        (
+            "push",
+            f"--force-with-lease=refs/heads/staging:{first['staging_sha']}",
+            "origin",
+            f"{second['staging_sha']}:refs/heads/staging",
+        )
+    ]
+
+
+def test_staging_only_noop_fast_path_skips_push(env, pushes):
     pr = env.add_pr(6, "n.txt", "n\n")
     first = env.run([pr], staging_only=True)
     assert first["pushed"] is True
+    pushes.clear()
 
-    pushes = []
-    real_git = stage_mod.git
-
-    def spy(cwd, *args, **kwargs):
-        if args and args[0] == "push":
-            pushes.append(args)
-        return real_git(cwd, *args, **kwargs)
-
-    monkeypatch.setattr(stage_mod, "git", spy)
     second = env.run([pr], staging_only=True)
     assert second["pushed"] is False
     assert second["staging_sha"] == first["staging_sha"]
@@ -521,6 +612,42 @@ def test_staging_only_reports_change_causes(env):
     env.add_pr(9, "c9.txt", "9\n")
     third = env.run(stage_mod.merge_stream([pr], [9]), staging_only=True)
     assert third["causes"] == ["extras"]
+
+
+def test_staging_only_cause_open_pr_head_moved(env):
+    pr = env.add_pr(31, "o.txt", "o\n")
+    env.run([pr], staging_only=True)
+    moved = env.advance_pr(31, "o.txt", "o2\n")
+    second = env.run([moved], staging_only=True)
+    assert second["causes"] == ["open PR set"]
+
+
+def test_staging_only_cause_extra_removed_then_promoted(env):
+    keep = env.add_pr(32, "k.txt", "k\n")
+    extra = env.add_pr(33, "x.txt", "x\n")
+    env.run(stage_mod.merge_stream([keep], [33]), staging_only=True)
+
+    # unpinned from extras.txt: reported as dropped, never as an open-PR change
+    dropped = env.run(stage_mod.merge_stream([keep], []), staging_only=True)
+    assert dropped["causes"] == ["dropped PR #33"]
+
+    # the same number returns as an open PR — a source transition, not a drop
+    promoted = env.run(stage_mod.merge_stream([keep, extra], []), staging_only=True)
+    assert promoted["causes"] == ["open PR set"]
+
+
+def test_old_composition_decoded_past_any_merge_count(env, monkeypatch):
+    """The previous composition is decoded by walking to the real upstream
+    base, so a manifest longer than any PR-list bound still yields real
+    causes instead of degrading to 'no previous composition'."""
+    extras = [env.add_pr(40 + i, f"w{i}.txt", f"{i}\n") for i in range(3)]
+    stream = stage_mod.merge_stream([], [p["number"] for p in extras])
+    env.run(stream, staging_only=True)
+
+    monkeypatch.setattr(stage_mod, "PR_LIST_LIMIT", 1)
+    env.advance_main("wmain.txt", "m\n")
+    second = env.run(stream, staging_only=True)
+    assert second["causes"] == ["upstream HEAD"]
 
 
 def test_cli_staging_only_with_extras_manifest(env, tmp_path, monkeypatch, capsys):
