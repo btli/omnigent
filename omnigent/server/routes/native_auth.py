@@ -24,8 +24,8 @@ on the client:
    ``/auth/native-exchange``. PKCE plus state bind the native ``POST`` used by
    oidc/accounts mode; the browser-only header-mode hop additionally requires
    the same authenticated identity that created the flow. The credential is
-   the proxy-forwarded per-user access token in header mode (Databricks Apps),
-   or a freshly minted session JWT in oidc/accounts mode.
+   the proxy-forwarded per-user access token in header mode (self-managed front
+   doors), or a freshly minted session JWT in oidc/accounts mode.
 
 The exchange has two transports because a front-door proxy 302s every
 unauthenticated *native* request to its IdP — a plain HTTPS ``POST``
@@ -41,8 +41,8 @@ redirect therefore tells the app which one to use:
   to its Digital Asset Links check. This is the
   only live transport for a front-door deployment, so the second-hop URL exposes
   the code + verifier and the final redirect exposes the credential to
-  browser/proxy diagnostics. Both exchanges are transport-bound and consume
-  the code only after state, PKCE, transport, and any required identity bind.
+  browser/proxy diagnostics. Both exchanges are transport-bound and redeem the
+  code at most once after state, PKCE, transport, and any required identity bind.
 
 There is deliberately no separate pre-registration endpoint: behind a
 front door the app cannot reach one, and a public one would not
@@ -551,9 +551,9 @@ def create_native_auth_router(
     ) -> tuple[Response | None, _NativeFlow | None]:
         """Validate and atomically consume a flow for its credential.
 
-        Parameter shapes are checked before looking up the record. State,
-        verifier, transport, and the browser-only identity bind are validated
-        before the single-use record is consumed.
+        Parameter shapes are checked before claiming the record. The record is
+        restored after non-fatal state, verifier, transport, or browser-identity
+        mismatches so the legitimate client can retry.
 
         :returns: ``(error_response, None)`` on failure or
             ``(None, flow)`` on success.
@@ -565,27 +565,32 @@ def create_native_auth_router(
         if not _VERIFIER_RE.fullmatch(verifier):
             return _bad_request("Missing or malformed code_verifier parameter"), None
 
-        flow = _flows.get(code)
+        # Single-use invariant: remove before validation can ever await or move threads.
+        # Restore only non-fatal mismatches so the legitimate client can retry.
+        flow = _flows.pop(code, None)
         if flow is None:
             return _bad_request("Unknown, expired, or already used code"), None
         if time.time() - flow.created_at > _FLOW_TTL_SECONDS:
-            _flows.pop(code, None)
             return _bad_request("Unknown, expired, or already used code"), None
         if not hmac.compare_digest(flow.state, state):
+            _flows.setdefault(code, flow)
             return _bad_request("State mismatch"), None
         if not hmac.compare_digest(flow.code_challenge, derive_code_challenge(verifier)):
+            _flows.setdefault(code, flow)
             return _bad_request("code_verifier does not match the challenge"), None
         if not hmac.compare_digest(flow.exchange_transport, transport):
+            _flows.setdefault(code, flow)
             return _bad_request("Exchange transport mismatch"), None
         if transport == "tab":
             caller_user_id = auth_provider.get_user_id(request)
             if caller_user_id is None:
+                _flows.setdefault(code, flow)
                 return JSONResponse(status_code=401, content={"error": "not authenticated"}), None
             if not hmac.compare_digest(flow.user_id, caller_user_id):
+                _flows.setdefault(code, flow)
                 return JSONResponse(
                     status_code=403, content={"error": "flow identity mismatch"}
                 ), None
-        _flows.pop(code, None)
         return None, flow
 
     def _credential_for(flow: _NativeFlow) -> str | None:
