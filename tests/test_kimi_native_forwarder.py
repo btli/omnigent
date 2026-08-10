@@ -822,15 +822,69 @@ class TestUsageSync:
         assert trusted is True
         assert any("starting fresh" in r.message for r in caplog.records)
 
-    def test_empty_usage_state_is_transient_not_fresh(self, tmp_path: Path) -> None:
-        """An empty state file is a write in flight, not corruption: billing
-        suspends and the read is re-attempted rather than starting fresh."""
+    def test_empty_usage_state_starts_fresh(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The only state writer is atomic (tmp + replace), so an empty file
+        can never be a write in flight: it is confirmed corruption, and
+        suspending on it would trap billing forever (nothing writes while
+        suspended, so a re-read sees the same empty file)."""
+        import logging
+
+        caplog.set_level(logging.WARNING, logger="omnigent.kimi_native_forwarder")
         (tmp_path / "kimi_usage_state.json").write_text("", encoding="utf-8")
 
         state, trusted = _read_usage_state(tmp_path)
 
         assert state is None
-        assert trusted is False
+        assert trusted is True
+        assert any("starting fresh" in r.message for r in caplog.records)
+
+    def test_invalid_utf8_usage_state_starts_fresh(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Undecodable bytes are confirmed corruption — a fresh start, not an
+        exception that would crash the forwarder into a restart loop."""
+        import logging
+
+        caplog.set_level(logging.WARNING, logger="omnigent.kimi_native_forwarder")
+        (tmp_path / "kimi_usage_state.json").write_bytes(b"\xff\xfe{}")
+
+        state, trusted = _read_usage_state(tmp_path)
+
+        assert state is None
+        assert trusted is True
+        assert any("starting fresh" in r.message for r in caplog.records)
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            pytest.param({"totals": "nope", "billed_line": -1}, id="totals-wrong-type"),
+            pytest.param(
+                {"totals": {"input_other": "10"}, "billed_line": -1},
+                id="totals-value-wrong-type",
+            ),
+            pytest.param({"totals": {}, "model": 7, "billed_line": -1}, id="model-wrong-type"),
+            pytest.param({"totals": {}, "billed_line": "5"}, id="billed-line-wrong-type"),
+            pytest.param({"billed_line": -1}, id="totals-missing"),
+            pytest.param({"totals": {}}, id="billed-line-missing"),
+        ],
+    )
+    def test_schema_invalid_usage_state_starts_fresh(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, payload: dict
+    ) -> None:
+        """Parseable JSON with a wrong-typed or missing field is corruption:
+        silently defaulting it would trust a baseline that was never written."""
+        import logging
+
+        caplog.set_level(logging.WARNING, logger="omnigent.kimi_native_forwarder")
+        (tmp_path / "kimi_usage_state.json").write_text(json.dumps(payload), encoding="utf-8")
+
+        state, trusted = _read_usage_state(tmp_path)
+
+        assert state is None
+        assert trusted is True
+        assert any("starting fresh" in r.message for r in caplog.records)
 
     @pytest.mark.asyncio
     async def test_suspended_never_persists_and_adopts_recovered_state(
@@ -857,7 +911,12 @@ class TestUsageSync:
         assert _write_usage_state(tmp_path, prior) is True
         on_disk = (tmp_path / "kimi_usage_state.json").read_text(encoding="utf-8")
 
-        # A transient read failure hid the prior state at startup.
+        # A transient read failure hid the prior state at startup and persists
+        # through the suspended row (recovery re-reads before dropping).
+        from omnigent import kimi_native_forwarder as fwd
+
+        real_read = fwd._read_usage_state
+        monkeypatch.setattr(fwd, "_read_usage_state", lambda _b: (None, False))
         sync = _sync(tmp_path, state=None, trusted=False)
         sync.note_model("system.ai.kimi-k3-mini")
         sync.record(_usage_item(9, input_other=999, output=99), wire="/w/b")
@@ -869,6 +928,7 @@ class TestUsageSync:
         # are the baseline (the suspended row's 999 was dropped), the newer
         # in-memory model wins, and the already-posted model is not re-posted
         # under its old value.
+        monkeypatch.setattr(fwd, "_read_usage_state", real_read)
         await sync.sync(client)
         assert [b["data"]["model"] for b in _model_posts(client)] == ["system.ai.kimi-k3-mini"]
         data = _usage_posts(client)[-1]["data"]
@@ -880,6 +940,63 @@ class TestUsageSync:
         sync.record(_usage_item(10, input_other=7, output=3), wire="/w/b")
         await sync.sync(client)
         assert _usage_posts(client)[-1]["data"]["cumulative_input_tokens"] == 107
+
+    @pytest.mark.asyncio
+    async def test_recovery_before_record_bills_same_poll_rows(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A row arriving after the state file became readable again bills in
+        the same poll: recovery runs before the row is consumed, not after."""
+        _no_window(monkeypatch)
+        client = _RecordingClient()
+        prior = _UsageState(
+            totals={"input_other": 100, "output": 20, "cache_read": 0, "cache_creation": 0},
+        )
+        assert _write_usage_state(tmp_path, prior) is True
+
+        # Suspended at startup, but the file is readable by the time the
+        # poll's rows arrive.
+        sync = _sync(tmp_path, state=None, trusted=False)
+        sync.record(_usage_item(1, input_other=7, output=3), wire="/w/a")
+        await sync.sync(client)
+
+        data = _usage_posts(client)[-1]["data"]
+        assert data["cumulative_input_tokens"] == 107
+        assert data["cumulative_output_tokens"] == 23
+
+    @pytest.mark.asyncio
+    async def test_model_adopted_at_unsuspend_persists_despite_failed_post(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A model seen while suspended is persisted at unsuspend, before any
+        POST: the wire cursor is already past its llm.request row, so a failed
+        post followed by a crash must not lose it."""
+        _no_window(monkeypatch)
+        client = _RecordingClient()
+        prior = _UsageState(
+            totals={"input_other": 100, "output": 20, "cache_read": 0, "cache_creation": 0},
+            model="system.ai.kimi-k3",
+            posted_model="system.ai.kimi-k3",
+        )
+        assert _write_usage_state(tmp_path, prior) is True
+
+        from omnigent import kimi_native_forwarder as fwd
+
+        real_read = fwd._read_usage_state
+        monkeypatch.setattr(fwd, "_read_usage_state", lambda _b: (None, False))
+        sync = _sync(tmp_path, state=None, trusted=False)
+        sync.note_model("system.ai.kimi-k3-mini")
+
+        monkeypatch.setattr(fwd, "_read_usage_state", real_read)
+        client.fail_with = httpx.ConnectError("server down")
+        await sync.sync(client)
+
+        # A crash here must find the adopted model on disk.
+        state, trusted = _read_usage_state(tmp_path)
+        assert trusted is True
+        assert state is not None
+        assert state.model == "system.ai.kimi-k3-mini"
+        assert state.posted_model == "system.ai.kimi-k3"
 
     @pytest.mark.asyncio
     async def test_suspension_persists_until_state_reads_again(
