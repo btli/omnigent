@@ -370,6 +370,7 @@ def _sync(
     bridge_dir: Path,
     state: _UsageState | None = None,
     *,
+    trusted: bool = True,
     billing_floor_ms: int = 0,
 ) -> _KimiUsageSync:
     return _KimiUsageSync(
@@ -378,6 +379,7 @@ def _sync(
         session_id="conv_k",
         bridge_dir=bridge_dir,
         state=state,
+        trusted=trusted,
         billing_floor_ms=billing_floor_ms,
     )
 
@@ -764,14 +766,14 @@ class TestUsageSync:
         assert _usage_posts(client)[-1]["data"]["cumulative_input_tokens"] == 150
 
     @pytest.mark.asyncio
-    async def test_state_write_failure_holds_cursor_then_recovers(
+    async def test_persist_failure_never_blocks_delivery_and_state_catches_up(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """A failed usage-state write must gate the wire cursor.
+        """A failed usage-state write never gates anything (design ruling).
 
-        record() returns False so the caller re-attempts the row; once the
-        write works the row is billed exactly once — including across a
-        crash-restart from the (stale) persisted state.
+        Delivery flows from the in-memory totals immediately; the per-poll
+        sync retries the persist, and the next successful write captures the
+        current state. Replay after recovery stays idempotent.
         """
         from omnigent import kimi_native_forwarder as fwd
 
@@ -782,69 +784,143 @@ class TestUsageSync:
         monkeypatch.setattr(fwd, "_write_usage_state", lambda _b, _s: False)
 
         item = _usage_item(3, input_other=100, output=10)
-        assert sync.record(item, wire="/w/a") is False
+        sync.record(item, wire="/w/a")
+        await sync.sync(client)
 
-        # The write path recovers: the retried (replayed) row persists and
-        # the totals contain it exactly once.
+        # Delivered from in-memory totals despite the failed persist...
+        assert _usage_posts(client)[-1]["data"]["cumulative_input_tokens"] == 100
+        # ...while nothing was written yet.
+        assert _read_usage_state(tmp_path) == (None, True)
+
+        # The write path recovers: the per-poll sync retries the persist
+        # without any new wire record.
         monkeypatch.setattr(fwd, "_write_usage_state", real_write)
-        assert sync.record(item, wire="/w/a") is True
+        await sync.sync(client)
+        state, trusted = _read_usage_state(tmp_path)
+        assert trusted is True
+        assert state is not None
+        assert state.totals["input_other"] == 100
+
+        # A replay of the already-billed row stays idempotent.
+        sync.record(item, wire="/w/a")
         await sync.sync(client)
         assert _usage_posts(client)[-1]["data"]["cumulative_input_tokens"] == 100
 
-        # Crash-restart from the now-persisted state: the replayed row is
-        # idempotent (no double-bill).
-        restarted = _sync(tmp_path, state=_read_usage_state(tmp_path)[0])
-        assert restarted.record(item, wire="/w/a") is True
-        await restarted.sync(client)
-        assert _usage_posts(client)[-1]["data"]["cumulative_input_tokens"] == 100
-
-    @pytest.mark.asyncio
-    async def test_unreadable_usage_state_suspends_billing_until_writable(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        caplog: pytest.LogCaptureFixture,
+    def test_corrupt_usage_state_starts_fresh(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """A present-but-corrupt state file must not silently start fresh.
-
-        Billing stays suspended (rows hold the cursor) while the state is
-        unwritable; once writable again billing resumes fail-safe.
-        """
+        """Confirmed corruption (file reads but definitively fails to parse)
+        is a trusted fresh start — re-reading cannot fix it."""
         import logging
 
-        from omnigent import kimi_native_forwarder as fwd
+        caplog.set_level(logging.WARNING, logger="omnigent.kimi_native_forwarder")
+        (tmp_path / "kimi_usage_state.json").write_text("{corrupt", encoding="utf-8")
+
+        state, trusted = _read_usage_state(tmp_path)
+
+        assert state is None
+        assert trusted is True
+        assert any("starting fresh" in r.message for r in caplog.records)
+
+    def test_empty_usage_state_is_transient_not_fresh(self, tmp_path: Path) -> None:
+        """An empty state file is a write in flight, not corruption: billing
+        suspends and the read is re-attempted rather than starting fresh."""
+        (tmp_path / "kimi_usage_state.json").write_text("", encoding="utf-8")
+
+        state, trusted = _read_usage_state(tmp_path)
+
+        assert state is None
+        assert trusted is False
+
+    @pytest.mark.asyncio
+    async def test_suspended_never_persists_and_adopts_recovered_state(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """While suspended, NOTHING persists — the intact on-disk state must
+        not be clobbered by zeroed in-memory values even when writes would
+        succeed — and recovery adopts the on-disk baseline.
+
+        Rows seen while suspended are dropped (undercount, clamp-safe); an
+        llm.request seen while suspended is newer than the disk model and
+        wins on adopt.
+        """
+        _no_window(monkeypatch)
+        client = _RecordingClient()
+        prior = _UsageState(
+            totals={"input_other": 100, "output": 20, "cache_read": 0, "cache_creation": 0},
+            model="system.ai.kimi-k3",
+            posted_model="system.ai.kimi-k3",
+            context_tokens=42,
+            billed_wire="/w/a",
+            billed_line=5,
+        )
+        assert _write_usage_state(tmp_path, prior) is True
+        on_disk = (tmp_path / "kimi_usage_state.json").read_text(encoding="utf-8")
+
+        # A transient read failure hid the prior state at startup.
+        sync = _sync(tmp_path, state=None, trusted=False)
+        sync.note_model("system.ai.kimi-k3-mini")
+        sync.record(_usage_item(9, input_other=999, output=99), wire="/w/b")
+
+        # Nothing persisted: the recoverable on-disk state is untouched.
+        assert (tmp_path / "kimi_usage_state.json").read_text(encoding="utf-8") == on_disk
+
+        # The per-poll sync re-reads, adopts, and unsuspends: the disk totals
+        # are the baseline (the suspended row's 999 was dropped), the newer
+        # in-memory model wins, and the already-posted model is not re-posted
+        # under its old value.
+        await sync.sync(client)
+        assert [b["data"]["model"] for b in _model_posts(client)] == ["system.ai.kimi-k3-mini"]
+        data = _usage_posts(client)[-1]["data"]
+        assert data["cumulative_input_tokens"] == 100
+        assert data["cumulative_output_tokens"] == 20
+        assert data["context_tokens"] == 42
+
+        # Billing resumed: a new row bills on top of the adopted baseline.
+        sync.record(_usage_item(10, input_other=7, output=3), wire="/w/b")
+        await sync.sync(client)
+        assert _usage_posts(client)[-1]["data"]["cumulative_input_tokens"] == 107
+
+    @pytest.mark.asyncio
+    async def test_suspension_persists_until_state_reads_again(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A still-transient read failure keeps billing suspended each poll;
+        once the file reads again the suspension lifts and new rows bill."""
+        import logging
 
         caplog.set_level(logging.WARNING, logger="omnigent.kimi_native_forwarder")
         _no_window(monkeypatch)
         client = _RecordingClient()
-        (tmp_path / "kimi_usage_state.json").write_text("{corrupt", encoding="utf-8")
+        # A directory at the state path raises OSError on read: transient.
+        state_path = tmp_path / "kimi_usage_state.json"
+        state_path.mkdir()
         state, trusted = _read_usage_state(tmp_path)
-        assert state is None
-        assert trusted is False
-        assert any("billing suspended" in r.message for r in caplog.records)
+        assert (state, trusted) == (None, False)
 
-        sync = _KimiUsageSync(
-            base_url="http://ap",
-            headers={},
-            session_id="conv_k",
-            bridge_dir=tmp_path,
-            state=state,
-            trusted=trusted,
-        )
-        # While the state file cannot be rewritten, nothing bills and the
-        # cursor is held.
-        real_write = fwd._write_usage_state
-        monkeypatch.setattr(fwd, "_write_usage_state", lambda _b, _s: False)
-        item = _usage_item(1, input_other=100, output=10)
-        assert sync.record(item, wire="/w/a") is False
+        sync = _sync(tmp_path, state=state, trusted=trusted)
+        sync.record(_usage_item(1, input_other=100, output=10), wire="/w/a")
         await sync.sync(client)
+
+        # Still suspended: nothing posted, nothing written (not even a tmp).
         assert _usage_posts(client) == []
+        assert not (tmp_path / "kimi_usage_state.json.tmp").exists()
+        assert any("dropping usage.record" in r.message for r in caplog.records)
 
-        # Writable again: billing resumes and the held row bills once.
-        monkeypatch.setattr(fwd, "_write_usage_state", real_write)
-        assert sync.record(item, wire="/w/a") is True
+        # The path reads again with a real prior state: recovery adopts it.
+        state_path.rmdir()
+        _write_usage_state(
+            tmp_path,
+            _UsageState(
+                totals={"input_other": 50, "output": 5, "cache_read": 0, "cache_creation": 0}
+            ),
+        )
         await sync.sync(client)
-        assert _usage_posts(client)[-1]["data"]["cumulative_input_tokens"] == 100
+        assert _usage_posts(client)[-1]["data"]["cumulative_input_tokens"] == 50
+
+        sync.record(_usage_item(2, input_other=5, output=1), wire="/w/a")
+        await sync.sync(client)
+        assert _usage_posts(client)[-1]["data"]["cumulative_input_tokens"] == 55
 
     @pytest.mark.asyncio
     async def test_new_wire_keeps_cumulative_totals(
@@ -1137,6 +1213,58 @@ class TestForwardLoopUsage:
         ]
         assert combined
         assert combined[-1]["data"]["cumulative_output_tokens"] == 15
+
+    @pytest.mark.asyncio
+    async def test_transcript_flows_while_usage_state_unwritable(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The wire cursor is never gated on usage-state durability.
+
+        With the bridge dir unwritable for usage state, the live loop still
+        mirrors the transcript, still delivers usage from in-memory totals,
+        and still advances the cursor past every row (design ruling:
+        transcript liveness wins over usage durability).
+        """
+        from omnigent import kimi_native_forwarder as fwd
+
+        home = tmp_path / "home"
+        bridge = tmp_path / "bridge"
+        bridge.mkdir()
+        monkeypatch.setattr(fwd, "_write_usage_state", lambda _b, _s: False)
+        now_ms = int(time.time() * 1000)
+        _loop_wire(
+            home,
+            [
+                {"type": "llm.request", "kind": "loop", "model": "system.ai.kimi-k3"},
+                _loop_usage_row(input_other=42, output=7, time_ms=now_ms),
+                {
+                    "type": "turn.prompt",
+                    "input": [{"type": "text", "text": "hi"}],
+                    "origin": {"kind": "user"},
+                },
+            ],
+        )
+        client = _FakeAsyncClient()
+
+        def _done() -> bool:
+            types = {b["type"] for b in client.posts}
+            return {"external_conversation_item", "external_session_usage"} <= types
+
+        await _drive_loop(
+            monkeypatch,
+            bridge_dir=bridge,
+            home=home,
+            client=client,
+            launch_epoch_ms=0,
+            until=_done,
+        )
+
+        usage = next(b for b in client.posts if b["type"] == "external_session_usage")
+        assert usage["data"]["cumulative_input_tokens"] == 42
+        # The cursor advanced past every row despite the failed persists.
+        state = _read_state(bridge)
+        assert state is not None
+        assert state.last_line >= 3
 
 
 class TestReadWireResilience:
