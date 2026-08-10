@@ -385,6 +385,18 @@ def _sync(
     )
 
 
+def _valid_usage_payload() -> dict:
+    """The canonical on-disk usage-state shape the writer emits."""
+    return {
+        "totals": {"input_other": 10, "output": 2, "cache_read": 3, "cache_creation": 0},
+        "model": "system.ai.kimi-k3",
+        "posted_model": "system.ai.kimi-k3",
+        "context_tokens": 13,
+        "billed_wire": "/w/a",
+        "billed_line": 5,
+    }
+
+
 def _no_window(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep the usage sync off the real model-catalog/litellm lookup."""
     from omnigent.llms import context_window
@@ -857,25 +869,9 @@ class TestUsageSync:
         assert trusted is True
         assert any("starting fresh" in r.message for r in caplog.records)
 
-    @pytest.mark.parametrize(
-        "payload",
-        [
-            pytest.param({"totals": "nope", "billed_line": -1}, id="totals-wrong-type"),
-            pytest.param(
-                {"totals": {"input_other": "10"}, "billed_line": -1},
-                id="totals-value-wrong-type",
-            ),
-            pytest.param({"totals": {}, "model": 7, "billed_line": -1}, id="model-wrong-type"),
-            pytest.param({"totals": {}, "billed_line": "5"}, id="billed-line-wrong-type"),
-            pytest.param({"billed_line": -1}, id="totals-missing"),
-            pytest.param({"totals": {}}, id="billed-line-missing"),
-        ],
-    )
-    def test_schema_invalid_usage_state_starts_fresh(
+    def _assert_starts_fresh(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture, payload: dict
     ) -> None:
-        """Parseable JSON with a wrong-typed or missing field is corruption:
-        silently defaulting it would trust a baseline that was never written."""
         import logging
 
         caplog.set_level(logging.WARNING, logger="omnigent.kimi_native_forwarder")
@@ -890,9 +886,43 @@ class TestUsageSync:
     @pytest.mark.parametrize(
         "mutate",
         [
+            pytest.param(lambda p: p.update(totals="nope"), id="totals-wrong-type"),
+            pytest.param(lambda p: p["totals"].update(output=True), id="counter-boolean"),
+            pytest.param(lambda p: p["totals"].update(output=-1), id="counter-negative"),
+            pytest.param(lambda p: p["totals"].update(output="2"), id="counter-wrong-type"),
+            pytest.param(lambda p: p.update(model=7), id="model-wrong-type"),
+            pytest.param(lambda p: p.update(model=""), id="model-empty-string"),
+            pytest.param(lambda p: p.update(posted_model=7), id="posted-model-wrong-type"),
+            pytest.param(lambda p: p.update(posted_model=""), id="posted-model-empty-string"),
+            pytest.param(lambda p: p.update(billed_wire=7), id="billed-wire-wrong-type"),
+            pytest.param(lambda p: p.update(context_tokens=-1), id="context-tokens-negative"),
+            pytest.param(lambda p: p.update(context_tokens="13"), id="context-tokens-wrong-type"),
+            pytest.param(lambda p: p.update(context_tokens=True), id="context-tokens-boolean"),
+            pytest.param(lambda p: p.update(billed_line="5"), id="billed-line-wrong-type"),
+            pytest.param(lambda p: p.update(billed_line=True), id="billed-line-boolean"),
+        ],
+    )
+    def test_schema_invalid_usage_state_starts_fresh(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, mutate: Callable[[dict], object]
+    ) -> None:
+        """One wrong-typed VALUE in an otherwise canonical payload is
+        corruption. Every case keeps the full writer-emitted key set so the
+        value-type rules themselves reject it, not the key-set guard —
+        silently defaulting the value would trust a baseline that was never
+        written (True is an instance of int, so booleans need their own
+        rejection)."""
+        payload = _valid_usage_payload()
+        mutate(payload)
+        self._assert_starts_fresh(tmp_path, caplog, payload)
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
             pytest.param(lambda p: p.update(totals={"input_other": 10}), id="totals-single-key"),
             pytest.param(lambda p: p["totals"].pop("cache_creation"), id="totals-one-key-missing"),
             pytest.param(lambda p: p["totals"].update(extra=1), id="totals-extra-key"),
+            pytest.param(lambda p: p.pop("totals"), id="totals-missing"),
+            pytest.param(lambda p: p.pop("billed_line"), id="billed-line-missing"),
             pytest.param(lambda p: p.pop("posted_model"), id="nullable-field-missing"),
             pytest.param(lambda p: p.pop("context_tokens"), id="context-tokens-missing"),
             pytest.param(lambda p: p.update(extra=1), id="top-level-extra-key"),
@@ -905,30 +935,15 @@ class TestUsageSync:
     def test_partial_or_inconsistent_usage_state_starts_fresh(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture, mutate: Callable[[dict], object]
     ) -> None:
-        """Partial totals or a torn watermark pair is corruption, not a
-        trustable baseline: the writer always persists all four counters and
-        the watermark as a pair, and trusting a subset would zero the missing
-        counters while the watermark suppresses re-billing — a permanent
-        undercount that never self-corrects (fresh start re-bills forward)."""
-        import logging
-
-        caplog.set_level(logging.WARNING, logger="omnigent.kimi_native_forwarder")
-        payload: dict = {
-            "totals": {"input_other": 10, "output": 2, "cache_read": 3, "cache_creation": 0},
-            "model": "system.ai.kimi-k3",
-            "posted_model": "system.ai.kimi-k3",
-            "context_tokens": 13,
-            "billed_wire": "/w/a",
-            "billed_line": 5,
-        }
+        """A missing/extra field, partial totals, or a torn watermark pair is
+        corruption, not a trustable baseline: the writer always persists all
+        four counters and the watermark as a pair, and trusting a subset
+        would zero the missing counters while the watermark suppresses
+        re-billing — a permanent undercount that never self-corrects (fresh
+        start re-bills forward)."""
+        payload = _valid_usage_payload()
         mutate(payload)
-        (tmp_path / "kimi_usage_state.json").write_text(json.dumps(payload), encoding="utf-8")
-
-        state, trusted = _read_usage_state(tmp_path)
-
-        assert state is None
-        assert trusted is True
-        assert any("starting fresh" in r.message for r in caplog.records)
+        self._assert_starts_fresh(tmp_path, caplog, payload)
 
     @pytest.mark.asyncio
     async def test_suspended_never_persists_and_adopts_recovered_state(
