@@ -288,6 +288,48 @@ async def test_stalled_response_head_raises_read_timeout() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stalled_body_on_replaced_tunnel_raises_connection_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A read timeout on a stale-generation request is a tunnel transition.
+
+    Newest-wins replacement can race a stalled read: the new tunnel is
+    already registered while the old request's abort wakeup (scheduled
+    onto the request loop) has not landed yet. The timeout must classify
+    as ``ConnectionError`` (the runner_disconnected path), not
+    ``httpx.ReadTimeout`` — a "runner still registered" liveness check
+    would otherwise misattribute it as a live-tunnel stream loss. The
+    abort is no-opped to hold that race window open deterministically.
+    """
+    reg = TunnelRegistry()
+    reg.register("r1", _NoopWS(), _hello())
+    transport = WSTunnelTransport(reg, "r1")
+
+    task = asyncio.create_task(transport.handle_async_request(_make_stream_request(0.05)))
+    await asyncio.sleep(0.01)
+
+    session = reg.get("r1")
+    assert session is not None
+    req_id = next(iter(session.in_flight))
+    reg.route_response_frame("r1", ResponseHeadFrame(id=req_id, status=200))
+    response = await task
+
+    monkeypatch.setattr(
+        TunnelRegistry,
+        "_abort_session_inflight",
+        staticmethod(lambda session, error: None),
+    )
+    reg.register("r1", _NoopWS(), _hello())
+    assert reg.get("r1") is not session
+
+    async def _drain() -> list[bytes]:
+        return [chunk async for chunk in response.stream]
+
+    with pytest.raises(ConnectionError, match="replaced"):
+        await asyncio.wait_for(_drain(), timeout=2.0)
+
+
+@pytest.mark.asyncio
 async def test_stalled_body_read_timeout_carries_request() -> None:
     """The body-path ReadTimeout carries the originating request.
 

@@ -5898,13 +5898,17 @@ def _is_tunnel_transition_error(exc: BaseException) -> bool:
 
 
 def _runner_tunnel_alive(runner_client: httpx.AsyncClient, runner_id: str | None) -> bool:
-    """True when ``runner_id`` is still registered on a WS tunnel transport."""
+    """True when ``runner_id`` is still registered on a WS tunnel transport.
+
+    Falls back to False (the runner_disconnected path) when the client
+    isn't backed by a :class:`WSTunnelTransport`.
+    """
     if runner_id is None:
         return False
-    transport = runner_client._transport
+    transport = getattr(runner_client, "_transport", None)
     if not isinstance(transport, WSTunnelTransport):
         return False
-    return transport._registry.get(runner_id) is not None
+    return transport.runner_registered(runner_id)
 
 
 async def _relay_runner_stream(
