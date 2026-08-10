@@ -296,6 +296,9 @@ class TestState:
             totals={"input_other": 100, "output": 20, "cache_read": 50, "cache_creation": 5},
             model="system.ai.kimi-k3",
             posted_model="system.ai.kimi-k3",
+            context_tokens=150,
+            billed_through_ms=1786275843173,
+            billed_line=42,
         )
         _write_usage_state(tmp_path, state)
         loaded = _read_usage_state(tmp_path)
@@ -362,9 +365,19 @@ def _usage_item(
     return item
 
 
-def _sync(bridge_dir: Path, state: _UsageState | None = None) -> _KimiUsageSync:
+def _sync(
+    bridge_dir: Path,
+    state: _UsageState | None = None,
+    *,
+    billing_floor_ms: int = 0,
+) -> _KimiUsageSync:
     return _KimiUsageSync(
-        base_url="http://ap", headers={}, session_id="conv_k", bridge_dir=bridge_dir, state=state
+        base_url="http://ap",
+        headers={},
+        session_id="conv_k",
+        bridge_dir=bridge_dir,
+        state=state,
+        billing_floor_ms=billing_floor_ms,
     )
 
 
@@ -372,7 +385,7 @@ def _no_window(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep the usage sync off the real model-catalog/litellm lookup."""
     from omnigent.llms import context_window
 
-    monkeypatch.setattr(context_window, "find_model_context_window", lambda _m: None)
+    monkeypatch.setattr(context_window, "find_model_context_window", lambda _m, **_kw: None)
 
 
 def _usage_posts(client: _RecordingClient) -> list[dict]:
@@ -520,7 +533,7 @@ class TestUsageSync:
     ) -> None:
         from omnigent.llms import context_window
 
-        monkeypatch.setattr(context_window, "find_model_context_window", lambda _m: 262_144)
+        monkeypatch.setattr(context_window, "find_model_context_window", lambda _m, **_kw: 262_144)
         client = _RecordingClient()
         sync = _sync(tmp_path)
         sync.note_model("system.ai.kimi-k3")
@@ -601,6 +614,85 @@ class TestUsageSync:
         assert data["cumulative_output_tokens"] == 21
         # Attribution stays on the resolved llm.request model, not the alias.
         assert data["model"] == "system.ai.kimi-k3"
+
+    @pytest.mark.asyncio
+    async def test_replayed_rows_after_stale_cursor_are_not_rebilled(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Crash between the totals write and the cursor write must not
+        double-bill: the billed high-water mark persists WITH the totals, so
+        re-reading the same wire rows on restart is idempotent."""
+        _no_window(monkeypatch)
+        client = _RecordingClient()
+        first = _sync(tmp_path)
+        first.record(_usage_item(3, input_other=100, output=10))
+        # Simulated hard kill: the wire cursor was NOT advanced, so a restart
+        # replays line 3 into a sync rebuilt from the persisted usage state.
+        sync = _sync(tmp_path, state=_read_usage_state(tmp_path))
+        sync.record(_usage_item(3, input_other=100, output=10))
+        await sync.sync(client)
+
+        data = _usage_posts(client)[-1]["data"]
+        assert data["cumulative_input_tokens"] == 100
+        assert data["cumulative_output_tokens"] == 10
+
+    @pytest.mark.asyncio
+    async def test_same_millisecond_sibling_record_still_bills(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The high-water mark tiebreaks on the wire line, so a distinct
+        record sharing the previous record's timestamp still counts."""
+        _no_window(monkeypatch)
+        client = _RecordingClient()
+        sync = _sync(tmp_path)
+        sync.record(_usage_item(3, input_other=100, output=10, time_ms=777))
+        sync.record(_usage_item(4, input_other=50, output=5, time_ms=777))
+        await sync.sync(client)
+
+        assert _usage_posts(client)[-1]["data"]["cumulative_input_tokens"] == 150
+
+    @pytest.mark.asyncio
+    async def test_billing_floor_is_strictly_launch(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Records stamped even 1ms (or 9s) before launch are a prior
+        session's history and never bill; the discovery mtime skew must not
+        leak into billing."""
+        _no_window(monkeypatch)
+        client = _RecordingClient()
+        launch_ms = 1786275843173
+        sync = _sync(tmp_path, billing_floor_ms=launch_ms)
+
+        sync.record(_usage_item(1, input_other=90000, output=9000, time_ms=launch_ms - 9_000))
+        sync.record(_usage_item(2, input_other=99999, output=9999, time_ms=launch_ms - 1))
+        sync.record(_usage_item(3, input_other=11, output=2, time_ms=launch_ms))
+        await sync.sync(client)
+
+        data = _usage_posts(client)[-1]["data"]
+        assert data["cumulative_input_tokens"] == 11
+        assert data["cumulative_output_tokens"] == 2
+
+    @pytest.mark.asyncio
+    async def test_failed_post_retries_with_context_tokens_after_restart(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """context_tokens persists with the pending state: a post that failed
+        right before a restart retries WITH the context occupancy."""
+        _no_window(monkeypatch)
+        client = _RecordingClient()
+        client.fail_with = httpx.ConnectError("boom")
+        first = _sync(tmp_path)
+        first.record(_usage_item(1, input_other=10, output=1, cache_read=30))
+        await first.sync(client)
+        assert client.posts == []
+
+        client.fail_with = None
+        sync = _sync(tmp_path, state=_read_usage_state(tmp_path))
+        await sync.sync(client)
+
+        data = _usage_posts(client)[0]["data"]
+        assert data["context_tokens"] == 10 + 30
+        assert data["cumulative_input_tokens"] == 40
 
     @pytest.mark.asyncio
     async def test_new_wire_keeps_cumulative_totals(
@@ -807,10 +899,13 @@ class TestForwardLoopUsage:
         bridge = tmp_path / "bridge"
         bridge.mkdir()
         now_ms = int(time.time() * 1000)
+        # History includes rows only 9s and 1ms before launch — inside the
+        # discovery mtime skew, which must NOT leak into billing.
         _loop_wire(
             home,
             [
-                _loop_usage_row(input_other=99999, output=9999, time_ms=now_ms - 3_600_000),
+                _loop_usage_row(input_other=90000, output=9000, time_ms=now_ms - 9_000),
+                _loop_usage_row(input_other=99999, output=9999, time_ms=now_ms - 1),
                 {
                     "type": "turn.prompt",
                     "input": [{"type": "text", "text": "hi"}],
@@ -826,7 +921,7 @@ class TestForwardLoopUsage:
             bridge_dir=bridge,
             home=home,
             client=client,
-            launch_epoch_ms=now_ms - 60_000,
+            launch_epoch_ms=now_ms,
             until=lambda: any(b["type"] == "external_session_usage" for b in client.posts),
         )
 
@@ -893,8 +988,14 @@ class TestForwardLoopUsage:
 
 
 class TestReadWireResilience:
-    def test_invalid_utf8_is_replace_decoded_not_raised(self, tmp_path: Path) -> None:
-        """A torn/malformed write must not crash-loop the supervisor."""
+    def test_invalid_utf8_is_replace_decoded_not_raised(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A torn/malformed write must not crash-loop the supervisor — and it
+        must leave a (once-per-file) diagnostic rather than vanish silently."""
+        import logging
+
+        caplog.set_level(logging.WARNING, logger="omnigent.kimi_native_forwarder")
         wire = tmp_path / "wire.jsonl"
         good = json.dumps(
             {
@@ -906,8 +1007,25 @@ class TestReadWireResilience:
         wire.write_bytes(b"\xff\xfe garbage \xff\n" + good + b"\n")
 
         items = read_kimi_wire_items(wire, 0)
+        items_again = read_kimi_wire_items(wire, 0)
 
         assert [(i.role, i.text) for i in items] == [("user", "hi")]
+        assert [(i.role, i.text) for i in items_again] == [("user", "hi")]
+        warnings = [r for r in caplog.records if "unparseable wire row" in r.message]
+        assert len(warnings) == 1
+
+    def test_truncated_json_row_is_skipped_with_diagnostic(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        caplog.set_level(logging.WARNING, logger="omnigent.kimi_native_forwarder")
+        wire = tmp_path / "wire.jsonl"
+        wire.write_text('{"type": "turn.prom\n', encoding="utf-8")
+
+        assert read_kimi_wire_items(wire, 0) == []
+        warnings = [r for r in caplog.records if "unparseable wire row" in r.message]
+        assert len(warnings) == 1
 
     def test_unreadable_file_logs_once_and_returns_empty(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture

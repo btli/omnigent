@@ -384,6 +384,20 @@ def test_find_model_context_window_honors_env_override(
     assert get_model_context_window("uncatalogued-model") == 555_000
 
 
+def test_find_model_context_window_catalog_pure_ignores_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``allow_override=False`` resolves from model metadata only.
+
+    Per-model consumers (the kimi-native forwarder's usage posts) must not
+    stamp a process-wide override onto an arbitrary model — an unresolvable
+    model omits the window instead.
+    """
+    monkeypatch.setattr(context_window, "find_catalog_models", lambda _model: [])
+    monkeypatch.setenv("AP_CONTEXT_WINDOW_OVERRIDE", "555000")
+    assert find_model_context_window("uncatalogued-model", allow_override=False) is None
+
+
 def test_get_model_context_window_encoded_and_offline_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

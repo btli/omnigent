@@ -173,7 +173,13 @@ def _sum_wire_usage(
             start = offset if 0 <= offset <= size else 0
             fh.seek(start)
             blob = fh.read()
-    except OSError:
+    except OSError as exc:
+        _warn_once(
+            f"wire-unreadable:{wire_path}",
+            "kimi executor: cannot read wire log %s (no usage reported): %s",
+            wire_path,
+            exc,
+        )
         return None, None, offset
     first_read = start == 0
     totals = {
@@ -187,13 +193,23 @@ def _sum_wire_usage(
     record_model: str | None = None
     for raw in blob.decode("utf-8", errors="replace").splitlines():
         line = raw.strip()
-        if not line.startswith("{"):
+        if not line:
             continue
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
+        row: object = None
+        if line.startswith("{"):
+            try:
+                row = json.loads(line)
+            except ValueError:
+                row = None
         if not isinstance(row, dict):
+            # Torn write / non-JSON noise: skip, but keep the diagnostic.
+            _warn_once(
+                f"wire-badrow:{wire_path}",
+                "kimi executor: skipping unparseable wire row(s) in %s "
+                "(further rows logged at debug)",
+                wire_path,
+            )
+            _logger.debug("kimi executor: unparseable wire row: %.200s", line)
             continue
         row_type = row.get("type")
         if row_type == "llm.request":
@@ -227,7 +243,7 @@ def _sum_wire_usage(
             # Schema drift: skip the whole record — partial/zero sums would
             # be silently wrong and the checkpoint advances irreversibly.
             _warn_once(
-                "usage.record-drift",
+                f"usage.record-drift:{wire_path}",
                 "kimi executor: skipping usage.record not matching the pinned "
                 "0.34.0 schema (further drift logged at debug): %r",
                 row,
@@ -240,6 +256,10 @@ def _sum_wire_usage(
             totals[out_key] += value
         record_model = model
         counted = True
+    if counted:
+        # The relay path stores total_tokens as its own accumulator (never
+        # derived), so omitting it would report 0 total forever.
+        totals["total_tokens"] = sum(totals.values())
     # Bytes appended between the size probe and the read must not be
     # re-counted next turn: checkpoint what was actually consumed.
     return (totals if counted else None), (request_model or record_model), start + len(blob)
@@ -496,7 +516,10 @@ class KimiExecutor(Executor):
             wire = _find_wire_log(resolve_user_kimi_home(), session_id)
             if wire is not None:
                 self._wire_offsets[session_id] = wire.stat().st_size
-        except OSError:
+        except Exception:
+            # Best-effort boundary (e.g. Path.home() in a HOME-less env):
+            # seeding must never fail the turn.
+            _logger.exception("kimi executor: wire checkpoint seeding failed")
             return
 
     def _collect_turn_usage(self, turn_start_ms: int) -> dict[str, object] | None:
@@ -515,6 +538,12 @@ class KimiExecutor(Executor):
         try:
             wire_path = _find_wire_log(resolve_user_kimi_home(), session_id)
             if wire_path is None:
+                _warn_once(
+                    f"wire-missing:{session_id}",
+                    "kimi executor: no wire log found for %s (no usage reported "
+                    "this turn; retried next turn)",
+                    session_id,
+                )
                 return None
             offset = self._wire_offsets.get(session_id, 0)
             totals, model, new_offset = _sum_wire_usage(
