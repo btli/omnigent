@@ -33,9 +33,10 @@ class OmnigentWebViewClientTest {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
         var readyUrl: String? = null
         val client =
-            client(shouldInjectBridgeAtPageReady = true) { url ->
-                readyUrl = url
-            }
+            client(
+                shouldInjectBridgeAtPageReady = true,
+                onPageReady = { url -> readyUrl = url },
+            )
 
         client.onPageFinished(webView, PINNED_URL)
 
@@ -291,16 +292,119 @@ class OmnigentWebViewClientTest {
     /** Run posted bounces (see the client's mainHandler) before asserting. */
     private fun idleMainLooper() = shadowOf(Looper.getMainLooper()).idle()
 
+    @Test
+    fun `idp redirect opens the auth tab when one is available`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        var logins = 0
+        var proxyLogins = 0
+        val client =
+            client(
+                pinnedOrigin = DATABRICKS_ORIGIN,
+                onLoginRequired = { logins++ },
+                useAuthTab = true,
+                onProxyLoginRequired = { proxyLogins++ },
+            )
+
+        val handled = client.shouldOverrideUrlLoading(webView, request(IDP_URL))
+
+        assertTrue(handled) // true = the redirect never loads in the WebView
+        assertEquals(1, proxyLogins)
+        assertEquals(0, logins) // the system-browser flow stays untouched
+    }
+
+    @Test
+    fun `tapped external link beats the auth tab on in-webview-auth servers`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        webView.currentUrl = "$DATABRICKS_ORIGIN/app"
+        var proxyLogins = 0
+        val client =
+            client(
+                pinnedOrigin = DATABRICKS_ORIGIN,
+                useAuthTab = true,
+                onProxyLoginRequired = { proxyLogins++ },
+            )
+
+        val handled =
+            client.shouldOverrideUrlLoading(
+                webView,
+                request("https://example.org/docs", hasGesture = true),
+            )
+
+        assertTrue(handled)
+        assertEquals(0, proxyLogins) // external link, not a login bounce
+    }
+
+    @Test
+    fun `off-origin landing opens the auth tab when one is available`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        var proxyLogins = 0
+        val client =
+            client(
+                pinnedOrigin = DATABRICKS_ORIGIN,
+                useAuthTab = true,
+                onProxyLoginRequired = { proxyLogins++ },
+            )
+
+        client.onPageStarted(webView, IDP_URL, null)
+
+        assertTrue(webView.stopLoadingCalled)
+        assertEquals(1, proxyLogins)
+    }
+
+    @Test
+    fun `off-origin landing stays inline once the auth tab is unavailable`() {
+        // The fallback posture: shouldUseAuthTabLogin() returns false (no
+        // support, or a dismissed tab downgraded the flow) — the redirect
+        // chain must keep loading inline exactly as before.
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        var proxyLogins = 0
+        val client =
+            client(
+                pinnedOrigin = DATABRICKS_ORIGIN,
+                useAuthTab = false,
+                onProxyLoginRequired = { proxyLogins++ },
+            )
+
+        client.onPageStarted(webView, IDP_URL, null)
+        val handled = client.shouldOverrideUrlLoading(webView, request(IDP_URL))
+
+        assertFalse(webView.stopLoadingCalled)
+        assertFalse(handled)
+        assertEquals(0, proxyLogins)
+    }
+
+    @Test
+    fun `auth tab is never used for servers on the system-browser flow`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        var logins = 0
+        var proxyLogins = 0
+        val client =
+            client(
+                onLoginRequired = { logins++ },
+                useAuthTab = true,
+                onProxyLoginRequired = { proxyLogins++ },
+            )
+
+        client.onPageStarted(webView, IDP_URL, null)
+
+        assertEquals(1, logins)
+        assertEquals(0, proxyLogins)
+    }
+
     private fun client(
         shouldInjectBridgeAtPageReady: Boolean = false,
         pinnedOrigin: String = PINNED_ORIGIN,
         onLoginRequired: () -> Unit = {},
         onPageReady: (String?) -> Unit = {},
+        useAuthTab: Boolean = false,
+        onProxyLoginRequired: () -> Unit = {},
     ) = OmnigentWebViewClient(
         pinnedOrigin = { pinnedOrigin },
         shouldInjectBridgeAtPageReady = { shouldInjectBridgeAtPageReady },
         onPageReady = onPageReady,
         onLoginRequired = onLoginRequired,
+        shouldUseAuthTabLogin = { useAuthTab },
+        onProxyLoginRequired = onProxyLoginRequired,
     )
 
     private fun request(

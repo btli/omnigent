@@ -11,10 +11,13 @@ import android.webkit.WebViewClient
 
 /**
  * Signals [onPageReady] once a pinned-origin page finishes loading and decides
- * where the login flow runs: inline for servers matching [usesInWebViewAuth],
- * otherwise handed to the system browser via [onLoginRequired]. A landing on a
- * bare Databricks workspace root is bounced to the workspace's `/omnigent`
- * mount (see [workspaceRootTarget]).
+ * where the login flow runs. For servers matching [usesInWebViewAuth] the
+ * redirect chain runs in an Auth Tab via [onProxyLoginRequired] when
+ * [shouldUseAuthTabLogin] allows it (a real browser context, so IdPs that
+ * refuse embedded user-agents still work), and inline in the WebView
+ * otherwise. Every other server is handed to the system browser via
+ * [onLoginRequired]. A landing on a bare Databricks workspace root is bounced
+ * to the workspace's `/omnigent` mount (see [workspaceRootTarget]).
  *
  * The facade is normally registered with `addDocumentStartJavaScript` in
  * `MainActivity`. Older WebViews that support the message listener but not
@@ -28,6 +31,8 @@ class OmnigentWebViewClient(
     private val shouldInjectBridgeAtPageReady: () -> Boolean,
     private val onPageReady: (url: String?) -> Unit,
     private val onLoginRequired: () -> Unit,
+    private val shouldUseAuthTabLogin: () -> Boolean = { false },
+    private val onProxyLoginRequired: () -> Unit = {},
 ) : WebViewClient() {
     // Bare-root -> /omnigent bounces since the last app page loaded; see
     // workspaceRootTarget for why they're capped.
@@ -57,12 +62,23 @@ class OmnigentWebViewClient(
         // load of the pinned server (e.g. it's offline), NOT an IdP redirect —
         // don't misread it as a bounce and pop the browser. Mirror the http(s)
         // gate in shouldOverrideUrlLoading.
-        if (isHttpScheme(scheme) && origin != pinned && !usesInWebViewAuth(pinned)) {
-            // Log origin only, never the full URL (carries OAuth state/PKCE).
-            authLog("off-origin landing $origin -> login")
-            view.stopLoading()
-            onLoginRequired()
-            return
+        if (isHttpScheme(scheme) && origin != pinned) {
+            if (!usesInWebViewAuth(pinned)) {
+                // Log origin only, never the full URL (carries OAuth state/PKCE).
+                authLog("off-origin landing $origin -> login")
+                view.stopLoading()
+                onLoginRequired()
+                return
+            }
+            // In-WebView-auth server bouncing to its front door / IdP: run
+            // the login in an Auth Tab when one is available, else keep
+            // loading inline (the pre-Auth-Tab behavior, and the fallback).
+            if (shouldUseAuthTabLogin()) {
+                authLog("off-origin landing $origin -> auth tab")
+                view.stopLoading()
+                onProxyLoginRequired()
+                return
+            }
         }
 
         // Workspace roots are caught here too, not only in
@@ -150,15 +166,22 @@ class OmnigentWebViewClient(
 
         authLog("off-origin nav $origin gesture=${request.hasGesture()}")
 
-        // In-WebView auth: the IdP flow runs inline — safe because the native
-        // bridge is origin-allowlisted to the pinned origin by WebView itself, so
-        // the IdP page can't reach it. Only a gesture from a pinned-origin page is
-        // an external link; once we're on the IdP's own pages its navigations
-        // (sign-in buttons, form posts, tenant hops) are all gesture-driven and
-        // must stay inline or the flow ejects to the browser mid-login.
+        // In-WebView auth: a server redirect to the front door / IdP runs in an
+        // Auth Tab when available (real browser context — IdPs that refuse
+        // embedded user-agents still work). Without one the flow runs inline —
+        // safe because the native bridge is origin-allowlisted to the pinned
+        // origin by WebView itself, so the IdP page can't reach it. Only a
+        // gesture from a pinned-origin page is an external link; once we're on
+        // the IdP's own pages its navigations (sign-in buttons, form posts,
+        // tenant hops) are all gesture-driven and must stay inline or the flow
+        // ejects to the browser mid-login.
         if (usesInWebViewAuth(pinned)) {
             if (originOf(view.url) == pinned && request.hasGesture()) {
                 runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
+                return true
+            }
+            if (shouldUseAuthTabLogin()) {
+                onProxyLoginRequired()
                 return true
             }
             return false
