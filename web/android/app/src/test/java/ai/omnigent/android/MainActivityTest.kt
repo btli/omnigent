@@ -163,6 +163,22 @@ class MainActivityTest {
     }
 
     @Test
+    fun `missing auth tab provider falls back without reloading a custom origin`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        ServerStore(context).connect(CUSTOM_ORIGIN)
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        val webView = shadowOf(activity.webView())
+        val loadedBeforeFallback = webView.lastLoadedUrl
+        activity.authTabProviderPackageForTest = { null }
+
+        activity.startProxyLogin()
+
+        assertFalse(activity.authTabFlow.inFlight)
+        assertTrue(activity.authTabFellBack)
+        assertEquals(loadedBeforeFallback, webView.lastLoadedUrl)
+    }
+
+    @Test
     fun `exchange auth tab launch falls back when provider resolution is null`() {
         val origin = DATABRICKS_ORIGIN
         ServerStore(ApplicationProvider.getApplicationContext()).connect(origin)
@@ -192,6 +208,7 @@ class MainActivityTest {
             .get(this) as WebView
 
     private companion object {
+        const val CUSTOM_ORIGIN = "https://example.com"
         const val DATABRICKS_ORIGIN = "https://example.databricksapps.com"
     }
 }
