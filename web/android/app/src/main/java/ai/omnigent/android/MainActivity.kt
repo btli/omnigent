@@ -64,17 +64,15 @@ class MainActivity : AppCompatActivity() {
         }
     internal val authTabFlow = AuthTabFlow()
     private val nativeExchange = NativeAuthExchange()
-    private val authTabCapabilityProbe = AuthTabCapabilityProbe()
+    private val authTabCapabilityProbe by lazy { AuthTabCapabilityProbe(this) }
     private val authTabProviderPackage by lazy { AuthTabSupport.providerPackage(this) }
     internal var authTabProviderPackageForTest: (() -> String?)? = null
     internal var authTabOriginCapable: Boolean? = null
     private var authTabCapabilityPending = false
 
-    // One-shot downgrade to the inline in-WebView login after an Auth Tab
-    // flow is dismissed or fails, so a bounce -> tab -> cancel -> bounce
-    // cycle can't loop. Sticky for the rest of the process (a mere page
-    // load proves nothing about why the tab failed); reset only on a
-    // server switch, where the new server deserves a fresh attempt.
+    // One-shot downgrade after an Auth Tab flow is dismissed or fails, so a
+    // bounce -> tab -> cancel -> bounce cycle can't loop. Reset only on an
+    // explicit reload or server switch, where a fixed server deserves a retry.
     internal var authTabFellBack = false
 
     // Bridge-dependent work deferred until the page (and its injected emit
@@ -415,10 +413,19 @@ class MainActivity : AppCompatActivity() {
     private fun probeAuthTabCapability() {
         val origin = pinnedOrigin ?: return
         if (authTabCapabilityPending) return
+        if (usesInWebViewAuth(origin)) {
+            authTabOriginCapable = false
+            return
+        }
+        if (resolvedAuthTabProviderPackage() == null) {
+            authTabOriginCapable = false
+            fallBackFromAuthTab("no Auth Tab provider")
+            return
+        }
         authTabCapabilityPending = true
         authTabCapabilityProbe.probe(origin) { supported ->
-            if (isDestroyed || isFinishing || origin != pinnedOrigin) return@probe
             authTabCapabilityPending = false
+            if (isDestroyed || isFinishing || origin != pinnedOrigin) return@probe
             authTabOriginCapable = supported
             authLog("asset links probe $origin -> ${if (supported) "available" else "unavailable"}")
             when {
@@ -426,12 +433,8 @@ class MainActivity : AppCompatActivity() {
                     startProxyLogin()
                 }
 
-                supported || usesInWebViewAuth(origin) -> {
-                    fallBackToInlineLogin("Auth Tab capability unavailable")
-                }
-
                 else -> {
-                    startLogin()
+                    fallBackFromAuthTab("Auth Tab capability unavailable")
                 }
             }
         }
@@ -442,9 +445,8 @@ class MainActivity : AppCompatActivity() {
      * `/auth/native-complete` there, let whatever fronts the server (a
      * front-door auth proxy, its IdP hops) run in a real browser context,
      * and receive the completion redirect back through
-     * [handleAuthTabResult]. Triggered by [OmnigentWebViewClient] when an
-     * in-WebView-auth server bounces off-origin and an Auth Tab is
-     * available.
+     * [handleAuthTabResult]. Triggered by [OmnigentWebViewClient] when a
+     * capable server bounces off-origin and an Auth Tab is available.
      */
     internal fun startProxyLogin() {
         val origin = pinnedOrigin ?: return
@@ -455,12 +457,12 @@ class MainActivity : AppCompatActivity() {
         }
         val providerPackage = resolvedAuthTabProviderPackage()
         if (providerPackage == null) {
-            fallBackToInlineLogin("no Auth Tab provider")
+            fallBackFromAuthTab("no Auth Tab provider")
             return
         }
         val callback = NativeAuth.callback(origin)
         if (callback == null) {
-            fallBackToInlineLogin("auth tab requires an HTTPS server origin")
+            fallBackFromAuthTab("auth tab requires an HTTPS server origin")
             return
         }
         val url = authTabFlow.begin(origin, packageName) ?: return
@@ -475,14 +477,14 @@ class MainActivity : AppCompatActivity() {
                 callback.path,
             )
         } catch (_: Exception) {
-            // No browser able to take the launch — abandon the flow and let
-            // the next bounce run inline.
+            // No browser able to take the launch — abandon the flow and use
+            // the origin's established fallback.
             authTabFlow.cancel()
-            fallBackToInlineLogin("auth tab launch failed")
+            fallBackFromAuthTab("auth tab launch failed")
         }
     }
 
-    /** Advance the login with an Auth Tab result, or fall back to inline. */
+    /** Advance the login with an Auth Tab result, or use the established fallback. */
     internal fun onAuthTabOutcome(
         resultCode: Int,
         resultUri: Uri?,
@@ -493,7 +495,7 @@ class MainActivity : AppCompatActivity() {
             // server without /auth/native-complete (login completes but no
             // redirect ever fires, so the user closes the tab).
             authTabFlow.cancel()
-            fallBackToInlineLogin("auth tab result=$resultCode")
+            fallBackFromAuthTab("auth tab result=$resultCode")
             return
         }
         // The tab is gone either way, so an unmatched callback (wrong state, a
@@ -503,7 +505,7 @@ class MainActivity : AppCompatActivity() {
         when (val outcome = authTabFlow.handleCallback(resultUri, pinnedOrigin)) {
             null -> {
                 authTabFlow.cancel()
-                fallBackToInlineLogin("auth tab callback unmatched")
+                fallBackFromAuthTab("auth tab callback unmatched")
             }
 
             is AuthTabFlow.Outcome.LaunchExchangeTab -> {
@@ -514,13 +516,13 @@ class MainActivity : AppCompatActivity() {
                 val callback = pinnedOrigin?.let(NativeAuth::callback)
                 if (callback == null) {
                     authTabFlow.cancel()
-                    fallBackToInlineLogin("exchange tab lost HTTPS callback origin")
+                    fallBackFromAuthTab("exchange tab lost HTTPS callback origin")
                     return
                 }
                 val providerPackage = resolvedAuthTabProviderPackage()
                 if (providerPackage == null) {
                     authTabFlow.cancel()
-                    fallBackToInlineLogin("exchange tab lost Auth Tab provider")
+                    fallBackFromAuthTab("exchange tab lost Auth Tab provider")
                     return
                 }
                 try {
@@ -532,7 +534,7 @@ class MainActivity : AppCompatActivity() {
                     )
                 } catch (_: Exception) {
                     authTabFlow.cancel()
-                    fallBackToInlineLogin("exchange tab launch failed")
+                    fallBackFromAuthTab("exchange tab launch failed")
                 }
             }
 
@@ -546,7 +548,7 @@ class MainActivity : AppCompatActivity() {
                     // switch may have landed meanwhile.
                     authTabFlow.cancel()
                     if (auth == null || outcome.origin != pinnedOrigin) {
-                        fallBackToInlineLogin("code exchange failed")
+                        fallBackFromAuthTab("code exchange failed")
                     } else {
                         applyNativeAuthResult(auth)
                     }
@@ -563,7 +565,7 @@ class MainActivity : AppCompatActivity() {
         when (auth.tokenType) {
             NativeAuth.TOKEN_TYPE_SESSION -> {
                 if (!installSessionCookie(auth.token)) {
-                    fallBackToInlineLogin("session token rejected")
+                    fallBackFromAuthTab("session token rejected")
                 }
             }
 
@@ -585,16 +587,29 @@ class MainActivity : AppCompatActivity() {
         webView.loadUrl(url, mapOf("Authorization" to "Bearer $token"))
     }
 
-    /**
-     * Downgrade this login to the inline in-WebView flow (the pre-Auth-Tab
-     * behavior): reload the server and let its redirect chain run in the
-     * WebView. One-shot until a pinned-origin page loads, so a failing Auth
-     * Tab can't loop.
-     */
+    /** Route an Auth Tab failure through the origin's established login surface. */
+    private fun fallBackFromAuthTab(reason: String) {
+        if (usesInWebViewAuth(pinnedOrigin)) {
+            fallBackToInlineLogin(reason)
+            return
+        }
+        authLog("auth tab fallback -> system browser ($reason)")
+        authTabFellBack = true
+        startLogin()
+    }
+
+    /** Reload a legacy in-WebView-auth server so its redirect chain stays inline. */
     private fun fallBackToInlineLogin(reason: String) {
         authLog("auth tab fallback -> inline ($reason)")
         authTabFellBack = true
         currentServerUrl?.let { webView.loadUrl(it) }
+    }
+
+    private fun resetAuthTabCapability(origin: String?) {
+        authTabCapabilityProbe.forget(origin)
+        authTabFellBack = false
+        authTabOriginCapable = null
+        authTabCapabilityPending = false
     }
 
     /**
@@ -756,6 +771,7 @@ class MainActivity : AppCompatActivity() {
         serverUrl: String,
         newOrigin: String,
     ) {
+        val previousOrigin = pinnedOrigin
         removeBridge()
         pinnedOrigin = newOrigin
         currentServerUrl = serverUrl
@@ -766,9 +782,8 @@ class MainActivity : AppCompatActivity() {
         // the flow's origin binding would reject its callback anyway, but
         // drop it eagerly so a fresh login can start immediately.
         authTabFlow.cancel()
-        authTabFellBack = false
-        authTabOriginCapable = null
-        authTabCapabilityPending = false
+        authTabCapabilityProbe.forget(previousOrigin)
+        resetAuthTabCapability(newOrigin)
         (switchButton as? TextView)?.text = hostLabelOf(serverUrl)
         installBridge()
         webView.loadUrl(serverUrl)
@@ -816,6 +831,7 @@ class MainActivity : AppCompatActivity() {
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 3 -> {
+                    resetAuthTabCapability(pinnedOrigin)
                     webView.reload()
                     true
                 }
