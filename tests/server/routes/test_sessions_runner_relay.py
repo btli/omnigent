@@ -815,6 +815,106 @@ async def test_relay_repeated_stalls_exhaust_nonzero_grace_with_session_stream_l
         )
 
 
+async def _feed_banner_then_stall(registry: TunnelRegistry, runner_id: str) -> None:
+    """Serve every new stream request a head + banner heartbeat, then stall.
+
+    Mimics a runner that accepts stream connects (the /stream endpoint
+    emits an immediate ``session.heartbeat`` banner on subscription) but
+    never delivers anything after it.
+    """
+    seen: set[str] = set()
+    while True:
+        session = registry.get(runner_id)
+        req_id = None
+        if session is not None:
+            for rid in session.in_flight:
+                if rid not in seen:
+                    req_id = rid
+                    break
+        if req_id is None:
+            await asyncio.sleep(0.01)
+            continue
+        seen.add(req_id)
+        registry.route_response_frame(
+            runner_id,
+            ResponseHeadFrame(
+                id=req_id,
+                status=200,
+                headers=[["content-type", "text/event-stream"]],
+            ),
+        )
+        registry.route_response_frame(
+            runner_id,
+            ResponseBodyFrame(
+                id=req_id,
+                body='data: {"type": "session.heartbeat"}\n\n',
+                encoding="utf-8",
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_relay_banner_only_attempts_exhaust_nonzero_grace_with_session_stream_lost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Attempts that only ever see the banner heartbeat exhaust the grace.
+
+    The runner's /stream endpoint yields an immediate ``session.heartbeat``
+    banner the moment a subscription is served, so merely reaching the
+    runner must not count as stream progress — otherwise a runner that
+    accepts connects but stalls every attempt refreshes the grace
+    deadline forever and terminal ``session_stream_lost`` is unreachable.
+    Only frames after that first banner may refresh the deadline.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    # Each banner-then-stall attempt (0.3s) outlasts the grace (0.2s),
+    # mirroring production's 45s read timeout vs 10s grace.
+    monkeypatch.setattr(orchestration, "_RELAY_STREAM_READ_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 0.2)
+    monkeypatch.setattr(orchestration, "_RELAY_RETRY_INTERVAL_S", 0.05)
+    sessions_module._runner_relay_tasks.clear()
+    runner_id = "runner_banner_stall_grace"
+    registry = TunnelRegistry()
+    _register_test_runner(registry, runner_id)
+    client = httpx.AsyncClient(
+        transport=WSTunnelTransport(registry, runner_id),
+        base_url="http://runner",
+    )
+    session_id = "0718293a4b5c6d7e8f90a1b2c3d4e5f6"
+
+    feeder = asyncio.create_task(_feed_banner_then_stall(registry, runner_id))
+    collector = None
+    try:
+        handle = sessions_module._ensure_runner_relay(
+            session_id,
+            runner_id,
+            client,
+            conversation_store=None,
+        )
+        assert handle is not None
+        collector = await start_session_stream_collector(session_id)
+
+        # Every attempt gets the banner and nothing else. Without
+        # banner-excluded progress this retries forever and the wait
+        # below times out.
+        await asyncio.wait_for(handle.task, timeout=3.0)
+
+        event = await asyncio.wait_for(collector.queue.get(), timeout=2.0)
+        assert event.get("type") == "session.status"
+        assert event.get("status") == "failed"
+        assert event["error"]["code"] == "session_stream_lost"
+        assert registry.get(runner_id) is not None
+    finally:
+        await _cleanup_relay_test(
+            session_id=session_id,
+            collector=collector,
+            client=client,
+            feeder=feeder,
+        )
+
+
 class _RecordingLabelStore:
     """Minimal conversation store that records ``set_labels`` calls.
 
