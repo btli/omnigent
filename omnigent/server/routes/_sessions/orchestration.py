@@ -2602,11 +2602,12 @@ async def _publish_runner_recovered_status_impl(
     is live, so it clears any stale ``failed`` state. A *passive* tunnel
     reconnect is weaker: the process merely came back on its own, saying
     nothing about a genuine task error. Callers on that path pass
-    ``require_disconnect_code=True`` so only a ``runner_disconnected``
-    failure is cleared — a genuine task failure (``response.failed`` / a
-    setup error with any other ``last_task_error`` code) survives the
-    reconnect, keeping the red "Failed" pill instead of silently flipping
-    it back to idle and hiding the error.
+    ``require_disconnect_code=True`` so only a transport failure
+    (``runner_disconnected`` or ``session_stream_lost``) is cleared — a
+    genuine task failure (``response.failed`` / a setup error with any
+    other ``last_task_error`` code) survives the reconnect, keeping the
+    red "Failed" pill instead of silently flipping it back to idle and
+    hiding the error.
 
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
@@ -2614,23 +2615,28 @@ async def _publish_runner_recovered_status_impl(
         code and clear the labels on genuine recovery.
     :param require_disconnect_code: When ``True`` (passive-reconnect
         caller), only clear if the persisted ``last_task_error.code`` is
-        ``runner_disconnected``; when ``False`` (default, explicit
+        a transport failure (``runner_disconnected`` or
+        ``session_stream_lost``); when ``False`` (default, explicit
         rebind/handshake), clear any stale ``failed`` state. Labels are
         cleared in both cases.
     :returns: None.
     """
     if _session_status_cache.get(session_id) != "failed":
         return
-    # A passive reconnect must distinguish a benign runner disconnect
-    # from a real task failure: both land the cache on "failed", but only
-    # the disconnect persists a ``runner_disconnected`` label. The
-    # reconnect proves the runner is reachable again, which invalidates a
-    # disconnect failure but says nothing about a genuine task error —
-    # leave that one alone. Explicit rebinds skip this guard.
+    # A passive reconnect must distinguish a transport failure from a real
+    # task failure: both land the cache on "failed", but only a transport
+    # failure persists a ``runner_disconnected`` (runner went away) or
+    # ``session_stream_lost`` (tunnel/stream died under a registered
+    # runner) label. The reconnect proves the runner is reachable again,
+    # which invalidates either of those but says nothing about a genuine
+    # task error — leave that one alone. Explicit rebinds skip this guard.
     if require_disconnect_code:
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         last_error = _last_task_error_from_labels(conv.labels) if conv is not None else None
-        if last_error is None or last_error.get("code") != "runner_disconnected":
+        if last_error is None or last_error.get("code") not in {
+            "runner_disconnected",
+            "session_stream_lost",
+        }:
             return
     _session_status_cache[session_id] = "idle"
     session_live_state.persist_live_status(session_id, "idle")
