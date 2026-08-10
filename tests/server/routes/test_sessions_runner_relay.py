@@ -1927,6 +1927,38 @@ class _FlakyThenHealthyRunnerClient:
         return _HeartbeatStreamResponse(release)
 
 
+class _FlakyConnectErrorThenHealthyRunnerClient:
+    """Fake runner client that stays offline for a retry, then reconnects.
+
+    The first ``stream`` call raises the ``ConnectionError`` shape
+    ``WSTunnelTransport`` emits on tunnel close; the second raises the
+    ``httpx.ConnectError`` an unregistered runner produces before it
+    re-registers. Later calls serve a heartbeat and a terminating
+    ``[DONE]``.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def stream(
+        self,
+        method: str,
+        path: str,
+        *,
+        timeout: Any,
+    ) -> _HeartbeatStreamResponse:
+        del method, timeout
+        self.calls += 1
+        if self.calls == 1:
+            raise ConnectionError("tunnel closed before request completed")
+        if self.calls == 2:
+            request = httpx.Request("GET", f"http://runner{path}")
+            raise httpx.ConnectError("runner is not registered yet", request=request)
+        release = asyncio.Event()
+        release.set()
+        return _HeartbeatStreamResponse(release)
+
+
 @pytest.mark.asyncio
 async def test_relay_retries_transport_drop_within_grace(
     monkeypatch: pytest.MonkeyPatch,
@@ -1963,6 +1995,55 @@ async def test_relay_retries_transport_drop_within_grace(
         assert fake_runner.calls == 2, "relay did not retry after the drop"
         # The blip resolved silently: no failed status reached the cache
         # and no runner_disconnected labels were persisted.
+        assert sessions_module._session_status_cache.get(session_id) is None
+        assert store.labels.get(session_id) is None
+    finally:
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=1.0)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+async def test_relay_retries_connect_error_before_runner_reregisters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An offline retry attempt stays inside the grace until the runner returns.
+
+    A runner that has dropped its tunnel refuses connects outright
+    (``httpx.ConnectError``) until it re-registers. That gap must keep
+    the supervisor retrying rather than terminating the relay, so the
+    session recovers once the runner is back instead of surfacing
+    ``failed``.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._RELAY_RETRY_INTERVAL_S",
+        0.01,
+    )
+    sessions_module._runner_relay_tasks.clear()
+    fake_runner = _FlakyConnectErrorThenHealthyRunnerClient()
+    store = _RecordingLabelStore()
+    session_id = "6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e"
+
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_connect_error_then_healthy",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        await asyncio.wait_for(handle.task, timeout=2.0)
+
+        assert fake_runner.calls == 3, "relay did not retry after ConnectError"
+        # The offline gap resolved silently: no failed status reached the
+        # cache and no disconnect labels were persisted.
         assert sessions_module._session_status_cache.get(session_id) is None
         assert store.labels.get(session_id) is None
     finally:
