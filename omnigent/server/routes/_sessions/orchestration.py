@@ -5832,10 +5832,11 @@ class _RelayTransportLost(Exception):
     :param stream_lost: Whether the runner's tunnel was still registered
         when the stream dropped — a live-tunnel stream loss, not a
         runner disconnect.
-    :param progress: Whether the attempt received at least one stream
-        chunk (event or heartbeat) before dropping. Zero-progress
-        attempts must not refresh the reconnect-grace deadline, or a
-        wedged-but-registered runner would retry forever.
+    :param progress: Whether the attempt received a stream event beyond
+        the runner's initial subscription-banner heartbeat before
+        dropping. Zero-progress attempts must not refresh the
+        reconnect-grace deadline, or a wedged-but-registered runner
+        (which still serves the banner on connect) would retry forever.
     """
 
     def __init__(
@@ -6110,9 +6111,11 @@ async def _relay_runner_stream_once(
         ``"runner_abc123"``. ``None`` skips the live-tunnel check.
     """
     text_acc: list[str] = []
-    # Whether this attempt received any stream chunk; gates the
-    # supervisor's grace-deadline refresh on transport loss.
+    # Whether this attempt received any stream event beyond the initial
+    # banner heartbeat; gates the supervisor's grace-deadline refresh on
+    # transport loss.
     made_progress = False
+    saw_banner_heartbeat = False
     current_response_id: str | None = None
     # Model/agent label from the turn header, stamped on text segments
     # flushed at tool-call boundaries (the boundary event carries no model).
@@ -6153,7 +6156,6 @@ async def _relay_runner_stream_once(
             )
             buffer = ""
             async for chunk in resp.aiter_text():
-                made_progress = True
                 buffer += chunk
                 while "\n\n" in buffer:
                     frame, _, buffer = buffer.partition("\n\n")
@@ -6183,7 +6185,17 @@ async def _relay_runner_stream_once(
                     if evt_type == "session.heartbeat":
                         if ready is not None:
                             ready.set()
+                        # The first heartbeat is the subscription banner the
+                        # runner emits the moment the stream is served — it
+                        # only proves the connect reached the runner. Only a
+                        # later keepalive heartbeat counts as progress.
+                        if saw_banner_heartbeat:
+                            made_progress = True
+                        saw_banner_heartbeat = True
                         continue
+
+                    # Any non-heartbeat event is real stream progress.
+                    made_progress = True
 
                     # Stopped turn: drop its trailing response.* output (no
                     # forward, no persist) but keep text_acc — the pre-stop
