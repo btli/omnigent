@@ -566,7 +566,8 @@ def create_native_auth_router(
             return _bad_request("Missing or malformed code_verifier parameter"), None
 
         # Single-use invariant: remove before validation can ever await or move threads.
-        # Restore only non-fatal mismatches so the legitimate client can retry.
+        # A concurrent retry can lose during mismatch restoration; accept that narrow
+        # race because the client can restart this short-lived, process-local flow.
         flow = _flows.pop(code, None)
         if flow is None:
             return _bad_request("Unknown, expired, or already used code"), None
