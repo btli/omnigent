@@ -11,10 +11,15 @@ import androidx.browser.customtabs.CustomTabsClient
  * flow instead and never downgrades to a custom-scheme callback.
  */
 object AuthTabSupport {
-    fun providerPackage(context: Context): String? =
-        supportedProviderPackage(CustomTabsClient.getPackageName(context, null)) { provider ->
+    fun providerPackage(context: Context): String? {
+        val resolved = CustomTabsClient.getPackageName(context, null)
+        if (resolved == null) {
+            authLog("Auth Tab provider unresolved; Custom Tabs service may be hidden or absent")
+        }
+        return supportedProviderPackage(resolved) { provider ->
             CustomTabsClient.isAuthTabSupported(context, provider)
         }
+    }
 
     internal fun supportedProviderPackage(
         providerPackage: String?,

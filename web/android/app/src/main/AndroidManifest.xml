@@ -9,6 +9,12 @@
 
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
 
+    <queries>
+        <intent>
+            <action android:name="android.support.customtabs.action.CustomTabsService" />
+        </intent>
+    </queries>
+
     <!--
       allowBackup=false: the WebView cookie store holds the authenticated
       __Host-ap_session cookie, so cloud Auto Backup and `adb backup` would

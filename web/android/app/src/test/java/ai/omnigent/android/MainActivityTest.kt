@@ -149,6 +149,41 @@ class MainActivityTest {
         assertTrue(activity.authTabFellBack)
     }
 
+    @Test
+    fun `initial auth tab launch falls back when provider resolution is null`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        activity.authTabProviderPackageForTest = { null }
+
+        activity.startProxyLogin()
+
+        assertFalse(activity.authTabFlow.inFlight)
+        assertTrue(activity.authTabFellBack)
+        assertEquals("https://example.com", shadowOf(activity.webView()).lastLoadedUrl)
+    }
+
+    @Test
+    fun `exchange auth tab launch falls back when provider resolution is null`() {
+        val origin = "https://example.com"
+        ServerStore(ApplicationProvider.getApplicationContext()).connect(origin)
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        activity.authTabProviderPackageForTest = { null }
+        val completion = activity.authTabFlow.begin(origin, activity.packageName)!!
+        val state = completion.getQueryParameter("state")!!
+
+        activity.onAuthTabOutcome(
+            AuthTabIntent.RESULT_OK,
+            Uri.parse(
+                "$origin${NativeAuth.CALLBACK_PATH}" +
+                    "?state=$state&code=one-time-code-1234&exchange=tab",
+            ),
+        )
+
+        assertFalse(activity.authTabFlow.inFlight)
+        assertTrue(activity.authTabFellBack)
+        assertEquals(origin, shadowOf(activity.webView()).lastLoadedUrl)
+    }
+
     private fun MainActivity.webView(): WebView =
         MainActivity::class
             .java

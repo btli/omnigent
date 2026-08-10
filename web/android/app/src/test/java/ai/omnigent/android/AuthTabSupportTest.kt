@@ -13,6 +13,8 @@ import org.robolectric.annotation.Config
 class AuthTabSupportTest {
     @Test
     fun `launch intent pins the resolved provider package`() {
+        // The independent reviewer also verified against browser-1.9.0 bytecode
+        // that launch() hands this same pinned Intent instance to the launcher.
         val intent = AuthTabSupport.launchIntent(PROVIDER_PACKAGE).intent
 
         assertEquals(PROVIDER_PACKAGE, intent.`package`)
@@ -20,6 +22,8 @@ class AuthTabSupportTest {
 
     @Test
     fun `a null provider disables auth tab without probing support`() {
+        // Robolectric does not enforce Android 11 package visibility; the
+        // manifest <queries> path still needs device or bytecode verification.
         var supportChecked = false
 
         val provider =
@@ -30,6 +34,13 @@ class AuthTabSupportTest {
 
         assertNull(provider)
         assertFalse(supportChecked)
+    }
+
+    @Test
+    fun `an unsupported resolved provider disables auth tab`() {
+        val provider = AuthTabSupport.supportedProviderPackage(PROVIDER_PACKAGE) { false }
+
+        assertNull(provider)
     }
 
     private companion object {

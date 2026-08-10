@@ -17,7 +17,8 @@ import java.security.SecureRandom
  * transport keeps the verifier in a request body; the front-door tab
  * transport must put code + verifier in its second-hop URL, where browser
  * history and browser/proxy diagnostics may observe them. The final
- * header-mode token redirect has the same diagnostic exposure.
+ * header-mode token redirect has the same diagnostic exposure; the server
+ * validates every binding before consuming the code.
  *
  * Main-thread confined, like the rest of the login state in
  * [MainActivity].

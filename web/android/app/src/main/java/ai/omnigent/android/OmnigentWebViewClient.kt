@@ -11,13 +11,12 @@ import android.webkit.WebViewClient
 
 /**
  * Signals [onPageReady] once a pinned-origin page finishes loading and decides
- * where the login flow runs. For servers matching [usesInWebViewAuth] the
- * redirect chain runs in an Auth Tab via [onProxyLoginRequired] when
- * [shouldUseAuthTabLogin] allows it (a real browser context, so IdPs that
- * refuse embedded user-agents still work), and inline in the WebView
- * otherwise. Every other server is handed to the system browser via
- * [onLoginRequired]. A landing on a bare Databricks workspace root is bounced
- * to the workspace's `/omnigent` mount (see [workspaceRootTarget]).
+ * where the login flow runs. Origins that anonymously advertise Digital Asset
+ * Links, plus the legacy Databricks inline-auth domains, use Auth Tab when
+ * [shouldUseAuthTabLogin] allows it and otherwise stay inline. Other origins
+ * are handed to the system browser via [onLoginRequired]. A landing on a bare
+ * Databricks workspace root is bounced to the workspace's `/omnigent` mount
+ * (see [workspaceRootTarget]).
  *
  * The facade is normally registered with `addDocumentStartJavaScript` in
  * `MainActivity`. Older WebViews that support the message listener but not
@@ -31,6 +30,8 @@ class OmnigentWebViewClient(
     private val shouldInjectBridgeAtPageReady: () -> Boolean,
     private val onPageReady: (url: String?) -> Unit,
     private val onLoginRequired: () -> Unit,
+    private val authTabCapability: () -> Boolean? = { false },
+    private val onAuthTabCapabilityRequired: () -> Unit = {},
     private val shouldUseAuthTabLogin: () -> Boolean = { false },
     private val onProxyLoginRequired: () -> Unit = {},
 ) : WebViewClient() {
@@ -63,7 +64,15 @@ class OmnigentWebViewClient(
         // don't misread it as a bounce and pop the browser. Mirror the http(s)
         // gate in shouldOverrideUrlLoading.
         if (isHttpScheme(scheme) && origin != pinned) {
-            if (!usesInWebViewAuth(pinned)) {
+            val capability = authTabCapability()
+            if (capability == null) {
+                authLog("off-origin landing $origin -> asset links probe")
+                view.stopLoading()
+                onAuthTabCapabilityRequired()
+                return
+            }
+            val usesInlineFallback = capability || usesInWebViewAuth(pinned)
+            if (!usesInlineFallback) {
                 // Log origin only, never the full URL (carries OAuth state/PKCE).
                 authLog("off-origin landing $origin -> login")
                 view.stopLoading()
@@ -166,6 +175,18 @@ class OmnigentWebViewClient(
 
         authLog("off-origin nav $origin gesture=${request.hasGesture()}")
 
+        // A gesture from the app page is an external link, never a login bounce.
+        if (originOf(view.url) == pinned && request.hasGesture()) {
+            runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
+            return true
+        }
+
+        val capability = authTabCapability()
+        if (capability == null) {
+            onAuthTabCapabilityRequired()
+            return true
+        }
+
         // In-WebView auth: a server redirect to the front door / IdP runs in an
         // Auth Tab when available (real browser context — IdPs that refuse
         // embedded user-agents still work). Without one the flow runs inline —
@@ -175,11 +196,7 @@ class OmnigentWebViewClient(
         // the IdP's own pages its navigations (sign-in buttons, form posts,
         // tenant hops) are all gesture-driven and must stay inline or the flow
         // ejects to the browser mid-login.
-        if (usesInWebViewAuth(pinned)) {
-            if (originOf(view.url) == pinned && request.hasGesture()) {
-                runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
-                return true
-            }
+        if (capability || usesInWebViewAuth(pinned)) {
             if (shouldUseAuthTabLogin()) {
                 onProxyLoginRequired()
                 return true
