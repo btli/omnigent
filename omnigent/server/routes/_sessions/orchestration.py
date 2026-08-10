@@ -5683,6 +5683,10 @@ class _RelayTransportLost(Exception):
         dropping. Zero-progress attempts must not refresh the
         reconnect-grace deadline, or a wedged-but-registered runner
         (which still serves the banner on connect) would retry forever.
+    :param saw_banner: Whether the attempt received the subscription
+        banner at all — proof the reconnect reached the runner, used
+        for idle-stream recovery between the banner and the first
+        keepalive heartbeat.
     """
 
     def __init__(
@@ -5691,11 +5695,13 @@ class _RelayTransportLost(Exception):
         intentional: bool,
         stream_lost: bool = False,
         progress: bool = False,
+        saw_banner: bool = False,
     ) -> None:
         super().__init__("runner stream transport lost")
         self.intentional = intentional
         self.stream_lost = stream_lost
         self.progress = progress
+        self.saw_banner = saw_banner
 
 
 async def _runner_drop_interrupted_turn(
@@ -5809,6 +5815,7 @@ async def _relay_runner_stream(
     loop = asyncio.get_running_loop()
     deadline: float | None = None
     while True:
+        started = loop.time()
         try:
             await _relay_runner_stream_once(
                 session_id,
@@ -5822,10 +5829,19 @@ async def _relay_runner_stream(
             now = loop.time()
             # An attempt that made progress (received a stream event)
             # was a live stream dropping anew — give the new outage a
-            # fresh window. Zero-progress attempts (e.g. repeated read
-            # timeouts on a wedged-but-registered runner) must not
-            # refresh, so consecutive stalls exhaust the grace.
-            if deadline is None or lost.progress:
+            # fresh window. So was an idle attempt that reached the
+            # banner, outlived the whole grace, and ended in a
+            # disconnect: between the banner and the first keepalive
+            # heartbeat a healthy idle stream carries no frames, so
+            # duration stands in for progress there. Read-timeout
+            # stalls (stream_lost) never refresh on duration — a
+            # wedged-but-registered runner must exhaust the grace.
+            idle_recovery = (
+                lost.saw_banner
+                and not lost.stream_lost
+                and now - started > RUNNER_DISCONNECT_GRACE_S
+            )
+            if deadline is None or lost.progress or idle_recovery:
                 deadline = now + RUNNER_DISCONNECT_GRACE_S
             if not lost.intentional and now + _RELAY_RETRY_INTERVAL_S < deadline:
                 _logger.info(
@@ -6431,6 +6447,7 @@ async def _relay_runner_stream_once(
                 and _runner_tunnel_alive(runner_client, runner_id)
             ),
             progress=made_progress,
+            saw_banner=saw_banner_heartbeat,
         ) from exc
     except asyncio.CancelledError:
         raise
