@@ -254,6 +254,7 @@ def merge_prs(cwd: str | Path, prs: list[dict], upstream: str) -> tuple[list[dic
             continue
         # --no-commit leaves MERGE_HEAD behind on a real merge; an
         # already-merged PR returns 0 with nothing to commit.
+        minted = False
         if git(cwd, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False).returncode == 0:
             # Stamp the merge with the PR head's committer date: identical
             # inputs reproduce the exact staging sha, so a same-day rerun with
@@ -268,7 +269,10 @@ def merge_prs(cwd: str | Path, prs: list[dict], upstream: str) -> tuple[list[dic
                 f"staging: merge PR #{num} ({branch} @ {oid[:12]})",
                 env={"GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when},
             )
-        applied.append({"pr": num, "branch": branch, "oid": oid, "source": source})
+            minted = True
+        applied.append(
+            {"pr": num, "branch": branch, "oid": oid, "source": source, "minted": minted}
+        )
     return applied, skipped
 
 
@@ -299,7 +303,13 @@ def push_causes(
     if old is None:
         return ["no previous composition to compare"]
     old_base, old_merges = old
-    new = {p["pr"]: (p["branch"], str(p["oid"])[:12], p["source"]) for p in applied}
+    # Only minted merges are comparable: the decoded old composition knows
+    # merge subjects, and an already-merged PR mints none.
+    new = {
+        p["pr"]: (p["branch"], str(p["oid"])[:12], p["source"])
+        for p in applied
+        if p.get("minted", True)
+    }
     label = {"open": "open PR set", "extra": "extras"}
     causes: list[str] = []
     if old_base != upstream_sha:

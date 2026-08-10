@@ -636,6 +636,21 @@ def test_staging_only_cause_extra_removed_then_promoted(env):
     assert promoted["causes"] == ["open PR set"]
 
 
+def test_staging_only_cause_already_merged_pr_is_not_a_change(env):
+    """An open PR already merged upstream mints no merge commit, so the old
+    composition can't mention it either: an upstream move must not be
+    misreported as an open-PR change."""
+    git(env.seed, "checkout", "-q", "main")
+    head = git(env.seed, "rev-parse", "HEAD").stdout.strip()
+    git(env.seed, "push", str(env.upstream), "main:refs/pull/50/head")
+    pr = {"number": 50, "headRefName": "pr-50", "headRefOid": head}
+    env.run([pr], staging_only=True)
+
+    env.advance_main("am.txt", "am\n")
+    second = env.run([pr], staging_only=True)
+    assert second["causes"] == ["upstream HEAD"]
+
+
 def test_old_composition_decoded_past_any_merge_count(env, monkeypatch):
     """The previous composition is decoded by walking to the real upstream
     base, so a manifest longer than any PR-list bound still yields real
