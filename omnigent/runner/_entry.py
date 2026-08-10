@@ -849,6 +849,8 @@ def _mint_managed_owner_token(
     :raises httpx.HTTPError: On network failure or a non-2xx response.
     :raises KeyError: If the response is missing the expected fields.
     """
+    from omnigent_client._http import is_loopback_url
+
     from omnigent.cli_auth import databricks_request_headers
     from omnigent.runner.identity import (
         OMNIGENT_INTERNAL_WS_ORIGIN,
@@ -860,7 +862,7 @@ def _mint_managed_owner_token(
         RUNNER_TUNNEL_TOKEN_HEADER: binding_token,
         **databricks_request_headers(server_url, bearer_token=proxy_bearer),
     }
-    with httpx.Client(timeout=10.0) as client:
+    with httpx.Client(timeout=10.0, trust_env=not is_loopback_url(server_url)) as client:
         response = client.post(mint_url, headers=headers)
         response.raise_for_status()
         payload = response.json()
@@ -1196,6 +1198,8 @@ def create_app(
     # tunnel the runner opened to the Omnigent server at startup).
     # stdio_cwd=runner_workspace ensures relative command paths like
     # ".venv/bin/python" resolve against the user's project root.
+    from omnigent_client._http import is_loopback_url
+
     from omnigent.runner.mcp_manager import RunnerMcpManager
 
     # Reuse the caller's factory when given (shares one resolved SDK auth +
@@ -1205,6 +1209,8 @@ def create_app(
     binding_token = _runner_tunnel_binding_token_from_env()
     server_client = httpx.AsyncClient(
         base_url=server_url,
+        # A proxy cannot reach a loopback server, so local targets bypass it.
+        trust_env=not is_loopback_url(server_url),
         auth=_RunnerDatabricksAuth(auth_token_factory),
         # Announce the runner as a first-party non-browser client via the
         # sentinel Origin. The server's require_trusted_origin CSRF guard on
@@ -1643,16 +1649,46 @@ def _install_signal_handlers(
             record_reason(f"received {signal.Signals(sig).name}")
         stop_event.set()
 
+    degraded = False
+
+    def _try_add_handler(sig: int, callback: Callable[..., None], *args: object) -> None:
+        """Register one handler; degrade instead of crashing the runner.
+
+        ``add_signal_handler`` raises RuntimeError when the loop's signal
+        wakeup fd is unusable — observed in zygote-forked runners whose
+        wakeup fd ended up in blocking mode ("the fd N must be in
+        non-blocking mode"), crash-looping every fork of the session.
+        Graceful-shutdown handlers are a nicety: a runner without them
+        still serves sessions and still exits via the parent-death
+        backstop, so warn once and continue instead of dying.
+
+        :param sig: Signal number to register.
+        :param callback: Handler invoked when the signal arrives.
+        :param args: Positional arguments passed to ``callback``.
+        :returns: None.
+        """
+        nonlocal degraded
+        if degraded:
+            return
+        try:
+            with contextlib.suppress(NotImplementedError):
+                loop.add_signal_handler(sig, callback, *args)
+        except RuntimeError:
+            degraded = True
+            _logger.warning(
+                "Signal handler registration failed; continuing without "
+                "graceful-shutdown signal handling",
+                exc_info=True,
+            )
+
     for sig in (signal.SIGINT, signal.SIGTERM):
-        with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(sig, _handle_shutdown_signal, sig)
+        _try_add_handler(sig, _handle_shutdown_signal, sig)
     if adopted_event is not None:
         from omnigent.runner.identity import RUNNER_ADOPT_SIGNAL
 
         if RUNNER_ADOPT_SIGNAL is None:
             return
-        with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(RUNNER_ADOPT_SIGNAL, adopted_event.set)
+        _try_add_handler(RUNNER_ADOPT_SIGNAL, adopted_event.set)
 
 
 def _install_crash_logging() -> None:

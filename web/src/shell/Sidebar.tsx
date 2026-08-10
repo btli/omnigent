@@ -177,6 +177,7 @@ import {
   sortByUpdatedAtDesc,
   writeLegacyPinnedConversationIds,
 } from "./sidebarNav";
+import { SidebarServerPicker } from "./SidebarServerPicker";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 
 // Positioning for a row's trailing session-state badge. On desktop it shares
@@ -1005,6 +1006,12 @@ export function Sidebar({
               getVisibleIdsRef={getVisibleIdsRef}
             />
           </nav>
+
+          {/* Desktop server picker, pinned below the scrolling session list.
+          Self-hiding: renders nothing outside the Electron shell (see
+          SidebarServerPicker), so browsers keep an unchanged sidebar that ends
+          with the list. */}
+          <SidebarServerPicker />
         </>
       )}
     </aside>
@@ -3752,10 +3759,11 @@ function ConversationRow({
             <Button
               type="button"
               variant="destructive"
+              data-testid="stop-session-confirm"
               onClick={() =>
                 stopSession.mutate(conversation.id, { onSuccess: () => setStopOpen(false) })
               }
-              disabled={stopSession.isPending}
+              loading={stopSession.isPending}
             >
               Stop session
             </Button>
@@ -4092,9 +4100,10 @@ function ProjectFolderMenu({
               <Button
                 type="submit"
                 data-testid="rename-project-confirm"
-                disabled={renameProject.isPending || renameValue.trim() === ""}
+                loading={renameProject.isPending}
+                disabled={renameValue.trim() === ""}
               >
-                {renameProject.isPending ? "Renaming…" : "Rename"}
+                Rename
               </Button>
             </DialogFooter>
           </form>
@@ -4139,7 +4148,7 @@ function ProjectFolderMenu({
             <Button
               type="button"
               variant="destructive"
-              disabled={deleteProject.isPending}
+              loading={deleteProject.isPending}
               onClick={() => {
                 deleteProject.mutate(
                   { id: projectId, name: projectName },
@@ -4152,7 +4161,7 @@ function ProjectFolderMenu({
                 );
               }}
             >
-              {deleteProject.isPending ? "Deleting…" : "Delete project"}
+              Delete project
             </Button>
           </DialogFooter>
         </DialogContent>

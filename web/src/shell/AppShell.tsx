@@ -65,7 +65,11 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isSingleUserMode } from "@/lib/capabilities";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { useChatStore } from "@/store/chatStore";
-import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
+import {
+  STARTING_GRACE_S,
+  livenessRowFromSession,
+  useSessionLiveness,
+} from "@/hooks/useSessionLiveness";
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { ChatHeader } from "./ChatHeader";
@@ -76,7 +80,6 @@ import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { isMobileViewport, Sidebar } from "./Sidebar";
-import { TitleBarServerPicker } from "./TitleBarServerPicker";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useRootSessionId, useSession } from "@/hooks/useSession";
 import {
@@ -346,10 +349,13 @@ export function AppShell() {
   // `failed` session suppresses the terminal-startup spinner so a crashed
   // runner shows only the error banner, not a spinner that can never resolve.
   const sessionStatus = useChatStore((s) => s.sessionStatus);
+  // Set when this client launches a runner outside the send path (a host
+  // switch); extends the liveness startup grace so the move spins.
+  const runnerLaunchedAt = useChatStore((s) => s.runnerLaunchedAt);
   const liveness = useSessionLiveness(
     conversationId ?? undefined,
     activeConv ?? livenessRowFromSession(activeSession),
-    { turnActive: chatStatus === "streaming" },
+    { turnActive: chatStatus === "streaming", launchedAt: runnerLaunchedAt },
   );
   // Full agent object (mcp_servers + policies) for the header info icon.
   // react-query-cached, so this shares the fetch ChatPage's picker makes.
@@ -1254,9 +1260,14 @@ export function AppShell() {
   // local send lifecycle back to `idle` and the suppression re-engages.
   // `sessionStatus` (declared above) is set by both the live
   // `session.status:failed` push and the snapshot reload.
+  // A host switch tears down the old runner, which can push a lingering
+  // `failed` before the new one connects — so a just-requested launch lifts
+  // the failed-suppression exactly like an in-flight send does.
+  const launchPending =
+    runnerLaunchedAt !== null && Date.now() - runnerLaunchedAt < STARTING_GRACE_S * 1000;
   const terminalStartingUp =
     !terminalsAvailable &&
-    (sessionStatus !== "failed" || chatStatus === "streaming") &&
+    (sessionStatus !== "failed" || chatStatus === "streaming" || launchPending) &&
     (liveness.kind === "starting" || terminalPending);
   // A rail-opened shell (any open terminal key other than the agent's
   // own terminal) takes over the main view chrome-free:
@@ -1354,12 +1365,11 @@ export function AppShell() {
           canvas for the traffic lights, and the strip is the window's one
           drag surface — content below and right stays fully clickable. */}
             {isMacElectronShell() && <div className="electron-drag-strip" aria-hidden="true" />}
-            {/* Centered title + server picker in the freed title-bar strip. The
-          open thread's title (snapshot first — it's the only source for
-          child sessions — then the sidebar row) replaces the brand label. */}
-            {isMacElectronShell() && (
-              <TitleBarServerPicker threadTitle={activeSession?.title ?? activeConv?.title} />
-            )}
+            {/* The server picker is NOT here: it lives at the bottom of the
+          sidebar (SidebarServerPicker). This strip is shared with the chat
+          header — which is taller and also anchored at top-0 — so a centered
+          "<thread> — <host>" label here collided with the header's action
+          cluster on a narrow window. The strip stays pure drag surface. */}
             <Sidebar
               open={sidebarOpen}
               onOpen={() => {
