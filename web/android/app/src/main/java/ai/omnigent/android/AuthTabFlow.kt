@@ -9,12 +9,15 @@ import java.security.SecureRandom
  * the flow that started it: a callback is accepted only when its `state`
  * nonce matches the pending flow AND the pinned origin is still the one
  * the flow was launched for. A result from a previous server (switched
- * away mid-login) or an unsolicited `omnigent://auth-callback` intent
- * can therefore never advance a login.
+ * away mid-login) or an unsolicited callback can therefore never
+ * advance a login.
  *
  * The flow is two-legged (see [NativeAuth]): leg 1 returns a one-time
- * code, leg 2 exchanges it — with the PKCE verifier this class holds and
- * that never leaves the process — for the credential.
+ * code, leg 2 exchanges it with the PKCE verifier held here. The POST
+ * transport keeps the verifier in a request body; the front-door tab
+ * transport must put code + verifier in its second-hop URL, where browser
+ * history and browser/proxy diagnostics may observe them. The final
+ * header-mode token redirect has the same diagnostic exposure.
  *
  * Main-thread confined, like the rest of the login state in
  * [MainActivity].
@@ -59,12 +62,20 @@ class AuthTabFlow {
      * to open in the Auth Tab, or null when a flow is already in flight
      * (a redirect storm must not stack tabs).
      */
-    fun begin(origin: String): Uri? {
+    fun begin(
+        origin: String,
+        clientPackage: String,
+    ): Uri? {
         if (pending != null) return null
         val state = randomUrlSafe()
         val verifier = randomUrlSafe(32)
         pending = Pending(state, origin, verifier)
-        return NativeAuth.completionUrl(origin, state, NativeAuth.deriveCodeChallenge(verifier))
+        return NativeAuth.completionUrl(
+            origin,
+            state,
+            NativeAuth.deriveCodeChallenge(verifier),
+            clientPackage,
+        )
     }
 
     /**
@@ -84,7 +95,7 @@ class AuthTabFlow {
         if (currentOrigin == null || currentOrigin != flow.origin) return null
 
         if (!flow.codeIssued) {
-            val grant = NativeAuth.parseCodeCallback(uri) ?: return null
+            val grant = NativeAuth.parseCodeCallback(uri, flow.origin) ?: return null
             if (grant.state != flow.state) return null
             flow.codeIssued = true
             return if (grant.exchange == NativeAuth.EXCHANGE_TAB) {
@@ -96,7 +107,7 @@ class AuthTabFlow {
             }
         }
 
-        val result = NativeAuth.parseTokenCallback(uri) ?: return null
+        val result = NativeAuth.parseTokenCallback(uri, flow.origin) ?: return null
         if (result.state != flow.state) return null
         pending = null
         return Outcome.Complete(result)
