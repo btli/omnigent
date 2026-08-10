@@ -1025,6 +1025,103 @@ async def test_relay_idle_attempt_outliving_grace_refreshes_on_disconnect(
         )
 
 
+@pytest.mark.asyncio
+async def test_relay_slow_banner_then_disconnect_exhausts_nonzero_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Attempts whose banner alone outlasts the grace must not refresh it.
+
+    A wedged runner can take longer than the whole grace just to serve
+    the subscription banner and then drop immediately. Attempt duration
+    must not stand in for stream health there — only the interval AFTER
+    the banner counts — or such a runner refreshes the grace forever and
+    terminal failure is unreachable.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    monkeypatch.setattr(orchestration, "_RELAY_STREAM_READ_TIMEOUT_S", 5.0)
+    monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 0.2)
+    monkeypatch.setattr(orchestration, "_RELAY_RETRY_INTERVAL_S", 0.05)
+    sessions_module._runner_relay_tasks.clear()
+    runner_id = "runner_slow_banner_grace"
+    registry = TunnelRegistry()
+    _register_test_runner(registry, runner_id)
+    client = httpx.AsyncClient(
+        transport=WSTunnelTransport(registry, runner_id),
+        base_url="http://runner",
+    )
+    session_id = "293a4b5c6d7e8f90a1b2c3d4e5f60718"
+
+    seen: set[str] = set()
+
+    async def _wait_new_request() -> str:
+        for _ in range(400):
+            session = registry.get(runner_id)
+            if session is not None:
+                for rid in session.in_flight:
+                    if rid not in seen:
+                        seen.add(rid)
+                        return rid
+            await asyncio.sleep(0.01)
+        raise AssertionError("relay never opened a new tunnel stream request")
+
+    async def _feeder() -> None:
+        # Every attempt: banner arrives only after the whole grace has
+        # elapsed, then the tunnel drops right away.
+        while True:
+            req_id = await _wait_new_request()
+            await asyncio.sleep(0.3)
+            registry.route_response_frame(
+                runner_id,
+                ResponseHeadFrame(
+                    id=req_id,
+                    status=200,
+                    headers=[["content-type", "text/event-stream"]],
+                ),
+            )
+            registry.route_response_frame(
+                runner_id,
+                ResponseBodyFrame(
+                    id=req_id,
+                    body='data: {"type": "session.heartbeat"}\n\n',
+                    encoding="utf-8",
+                ),
+            )
+            # Let the banner chunk reach the relay before dropping.
+            await asyncio.sleep(0.05)
+            registry.deregister(runner_id)
+            _register_test_runner(registry, runner_id)
+
+    feeder = asyncio.create_task(_feeder())
+    collector = None
+    try:
+        handle = sessions_module._ensure_runner_relay(
+            session_id,
+            runner_id,
+            client,
+            conversation_store=None,
+        )
+        assert handle is not None
+        collector = await start_session_stream_collector(session_id)
+
+        # Without a post-banner healthy interval no attempt may refresh
+        # the grace; the loop must terminate instead of retrying forever.
+        await asyncio.wait_for(handle.task, timeout=3.0)
+
+        event = await asyncio.wait_for(collector.queue.get(), timeout=2.0)
+        assert event.get("type") == "session.status"
+        assert event.get("status") == "failed"
+        assert event["error"]["code"] == "runner_disconnected"
+    finally:
+        await _cleanup_relay_test(
+            session_id=session_id,
+            collector=collector,
+            client=client,
+            feeder=feeder,
+        )
+
+
 class _RecordingLabelStore:
     """Minimal conversation store that records ``set_labels`` calls.
 

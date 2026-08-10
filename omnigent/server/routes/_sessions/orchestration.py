@@ -5837,10 +5837,15 @@ class _RelayTransportLost(Exception):
         dropping. Zero-progress attempts must not refresh the
         reconnect-grace deadline, or a wedged-but-registered runner
         (which still serves the banner on connect) would retry forever.
-    :param saw_banner: Whether the attempt received the subscription
-        banner at all — proof the reconnect reached the runner, used
-        for idle-stream recovery between the banner and the first
-        keepalive heartbeat.
+    :param banner_at: Monotonic loop time when the attempt received the
+        subscription banner, or ``None`` when it never did. The
+        interval AFTER the banner (not the whole attempt, which can be
+        dominated by a slow connect) measures how long the stream was
+        provably healthy, for idle-stream recovery between the banner
+        and the first keepalive heartbeat.
+    :param timed_out: Whether the attempt ended in an httpx timeout.
+        A read-timeout stall never qualifies as idle recovery, even on
+        transports whose stalls can't be attributed as stream loss.
     """
 
     def __init__(
@@ -5849,13 +5854,15 @@ class _RelayTransportLost(Exception):
         intentional: bool,
         stream_lost: bool = False,
         progress: bool = False,
-        saw_banner: bool = False,
+        banner_at: float | None = None,
+        timed_out: bool = False,
     ) -> None:
         super().__init__("runner stream transport lost")
         self.intentional = intentional
         self.stream_lost = stream_lost
         self.progress = progress
-        self.saw_banner = saw_banner
+        self.banner_at = banner_at
+        self.timed_out = timed_out
 
 
 async def _runner_drop_interrupted_turn(
@@ -5969,7 +5976,6 @@ async def _relay_runner_stream(
     loop = asyncio.get_running_loop()
     deadline: float | None = None
     while True:
-        started = loop.time()
         try:
             await _relay_runner_stream_once(
                 session_id,
@@ -5983,17 +5989,20 @@ async def _relay_runner_stream(
             now = loop.time()
             # An attempt that made progress (received a stream event)
             # was a live stream dropping anew — give the new outage a
-            # fresh window. So was an idle attempt that reached the
-            # banner, outlived the whole grace, and ended in a
-            # disconnect: between the banner and the first keepalive
-            # heartbeat a healthy idle stream carries no frames, so
-            # duration stands in for progress there. Read-timeout
-            # stalls (stream_lost) never refresh on duration — a
-            # wedged-but-registered runner must exhaust the grace.
+            # fresh window. So was an idle attempt whose stream stayed
+            # provably healthy PAST the banner for longer than the
+            # whole grace and then genuinely disconnected: between the
+            # banner and the first keepalive heartbeat a healthy idle
+            # stream carries no frames, so the post-banner interval
+            # stands in for progress there. Timeouts never refresh on
+            # duration (regardless of how the transport attributes
+            # them) — a wedged runner must exhaust the grace, even one
+            # slow enough that serving the banner alone outlasts it.
             idle_recovery = (
-                lost.saw_banner
+                lost.banner_at is not None
                 and not lost.stream_lost
-                and now - started > RUNNER_DISCONNECT_GRACE_S
+                and not lost.timed_out
+                and now - lost.banner_at > RUNNER_DISCONNECT_GRACE_S
             )
             if deadline is None or lost.progress or idle_recovery:
                 deadline = now + RUNNER_DISCONNECT_GRACE_S
@@ -6129,9 +6138,10 @@ async def _relay_runner_stream_once(
     text_acc: list[str] = []
     # Whether this attempt received any stream event beyond the initial
     # banner heartbeat; gates the supervisor's grace-deadline refresh on
-    # transport loss.
+    # transport loss. The banner's arrival time bounds how long the
+    # stream was provably healthy after connecting.
     made_progress = False
-    saw_banner_heartbeat = False
+    banner_at: float | None = None
     current_response_id: str | None = None
     # Model/agent label from the turn header, stamped on text segments
     # flushed at tool-call boundaries (the boundary event carries no model).
@@ -6205,9 +6215,10 @@ async def _relay_runner_stream_once(
                         # runner emits the moment the stream is served — it
                         # only proves the connect reached the runner. Only a
                         # later keepalive heartbeat counts as progress.
-                        if saw_banner_heartbeat:
+                        if banner_at is not None:
                             made_progress = True
-                        saw_banner_heartbeat = True
+                        else:
+                            banner_at = asyncio.get_running_loop().time()
                         continue
 
                     # Any non-heartbeat event is real stream progress.
@@ -6648,7 +6659,8 @@ async def _relay_runner_stream_once(
                 and _runner_tunnel_alive(runner_client, runner_id)
             ),
             progress=made_progress,
-            saw_banner=saw_banner_heartbeat,
+            banner_at=banner_at,
+            timed_out=isinstance(exc, httpx.TimeoutException),
         ) from exc
     except asyncio.CancelledError:
         raise
