@@ -915,6 +915,116 @@ async def test_relay_banner_only_attempts_exhaust_nonzero_grace_with_session_str
         )
 
 
+@pytest.mark.asyncio
+async def test_relay_idle_attempt_outliving_grace_refreshes_on_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An idle-but-healthy attempt that outlives the grace gets a fresh window.
+
+    Between the banner and the first keepalive heartbeat (10-15s in
+    production) a healthy idle stream carries no frames, so a disconnect
+    there has ``progress=False``. It must still refresh the grace — the
+    attempt provably reconnected and outlived the window — or #4516's
+    flapping-tunnel recovery regresses in that gap. Read-timeout stalls
+    stay progress-gated regardless of duration.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    monkeypatch.setattr(orchestration, "_RELAY_STREAM_READ_TIMEOUT_S", 5.0)
+    monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 0.2)
+    monkeypatch.setattr(orchestration, "_RELAY_RETRY_INTERVAL_S", 0.05)
+    sessions_module._runner_relay_tasks.clear()
+    runner_id = "runner_idle_disconnect_grace"
+    registry = TunnelRegistry()
+    _register_test_runner(registry, runner_id)
+    client = httpx.AsyncClient(
+        transport=WSTunnelTransport(registry, runner_id),
+        base_url="http://runner",
+    )
+    session_id = "18293a4b5c6d7e8f90a1b2c3d4e5f607"
+
+    seen: set[str] = set()
+
+    async def _wait_new_request() -> str:
+        for _ in range(400):
+            session = registry.get(runner_id)
+            if session is not None:
+                for rid in session.in_flight:
+                    if rid not in seen:
+                        seen.add(rid)
+                        return rid
+            await asyncio.sleep(0.01)
+        raise AssertionError("relay never opened a new tunnel stream request")
+
+    def _feed_banner(req_id: str) -> None:
+        registry.route_response_frame(
+            runner_id,
+            ResponseHeadFrame(
+                id=req_id,
+                status=200,
+                headers=[["content-type", "text/event-stream"]],
+            ),
+        )
+        registry.route_response_frame(
+            runner_id,
+            ResponseBodyFrame(
+                id=req_id,
+                body='data: {"type": "session.heartbeat"}\n\n',
+                encoding="utf-8",
+            ),
+        )
+
+    async def _feeder() -> None:
+        # Attempt 1: drop before the head so the first failure sets the
+        # grace deadline without any banner.
+        await _wait_new_request()
+        registry.deregister(runner_id)
+        _register_test_runner(registry, runner_id)
+        # Attempt 2: banner, idle past the whole grace, then disconnect.
+        req2 = await _wait_new_request()
+        _feed_banner(req2)
+        await asyncio.sleep(0.3)
+        registry.deregister(runner_id)
+        _register_test_runner(registry, runner_id)
+        # Attempt 3 exists only if attempt 2 refreshed the window: end
+        # it cleanly so the relay exits without any failure.
+        req3 = await _wait_new_request()
+        _feed_banner(req3)
+        registry.route_response_frame(
+            runner_id,
+            ResponseBodyFrame(id=req3, body="data: [DONE]\n\n", encoding="utf-8"),
+        )
+
+    feeder = asyncio.create_task(_feeder())
+    collector = None
+    try:
+        handle = sessions_module._ensure_runner_relay(
+            session_id,
+            runner_id,
+            client,
+            conversation_store=None,
+        )
+        assert handle is not None
+        collector = await start_session_stream_collector(session_id)
+
+        await asyncio.wait_for(handle.task, timeout=3.0)
+        await feeder
+
+        # The idle attempt's disconnect must have been retried, not
+        # published as a terminal failure.
+        while not collector.queue.empty():
+            event = collector.queue.get_nowait()
+            assert event.get("status") != "failed", event
+    finally:
+        await _cleanup_relay_test(
+            session_id=session_id,
+            collector=collector,
+            client=client,
+            feeder=feeder,
+        )
+
+
 class _RecordingLabelStore:
     """Minimal conversation store that records ``set_labels`` calls.
 
