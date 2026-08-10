@@ -16,7 +16,9 @@ name: Personal Staging Nightly
 
 on:
   schedule:
-    - cron: "37 5 * * *"
+    # Intent: 3:00 AM Pacific. GitHub cron is UTC-only: 10:00 UTC is 3:00 AM PDT,
+    # then 2:00 AM PST after November's DST change; winter is 0 11 * * *.
+    - cron: "0 10 * * *"
   workflow_dispatch:
 
 permissions:
