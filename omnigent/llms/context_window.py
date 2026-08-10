@@ -64,15 +64,18 @@ def find_model_context_window(model: str) -> int | None:
     """
     Look up the model's context window in tokens, or ``None`` when unknown.
 
-    Same metadata sources as :func:`get_model_context_window` (model-id
-    markers, catalog, litellm) but with no default fallback, for callers
-    that must omit the window rather than report a guessed one (e.g. the
-    kimi-native forwarder's context ring).
+    Same resolution as :func:`get_model_context_window` (env override,
+    model-id markers, catalog, litellm) but with no default fallback, for
+    callers that must omit the window rather than report a guessed one
+    (e.g. the kimi-native forwarder's context ring).
 
     :param model: The model identifier, e.g. ``"openai/gpt-4o"``.
     :returns: Context window size in tokens, or ``None`` when no
         metadata source resolves the model.
     """
+    override = os.environ.get("AP_CONTEXT_WINDOW_OVERRIDE")
+    if override is not None:
+        return int(override)
     encoded = _encoded_context_window(model)
     if encoded is not None:
         return encoded
@@ -123,9 +126,6 @@ def get_model_context_window(model: str) -> int:
         ``"databricks-gpt-5-5"``.
     :returns: Context window size in tokens.
     """
-    override = os.environ.get("AP_CONTEXT_WINDOW_OVERRIDE")
-    if override is not None:
-        return int(override)
     window = find_model_context_window(model)
     if window is not None:
         return window

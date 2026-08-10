@@ -9,7 +9,12 @@ gate, not here.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
+import shutil
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -21,11 +26,18 @@ from omnigent.kimi_native_forwarder import (
     _ForwardState,
     _KimiUsageSync,
     _read_state,
+    _read_usage_state,
     _row_to_item,
+    _UsageState,
     _write_state,
+    _write_usage_state,
     clear_kimi_bridge_state,
+    forward_kimi_wire_to_session,
     read_kimi_wire_items,
 )
+
+#: Sentinel marking "remove this key" in test-row builders.
+_ABSENT = object()
 
 
 class TestRowToItem:
@@ -144,32 +156,62 @@ class TestRowToItem:
             "cache_creation": 0,
         }
         assert item.model == "kimi-k3-databricks"
+        assert item.time_ms == 1786275843173
         assert item.response_id == "kimi:usage:7"
 
     def test_usage_record_non_turn_scope_skipped(self) -> None:
         """Only turn-scoped records carry the session's own spend."""
         row = {
             "type": "usage.record",
+            "model": "kimi-k3-databricks",
             "usage": {"inputOther": 10, "output": 1, "inputCacheRead": 0, "inputCacheCreation": 0},
             "usageScope": "aggregate",
+            "time": 1786275843173,
         }
         assert _row_to_item(0, row) is None
 
-    def test_usage_record_malformed_counts_default_to_zero(self) -> None:
-        """Non-int / negative fields count as 0 — tolerant, never crash."""
-        row = {
-            "type": "usage.record",
-            "usage": {"inputOther": "lots", "output": -5, "inputCacheRead": 7},
-            "usageScope": "turn",
-        }
-        item = _row_to_item(0, row)
-        assert item is not None
-        assert item.usage == {
-            "input_other": 0,
-            "output": 0,
-            "cache_read": 7,
-            "cache_creation": 0,
-        }
+    def test_usage_record_drift_skips_whole_record(self) -> None:
+        """Any deviation from the pinned schema skips the ENTIRE record.
+
+        The cursor advances irreversibly, so partial/zeroed accounting from
+        schema drift must never be emitted — emit nothing instead.
+        """
+
+        def _row(**overrides: object) -> dict[str, object]:
+            usage: dict[str, object] = {
+                "inputOther": 10,
+                "output": 1,
+                "inputCacheRead": 7,
+                "inputCacheCreation": 0,
+            }
+            row: dict[str, object] = {
+                "type": "usage.record",
+                "model": "kimi-k3-databricks",
+                "usage": usage,
+                "usageScope": "turn",
+                "time": 1786275843173,
+            }
+            for key, value in overrides.items():
+                target = usage if key in usage else row
+                if value is _ABSENT:
+                    target.pop(key, None)
+                else:
+                    target[key] = value
+            return row
+
+        assert _row_to_item(0, _row()) is not None
+        drifted = [
+            _row(inputOther="lots"),  # non-int count
+            _row(output=-5),  # negative count
+            _row(inputCacheRead=True),  # boolean masquerading as a count
+            _row(inputCacheCreation=_ABSENT),  # missing count field
+            _row(model=_ABSENT),  # missing model
+            _row(model=""),  # empty model
+            _row(time=_ABSENT),  # missing time
+            _row(time="yesterday"),  # invalid time
+        ]
+        for row in drifted:
+            assert _row_to_item(0, row) is None, row
 
     def test_llm_request_prefers_provider_resolved_model(self) -> None:
         """Pinned 0.34.0 ``llm.request`` shape → a model item on the resolved id."""
@@ -239,34 +281,42 @@ class TestReadNewItems:
 
 
 class TestState:
-    def test_round_trip_and_clear(self, tmp_path: Path) -> None:
+    def test_cursor_round_trip_and_clear(self, tmp_path: Path) -> None:
         assert _read_state(tmp_path) is None
         _write_state(tmp_path, _ForwardState(wire_path="/x/wire.jsonl", last_line=7))
         loaded = _read_state(tmp_path)
         assert loaded is not None
         assert loaded.wire_path == "/x/wire.jsonl"
         assert loaded.last_line == 7
-        assert loaded.usage_totals == {}
         clear_kimi_bridge_state(tmp_path)
         assert _read_state(tmp_path) is None
 
-    def test_round_trip_preserves_usage_totals(self, tmp_path: Path) -> None:
-        """Cumulative sums survive a forwarder restart (server usage is monotonic,
-        so a zero-reset would silently drop all post-restart usage)."""
-        totals = {"input_other": 100, "output": 20, "cache_read": 50, "cache_creation": 5}
-        _write_state(tmp_path, _ForwardState("/x/wire.jsonl", 3, totals))
-        loaded = _read_state(tmp_path)
-        assert loaded is not None
-        assert loaded.usage_totals == totals
-
-    def test_legacy_state_without_totals_still_loads(self, tmp_path: Path) -> None:
-        (tmp_path / "kimi_forwarder.json").write_text(
-            json.dumps({"wire_path": "/x/wire.jsonl", "last_line": 4}), encoding="utf-8"
+    def test_usage_state_round_trip(self, tmp_path: Path) -> None:
+        state = _UsageState(
+            totals={"input_other": 100, "output": 20, "cache_read": 50, "cache_creation": 5},
+            model="system.ai.kimi-k3",
+            posted_model="system.ai.kimi-k3",
         )
-        loaded = _read_state(tmp_path)
+        _write_usage_state(tmp_path, state)
+        loaded = _read_usage_state(tmp_path)
+        assert loaded == state
+
+    def test_usage_state_survives_terminal_recreation(self, tmp_path: Path) -> None:
+        """clear_kimi_bridge_state resets only the wire cursor.
+
+        The cumulative usage state belongs to the Omnigent session, not the
+        terminal: zeroing it on terminal recreation would make every later
+        cumulative post a server-ignored decrease.
+        """
+        _write_state(tmp_path, _ForwardState(wire_path="/x/wire.jsonl", last_line=7))
+        _write_usage_state(tmp_path, _UsageState(totals={"input_other": 100}))
+
+        clear_kimi_bridge_state(tmp_path)
+
+        assert _read_state(tmp_path) is None
+        loaded = _read_usage_state(tmp_path)
         assert loaded is not None
-        assert loaded.last_line == 4
-        assert loaded.usage_totals == {}
+        assert loaded.totals == {"input_other": 100}
 
 
 class _RecordingClient:
@@ -292,10 +342,12 @@ def _usage_item(
     output: int = 0,
     cache_read: int = 0,
     cache_creation: int = 0,
-    model: str | None = None,
+    model: str = "kimi-k3-databricks",
+    time_ms: int = 1786275843173,
 ) -> KimiWireItem:
     row: dict[str, object] = {
         "type": "usage.record",
+        "model": model,
         "usage": {
             "inputOther": input_other,
             "output": output,
@@ -303,28 +355,39 @@ def _usage_item(
             "inputCacheCreation": cache_creation,
         },
         "usageScope": "turn",
+        "time": time_ms,
     }
-    if model is not None:
-        row["model"] = model
     item = _row_to_item(line_no, row)
     assert item is not None
     return item
 
 
-def _sync(totals: dict[str, int] | None = None) -> _KimiUsageSync:
-    return _KimiUsageSync(base_url="http://ap", headers={}, session_id="conv_k", totals=totals)
+def _sync(bridge_dir: Path, state: _UsageState | None = None) -> _KimiUsageSync:
+    return _KimiUsageSync(
+        base_url="http://ap", headers={}, session_id="conv_k", bridge_dir=bridge_dir, state=state
+    )
 
 
 def _no_window(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep flush() off the real model-catalog/litellm lookup."""
+    """Keep the usage sync off the real model-catalog/litellm lookup."""
     from omnigent.llms import context_window
 
     monkeypatch.setattr(context_window, "find_model_context_window", lambda _m: None)
 
 
+def _usage_posts(client: _RecordingClient) -> list[dict]:
+    return [b for _u, b in client.posts if b["type"] == "external_session_usage"]
+
+
+def _model_posts(client: _RecordingClient) -> list[dict]:
+    return [b for _u, b in client.posts if b["type"] == "external_model_change"]
+
+
 class TestUsageSync:
     @pytest.mark.asyncio
-    async def test_accumulates_cumulative_totals(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_accumulates_cumulative_totals(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         """Per-call records sum into cumulative SET-semantics fields.
 
         ``cumulative_input_tokens`` is INCLUSIVE of cache reads (the server
@@ -335,79 +398,99 @@ class TestUsageSync:
         """
         _no_window(monkeypatch)
         client = _RecordingClient()
-        sync = _sync()
+        sync = _sync(tmp_path)
 
         sync.record(_usage_item(1, input_other=20559, output=160))
-        await sync.flush(client)
+        await sync.sync(client)
         sync.record(_usage_item(2, input_other=2975, output=76, cache_read=17920))
-        await sync.flush(client)
+        await sync.sync(client)
 
-        assert len(client.posts) == 2
-        url, body = client.posts[1]
-        assert url == "http://ap/v1/sessions/conv_k/events"
-        assert body["type"] == "external_session_usage"
-        assert body["data"] == {
+        posts = _usage_posts(client)
+        assert len(posts) == 2
+        assert posts[1]["data"] == {
             "cumulative_input_tokens": 20559 + 2975 + 17920,
             "cumulative_cache_read_input_tokens": 17920,
             "cumulative_output_tokens": 160 + 76,
             "context_tokens": 2975 + 17920,
+            "model": "kimi-k3-databricks",
         }
 
     @pytest.mark.asyncio
     async def test_model_rides_along_on_every_usage_post(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """The effective model is attached to every token post (the server
-        reprices cumulative totals per post and needs it each time)."""
+        reprices cumulative totals per post and needs it each time), and the
+        llm.request-resolved id wins over the record alias."""
         _no_window(monkeypatch)
         client = _RecordingClient()
-        sync = _sync()
-        await sync.sync_model(client, "system.ai.kimi-k3")
+        sync = _sync(tmp_path)
+        sync.note_model("system.ai.kimi-k3")
 
         sync.record(_usage_item(1, input_other=10, output=1))
-        await sync.flush(client)
+        await sync.sync(client)
         sync.record(_usage_item(2, input_other=20, output=2))
-        await sync.flush(client)
+        await sync.sync(client)
 
-        usage_posts = [b for _u, b in client.posts if b["type"] == "external_session_usage"]
-        assert len(usage_posts) == 2
-        assert all(b["data"]["model"] == "system.ai.kimi-k3" for b in usage_posts)
+        posts = _usage_posts(client)
+        assert len(posts) == 2
+        assert all(b["data"]["model"] == "system.ai.kimi-k3" for b in posts)
 
     @pytest.mark.asyncio
     async def test_usage_record_alias_fills_model_until_llm_request(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         _no_window(monkeypatch)
         client = _RecordingClient()
-        sync = _sync()
+        sync = _sync(tmp_path)
 
         sync.record(_usage_item(1, input_other=10, output=1, model="kimi-k3-databricks"))
-        await sync.flush(client)
+        await sync.sync(client)
 
-        assert client.posts[0][1]["data"]["model"] == "kimi-k3-databricks"
+        assert _usage_posts(client)[0]["data"]["model"] == "kimi-k3-databricks"
 
     @pytest.mark.asyncio
-    async def test_flush_dedupes_unchanged_totals(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_sync_dedupes_unchanged_totals(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         _no_window(monkeypatch)
         client = _RecordingClient()
-        sync = _sync()
+        sync = _sync(tmp_path)
 
         sync.record(_usage_item(1, input_other=10, output=1))
-        await sync.flush(client)
-        await sync.flush(client)
+        await sync.sync(client)
+        await sync.sync(client)
 
-        assert len(client.posts) == 1
+        assert len(_usage_posts(client)) == 1
 
     @pytest.mark.asyncio
-    async def test_model_change_posts_once_and_is_not_seeded_at_spawn(self) -> None:
+    async def test_sync_posts_nothing_before_any_usage(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The per-poll sync must not SET the server's token fields to zero
+        before anything was accumulated."""
+        _no_window(monkeypatch)
+        client = _RecordingClient()
+        sync = _sync(tmp_path)
+
+        await sync.sync(client)
+
+        assert client.posts == []
+
+    @pytest.mark.asyncio
+    async def test_model_change_posts_once_and_is_not_seeded_at_spawn(
+        self, tmp_path: Path
+    ) -> None:
         """The FIRST llm.request mirrors the spawn model (baseline never
         seeded — the codex pattern, so the cost gate sees the real model),
         and an unchanged model is not re-posted."""
         client = _RecordingClient()
-        sync = _sync()
+        sync = _sync(tmp_path)
 
-        await sync.sync_model(client, "system.ai.kimi-k3")
-        await sync.sync_model(client, "system.ai.kimi-k3")
+        sync.note_model("system.ai.kimi-k3")
+        await sync.sync(client)
+        sync.note_model("system.ai.kimi-k3")
+        await sync.sync(client)
 
         assert client.posts == [
             (
@@ -417,88 +500,133 @@ class TestUsageSync:
         ]
 
     @pytest.mark.asyncio
-    async def test_model_change_posts_again_on_switch(self) -> None:
+    async def test_model_change_posts_again_on_switch(self, tmp_path: Path) -> None:
         client = _RecordingClient()
-        sync = _sync()
+        sync = _sync(tmp_path)
 
-        await sync.sync_model(client, "system.ai.kimi-k3")
-        await sync.sync_model(client, "system.ai.kimi-k3-mini")
+        sync.note_model("system.ai.kimi-k3")
+        await sync.sync(client)
+        sync.note_model("system.ai.kimi-k3-mini")
+        await sync.sync(client)
 
-        models = [b["data"]["model"] for _u, b in client.posts]
-        assert models == ["system.ai.kimi-k3", "system.ai.kimi-k3-mini"]
+        assert [b["data"]["model"] for b in _model_posts(client)] == [
+            "system.ai.kimi-k3",
+            "system.ai.kimi-k3-mini",
+        ]
 
     @pytest.mark.asyncio
     async def test_context_window_included_when_resolvable(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         from omnigent.llms import context_window
 
         monkeypatch.setattr(context_window, "find_model_context_window", lambda _m: 262_144)
         client = _RecordingClient()
-        sync = _sync()
-        await sync.sync_model(client, "system.ai.kimi-k3")
+        sync = _sync(tmp_path)
+        sync.note_model("system.ai.kimi-k3")
 
         sync.record(_usage_item(1, input_other=10, output=1))
-        await sync.flush(client)
+        await sync.sync(client)
 
-        usage_post = client.posts[-1][1]
-        assert usage_post["data"]["context_window"] == 262_144
+        assert _usage_posts(client)[-1]["data"]["context_window"] == 262_144
 
     @pytest.mark.asyncio
     async def test_context_window_omitted_when_unresolvable(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """An unknown model must OMIT the window — a guessed default would
         draw a wrong context ring."""
         _no_window(monkeypatch)
         client = _RecordingClient()
-        sync = _sync()
-        await sync.sync_model(client, "system.ai.kimi-k3")
+        sync = _sync(tmp_path)
+        sync.note_model("system.ai.kimi-k3")
 
         sync.record(_usage_item(1, input_other=10, output=1))
-        await sync.flush(client)
+        await sync.sync(client)
 
-        assert "context_window" not in client.posts[-1][1]["data"]
+        assert "context_window" not in _usage_posts(client)[-1]["data"]
 
     @pytest.mark.asyncio
-    async def test_post_failure_is_swallowed_and_retried(
-        self, monkeypatch: pytest.MonkeyPatch
+    async def test_post_failure_is_swallowed_and_retried_by_next_sync(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """A failed usage post never raises (it must not stall transcript
-        mirroring); the next flush re-posts the cumulative totals."""
+        """A failed post never raises (it must not stall transcript
+        mirroring); the per-poll sync re-posts without new wire records."""
         _no_window(monkeypatch)
         client = _RecordingClient()
         client.fail_with = httpx.ConnectError("boom")
-        sync = _sync()
+        sync = _sync(tmp_path)
 
+        sync.note_model("system.ai.kimi-k3")
         sync.record(_usage_item(1, input_other=10, output=1))
-        await sync.flush(client)
+        await sync.sync(client)
         assert client.posts == []
 
         client.fail_with = None
-        await sync.flush(client)
-        assert len(client.posts) == 1
-        assert client.posts[0][1]["data"]["cumulative_input_tokens"] == 10
+        await sync.sync(client)
+        assert [b["data"]["model"] for b in _model_posts(client)] == ["system.ai.kimi-k3"]
+        assert _usage_posts(client)[0]["data"]["cumulative_input_tokens"] == 10
 
     @pytest.mark.asyncio
-    async def test_totals_seeded_from_persisted_state(
-        self, monkeypatch: pytest.MonkeyPatch
+    async def test_state_restored_across_restart(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """A restarted forwarder resumes the cumulative counters instead of
-        resetting to zero (which the server's monotonic clamp would ignore)."""
+        """A restarted forwarder resumes the counters AND the model baselines.
+
+        Totals must not reset to zero (later cumulative posts would look like
+        decreases); the effective model must not downgrade to the record alias
+        when the restart lands between llm.request and usage.record; and an
+        unchanged, already-posted model must not be re-posted.
+        """
         _no_window(monkeypatch)
         client = _RecordingClient()
-        sync = _sync(
-            totals={"input_other": 100, "output": 20, "cache_read": 50, "cache_creation": 5}
-        )
+        first = _sync(tmp_path)
+        first.note_model("system.ai.kimi-k3")
+        first.record(_usage_item(1, input_other=100, output=20, cache_read=50, cache_creation=5))
+        await first.sync(client)
+        client.posts.clear()
 
-        sync.record(_usage_item(9, input_other=10, output=1))
-        await sync.flush(client)
+        # Restart: a fresh sync built from the persisted usage state.
+        sync = _sync(tmp_path, state=_read_usage_state(tmp_path))
+        await sync.sync(client)
+        # Already-delivered model is not re-posted after restart.
+        assert _model_posts(client) == []
 
-        data = client.posts[0][1]["data"]
+        sync.record(_usage_item(9, input_other=10, output=1, model="other-alias"))
+        await sync.sync(client)
+
+        data = _usage_posts(client)[-1]["data"]
         assert data["cumulative_input_tokens"] == 100 + 50 + 5 + 10
         assert data["cumulative_cache_read_input_tokens"] == 50
         assert data["cumulative_output_tokens"] == 21
+        # Attribution stays on the resolved llm.request model, not the alias.
+        assert data["model"] == "system.ai.kimi-k3"
+
+    @pytest.mark.asyncio
+    async def test_new_wire_keeps_cumulative_totals(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Adopting a new wire log resets the per-log view only.
+
+        The cumulative totals carry forward: a zero-reset would make every
+        later post a decrease the server ignores until the old peak is
+        re-crossed.
+        """
+        _no_window(monkeypatch)
+        client = _RecordingClient()
+        sync = _sync(tmp_path)
+        sync.record(_usage_item(1, input_other=100, output=20))
+        await sync.sync(client)
+
+        sync.note_new_wire()
+        sync.record(_usage_item(1, input_other=7, output=3))
+        await sync.sync(client)
+
+        data = _usage_posts(client)[-1]["data"]
+        assert data["cumulative_input_tokens"] == 107
+        assert data["cumulative_output_tokens"] == 23
+        # Context occupancy reflects only the new log's latest record.
+        assert data["context_tokens"] == 7
 
 
 class TestDiscoverWire:
@@ -538,3 +666,259 @@ class TestDiscoverWire:
         self._make_session(home, "session_stale", "/ws", mtime=1000.0)
         # launch far in the future (ms) → the 1000s-mtime session is below the floor.
         assert _discover_wire(home, "/ws", launch_epoch_ms=9_000_000_000_000) is None
+
+
+class _FakeAsyncClient:
+    """Stands in for the loop's ``httpx.AsyncClient`` context manager.
+
+    Records POST bodies; ``fail_usage_posts`` makes that many
+    ``external_session_usage`` posts raise before succeeding, to exercise the
+    per-poll retry path.
+    """
+
+    def __init__(self, *, fail_usage_posts: int = 0) -> None:
+        self.posts: list[dict] = []
+        self.fail_usage_posts = fail_usage_posts
+
+    async def __aenter__(self) -> _FakeAsyncClient:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> bool:
+        return False
+
+    async def post(self, url: str, *, headers: dict, json: dict) -> httpx.Response:
+        del headers
+        if json.get("type") == "external_session_usage" and self.fail_usage_posts > 0:
+            self.fail_usage_posts -= 1
+            raise httpx.ConnectError("boom")
+        self.posts.append(json)
+        return httpx.Response(200, request=httpx.Request("POST", url))
+
+
+def _loop_wire(home: Path, rows: list[dict[str, object]]) -> Path:
+    wire = home / "sessions" / "wd_x" / "session_loop" / "agents" / "main" / "wire.jsonl"
+    wire.parent.mkdir(parents=True, exist_ok=True)
+    wire.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    return wire
+
+
+def _loop_usage_row(*, input_other: int, output: int, time_ms: int) -> dict[str, object]:
+    return {
+        "type": "usage.record",
+        "model": "kimi-k3-databricks",
+        "usage": {
+            "inputOther": input_other,
+            "output": output,
+            "inputCacheRead": 0,
+            "inputCacheCreation": 0,
+        },
+        "usageScope": "turn",
+        "time": time_ms,
+    }
+
+
+async def _drive_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    bridge_dir: Path,
+    home: Path,
+    client: _FakeAsyncClient,
+    launch_epoch_ms: int,
+    until: Callable[[], bool],
+    timeout_s: float = 10.0,
+) -> None:
+    """Run the real forwarder loop until *until* holds, then cancel it."""
+    from omnigent import kimi_native_forwarder as fwd
+
+    _no_window(monkeypatch)
+    monkeypatch.setattr(fwd.httpx, "AsyncClient", lambda **_kw: client)
+    task = asyncio.create_task(
+        forward_kimi_wire_to_session(
+            base_url="http://ap",
+            headers={},
+            session_id="conv_loop",
+            bridge_dir=bridge_dir,
+            kimi_home=home,
+            workspace="/ws",
+            launch_epoch_ms=launch_epoch_ms,
+        )
+    )
+    try:
+        async with asyncio.timeout(timeout_s):
+            while not until():
+                await asyncio.sleep(0.05)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+class TestForwardLoopUsage:
+    @pytest.mark.asyncio
+    async def test_failed_turn_final_usage_post_retries_without_new_records(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The live loop redelivers a failed usage post on later polls.
+
+        The wire cursor advances past the record even while the post fails, so
+        without the per-poll retry an idle session would undercount forever.
+        """
+        home = tmp_path / "home"
+        bridge = tmp_path / "bridge"
+        bridge.mkdir()
+        now_ms = int(time.time() * 1000)
+        _loop_wire(
+            home,
+            [
+                {"type": "llm.request", "kind": "loop", "model": "system.ai.kimi-k3"},
+                _loop_usage_row(input_other=42, output=7, time_ms=now_ms),
+            ],
+        )
+        client = _FakeAsyncClient(fail_usage_posts=2)
+
+        await _drive_loop(
+            monkeypatch,
+            bridge_dir=bridge,
+            home=home,
+            client=client,
+            launch_epoch_ms=0,
+            until=lambda: any(b["type"] == "external_session_usage" for b in client.posts),
+        )
+
+        usage = next(b for b in client.posts if b["type"] == "external_session_usage")
+        assert usage["data"]["cumulative_input_tokens"] == 42
+        assert usage["data"]["cumulative_output_tokens"] == 7
+        assert usage["data"]["model"] == "system.ai.kimi-k3"
+        # The cursor advanced past the record even while its post was failing.
+        state = _read_state(bridge)
+        assert state is not None
+        assert state.last_line >= 2
+
+    @pytest.mark.asyncio
+    async def test_pre_launch_usage_history_is_not_billed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Resuming a pre-existing kimi session must not bill its history.
+
+        Only usage stamped at/after the Omnigent launch epoch counts; the
+        transcript is still mirrored in full.
+        """
+        home = tmp_path / "home"
+        bridge = tmp_path / "bridge"
+        bridge.mkdir()
+        now_ms = int(time.time() * 1000)
+        _loop_wire(
+            home,
+            [
+                _loop_usage_row(input_other=99999, output=9999, time_ms=now_ms - 3_600_000),
+                {
+                    "type": "turn.prompt",
+                    "input": [{"type": "text", "text": "hi"}],
+                    "origin": {"kind": "user"},
+                },
+                _loop_usage_row(input_other=11, output=2, time_ms=now_ms),
+            ],
+        )
+        client = _FakeAsyncClient()
+
+        await _drive_loop(
+            monkeypatch,
+            bridge_dir=bridge,
+            home=home,
+            client=client,
+            launch_epoch_ms=now_ms - 60_000,
+            until=lambda: any(b["type"] == "external_session_usage" for b in client.posts),
+        )
+
+        usage = next(b for b in client.posts if b["type"] == "external_session_usage")
+        assert usage["data"]["cumulative_input_tokens"] == 11
+        assert usage["data"]["cumulative_output_tokens"] == 2
+        # The pre-launch transcript is still mirrored.
+        assert any(b["type"] == "external_conversation_item" for b in client.posts)
+
+    @pytest.mark.asyncio
+    async def test_wire_log_switch_carries_totals_forward(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A rediscovered wire log must not zero the cumulative totals.
+
+        The server clamps cumulative fields, so a zero-reset would silently
+        drop the new log's usage until it re-crossed the old peak.
+        """
+        home = tmp_path / "home"
+        bridge = tmp_path / "bridge"
+        bridge.mkdir()
+        now_ms = int(time.time() * 1000)
+        wire_a = _loop_wire(home, [_loop_usage_row(input_other=100, output=10, time_ms=now_ms)])
+        client = _FakeAsyncClient()
+
+        def _saw_first_post() -> bool:
+            return any(b["type"] == "external_session_usage" for b in client.posts)
+
+        def _switch_wire() -> None:
+            shutil.rmtree(wire_a.parent.parent.parent)
+            wire_b = home / "sessions" / "wd_x" / "session_next" / "agents" / "main" / "wire.jsonl"
+            wire_b.parent.mkdir(parents=True, exist_ok=True)
+            wire_b.write_text(
+                json.dumps(_loop_usage_row(input_other=50, output=5, time_ms=now_ms)) + "\n",
+                encoding="utf-8",
+            )
+
+        def _saw_combined_total() -> bool:
+            if _saw_first_post() and not (home / "sessions" / "wd_x" / "session_next").exists():
+                _switch_wire()
+            return any(
+                b["type"] == "external_session_usage"
+                and b["data"]["cumulative_input_tokens"] == 150
+                for b in client.posts
+            )
+
+        await _drive_loop(
+            monkeypatch,
+            bridge_dir=bridge,
+            home=home,
+            client=client,
+            launch_epoch_ms=0,
+            until=_saw_combined_total,
+        )
+
+        combined = [
+            b
+            for b in client.posts
+            if b["type"] == "external_session_usage"
+            and b["data"]["cumulative_input_tokens"] == 150
+        ]
+        assert combined
+        assert combined[-1]["data"]["cumulative_output_tokens"] == 15
+
+
+class TestReadWireResilience:
+    def test_invalid_utf8_is_replace_decoded_not_raised(self, tmp_path: Path) -> None:
+        """A torn/malformed write must not crash-loop the supervisor."""
+        wire = tmp_path / "wire.jsonl"
+        good = json.dumps(
+            {
+                "type": "turn.prompt",
+                "input": [{"type": "text", "text": "hi"}],
+                "origin": {"kind": "user"},
+            }
+        ).encode()
+        wire.write_bytes(b"\xff\xfe garbage \xff\n" + good + b"\n")
+
+        items = read_kimi_wire_items(wire, 0)
+
+        assert [(i.role, i.text) for i in items] == [("user", "hi")]
+
+    def test_unreadable_file_logs_once_and_returns_empty(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        caplog.set_level(logging.WARNING, logger="omnigent.kimi_native_forwarder")
+        missing = tmp_path / "gone" / "wire.jsonl"
+
+        assert read_kimi_wire_items(missing, 0) == []
+        assert read_kimi_wire_items(missing, 0) == []
+
+        warnings = [r for r in caplog.records if "cannot read" in r.message]
+        assert len(warnings) == 1

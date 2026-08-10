@@ -369,6 +369,21 @@ def test_find_model_context_window_resolves_and_returns_none_when_unknown(
     assert find_model_context_window("uncatalogued-model") is None
 
 
+def test_find_model_context_window_honors_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``AP_CONTEXT_WINDOW_OVERRIDE`` overrides everything, so users can fix
+    the context ring for uncatalogued models."""
+
+    def _boom(_model: str) -> list[ModelInfo]:
+        raise AssertionError("catalog lookup must not run when the override is set")
+
+    monkeypatch.setattr(context_window, "find_catalog_models", _boom)
+    monkeypatch.setenv("AP_CONTEXT_WINDOW_OVERRIDE", "555000")
+    assert find_model_context_window("uncatalogued-model") == 555_000
+    assert get_model_context_window("uncatalogued-model") == 555_000
+
+
 def test_get_model_context_window_encoded_and_offline_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

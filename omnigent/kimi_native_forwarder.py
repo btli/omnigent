@@ -56,27 +56,54 @@ _logger = logging.getLogger(__name__)
 _POLL_INTERVAL_S = 0.25
 #: Persisted forwarder state (discovered wire path + high-water line count).
 _STATE_FILE = "kimi_forwarder.json"
+#: Persisted cumulative usage/model state. Deliberately SEPARATE from the wire
+#: cursor: the cursor is disposable (terminal recreation / wire rediscovery
+#: start a fresh tail), but the usage totals are session-cumulative — resetting
+#: them would make every later post look like a decrease the server ignores.
+_USAGE_STATE_FILE = "kimi_usage_state.json"
 #: Clock-skew tolerance when matching a session created at/after launch.
 _DISCOVER_SKEW_MS = 10_000
 #: Supervisor backoff bounds.
 _BACKOFF_INITIAL_S = 1.0
 _BACKOFF_MAX_S = 30.0
 
+#: One-shot log guard keys (schema drift / unreadable files log once, not per
+#: poll). Module-level: the forwarder loop can be restarted by its supervisor.
+_WARNED_KEYS: set[str] = set()
+
+
+def _warn_once(key: str, msg: str, *args: object) -> None:
+    """Log *msg* at warning level only the first time *key* is seen."""
+    if key in _WARNED_KEYS:
+        return
+    _WARNED_KEYS.add(key)
+    _logger.warning(msg, *args)
+
 
 @dataclass
 class _ForwardState:
-    """Durable cursor for the wire-log tail.
-
-    ``usage_totals`` carries the cumulative token sums already accumulated
-    from ``usage.record`` rows at ``last_line``. Persisted so a forwarder
-    restart doesn't reset the cumulative counters to zero — the server
-    clamps cumulative usage monotonically, so a reset would silently drop
-    all post-restart usage until the totals re-crossed the prior peak.
-    """
+    """Durable cursor for the wire-log tail."""
 
     wire_path: str
     last_line: int
-    usage_totals: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class _UsageState:
+    """Durable cumulative usage/model mirror state.
+
+    Survives forwarder restarts, terminal recreation, and wire-log switches
+    within the same Omnigent session: the posted fields are cumulative
+    (SET-semantics, clamped server-side), so zeroing them mid-session would
+    silently drop every later post until fresh totals re-crossed the peak.
+    ``model`` / ``posted_model`` are persisted so a restart between an
+    ``llm.request`` and its ``usage.record`` neither downgrades attribution
+    nor re-posts an unchanged model.
+    """
+
+    totals: dict[str, int] = field(default_factory=dict)
+    model: str | None = None
+    posted_model: str | None = None
 
 
 @dataclass
@@ -99,17 +126,22 @@ class KimiWireItem:
     # For kind == "usage": the record's model alias (pricing fallback).
     # For kind == "model": the effective model id.
     model: str | None = None
+    # For kind == "usage": the record's wall-clock ``time`` in epoch ms, so
+    # the forwarder can skip history that predates this Omnigent session.
+    time_ms: int | None = None
 
 
 _MirrorItem = KimiWireItem
 
 
 def clear_kimi_bridge_state(bridge_dir: Path) -> None:
-    """Drop any stale forwarder state so a new terminal starts a fresh tail.
+    """Drop the stale wire cursor so a new terminal starts a fresh tail.
 
     Mirrors ``cursor_native_forwarder.clear_cursor_bridge_state``: without this,
     a re-created terminal would resume the prior session's line offset against a
-    different wire log.
+    different wire log. The cumulative usage state (``_USAGE_STATE_FILE``) is
+    deliberately KEPT — it belongs to the Omnigent session, not the terminal,
+    and zeroing it would silently drop later usage posts (server-side clamps).
     """
     with contextlib.suppress(OSError):
         (bridge_dir / _STATE_FILE).unlink()
@@ -129,26 +161,58 @@ def _read_state(bridge_dir: Path) -> _ForwardState | None:
     wire_path = data.get("wire_path")
     last_line = data.get("last_line")
     if isinstance(wire_path, str) and isinstance(last_line, int):
-        raw_totals = data.get("usage_totals")
-        totals = (
-            {k: v for k, v in raw_totals.items() if isinstance(k, str) and isinstance(v, int)}
-            if isinstance(raw_totals, dict)
-            else {}
-        )
-        return _ForwardState(wire_path=wire_path, last_line=last_line, usage_totals=totals)
+        return _ForwardState(wire_path=wire_path, last_line=last_line)
     return None
 
 
 def _write_state(bridge_dir: Path, state: _ForwardState) -> None:
-    payload = {
-        "wire_path": state.wire_path,
-        "last_line": state.last_line,
-        "usage_totals": state.usage_totals,
-    }
+    payload = {"wire_path": state.wire_path, "last_line": state.last_line}
     tmp = bridge_dir / (_STATE_FILE + ".tmp")
     with contextlib.suppress(OSError):
         tmp.write_text(json.dumps(payload), encoding="utf-8")
         tmp.replace(bridge_dir / _STATE_FILE)
+
+
+def _read_usage_state(bridge_dir: Path) -> _UsageState | None:
+    try:
+        raw = (bridge_dir / _USAGE_STATE_FILE).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    raw_totals = data.get("totals")
+    totals = (
+        {
+            k: v
+            for k, v in raw_totals.items()
+            if isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool) and v >= 0
+        }
+        if isinstance(raw_totals, dict)
+        else {}
+    )
+    model = data.get("model")
+    posted_model = data.get("posted_model")
+    return _UsageState(
+        totals=totals,
+        model=model if isinstance(model, str) and model else None,
+        posted_model=posted_model if isinstance(posted_model, str) and posted_model else None,
+    )
+
+
+def _write_usage_state(bridge_dir: Path, state: _UsageState) -> None:
+    payload = {
+        "totals": state.totals,
+        "model": state.model,
+        "posted_model": state.posted_model,
+    }
+    tmp = bridge_dir / (_USAGE_STATE_FILE + ".tmp")
+    with contextlib.suppress(OSError):
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(bridge_dir / _USAGE_STATE_FILE)
 
 
 def workdirs_for_kimi_sessions(kimi_home: Path) -> dict[str, str]:
@@ -229,25 +293,35 @@ def _input_text(blocks: object) -> str:
     return "".join(parts)
 
 
-def _usage_counts(raw: object) -> dict[str, int] | None:
-    """Coerce a ``usage.record``'s ``usage`` dict into typed token counts.
+def _token_count(raw: object) -> int | None:
+    """A pinned token-count field: a non-boolean, non-negative int, else None."""
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+        return raw
+    return None
 
-    Missing / non-int / negative fields count as 0 (tolerant parsing);
-    ``None`` when the container isn't a dict at all.
+
+def _usage_counts(raw: object) -> dict[str, int] | None:
+    """Validate a ``usage.record``'s ``usage`` dict against the pinned schema.
+
+    All four Kimi Code 0.34.0 fields must be present as non-boolean,
+    non-negative ints; anything else returns ``None`` so the whole record is
+    skipped — partial/zeroed accounting from schema drift must never be
+    emitted (the wire cursor advances irreversibly).
     """
     if not isinstance(raw, dict):
         return None
-
-    def _count(key: str) -> int:
-        value = raw.get(key)
-        return value if isinstance(value, int) and value >= 0 else 0
-
-    return {
-        "input_other": _count("inputOther"),
-        "output": _count("output"),
-        "cache_read": _count("inputCacheRead"),
-        "cache_creation": _count("inputCacheCreation"),
-    }
+    counts: dict[str, int] = {}
+    for wire_key, out_key in (
+        ("inputOther", "input_other"),
+        ("output", "output"),
+        ("inputCacheRead", "cache_read"),
+        ("inputCacheCreation", "cache_creation"),
+    ):
+        value = _token_count(raw.get(wire_key))
+        if value is None:
+            return None
+        counts[out_key] = value
+    return counts
 
 
 def _row_to_item(line_no: int, row: dict[str, object]) -> KimiWireItem | None:
@@ -259,9 +333,18 @@ def _row_to_item(line_no: int, row: dict[str, object]) -> KimiWireItem | None:
         if row.get("usageScope") != "turn":
             return None
         counts = _usage_counts(row.get("usage"))
-        if counts is None:
-            return None
         model = row.get("model")
+        time_ms = _token_count(row.get("time"))
+        if counts is None or not (isinstance(model, str) and model) or time_ms is None:
+            # Schema drift: emit nothing rather than partial/zero accounting.
+            _warn_once(
+                "usage.record-drift",
+                "kimi forwarder: skipping usage.record not matching the pinned "
+                "0.34.0 schema (further drift logged at debug): %r",
+                row,
+            )
+            _logger.debug("kimi forwarder: skipped drifted usage.record: %r", row)
+            return None
         return KimiWireItem(
             line_no=line_no,
             role="assistant",
@@ -269,7 +352,8 @@ def _row_to_item(line_no: int, row: dict[str, object]) -> KimiWireItem | None:
             response_id=f"kimi:usage:{line_no}",
             kind="usage",
             usage=counts,
-            model=model if isinstance(model, str) and model else None,
+            model=model,
+            time_ms=time_ms,
         )
     if row_type == "llm.request":
         # Prefer the provider-resolved model id (e.g. ``system.ai.kimi-k3``)
@@ -360,11 +444,17 @@ def read_kimi_wire_items(wire_path: Path, last_line: int) -> list[KimiWireItem]:
 
     The wire log is append-only JSONL, so a line count is a stable high-water
     mark. Non-JSON / unrecognized lines advance the cursor without emitting.
+    Invalid UTF-8 (a torn concurrent write) is replace-decoded rather than
+    raised — a persistently malformed file must not crash-loop the supervisor.
     """
     try:
-        lines = wire_path.read_text(encoding="utf-8").splitlines()
-    except OSError:
+        text = wire_path.read_bytes().decode("utf-8", errors="replace")
+    except OSError as exc:
+        _warn_once(
+            f"wire-unreadable:{wire_path}", "kimi forwarder: cannot read %s: %s", wire_path, exc
+        )
         return []
+    lines = text.splitlines()
     items: list[KimiWireItem] = []
     for idx in range(last_line, len(lines)):
         line = lines[idx].strip()
@@ -479,9 +569,13 @@ class _KimiUsageSync:
     so the real spawn model lands in ``model_override`` for the cost gate.
 
     Every post is best-effort: a failure is logged and swallowed so usage
-    mirroring can never stall transcript forwarding. Cumulative semantics
-    self-heal a missed usage post on the next record; a missed model post
-    retries on the next ``llm.request``.
+    mirroring can never stall transcript forwarding. Failed posts are NOT
+    lost: :meth:`sync` runs on every poll and re-posts whatever still differs
+    from the last successfully delivered payload/model, so a turn-final
+    failure retries even when no further wire records ever arrive.
+
+    Cumulative usage/model state is persisted to ``_USAGE_STATE_FILE`` so
+    forwarder restarts and terminal recreation resume the counters.
     """
 
     _TOTAL_KEYS = ("input_other", "output", "cache_read", "cache_creation")
@@ -492,38 +586,52 @@ class _KimiUsageSync:
         base_url: str,
         headers: dict[str, str],
         session_id: str,
-        totals: dict[str, int] | None = None,
+        bridge_dir: Path,
+        state: _UsageState | None = None,
     ) -> None:
         self._events_url = f"{base_url.rstrip('/')}/v1/sessions/{session_id}/events"
         self._headers = headers
+        self._bridge_dir = bridge_dir
         self._totals: dict[str, int] = dict.fromkeys(self._TOTAL_KEYS, 0)
-        if totals:
-            for key in self._TOTAL_KEYS:
-                value = totals.get(key)
-                if isinstance(value, int) and value >= 0:
-                    self._totals[key] = value
-        # Latest record's context occupancy (inputOther + inputCacheRead +
-        # inputCacheCreation) — NOT cumulative.
-        self._context_tokens: int | None = None
         # Effective model: llm.request's provider-resolved id wins; a
         # usage.record's alias fills in until one is seen.
         self._model: str | None = None
         self._posted_model: str | None = None
+        if state is not None:
+            for key in self._TOTAL_KEYS:
+                value = state.totals.get(key)
+                if isinstance(value, int) and value >= 0:
+                    self._totals[key] = value
+            self._model = state.model
+            self._posted_model = state.posted_model
+        # Latest record's context occupancy (inputOther + inputCacheRead +
+        # inputCacheCreation) — NOT cumulative.
+        self._context_tokens: int | None = None
         self._last_posted: dict[str, int] | None = None
         self._window_cache: dict[str, int | None] = {}
 
-    def totals(self) -> dict[str, int]:
-        """Snapshot of the cumulative token sums, for state persistence."""
-        return dict(self._totals)
+    def _persist(self) -> None:
+        _write_usage_state(
+            self._bridge_dir,
+            _UsageState(
+                totals=dict(self._totals),
+                model=self._model,
+                posted_model=self._posted_model,
+            ),
+        )
 
-    def reset(self) -> None:
-        """Zero all accumulation for a freshly discovered wire log."""
-        self._totals = dict.fromkeys(self._TOTAL_KEYS, 0)
+    def note_new_wire(self) -> None:
+        """Adopt a freshly discovered wire log.
+
+        Only the per-log view resets (context occupancy, delivery dedup); the
+        cumulative totals and model carry forward — they are session-scoped,
+        and a zero-reset would make every later post a server-ignored decrease.
+        """
         self._context_tokens = None
         self._last_posted = None
 
     def record(self, item: KimiWireItem) -> None:
-        """Fold one ``usage.record`` item into the cumulative totals."""
+        """Fold one validated ``usage.record`` item into the cumulative totals."""
         usage = item.usage or {}
         for key in self._TOTAL_KEYS:
             self._totals[key] += usage.get(key, 0)
@@ -534,9 +642,34 @@ class _KimiUsageSync:
         )
         if self._model is None and item.model:
             self._model = item.model
+        self._persist()
 
-    async def flush(self, client: httpx.AsyncClient) -> None:
-        """POST the cumulative totals when they changed since the last post."""
+    def note_model(self, model: str | None) -> None:
+        """Adopt the effective model from an ``llm.request`` row."""
+        if not model or model == self._model:
+            return
+        self._model = model
+        self._persist()
+
+    async def sync(self, client: httpx.AsyncClient) -> None:
+        """Deliver any undelivered model change and usage totals (best-effort).
+
+        Cheap no-op when everything already matches the delivered baseline;
+        called per poll so a previously failed post retries without waiting
+        for another wire record.
+        """
+        if self._model and self._model != self._posted_model:
+            if await self._post(client, "external_model_change", {"model": self._model}):
+                self._posted_model = self._model
+                self._persist()
+        await self._flush(client)
+
+    async def _flush(self, client: httpx.AsyncClient) -> None:
+        """POST the cumulative totals when they differ from the delivered ones."""
+        # Nothing accumulated yet (fresh session, no restored state): posting
+        # zeros would SET the server's token fields to 0.
+        if self._context_tokens is None and not any(self._totals.values()):
+            return
         # The server's cumulative_input_tokens is INCLUSIVE of cache reads (it
         # splits cumulative_cache_read_input_tokens back out to price them at
         # the cache-read rate). There is no dedicated cumulative cache-creation
@@ -565,16 +698,6 @@ class _KimiUsageSync:
             body["model"] = self._model
         if await self._post(client, "external_session_usage", body):
             self._last_posted = payload
-
-    async def sync_model(self, client: httpx.AsyncClient, model: str | None) -> None:
-        """Mirror the effective model when it differs from the posted baseline."""
-        if not model:
-            return
-        self._model = model
-        if model == self._posted_model:
-            return
-        if await self._post(client, "external_model_change", {"model": model}):
-            self._posted_model = model
 
     async def _context_window(self) -> int | None:
         """Resolve the effective model's context window, or ``None``.
@@ -656,8 +779,12 @@ async def forward_kimi_wire_to_session(
         base_url=base_url,
         headers=headers,
         session_id=session_id,
-        totals=state.usage_totals if state is not None else None,
+        bridge_dir=bridge_dir,
+        state=_read_usage_state(bridge_dir),
     )
+    # Records older than the launch (minus skew) belong to a pre-existing kimi
+    # session that was resumed, not to this Omnigent session — never bill them.
+    usage_time_floor_ms = launch_epoch_ms - _DISCOVER_SKEW_MS
     # Final assistant text of the turn in flight, forwarded on the ``end_turn``
     # edge so the parent's inbox gets the real result instead of an empty one.
     last_assistant_text = ""
@@ -670,22 +797,21 @@ async def forward_kimi_wire_to_session(
                 if discovered is not None and discovered != wire_path:
                     wire_path = discovered
                     last_line = 0
-                    usage_sync.reset()
-                    _write_state(
-                        bridge_dir, _ForwardState(str(wire_path), last_line, usage_sync.totals())
-                    )
+                    # Cursor resets; cumulative usage totals carry forward.
+                    usage_sync.note_new_wire()
+                    _write_state(bridge_dir, _ForwardState(str(wire_path), last_line))
             if wire_path is not None and wire_path.exists():
                 items = await asyncio.to_thread(read_kimi_wire_items, wire_path, last_line)
                 for item in items:
                     try:
                         if item.kind == "usage":
-                            # Best-effort (never raises): a failed post must not
-                            # stall transcript mirroring, and the cumulative
-                            # totals self-heal it on the next record.
-                            usage_sync.record(item)
-                            await usage_sync.flush(client)
+                            # Accumulate only; delivery happens in the per-poll
+                            # sync below so a failed post retries every poll
+                            # without stalling transcript mirroring.
+                            if item.time_ms is not None and item.time_ms >= usage_time_floor_ms:
+                                usage_sync.record(item)
                         elif item.kind == "model":
-                            await usage_sync.sync_model(client, item.model)
+                            usage_sync.note_model(item.model)
                         elif item.kind == "turn_end":
                             await _post_external_session_status(
                                 client,
@@ -696,6 +822,8 @@ async def forward_kimi_wire_to_session(
                                 output=last_assistant_text,
                             )
                             last_assistant_text = ""
+                            # Turn boundary: deliver the final totals promptly.
+                            await usage_sync.sync(client)
                         elif item.kind == "reasoning":
                             await _post_reasoning_item(
                                 client,
@@ -719,9 +847,11 @@ async def forward_kimi_wire_to_session(
                         _logger.warning("kimi forwarder: POST failed (will retry): %s", exc)
                         break
                     last_line = item.line_no + 1
-                    _write_state(
-                        bridge_dir, _ForwardState(str(wire_path), last_line, usage_sync.totals())
-                    )
+                    _write_state(bridge_dir, _ForwardState(str(wire_path), last_line))
+                # Deliver pending usage/model every poll (no-op when nothing
+                # changed): retries any previously failed post even when no
+                # further wire records arrive, e.g. a turn-final failure.
+                await usage_sync.sync(client)
             await asyncio.sleep(_POLL_INTERVAL_S)
 
 
