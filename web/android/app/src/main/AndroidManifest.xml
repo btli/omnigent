@@ -48,9 +48,9 @@
             android:windowSoftInputMode="adjustResize" />
 
         <!--
-          Deliberately NO intent filter for omnigent://auth-callback: login
-          callbacks are accepted only through the Auth Tab's Activity-result
-          channel (see NativeAuth), never as a broadcastable VIEW intent.
+          Deliberately NO intent filter for /auth/native-callback: Auth Tab
+          verifies each server's HTTPS Digital Asset Links and returns the
+          callback only through its Activity-result channel (see NativeAuth).
         -->
     </application>
 

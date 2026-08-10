@@ -30,6 +30,29 @@ structural equivalent of the iOS bridge's frame-origin + `isMainFrame` check:
 the transport object is never delivered to a sandboxed / cross-origin
 agent-HTML iframe, so an injected artifact can't reach the native surface.
 
+## Auth Tab server association
+
+Servers behind a front-door auth proxy can run login in an Android Auth Tab,
+but only after the server operator associates the installed app's package and
+signing certificate. Add this non-secret setting to the server config:
+
+```yaml
+android_auth_tab_apps:
+  - package_name: ai.omnigent.android
+    sha256_cert_fingerprints:
+      - "AA:BB:CC:...:FF"
+```
+
+Hosted entrypoints can instead set `OMNIGENT_ANDROID_AUTH_TAB_APPS` to the same
+list encoded as JSON. Use the app-signing certificate fingerprint (not the
+upload certificate when Play App Signing is enabled); self-built APKs use the
+certificate that signed that APK. The server publishes the configured entries
+at `/.well-known/assetlinks.json` for Auth Tab's Digital Asset Links check.
+
+The allowlist is empty by default. Missing configuration, a package/signature
+mismatch, or a verification timeout fails closed and returns the shell to the
+inline WebView login; there is no custom-scheme fallback.
+
 ## Scope (first version)
 
 Provides native setup chrome (server entry + recent servers via

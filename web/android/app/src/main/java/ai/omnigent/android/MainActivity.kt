@@ -418,12 +418,22 @@ class MainActivity : AppCompatActivity() {
             authLog("auth tab attempts exhausted ($loginAttempts) — not retrying")
             return
         }
-        val url = authTabFlow.begin(origin) ?: return
+        val callback = NativeAuth.callback(origin)
+        if (callback == null) {
+            fallBackToInlineLogin("auth tab requires an HTTPS server origin")
+            return
+        }
+        val url = authTabFlow.begin(origin, packageName) ?: return
         loginAttempts++
         historyCleared = false
-        authLog("proxy login -> auth tab") // URL carries only the state nonce
+        authLog("proxy login -> auth tab") // URL carries app binding + PKCE, no credential
         try {
-            AuthTabIntent.Builder().build().launch(authTabLauncher, url, NativeAuth.SCHEME)
+            AuthTabIntent.Builder().build().launch(
+                authTabLauncher,
+                url,
+                callback.host,
+                callback.path,
+            )
         } catch (_: Exception) {
             // No browser able to take the launch — abandon the flow and let
             // the next bounce run inline.
@@ -461,11 +471,18 @@ class MainActivity : AppCompatActivity() {
                 // authenticated browser hop (a native POST can't cross the
                 // proxy). The same launcher receives the final callback.
                 authLog("auth tab -> exchange hop")
+                val callback = pinnedOrigin?.let(NativeAuth::callback)
+                if (callback == null) {
+                    authTabFlow.cancel()
+                    fallBackToInlineLogin("exchange tab lost HTTPS callback origin")
+                    return
+                }
                 try {
                     AuthTabIntent.Builder().build().launch(
                         authTabLauncher,
                         outcome.url,
-                        NativeAuth.SCHEME,
+                        callback.host,
+                        callback.path,
                     )
                 } catch (_: Exception) {
                     authTabFlow.cancel()
