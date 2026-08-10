@@ -85,8 +85,8 @@ object NativeAuth {
      * The exchange URL for the second Auth Tab hop (front-door servers,
      * where a native POST can't cross the proxy). The URL necessarily
      * exposes the single-use code + verifier to browser history and
-     * browser/proxy diagnostics; the server consumes the code when the
-     * first syntactically valid exchange attempt lands.
+     * browser/proxy diagnostics; the server consumes the code only after
+     * state, PKCE, transport, and browser identity all match.
      */
     fun exchangeUrl(
         origin: String,

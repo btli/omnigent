@@ -300,6 +300,7 @@ class OmnigentWebViewClientTest {
         val client =
             client(
                 pinnedOrigin = DATABRICKS_ORIGIN,
+                authTabCapability = false,
                 onLoginRequired = { logins++ },
                 useAuthTab = true,
                 onProxyLoginRequired = { proxyLogins++ },
@@ -341,6 +342,7 @@ class OmnigentWebViewClientTest {
         val client =
             client(
                 pinnedOrigin = DATABRICKS_ORIGIN,
+                authTabCapability = false,
                 useAuthTab = true,
                 onProxyLoginRequired = { proxyLogins++ },
             )
@@ -391,11 +393,75 @@ class OmnigentWebViewClientTest {
         assertEquals(0, proxyLogins)
     }
 
+    @Test
+    fun `asset links capability enables auth tab on a custom origin`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        var proxyLogins = 0
+        val client =
+            client(
+                authTabCapability = true,
+                useAuthTab = true,
+                onProxyLoginRequired = { proxyLogins++ },
+            )
+
+        val handled = client.shouldOverrideUrlLoading(webView, request(IDP_URL))
+
+        assertTrue(handled)
+        assertEquals(1, proxyLogins)
+    }
+
+    @Test
+    fun `custom capable origin stays inline when auth tab is unavailable`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val client = client(authTabCapability = true, useAuthTab = false)
+
+        val handled = client.shouldOverrideUrlLoading(webView, request(IDP_URL))
+
+        assertFalse(handled)
+    }
+
+    @Test
+    fun `unknown capability defers an off-origin redirect for probing`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        var probes = 0
+        var logins = 0
+        val client =
+            client(
+                authTabCapability = null,
+                onAuthTabCapabilityRequired = { probes++ },
+                onLoginRequired = { logins++ },
+            )
+
+        val handled = client.shouldOverrideUrlLoading(webView, request(IDP_URL))
+
+        assertTrue(handled)
+        assertEquals(1, probes)
+        assertEquals(0, logins)
+    }
+
+    @Test
+    fun `unknown capability stops an off-origin landing for probing`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        var probes = 0
+        val client =
+            client(
+                authTabCapability = null,
+                onAuthTabCapabilityRequired = { probes++ },
+            )
+
+        client.onPageStarted(webView, IDP_URL, null)
+
+        assertTrue(webView.stopLoadingCalled)
+        assertEquals(1, probes)
+    }
+
     private fun client(
         shouldInjectBridgeAtPageReady: Boolean = false,
         pinnedOrigin: String = PINNED_ORIGIN,
         onLoginRequired: () -> Unit = {},
         onPageReady: (String?) -> Unit = {},
+        authTabCapability: Boolean? = false,
+        onAuthTabCapabilityRequired: () -> Unit = {},
         useAuthTab: Boolean = false,
         onProxyLoginRequired: () -> Unit = {},
     ) = OmnigentWebViewClient(
@@ -403,6 +469,8 @@ class OmnigentWebViewClientTest {
         shouldInjectBridgeAtPageReady = { shouldInjectBridgeAtPageReady },
         onPageReady = onPageReady,
         onLoginRequired = onLoginRequired,
+        authTabCapability = { authTabCapability },
+        onAuthTabCapabilityRequired = onAuthTabCapabilityRequired,
         shouldUseAuthTabLogin = { useAuthTab },
         onProxyLoginRequired = onProxyLoginRequired,
     )
