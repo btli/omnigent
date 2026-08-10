@@ -755,6 +755,66 @@ async def test_relay_tunnel_replacement_stays_runner_disconnected(
         )
 
 
+@pytest.mark.asyncio
+async def test_relay_repeated_stalls_exhaust_nonzero_grace_with_session_stream_lost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Zero-progress stalls exhaust a NON-ZERO grace and terminate.
+
+    At production config every stalled attempt outlasts the whole grace
+    window, so a duration-based deadline refresh retries forever and
+    terminal ``session_stream_lost`` is unreachable. Only an attempt
+    that made progress (received a stream event) may refresh the
+    deadline: back-to-back zero-progress stalls on a live tunnel must
+    exhaust the grace and publish terminal ``session_stream_lost``.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    # Each stalled attempt (0.3s) outlasts the grace (0.2s), mirroring
+    # production's 45s read timeout vs 10s grace.
+    monkeypatch.setattr(orchestration, "_RELAY_STREAM_READ_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 0.2)
+    monkeypatch.setattr(orchestration, "_RELAY_RETRY_INTERVAL_S", 0.05)
+    sessions_module._runner_relay_tasks.clear()
+    runner_id = "runner_repeated_stall_grace"
+    registry = TunnelRegistry()
+    _register_test_runner(registry, runner_id)
+    client = httpx.AsyncClient(
+        transport=WSTunnelTransport(registry, runner_id),
+        base_url="http://runner",
+    )
+    session_id = "f60718293a4b5c6d7e8f90a1b2c3d4e5"
+
+    collector = None
+    try:
+        handle = sessions_module._ensure_runner_relay(
+            session_id,
+            runner_id,
+            client,
+            conversation_store=None,
+        )
+        assert handle is not None
+        collector = await start_session_stream_collector(session_id)
+
+        # Never feed a response: every attempt stalls with zero progress.
+        # Without progress-gated refresh this retries forever and the
+        # wait below times out.
+        await asyncio.wait_for(handle.task, timeout=3.0)
+
+        event = await asyncio.wait_for(collector.queue.get(), timeout=2.0)
+        assert event.get("type") == "session.status"
+        assert event.get("status") == "failed"
+        assert event["error"]["code"] == "session_stream_lost"
+        assert registry.get(runner_id) is not None
+    finally:
+        await _cleanup_relay_test(
+            session_id=session_id,
+            collector=collector,
+            client=client,
+        )
+
+
 class _RecordingLabelStore:
     """Minimal conversation store that records ``set_labels`` calls.
 
