@@ -21,6 +21,17 @@ and recency. Relevant wire events:
   (``part.type == "think"`` is reasoning, mirrored as a transient
   ``external_output_reasoning_delta`` from ``part["think"]``; ``tool.call`` /
   ``tool.result`` events are still skipped — the embedded terminal shows them.)
+- ``{"type": "usage.record", "model": …, "usage": {"inputOther", "output",
+  "inputCacheRead", "inputCacheCreation"}, "usageScope": "turn"}`` → token
+  usage for one LLM call. Accumulated into per-session cumulative totals and
+  POSTed as coalesced ``external_session_usage`` events (the server prices
+  them into ``total_cost_usd`` via the model catalog; kimi emits no monetary
+  data, same as codex-native).
+- ``{"type": "llm.request", "model": …, "modelAlias": …}`` → the effective
+  model (the provider-resolved id, falling back to the configured alias).
+  Mirrored as a deduped ``external_model_change`` so the cost gate and the
+  web model picker see the real model — never seeded at spawn (the codex
+  pattern: the spawn model must land in ``model_override`` too).
 
 Each mirrored turn is POSTed as an ``external_conversation_item`` to
 ``/v1/sessions/{id}/events`` (the same shape :mod:`omnigent.kimi_native_hook`
@@ -34,7 +45,7 @@ import asyncio
 import contextlib
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
@@ -54,10 +65,18 @@ _BACKOFF_MAX_S = 30.0
 
 @dataclass
 class _ForwardState:
-    """Durable cursor for the wire-log tail."""
+    """Durable cursor for the wire-log tail.
+
+    ``usage_totals`` carries the cumulative token sums already accumulated
+    from ``usage.record`` rows at ``last_line``. Persisted so a forwarder
+    restart doesn't reset the cumulative counters to zero — the server
+    clamps cumulative usage monotonically, so a reset would silently drop
+    all post-restart usage until the totals re-crossed the prior peak.
+    """
 
     wire_path: str
     last_line: int
+    usage_totals: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -69,9 +88,17 @@ class KimiWireItem:
     text: str
     response_id: str
     # "message" (a user/assistant turn → external_conversation_item),
-    # "reasoning" (a think block → external_output_reasoning_delta), or
-    # "turn_end" (an ``end_turn`` step → external_session_status: idle).
+    # "reasoning" (a think block → external_output_reasoning_delta),
+    # "turn_end" (an ``end_turn`` step → external_session_status: idle),
+    # "usage" (a per-call token record → coalesced external_session_usage), or
+    # "model" (an llm.request's effective model → deduped external_model_change).
     kind: str = "message"
+    # For kind == "usage": the record's token counts, keyed
+    # input_other / output / cache_read / cache_creation.
+    usage: dict[str, int] | None = None
+    # For kind == "usage": the record's model alias (pricing fallback).
+    # For kind == "model": the effective model id.
+    model: str | None = None
 
 
 _MirrorItem = KimiWireItem
@@ -102,12 +129,22 @@ def _read_state(bridge_dir: Path) -> _ForwardState | None:
     wire_path = data.get("wire_path")
     last_line = data.get("last_line")
     if isinstance(wire_path, str) and isinstance(last_line, int):
-        return _ForwardState(wire_path=wire_path, last_line=last_line)
+        raw_totals = data.get("usage_totals")
+        totals = (
+            {k: v for k, v in raw_totals.items() if isinstance(k, str) and isinstance(v, int)}
+            if isinstance(raw_totals, dict)
+            else {}
+        )
+        return _ForwardState(wire_path=wire_path, last_line=last_line, usage_totals=totals)
     return None
 
 
 def _write_state(bridge_dir: Path, state: _ForwardState) -> None:
-    payload = {"wire_path": state.wire_path, "last_line": state.last_line}
+    payload = {
+        "wire_path": state.wire_path,
+        "last_line": state.last_line,
+        "usage_totals": state.usage_totals,
+    }
     tmp = bridge_dir / (_STATE_FILE + ".tmp")
     with contextlib.suppress(OSError):
         tmp.write_text(json.dumps(payload), encoding="utf-8")
@@ -192,9 +229,64 @@ def _input_text(blocks: object) -> str:
     return "".join(parts)
 
 
+def _usage_counts(raw: object) -> dict[str, int] | None:
+    """Coerce a ``usage.record``'s ``usage`` dict into typed token counts.
+
+    Missing / non-int / negative fields count as 0 (tolerant parsing);
+    ``None`` when the container isn't a dict at all.
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    def _count(key: str) -> int:
+        value = raw.get(key)
+        return value if isinstance(value, int) and value >= 0 else 0
+
+    return {
+        "input_other": _count("inputOther"),
+        "output": _count("output"),
+        "cache_read": _count("inputCacheRead"),
+        "cache_creation": _count("inputCacheCreation"),
+    }
+
+
 def _row_to_item(line_no: int, row: dict[str, object]) -> KimiWireItem | None:
     """Map one wire-log row to a conversation item, or ``None`` to skip it."""
     row_type = row.get("type")
+    if row_type == "usage.record":
+        # Pinned to the Kimi Code 0.34.0 shape: only turn-scoped records carry
+        # the session's own token spend; an unknown scope is skipped fail-safe.
+        if row.get("usageScope") != "turn":
+            return None
+        counts = _usage_counts(row.get("usage"))
+        if counts is None:
+            return None
+        model = row.get("model")
+        return KimiWireItem(
+            line_no=line_no,
+            role="assistant",
+            text="",
+            response_id=f"kimi:usage:{line_no}",
+            kind="usage",
+            usage=counts,
+            model=model if isinstance(model, str) and model else None,
+        )
+    if row_type == "llm.request":
+        # Prefer the provider-resolved model id (e.g. ``system.ai.kimi-k3``)
+        # over the configured alias (e.g. ``kimi-k3-databricks``).
+        model = row.get("model")
+        if not (isinstance(model, str) and model):
+            model = row.get("modelAlias")
+        if not (isinstance(model, str) and model):
+            return None
+        return KimiWireItem(
+            line_no=line_no,
+            role="assistant",
+            text="",
+            response_id=f"kimi:model:{line_no}",
+            kind="model",
+            model=model,
+        )
     if row_type == "turn.prompt":
         origin = row.get("origin")
         if isinstance(origin, dict) and origin.get("kind") != "user":
@@ -374,6 +466,159 @@ async def _post_reasoning_item(
     resp.raise_for_status()
 
 
+class _KimiUsageSync:
+    """Mirror kimi token usage and the effective model to Omnigent.
+
+    The kimi analog of codex-native's ``_SessionUsageCoalescer`` +
+    ``_sync_model_change``: per-call ``usage.record`` rows accumulate into
+    cumulative (SET-semantics) session totals posted as coalesced
+    ``external_session_usage`` events with the model riding along on every
+    post (the server prices the tokens via the model catalog — kimi emits no
+    monetary data). ``llm.request`` rows mirror the effective model as a
+    deduped ``external_model_change``; the baseline is never seeded at spawn,
+    so the real spawn model lands in ``model_override`` for the cost gate.
+
+    Every post is best-effort: a failure is logged and swallowed so usage
+    mirroring can never stall transcript forwarding. Cumulative semantics
+    self-heal a missed usage post on the next record; a missed model post
+    retries on the next ``llm.request``.
+    """
+
+    _TOTAL_KEYS = ("input_other", "output", "cache_read", "cache_creation")
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        headers: dict[str, str],
+        session_id: str,
+        totals: dict[str, int] | None = None,
+    ) -> None:
+        self._events_url = f"{base_url.rstrip('/')}/v1/sessions/{session_id}/events"
+        self._headers = headers
+        self._totals: dict[str, int] = dict.fromkeys(self._TOTAL_KEYS, 0)
+        if totals:
+            for key in self._TOTAL_KEYS:
+                value = totals.get(key)
+                if isinstance(value, int) and value >= 0:
+                    self._totals[key] = value
+        # Latest record's context occupancy (inputOther + inputCacheRead +
+        # inputCacheCreation) — NOT cumulative.
+        self._context_tokens: int | None = None
+        # Effective model: llm.request's provider-resolved id wins; a
+        # usage.record's alias fills in until one is seen.
+        self._model: str | None = None
+        self._posted_model: str | None = None
+        self._last_posted: dict[str, int] | None = None
+        self._window_cache: dict[str, int | None] = {}
+
+    def totals(self) -> dict[str, int]:
+        """Snapshot of the cumulative token sums, for state persistence."""
+        return dict(self._totals)
+
+    def reset(self) -> None:
+        """Zero all accumulation for a freshly discovered wire log."""
+        self._totals = dict.fromkeys(self._TOTAL_KEYS, 0)
+        self._context_tokens = None
+        self._last_posted = None
+
+    def record(self, item: KimiWireItem) -> None:
+        """Fold one ``usage.record`` item into the cumulative totals."""
+        usage = item.usage or {}
+        for key in self._TOTAL_KEYS:
+            self._totals[key] += usage.get(key, 0)
+        self._context_tokens = (
+            usage.get("input_other", 0)
+            + usage.get("cache_read", 0)
+            + usage.get("cache_creation", 0)
+        )
+        if self._model is None and item.model:
+            self._model = item.model
+
+    async def flush(self, client: httpx.AsyncClient) -> None:
+        """POST the cumulative totals when they changed since the last post."""
+        # The server's cumulative_input_tokens is INCLUSIVE of cache reads (it
+        # splits cumulative_cache_read_input_tokens back out to price them at
+        # the cache-read rate). There is no dedicated cumulative cache-creation
+        # field, so creation tokens fold into the input total — they price at
+        # the full input rate, the accepted approximation.
+        payload: dict[str, int] = {
+            "cumulative_input_tokens": (
+                self._totals["input_other"]
+                + self._totals["cache_creation"]
+                + self._totals["cache_read"]
+            ),
+            "cumulative_cache_read_input_tokens": self._totals["cache_read"],
+            "cumulative_output_tokens": self._totals["output"],
+        }
+        if self._context_tokens is not None:
+            payload["context_tokens"] = self._context_tokens
+        window = await self._context_window()
+        if window is not None:
+            payload["context_window"] = window
+        if payload == self._last_posted:
+            return
+        # The model rides along on every token post (outside the dedup): the
+        # server reprices the cumulative totals per post and needs it each time.
+        body: dict[str, object] = dict(payload)
+        if self._model:
+            body["model"] = self._model
+        if await self._post(client, "external_session_usage", body):
+            self._last_posted = payload
+
+    async def sync_model(self, client: httpx.AsyncClient, model: str | None) -> None:
+        """Mirror the effective model when it differs from the posted baseline."""
+        if not model:
+            return
+        self._model = model
+        if model == self._posted_model:
+            return
+        if await self._post(client, "external_model_change", {"model": model}):
+            self._posted_model = model
+
+    async def _context_window(self) -> int | None:
+        """Resolve the effective model's context window, or ``None``.
+
+        Uses the model-catalog helpers (never ``llm.request.maxTokens``,
+        which is the max *output* tokens) and caches per model id. Omitted
+        when no metadata source resolves the model — a guessed default would
+        draw a wrong context ring.
+        """
+        model = self._model
+        if not model:
+            return None
+        if model not in self._window_cache:
+            from omnigent.llms.context_window import find_model_context_window
+
+            try:
+                window = await asyncio.to_thread(find_model_context_window, model)
+            except Exception:
+                # Best-effort boundary: a metadata lookup failure must not
+                # stop usage mirroring; the window is simply omitted.
+                _logger.exception("kimi forwarder: context-window lookup failed for %s", model)
+                window = None
+            self._window_cache[model] = window
+        return self._window_cache[model]
+
+    async def _post(
+        self, client: httpx.AsyncClient, event_type: str, data: dict[str, object]
+    ) -> bool:
+        """POST one session event; log-and-swallow failures (best-effort)."""
+        try:
+            resp = await client.post(
+                self._events_url, headers=self._headers, json={"type": event_type, "data": data}
+            )
+        except httpx.HTTPError as exc:
+            _logger.warning("kimi forwarder: %s POST failed: %s", event_type, exc)
+            return False
+        if resp.status_code >= 400:
+            _logger.warning(
+                "kimi forwarder: %s POST rejected with HTTP %d", event_type, resp.status_code
+            )
+            return False
+        return True
+
+
 async def forward_kimi_wire_to_session(
     *,
     base_url: str,
@@ -407,6 +652,12 @@ async def forward_kimi_wire_to_session(
     state = _read_state(bridge_dir)
     wire_path = Path(state.wire_path) if state is not None else None
     last_line = state.last_line if state is not None else 0
+    usage_sync = _KimiUsageSync(
+        base_url=base_url,
+        headers=headers,
+        session_id=session_id,
+        totals=state.usage_totals if state is not None else None,
+    )
     # Final assistant text of the turn in flight, forwarded on the ``end_turn``
     # edge so the parent's inbox gets the real result instead of an empty one.
     last_assistant_text = ""
@@ -419,12 +670,23 @@ async def forward_kimi_wire_to_session(
                 if discovered is not None and discovered != wire_path:
                     wire_path = discovered
                     last_line = 0
-                    _write_state(bridge_dir, _ForwardState(str(wire_path), last_line))
+                    usage_sync.reset()
+                    _write_state(
+                        bridge_dir, _ForwardState(str(wire_path), last_line, usage_sync.totals())
+                    )
             if wire_path is not None and wire_path.exists():
                 items = await asyncio.to_thread(read_kimi_wire_items, wire_path, last_line)
                 for item in items:
                     try:
-                        if item.kind == "turn_end":
+                        if item.kind == "usage":
+                            # Best-effort (never raises): a failed post must not
+                            # stall transcript mirroring, and the cumulative
+                            # totals self-heal it on the next record.
+                            usage_sync.record(item)
+                            await usage_sync.flush(client)
+                        elif item.kind == "model":
+                            await usage_sync.sync_model(client, item.model)
+                        elif item.kind == "turn_end":
                             await _post_external_session_status(
                                 client,
                                 base_url=base_url,
@@ -457,7 +719,9 @@ async def forward_kimi_wire_to_session(
                         _logger.warning("kimi forwarder: POST failed (will retry): %s", exc)
                         break
                     last_line = item.line_no + 1
-                    _write_state(bridge_dir, _ForwardState(str(wire_path), last_line))
+                    _write_state(
+                        bridge_dir, _ForwardState(str(wire_path), last_line, usage_sync.totals())
+                    )
             await asyncio.sleep(_POLL_INTERVAL_S)
 
 
