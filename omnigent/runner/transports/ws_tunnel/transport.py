@@ -41,6 +41,11 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 )
 from omnigent.runner.transports.ws_tunnel.registry import RequestState, TunnelRegistry
 
+# Bound on the best-effort request.cancel send: the send awaits an ack
+# from the session's owner loop, and a wedged loop never acks — the
+# timeout that triggered the cancel must still surface to the caller.
+_CANCEL_SEND_TIMEOUT_S = 1.0
+
 
 async def _send_cancel_frame(
     registry: TunnelRegistry,
@@ -52,15 +57,19 @@ async def _send_cancel_frame(
 
     Without it the runner's stream generator leaks and keeps consuming
     from the session's shared event queue, starving a restarted stream.
-    Must run while the request is still open; send failures are ignored
-    (the tunnel may already be dying).
+    Must run while the request is still open; send failures and a send
+    that outlasts :data:`_CANCEL_SEND_TIMEOUT_S` are ignored (the
+    tunnel may already be dying or its owner loop wedged).
     """
     if not registry.request_is_open(state.session, req_id):
         return
     try:  # noqa: SIM105 — contextlib.suppress doesn't work with await
-        await registry.send_text(
-            state.session,
-            encode_frame(RequestCancelFrame(id=req_id, reason=reason)),
+        await asyncio.wait_for(
+            registry.send_text(
+                state.session,
+                encode_frame(RequestCancelFrame(id=req_id, reason=reason)),
+            ),
+            _CANCEL_SEND_TIMEOUT_S,
         )
     except Exception:  # noqa: BLE001 — best-effort cleanup
         pass
@@ -86,12 +95,14 @@ class _TunneledByteStream(httpx.AsyncByteStream):
         req_id: str,
         state: RequestState,
         read_timeout: float | None = None,
+        request: httpx.Request | None = None,
     ) -> None:
         self._registry = registry
         self._runner_id = runner_id
         self._req_id = req_id
         self._state = state
         self._read_timeout = read_timeout
+        self._request = request
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         state = self._state
@@ -111,7 +122,8 @@ class _TunneledByteStream(httpx.AsyncByteStream):
                         )
                         raise httpx.ReadTimeout(
                             f"tunneled response from runner {self._runner_id!r} "
-                            f"stalled beyond {self._read_timeout}s read timeout"
+                            f"stalled beyond {self._read_timeout}s read timeout",
+                            request=self._request,
                         ) from None
                 if state.aborted_with is not None:
                     raise state.aborted_with
@@ -228,6 +240,7 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
             req_id,
             state,
             read_timeout=read_timeout,
+            request=request,
         )
         return httpx.Response(
             status_code=head.status,
