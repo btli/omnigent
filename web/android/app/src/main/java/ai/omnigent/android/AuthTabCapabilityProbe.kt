@@ -21,8 +21,8 @@ import java.util.concurrent.Executors
  */
 internal class AuthTabCapabilityProbe(
     context: Context,
-    private val signingFingerprint: () -> String? = { signingCertificateSha256(context) },
-    private val fetch: (String, String, String) -> Boolean = ::fetchAssetLinks,
+    private val signingFingerprints: () -> Set<String> = { signingCertificateSha256(context) },
+    private val fetch: (String, String, Set<String>) -> Boolean = ::fetchAssetLinks,
     private val execute: ((() -> Unit) -> Unit) = { task -> IO.execute(task) },
     private val post: ((() -> Unit) -> Unit) = { task -> MAIN.post(task) },
 ) {
@@ -61,8 +61,8 @@ internal class AuthTabCapabilityProbe(
         execute {
             // This is only a launch hint; browser DAL verification remains authoritative.
             val supported =
-                signingFingerprint()?.let { fingerprint ->
-                    runCatching { fetch(normalized, packageName, fingerprint) }.getOrDefault(false)
+                signingFingerprints().takeIf { it.isNotEmpty() }?.let { fingerprints ->
+                    runCatching { fetch(normalized, packageName, fingerprints) }.getOrDefault(false)
                 } ?: false
             val callbacks =
                 synchronized(lock) {
@@ -94,7 +94,7 @@ internal class AuthTabCapabilityProbe(
         fun fetchAssetLinks(
             origin: String,
             packageName: String,
-            signingFingerprint: String,
+            signingFingerprints: Set<String>,
         ): Boolean {
             val connection =
                 URL("$origin/.well-known/assetlinks.json").openConnection() as HttpURLConnection
@@ -110,14 +110,14 @@ internal class AuthTabCapabilityProbe(
                 hasMatchingAssetLinks(
                     InputStreamReader(connection.inputStream, Charsets.UTF_8),
                     packageName,
-                    signingFingerprint,
+                    signingFingerprints,
                 )
             } finally {
                 connection.disconnect()
             }
         }
 
-        fun signingCertificateSha256(context: Context): String? =
+        fun signingCertificateSha256(context: Context): Set<String> =
             runCatching {
                 @Suppress("DEPRECATION")
                 val packageInfo =
@@ -125,23 +125,26 @@ internal class AuthTabCapabilityProbe(
                         context.packageName,
                         PackageManager.GET_SIGNING_CERTIFICATES,
                     )
-                val certificate =
-                    packageInfo.signingInfo?.apkContentsSigners?.firstOrNull()
-                        ?: return@runCatching null
-                MessageDigest
-                    .getInstance("SHA-256")
-                    .digest(certificate.toByteArray())
-                    .joinToString(":") { byte ->
-                        String.format(Locale.US, "%02X", byte.toInt() and 0xff)
-                    }
-            }.getOrNull()
+                val signingInfo = packageInfo.signingInfo ?: return@runCatching emptySet()
+                (
+                    signingInfo.apkContentsSigners.orEmpty().asSequence() +
+                        signingInfo.signingCertificateHistory.orEmpty().asSequence()
+                ).map { certificate ->
+                    MessageDigest
+                        .getInstance("SHA-256")
+                        .digest(certificate.toByteArray())
+                        .joinToString(":") { byte ->
+                            String.format(Locale.US, "%02X", byte.toInt() and 0xff)
+                        }
+                }.toSet()
+            }.getOrDefault(emptySet())
     }
 }
 
 internal fun hasMatchingAssetLinks(
     source: Reader,
     packageName: String,
-    signingFingerprint: String,
+    signingFingerprints: Set<String>,
 ): Boolean =
     runCatching {
         JsonReader(source).use { reader ->
@@ -149,17 +152,17 @@ internal fun hasMatchingAssetLinks(
             reader.beginArray()
             var matches = false
             while (reader.hasNext()) {
-                matches = readAssetLink(reader, packageName, signingFingerprint) || matches
+                matches = readAssetLink(reader, packageName, signingFingerprints) || matches
             }
             reader.endArray()
-            matches && reader.peek() == JsonToken.END_DOCUMENT
+            matches
         }
     }.getOrDefault(false)
 
 private fun readAssetLink(
     reader: JsonReader,
     packageName: String,
-    signingFingerprint: String,
+    signingFingerprints: Set<String>,
 ): Boolean {
     if (reader.peek() != JsonToken.BEGIN_OBJECT) {
         reader.skipValue()
@@ -179,7 +182,7 @@ private fun readAssetLink(
             }
 
             "target" -> {
-                targetMatches = readTarget(reader, packageName, signingFingerprint)
+                targetMatches = readTarget(reader, packageName, signingFingerprints)
             }
 
             else -> {
@@ -194,7 +197,7 @@ private fun readAssetLink(
 private fun readTarget(
     reader: JsonReader,
     packageName: String,
-    signingFingerprint: String,
+    signingFingerprints: Set<String>,
 ): Boolean {
     if (reader.peek() != JsonToken.BEGIN_OBJECT) {
         reader.skipValue()
@@ -215,7 +218,12 @@ private fun readTarget(
             }
 
             "sha256_cert_fingerprints" -> {
-                fingerprintMatches = readStringArrayContains(reader, signingFingerprint)
+                fingerprintMatches =
+                    readStringArrayContains(
+                        reader,
+                        signingFingerprints.mapTo(mutableSetOf(), ::normalizeFingerprint),
+                        ::normalizeFingerprint,
+                    )
             }
 
             else -> {
@@ -240,6 +248,12 @@ private fun readString(reader: JsonReader): String? {
 private fun readStringArrayContains(
     reader: JsonReader,
     expected: String,
+): Boolean = readStringArrayContains(reader, setOf(expected))
+
+private fun readStringArrayContains(
+    reader: JsonReader,
+    expected: Set<String>,
+    normalize: (String) -> String = { it },
 ): Boolean {
     if (reader.peek() != JsonToken.BEGIN_ARRAY) {
         reader.skipValue()
@@ -249,7 +263,7 @@ private fun readStringArrayContains(
     var matches = false
     while (reader.hasNext()) {
         if (reader.peek() == JsonToken.STRING) {
-            matches = reader.nextString() == expected || matches
+            matches = normalize(reader.nextString()) in expected || matches
         } else {
             reader.skipValue()
         }
@@ -257,3 +271,6 @@ private fun readStringArrayContains(
     reader.endArray()
     return matches
 }
+
+private fun normalizeFingerprint(fingerprint: String): String =
+    fingerprint.replace(":", "").uppercase(Locale.US)

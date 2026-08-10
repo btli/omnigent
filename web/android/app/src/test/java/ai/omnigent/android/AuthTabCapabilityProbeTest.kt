@@ -44,6 +44,50 @@ class AuthTabCapabilityProbeTest {
     }
 
     @Test
+    fun `lowercase colonless fingerprint advertises auth tab capability`() {
+        assertTrue(
+            matches(
+                assetLink(fingerprint = SIGNING_FINGERPRINT.replace(":", "").lowercase()),
+            ),
+        )
+    }
+
+    @Test
+    fun `second signer of multi signer app advertises auth tab capability`() {
+        assertTrue(
+            matches(
+                assetLink(fingerprint = SECOND_SIGNING_FINGERPRINT),
+                setOf(SIGNING_FINGERPRINT, SECOND_SIGNING_FINGERPRINT),
+            ),
+        )
+    }
+
+    @Test
+    fun `historical signing certificate advertises auth tab capability`() {
+        assertTrue(
+            matches(
+                assetLink(fingerprint = HISTORICAL_SIGNING_FINGERPRINT),
+                setOf(SIGNING_FINGERPRINT, HISTORICAL_SIGNING_FINGERPRINT),
+            ),
+        )
+    }
+
+    @Test
+    fun `unrelated fingerprint does not match any app signer`() {
+        assertFalse(
+            matches(
+                assetLink(fingerprint = WRONG_FINGERPRINT),
+                setOf(SIGNING_FINGERPRINT, SECOND_SIGNING_FINGERPRINT),
+            ),
+        )
+    }
+
+    @Test
+    fun `matching array with trailing padding advertises auth tab capability`() {
+        assertTrue(matches(assetLink() + "\n<!-- CDN padding -->"))
+    }
+
+    @Test
     fun `malformed asset links does not advertise auth tab capability`() {
         assertFalse(matches("[{"))
     }
@@ -55,7 +99,7 @@ class AuthTabCapabilityProbeTest {
         val probe =
             AuthTabCapabilityProbe(
                 context(),
-                signingFingerprint = { SIGNING_FINGERPRINT },
+                signingFingerprints = { setOf(SIGNING_FINGERPRINT) },
                 fetch = { _, _, _ ->
                     fetches++
                     true
@@ -78,7 +122,7 @@ class AuthTabCapabilityProbeTest {
         val probe =
             AuthTabCapabilityProbe(
                 context(),
-                signingFingerprint = { SIGNING_FINGERPRINT },
+                signingFingerprints = { setOf(SIGNING_FINGERPRINT) },
                 fetch = { _, _, _ -> ++fetches > 1 },
                 execute = { task -> task() },
                 post = { task -> task() },
@@ -100,7 +144,7 @@ class AuthTabCapabilityProbeTest {
         val probe =
             AuthTabCapabilityProbe(
                 context(),
-                signingFingerprint = { SIGNING_FINGERPRINT },
+                signingFingerprints = { setOf(SIGNING_FINGERPRINT) },
                 fetch = { _, _, _ ->
                     fetches++
                     false
@@ -126,7 +170,7 @@ class AuthTabCapabilityProbeTest {
         val probe =
             AuthTabCapabilityProbe(
                 context(),
-                signingFingerprint = { SIGNING_FINGERPRINT },
+                signingFingerprints = { setOf(SIGNING_FINGERPRINT) },
                 fetch = { _, _, _ ->
                     fetched = true
                     true
@@ -141,11 +185,14 @@ class AuthTabCapabilityProbeTest {
         assertFalse(result)
     }
 
-    private fun matches(body: String): Boolean =
+    private fun matches(
+        body: String,
+        signingFingerprints: Set<String> = setOf(SIGNING_FINGERPRINT),
+    ): Boolean =
         hasMatchingAssetLinks(
             StringReader(body),
             PACKAGE_NAME,
-            SIGNING_FINGERPRINT,
+            signingFingerprints,
         )
 
     private fun assetLink(
@@ -175,5 +222,11 @@ class AuthTabCapabilityProbeTest {
         const val WRONG_FINGERPRINT =
             "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:" +
                 "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99"
+        const val SECOND_SIGNING_FINGERPRINT =
+            "22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:" +
+                "22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11"
+        const val HISTORICAL_SIGNING_FINGERPRINT =
+            "33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:" +
+                "33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22"
     }
 }
