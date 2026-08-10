@@ -5432,12 +5432,23 @@ class _RelayTransportLost(Exception):
     :param stream_lost: Whether the runner's tunnel was still registered
         when the stream dropped — a live-tunnel stream loss, not a
         runner disconnect.
+    :param progress: Whether the attempt received at least one stream
+        chunk (event or heartbeat) before dropping. Zero-progress
+        attempts must not refresh the reconnect-grace deadline, or a
+        wedged-but-registered runner would retry forever.
     """
 
-    def __init__(self, *, intentional: bool, stream_lost: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        intentional: bool,
+        stream_lost: bool = False,
+        progress: bool = False,
+    ) -> None:
         super().__init__("runner stream transport lost")
         self.intentional = intentional
         self.stream_lost = stream_lost
+        self.progress = progress
 
 
 # Relay stream read timeout: 3x the runner's session-stream heartbeat
@@ -5500,7 +5511,6 @@ async def _relay_runner_stream(
     loop = asyncio.get_running_loop()
     deadline: float | None = None
     while True:
-        started = loop.time()
         try:
             await _relay_runner_stream_once(
                 session_id,
@@ -5512,9 +5522,12 @@ async def _relay_runner_stream(
             return
         except _RelayTransportLost as lost:
             now = loop.time()
-            # An attempt that streamed longer than the grace was a live
-            # tunnel dropping anew — give the new outage a fresh window.
-            if deadline is None or now - started > RUNNER_DISCONNECT_GRACE_S:
+            # An attempt that made progress (received a stream event)
+            # was a live stream dropping anew — give the new outage a
+            # fresh window. Zero-progress attempts (e.g. repeated read
+            # timeouts on a wedged-but-registered runner) must not
+            # refresh, so consecutive stalls exhaust the grace.
+            if deadline is None or lost.progress:
                 deadline = now + RUNNER_DISCONNECT_GRACE_S
             if not lost.intentional and now + _RELAY_RETRY_INTERVAL_S < deadline:
                 _logger.info(
@@ -5620,6 +5633,9 @@ async def _relay_runner_stream_once(
         ``"runner_abc123"``. ``None`` skips the live-tunnel check.
     """
     text_acc: list[str] = []
+    # Whether this attempt received any stream chunk; gates the
+    # supervisor's grace-deadline refresh on transport loss.
+    made_progress = False
     current_response_id: str | None = None
     # Model/agent label from the turn header, stamped on text segments
     # flushed at tool-call boundaries (the boundary event carries no model).
@@ -5649,6 +5665,7 @@ async def _relay_runner_stream_once(
             _logger.info("Relay: connected to runner GET /stream for session=%s", session_id)
             buffer = ""
             async for chunk in resp.aiter_text():
+                made_progress = True
                 buffer += chunk
                 while "\n\n" in buffer:
                     frame, _, buffer = buffer.partition("\n\n")
@@ -6067,6 +6084,7 @@ async def _relay_runner_stream_once(
                 and not isinstance(exc, httpx.ConnectError)
                 and _runner_tunnel_alive(runner_client, runner_id)
             ),
+            progress=made_progress,
         ) from exc
     except asyncio.CancelledError:
         raise
