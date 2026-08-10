@@ -86,6 +86,7 @@ from omnigent.inner.executor import (
     ToolSpec,
     TurnComplete,
 )
+from omnigent.kimi_native_credentials import resolve_user_kimi_home
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 
 _logger = logging.getLogger(__name__)
@@ -109,14 +110,6 @@ _SESSION_RESUME_RE = re.compile(
 #: Clock-skew tolerance when time-filtering the first read of a resumed wire
 #: log (kimi writes record ``time`` from the same host, so drift is minimal).
 _USAGE_TIME_SKEW_MS = 10_000
-
-
-def _kimi_code_home() -> Path:
-    """Kimi's persistent state dir: ``$KIMI_CODE_HOME`` or ``~/.kimi-code``."""
-    override = os.environ.get("KIMI_CODE_HOME")
-    if override:
-        return Path(override)
-    return Path.home() / ".kimi-code"
 
 
 def _find_wire_log(home: Path, session_id: str) -> Path | None:
@@ -465,7 +458,7 @@ class KimiExecutor(Executor):
         if not session_id:
             return None
         try:
-            wire_path = _find_wire_log(_kimi_code_home(), session_id)
+            wire_path = _find_wire_log(resolve_user_kimi_home(), session_id)
             if wire_path is None:
                 return None
             offset = self._wire_offsets.get(session_id, 0)
