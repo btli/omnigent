@@ -3,8 +3,10 @@ package ai.omnigent.android
 import android.content.Context
 import android.content.RestrictionsManager
 import android.content.res.Configuration
+import android.net.Uri
 import android.os.Bundle
 import android.webkit.WebView
+import androidx.browser.auth.AuthTabIntent
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
@@ -98,6 +100,39 @@ class MainActivityTest {
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
 
         assertEquals("https://example.com", shadowOf(activity.webView()).lastLoadedUrl)
+    }
+
+    @Test
+    fun `dismissed auth tab falls back to the inline login`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        activity.authTabFlow.begin("https://example.com")
+
+        activity.onAuthTabOutcome(AuthTabIntent.RESULT_CANCELED, null)
+
+        assertFalse(activity.authTabFlow.inFlight)
+        assertTrue(activity.authTabFellBack)
+        assertEquals("https://example.com", shadowOf(activity.webView()).lastLoadedUrl)
+    }
+
+    @Test
+    fun `unmatched auth callback abandons the flow and falls back`() {
+        // Regression: a mismatched or malformed callback used to leave the
+        // pending flow armed, so the in-flight check short-circuited every
+        // later login attempt — a permanent wedge until process death.
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        activity.authTabFlow.begin("https://example.com")
+
+        activity.onAuthTabOutcome(
+            AuthTabIntent.RESULT_OK,
+            Uri.parse(
+                "omnigent://auth-callback?state=not-the-flow-state&code=c0de&exchange=tab",
+            ),
+        )
+
+        assertFalse(activity.authTabFlow.inFlight)
+        assertTrue(activity.authTabFellBack)
     }
 
     private fun MainActivity.webView(): WebView =
