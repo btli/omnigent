@@ -886,7 +886,14 @@ class TestUsageSync:
     @pytest.mark.parametrize(
         "mutate",
         [
-            pytest.param(lambda p: p.update(totals="nope"), id="totals-wrong-type"),
+            pytest.param(
+                # A LIST of exactly the four counter names set()-compares equal
+                # to the expected key set, so only the dict guard rejects it.
+                lambda p: p.update(
+                    totals=["input_other", "output", "cache_read", "cache_creation"]
+                ),
+                id="totals-wrong-type",
+            ),
             pytest.param(lambda p: p["totals"].update(output=True), id="counter-boolean"),
             pytest.param(lambda p: p["totals"].update(output=-1), id="counter-negative"),
             pytest.param(lambda p: p["totals"].update(output="2"), id="counter-wrong-type"),
