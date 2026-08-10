@@ -2740,10 +2740,17 @@ def create_app(
     # proxy authenticates the browser and the shell collects the
     # credential via the completion redirect).
     if isinstance(auth_provider, UnifiedAuthProvider):
-        from omnigent.server.routes.native_auth import create_native_auth_router
+        from omnigent.server.routes.native_auth import (
+            create_android_asset_links_router,
+            create_native_auth_router,
+            resolve_android_auth_tab_apps,
+        )
+
+        android_auth_tab_apps = resolve_android_auth_tab_apps(server_config)
+        app.include_router(create_android_asset_links_router(android_auth_tab_apps))
 
         app.include_router(
-            create_native_auth_router(auth_provider),
+            create_native_auth_router(auth_provider, android_auth_tab_apps),
             prefix="/auth",
             tags=["auth"],
         )
