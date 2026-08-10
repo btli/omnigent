@@ -7,7 +7,7 @@ import java.security.MessageDigest
 /**
  * The native-login contract shared with the server's
  * `/auth/native-complete` + `/auth/native-exchange` pair — an OAuth-style
- * code flow (PKCE, RFC 7636) whose callback is bound to this app through
+ * code flow (PKCE, RFC 7636) whose callback the browser checks against
  * Android Digital Asset Links:
  *
  * 1. The shell opens `native-complete` (with its package, a state nonce,
@@ -15,8 +15,8 @@ import java.security.MessageDigest
  *    / IdP chain runs in the real browser.
  * 2. The server 302s `https://<server>/auth/native-callback` with the
  *    state and an opaque one-time **code** (never a token), plus which
- *    exchange transport to use. Auth Tab returns it only after the
- *    server's Digital Asset Links verify this package and signing cert.
+ *    exchange transport to use. The callback is honored only if the
+ *    browser's client-side Digital Asset Links check succeeds.
  * 3. The shell exchanges code + state + verifier for the credential:
  *    a native POST where reachable, or a second silent Auth Tab hop for
  *    servers behind a front-door proxy that 302s native requests.
@@ -140,7 +140,7 @@ object NativeAuth {
         return Result(state, tokenType, token)
     }
 
-    /** The verified HTTPS callback host/path for [origin], or null if invalid. */
+    /** The HTTPS callback host/path the browser must verify, or null if invalid. */
     fun callback(origin: String): Callback? {
         val uri = Uri.parse(origin)
         val host = uri.host ?: return null

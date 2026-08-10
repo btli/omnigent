@@ -34,6 +34,7 @@ from omnigent.server.routes.native_auth import (
     create_native_auth_router,
     resolve_android_auth_tab_apps,
     resolve_forwarded_token_header,
+    resolve_native_auth_base_url,
 )
 
 _SECRET = bytes.fromhex("ab" * 32)
@@ -49,11 +50,16 @@ _CHALLENGE = derive_code_challenge(_VERIFIER)
 def _client(
     provider: UnifiedAuthProvider,
     allowed_apps: tuple[AndroidAuthTabApp, ...] = _ALLOWED_APPS,
+    callback_base_url: str = _ORIGIN,
+    request_base_url: str = _ORIGIN,
 ) -> TestClient:
     app = FastAPI()
     app.include_router(create_android_asset_links_router(allowed_apps))
-    app.include_router(create_native_auth_router(provider, allowed_apps), prefix="/auth")
-    return TestClient(app, base_url=_ORIGIN, follow_redirects=False)
+    app.include_router(
+        create_native_auth_router(provider, allowed_apps, callback_base_url),
+        prefix="/auth",
+    )
+    return TestClient(app, base_url=request_base_url, follow_redirects=False)
 
 
 def _header_provider() -> UnifiedAuthProvider:
@@ -104,15 +110,15 @@ _HEADER_AUTH = {
 }
 
 
-def _cookie_auth(provider_name: str) -> dict[str, str]:
-    bearer = mint_session_token("alice@example.com", _SECRET, 3600, provider_name)
+def _cookie_auth(provider_name: str, user_id: str = "alice@example.com") -> dict[str, str]:
+    bearer = mint_session_token(user_id, _SECRET, 3600, provider_name)
     return {"Authorization": f"Bearer {bearer}"}
 
 
-def _callback_params(response) -> dict[str, list[str]]:
+def _callback_params(response, expected_origin: str = _ORIGIN) -> dict[str, list[str]]:
     location = response.headers["location"]
     parts = urlsplit(location)
-    assert f"{parts.scheme}://{parts.netloc}" == _ORIGIN
+    assert f"{parts.scheme}://{parts.netloc}" == expected_origin
     assert parts.path == "/auth/native-callback"
     return parse_qs(parts.query)
 
@@ -123,6 +129,7 @@ def _complete(
     state: str = _STATE,
     challenge: str = _CHALLENGE,
     client_package: str = _ANDROID_PACKAGE,
+    callback_origin: str = _ORIGIN,
 ) -> dict[str, list[str]]:
     response = client.get(
         "/auth/native-complete",
@@ -135,7 +142,7 @@ def _complete(
     )
     assert response.status_code == 302
     assert response.headers["cache-control"] == "no-store"
-    return _callback_params(response)
+    return _callback_params(response, callback_origin)
 
 
 class TestCompleteValidation:
@@ -180,7 +187,7 @@ class TestCompleteValidation:
             assert response.status_code == 400
             assert "location" not in response.headers
 
-    def test_unconfigured_android_app_cannot_initiate_a_flow(self) -> None:
+    def test_unlisted_package_string_is_refused(self) -> None:
         attacker_verifier = "A" * 43
         response = _client(_header_provider()).get(
             "/auth/native-complete",
@@ -198,6 +205,21 @@ class TestCompleteValidation:
             "state": ["attacker-state-1234"],
             "error": ["client_not_allowed"],
         }
+
+    def test_allowed_package_string_is_not_server_side_app_identity_proof(self) -> None:
+        attacker_verifier = "A" * 43
+
+        params = _complete(
+            _client(_header_provider()),
+            _HEADER_AUTH,
+            state="attacker-state-1234",
+            challenge=derive_code_challenge(attacker_verifier),
+            client_package=_ANDROID_PACKAGE,
+        )
+
+        assert params["state"] == ["attacker-state-1234"]
+        assert params["code"]
+        assert params["exchange"] == ["tab"]
 
     def test_empty_app_allowlist_disables_flow_creation(self) -> None:
         params = _complete(
@@ -236,6 +258,35 @@ class TestCompleteValidation:
         )
 
         assert apps == _ALLOWED_APPS
+
+    def test_server_config_resolves_native_auth_https_origin(self, monkeypatch) -> None:
+        monkeypatch.delenv("OMNIGENT_NATIVE_AUTH_BASE_URL", raising=False)
+
+        assert (
+            resolve_native_auth_base_url({"native_auth_base_url": "https://public.example.com/"})
+            == "https://public.example.com"
+        )
+
+    def test_native_auth_base_url_must_be_an_https_origin(self, monkeypatch) -> None:
+        monkeypatch.delenv("OMNIGENT_NATIVE_AUTH_BASE_URL", raising=False)
+
+        with pytest.raises(ValueError, match="absolute HTTPS origin"):
+            resolve_native_auth_base_url({"native_auth_base_url": "http://public.example.com"})
+
+    def test_proxied_completion_uses_configured_public_https_origin(self) -> None:
+        public_origin = "https://public.example.com"
+        params = _complete(
+            _client(
+                _header_provider(),
+                callback_base_url=public_origin,
+                request_base_url="http://app.internal:8000",
+            ),
+            _HEADER_AUTH,
+            callback_origin=public_origin,
+        )
+
+        assert params["code"]
+        assert params["exchange"] == ["tab"]
 
     def test_completion_redirect_never_carries_a_token(self) -> None:
         for provider, headers in (
@@ -318,6 +369,7 @@ class TestCompleteValidation:
         rejected = client.post(
             "/auth/native-exchange",
             data={"code": code, "state": _STATE, "code_verifier": _VERIFIER},
+            headers={"X-Forwarded-Email": "alice@example.com"},
         )
         assert rejected.status_code == 400
         assert rejected.json()["error"] == "Exchange transport mismatch"
@@ -329,6 +381,7 @@ class TestCompleteValidation:
         exchanged = client.get(
             "/auth/native-exchange",
             params={"code": next_code, "state": _STATE, "code_verifier": _VERIFIER},
+            headers={"X-Forwarded-Email": "alice@example.com"},
         )
         assert _callback_params(exchanged)["token"] == ["custom-token"]
 
@@ -341,6 +394,7 @@ class TestExchange:
         response = client.get(
             "/auth/native-exchange",
             params={"code": code, "state": _STATE, "code_verifier": _VERIFIER},
+            headers=_HEADER_AUTH,
         )
 
         assert response.status_code == 302
@@ -362,6 +416,7 @@ class TestExchange:
         response = client.post(
             "/auth/native-exchange",
             data={"code": code, "state": _STATE, "code_verifier": _VERIFIER},
+            headers=_cookie_auth(provider_name),
         )
 
         assert response.status_code == 200
@@ -371,13 +426,61 @@ class TestExchange:
         assert claims["sub"] == "alice@example.com"
         assert response.headers["cache-control"] == "no-store"
 
+    def test_header_mode_exchange_rejects_a_different_authenticated_user(self) -> None:
+        client = _client(_header_provider())
+        code = _complete(client, _HEADER_AUTH)["code"][0]
+        fields = {"code": code, "state": _STATE, "code_verifier": _VERIFIER}
+
+        rejected = client.get(
+            "/auth/native-exchange",
+            params=fields,
+            headers={"X-Forwarded-Email": "bob@example.com"},
+        )
+        retry = client.get("/auth/native-exchange", params=fields, headers=_HEADER_AUTH)
+
+        assert _callback_params(rejected)["error"] == ["exchange_failed"]
+        assert _callback_params(retry)["error"] == ["exchange_failed"]
+
+    def test_cookie_mode_exchange_rejects_a_different_authenticated_user(self) -> None:
+        client = _client(_oidc_provider())
+        code = _complete(client, _cookie_auth("oidc"))["code"][0]
+        fields = {"code": code, "state": _STATE, "code_verifier": _VERIFIER}
+
+        rejected = client.post(
+            "/auth/native-exchange",
+            data=fields,
+            headers=_cookie_auth("oidc", "bob@example.com"),
+        )
+        retry = client.post(
+            "/auth/native-exchange",
+            data=fields,
+            headers=_cookie_auth("oidc"),
+        )
+
+        assert rejected.status_code == 403
+        assert rejected.json()["error"] == "flow identity mismatch"
+        assert retry.status_code == 400
+        assert retry.json()["error"] == "Unknown, expired, or already used code"
+
+    def test_cookie_mode_exchange_requires_authentication(self) -> None:
+        client = _client(_oidc_provider())
+        code = _complete(client, _cookie_auth("oidc"))["code"][0]
+
+        response = client.post(
+            "/auth/native-exchange",
+            data={"code": code, "state": _STATE, "code_verifier": _VERIFIER},
+        )
+
+        assert response.status_code == 401
+        assert response.json()["error"] == "not authenticated"
+
     def test_replayed_code_is_rejected(self) -> None:
         client = _client(_header_provider())
         code = _complete(client, _HEADER_AUTH)["code"][0]
         fields = {"code": code, "state": _STATE, "code_verifier": _VERIFIER}
 
-        first = client.get("/auth/native-exchange", params=fields)
-        replay = client.get("/auth/native-exchange", params=fields)
+        first = client.get("/auth/native-exchange", params=fields, headers=_HEADER_AUTH)
+        replay = client.get("/auth/native-exchange", params=fields, headers=_HEADER_AUTH)
 
         assert first.status_code == 302
         assert "token" in _callback_params(first)
@@ -388,8 +491,9 @@ class TestExchange:
         code = _complete(client, _cookie_auth("oidc"))["code"][0]
         fields = {"code": code, "state": _STATE, "code_verifier": _VERIFIER}
 
-        rejected = client.get("/auth/native-exchange", params=fields)
-        retry = client.post("/auth/native-exchange", data=fields)
+        auth = _cookie_auth("oidc")
+        rejected = client.get("/auth/native-exchange", params=fields, headers=auth)
+        retry = client.post("/auth/native-exchange", data=fields, headers=auth)
 
         assert rejected.status_code == 302
         params = _callback_params(rejected)
@@ -404,8 +508,8 @@ class TestExchange:
         code = _complete(client, _HEADER_AUTH)["code"][0]
         fields = {"code": code, "state": _STATE, "code_verifier": _VERIFIER}
 
-        rejected = client.post("/auth/native-exchange", data=fields)
-        retry = client.get("/auth/native-exchange", params=fields)
+        rejected = client.post("/auth/native-exchange", data=fields, headers=_HEADER_AUTH)
+        retry = client.get("/auth/native-exchange", params=fields, headers=_HEADER_AUTH)
 
         assert rejected.status_code == 400
         assert rejected.json()["error"] == "Exchange transport mismatch"
@@ -416,8 +520,9 @@ class TestExchange:
         code = _complete(client, _cookie_auth("oidc"))["code"][0]
         fields = {"code": code, "state": _STATE, "code_verifier": _VERIFIER}
 
-        query_only = client.post("/auth/native-exchange", params=fields)
-        proper_form = client.post("/auth/native-exchange", data=fields)
+        auth = _cookie_auth("oidc")
+        query_only = client.post("/auth/native-exchange", params=fields, headers=auth)
+        proper_form = client.post("/auth/native-exchange", data=fields, headers=auth)
 
         assert query_only.status_code == 400
         assert query_only.json()["error"] == "Missing or malformed code parameter"
@@ -432,10 +537,12 @@ class TestExchange:
         wrong = client.post(
             "/auth/native-exchange",
             data={"code": code, "state": _STATE, "code_verifier": "A" * 43},
+            headers=_cookie_auth("oidc"),
         )
         retry = client.post(
             "/auth/native-exchange",
             data={"code": code, "state": _STATE, "code_verifier": _VERIFIER},
+            headers=_cookie_auth("oidc"),
         )
 
         assert wrong.status_code == 400
@@ -448,6 +555,7 @@ class TestExchange:
         response = client.post(
             "/auth/native-exchange",
             data={"code": code, "state": "different-state1", "code_verifier": _VERIFIER},
+            headers=_cookie_auth("oidc"),
         )
 
         assert response.status_code == 400
@@ -469,6 +577,7 @@ class TestExchange:
         response = client.post(
             "/auth/native-exchange",
             data={"code": code, "state": _STATE, "code_verifier": _VERIFIER},
+            headers=_cookie_auth("oidc"),
         )
 
         assert response.status_code == 400

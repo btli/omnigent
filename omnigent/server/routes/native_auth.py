@@ -1,10 +1,10 @@
-"""Native-shell login through a verified HTTPS Auth Tab callback.
+"""Native-shell login through an HTTPS Auth Tab callback.
 
 The Android shell drives browser-based logins through Auth Tab, whose
 cookie jar is isolated from the shell's WebView. These endpoints are the
 completion legs of that flow, shaped like an OAuth public-client code
-flow (RFC 7636) with Android Digital Asset Links binding the callback to
-an operator-approved package and signing certificate:
+flow (RFC 7636) with Android Digital Asset Links protecting the callback
+on the client:
 
 1. The app opens ``GET /auth/native-complete?state=<nonce>&
    code_challenge=<S256>&client_package=<package>`` in the auth surface.
@@ -12,15 +12,19 @@ an operator-approved package and signing certificate:
    and its IdP hops) runs in a real browser context.
 2. Once the request arrives authenticated, the server creates a
    short-lived, single-use flow record binding the app's ``state`` and
-   PKCE challenge to the authenticated identity and selected package,
-   then 302s to ``https://<server-origin>/auth/native-callback`` with the
+   PKCE challenge to the authenticated identity after checking the
+   untrusted package selector against the allowlist,
+   then 302s to the configured public
+   ``https://<server-origin>/auth/native-callback`` with the
    state and an **opaque one-time code** — never a credential. Auth Tab
-   returns that redirect only when the server's Digital Asset Links file
-   verifies the *actual calling app's* package and signing certificate.
+   returns that redirect to the app only if the browser's Digital Asset
+   Links check succeeds. That is a client-side control; the server cannot
+   observe or attest the result.
 3. The app exchanges ``code + state + code_verifier`` at
-   ``/auth/native-exchange`` for the credential: the proxy-forwarded
-   per-user access token in header mode (Databricks Apps), or a freshly
-   minted session JWT in oidc/accounts mode.
+   ``/auth/native-exchange`` while authenticated as the same identity that
+   created the flow. The credential is the proxy-forwarded per-user access
+   token in header mode (Databricks Apps), or a freshly minted session JWT
+   in oidc/accounts mode.
 
 The exchange has two transports because a front-door proxy 302s every
 unauthenticated *native* request to its IdP — a plain HTTPS ``POST``
@@ -32,7 +36,8 @@ redirect therefore tells the app which one to use:
 - ``exchange=tab`` (header mode): the app opens the exchange ``GET`` in
   a second auth-surface hop; the front-door session from step 1 is
   already warm in the browser, so the hop completes silently and the
-  credential returns via one final verified HTTPS redirect. This is the
+  credential returns via one final HTTPS redirect that the browser subjects
+  to its Digital Asset Links check. This is the
   only transport a front door leaves open, so the second-hop URL exposes
   the code + verifier and the final redirect exposes the credential to
   browser/proxy diagnostics. Both exchanges are transport-bound and the
@@ -42,9 +47,17 @@ There is deliberately no separate pre-registration endpoint: behind a
 front door the app cannot reach one, and a public one would not
 authenticate the initiator anyway. Operators configure approved Android
 package/fingerprint pairs through ``android_auth_tab_apps`` in the server
-config or ``OMNIGENT_ANDROID_AUTH_TAB_APPS`` as JSON. The default is an
-empty allowlist, which creates no flow; Auth Tab verification then fails
-closed and the Android shell returns to its inline-WebView fallback.
+config or ``OMNIGENT_ANDROID_AUTH_TAB_APPS`` as JSON, plus the public callback
+origin through ``native_auth_base_url`` or ``OMNIGENT_NATIVE_AUTH_BASE_URL``.
+The default is an empty allowlist, which creates no flow; Auth Tab verification
+then fails closed and the Android shell returns to its inline-WebView fallback.
+
+``client_package`` is an untrusted query parameter, not server-side app
+identity verification. A malicious app can send an allowlisted package string
+and cause an authenticated browser request to allocate a flow. Credential
+delivery still depends on the browser's Digital Asset Links result and the
+app-held state/PKCE verifier; the server cannot prove which Android app sent
+the initiation URL.
 
 The flow records are held in process memory with a short TTL, mirroring
 the OIDC router's CLI login tickets. Supported deployments keep one
@@ -64,7 +77,7 @@ import secrets
 import time
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 
 from fastapi import APIRouter, Request
 from starlette.responses import JSONResponse, RedirectResponse, Response
@@ -74,13 +87,15 @@ from omnigent.server.oidc import derive_code_challenge
 
 _logger = logging.getLogger(__name__)
 
-# The HTTPS callback stays on the authenticated server origin. Auth Tab
-# verifies ownership with Digital Asset Links before returning it to the
-# calling app; it is never caller-configurable.
+# The HTTPS callback stays on the configured public server origin. The browser
+# checks it against Digital Asset Links before the app honors the result; it is
+# never caller-configurable.
 _CALLBACK_PATH = "/auth/native-callback"
 
 _ANDROID_AUTH_TAB_APPS_CONFIG = "android_auth_tab_apps"
 _ANDROID_AUTH_TAB_APPS_ENV = "OMNIGENT_ANDROID_AUTH_TAB_APPS"
+_NATIVE_AUTH_BASE_URL_CONFIG = "native_auth_base_url"
+_NATIVE_AUTH_BASE_URL_ENV = "OMNIGENT_NATIVE_AUTH_BASE_URL"
 _ASSET_LINK_RELATION = "delegate_permission/common.handle_all_urls"
 
 # Proxy-forwarded per-user access token read in header mode. Databricks
@@ -197,6 +212,48 @@ def resolve_android_auth_tab_apps(
     return tuple(resolved)
 
 
+def resolve_native_auth_base_url(
+    server_config: dict[str, Any] | None = None,
+) -> str | None:
+    """Resolve the configured public HTTPS origin for native callbacks.
+
+    ``OMNIGENT_NATIVE_AUTH_BASE_URL`` takes precedence over the
+    ``native_auth_base_url`` server-config key. The value must be an absolute
+    HTTPS origin with no credentials, path, query, or fragment. Request headers
+    and ASGI scope are deliberately ignored so a TLS-terminating proxy cannot
+    make callbacks inherit its internal ``http://`` hop.
+
+    :returns: The normalized origin without a trailing slash, or ``None`` when
+        unset.
+    :raises ValueError: If a configured value is not an absolute HTTPS origin.
+    """
+    env_value = os.environ.get(_NATIVE_AUTH_BASE_URL_ENV)
+    raw_value = (
+        env_value
+        if env_value is not None
+        else (server_config or {}).get(_NATIVE_AUTH_BASE_URL_CONFIG)
+    )
+    if raw_value is None or not str(raw_value).strip():
+        return None
+
+    value = str(raw_value).strip()
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            f"{_NATIVE_AUTH_BASE_URL_CONFIG} must be an absolute HTTPS origin "
+            f"without a path, query, or fragment, got {value!r}"
+        )
+    return f"https://{parsed.netloc}"
+
+
 def create_android_asset_links_router(
     allowed_apps: tuple[AndroidAuthTabApp, ...],
 ) -> APIRouter:
@@ -269,6 +326,7 @@ class _NativeFlow:
 def create_native_auth_router(
     auth_provider: UnifiedAuthProvider,
     allowed_apps: tuple[AndroidAuthTabApp, ...],
+    callback_base_url: str,
 ) -> APIRouter:
     """Create the router serving the native-login endpoints (mounted at ``/auth``).
 
@@ -281,6 +339,9 @@ def create_native_auth_router(
     :param allowed_apps: Package/signing-certificate associations served
         through Digital Asset Links. An empty tuple disables flow
         creation and makes Auth Tab fall back after verification fails.
+    :param callback_base_url: Configured public HTTPS origin used for every
+        callback ``Location``. Never inferred from the request or forwarded
+        headers.
     :returns: A FastAPI router with the callback, completion, and exchange
         routes.
     """
@@ -298,10 +359,10 @@ def create_native_auth_router(
         for code in expired:
             del _flows[code]
 
-    def _redirect_to_app(request: Request, params: dict[str, str]) -> Response:
-        callback_url = request.url_for("native_auth_callback").include_query_params(**params)
+    def _redirect_to_app(params: dict[str, str]) -> Response:
+        callback_url = f"{callback_base_url}{_CALLBACK_PATH}?{urlencode(params)}"
         response = RedirectResponse(
-            url=str(callback_url),
+            url=callback_url,
             status_code=302,
         )
         # Completion redirects carry one-time secrets — keep every one of
@@ -317,7 +378,7 @@ def create_native_auth_router(
         """Fail closed when a browser does not hand the callback to Auth Tab."""
         response = JSONResponse(
             status_code=400,
-            content={"error": "native auth callback was not handled by a verified app"},
+            content={"error": "browser did not return the native auth callback to the app"},
         )
         response.headers["Cache-Control"] = "no-store"
         return response
@@ -330,7 +391,7 @@ def create_native_auth_router(
             ``code_challenge`` (PKCE S256), ``client_package`` (the
             configured Android association), and, once authenticated,
             whatever identity the active mode uses.
-        :returns: 302 to the server-origin verified callback URI with
+        :returns: 302 to the configured public HTTPS callback URI with
             ``state``/``code``/``exchange`` (or ``error=no_token`` when
             header mode has no forwarded token to offer); 302 to the
             login page when a cookie-mode request is unauthenticated;
@@ -353,7 +414,7 @@ def create_native_auth_router(
             # the HTTPS callback makes Auth Tab perform association
             # verification and close with a failure, which the app turns
             # into the inline login fallback.
-            return _redirect_to_app(request, {"state": state, "error": "client_not_allowed"})
+            return _redirect_to_app({"state": state, "error": "client_not_allowed"})
 
         user_id = auth_provider.get_user_id(request)
         if user_id is None:
@@ -392,7 +453,7 @@ def create_native_auth_router(
                     forwarded_token_header,
                     user_id,
                 )
-                return _redirect_to_app(request, {"state": state, "error": "no_token"})
+                return _redirect_to_app({"state": state, "error": "no_token"})
             token_type = "bearer"
             exchange_transport = "tab"
         else:
@@ -413,12 +474,10 @@ def create_native_auth_router(
             exchange_transport=exchange_transport,
             forwarded_token=forwarded_token,
         )
-        return _redirect_to_app(
-            request,
-            {"state": state, "code": code, "exchange": exchange_transport},
-        )
+        return _redirect_to_app({"state": state, "code": code, "exchange": exchange_transport})
 
     def _exchange(
+        request: Request,
         code: str,
         state: str,
         verifier: str,
@@ -428,8 +487,8 @@ def create_native_auth_router(
 
         Parameter shapes are checked before looking up the record. A
         syntactically valid attempt then pops before the TTL, state,
-        verifier, and transport checks, so any such mismatch burns the
-        code and cannot be retried through the other transport.
+        verifier, caller-identity, and transport checks, so any such mismatch
+        burns the code and cannot be retried through the other transport.
 
         :returns: ``(error_response, None)`` on failure or
             ``(None, flow)`` on success.
@@ -450,6 +509,11 @@ def create_native_auth_router(
             return _bad_request("State mismatch"), None
         if not hmac.compare_digest(flow.code_challenge, derive_code_challenge(verifier)):
             return _bad_request("code_verifier does not match the challenge"), None
+        caller_user_id = auth_provider.get_user_id(request)
+        if caller_user_id is None:
+            return JSONResponse(status_code=401, content={"error": "not authenticated"}), None
+        if flow.user_id != caller_user_id:
+            return JSONResponse(status_code=403, content={"error": "flow identity mismatch"}), None
         if not hmac.compare_digest(flow.exchange_transport, transport):
             return _bad_request("Exchange transport mismatch"), None
         return None, flow
@@ -488,6 +552,7 @@ def create_native_auth_router(
             return str(form.get(name) or "")
 
         error, flow = _exchange(
+            request,
             _field("code"),
             _field("state"),
             _field("code_verifier"),
@@ -510,12 +575,10 @@ def create_native_auth_router(
     async def native_exchange_tab(request: Request) -> Response:
         """Exchange a code through a second auth-surface hop (header mode).
 
-        The only transport a front-door proxy leaves open: the browser
-        that just completed the front-door login carries this GET through
-        silently, and the credential returns via the final redirect. It
-        is emitted only after the ``code_verifier`` proved the caller
-        initiated the flow, so nothing a bystander captured earlier can
-        reach this point.
+        The browser that completed the front-door login carries this GET
+        through silently, and the credential returns via the final redirect.
+        The server emits it after both the ``code_verifier`` and the currently
+        authenticated user match the flow created during completion.
 
         :param request: Query fields ``code``, ``state``,
             ``code_verifier``.
@@ -526,23 +589,19 @@ def create_native_auth_router(
         code = request.query_params.get("code") or ""
         state = request.query_params.get("state") or ""
         verifier = request.query_params.get("code_verifier") or ""
-        error, flow = _exchange(code, state, verifier, "tab")
+        error, flow = _exchange(request, code, state, verifier, "tab")
         if error is not None:
             # The surface expects a redirect; a JSON body would strand the
             # tab. Redirect with an error when the state is at least
             # well-formed, else answer the 400 directly.
             if _STATE_RE.fullmatch(state):
-                return _redirect_to_app(
-                    request,
-                    {"state": state, "error": "exchange_failed"},
-                )
+                return _redirect_to_app({"state": state, "error": "exchange_failed"})
             return error
         assert flow is not None
         token = _credential_for(flow)
         if not token:
-            return _redirect_to_app(request, {"state": state, "error": "exchange_failed"})
+            return _redirect_to_app({"state": state, "error": "exchange_failed"})
         return _redirect_to_app(
-            request,
             {"state": state, "token_type": flow.token_type, "token": token},
         )
 
