@@ -1,14 +1,19 @@
-"""Tests for ``GET /auth/native-complete`` (native-shell login completion).
+"""Tests for the native-shell login endpoints.
 
-The endpoint hands a credential to the mobile shells through a fixed
-``omnigent://auth-callback`` redirect: the proxy-forwarded access token
-in header mode, a minted session JWT in the cookie modes. These tests
-drive the real router with a ``TestClient`` per auth mode and assert on
-the redirect ``Location`` — the app-facing contract.
+``GET /auth/native-complete`` creates a single-use, PKCE-bound flow for
+an authenticated request and redirects the app an opaque one-time code;
+``/auth/native-exchange`` (POST for natively reachable servers, GET for
+the second Auth Tab hop behind a front door) turns code + state +
+verifier into the credential. These tests drive the real router with a
+``TestClient`` per auth mode, asserting on the redirect ``Location`` and
+exchange responses — the app-facing contract — with a focus on the
+attack paths: replay, initiation-less requests, expiry, and every
+mismatch of state or verifier.
 """
 
 from __future__ import annotations
 
+import time
 from urllib.parse import parse_qs, quote, urlsplit
 
 import jwt
@@ -18,7 +23,11 @@ from fastapi.testclient import TestClient
 
 from omnigent.server.accounts_config import AccountsConfig
 from omnigent.server.auth import UnifiedAuthProvider
-from omnigent.server.oidc import OIDCConfig, mint_session_token
+from omnigent.server.oidc import (
+    OIDCConfig,
+    derive_code_challenge,
+    mint_session_token,
+)
 from omnigent.server.routes.native_auth import (
     create_native_auth_router,
     resolve_forwarded_token_header,
@@ -26,6 +35,8 @@ from omnigent.server.routes.native_auth import (
 
 _SECRET = bytes.fromhex("ab" * 32)
 _STATE = "state-nonce-1234"
+_VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"  # RFC 7636 App. B
+_CHALLENGE = derive_code_challenge(_VERIFIER)
 
 
 def _client(provider: UnifiedAuthProvider) -> TestClient:
@@ -76,6 +87,17 @@ def _accounts_provider() -> UnifiedAuthProvider:
     return UnifiedAuthProvider("accounts", accounts_config=config)
 
 
+_HEADER_AUTH = {
+    "X-Forwarded-Email": "alice@example.com",
+    "X-Forwarded-Access-Token": "workspace-token-abc",
+}
+
+
+def _cookie_auth(provider_name: str) -> dict[str, str]:
+    bearer = mint_session_token("alice@example.com", _SECRET, 3600, provider_name)
+    return {"Authorization": f"Bearer {bearer}"}
+
+
 def _callback_params(response) -> dict[str, list[str]]:
     location = response.headers["location"]
     parts = urlsplit(location)
@@ -83,7 +105,23 @@ def _callback_params(response) -> dict[str, list[str]]:
     return parse_qs(parts.query)
 
 
-class TestStateValidation:
+def _complete(
+    client: TestClient,
+    headers: dict[str, str],
+    state: str = _STATE,
+    challenge: str = _CHALLENGE,
+) -> dict[str, list[str]]:
+    response = client.get(
+        "/auth/native-complete",
+        params={"state": state, "code_challenge": challenge},
+        headers=headers,
+    )
+    assert response.status_code == 302
+    assert response.headers["cache-control"] == "no-store"
+    return _callback_params(response)
+
+
+class TestCompleteValidation:
     @pytest.mark.parametrize(
         "state",
         ["", "short", "has space in it", "semi;colon-injection", "x" * 129, "quer?y"],
@@ -92,110 +130,216 @@ class TestStateValidation:
         client = _client(_header_provider())
         response = client.get(
             "/auth/native-complete",
-            params={"state": state} if state else {},
-            headers={"X-Forwarded-Email": "alice@example.com"},
+            params={"state": state, "code_challenge": _CHALLENGE} if state else {},
+            headers=_HEADER_AUTH,
         )
         assert response.status_code == 400
-
-    def test_state_is_never_echoed_unvalidated(self) -> None:
-        # A rejected state must not appear in any redirect Location.
-        client = _client(_header_provider())
-        response = client.get(
-            "/auth/native-complete",
-            params={"state": "bad state"},
-            headers={"X-Forwarded-Email": "alice@example.com"},
-        )
         assert "location" not in response.headers
 
+    def test_missing_or_malformed_challenge_is_rejected(self) -> None:
+        # An authenticated cross-site GET without a PKCE challenge — the
+        # "token oracle" shape — must yield nothing at all, not a flow.
+        client = _client(_header_provider())
+        for params in (
+            {"state": _STATE},
+            {"state": _STATE, "code_challenge": "short"},
+            {"state": _STATE, "code_challenge": "!" * 43},
+        ):
+            response = client.get("/auth/native-complete", params=params, headers=_HEADER_AUTH)
+            assert response.status_code == 400
+            assert "location" not in response.headers
 
-class TestHeaderMode:
-    def test_relays_forwarded_access_token(self) -> None:
+    def test_completion_redirect_never_carries_a_token(self) -> None:
+        for provider, headers in (
+            (_header_provider(), _HEADER_AUTH),
+            (_oidc_provider(), _cookie_auth("oidc")),
+            (_accounts_provider(), _cookie_auth("accounts")),
+        ):
+            params = _complete(_client(provider), headers)
+            assert "token" not in params
+            assert "token_type" not in params
+            assert params["state"] == [_STATE]
+            assert params["code"], "expected a one-time code"
+
+    def test_unauthenticated_header_mode_is_401(self) -> None:
         client = _client(_header_provider())
         response = client.get(
             "/auth/native-complete",
-            params={"state": _STATE},
-            headers={
-                "X-Forwarded-Email": "alice@example.com",
-                "X-Forwarded-Access-Token": "workspace-token-abc",
-            },
+            params={"state": _STATE, "code_challenge": _CHALLENGE},
+        )
+        assert response.status_code == 401
+
+    @pytest.mark.parametrize(
+        ("provider_factory", "login_url"),
+        [(_oidc_provider, "/auth/login"), (_accounts_provider, "/login")],
+    )
+    def test_unauthenticated_cookie_mode_bounces_through_login(
+        self, provider_factory, login_url: str
+    ) -> None:
+        client = _client(provider_factory())
+        response = client.get(
+            "/auth/native-complete",
+            params={"state": _STATE, "code_challenge": _CHALLENGE},
         )
         assert response.status_code == 302
-        params = _callback_params(response)
-        assert params["state"] == [_STATE]
-        assert params["token_type"] == ["bearer"]
-        assert params["token"] == ["workspace-token-abc"]
-        # The Location carries a credential — it must never be cached.
-        assert response.headers["cache-control"] == "no-store"
+        expected_return = quote(
+            f"/auth/native-complete?state={_STATE}&code_challenge={_CHALLENGE}", safe=""
+        )
+        assert response.headers["location"] == f"{login_url}?return_to={expected_return}"
 
-    def test_no_forwarded_token_redirects_with_error(self) -> None:
+    def test_header_mode_without_forwarded_token_reports_no_token(self) -> None:
         client = _client(_header_provider())
         response = client.get(
             "/auth/native-complete",
-            params={"state": _STATE},
+            params={"state": _STATE, "code_challenge": _CHALLENGE},
             headers={"X-Forwarded-Email": "alice@example.com"},
         )
-        assert response.status_code == 302
         params = _callback_params(response)
-        assert params["state"] == [_STATE]
         assert params["error"] == ["no_token"]
-        assert "token" not in params
+        assert "code" not in params
 
-    def test_unauthenticated_is_401(self) -> None:
-        # Header mode has no login page to bounce through: a request
-        # without identity means the fronting proxy failed at its job.
-        client = _client(_header_provider())
-        response = client.get("/auth/native-complete", params={"state": _STATE})
-        assert response.status_code == 401
+    def test_exchange_transport_matches_the_mode(self) -> None:
+        # A native POST can't cross a front-door proxy, so header mode
+        # exchanges through a second browser hop; cookie modes POST.
+        assert _complete(_client(_header_provider()), _HEADER_AUTH)["exchange"] == ["tab"]
+        assert _complete(_client(_oidc_provider()), _cookie_auth("oidc"))["exchange"] == ["post"]
 
     def test_forwarded_token_header_is_overridable(self, monkeypatch) -> None:
         monkeypatch.setenv("OMNIGENT_FORWARDED_TOKEN_HEADER", "X-Custom-Token")
         assert resolve_forwarded_token_header() == "X-Custom-Token"
         client = _client(_header_provider())
-        response = client.get(
-            "/auth/native-complete",
-            params={"state": _STATE},
-            headers={
-                "X-Forwarded-Email": "alice@example.com",
-                "X-Custom-Token": "custom-token",
-            },
+        params = _complete(
+            client,
+            {"X-Forwarded-Email": "alice@example.com", "X-Custom-Token": "custom-token"},
         )
-        params = _callback_params(response)
-        assert params["token"] == ["custom-token"]
+        code = params["code"][0]
+        exchanged = client.post(
+            "/auth/native-exchange",
+            data={"code": code, "state": _STATE, "code_verifier": _VERIFIER},
+        )
+        assert exchanged.json()["token"] == "custom-token"
 
 
-class TestCookieModes:
-    @pytest.mark.parametrize(
-        ("provider_factory", "login_url"),
-        [(_oidc_provider, "/auth/login"), (_accounts_provider, "/login")],
-    )
-    def test_unauthenticated_bounces_through_login(
-        self, provider_factory, login_url: str
-    ) -> None:
-        client = _client(provider_factory())
-        response = client.get("/auth/native-complete", params={"state": _STATE})
+class TestExchange:
+    def test_header_mode_tab_exchange_relays_the_forwarded_token(self) -> None:
+        client = _client(_header_provider())
+        code = _complete(client, _HEADER_AUTH)["code"][0]
+
+        response = client.get(
+            "/auth/native-exchange",
+            params={"code": code, "state": _STATE, "code_verifier": _VERIFIER},
+        )
+
         assert response.status_code == 302
-        expected_return = quote(f"/auth/native-complete?state={_STATE}", safe="")
-        assert response.headers["location"] == f"{login_url}?return_to={expected_return}"
+        params = _callback_params(response)
+        assert params["token_type"] == ["bearer"]
+        assert params["token"] == ["workspace-token-abc"]
+        assert response.headers["cache-control"] == "no-store"
 
     @pytest.mark.parametrize(
         ("provider_factory", "provider_name"),
         [(_oidc_provider, "oidc"), (_accounts_provider, "accounts")],
     )
-    def test_authenticated_mints_session_token(
+    def test_cookie_mode_post_exchange_mints_a_session_token(
         self, provider_factory, provider_name: str
     ) -> None:
-        provider = provider_factory()
-        client = _client(provider)
-        bearer = mint_session_token("alice@example.com", _SECRET, 3600, provider_name)
-        response = client.get(
-            "/auth/native-complete",
-            params={"state": _STATE},
-            headers={"Authorization": f"Bearer {bearer}"},
+        client = _client(provider_factory())
+        code = _complete(client, _cookie_auth(provider_name))["code"][0]
+
+        response = client.post(
+            "/auth/native-exchange",
+            data={"code": code, "state": _STATE, "code_verifier": _VERIFIER},
         )
-        assert response.status_code == 302
-        params = _callback_params(response)
-        assert params["state"] == [_STATE]
-        assert params["token_type"] == ["session"]
-        claims = jwt.decode(params["token"][0], _SECRET, algorithms=["HS256"])
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["token_type"] == "session"
+        claims = jwt.decode(body["token"], _SECRET, algorithms=["HS256"])
         assert claims["sub"] == "alice@example.com"
         assert response.headers["cache-control"] == "no-store"
+
+    def test_replayed_code_is_rejected(self) -> None:
+        client = _client(_header_provider())
+        code = _complete(client, _HEADER_AUTH)["code"][0]
+        fields = {"code": code, "state": _STATE, "code_verifier": _VERIFIER}
+
+        first = client.get("/auth/native-exchange", params=fields)
+        replay = client.get("/auth/native-exchange", params=fields)
+
+        assert first.status_code == 302
+        assert "token" in _callback_params(first)
+        assert _callback_params(replay)["error"] == ["exchange_failed"]
+
+    def test_wrong_verifier_burns_the_code(self) -> None:
+        # The pop happens before the PKCE check, so a failed guess consumes
+        # the code — the right verifier can't be retried afterwards either.
+        client = _client(_header_provider())
+        code = _complete(client, _HEADER_AUTH)["code"][0]
+
+        wrong = client.post(
+            "/auth/native-exchange",
+            data={"code": code, "state": _STATE, "code_verifier": "A" * 43},
+        )
+        retry = client.post(
+            "/auth/native-exchange",
+            data={"code": code, "state": _STATE, "code_verifier": _VERIFIER},
+        )
+
+        assert wrong.status_code == 400
+        assert retry.status_code == 400
+
+    def test_wrong_state_is_rejected(self) -> None:
+        client = _client(_header_provider())
+        code = _complete(client, _HEADER_AUTH)["code"][0]
+
+        response = client.post(
+            "/auth/native-exchange",
+            data={"code": code, "state": "different-state1", "code_verifier": _VERIFIER},
+        )
+
+        assert response.status_code == 400
+
+    def test_unknown_code_is_rejected(self) -> None:
+        client = _client(_header_provider())
+        response = client.post(
+            "/auth/native-exchange",
+            data={"code": "never-issued-code", "state": _STATE, "code_verifier": _VERIFIER},
+        )
+        assert response.status_code == 400
+
+    def test_expired_code_is_rejected(self, monkeypatch) -> None:
+        client = _client(_header_provider())
+        code = _complete(client, _HEADER_AUTH)["code"][0]
+
+        real_time = time.time
+        monkeypatch.setattr(time, "time", lambda: real_time() + 121)
+        response = client.post(
+            "/auth/native-exchange",
+            data={"code": code, "state": _STATE, "code_verifier": _VERIFIER},
+        )
+
+        assert response.status_code == 400
+
+    def test_malformed_exchange_fields_are_rejected(self) -> None:
+        client = _client(_header_provider())
+        _complete(client, _HEADER_AUTH)
+        for fields in (
+            {"state": _STATE, "code_verifier": _VERIFIER},
+            {"code": "c;de", "state": _STATE, "code_verifier": _VERIFIER},
+            {"code": "c0de-c0de-c0de-c0de", "state": "bad state", "code_verifier": _VERIFIER},
+            {"code": "c0de-c0de-c0de-c0de", "state": _STATE, "code_verifier": "short"},
+        ):
+            assert client.post("/auth/native-exchange", data=fields).status_code == 400
+
+    def test_tab_exchange_error_redirects_instead_of_stranding_the_tab(self) -> None:
+        client = _client(_header_provider())
+        response = client.get(
+            "/auth/native-exchange",
+            params={
+                "code": "never-issued-code",
+                "state": _STATE,
+                "code_verifier": _VERIFIER,
+            },
+        )
+        assert response.status_code == 302
+        assert _callback_params(response)["error"] == ["exchange_failed"]
