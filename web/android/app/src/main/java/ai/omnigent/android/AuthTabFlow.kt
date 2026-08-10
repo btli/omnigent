@@ -6,8 +6,8 @@ import java.security.SecureRandom
 
 /**
  * Tracks the single in-flight Auth Tab login and binds every callback to
- * the flow that started it: a callback is accepted only when its `state`
- * nonce matches the pending flow AND the pinned origin is still the one
+ * the flow that started it: a callback is accepted if its `state` nonce
+ * matches the pending flow AND the pinned origin is still the one
  * the flow was launched for. A result from a previous server (switched
  * away mid-login) or an unsolicited callback can therefore never
  * advance a login.
