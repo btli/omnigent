@@ -1122,6 +1122,142 @@ async def test_relay_slow_banner_then_disconnect_exhausts_nonzero_grace(
         )
 
 
+class _BannerThenReadTimeoutResponse:
+    """Fake stream that serves the banner, idles, then times out reading.
+
+    :param idle_s: Seconds to idle after the banner before the read
+        timeout fires — set longer than the grace so attempt duration
+        alone would look like a healthy idle stream.
+    """
+
+    def __init__(self, idle_s: float) -> None:
+        self._idle_s = idle_s
+
+    async def __aenter__(self) -> _BannerThenReadTimeoutResponse:
+        """Enter the async stream context.
+
+        :returns: This fake response.
+        """
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Exit the async stream context.
+
+        :param exc_type: Exception type, if any.
+        :param exc: Exception instance, if any.
+        :param traceback: Exception traceback, if any.
+        :returns: None.
+        """
+        del exc_type, exc, traceback
+
+    async def aiter_text(self) -> AsyncIterator[str]:
+        """Yield the subscription banner, then stall into a read timeout.
+
+        :yields: The runner's subscription-banner SSE frame.
+        """
+        yield 'data: {"type": "session.heartbeat"}\n\n'
+        await asyncio.sleep(self._idle_s)
+        raise httpx.ReadTimeout("relay stream read timed out")
+
+
+class _BannerThenReadTimeoutRunnerClient:
+    """Fake runner client (legacy shape) that stalls after every banner.
+
+    Not backed by :class:`WSTunnelTransport`, so a stall here cannot be
+    attributed as stream loss (``stream_lost`` stays False) — the timeout
+    itself is the only signal that the idle interval wasn't healthy.
+
+    :param idle_s: Seconds each attempt idles after the banner.
+    """
+
+    def __init__(self, idle_s: float) -> None:
+        self.calls = 0
+        self._idle_s = idle_s
+
+    def stream(
+        self,
+        method: str,
+        path: str,
+        *,
+        timeout: Any,
+    ) -> _BannerThenReadTimeoutResponse:
+        """Serve another banner-then-stall attempt.
+
+        :param method: Ignored HTTP method.
+        :param path: Ignored request path.
+        :param timeout: Ignored timeout (the fake raises on its own).
+        :returns: The fake streaming response.
+        """
+        del method, path, timeout
+        self.calls += 1
+        return _BannerThenReadTimeoutResponse(self._idle_s)
+
+
+@pytest.mark.asyncio
+async def test_relay_read_timeout_without_stream_loss_exhausts_nonzero_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Read-timeout stalls exhaust the grace even when unattributable.
+
+    On a transport that exposes no liveness probe (the legacy fixed
+    client) a stalled attempt carries ``stream_lost=False``, so only the
+    timeout itself distinguishes a wedged stream from a healthy idle one.
+    Without that signal each banner-then-stall attempt outlasts the whole
+    grace, refreshes the deadline as idle recovery, and terminal failure
+    is unreachable. The grace stays non-zero so the terminal state is
+    reached by exhausting it, not by skipping it.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 0.2)
+    monkeypatch.setattr(orchestration, "_RELAY_RETRY_INTERVAL_S", 0.05)
+    sessions_module._runner_relay_tasks.clear()
+    # Each attempt idles past the whole grace before timing out, mirroring
+    # production's 45s read timeout vs 10s grace.
+    fake_runner = _BannerThenReadTimeoutRunnerClient(idle_s=0.3)
+    session_id = "3a4b5c6d7e8f90a1b2c3d4e5f6071829"
+
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_banner_then_read_timeout",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=None,
+        )
+        assert handle is not None
+        collector = await start_session_stream_collector(session_id)
+
+        # Without the timeout signal this retries forever and the wait
+        # below times out.
+        await asyncio.wait_for(handle.task, timeout=3.0)
+
+        event = await asyncio.wait_for(collector.queue.get(), timeout=2.0)
+        assert event.get("type") == "session.status"
+        assert event.get("status") == "failed"
+        # No liveness probe on this transport, so the stall stays a
+        # runner disconnect rather than a stream loss.
+        assert event["error"]["code"] == "runner_disconnected"
+    finally:
+        if collector is not None:
+            await collector.stop()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=1.0)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
 class _RecordingLabelStore:
     """Minimal conversation store that records ``set_labels`` calls.
 
