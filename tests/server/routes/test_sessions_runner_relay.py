@@ -638,16 +638,24 @@ async def test_relay_publishes_failed_status_on_tunnel_close(
 
 
 @pytest.mark.asyncio
-async def test_relay_publishes_session_stream_lost_when_runner_still_connected() -> None:
+async def test_relay_publishes_session_stream_lost_when_runner_still_connected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     A session-stream failure while the runner tunnel is up is not
     ``runner_disconnected``.
 
     Uses a real :class:`WSTunnelTransport` with the runner still
-    registered; a read timeout must stamp ``session_stream_lost``.
+    registered; a read timeout must stamp ``session_stream_lost``. The
+    reconnect grace is zeroed so the drop is terminal on the first
+    attempt.
     """
     from omnigent.server.routes import sessions as sessions_module
 
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
     sessions_module._runner_relay_tasks.clear()
     gate = asyncio.Event()
     runner_id = "runner_session_stream_lost"
@@ -684,15 +692,23 @@ async def test_relay_publishes_session_stream_lost_when_runner_still_connected()
 
 
 @pytest.mark.asyncio
-async def test_relay_tunnel_replacement_stays_runner_disconnected() -> None:
+async def test_relay_tunnel_replacement_stays_runner_disconnected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Newest-wins replacement aborts must not stamp ``session_stream_lost``.
 
     Replacement registers the new tunnel before aborting the old stream,
     so a naive "registry still has runner" check would misattribute. The
-    recoverable reconnect path only clears ``runner_disconnected``.
+    recoverable reconnect path only clears ``runner_disconnected``. The
+    reconnect grace is zeroed so the drop is terminal on the first
+    attempt.
     """
     from omnigent.server.routes import sessions as sessions_module
 
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
     sessions_module._runner_relay_tasks.clear()
     runner_id = "runner_tunnel_replacement"
     registry = TunnelRegistry()
@@ -841,10 +857,20 @@ async def test_relay_persists_disconnect_error_labels_on_tunnel_close(
 
 
 @pytest.mark.asyncio
-async def test_relay_persists_session_stream_lost_error_labels() -> None:
-    """A live-tunnel stream loss persists ``session_stream_lost`` labels."""
+async def test_relay_persists_session_stream_lost_error_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live-tunnel stream loss persists ``session_stream_lost`` labels.
+
+    The reconnect grace is zeroed so the drop is terminal on the first
+    attempt.
+    """
     from omnigent.server.routes import sessions as sessions_module
 
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
     sessions_module._runner_relay_tasks.clear()
     gate = asyncio.Event()
     runner_id = "runner_session_stream_lost_labels"
@@ -1619,12 +1645,14 @@ async def test_relay_real_transport_read_timeout_stamps_session_stream_lost(
     End-to-end reachability: the relay's per-request read timeout must be
     honored by :class:`WSTunnelTransport` itself (no hand-injected error),
     raise ``httpx.ReadTimeout`` on silence, and leave the tunnel registered
-    so attribution resolves to ``session_stream_lost``.
+    so attribution resolves to ``session_stream_lost``. The reconnect
+    grace is zeroed so the drop is terminal on the first attempt.
     """
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes._sessions import orchestration
 
     monkeypatch.setattr(orchestration, "_RELAY_STREAM_READ_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 0.0)
     sessions_module._runner_relay_tasks.clear()
     runner_id = "runner_stream_stall_real_transport"
     registry = TunnelRegistry()
