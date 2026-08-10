@@ -1049,6 +1049,42 @@ def test_run_turn_model_falls_back_to_usage_record(
     assert turn.usage["model"] == "kimi-k3-databricks"
 
 
+def test_run_turn_historical_request_model_does_not_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A resumed log's historical llm.request must not attribute this turn:
+    only turn-window requests count, so the counted record's own model wins
+    when no current request exists."""
+    _write_wire(
+        tmp_path,
+        "session_histreq-1",
+        [
+            {
+                "type": "llm.request",
+                "kind": "loop",
+                "model": "system.ai.stale-model",
+                "modelAlias": "stale-alias",
+                "time": int(time.time() * 1000) - 1,
+            }
+        ],
+    )
+
+    def _append_current_usage() -> None:
+        wire = _wire_path(tmp_path, "session_histreq-1")
+        with wire.open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(_usage_row(input_other=9, output=1, time_ms=int(time.time() * 1000)))
+                + "\n"
+            )
+
+    events, _ex = _run_stubbed_turn(
+        monkeypatch, tmp_path, session_id="session_histreq-1", on_spawn=_append_current_usage
+    )
+    turn = next(e for e in events if isinstance(e, TurnComplete))
+    assert turn.usage is not None
+    assert turn.usage["model"] == "kimi-k3-databricks"
+
+
 def test_run_turn_survives_homeless_environment_when_seeding(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

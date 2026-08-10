@@ -60,7 +60,7 @@ _FALLBACK_CACHE_READ_INPUT_RATIO: float = 0.10
 _FALLBACK_CACHE_WRITE_INPUT_RATIO: float = 1.25
 
 
-def find_model_context_window(model: str, *, allow_override: bool = True) -> int | None:
+def find_model_context_window(model: str) -> int | None:
     """
     Look up the model's context window in tokens, or ``None`` when unknown.
 
@@ -70,17 +70,12 @@ def find_model_context_window(model: str, *, allow_override: bool = True) -> int
     (e.g. the kimi-native forwarder's context ring).
 
     :param model: The model identifier, e.g. ``"openai/gpt-4o"``.
-    :param allow_override: Honor ``AP_CONTEXT_WINDOW_OVERRIDE`` (its
-        documented override-everything semantics). Pass ``False`` for
-        catalog-pure resolution, where a process-wide override must not be
-        attributed to an arbitrary model (e.g. per-model usage posts).
     :returns: Context window size in tokens, or ``None`` when no
         metadata source resolves the model.
     """
-    if allow_override:
-        override = os.environ.get("AP_CONTEXT_WINDOW_OVERRIDE")
-        if override is not None:
-            return int(override)
+    override = os.environ.get("AP_CONTEXT_WINDOW_OVERRIDE")
+    if override is not None:
+        return int(override)
     encoded = _encoded_context_window(model)
     if encoded is not None:
         return encoded

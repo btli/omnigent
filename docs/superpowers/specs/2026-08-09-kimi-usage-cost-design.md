@@ -76,7 +76,10 @@ server changes; no client-side cost computation.
 
 - **Map `usage.record`:** accumulate per-session cumulative totals from
   the per-turn records:
-  - `cumulative_input_tokens` = Σ(`inputOther` + `inputCacheCreation`)
+  - `cumulative_input_tokens` = Σ(`inputOther` + `inputCacheRead` +
+    `inputCacheCreation`) — INCLUSIVE of cache reads, matching the server
+    contract (`_persist_native_cumulative_usage` splits the separately
+    reported cache-read total back out to price it at the cache-read rate)
   - `cumulative_cache_read_input_tokens` = Σ(`inputCacheRead`)
   - `cumulative_output_tokens` = Σ(`output`)
   - Implementer note: verify the exact accepted keys against

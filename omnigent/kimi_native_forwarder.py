@@ -100,17 +100,19 @@ class _UsageState:
     ``llm.request`` and its ``usage.record`` neither downgrades attribution
     nor re-posts an unchanged model. ``context_tokens`` is persisted so a
     post that failed right before a restart retries WITH the context
-    occupancy. ``billed_through_ms`` / ``billed_line`` are the billed
-    high-water mark (the last recorded row's timestamp + wire line): totals
-    and mark persist in ONE write, so a crash between recording a row and
-    advancing the separate wire cursor cannot re-bill the row on restart.
+    occupancy. ``billed_wire`` / ``billed_line`` are the billed high-water
+    mark (the wire log identity + the last recorded row's line in it):
+    totals and mark persist in ONE write, so a crash between recording a
+    row and advancing the separate wire cursor cannot re-bill the row on
+    restart. The mark is scoped to its wire — line numbers restart per log,
+    and a new log's rows must bill regardless of the old log's mark.
     """
 
     totals: dict[str, int] = field(default_factory=dict)
     model: str | None = None
     posted_model: str | None = None
     context_tokens: int | None = None
-    billed_through_ms: int = -1
+    billed_wire: str | None = None
     billed_line: int = -1
 
 
@@ -181,17 +183,45 @@ def _write_state(bridge_dir: Path, state: _ForwardState) -> None:
         tmp.replace(bridge_dir / _STATE_FILE)
 
 
-def _read_usage_state(bridge_dir: Path) -> _UsageState | None:
+def _read_usage_state(bridge_dir: Path) -> tuple[_UsageState | None, bool]:
+    """Load the persisted usage state as ``(state, trusted)``.
+
+    ``trusted`` is False only when a state file is present but unreadable /
+    unparseable: the totals already billed are then unknown, and silently
+    starting fresh would post lower cumulative SET totals that the server's
+    monotonic clamp drops — permanently losing the billed rows. Callers must
+    suspend billing until the state is writable again.
+    """
+    path = bridge_dir / _USAGE_STATE_FILE
     try:
-        raw = (bridge_dir / _USAGE_STATE_FILE).read_text(encoding="utf-8")
-    except OSError:
-        return None
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, True
+    except OSError as exc:
+        _warn_once(
+            f"usage-state-unreadable:{bridge_dir}",
+            "kimi forwarder: usage state %s unreadable (%s); billing suspended "
+            "until it is writable again",
+            path,
+            exc,
+        )
+        return None, False
+
+    def _corrupt() -> tuple[None, bool]:
+        _warn_once(
+            f"usage-state-unreadable:{bridge_dir}",
+            "kimi forwarder: usage state %s is corrupt; billing suspended "
+            "until it is writable again",
+            path,
+        )
+        return None, False
+
     try:
         data = json.loads(raw)
     except ValueError:
-        return None
+        return _corrupt()
     if not isinstance(data, dict):
-        return None
+        return _corrupt()
     raw_totals = data.get("totals")
     totals = (
         {
@@ -205,12 +235,8 @@ def _read_usage_state(bridge_dir: Path) -> _UsageState | None:
     model = data.get("model")
     posted_model = data.get("posted_model")
     context_tokens = data.get("context_tokens")
-    billed_through_ms = data.get("billed_through_ms")
+    billed_wire = data.get("billed_wire")
     billed_line = data.get("billed_line")
-
-    def _int(value: object, default: int) -> int:
-        return value if isinstance(value, int) and not isinstance(value, bool) else default
-
     return _UsageState(
         totals=totals,
         model=model if isinstance(model, str) and model else None,
@@ -222,24 +248,38 @@ def _read_usage_state(bridge_dir: Path) -> _UsageState | None:
             and context_tokens >= 0
             else None
         ),
-        billed_through_ms=_int(billed_through_ms, -1),
-        billed_line=_int(billed_line, -1),
-    )
+        billed_wire=billed_wire if isinstance(billed_wire, str) and billed_wire else None,
+        billed_line=(
+            billed_line
+            if isinstance(billed_line, int) and not isinstance(billed_line, bool)
+            else -1
+        ),
+    ), True
 
 
-def _write_usage_state(bridge_dir: Path, state: _UsageState) -> None:
+def _write_usage_state(bridge_dir: Path, state: _UsageState) -> bool:
+    """Persist the usage state; ``False`` when the write failed (logged once)."""
     payload = {
         "totals": state.totals,
         "model": state.model,
         "posted_model": state.posted_model,
         "context_tokens": state.context_tokens,
-        "billed_through_ms": state.billed_through_ms,
+        "billed_wire": state.billed_wire,
         "billed_line": state.billed_line,
     }
     tmp = bridge_dir / (_USAGE_STATE_FILE + ".tmp")
-    with contextlib.suppress(OSError):
+    try:
         tmp.write_text(json.dumps(payload), encoding="utf-8")
         tmp.replace(bridge_dir / _USAGE_STATE_FILE)
+    except OSError as exc:
+        _warn_once(
+            f"usage-state-unwritable:{bridge_dir}",
+            "kimi forwarder: cannot persist usage state under %s: %s",
+            bridge_dir,
+            exc,
+        )
+        return False
+    return True
 
 
 def workdirs_for_kimi_sessions(kimi_home: Path) -> dict[str, str]:
@@ -626,6 +666,7 @@ class _KimiUsageSync:
         session_id: str,
         bridge_dir: Path,
         state: _UsageState | None = None,
+        trusted: bool = True,
         billing_floor_ms: int = 0,
     ) -> None:
         self._events_url = f"{base_url.rstrip('/')}/v1/sessions/{session_id}/events"
@@ -636,6 +677,13 @@ class _KimiUsageSync:
         # discovery mtime skew must not leak into billing, or a turn finishing
         # just before terminal recreation would be re-billed.
         self._billing_floor_ms = billing_floor_ms
+        # Present-but-unreadable prior state: the already-billed totals are
+        # unknown, so billing stays suspended until the state file is writable
+        # again (fresh-start totals would be clamped away by the server).
+        self._suspended = not trusted
+        # A persist that failed after the in-memory state advanced; retried
+        # before the wire cursor is allowed past the affected row.
+        self._dirty = False
         self._totals: dict[str, int] = dict.fromkeys(self._TOTAL_KEYS, 0)
         # Effective model: llm.request's provider-resolved id wins; a
         # usage.record's alias fills in until one is seen.
@@ -644,10 +692,11 @@ class _KimiUsageSync:
         # Latest record's context occupancy (inputOther + inputCacheRead +
         # inputCacheCreation) — NOT cumulative.
         self._context_tokens: int | None = None
-        # Billed high-water mark: (timestamp, wire line) of the last recorded
-        # row. Persisted atomically WITH the totals, so replaying rows after a
-        # crash (the wire cursor persists separately) is idempotent.
-        self._billed_ms = -1
+        # Billed high-water mark: the wire log identity + the last recorded
+        # row's line in it. Persisted atomically WITH the totals, so replaying
+        # rows after a crash (the wire cursor persists separately) is
+        # idempotent. Scoped per wire: line numbers restart in a new log.
+        self._billed_wire: str | None = None
         self._billed_line = -1
         if state is not None:
             for key in self._TOTAL_KEYS:
@@ -657,51 +706,75 @@ class _KimiUsageSync:
             self._model = state.model
             self._posted_model = state.posted_model
             self._context_tokens = state.context_tokens
-            self._billed_ms = state.billed_through_ms
+            self._billed_wire = state.billed_wire
             self._billed_line = state.billed_line
         self._last_posted: dict[str, int] | None = None
         self._window_cache: dict[str, int | None] = {}
 
-    def _persist(self) -> None:
-        _write_usage_state(
+    def _persist(self) -> bool:
+        ok = _write_usage_state(
             self._bridge_dir,
             _UsageState(
                 totals=dict(self._totals),
                 model=self._model,
                 posted_model=self._posted_model,
                 context_tokens=self._context_tokens,
-                billed_through_ms=self._billed_ms,
+                billed_wire=self._billed_wire,
                 billed_line=self._billed_line,
             ),
         )
+        self._dirty = not ok
+        return ok
 
     def note_new_wire(self) -> None:
         """Adopt a freshly discovered wire log.
 
-        Only the per-log view resets (context occupancy, delivery dedup, and
-        the line half of the billed mark — line numbers restart per log); the
-        cumulative totals, model, and billed timestamp carry forward — they
-        are session-scoped, and a zero-reset would make every later post a
-        server-ignored decrease.
+        Only the per-log view resets (context occupancy, delivery dedup); the
+        cumulative totals and model carry forward — they are session-scoped,
+        and a zero-reset would make every later post a server-ignored
+        decrease. The billed mark needs no reset: it is scoped to its wire
+        identity, so a different log's rows never compare against it.
         """
         self._context_tokens = None
         self._last_posted = None
-        self._billed_line = -1
 
-    def record(self, item: KimiWireItem) -> None:
+    def record(self, item: KimiWireItem, *, wire: str) -> bool:
         """Fold one validated ``usage.record`` item into the cumulative totals.
 
-        Skips rows at/below the billed high-water mark (a crash between the
-        totals write and the wire-cursor write replays rows on restart) and
-        rows stamped before the billing floor (a resumed session's history).
+        Skips rows at/below the billed high-water mark within the same *wire*
+        (a crash between the totals write and the wire-cursor write replays
+        rows on restart) and rows stamped before the billing floor (a resumed
+        session's history). Timestamps gate ONLY the floor — replay
+        idempotency is per-wire line-based, so a clock regression can never
+        suppress a later legitimate row.
+
+        :returns: ``False`` when the durable state could not be written; the
+            caller must then hold the wire cursor on this row so it is
+            re-attempted on the next poll — advancing past it would lose the
+            row across a restart (the stale persisted totals are cumulative
+            SET values the server clamps monotonically).
         """
+        if self._suspended:
+            if not self._persist():
+                return False
+            self._suspended = False
         time_ms = item.time_ms
         if time_ms is None or time_ms < self._billing_floor_ms:
-            return
-        if time_ms < self._billed_ms or (
-            time_ms == self._billed_ms and item.line_no <= self._billed_line
-        ):
-            return
+            _warn_once(
+                f"usage-floor-skip:{wire}",
+                "kimi forwarder: skipping pre-launch usage.record row(s) in %s "
+                "(resumed session history is not billed)",
+                wire,
+            )
+            return True
+        if wire == self._billed_wire and item.line_no <= self._billed_line:
+            _warn_once(
+                f"usage-replay-skip:{wire}",
+                "kimi forwarder: skipping already-billed usage.record row(s) replayed from %s",
+                wire,
+            )
+            # A previously failed persist still gates the cursor.
+            return self._persist() if self._dirty else True
         usage = item.usage or {}
         for key in self._TOTAL_KEYS:
             self._totals[key] += usage.get(key, 0)
@@ -712,9 +785,9 @@ class _KimiUsageSync:
         )
         if self._model is None and item.model:
             self._model = item.model
-        self._billed_ms = time_ms
+        self._billed_wire = wire
         self._billed_line = item.line_no
-        self._persist()
+        return self._persist()
 
     def note_model(self, model: str | None) -> None:
         """Adopt the effective model from an ``llm.request`` row."""
@@ -786,11 +859,7 @@ class _KimiUsageSync:
             from omnigent.llms.context_window import find_model_context_window
 
             try:
-                window = await asyncio.to_thread(
-                    # Catalog-pure: a process-wide override env var must not
-                    # stamp an arbitrary window onto kimi usage posts.
-                    lambda: find_model_context_window(model, allow_override=False)
-                )
+                window = await asyncio.to_thread(find_model_context_window, model)
             except Exception:
                 # Best-effort boundary: a metadata lookup failure must not
                 # stop usage mirroring; the window is simply omitted.
@@ -851,12 +920,14 @@ async def forward_kimi_wire_to_session(
     state = _read_state(bridge_dir)
     wire_path = Path(state.wire_path) if state is not None else None
     last_line = state.last_line if state is not None else 0
+    usage_state, usage_state_trusted = _read_usage_state(bridge_dir)
     usage_sync = _KimiUsageSync(
         base_url=base_url,
         headers=headers,
         session_id=session_id,
         bridge_dir=bridge_dir,
-        state=_read_usage_state(bridge_dir),
+        state=usage_state,
+        trusted=usage_state_trusted,
         # STRICT: records stamped before launch are a resumed session's
         # history (the mtime skew applies to discovery only, never billing).
         billing_floor_ms=launch_epoch_ms,
@@ -884,7 +955,10 @@ async def forward_kimi_wire_to_session(
                             # Accumulate only; delivery happens in the per-poll
                             # sync below so a failed post retries every poll
                             # without stalling transcript mirroring.
-                            usage_sync.record(item)
+                            if not usage_sync.record(item, wire=str(wire_path)):
+                                # Durable usage state couldn't be written: hold
+                                # the cursor on this row and retry next poll.
+                                break
                         elif item.kind == "model":
                             usage_sync.note_model(item.model)
                         elif item.kind == "turn_end":
