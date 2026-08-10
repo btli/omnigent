@@ -183,28 +183,44 @@ def _write_state(bridge_dir: Path, state: _ForwardState) -> None:
         tmp.replace(bridge_dir / _STATE_FILE)
 
 
+#: The cumulative token counters the writer always persists — all four, even
+#: as zeros, so a partial ``totals`` on disk can only be corruption.
+_TOTAL_KEYS = ("input_other", "output", "cache_read", "cache_creation")
+
+#: The exact top-level field set the writer emits; anything else is corruption.
+_STATE_KEYS = frozenset(
+    {"totals", "model", "posted_model", "context_tokens", "billed_wire", "billed_line"}
+)
+
+
 def _parse_usage_state(data: object) -> _UsageState | None:
     """Validate a decoded state payload; ``None`` on any schema mismatch.
 
-    Strict on purpose: the only writer always emits every field with these
-    exact types, so a wrong-typed or missing field is corruption — silently
-    defaulting it would trust a baseline that was never written.
+    Strict on purpose: the only writer always emits exactly this shape, so
+    any deviation is corruption. Trusting a partial one is worse than a
+    fresh start — a subset of totals next to a valid billed watermark would
+    zero the missing counters while the watermark suppresses re-billing: a
+    permanent undercount that never self-corrects.
     """
 
     def _count(value: object) -> bool:
         return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
-    if not isinstance(data, dict):
+    if not isinstance(data, dict) or set(data) != _STATE_KEYS:
         return None
     totals = data.get("totals")
-    if not isinstance(totals, dict) or not all(
-        isinstance(k, str) and _count(v) for k, v in totals.items()
+    if (
+        not isinstance(totals, dict)
+        or set(totals) != set(_TOTAL_KEYS)
+        or not all(_count(v) for v in totals.values())
     ):
         return None
     model = data.get("model")
     posted_model = data.get("posted_model")
     billed_wire = data.get("billed_wire")
-    if not all(v is None or isinstance(v, str) for v in (model, posted_model, billed_wire)):
+    if not all(
+        v is None or (isinstance(v, str) and v) for v in (model, posted_model, billed_wire)
+    ):
         return None
     context_tokens = data.get("context_tokens")
     if context_tokens is not None and not _count(context_tokens):
@@ -212,12 +228,17 @@ def _parse_usage_state(data: object) -> _UsageState | None:
     billed_line = data.get("billed_line")
     if not isinstance(billed_line, int) or isinstance(billed_line, bool):
         return None
+    # The watermark persists as a pair: -1 is the no-mark sentinel, so a wire
+    # without a real line (or a line without its wire) was never written and
+    # cannot be trusted to suppress replay.
+    if (billed_wire is None) != (billed_line == -1) or billed_line < -1:
+        return None
     return _UsageState(
         totals=dict(totals),
-        model=model or None,
-        posted_model=posted_model or None,
+        model=model,
+        posted_model=posted_model,
         context_tokens=context_tokens,
-        billed_wire=billed_wire or None,
+        billed_wire=billed_wire,
         billed_line=billed_line,
     )
 
@@ -675,8 +696,6 @@ class _KimiUsageSync:
     claude/codex forwarder trust model.
     """
 
-    _TOTAL_KEYS = ("input_other", "output", "cache_read", "cache_creation")
-
     def __init__(
         self,
         *,
@@ -704,7 +723,7 @@ class _KimiUsageSync:
         # A persist that failed after the in-memory state advanced; the
         # per-poll sync retries the write. Never gates the wire cursor.
         self._dirty = False
-        self._totals: dict[str, int] = dict.fromkeys(self._TOTAL_KEYS, 0)
+        self._totals: dict[str, int] = dict.fromkeys(_TOTAL_KEYS, 0)
         # Effective model: llm.request's provider-resolved id wins; a
         # usage.record's alias fills in until one is seen.
         self._model: str | None = None
@@ -729,7 +748,7 @@ class _KimiUsageSync:
         The in-memory model wins when already set (an ``llm.request`` seen
         while suspended is newer than the disk copy).
         """
-        for key in self._TOTAL_KEYS:
+        for key in _TOTAL_KEYS:
             value = state.totals.get(key)
             if isinstance(value, int) and value >= 0:
                 self._totals[key] = value
@@ -836,7 +855,7 @@ class _KimiUsageSync:
             )
             return
         usage = item.usage or {}
-        for key in self._TOTAL_KEYS:
+        for key in _TOTAL_KEYS:
             self._totals[key] += usage.get(key, 0)
         self._context_tokens = (
             usage.get("input_other", 0)

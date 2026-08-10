@@ -313,14 +313,15 @@ class TestState:
         cumulative post a server-ignored decrease.
         """
         _write_state(tmp_path, _ForwardState(wire_path="/x/wire.jsonl", last_line=7))
-        _write_usage_state(tmp_path, _UsageState(totals={"input_other": 100}))
+        totals = {"input_other": 100, "output": 20, "cache_read": 0, "cache_creation": 0}
+        _write_usage_state(tmp_path, _UsageState(totals=dict(totals)))
 
         clear_kimi_bridge_state(tmp_path)
 
         assert _read_state(tmp_path) is None
         loaded, _trusted = _read_usage_state(tmp_path)
         assert loaded is not None
-        assert loaded.totals == {"input_other": 100}
+        assert loaded.totals == totals
 
 
 class _RecordingClient:
@@ -878,6 +879,49 @@ class TestUsageSync:
         import logging
 
         caplog.set_level(logging.WARNING, logger="omnigent.kimi_native_forwarder")
+        (tmp_path / "kimi_usage_state.json").write_text(json.dumps(payload), encoding="utf-8")
+
+        state, trusted = _read_usage_state(tmp_path)
+
+        assert state is None
+        assert trusted is True
+        assert any("starting fresh" in r.message for r in caplog.records)
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            pytest.param(lambda p: p.update(totals={"input_other": 10}), id="totals-single-key"),
+            pytest.param(lambda p: p["totals"].pop("cache_creation"), id="totals-one-key-missing"),
+            pytest.param(lambda p: p["totals"].update(extra=1), id="totals-extra-key"),
+            pytest.param(lambda p: p.pop("posted_model"), id="nullable-field-missing"),
+            pytest.param(lambda p: p.pop("context_tokens"), id="context-tokens-missing"),
+            pytest.param(lambda p: p.update(extra=1), id="top-level-extra-key"),
+            pytest.param(lambda p: p.update(billed_wire=None), id="line-without-wire"),
+            pytest.param(lambda p: p.update(billed_line=-1), id="wire-without-line"),
+            pytest.param(lambda p: p.update(billed_line=-3), id="line-below-sentinel"),
+            pytest.param(lambda p: p.update(billed_wire=""), id="empty-wire-with-line"),
+        ],
+    )
+    def test_partial_or_inconsistent_usage_state_starts_fresh(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, mutate: Callable[[dict], object]
+    ) -> None:
+        """Partial totals or a torn watermark pair is corruption, not a
+        trustable baseline: the writer always persists all four counters and
+        the watermark as a pair, and trusting a subset would zero the missing
+        counters while the watermark suppresses re-billing — a permanent
+        undercount that never self-corrects (fresh start re-bills forward)."""
+        import logging
+
+        caplog.set_level(logging.WARNING, logger="omnigent.kimi_native_forwarder")
+        payload: dict = {
+            "totals": {"input_other": 10, "output": 2, "cache_read": 3, "cache_creation": 0},
+            "model": "system.ai.kimi-k3",
+            "posted_model": "system.ai.kimi-k3",
+            "context_tokens": 13,
+            "billed_wire": "/w/a",
+            "billed_line": 5,
+        }
+        mutate(payload)
         (tmp_path / "kimi_usage_state.json").write_text(json.dumps(payload), encoding="utf-8")
 
         state, trusted = _read_usage_state(tmp_path)
