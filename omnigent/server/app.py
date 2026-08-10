@@ -2731,6 +2731,23 @@ def create_app(
             tags=["hosts"],
         )
 
+    from omnigent.server.auth import UnifiedAuthProvider
+
+    # Native-shell login completion (/auth/native-complete): mounted for
+    # every unified provider mode — unlike the per-mode login routers
+    # below — because header mode has no other /auth surface yet is
+    # exactly the mode that needs it (front-door deploys, where the
+    # proxy authenticates the browser and the shell collects the
+    # credential via the completion redirect).
+    if isinstance(auth_provider, UnifiedAuthProvider):
+        from omnigent.server.routes.native_auth import create_native_auth_router
+
+        app.include_router(
+            create_native_auth_router(auth_provider),
+            prefix="/auth",
+            tags=["auth"],
+        )
+
     # Mount the auth router that matches the active provider. OIDC and
     # accounts share the /auth prefix but expose different endpoints
     # under it (OIDC: /login, /callback, /logout, /cli-login, /cli-poll;
@@ -2739,8 +2756,6 @@ def create_app(
     # Must be registered BEFORE the SPA static mount because the SPA's
     # HTML5-history fallback catches all unmatched extensionless paths.
     if auth_provider is not None and getattr(auth_provider, "login_url", None):
-        from omnigent.server.auth import UnifiedAuthProvider
-
         # ``admin_list`` is built once near app creation (see above) so the
         # auth routes and ``/v1/me`` share one roster. Consulted on each login
         # to promote listed identities — the only admin path for OIDC, and an
