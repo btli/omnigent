@@ -107,9 +107,23 @@ _SESSION_RESUME_RE = re.compile(
 )
 
 
-#: Clock-skew tolerance when time-filtering the first read of a resumed wire
-#: log (kimi writes record ``time`` from the same host, so drift is minimal).
-_USAGE_TIME_SKEW_MS = 10_000
+#: One-shot log guard keys (schema drift logs once per process, not per row).
+_WARNED_KEYS: set[str] = set()
+
+
+def _warn_once(key: str, msg: str, *args: object) -> None:
+    """Log *msg* at warning level only the first time *key* is seen."""
+    if key in _WARNED_KEYS:
+        return
+    _WARNED_KEYS.add(key)
+    _logger.warning(msg, *args)
+
+
+def _token_count(raw: object) -> int | None:
+    """A pinned token-count field: a non-boolean, non-negative int, else None."""
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+        return raw
+    return None
 
 
 def _find_wire_log(home: Path, session_id: str) -> Path | None:
@@ -132,19 +146,25 @@ def _sum_wire_usage(
     wire_path: Path,
     *,
     offset: int,
-    turn_start_ms: float,
+    turn_start_ms: int,
 ) -> tuple[dict[str, int] | None, str | None, int]:
     """Sum the turn's ``usage.record`` rows from the wire log's new bytes.
 
     Reads from byte *offset* (the per-session checkpoint). On the first read
     of a wire log (``offset == 0``) the file may carry a resumed session's
     history (``-C`` / ``-S`` into an existing session), so rows are also
-    gated on ``time >= turn_start_ms`` — a row without a valid ``time`` is
-    then skipped fail-safe. With a checkpoint, every new row belongs to this
-    turn and no time gate applies.
+    gated on a STRICT ``time >= turn_start_ms`` — no backward allowance, or a
+    turn finished moments before the resume would be re-billed. With a
+    checkpoint, every new row belongs to this turn and no time gate applies.
+
+    Rows are validated against the pinned Kimi Code 0.34.0 schema (four
+    non-boolean, non-negative int counts + a model string); drifted rows are
+    skipped whole and logged once — never partially counted.
 
     :returns: ``(token sums or None when no row counted, effective model or
-        None, new checkpoint offset)``. Tolerant of a missing/unreadable
+        None, new checkpoint offset)``. The model prefers the newest
+        ``llm.request`` (provider-resolved id, then alias) and falls back to
+        the newest counted record's model. Tolerant of a missing/unreadable
         file and malformed rows.
     """
     try:
@@ -163,7 +183,8 @@ def _sum_wire_usage(
         "cache_creation_input_tokens": 0,
     }
     counted = False
-    model: str | None = None
+    request_model: str | None = None
+    record_model: str | None = None
     for raw in blob.decode("utf-8", errors="replace").splitlines():
         line = raw.strip()
         if not line.startswith("{"):
@@ -181,30 +202,47 @@ def _sum_wire_usage(
             if not (isinstance(candidate, str) and candidate):
                 candidate = row.get("modelAlias")
             if isinstance(candidate, str) and candidate:
-                model = candidate
+                request_model = candidate
             continue
         if row_type != "usage.record" or row.get("usageScope") != "turn":
             continue
-        if first_read:
-            row_time = row.get("time")
-            if not isinstance(row_time, (int, float)):
-                continue
-            if row_time < turn_start_ms - _USAGE_TIME_SKEW_MS:
-                continue
+        model = row.get("model")
+        row_time = _token_count(row.get("time"))
         usage = row.get("usage")
-        if not isinstance(usage, dict):
+        counts: dict[str, int] | None = None
+        if isinstance(usage, dict):
+            counts = {}
+            for wire_key, out_key in (
+                ("inputOther", "input_tokens"),
+                ("output", "output_tokens"),
+                ("inputCacheRead", "cache_read_input_tokens"),
+                ("inputCacheCreation", "cache_creation_input_tokens"),
+            ):
+                value = _token_count(usage.get(wire_key))
+                if value is None:
+                    counts = None
+                    break
+                counts[out_key] = value
+        if counts is None or not (isinstance(model, str) and model) or row_time is None:
+            # Schema drift: skip the whole record — partial/zero sums would
+            # be silently wrong and the checkpoint advances irreversibly.
+            _warn_once(
+                "usage.record-drift",
+                "kimi executor: skipping usage.record not matching the pinned "
+                "0.34.0 schema (further drift logged at debug): %r",
+                row,
+            )
+            _logger.debug("kimi executor: skipped drifted usage.record: %r", row)
             continue
-        for wire_key, out_key in (
-            ("inputOther", "input_tokens"),
-            ("output", "output_tokens"),
-            ("inputCacheRead", "cache_read_input_tokens"),
-            ("inputCacheCreation", "cache_creation_input_tokens"),
-        ):
-            value = usage.get(wire_key)
-            if isinstance(value, int) and value >= 0:
-                totals[out_key] += value
+        if first_read and row_time < turn_start_ms:
+            continue
+        for out_key, value in counts.items():
+            totals[out_key] += value
+        record_model = model
         counted = True
-    return (totals if counted else None), model, size
+    # Bytes appended between the size probe and the read must not be
+    # re-counted next turn: checkpoint what was actually consumed.
+    return (totals if counted else None), (request_model or record_model), start + len(blob)
 
 
 def _parse_truthy(value: str | None) -> bool:
@@ -444,7 +482,24 @@ class KimiExecutor(Executor):
         argv.extend(["-p", prompt_text])
         return argv
 
-    def _collect_turn_usage(self, turn_start_ms: float) -> dict[str, object] | None:
+    def _seed_wire_checkpoint(self) -> None:
+        """Snapshot the resumed session's wire EOF before spawning.
+
+        A known session id with no checkpoint (e.g. an earlier extraction
+        failure) must not bill pre-existing records to this turn: everything
+        already in the file predates the spawn. Best-effort.
+        """
+        session_id = self._session_id
+        if not session_id or session_id in self._wire_offsets:
+            return
+        try:
+            wire = _find_wire_log(resolve_user_kimi_home(), session_id)
+            if wire is not None:
+                self._wire_offsets[session_id] = wire.stat().st_size
+        except OSError:
+            return
+
+    def _collect_turn_usage(self, turn_start_ms: int) -> dict[str, object] | None:
         """Best-effort per-turn token usage from kimi's persisted wire log.
 
         Kimi's stream-json stdout carries no usage/model records, but the
@@ -595,9 +650,14 @@ class KimiExecutor(Executor):
         argv[0] = self._sandbox_launch_path(tuple(env.keys()))
 
         started_at = time.monotonic()
+        # Checkpoint a resumed session's wire EOF before spawning, so the
+        # usage read after exit never bills pre-existing records to this turn.
+        self._seed_wire_checkpoint()
         # Wall-clock floor for the wire-log usage read: on the first read of a
         # resumed session's log, only records stamped at/after this turn count.
-        turn_start_ms = time.time() * 1000.0
+        # Truncated to whole ms — record ``time`` stamps are ms-resolution, so
+        # the strict gate must compare at the same granularity.
+        turn_start_ms = int(time.time() * 1000)
         process: asyncio.subprocess.Process | None = None
         stderr_buf = bytearray()
         any_text_emitted = False
