@@ -106,9 +106,22 @@ class MainActivityTest {
     fun `dismissed auth tab falls back to the inline login`() {
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
-        activity.authTabFlow.begin("https://example.com")
+        activity.authTabFlow.begin("https://example.com", activity.packageName)
 
         activity.onAuthTabOutcome(AuthTabIntent.RESULT_CANCELED, null)
+
+        assertFalse(activity.authTabFlow.inFlight)
+        assertTrue(activity.authTabFellBack)
+        assertEquals("https://example.com", shadowOf(activity.webView()).lastLoadedUrl)
+    }
+
+    @Test
+    fun `failed app link verification falls back to inline login`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        activity.authTabFlow.begin("https://example.com", activity.packageName)
+
+        activity.onAuthTabOutcome(AuthTabIntent.RESULT_VERIFICATION_FAILED, null)
 
         assertFalse(activity.authTabFlow.inFlight)
         assertTrue(activity.authTabFellBack)
@@ -122,12 +135,13 @@ class MainActivityTest {
         // later login attempt — a permanent wedge until process death.
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
-        activity.authTabFlow.begin("https://example.com")
+        activity.authTabFlow.begin("https://example.com", activity.packageName)
 
         activity.onAuthTabOutcome(
             AuthTabIntent.RESULT_OK,
             Uri.parse(
-                "omnigent://auth-callback?state=not-the-flow-state&code=c0de&exchange=tab",
+                "https://example.com${NativeAuth.CALLBACK_PATH}" +
+                    "?state=not-the-flow-state&code=c0de&exchange=tab",
             ),
         )
 

@@ -29,20 +29,31 @@ from omnigent.server.oidc import (
     mint_session_token,
 )
 from omnigent.server.routes.native_auth import (
+    AndroidAuthTabApp,
+    create_android_asset_links_router,
     create_native_auth_router,
+    resolve_android_auth_tab_apps,
     resolve_forwarded_token_header,
 )
 
 _SECRET = bytes.fromhex("ab" * 32)
+_ORIGIN = "https://server.example.com"
+_ANDROID_PACKAGE = "ai.omnigent.android"
+_ANDROID_FINGERPRINT = ":".join(["AA"] * 32)
+_ALLOWED_APPS = (AndroidAuthTabApp(_ANDROID_PACKAGE, (_ANDROID_FINGERPRINT,)),)
 _STATE = "state-nonce-1234"
 _VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"  # RFC 7636 App. B
 _CHALLENGE = derive_code_challenge(_VERIFIER)
 
 
-def _client(provider: UnifiedAuthProvider) -> TestClient:
+def _client(
+    provider: UnifiedAuthProvider,
+    allowed_apps: tuple[AndroidAuthTabApp, ...] = _ALLOWED_APPS,
+) -> TestClient:
     app = FastAPI()
-    app.include_router(create_native_auth_router(provider), prefix="/auth")
-    return TestClient(app, follow_redirects=False)
+    app.include_router(create_android_asset_links_router(allowed_apps))
+    app.include_router(create_native_auth_router(provider, allowed_apps), prefix="/auth")
+    return TestClient(app, base_url=_ORIGIN, follow_redirects=False)
 
 
 def _header_provider() -> UnifiedAuthProvider:
@@ -101,7 +112,8 @@ def _cookie_auth(provider_name: str) -> dict[str, str]:
 def _callback_params(response) -> dict[str, list[str]]:
     location = response.headers["location"]
     parts = urlsplit(location)
-    assert f"{parts.scheme}://{parts.netloc}" == "omnigent://auth-callback"
+    assert f"{parts.scheme}://{parts.netloc}" == _ORIGIN
+    assert parts.path == "/auth/native-callback"
     return parse_qs(parts.query)
 
 
@@ -110,10 +122,15 @@ def _complete(
     headers: dict[str, str],
     state: str = _STATE,
     challenge: str = _CHALLENGE,
+    client_package: str = _ANDROID_PACKAGE,
 ) -> dict[str, list[str]]:
     response = client.get(
         "/auth/native-complete",
-        params={"state": state, "code_challenge": challenge},
+        params={
+            "state": state,
+            "code_challenge": challenge,
+            "client_package": client_package,
+        },
         headers=headers,
     )
     assert response.status_code == 302
@@ -130,7 +147,13 @@ class TestCompleteValidation:
         client = _client(_header_provider())
         response = client.get(
             "/auth/native-complete",
-            params={"state": state, "code_challenge": _CHALLENGE} if state else {},
+            params={
+                "state": state,
+                "code_challenge": _CHALLENGE,
+                "client_package": _ANDROID_PACKAGE,
+            }
+            if state
+            else {},
             headers=_HEADER_AUTH,
         )
         assert response.status_code == 400
@@ -141,13 +164,78 @@ class TestCompleteValidation:
         # "token oracle" shape — must yield nothing at all, not a flow.
         client = _client(_header_provider())
         for params in (
-            {"state": _STATE},
-            {"state": _STATE, "code_challenge": "short"},
-            {"state": _STATE, "code_challenge": "!" * 43},
+            {"state": _STATE, "client_package": _ANDROID_PACKAGE},
+            {
+                "state": _STATE,
+                "code_challenge": "short",
+                "client_package": _ANDROID_PACKAGE,
+            },
+            {
+                "state": _STATE,
+                "code_challenge": "!" * 43,
+                "client_package": _ANDROID_PACKAGE,
+            },
         ):
             response = client.get("/auth/native-complete", params=params, headers=_HEADER_AUTH)
             assert response.status_code == 400
             assert "location" not in response.headers
+
+    def test_unconfigured_android_app_cannot_initiate_a_flow(self) -> None:
+        attacker_verifier = "A" * 43
+        response = _client(_header_provider()).get(
+            "/auth/native-complete",
+            params={
+                "state": "attacker-state-1234",
+                "code_challenge": derive_code_challenge(attacker_verifier),
+                "client_package": "com.evil.unverified",
+            },
+            headers=_HEADER_AUTH,
+        )
+
+        assert response.status_code == 302
+        params = _callback_params(response)
+        assert params == {
+            "state": ["attacker-state-1234"],
+            "error": ["client_not_allowed"],
+        }
+
+    def test_empty_app_allowlist_disables_flow_creation(self) -> None:
+        params = _complete(
+            _client(_header_provider(), allowed_apps=()),
+            _HEADER_AUTH,
+        )
+        assert params["error"] == ["client_not_allowed"]
+        assert "code" not in params
+
+    def test_assetlinks_lists_configured_package_and_fingerprint(self) -> None:
+        response = _client(_header_provider()).get("/.well-known/assetlinks.json")
+
+        assert response.status_code == 200
+        assert response.json() == [
+            {
+                "relation": ["delegate_permission/common.handle_all_urls"],
+                "target": {
+                    "namespace": "android_app",
+                    "package_name": _ANDROID_PACKAGE,
+                    "sha256_cert_fingerprints": [_ANDROID_FINGERPRINT],
+                },
+            }
+        ]
+
+    def test_server_config_normalizes_android_app_fingerprints(self, monkeypatch) -> None:
+        monkeypatch.delenv("OMNIGENT_ANDROID_AUTH_TAB_APPS", raising=False)
+        apps = resolve_android_auth_tab_apps(
+            {
+                "android_auth_tab_apps": [
+                    {
+                        "package_name": _ANDROID_PACKAGE,
+                        "sha256_cert_fingerprints": ["aa" * 32],
+                    }
+                ]
+            }
+        )
+
+        assert apps == _ALLOWED_APPS
 
     def test_completion_redirect_never_carries_a_token(self) -> None:
         for provider, headers in (
@@ -165,7 +253,11 @@ class TestCompleteValidation:
         client = _client(_header_provider())
         response = client.get(
             "/auth/native-complete",
-            params={"state": _STATE, "code_challenge": _CHALLENGE},
+            params={
+                "state": _STATE,
+                "code_challenge": _CHALLENGE,
+                "client_package": _ANDROID_PACKAGE,
+            },
         )
         assert response.status_code == 401
 
@@ -179,11 +271,17 @@ class TestCompleteValidation:
         client = _client(provider_factory())
         response = client.get(
             "/auth/native-complete",
-            params={"state": _STATE, "code_challenge": _CHALLENGE},
+            params={
+                "state": _STATE,
+                "code_challenge": _CHALLENGE,
+                "client_package": _ANDROID_PACKAGE,
+            },
         )
         assert response.status_code == 302
         expected_return = quote(
-            f"/auth/native-complete?state={_STATE}&code_challenge={_CHALLENGE}", safe=""
+            f"/auth/native-complete?state={_STATE}&code_challenge={_CHALLENGE}"
+            + f"&client_package={_ANDROID_PACKAGE}",
+            safe="",
         )
         assert response.headers["location"] == f"{login_url}?return_to={expected_return}"
 
@@ -191,7 +289,11 @@ class TestCompleteValidation:
         client = _client(_header_provider())
         response = client.get(
             "/auth/native-complete",
-            params={"state": _STATE, "code_challenge": _CHALLENGE},
+            params={
+                "state": _STATE,
+                "code_challenge": _CHALLENGE,
+                "client_package": _ANDROID_PACKAGE,
+            },
             headers={"X-Forwarded-Email": "alice@example.com"},
         )
         params = _callback_params(response)
@@ -213,11 +315,22 @@ class TestCompleteValidation:
             {"X-Forwarded-Email": "alice@example.com", "X-Custom-Token": "custom-token"},
         )
         code = params["code"][0]
-        exchanged = client.post(
+        rejected = client.post(
             "/auth/native-exchange",
             data={"code": code, "state": _STATE, "code_verifier": _VERIFIER},
         )
-        assert exchanged.json()["token"] == "custom-token"
+        assert rejected.status_code == 400
+        assert rejected.json()["error"] == "Exchange transport mismatch"
+
+        next_code = _complete(
+            client,
+            {"X-Forwarded-Email": "alice@example.com", "X-Custom-Token": "custom-token"},
+        )["code"][0]
+        exchanged = client.get(
+            "/auth/native-exchange",
+            params={"code": next_code, "state": _STATE, "code_verifier": _VERIFIER},
+        )
+        assert _callback_params(exchanged)["token"] == ["custom-token"]
 
 
 class TestExchange:
@@ -270,11 +383,51 @@ class TestExchange:
         assert "token" in _callback_params(first)
         assert _callback_params(replay)["error"] == ["exchange_failed"]
 
+    def test_post_flow_rejects_get_transport_without_token_redirect(self) -> None:
+        client = _client(_oidc_provider())
+        code = _complete(client, _cookie_auth("oidc"))["code"][0]
+        fields = {"code": code, "state": _STATE, "code_verifier": _VERIFIER}
+
+        rejected = client.get("/auth/native-exchange", params=fields)
+        retry = client.post("/auth/native-exchange", data=fields)
+
+        assert rejected.status_code == 302
+        params = _callback_params(rejected)
+        assert params["error"] == ["exchange_failed"]
+        assert "token" not in params
+        assert "token_type" not in params
+        assert retry.status_code == 400
+        assert retry.json()["error"] == "Unknown, expired, or already used code"
+
+    def test_tab_flow_rejects_post_transport(self) -> None:
+        client = _client(_header_provider())
+        code = _complete(client, _HEADER_AUTH)["code"][0]
+        fields = {"code": code, "state": _STATE, "code_verifier": _VERIFIER}
+
+        rejected = client.post("/auth/native-exchange", data=fields)
+        retry = client.get("/auth/native-exchange", params=fields)
+
+        assert rejected.status_code == 400
+        assert rejected.json()["error"] == "Exchange transport mismatch"
+        assert _callback_params(retry)["error"] == ["exchange_failed"]
+
+    def test_post_exchange_ignores_query_string_parameters(self) -> None:
+        client = _client(_oidc_provider())
+        code = _complete(client, _cookie_auth("oidc"))["code"][0]
+        fields = {"code": code, "state": _STATE, "code_verifier": _VERIFIER}
+
+        query_only = client.post("/auth/native-exchange", params=fields)
+        proper_form = client.post("/auth/native-exchange", data=fields)
+
+        assert query_only.status_code == 400
+        assert query_only.json()["error"] == "Missing or malformed code parameter"
+        assert proper_form.status_code == 200
+
     def test_wrong_verifier_burns_the_code(self) -> None:
         # The pop happens before the PKCE check, so a failed guess consumes
         # the code — the right verifier can't be retried afterwards either.
-        client = _client(_header_provider())
-        code = _complete(client, _HEADER_AUTH)["code"][0]
+        client = _client(_oidc_provider())
+        code = _complete(client, _cookie_auth("oidc"))["code"][0]
 
         wrong = client.post(
             "/auth/native-exchange",
@@ -289,8 +442,8 @@ class TestExchange:
         assert retry.status_code == 400
 
     def test_wrong_state_is_rejected(self) -> None:
-        client = _client(_header_provider())
-        code = _complete(client, _HEADER_AUTH)["code"][0]
+        client = _client(_oidc_provider())
+        code = _complete(client, _cookie_auth("oidc"))["code"][0]
 
         response = client.post(
             "/auth/native-exchange",
@@ -308,8 +461,8 @@ class TestExchange:
         assert response.status_code == 400
 
     def test_expired_code_is_rejected(self, monkeypatch) -> None:
-        client = _client(_header_provider())
-        code = _complete(client, _HEADER_AUTH)["code"][0]
+        client = _client(_oidc_provider())
+        code = _complete(client, _cookie_auth("oidc"))["code"][0]
 
         real_time = time.time
         monkeypatch.setattr(time, "time", lambda: real_time() + 121)
