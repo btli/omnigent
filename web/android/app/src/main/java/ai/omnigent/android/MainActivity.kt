@@ -60,15 +60,18 @@ class MainActivity : AppCompatActivity() {
     // (it binds to the Custom Tabs provider's metadata, not to session state).
     private val authTabLauncher =
         AuthTabIntent.registerActivityResultLauncher(this) { result ->
-            handleAuthTabResult(result)
+            onAuthTabOutcome(result.resultCode, result.resultUri)
         }
-    private val authTabFlow = AuthTabFlow()
+    internal val authTabFlow = AuthTabFlow()
+    private val nativeExchange = NativeAuthExchange()
     private val authTabSupported by lazy { AuthTabSupport.isSupported(this) }
 
     // One-shot downgrade to the inline in-WebView login after an Auth Tab
     // flow is dismissed or fails, so a bounce -> tab -> cancel -> bounce
-    // cycle can't loop. Re-armed once a pinned-origin page loads.
-    private var authTabFellBack = false
+    // cycle can't loop. Sticky for the rest of the process (a mere page
+    // load proves nothing about why the tab failed); reset only on a
+    // server switch, where the new server deserves a fresh attempt.
+    internal var authTabFellBack = false
 
     // Bridge-dependent work deferred until the page (and its injected emit
     // callbacks) exist — see onPageReady.
@@ -429,37 +432,68 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** Auth Tab closed: complete the login, or fall back to the inline flow. */
-    private fun handleAuthTabResult(result: AuthTabIntent.AuthResult) {
+    /** Advance the login with an Auth Tab result, or fall back to inline. */
+    internal fun onAuthTabOutcome(
+        resultCode: Int,
+        resultUri: Uri?,
+    ) {
         if (isDestroyed || isFinishing || !::webView.isInitialized) return
-        if (result.resultCode != AuthTabIntent.RESULT_OK) {
+        if (resultCode != AuthTabIntent.RESULT_OK) {
             // Dismissed, or the tab failed — includes the transition case of a
             // server without /auth/native-complete (login completes but no
             // redirect ever fires, so the user closes the tab).
             authTabFlow.cancel()
-            fallBackToInlineLogin("auth tab result=${result.resultCode}")
+            fallBackToInlineLogin("auth tab result=$resultCode")
             return
         }
-        val auth = authTabFlow.complete(result.resultUri, pinnedOrigin)
-        if (auth == null) {
-            // Wrong state, a server-reported error (no relayable token), or
-            // the pinned server changed mid-flow.
-            authTabFlow.cancel()
-            fallBackToInlineLogin("auth tab callback unmatched")
-            return
-        }
-        applyNativeAuthResult(auth)
-    }
+        // The tab is gone either way, so an unmatched callback (wrong state, a
+        // server-reported error, the pinned server changed mid-flow) must
+        // abandon the flow — leaving it armed would wedge every later login
+        // behind the in-flight check.
+        when (val outcome = authTabFlow.handleCallback(resultUri, pinnedOrigin)) {
+            null -> {
+                authTabFlow.cancel()
+                fallBackToInlineLogin("auth tab callback unmatched")
+            }
 
-    /**
-     * An `omnigent://auth-callback` VIEW intent (Custom-Tab fallback path,
-     * forwarded by [AuthRedirectActivity]). Unlike the Activity-result path,
-     * an unmatched URI here is dropped silently: any app can fire one, so it
-     * must be inert unless it binds to the one in-flight flow.
-     */
-    private fun handleAuthRedirectIntent(uri: Uri) {
-        val auth = authTabFlow.complete(uri, pinnedOrigin) ?: return
-        applyNativeAuthResult(auth)
+            is AuthTabFlow.Outcome.LaunchExchangeTab -> {
+                // Front-door server: exchange rides a second, silently
+                // authenticated browser hop (a native POST can't cross the
+                // proxy). The same launcher receives the final callback.
+                authLog("auth tab -> exchange hop")
+                try {
+                    AuthTabIntent.Builder().build().launch(
+                        authTabLauncher,
+                        outcome.url,
+                        NativeAuth.SCHEME,
+                    )
+                } catch (_: Exception) {
+                    authTabFlow.cancel()
+                    fallBackToInlineLogin("exchange tab launch failed")
+                }
+            }
+
+            is AuthTabFlow.Outcome.ExchangePost -> {
+                authLog("auth tab -> exchange post")
+                nativeExchange.exchange(outcome) { auth ->
+                    if (isDestroyed || isFinishing || !::webView.isInitialized) {
+                        return@exchange
+                    }
+                    // Re-check the origin: the exchange ran async and a server
+                    // switch may have landed meanwhile.
+                    authTabFlow.cancel()
+                    if (auth == null || outcome.origin != pinnedOrigin) {
+                        fallBackToInlineLogin("code exchange failed")
+                    } else {
+                        applyNativeAuthResult(auth)
+                    }
+                }
+            }
+
+            is AuthTabFlow.Outcome.Complete -> {
+                applyNativeAuthResult(outcome.result)
+            }
+        }
     }
 
     private fun applyNativeAuthResult(auth: NativeAuth.Result) {
@@ -619,6 +653,7 @@ class MainActivity : AppCompatActivity() {
         pendingMicRequest?.deny()
         pendingMicRequest = null
         loginManager.shutdown()
+        nativeExchange.shutdown()
         if (::blobSaver.isInitialized) blobSaver.shutdown()
         if (::webView.isInitialized) {
             removeBridge()
@@ -630,18 +665,6 @@ class MainActivity : AppCompatActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-
-        // A login-completion redirect delivered as a VIEW intent (the
-        // Custom-Tab fallback path) — consume it here; it carries no
-        // navigate path and must not fall through to the handling below.
-        val data = intent.data
-        if (data != null &&
-            data.scheme?.lowercase() == NativeAuth.SCHEME &&
-            data.host?.lowercase() == NativeAuth.HOST
-        ) {
-            handleAuthRedirectIntent(data)
-            return
-        }
 
         // Detect a server change: ConnectActivity re-enters us via
         // CLEAR_TOP|SINGLE_TOP after the user picks a different server. The
@@ -768,7 +791,6 @@ class MainActivity : AppCompatActivity() {
         }
         pageLoaded = true
         loginAttempts = 0 // reached a pinned-origin page — we're past the login redirect
-        authTabFellBack = false // re-arm the Auth Tab for the next login
         flushPendingActivation()
         emitInsets()
     }
