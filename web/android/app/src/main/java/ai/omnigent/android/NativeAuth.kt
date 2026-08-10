@@ -24,8 +24,8 @@ import java.security.MessageDigest
  * There is deliberately no manifest VIEW handler for the HTTPS callback.
  * Auth Tab verifies the dynamic server host itself and returns callbacks
  * only through its Activity-result channel. Verification failure closes
- * the tab and the shell falls back to inline WebView login; it never
- * downgrades to an unbound custom scheme.
+ * the tab and the shell uses the origin's established login fallback; it
+ * never downgrades to an unbound custom scheme.
  */
 object NativeAuth {
     private const val COMPLETE_PATH = "/auth/native-complete"
