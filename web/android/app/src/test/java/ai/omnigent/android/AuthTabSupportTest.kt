@@ -13,8 +13,8 @@ import org.robolectric.annotation.Config
 class AuthTabSupportTest {
     @Test
     fun `launch intent pins the resolved provider package`() {
-        // The independent reviewer also verified against browser-1.9.0 bytecode
-        // that launch() hands this same pinned Intent instance to the launcher.
+        // launch() forwards this exact Intent instance, so pinning package here
+        // pins the launched browser.
         val intent = AuthTabSupport.launchIntent(PROVIDER_PACKAGE).intent
 
         assertEquals(PROVIDER_PACKAGE, intent.`package`)
