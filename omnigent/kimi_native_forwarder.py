@@ -183,41 +183,58 @@ def _write_state(bridge_dir: Path, state: _ForwardState) -> None:
         tmp.replace(bridge_dir / _STATE_FILE)
 
 
+def _parse_usage_state(data: object) -> _UsageState | None:
+    """Validate a decoded state payload; ``None`` on any schema mismatch.
+
+    Strict on purpose: the only writer always emits every field with these
+    exact types, so a wrong-typed or missing field is corruption — silently
+    defaulting it would trust a baseline that was never written.
+    """
+
+    def _count(value: object) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+    if not isinstance(data, dict):
+        return None
+    totals = data.get("totals")
+    if not isinstance(totals, dict) or not all(
+        isinstance(k, str) and _count(v) for k, v in totals.items()
+    ):
+        return None
+    model = data.get("model")
+    posted_model = data.get("posted_model")
+    billed_wire = data.get("billed_wire")
+    if not all(v is None or isinstance(v, str) for v in (model, posted_model, billed_wire)):
+        return None
+    context_tokens = data.get("context_tokens")
+    if context_tokens is not None and not _count(context_tokens):
+        return None
+    billed_line = data.get("billed_line")
+    if not isinstance(billed_line, int) or isinstance(billed_line, bool):
+        return None
+    return _UsageState(
+        totals=dict(totals),
+        model=model or None,
+        posted_model=posted_model or None,
+        context_tokens=context_tokens,
+        billed_wire=billed_wire or None,
+        billed_line=billed_line,
+    )
+
+
 def _read_usage_state(bridge_dir: Path) -> tuple[_UsageState | None, bool]:
     """Load the persisted usage state as ``(state, trusted)``.
 
     ``trusted`` is False only on a TRANSIENT failure — the file exists but
-    cannot be read right now (EACCES/EIO/…) or is empty (a write in flight):
-    the already-billed totals are then unknown, so callers must suspend
-    billing and re-attempt the read rather than start fresh (fresh totals
-    are lower cumulative SET values the server's monotonic clamp drops).
-    Confirmed corruption — the file reads fully but definitively fails to
-    parse — IS trusted as a fresh start: re-reading cannot fix it.
+    cannot be read right now (EACCES/EIO/…): the already-billed totals are
+    then unknown, so callers must suspend billing and re-attempt the read
+    rather than start fresh (fresh totals are lower cumulative SET values
+    the server's monotonic clamp drops). Any content that is not a valid
+    state — empty, undecodable, unparseable, or schema-invalid — is
+    confirmed corruption and IS trusted as a fresh start: the only writer
+    is atomic (tmp + replace), so re-reading cannot improve on it.
     """
     path = bridge_dir / _USAGE_STATE_FILE
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return None, True
-    except OSError as exc:
-        _warn_once(
-            f"usage-state-unreadable:{bridge_dir}",
-            "kimi forwarder: usage state %s unreadable (%s); billing suspended "
-            "until it reads again",
-            path,
-            exc,
-        )
-        return None, False
-    if not raw.strip():
-        # Empty is a write in flight (or an external truncation about to be
-        # rewritten), not corruption: wait for the content.
-        _warn_once(
-            f"usage-state-empty:{bridge_dir}",
-            "kimi forwarder: usage state %s is empty (write in flight?); "
-            "billing suspended until it reads again",
-            path,
-        )
-        return None, False
 
     def _corrupt() -> tuple[None, bool]:
         _warn_once(
@@ -229,44 +246,28 @@ def _read_usage_state(bridge_dir: Path) -> tuple[_UsageState | None, bool]:
         return None, True
 
     try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, True
+    except UnicodeDecodeError:
+        return _corrupt()
+    except OSError as exc:
+        _warn_once(
+            f"usage-state-unreadable:{bridge_dir}",
+            "kimi forwarder: usage state %s unreadable (%s); billing suspended "
+            "until it reads again",
+            path,
+            exc,
+        )
+        return None, False
+    try:
         data = json.loads(raw)
     except ValueError:
         return _corrupt()
-    if not isinstance(data, dict):
+    state = _parse_usage_state(data)
+    if state is None:
         return _corrupt()
-    raw_totals = data.get("totals")
-    totals = (
-        {
-            k: v
-            for k, v in raw_totals.items()
-            if isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool) and v >= 0
-        }
-        if isinstance(raw_totals, dict)
-        else {}
-    )
-    model = data.get("model")
-    posted_model = data.get("posted_model")
-    context_tokens = data.get("context_tokens")
-    billed_wire = data.get("billed_wire")
-    billed_line = data.get("billed_line")
-    return _UsageState(
-        totals=totals,
-        model=model if isinstance(model, str) and model else None,
-        posted_model=posted_model if isinstance(posted_model, str) and posted_model else None,
-        context_tokens=(
-            context_tokens
-            if isinstance(context_tokens, int)
-            and not isinstance(context_tokens, bool)
-            and context_tokens >= 0
-            else None
-        ),
-        billed_wire=billed_wire if isinstance(billed_wire, str) and billed_wire else None,
-        billed_line=(
-            billed_line
-            if isinstance(billed_line, int) and not isinstance(billed_line, bool)
-            else -1
-        ),
-    ), True
+    return state, True
 
 
 def _write_usage_state(bridge_dir: Path, state: _UsageState) -> bool:
@@ -772,6 +773,11 @@ class _KimiUsageSync:
             self._adopt(state)
         self._suspended = False
         _logger.info("kimi forwarder: usage state readable again; billing resumed")
+        # Anything adopted in memory while suspended (e.g. a newer model from
+        # an llm.request) must reach disk now — the wire cursor may already be
+        # past the row that carried it. A failed write retries via the dirty
+        # flag and never gates the cursor.
+        self._persist()
 
     def note_new_wire(self) -> None:
         """Adopt a freshly discovered wire log.
@@ -801,6 +807,10 @@ class _KimiUsageSync:
         unknown baseline — both directions undercount at worst, which the
         server's monotonic clamp makes safe.
         """
+        if self._suspended:
+            # The prior state may have become readable since the last poll:
+            # recover first so this poll's rows bill instead of dropping.
+            self._try_recover()
         if self._suspended:
             _warn_once(
                 f"usage-suspended-skip:{wire}",
