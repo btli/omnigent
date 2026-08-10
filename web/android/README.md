@@ -33,21 +33,66 @@ agent-HTML iframe, so an injected artifact can't reach the native surface.
 ## Auth Tab server association
 
 Servers behind a front-door auth proxy can run login in an Android Auth Tab,
-but only after the server operator associates the installed app's package and
-signing certificate. Add this non-secret setting to the server config:
+and the callback is honored only if the browser's Digital Asset Links check
+succeeds. That check is a client-side browser control; the server cannot verify
+which Android app opened `/auth/native-complete`. In particular,
+`client_package` is an untrusted query parameter: another app can copy the
+allowlisted package string and make the authenticated server allocate a flow.
+It still needs the state/PKCE verifier and a browser-approved callback to obtain
+the credential.
+
+Configure the public HTTPS origin plus the installed app's package and signing
+certificate in the non-secret server config:
 
 ```yaml
+native_auth_base_url: https://omnigent.example.com
 android_auth_tab_apps:
   - package_name: ai.omnigent.android
     sha256_cert_fingerprints:
-      - "AA:BB:CC:...:FF"
+      - "REPLACE_WITH_PLAY_OR_APK_SIGNING_CERT_SHA256"
 ```
 
-Hosted entrypoints can instead set `OMNIGENT_ANDROID_AUTH_TAB_APPS` to the same
-list encoded as JSON. Use the app-signing certificate fingerprint (not the
-upload certificate when Play App Signing is enabled); self-built APKs use the
-certificate that signed that APK. The server publishes the configured entries
-at `/.well-known/assetlinks.json` for Auth Tab's Digital Asset Links check.
+No official release-signing fingerprint is stored in this repository; a human
+release operator must replace the placeholder. Use the app-signing certificate
+fingerprint (not the upload certificate when Play App Signing is enabled);
+self-built APKs use the certificate that signed that APK. Hosted entrypoints
+also accept `OMNIGENT_NATIVE_AUTH_BASE_URL` and
+`OMNIGENT_ANDROID_AUTH_TAB_APPS` (the app list encoded as JSON). The configured
+base URL must be the same origin users enter in the Android shell. Callback
+locations are built from this value, never from forwarded headers or the
+proxy-to-app request URL.
+
+### Make Digital Asset Links anonymous at the front door
+
+The browser fetches
+`https://<native_auth_base_url>/.well-known/assetlinks.json` without the user's
+front-door cookie. Configure the operator-managed edge/front door to bypass
+authentication for the exact `GET`/`HEAD` path
+`/.well-known/assetlinks.json` and serve the JSON with HTTP 200; keep every
+other path, including `/auth/*`, protected. The app already serves the
+configured JSON at that path, so a reverse proxy can pass the request through,
+or the edge can serve the same static body directly.
+
+Run this from a machine with no browser session, cookies, or Authorization
+header:
+
+```bash
+origin=https://omnigent.example.com
+status="$(curl --silent --show-error --output /tmp/assetlinks.json \
+  --write-out '%{http_code}' "$origin/.well-known/assetlinks.json")"
+test "$status" = 200 && python -m json.tool /tmp/assetlinks.json
+```
+
+A redirect to login or any 401/403 response is a failed reachability check.
+Without the anonymous exemption, the Android shell **always** falls back to the
+inline WebView flow.
+
+Databricks Apps does not provide public/anonymous access or a customer
+path-level authentication exemption (see the
+[Databricks Apps permissions documentation](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/permissions)).
+Therefore a direct `*.databricksapps.com` origin always takes the inline
+fallback. Auth Tab requires an operator-managed same-origin front door/custom
+domain that can expose this exact file anonymously while protecting the app.
 
 The allowlist is empty by default. Missing configuration, a package/signature
 mismatch, or a verification timeout fails closed and returns the shell to the

@@ -56,15 +56,15 @@ class MainActivity : AppCompatActivity() {
 
     // Auth Tab login for servers whose auth fronts them with a browser
     // redirect chain (Databricks-hosted). The launcher must be registered
-    // before RESUMED, hence the field initializer; support is queried once
-    // (it binds to the Custom Tabs provider's metadata, not to session state).
+    // before RESUMED, hence the field initializer; the provider is resolved
+    // once and every launch is pinned to that exact package.
     private val authTabLauncher =
         AuthTabIntent.registerActivityResultLauncher(this) { result ->
             onAuthTabOutcome(result.resultCode, result.resultUri)
         }
     internal val authTabFlow = AuthTabFlow()
     private val nativeExchange = NativeAuthExchange()
-    private val authTabSupported by lazy { AuthTabSupport.isSupported(this) }
+    private val authTabProviderPackage by lazy { AuthTabSupport.providerPackage(this) }
 
     // One-shot downgrade to the inline in-WebView login after an Auth Tab
     // flow is dismissed or fails, so a bounce -> tab -> cancel -> bounce
@@ -167,7 +167,7 @@ class MainActivity : AppCompatActivity() {
                         onPageReady = ::onPageReady,
                         onLoginRequired = ::startLogin,
                         shouldUseAuthTabLogin = {
-                            !authTabFellBack && authTabSupported &&
+                            !authTabFellBack && authTabProviderPackage != null &&
                                 loginAttempts < MAX_LOGIN_ATTEMPTS
                         },
                         onProxyLoginRequired = ::startProxyLogin,
@@ -418,6 +418,11 @@ class MainActivity : AppCompatActivity() {
             authLog("auth tab attempts exhausted ($loginAttempts) — not retrying")
             return
         }
+        val providerPackage = authTabProviderPackage
+        if (providerPackage == null) {
+            fallBackToInlineLogin("no Auth Tab provider")
+            return
+        }
         val callback = NativeAuth.callback(origin)
         if (callback == null) {
             fallBackToInlineLogin("auth tab requires an HTTPS server origin")
@@ -426,9 +431,9 @@ class MainActivity : AppCompatActivity() {
         val url = authTabFlow.begin(origin, packageName) ?: return
         loginAttempts++
         historyCleared = false
-        authLog("proxy login -> auth tab") // URL carries app binding + PKCE, no credential
+        authLog("proxy login -> auth tab") // URL carries package selector + PKCE, no credential
         try {
-            AuthTabIntent.Builder().build().launch(
+            AuthTabSupport.launchIntent(providerPackage).launch(
                 authTabLauncher,
                 url,
                 callback.host,
@@ -477,8 +482,14 @@ class MainActivity : AppCompatActivity() {
                     fallBackToInlineLogin("exchange tab lost HTTPS callback origin")
                     return
                 }
+                val providerPackage = authTabProviderPackage
+                if (providerPackage == null) {
+                    authTabFlow.cancel()
+                    fallBackToInlineLogin("exchange tab lost Auth Tab provider")
+                    return
+                }
                 try {
-                    AuthTabIntent.Builder().build().launch(
+                    AuthTabSupport.launchIntent(providerPackage).launch(
                         authTabLauncher,
                         outcome.url,
                         callback.host,

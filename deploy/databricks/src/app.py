@@ -170,6 +170,7 @@ try:
     from omnigent.runtime.caps import RuntimeCaps
     from omnigent.server.app import create_app
     from omnigent.server.auth import create_auth_provider, warn_if_single_user_exposed
+    from omnigent.server.server_config import load_server_config
 
     # OTel: the Databricks Apps platform auto-injects
     # OTEL_EXPORTER_OTLP_ENDPOINT when `telemetry_export_destinations`
@@ -177,6 +178,7 @@ try:
     # OTLP to the platform collector, which writes to the configured
     # UC tables. No-op if neither OTEL nor MLflow env vars are set.
     telemetry.init()
+    server_config = load_server_config()
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
     from omnigent.stores.artifact_store.databricks_volumes import (
         DatabricksVolumesArtifactStore,
@@ -269,6 +271,7 @@ try:
         host_store=host_store,
         scheduled_task_store=scheduled_task_store,
         auth_provider=auth_provider,
+        server_config=server_config,
     )
 
     if __name__ == "__main__":

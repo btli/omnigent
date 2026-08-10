@@ -1,20 +1,29 @@
 package ai.omnigent.android
 
 import android.content.Context
+import androidx.browser.auth.AuthTabIntent
 import androidx.browser.customtabs.CustomTabsClient
 
 /**
- * Whether the device's Custom Tabs provider implements the Auth Tab
- * surface (Chrome 132+). Gates the redirect-based login flow: only an
- * Auth Tab verifies the HTTPS callback's Digital Asset Links and returns
- * it through an Activity result. Without support, or when verification
- * fails, the shell keeps the in-WebView login flow instead; it never
- * downgrades to a custom-scheme callback.
+ * Resolves the device's Auth-Tab-capable Custom Tabs provider and builds
+ * launches pinned to that package. The browser performs the Digital Asset
+ * Links check client-side; if it fails, the shell keeps the in-WebView login
+ * flow instead and never downgrades to a custom-scheme callback.
  */
 object AuthTabSupport {
-    fun isSupported(context: Context): Boolean {
-        val provider = CustomTabsClient.getPackageName(context, null) ?: return false
-        return runCatching { CustomTabsClient.isAuthTabSupported(context, provider) }
-            .getOrDefault(false)
+    fun providerPackage(context: Context): String? =
+        supportedProviderPackage(CustomTabsClient.getPackageName(context, null)) { provider ->
+            CustomTabsClient.isAuthTabSupported(context, provider)
+        }
+
+    internal fun supportedProviderPackage(
+        providerPackage: String?,
+        isSupported: (String) -> Boolean,
+    ): String? {
+        val provider = providerPackage ?: return null
+        return provider.takeIf { runCatching { isSupported(it) }.getOrDefault(false) }
     }
+
+    internal fun launchIntent(providerPackage: String): AuthTabIntent =
+        AuthTabIntent.Builder().build().also { it.intent.setPackage(providerPackage) }
 }

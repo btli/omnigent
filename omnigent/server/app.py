@@ -2744,16 +2744,28 @@ def create_app(
             create_android_asset_links_router,
             create_native_auth_router,
             resolve_android_auth_tab_apps,
+            resolve_native_auth_base_url,
         )
 
         android_auth_tab_apps = resolve_android_auth_tab_apps(server_config)
+        native_auth_base_url = resolve_native_auth_base_url(server_config)
+        if android_auth_tab_apps and native_auth_base_url is None:
+            raise ValueError(
+                "native_auth_base_url (or OMNIGENT_NATIVE_AUTH_BASE_URL) is required "
+                "when android_auth_tab_apps is configured"
+            )
         app.include_router(create_android_asset_links_router(android_auth_tab_apps))
 
-        app.include_router(
-            create_native_auth_router(auth_provider, android_auth_tab_apps),
-            prefix="/auth",
-            tags=["auth"],
-        )
+        if native_auth_base_url is not None:
+            app.include_router(
+                create_native_auth_router(
+                    auth_provider,
+                    android_auth_tab_apps,
+                    native_auth_base_url,
+                ),
+                prefix="/auth",
+                tags=["auth"],
+            )
 
     # Mount the auth router that matches the active provider. OIDC and
     # accounts share the /auth prefix but expose different endpoints
