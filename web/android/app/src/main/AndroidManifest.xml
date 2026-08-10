@@ -46,6 +46,27 @@
             android:name=".ConnectActivity"
             android:exported="false"
             android:windowSoftInputMode="adjustResize" />
+
+        <!--
+          Login-completion trampoline: claims only omnigent://auth-callback
+          (scheme + host), so it can coexist with a broader omnigent://
+          deep-link handler. Runs in a disposable task and forwards into
+          MainActivity, whose state-nonce check drops unsolicited intents.
+        -->
+        <activity
+            android:name=".AuthRedirectActivity"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="omnigent" android:host="auth-callback" />
+            </intent-filter>
+        </activity>
     </application>
 
 </manifest>
