@@ -104,28 +104,28 @@ class MainActivityTest {
 
     @Test
     fun `dismissed auth tab falls back to the inline login`() {
-        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        ServerStore(ApplicationProvider.getApplicationContext()).connect(DATABRICKS_ORIGIN)
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
-        activity.authTabFlow.begin("https://example.com", activity.packageName)
+        activity.authTabFlow.begin(DATABRICKS_ORIGIN, activity.packageName)
 
         activity.onAuthTabOutcome(AuthTabIntent.RESULT_CANCELED, null)
 
         assertFalse(activity.authTabFlow.inFlight)
         assertTrue(activity.authTabFellBack)
-        assertEquals("https://example.com", shadowOf(activity.webView()).lastLoadedUrl)
+        assertEquals(DATABRICKS_ORIGIN, shadowOf(activity.webView()).lastLoadedUrl)
     }
 
     @Test
     fun `failed app link verification falls back to inline login`() {
-        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        ServerStore(ApplicationProvider.getApplicationContext()).connect(DATABRICKS_ORIGIN)
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
-        activity.authTabFlow.begin("https://example.com", activity.packageName)
+        activity.authTabFlow.begin(DATABRICKS_ORIGIN, activity.packageName)
 
         activity.onAuthTabOutcome(AuthTabIntent.RESULT_VERIFICATION_FAILED, null)
 
         assertFalse(activity.authTabFlow.inFlight)
         assertTrue(activity.authTabFellBack)
-        assertEquals("https://example.com", shadowOf(activity.webView()).lastLoadedUrl)
+        assertEquals(DATABRICKS_ORIGIN, shadowOf(activity.webView()).lastLoadedUrl)
     }
 
     @Test
@@ -133,14 +133,14 @@ class MainActivityTest {
         // Regression: a mismatched or malformed callback used to leave the
         // pending flow armed, so the in-flight check short-circuited every
         // later login attempt — a permanent wedge until process death.
-        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        ServerStore(ApplicationProvider.getApplicationContext()).connect(DATABRICKS_ORIGIN)
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
-        activity.authTabFlow.begin("https://example.com", activity.packageName)
+        activity.authTabFlow.begin(DATABRICKS_ORIGIN, activity.packageName)
 
         activity.onAuthTabOutcome(
             AuthTabIntent.RESULT_OK,
             Uri.parse(
-                "https://example.com${NativeAuth.CALLBACK_PATH}" +
+                "$DATABRICKS_ORIGIN${NativeAuth.CALLBACK_PATH}" +
                     "?state=not-the-flow-state&code=c0de&exchange=tab",
             ),
         )
@@ -151,7 +151,7 @@ class MainActivityTest {
 
     @Test
     fun `initial auth tab launch falls back when provider resolution is null`() {
-        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        ServerStore(ApplicationProvider.getApplicationContext()).connect(DATABRICKS_ORIGIN)
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
         activity.authTabProviderPackageForTest = { null }
 
@@ -159,12 +159,12 @@ class MainActivityTest {
 
         assertFalse(activity.authTabFlow.inFlight)
         assertTrue(activity.authTabFellBack)
-        assertEquals("https://example.com", shadowOf(activity.webView()).lastLoadedUrl)
+        assertEquals(DATABRICKS_ORIGIN, shadowOf(activity.webView()).lastLoadedUrl)
     }
 
     @Test
     fun `exchange auth tab launch falls back when provider resolution is null`() {
-        val origin = "https://example.com"
+        val origin = DATABRICKS_ORIGIN
         ServerStore(ApplicationProvider.getApplicationContext()).connect(origin)
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
         activity.authTabProviderPackageForTest = { null }
@@ -190,4 +190,8 @@ class MainActivityTest {
             .getDeclaredField("webView")
             .apply { isAccessible = true }
             .get(this) as WebView
+
+    private companion object {
+        const val DATABRICKS_ORIGIN = "https://example.databricksapps.com"
+    }
 }
