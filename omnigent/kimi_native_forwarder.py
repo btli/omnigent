@@ -98,12 +98,20 @@ class _UsageState:
     silently drop every later post until fresh totals re-crossed the peak.
     ``model`` / ``posted_model`` are persisted so a restart between an
     ``llm.request`` and its ``usage.record`` neither downgrades attribution
-    nor re-posts an unchanged model.
+    nor re-posts an unchanged model. ``context_tokens`` is persisted so a
+    post that failed right before a restart retries WITH the context
+    occupancy. ``billed_through_ms`` / ``billed_line`` are the billed
+    high-water mark (the last recorded row's timestamp + wire line): totals
+    and mark persist in ONE write, so a crash between recording a row and
+    advancing the separate wire cursor cannot re-bill the row on restart.
     """
 
     totals: dict[str, int] = field(default_factory=dict)
     model: str | None = None
     posted_model: str | None = None
+    context_tokens: int | None = None
+    billed_through_ms: int = -1
+    billed_line: int = -1
 
 
 @dataclass
@@ -196,10 +204,26 @@ def _read_usage_state(bridge_dir: Path) -> _UsageState | None:
     )
     model = data.get("model")
     posted_model = data.get("posted_model")
+    context_tokens = data.get("context_tokens")
+    billed_through_ms = data.get("billed_through_ms")
+    billed_line = data.get("billed_line")
+
+    def _int(value: object, default: int) -> int:
+        return value if isinstance(value, int) and not isinstance(value, bool) else default
+
     return _UsageState(
         totals=totals,
         model=model if isinstance(model, str) and model else None,
         posted_model=posted_model if isinstance(posted_model, str) and posted_model else None,
+        context_tokens=(
+            context_tokens
+            if isinstance(context_tokens, int)
+            and not isinstance(context_tokens, bool)
+            and context_tokens >= 0
+            else None
+        ),
+        billed_through_ms=_int(billed_through_ms, -1),
+        billed_line=_int(billed_line, -1),
     )
 
 
@@ -208,6 +232,9 @@ def _write_usage_state(bridge_dir: Path, state: _UsageState) -> None:
         "totals": state.totals,
         "model": state.model,
         "posted_model": state.posted_model,
+        "context_tokens": state.context_tokens,
+        "billed_through_ms": state.billed_through_ms,
+        "billed_line": state.billed_line,
     }
     tmp = bridge_dir / (_USAGE_STATE_FILE + ".tmp")
     with contextlib.suppress(OSError):
@@ -458,13 +485,24 @@ def read_kimi_wire_items(wire_path: Path, last_line: int) -> list[KimiWireItem]:
     items: list[KimiWireItem] = []
     for idx in range(last_line, len(lines)):
         line = lines[idx].strip()
-        if not line or not line.startswith("{"):
+        if not line:
             continue
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
+        row: object = None
+        if line.startswith("{"):
+            try:
+                row = json.loads(line)
+            except ValueError:
+                row = None
         if not isinstance(row, dict):
+            # Torn write / non-JSON noise: skip, but keep the diagnostic.
+            _warn_once(
+                f"wire-badrow:{wire_path}",
+                "kimi forwarder: skipping unparseable wire row(s) in %s "
+                "(first: line %d; further rows logged at debug)",
+                wire_path,
+                idx + 1,
+            )
+            _logger.debug("kimi forwarder: unparseable wire row %d: %.200s", idx + 1, line)
             continue
         item = _row_to_item(idx, row)
         if item is not None:
@@ -588,15 +626,29 @@ class _KimiUsageSync:
         session_id: str,
         bridge_dir: Path,
         state: _UsageState | None = None,
+        billing_floor_ms: int = 0,
     ) -> None:
         self._events_url = f"{base_url.rstrip('/')}/v1/sessions/{session_id}/events"
         self._headers = headers
         self._bridge_dir = bridge_dir
+        # Records stamped before this Omnigent session launched belong to a
+        # resumed pre-existing kimi session — never billed. STRICT floor: the
+        # discovery mtime skew must not leak into billing, or a turn finishing
+        # just before terminal recreation would be re-billed.
+        self._billing_floor_ms = billing_floor_ms
         self._totals: dict[str, int] = dict.fromkeys(self._TOTAL_KEYS, 0)
         # Effective model: llm.request's provider-resolved id wins; a
         # usage.record's alias fills in until one is seen.
         self._model: str | None = None
         self._posted_model: str | None = None
+        # Latest record's context occupancy (inputOther + inputCacheRead +
+        # inputCacheCreation) — NOT cumulative.
+        self._context_tokens: int | None = None
+        # Billed high-water mark: (timestamp, wire line) of the last recorded
+        # row. Persisted atomically WITH the totals, so replaying rows after a
+        # crash (the wire cursor persists separately) is idempotent.
+        self._billed_ms = -1
+        self._billed_line = -1
         if state is not None:
             for key in self._TOTAL_KEYS:
                 value = state.totals.get(key)
@@ -604,9 +656,9 @@ class _KimiUsageSync:
                     self._totals[key] = value
             self._model = state.model
             self._posted_model = state.posted_model
-        # Latest record's context occupancy (inputOther + inputCacheRead +
-        # inputCacheCreation) — NOT cumulative.
-        self._context_tokens: int | None = None
+            self._context_tokens = state.context_tokens
+            self._billed_ms = state.billed_through_ms
+            self._billed_line = state.billed_line
         self._last_posted: dict[str, int] | None = None
         self._window_cache: dict[str, int | None] = {}
 
@@ -617,21 +669,39 @@ class _KimiUsageSync:
                 totals=dict(self._totals),
                 model=self._model,
                 posted_model=self._posted_model,
+                context_tokens=self._context_tokens,
+                billed_through_ms=self._billed_ms,
+                billed_line=self._billed_line,
             ),
         )
 
     def note_new_wire(self) -> None:
         """Adopt a freshly discovered wire log.
 
-        Only the per-log view resets (context occupancy, delivery dedup); the
-        cumulative totals and model carry forward — they are session-scoped,
-        and a zero-reset would make every later post a server-ignored decrease.
+        Only the per-log view resets (context occupancy, delivery dedup, and
+        the line half of the billed mark — line numbers restart per log); the
+        cumulative totals, model, and billed timestamp carry forward — they
+        are session-scoped, and a zero-reset would make every later post a
+        server-ignored decrease.
         """
         self._context_tokens = None
         self._last_posted = None
+        self._billed_line = -1
 
     def record(self, item: KimiWireItem) -> None:
-        """Fold one validated ``usage.record`` item into the cumulative totals."""
+        """Fold one validated ``usage.record`` item into the cumulative totals.
+
+        Skips rows at/below the billed high-water mark (a crash between the
+        totals write and the wire-cursor write replays rows on restart) and
+        rows stamped before the billing floor (a resumed session's history).
+        """
+        time_ms = item.time_ms
+        if time_ms is None or time_ms < self._billing_floor_ms:
+            return
+        if time_ms < self._billed_ms or (
+            time_ms == self._billed_ms and item.line_no <= self._billed_line
+        ):
+            return
         usage = item.usage or {}
         for key in self._TOTAL_KEYS:
             self._totals[key] += usage.get(key, 0)
@@ -642,6 +712,8 @@ class _KimiUsageSync:
         )
         if self._model is None and item.model:
             self._model = item.model
+        self._billed_ms = time_ms
+        self._billed_line = item.line_no
         self._persist()
 
     def note_model(self, model: str | None) -> None:
@@ -714,7 +786,11 @@ class _KimiUsageSync:
             from omnigent.llms.context_window import find_model_context_window
 
             try:
-                window = await asyncio.to_thread(find_model_context_window, model)
+                window = await asyncio.to_thread(
+                    # Catalog-pure: a process-wide override env var must not
+                    # stamp an arbitrary window onto kimi usage posts.
+                    lambda: find_model_context_window(model, allow_override=False)
+                )
             except Exception:
                 # Best-effort boundary: a metadata lookup failure must not
                 # stop usage mirroring; the window is simply omitted.
@@ -781,10 +857,10 @@ async def forward_kimi_wire_to_session(
         session_id=session_id,
         bridge_dir=bridge_dir,
         state=_read_usage_state(bridge_dir),
+        # STRICT: records stamped before launch are a resumed session's
+        # history (the mtime skew applies to discovery only, never billing).
+        billing_floor_ms=launch_epoch_ms,
     )
-    # Records older than the launch (minus skew) belong to a pre-existing kimi
-    # session that was resumed, not to this Omnigent session — never bill them.
-    usage_time_floor_ms = launch_epoch_ms - _DISCOVER_SKEW_MS
     # Final assistant text of the turn in flight, forwarded on the ``end_turn``
     # edge so the parent's inbox gets the real result instead of an empty one.
     last_assistant_text = ""
@@ -808,8 +884,7 @@ async def forward_kimi_wire_to_session(
                             # Accumulate only; delivery happens in the per-poll
                             # sync below so a failed post retries every poll
                             # without stalling transcript mirroring.
-                            if item.time_ms is not None and item.time_ms >= usage_time_floor_ms:
-                                usage_sync.record(item)
+                            usage_sync.record(item)
                         elif item.kind == "model":
                             usage_sync.note_model(item.model)
                         elif item.kind == "turn_end":

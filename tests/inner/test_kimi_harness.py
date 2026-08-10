@@ -821,6 +821,9 @@ def test_run_turn_reports_wire_usage(monkeypatch: pytest.MonkeyPatch, tmp_path: 
         "output_tokens": 160 + 76,
         "cache_read_input_tokens": 17920,
         "cache_creation_input_tokens": 8,
+        # The relay path accumulates total_tokens independently (never
+        # derived), so it must be reported or the total stays 0 forever.
+        "total_tokens": 20559 + 2975 + 160 + 76 + 17920 + 8,
         "model": "system.ai.kimi-k3",
     }
 
@@ -918,15 +921,19 @@ def test_run_turn_known_session_seeds_checkpoint_before_spawn(
 
 
 def test_run_turn_missing_wire_log_reports_no_usage(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """No wire log for the session (or none yet) → usage None, never an error —
     and the extraction recovers once the log appears on a later turn."""
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="omnigent.inner.kimi_executor")
     (tmp_path / "sessions").mkdir()
     events, ex = _run_stubbed_turn(monkeypatch, tmp_path, session_id="session_missing-1")
     turn = next(e for e in events if isinstance(e, TurnComplete))
     assert turn.usage is None
     assert not [e for e in events if isinstance(e, ExecutorError)]
+    assert any("no wire log found" in r.message for r in caplog.records)
 
     # The wire log shows up during a later turn (kimi created the session
     # mid-run): that turn reports usage — proving the None above was the
@@ -947,7 +954,7 @@ def test_run_turn_missing_wire_log_reports_no_usage(
 
 
 def test_run_turn_malformed_wire_rows_are_skipped_whole(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Garbage lines and schema-drifted records are skipped WHOLE (never
     partially counted) and never crash the turn; only records matching the
@@ -1007,6 +1014,9 @@ def test_run_turn_malformed_wire_rows_are_skipped_whole(
         with wire.open("a", encoding="utf-8") as fh:
             fh.write("this is not json\n{truncated\n")
 
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="omnigent.inner.kimi_executor")
     events, _ex = _run_stubbed_turn(
         monkeypatch, tmp_path, session_id="session_mal-1", on_spawn=_write_mixed
     )
@@ -1014,6 +1024,9 @@ def test_run_turn_malformed_wire_rows_are_skipped_whole(
     assert turn.usage is not None
     assert turn.usage["input_tokens"] == 4
     assert turn.usage["output_tokens"] == 1
+    # Drifted records and non-JSON lines each leave a once-per-file diagnostic.
+    assert any("not matching the pinned" in r.message for r in caplog.records)
+    assert any("unparseable wire row" in r.message for r in caplog.records)
 
 
 def test_run_turn_model_falls_back_to_usage_record(
@@ -1034,6 +1047,46 @@ def test_run_turn_model_falls_back_to_usage_record(
     turn = next(e for e in events if isinstance(e, TurnComplete))
     assert turn.usage is not None
     assert turn.usage["model"] == "kimi-k3-databricks"
+
+
+def test_run_turn_survives_homeless_environment_when_seeding(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Pre-spawn checkpoint seeding is best-effort: a HOME-less environment
+    (resolve_user_kimi_home → Path.home() raises RuntimeError) must not fail
+    the turn."""
+    monkeypatch.setattr(
+        kimi_executor,
+        "resolve_user_kimi_home",
+        lambda: (_ for _ in ()).throw(RuntimeError("no HOME")),
+    )
+    ex = KimiExecutor(binary_path="kimi")
+    ex._session_id = "session_nohome-1"
+
+    events = _collect_stubbed_turn(monkeypatch, ex, session_id="session_nohome-1")
+
+    assert not [e for e in events if isinstance(e, ExecutorError)]
+    turn = next(e for e in events if isinstance(e, TurnComplete))
+    assert turn.usage is None
+
+
+def test_sum_wire_usage_unreadable_file_logs_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unreadable wire log reports no usage and leaves one diagnostic."""
+    import logging
+
+    from omnigent.inner.kimi_executor import _sum_wire_usage
+
+    caplog.set_level(logging.WARNING, logger="omnigent.inner.kimi_executor")
+    unreadable = tmp_path / "wire.jsonl"
+    unreadable.mkdir()  # opening a directory as a file raises OSError
+
+    assert _sum_wire_usage(unreadable, offset=0, turn_start_ms=0) == (None, None, 0)
+    assert _sum_wire_usage(unreadable, offset=0, turn_start_ms=0) == (None, None, 0)
+
+    warnings = [r for r in caplog.records if "cannot read wire log" in r.message]
+    assert len(warnings) == 1
 
 
 def _usage_row(*, input_other: int, output: int, time_ms: int) -> dict[str, Any]:
