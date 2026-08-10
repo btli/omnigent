@@ -41,6 +41,13 @@ allowlisted package string and make the authenticated server allocate a flow.
 It still needs the state/PKCE verifier and a browser-approved callback to obtain
 the credential.
 
+The shell does not classify this flow by hostname. On the first off-origin
+login bounce for a server origin, it anonymously probes
+`/.well-known/assetlinks.json`, caches the result for that origin, and selects
+Auth Tab only when the response is HTTP 200 with a non-empty JSON array. A
+failed or empty probe preserves the existing inline fallback for Databricks
+origins; other server types keep their existing system-browser login path.
+
 Configure the public HTTPS origin plus the installed app's package and signing
 certificate in the non-secret server config:
 
@@ -59,8 +66,8 @@ self-built APKs use the certificate that signed that APK. Hosted entrypoints
 also accept `OMNIGENT_NATIVE_AUTH_BASE_URL` and
 `OMNIGENT_ANDROID_AUTH_TAB_APPS` (the app list encoded as JSON). The configured
 base URL must be the same origin users enter in the Android shell. Callback
-locations are built from this value, never from forwarded headers or the
-proxy-to-app request URL.
+locations are built from this value only after its host matches the request's
+`Host`/`X-Forwarded-Host`; a mismatch is logged and refused.
 
 ### Make Digital Asset Links anonymous at the front door
 
@@ -78,12 +85,16 @@ header:
 
 ```bash
 origin=https://omnigent.example.com
+package_name=ai.omnigent.android
 status="$(curl --silent --show-error --output /tmp/assetlinks.json \
   --write-out '%{http_code}' "$origin/.well-known/assetlinks.json")"
-test "$status" = 200 && python -m json.tool /tmp/assetlinks.json
+test "$status" = 200
+jq -e --arg package "$package_name" \
+  'type == "array" and length > 0 and any(.[]; .target.package_name == $package)' \
+  /tmp/assetlinks.json
 ```
 
-A redirect to login or any 401/403 response is a failed reachability check.
+A `200 []`, redirect to login, or any 401/403 response is a failed reachability check.
 Without the anonymous exemption, the Android shell **always** falls back to the
 inline WebView flow.
 
@@ -97,6 +108,22 @@ domain that can expose this exact file anonymously while protecting the app.
 The allowlist is empty by default. Missing configuration, a package/signature
 mismatch, or a verification timeout fails closed and returns the shell to the
 inline WebView login; there is no custom-scheme fallback.
+
+### Human verification with a self-managed front door
+
+1. Put Omnigent behind `https://omnigent.example.com`, and exempt only
+   `/.well-known/assetlinks.json` from front-door authentication.
+2. Set `native_auth_base_url` and `android_auth_tab_apps` together using the
+   package/fingerprint of the APK installed on the test device.
+3. Run the anonymous `curl` + `jq` check above from a clean machine or incognito
+   network client; it must exit zero.
+4. Install the APK, enter `https://omnigent.example.com` as the server, clear any
+   existing front-door session, and start login.
+5. Confirm `adb logcat -s OmnigentAuth` contains `asset links probe ... -> available`
+   followed by `proxy login -> auth tab`, then complete login and verify the SPA
+   loads authenticated in the WebView.
+6. Remove the anonymous exemption or return `[]`, repeat login, and confirm the
+   shell takes the fallback instead of launching Auth Tab.
 
 ## Scope (first version)
 
