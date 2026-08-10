@@ -19,6 +19,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     ResponseHeadFrame,
     decode_frame,
 )
+from omnigent.runner.transports.ws_tunnel import transport as transport_module
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
 from omnigent.runner.transports.ws_tunnel.transport import (
     WSTunnelTransport,
@@ -284,6 +285,73 @@ async def test_stalled_response_head_raises_read_timeout() -> None:
     assert session is not None
     assert not session.in_flight
     assert len(_drain_cancel_frames(session)) == 1
+
+
+@pytest.mark.asyncio
+async def test_stalled_body_read_timeout_carries_request() -> None:
+    """The body-path ReadTimeout carries the originating request.
+
+    httpx raises ``RuntimeError`` from ``exc.request`` when the error
+    was built without one, breaking callers that log or classify by
+    request.
+    """
+    reg = TunnelRegistry()
+    reg.register("r1", _NoopWS(), _hello())
+    transport = WSTunnelTransport(reg, "r1")
+
+    request = _make_stream_request(0.05)
+    task = asyncio.create_task(transport.handle_async_request(request))
+    await asyncio.sleep(0.01)
+
+    session = reg.get("r1")
+    assert session is not None
+    req_id = next(iter(session.in_flight))
+    reg.route_response_frame("r1", ResponseHeadFrame(id=req_id, status=200))
+    response = await task
+
+    async def _drain() -> list[bytes]:
+        return [chunk async for chunk in response.stream]
+
+    with pytest.raises(httpx.ReadTimeout) as excinfo:
+        await asyncio.wait_for(_drain(), timeout=2.0)
+    assert excinfo.value.request is request
+
+
+@pytest.mark.asyncio
+async def test_read_timeout_surfaces_when_cancel_send_hangs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unresponsive session-owner loop can't hang timeout recovery.
+
+    The best-effort request.cancel send awaits an ack from the session's
+    owner loop; a wedged loop never acks. The send must be bounded so
+    ``httpx.ReadTimeout`` still surfaces and the request is cleaned up.
+    """
+    reg = TunnelRegistry()
+    reg.register("r1", _NoopWS(), _hello())
+    transport = WSTunnelTransport(reg, "r1")
+
+    task = asyncio.create_task(transport.handle_async_request(_make_stream_request(0.05)))
+    await asyncio.sleep(0.01)
+
+    session = reg.get("r1")
+    assert session is not None
+    req_id = next(iter(session.in_flight))
+    reg.route_response_frame("r1", ResponseHeadFrame(id=req_id, status=200))
+    response = await task
+
+    async def _hang(session: RunnerSession, data: str) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(reg, "send_text", _hang)
+    monkeypatch.setattr(transport_module, "_CANCEL_SEND_TIMEOUT_S", 0.05, raising=False)
+
+    async def _drain() -> list[bytes]:
+        return [chunk async for chunk in response.stream]
+
+    with pytest.raises(httpx.ReadTimeout):
+        await asyncio.wait_for(_drain(), timeout=2.0)
+    assert req_id not in session.in_flight
 
 
 @pytest.mark.asyncio
