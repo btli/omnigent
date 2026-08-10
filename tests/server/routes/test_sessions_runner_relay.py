@@ -632,7 +632,9 @@ async def test_relay_publishes_failed_status_on_tunnel_close(
 
 
 @pytest.mark.asyncio
-async def test_relay_publishes_session_stream_lost_when_runner_still_connected() -> None:
+async def test_relay_publishes_session_stream_lost_when_runner_still_connected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     A session-stream failure while the runner tunnel is up is not
     ``runner_disconnected``.
@@ -642,6 +644,10 @@ async def test_relay_publishes_session_stream_lost_when_runner_still_connected()
     """
     from omnigent.server.routes import sessions as sessions_module
 
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
     sessions_module._runner_relay_tasks.clear()
     gate = asyncio.Event()
     runner_id = "runner_session_stream_lost"
@@ -827,10 +833,16 @@ async def test_relay_persists_disconnect_error_labels_on_tunnel_close(
 
 
 @pytest.mark.asyncio
-async def test_relay_persists_session_stream_lost_error_labels() -> None:
+async def test_relay_persists_session_stream_lost_error_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A live-tunnel stream loss persists ``session_stream_lost`` labels."""
     from omnigent.server.routes import sessions as sessions_module
 
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
     sessions_module._runner_relay_tasks.clear()
     gate = asyncio.Event()
     runner_id = "runner_session_stream_lost_labels"
@@ -1174,6 +1186,31 @@ class _FlakyThenHealthyRunnerClient:
         return _HeartbeatStreamResponse(release)
 
 
+class _FlakyConnectErrorThenHealthyRunnerClient:
+    """Fake runner client that reconnects after an offline retry attempt."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def stream(
+        self,
+        method: str,
+        path: str,
+        *,
+        timeout: Any,
+    ) -> _HeartbeatStreamResponse:
+        del method, timeout
+        self.calls += 1
+        if self.calls == 1:
+            raise ConnectionError("tunnel closed before request completed")
+        if self.calls == 2:
+            request = httpx.Request("GET", f"http://runner{path}")
+            raise httpx.ConnectError("runner is not registered yet", request=request)
+        release = asyncio.Event()
+        release.set()
+        return _HeartbeatStreamResponse(release)
+
+
 @pytest.mark.asyncio
 async def test_relay_retries_transport_drop_within_grace(
     monkeypatch: pytest.MonkeyPatch,
@@ -1210,6 +1247,45 @@ async def test_relay_retries_transport_drop_within_grace(
         assert fake_runner.calls == 2, "relay did not retry after the drop"
         # The blip resolved silently: no failed status reached the cache
         # and no runner_disconnected labels were persisted.
+        assert sessions_module._session_status_cache.get(session_id) is None
+        assert store.labels.get(session_id) is None
+    finally:
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=1.0)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+async def test_relay_retries_connect_error_before_runner_reregisters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An offline retry attempt stays inside grace until the runner returns."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._RELAY_RETRY_INTERVAL_S",
+        0.01,
+    )
+    sessions_module._runner_relay_tasks.clear()
+    fake_runner = _FlakyConnectErrorThenHealthyRunnerClient()
+    store = _RecordingLabelStore()
+    session_id = "6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e"
+
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_connect_error_then_healthy",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        await asyncio.wait_for(handle.task, timeout=2.0)
+
+        assert fake_runner.calls == 3, "relay did not retry after ConnectError"
         assert sessions_module._session_status_cache.get(session_id) is None
         assert store.labels.get(session_id) is None
     finally:
@@ -1346,7 +1422,9 @@ async def test_relay_real_transport_read_timeout_stamps_session_stream_lost(
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes._sessions import orchestration
 
-    monkeypatch.setattr(orchestration, "_RELAY_STREAM_READ_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(orchestration, "_RELAY_STREAM_READ_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 0.3)
+    monkeypatch.setattr(orchestration, "_RELAY_RETRY_INTERVAL_S", 0.01)
     sessions_module._runner_relay_tasks.clear()
     runner_id = "runner_stream_stall_real_transport"
     registry = TunnelRegistry()
@@ -1374,7 +1452,11 @@ async def test_relay_real_transport_read_timeout_stamps_session_stream_lost(
         assert handle is not None
         collector = await start_session_stream_collector(session_id)
 
-        await asyncio.wait_for(handle.task, timeout=5.0)
+        await asyncio.wait_for(heartbeat_ready.wait(), timeout=1.0)
+        await asyncio.sleep(0.08)
+        assert not handle.task.done(), "live stream loss bypassed disconnect grace"
+
+        await asyncio.wait_for(handle.task, timeout=2.0)
 
         event = await asyncio.wait_for(collector.queue.get(), timeout=2.0)
         assert event.get("type") == "session.status"

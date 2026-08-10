@@ -5485,12 +5485,12 @@ async def _relay_runner_stream(
     """
     Run the runner-stream relay, riding out transient tunnel drops.
 
-    Transport drops from ingress recycles and sleep-wake reconnects
-    re-register the runner within :data:`RUNNER_DISCONNECT_GRACE_S`, so a
-    lost stream retries inside that window instead of failing the
-    session. The ``failed`` status (with durable ``runner_disconnected``
-    labels) publishes only when the runner stays gone past the grace; an
-    intentional Stop still exits quietly at once.
+    Transport drops from ingress recycles and sleep-wake reconnects, along
+    with live-tunnel stream errors, retry inside
+    :data:`RUNNER_DISCONNECT_GRACE_S` instead of failing the session
+    immediately. The ``failed`` status publishes only when the stream cannot
+    recover before the grace expires; an intentional Stop still exits quietly
+    at once.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
@@ -6067,7 +6067,7 @@ async def _relay_runner_stream_once(
             stream_lost=(
                 not transition_error and not isinstance(exc, httpx.ConnectError) and tunnel_alive
             ),
-            retryable=transition_error and not tunnel_alive,
+            retryable=not tunnel_alive or not transition_error,
         ) from exc
     except asyncio.CancelledError:
         raise
