@@ -83,8 +83,8 @@ class Env:
     def fork_log(self, ref: str) -> str:
         return git(self.fork, "log", "--format=%s", ref).stdout
 
-    def run(self, prs, date=DATE) -> dict:
-        return stage_mod.stage(self.work, prs, date)
+    def run(self, prs, date=DATE, **kwargs) -> dict:
+        return stage_mod.stage(self.work, prs, date, **kwargs)
 
 
 @pytest.fixture
@@ -112,7 +112,9 @@ def test_conflicting_pr_skipped_with_paths(env):
 
     report = env.run([good, bad])
     assert [p["pr"] for p in report["applied"]] == [2]
-    assert report["skipped"] == [{"pr": 3, "branch": "pr-3", "conflict_paths": ["a.txt"]}]
+    assert report["skipped"] == [
+        {"pr": 3, "branch": "pr-3", "conflict_paths": ["a.txt"], "source": "open"}
+    ]
     # the good PR still landed on staging
     assert "merge PR #2" in env.fork_log("staging")
 
@@ -398,3 +400,162 @@ def test_cli_writes_report_and_notes(env, tmp_path, capsys):
     assert "#11" in out
     assert "runner-ephemeral keystore" in out
     assert f"v1.2.3.dev{STAMP}" in out
+
+
+def test_parse_extras_comments_blanks_and_missing(tmp_path):
+    manifest = tmp_path / "extras.txt"
+    manifest.write_text("# pinned fixes\n\n12  # trailing comment\n7\n12\n")
+    assert stage_mod.parse_extras(manifest) == [12, 7, 12]
+    assert stage_mod.parse_extras(tmp_path / "missing.txt") == []
+
+
+def test_parse_extras_garbage_line_fails_loud(tmp_path):
+    manifest = tmp_path / "extras.txt"
+    manifest.write_text("12\nnot-a-number\n")
+    with pytest.raises(stage_mod.StageError, match="invalid PR number"):
+        stage_mod.parse_extras(manifest)
+
+
+def test_merge_stream_union_dedupe_open_wins():
+    open_prs = [{"number": 9, "headRefName": "pr-9", "headRefOid": "x" * 40}]
+    stream = stage_mod.merge_stream(open_prs, [9, 4, 4, 20])
+    assert [(p["number"], p["source"]) for p in stream] == [
+        (4, "extra"),
+        (9, "open"),
+        (20, "extra"),
+    ]
+    # the open entry wins the dedupe: its pinned head survives
+    assert stream[1]["headRefOid"] == "x" * 40
+
+
+def test_extra_pr_merges_from_pull_ref_with_source(env):
+    open_pr = env.add_pr(3, "o.txt", "o\n")
+    env.add_pr(8, "x.txt", "x\n")  # stands in for a closed PR: ref exists, not listed open
+    report = env.run(stage_mod.merge_stream([open_pr], [8]))
+    assert [(p["pr"], p["source"]) for p in report["applied"]] == [(3, "open"), (8, "extra")]
+    assert "merge PR #8 (pull/8/head" in env.fork_log("staging")
+
+
+def test_unfetchable_extra_is_loud_skip(env):
+    ok = env.add_pr(2, "k.txt", "k\n")
+    report = env.run(stage_mod.merge_stream([ok], [999]))
+    assert [p["pr"] for p in report["applied"]] == [2]
+    assert report["skipped"] == [
+        {
+            "pr": 999,
+            "branch": "pull/999/head",
+            "conflict_paths": [],
+            "reason": "extra unfetchable (likely deleted; remove from extras.txt)",
+            "source": "extra",
+        }
+    ]
+    # distinct from conflict skips, and loud in the human surfaces
+    assert "remove from extras.txt" in stage_mod.notes(report, signed=True)
+    report["pin_created"] = True
+    assert "remove from extras.txt" in stage_mod.summarize(report)
+
+
+def test_staging_only_pushes_only_staging_with_lease(env, monkeypatch):
+    pr = env.add_pr(5, "s.txt", "s\n")
+    pushes = []
+    real_git = stage_mod.git
+
+    def spy(cwd, *args, **kwargs):
+        if args and args[0] == "push":
+            pushes.append(args)
+        return real_git(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(stage_mod, "git", spy)
+    report = env.run([pr], staging_only=True)
+
+    assert report["pushed"] is True
+    assert env.fork_ref("refs/heads/staging") == report["staging_sha"]
+    # exactly one push, leased, carrying exactly one refspec
+    assert pushes == [
+        (
+            "push",
+            "--force-with-lease=refs/heads/staging:",
+            "origin",
+            f"{report['staging_sha']}:refs/heads/staging",
+        )
+    ]
+    refs = [
+        line.split("\t")[1]
+        for line in git(env.work, "ls-remote", str(env.fork)).stdout.strip().splitlines()
+    ]
+    assert refs == ["refs/heads/staging"]
+    for key in ("branch", "tag", "dev_tag", "pin_created"):
+        assert key not in report
+
+
+def test_staging_only_noop_fast_path_skips_push(env, monkeypatch):
+    pr = env.add_pr(6, "n.txt", "n\n")
+    first = env.run([pr], staging_only=True)
+    assert first["pushed"] is True
+
+    pushes = []
+    real_git = stage_mod.git
+
+    def spy(cwd, *args, **kwargs):
+        if args and args[0] == "push":
+            pushes.append(args)
+        return real_git(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(stage_mod, "git", spy)
+    second = env.run([pr], staging_only=True)
+    assert second["pushed"] is False
+    assert second["staging_sha"] == first["staging_sha"]
+    assert pushes == []
+    assert "unchanged — push skipped" in stage_mod.summarize(second)
+
+
+def test_staging_only_reports_change_causes(env):
+    pr = env.add_pr(7, "c7.txt", "7\n")
+    env.run([pr], staging_only=True)
+
+    env.advance_main("c8.txt", "8\n")
+    second = env.run([pr], staging_only=True)
+    assert second["pushed"] is True
+    assert second["causes"] == ["upstream HEAD"]
+
+    env.add_pr(9, "c9.txt", "9\n")
+    third = env.run(stage_mod.merge_stream([pr], [9]), staging_only=True)
+    assert third["causes"] == ["extras"]
+
+
+def test_cli_staging_only_with_extras_manifest(env, tmp_path, monkeypatch, capsys):
+    open_pr = env.add_pr(11, "i.txt", "i\n")
+    env.add_pr(12, "j.txt", "j\n")  # reachable only through the manifest
+    prs_json = tmp_path / "prs.json"
+    prs_json.write_text(json.dumps([open_pr]))
+    extras = tmp_path / "extras.txt"
+    extras.write_text("# pinned\n12\n999\n")
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    report_path = tmp_path / "r.json"
+
+    rc = stage_mod.main(
+        [
+            "stage",
+            "--workdir",
+            str(env.work),
+            "--date",
+            STAMP,
+            "--prs-json",
+            str(prs_json),
+            "--extras",
+            str(extras),
+            "--staging-only",
+            "--report",
+            str(report_path),
+        ]
+    )
+    assert rc == 0
+    report = json.loads(report_path.read_text())
+    assert [(p["pr"], p["source"]) for p in report["applied"]] == [(11, "open"), (12, "extra")]
+    assert [p["pr"] for p in report["skipped"]] == [999]
+    assert report["skipped"][0]["reason"].startswith("extra unfetchable")
+    text = summary.read_text()
+    assert "## Personal staging hourly" in text
+    assert "extra unfetchable" in text
+    capsys.readouterr()
