@@ -247,8 +247,7 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
                     # tunnel transition, not a live-stream loss.
                     if self._registry.get(self._runner_id) is not state.session:
                         raise ConnectionError(
-                            f"runner {self._runner_id!r} tunnel was replaced "
-                            "during a stalled read"
+                            f"runner {self._runner_id!r} tunnel was replaced during a stalled read"
                         ) from None
                     raise httpx.ReadTimeout(
                         f"response head from runner {self._runner_id!r} "

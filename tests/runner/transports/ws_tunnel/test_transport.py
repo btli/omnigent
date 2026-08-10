@@ -11,6 +11,7 @@ import asyncio
 import httpx
 import pytest
 
+from omnigent.runner.transports.ws_tunnel import transport as transport_module
 from omnigent.runner.transports.ws_tunnel.frames import (
     HelloFrame,
     RequestCancelFrame,
@@ -19,7 +20,6 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     ResponseHeadFrame,
     decode_frame,
 )
-from omnigent.runner.transports.ws_tunnel import transport as transport_module
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
 from omnigent.runner.transports.ws_tunnel.transport import (
     WSTunnelTransport,
