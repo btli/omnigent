@@ -378,6 +378,8 @@ class OmnigentWebViewClientTest {
         assertTrue(webView.stopLoadingCalled)
         assertEquals(1, probes)
     }
+
+    @Test
     fun `a login chain landing on the workspace root bounces to the mount`() {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
         val client = client(pinnedOrigin = DATABRICKS_ORIGIN)
