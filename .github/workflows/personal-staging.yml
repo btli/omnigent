@@ -129,6 +129,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # git merge --no-ff --no-commit checks identity before the composer reaches
+          # its commit phase (run 31338098075 failed here). This identity is preflight-only;
+          # stage.py's COMMIT_IDENT -c overrides set reproducible staging commit identities.
+          # Do not use GIT_AUTHOR_* / GIT_COMMITTER_* env instead: env beats -c,
+          # changing those identities and breaking same-day SHA reproducibility.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/omnigent-ai/omnigent.git
           python3 .github/scripts/personal-staging/stage.py stage \
             --upstream-remote upstream --fork-remote origin \
