@@ -16,7 +16,11 @@ Omnigent turn:
 - captures the kimi session id from the ``role:"meta"`` /
   ``type:"session.resume_hint"`` line for resume on the next turn,
 - uses the subprocess's ``cwd=`` for the working directory (upstream
-  has no ``--work-dir`` flag).
+  has no ``--work-dir`` flag),
+- after the subprocess exits, best-effort sums the turn's ``usage.record``
+  rows from kimi's persisted ``wire.jsonl`` (the stream-json stdout carries
+  no usage or model records) into ``TurnComplete.usage``, stamping the
+  effective model from ``llm.request``.
 
 Kimi runs its own agent loop and its own tools (Bash, edit, read, web,
 …) — Omnigent does not re-execute them. The executor advertises
@@ -82,6 +86,7 @@ from omnigent.inner.executor import (
     ToolSpec,
     TurnComplete,
 )
+from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 
 _logger = logging.getLogger(__name__)
 
@@ -99,6 +104,114 @@ _SESSION_RESUME_RE = re.compile(
     r"To resume this session:\s+\S+\s+-r\s+(\S+)",
     re.IGNORECASE,
 )
+
+
+#: Clock-skew tolerance when time-filtering the first read of a resumed wire
+#: log (kimi writes record ``time`` from the same host, so drift is minimal).
+_USAGE_TIME_SKEW_MS = 10_000
+
+
+def _kimi_code_home() -> Path:
+    """Kimi's persistent state dir: ``$KIMI_CODE_HOME`` or ``~/.kimi-code``."""
+    override = os.environ.get("KIMI_CODE_HOME")
+    if override:
+        return Path(override)
+    return Path.home() / ".kimi-code"
+
+
+def _find_wire_log(home: Path, session_id: str) -> Path | None:
+    """Locate the session's persisted wire log under *home*, or ``None``.
+
+    The session dir name equals the resume-hint session id
+    (``session_<uuid>``); workspaces (``wd_*``) are globbed because the
+    hint doesn't say which one the session lives under.
+    """
+    try:
+        for wire in (home / "sessions").glob(f"*/{session_id}/agents/main/wire.jsonl"):
+            if wire.is_file():
+                return wire
+    except OSError:
+        return None
+    return None
+
+
+def _sum_wire_usage(
+    wire_path: Path,
+    *,
+    offset: int,
+    turn_start_ms: float,
+) -> tuple[dict[str, int] | None, str | None, int]:
+    """Sum the turn's ``usage.record`` rows from the wire log's new bytes.
+
+    Reads from byte *offset* (the per-session checkpoint). On the first read
+    of a wire log (``offset == 0``) the file may carry a resumed session's
+    history (``-C`` / ``-S`` into an existing session), so rows are also
+    gated on ``time >= turn_start_ms`` — a row without a valid ``time`` is
+    then skipped fail-safe. With a checkpoint, every new row belongs to this
+    turn and no time gate applies.
+
+    :returns: ``(token sums or None when no row counted, effective model or
+        None, new checkpoint offset)``. Tolerant of a missing/unreadable
+        file and malformed rows.
+    """
+    try:
+        with wire_path.open("rb") as fh:
+            size = fh.seek(0, os.SEEK_END)
+            start = offset if 0 <= offset <= size else 0
+            fh.seek(start)
+            blob = fh.read()
+    except OSError:
+        return None, None, offset
+    first_read = start == 0
+    totals = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
+    counted = False
+    model: str | None = None
+    for raw in blob.decode("utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        row_type = row.get("type")
+        if row_type == "llm.request":
+            # Provider-resolved model id, falling back to the configured alias.
+            candidate = row.get("model")
+            if not (isinstance(candidate, str) and candidate):
+                candidate = row.get("modelAlias")
+            if isinstance(candidate, str) and candidate:
+                model = candidate
+            continue
+        if row_type != "usage.record" or row.get("usageScope") != "turn":
+            continue
+        if first_read:
+            row_time = row.get("time")
+            if not isinstance(row_time, (int, float)):
+                continue
+            if row_time < turn_start_ms - _USAGE_TIME_SKEW_MS:
+                continue
+        usage = row.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        for wire_key, out_key in (
+            ("inputOther", "input_tokens"),
+            ("output", "output_tokens"),
+            ("inputCacheRead", "cache_read_input_tokens"),
+            ("inputCacheCreation", "cache_creation_input_tokens"),
+        ):
+            value = usage.get(wire_key)
+            if isinstance(value, int) and value >= 0:
+                totals[out_key] += value
+        counted = True
+    return (totals if counted else None), model, size
 
 
 def _parse_truthy(value: str | None) -> bool:
@@ -212,6 +325,9 @@ class KimiExecutor(Executor):
         # Per-session state: kimi session id captured from the prior turn's
         # ``role:"meta"`` event, fed to ``-S <id>`` on the next turn.
         self._session_id: str | None = None
+        # Byte-offset checkpoints into each kimi session's persisted wire log,
+        # so a turn only sums the usage records new since the prior turn.
+        self._wire_offsets: dict[str, int] = {}
         # Tracks whether we've already warned this session about tools
         # being declared without a provider-injection bridge (one warning
         # per session; the tool-injection bridge is a deferred follow-up).
@@ -335,6 +451,40 @@ class KimiExecutor(Executor):
         argv.extend(["-p", prompt_text])
         return argv
 
+    def _collect_turn_usage(self, turn_start_ms: float) -> dict[str, object] | None:
+        """Best-effort per-turn token usage from kimi's persisted wire log.
+
+        Kimi's stream-json stdout carries no usage/model records, but the
+        session's ``wire.jsonl`` does. Sums the turn's ``usage.record`` rows
+        (new since this session's byte checkpoint) into ``TurnComplete.usage``
+        keys, stamping the effective model from ``llm.request`` so the server
+        attributes tokens per model. Never raises — any failure logs at debug
+        and reports no usage.
+        """
+        session_id = self._session_id
+        if not session_id:
+            return None
+        try:
+            wire_path = _find_wire_log(_kimi_code_home(), session_id)
+            if wire_path is None:
+                return None
+            offset = self._wire_offsets.get(session_id, 0)
+            totals, model, new_offset = _sum_wire_usage(
+                wire_path, offset=offset, turn_start_ms=turn_start_ms
+            )
+            self._wire_offsets[session_id] = new_offset
+            if totals is None:
+                return None
+            usage: dict[str, object] = dict(totals)
+            if model:
+                usage["model"] = model
+            _notify_usage_from_dict(model=model or self._model or "kimi", usage=usage)
+            return usage
+        except Exception:
+            # Best-effort boundary: usage extraction must never fail the turn.
+            _logger.exception("kimi executor: wire-log usage extraction failed")
+            return None
+
     def _translate_event(self, payload: Mapping[str, object]) -> list[ExecutorEvent]:
         """Translate one kimi stream-json line into Omnigent events.
 
@@ -452,6 +602,9 @@ class KimiExecutor(Executor):
         argv[0] = self._sandbox_launch_path(tuple(env.keys()))
 
         started_at = time.monotonic()
+        # Wall-clock floor for the wire-log usage read: on the first read of a
+        # resumed session's log, only records stamped at/after this turn count.
+        turn_start_ms = time.time() * 1000.0
         process: asyncio.subprocess.Process | None = None
         stderr_buf = bytearray()
         any_text_emitted = False
@@ -553,6 +706,7 @@ class KimiExecutor(Executor):
 
         yield TurnComplete(
             response="".join(final_text_parts) if any_text_emitted else None,
+            usage=self._collect_turn_usage(turn_start_ms),
         )
 
     # -- session lifecycle ---------------------------------------------------
