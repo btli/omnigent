@@ -642,10 +642,17 @@ class _ForwardDedupeState:
         from ``posted_cost`` because it advances mid-turn (with in-flight
         sub-agent spend) while ``S`` stays frozen. ``None`` until first
         post.
+    :param recorded_token_usage: Last token counters recorded on a
+        ``claude_native.usage`` span as ``gen_ai.usage.*``. Deduped
+        separately from ``usage`` because that snapshot also moves on
+        context/cache churn: re-recording an unchanged figure would
+        multiply-count it in any backend that sums usage across spans.
+        ``None`` until the first recording.
     """
 
     usage: dict[str, float] | None = None
     context_window: int | None = None
+    recorded_token_usage: dict[str, int] | None = None
     observed_model: str | None = None
     posted_model: str | None = None
     # Last DISPLAY cost (USD) POSTed as ``cumulative_cost_usd`` — the
@@ -854,6 +861,7 @@ async def forward_claude_transcript_to_session(
     poll_interval_s: float = _DEFAULT_POLL_INTERVAL_S,
     auth: httpx.Auth | None = None,
     skip_user_messages: bool = False,
+    start_at_offset: int | None = None,
 ) -> None:
     """
     Tail Claude's JSONL transcript and mirror semantic items into AP.
@@ -875,6 +883,12 @@ async def forward_claude_transcript_to_session(
     :param start_at_end: When ``True`` and no prior forward cursor
         exists, start from the current transcript end. This is used
         for reattach so old transcript lines are not duplicated.
+        Ignored when *start_at_offset* is set.
+    :param start_at_offset: Byte length of a resume prefix this launch
+        synthesized, e.g. ``5920``. Preferred over *start_at_end* on the
+        cold-resume path: the exact prefix is known before launch, where a
+        live end-offset measured after Claude boots can skip a prompt the
+        executor injected in the meantime.
     :param poll_interval_s: Seconds between transcript polls.
     :param auth: Optional httpx Auth that mints a fresh bearer token
         per request, e.g. ``_server_auth(profile)`` for a Databricks
@@ -1040,6 +1054,7 @@ async def forward_claude_transcript_to_session(
                         transcript_path=transcript_path,
                         start_at_end=start_at_end,
                         session_id=current_session_id,
+                        start_at_offset=start_at_offset,
                     )
                     # Forward streamed deltas BEFORE the transcript items so a
                     # message's live chunks (incl. its ``final`` chunk) always
@@ -2056,6 +2071,7 @@ async def supervise_forwarder(
     poll_interval_s: float = _DEFAULT_POLL_INTERVAL_S,
     auth: httpx.Auth | None = None,
     skip_user_messages: bool = False,
+    start_at_offset: int | None = None,
 ) -> None:
     """
     Run :func:`forward_claude_transcript_to_session` under a restart supervisor.
@@ -2092,6 +2108,9 @@ async def supervise_forwarder(
     :param agent_name: Agent/model name to stamp on mirrored output.
     :param start_at_end: When ``True`` and no prior forward cursor
         exists, start from the current transcript end.
+    :param start_at_offset: Byte length of a resume prefix this launch
+        synthesized. Forwarded verbatim; see
+        :func:`forward_claude_transcript_to_session`.
     :param poll_interval_s: Seconds between transcript polls inside
         the forwarder loop. Forwarded verbatim.
     :param auth: Optional httpx Auth that mints a fresh bearer token
@@ -2114,6 +2133,7 @@ async def supervise_forwarder(
                 poll_interval_s=poll_interval_s,
                 auth=auth,
                 skip_user_messages=skip_user_messages,
+                start_at_offset=start_at_offset,
             )
             # The forwarder loop is ``while True`` and is not expected
             # to return normally. Treat any normal return as a crash
@@ -3098,6 +3118,7 @@ async def _ensure_state_for_transcript(
     transcript_path: Path,
     start_at_end: bool,
     session_id: str,
+    start_at_offset: int | None = None,
 ) -> TranscriptForwardState:
     """
     Return a cursor state compatible with the observed transcript.
@@ -3106,9 +3127,14 @@ async def _ensure_state_for_transcript(
     :param state: Existing cursor state, or ``None``.
     :param transcript_path: Current transcript path from hooks.
     :param start_at_end: Whether a missing cursor should skip the
-        transcript's existing lines.
+        transcript's existing lines. Only consulted when
+        *start_at_offset* is ``None``.
     :param session_id: Omnigent session/conversation id, e.g.
         ``"conv_abc123"``. Used for stale-cursor diagnostics.
+    :param start_at_offset: Exact byte length of a prefix this launch
+        synthesized itself, e.g. ``5920``. Takes precedence over
+        *start_at_end* — see the seeding comment below for why a measured
+        prefix is required rather than a live ``stat``.
     :returns: Cursor state for ``transcript_path``.
     """
     if state is not None and state.transcript_path == transcript_path:
@@ -3131,7 +3157,22 @@ async def _ensure_state_for_transcript(
             await _write_forward_state_async(bridge_dir, validated)
         return validated
     byte_offset = 0
-    if start_at_end:
+    if start_at_offset is not None:
+        # Cold resume: the caller wrote the prefix and measured it before
+        # launching Claude, so skip exactly that and nothing else.
+        #
+        # Seeding from a live ``stat`` here loses messages. Resolving
+        # ``transcript_path`` requires Claude to boot and fire its first hook,
+        # and the executor's ``inject_user_message`` waits on the same boot —
+        # the two are unordered, so the paste routinely wins. Whatever Claude
+        # wrote in that window (the user's prompt included) then sits *behind*
+        # the seeded cursor and is skipped for the session's lifetime: visible
+        # in the TUI pane, absent from the Omnigent DB, with no error anywhere.
+        end_offset = await asyncio.to_thread(_transcript_end_offset, transcript_path)
+        byte_offset = min(start_at_offset, end_offset)
+    elif start_at_end:
+        # Reattach: nothing was synthesized, so the whole existing transcript
+        # is content Omnigent already holds and a live end-offset is correct.
         byte_offset = await asyncio.to_thread(_transcript_end_offset, transcript_path)
     state = TranscriptForwardState(
         transcript_path=transcript_path,
@@ -3701,6 +3742,16 @@ async def _forward_available_items(
     window_changed = (
         resolved_context_window is not None and resolved_context_window != dedupe.context_window
     )
+    # OTel token usage is sourced from the transcript, NOT from ``posted_usage``.
+    # ``posted_usage`` prefers the statusLine gauge, which is re-read every poll
+    # and moves while a message is still streaming, so recording it would emit
+    # several spans per API call and a summing backend would multiply-count the
+    # same prompt. ``result.latest_usage`` is the last COMPLETE assistant
+    # record's ``message.usage`` — one final figure per API call — and the
+    # dedupe keeps each one to a single span, so summing matches what the
+    # provider actually charged for.
+    token_usage = _gen_ai_usage_tokens(result.latest_usage)
+    record_token_usage = token_usage if token_usage != dedupe.recorded_token_usage else None
     if usage_changed or window_changed:
         try:
             await _post_external_session_usage(
@@ -3708,11 +3759,14 @@ async def _forward_available_items(
                 session_id=session_id,
                 usage=posted_usage,
                 context_window=resolved_context_window,
+                token_usage=record_token_usage,
             )
             if usage_changed:
                 dedupe.usage = posted_usage
             if window_changed:
                 dedupe.context_window = resolved_context_window
+            if record_token_usage is not None:
+                dedupe.recorded_token_usage = record_token_usage
         except httpx.HTTPError as exc:
             _logger.warning(
                 "Failed to forward Claude transcript usage; session=%s bridge_dir=%s "
@@ -4244,6 +4298,7 @@ async def _post_external_session_usage(
     session_id: str,
     usage: Mapping[str, float | str] | None,
     context_window: int | None = None,
+    token_usage: dict[str, int] | None = None,
 ) -> None:
     """
     Post one ``external_session_usage`` event to the Sessions API.
@@ -4258,6 +4313,11 @@ async def _post_external_session_usage(
         cost with the active model for per-model attribution.
     :param context_window: Resolved window in tokens, or ``None`` to
         leave the server's persisted value untouched.
+    :param token_usage: One API call's final token counters to record on the
+        span as ``gen_ai.usage.*``, e.g. ``{"input_tokens": 1523,
+        "output_tokens": 847}``. ``None`` records no token attributes. Pass
+        only counts not already recorded — a backend that sums usage across
+        spans double-counts a repeated figure.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
     payload: dict[str, object] = {}
@@ -4267,11 +4327,62 @@ async def _post_external_session_usage(
         payload["context_window"] = context_window
     if not payload:
         return
-    resp = await client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={"type": "external_session_usage", "data": payload},
-    )
-    resp.raise_for_status()
+    from omnigent.runtime import telemetry
+
+    # A native Claude turn runs to completion in the terminal, so the
+    # harness executor's TurnComplete carries no usage and the agent span
+    # closes without any ``gen_ai.usage.*``. This forwarder is the only
+    # place that sees the real token counts, so stamp them here — under
+    # session_scope, which is what makes per-session token totals queryable
+    # in MLflow / any OTel backend.
+    with (
+        telemetry.session_scope(session_id),
+        telemetry.span("claude_native.usage") as usage_span,
+    ):
+        if token_usage is not None:
+            telemetry.record_llm_usage(usage_span, token_usage)
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "external_session_usage", "data": payload},
+        )
+        resp.raise_for_status()
+
+
+# Usage keys that carry token counts, in the spelling ``record_llm_usage``
+# expects. ``context_tokens`` is deliberately absent: it is a derived
+# input+cache total for the context-window gauge, not a GenAI usage counter.
+_GEN_AI_TOKEN_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
+
+
+def _gen_ai_usage_tokens(usage: Mapping[str, float | str] | None) -> dict[str, int] | None:
+    """
+    Extract the token counters from a usage payload for OTel recording.
+
+    Non-token entries (``context_tokens``, cost floats, the ``model``
+    tag) are dropped, so a cost-only post records no token attributes
+    rather than inventing zeros.
+
+    :param usage: Usage payload posted to the Sessions API, or ``None``.
+    :returns: Token counts keyed for
+        :func:`omnigent.runtime.telemetry.record_llm_usage`, e.g.
+        ``{"input_tokens": 1523, "output_tokens": 847}``. ``None`` when the
+        payload carries no input/output counts.
+    """
+    if usage is None:
+        return None
+    tokens = {
+        key: int(value)
+        for key, value in usage.items()
+        if key in _GEN_AI_TOKEN_KEYS and isinstance(value, (int, float))
+    }
+    if "input_tokens" not in tokens and "output_tokens" not in tokens:
+        return None
+    return tokens
 
 
 def _model_alias_for(model: str | None) -> str | None:

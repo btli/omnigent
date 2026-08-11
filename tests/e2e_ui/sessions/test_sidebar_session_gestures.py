@@ -13,7 +13,6 @@ import uuid
 import httpx
 from playwright.sync_api import Browser, Locator, Page, expect
 
-
 _MOBILE_VIEWPORT = {"width": 390, "height": 844}
 
 
@@ -40,9 +39,7 @@ def _row_link(page: Page, session_id: str) -> Locator:
 
 def _section(page: Page, title: str) -> Locator:
     """Locate the sidebar section headed by ``title``."""
-    return page.locator("section").filter(
-        has=page.get_by_role("button", name=title, exact=True)
-    )
+    return page.locator("section").filter(has=page.get_by_role("button", name=title, exact=True))
 
 
 def test_still_touch_opens_session_context_menu_without_dragging(
