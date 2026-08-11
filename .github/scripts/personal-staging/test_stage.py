@@ -524,7 +524,11 @@ def test_extra_transport_failure_blocks_push_and_spares_the_manifest(env, monkey
     assert report["pushed"] is False
     # previous staging content preserved — no silent regression
     assert env.fork_ref("refs/heads/staging") == first["staging_sha"]
-    assert "NOT pushed" in stage_mod.summarize(report)
+    text = stage_mod.summarize(report)
+    assert "NOT pushed" in text
+    assert "candidate (not pushed)" in text
+    assert f"| Remote staging | `{first['staging_sha']}` |" in text
+    assert "| Skipped #4 |" in text
 
 
 def test_extra_transport_failure_fails_the_nightly_before_publishing(env, monkeypatch):
@@ -597,7 +601,90 @@ def test_staging_only_noop_fast_path_skips_push(env, pushes):
     assert second["pushed"] is False
     assert second["staging_sha"] == first["staging_sha"]
     assert pushes == []
-    assert "unchanged — push skipped" in stage_mod.summarize(second)
+    text = stage_mod.summarize(second)
+    assert "no-op: staging unchanged; 1 PRs applied, 0 skipped" in text
+    assert "| Skipped #" not in text
+    assert "candidate (not pushed)" in text
+    assert f"| Remote staging | `{first['staging_sha']}` |" in text
+
+
+def test_summarize_hourly_noop_collapses_skip_detail():
+    """No-op hours must not dump the full skip table — one count line only."""
+    skipped = [
+        {"pr": 90 + i, "branch": f"b{i}", "conflict_paths": [f"p{i}.txt"], "source": "open"}
+        for i in range(5)
+    ]
+    report = {
+        "staging_only": True,
+        "upstream_sha": "u" * 40,
+        "staging_sha": "c" * 40,
+        "remote_staging_sha": "c" * 40,
+        "pushed": False,
+        "blocked": [],
+        "causes": [],
+        "applied": [{"pr": i} for i in range(3)],
+        "skipped": skipped,
+    }
+    text = stage_mod.summarize(report)
+    assert "no-op: staging unchanged; 3 PRs applied, 5 skipped" in text
+    assert "| Skipped #" not in text
+    assert "candidate (not pushed)" in text
+    assert f"| Remote staging | `{'c' * 40}` |" in text
+
+
+def test_summarize_hourly_push_keeps_full_skip_table():
+    """A real push still renders every skip row — the detail that matters."""
+    report = {
+        "staging_only": True,
+        "upstream_sha": "u" * 40,
+        "staging_sha": "s" * 40,
+        "remote_staging_sha": "r" * 40,
+        "pushed": True,
+        "blocked": [],
+        "causes": ["upstream HEAD"],
+        "applied": [{"pr": 1}],
+        "skipped": [
+            {
+                "pr": 99,
+                "branch": "pull/99/head",
+                "conflict_paths": [],
+                "reason": stage_mod.EXTRA_MISSING,
+                "source": "extra",
+            }
+        ],
+    }
+    text = stage_mod.summarize(report)
+    assert "pushed (changed: upstream HEAD)" in text
+    assert "| Staging |" in text and "candidate (not pushed)" not in text
+    assert "| Skipped #99 |" in text and "remove from extras.txt" in text
+    assert "| Applied / skipped | 1 / 1 |" in text
+
+
+def test_summarize_hourly_blocked_labels_candidate_not_staging():
+    report = {
+        "staging_only": True,
+        "upstream_sha": "u" * 40,
+        "staging_sha": "c" * 40,
+        "remote_staging_sha": "r" * 40,
+        "pushed": False,
+        "blocked": [4],
+        "causes": [],
+        "applied": [],
+        "skipped": [
+            {
+                "pr": 4,
+                "branch": "pull/4/head",
+                "conflict_paths": [],
+                "reason": stage_mod.EXTRA_FETCH_FAILED,
+                "source": "extra",
+            }
+        ],
+    }
+    text = stage_mod.summarize(report)
+    assert "NOT pushed" in text
+    assert "candidate (not pushed)" in text and f"| Remote staging | `{'r' * 40}` |" in text
+    assert "| Skipped #4 |" in text
+    assert "| Staging |" not in text.replace("Remote staging", "")
 
 
 def test_staging_only_reports_change_causes(env):
@@ -651,15 +738,14 @@ def test_staging_only_cause_already_merged_pr_is_not_a_change(env):
     assert second["causes"] == ["upstream HEAD"]
 
 
-def test_old_composition_decoded_past_any_merge_count(env, monkeypatch):
-    """The previous composition is decoded by walking to the real upstream
-    base, so a manifest longer than any PR-list bound still yields real
-    causes instead of degrading to 'no previous composition'."""
+def test_old_composition_decoded_past_any_merge_count(env):
+    """composition_of walks first-parent to the real upstream base, so a
+    multi-merge previous composition still yields real causes instead of
+    degrading to 'no previous composition'."""
     extras = [env.add_pr(40 + i, f"w{i}.txt", f"{i}\n") for i in range(3)]
     stream = stage_mod.merge_stream([], [p["number"] for p in extras])
     env.run(stream, staging_only=True)
 
-    monkeypatch.setattr(stage_mod, "PR_LIST_LIMIT", 1)
     env.advance_main("wmain.txt", "m\n")
     second = env.run(stream, staging_only=True)
     assert second["causes"] == ["upstream HEAD"]

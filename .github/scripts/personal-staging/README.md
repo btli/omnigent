@@ -64,9 +64,11 @@ Its `sync-main` job soft-fails on a merge *conflict* (abort + `::warning::`
 compose job stacks from upstream HEAD and never reads fork main. Only a
 genuine content conflict is soft-failed: a merge that fails with no
 unmerged paths (bad object, corrupt repo) still fails the job loudly. If
-its `git push origin main` loses a race with the nightly or a human push,
-it re-fetches and retries once, then warns and exits 0 — `main` is never
-force-pushed.
+its `git push origin main` is rejected as a confirmed stale ref
+(`! [rejected]` with `non-fast-forward` / `fetch first` / `stale info` —
+typically a race with the nightly or a human push), it re-fetches and
+retries once, then warns and exits 0. Auth, permissions, or transport
+failures still fail the job. `main` is never force-pushed.
 
 The workflow uses its own concurrency group (`personal-staging-hourly`,
 `cancel-in-progress: true`) so stale hourly runs coalesce and can never

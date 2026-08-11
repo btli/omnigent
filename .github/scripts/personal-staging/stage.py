@@ -372,6 +372,10 @@ def stage(
             "date": datestamp,
             "upstream_sha": upstream_sha,
             "staging_sha": staging_sha,
+            # Pre-push remote tip: distinct from the local candidate when the
+            # push is blocked or a no-op, so the summary never labels an
+            # unpublished composition as "Staging".
+            "remote_staging_sha": expected_staging,
             "staging_only": True,
             "blocked": blocked,
             "pushed": not blocked and expected_staging != staging_sha,
@@ -489,6 +493,10 @@ def notes(report: dict, signed: bool) -> str:
 
 def summarize(report: dict) -> str:
     if report.get("staging_only"):
+        # A no-op hour produces the same ~19-row skip table every time; collapse
+        # it to a one-line count so the few lines that matter stay visible.
+        # Runs that push (or that block on unreachable extras) keep full detail.
+        noop = not report["pushed"] and not report["blocked"]
         if report["blocked"]:
             result = (
                 "**NOT pushed** — extras unreachable: "
@@ -498,15 +506,30 @@ def summarize(report: dict) -> str:
         elif report["pushed"]:
             result = f"pushed (changed: {', '.join(report['causes'])})"
         else:
-            result = "unchanged — push skipped"
+            result = (
+                f"no-op: staging unchanged; {len(report['applied'])} PRs applied, "
+                f"{len(report['skipped'])} skipped"
+            )
+        if report["pushed"]:
+            sha_rows = [f"| Staging | `{report['staging_sha']}` |"]
+        else:
+            remote = report.get("remote_staging_sha") or "(none)"
+            sha_rows = [
+                f"| candidate (not pushed) | `{report['staging_sha']}` |",
+                f"| Remote staging | `{remote}` |",
+            ]
         rows = [
             "## Personal staging hourly",
             "",
             "| | |",
             "| --- | --- |",
             f"| Upstream main | `{report['upstream_sha']}` |",
-            f"| Staging | `{report['staging_sha']}` |",
+            *sha_rows,
             f"| Result | {result} |",
+        ]
+        if noop:
+            return "\n".join(rows) + "\n"
+        rows += [
             f"| Applied / skipped | {len(report['applied'])} / {len(report['skipped'])} |",
         ]
         rows += [f"| Skipped #{p['pr']} | {_skip_reason(p)} |" for p in report["skipped"]]
