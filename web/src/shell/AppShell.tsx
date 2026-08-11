@@ -1547,8 +1547,8 @@ export function AppShell() {
                 />
               </div>
             )}
-            {/* The server picker is NOT here: it lives at the bottom of the
-          sidebar (SidebarServerPicker). This strip is shared with the chat
+            {/* The desktop server picker is NOT here: it lives at the bottom of
+          the sidebar (SidebarServerPicker). This strip is shared with the chat
           header — which is taller and also anchored at top-0 — so a centered
           "<thread> — <host>" label here collided with the header's action
           cluster on a narrow window. The strip stays pure drag surface. */}

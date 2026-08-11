@@ -943,9 +943,7 @@ export function Sidebar({
           </nav>
 
           {/* Desktop server picker, pinned below the scrolling session list.
-          Self-hiding: renders nothing outside the Electron shell (see
-          SidebarServerPicker), so browsers keep an unchanged sidebar that ends
-          with the list. */}
+          It self-hides when the active shell has no picker IPC. */}
           <SidebarServerPicker />
         </>
       )}

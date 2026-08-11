@@ -5,7 +5,7 @@
 // on a plain tap (no onNavClick) so mobile lands back on the conversation list
 // instead of the homepage. Section links still close it.
 
-import { cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { MemoryRouter, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -133,7 +133,12 @@ describe("settingsNavGroups", () => {
 });
 
 describe("SettingsSidebarBody", () => {
-  it("keeps the server picker reachable inside the pinned settings sidebar", async () => {
+  it("shows the settings picker only when picker IPC resolves", async () => {
+    renderBody();
+    await act(async () => {});
+    expect(screen.queryByRole("button", { name: /Switch server/ })).toBeNull();
+
+    cleanup();
     (window as unknown as Record<string, unknown>).omnigentNative = {
       kind: "android",
       getServerPicker: () =>
@@ -144,11 +149,11 @@ describe("SettingsSidebarBody", () => {
     };
     renderBody();
 
-    expect(
-      await screen.findByRole("button", {
-        name: "Server: localhost:8000. Switch server",
-      }),
-    ).toHaveClass("sidebar-row");
+    const trigger = await screen.findByRole("button", {
+      name: "Server: localhost:8000. Switch server",
+    });
+    expect(trigger).toHaveClass("sidebar-row");
+    expect(trigger.querySelector(".lucide-chevron-up")).not.toBeNull();
   });
 
   it("renders Back as a standard sidebar row without a collapse button", () => {

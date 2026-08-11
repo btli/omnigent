@@ -1,5 +1,5 @@
-import { cleanup, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { act, cleanup, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -84,6 +84,7 @@ function renderHeader(props: {
 
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
   delete (window as unknown as Record<string, unknown>).omnigentNative;
 });
 
@@ -156,7 +157,23 @@ describe("ChatHeader — open-sidebar toggle visibility", () => {
 });
 
 describe("ChatHeader — mobile server picker", () => {
-  it("mounts the header variant behind the mobile-only breakpoint", async () => {
+  it("shows the header variant at mobile width only when picker IPC resolves", async () => {
+    vi.stubGlobal("matchMedia", (query: string) => ({
+      matches: query.includes("max-width"),
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    }));
+
+    renderHeader({ sidebarOpen: false });
+    await act(async () => {});
+    expect(screen.queryByRole("button", { name: /Switch server/ })).toBeNull();
+
+    cleanup();
     (window as unknown as Record<string, unknown>).omnigentNative = {
       kind: "android",
       getServerPicker: () =>
@@ -166,14 +183,13 @@ describe("ChatHeader — mobile server picker", () => {
         }),
     };
 
-    const { container } = renderHeader({ sidebarOpen: false });
+    renderHeader({ sidebarOpen: false });
 
     const trigger = await screen.findByRole("button", {
       name: "Server: localhost:8000. Switch server",
     });
-    const mobileOnlyMount = container.querySelector('[class~="md:hidden"]');
-    expect(mobileOnlyMount).not.toBeNull();
-    expect(mobileOnlyMount).toContainElement(trigger);
+    expect(trigger.closest('[class~="md:hidden"]')).not.toBeNull();
+    expect(trigger).not.toHaveClass("sidebar-row");
     expect(trigger.querySelector(".lucide-chevron-down")).not.toBeNull();
   });
 });

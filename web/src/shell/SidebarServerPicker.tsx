@@ -36,37 +36,8 @@ function originOf(url: string): string | null {
   }
 }
 
-/**
- * Server picker for native shells, rendered in the sidebar or mobile header.
- *
- * A sidebar row (server glyph + current host + an upward chevron) that opens a
- * menu of recently-connected servers — selecting one re-points the whole window
- * via the shell — plus "Connect to new server…", which returns the window to
- * the shell's setup page.
- *
- * This deliberately lives at the bottom of the sidebar rather than in the
- * window's title bar. The macOS shell hides the native title bar (titleBarStyle
- * "hiddenInset"), and the previous picker filled that freed strip with a
- * centered "<thread> — <host>" label. But the chat header occupies the same
- * strip (`absolute top-0`, and taller at h-14), so on a narrow window the
- * centered label ran into the header's action cluster. Docking the picker here
- * takes it out of that contested space; the drag strip and the sidebar's
- * traffic-light top margin stay exactly as they were, since those are what keep
- * the OS window controls off the sidebar card.
- *
- * Renders nothing until the shell confirms this page is a connected server
- * (getServerPicker resolves non-null) — so it's absent in plain browsers, under
- * shells too old for the picker IPC, and on foreign pages. That single check is
- * the whole gate: no platform sniffing, matching how the rest of nativeBridge
- * degrades (one bundle, many runtimes, decided at runtime). Note this reaches
- * every Electron platform, where the old title-bar picker was macOS-only —
- * Windows and Linux desktop users previously had no in-app picker at all.
- */
-export function SidebarServerPicker({
-  variant = "sidebar",
-}: {
-  variant?: "sidebar" | "header";
-}) {
+/** Server picker that self-hides when the active shell has no picker IPC. */
+export function SidebarServerPicker({ variant = "sidebar" }: { variant?: "sidebar" | "header" }) {
   const [info, setInfo] = useState<ServerPickerInfo | null>(null);
 
   useEffect(() => {
@@ -88,8 +59,6 @@ export function SidebarServerPicker({
   const inSidebar = variant === "sidebar";
 
   return (
-    // shrink-0 keeps the row at its natural height so the scrolling session
-    // list above (flex-1) gives up space instead of squashing it.
     <div
       className={cn(inSidebar && "shrink-0 px-2 pt-1 pb-2")}
       data-testid="sidebar-server-picker-row"
@@ -99,13 +68,9 @@ export function SidebarServerPicker({
           <Button
             type="button"
             variant="ghost"
-            // Same shared row construct as New session / Inbox / Settings, so
-            // the icon lands on the sidebar's icon column and the label on its
-            // label column.
             className={cn(
               inSidebar && SIDEBAR_ROW,
-              inSidebar && "w-full justify-start",
-              "border-0 font-normal",
+              "w-full justify-start border-0 font-normal",
               "text-muted-foreground",
               "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50",
               "data-[state=open]:bg-muted data-[state=open]:text-foreground",

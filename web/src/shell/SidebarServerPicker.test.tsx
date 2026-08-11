@@ -43,7 +43,7 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("SidebarServerPicker", () => {
-  it("keeps the desktop dock styling while adapting the header layout", async () => {
+  it("keeps the desktop dock styling while changing only header cosmetics", async () => {
     getServerPicker.mockResolvedValue({
       currentOrigin: "http://localhost:8000",
       recentServers: [],
@@ -72,7 +72,8 @@ describe("SidebarServerPicker", () => {
       "pt-1",
       "pb-2",
     );
-    expect(headerTrigger).not.toHaveClass("sidebar-row", "w-full");
+    expect(headerTrigger).not.toHaveClass("sidebar-row");
+    expect(headerTrigger).toHaveClass("w-full", "justify-start");
     expect(headerTrigger.querySelector(".lucide-chevron-down")).not.toBeNull();
     fireEvent.pointerDown(headerTrigger, { button: 0, ctrlKey: false });
     expect(await screen.findByRole("menu")).toHaveAttribute("data-side", "bottom");
