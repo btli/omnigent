@@ -65,6 +65,42 @@ class StageError(RuntimeError):
     pass
 
 
+# Soft-failable ``git push --porcelain`` rejection reasons for refs/heads/main.
+# Distinct from ``[remote rejected]`` (hooks/auth policy), which must stay loud.
+_STALE_REF_REASONS = frozenset({"non-fast-forward", "fetch first", "stale info"})
+
+
+def is_stale_ref_push_rejection(porcelain: str, *, ref: str = "refs/heads/main") -> bool:
+    """True iff ``git push --porcelain`` shows a confirmed stale-ref race on ``ref``.
+
+    Classifies from porcelain status lines only — never from free-form stderr
+    prose — so a pre-receive hook that prints ``fetch first`` while emitting
+    ``[remote rejected]`` cannot soft-fail. Soft-fail only when the target
+    ref's line is flag ``!`` with summary ``[rejected]`` (not
+    ``[remote rejected]``) and a non-fast-forward / fetch-first / stale-info
+    reason. No matching status line (auth, transport, empty output) is a
+    hard failure.
+    """
+    for line in porcelain.splitlines():
+        if "\t" not in line:
+            continue
+        # Status lines are ``<flag>\\t<from>:<to>\\t<summary>``; ignore To/Done
+        # and any hook noise that lacks this shape.
+        flag, *fields = line.split("\t")
+        if len(flag) != 1 or len(fields) < 2 or ":" not in fields[0]:
+            continue
+        dst = fields[0].rsplit(":", 1)[-1]
+        if dst != ref:
+            continue
+        summary = fields[1]
+        # Soft-fail ONLY canonical local rejection — never [remote rejected].
+        if flag != "!" or not summary.startswith("[rejected]"):
+            return False
+        m = re.fullmatch(r"\[rejected\] \((.+)\)", summary)
+        return bool(m and m.group(1) in _STALE_REF_REASONS)
+    return False
+
+
 def git(
     cwd: str | Path, *args: str, check: bool = True, env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess:
@@ -577,7 +613,20 @@ def main(argv: list[str] | None = None) -> int:
     p_notes.add_argument("--report", default="merge-report.json")
     p_notes.add_argument("--signed", choices=["true", "false"], required=True)
 
+    p_stale = sub.add_parser(
+        "is-stale-ref-rejection",
+        help="exit 0 iff stdin is git-push --porcelain for a main stale-ref race",
+    )
+    p_stale.add_argument(
+        "--ref",
+        default="refs/heads/main",
+        help="destination ref to classify (default: refs/heads/main)",
+    )
+
     args = parser.parse_args(argv)
+
+    if args.cmd == "is-stale-ref-rejection":
+        return 0 if is_stale_ref_push_rejection(sys.stdin.read(), ref=args.ref) else 1
 
     if args.cmd == "notes":
         report = json.loads(Path(args.report).read_text())

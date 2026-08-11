@@ -83,18 +83,21 @@ jobs:
           }
 
           # Soft-fail ONLY a confirmed non-fast-forward / stale-ref rejection
-          # (! [rejected] + non-fast-forward|fetch first|stale info). Auth,
-          # permissions, or transport failures must fail the step — same
-          # classification discipline as merge_or_soft_fail above.
+          # on refs/heads/main, classified from `git push --porcelain` status
+          # lines (stage.py is-stale-ref-rejection) — never from free-form
+          # stderr. Auth, permissions, transport, or [remote rejected] hooks
+          # must fail the step — same discipline as merge_or_soft_fail above.
           is_stale_ref_rejection() {
-            printf '%s\n' "$1" | grep -q '! \[rejected\]' \
-              && printf '%s\n' "$1" | grep -qiE 'non-fast-forward|fetch first|stale info'
+            printf '%s\n' "$1" | python3 .github/scripts/personal-staging/stage.py \
+              is-stale-ref-rejection
           }
 
           merge_or_soft_fail FETCH_HEAD
-          if ! push_err=$(git push origin main 2>&1); then
-            printf '%s\n' "$push_err" >&2
-            if ! is_stale_ref_rejection "$push_err"; then
+          # Porcelain status → stdout; prose errors → stderr. Classify stdout only.
+          if ! push_out=$(git push --porcelain origin main 2>push_err.txt); then
+            cat push_err.txt >&2
+            printf '%s\n' "$push_out" >&2
+            if ! is_stale_ref_rejection "$push_out"; then
               echo "::error::sync-main: git push failed (not a stale-ref race)"
               exit 1
             fi
@@ -102,9 +105,10 @@ jobs:
             # once; never force-push main.
             git fetch origin main
             merge_or_soft_fail FETCH_HEAD
-            if ! push_err=$(git push origin main 2>&1); then
-              printf '%s\n' "$push_err" >&2
-              if is_stale_ref_rejection "$push_err"; then
+            if ! push_out=$(git push --porcelain origin main 2>push_err.txt); then
+              cat push_err.txt >&2
+              printf '%s\n' "$push_out" >&2
+              if is_stale_ref_rejection "$push_out"; then
                 soft_fail "could not push fork main" \
                   "Lost the push race twice; the next hourly run retries."
               fi

@@ -5,8 +5,8 @@
 # `#` comments are ignored. Remove an entry once the change lands
 # upstream. A ref confirmed deleted (`ls-remote` reports it absent) is
 # skipped loudly in the run report; a transport failure reaching upstream
-# blocks the push and fails the run instead — that is not a cue to edit
-# the manifest.
+# blocks the hourly push (run stays green with a warning); fails the
+# nightly run — that is not a cue to edit the manifest.
 #
 # Example:
 # 1234  # keep the composer hotfix until upstream merges it
