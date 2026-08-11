@@ -87,6 +87,9 @@ const ERR_ABORTED = -3;
  */
 const POPUP_PRELOAD = path.join(__dirname, "popup_preload.js");
 
+/** Preload registered for top-level documents in the default session. */
+const WEB_AUTHN_PRELOAD = path.join(__dirname, "webauthn.js");
+
 /** Absolute path to the app icon (PNG works for the macOS dock at runtime). */
 const ICON_PNG = path.join(__dirname, "..", "icons", "icon.png");
 
@@ -1061,6 +1064,7 @@ function createWindow(targetUrl, opts = {}) {
       // Security: the SPA is remote/untrusted relative to the shell, so we
       // keep Node out of the renderer and isolate the preload's context.
       preload: path.join(__dirname, "preload.js"),
+      sandbox: true,
       contextIsolation: true,
       nodeIntegration: false,
       // Electron passes HTML5 drag-drop through to the page by default (no
@@ -2913,6 +2917,14 @@ if (!gotLock) {
     registerPermissions();
     registerLocalhostAccess();
     registerSessionExpiryAccess();
+    // Shell-created renderers use defaultSession; no custom partitions are
+    // created here. Electron 42 does not apply registered preloads to iframe
+    // documents or their later navigations, so this shim covers top-level only.
+    session.defaultSession.registerPreloadScript({
+      id: "omnigent-webauthn",
+      type: "frame",
+      filePath: WEB_AUTHN_PRELOAD,
+    });
     registerIpc();
     buildMenu();
     // Patch PATH for GUI-launched Electron on macOS/Linux:
