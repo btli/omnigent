@@ -82,7 +82,10 @@ function renderHeader(props: {
   );
 }
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  delete (window as unknown as Record<string, unknown>).omnigentNative;
+});
 
 describe("ChatHeader — deployed Share presentation", () => {
   it("matches the compact Vercel action", () => {
@@ -149,6 +152,29 @@ describe("ChatHeader — open-sidebar toggle visibility", () => {
     // present. A regression here would hide the only way to reopen the
     // sidebar via pointer.
     expect(screen.getByRole("button", { name: "Open sidebar" })).toBeInTheDocument();
+  });
+});
+
+describe("ChatHeader — mobile server picker", () => {
+  it("mounts the header variant behind the mobile-only breakpoint", async () => {
+    (window as unknown as Record<string, unknown>).omnigentNative = {
+      kind: "android",
+      getServerPicker: () =>
+        Promise.resolve({
+          currentOrigin: "http://localhost:8000",
+          recentServers: [],
+        }),
+    };
+
+    const { container } = renderHeader({ sidebarOpen: false });
+
+    const trigger = await screen.findByRole("button", {
+      name: "Server: localhost:8000. Switch server",
+    });
+    const mobileOnlyMount = container.querySelector('[class~="md:hidden"]');
+    expect(mobileOnlyMount).not.toBeNull();
+    expect(mobileOnlyMount).toContainElement(trigger);
+    expect(trigger.querySelector(".lucide-chevron-down")).not.toBeNull();
   });
 });
 

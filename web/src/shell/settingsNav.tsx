@@ -27,6 +27,7 @@ import { isSingleUserMode } from "@/lib/capabilities";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
+import { SidebarServerPicker } from "./SidebarServerPicker";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 
 export type SettingsSectionId =
@@ -279,6 +280,7 @@ export function SettingsSidebarBody({
           </div>
         ))}
       </nav>
+      <SidebarServerPicker />
     </>
   );
 }

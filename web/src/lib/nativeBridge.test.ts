@@ -1,11 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  getServerPicker,
   isAndroidShell,
   isElectronShell,
   isIOSShell,
   isNativeShell,
   nativeNotify,
+  openServerSetup,
   onNativeNotificationActivated,
   onNativeSidebarDrag,
   PRE_MANIFEST_BASELINE,
@@ -15,6 +17,7 @@ import {
   setNativeServerSwitcherHidden,
   setThemeSource,
   supportsBrowser,
+  switchServer,
 } from "./nativeBridge";
 
 // The Electron preload bridge mock, installed on window.omnigentDesktop.
@@ -262,6 +265,31 @@ describe("serverManifestOf", () => {
       serverManifest: { manifestVersion: "1" } as unknown as ServerManifest,
     });
     expect(result).toEqual(PRE_MANIFEST_BASELINE);
+  });
+});
+
+describe("server picker bridge", () => {
+  it("uses picker IPC exposed by a non-Electron native shell", async () => {
+    const info = {
+      currentOrigin: "http://localhost:6767",
+      recentServers: ["https://other.example.com/"],
+    };
+    const getPicker = vi.fn().mockResolvedValue(info);
+    const switchPickerServer = vi.fn().mockResolvedValue(undefined);
+    const openPickerSetup = vi.fn();
+    (window as unknown as Record<string, unknown>).omnigentNative = {
+      kind: "android",
+      getServerPicker: getPicker,
+      switchServer: switchPickerServer,
+      openServerSetup: openPickerSetup,
+    };
+
+    await expect(getServerPicker()).resolves.toEqual(info);
+    await switchServer("https://other.example.com/");
+    openServerSetup();
+
+    expect(switchPickerServer).toHaveBeenCalledWith("https://other.example.com/");
+    expect(openPickerSetup).toHaveBeenCalledOnce();
   });
 });
 

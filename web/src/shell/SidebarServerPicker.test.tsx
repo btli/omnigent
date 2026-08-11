@@ -16,10 +16,10 @@ vi.mock("@/lib/nativeBridge", () => ({
   openServerSetup: () => openServerSetup(),
 }));
 
-function renderPicker() {
+function renderPicker(variant: "sidebar" | "header" = "sidebar") {
   return render(
     <TooltipProvider>
-      <SidebarServerPicker />
+      <SidebarServerPicker variant={variant} />
     </TooltipProvider>,
   );
 }
@@ -43,6 +43,41 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("SidebarServerPicker", () => {
+  it("keeps the desktop dock styling while adapting the header layout", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "http://localhost:8000",
+      recentServers: [],
+    });
+    renderPicker();
+
+    const sidebarTrigger = await screen.findByTestId("sidebar-server-picker");
+    expect(screen.getByTestId("sidebar-server-picker-row")).toHaveClass(
+      "shrink-0",
+      "px-2",
+      "pt-1",
+      "pb-2",
+    );
+    expect(sidebarTrigger).toHaveClass("sidebar-row", "w-full", "justify-start");
+    expect(sidebarTrigger.querySelector(".lucide-chevron-up")).not.toBeNull();
+    fireEvent.pointerDown(sidebarTrigger, { button: 0, ctrlKey: false });
+    expect(await screen.findByRole("menu")).toHaveAttribute("data-side", "top");
+
+    cleanup();
+    renderPicker("header");
+
+    const headerTrigger = await screen.findByTestId("sidebar-server-picker");
+    expect(screen.getByTestId("sidebar-server-picker-row")).not.toHaveClass(
+      "shrink-0",
+      "px-2",
+      "pt-1",
+      "pb-2",
+    );
+    expect(headerTrigger).not.toHaveClass("sidebar-row", "w-full");
+    expect(headerTrigger.querySelector(".lucide-chevron-down")).not.toBeNull();
+    fireEvent.pointerDown(headerTrigger, { button: 0, ctrlKey: false });
+    expect(await screen.findByRole("menu")).toHaveAttribute("data-side", "bottom");
+  });
+
   it("renders nothing in a plain browser (bridge resolves null)", async () => {
     getServerPicker.mockResolvedValue(null);
     const { container } = renderPicker();

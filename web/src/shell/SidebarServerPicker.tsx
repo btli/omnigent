@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { CheckIcon, ChevronUpIcon, PlusIcon, ServerIcon } from "lucide-react";
+import { CheckIcon, ChevronDownIcon, ChevronUpIcon, PlusIcon, ServerIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -37,7 +37,7 @@ function originOf(url: string): string | null {
 }
 
 /**
- * Server picker for the Electron desktop shell, pinned to the sidebar's bottom.
+ * Server picker for native shells, rendered in the sidebar or mobile header.
  *
  * A sidebar row (server glyph + current host + an upward chevron) that opens a
  * menu of recently-connected servers — selecting one re-points the whole window
@@ -62,7 +62,11 @@ function originOf(url: string): string | null {
  * every Electron platform, where the old title-bar picker was macOS-only —
  * Windows and Linux desktop users previously had no in-app picker at all.
  */
-export function SidebarServerPicker() {
+export function SidebarServerPicker({
+  variant = "sidebar",
+}: {
+  variant?: "sidebar" | "header";
+}) {
   const [info, setInfo] = useState<ServerPickerInfo | null>(null);
 
   useEffect(() => {
@@ -81,11 +85,15 @@ export function SidebarServerPicker() {
   // out from under us; recents matching the current origin collapse into it.
   const others = info.recentServers.filter((url) => originOf(url) !== info.currentOrigin);
   const currentHost = hostOf(info.currentOrigin);
+  const inSidebar = variant === "sidebar";
 
   return (
     // shrink-0 keeps the row at its natural height so the scrolling session
     // list above (flex-1) gives up space instead of squashing it.
-    <div className="shrink-0 px-2 pt-1 pb-2" data-testid="sidebar-server-picker-row">
+    <div
+      className={cn(inSidebar && "shrink-0 px-2 pt-1 pb-2")}
+      data-testid="sidebar-server-picker-row"
+    >
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button
@@ -95,8 +103,9 @@ export function SidebarServerPicker() {
             // the icon lands on the sidebar's icon column and the label on its
             // label column.
             className={cn(
-              SIDEBAR_ROW,
-              "w-full justify-start border-0 font-normal",
+              inSidebar && SIDEBAR_ROW,
+              inSidebar && "w-full justify-start",
+              "border-0 font-normal",
               "text-muted-foreground",
               "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50",
               "data-[state=open]:bg-muted data-[state=open]:text-foreground",
@@ -106,13 +115,15 @@ export function SidebarServerPicker() {
           >
             <ServerIcon className="ui-icon text-muted-foreground" />
             <span className="truncate">{currentHost}</span>
-            {/* Points up: the menu opens upward from the sidebar's bottom. */}
-            <ChevronUpIcon className="ui-icon ml-auto shrink-0 text-muted-foreground" />
+            {inSidebar ? (
+              <ChevronUpIcon className="ui-icon ml-auto shrink-0 text-muted-foreground" />
+            ) : (
+              <ChevronDownIcon className="ui-icon ml-auto shrink-0 text-muted-foreground" />
+            )}
           </Button>
         </DropdownMenuTrigger>
-        {/* side="top" — the trigger sits at the bottom of the window, so the
-            menu must grow upward rather than off-screen. */}
-        <DropdownMenuContent side="top" align="start" className="min-w-56">
+        {/* The sidebar dock opens upward; the header control opens downward. */}
+        <DropdownMenuContent side={inSidebar ? "top" : "bottom"} align="start" className="min-w-56">
           <DropdownMenuLabel className="text-muted-foreground">Recents</DropdownMenuLabel>
           <DropdownMenuItem disabled className="gap-2 opacity-100">
             <CheckIcon className="size-4 shrink-0" />

@@ -62,7 +62,10 @@ beforeEach(() => {
   mocks.singleUser = false;
   mocks.isAdmin = false;
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  delete (window as unknown as Record<string, unknown>).omnigentNative;
+});
 
 describe("settingsNavGroups", () => {
   it("flags Keyboard shortcuts as hidden on mobile, but not the other items", () => {
@@ -130,6 +133,24 @@ describe("settingsNavGroups", () => {
 });
 
 describe("SettingsSidebarBody", () => {
+  it("keeps the server picker reachable inside the pinned settings sidebar", async () => {
+    (window as unknown as Record<string, unknown>).omnigentNative = {
+      kind: "android",
+      getServerPicker: () =>
+        Promise.resolve({
+          currentOrigin: "http://localhost:8000",
+          recentServers: [],
+        }),
+    };
+    renderBody();
+
+    expect(
+      await screen.findByRole("button", {
+        name: "Server: localhost:8000. Switch server",
+      }),
+    ).toHaveClass("sidebar-row");
+  });
+
   it("renders Back as a standard sidebar row without a collapse button", () => {
     renderBody();
     const backLink = screen.getByRole("link", { name: "Back" });

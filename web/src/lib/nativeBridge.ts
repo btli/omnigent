@@ -115,6 +115,12 @@ interface NativeShellApi {
    * hardcoding them. Absent on older shells. Returns an unsubscribe.
    */
   onNativeInsets?: (callback: (insets: NativeInsets) => void) => () => void;
+  /** Current server origin + recent servers, or null on a foreign page. */
+  getServerPicker?: () => Promise<ServerPickerInfo | null>;
+  /** Re-point this window to a previously-connected server URL. */
+  switchServer?: (url: string) => Promise<void>;
+  /** Return this window to the shell's "connect to server" setup page. */
+  openServerSetup?: () => void;
 }
 
 export type ThemeSource = "light" | "dark" | "system";
@@ -156,12 +162,6 @@ interface ElectronDesktopApi extends NativeShellApi {
    * idle, so the web never shows a (duplicate) banner. Absent on older shells.
    */
   updates?: ElectronUpdateBridge;
-  /** Current server origin + recent servers, or null on a foreign page. */
-  getServerPicker?: () => Promise<ServerPickerInfo | null>;
-  /** Re-point this window to a previously-connected server URL. */
-  switchServer?: (url: string) => Promise<void>;
-  /** Return this window to the shell's "connect to server" setup page. */
-  openServerSetup?: () => void;
   /** This machine's identity (CLI installed + host id) — fast, no subprocess. */
   getHostIdentity?: () => Promise<HostIdentity | null>;
   /** Start / stop / restart this machine's host daemon for the window's server. */
@@ -269,7 +269,7 @@ export interface ElectronUpdateBridge {
   onStatus: (callback: (status: UpdateStatus) => void) => () => void;
 }
 
-/** Data backing the title-bar server picker, from the Electron shell. */
+/** Data backing the server picker, from a native shell. */
 export interface ServerPickerInfo {
   /** Origin this window is connected to, e.g. `"http://localhost:8000"`. */
   currentOrigin: string;
@@ -659,51 +659,51 @@ export function onNativeInsets(callback: (insets: NativeInsets) => void): () => 
 }
 
 /**
- * Fetch the title-bar server picker data from the Electron shell: the
+ * Fetch server picker data from a native shell: the
  * window's current server origin plus the recently-connected server list.
  *
- * Resolves `null` outside the Electron shell, under a shell too old to
+ * Resolves `null` outside a native shell, under a shell too old to
  * support the picker, or on a page the shell doesn't recognize as a
  * connected server — callers hide the picker in all of those cases.
  */
 export async function getServerPicker(): Promise<ServerPickerInfo | null> {
-  const electron = electronApi();
-  if (!electron?.getServerPicker) return null;
+  const native = nativeApi();
+  if (!native?.getServerPicker) return null;
   try {
-    return await electron.getServerPicker();
+    return await native.getServerPicker();
   } catch (err) {
-    console.warn("[nativeBridge] electron getServerPicker failed:", err);
+    console.warn("[nativeBridge] getServerPicker failed:", err);
     return null;
   }
 }
 
 /**
- * Ask the Electron shell to re-point this window to another
+ * Ask the native shell to re-point this window to another
  * previously-connected server URL (one of `ServerPickerInfo.recentServers`).
  * The shell navigates the whole window, so on success this page unloads.
  */
 export async function switchServer(url: string): Promise<void> {
-  const electron = electronApi();
-  if (!electron?.switchServer) return;
+  const native = nativeApi();
+  if (!native?.switchServer) return;
   try {
-    await electron.switchServer(url);
+    await native.switchServer(url);
   } catch (err) {
-    console.warn("[nativeBridge] electron switchServer failed:", err);
+    console.warn("[nativeBridge] switchServer failed:", err);
   }
 }
 
 /**
- * Ask the Electron shell to return this window to its "connect to server"
+ * Ask the native shell to return this window to its "connect to server"
  * setup page (the picker's "+ Connect to new server…" action). The window
  * navigates away on success.
  */
 export function openServerSetup(): void {
-  const electron = electronApi();
-  if (!electron?.openServerSetup) return;
+  const native = nativeApi();
+  if (!native?.openServerSetup) return;
   try {
-    electron.openServerSetup();
+    native.openServerSetup();
   } catch (err) {
-    console.warn("[nativeBridge] electron openServerSetup failed:", err);
+    console.warn("[nativeBridge] openServerSetup failed:", err);
   }
 }
 

@@ -30,6 +30,7 @@ import type { Agent } from "@/hooks/useAgents";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { cn } from "@/lib/utils";
 import { TAB_BADGE_BASE } from "./railTabs";
+import { SidebarServerPicker } from "./SidebarServerPicker";
 import { ViewModeToggle } from "./ViewModeToggle";
 import { useCallback, useEffect, useRef } from "react";
 
@@ -269,6 +270,9 @@ export function ChatHeader({
             <TooltipContent side="bottom">Open sidebar</TooltipContent>
           </Tooltip>
         )}
+        <div className="md:hidden">
+          <SidebarServerPicker variant="header" />
+        </div>
         {isChildSession && parentSessionId && (
           <>
             {/* Back affordance. Ghost (not a filled pill) so it sits on the
