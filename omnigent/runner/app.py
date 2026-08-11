@@ -617,6 +617,31 @@ class _SessionSnapshot:
 
 
 @dataclasses.dataclass(frozen=True)
+class _CommentRelayBinding:
+    """A running comment relay plus the agent and bridge it was built for.
+
+    A relay advertises the tool surface of one agent spec and writes it into
+    one bridge directory. Recording both lets
+    ``_ensure_comment_relay_started`` notice that the session moved to a
+    different agent and replace the relay, instead of leaving the previous
+    agent's surface advertised to the new harness.
+
+    :param relay: The relay currently serving the session.
+    :param spec_entry: Resolved spec the advertised surface was built from,
+        compared by identity: the session spec cache hands back the same
+        object until an agent switch or an agent update evicts it, so a
+        changed object means the surface has to be rebuilt. ``None`` when
+        the spec could not be resolved and the fallback surface was used.
+    :param bridge_dir: Directory the relay wrote ``tool_relay.json`` into,
+        e.g. ``Path("/tmp/omnigent-bridge/conv_abc123")``.
+    """
+
+    relay: ClaudeNativeToolRelay
+    spec_entry: _SpecEntry | None
+    bridge_dir: Path
+
+
+@dataclasses.dataclass(frozen=True)
 class _SessionInitContext:
     """Metadata source selected before shared session initialization runs."""
 
@@ -1938,7 +1963,7 @@ def create_runner_app(
     _session_sub_agent_names: dict[str, str] = {}
     _session_tool_schemas: dict[str, list[_JsonObject]] = {}  # session_id → cached tool schemas
     _session_mcp_spec_hash: dict[str, str] = {}  # session_id → last MCP spec hash
-    _session_comment_relays: dict[str, ClaudeNativeToolRelay] = {}
+    _session_comment_relays: dict[str, _CommentRelayBinding] = {}
     _codex_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _pi_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _opencode_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
@@ -3339,8 +3364,8 @@ def create_runner_app(
         _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
         _session_tool_schemas.pop(session_id, None)
-        if _relay := _session_comment_relays.pop(session_id, None):
-            _relay.close()
+        if _binding := _session_comment_relays.pop(session_id, None):
+            _binding.relay.close()
         _session_histories.pop(session_id, None)
         _last_server_item_id.pop(session_id, None)
         _session_event_queues.pop(session_id, None)
@@ -5053,6 +5078,24 @@ def create_runner_app(
         logger=_logger,
     )
 
+    def _discard_comment_relay(session_id: str, relay: ClaudeNativeToolRelay) -> None:
+        """Unbind and close *relay*, unless another path already replaced it.
+
+        Removal is by relay instance rather than by session id: a
+        replacement installed while the caller was working owns the entry
+        and has already closed *relay*, so popping the key would tear down
+        the newer relay instead of the intended one.
+
+        :param session_id: Session/conversation id the relay was bound to.
+        :param relay: The relay instance the caller installed.
+        :returns: None.
+        """
+        binding = _session_comment_relays.get(session_id)
+        if binding is None or binding.relay is not relay:
+            return
+        del _session_comment_relays[session_id]
+        relay.close()
+
     async def _ensure_comment_relay_started(
         session_id: str,
         *,
@@ -5061,41 +5104,78 @@ def create_runner_app(
         await_notify: bool = False,
         session_labels: Mapping[str, str] | None = None,
     ) -> None:
-        if session_id in _session_comment_relays:
-            return
-
         import json as _json
 
         from omnigent.claude_native_bridge import (
+            BRIDGE_ID_LABEL_KEY,
             bridge_dir_for_bridge_id,
             post_tools_changed,
             start_tool_relay,
         )
 
+        try:
+            spec_entry = await _resolve_session_spec_entry(session_id)
+        except OmnigentError:
+            # Resolution failed; this is not the same as a session that
+            # resolves to no spec. A relay already serving the session was
+            # built from a real spec, so replacing it with the fallback
+            # surface would withdraw spec-gated tools the agent does grant.
+            # Keep it: once resolution recovers, the resolved spec differs
+            # from the stored one and the relay rebuilds then.
+            if session_id in _session_comment_relays:
+                return
+            spec_entry = None
+
+        # The bridge dir, when the caller pinned it down or handed over the
+        # labels it comes from. Deriving it any other way costs a server
+        # round trip, which a session whose agent has not changed must not
+        # pay on every turn.
+        known_bridge_dir: Path | None = None
         if explicit_bridge_dir is not None:
-            bridge_dir = explicit_bridge_dir
-        else:
-            if bridge_id is None:
-                bridge_id = await _claude_native_bridge_id_with_optional_labels(
+            known_bridge_dir = explicit_bridge_dir
+        elif bridge_id is not None:
+            known_bridge_dir = bridge_dir_for_bridge_id(bridge_id or session_id)
+        elif session_labels is not None:
+            known_bridge_dir = bridge_dir_for_bridge_id(
+                session_labels.get(BRIDGE_ID_LABEL_KEY) or session_id
+            )
+
+        # Same agent and no bridge hint to check against: skip the lookup that
+        # would cost a server round trip. This rests on a bridge id only ever
+        # being reassigned alongside the agent (a native-harness-family
+        # switch), which the spec comparison already caught. The callers that
+        # can reassign it independently — the terminal-launch and per-harness
+        # startup paths — all pass a bridge hint and take the branch below.
+        current = _session_comment_relays.get(session_id)
+        if current is not None and current.spec_entry is spec_entry and known_bridge_dir is None:
+            return
+
+        bridge_dir = known_bridge_dir
+        if bridge_dir is None:
+            bridge_dir = bridge_dir_for_bridge_id(
+                await _claude_native_bridge_id_with_optional_labels(
                     server_client=server_client,
                     session_id=session_id,
                     session_labels=session_labels,
                 )
+                or session_id
+            )
 
-            if session_id in _session_comment_relays:
-                return
-
-            bridge_dir = bridge_dir_for_bridge_id(bridge_id or session_id)
-
-        try:
-            relay_spec = await _resolve_session_agent_spec(session_id)
-        except OmnigentError:
-            relay_spec = None
-        if session_id in _session_comment_relays:
+        # Re-read after the awaits above: a concurrent caller may have
+        # installed a relay that already matches the current agent.
+        current = _session_comment_relays.get(session_id)
+        if (
+            current is not None
+            and current.spec_entry is spec_entry
+            and current.bridge_dir == bridge_dir
+        ):
             return
+
         from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
 
-        relay_schemas: list[_JsonObject] = build_native_relay_tool_schemas(relay_spec)
+        relay_schemas: list[_JsonObject] = build_native_relay_tool_schemas(
+            _unwrap_spec_entry(spec_entry)
+        )
 
         _captured_session_id = session_id
 
@@ -5127,7 +5207,18 @@ def create_runner_app(
                 exc_info=True,
             )
             return
-        _session_comment_relays[session_id] = relay
+        superseded = _session_comment_relays.get(session_id)
+        _session_comment_relays[session_id] = _CommentRelayBinding(
+            relay=relay,
+            spec_entry=spec_entry,
+            bridge_dir=bridge_dir,
+        )
+        # Close last: the new advertisement is already written, and
+        # ClaudeNativeToolRelay.close only unlinks a tool_relay.json that
+        # still points at the relay being closed, so a shared bridge dir
+        # keeps the new file.
+        if superseded is not None:
+            superseded.relay.close()
 
         async def _notify_tools_changed() -> None:
             try:
@@ -6893,14 +6984,22 @@ def create_runner_app(
             )
         bridge_inject = bool(body.get("bridge_inject_dir"))
         bridge_id = session_id
-        relay_existed = False
+        # Set only when this launch installed the relay, so a failure rolls
+        # back what it started and leaves a relay that was already serving
+        # the session (or that another path installed meanwhile) alone.
+        launched_relay: ClaudeNativeToolRelay | None = None
         if bridge_inject:
             bridge_id = await _claude_native_bridge_id_for_session(
                 server_client=server_client,
                 session_id=session_id,
             )
-            relay_existed = session_id in _session_comment_relays
+            relay_before = _session_comment_relays.get(session_id)
             await _ensure_comment_relay_started(session_id, bridge_id=bridge_id)
+            relay_after = _session_comment_relays.get(session_id)
+            if relay_after is not None and (
+                relay_before is None or relay_before.relay is not relay_after.relay
+            ):
+                launched_relay = relay_after.relay
 
         try:
             launch_method = (
@@ -6919,10 +7018,8 @@ def create_runner_app(
                 resource_role=(CLAUDE_NATIVE_TERMINAL_ROLE if bridge_inject else None),
             )
         except RuntimeError as exc:
-            if bridge_inject and not relay_existed:
-                relay = _session_comment_relays.pop(session_id, None)
-                if relay is not None:
-                    relay.close()
+            if launched_relay is not None:
+                _discard_comment_relay(session_id, launched_relay)
             return JSONResponse(
                 status_code=500,
                 content={
@@ -8727,6 +8824,18 @@ def create_runner_app(
             )
 
     async def _catch_up_scan() -> None:
+        # The tunnel just reconnected, which usually means the SERVER restarted
+        # (deploy, crash, replica failover) and lost its in-memory session-status
+        # cache. This runner did not restart, so every status source still
+        # believes its last edge was delivered and nothing re-asserts — a
+        # native session mid-turn during the restart would sit on a stale
+        # ``idle`` for the rest of the turn. Re-arm them before the item scan
+        # below (which skips native harnesses entirely).
+        if resource_registry is not None:
+            try:
+                resource_registry.resync_session_statuses()
+            except Exception:  # noqa: BLE001 — best-effort; never block catch-up.
+                _logger.warning("Session status resync failed after reconnect", exc_info=True)
         for session_id in list(_session_histories):
             if _is_native_harness(session_id):
                 continue
@@ -8800,9 +8909,13 @@ def create_runner_app(
         and _pane_reaper_registry is not None
         and hasattr(_pane_reaper_registry, "native_panes")
     ):
-        from omnigent.native_cost_popup import _list_tmux_clients
+        from omnigent.native_cost_popup import _list_tmux_clients, _tmux_window_activity_at
         from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
-        from omnigent.terminals.pane_reaper import NativePaneReaper, PaneRef
+        from omnigent.terminals.pane_reaper import (
+            PANE_OUTPUT_BUSY_WINDOW_S,
+            NativePaneReaper,
+            PaneRef,
+        )
 
         def _native_panes_for_reaper() -> list[PaneRef]:
             panes: list[PaneRef] = []
@@ -8823,7 +8936,18 @@ def create_runner_app(
             if _native_pane_status.get(conv_id) == "running":
                 return True
             clients = await asyncio.to_thread(_list_tmux_clients, str(pane.socket_path), "main")
-            return bool(clients)
+            if clients:
+                return True
+            # Primary evidence: tmux stamps window_activity on every byte the
+            # pane emits, so a producing terminal stays busy even when the
+            # status pipeline above has silently stalled (a stalled forwarder
+            # once froze the busy signal and got a live session reaped).
+            activity_at = await asyncio.to_thread(
+                _tmux_window_activity_at, str(pane.socket_path), "main"
+            )
+            return (
+                activity_at is not None and time.time() - activity_at < PANE_OUTPUT_BUSY_WINDOW_S
+            )
 
         async def _reap_native_pane(pane: PaneRef) -> None:
             try:
