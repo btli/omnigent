@@ -14,7 +14,7 @@ import org.robolectric.annotation.Config
 @Config(sdk = [35])
 class SessionTokenBindingTest {
     // JWT-shaped (three base64url segments) so isJwtShaped passes.
-    private val token = "aGVhZGVy.cGF5bG9hZA.c2lnbmF0dXJl"
+    private val signedJwt = "aGVhZGVy.cGF5bG9hZA.c2lnbmF0dXJl"
     private val pinned = "https://example.com"
 
     private fun launch(): MainActivity {
@@ -25,7 +25,7 @@ class SessionTokenBindingTest {
     @Test
     fun `token from a different origin is dropped`() {
         val activity = launch()
-        activity.onSessionToken("https://other.example", token)
+        activity.onSessionToken("https://other.example", signedJwt)
         val cookie = CookieManager.getInstance().getCookie(pinned)
         assertFalse(cookie?.contains("ap_session") == true)
     }
@@ -33,7 +33,7 @@ class SessionTokenBindingTest {
     @Test
     fun `token from the pinned origin is injected`() {
         val activity = launch()
-        activity.onSessionToken(pinned, token)
+        activity.onSessionToken(pinned, signedJwt)
         val cookie = CookieManager.getInstance().getCookie(pinned)
         assertTrue(cookie?.contains("ap_session") == true)
     }
