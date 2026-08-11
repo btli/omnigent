@@ -28,6 +28,7 @@ class OmnigentWebViewClient(
     private val shouldInjectBridgeAtPageReady: () -> Boolean,
     private val onPageReady: (url: String?) -> Unit,
     private val onLoginRequired: () -> Unit,
+    private val onNavigationStarted: () -> Unit,
 ) : WebViewClient() {
     // Bare-root -> /omnigent bounces since the last app page loaded; see
     // workspaceRootTarget for why they're capped.
@@ -41,6 +42,7 @@ class OmnigentWebViewClient(
         favicon: Bitmap?,
     ) {
         super.onPageStarted(view, url, favicon)
+        onNavigationStarted()
 
         val origin = originOf(url)
         val scheme = url?.let { Uri.parse(it).scheme?.lowercase() }

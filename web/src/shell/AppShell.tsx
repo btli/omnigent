@@ -6,6 +6,7 @@ import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
+import { useNativeServerSwitcherBand } from "@/hooks/useNativeServerSwitcherBand";
 import { useIsEmbedded } from "@/lib/embedded";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
@@ -169,6 +170,9 @@ export function AppShell() {
       : undefined;
   const [searchParams, setSearchParams] = useSearchParams();
   const [sidebarOpen, setSidebarOpen] = useState(initialSidebarOpen);
+  // Callback refs (not useRef): the band effect must re-run once the layout attaches.
+  const [chatColumn, setChatColumn] = useState<HTMLElement | null>(null);
+  useNativeServerSwitcherBand(chatColumn);
   const [sidebarPeek, setSidebarPeek] = useState(false);
 
   // The settings nav lives INSIDE the sidebar, and its "Back" row is the only
@@ -1587,7 +1591,7 @@ export function AppShell() {
                 style={
                   {
                     "--workspace-panel-offset": workspacePanelVisible
-                      ? `${inlinePanelWidth}px`
+                      ? `${inlinePanelWidth + 16}px`
                       : "0px",
                   } as CSSProperties
                 }
@@ -1651,7 +1655,7 @@ export function AppShell() {
                     onOpenMainExecutionLog: openMainExecutionLog,
                   }}
                 />
-                <main className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+                <main ref={setChatColumn} className="relative flex min-h-0 min-w-0 flex-1 flex-col">
                   <Outlet />
                 </main>
 
