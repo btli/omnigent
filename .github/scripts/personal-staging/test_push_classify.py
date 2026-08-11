@@ -111,6 +111,8 @@ def test_cli_is_stale_ref_rejection_exit_codes():
         "!\trefs/heads/other:refs/heads/other\t[rejected] (non-fast-forward)",
         "!\trefs/heads/main:refs/heads/main\t[rejected] (already exists)",
         "=\trefs/heads/main:refs/heads/main\t[up to date]",
+        # Non-'!' flag with a [rejected] summary must hard-fail (not soft-fail).
+        " \trefs/heads/main:refs/heads/main\t[rejected] (non-fast-forward)",
     ],
 )
 def test_non_main_or_other_reasons_are_hard_fail(line: str):
