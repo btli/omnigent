@@ -1985,6 +1985,8 @@ describe("touch swipe actions", () => {
       expect.anything(),
     );
 
+    // Archiving replaces the interactive row with its in-flight status until
+    // the list refetch removes it, so exercise the opposite mapping fresh.
     cleanup();
     mocks.archive.mutate.mockClear();
     renderSidebar();

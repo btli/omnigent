@@ -2140,7 +2140,7 @@ describe("NewChatLandingScreen", () => {
     // worktree chip) — the sandbox default doesn't wedge the normal path.
     fireEvent.click(hostItem);
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip")).not.toHaveTextContent("Sandbox"),
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveTextContent("machine-1"),
     );
     expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeTruthy();
     expect(screen.getByTestId("new-chat-landing-branch-chip")).toBeTruthy();
@@ -3116,7 +3116,7 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-host-host_1"));
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip")).not.toHaveTextContent("Sandbox"),
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveTextContent("machine-1"),
     );
     // With no custom agents yet, the create item is a top-level row (no
     // "Custom agents" submenu to hide it behind) and opens the dialog.
@@ -3137,7 +3137,7 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-host-host_1"));
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip")).not.toHaveTextContent("Sandbox"),
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveTextContent("machine-1"),
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-create-agent"));
