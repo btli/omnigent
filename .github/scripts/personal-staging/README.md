@@ -1,11 +1,13 @@
 # Personal staging nightly (fork-only)
 
-`.github/workflows/personal-staging.yml` runs nightly (05:37 UTC, plus
-`workflow_dispatch`) on the `btli/omnigent` fork only. It:
+`.github/workflows/personal-staging.yml` runs nightly (10:00 UTC — cron
+`0 10 * * *` — plus `workflow_dispatch`) on the `btli/omnigent` fork only.
+It:
 
 1. Composes fork branch `staging` = upstream `omnigent-ai/omnigent` main +
-   every open btli PR, merged sequentially ascending by PR number
-   (`stage.py`). A conflicting PR is skipped — its conflict paths land in
+   every open btli PR plus the [`extras.txt`](#extras-manifest-extrastxt)
+   pins, merged sequentially ascending by PR number (`stage.py`). A
+   conflicting PR is skipped — its conflict paths land in
    `merge-report.json` — and the run continues. All PRs conflicting is a
    reported outcome, not a failure.
 2. Pins an immutable `nightly-YYYYMMDD` branch + tag at the staging commit
@@ -38,6 +40,89 @@
 **This never touches branch `testing`** — that remains the manually composed
 homelab deploy branch driven by `just test-branch`. Nothing here flips any
 existing behavior.
+
+## Hourly staging refresh (`personal-staging-hourly.yml`)
+
+`Personal Staging Hourly` (cron `17 * * * *`, plus `workflow_dispatch`)
+keeps branch `staging` fresh between nightlies. The odd minute is
+deliberate: `:00` would collide with the nightly's 10:00 UTC slot (both
+push fork main) and GitHub delays or drops runs scheduled on that
+congested minute. It runs the same composer
+with `--staging-only`: compose upstream main + open btli PRs + extras
+exactly as the nightly does, then push ONLY `refs/heads/staging`
+(`--force-with-lease`). It mints no `nightly-*` pins and no dev tags, and
+builds no APK/releases/images — those stay nightly-only.
+
+Composition is byte-reproducible, so when the composed commit equals the
+current remote `staging` sha the run is a no-op: the push is skipped and
+the summary reports "unchanged". When it does push, the summary's one-line
+result names which of upstream HEAD, the open PR set, or the extras
+changed.
+
+Its `sync-main` job soft-fails on a merge *conflict* (abort + `::warning::`
++ summary, exit 0) — unlike the nightly's, which hard-fails — because the
+compose job stacks from upstream HEAD and never reads fork main. Only a
+genuine content conflict is soft-failed: a merge that fails with no
+unmerged paths (bad object, corrupt repo) still fails the job loudly. If
+its `git push origin main` is rejected as a confirmed stale ref
+(`! [rejected]` with `non-fast-forward` / `fetch first` / `stale info` —
+typically a race with the nightly or a human push), it re-fetches and
+retries once, then warns and exits 0. Auth, permissions, or transport
+failures still fail the job. `main` is never force-pushed.
+
+The workflow uses its own concurrency group (`personal-staging-hourly`,
+`cancel-in-progress: true`) so stale hourly runs coalesce and can never
+cancel a running nightly; if an hourly push loses a `--force-with-lease`
+race with the nightly, the next hour retries.
+
+## `staging` is ephemeral — do not track it
+
+`staging` is **rebuilt from scratch and force-pushed, now up to 24× a
+day**. Its history is rewritten every time upstream or a PR moves: commit
+shas are not stable, and a commit that was on the branch an hour ago may
+be gone. Nothing should track the branch tip.
+
+- **Pin instead:** for anything reproducible — homelab deploys, container
+  builds, bisecting — use a `nightly-YYYYMMDD` pin (branch + tag, both
+  immutable) or the `vX.Y.Z.devYYYYMMDD` tag from the nightly.
+- **Existing clone:** `git pull` on `staging` will refuse or conflict
+  after a rewrite. Recover with:
+
+  ```sh
+  git fetch origin && git reset --hard origin/staging
+  ```
+
+  (discards local work on the branch — keep none there).
+
+## Extras manifest (`extras.txt`)
+
+`stage.py` always reads `.github/scripts/personal-staging/extras.txt`
+(missing file == no extras), so extras land in BOTH the hourly and the
+nightly composition. Format: one PR number per line; blank lines and `#`
+comments allowed; anything else fails the run loudly.
+
+Extras are PR numbers that must stay baked into `staging` even though
+they are no longer open (typically closed-without-merge) — GitHub keeps
+`refs/pull/N/head` fetchable after close. The merge stream is the union
+of open PRs and extras, deduped by PR number (the open entry wins),
+sorted ascending — the same ordering rule as always. **Remove an entry
+once the change lands upstream.**
+
+An extra that can't be resolved gets one of two distinct outcomes, because
+a deleted ref and an unreachable server are different problems:
+
+- **Confirmed gone** (`ls-remote` says the ref no longer exists): skipped
+  loudly with reason `extra unfetchable (likely deleted; remove from
+  extras.txt)` — distinct from a conflict skip — and the run continues.
+  This is the only reason that invites editing the manifest.
+- **Could not reach upstream** (the fetch keeps failing after retries, and
+  the existence probe itself errors): reason `extra fetch failed (cannot
+  reach upstream; pin kept, staging not advanced)`. The hourly run does
+  **not** push — `staging` keeps its previous content rather than silently
+  losing a required pin — and emits a `::warning::`. The nightly fails the
+  job instead, before any ref moves, since it publishes releases from that
+  composition. **Do not delete the pin on this reason**; it means the
+  fetch failed, not that the PR is gone.
 
 ## Stable download URL
 
