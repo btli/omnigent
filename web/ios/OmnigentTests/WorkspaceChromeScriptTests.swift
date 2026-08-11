@@ -59,6 +59,8 @@ final class NativeBridgeScriptTests: XCTestCase {
     XCTAssertTrue(source.contains("currentOrigin: pickerCurrentOrigin"))
     XCTAssertTrue(source.contains("recentServers: [...pickerRecentServers]"))
     XCTAssertTrue(source.contains("return Promise.reject(new Error("))
+    XCTAssertTrue(source.contains(#"method: "switchServer""#))
+    XCTAssertTrue(source.contains(#"method: "openServerSetup""#))
     XCTAssertTrue(source.contains("\"https://current.example.com\""))
     XCTAssertTrue(source.contains("\"https://quote.example.com/\\\"quoted\\\"\""))
   }

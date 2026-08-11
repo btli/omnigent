@@ -27,6 +27,8 @@ class OmnigentBridgeListenerTest {
     private lateinit var listener: OmnigentBridgeListener
     private lateinit var shadow: ShadowNotificationManager
     private val serverSwitcherHiddenChanges = mutableListOf<Boolean>()
+    private val switchedServers = mutableListOf<String>()
+    private var serverSetupOpenCount = 0
 
     private val badgeId = 1
 
@@ -39,6 +41,8 @@ class OmnigentBridgeListenerTest {
                 notifications = NativeNotificationManager(context),
                 blobSaver = BlobSaver(context),
                 onServerSwitcherHidden = serverSwitcherHiddenChanges::add,
+                onSwitchServer = switchedServers::add,
+                onOpenServerSetup = { serverSetupOpenCount++ },
             )
         shadow =
             shadowOf(
@@ -138,12 +142,24 @@ class OmnigentBridgeListenerTest {
 
     @Test
     fun `setServerSwitcherHidden ignores malformed payloads`() {
+        listener.handle("""{"method":"setServerSwitcherHidden","hidden":true}""")
         listener.handle("""{"method":"setServerSwitcherHidden"}""")
         listener.handle("""{"method":"setServerSwitcherHidden","hidden":"true"}""")
         listener.handle("""{"method":"setServerSwitcherHidden","hidden":1}""")
         listener.handle("""{"method":"setServerSwitcherHidden","hidden":null}""")
 
-        assertTrue(serverSwitcherHiddenChanges.isEmpty())
+        assertEquals(listOf(true), serverSwitcherHiddenChanges)
+    }
+
+    @Test
+    fun `server picker messages dispatch valid native actions`() {
+        listener.handle("""{"method":"switchServer","url":"https://known.example.com"}""")
+        listener.handle("""{"method":"switchServer","url":123}""")
+        listener.handle("""{"method":"switchServer"}""")
+        listener.handle("""{"method":"openServerSetup"}""")
+
+        assertEquals(listOf("https://known.example.com"), switchedServers)
+        assertEquals(1, serverSetupOpenCount)
     }
 
     @Test

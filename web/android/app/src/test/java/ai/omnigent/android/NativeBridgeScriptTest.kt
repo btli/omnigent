@@ -22,6 +22,8 @@ class NativeBridgeScriptTest {
         assertTrue(source.contains("currentOrigin: pickerCurrentOrigin"))
         assertTrue(source.contains("recentServers: [...pickerRecentServers]"))
         assertTrue(source.contains("return Promise.reject(new Error("))
+        assertTrue(source.contains("""post({ method: "switchServer", url });"""))
+        assertTrue(source.contains("""post({ method: "openServerSetup" });"""))
         assertTrue(source.contains("\"https://current.example.com\""))
         assertTrue(source.contains("\"https://quote.example.com/\\\"quoted\\\"\""))
     }

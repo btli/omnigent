@@ -17,6 +17,7 @@ package ai.omnigent.android
 object NativeBridgeScript {
     val source: String = source(currentOrigin = "", recentServers = emptyList())
 
+    @Suppress("ktlint:standard:string-template-indent", "ktlint:standard:indent")
     fun source(
         currentOrigin: String,
         recentServers: List<String>,

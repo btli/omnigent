@@ -96,11 +96,13 @@ class OmnigentBridgeListener(
             }
 
             "switchServer" -> {
-                val url = json.optString("url").ifEmpty { return }
+                val url = (json.opt("url") as? String)?.ifEmpty { return } ?: return
                 onSwitchServer(url)
             }
 
-            "openServerSetup" -> onOpenServerSetup()
+            "openServerSetup" -> {
+                onOpenServerSetup()
+            }
 
             "blobBase64" -> {
                 blobSaver.save(

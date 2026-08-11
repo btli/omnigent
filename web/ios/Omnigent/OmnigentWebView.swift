@@ -19,16 +19,15 @@ struct OmnigentWebView: UIViewRepresentable {
   func makeUIView(context: Context) -> WKWebView {
     let contentController = WKUserContentController()
     contentController.add(context.coordinator, name: "omnigentNative")
+    let bridgeScriptSource = nativeBridgeScriptSource
     contentController.addUserScript(
       WKUserScript(
-        source: Self.nativeBridgeScript(
-          currentOrigin: initialURL.omnigentOrigin ?? initialURL.absoluteString,
-          recentServers: offeredServers
-        ),
+        source: bridgeScriptSource,
         injectionTime: .atDocumentStart,
         forMainFrameOnly: true
       )
     )
+    context.coordinator.bridgeScriptSource = bridgeScriptSource
 
     let configuration = WKWebViewConfiguration()
     configuration.userContentController = contentController
@@ -74,6 +73,19 @@ struct OmnigentWebView: UIViewRepresentable {
   func updateUIView(_ webView: WKWebView, context: Context) {
     context.coordinator.parent = self
     model.webView = webView
+    let bridgeScriptSource = nativeBridgeScriptSource
+    if context.coordinator.bridgeScriptSource != bridgeScriptSource {
+      let contentController = webView.configuration.userContentController
+      contentController.removeAllUserScripts()
+      contentController.addUserScript(
+        WKUserScript(
+          source: bridgeScriptSource,
+          injectionTime: .atDocumentStart,
+          forMainFrameOnly: true
+        )
+      )
+      context.coordinator.bridgeScriptSource = bridgeScriptSource
+    }
     if context.coordinator.pinnedURL != initialURL {
       context.coordinator.load(initialURL, in: webView)
     }
@@ -84,6 +96,14 @@ struct OmnigentWebView: UIViewRepresentable {
     coordinator.detach()
   }
 
+  private var nativeBridgeScriptSource: String {
+    Self.nativeBridgeScript(
+      currentOrigin: initialURL.omnigentOrigin ?? initialURL.absoluteString,
+      recentServers: offeredServers
+    )
+  }
+
+  // swift-format-ignore
   static func nativeBridgeScript(
     currentOrigin: String,
     recentServers: [String]
@@ -330,6 +350,7 @@ struct OmnigentWebView: UIViewRepresentable {
     UIGestureRecognizerDelegate
   {
     var parent: OmnigentWebView
+    var bridgeScriptSource: String?
     private weak var webView: WKWebView?
     /// The server this web view is pinned to; nil before the first load. Doubles as
     /// the identity `updateUIView` compares against, so a re-render only reloads
