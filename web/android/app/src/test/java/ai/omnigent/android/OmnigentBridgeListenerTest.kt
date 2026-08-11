@@ -8,6 +8,7 @@ import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -25,6 +26,7 @@ class OmnigentBridgeListenerTest {
     private lateinit var context: Application
     private lateinit var listener: OmnigentBridgeListener
     private lateinit var shadow: ShadowNotificationManager
+    private val serverSwitcherHiddenChanges = mutableListOf<Boolean>()
 
     private val badgeId = 1
 
@@ -36,6 +38,7 @@ class OmnigentBridgeListenerTest {
             OmnigentBridgeListener(
                 notifications = NativeNotificationManager(context),
                 blobSaver = BlobSaver(context),
+                onServerSwitcherHidden = serverSwitcherHiddenChanges::add,
             )
         shadow =
             shadowOf(
@@ -123,6 +126,24 @@ class OmnigentBridgeListenerTest {
     fun `notify without a title is dropped`() {
         listener.handle("""{"method":"notify","params":{"body":"b"}}""")
         assertEquals(0, shadow.allNotifications.size)
+    }
+
+    @Test
+    fun `setServerSwitcherHidden hides and shows the native switcher`() {
+        listener.handle("""{"method":"setServerSwitcherHidden","hidden":true}""")
+        listener.handle("""{"method":"setServerSwitcherHidden","hidden":false}""")
+
+        assertEquals(listOf(true, false), serverSwitcherHiddenChanges)
+    }
+
+    @Test
+    fun `setServerSwitcherHidden ignores malformed payloads`() {
+        listener.handle("""{"method":"setServerSwitcherHidden"}""")
+        listener.handle("""{"method":"setServerSwitcherHidden","hidden":"true"}""")
+        listener.handle("""{"method":"setServerSwitcherHidden","hidden":1}""")
+        listener.handle("""{"method":"setServerSwitcherHidden","hidden":null}""")
+
+        assertTrue(serverSwitcherHiddenChanges.isEmpty())
     }
 
     @Test

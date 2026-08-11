@@ -4,8 +4,11 @@ import WebKit
 
 struct OmnigentWebView: UIViewRepresentable {
   let initialURL: URL
+  let offeredServers: [String]
   @ObservedObject var model: WebViewModel
   @ObservedObject var settings: SettingsStore
+  let switchToServer: (URL) -> Void
+  let connectToNewServer: () -> Void
   let loadFailed: (URL, String) -> Void
   let loadSucceeded: () -> Void
 
@@ -18,7 +21,10 @@ struct OmnigentWebView: UIViewRepresentable {
     contentController.add(context.coordinator, name: "omnigentNative")
     contentController.addUserScript(
       WKUserScript(
-        source: Self.nativeBridgeScript,
+        source: Self.nativeBridgeScript(
+          currentOrigin: initialURL.omnigentOrigin ?? initialURL.absoluteString,
+          recentServers: offeredServers
+        ),
         injectionTime: .atDocumentStart,
         forMainFrameOnly: true
       )
@@ -78,7 +84,13 @@ struct OmnigentWebView: UIViewRepresentable {
     coordinator.detach()
   }
 
-  private static let nativeBridgeScript = """
+  static func nativeBridgeScript(
+    currentOrigin: String,
+    recentServers: [String]
+  ) -> String {
+    let recentsLiteral =
+      recentServers.map(WebViewModel.javascriptString).joined(separator: ", ")
+    return """
     (() => {
       if (window.omnigentNative && window.omnigentNative.kind === "ios") return;
       const ensureViewportFit = () => {
@@ -153,6 +165,8 @@ struct OmnigentWebView: UIViewRepresentable {
       const callbacks = new Set();
       const openPathCallbacks = new Set();
       const viewModeCallbacks = new Set();
+      const pickerCurrentOrigin = \(WebViewModel.javascriptString(currentOrigin));
+      const pickerRecentServers = [\(recentsLiteral)];
       const defineEmit = (name, fn) => {
         Object.defineProperty(window, name, {
           configurable: false,
@@ -285,9 +299,31 @@ struct OmnigentWebView: UIViewRepresentable {
           if (lastInsets) { try { callback(lastInsets); } catch {} }
           return () => insetCallbacks.delete(callback);
         },
+        getServerPicker() {
+          return Promise.resolve({
+            currentOrigin: pickerCurrentOrigin,
+            recentServers: [...pickerRecentServers],
+          });
+        },
+        switchServer(url) {
+          if (typeof url !== "string" || !pickerRecentServers.includes(url)) {
+            return Promise.reject(new Error("switchServer target must be an offered server"));
+          }
+          window.webkit.messageHandlers.omnigentNative.postMessage({
+            method: "switchServer",
+            url,
+          });
+          return Promise.resolve();
+        },
+        openServerSetup() {
+          window.webkit.messageHandlers.omnigentNative.postMessage({
+            method: "openServerSetup",
+          });
+        },
       });
     })();
     """
+  }
 
   @MainActor
   final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler,
@@ -448,6 +484,14 @@ struct OmnigentWebView: UIViewRepresentable {
         parent.model.serverSwitcherHidden = (body["hidden"] as? NSNumber)?.boolValue ?? true
       case "setSidebarOpen":
         parent.model.serverSwitcherHidden = (body["open"] as? NSNumber)?.boolValue ?? true
+      case "switchServer":
+        guard let value = body["url"] as? String,
+          parent.offeredServers.contains(value),
+          let url = URL(string: value)
+        else { return }
+        parent.switchToServer(url)
+      case "openServerSetup":
+        parent.connectToNewServer()
       case "setViewMode":
         let mode: WebViewMode = (body["mode"] as? String) == "terminal" ? .terminal : .chat
         parent.model.viewMode = mode

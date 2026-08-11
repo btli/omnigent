@@ -15,8 +15,16 @@ package ai.omnigent.android
  * `evaluateJavascript` into the `window.__omnigentNativeEmit*` functions here.
  */
 object NativeBridgeScript {
-    val source: String =
-        """
+    val source: String = source(currentOrigin = "", recentServers = emptyList())
+
+    fun source(
+        currentOrigin: String,
+        recentServers: List<String>,
+    ): String {
+        val originLiteral = jsString(currentOrigin)
+        val recentsLiteral =
+            recentServers.joinToString(prefix = "[", postfix = "]") { jsString(it) }
+        return """
         (() => {
           if (window.omnigentNative && window.omnigentNative.kind === "android") return;
 
@@ -88,6 +96,8 @@ object NativeBridgeScript {
               if (bridge) bridge.postMessage(JSON.stringify(payload));
             } catch (_) {}
           };
+          const pickerCurrentOrigin = $originLiteral;
+          const pickerRecentServers = $recentsLiteral;
 
           const notificationCallbacks = new Set();
           // An activation is a fire-once event, but the native side may emit it
@@ -250,7 +260,27 @@ object NativeBridgeScript {
               if (lastInsets) { try { callback(lastInsets); } catch (_) {} }
               return () => insetCallbacks.delete(callback);
             },
+            setServerSwitcherHidden(hidden) {
+              post({ method: "setServerSwitcherHidden", hidden: hidden === true });
+            },
+            getServerPicker() {
+              return Promise.resolve({
+                currentOrigin: pickerCurrentOrigin,
+                recentServers: [...pickerRecentServers],
+              });
+            },
+            switchServer(url) {
+              if (typeof url !== "string" || !pickerRecentServers.includes(url)) {
+                return Promise.reject(new Error("switchServer target must be an offered server"));
+              }
+              post({ method: "switchServer", url });
+              return Promise.resolve();
+            },
+            openServerSetup() {
+              post({ method: "openServerSetup" });
+            },
           });
         })();
         """.trimIndent()
+    }
 }

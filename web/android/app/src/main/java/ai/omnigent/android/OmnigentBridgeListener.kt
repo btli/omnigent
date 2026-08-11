@@ -23,6 +23,9 @@ import org.json.JSONObject
 class OmnigentBridgeListener(
     private val notifications: NativeNotificationManager,
     private val blobSaver: BlobSaver,
+    private val onServerSwitcherHidden: (Boolean) -> Unit = {},
+    private val onSwitchServer: (String) -> Unit = {},
+    private val onOpenServerSetup: () -> Unit = {},
 ) : WebViewCompat.WebMessageListener {
     override fun onPostMessage(
         view: WebView,
@@ -86,6 +89,18 @@ class OmnigentBridgeListener(
                     navigatePath = params.optString("navigatePath").ifEmpty { null },
                 )
             }
+
+            "setServerSwitcherHidden" -> {
+                val hidden = json.opt("hidden") as? Boolean ?: return
+                onServerSwitcherHidden(hidden)
+            }
+
+            "switchServer" -> {
+                val url = json.optString("url").ifEmpty { return }
+                onSwitchServer(url)
+            }
+
+            "openServerSetup" -> onOpenServerSetup()
 
             "blobBase64" -> {
                 blobSaver.save(

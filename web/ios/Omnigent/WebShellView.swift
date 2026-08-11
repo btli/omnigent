@@ -20,11 +20,18 @@ struct WebShellView: View {
 
   var body: some View {
     GeometryReader { geometry in
+      let offeredServers = ManagedServers.merged(
+        managed: managedConfiguration.serverURLs,
+        recents: settings.recentServers
+      )
       ZStack(alignment: .top) {
         OmnigentWebView(
           initialURL: initialURL,
+          offeredServers: offeredServers,
           model: model,
           settings: settings,
+          switchToServer: switchToServer,
+          connectToNewServer: connectToNewServer,
           loadFailed: loadFailed,
           loadSucceeded: loadSucceeded
         )
@@ -32,8 +39,7 @@ struct WebShellView: View {
 
         ServerSwitcher(
           currentURL: model.currentURL ?? initialURL,
-          recents: ManagedServers.merged(
-            managed: managedConfiguration.serverURLs, recents: settings.recentServers),
+          recents: offeredServers,
           isLoading: model.isLoading,
           maxWidth: ServerSwitcherMetrics.maxWidth(for: geometry.size.width),
           switchServer: switchServer,

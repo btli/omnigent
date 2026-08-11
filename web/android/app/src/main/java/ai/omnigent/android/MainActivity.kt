@@ -62,9 +62,8 @@ class MainActivity : AppCompatActivity() {
     private var loginAttempts = 0 // capped browser-login retries; reset in onPageReady
     private var historyCleared = false // drop pre-auth/login-redirect history once
 
-    // Floating server switcher — mirrors the iOS `ServerSwitcher`. Always
-    // visible so it's always available as a recovery path (backward compatible
-    // with older web builds). Theme-aware via brand colors (light/dark XML).
+    // Floating server switcher — mirrors the iOS `ServerSwitcher`. Visible by
+    // default for older web builds; bridge-aware pages may hide it.
     private lateinit var switchButton: View
 
     // WebChromeClient affordances that need Activity-scoped result launchers.
@@ -144,6 +143,7 @@ class MainActivity : AppCompatActivity() {
                         },
                         onPageReady = ::onPageReady,
                         onLoginRequired = ::startLogin,
+                        bridgeScriptSource = ::nativeBridgeScriptSource,
                     )
                 webChromeClient =
                     OmnigentWebChromeClient(
@@ -308,6 +308,11 @@ class MainActivity : AppCompatActivity() {
                 OmnigentBridgeListener(
                     notifications = notifications,
                     blobSaver = blobSaver,
+                    onServerSwitcherHidden = { hidden ->
+                        switchButton.visibility = if (hidden) View.GONE else View.VISIBLE
+                    },
+                    onSwitchServer = ::switchServerFromBridge,
+                    onOpenServerSetup = ::openServerSetupFromBridge,
                 ),
             )
         } catch (_: IllegalArgumentException) {
@@ -320,13 +325,33 @@ class MainActivity : AppCompatActivity() {
                 bridgeScriptHandler =
                     WebViewCompat.addDocumentStartJavaScript(
                         webView,
-                        NativeBridgeScript.source,
+                        nativeBridgeScriptSource(),
                         setOf(origin),
                     )
             } catch (_: IllegalArgumentException) {
                 // Keep the transport; onPageFinished will inject the facade instead.
             }
         }
+    }
+
+    private fun nativeBridgeScriptSource(): String {
+        val store = ServerStore(this)
+        return NativeBridgeScript.source(
+            currentOrigin = pinnedOrigin.orEmpty(),
+            recentServers = store.offeredServers(),
+        )
+    }
+
+    private fun switchServerFromBridge(url: String) {
+        val store = ServerStore(this)
+        if (url !in store.offeredServers()) return
+        val newOrigin = originOf(url) ?: return
+        store.connect(url)
+        reloadWithNewServer(url, newOrigin)
+    }
+
+    private fun openServerSetupFromBridge() {
+        startActivity(Intent(this, ConnectActivity::class.java))
     }
 
     private fun applySystemBarContrast() {
