@@ -194,6 +194,14 @@
     env(safe-area-inset-bottom, 0px),
     var(--omnigent-android-safe-area-bottom, 0px)
   );
+  --omnigent-safe-left: max(
+    env(safe-area-inset-left, 0px),
+    var(--omnigent-android-safe-area-left, 0px)
+  );
+  --omnigent-safe-right: max(
+    env(safe-area-inset-right, 0px),
+    var(--omnigent-android-safe-area-right, 0px)
+  );
   --omnigent-native-top-bar: 0px; /* set by native bridge (px) */
   --omnigent-native-bottom-bar: 0px; /* set by native bridge (px) */
   --omnigent-top-bar-visible: 0; /* web-owned 0|1 */
@@ -889,19 +897,36 @@ aside[aria-label="Workspace"][data-maximized] {
     height: var(--omnigent-inset-bottom);
     flex: none;
   }
+}
 
-  :is([data-ios-native], [data-android-native])
-    :is(
-      .conversations-sidebar,
-      [data-testid="file-viewer"],
-      [data-testid="files-panel-drawer"],
-      [data-testid="terminals-panel"],
-      [data-testid="subagents-panel-drawer"],
-      [data-testid="todos-panel-drawer"]
-    ) {
-    padding-top: var(--omnigent-safe-top);
-    padding-bottom: var(--omnigent-safe-bottom);
-  }
+/* Full-height native surfaces — the Workspace rail (md+ only), the sidebar,
+ * push panels (full-screen overlays below md, docked edge panels above), and
+ * rail-tab drawers (md:hidden) — touch screen edges at every width, so one
+ * ungated rule folds the OS safe area into all four padding edges. Physical
+ * (not logical) edges keep RTL correct; on the content-facing edge the padding
+ * costs a few px only on display-cutout devices. iOS is included at md+ too:
+ * the shell WebView is edge-to-edge there as well.
+ * :not([data-collapsed]): closed panels stay mounted at w-0, and with
+ * border-box sizing lateral padding would give them real width — cutout-sized
+ * gaps in the layout.
+ * :not(aside[aria-label="Workspace"] *): panels docked inside the
+ * already-padded rail would double the inset. */
+:is([data-ios-native], [data-android-native])
+  :is(
+    aside[aria-label="Workspace"],
+    .conversations-sidebar,
+    [data-testid="execution-logs-panel"],
+    [data-testid="file-viewer"],
+    [data-testid="files-panel-drawer"],
+    [data-testid="terminals-panel"],
+    [data-testid="subagents-panel-drawer"],
+    [data-testid="todos-panel-drawer"],
+    [data-testid="shells-panel-drawer"]
+  ):not(aside[aria-label="Workspace"] *):not([data-collapsed]) {
+  padding-top: var(--omnigent-safe-top);
+  padding-bottom: var(--omnigent-safe-bottom);
+  padding-left: var(--omnigent-safe-left);
+  padding-right: var(--omnigent-safe-right);
 }
 
 @media (width < 48rem) and (prefers-reduced-motion: reduce) {
