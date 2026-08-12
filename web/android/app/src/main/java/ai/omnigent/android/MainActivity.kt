@@ -667,6 +667,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun emitInsets() {
+        // lastInsets unions systemBars() with displayCutout() (per-edge max — see
+        // systemSafeAreaInsets), so a landscape cutout reaches the left/right
+        // vars; any cutout share of top/bottom also widens the existing
+        // chat-surface padding on cutout devices.
         // Feed the OS safe area into the web layer two ways, because the shell
         // pins to a user-supplied server whose web build may PRE-DATE the Android
         // shell's CSS — it can't be assumed to carry the `[data-android-native]`
