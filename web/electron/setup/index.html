@@ -567,10 +567,11 @@
         }
         button.disabled = true;
         try {
-          // setServerUrl persists the URL and navigates this window to it —
-          // after which the server's SPA takes over the window. Connecting this
-          // machine as a runner is done later from the host menu, not here.
-          await setup.setServerUrl(value);
+          // setServerUrl authenticates, then persists the URL and navigates this
+          // window to it. Connecting this machine as a runner is done later from
+          // the host menu, not here.
+          const result = await setup.setServerUrl(value);
+          if (result && result.loaded === false) button.disabled = false;
         } catch (e) {
           err.textContent = String(e && e.message ? e.message : e);
           button.disabled = false;
@@ -587,7 +588,8 @@
       // connects this window to it through the normal flow. It
       // needs the local omnigent CLI, so we detect the CLI on load and, when
       // it's missing, show install instructions plus a way to point at the
-      // binary. Remote Connect never depends on the CLI.
+      // binary. Remote sign-in uses the system browser in-process and does not
+      // require the local CLI.
       const startLocalBtn = document.getElementById("start-local");
       const localSection = document.getElementById("local-section");
       const cliGear = document.getElementById("cli-gear");
@@ -714,10 +716,11 @@
               // window loads the server and this page goes away. Connecting this
               // machine as a runner is done later from the host menu.
               input.value = result.url;
-              await setup.setServerUrl(result.url);
-              return;
+              const loadResult = await setup.setServerUrl(result.url);
+              if (loadResult?.loaded === true) return;
+            } else {
+              err.textContent = (result && result.error) || "Could not start the local server.";
             }
-            err.textContent = (result && result.error) || "Could not start the local server.";
           } catch (e) {
             err.textContent = String(e && e.message ? e.message : e);
           }

@@ -15,6 +15,7 @@ const {
   parseLocalServerPidfile,
   candidatePaths,
   resolveCliPath,
+  serverAuthEntry,
   parseJsonLoose,
   matchesServer,
   parseDaemonRecord,
@@ -35,6 +36,48 @@ describe("normalizeServerUrl", () => {
     assert.equal(normalizeServerUrl(undefined), "");
     assert.equal(normalizeServerUrl(null), "");
     assert.equal(normalizeServerUrl(42), "");
+  });
+});
+
+describe("serverAuthEntry", () => {
+  afterEach(() => mock.restoreAll());
+
+  it("returns a non-expired OIDC token entry", () => {
+    mock.method(fs, "readFileSync", () =>
+      JSON.stringify({
+        "https://server.example": {
+          token: "session-jwt",
+          user_id: "user@example.com",
+          expires_at: 200,
+        },
+      }),
+    );
+
+    assert.deepEqual(serverAuthEntry("https://server.example/", { nowSeconds: 100 }), {
+      token: "session-jwt",
+      user_id: "user@example.com",
+      expires_at: 200,
+    });
+  });
+
+  it("rejects an expired token entry", () => {
+    mock.method(fs, "readFileSync", () =>
+      JSON.stringify({
+        "https://server.example": { token: "expired", expires_at: 99 },
+      }),
+    );
+
+    assert.equal(serverAuthEntry("https://server.example", { nowSeconds: 100 }), null);
+  });
+
+  it("keeps the existing Databricks pointer shape valid", () => {
+    const entry = {
+      auth_type: "databricks",
+      workspace_host: "https://workspace.example",
+    };
+    mock.method(fs, "readFileSync", () => JSON.stringify({ "https://app.example": entry }));
+
+    assert.deepEqual(serverAuthEntry("https://app.example", { nowSeconds: 100 }), entry);
   });
 });
 
