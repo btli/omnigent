@@ -160,12 +160,13 @@ describe("index.css app-shell viewport lock", () => {
  * Workspace rail, the conversations sidebar, and every push panel / rail-tab
  * drawer. The assertions below apply it verbatim — no media stripping, which
  * is what made the earlier phone-width-gated assertions vacuous. */
-const nativePanelRule =
-  cssBlocks.find(
-    ([block]) =>
-      block.includes('[data-testid="execution-logs-panel"]') &&
-      block.includes("--omnigent-safe-top"),
-  )?.[0] ?? "";
+// Every block carrying panel testids + the safe-area fold (a single rule
+// today). Matching ALL blocks, not the first, so if the rule is ever split
+// no trailing block's panels silently escape the assertions below.
+const nativePanelBlocks = cssBlocks
+  .filter(([block]) => block.includes('data-testid="') && block.includes("--omnigent-safe-top"))
+  .map((match) => ({ block: match[0], index: match.index! }));
+const nativePanelRule = nativePanelBlocks.map(({ block }) => block).join("\n");
 const rootSafeAreaRule =
   cssBlocks.find(
     ([block]) => block.includes(":root") && block.includes("--omnigent-safe-top"),
@@ -176,16 +177,33 @@ const nativeInsetMatch = nativeBridgeSource.match(
 );
 const nativeInsetCss = trimIndent(nativeInsetMatch?.[1] ?? "");
 
-/* Panel testids DERIVED from the index.css rule (never hand-maintained), so
- * the stub coverage tracks the rule, and the superset check below fails when
- * a panel lands in index.css without the Android injected sheet — such a
- * panel would lose its inset on pre-shell servers. */
+/* Panel testids DERIVED from the index.css rule, so the stub coverage tracks
+ * the rule, and the css→kotlin superset check below fails when a panel lands
+ * in index.css without the Android injected sheet — such a panel would lose
+ * its inset on pre-shell servers. Derivation alone can't catch deletion,
+ * though: dropping a testid from BOTH stylesheets shrinks both lists
+ * together and stays green, so REQUIRED_PANEL_TEST_IDS anchors the rule to
+ * an independent, hand-maintained expectation. */
 const cssPanelTestIds = [...nativePanelRule.matchAll(/data-testid="([^"]+)"/g)]
   .map((match) => match[1])
   .sort();
 const kotlinPanelTestIds = [...nativeInsetCss.matchAll(/data-testid="([^"]+)"/g)]
   .map((match) => match[1])
   .sort();
+
+/* Panels that MUST carry the safe-area fold (sorted). The drift guards below
+ * compare both stylesheets against this list, so deleting a testid from the
+ * unified rule fails even if the Kotlin sheet is edited to match. Update it
+ * when a panel deliberately joins or leaves the rule. */
+const REQUIRED_PANEL_TEST_IDS = [
+  "execution-logs-panel",
+  "file-viewer",
+  "files-panel-drawer",
+  "shells-panel-drawer",
+  "subagents-panel-drawer",
+  "terminals-panel",
+  "todos-panel-drawer",
+];
 
 function trimIndent(value: string): string {
   const lines = value
@@ -273,6 +291,27 @@ describe("index.css native safe-area layout", () => {
     expect(cssPanelTestIds.length).toBeGreaterThan(0);
   });
 
+  it("keeps every required panel testid in the index.css rule", () => {
+    // Independent of the Kotlin sheet: deleting a testid from BOTH
+    // stylesheets shrinks the derived lists together, so only this
+    // checked-in expectation still fails on that edit.
+    expect(cssPanelTestIds).toEqual(expect.arrayContaining(REQUIRED_PANEL_TEST_IDS));
+  });
+
+  it("keeps the unified rule at stylesheet top level, outside any at-rule", () => {
+    // cssBlocks matches innermost blocks, so re-wrapping the rule in
+    // e.g. @media (width < 48rem) would leave every other assertion here
+    // green while silently dropping the md+ coverage this change exists
+    // for. Brace depth must be 0 where each matching block starts.
+    expect(nativePanelBlocks.length).toBeGreaterThan(0);
+    for (const { index } of nativePanelBlocks) {
+      const before = cssSource.slice(0, index);
+      const opens = (before.match(/\{/g) ?? []).length;
+      const closes = (before.match(/\}/g) ?? []).length;
+      expect(opens - closes, "the unified rule must not sit inside an at-rule").toBe(0);
+    }
+  });
+
   it.each(["android", "ios"] as const)(
     "computes four-edge padding on the rail, sidebar, and every panel in the %s shell",
     (platform) => assertNativePanelPadding(nativePanelRule, platform),
@@ -331,6 +370,37 @@ describe("index.css native safe-area layout", () => {
     });
   });
 
+  it("leaves the peeking sidebar unpadded — the card floats clear of every bar", () => {
+    withStyle(nativePanelRule, () => {
+      const shell = document.createElement("div");
+      shell.setAttribute("data-android-native", "");
+      const sidebar = document.createElement("div");
+      sidebar.className = "conversations-sidebar is-peek";
+      shell.appendChild(sidebar);
+      document.body.appendChild(shell);
+      try {
+        // Peek is a floating card inset 8px off every screen edge (md:absolute
+        // md:inset-2 p-0); it touches neither bar, and effectiveOpen is true
+        // so no data-collapsed saves it — an unguarded rule would override
+        // the card's p-0 with cutout-sized padding.
+        const computed = getComputedStyle(sidebar);
+        expect(computed.paddingTop).toBe("0");
+        expect(computed.paddingBottom).toBe("0");
+        expect(computed.paddingLeft).toBe("0");
+        expect(computed.paddingRight).toBe("0");
+      } finally {
+        shell.remove();
+      }
+    });
+  });
+
+  it("keeps the is-peek marker on the sidebar component", () => {
+    // The CSS guard keys on .is-peek; this pins the class the real component
+    // sets while peeking, so a rename can't silently re-pad the card.
+    const source = readFileSync("src/shell/Sidebar.tsx", "utf8");
+    expect(source).toMatch(/peek\s*&&\s*"is-peek /);
+  });
+
   it("does not double-count app-owned bar footprints", () => {
     expect(nativePanelRule).not.toMatch(/--omnigent-(?:inset|native)-/);
   });
@@ -339,12 +409,25 @@ describe("index.css native safe-area layout", () => {
     // The sheet covers servers whose web build predates the Android shell: a
     // panel in index.css but missing there loses its inset on those servers.
     // The reverse drift (sheet-only) is harmless extra coverage on old builds.
-    expect(nativeInsetCss).toContain('aside[aria-label="Workspace"]');
-    expect(nativeInsetCss).toContain(".conversations-sidebar");
+    // Structural selectors are DERIVED from the index.css rule so the sheet is
+    // checked against whatever the rule actually says; the rule itself is
+    // anchored by the DOM padding assertions and the required-testid list.
+    const structuralSelectors = [
+      ...new Set(
+        [...nativePanelRule.matchAll(/aside\[aria-label="[^"]+"\]|\.conversations-sidebar/g)].map(
+          (match) => match[0],
+        ),
+      ),
+    ];
+    expect(structuralSelectors.length).toBeGreaterThanOrEqual(2);
+    for (const selector of structuralSelectors) {
+      expect(nativeInsetCss).toContain(selector);
+    }
     expect(kotlinPanelTestIds).toEqual(expect.arrayContaining(cssPanelTestIds));
     // The sheet carries the same guards, or old servers inherit the defects
     // those guards fix.
     expect(nativeInsetCss).toContain(":not([data-collapsed])");
+    expect(nativeInsetCss).toContain(":not(.is-peek)");
     expect(nativeInsetCss).toContain(':not(aside[aria-label="Workspace"] *)');
   });
 });
@@ -377,6 +460,23 @@ describe("Android injected safe-area layout", () => {
         expect(computed.paddingLeft).toBe("0");
       } finally {
         panel.remove();
+      }
+    });
+  });
+
+  it("leaves the peeking sidebar unpadded in the injected sheet too", () => {
+    withStyle(nativeInsetCss, () => {
+      const sidebar = document.createElement("div");
+      sidebar.className = "conversations-sidebar is-peek";
+      document.body.appendChild(sidebar);
+      try {
+        // Old server builds get the same floating-card treatment; the sheet
+        // must not pad it either.
+        const computed = getComputedStyle(sidebar);
+        expect(computed.paddingTop).toBe("0");
+        expect(computed.paddingLeft).toBe("0");
+      } finally {
+        sidebar.remove();
       }
     });
   });
