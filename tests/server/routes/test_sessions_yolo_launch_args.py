@@ -1,13 +1,14 @@
 """Unit tests for native-worker YOLO ``terminal_launch_args`` derivation.
 
 Nessie's native sub-agent workers (claude-native / codex-native /
-cursor-native) launch in a headless pane where no human can answer an
-approval prompt. The server translates a worker's bypass stance into the
-per-session ``terminal_launch_args`` the runner appends to the native
-CLI argv: claude-native opts in via ``permission_mode``, while
-codex-native and cursor-native default to full bypass (issue #171 /
-cursor ``--yolo``) because the headless seam has no safe non-bypass
-default, with ``yolo: false`` as the opt-out.
+cursor-native / kimi-native / antigravity-native) launch in a headless
+pane where no human can answer an approval prompt. The server translates
+a worker's bypass stance into the per-session ``terminal_launch_args``
+the runner appends to the native CLI argv: claude-native and
+antigravity-native opt in via ``permission_mode``, kimi-native opts in
+via ``yolo: true``, while codex-native and cursor-native default to full
+bypass (issue #171 / cursor ``--yolo``) because the headless seam has no
+safe non-bypass default, with ``yolo: false`` as the opt-out.
 
 These tests exercise the pure translation helper
 ``_derive_terminal_launch_args_from_spec`` directly with real
@@ -200,20 +201,6 @@ def test_non_native_harness_with_bypass_fields_is_ignored(harness: str) -> None:
     assert _derive_terminal_launch_args_from_spec(spec) is None
 
 
-def test_kimi_native_yolo_true_translates_to_yolo_flag() -> None:
-    """
-    kimi-native + ``yolo: true`` (string ``"True"``) -> ``["--yolo"]``.
-
-    kimi's ``--yolo`` auto-approves regular tool calls, the same stance as
-    cursor's ``--yolo`` / codex's bypass (``--auto`` full autonomy is
-    deliberately NOT mapped). A failure means a YOLO kimi worker launches
-    with no flag and parks every risky tool call on a web approval card no
-    headless pane can answer.
-    """
-    spec = _spec_with_config({"harness": "kimi-native", "yolo": "True"})
-    assert _derive_terminal_launch_args_from_spec(spec) == ["--yolo"]
-
-
 def test_kimi_native_without_yolo_field_returns_none() -> None:
     """
     kimi-native bypass is opt-IN: an absent ``yolo`` leaves args unset.
@@ -226,29 +213,19 @@ def test_kimi_native_without_yolo_field_returns_none() -> None:
     assert _derive_terminal_launch_args_from_spec(spec) is None
 
 
-def test_kimi_native_yolo_false_returns_none() -> None:
-    """``yolo: false`` (string ``"False"``) must not read as enabled.
-
-    Guards the ``bool("False") is True`` trap on the parser's stringified
-    value.
-    """
-    spec = _spec_with_config({"harness": "kimi-native", "yolo": "False"})
-    assert _derive_terminal_launch_args_from_spec(spec) is None
-
-
 @pytest.mark.parametrize(
     ("yolo", "expected"),
     [
         # Accepted spellings: real bool (programmatic spec) + the parser's
-        # stringified form, case/whitespace-insensitive (mirrors
-        # _spec_config_flag_explicitly_disabled).
+        # stringified form, case-insensitive with no whitespace tolerance.
         (True, ["--yolo"]),
         ("True", ["--yolo"]),
         ("true", ["--yolo"]),
-        (" TRUE ", ["--yolo"]),
-        # Rejected: bool False, the parser's "False", and truthy-LOOKING
-        # spellings that are NOT part of the contract — they must silently
-        # (debug-logged) leave args unset rather than half-enable bypass.
+        # Rejected: padded strings, bool False, the parser's "False", and
+        # truthy-LOOKING spellings that are NOT part of the contract — they
+        # must silently (debug-logged) leave args unset rather than
+        # half-enable bypass.
+        (" TRUE ", None),
         (False, None),
         ("False", None),
         ("1", None),
@@ -261,11 +238,14 @@ def test_kimi_native_yolo_spelling_boundary(yolo: object, expected: list[str] | 
     """
     Pin the accepted-vs-rejected spelling boundary for the kimi opt-in.
 
-    Only a real bool ``True`` or a case-insensitive ``"true"`` string
-    enables ``--yolo``; every other present value (including YAML-1.1-style
-    ``yes``/``on`` and numeric ``1``) leaves launch args unset. A failure
-    here means the opt-in boundary drifted — either silently enabling
-    bypass for a spelling the contract rejects, or dropping one it accepts.
+    Only a real bool ``True`` or a case-insensitive, unpadded ``"true"``
+    string enables ``--yolo`` (kimi's auto-approve-tools flag — ``--auto``
+    full autonomy is deliberately NOT mapped); every other present value
+    (including YAML-1.1-style ``yes``/``on`` and numeric ``1``) leaves
+    launch args unset. A failure here means the opt-in boundary drifted —
+    either silently enabling bypass for a spelling the contract rejects, or
+    dropping one it accepts and parking a YOLO kimi worker on approval
+    cards no headless pane can answer.
     """
     spec = _spec_with_config({"harness": "kimi-native", "yolo": yolo})
     assert _derive_terminal_launch_args_from_spec(spec) == expected
@@ -274,11 +254,11 @@ def test_kimi_native_yolo_spelling_boundary(yolo: object, expected: list[str] | 
 @pytest.mark.parametrize(
     ("mode", "expected"),
     [
-        # permission_mode is matched exactly (modulo surrounding
-        # whitespace), mirroring the runner's should_skip_permissions
-        # comparison and claude-native's verbatim pass-through.
+        # permission_mode is matched exactly (no whitespace tolerance),
+        # mirroring the runner's should_skip_permissions comparison and
+        # claude-native's verbatim pass-through.
         ("bypassPermissions", ["--dangerously-skip-permissions"]),
-        (" bypassPermissions ", ["--dangerously-skip-permissions"]),
+        (" bypassPermissions ", None),
         ("bypasspermissions", None),
         ("BYPASSPERMISSIONS", None),
         ("acceptEdits", None),
@@ -289,33 +269,16 @@ def test_antigravity_native_mode_spelling_boundary(mode: str, expected: list[str
     """
     Pin exact-match semantics for the agy ``permission_mode`` opt-in.
 
-    A wrong-case spelling must NOT enable the all-or-nothing bypass flag:
-    the runner's own ``should_skip_permissions`` compares the mode exactly,
-    so a lenient server-side match would create a mode string that bypasses
-    here but prompts on other agy paths.
+    ``--dangerously-skip-permissions`` is agy's only pre-emptive permission
+    control, so ``bypassPermissions`` is the only mode that maps to a flag —
+    non-bypass modes (``acceptEdits``, ...) have no agy analogue and must
+    leave args unset. A wrong-case or padded spelling must NOT enable the
+    flag either: the runner's own ``should_skip_permissions`` compares the
+    mode exactly, so a lenient server-side match would create a mode string
+    that bypasses here but prompts on other agy paths.
     """
     spec = _spec_with_config({"harness": "antigravity-native", "permission_mode": mode})
     assert _derive_terminal_launch_args_from_spec(spec) == expected
-
-
-def test_antigravity_native_bypass_permission_mode_translates_to_flag() -> None:
-    """
-    antigravity-native + ``permission_mode: bypassPermissions`` ->
-    ``["--dangerously-skip-permissions"]``.
-
-    agy's only pre-emptive permission control is this all-or-nothing flag;
-    the runner-side spawn path appends the persisted
-    ``terminal_launch_args`` verbatim to the agy argv (build_agy_launch's
-    ``extra_args``), so this derived value is what reaches the CLI. A
-    failure means a bypass-declared agy worker still prompts per tool and
-    stalls headless.
-    """
-    spec = _spec_with_config(
-        {"harness": "antigravity-native", "permission_mode": "bypassPermissions"}
-    )
-    assert _derive_terminal_launch_args_from_spec(spec) == [
-        "--dangerously-skip-permissions",
-    ]
 
 
 def test_antigravity_native_without_permission_mode_returns_none() -> None:
@@ -324,13 +287,20 @@ def test_antigravity_native_without_permission_mode_returns_none() -> None:
     assert _derive_terminal_launch_args_from_spec(spec) is None
 
 
-def test_antigravity_native_non_bypass_mode_returns_none() -> None:
+def test_antigravity_native_non_string_mode_is_fail_closed() -> None:
     """
-    A non-bypass ``permission_mode`` maps to nothing for agy.
+    A non-string ``permission_mode`` must never enable the bypass flag.
 
-    agy has no per-tool / acceptEdits analogue — only the all-or-nothing
-    bypass flag — so any mode other than ``bypassPermissions`` must leave
-    current behavior unchanged rather than emit a wrong flag.
+    ``executor.config`` is ``dict[str, Any]``, so the value can be an
+    arbitrary object — including one whose ``__eq__`` answers True for any
+    comparison. Only a real string match may emit the all-or-nothing flag.
     """
-    spec = _spec_with_config({"harness": "antigravity-native", "permission_mode": "acceptEdits"})
+
+    class _EqAnything:
+        def __eq__(self, other: object) -> bool:
+            return True
+
+        __hash__ = object.__hash__
+
+    spec = _spec_with_config({"harness": "antigravity-native", "permission_mode": _EqAnything()})
     assert _derive_terminal_launch_args_from_spec(spec) is None

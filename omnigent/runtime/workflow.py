@@ -1313,7 +1313,7 @@ def _build_codex_spawn_env(
         agent cache). Threaded through as
         ``HARNESS_CODEX_BUNDLE_DIR`` so the harness wrap's executor
         can also source bundled skills from
-        ``<bundle>/skills/<name>/``.
+        ``<bundle>/skills/<dir>/``.
     :returns: A dict of env-var overrides for
         :meth:`HarnessProcessManager.get_client(env=...)`.
     """
@@ -1385,7 +1385,7 @@ def _build_pi_spawn_env(
     :param workdir: The bundle's on-disk path (extracted by the
         agent cache). Threaded through as ``HARNESS_PI_BUNDLE_DIR``
         so the harness wrap's executor can source bundled skills
-        from ``<bundle>/skills/<name>/``.
+        from ``<bundle>/skills/<dir>/``.
     :returns: A dict of env-var overrides for
         :meth:`HarnessProcessManager.get_client(env=...)`.
     """
@@ -1979,6 +1979,53 @@ def _build_kimi_spawn_env(
     if os_env_payload is not None:
         env["HARNESS_KIMI_OS_ENV"] = os_env_payload
     _apply_harness_path_override(env, "kimi")
+    return env
+
+
+def _build_hermes_spawn_env(
+    spec: AgentSpec,
+    *,
+    cwd: Path | None = None,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """Build the env-var dict the hermes harness wrap reads.
+
+    Maps ``spec.executor`` fields → the ``HARNESS_HERMES_*`` env vars defined
+    in :mod:`omnigent.inner.hermes_harness`. Hermes owns its own file-based
+    auth (``hermes setup`` / ``hermes model``, credentials under its
+    ``HERMES_HOME``), so — like :func:`_build_kimi_spawn_env` — this threads
+    only the model, working directory, skills filter, and ``os_env`` sandbox
+    spec; there is no gateway/provider env surface to configure.
+
+    A hermes session with no spawn env is not inert: the wrap falls back to
+    ``sandbox=none`` and the runner-wide launch directory, so the sandbox and
+    workspace a session selected have to be threaded here to take effect.
+
+    :param spec: The agent spec.
+    :param cwd: Runtime working directory for the hermes subprocess — the
+        session workspace, NOT the agent bundle dir. Threaded as
+        ``HARNESS_HERMES_CWD``; when unset the wrap falls back to
+        ``OMNIGENT_RUNNER_WORKSPACE``.
+    :param workdir: The bundle's on-disk path. Accepted for signature parity
+        with the sibling builders but not threaded: ``HARNESS_HERMES_BUNDLE_DIR``
+        is reserved (there is no ``hermes chat`` flag for it yet), so the wrap
+        would read a value it cannot pass on.
+    :returns: A dict of env-var overrides.
+    """
+    env: dict[str, str] = {}
+    model = _resolve_spec_model(spec)
+    if model is not None:
+        env["HARNESS_HERMES_MODEL"] = model
+    if cwd is not None:
+        env["HARNESS_HERMES_CWD"] = str(cwd)
+    # Always set so the wrap doesn't fall back to "all" and override an
+    # explicit ``skills: none`` from the spec. Hermes turns this into its
+    # ``-s`` / ``--ignore-rules`` argv (see hermes_executor._build_args).
+    env["HARNESS_HERMES_SKILLS_FILTER"] = json.dumps(spec.skills_filter)
+    os_env_payload = _serialize_os_env(spec.os_env)
+    if os_env_payload is not None:
+        env["HARNESS_HERMES_OS_ENV"] = os_env_payload
+    _apply_harness_path_override(env, "hermes")
     return env
 
 

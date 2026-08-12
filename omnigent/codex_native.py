@@ -43,6 +43,7 @@ from omnigent.codex_native_app_server import (
     client_for_transport,
     codex_session_meta_model_provider,
     codex_terminal_env,
+    native_codex_launch_base_url,
     normalize_codex_permission_launch_args,
     preload_codex_thread_for_resume,
     resolve_native_codex_launch,
@@ -252,7 +253,9 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
     try:
         launch = resolve_native_codex_launch(model=None)
         routes_through_provider = (
-            launch.profile is not None or codex_session_meta_model_provider(launch) != "openai"
+            launch.profile is not None
+            or codex_session_meta_model_provider(launch) != "openai"
+            or native_codex_launch_base_url(launch) is not None
         )
     except Exception:  # noqa: BLE001 - readiness must never raise; fail onto auth.json.
         _logger.debug("codex readiness: launch resolve failed; using auth.json", exc_info=True)
@@ -847,6 +850,7 @@ async def _prepare_codex_terminal_via_daemon(
         trust_env=not is_loopback_url(base_url),
     ) as client:
         reattached = session_id is not None
+        fresh_session = session_id is None
         if session_id is None:
             if session_bundle is None:
                 raise click.ClickException("Creating a Codex session requires a session bundle.")
@@ -915,6 +919,7 @@ async def _prepare_codex_terminal_via_daemon(
             host_id=host_id,
             session_id=session_id,
             workspace=workspace,
+            fresh=fresh_session,
         )
         _update_startup_progress(startup_progress, "Waiting for runner...")
         await wait_for_runner_online(client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S)
