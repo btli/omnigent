@@ -23,13 +23,97 @@ const os = require("node:os");
 const { createRequire } = require("node:module");
 const path = require("node:path");
 const vm = require("node:vm");
+const { runInNewContext } = vm;
+
+const { isSetupIdle, withServerLoad } = require("../src/server_load");
 
 const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
 const preloadSource = readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
 const setupSource = readFileSync(path.join(__dirname, "../setup/index.html"), "utf8");
+const startLocalHandlerSource = setupSource.match(
+  /startLocalBtn\.addEventListener\("click",\s*(async \(\) => \{[\s\S]*?\n        \})\);/,
+)?.[1];
 
 // Strip block comments, then line comments (leaving `://` in URLs intact).
 const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
+const oidcSessionCode = liveCode.match(
+  /async function ensureWindowOidcSession[\s\S]*?(?=async function loadAuthenticatedServerUrl)/,
+)?.[0];
+const switchServerCode = liveCode.match(
+  /ipcMain\.handle\("omnigent:switch-server"[\s\S]*?(?=ipcMain\.on\("omnigent:open-server-setup")/,
+)?.[0];
+const openServerSetupCode = liveCode.match(
+  /ipcMain\.on\("omnigent:open-server-setup"[\s\S]*?(?=ipcMain\.on\("omnigent:find-query")/,
+)?.[0];
+const setupServerCode = liveCode.match(
+  /ipcMain\.handle\("omnigent:set-server-url"[\s\S]*?(?=ipcMain\.handle\("omnigent:get-server-url")/,
+)?.[0];
+const createWindowCode = liveCode.match(
+  /function createWindow\(targetUrl, opts = \{\}\)[\s\S]*?(?=const MAX_SPELL_SUGGESTIONS)/,
+)?.[0];
+const oauthPopupCode = liveCode.match(
+  /function hardenOauthPopup\(child\)[\s\S]*?(?=async function showWebAuthnTimeout)/,
+)?.[0];
+const deepLinkHandlerCode = liveCode.match(
+  /async function handleDeepLink\(raw\)[\s\S]*?(?=app\.setName)/,
+)?.[0];
+
+async function runConsentUnknownDeepLink(
+  initialPendingLoads,
+  { closeDuringExpansion = false } = {},
+) {
+  const state = { origin: null, pendingServerLoads: initialPendingLoads, serverUrl: null };
+  let destroyed = false;
+  const parent = {
+    isDestroyed: () => destroyed,
+    webContents: { getURL: () => "file:///setup" },
+  };
+  const windowStates = new Map([[parent, state]]);
+  const parentLoads = [];
+  const created = [];
+  const pendingDuringExpansion = [];
+  const handler = runInNewContext(`${deepLinkHandlerCode}; handleDeepLink`, {
+    BrowserWindow: { getFocusedWindow: () => parent },
+    activeWindow: () => parent,
+    chooseDeepLinkStrategy: () => ({ strategy: "consent-unknown" }),
+    confirmOpenDeepLink: async () => true,
+    console: { log: () => {} },
+    createWindow: (_target, options) => {
+      created.push(options);
+      return {};
+    },
+    expandDatabricksWorkspaceUrl: async () => {
+      pendingDuringExpansion.push(state.pendingServerLoads);
+      if (closeDuringExpansion) {
+        destroyed = true;
+        windowStates.delete(parent);
+      }
+      return "https://unknown.example";
+    },
+    findKnownServerUrl: () => null,
+    focusAndRestore: () => {},
+    isSetupIdle,
+    knownOrigins: () => new Set(),
+    loadServerUrl: async (win) => {
+      parentLoads.push(win);
+      return true;
+    },
+    originOf: (url) => {
+      try {
+        return new URL(url).origin;
+      } catch {
+        return null;
+      }
+    },
+    parseOmnigentDeepLink: () => ({ origin: "https://unknown.example", path: "/c/1" }),
+    rememberServerUrl: () => {},
+    windows: windowStates,
+    withServerLoad,
+  });
+
+  await handler("omnigent://unknown.example/c/1");
+  return { created, parent, parentLoads, pendingDuringExpansion, state };
+}
 
 function loadNavigationHarness({
   serverUrl = "https://host.example/ml/omnigents",
@@ -288,6 +372,31 @@ describe("workspace root bounce wiring (src/main.js)", () => {
   });
 });
 
+describe("setup Start locally", () => {
+  it("restores the button when the connection is not accepted", async () => {
+    assert.ok(startLocalHandlerSource);
+    const startLocalBtn = { disabled: false, textContent: "Start locally" };
+    const err = { textContent: "" };
+    const input = { value: "" };
+    const handler = runInNewContext(`(${startLocalHandlerSource})`, {
+      cliInstalled: true,
+      err,
+      input,
+      setup: {
+        setServerUrl: async () => ({ loaded: false }),
+        startLocalServer: async () => ({ ok: true, url: "http://localhost:8000" }),
+      },
+      startLocalBtn,
+    });
+
+    await handler();
+
+    assert.equal(startLocalBtn.disabled, false);
+    assert.equal(startLocalBtn.textContent, "Start locally");
+    assert.equal(err.textContent, "");
+  });
+});
+
 describe("workspace chrome injection wiring (src/main.js)", () => {
   it("invokes registerWorkspaceChromeHide(win.webContents) as live code", () => {
     assert.match(
@@ -332,6 +441,182 @@ describe("navigation fallback wiring (src/main.js)", () => {
     assert.equal(harness.calls.loadFile.length, 1);
     assert.equal(harness.calls.loadFile[0][0], harness.api.SETUP_PAGE);
     harness.cleanup();
+  });
+});
+
+describe("remote OIDC browser handoff wiring (src/main.js)", () => {
+  it("uses the main-process ticket client without requiring the CLI", () => {
+    assert.ok(oidcSessionCode);
+    assert.match(oidcSessionCode, /runOidcBrowserLogin\(/);
+    assert.match(oidcSessionCode, /onPollError:[\s\S]{0,180}updateMessage\(/);
+    assert.doesNotMatch(oidcSessionCode, /resolvedCliPath|omnigentCli\.loginServer/);
+    assert.doesNotMatch(oidcSessionCode, /storeServerAuthToken|auth_tokens\.json/);
+  });
+
+  it("deduplicates concurrent OIDC flows per shell window", () => {
+    assert.match(liveCode, /const oidcLoginFlows = new WeakMap\(\)/);
+    assert.match(
+      liveCode,
+      /oidcLoginFlows\.get\(win\)[\s\S]{0,180}existingFlow\?\.serverUrl === serverUrl[\s\S]{0,80}existingFlow\.promise/,
+    );
+  });
+
+  it("routes the saved cold-launch destination through loadServerUrl", () => {
+    assert.ok(createWindowCode);
+    assert.match(
+      createWindowCode,
+      /if \(destination\)[\s\S]{0,200}loadInitialDestination\([\s\S]{0,300}loadServerUrl\(win, serverUrl, undefined, destination/,
+    );
+    assert.doesNotMatch(
+      createWindowCode,
+      /if \(destination\)[\s\S]{0,300}win\.loadURL\(destination\)/,
+    );
+  });
+
+  it("commits Setup Connect settings only inside beforeLoad", () => {
+    assert.ok(setupServerCode);
+    assert.match(
+      setupServerCode,
+      /loadServerUrl\(win, target,[\s\S]{0,300}beforeLoad:\s*\(\)\s*=>\s*\{[\s\S]{0,300}settings\.server_url = target/,
+    );
+    const beforeTransaction = setupServerCode.slice(0, setupServerCode.indexOf("loadServerUrl"));
+    assert.doesNotMatch(beforeTransaction, /settings\.server_url = target/);
+  });
+
+  it("blocks deep-link reuse during Setup workspace expansion", async () => {
+    const state = { serverUrl: null };
+    const win = {};
+    const expansion = Promise.withResolvers();
+    const handlerSource = setupServerCode.slice(
+      setupServerCode.indexOf("async"),
+      setupServerCode.lastIndexOf(");"),
+    );
+    const handler = runInNewContext(`(${handlerSource})`, {
+      BrowserWindow: { fromWebContents: () => win },
+      expandDatabricksWorkspaceUrl: () => expansion.promise,
+      isSetupPageSender: () => true,
+      normalizeUrl: (url) => url,
+      windows: new Map([[win, state]]),
+      withServerLoad,
+    });
+
+    const connecting = handler({ sender: {} }, "https://workspace.example");
+    assert.equal(isSetupIdle(state), false);
+    expansion.reject(new Error("stop after expansion"));
+    await assert.rejects(connecting, /stop after expansion/);
+    assert.equal(isSetupIdle(state), true);
+  });
+
+  it("ignores Setup Connect while another load is pending", async () => {
+    const state = { serverUrl: null, pendingServerLoads: 1 };
+    const win = {};
+    let expansionCalled = false;
+    const handlerSource = setupServerCode.slice(
+      setupServerCode.indexOf("async"),
+      setupServerCode.lastIndexOf(");"),
+    );
+    const handler = runInNewContext(`(${handlerSource})`, {
+      BrowserWindow: { fromWebContents: () => win },
+      expandDatabricksWorkspaceUrl: async () => {
+        expansionCalled = true;
+        throw new Error("unexpected expansion");
+      },
+      isSetupPageSender: () => true,
+      normalizeUrl: (url) => url,
+      windows: new Map([[win, state]]),
+      withServerLoad,
+    });
+
+    const result = await handler({ sender: {} }, "https://workspace.example");
+    assert.equal(result.loaded, false);
+    assert.equal(expansionCalled, false);
+    assert.equal(state.pendingServerLoads, 1);
+  });
+
+  it("commits switched-server settings and manifest only inside beforeLoad", () => {
+    assert.ok(switchServerCode);
+    assert.match(
+      switchServerCode,
+      /loadServerUrl\(win, url,[\s\S]{0,300}beforeLoad:\s*\(\)\s*=>\s*\{[\s\S]{0,300}settings\.server_url = url[\s\S]{0,300}setWindowServerManifest\(win, PRE_MANIFEST_BASELINE\)/,
+    );
+    const beforeTransaction = switchServerCode.slice(0, switchServerCode.indexOf("loadServerUrl"));
+    assert.doesNotMatch(beforeTransaction, /settings\.server_url = url|setWindowServerManifest/);
+  });
+
+  it("ignores switch-server while another window load is pending", async () => {
+    const target = "https://other.example";
+    const state = { ephemeral: false, pendingServerLoads: 1 };
+    const win = {};
+    let loadCalls = 0;
+    const handlerSource = switchServerCode.slice(
+      switchServerCode.indexOf("async"),
+      switchServerCode.lastIndexOf(");"),
+    );
+    const handler = runInNewContext(`(${handlerSource})`, {
+      BrowserWindow: { fromWebContents: () => win },
+      isPinnedOriginSender: () => true,
+      loadServerUrl: async () => {
+        loadCalls += 1;
+        return true;
+      },
+      loadSettings: () => ({ recent_servers: [target] }),
+      rememberRecentServer: () => {},
+      saveSettings: () => {},
+      windows: new Map([[win, state]]),
+    });
+
+    await handler({ sender: {} }, target);
+    assert.equal(loadCalls, 0);
+    state.pendingServerLoads = 0;
+    await handler({ sender: {} }, target);
+    assert.equal(loadCalls, 1);
+  });
+
+  it("ignores open-server-setup while another window load is pending", () => {
+    const state = { ephemeral: false, pendingServerLoads: 1 };
+    let loadFileCalls = 0;
+    let pinCalls = 0;
+    const win = { loadFile: () => (loadFileCalls += 1) };
+    const handlerSource = openServerSetupCode.slice(
+      openServerSetupCode.indexOf("(event) =>"),
+      openServerSetupCode.lastIndexOf(");"),
+    );
+    const handler = runInNewContext(`(${handlerSource})`, {
+      BrowserWindow: { fromWebContents: () => win },
+      SETUP_PAGE: "/setup/index.html",
+      isPinnedOriginSender: () => true,
+      pinWindow: () => (pinCalls += 1),
+      setWindowServerUrl: () => {},
+      windows: new Map([[win, state]]),
+    });
+
+    handler({ sender: {} });
+    assert.equal(pinCalls, 0);
+    assert.equal(loadFileCalls, 0);
+    state.pendingServerLoads = 0;
+    handler({ sender: {} });
+    assert.equal(pinCalls, 1);
+    assert.equal(loadFileCalls, 1);
+  });
+
+  it("intercepts live OIDC expiry before the renderer reaches /auth/login", () => {
+    assert.match(
+      liveCode,
+      /registerOidcSessionExpiryHandoff\([\s\S]{0,700}ensureWindowOidcSession\([\s\S]{0,250}loadAuthenticatedServerUrl\(win, expiredServerUrl, undefined, returnUrl\)/,
+    );
+  });
+
+  it("limits the fail-loud WebAuthn guard to main-window fallback authentication", () => {
+    assert.ok(oauthPopupCode);
+    assert.doesNotMatch(oauthPopupCode, /registerWebAuthnTimeout|showWebAuthnTimeout/);
+    assert.match(
+      oidcSessionCode,
+      /setWindowAuthenticationNavigation\(win, true\)[\s\S]{0,220}setWindowAuthenticationNavigation\(win, probe\.kind === "other"\)/,
+    );
+    assert.match(
+      liveCode,
+      /registerWebAuthnTimeout\(win\.webContents,[\s\S]{0,500}isWebAuthnEscapePage\([\s\S]{0,160}authenticationNavigation === true/,
+    );
   });
 });
 
@@ -626,6 +911,36 @@ describe("deep-link ingestion wiring (src/main.js)", () => {
         "handleDeepLink, reopening the pre-consent SSRF. The probe must run only after",
         "confirmOpenDeepLink (in the consent-unknown branch), not before chooseDeepLinkStrategy.",
       ].join(" "),
+    );
+  });
+
+  it("registers consent-unknown expansion as a pending load", async () => {
+    const result = await runConsentUnknownDeepLink(0);
+    assert.deepEqual(result.pendingDuringExpansion, [1]);
+    assert.equal(result.state.pendingServerLoads, 0);
+  });
+
+  it("reuses an idle setup parent but not a busy one", async () => {
+    const idle = await runConsentUnknownDeepLink(0);
+    assert.deepEqual(idle.parentLoads, [idle.parent]);
+    assert.equal(idle.created.length, 0);
+
+    const busy = await runConsentUnknownDeepLink(1);
+    assert.equal(busy.parentLoads.length, 0);
+    assert.equal(busy.created.length, 1);
+    assert.equal(busy.state.pendingServerLoads, 1);
+  });
+
+  it("opens a replacement when the idle parent closes during expansion", async () => {
+    const result = await runConsentUnknownDeepLink(0, { closeDuringExpansion: true });
+    assert.equal(result.created.length, 1);
+    assert.equal(result.parentLoads.length, 0);
+  });
+
+  it("remembers explicit consent even when loading the reused window fails", () => {
+    assert.match(
+      deepLinkHandlerCode,
+      /await loadServerUrl\(parent,[\s\S]{0,100}\.catch\(\(\) => \{\}\);[\s\S]{0,300}rememberServerUrl\(serverUrl\)/,
     );
   });
 });
