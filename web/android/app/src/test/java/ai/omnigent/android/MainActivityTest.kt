@@ -45,6 +45,29 @@ class MainActivityTest {
     }
 
     @Test
+    fun `landscape cutout unions with the system bars per edge`() {
+        // Landscape phone: the gesture nav bar keeps the bottom inset while the
+        // camera cutout eats the left edge — a systemBars()-only source would
+        // report left as 0 and let the rail/drawers slide under the cutout.
+        val bars = Insets.of(0, 24, 0, 16)
+        val cutout = Insets.of(31, 0, 0, 0)
+        val insets =
+            WindowInsetsCompat
+                .Builder()
+                .setInsets(WindowInsetsCompat.Type.systemBars(), bars)
+                .setInsets(WindowInsetsCompat.Type.displayCutout(), cutout)
+                .build()
+
+        val safeArea = systemSafeAreaInsets(insets)
+        assertEquals(Insets.of(31, 24, 0, 16), safeArea)
+
+        val script = androidSafeAreaScript(safeArea, 1f)
+        assertTrue(script.contains("const top = '24.0px'"))
+        assertTrue(script.contains("const bottom = '16.0px'"))
+        assertTrue(script.contains("const left = '31.0px'"))
+    }
+
+    @Test
     fun `webview leaves algorithmic darkening disabled`() {
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
