@@ -1587,7 +1587,7 @@ export function AppShell() {
                 style={
                   {
                     "--workspace-panel-offset": workspacePanelVisible
-                      ? `${inlinePanelWidth}px`
+                      ? `${inlinePanelWidth + 16}px`
                       : "0px",
                   } as CSSProperties
                 }

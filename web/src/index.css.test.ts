@@ -144,28 +144,15 @@ describe("index.css bg-card glass rule selector", () => {
   });
 });
 
-const workspaceAttribute = /\[\s*aria-label\s*=\s*("Workspace"|'Workspace'|Workspace)\s*\]/;
-// Rules that style the rail itself — the docked-panel rule mentions the rail
-// only inside :not(...) (to exempt nested panels), so strip those first.
-const workspaceRules = cssBlocks.filter(([block]) =>
-  workspaceAttribute.test(selectorOf(block).replace(/:not\([^)]*\)/g, "")),
-);
-const dockedPanelRule =
+/* The unified native-panel rule: one ungated :is() list covering the
+ * Workspace rail, the conversations sidebar, and every push panel / rail-tab
+ * drawer. The assertions below apply it verbatim — no media stripping, which
+ * is what made the earlier phone-width-gated assertions vacuous. */
+const nativePanelRule =
   cssBlocks.find(
     ([block]) =>
       block.includes('[data-testid="execution-logs-panel"]') &&
-      block.includes("--omnigent-safe-top") &&
-      block.includes(":not("),
-  )?.[0] ?? "";
-const workspaceSafeAreaRules = workspaceRules.filter(([block]) =>
-  block.includes("--omnigent-safe-top"),
-);
-const workspaceSafeAreaRule = workspaceSafeAreaRules[0]?.[0] ?? "";
-const workspaceSelector = selectorOf(workspaceSafeAreaRule);
-const workspaceCss = workspaceRules.map(([block]) => block).join("\n");
-const fullHeightPanelRule =
-  cssBlocks.find(
-    ([block]) => block.includes(".conversations-sidebar") && block.includes("--omnigent-safe-top"),
+      block.includes("--omnigent-safe-top"),
   )?.[0] ?? "";
 const rootSafeAreaRule =
   cssBlocks.find(
@@ -176,19 +163,17 @@ const nativeInsetMatch = nativeBridgeSource.match(
   /internal val insetStyles: String\s*=\s*"""([\s\S]*?)"""\.trimIndent\(\)/,
 );
 const nativeInsetCss = trimIndent(nativeInsetMatch?.[1] ?? "");
-// Test DOMs don't evaluate media queries, so the padding assertions run on
-// the flattened rules; the phone-width guard is asserted structurally below.
-const nativeInsetFlatCss = nativeInsetCss.replace(/@media[^{]*\{((?:[^{}]*\{[^{}]*\})*)\}/g, "$1");
 
-const FULL_HEIGHT_PANEL_TARGETS = [
-  { className: "conversations-sidebar" },
-  { testId: "execution-logs-panel" },
-  { testId: "file-viewer" },
-  { testId: "files-panel-drawer" },
-  { testId: "terminals-panel" },
-  { testId: "subagents-panel-drawer" },
-  { testId: "todos-panel-drawer" },
-] as const;
+/* Panel testids DERIVED from the index.css rule (never hand-maintained), so
+ * the stub coverage tracks the rule, and the superset check below fails when
+ * a panel lands in index.css without the Android injected sheet — such a
+ * panel would lose its inset on pre-shell servers. */
+const cssPanelTestIds = [...nativePanelRule.matchAll(/data-testid="([^"]+)"/g)]
+  .map((match) => match[1])
+  .sort();
+const kotlinPanelTestIds = [...nativeInsetCss.matchAll(/data-testid="([^"]+)"/g)]
+  .map((match) => match[1])
+  .sort();
 
 function trimIndent(value: string): string {
   const lines = value
@@ -200,20 +185,6 @@ function trimIndent(value: string): string {
     .map((line) => line.match(/^\s*/)?.[0].length ?? 0);
   const indent = Math.min(...indents);
   return lines.map((line) => line.slice(indent)).join("\n");
-}
-
-/* The Workspace rules key on `aria-label="Workspace"`, so a stub <aside>
- * carries the selector⇄DOM contract; the source assertion in the suite below
- * pins the real component to the same label without coupling a CSS test to
- * the component's full prop surface and data hooks. */
-function renderWorkspace(platform: "android" | "ios"): HTMLElement {
-  const shell = document.createElement("div");
-  shell.setAttribute(`data-${platform}-native`, "");
-  const aside = document.createElement("aside");
-  aside.setAttribute("aria-label", "Workspace");
-  shell.appendChild(aside);
-  document.body.appendChild(shell);
-  return aside;
 }
 
 /** Runs `assertions` with `css` applied to the document, then removes it. */
@@ -237,31 +208,32 @@ function expectSafeAreaPadding(element: HTMLElement, variableFallback: string): 
   expect(computed.paddingRight).toBe(`var(--omnigent-safe-right${variableFallback})`);
 }
 
-function assertWorkspacePadding(
+/* Mounts the rail, the sidebar, and every derived panel testid under a
+ * native-shell root and asserts the four-edge fold on each. `platform` sets
+ * the native-shell attribute; it is null for the injected Android sheet,
+ * whose job is covering server builds that predate the data-android-native
+ * tag. */
+function assertNativePanelPadding(
   css: string,
-  platform: "android" | "ios",
+  platform: "android" | "ios" | null,
   variableFallback = "",
 ): void {
   withStyle(css, () => {
-    const aside = renderWorkspace(platform);
-    try {
-      expectSafeAreaPadding(aside, variableFallback);
-    } finally {
-      aside.parentElement?.remove();
-    }
-  });
-}
-
-function assertFullHeightPanelPadding(css: string, variableFallback = ""): void {
-  withStyle(css, () => {
     const shell = document.createElement("div");
-    shell.setAttribute("data-android-native", "");
+    if (platform) shell.setAttribute(`data-${platform}-native`, "");
     document.body.appendChild(shell);
     try {
-      for (const target of FULL_HEIGHT_PANEL_TARGETS) {
+      const rail = document.createElement("aside");
+      rail.setAttribute("aria-label", "Workspace");
+      shell.appendChild(rail);
+      expectSafeAreaPadding(rail, variableFallback);
+      const sidebar = document.createElement("div");
+      sidebar.className = "conversations-sidebar";
+      shell.appendChild(sidebar);
+      expectSafeAreaPadding(sidebar, variableFallback);
+      for (const testId of cssPanelTestIds) {
         const panel = document.createElement("div");
-        if ("className" in target) panel.className = target.className;
-        if ("testId" in target) panel.dataset.testid = target.testId;
+        panel.dataset.testid = testId;
         shell.appendChild(panel);
         expectSafeAreaPadding(panel, variableFallback);
       }
@@ -269,19 +241,6 @@ function assertFullHeightPanelPadding(css: string, variableFallback = ""): void 
       shell.remove();
     }
   });
-}
-
-// Comments and quoted strings blanked out (index-preserving), so brace
-// counting can't be fooled by braces inside string or comment text.
-const cssDepthSource = cssSource.replace(
-  /\/\*[\s\S]*?\*\/|"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'/g,
-  (match) => " ".repeat(match.length),
-);
-
-/** Brace nesting depth at a source index; 0 is top level. */
-function braceDepthAt(sourceIndex: number): number {
-  const prefix = cssDepthSource.slice(0, sourceIndex);
-  return (prefix.match(/\{/g)?.length ?? 0) - (prefix.match(/\}/g)?.length ?? 0);
 }
 
 describe("index.css native safe-area layout", () => {
@@ -297,65 +256,50 @@ describe("index.css native safe-area layout", () => {
     });
   });
 
-  it("keeps the Workspace rule at the top level", () => {
-    expect(workspaceSafeAreaRule, "the Workspace safe-area rule is gone").not.toBe("");
-    expect(workspaceSafeAreaRules).toHaveLength(1);
-    expect(braceDepthAt(workspaceSafeAreaRules[0]?.index ?? -1)).toBe(0);
+  it("has the unified native panel rule this suite asserts against", () => {
+    expect(nativePanelRule, "the native full-height panel rule is gone").not.toBe("");
+    expect(cssPanelTestIds.length).toBeGreaterThan(0);
   });
 
   it.each(["android", "ios"] as const)(
-    "computes four-edge padding on the Workspace rail in the %s shell",
-    (platform) => assertWorkspacePadding(workspaceCss, platform),
+    "computes four-edge padding on the rail, sidebar, and every panel in the %s shell",
+    (platform) => assertNativePanelPadding(nativePanelRule, platform),
   );
 
   it("keeps the Workspace aria-label on the rail component", () => {
-    // The stub <aside> in renderWorkspace stands in for WorkspacePanel; this
-    // pins the real component to the label the CSS selector keys on.
+    // The stub <aside> in assertNativePanelPadding stands in for
+    // WorkspacePanel; this pins the real component to the label the CSS
+    // selector keys on.
     const source = readFileSync("src/shell/WorkspacePanel.tsx", "utf8");
     expect(source).toMatch(/<aside[\s\S]{0,600}?aria-label="Workspace"/);
   });
 
-  it("computes four-edge padding on every full-height native panel", () => {
-    assertFullHeightPanelPadding(fullHeightPanelRule);
-  });
-
-  it("fails its layout contract when a later padding shorthand wins", () => {
-    expect(workspaceSelector).not.toBe("");
-    expect(() =>
-      assertWorkspacePadding(`${workspaceCss}\n${workspaceSelector}{padding:0}`, "android"),
-    ).toThrow();
-  });
-
-  it("does not double-count app-owned bar footprints", () => {
-    expect(workspaceSafeAreaRule).not.toMatch(/--omnigent-(?:inset|native)-/);
-  });
-
-  it("pads docked right-edge panels on every edge but the content side", () => {
-    // At md+ these panels replace the rail in the same slot: right edge at
-    // the window edge, content to their left — so no padding-left.
-    expect(dockedPanelRule, "the docked-panel safe-area rule is gone").not.toBe("");
-    expect(dockedPanelRule).not.toContain("padding-left");
-    withStyle(dockedPanelRule, () => {
+  it("leaves collapsed panels unpadded, so their w-0 width stays zero", () => {
+    withStyle(nativePanelRule, () => {
       const shell = document.createElement("div");
       shell.setAttribute("data-android-native", "");
       const panel = document.createElement("div");
       panel.dataset.testid = "execution-logs-panel";
+      panel.setAttribute("data-collapsed", "");
       shell.appendChild(panel);
       document.body.appendChild(shell);
       try {
+        // Closed push panels stay mounted at w-0; with border-box sizing any
+        // padding would give them real width — a cutout-sized gap in the
+        // layout (the e2e layer asserts the layout width itself stays 0).
         const computed = getComputedStyle(panel);
-        expect(computed.paddingTop).toBe("var(--omnigent-safe-top)");
-        expect(computed.paddingBottom).toBe("var(--omnigent-safe-bottom)");
-        expect(computed.paddingRight).toBe("var(--omnigent-safe-right)");
+        expect(computed.paddingTop).toBe("0");
+        expect(computed.paddingBottom).toBe("0");
         expect(computed.paddingLeft).toBe("0");
+        expect(computed.paddingRight).toBe("0");
       } finally {
         shell.remove();
       }
     });
   });
 
-  it("exempts panels nested inside the already-padded rail from the docked rule", () => {
-    withStyle(dockedPanelRule, () => {
+  it("exempts panels nested inside the already-padded rail", () => {
+    withStyle(nativePanelRule, () => {
       const shell = document.createElement("div");
       shell.setAttribute("data-android-native", "");
       const rail = document.createElement("aside");
@@ -374,6 +318,23 @@ describe("index.css native safe-area layout", () => {
       }
     });
   });
+
+  it("does not double-count app-owned bar footprints", () => {
+    expect(nativePanelRule).not.toMatch(/--omnigent-(?:inset|native)-/);
+  });
+
+  it("keeps the Android injected sheet's panel coverage a superset of index.css's", () => {
+    // The sheet covers servers whose web build predates the Android shell: a
+    // panel in index.css but missing there loses its inset on those servers.
+    // The reverse drift (sheet-only) is harmless extra coverage on old builds.
+    expect(nativeInsetCss).toContain('aside[aria-label="Workspace"]');
+    expect(nativeInsetCss).toContain(".conversations-sidebar");
+    expect(kotlinPanelTestIds).toEqual(expect.arrayContaining(cssPanelTestIds));
+    // The sheet carries the same guards, or old servers inherit the defects
+    // those guards fix.
+    expect(nativeInsetCss).toContain(":not([data-collapsed])");
+    expect(nativeInsetCss).toContain(':not(aside[aria-label="Workspace"] *)');
+  });
 });
 
 describe("Android injected safe-area layout", () => {
@@ -386,44 +347,26 @@ describe("Android injected safe-area layout", () => {
     expect(nativeInsetCss).not.toContain("${");
   });
 
-  it("computes four-edge padding on the Workspace rail", () => {
-    assertWorkspacePadding(nativeInsetFlatCss, "android", ", 0px");
+  it("computes four-edge padding on the rail, sidebar, and every panel", () => {
+    // No native-shell attribute: the sheet exists for server builds that
+    // predate the data-android-native tag.
+    assertNativePanelPadding(nativeInsetCss, null, ", 0px");
   });
 
-  it("computes four-edge padding on every full-height panel", () => {
-    assertFullHeightPanelPadding(nativeInsetFlatCss, ", 0px");
-  });
-
-  it("scopes the panel rule to phone widths but keeps the Workspace rule global", () => {
-    // Mirrors index.css: the full-height panels are phone drawers, while the
-    // Workspace rail only exists at md+ — an unscoped panel rule would
-    // double-pad panels docked inside the already-padded rail.
-    const media = nativeInsetCss.match(/^@media \(width < 48rem\)\{(.*)\}$/m);
-    expect(media?.[1], "panel rule lost its phone-width media guard").toContain(
-      ".conversations-sidebar",
-    );
-    expect(nativeInsetCss).toMatch(/^aside\[aria-label="Workspace"\]/m);
-  });
-
-  it("pads docked md+ panels on every edge but the content side", () => {
-    // Mirrors the index.css docked-panel rule for pre-shell servers: right
-    // edge at the window edge, content to the left, rail descendants exempt.
-    const media = nativeInsetCss.match(/^@media \(width >= 48rem\)\{(.*)\}$/m);
-    expect(media?.[1], "docked-panel rule lost from the injected sheet").toContain(
-      "execution-logs-panel",
-    );
-    expect(media?.[1]).toContain(':not(aside[aria-label="Workspace"] *)');
-    expect(media?.[1]).not.toContain("padding-left");
-  });
-
-  it("pads the md+ conversations sidebar on every edge but the content side", () => {
-    // At md+ the sidebar is a pinned column at the left screen edge; its
-    // right edge faces content, so it gets top/bottom/left insets only.
-    const rules = nativeInsetCss.match(/^@media \(width >= 48rem\)\{.*\}$/gm);
-    const sidebar = rules?.find((rule) => rule.includes(".conversations-sidebar"));
-    expect(sidebar, "md+ sidebar rule lost from the injected sheet").toBeDefined();
-    expect(sidebar).toContain("padding-left");
-    expect(sidebar).not.toContain("padding-right");
+  it("leaves collapsed panels unpadded in the injected sheet too", () => {
+    withStyle(nativeInsetCss, () => {
+      const panel = document.createElement("div");
+      panel.dataset.testid = "execution-logs-panel";
+      panel.setAttribute("data-collapsed", "");
+      document.body.appendChild(panel);
+      try {
+        const computed = getComputedStyle(panel);
+        expect(computed.paddingTop).toBe("0");
+        expect(computed.paddingLeft).toBe("0");
+      } finally {
+        panel.remove();
+      }
+    });
   });
 });
 
