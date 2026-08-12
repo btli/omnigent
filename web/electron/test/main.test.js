@@ -26,6 +26,15 @@ const preloadSource = readFileSync(path.join(__dirname, "../src/preload.js"), "u
 
 // Strip block comments, then line comments (leaving `://` in URLs intact).
 const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
+const oidcSessionCode = liveCode.match(
+  /async function ensureWindowOidcSession[\s\S]*?(?=async function loadAuthenticatedServerUrl)/,
+)?.[0];
+const switchServerCode = liveCode.match(
+  /ipcMain\.handle\("omnigent:switch-server"[\s\S]*?(?=ipcMain\.on\("omnigent:open-server-setup")/,
+)?.[0];
+const setupServerCode = liveCode.match(
+  /ipcMain\.handle\("omnigent:set-server-url"[\s\S]*?(?=ipcMain\.handle\("omnigent:get-server-url")/,
+)?.[0];
 
 function runPreload(windowObject) {
   const exposed = [];
@@ -120,6 +129,61 @@ describe("workspace chrome injection wiring (src/main.js)", () => {
         "switcher visible. The CSS targets .omnigent-app (workspace-embedded build only), so",
         "injecting on every load is a safe no-op elsewhere. See src/workspace-chrome.js.",
       ].join(" "),
+    );
+  });
+});
+
+describe("remote OIDC browser handoff wiring (src/main.js)", () => {
+  it("uses the main-process ticket client without requiring the CLI", () => {
+    assert.ok(oidcSessionCode);
+    assert.match(oidcSessionCode, /runOidcBrowserLogin\(/);
+    assert.match(oidcSessionCode, /onPollError:[\s\S]{0,180}updateMessage\(/);
+    assert.doesNotMatch(oidcSessionCode, /resolvedCliPath|omnigentCli\.loginServer/);
+  });
+
+  it("deduplicates concurrent OIDC flows per shell window", () => {
+    assert.match(liveCode, /const oidcLoginFlows = new WeakMap\(\)/);
+    assert.match(
+      liveCode,
+      /oidcLoginFlows\.get\(win\)[\s\S]{0,180}existingFlow\?\.serverUrl === serverUrl[\s\S]{0,80}existingFlow\.promise/,
+    );
+  });
+
+  it("commits Setup Connect settings only inside beforeLoad", () => {
+    assert.ok(setupServerCode);
+    assert.match(
+      setupServerCode,
+      /loadServerUrl\(win, target,[\s\S]{0,300}beforeLoad:\s*\(\)\s*=>\s*\{[\s\S]{0,300}settings\.server_url = target/,
+    );
+    const beforeTransaction = setupServerCode.slice(0, setupServerCode.indexOf("loadServerUrl"));
+    assert.doesNotMatch(beforeTransaction, /settings\.server_url = target/);
+  });
+
+  it("commits switched-server settings and manifest only inside beforeLoad", () => {
+    assert.ok(switchServerCode);
+    assert.match(
+      switchServerCode,
+      /loadServerUrl\(win, url,[\s\S]{0,300}beforeLoad:\s*\(\)\s*=>\s*\{[\s\S]{0,300}settings\.server_url = url[\s\S]{0,300}setWindowServerManifest\(win, PRE_MANIFEST_BASELINE\)/,
+    );
+    const beforeTransaction = switchServerCode.slice(0, switchServerCode.indexOf("loadServerUrl"));
+    assert.doesNotMatch(beforeTransaction, /settings\.server_url = url|setWindowServerManifest/);
+  });
+
+  it("intercepts live OIDC expiry before the renderer reaches /auth/login", () => {
+    assert.match(
+      liveCode,
+      /registerOidcSessionExpiryHandoff\([\s\S]{0,700}ensureWindowOidcSession\([\s\S]{0,250}loadAuthenticatedServerUrl\(win, expiredServerUrl, undefined, returnUrl\)/,
+    );
+  });
+
+  it("limits the fail-loud WebAuthn guard to sign-in surfaces and OAuth popups", () => {
+    assert.match(
+      liveCode,
+      /function hardenOauthPopup\([\s\S]{0,1400}registerWebAuthnTimeout\(child\.webContents/,
+    );
+    assert.match(
+      liveCode,
+      /registerWebAuthnTimeout\(win\.webContents,[\s\S]{0,300}shouldInject:[\s\S]{0,200}isWebAuthnEscapePage\(/,
     );
   });
 });
@@ -380,6 +444,11 @@ describe("deep-link ingestion wiring (src/main.js)", () => {
         "handleDeepLink, reopening the pre-consent SSRF. The probe must run only after",
         "confirmOpenDeepLink (in the consent-unknown branch), not before chooseDeepLinkStrategy.",
       ].join(" "),
+    );
+    assert.match(
+      liveCode,
+      /openServerAfterConsent\([\s\S]{0,900}remember:\s*\(\)\s*=>\s*rememberServerUrl\(serverUrl\)/,
+      "explicit deep-link origin consent must remain independent of OIDC login completion",
     );
   });
 });
