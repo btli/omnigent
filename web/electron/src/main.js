@@ -48,8 +48,24 @@ const { registerWorkspaceChromeHide } = require("./workspace-chrome");
 const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
-const { registerSessionExpiryReload } = require("./session-expiry");
+const {
+  registerSessionExpiryReload,
+  registerOidcSessionExpiryHandoff,
+} = require("./session-expiry");
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
+const {
+  OIDC_LOGIN_TIMEOUT_MS,
+  probeServerAuth,
+  runOidcBrowserLogin,
+  installAndVerifySessionCookie,
+} = require("./oidc_auth");
+const { runOidcLoginDialog } = require("./oidc_login_dialog");
+const {
+  loadServerAfterAuth,
+  loadInitialDestination,
+  openServerAfterConsent,
+} = require("./server_load");
+const { isWebAuthnEscapePage, registerWebAuthnTimeout } = require("./webauthn_timeout");
 const omnigentCli = require("./omnigent_cli");
 const serverManager = require("./server_manager");
 
@@ -61,6 +77,9 @@ const SETUP_PAGE_URL = pathToFileURL(SETUP_PAGE);
 
 /** Absolute path to the bundled find-in-page bar page. */
 const FIND_PAGE = path.join(__dirname, "..", "find", "index.html");
+/** Shell-owned system-browser sign-in status page and its isolated preload. */
+const OIDC_LOGIN_PAGE = path.join(__dirname, "oidc_login.html");
+const OIDC_LOGIN_PRELOAD = path.join(__dirname, "oidc_login_preload.js");
 // Built by web's `build:overlay` into electron/overlay/ (shipped by
 // electron-builder). Shell-owned so the update UI is independent of the
 // connected server's web-bundle version.
@@ -446,6 +465,9 @@ function applyDockIcon() {
  * @type {Map<BrowserWindow, WindowState>}
  */
 const windows = new Map();
+
+/** One in-flight browser-login flow per shell window, mirroring Android. */
+const oidcLoginFlows = new WeakMap();
 
 /**
  * Live OAuth popup child windows (see hardenOauthPopup). Tracked apart
@@ -972,6 +994,41 @@ function hardenOauthPopup(child) {
     }
     return { action: "deny" };
   });
+  registerWebAuthnTimeout(child.webContents, {
+    onTimeout: () => void showWebAuthnTimeout(child),
+  });
+}
+
+/**
+ * Surface a WebAuthn request that Electron could not service. Opening the
+ * current sign-in URL is a native, user-confirmed action; page content gets no
+ * shell bridge and cannot trigger shell.openExternal directly.
+ *
+ * @param {Electron.BrowserWindow} win
+ */
+async function showWebAuthnTimeout(win) {
+  if (!win || win.isDestroyed()) return;
+  const signInUrl = win.webContents.getURL();
+  let protocol;
+  try {
+    protocol = new URL(signInUrl).protocol;
+  } catch {
+    return;
+  }
+  if (!WEB_SCHEMES.has(protocol)) return;
+  const { response } = await dialog.showMessageBox(win, {
+    type: "warning",
+    title: "Sign-in is still waiting",
+    message: "This security-key request is taking longer than expected.",
+    detail:
+      "The request is still active, so a roaming USB security key can finish here. " +
+      "Or open this sign-in in your system browser for platform passkeys.",
+    buttons: ["Open in Browser", "Keep Waiting"],
+    defaultId: 0,
+    cancelId: 1,
+    noLink: true,
+  });
+  if (response === 0) void shell.openExternal(signInUrl);
 }
 
 /**
@@ -1004,10 +1061,135 @@ function resolveServerPath(serverUrl, routePath) {
  * @param {string} [routePath] Optional basename-less in-app path (e.g. ``/c/<id>``).
  * @returns {Promise<void>}
  */
-function loadServerUrl(win, serverUrl, routePath) {
+async function ensureWindowOidcSession(win, serverUrl) {
+  if (omnigentCli.isLoopbackServer(serverUrl)) return true;
+
+  let probe;
+  try {
+    probe = await probeServerAuth(session.defaultSession, serverUrl);
+  } catch {
+    // Preserve the existing load/failure behavior for unreachable or unknown
+    // servers. did-fail-load will surface the actionable connection error.
+    return true;
+  }
+  if (probe.kind !== "oidc") return true;
+
+  const installCachedSession = async () => {
+    const entry = omnigentCli.serverAuthEntry(serverUrl);
+    if (!entry || typeof entry.token !== "string") return false;
+    await installAndVerifySessionCookie(session.defaultSession, serverUrl, entry.token);
+    console.log(
+      `[omnigent] OIDC session cookie accepted and verified for ${new URL(serverUrl).host}`,
+    );
+    return true;
+  };
+
+  try {
+    if (await installCachedSession()) return true;
+  } catch {
+    // A present-but-rejected/expired cookie should trigger a fresh browser flow.
+  }
+
+  const existingFlow = oidcLoginFlows.get(win);
+  if (existingFlow?.serverUrl === serverUrl) return existingFlow.promise;
+
+  const promise = runOidcLoginDialog({
+    BrowserWindow,
+    ipcMain,
+    parent: win,
+    serverUrl,
+    pagePath: OIDC_LOGIN_PAGE,
+    preloadPath: OIDC_LOGIN_PRELOAD,
+    runAttempt: async ({ signal, updateMessage }) => {
+      const host = new URL(serverUrl).host;
+      const result = await runOidcBrowserLogin(
+        session.defaultSession,
+        serverUrl,
+        (url) => shell.openExternal(url),
+        {
+          timeoutMs: OIDC_LOGIN_TIMEOUT_MS,
+          signal,
+          onPollError: () => {
+            updateMessage(`Still waiting — the last attempt failed to reach ${host}. Retrying…`);
+          },
+        },
+      );
+      if (signal.aborted || (!result.ok && result.reason === "cancelled")) {
+        return { ok: false, error: "Sign-in was cancelled." };
+      }
+      if (!result.ok && result.reason === "timed_out") {
+        return {
+          ok: false,
+          error: "Sign-in timed out after 5 minutes. Complete the browser flow, then retry.",
+        };
+      }
+      if (!result.ok && result.reason === "expired") {
+        return {
+          ok: false,
+          error: "The sign-in ticket expired. Retry to open a fresh browser sign-in.",
+        };
+      }
+      if (!result.ok) {
+        return {
+          ok: false,
+          error: "The browser sign-in did not complete. Check the server and try again.",
+        };
+      }
+      try {
+        await installAndVerifySessionCookie(session.defaultSession, serverUrl, result.token);
+      } catch {
+        return {
+          ok: false,
+          error: "Sign-in completed, but Electron could not install and verify the session cookie.",
+        };
+      }
+      try {
+        omnigentCli.storeServerAuthToken(serverUrl, {
+          token: result.token,
+          userId: result.userId,
+          expiresAt: Date.now() / 1000 + result.expiresIn,
+        });
+      } catch {
+        console.warn(
+          `[omnigent] OIDC session verified for ${new URL(serverUrl).host}, but shared token storage failed`,
+        );
+      }
+      return { ok: true };
+    },
+  }).finally(() => {
+    if (oidcLoginFlows.get(win)?.promise === promise) oidcLoginFlows.delete(win);
+  });
+  oidcLoginFlows.set(win, { serverUrl, promise });
+  return promise;
+}
+
+async function loadAuthenticatedServerUrl(win, serverUrl, routePath, exactLoadUrl) {
+  if (win.isDestroyed()) return;
   pinWindow(win, originOf(serverUrl));
   setWindowServerUrl(win, serverUrl);
-  return win.loadURL(routePath ? resolveServerPath(serverUrl, routePath) : serverUrl);
+  const destination =
+    exactLoadUrl ?? (routePath ? resolveServerPath(serverUrl, routePath) : serverUrl);
+  await win.loadURL(destination);
+}
+
+async function loadServerUrl(win, serverUrl, routePath, exactLoadUrl, { beforeLoad } = {}) {
+  return loadServerAfterAuth({
+    authenticate: async () => (await ensureWindowOidcSession(win, serverUrl)) && !win.isDestroyed(),
+    beforeLoad,
+    load: () => loadAuthenticatedServerUrl(win, serverUrl, routePath, exactLoadUrl),
+  });
+}
+
+async function loadSetupPage(win, { error, url } = {}) {
+  if (win.isDestroyed()) return;
+  const search = new URLSearchParams();
+  if (windows.get(win)?.ephemeral) search.set("ephemeral", "1");
+  if (error) search.set("error", error);
+  if (url) search.set("url", url);
+  pinWindow(win, null);
+  setWindowServerUrl(win, null);
+  setWindowServerManifest(win, PRE_MANIFEST_BASELINE);
+  await win.loadFile(SETUP_PAGE, search.size > 0 ? { search: search.toString() } : undefined);
 }
 
 /**
@@ -1097,11 +1279,11 @@ function createWindow(targetUrl, opts = {}) {
   const destination = destinationOrigin ? loadUrl : null;
   updateOverlay.ensureOverlay(win);
   windows.set(win, {
-    // Pin to the destination's origin up front; setup-page windows stay
-    // unpinned (null) until the user connects them.
-    origin: destinationOrigin,
-    // Clean server identity (no conversation path) for host/server CLI
-    // commands; ``loadUrl`` (possibly /c/<id>) is what gets loaded below.
+    // A destination is pinned only after its auth gate succeeds. Until then the
+    // shell-owned sign-in modal has no privileged server origin underneath it.
+    origin: null,
+    // Keep the clean identity separate from the exact load URL even while the
+    // auth gate is pending; privileges still require the null origin to be set.
     serverUrl: destination ? serverUrl : null,
     ephemeral,
     badgeCount: 0,
@@ -1109,29 +1291,28 @@ function createWindow(targetUrl, opts = {}) {
     browserRegistry: createBrowserRegistryForWindow(win),
   });
   if (destination) {
-    // Learn the server's version alongside the load. Every window that opens
-    // straight onto a server (normal app launch with a saved URL, a deep link,
-    // a new window) comes through here — without this the manifest would only
-    // exist after a fresh setup-page connect. Never awaited and never throws
-    // (see fetchServerManifest), so it cannot delay or fail the load.
-    if (serverUrl) {
-      void fetchServerManifest(serverUrl).then((manifest) => {
-        if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
-      });
-    }
-    void win.loadURL(destination);
+    void loadInitialDestination({
+      loadServer: () =>
+        loadServerUrl(win, serverUrl, undefined, destination, {
+          beforeLoad: () => {
+            void fetchServerManifest(serverUrl).then((manifest) => {
+              if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
+            });
+          },
+        }),
+      loadSetup: () => loadSetupPage(win),
+    }).catch(() => loadSetupPage(win));
   } else {
-    // ?ephemeral=1 only changes the setup page's copy (the window's
-    // WindowState is the source of truth for persistence behavior).
-    const search = new URLSearchParams();
-    if (ephemeral) search.set("ephemeral", "1");
     if (serverUrl && !destinationOrigin) {
       // Fail loud on a corrupt hand-edited settings.json: show WHY the
       // window landed on setup instead of silently presenting a blank form.
-      search.set("error", "saved server URL in settings.json is not a valid URL");
-      search.set("url", serverUrl);
+      void loadSetupPage(win, {
+        error: "saved server URL in settings.json is not a valid URL",
+        url: serverUrl,
+      });
+    } else {
+      void loadSetupPage(win);
     }
-    void win.loadFile(SETUP_PAGE, search.size > 0 ? { search: search.toString() } : undefined);
   }
 
   // Page-initiated window.open / target=_blank: web links open in the
@@ -1175,6 +1356,27 @@ function createWindow(targetUrl, opts = {}) {
 
   // Fires only for window.open the handler above allowed (OAuth popups).
   win.webContents.on("did-create-window", (child) => hardenOauthPopup(child));
+
+  registerOidcSessionExpiryHandoff(
+    win.webContents,
+    () => {
+      const pinnedServerUrl = windows.get(win)?.serverUrl ?? null;
+      return pinnedServerUrl && !omnigentCli.isLoopbackServer(pinnedServerUrl)
+        ? pinnedServerUrl
+        : null;
+    },
+    async ({ serverUrl: expiredServerUrl, returnUrl }) => {
+      const authenticated = await ensureWindowOidcSession(win, expiredServerUrl);
+      if (!authenticated || win.isDestroyed()) return;
+      await loadAuthenticatedServerUrl(win, expiredServerUrl, undefined, returnUrl);
+    },
+  );
+
+  registerWebAuthnTimeout(win.webContents, {
+    shouldInject: () =>
+      isWebAuthnEscapePage(win.webContents.getURL(), windows.get(win)?.serverUrl ?? null),
+    onTimeout: () => void showWebAuthnTimeout(win),
+  });
 
   // Server unreachable / DNS failure / TLS error → fall back to the setup
   // page with the failure shown, instead of stranding the user on Chromium's
@@ -1451,9 +1653,13 @@ function isFindBarSender(event) {
 function newWindow() {
   const win = activeWindow();
   const current = win?.webContents.getURL();
+  const state = win ? windows.get(win) : null;
   // Cloning an ephemeral (multi-server) window keeps the clone
   // ephemeral, so Change Server… from it still won't touch saved settings.
-  createWindow(current, { ephemeral: win ? windows.get(win)?.ephemeral === true : false });
+  createWindow(current, {
+    ephemeral: state?.ephemeral === true,
+    serverUrl: state?.serverUrl ?? undefined,
+  });
 }
 
 /**
@@ -2104,45 +2310,38 @@ function registerIpc() {
     // Multi-server windows connect without touching the saved server —
     // the connection lives and dies with the window.
     const ephemeral = Boolean(win && windows.get(win)?.ephemeral);
-    if (!ephemeral) {
-      const settings = loadSettings();
-      // The saved default persists immediately even if this load fails:
-      // the failure fallback keeps it pre-filled so Connect retries it.
-      settings.server_url = target;
-      saveSettings(settings);
-    }
     if (win) {
-      // The user explicitly chose this server — it becomes the window's
-      // trusted origin for privileged IPC and permission grants.
-      pinWindow(win, new URL(target).origin);
-      setWindowServerUrl(win, target);
       // Learn what this server is before deciding anything version-dependent
       // about the window. Deliberately NOT awaited ahead of loadURL: the
       // manifest is advisory, and a slow/absent one must not delay (or block)
       // connecting. fetchServerManifest never rejects — it resolves to the
       // pre-manifest baseline — so no catch is needed here.
-      void fetchServerManifest(target).then((manifest) => {
-        if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
-      });
-      win
-        .loadURL(target)
-        .then(() => {
-          // Only a server that actually responded earns a recents slot —
-          // a typo'd or unreachable URL must not show up in the
-          // quick-pick list on the setup page.
+      const loaded = await loadServerUrl(win, target, undefined, undefined, {
+        beforeLoad: () => {
           if (!ephemeral) {
             const settings = loadSettings();
-            rememberRecentServer(settings, target);
+            settings.server_url = target;
             saveSettings(settings);
           }
-          // The desktop does NOT auto-connect this machine as a runner on
-          // connect — that's an explicit action from the host menu.
-        })
-        .catch(() => {
-          // Load failure is handled by the did-fail-load fallback (setup
-          // page with the error); the URL is deliberately not recorded.
-        });
+          void fetchServerManifest(target).then((manifest) => {
+            if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
+          });
+        },
+      });
+      if (!loaded) return { loaded: false };
+      // Only a server that actually responded earns a recents slot —
+      // a typo'd or unreachable URL must not show up in the
+      // quick-pick list on the setup page.
+      if (!ephemeral) {
+        const settings = loadSettings();
+        rememberRecentServer(settings, target);
+        saveSettings(settings);
+      }
+      // The desktop does NOT auto-connect this machine as a runner on
+      // connect — that's an explicit action from the host menu.
+      return { loaded: true };
     }
+    return { loaded: false };
   });
 
   // Setup page → pre-fill the input with any saved URL.
@@ -2202,7 +2401,7 @@ function registerIpc() {
   // grants), so a server page must never be able to pin a window to an
   // arbitrary origin of its choosing — only to servers the user previously
   // connected to by hand.
-  ipcMain.handle("omnigent:switch-server", (event, url) => {
+  ipcMain.handle("omnigent:switch-server", async (event, url) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("switch-server is only available to a connected server page");
     }
@@ -2213,33 +2412,26 @@ function registerIpc() {
     }
     const win = BrowserWindow.fromWebContents(event.sender);
     const ephemeral = Boolean(win && windows.get(win)?.ephemeral);
-    if (!ephemeral) {
-      const settings = loadSettings();
-      settings.server_url = url;
-      saveSettings(settings);
-    }
     if (win) {
-      pinWindow(win, new URL(url).origin);
-      setWindowServerUrl(win, url);
-      // Switching servers means a possibly DIFFERENT version: re-read the
-      // manifest so the window never keeps the previous server's answer. Reset
-      // to the baseline first — until the new fetch lands, "unknown" is the
-      // honest state, and stale-but-plausible would be worse than absent.
-      setWindowServerManifest(win, PRE_MANIFEST_BASELINE);
-      void fetchServerManifest(url).then((manifest) => {
-        if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
+      const loaded = await loadServerUrl(win, url, undefined, undefined, {
+        beforeLoad: () => {
+          if (!ephemeral) {
+            const settings = loadSettings();
+            settings.server_url = url;
+            saveSettings(settings);
+          }
+          // Commit the new manifest only after authentication succeeds, so a
+          // cancelled switch leaves the old page and its metadata paired.
+          setWindowServerManifest(win, PRE_MANIFEST_BASELINE);
+          void fetchServerManifest(url).then((manifest) => {
+            if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
+          });
+        },
       });
-      win
-        .loadURL(url)
-        .then(() => {
-          if (ephemeral) return;
-          const settings = loadSettings();
-          rememberRecentServer(settings, url); // bump to head of the recents
-          saveSettings(settings);
-        })
-        .catch(() => {
-          // Load failure falls back via did-fail-load → setup page w/ error.
-        });
+      if (!loaded || ephemeral) return;
+      const settings = loadSettings();
+      rememberRecentServer(settings, url); // bump to head of the recents
+      saveSettings(settings);
     }
   });
 
@@ -2833,17 +3025,23 @@ async function handleDeepLink(raw) {
       // decision stands; the user approved connecting to this host.
       const serverUrl = await expandDatabricksWorkspaceUrl(targetOrigin);
       if (!originOf(serverUrl)) return; // expansion yielded an unparseable URL
-      // Reuse the just-created setup-page window instead of opening a second;
-      // if a window was already open (warm start), open a new one.
-      if (!pinnedOrigin(parent)) {
-        await loadServerUrl(parent, serverUrl, parsed.path).catch(() => {});
-        focusAndRestore(parent);
-      } else {
-        const win = createWindow(undefined, { serverUrl, path: parsed.path });
-        focusAndRestore(win);
-      }
-      // Record the newly-trusted server so the next link is frictionless.
-      rememberServerUrl(serverUrl);
+      await openServerAfterConsent({
+        open: async () => {
+          // Reuse the just-created setup-page window instead of opening a second;
+          // if a window was already open (warm start), open a new one.
+          if (!pinnedOrigin(parent)) {
+            const loaded = await loadServerUrl(parent, serverUrl, parsed.path).catch(() => false);
+            focusAndRestore(parent);
+            return loaded;
+          }
+          const win = createWindow(undefined, { serverUrl, path: parsed.path });
+          focusAndRestore(win);
+          return true;
+        },
+        // Record explicit origin consent independently of login completion.
+        // Unlike Setup Connect, this never changes the launch default.
+        remember: () => rememberServerUrl(serverUrl),
+      });
       return;
     }
   }

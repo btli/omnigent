@@ -4,8 +4,8 @@
 // user would run by hand — `server --background/stop/status` and `host status` (the
 // long-lived `host` connection is spawned by server_manager.js, which owns its
 // lifetime). This module locates the binary, runs the short exit-quick
-// commands, and parses their `--json` output. The CLI is the single source of
-// truth for live state; nothing here is persisted.
+// commands, parses their `--json` output, and shares the CLI-compatible remote
+// auth store used by browser login.
 //
 // Unlike src/url.js this is main-process only (it needs child_process / fs),
 // so it's a plain CommonJS module — never loaded in the renderer.
@@ -18,6 +18,7 @@
 "use strict";
 
 const { execFile, execFileSync } = require("child_process");
+const { randomUUID } = require("node:crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -376,50 +377,158 @@ function resolveCliPath(configuredPath, deps = {}) {
  *
  * @param {string} cliPath
  * @param {string[]} args
- * @param {{ timeoutMs?: number }} [opts]
- * @returns {Promise<{ code: number, stdout: string, stderr: string }>}
+ * @param {{ timeoutMs?: number, signal?: AbortSignal }} [opts]
+ * @returns {Promise<{
+ *   code: number,
+ *   stdout: string,
+ *   stderr: string,
+ *   aborted: boolean,
+ *   timedOut: boolean,
+ * }>}
  */
-function runCli(cliPath, args, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+function runCli(cliPath, args, { timeoutMs = DEFAULT_TIMEOUT_MS, signal } = {}) {
   return new Promise((resolve) => {
-    execFile(cliPath, args, { timeout: timeoutMs, encoding: "utf8" }, (err, stdout, stderr) => {
+    const options = { timeout: timeoutMs, encoding: "utf8" };
+    if (signal) options.signal = signal;
+    execFile(cliPath, args, options, (err, stdout, stderr) => {
       // execFile sets err.code to the numeric exit code on a normal non-zero
       // exit, or a string errno (e.g. "ENOENT") when the spawn itself failed.
       const code = err ? (typeof err.code === "number" ? err.code : 1) : 0;
-      resolve({ code, stdout: stdout || "", stderr: stderr || "" });
+      const aborted = Boolean(
+        signal?.aborted || err?.name === "AbortError" || err?.code === "ABORT_ERR",
+      );
+      resolve({
+        code,
+        stdout: stdout || "",
+        stderr: stderr || "",
+        aborted,
+        timedOut: Boolean(err?.killed && !aborted),
+      });
     });
   });
 }
 
 /**
- * Whether the CLI holds valid stored credentials for a server — read straight
- * from `~/.omnigent/auth_tokens.json` (no subprocess), mirroring
+ * The CLI's valid stored credential entry for a server — read straight from
+ * `~/.omnigent/auth_tokens.json` (no subprocess), mirroring
  * omnigent/cli_auth.py: keyed by the trailing-slash-stripped URL, a record is
  * valid if it's a Databricks pointer (has `workspace_host`) or a non-expired
  * session token. The CLI's `state_dir()` is hardcoded to `~/.omnigent`.
  *
  * @param {string} serverUrl
- * @returns {boolean}
+ * @param {{ nowSeconds?: number }} [opts]
+ * @returns {Record<string, unknown> | null}
  */
-function serverAuthed(serverUrl) {
-  if (typeof serverUrl !== "string" || serverUrl === "") return false;
+function serverAuthEntry(serverUrl, { nowSeconds = Date.now() / 1000 } = {}) {
+  if (typeof serverUrl !== "string" || serverUrl === "") return null;
   const key = serverUrl.replace(/\/+$/, "");
   let data;
   try {
     data = JSON.parse(fs.readFileSync(path.join(stateDir(), "auth_tokens.json"), "utf8"));
   } catch {
-    return false;
+    return null;
   }
   const entry = data && typeof data === "object" ? data[key] : null;
-  if (!entry || typeof entry !== "object") return false;
+  if (!entry || typeof entry !== "object") return null;
   if (entry.auth_type === "databricks") {
-    return typeof entry.workspace_host === "string" && entry.workspace_host !== "";
+    return typeof entry.workspace_host === "string" && entry.workspace_host !== "" ? entry : null;
   }
   if (typeof entry.token === "string" && entry.token !== "") {
     // expires_at is unix seconds (cli_auth uses time.time()); treat absent as
     // non-expiring.
-    return typeof entry.expires_at === "number" ? entry.expires_at >= Date.now() / 1000 : true;
+    return typeof entry.expires_at === "number" && entry.expires_at < nowSeconds ? null : entry;
   }
-  return false;
+  return null;
+}
+
+function authTokenStoreSnapshot(tokenPath) {
+  try {
+    const raw = fs.readFileSync(tokenPath, "utf8");
+    const parsed = JSON.parse(raw);
+    return {
+      raw,
+      records: parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {},
+    };
+  } catch {
+    return { raw: null, records: {} };
+  }
+}
+
+/**
+ * Persist a browser-login token in the CLI-compatible auth store. Writes an
+ * owner-only temporary file and atomically renames it into place so the JWT is
+ * never exposed through a partial or broadly-readable file.
+ *
+ * @param {string} serverUrl
+ * @param {{ token: string, userId: string | null, expiresAt: number }} entry
+ */
+function storeServerAuthToken(serverUrl, { token, userId, expiresAt }) {
+  if (typeof serverUrl !== "string" || serverUrl === "") throw new Error("Invalid server URL");
+  if (typeof token !== "string" || token === "") throw new Error("Invalid session token");
+  if (typeof expiresAt !== "number" || !Number.isFinite(expiresAt)) {
+    throw new Error("Invalid session expiry");
+  }
+
+  const directory = stateDir();
+  const tokenPath = path.join(directory, "auth_tokens.json");
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  try {
+    fs.chmodSync(directory, 0o700);
+  } catch {
+    // Best effort on filesystems that do not expose POSIX permissions.
+  }
+
+  const key = serverUrl.replace(/\/+$/, "");
+  const storedEntry = {
+    token,
+    user_id: userId ?? "",
+    expires_at: expiresAt,
+  };
+
+  const temporaryPath = path.join(
+    directory,
+    `.auth_tokens.json.${process.pid}.${randomUUID()}.tmp`,
+  );
+  let descriptor = null;
+  try {
+    descriptor = fs.openSync(temporaryPath, "wx", 0o600);
+    let stableSnapshot = false;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const snapshot = authTokenStoreSnapshot(tokenPath);
+      const records = { ...snapshot.records, [key]: storedEntry };
+      fs.ftruncateSync(descriptor, 0);
+      fs.writeSync(descriptor, JSON.stringify(records, null, 2), 0, "utf8");
+      fs.fsyncSync(descriptor);
+      if (authTokenStoreSnapshot(tokenPath).raw === snapshot.raw) {
+        stableSnapshot = true;
+        break;
+      }
+    }
+    if (!stableSnapshot) {
+      throw new Error("Shared auth token store changed repeatedly during write");
+    }
+    fs.closeSync(descriptor);
+    descriptor = null;
+    fs.renameSync(temporaryPath, tokenPath);
+    fs.chmodSync(tokenPath, 0o600);
+  } finally {
+    if (descriptor !== null) fs.closeSync(descriptor);
+    try {
+      fs.unlinkSync(temporaryPath);
+    } catch {
+      // The successful atomic rename removes the temporary path.
+    }
+  }
+}
+
+/**
+ * Whether the CLI holds valid stored credentials for a server.
+ *
+ * @param {string} serverUrl
+ * @returns {boolean}
+ */
+function serverAuthed(serverUrl) {
+  return serverAuthEntry(serverUrl) !== null;
 }
 
 /**
@@ -430,12 +539,16 @@ function serverAuthed(serverUrl) {
  *
  * @param {string} cliPath
  * @param {string} serverUrl
- * @param {{ timeoutMs?: number }} [opts]
- * @returns {Promise<{ ok: boolean, output: string }>}
+ * @param {{ timeoutMs?: number, signal?: AbortSignal }} [opts]
+ * @returns {Promise<{ ok: boolean, aborted: boolean, timedOut: boolean }>}
  */
-async function loginServer(cliPath, serverUrl, { timeoutMs = 180000 } = {}) {
-  const res = await runCli(cliPath, ["login", serverUrl], { timeoutMs });
-  return { ok: res.code === 0, output: (res.stdout || res.stderr).trim() };
+async function loginServer(cliPath, serverUrl, { timeoutMs = 180000, signal } = {}) {
+  const res = await runCli(cliPath, ["login", serverUrl], { timeoutMs, signal });
+  return {
+    ok: res.code === 0,
+    aborted: res.aborted,
+    timedOut: res.timedOut,
+  };
 }
 
 /**
@@ -892,6 +1005,8 @@ module.exports = {
   startLocalServer,
   stopLocalServer,
   stopHost,
+  serverAuthEntry,
+  storeServerAuthToken,
   serverAuthed,
   loginServer,
   matchesServer,

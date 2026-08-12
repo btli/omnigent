@@ -7,6 +7,8 @@
 const { describe, it, mock, afterEach } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("fs");
+const os = require("os");
+const path = require("path");
 
 const {
   normalizeServerUrl,
@@ -15,6 +17,9 @@ const {
   parseLocalServerPidfile,
   candidatePaths,
   resolveCliPath,
+  runCli,
+  serverAuthEntry,
+  storeServerAuthToken,
   parseJsonLoose,
   matchesServer,
   parseDaemonRecord,
@@ -33,6 +38,173 @@ describe("normalizeServerUrl", () => {
     assert.equal(normalizeServerUrl(undefined), "");
     assert.equal(normalizeServerUrl(null), "");
     assert.equal(normalizeServerUrl(42), "");
+  });
+});
+
+describe("serverAuthEntry", () => {
+  afterEach(() => mock.restoreAll());
+
+  it("returns a non-expired OIDC token entry", () => {
+    mock.method(fs, "readFileSync", () =>
+      JSON.stringify({
+        "https://server.example": {
+          token: "session-jwt",
+          user_id: "user@example.com",
+          expires_at: 200,
+        },
+      }),
+    );
+
+    assert.deepEqual(serverAuthEntry("https://server.example/", { nowSeconds: 100 }), {
+      token: "session-jwt",
+      user_id: "user@example.com",
+      expires_at: 200,
+    });
+  });
+
+  it("rejects an expired token entry", () => {
+    mock.method(fs, "readFileSync", () =>
+      JSON.stringify({
+        "https://server.example": { token: "expired", expires_at: 99 },
+      }),
+    );
+
+    assert.equal(serverAuthEntry("https://server.example", { nowSeconds: 100 }), null);
+  });
+
+  it("keeps the existing Databricks pointer shape valid", () => {
+    const entry = {
+      auth_type: "databricks",
+      workspace_host: "https://workspace.example",
+    };
+    mock.method(fs, "readFileSync", () => JSON.stringify({ "https://app.example": entry }));
+
+    assert.deepEqual(serverAuthEntry("https://app.example", { nowSeconds: 100 }), entry);
+  });
+});
+
+describe("storeServerAuthToken", () => {
+  let temporaryHome = null;
+
+  afterEach(() => {
+    mock.restoreAll();
+    if (temporaryHome) fs.rmSync(temporaryHome, { recursive: true, force: true });
+    temporaryHome = null;
+  });
+
+  it("atomically writes an expiring CLI-compatible owner-only token entry", () => {
+    temporaryHome = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-electron-auth-"));
+    mock.method(os, "homedir", () => temporaryHome);
+    const stateDirectory = path.join(temporaryHome, ".omnigent");
+    fs.mkdirSync(stateDirectory, { recursive: true });
+    fs.writeFileSync(
+      path.join(stateDirectory, "auth_tokens.json"),
+      JSON.stringify({
+        "https://workspace.example": {
+          auth_type: "databricks",
+          workspace_host: "https://workspace.example",
+        },
+      }),
+      { mode: 0o600 },
+    );
+
+    storeServerAuthToken("https://server.example/", {
+      token: "session-jwt",
+      userId: "user@example.com",
+      expiresAt: 200,
+    });
+
+    const tokenPath = path.join(stateDirectory, "auth_tokens.json");
+    const stored = JSON.parse(fs.readFileSync(tokenPath, "utf8"));
+    assert.deepEqual(stored["https://server.example"], {
+      token: "session-jwt",
+      user_id: "user@example.com",
+      expires_at: 200,
+    });
+    assert.equal(stored["https://workspace.example"].auth_type, "databricks");
+    assert.equal(fs.statSync(tokenPath).mode & 0o777, 0o600);
+    assert.equal(
+      serverAuthEntry("https://server.example", { nowSeconds: 100 }).token,
+      "session-jwt",
+    );
+    assert.equal(serverAuthEntry("https://server.example", { nowSeconds: 201 }), null);
+  });
+
+  it("re-reads and merges a concurrent CLI write before replacing the token map", () => {
+    temporaryHome = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-electron-auth-"));
+    mock.method(os, "homedir", () => temporaryHome);
+    const stateDirectory = path.join(temporaryHome, ".omnigent");
+    const tokenPath = path.join(stateDirectory, "auth_tokens.json");
+    fs.mkdirSync(stateDirectory, { recursive: true });
+    fs.writeFileSync(
+      tokenPath,
+      JSON.stringify({
+        "https://workspace.example": {
+          auth_type: "databricks",
+          workspace_host: "https://workspace.example",
+        },
+      }),
+      { mode: 0o600 },
+    );
+    const originalFsyncSync = fs.fsyncSync.bind(fs);
+    let injected = false;
+    mock.method(fs, "fsyncSync", (descriptor) => {
+      originalFsyncSync(descriptor);
+      if (injected) return;
+      injected = true;
+      fs.writeFileSync(
+        tokenPath,
+        JSON.stringify({
+          "https://workspace.example": {
+            auth_type: "databricks",
+            workspace_host: "https://workspace.example",
+          },
+          "https://cli.example": {
+            token: "cli-session",
+            user_id: "cli@example.com",
+            expires_at: 300,
+          },
+        }),
+        { mode: 0o600 },
+      );
+    });
+
+    storeServerAuthToken("https://server.example", {
+      token: "desktop-session",
+      userId: "desktop@example.com",
+      expiresAt: 200,
+    });
+
+    const stored = JSON.parse(fs.readFileSync(tokenPath, "utf8"));
+    assert.equal(stored["https://server.example"].token, "desktop-session");
+    assert.equal(stored["https://cli.example"].token, "cli-session");
+    assert.equal(stored["https://workspace.example"].auth_type, "databricks");
+  });
+});
+
+describe("runCli cancellation", () => {
+  it("aborts the login subprocess when the user cancels", async () => {
+    const controller = new AbortController();
+    const running = runCli(process.execPath, ["-e", "setTimeout(() => {}, 5000)"], {
+      timeoutMs: 5000,
+      signal: controller.signal,
+    });
+    setTimeout(() => controller.abort(), 20);
+
+    const result = await running;
+
+    assert.equal(result.aborted, true);
+    assert.notEqual(result.code, 0);
+  });
+
+  it("distinguishes a bounded timeout from user cancellation", async () => {
+    const result = await runCli(process.execPath, ["-e", "setTimeout(() => {}, 5000)"], {
+      timeoutMs: 20,
+    });
+
+    assert.equal(result.aborted, false);
+    assert.equal(result.timedOut, true);
+    assert.notEqual(result.code, 0);
   });
 });
 
