@@ -4,8 +4,8 @@
 // user would run by hand — `server --background/stop/status` and `host status` (the
 // long-lived `host` connection is spawned by server_manager.js, which owns its
 // lifetime). This module locates the binary, runs the short exit-quick
-// commands, and parses their `--json` output. The CLI is the single source of
-// truth for live state; nothing here is persisted.
+// commands, parses their `--json` output, and reads the CLI-compatible remote
+// auth store when a CLI login already exists.
 //
 // Unlike src/url.js this is main-process only (it needs child_process / fs),
 // so it's a plain CommonJS module — never loaded in the renderer.
@@ -397,35 +397,46 @@ function runCli(cliPath, args, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
 }
 
 /**
- * Whether the CLI holds valid stored credentials for a server — read straight
- * from `~/.omnigent/auth_tokens.json` (no subprocess), mirroring
+ * The CLI's valid stored credential entry for a server — read straight from
+ * `~/.omnigent/auth_tokens.json` (no subprocess), mirroring
  * omnigent/cli_auth.py: keyed by the trailing-slash-stripped URL, a record is
  * valid if it's a Databricks pointer (has `workspace_host`) or a non-expired
  * session token. The CLI's `state_dir()` is hardcoded to `~/.omnigent`.
  *
  * @param {string} serverUrl
- * @returns {boolean}
+ * @param {{ nowSeconds?: number }} [opts]
+ * @returns {Record<string, unknown> | null}
  */
-function serverAuthed(serverUrl) {
-  if (typeof serverUrl !== "string" || serverUrl === "") return false;
+function serverAuthEntry(serverUrl, { nowSeconds = Date.now() / 1000 } = {}) {
+  if (typeof serverUrl !== "string" || serverUrl === "") return null;
   const key = serverUrl.replace(/\/+$/, "");
   let data;
   try {
     data = JSON.parse(fs.readFileSync(path.join(stateDir(), "auth_tokens.json"), "utf8"));
   } catch {
-    return false;
+    return null;
   }
   const entry = data && typeof data === "object" ? data[key] : null;
-  if (!entry || typeof entry !== "object") return false;
+  if (!entry || typeof entry !== "object") return null;
   if (entry.auth_type === "databricks") {
-    return typeof entry.workspace_host === "string" && entry.workspace_host !== "";
+    return typeof entry.workspace_host === "string" && entry.workspace_host !== "" ? entry : null;
   }
   if (typeof entry.token === "string" && entry.token !== "") {
     // expires_at is unix seconds (cli_auth uses time.time()); treat absent as
     // non-expiring.
-    return typeof entry.expires_at === "number" ? entry.expires_at >= Date.now() / 1000 : true;
+    return typeof entry.expires_at === "number" && entry.expires_at < nowSeconds ? null : entry;
   }
-  return false;
+  return null;
+}
+
+/**
+ * Whether the CLI holds valid stored credentials for a server.
+ *
+ * @param {string} serverUrl
+ * @returns {boolean}
+ */
+function serverAuthed(serverUrl) {
+  return serverAuthEntry(serverUrl) !== null;
 }
 
 /**
@@ -721,21 +732,8 @@ function daemonServerUrl(record) {
  * @returns {string | null}
  */
 function bearerTokenFor(serverUrl) {
-  if (typeof serverUrl !== "string" || serverUrl === "") return null;
-  const key = serverUrl.replace(/\/+$/, "");
-  let data;
-  try {
-    data = JSON.parse(fs.readFileSync(path.join(stateDir(), "auth_tokens.json"), "utf8"));
-  } catch {
-    return null;
-  }
-  const entry = data && typeof data === "object" ? data[key] : null;
-  if (!entry || typeof entry !== "object") return null;
-  if (typeof entry.token === "string" && entry.token !== "") {
-    if (typeof entry.expires_at === "number" && entry.expires_at < Date.now() / 1000) return null;
-    return entry.token;
-  }
-  return null;
+  const entry = serverAuthEntry(serverUrl);
+  return typeof entry?.token === "string" ? entry.token : null;
 }
 
 /**
@@ -948,6 +946,7 @@ module.exports = {
   startLocalServer,
   stopLocalServer,
   stopHost,
+  serverAuthEntry,
   serverAuthed,
   probeServerAuth,
   loginServer,
