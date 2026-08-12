@@ -19,12 +19,32 @@ const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const { readFileSync } = require("node:fs");
 const path = require("node:path");
+const vm = require("node:vm");
 
 const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
 const preloadSource = readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
 
 // Strip block comments, then line comments (leaving `://` in URLs intact).
 const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
+
+function runPreload(windowObject) {
+  const exposed = [];
+  const contextBridge = {
+    exposeInMainWorld: (name, value) => exposed.push({ name, value }),
+  };
+  const ipcRenderer = {
+    invoke: () => Promise.resolve(),
+    on: () => {},
+    removeListener: () => {},
+    send: () => {},
+  };
+  const context = vm.createContext({
+    window: windowObject,
+    require: () => ({ contextBridge, ipcRenderer }),
+  });
+  new vm.Script(`(function () {\n${preloadSource}\n})()`).runInContext(context);
+  return exposed;
+}
 
 describe("setup clipboard IPC wiring", () => {
   it("exposes a narrow copy action through the setup bridge", () => {
@@ -39,6 +59,37 @@ describe("setup clipboard IPC wiring", () => {
       liveCode,
       /ipcMain\.handle\("omnigent:copy-setup-text",[\s\S]{0,200}!isSetupPageSender\(event\)[\s\S]{0,300}clipboard\.writeText\(text\)/,
     );
+  });
+});
+
+describe("WebAuthn preload wiring", () => {
+  it("registers the guard preload for top-level default-session documents", () => {
+    assert.match(liveCode, /const WEB_AUTHN_PRELOAD = path\.join\(__dirname, "webauthn\.js"\)/);
+    assert.match(
+      liveCode,
+      /session\.defaultSession\.registerPreloadScript\(\{[\s\S]{0,180}type: "frame"[\s\S]{0,120}filePath: WEB_AUTHN_PRELOAD/,
+    );
+  });
+
+  it("keeps the shell renderer sandboxed and the preload gate fail-closed", () => {
+    assert.match(
+      liveCode,
+      /preload: path\.join\(__dirname, "preload\.js"\)[\s\S]{0,140}sandbox: true[\s\S]{0,100}contextIsolation: true[\s\S]{0,100}nodeIntegration: false/,
+    );
+    assert.match(preloadSource, /if \(window\.top !== window\) return;/);
+    assert.doesNotMatch(liveCode, /nodeIntegrationInSubFrames/);
+  });
+
+  it("keeps the popup preload sandboxed and without Node subframes", () => {
+    assert.match(
+      liveCode,
+      /preload: POPUP_PRELOAD[\s\S]{0,180}sandbox: true[\s\S]{0,140}contextIsolation: true[\s\S]{0,100}nodeIntegration: false/,
+    );
+    assert.doesNotMatch(liveCode, /nodeIntegrationInSubFrames/);
+  });
+
+  it("does not expose shell bridges to a subframe when process metadata is absent", () => {
+    assert.deepEqual(runPreload({ top: {} }), []);
   });
 });
 
@@ -86,18 +137,6 @@ describe("window-open policy wiring (src/main.js)", () => {
         "src/main.js no longer passes window.open through decideWindowOpen. Either every",
         "popup is denied (OAuth sign-in breaks) or popups open without the",
         "pinned-opener/https/allowlist conditions. Restore the dispatch.",
-      ].join(" "),
-    );
-  });
-
-  it("attaches the no-op popup preload and sandbox to allowed popups", () => {
-    assert.match(
-      liveCode,
-      /preload:\s*POPUP_PRELOAD[\s\S]{0,120}sandbox:\s*true/,
-      [
-        "Allowed popups no longer force preload: POPUP_PRELOAD + sandbox: true, so a child",
-        "window can inherit the SHELL preload's IPC bridges while showing third-party",
-        "sign-in pages. Restore both overrides (see popup_preload.js).",
       ].join(" "),
     );
   });

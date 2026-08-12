@@ -16,6 +16,7 @@
 
 const { contextBridge, ipcRenderer } = require("electron");
 
+if (window.top !== window) return;
 // Collapse the update states the in-page UpdateBanner renders on
 // (available / downloaded / error-security) to `idle` so the server page can
 // never show a banner — that UI is shell-owned (the corner overlay). Kept here
