@@ -50,7 +50,8 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           # App tokens cannot push workflow-file changes; prefer the
-          # workflows-scoped PAT, with today's token as fallback.
+          # workflows-scoped PAT, with GitHub token as fallback.
+          # PAT pushes trigger workflows, so merge commits carry [skip ci].
           token: ${{ secrets.STAGING_PUSH_TOKEN || github.token }}
           ref: main
           fetch-depth: 0
@@ -73,7 +74,7 @@ jobs:
           # (unmerged index entries) are skippable. A bad object or a transport
           # error must stay loud instead of hiding behind an hourly warning.
           merge_or_soft_fail() {
-            if git merge --no-edit "$1"; then
+            if git merge -m "Merge upstream main [skip ci]" "$1"; then
               return 0
             fi
             if [ -z "$(git ls-files -u)" ]; then
@@ -164,7 +165,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           # App tokens cannot push workflow-file changes; prefer the
-          # workflows-scoped PAT, with today's token as fallback.
+          # workflows-scoped PAT, with GitHub token as fallback.
           token: ${{ secrets.STAGING_PUSH_TOKEN || github.token }}
           fetch-depth: 0
 
