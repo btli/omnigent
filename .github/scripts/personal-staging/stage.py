@@ -274,14 +274,6 @@ def dev_version(cwd: str | Path, upstream_sha: str, datestamp: str) -> str:
     return f"v{m.group(1)}.dev{datestamp}"
 
 
-def _ordered_pins(prs: list[dict]) -> list[dict]:
-    """PRs stay ascending by number (the composition's original rule);
-    fork-branch extras follow in manifest order — they have no PR number."""
-    branches = [p for p in prs if p.get("source") == "extra-branch"]
-    numbered = [p for p in prs if p.get("source") != "extra-branch"]
-    return sorted(numbered, key=lambda p: p["number"]) + branches
-
-
 def _pin_label(p: dict) -> str:
     if p.get("source") == "extra-branch":
         return f"branch:{p['branch']}"
@@ -293,7 +285,7 @@ def merge_prs(
 ) -> tuple[list[dict], list[dict]]:
     applied: list[dict] = []
     skipped: list[dict] = []
-    for pr in _ordered_pins(prs):
+    for pr in sorted(prs, key=lambda p: (p["number"] is None, p["number"])):
         num, source = pr.get("number"), pr.get("source", "open")
         if source == "extra-branch":
             branch = pr["headRefName"]
@@ -408,12 +400,6 @@ def composition_of(
     return None
 
 
-def _pin_key(p: dict) -> int | str:
-    if p.get("source") == "extra-branch":
-        return f"branch:{p['branch']}"
-    return p["pr"]
-
-
 def _blocked_label(n: object) -> str:
     if isinstance(n, int):
         return f"#{n}"
@@ -434,7 +420,11 @@ def push_causes(
     # Only minted merges are comparable: the decoded old composition knows
     # merge subjects, and an already-merged PR mints none.
     new = {
-        _pin_key(p): (p["branch"], str(p["oid"])[:12], p["source"])
+        (f"branch:{p['branch']}" if p.get("source") == "extra-branch" else p["pr"]): (
+            p["branch"],
+            str(p["oid"])[:12],
+            p["source"],
+        )
         for p in applied
         if p.get("minted", True)
     }
@@ -749,11 +739,7 @@ def main(argv: list[str] | None = None) -> int:
         # manifest always comes from the trusted checkout.
         pr_extras, branch_extras = parse_extras(Path(args.extras))
         prs = merge_stream(prs, pr_extras)
-        seen: set[str] = set()
-        for name in branch_extras:
-            if name in seen:
-                continue
-            seen.add(name)
+        for name in dict.fromkeys(branch_extras):
             prs.append({"source": "extra-branch", "headRefName": name, "number": None})
         report = stage(
             args.workdir,
