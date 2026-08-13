@@ -96,8 +96,12 @@ pointerdown (pointerType touch|pen; mouse passes through unchanged)
 ```
 
 The menu opens AT `MENU_HOLD_MS` while the finger is still down (TR-12),
-with a haptic cue — not on release. While undecided the dispatcher buffers
-via refs — no React state churn, passive listeners on scroll containers
+with a haptic cue — not on release. Award is exclusive and
+first-crossed-wins per TR-11 — there is no geometric disjointness between
+hold and swipe; crossing any award threshold cancels hold eligibility. A
+second touch pointer joining an undecided sequence cancels it and yields
+to browser pinch-zoom (TR-28). While undecided the dispatcher buffers via
+refs — no React state churn, passive listeners on scroll containers
 (TR-16(a)/(b) are component-test assertions).
 
 Integration points, in order:
@@ -110,8 +114,11 @@ Integration points, in order:
    review defects encoded as regression tests (TR-29).
 2. **Edge ownership table** — a small module implementing TR-14's
    normative matrix (start-edge → rail open; end-edge → released to
-   browser/OS; back → dismissal stack). `__omnigentNativeHandleBack`
-   (Android) and the iOS edge-pan handoff both resolve through it (TR-28).
+   browser/OS; Android back → dismissal stack; browser back → per-layer
+   history entries, one `popstate` closes one token-matched layer).
+   `__omnigentNativeHandleBack` (Android) and the iOS edge-pan handoff
+   both resolve through it (TR-28); iOS edge-pan only ever OPENS the rail
+   — dismissal on iOS is tap/scrim/keyboard per TR-24.
    Per-surface `touch-action`/`overscroll-behavior` claims land per TR-28's
    baseline table.
 3. **Editor/table surfaces** — `TableBubbleMenu`'s mouse-only table

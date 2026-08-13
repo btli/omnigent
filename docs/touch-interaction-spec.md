@@ -87,7 +87,7 @@ changes bindings, not the spec (TR-30).
   action buttons, `md:opacity-0 md:group-hover:opacity-100`) MUST be
   reachable on hover-less / coarse-pointer devices: persistent visibility,
   or an equivalent touch path (row menu, swipe action). This is what makes
-  TR-19's touch-laptop audience real — today those devices can reveal no
+  TR-20's touch-laptop audience real — today those devices can reveal no
   row action at all.
 
 ### Resize
@@ -102,9 +102,12 @@ changes bindings, not the spec (TR-30).
   (never a half-state); listeners are removed on unmount; a second
   concurrent pointer is ignored (first pointer wins); drags over embedded
   iframes keep receiving moves (overlay shield or capture).
-- **TR-7** Resize handles MUST have a coarse-pointer hit target of at least
-  24 CSS px (44 px preferred where layout permits) without changing their
-  visual weight on fine-pointer devices.
+- **TR-7** Resize handles MUST have an invisible hit target of at least
+  24 CSS px (44 px preferred where layout permits) on ALL devices — touch
+  and pen alike, regardless of what capability queries report — without
+  changing their visual weight. Pen-first devices commonly expose a fine
+  pointer, and a 1 px visual handle is impractical to acquire with either
+  input.
 - **TR-8** Existing keyboard resize paths (arrow keys on separators) MUST be
   preserved; hooks that lack a keyboard path (`useResizableColumn`) MUST
   gain one.
@@ -119,15 +122,22 @@ changes bindings, not the spec (TR-30).
   it to at most one intent: scroll, horizontal swipe, long-press (menu),
   long-press-drag (reorder), edge-swipe, or resize.
 - **TR-11** Recognition thresholds are normative, defined once in an
-  exported constants module, and MUST keep competing activation regions
-  disjoint. Initial values (tunable only within the stated ranges, and only
-  with the device-matrix retest required by the design doc):
+  exported constants module. Award is EXCLUSIVE and first-crossed-wins:
+  the dispatcher evaluates each move against the thresholds below, the
+  first award (scroll release, swipe, drag, menu) ends arbitration for the
+  sequence, and hold arming is eligible only while no award has occurred
+  and total travel stays within `HOLD_DRIFT_PX`. There is NO geometric
+  disjointness guarantee between hold and swipe regions — exclusivity
+  comes from this precedence rule, not from region math. Invariants
+  DOMINATE tuning ranges: a retune is legal only if it satisfies every
+  invariant AND passes the device-matrix retest required by the design
+  doc; the ranges are guidance, not a grant.
 
   | Constant | Value | Meaning | Tuning range | Invariant |
   |---|---|---|---|---|
-  | `SWIPE_ACTIVATION_PX` | 12 | horizontal travel that awards `swipe`, axis-locked (see TR-13) | 8–16 | `< HOLD_DRIFT_PX / √2` |
+  | `SWIPE_ACTIVATION_PX` | 12 | horizontal travel that awards `swipe` when horizontal-first (see TR-13) | 8–16 | `> DRAG_TOLERANCE_PX` |
   | `HOLD_MS` | 250 | stationary hold that arms drag-or-menu (dnd-kit parity on main) | 200–350 | `< MENU_HOLD_MS` |
-  | `HOLD_DRIFT_PX` | 25 | max travel while holding before the hold cancels (the train's 25/√2 ≈ 17.7 per-axis bound keeps swipe and hold disjoint) | 20–30 | `/√2 > SWIPE_ACTIVATION_PX` |
+  | `HOLD_DRIFT_PX` | 20 | total travel that cancels hold eligibility (the train's hold tolerance in `c21fec929`; its 25 px circle was the separate scroll-fallback radius) | 8–20 | crossing any award threshold also cancels hold |
   | `MENU_HOLD_MS` | 500 | stationary hold that opens the context menu (replaces Radix's ~700 ms default) | 400–700 | `> HOLD_MS` |
   | `DRAG_TOLERANCE_PX` | 8 | movement after arming that converts hold → drag (dnd-kit parity) | 5–10 | `< SWIPE_ACTIVATION_PX` |
   | `EDGE_ZONE_PX` | 24 | width of the screen-edge strip that recognizes edge-swipe | 16–32 | — |
@@ -157,7 +167,8 @@ changes bindings, not the spec (TR-30).
   |---|---|---|
   | Start-edge swipe (within `EDGE_ZONE_PX`) | Rail/sidebar open (dispatcher) | iOS `UIScreenEdgePanGestureRecognizer` delegates its drag here; WebKit back-forward gestures stay disabled |
   | End-edge swipe | Released to browser/OS (back-forward where the platform provides it) | No app consumer may claim it without amending this table |
-  | Android hardware/system back, browser back | Dismissal stack below, then history | Routed via `__omnigentNativeHandleBack` |
+  | Android hardware/system back | Dismissal stack below, then WebView history | Routed via `__omnigentNativeHandleBack` (Android shell only) |
+  | Browser back (`popstate`) | Topmost history-participating layer, else normal history navigation | Each dismissible layer pushes ONE history entry on open; `popstate` closes exactly one layer, matched by a state token so re-entrant pops cannot loop; transient popovers that don't push are not browser-back-dismissible |
   | Dismissal stack (top → bottom) | modal dialogs → context menus/popovers → expanded rail panel or `MobilePanelDrawer` → rail/sidebar overlay → in-app history → browser history/app exit | One layer per back press |
 
 - **TR-15** Every gesture MUST have a non-gesture equivalent. The parity
@@ -181,9 +192,14 @@ changes bindings, not the spec (TR-30).
   testable gates: (a) no non-passive move listeners on scroll containers
   while a sequence is undecided; (b) no React state commits per
   `pointermove` while undecided (both assertable in component tests); and
-  (c) a manual gate on a named low-end Android reference device
-  (Moto G-class): scrolling a 500-row session list holds ≥ 55 fps average
-  with no input-latency spike over 100 ms.
+  (c) a manual gate on the named reference configuration — Moto G Power
+  (2023), Android 13, current stable Chrome — running a scripted,
+  repeatable benchmark: populate 500 session rows, 5 s warm-up, then 30 s
+  of scripted fling scrolls traced with Perfetto/Chrome tracing; pass =
+  mean fps ≥ 55 over the scripted window AND p95 input latency < 100 ms.
+  The script and trace config are committed alongside the dispatcher;
+  substituting hardware requires amending this requirement, not ad-hoc
+  judgment.
 
 ### Session-row touch actions (from #3985 / #3154 / #4057 / #4060 / #4065)
 
@@ -228,9 +244,12 @@ changes bindings, not the spec (TR-30).
   current full-screen `fixed inset-0` session list pinned open), expanding
   into the content panel; expansion/collapse is reachable by tap, by
   start-edge swipe (via the dispatcher, per TR-14), and by keyboard.
-- **TR-24** Hardware/system back (Android), the iOS edge gesture, and
-  browser back MUST dismiss rail layers in the order defined by TR-14's
-  dismissal stack.
+- **TR-24** Hardware/system back (Android) and browser back (via the
+  history participation defined in TR-14) MUST dismiss rail layers in the
+  order defined by TR-14's dismissal stack. iOS has NO edge dismissal
+  gesture — TR-14 assigns the start edge exclusively to opening the rail
+  and releases the end edge to the OS — so on iOS dismissal is by tap on
+  the scrim or rail anchor, the close button, or keyboard.
 - **TR-25** The rail MUST inherit the tab semantics, ARIA labels, and
   roving-tabindex keyboard behavior of the existing `WorkspacePanel` Radix
   tabs; screen-reader users get one nav landmark, not a stack of bespoke
@@ -253,8 +272,8 @@ changes bindings, not the spec (TR-30).
   | Surface | `touch-action` | `overscroll-behavior` | Notes |
   |---|---|---|---|
   | Chat transcript scroller | `pan-y pinch-zoom` | `contain` | no pull-to-refresh reload mid-session |
-  | Session list rows | `pan-y` (dispatcher claims horizontal) | `contain` | swipe/hold handled per TR-11..13 |
-  | Rail anchor + edge zone | `pan-y` | `contain` | start-edge swipe per TR-14 |
+  | Session list rows | `pan-y pinch-zoom` (dispatcher claims horizontal) | `contain` | swipe/hold per TR-11..13; a second pointer joining cancels the sequence and yields to pinch-zoom |
+  | Rail anchor + edge zone | `pan-y pinch-zoom` | `contain` | start-edge swipe per TR-14; second pointer yields to pinch-zoom |
   | Resize handles | `none` | — | TR-9 |
   | Text/editor content | browser default | default | selection untouched |
   | Embedded browser panel | browser default inside the frame | `contain` at the boundary | |
