@@ -49,6 +49,9 @@ jobs:
       - name: Checkout fork main with full history
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          # App tokens cannot push workflow-file changes; prefer the
+          # workflows-scoped PAT, with today's token as fallback.
+          token: ${{ secrets.STAGING_PUSH_TOKEN || github.token }}
           ref: main
           fetch-depth: 0
 
@@ -160,6 +163,9 @@ jobs:
       - name: Checkout fork with full history
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          # App tokens cannot push workflow-file changes; prefer the
+          # workflows-scoped PAT, with today's token as fallback.
+          token: ${{ secrets.STAGING_PUSH_TOKEN || github.token }}
           fetch-depth: 0
 
       - name: Compose staging from upstream main + open btli PRs + extras
