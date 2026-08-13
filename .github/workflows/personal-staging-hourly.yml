@@ -42,6 +42,7 @@ jobs:
     # from pushing fork main with this job's write token.
     if: github.repository == 'btli/omnigent' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    environment: staging-push
     timeout-minutes: 10
     permissions:
       contents: write
@@ -51,12 +52,14 @@ jobs:
         with:
           # App tokens cannot push workflow-file changes; prefer the
           # workflows-scoped PAT, with GitHub token as fallback.
-          # PAT pushes trigger workflows, so merge commits carry [skip ci].
+          # PAT pushes trigger workflows, so PAT merges force a [skip ci] commit.
           token: ${{ secrets.STAGING_PUSH_TOKEN || github.token }}
           ref: main
           fetch-depth: 0
 
       - name: Merge upstream main and push (soft-fail on conflict)
+        env:
+          HAS_PAT: ${{ secrets.STAGING_PUSH_TOKEN != '' }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -74,8 +77,10 @@ jobs:
           # (unmerged index entries) are skippable. A bad object or a transport
           # error must stay loud instead of hiding behind an hourly warning.
           merge_or_soft_fail() {
-            if git merge -m "Merge upstream main [skip ci]" "$1"; then
-              return 0
+            if [ "$HAS_PAT" = "true" ]; then
+              git merge --no-ff -m "Merge upstream main [skip ci]" "$1" && return 0
+            else
+              git merge --no-edit "$1" && return 0
             fi
             if [ -z "$(git ls-files -u)" ]; then
               echo "::error::sync-main: git merge failed with no conflicting paths — not a content conflict"
@@ -157,6 +162,7 @@ jobs:
     # security boundary — see the nightly workflow's integrate job.
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    environment: staging-push
     timeout-minutes: 20
     permissions:
       contents: write
