@@ -63,8 +63,9 @@ Migration of the five hooks to
 `touch-action: none` on handles (TR-6, TR-9) and TR-6's robustness
 outcomes: clean abort on `pointercancel`/capture loss, unmount cleanup,
 first-pointer-wins, and iframe-overlay shielding during drags (the
-existing mouse paths already overlay iframes; keep that). Coarse-pointer
-hit-target padding on handles (TR-7); `useResizableColumn` gains the
+existing mouse paths already overlay iframes; keep that). Invisible
+hit-target padding on handles on all devices (TR-7); `useResizableColumn`
+gains the
 keyboard path the other hooks already have (TR-8). No API change for
 consumers — five small, independently reviewable PRs.
 
@@ -80,14 +81,14 @@ routes through the dispatcher as a `resize`-intent claimant.
 
 Generalizes the train's `useRowGesture` (commit `8dd70928c` and successors
 on `feature/mobile-slide-actions-v2` / `train/polly/session-row-gesture-fix`
-— recover the hardening: drift tolerance, the disjoint-region math now
-normative in TR-11's threshold table, WebView haptics). One instance owns
+— recover the hardening: drift tolerance, the threshold constants now
+normative in TR-11's table, WebView haptics). One instance owns
 one contended surface's pointer stream and awards it to a single intent
 (TR-10). Timing and thresholds are TR-11/TR-12's; the state machine:
 
 ```
 pointerdown (pointerType touch|pen; mouse passes through unchanged)
-  └─ undecided ──(vertical-first movement)──────────────► release to scroll
+  └─ undecided ──(vertical-first ≥ SCROLL_ACTIVATION_PX)──► release to scroll
        │        ──(horizontal-first ≥ SWIPE_ACTIVATION_PX)► swipe
        │        ──(stationary within HOLD_DRIFT_PX for HOLD_MS)► armed
        │              ├─(moves > DRAG_TOLERANCE_PX)───────► drag (menu suppressed)
@@ -100,7 +101,9 @@ with a haptic cue — not on release. Award is exclusive and
 first-crossed-wins per TR-11 — there is no geometric disjointness between
 hold and swipe; crossing any award threshold cancels hold eligibility. A
 second touch pointer joining an undecided sequence cancels it and yields
-to browser pinch-zoom (TR-28). While undecided the dispatcher buffers via
+to browser pinch-zoom; one joining an already-awarded sequence is ignored
+— first pointer keeps ownership (TR-11, TR-28). While undecided the
+dispatcher buffers via
 refs — no React state churn, passive listeners on scroll containers
 (TR-16(a)/(b) are component-test assertions).
 
@@ -115,7 +118,9 @@ Integration points, in order:
 2. **Edge ownership table** — a small module implementing TR-14's
    normative matrix (start-edge → rail open; end-edge → released to
    browser/OS; Android back → dismissal stack; browser back → per-layer
-   history entries, one `popstate` closes one token-matched layer).
+   history entries, one `popstate` closes one token-matched layer, and
+   non-popstate dismissals — scrim tap, Escape, close button, Android back
+   — consume their layer's entry so back never no-ops on an orphan).
    `__omnigentNativeHandleBack` (Android) and the iOS edge-pan handoff
    both resolve through it (TR-28); iOS edge-pan only ever OPENS the rail
    — dismissal on iOS is tap/scrim/keyboard per TR-24.
@@ -164,9 +169,10 @@ extensions above it; it does not fork the contract. Mobile gets:
   (TR-25);
 - safe-area insets applied once at the rail boundary from the existing
   `--omnigent-safe-*` vars (TR-26);
-- Android back and iOS edge-pan dismiss rail layers per TR-14's dismissal
-  stack (TR-24); displaced header controls (the #3589/#4551 strip) get
-  rail homes (TR-27).
+- Android back and browser back dismiss rail layers per TR-14's dismissal
+  stack; iOS has no edge-dismissal gesture — dismissal there is scrim tap,
+  rail anchor, close button, or keyboard (TR-24); displaced header
+  controls (the #3589/#4551 strip) get rail homes (TR-27).
 
 Migration runs the rail behind a temporary fallback alongside the FAB/drawer
 path, then removes the duplicates once task coverage is proven.

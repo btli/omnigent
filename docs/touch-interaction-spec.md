@@ -133,11 +133,18 @@ changes bindings, not the spec (TR-30).
   invariant AND passes the device-matrix retest required by the design
   doc; the ranges are guidance, not a grant.
 
+  Multi-pointer rule: a second touch pointer joining an UNDECIDED sequence
+  cancels it and yields the stream to browser pinch-zoom (TR-28); a second
+  pointer joining a sequence that has already been awarded (swipe, drag,
+  menu, resize) is ignored — the award stands and the first pointer keeps
+  ownership until it ends the sequence.
+
   | Constant | Value | Meaning | Tuning range | Invariant |
   |---|---|---|---|---|
   | `SWIPE_ACTIVATION_PX` | 12 | horizontal travel that awards `swipe` when horizontal-first (see TR-13) | 8–16 | `> DRAG_TOLERANCE_PX` |
+  | `SCROLL_ACTIVATION_PX` | 10 | vertical travel that releases an undecided sequence to native scroll when vertical-first (see TR-13) | 8–16 | crossing it cancels hold eligibility |
   | `HOLD_MS` | 250 | stationary hold that arms drag-or-menu (dnd-kit parity on main) | 200–350 | `< MENU_HOLD_MS` |
-  | `HOLD_DRIFT_PX` | 20 | total travel that cancels hold eligibility (the train's hold tolerance in `c21fec929`; its 25 px circle was the separate scroll-fallback radius) | 8–20 | crossing any award threshold also cancels hold |
+  | `HOLD_DRIFT_PX` | 20 | total travel that cancels hold eligibility (the train's hold tolerance in `c21fec929`; its 25 px circle was the separate scroll-fallback radius) | 16–24 | crossing any award threshold also cancels hold |
   | `MENU_HOLD_MS` | 500 | stationary hold that opens the context menu (replaces Radix's ~700 ms default) | 400–700 | `> HOLD_MS` |
   | `DRAG_TOLERANCE_PX` | 8 | movement after arming that converts hold → drag (dnd-kit parity) | 5–10 | `< SWIPE_ACTIVATION_PX` |
   | `EDGE_ZONE_PX` | 24 | width of the screen-edge strip that recognizes edge-swipe | 16–32 | — |
@@ -155,7 +162,8 @@ changes bindings, not the spec (TR-30).
   250 ms sensor permanently shadows Radix's long-press, is a defect this
   requirement forbids.
 - **TR-13** Axis lock: while a sequence is undecided, vertical-first
-  movement releases it to native scroll and horizontal-first movement
+  movement of at least `SCROLL_ACTIVATION_PX` releases it to native scroll
+  and horizontal-first movement
   (|dx| > |dy| at award time) is eligible for `swipe`. A slow or hesitant
   swipe MUST NOT convert into a drag, and vertical scrolling MUST never be
   hijacked by a horizontal consumer.
@@ -168,7 +176,7 @@ changes bindings, not the spec (TR-30).
   | Start-edge swipe (within `EDGE_ZONE_PX`) | Rail/sidebar open (dispatcher) | iOS `UIScreenEdgePanGestureRecognizer` delegates its drag here; WebKit back-forward gestures stay disabled |
   | End-edge swipe | Released to browser/OS (back-forward where the platform provides it) | No app consumer may claim it without amending this table |
   | Android hardware/system back | Dismissal stack below, then WebView history | Routed via `__omnigentNativeHandleBack` (Android shell only) |
-  | Browser back (`popstate`) | Topmost history-participating layer, else normal history navigation | Each dismissible layer pushes ONE history entry on open; `popstate` closes exactly one layer, matched by a state token so re-entrant pops cannot loop; transient popovers that don't push are not browser-back-dismissible |
+  | Browser back (`popstate`) | Topmost history-participating layer, else normal history navigation | Each dismissible layer pushes ONE history entry on open; `popstate` closes exactly one layer, matched by a state token so re-entrant pops cannot loop; transient popovers that don't push are not browser-back-dismissible. Close-path reconciliation: any NON-popstate dismissal of a history-participating layer (scrim tap, Escape, close button, Android back) MUST also consume that layer's history entry — e.g. `history.back()` with the resulting token-matched pop treated as already-handled — so no orphaned entry survives and a later back press never visibly no-ops |
   | Dismissal stack (top → bottom) | modal dialogs → context menus/popovers → expanded rail panel or `MobilePanelDrawer` → rail/sidebar overlay → in-app history → browser history/app exit | One layer per back press |
 
 - **TR-15** Every gesture MUST have a non-gesture equivalent. The parity
@@ -212,8 +220,10 @@ changes bindings, not the spec (TR-30).
 - **TR-18** Row long-press follows TR-12 exactly (menu at `MENU_HOLD_MS`,
   drag conversion suppresses the menu).
 - **TR-19** Drag-to-ungroup (the #4057 drop zone) and any future drop
-  targets MUST work with touch drag; drop targets MUST meet coarse-pointer
-  hit-target size (TR-7).
+  targets MUST work with touch drag; drop targets MUST present a hit
+  target of at least 44 CSS px in the drop-approach axis on all devices
+  (TR-7's sizing rule covers resize handles only, so the size is stated
+  here directly).
 - **TR-20** Row gestures bind to `pointerType` per TR-2 — never to viewport
   width — so foldables and touch laptops at ≥ 768 px get working row
   gestures (already prototyped in the abandoned train's coarse-pointer
