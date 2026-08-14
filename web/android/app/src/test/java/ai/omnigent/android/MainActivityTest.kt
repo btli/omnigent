@@ -4,6 +4,8 @@ import android.content.Context
 import android.content.RestrictionsManager
 import android.content.res.Configuration
 import android.os.Bundle
+import android.widget.Button
+import android.widget.EditText
 import androidx.core.graphics.Insets
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -64,6 +66,17 @@ class MainActivityTest {
         assertTrue(script.contains("const top = '24.0px'"))
         assertTrue(script.contains("const bottom = '16.0px'"))
         assertTrue(script.contains("const left = '31.0px'"))
+    }
+
+    @Test
+    fun `connect activity marks its handoff as an explicit server change`() {
+        val activity = Robolectric.buildActivity(ConnectActivity::class.java).setup().get()
+        activity.findViewById<EditText>(R.id.server_url).setText("https://new.example")
+
+        activity.findViewById<Button>(R.id.connect).performClick()
+
+        val intent = shadowOf(activity).nextStartedActivity
+        assertTrue(intent.getBooleanExtra(ConnectActivity.EXTRA_SERVER_CHANGED, false))
     }
 
     @Test

@@ -16,6 +16,10 @@ are HTTPS-only except device-local loopback (for omnigent:// deep links — see
 _Deep links_ below), mirroring the iOS `NSAllowsArbitraryLoadsInWebContent`
 debug-only posture.
 
+The release configuration explicitly allowlists `::1`, but IPv6 loopback
+loading still needs verification with a release build on a device or emulator;
+unit tests cannot demonstrate WebView's platform policy enforcement.
+
 ## Deep links
 
 The app handles `omnigent://<host>[:port]/c/<id>` links. The manifest's
