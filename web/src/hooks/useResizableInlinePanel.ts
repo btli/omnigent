@@ -5,7 +5,7 @@
 // ExecutionLogsPanel / FilesPanelDrawer — those open at ~50 % by default
 // while the inline panel starts at a compact sidebar width.
 
-import { useCallback, useEffect, useReducer, useRef, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useReducer, useRef, useState, useSyncExternalStore } from "react";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
@@ -15,8 +15,11 @@ const MAX_WIDTH_RATIO = 0.99;
 const CHAT_MIN_WIDTH_PX = 480;
 /** Visual gap between the chat column and the rail. */
 const GAP_PX = 8;
-/** Invisible cross-axis padding so a 4px visual handle (`w-1`) still hits 44px. */
-const HANDLE_HIT_PAD_PX = 20;
+// The handle sits on the panel's left edge. Weight the invisible target toward
+// the adjacent chat while limiting the inward pad to the panel's 8px gutter.
+const COARSE_OUTWARD_HANDLE_HIT_PAD_PX = 36;
+const FINE_OUTWARD_HANDLE_HIT_PAD_PX = 16;
+const INWARD_HANDLE_HIT_PAD_PX = 4;
 
 // ~36 % of viewport, clamped [420, 600] — ~30 % wider than the prior default so
 // the first manual open lands at a comfortable working width.
@@ -153,6 +156,9 @@ export function useResizableInlinePanel(
 ) {
   const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
   const isMobileViewport = useIsMobileViewport();
+  const [isCoarsePointer, setIsCoarsePointer] = useState(
+    () => typeof window !== "undefined" && !!window.matchMedia?.("(pointer: coarse)").matches,
+  );
   // On a session switch the module store still holds the previous session's
   // width until the effect below re-seeds it after commit. Derive this render's
   // width straight from the incoming session's saved value so the panel doesn't
@@ -204,6 +210,14 @@ export function useResizableInlinePanel(
   useEffect(() => {
     loadSession(sessionId);
   }, [sessionId]);
+
+  useEffect(() => {
+    const media = window.matchMedia?.("(pointer: coarse)");
+    if (!media) return;
+    const onChange = (event: MediaQueryListEvent) => setIsCoarsePointer(event.matches);
+    media.addEventListener("change", onChange);
+    return () => media.removeEventListener("change", onChange);
+  }, []);
 
   // Re-clamp on viewport resize so the panel can't overflow a shrunken window.
   // Re-derive the effective width from the persisted preference so widening the
@@ -337,8 +351,14 @@ export function useResizableInlinePanel(
       style: {
         touchAction: "none",
         boxSizing: "content-box" as const,
-        paddingInline: HANDLE_HIT_PAD_PX,
-        marginInline: -HANDLE_HIT_PAD_PX,
+        paddingLeft: isCoarsePointer
+          ? COARSE_OUTWARD_HANDLE_HIT_PAD_PX
+          : FINE_OUTWARD_HANDLE_HIT_PAD_PX,
+        paddingRight: INWARD_HANDLE_HIT_PAD_PX,
+        marginLeft: isCoarsePointer
+          ? -COARSE_OUTWARD_HANDLE_HIT_PAD_PX
+          : -FINE_OUTWARD_HANDLE_HIT_PAD_PX,
+        marginRight: -INWARD_HANDLE_HIT_PAD_PX,
         backgroundClip: "content-box",
       },
       role: "separator" as const,

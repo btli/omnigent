@@ -404,20 +404,53 @@ describe("useResizableInlinePanel pointer drag", () => {
     expect(result.current.panelWidth).toBe(800);
   });
 
-  it("returns touch-action none and a 44px cross-axis hit target on handleProps", () => {
+  it("returns touch-action none and a 24px fine-pointer hit target on handleProps", () => {
     // WorkspacePanel spreads handleProps onto a 4px visual handle (w-1).
-    // The invisible hit target has to live in the returned style — 20px
-    // padding each side + content-box sizing = 44px without changing the
-    // painted width (background-clip: content-box).
+    // The target favors the outward chat side so panel controls remain clear.
     const { result } = renderHook(() => useResizableInlinePanel(SESSION));
 
     expect(result.current.handleProps.style).toMatchObject({
       touchAction: "none",
       boxSizing: "content-box",
-      paddingInline: 20,
-      marginInline: -20,
+      paddingLeft: 16,
+      paddingRight: 4,
+      marginLeft: -16,
+      marginRight: -4,
       backgroundClip: "content-box",
     });
+  });
+
+  it("reacts to coarse-pointer changes with a 44px outward-weighted target", () => {
+    const originalMatchMedia = window.matchMedia;
+    let coarse = false;
+    let onChange: ((event: MediaQueryListEvent) => void) | undefined;
+    window.matchMedia = ((query: string) => ({
+      matches: query === "(pointer: coarse)" ? coarse : false,
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => {
+        if (query === "(pointer: coarse)") onChange = listener;
+      },
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    })) as typeof window.matchMedia;
+
+    try {
+      const { result } = renderHook(() => useResizableInlinePanel(SESSION));
+      coarse = true;
+      act(() => onChange?.({ matches: true } as MediaQueryListEvent));
+
+      expect(result.current.handleProps.style).toMatchObject({
+        paddingLeft: 36,
+        paddingRight: 4,
+        marginLeft: -36,
+        marginRight: -4,
+      });
+    } finally {
+      window.matchMedia = originalMatchMedia;
+    }
   });
 });
 
