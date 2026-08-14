@@ -43,12 +43,13 @@ EXTRAS_FILE = Path(__file__).resolve().parent / "extras.txt"
 # invites editing the manifest, and only a failure to reach the remote blocks
 # the push (dropping a required pin would silently regress staging).
 EXTRA_MISSING = "extra unfetchable (likely deleted; remove from extras.txt)"
-EXTRA_FETCH_FAILED = "extra fetch failed (cannot reach upstream; pin kept, staging not advanced)"
+EXTRA_FETCH_FAILED = "extra fetch failed (cannot reach remote; pin kept, staging not advanced)"
 EXTRA_FETCH_ATTEMPTS = 3
 EXTRA_FETCH_BACKOFF_S = 2
 # Subject line minted below for every staging merge commit; also decoded to
 # diff two compositions (what changed between the old and new staging).
 STAGING_MERGE_RE = re.compile(r"staging: merge PR #(\d+) \((.+) @ ([0-9a-f]{12})\)")
+STAGING_BRANCH_MERGE_RE = re.compile(r"staging: merge branch (.+) \((.+) @ ([0-9a-f]{12})\)")
 # Fixed identity, no gpg signature: the merge commit must be byte-reproducible
 # so an unchanged same-day rerun lands on the identical sha (no-op detection).
 COMMIT_IDENT = [
@@ -164,40 +165,75 @@ def check_not_truncated(prs: list[dict]) -> list[dict]:
     return prs
 
 
-def parse_extras(path: Path) -> list[int]:
-    """PR numbers from the extras manifest: one per line, blank lines and
-    ``#``-to-end-of-line comments allowed; a missing file means no extras.
-    A non-numeric entry is a config error — fail loud, don't drop a pin."""
+def _validate_branch_pin(name: str) -> str | None:
+    """Return a fail-loud reason, or None if ``name`` is a legal fork-branch pin.
+
+    Reject ``-`` prefixes before any git argv so a crafted name cannot be
+    parsed as an option; then ``git check-ref-format --branch`` (name is now
+    a positional value, not a flag). ``main`` and ``staging`` are the
+    composition's own refs — pinning them would self-merge."""
+    if not name:
+        return "invalid branch name"
+    if name.startswith("-"):
+        return "branch name must not start with '-'"
+    if name in {"main", "staging"}:
+        return f"branch {name!r} is a composition self-reference"
+    # name is a single argv after --branch and does not start with '-'.
+    proc = subprocess.run(
+        ["git", "check-ref-format", "--branch", name],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if proc.returncode != 0 or proc.stdout.strip() != name:
+        return f"invalid branch name {name!r}"
+    return None
+
+
+def parse_extras(path: Path) -> tuple[list[int], list[str]]:
+    """PR numbers and ``branch:<name>`` pins from the extras manifest: one
+    per line, blank lines and ``#``-to-end-of-line comments allowed; a
+    missing file means no extras. Anything else is a config error — fail
+    loud, don't drop a pin."""
     try:
         text = path.read_text()
     except FileNotFoundError:
-        return []
+        return [], []
     numbers: list[int] = []
+    branches: list[str] = []
     for lineno, raw in enumerate(text.splitlines(), 1):
         entry = raw.split("#", 1)[0].strip()
         if not entry:
             continue
-        if not entry.isdigit():
-            raise StageError(f"{path}:{lineno}: invalid PR number {entry!r}")
-        numbers.append(int(entry))
-    return numbers
+        if entry.isdigit():
+            numbers.append(int(entry))
+            continue
+        if entry.startswith("branch:"):
+            name = entry[len("branch:") :]
+            reason = _validate_branch_pin(name)
+            if reason:
+                raise StageError(f"{path}:{lineno}: {reason} {entry!r}")
+            branches.append(name)
+            continue
+        raise StageError(f"{path}:{lineno}: invalid extras entry {entry!r}")
+    return numbers, branches
 
 
-def fetch_extra(cwd: str | Path, upstream: str, num: int) -> tuple[str, str]:
-    """Resolve a pinned extra's frozen ``refs/pull/N/head`` to a commit oid,
-    returning ``(oid, "")`` on success and ``("", reason)`` otherwise. A
-    deleted ref and an unreachable remote are different answers: only
-    ls-remote reporting the ref absent proves deletion, so only that outcome
-    invites editing the manifest."""
-    ref = f"refs/pull/{num}/head"
+def fetch_extra(cwd: str | Path, remote: str, ref: str) -> tuple[str, str]:
+    """Resolve a pinned extra ref to a commit oid, returning ``(oid, "")``
+    on success and ``("", reason)`` otherwise. A deleted ref and an
+    unreachable remote are different answers: only ls-remote reporting the
+    ref absent proves deletion, so only that outcome invites editing the
+    manifest. Refs are passed after ``--`` so a crafted name cannot be
+    parsed as a git option."""
     for attempt in range(EXTRA_FETCH_ATTEMPTS):
-        if git(cwd, "fetch", upstream, ref, check=False).returncode == 0:
+        if git(cwd, "fetch", remote, "--", ref, check=False).returncode == 0:
             head = git(cwd, "rev-parse", "-q", "--verify", "FETCH_HEAD^{commit}", check=False)
             if head.returncode == 0:
                 return head.stdout.strip(), ""
         if attempt + 1 < EXTRA_FETCH_ATTEMPTS:
             time.sleep(EXTRA_FETCH_BACKOFF_S)
-    probe = git(cwd, "ls-remote", upstream, ref, check=False)
+    probe = git(cwd, "ls-remote", remote, "--", ref, check=False)
     if probe.returncode == 0 and not probe.stdout.strip():
         return "", EXTRA_MISSING
     return "", EXTRA_FETCH_FAILED
@@ -238,16 +274,38 @@ def dev_version(cwd: str | Path, upstream_sha: str, datestamp: str) -> str:
     return f"v{m.group(1)}.dev{datestamp}"
 
 
-def merge_prs(cwd: str | Path, prs: list[dict], upstream: str) -> tuple[list[dict], list[dict]]:
+def _pin_label(p: dict) -> str:
+    if p.get("source") == "extra-branch":
+        return f"branch:{p['branch']}"
+    return f"#{p['pr']}"
+
+
+def merge_prs(
+    cwd: str | Path, prs: list[dict], upstream: str, fork: str = "origin"
+) -> tuple[list[dict], list[dict]]:
     applied: list[dict] = []
     skipped: list[dict] = []
-    for pr in sorted(prs, key=lambda p: p["number"]):
-        num, source = pr["number"], pr.get("source", "open")
-        if source == "extra":
+    for pr in sorted(prs, key=lambda p: (p["number"] is None, p["number"])):
+        num, source = pr.get("number"), pr.get("source", "open")
+        if source == "extra-branch":
+            branch = pr["headRefName"]
+            oid, reason = fetch_extra(cwd, fork, f"refs/heads/{branch}")
+            if not oid:
+                skipped.append(
+                    {
+                        "pr": None,
+                        "branch": branch,
+                        "conflict_paths": [],
+                        "reason": reason,
+                        "source": source,
+                    }
+                )
+                continue
+        elif source == "extra":
             # No pinned head for an extra: its refs/pull/N/head is frozen by
             # GitHub after close, so the ref itself is the only pin.
             branch = f"pull/{num}/head"
-            oid, reason = fetch_extra(cwd, upstream, num)
+            oid, reason = fetch_extra(cwd, upstream, f"refs/pull/{num}/head")
             if not oid:
                 skipped.append(
                     {
@@ -261,7 +319,7 @@ def merge_prs(cwd: str | Path, prs: list[dict], upstream: str) -> tuple[list[dic
                 continue
         else:
             branch, oid = pr["headRefName"], pr["headRefOid"]
-            git(cwd, "fetch", upstream, f"refs/pull/{num}/head")
+            git(cwd, "fetch", upstream, "--", f"refs/pull/{num}/head")
             # The listed head may have been force-pushed away between list and fetch.
             if git(cwd, "cat-file", "-e", f"{oid}^{{commit}}", check=False).returncode != 0:
                 skipped.append(
@@ -274,13 +332,14 @@ def merge_prs(cwd: str | Path, prs: list[dict], upstream: str) -> tuple[list[dic
                     }
                 )
                 continue
-        merge = git(cwd, "merge", "--no-ff", "--no-commit", oid, check=False)
+        merge = git(cwd, "merge", "--no-ff", "--no-commit", "--", oid, check=False)
         if merge.returncode != 0:
             # Only a genuine content conflict (unmerged index entries) is
             # skippable; anything else is a broken workspace — fail loud.
             if not git(cwd, "ls-files", "-u").stdout.strip():
+                what = f"branch {branch}" if source == "extra-branch" else f"PR #{num}"
                 raise StageError(
-                    f"merge of PR #{num} failed without conflicts: {merge.stderr.strip()}"
+                    f"merge of {what} failed without conflicts: {merge.stderr.strip()}"
                 )
             paths = conflict_paths(cwd)
             git(cwd, "merge", "--abort")
@@ -296,13 +355,18 @@ def merge_prs(cwd: str | Path, prs: list[dict], upstream: str) -> tuple[list[dic
             # inputs reproduce the exact staging sha, so a same-day rerun with
             # nothing new is detected as a no-op instead of minting -rerunN.
             when = git(cwd, "show", "-s", "--format=%cI", oid).stdout.strip()
+            subject = (
+                f"staging: merge branch {branch} ({branch} @ {oid[:12]})"
+                if source == "extra-branch"
+                else f"staging: merge PR #{num} ({branch} @ {oid[:12]})"
+            )
             git(
                 cwd,
                 *COMMIT_IDENT,
                 "commit",
                 "--no-verify",
                 "-m",
-                f"staging: merge PR #{num} ({branch} @ {oid[:12]})",
+                subject,
                 env={"GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when},
             )
             minted = True
@@ -312,25 +376,39 @@ def merge_prs(cwd: str | Path, prs: list[dict], upstream: str) -> tuple[list[dic
     return applied, skipped
 
 
-def composition_of(cwd: str | Path, sha: str) -> tuple[str, dict[int, tuple[str, str]]] | None:
+def composition_of(
+    cwd: str | Path, sha: str
+) -> tuple[str, dict[int | str, tuple[str, str]]] | None:
     """Decode a pushed staging commit into (upstream base sha, {pr: (branch,
     head12)}) from its first-parent merge subjects, walking to the real base —
     the merge count is unbounded. None when the sha isn't readable."""
     if not sha or git(cwd, "cat-file", "-e", f"{sha}^{{commit}}", check=False).returncode != 0:
         return None
-    merges: dict[int, tuple[str, str]] = {}
+    merges: dict[int | str, tuple[str, str]] = {}
     out = git(cwd, "log", "--first-parent", "--format=%H%x09%s", sha).stdout
     for line in out.splitlines():
         commit, _, subject = line.partition("\t")
         m = STAGING_MERGE_RE.fullmatch(subject)
-        if not m:
-            return commit, merges
-        merges[int(m.group(1))] = (m.group(2), m.group(3))
+        if m:
+            merges[int(m.group(1))] = (m.group(2), m.group(3))
+            continue
+        b = STAGING_BRANCH_MERGE_RE.fullmatch(subject)
+        if b:
+            merges[f"branch:{b.group(1)}"] = (b.group(2), b.group(3))
+            continue
+        return commit, merges
     return None
 
 
+def _blocked_label(n: object) -> str:
+    if isinstance(n, int):
+        return f"#{n}"
+    s = str(n)
+    return s if s.startswith("branch:") else f"branch:{s}"
+
+
 def push_causes(
-    old: tuple[str, dict[int, tuple[str, str]]] | None,
+    old: tuple[str, dict[int | str, tuple[str, str]]] | None,
     upstream_sha: str,
     applied: list[dict],
 ) -> list[str]:
@@ -342,21 +420,26 @@ def push_causes(
     # Only minted merges are comparable: the decoded old composition knows
     # merge subjects, and an already-merged PR mints none.
     new = {
-        p["pr"]: (p["branch"], str(p["oid"])[:12], p["source"])
+        (f"branch:{p['branch']}" if p.get("source") == "extra-branch" else p["pr"]): (
+            p["branch"],
+            str(p["oid"])[:12],
+            p["source"],
+        )
         for p in applied
         if p.get("minted", True)
     }
-    label = {"open": "open PR set", "extra": "extras"}
+    label = {"open": "open PR set", "extra": "extras", "extra-branch": "extras"}
     causes: list[str] = []
     if old_base != upstream_sha:
         causes.append("upstream HEAD")
     dropped: list[str] = []
-    for num in sorted(old_merges.keys() | new.keys()):
+    # ints (PR numbers) sort before str keys (branch: pins)
+    for num in sorted(old_merges.keys() | new.keys(), key=lambda k: (isinstance(k, str), k)):
         entry = new.get(num)
         if entry is None:
             # No longer composed at all (unpinned extra, closed PR, skip) —
             # say so rather than guessing which input it used to come from.
-            dropped.append(f"#{num}")
+            dropped.append(_blocked_label(num))
         elif old_merges.get(num) != entry[:2] and label[entry[2]] not in causes:
             causes.append(label[entry[2]])
     if dropped:
@@ -392,12 +475,16 @@ def stage(
     upstream_sha = git(cwd, "rev-parse", "FETCH_HEAD").stdout.strip()
     git(cwd, "checkout", "--detach", upstream_sha)
 
-    applied, skipped = merge_prs(cwd, prs, upstream)
+    applied, skipped = merge_prs(cwd, prs, upstream, fork)
     staging_sha = git(cwd, "rev-parse", "HEAD").stdout.strip()
 
     # An extra we could not even reach is an infrastructure failure, not a
     # composition: publishing without it would silently regress staging.
-    blocked = [p["pr"] for p in skipped if p.get("reason") == EXTRA_FETCH_FAILED]
+    blocked = [
+        p["branch"] if p.get("source") == "extra-branch" else p["pr"]
+        for p in skipped
+        if p.get("reason") == EXTRA_FETCH_FAILED
+    ]
 
     if staging_only:
         # Hourly mode: only refs/heads/staging moves — no pins, no tags.
@@ -440,7 +527,7 @@ def stage(
     if blocked:
         raise StageError(
             "extras unreachable due to infrastructure failure (not deleted): "
-            + ", ".join(f"#{n}" for n in blocked)
+            + ", ".join(_blocked_label(n) for n in blocked)
             + "; refusing to publish a composition without them"
         )
 
@@ -507,11 +594,12 @@ def notes(report: dict, signed: bool) -> str:
         f"## Applied PRs ({len(report['applied'])})",
     ]
     lines += [
-        f"- #{p['pr']} {md_code(p['branch'])} @ `{str(p['oid'])[:12]}`" for p in report["applied"]
+        f"- {_pin_label(p)} {md_code(p['branch'])} @ `{str(p['oid'])[:12]}`"
+        for p in report["applied"]
     ] or ["- none"]
     lines += ["", f"## Skipped PRs ({len(report['skipped'])})"]
     lines += [
-        f"- #{p['pr']} {md_code(p['branch'])} — {_skip_reason(p)}" for p in report["skipped"]
+        f"- {_pin_label(p)} {md_code(p['branch'])} — {_skip_reason(p)}" for p in report["skipped"]
     ] or ["- none"]
     lines += ["", "## APK signing"]
     if signed:
@@ -536,7 +624,7 @@ def summarize(report: dict) -> str:
         if report["blocked"]:
             result = (
                 "**NOT pushed** — extras unreachable: "
-                + ", ".join(f"#{n}" for n in report["blocked"])
+                + ", ".join(_blocked_label(n) for n in report["blocked"])
                 + " (staging left at its previous commit)"
             )
         elif report["pushed"]:
@@ -568,7 +656,7 @@ def summarize(report: dict) -> str:
         rows += [
             f"| Applied / skipped | {len(report['applied'])} / {len(report['skipped'])} |",
         ]
-        rows += [f"| Skipped #{p['pr']} | {_skip_reason(p)} |" for p in report["skipped"]]
+        rows += [f"| Skipped {_pin_label(p)} | {_skip_reason(p)} |" for p in report["skipped"]]
         return "\n".join(rows) + "\n"
 
     pin_note = "" if report["pin_created"] else " (already pinned — rerun no-op)"
@@ -583,7 +671,7 @@ def summarize(report: dict) -> str:
         f"| Dev tag | `{report['dev_tag']}` |",
         f"| Applied / skipped | {len(report['applied'])} / {len(report['skipped'])} |",
     ]
-    rows += [f"| Skipped #{p['pr']} | {_skip_reason(p)} |" for p in report["skipped"]]
+    rows += [f"| Skipped {_pin_label(p)} | {_skip_reason(p)} |" for p in report["skipped"]]
     return "\n".join(rows) + "\n"
 
 
@@ -649,7 +737,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         # Extras are read here, before any merge touches the worktree, so the
         # manifest always comes from the trusted checkout.
-        prs = merge_stream(prs, parse_extras(Path(args.extras)))
+        pr_extras, branch_extras = parse_extras(Path(args.extras))
+        prs = merge_stream(prs, pr_extras)
+        for name in dict.fromkeys(branch_extras):
+            prs.append({"source": "extra-branch", "headRefName": name, "number": None})
         report = stage(
             args.workdir,
             prs,
@@ -666,8 +757,8 @@ def main(argv: list[str] | None = None) -> int:
     append_summary(summarize(report))
     if report.get("blocked"):
         print(
-            "::warning::could not reach upstream for extras "
-            + ", ".join(f"#{n}" for n in report["blocked"])
+            "::warning::could not reach remote for extras "
+            + ", ".join(_blocked_label(n) for n in report["blocked"])
             + " — staging left unchanged; this is an infrastructure failure, not a deleted ref"
         )
     print(json.dumps(report, indent=2))

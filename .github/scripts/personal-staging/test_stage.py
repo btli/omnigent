@@ -70,6 +70,20 @@ class Env:
         git(self.seed, "push", str(self.upstream), f"{branch}:refs/pull/{number}/head")
         return {"number": number, "headRefName": branch, "headRefOid": oid}
 
+    def add_fork_branch(self, name: str, filename: str, content: str) -> str:
+        """Branch off upstream main, one commit, pushed to the fork remote."""
+        git(self.seed, "checkout", "-q", "main")
+        git(self.seed, "checkout", "-q", "-b", name)
+        oid = commit_file(self.seed, filename, content, f"fork branch {name}")
+        git(self.seed, "push", str(self.fork), f"{name}:refs/heads/{name}")
+        return oid
+
+    def advance_fork_branch(self, name: str, filename: str, content: str) -> str:
+        git(self.seed, "checkout", "-q", name)
+        oid = commit_file(self.seed, filename, content, f"fork branch {name} update")
+        git(self.seed, "push", str(self.fork), f"{name}:refs/heads/{name}")
+        return oid
+
     def advance_pr(self, number: int, filename: str, content: str) -> dict:
         """New head on an existing PR branch, force-pushed to its pull ref."""
         branch = f"pr-{number}"
@@ -437,14 +451,41 @@ def test_parse_extras_comments_blanks_and_missing(tmp_path):
     manifest.write_text("# pinned fixes\n\n12  # trailing comment\n7\n12\n")
     # the contract is WHICH numbers are pinned — comments and blank lines are
     # ignored; ordering and duplicates are normalized later by merge_stream
-    assert sorted(set(stage_mod.parse_extras(manifest))) == [7, 12]
-    assert stage_mod.parse_extras(tmp_path / "missing.txt") == []
+    assert stage_mod.parse_extras(manifest) == ([12, 7, 12], [])
+    assert stage_mod.parse_extras(tmp_path / "missing.txt") == ([], [])
 
 
 def test_parse_extras_garbage_line_fails_loud(tmp_path):
     manifest = tmp_path / "extras.txt"
     manifest.write_text("12\nnot-a-number\n")
-    with pytest.raises(stage_mod.StageError, match="invalid PR number"):
+    with pytest.raises(stage_mod.StageError, match="invalid extras entry"):
+        stage_mod.parse_extras(manifest)
+
+
+def test_parse_extras_branch_homelab(tmp_path):
+    manifest = tmp_path / "extras.txt"
+    manifest.write_text("branch:homelab\n")
+    assert stage_mod.parse_extras(manifest) == ([], ["homelab"])
+
+
+@pytest.mark.parametrize(
+    ("entry", "match"),
+    [
+        ("branch:-evil", r"must not start with '-'"),
+        ("branch:main", r"self-reference"),
+        ("branch:staging", r"self-reference"),
+        ("branch:", r"invalid branch name"),
+        ("branch:foo..bar", r"invalid branch name"),
+        ("branch:foo bar", r"invalid branch name"),
+        ("branch:@{-1}", r"invalid branch name"),
+        ("tag:homelab", r"invalid extras entry"),
+        ("foo:bar", r"invalid extras entry"),
+    ],
+)
+def test_parse_extras_rejects_invalid_branch_pins(tmp_path, entry, match):
+    manifest = tmp_path / "extras.txt"
+    manifest.write_text(f"{entry}\n")
+    with pytest.raises(stage_mod.StageError, match=match):
         stage_mod.parse_extras(manifest)
 
 
@@ -787,3 +828,147 @@ def test_cli_staging_only_with_extras_manifest(env, tmp_path, monkeypatch, capsy
     assert "## Personal staging hourly" in text
     assert "extra unfetchable" in text
     capsys.readouterr()
+
+
+def test_branch_pin_merges_from_fork_and_records_sha(env, tmp_path):
+    oid = env.add_fork_branch("homelab", "homelab.txt", "lab\n")
+    extras = tmp_path / "extras.txt"
+    extras.write_text("branch:homelab\n")
+    prs_json = tmp_path / "prs.json"
+    prs_json.write_text("[]")
+    report_path = tmp_path / "r.json"
+
+    rc = stage_mod.main(
+        [
+            "stage",
+            "--workdir",
+            str(env.work),
+            "--date",
+            STAMP,
+            "--prs-json",
+            str(prs_json),
+            "--extras",
+            str(extras),
+            "--staging-only",
+            "--report",
+            str(report_path),
+        ]
+    )
+    assert rc == 0
+    report = json.loads(report_path.read_text())
+    assert [(p["branch"], p["source"], p["oid"]) for p in report["applied"]] == [
+        ("homelab", "extra-branch", oid)
+    ]
+    assert report["skipped"] == []
+    assert git(env.work, "show", f"{report['staging_sha']}:homelab.txt").stdout == "lab\n"
+
+
+def test_branch_pin_composition_decodes_and_reruns_reproducibly(env):
+    oid = env.add_fork_branch("homelab", "homelab.txt", "lab\n")
+    pin = {"source": "extra-branch", "headRefName": "homelab", "number": None}
+
+    first = env.run([pin], staging_only=True)
+    assert stage_mod.composition_of(env.work, first["staging_sha"]) == (
+        first["upstream_sha"],
+        {"branch:homelab": ("homelab", oid[:12])},
+    )
+
+    same = env.run([pin], staging_only=True)
+    assert same["pushed"] is False
+    assert same["staging_sha"] == first["staging_sha"]
+
+    env.advance_fork_branch("homelab", "homelab-2.txt", "lab 2\n")
+    changed = env.run([pin], staging_only=True)
+    assert changed["pushed"] is True
+    assert changed["causes"] == ["extras"]
+
+
+def test_branch_pin_transport_failure_blocks_push(env, tmp_path, monkeypatch, capsys):
+    oid = env.add_fork_branch("homelab", "homelab.txt", "lab\n")
+    pin = {"source": "extra-branch", "headRefName": "homelab", "number": None}
+    first = env.run([pin], staging_only=True)
+    assert first["applied"][0]["oid"] == oid
+
+    extras = tmp_path / "extras.txt"
+    extras.write_text("branch:homelab\n")
+    prs_json = tmp_path / "prs.json"
+    prs_json.write_text("[]")
+    report_path = tmp_path / "r.json"
+    _break_ref(monkeypatch, "refs/heads/homelab", commands=("fetch", "ls-remote"), fail_times=99)
+
+    assert (
+        stage_mod.main(
+            [
+                "stage",
+                "--workdir",
+                str(env.work),
+                "--date",
+                STAMP,
+                "--prs-json",
+                str(prs_json),
+                "--extras",
+                str(extras),
+                "--staging-only",
+                "--report",
+                str(report_path),
+            ]
+        )
+        == 0
+    )
+    report = json.loads(report_path.read_text())
+    assert report["blocked"] == ["homelab"]
+    assert report["pushed"] is False
+    assert report["skipped"] == [
+        {
+            "pr": None,
+            "branch": "homelab",
+            "conflict_paths": [],
+            "reason": stage_mod.EXTRA_FETCH_FAILED,
+            "source": "extra-branch",
+        }
+    ]
+    assert env.fork_ref("refs/heads/staging") == first["staging_sha"]
+    warning = capsys.readouterr().out
+    assert "could not reach remote for extras branch:homelab" in warning
+    assert "could not reach upstream" not in warning
+
+    with pytest.raises(stage_mod.StageError, match="branch:homelab"):
+        env.run([pin])
+    assert env.fork_ref("refs/heads/staging") == first["staging_sha"]
+
+
+def test_branch_pin_missing_is_loud_advisory_skip(env, tmp_path):
+    extras = tmp_path / "extras.txt"
+    extras.write_text("branch:no-such-branch\n")
+    prs_json = tmp_path / "prs.json"
+    prs_json.write_text("[]")
+    report_path = tmp_path / "r.json"
+
+    rc = stage_mod.main(
+        [
+            "stage",
+            "--workdir",
+            str(env.work),
+            "--date",
+            STAMP,
+            "--prs-json",
+            str(prs_json),
+            "--extras",
+            str(extras),
+            "--staging-only",
+            "--report",
+            str(report_path),
+        ]
+    )
+    assert rc == 0
+    report = json.loads(report_path.read_text())
+    assert report["applied"] == []
+    assert report["skipped"] == [
+        {
+            "pr": None,
+            "branch": "no-such-branch",
+            "conflict_paths": [],
+            "reason": stage_mod.EXTRA_MISSING,
+            "source": "extra-branch",
+        }
+    ]
