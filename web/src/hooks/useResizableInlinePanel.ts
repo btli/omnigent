@@ -6,7 +6,6 @@
 // while the inline panel starts at a compact sidebar width.
 
 import { useCallback, useEffect, useReducer, useRef, useState, useSyncExternalStore } from "react";
-import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
 const MIN_WIDTH_PX = 240;
@@ -15,11 +14,28 @@ const MAX_WIDTH_RATIO = 0.99;
 const CHAT_MIN_WIDTH_PX = 480;
 /** Visual gap between the chat column and the rail. */
 const GAP_PX = 8;
-// The handle sits on the panel's left edge. Weight the invisible target toward
-// the adjacent chat while limiting the inward pad to the panel's 8px gutter.
-const COARSE_OUTWARD_HANDLE_HIT_PAD_PX = 36;
-const FINE_OUTWARD_HANDLE_HIT_PAD_PX = 16;
-const INWARD_HANDLE_HIT_PAD_PX = 4;
+// The handle is a dedicated flex gutter between chat and panel, outside both
+// scroll containers. The painted `w-1` strip is centered in a small layout
+// gutter, with tightly bounded overhangs that avoid owning either surface.
+const PAINTED_STRIP_PX = 4;
+const COARSE_GUTTER_PX = 12;
+const FINE_GUTTER_PX = 10;
+const CHAT_SLIVER_PX = 6;
+const PANEL_SLIVER_PX = 8;
+
+function gutterStyle(isCoarse: boolean): React.CSSProperties {
+  const gutter = isCoarse ? COARSE_GUTTER_PX : FINE_GUTTER_PX;
+  const inset = (gutter - PAINTED_STRIP_PX) / 2;
+  return {
+    touchAction: "none",
+    boxSizing: "content-box",
+    paddingLeft: CHAT_SLIVER_PX + inset,
+    paddingRight: PANEL_SLIVER_PX + inset,
+    marginLeft: -CHAT_SLIVER_PX,
+    marginRight: -PANEL_SLIVER_PX,
+    backgroundClip: "content-box",
+  };
+}
 
 // ~36 % of viewport, clamped [420, 600] — ~30 % wider than the prior default so
 // the first manual open lands at a comfortable working width.
@@ -153,9 +169,9 @@ export function useResizableInlinePanel(
   sessionId: string | null,
   minWidthPx = MIN_WIDTH_PX,
   reservedPx = 0,
+  enabled = true,
 ) {
   const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
-  const isMobileViewport = useIsMobileViewport();
   const [isCoarsePointer, setIsCoarsePointer] = useState(
     () => typeof window !== "undefined" && !!window.matchMedia?.("(pointer: coarse)").matches,
   );
@@ -204,13 +220,6 @@ export function useResizableInlinePanel(
     overlayRef.current = null;
   }, []);
 
-  // Load the active session's saved width into the module store (and re-load
-  // when it changes) so the live store and the drag handlers operate on the
-  // right session.
-  useEffect(() => {
-    loadSession(sessionId);
-  }, [sessionId]);
-
   useEffect(() => {
     const media = window.matchMedia?.("(pointer: coarse)");
     if (!media) return;
@@ -254,9 +263,18 @@ export function useResizableInlinePanel(
     [removeDragOverlay],
   );
 
+  // A session switch removes the old panel identity even when the next
+  // session also renders a rail. Abort before re-seeding so a late pointerup
+  // cannot persist the old drag into the new conversation.
+  useEffect(() => {
+    endDrag(false);
+    loadSession(sessionId);
+  }, [endDrag, sessionId]);
+
   const onPointerDown = useCallback(
     (e: React.PointerEvent<HTMLElement>) => {
       // First pointer wins; secondary buttons do not start a resize.
+      if (!enabled || resolvedWidth === 0) return;
       if (activePointerIdRef.current !== null) return;
       if (e.button !== 0) return;
       try {
@@ -270,7 +288,7 @@ export function useResizableInlinePanel(
       document.body.style.cursor = "col-resize";
       document.body.style.userSelect = "none";
     },
-    [addDragOverlay],
+    [addDragOverlay, enabled, resolvedWidth],
   );
 
   const onPointerMove = useCallback((e: React.PointerEvent<HTMLElement>) => {
@@ -314,11 +332,12 @@ export function useResizableInlinePanel(
   }, [endDrag]);
 
   useEffect(() => {
-    if (isMobileViewport || resolvedWidth === 0) endDrag(false);
-  }, [endDrag, isMobileViewport, resolvedWidth]);
+    if (!enabled || resolvedWidth === 0) endDrag(false);
+  }, [enabled, endDrag, resolvedWidth]);
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
+      if (!enabled || resolvedWidth === 0) return;
       const step = 20;
       if (e.key === "ArrowLeft") {
         e.preventDefault();
@@ -334,7 +353,7 @@ export function useResizableInlinePanel(
         );
       }
     },
-    [resolvedWidth],
+    [enabled, resolvedWidth],
   );
 
   useEffect(() => () => endDrag(false), [endDrag]);
@@ -348,22 +367,11 @@ export function useResizableInlinePanel(
       onPointerCancel,
       onLostPointerCapture: onPointerCancel,
       onKeyDown,
-      style: {
-        touchAction: "none",
-        boxSizing: "content-box" as const,
-        paddingLeft: isCoarsePointer
-          ? COARSE_OUTWARD_HANDLE_HIT_PAD_PX
-          : FINE_OUTWARD_HANDLE_HIT_PAD_PX,
-        paddingRight: INWARD_HANDLE_HIT_PAD_PX,
-        marginLeft: isCoarsePointer
-          ? -COARSE_OUTWARD_HANDLE_HIT_PAD_PX
-          : -FINE_OUTWARD_HANDLE_HIT_PAD_PX,
-        marginRight: -INWARD_HANDLE_HIT_PAD_PX,
-        backgroundClip: "content-box",
-      },
+      style: gutterStyle(isCoarsePointer),
       role: "separator" as const,
       "aria-orientation": "vertical" as const,
       "aria-label": "Resize panel",
+      "aria-disabled": !enabled || resolvedWidth === 0,
       tabIndex: 0,
     },
   };

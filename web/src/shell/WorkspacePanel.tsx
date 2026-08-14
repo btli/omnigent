@@ -668,42 +668,43 @@ export function WorkspacePanel({
     [terminals],
   );
   return (
-    <aside
-      aria-label="Workspace"
-      inert={inert}
-      // Full-height desktop surface flush to the window edge, separated from
-      // the main content by a left divider — no outer margin, rounding, or
-      // shadow (mirrors the left sidebar). AppShell reserves the panel width
-      // from ChatHeader, so the pane extends to the top without sitting under
-      // the existing session action cluster.
-      // ``@container/rail`` makes the rail a named container-query context so
-      // the tab strip can switch scroll behavior on the rail's own width
-      // (see the strip below) without a JS width listener.
-      //
-      // Maximized: break out of the flex row and stretch across the content
-      // region (absolute inset-0) so the rail owns the full width, keeping the
-      // same flush/bordered styling — only the width changes. The resize
-      // handle is suppressed in that state — there's no neighbor to resize
-      // against.
-      data-maximized={maximized || undefined}
-      className={cn(
-        "@container/rail relative z-40 hidden md:flex md:min-h-0 md:flex-col md:border-l md:border-border md:bg-card",
-        maximized ? "md:absolute md:inset-0" : "md:shrink-0",
-      )}
-      // Width is fixed by the resize handle normally; maximized ignores it and
-      // stretches to the absolute inset instead.
-      style={maximized ? undefined : { width }}
-    >
-      {/* Left-edge horizontal resize handle — suppressed while maximized. */}
-      {!maximized && (
+    <>
+      {/* Dedicated resize gutter between chat and rail. Keeping it outside
+          both scroll containers prevents its hit slivers from covering the
+          transcript scrollbar or the rail's tabs/content. */}
+      {!maximized && handleProps["aria-disabled"] !== true && (
         <div
           {...handleProps}
-          className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
+          data-workspace-panel-resize-gutter
+          className="relative z-10 hidden w-1 shrink-0 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
         />
       )}
-      {/* Clip the rail's scrolling content without clipping the resize target,
-          whose outward hit pad extends across the panel boundary. */}
-      <div data-workspace-panel-clip className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      <aside
+        aria-label="Workspace"
+        inert={inert}
+        // Full-height desktop surface flush to the window edge, separated from
+        // the main content by a left divider — no outer margin, rounding, or
+        // shadow (mirrors the left sidebar). AppShell reserves the panel width
+        // from ChatHeader, so the pane extends to the top without sitting under
+        // the existing session action cluster.
+        // ``@container/rail`` makes the rail a named container-query context so
+        // the tab strip can switch scroll behavior on the rail's own width
+        // (see the strip below) without a JS width listener.
+        //
+        // Maximized: break out of the flex row and stretch across the content
+        // region (absolute inset-0) so the rail owns the full width, keeping the
+        // same flush/bordered styling — only the width changes. The resize
+        // handle is suppressed in that state — there's no neighbor to resize
+        // against.
+        data-maximized={maximized || undefined}
+        className={cn(
+          "@container/rail relative z-40 hidden md:flex md:min-h-0 md:flex-col md:overflow-hidden md:border-l md:border-border md:bg-card",
+          maximized ? "md:absolute md:inset-0" : "md:shrink-0",
+        )}
+        // Width is fixed by the resize handle normally; maximized ignores it and
+        // stretches to the absolute inset instead.
+        style={maximized ? undefined : { width }}
+      >
         {/* Tab strip, in display order Files · Changes · Agents · Shells · Tasks.
           Files (full folder tree) and Changes (changed-files-only list) are
           two peer tabs — same gate (an on-disk workspace), same FilesPanel,
@@ -955,7 +956,7 @@ export function WorkspacePanel({
             )
           )}
         </div>
-      </div>
-    </aside>
+      </aside>
+    </>
   );
 }

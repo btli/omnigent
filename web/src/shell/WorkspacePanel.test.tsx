@@ -677,14 +677,14 @@ describe("WorkspacePanel resize handle geometry", () => {
   const handleStyle = {
     touchAction: "none",
     boxSizing: "content-box",
-    paddingLeft: 36,
-    paddingRight: 4,
-    marginLeft: -36,
-    marginRight: -4,
+    paddingLeft: 10,
+    paddingRight: 12,
+    marginLeft: -6,
+    marginRight: -8,
     backgroundClip: "content-box",
   } as React.CSSProperties;
 
-  it("keeps the outward hit pad outside the clipped content wrapper", () => {
+  it("renders the resize target as a dedicated flex gutter beside the clipped panel", () => {
     renderWorkspace({
       handleProps: {
         tabIndex: 0,
@@ -696,15 +696,15 @@ describe("WorkspacePanel resize handle geometry", () => {
 
     const panel = screen.getByRole("complementary", { name: "Workspace" });
     const separator = screen.getByRole("separator", { name: "Resize panel" });
-    const clip = panel.querySelector(":scope > [data-workspace-panel-clip]");
 
-    expect(panel).not.toHaveClass("md:overflow-hidden");
-    expect(clip).toHaveClass("overflow-hidden");
-    expect(clip).not.toContainElement(separator);
-    expect(separator.style.marginLeft).toBe(`-${separator.style.paddingLeft}`);
+    expect(separator).toHaveAttribute("data-workspace-panel-resize-gutter");
+    expect(separator.nextElementSibling).toBe(panel);
+    expect(panel).toHaveClass("md:overflow-hidden");
+    expect(panel).not.toContainElement(separator);
+    expect(separator).toHaveClass("shrink-0");
   });
 
-  it("keeps the tab strip and content clear of all but the 4px inward gutter", () => {
+  it("keeps adjacent scroll surfaces outside the gutter ownership", () => {
     const onPointerDown = vi.fn();
     renderWorkspace({
       handleProps: {
@@ -717,7 +717,8 @@ describe("WorkspacePanel resize handle geometry", () => {
     });
 
     const separator = screen.getByRole("separator", { name: "Resize panel" });
-    expect(parseFloat(separator.style.paddingRight)).toBe(4);
+    expect(Math.abs(parseFloat(separator.style.marginLeft))).toBeLessThanOrEqual(6);
+    expect(Math.abs(parseFloat(separator.style.marginRight))).toBeLessThanOrEqual(8);
 
     const filesTab = screen.getByRole("tab", { name: "Files" });
     fireEvent.pointerDown(filesTab, { pointerId: 1, button: 0 });
@@ -737,9 +738,23 @@ describe("WorkspacePanel resize handle geometry", () => {
 
     const separator = screen.getByRole("separator", { name: "Resize panel" });
     expect(separator.className).toBe(
-      "absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors",
+      "relative z-10 hidden w-1 shrink-0 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block",
     );
     expect(separator.style.boxSizing).toBe("content-box");
     expect(separator.style.backgroundClip).toBe("content-box");
+  });
+
+  it("does not render the gutter when the hook marks it disabled", () => {
+    renderWorkspace({
+      handleProps: {
+        tabIndex: 0,
+        role: "separator",
+        "aria-label": "Resize panel",
+        "aria-disabled": true,
+        style: handleStyle,
+      },
+    });
+
+    expect(screen.queryByRole("separator", { name: "Resize panel" })).toBeNull();
   });
 });
