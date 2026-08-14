@@ -254,7 +254,33 @@ function closeProjectsMenu() {
   fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
 }
 
+// Evaluate min-/max-width media queries against a simulated viewport width,
+// so each test runs at an explicit real-browser width instead of inheriting
+// the global test-setup mock (which answers false to every query).
+function stubViewportWidth(width: number) {
+  Object.defineProperty(window, "matchMedia", {
+    writable: true,
+    configurable: true,
+    value: (query: string) => ({
+      matches: (() => {
+        const min = /^\(min-width: ([\d.]+)px\)$/.exec(query);
+        if (min) return width >= parseFloat(min[1]);
+        const max = /^\(max-width: ([\d.]+)px\)$/.exec(query);
+        if (max) return width <= parseFloat(max[1]);
+        return false;
+      })(),
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    }),
+  });
+}
+
 beforeEach(() => {
+  // Default to a desktop width: these suites assert hover affordances
+  // (session tooltips, project flyouts) that are gated off on mobile. Tests
+  // that need a mobile width re-pin it themselves.
+  stubViewportWidth(1280);
   useConvMock.mockReset();
   useHostsMock.mockReset();
   useHostsMock.mockReturnValue({ data: [] });
@@ -1385,43 +1411,28 @@ describe("Sidebar project sections", () => {
   });
 
   it("closes the mobile overlay when the project pencil is tapped", () => {
-    // Pin a mobile-width viewport (the canonical max-md query matches) so
-    // isMobileViewport() is true: a plain pencil tap must close the
-    // full-screen sidebar overlay, otherwise the pre-filed new-session page
-    // is left hidden behind it.
-    const originalMatchMedia = window.matchMedia;
-    Object.defineProperty(window, "matchMedia", {
-      writable: true,
-      configurable: true,
-      value: (query: string) => ({
-        matches: query === "(max-width: 767.98px)",
-        media: query,
-        addEventListener: () => {},
-        removeEventListener: () => {},
-      }),
-    });
+    // At a phone width isMobileViewport() is true: a plain pencil tap must
+    // close the full-screen sidebar overlay, otherwise the pre-filed
+    // new-session page is left hidden behind it.
+    stubViewportWidth(375);
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
     ]);
     const onClose = vi.fn();
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    try {
-      render(
-        <QueryClientProvider client={qc}>
-          <TooltipProvider>
-            <MemoryRouter initialEntries={["/"]}>
-              <Sidebar open onClose={onClose} />
-            </MemoryRouter>
-          </TooltipProvider>
-        </QueryClientProvider>,
-      );
+    render(
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/"]}>
+            <Sidebar open onClose={onClose} />
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
 
-      fireEvent.click(screen.getByTestId("project-new-session").closest("a")!);
-      expect(onClose).toHaveBeenCalled();
-    } finally {
-      window.matchMedia = originalMatchMedia;
-    }
+    fireEvent.click(screen.getByTestId("project-new-session").closest("a")!);
+    expect(onClose).toHaveBeenCalled();
   });
 
   it("starts a project folder collapsed with its rows hidden", () => {

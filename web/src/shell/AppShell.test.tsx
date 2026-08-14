@@ -474,7 +474,33 @@ function withWindowOrigin(origin: string, run: () => void) {
   }
 }
 
+// Evaluate min-/max-width media queries against a simulated viewport width,
+// so each test runs at an explicit real-browser width instead of inheriting
+// the global test-setup mock (which answers false to every query).
+function stubViewportWidth(width: number) {
+  Object.defineProperty(window, "matchMedia", {
+    writable: true,
+    configurable: true,
+    value: (query: string) => ({
+      matches: (() => {
+        const min = /^\(min-width: ([\d.]+)px\)$/.exec(query);
+        if (min) return width >= parseFloat(min[1]);
+        const max = /^\(max-width: ([\d.]+)px\)$/.exec(query);
+        if (max) return width <= parseFloat(max[1]);
+        return false;
+      })(),
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    }),
+  });
+}
+
 beforeEach(() => {
+  // Default to a mobile width: these suites were written against a sidebar
+  // that starts closed. Tests that need desktop semantics (hover peek)
+  // re-pin a desktop width themselves.
+  stubViewportWidth(375);
   useConvMock.mockReset();
   useTerminalsMock.mockReset();
   useTerminalsMock.mockReturnValue({
@@ -1258,8 +1284,13 @@ describe("Workspace rail maximize", () => {
     // armed from INSIDE it. Armed from the title-bar trigger (outside), a pointer
     // that never crosses the card leaves it with no pointerenter and therefore no
     // pointerleave, so the card used to sit open indefinitely.
+    // Hover peek is a desktop affordance; at a desktop width the sidebar
+    // starts open, so collapse it first to expose the peek trigger.
+    stubViewportWidth(1280);
     mockConversations([{ id: "conv_abc", permission_level: null }]);
     renderShell("/c/conv_abc");
+    fireEvent.keyDown(document, { code: "BracketLeft", metaKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
 
     fireEvent.pointerEnter(screen.getByRole("button", { name: /open sidebar/i }));
     await waitFor(() => expect(screen.getByTestId("sidebar")).toHaveAttribute("data-peek", "true"));
@@ -1274,8 +1305,13 @@ describe("Workspace rail maximize", () => {
   it("keeps peeking while the pointer is over the card itself", async () => {
     // The other half: dismissal must not be so eager that moving onto the card —
     // the entire point of peeking — closes it.
+    // Same desktop setup as above: collapse the open-by-default sidebar to
+    // expose the peek trigger.
+    stubViewportWidth(1280);
     mockConversations([{ id: "conv_abc", permission_level: null }]);
     renderShell("/c/conv_abc");
+    fireEvent.keyDown(document, { code: "BracketLeft", metaKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
 
     fireEvent.pointerEnter(screen.getByRole("button", { name: /open sidebar/i }));
     await waitFor(() => expect(screen.getByTestId("sidebar")).toHaveAttribute("data-peek", "true"));

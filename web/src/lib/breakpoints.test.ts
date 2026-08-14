@@ -2,35 +2,26 @@ import { renderHook } from "@testing-library/react";
 import { describe, expect, it, vi, afterEach } from "vitest";
 
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import {
-  MD_BREAKPOINT_PX,
-  MD_MAX_WIDTH_QUERY,
-  MD_MIN_WIDTH_QUERY,
-  isMobileViewport,
-} from "./breakpoints";
+import { MD_BREAKPOINT_PX, MD_MIN_WIDTH_QUERY, isMobileViewport } from "./breakpoints";
 
-function stubMatchMedia(matchesFor: (query: string) => boolean) {
+// Evaluate min-/max-width queries against a simulated viewport width, so
+// boundary behavior at fractional widths can be exercised.
+function stubViewportWidth(width: number) {
   Object.defineProperty(window, "matchMedia", {
     writable: true,
     configurable: true,
     value: vi.fn((query: string) => ({
-      matches: matchesFor(query),
+      matches: (() => {
+        const min = /^\(min-width: ([\d.]+)px\)$/.exec(query);
+        if (min) return width >= parseFloat(min[1]);
+        const max = /^\(max-width: ([\d.]+)px\)$/.exec(query);
+        if (max) return width <= parseFloat(max[1]);
+        return false;
+      })(),
       media: query,
       addEventListener: () => {},
       removeEventListener: () => {},
     })),
-  });
-}
-
-// Evaluate this module's min-/max-width queries against a simulated viewport
-// width, so boundary behavior at fractional widths can be exercised.
-function stubViewportWidth(width: number) {
-  stubMatchMedia((query) => {
-    const min = /^\(min-width: ([\d.]+)px\)$/.exec(query);
-    if (min) return width >= parseFloat(min[1]);
-    const max = /^\(max-width: ([\d.]+)px\)$/.exec(query);
-    if (max) return width <= parseFloat(max[1]);
-    return false;
   });
 }
 
@@ -41,10 +32,8 @@ afterEach(() => {
 describe("breakpoints", () => {
   it("encodes Tailwind's md breakpoint exactly once", () => {
     expect(MD_BREAKPOINT_PX).toBe(768);
-    // md: variant (inclusive lower bound).
+    // md: variant (inclusive lower bound) — the one canonical query.
     expect(MD_MIN_WIDTH_QUERY).toBe("(min-width: 768px)");
-    // max-md: variant (exclusive upper bound, 768 - 0.02).
-    expect(MD_MAX_WIDTH_QUERY).toBe("(max-width: 767.98px)");
   });
 
   it("isMobileViewport is true below md and false at md+", () => {
@@ -56,14 +45,15 @@ describe("breakpoints", () => {
   });
 
   // The hook, the imperative helper, and the native-shell signal must give
-  // the SAME answer at every width — including the fractional sliver
-  // (767.98, 768) where a max-width:767.98 and a !min-width:768 encoding
-  // would disagree. Canonical predicate: the max-md query.
+  // the SAME answer at every width. The pole is "mobile unless provably
+  // md+": in the fractional sliver (767.98, 768) — reachable under browser
+  // zoom — Tailwind's md: overrides don't apply, the page renders its mobile
+  // base styles, and the predicate must say mobile too.
   it.each([
     [767, true],
     [767.5, true],
     [767.98, true],
-    [767.99, false],
+    [767.99, true],
     [768, false],
   ])("hook, helper, and published signal agree at %spx", (width, mobile) => {
     stubViewportWidth(width);

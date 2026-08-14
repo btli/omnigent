@@ -80,7 +80,7 @@ import { FileViewerContext } from "./FileViewerContext";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
-import { MD_MIN_WIDTH_QUERY, isMobileViewport } from "@/lib/breakpoints";
+import { isMobileViewport } from "@/lib/breakpoints";
 import { Sidebar } from "./Sidebar";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
 import { useSettingsRoute } from "./settingsNav";
@@ -1893,14 +1893,11 @@ export function AppShell() {
 }
 
 /**
- * Initial sidebar open state — open on desktop, closed on mobile. SSR-
- * safe (returns false when window is undefined). Deliberately probes the
- * DESKTOP side (`min-width`) rather than negating `isMobileViewport()`:
- * the sidebar should default open only when the viewport is provably at
- * `md`+, so ambiguous environments (the fractional sliver, jsdom) start
- * closed.
+ * Initial sidebar open state — open on desktop, closed on mobile, per the
+ * one canonical layout predicate ("mobile unless provably md+"). SSR-safe
+ * (returns false when window is undefined).
  */
 function initialSidebarOpen(): boolean {
   if (typeof window === "undefined") return false;
-  return window.matchMedia(MD_MIN_WIDTH_QUERY).matches;
+  return !isMobileViewport();
 }

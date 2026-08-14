@@ -112,6 +112,35 @@ function renderWithTooltips(ui: ReactElement) {
   return render(<TooltipProvider>{ui}</TooltipProvider>);
 }
 
+// Evaluate min-/max-width media queries against a simulated viewport width,
+// so each test runs at an explicit real-browser width instead of inheriting
+// the global test-setup mock (which answers false to every query).
+function stubViewportWidth(width: number) {
+  Object.defineProperty(window, "matchMedia", {
+    writable: true,
+    configurable: true,
+    value: (query: string) => ({
+      matches: (() => {
+        const min = /^\(min-width: ([\d.]+)px\)$/.exec(query);
+        if (min) return width >= parseFloat(min[1]);
+        const max = /^\(max-width: ([\d.]+)px\)$/.exec(query);
+        if (max) return width <= parseFloat(max[1]);
+        return false;
+      })(),
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    }),
+  });
+}
+
+// These suites assert desktop composer behavior (mount autofocus,
+// Enter-sends, hover affordances); tests that need a mobile width re-pin it
+// themselves.
+beforeEach(() => {
+  stubViewportWidth(1280);
+});
+
 describe("Composer Claude goal control", () => {
   afterEach(() => {
     cleanup();
@@ -1459,29 +1488,13 @@ describe("Composer reply-quote focus", () => {
     expect(document.activeElement).toBe(ta);
   });
 
-  // The mobile boundary is the canonical md query (max-width: 767.98px), not
-  // the historical bespoke 767px — 767.5px sits between the two, so this test
-  // pins the migrated boundary: suppression must apply there.
+  // The mobile boundary is the canonical layout predicate (not provably at
+  // md+), not the historical bespoke 767px — 767.5px sits between the two,
+  // so this test pins the migrated boundary: suppression must apply there.
   it("suppresses mount autofocus at 767.5px (below the canonical md boundary)", () => {
-    const original = window.matchMedia;
-    Object.defineProperty(window, "matchMedia", {
-      writable: true,
-      configurable: true,
-      value: (query: string) => ({
-        // Simulate a 767.5px-wide viewport: only (max-width: 767.98px)
-        // matches; (min-width: 768px) and friends do not.
-        matches: query === "(max-width: 767.98px)",
-        media: query,
-        addEventListener: () => {},
-        removeEventListener: () => {},
-      }),
-    });
-    try {
-      render(<Composer {...composerProps()} />);
-      expect(document.activeElement).not.toBe(textarea());
-    } finally {
-      window.matchMedia = original;
-    }
+    stubViewportWidth(767.5);
+    render(<Composer {...composerProps()} />);
+    expect(document.activeElement).not.toBe(textarea());
   });
 
   it("does not steal focus when a quote is removed", () => {
