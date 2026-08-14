@@ -19,6 +19,8 @@ import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSi
 const DEFAULT_WIDTH_PX = 320;
 const MIN_WIDTH_PX = 220;
 const MAX_WIDTH_RATIO = 0.5;
+/** Invisible cross-axis padding so the 4px visual handle still hits 44px. */
+const HANDLE_HIT_PAD_PX = 20;
 
 function clamp(w: number): number {
   // No viewport available off the DOM (SSR / node test env) — this runs during
@@ -91,12 +93,7 @@ export function resetSidebarWidthStoreForTesting(): void {
 export function useResizableSidebar() {
   const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
   const width = clamp(raw ?? DEFAULT_WIDTH_PX);
-  const activeDragRef = useRef<{
-    element: HTMLElement;
-    pointerId: number;
-    startWidth: number;
-    cleanup: () => void;
-  } | null>(null);
+  const activePointerId = useRef<number | null>(null);
 
   // Re-clamp on viewport resize so a shrunken window pulls the sidebar back
   // under the ceiling; widening re-derives from the persisted preference so the
@@ -109,66 +106,51 @@ export function useResizableSidebar() {
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
-  const finishDrag = useCallback((persist: boolean, restoreStart: boolean) => {
-    const activeDrag = activeDragRef.current;
-    if (!activeDrag) return;
-
-    activeDragRef.current = null;
-    activeDrag.cleanup();
-    if (restoreStart) {
-      setStoredWidthRaw(activeDrag.startWidth);
-    } else if (persist) {
+  // No iframe shield: the sidebar never adjoins the preview iframe, so capture suffices.
+  const finishDrag = useCallback((commit: boolean) => {
+    if (activePointerId.current === null) return;
+    activePointerId.current = null;
+    if (commit) {
       persistWidth(storedWidth);
-    }
-    if (activeDrag.element.hasPointerCapture(activeDrag.pointerId)) {
-      activeDrag.element.releasePointerCapture(activeDrag.pointerId);
     }
     document.body.style.cursor = "";
     document.body.style.userSelect = "";
   }, []);
 
-  const onPointerDown = useCallback(
+  const onPointerDown = useCallback((e: React.PointerEvent<HTMLElement>) => {
+    // First pointer wins; a right/middle mouse press doesn't start a drag.
+    if (activePointerId.current !== null) return;
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+
+    e.preventDefault();
+    activePointerId.current = e.pointerId;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  }, []);
+
+  const onPointerMove = useCallback((e: React.PointerEvent<HTMLElement>) => {
+    if (e.pointerId !== activePointerId.current) return;
+    setStoredWidth(clamp(e.clientX));
+  }, []);
+
+  const onPointerUp = useCallback(
     (e: React.PointerEvent<HTMLElement>) => {
-      // A resize owns exactly one pointer stream until it ends.
-      if (activeDragRef.current) return;
-
-      e.preventDefault();
-      const element = e.currentTarget;
-      const pointerId = e.pointerId;
-      const startWidth = storedWidth ?? width;
-
-      function onPointerMove(event: PointerEvent) {
-        if (event.pointerId !== pointerId) return;
-        setStoredWidth(clamp(event.clientX));
+      if (e.pointerId !== activePointerId.current) return;
+      finishDrag(true);
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
       }
-
-      function onPointerUp(event: PointerEvent) {
-        if (event.pointerId !== pointerId) return;
-        finishDrag(true, false);
-      }
-
-      function onPointerAbort(event: PointerEvent) {
-        if (event.pointerId !== pointerId) return;
-        finishDrag(false, true);
-      }
-
-      function cleanup() {
-        element.removeEventListener("pointermove", onPointerMove);
-        element.removeEventListener("pointerup", onPointerUp);
-        element.removeEventListener("pointercancel", onPointerAbort);
-        element.removeEventListener("lostpointercapture", onPointerAbort);
-      }
-
-      activeDragRef.current = { element, pointerId, startWidth, cleanup };
-      element.addEventListener("pointermove", onPointerMove);
-      element.addEventListener("pointerup", onPointerUp);
-      element.addEventListener("pointercancel", onPointerAbort);
-      element.addEventListener("lostpointercapture", onPointerAbort);
-      element.setPointerCapture(pointerId);
-      document.body.style.cursor = "col-resize";
-      document.body.style.userSelect = "none";
     },
-    [finishDrag, width],
+    [finishDrag],
+  );
+
+  const onPointerCancel = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
+      if (e.pointerId !== activePointerId.current) return;
+      finishDrag(false);
+    },
+    [finishDrag],
   );
 
   const onKeyDown = useCallback(
@@ -186,13 +168,17 @@ export function useResizableSidebar() {
     [width],
   );
 
-  useEffect(() => () => finishDrag(false, true), [finishDrag]);
+  useEffect(() => () => finishDrag(false), [finishDrag]);
 
   return {
     /** Current sidebar width in px (already viewport-clamped). */
     width,
     handleProps: {
       onPointerDown,
+      onPointerMove,
+      onPointerUp,
+      onPointerCancel,
+      onLostPointerCapture: onPointerCancel,
       onKeyDown,
       role: "separator" as const,
       "aria-orientation": "vertical" as const,
@@ -200,7 +186,10 @@ export function useResizableSidebar() {
       tabIndex: 0,
       style: {
         touchAction: "none",
-        width: 44,
+        boxSizing: "content-box" as const,
+        paddingInline: HANDLE_HIT_PAD_PX,
+        marginInline: -HANDLE_HIT_PAD_PX,
+        backgroundClip: "content-box",
       },
     },
   };
