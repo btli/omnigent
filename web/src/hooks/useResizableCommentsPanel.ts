@@ -24,9 +24,15 @@ const MAX_WIDTH_PX = 640;
 const MIN_VIEWER_PX = 240;
 /** Tailwind `md` breakpoint — must track the value in tailwind.config. */
 const MD_BREAKPOINT = 768;
-/** Invisible padding on each side of the 1px visual handle, widening the hit
- * target for touch/pen without changing its visual weight. */
-const HANDLE_HIT_PAD_PX = 20;
+// Invisible hit padding around the ~1px visual handle. Asymmetric on purpose:
+// the natural grab side is the viewer side (the handle sits on the panel's
+// LEFT edge), where the pad only overlaps inert code-viewer margin — while the
+// inward pad lies over the panel's own header/tabs/cards, so it must stay
+// small enough not to steal their taps or vertical-scroll starts.
+const COARSE_VIEWER_PAD_PX = 32; // 32 + 4 paint + 8 = 44px total for fingers
+const COARSE_INWARD_PAD_PX = 8;
+const FINE_VIEWER_PAD_PX = 16; // 16 + 4 paint + 4 = 24px total for mouse/pen
+const FINE_INWARD_PAD_PX = 4;
 
 // ---------------------------------------------------------------------------
 // Module-level width store (shared across panel remounts within a session)
@@ -105,6 +111,9 @@ export function useResizableCommentsPanel() {
   const activePointerId = useRef<number | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const overlayRef = useRef<HTMLDivElement | null>(null);
+  // Removes the document-level pointerup/pointercancel fallbacks installed
+  // for the active drag; null when idle.
+  const removeDocFallbacks = useRef<(() => void) | null>(null);
 
   // While dragging, a transparent full-window overlay sits above the panel so
   // the pointer stream keeps reaching the parent document even if capture is
@@ -135,6 +144,20 @@ export function useResizableCommentsPanel() {
     return () => mql.removeEventListener("change", handler);
   }, []);
 
+  // Coarse pointers (fingers) get the full 44px hit box; fine pointers
+  // (mouse, trackpad, pen tip) can acquire a 24px one.
+  const [isCoarse, setIsCoarse] = useState(
+    () => typeof window !== "undefined" && !!window.matchMedia?.("(pointer: coarse)").matches,
+  );
+
+  useEffect(() => {
+    const mql = window.matchMedia?.("(pointer: coarse)");
+    if (!mql) return;
+    const handler = (e: MediaQueryListEvent) => setIsCoarse(e.matches);
+    mql.addEventListener("change", handler);
+    return () => mql.removeEventListener("change", handler);
+  }, []);
+
   // Clamp a candidate width to [MIN, dynamic max], leaving MIN_VIEWER_PX for
   // the sibling code/diff viewer so the panel can't swallow the whole row.
   const clampWidth = useCallback((candidate: number): number => {
@@ -153,6 +176,8 @@ export function useResizableCommentsPanel() {
     (persist: boolean) => {
       if (activePointerId.current === null) return;
       activePointerId.current = null;
+      removeDocFallbacks.current?.();
+      removeDocFallbacks.current = null;
       removeDragOverlay();
       if (persist) persistStoredWidth();
       document.body.style.cursor = "";
@@ -163,19 +188,42 @@ export function useResizableCommentsPanel() {
 
   const onPointerDown = useCallback(
     (e: React.PointerEvent) => {
-      // First pointer wins; a right/middle mouse press doesn't start a drag.
+      // First pointer wins; only the primary button/tip starts a drag. (A pen
+      // barrel button reports pointerType "pen" with button 2, so the guard
+      // must not be mouse-only; touch and pen tip are always button 0.)
       if (activePointerId.current !== null) return;
-      if (e.pointerType === "mouse" && e.button !== 0) return;
+      if (e.button !== 0) return;
+      // Capture BEFORE publishing any drag state: if capture throws (pointer
+      // already gone, detached node), staying fully idle avoids a stale
+      // activePointerId that a later reused pointerId could match — which
+      // would spuriously end (and persist) a drag that never started.
+      try {
+        e.currentTarget.setPointerCapture?.(e.pointerId); // jsdom lacks capture
+      } catch {
+        return;
+      }
       e.preventDefault();
       activePointerId.current = e.pointerId;
-      // Capture routes every move/up to the handle even when the pointer
-      // leaves it mid-drag. Optional-chained: jsdom lacks pointer capture.
-      e.currentTarget.setPointerCapture?.(e.pointerId);
+      // Document-level fallbacks: if the browser drops capture without
+      // delivering the handle's up/cancel, the drag still ends here so the
+      // max-z overlay can never outlive it.
+      const onDocPointerUp = (ev: PointerEvent) => {
+        if (ev.pointerId === activePointerId.current) endDrag(true);
+      };
+      const onDocPointerCancel = (ev: PointerEvent) => {
+        if (ev.pointerId === activePointerId.current) endDrag(false);
+      };
+      document.addEventListener("pointerup", onDocPointerUp);
+      document.addEventListener("pointercancel", onDocPointerCancel);
+      removeDocFallbacks.current = () => {
+        document.removeEventListener("pointerup", onDocPointerUp);
+        document.removeEventListener("pointercancel", onDocPointerCancel);
+      };
       addDragOverlay();
       document.body.style.cursor = "col-resize";
       document.body.style.userSelect = "none";
     },
-    [addDragOverlay],
+    [addDragOverlay, endDrag],
   );
 
   const onPointerMove = useCallback(
@@ -228,6 +276,12 @@ export function useResizableCommentsPanel() {
   // Unmount mid-drag: abort (no persist) and clean up body/overlay state.
   useEffect(() => () => endDrag(false), [endDrag]);
 
+  // The layout flipping to mobile mid-drag unmounts the handle, so its
+  // up/cancel can never arrive — abort so the overlay doesn't outlive the drag.
+  useEffect(() => {
+    if (!isDesktop) endDrag(false);
+  }, [isDesktop, endDrag]);
+
   // Re-clamp the stored width when the viewport resizes so a width chosen on
   // a wider layout doesn't crowd out the viewer after the window shrinks.
   useEffect(() => {
@@ -261,19 +315,23 @@ export function useResizableCommentsPanel() {
       role: "separator" as const,
       "aria-orientation": "vertical" as const,
       "aria-label": "Resize comments panel",
+      "aria-valuenow": width,
+      "aria-valuemin": MIN_WIDTH_PX,
+      "aria-valuemax": MAX_WIDTH_PX,
       tabIndex: 0,
       // The handle owns its touches outright (no scroll/selection may start
       // from it), and invisible padding widens the too-thin visual handle
-      // into a touch-acquirable hit target. Negative margins cancel the
+      // into an acquirable hit target — weighted toward the viewer side,
+      // where it overlaps nothing interactive. Negative margins cancel the
       // padding's footprint and content-box keeps hover/active backgrounds
       // painting only the visible sliver, so the visual weight is unchanged.
       style: {
         touchAction: "none",
         boxSizing: "content-box",
-        paddingLeft: HANDLE_HIT_PAD_PX,
-        paddingRight: HANDLE_HIT_PAD_PX,
-        marginLeft: -HANDLE_HIT_PAD_PX,
-        marginRight: -HANDLE_HIT_PAD_PX,
+        paddingLeft: isCoarse ? COARSE_VIEWER_PAD_PX : FINE_VIEWER_PAD_PX,
+        paddingRight: isCoarse ? COARSE_INWARD_PAD_PX : FINE_INWARD_PAD_PX,
+        marginLeft: isCoarse ? -COARSE_VIEWER_PAD_PX : -FINE_VIEWER_PAD_PX,
+        marginRight: isCoarse ? -COARSE_INWARD_PAD_PX : -FINE_INWARD_PAD_PX,
         backgroundClip: "content-box",
       } as React.CSSProperties,
     },
