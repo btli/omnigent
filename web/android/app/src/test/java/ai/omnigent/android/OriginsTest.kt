@@ -27,6 +27,12 @@ class OriginsTest {
     }
 
     @Test
+    fun `uses WebView compatible nontransitional IDNA`() {
+        assertEquals("xn--fa-hia.de", canonicalHost("faß.de"))
+        assertFalse(canonicalHost("faß.de") == canonicalHost("fass.de"))
+    }
+
+    @Test
     fun `canonical origin and default port helpers share normalization`() {
         assertEquals("https://example.com", canonicalOrigin("HTTPS", "Example.COM", 443))
         assertEquals("http://[::1]:8000", canonicalOrigin("http", "::1", 8000))

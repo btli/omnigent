@@ -121,7 +121,9 @@ class OmnigentWebViewClient(
         error: WebResourceError,
     ) {
         super.onReceivedError(view, request, error)
-        if (request.isForMainFrame) mainFrameLoadFailed = true
+        if (request.isForMainFrame && isBlockingLoadError(error.errorCode, error.description)) {
+            mainFrameLoadFailed = true
+        }
     }
 
     override fun onReceivedHttpError(
@@ -255,3 +257,8 @@ class OmnigentWebViewClient(
         const val MAX_ROOT_BOUNCES = 1
     }
 }
+
+internal fun isBlockingLoadError(
+    errorCode: Int,
+    description: CharSequence,
+): Boolean = errorCode != WebViewClient.ERROR_UNKNOWN || !description.contains("ERR_ABORTED")

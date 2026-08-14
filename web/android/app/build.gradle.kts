@@ -109,11 +109,12 @@ tasks.withType<Test>().configureEach {
     )
 }
 
-// `bundleRelease` runs the JVM unit tests first, so a failing test fails the
-// release build — and the CI check that builds the bundle on every web/android
-// change.
-tasks.matching { it.name == "bundleRelease" }.configureEach {
-    dependsOn("testDebugUnitTest")
+// Plain release bundles run unit tests for CI coverage. Publishing is kept out
+// of that graph because its process may hold Play service-account credentials.
+if (gradle.startParameter.taskNames.none { it.contains("publish", ignoreCase = true) }) {
+    tasks.matching { it.name == "bundleRelease" }.configureEach {
+        dependsOn("testDebugUnitTest")
+    }
 }
 
 // Gradle Play Publisher: `./gradlew publishReleaseBundle` builds the signed AAB
