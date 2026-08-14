@@ -730,7 +730,7 @@ export function Sidebar({
         // divider — no outer margin or rounding. Width (the user-resizable
         // variable) animates →0 to push main; when closed the border
         // collapses too so nothing lingers.
-        "md:translate-x-0 md:overflow-hidden",
+        "md:translate-x-0",
         // Normal desktop flow: relative panel that pushes main. Suppressed while
         // peeking so its `md:inset-auto`/`md:relative` don't override the
         // floating-card positioning below (same `md:` layer, source order wins).
@@ -769,9 +769,15 @@ export function Sidebar({
       {!peek && (
         <div
           {...resizeHandleProps}
+          data-testid="sidebar-resize-handle"
           className="absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
         />
       )}
+      {/* Clip scrolling sidebar content without clipping the boundary handle's
+          chat-side hit pad; keeping the handle as a sibling also limits its
+          inward overlap to the hook's small, intentional row-side padding. */}
+      {/* prettier-ignore */}
+      <div data-testid="sidebar-clipped-content" className="flex min-h-0 flex-1 flex-col md:overflow-hidden">
       {inSettings ? (
         <SettingsSidebarBody onNavClick={onNavClick} />
       ) : (
@@ -985,6 +991,7 @@ export function Sidebar({
           <SidebarServerPicker />
         </>
       )}
+      </div>
     </aside>
   );
 }
