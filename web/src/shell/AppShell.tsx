@@ -80,7 +80,8 @@ import { FileViewerContext } from "./FileViewerContext";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
-import { isMobileViewport, Sidebar } from "./Sidebar";
+import { isMobileViewport } from "@/lib/breakpoints";
+import { Sidebar } from "./Sidebar";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
 import { useSettingsRoute } from "./settingsNav";
 import { SubagentsPanel } from "./SubagentsPanel";
@@ -1899,5 +1900,5 @@ export function AppShell() {
  */
 function initialSidebarOpen(): boolean {
   if (typeof window === "undefined") return false;
-  return window.matchMedia("(min-width: 768px)").matches;
+  return !isMobileViewport();
 }

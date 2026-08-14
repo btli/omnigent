@@ -127,6 +127,7 @@ import {
 } from "@/hooks/useConversations";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { isMobileViewport } from "@/lib/breakpoints";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
 import { relativeTime } from "@/lib/relativeTime";
@@ -4611,20 +4612,6 @@ function BulkActionBar({
       </Dialog>
     </>
   );
-}
-
-/**
- * Returns true on mobile viewports (below the `md` breakpoint of
- * 768px). Used to gate the auto-close-on-navigation behavior — on
- * mobile the sidebar is a full-screen overlay so dismissing on action
- * is what reveals the destination; on desktop the sidebar pushes content
- * aside and staying open is more useful.
- *
- * SSR-safe (returns false when window is undefined).
- */
-export function isMobileViewport(): boolean {
-  if (typeof window === "undefined") return false;
-  return !window.matchMedia("(min-width: 768px)").matches;
 }
 
 // Default collapse state: every section (Pinned / Projects / Chats / Shared)
