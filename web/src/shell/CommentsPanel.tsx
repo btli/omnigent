@@ -147,22 +147,24 @@ export function CommentsPanel({
   }, [activeSelection, tab]);
 
   return (
-    <div
-      ref={containerRef}
-      style={isDesktop && width != null ? { width } : undefined}
-      className="relative flex shrink-0 flex-col border-border w-full h-64 border-t md:h-auto md:border-t-0 md:border-l"
-    >
-      {/* Resize handle — desktop only (mobile stacks the panel full-width below) */}
+    <>
+      {/* Divider gutter owning the resize interaction — desktop only (mobile
+          stacks the panel full-width below). A real flex child BETWEEN the
+          viewer and the panel, outside both scroll containers, so its
+          invisible hit slivers overhang each neighbor by only a few px
+          instead of sitting over the viewer's scrollbar or the panel's
+          header/tabs/cards. */}
       {isDesktop && (
         <div
           {...handleProps}
-          className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
+          className="relative z-10 w-1 shrink-0 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
         />
       )}
-      {/* Content wrapper carries the clipping so the handle's invisible hit
-          padding can extend past the panel's left edge over the viewer (the
-          natural grab side); the FileViewer row still bounds everything. */}
-      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      <div
+        ref={containerRef}
+        style={isDesktop && width != null ? { width } : undefined}
+        className="relative flex shrink-0 flex-col overflow-hidden border-border w-full h-64 border-t md:h-auto md:border-t-0 md:border-l"
+      >
         {/* Header — fixed height so layout doesn't shift when button is hidden */}
         <div className="flex h-11 shrink-0 items-center justify-between px-3 border-b border-border">
           <span className="text-sm font-semibold">Comments</span>
@@ -318,7 +320,7 @@ export function CommentsPanel({
           )}
         </div>
       </div>
-    </div>
+    </>
   );
 }
 

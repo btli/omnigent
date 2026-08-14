@@ -414,10 +414,10 @@ describe("CommentsPanel resize affordance", () => {
   it("renders a resize handle and applies an inline width on desktop", () => {
     renderPanel([makeComment("c1")], []);
 
-    // The separator is the drag handle; its parent is the panel root, which
+    // The separator is the divider gutter preceding the panel root, which
     // gets an explicit pixel width (default 240px) so it can be dragged wider.
     const handle = screen.getByRole("separator", { name: "Resize comments panel" });
-    expect((handle.parentElement as HTMLElement).style.width).toBe("240px");
+    expect((handle.nextElementSibling as HTMLElement).style.width).toBe("240px");
   });
 
   it("omits the handle and inline width on a narrow (mobile) viewport", () => {
@@ -514,36 +514,43 @@ describe("CommentsPanel active-comment reveal", () => {
 
 // ── Resize handle geometry ────────────────────────────────────────────────────
 
-describe("CommentsPanel resize handle geometry", () => {
+describe("CommentsPanel resize divider gutter", () => {
+  // jsdom has no layout engine, so these tests pin the structural invariants
+  // that produce the geometry in a real browser: the gutter must be a flex
+  // sibling BEFORE the panel root (i.e. between the viewer and the panel in
+  // FileViewer's row) and outside every scroll/clip container, with its hit
+  // overhang capped on both sides.
   const getSeparator = () => screen.getByRole("separator", { name: "Resize comments panel" });
   const dragOverlayPresent = () =>
     [...document.body.children].some(
       (c) => c instanceof HTMLElement && c.style.zIndex === "2147483647",
     );
 
-  it("leaves the handle's viewer-side hit pad unclipped by the panel root", () => {
+  it("renders the gutter between the viewer and the panel, outside both scroll containers", () => {
     const { container } = renderPanel([makeComment("c1")], []);
-    const root = container.firstElementChild as HTMLElement;
     const separator = getSeparator();
 
-    // The root must not clip: the hit pad extends past the panel's left edge
-    // over the viewer — the natural grab side. Clipping lives on an inner
-    // content wrapper that does NOT contain the handle.
-    expect(root.className).not.toMatch(/overflow-hidden/);
-    const wrapper = root.querySelector(":scope > .overflow-hidden");
-    expect(wrapper).not.toBeNull();
-    expect(wrapper?.contains(separator)).toBe(false);
+    // First child of the split row slot, immediately followed by the panel
+    // root — so in FileViewer's flex row it sits between viewer and panel.
+    expect(container.firstElementChild).toBe(separator);
+    const panelRoot = separator.nextElementSibling as HTMLElement;
+    expect(panelRoot).not.toBeNull();
+    expect(panelRoot.contains(separator)).toBe(false);
 
-    // The negative margin pushes the pad's footprint over the viewer side.
-    expect(separator.style.marginLeft).toBe(`-${separator.style.paddingLeft}`);
+    // The panel root clips its own content again; the gutter must sit outside
+    // every clipping/scrolling ancestor or its hit slivers would be cut off.
+    expect(panelRoot.className).toMatch(/overflow-hidden/);
+    expect(separator.closest(".overflow-hidden, .overflow-y-auto")).toBeNull();
   });
 
-  it("keeps taps and scrolls on the panel content out of the handle", () => {
+  it("caps the hit overhang over the viewer and the panel content", () => {
     renderPanel([makeComment("c1")], [makeComment("c2", "addressed")]);
+    const style = getSeparator().style;
 
-    // The inward pad stays small so it only overlaps the header/list gutter,
-    // never the tappable content.
-    expect(parseFloat(getSeparator().style.paddingRight)).toBeLessThanOrEqual(8);
+    // Slivers: ≤10px over the viewer (a 14px scrollbar keeps its majority),
+    // ≤8px inward (within the panel's 12px content gutter).
+    expect(-parseFloat(style.marginLeft)).toBeLessThanOrEqual(10);
+    expect(-parseFloat(style.marginRight)).toBeLessThanOrEqual(8);
 
     // Pressing and tapping a tab must interact with the tab, not the handle:
     // no drag overlay appears and the tab actually switches.
@@ -554,15 +561,23 @@ describe("CommentsPanel resize handle geometry", () => {
     expect(screen.getByText("Comment c2")).toBeInTheDocument();
   });
 
-  it("keeps the visible handle strip unchanged by the hit padding", () => {
+  it("keeps the painted strip slim inside the gutter's layout footprint", () => {
     renderPanel([], []);
     const separator = getSeparator();
+    const style = separator.style;
 
-    // 1px-ish painted strip: the pads are invisible (content-box background)
-    // and their footprint is cancelled by the matching negative margins.
+    // 4px painted strip (w-1, content-box background); the layout footprint
+    // is the slim gutter itself — padding minus the cancelling margins.
     expect(separator.className).toMatch(/\bw-1\b/);
-    expect(separator.style.boxSizing).toBe("content-box");
-    expect(separator.style.backgroundClip).toBe("content-box");
-    expect(separator.style.marginRight).toBe(`-${separator.style.paddingRight}`);
+    expect(style.boxSizing).toBe("content-box");
+    expect(style.backgroundClip).toBe("content-box");
+    const footprint =
+      4 +
+      parseFloat(style.paddingLeft) +
+      parseFloat(style.paddingRight) +
+      parseFloat(style.marginLeft) +
+      parseFloat(style.marginRight);
+    expect(footprint).toBeLessThanOrEqual(8);
+    expect(footprint).toBeGreaterThan(0);
   });
 });

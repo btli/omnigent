@@ -337,7 +337,24 @@ describe("useResizableCommentsPanel pointer drag", () => {
 });
 
 describe("useResizableCommentsPanel touch affordances", () => {
-  it("declares touch-action none and an invisible asymmetric hit target", () => {
+  // The handle is a divider gutter: a real flex child whose layout footprint
+  // is the gutter width (4px painted strip + padding + the cancelling
+  // negative margins) and whose hit box overhangs each neighbor by only a
+  // capped sliver. Derived from the returned style:
+  const gutterGeometry = (style: React.CSSProperties) => {
+    const padLeft = Number(style.paddingLeft);
+    const padRight = Number(style.paddingRight);
+    const marginLeft = Number(style.marginLeft);
+    const marginRight = Number(style.marginRight);
+    return {
+      hitTotal: 4 + padLeft + padRight,
+      footprint: 4 + padLeft + padRight + marginLeft + marginRight,
+      viewerOverhang: -marginLeft,
+      inwardOverhang: -marginRight,
+    };
+  };
+
+  it("declares touch-action none and a capped-sliver gutter hit target", () => {
     const { result, unmount } = renderHook(() => useResizableCommentsPanel());
     const { style } = result.current.handleProps;
 
@@ -345,16 +362,15 @@ describe("useResizableCommentsPanel touch affordances", () => {
     expect(style.touchAction).toBe("none");
 
     // Fine pointer (the matchMedia stub reports no coarse pointer): >=24px
-    // total, weighted toward the viewer side where nothing interactive sits.
-    const viewerPad = Number(style.paddingLeft);
-    const inwardPad = Number(style.paddingRight);
-    expect(viewerPad + 4 + inwardPad).toBeGreaterThanOrEqual(24);
-    expect(viewerPad).toBeGreaterThan(inwardPad);
+    // hit total in a 6px-wide gutter. The slivers are capped so a classic
+    // viewer scrollbar and the panel's content keep their pointer streams.
+    const g = gutterGeometry(style);
+    expect(g.hitTotal).toBeGreaterThanOrEqual(24);
+    expect(g.footprint).toBe(6);
+    expect(g.viewerOverhang).toBeLessThanOrEqual(10);
+    expect(g.inwardOverhang).toBeLessThanOrEqual(8);
 
-    // Negative margins cancel the pads' footprint and content-box keeps
-    // hover/active backgrounds off them — the visible strip is unchanged.
-    expect(Number(style.marginLeft)).toBe(-viewerPad);
-    expect(Number(style.marginRight)).toBe(-inwardPad);
+    // Content-box keeps hover/active backgrounds on the 4px painted strip.
     expect(style.boxSizing).toBe("content-box");
     expect(style.backgroundClip).toBe("content-box");
 
@@ -363,20 +379,17 @@ describe("useResizableCommentsPanel touch affordances", () => {
     unmount();
   });
 
-  it("widens the hit target to >=44px total on coarse-pointer devices", () => {
+  it("widens the gutter and hit target on coarse-pointer devices", () => {
     mockMatchMedia({ "(pointer: coarse)": true });
     const { result, unmount } = renderHook(() => useResizableCommentsPanel());
-    const { style } = result.current.handleProps;
 
-    const viewerPad = Number(style.paddingLeft);
-    const inwardPad = Number(style.paddingRight);
-    expect(viewerPad + 4 + inwardPad).toBeGreaterThanOrEqual(44);
-    // The natural grab side (over the viewer) must be >=24px on its own; the
-    // inward pad stays small so header/tab/card taps aren't stolen.
-    expect(viewerPad).toBeGreaterThanOrEqual(24);
-    expect(inwardPad).toBeLessThanOrEqual(8);
-    expect(Number(style.marginLeft)).toBe(-viewerPad);
-    expect(Number(style.marginRight)).toBe(-inwardPad);
+    // Coarse: 8px gutter, 26px hit total — TR-7's 24px floor with the same
+    // sliver caps (the preferred 44px would need a visually wide gutter).
+    const g = gutterGeometry(result.current.handleProps.style);
+    expect(g.hitTotal).toBe(26);
+    expect(g.footprint).toBe(8);
+    expect(g.viewerOverhang).toBeLessThanOrEqual(10);
+    expect(g.inwardOverhang).toBeLessThanOrEqual(8);
     unmount();
   });
 

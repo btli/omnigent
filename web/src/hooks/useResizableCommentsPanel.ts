@@ -24,15 +24,35 @@ const MAX_WIDTH_PX = 640;
 const MIN_VIEWER_PX = 240;
 /** Tailwind `md` breakpoint — must track the value in tailwind.config. */
 const MD_BREAKPOINT = 768;
-// Invisible hit padding around the ~1px visual handle. Asymmetric on purpose:
-// the natural grab side is the viewer side (the handle sits on the panel's
-// LEFT edge), where the pad only overlaps inert code-viewer margin — while the
-// inward pad lies over the panel's own header/tabs/cards, so it must stay
-// small enough not to steal their taps or vertical-scroll starts.
-const COARSE_VIEWER_PAD_PX = 32; // 32 + 4 paint + 8 = 44px total for fingers
-const COARSE_INWARD_PAD_PX = 8;
-const FINE_VIEWER_PAD_PX = 16; // 16 + 4 paint + 4 = 24px total for mouse/pen
-const FINE_INWARD_PAD_PX = 4;
+// The handle is a dedicated divider gutter between the viewer and the panel —
+// a real flex child outside both scroll containers, so its hit area overlays
+// almost no content. The painted strip (`w-1`) sits centered in the gutter;
+// invisible padding fills the rest and overhangs each side by a small sliver
+// via negative margins. The slivers are capped so the viewer's scrollbar and
+// the panel's header/tabs/cards keep their taps and scroll starts — which
+// also caps the hit total at 26px coarse / 24px fine (TR-7's 24px floor; the
+// preferred 44px would need a visually wide gutter the layout doesn't permit).
+const PAINTED_STRIP_PX = 4; // must match the handle's `w-1` class
+const GUTTER_COARSE_PX = 8;
+const GUTTER_FINE_PX = 6;
+const VIEWER_SLIVER_PX = 10; // ≤10: a 14px viewer scrollbar keeps 4px + its own gutter
+const INWARD_SLIVER_PX = 8; // ≤8: stays within the panel's 12px content gutter
+
+/** Inline style for the divider-gutter handle: layout footprint = gutter
+ * width, hit box = gutter + both slivers, paint = the centered `w-1` strip. */
+function gutterStyle(isCoarse: boolean): React.CSSProperties {
+  const gutter = isCoarse ? GUTTER_COARSE_PX : GUTTER_FINE_PX;
+  const inset = (gutter - PAINTED_STRIP_PX) / 2;
+  return {
+    touchAction: "none",
+    boxSizing: "content-box",
+    paddingLeft: VIEWER_SLIVER_PX + inset,
+    paddingRight: INWARD_SLIVER_PX + inset,
+    marginLeft: -VIEWER_SLIVER_PX,
+    marginRight: -INWARD_SLIVER_PX,
+    backgroundClip: "content-box",
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Module-level width store (shared across panel remounts within a session)
@@ -304,7 +324,12 @@ export function useResizableCommentsPanel() {
     containerRef,
     /** Whether the resize handle should render (desktop only). */
     isDesktop,
-    /** Props to spread onto the resize handle element. */
+    /**
+     * Props to spread onto the divider-gutter handle. Render it as the
+     * panel's PRECEDING SIBLING in the split row (a `w-1 shrink-0` flex
+     * child), never inside either scroll container — the pads would be
+     * clipped and would steal the neighbors' pointer streams.
+     */
     handleProps: {
       onPointerDown,
       onPointerMove,
@@ -319,21 +344,13 @@ export function useResizableCommentsPanel() {
       "aria-valuemin": MIN_WIDTH_PX,
       "aria-valuemax": MAX_WIDTH_PX,
       tabIndex: 0,
-      // The handle owns its touches outright (no scroll/selection may start
-      // from it), and invisible padding widens the too-thin visual handle
-      // into an acquirable hit target — weighted toward the viewer side,
-      // where it overlaps nothing interactive. Negative margins cancel the
-      // padding's footprint and content-box keeps hover/active backgrounds
-      // painting only the visible sliver, so the visual weight is unchanged.
-      style: {
-        touchAction: "none",
-        boxSizing: "content-box",
-        paddingLeft: isCoarse ? COARSE_VIEWER_PAD_PX : FINE_VIEWER_PAD_PX,
-        paddingRight: isCoarse ? COARSE_INWARD_PAD_PX : FINE_INWARD_PAD_PX,
-        marginLeft: isCoarse ? -COARSE_VIEWER_PAD_PX : -FINE_VIEWER_PAD_PX,
-        marginRight: isCoarse ? -COARSE_INWARD_PAD_PX : -FINE_INWARD_PAD_PX,
-        backgroundClip: "content-box",
-      } as React.CSSProperties,
+      // The gutter owns its touches outright (no scroll/selection may start
+      // from it). With content-box sizing the `w-1` class is the painted
+      // strip; padding centers it in the gutter and adds the overhang
+      // slivers, whose footprint the negative margins cancel — so the
+      // element occupies exactly the gutter width and the hover/active
+      // background (content-box clipped) never widens visually.
+      style: gutterStyle(isCoarse),
     },
   };
 }
