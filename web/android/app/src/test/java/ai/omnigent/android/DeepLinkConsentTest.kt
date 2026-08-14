@@ -68,7 +68,7 @@ class DeepLinkConsentTest {
     }
 
     @Test
-    fun `consent open persists after a failed load is retried successfully`() {
+    fun `failed consented load resolves navigation but persists after a successful retry`() {
         val activity = launchWithLink("omnigent://new.example/c/$hex")
         latestDialog().getButton(DialogInterface.BUTTON_POSITIVE).performClick()
         idle()
@@ -79,13 +79,14 @@ class DeepLinkConsentTest {
         // chrome-error:// one — so this is the only way the shell finds out.
         activity.invokeOnPageReady("https://new.example/", mainFrameLoadFailed = true)
 
-        // Never became a trusted recent, but the activation remains queued for
-        // a successful retry of the same origin.
+        // Never became a trusted recent, and the failed activation no longer
+        // blocks later links. Persistence remains deferred for a successful retry.
         assertEquals("https://current.example", store().currentServerUrl())
         assertFalse(store().recentServers().any { it.contains("new.example") })
-        assertEquals("/c/$hex", activity.privateField("pendingNavigatePath"))
+        assertNull(activity.privateField("pendingNavigatePath"))
         assertEquals("https://new.example", activity.privateField("pendingPersistUrl"))
         assertFalse(activity.privateField("pageLoaded") as Boolean)
+        assertFalse(activity.privateField("processingDeepLink") as Boolean)
 
         activity.invokeOnPageReady("https://new.example/", mainFrameLoadFailed = false)
         assertNull(activity.privateField("pendingNavigatePath"))
@@ -94,7 +95,7 @@ class DeepLinkConsentTest {
     }
 
     @Test
-    fun `main frame HTTP error retains activation and persistence until retry succeeds`() {
+    fun `main frame HTTP error resolves activation and retains persistence until retry`() {
         val activity = launchWithLink("omnigent://new.example/c/$hex")
         latestDialog().getButton(DialogInterface.BUTTON_POSITIVE).performClick()
         idle()
@@ -106,15 +107,37 @@ class DeepLinkConsentTest {
 
         assertEquals("https://current.example", store().currentServerUrl())
         assertFalse(store().recentServers().any { it.contains("new.example") })
-        assertEquals("/c/$hex", activity.privateField("pendingNavigatePath"))
+        assertNull(activity.privateField("pendingNavigatePath"))
         assertEquals("https://new.example", activity.privateField("pendingPersistUrl"))
-        assertTrue(activity.privateField("processingDeepLink") as Boolean)
+        assertFalse(activity.privateField("processingDeepLink") as Boolean)
 
         activity.invokeOnPageReady("https://new.example/")
 
         assertNull(activity.privateField("pendingNavigatePath"))
         assertEquals("https://new.example", store().currentServerUrl())
         assertFalse(activity.privateField("processingDeepLink") as Boolean)
+    }
+
+    @Test
+    fun `queued link is processed after the head load permanently fails`() {
+        val firstId = "first-$hex"
+        val secondId = "second-$hex"
+        store().connect("https://current.example")
+        val controller =
+            Robolectric.buildActivity(
+                MainActivity::class.java,
+                viewIntent("omnigent://failed.example/c/$firstId"),
+            )
+        val activity = controller.setup().get()
+        controller.newIntent(viewIntent("omnigent://next.example/c/$secondId"))
+        latestDialog().getButton(DialogInterface.BUTTON_POSITIVE).performClick()
+        idle()
+
+        activity.invokeOnPageReady("https://failed.example/", mainFrameLoadFailed = true)
+
+        assertFalse(activity.privateField("deepLinkAwaitingNavigation") as Boolean)
+        assertTrue(latestDialog().isShowing)
+        assertTrue((activity.privateField("deepLinkQueue") as ArrayDeque<*>).isEmpty())
     }
 
     @Test
