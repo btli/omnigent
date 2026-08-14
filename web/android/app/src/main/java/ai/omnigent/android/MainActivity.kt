@@ -811,10 +811,20 @@ class MainActivity : AppCompatActivity() {
         processNextDeepLink()
     }
 
+    private fun stopDeepLinkProcessing() {
+        deepLinkQueue.clear()
+        processingDeepLink = false
+        deepLinkAwaitingNavigation = false
+    }
+
     /** Consent gate for a link to a never-connected server: pinning a new
      *  origin grants it the bridge and notifications, so it needs an explicit
      *  yes. No network request or persistence happens before Open. */
     private fun showDeepLinkConsent(link: DeepLink) {
+        if (isFinishing || isDestroyed) {
+            stopDeepLinkProcessing()
+            return
+        }
         var answered = false
         val resolve = { accepted: Boolean ->
             if (!answered) {
@@ -831,9 +841,7 @@ class MainActivity : AppCompatActivity() {
                         pendingPersistUrl = link.origin
                         awaitingNavigation = true
                     } else if (!ServerStore(this).hasServer()) {
-                        deepLinkQueue.clear()
-                        processingDeepLink = false
-                        deepLinkAwaitingNavigation = false
+                        stopDeepLinkProcessing()
                         stopProcessing = true
                         startActivity(Intent(this, ConnectActivity::class.java))
                         finish()
