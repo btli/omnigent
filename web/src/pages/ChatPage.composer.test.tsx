@@ -157,9 +157,9 @@ function stubViewportWidth(width: number) {
     configurable: true,
     value: (query: string) => ({
       matches: (() => {
-        const min = /^\(min-width: ([\d.]+)px\)$/.exec(query);
+        const min = query.match(/^\(min-width: ([\d.]+)px\)$/);
         if (min) return width >= parseFloat(min[1]);
-        const max = /^\(max-width: ([\d.]+)px\)$/.exec(query);
+        const max = query.match(/^\(max-width: ([\d.]+)px\)$/);
         if (max) return width <= parseFloat(max[1]);
         return false;
       })(),
