@@ -355,8 +355,11 @@ describe("useResizableInlinePanel pointer drag", () => {
     expect(result.current.panelWidth).toBe(900);
   });
 
-  it("aborts without persisting when the width gate collapses mid-drag", () => {
-    const { result } = renderHook(() => useResizableInlinePanel(SESSION));
+  it("aborts without persisting when the panel-enabled gate flips false", () => {
+    const { result, rerender } = renderHook(
+      ({ enabled }) => useResizableInlinePanel(SESSION, undefined, 0, enabled),
+      { initialProps: { enabled: true } },
+    );
     const handle = createPointerHandle();
 
     act(() => {
@@ -365,14 +368,36 @@ describe("useResizableInlinePanel pointer drag", () => {
     });
     expect(result.current.panelWidth).toBe(800);
 
-    setInnerWidth(0);
-    act(() => window.dispatchEvent(new Event("resize")));
+    rerender({ enabled: false });
 
-    expect(result.current.panelWidth).toBe(0);
+    expect(result.current.panelWidth).toBe(800);
     expect(readSessionWorkspaceState(SESSION).widthPx).toBeUndefined();
     expect(overlaySelector()).toBeNull();
     expect(document.body.style.cursor).toBe("");
     expect(document.body.style.userSelect).toBe("");
+  });
+
+  it("aborts the old drag before loading a new session", () => {
+    const { result, rerender } = renderHook(({ sessionId }) => useResizableInlinePanel(sessionId), {
+      initialProps: { sessionId: "conv_old" },
+    });
+    const handle = createPointerHandle();
+
+    act(() => {
+      result.current.handleProps.onPointerDown(pointerEvent(handle.element));
+      result.current.handleProps.onPointerMove(pointerEvent(handle.element, { clientX: 1200 }));
+    });
+    expect(result.current.panelWidth).toBe(800);
+
+    rerender({ sessionId: "conv_new" });
+
+    expect(overlaySelector()).toBeNull();
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
+    act(() => dispatchDocumentPointer("pointerup", 1));
+
+    expect(readSessionWorkspaceState("conv_old").widthPx).toBeUndefined();
+    expect(readSessionWorkspaceState("conv_new").widthPx).toBeUndefined();
   });
 
   it("ignores additional pointers until the active drag ends", () => {
@@ -404,23 +429,21 @@ describe("useResizableInlinePanel pointer drag", () => {
     expect(result.current.panelWidth).toBe(800);
   });
 
-  it("returns touch-action none and a 24px fine-pointer hit target on handleProps", () => {
-    // WorkspacePanel spreads handleProps onto a 4px visual handle (w-1).
-    // The target favors the outward chat side so panel controls remain clear.
+  it("returns a 24px fine-pointer target with a 6px gutter footprint", () => {
     const { result } = renderHook(() => useResizableInlinePanel(SESSION));
 
     expect(result.current.handleProps.style).toMatchObject({
       touchAction: "none",
       boxSizing: "content-box",
-      paddingLeft: 16,
-      paddingRight: 4,
-      marginLeft: -16,
-      marginRight: -4,
+      paddingLeft: 11,
+      paddingRight: 9,
+      marginLeft: -10,
+      marginRight: -8,
       backgroundClip: "content-box",
     });
   });
 
-  it("reacts to coarse-pointer changes with a 44px outward-weighted target", () => {
+  it("reacts to coarse-pointer changes with a tightly bounded 26px target", () => {
     const originalMatchMedia = window.matchMedia;
     let coarse = false;
     let onChange: ((event: MediaQueryListEvent) => void) | undefined;
@@ -443,10 +466,10 @@ describe("useResizableInlinePanel pointer drag", () => {
       act(() => onChange?.({ matches: true } as MediaQueryListEvent));
 
       expect(result.current.handleProps.style).toMatchObject({
-        paddingLeft: 36,
-        paddingRight: 4,
-        marginLeft: -36,
-        marginRight: -4,
+        paddingLeft: 12,
+        paddingRight: 10,
+        marginLeft: -10,
+        marginRight: -8,
       });
     } finally {
       window.matchMedia = originalMatchMedia;

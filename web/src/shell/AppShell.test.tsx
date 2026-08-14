@@ -16,7 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
-import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 
 vi.mock("@/hooks/useConversations", () => ({
@@ -2064,6 +2064,46 @@ describe("FilesPanel visibility", () => {
 });
 
 describe("Right workspace card visibility", () => {
+  it("aborts an active resize when the workspace panel closes", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_drag_close", permission_level: null }]);
+
+    renderShell("/c/conv_drag_close");
+
+    const separator = screen.getByRole("separator", { name: "Resize panel" });
+    Object.assign(separator, {
+      setPointerCapture: vi.fn(),
+      hasPointerCapture: () => true,
+      releasePointerCapture: vi.fn(),
+    });
+
+    fireEvent.pointerDown(separator, { pointerId: 9, pointerType: "touch", button: 0 });
+    fireEvent.pointerMove(separator, { pointerId: 9, pointerType: "touch", clientX: 1200 });
+
+    expect(document.body.style.cursor).toBe("col-resize");
+    expect(document.body.style.userSelect).toBe("none");
+    expect(
+      [...document.body.children].some(
+        (child) => child instanceof HTMLElement && child.style.zIndex === "2147483647",
+      ),
+    ).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+
+    expect(screen.queryByRole("separator", { name: "Resize panel" })).toBeNull();
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
+    expect(
+      [...document.body.children].some(
+        (child) => child instanceof HTMLElement && child.style.zIndex === "2147483647",
+      ),
+    ).toBe(false);
+    expect(readSessionWorkspaceState("conv_drag_close").widthPx).toBeUndefined();
+  });
+
   it("reserves the visible pane width plus its two desktop margins from the header", () => {
     useEnvironmentMock.mockReturnValue({
       data: { available: false, root: null, home: null },
