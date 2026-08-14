@@ -1,5 +1,5 @@
 import { act, renderHook } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { resetWidthStoreForTesting, useResizableInlinePanel } from "./useResizableInlinePanel";
 
@@ -27,6 +27,47 @@ function nudgeWiderOnce(result: { current: ReturnType<typeof useResizableInlineP
   );
   return result.current.panelWidth;
 }
+
+function createPointerHandle() {
+  const element = document.createElement("div");
+  const capturedPointers = new Set<number>();
+  const setPointerCapture = vi.fn((pointerId: number) => capturedPointers.add(pointerId));
+  const releasePointerCapture = vi.fn((pointerId: number) => capturedPointers.delete(pointerId));
+  const hasPointerCapture = vi.fn((pointerId: number) => capturedPointers.has(pointerId));
+  Object.assign(element, { setPointerCapture, releasePointerCapture, hasPointerCapture });
+  return { element, setPointerCapture, releasePointerCapture };
+}
+
+function dispatchPointer(
+  element: HTMLElement,
+  type: string,
+  { pointerId, clientX = 0 }: { pointerId: number; clientX?: number },
+): void {
+  const event = new Event(type, { bubbles: true });
+  Object.defineProperties(event, {
+    pointerId: { value: pointerId },
+    clientX: { value: clientX },
+  });
+  element.dispatchEvent(event);
+}
+
+function startPointerDrag(
+  onPointerDown: React.PointerEventHandler<HTMLElement>,
+  element: HTMLElement,
+  pointerId: number,
+): void {
+  onPointerDown({
+    currentTarget: element,
+    pointerId,
+    preventDefault: () => {},
+  } as React.PointerEvent<HTMLElement>);
+}
+
+const overlaySelector = () =>
+  [...document.body.children].find(
+    (c): c is HTMLElement =>
+      c instanceof HTMLElement && c.style.position === "fixed" && c.style.zIndex === "2147483647",
+  ) ?? null;
 
 beforeEach(() => {
   setInnerWidth(2000);
@@ -104,14 +145,12 @@ describe("useResizableInlinePanel reserved width (sidebar)", () => {
     const collapsed = renderHook(() =>
       useResizableInlinePanel(SESSION, undefined, /* reservedPx */ 0),
     );
-    act(() => window.dispatchEvent(new MouseEvent("mousemove", { clientX: 0 })));
-    act(() =>
-      collapsed.result.current.handleProps.onMouseDown({
-        preventDefault: () => {},
-      } as React.MouseEvent),
-    );
-    act(() => window.dispatchEvent(new MouseEvent("mousemove", { clientX: 100 })));
-    act(() => window.dispatchEvent(new MouseEvent("mouseup")));
+    const handle = createPointerHandle();
+    act(() => {
+      startPointerDrag(collapsed.result.current.handleProps.onPointerDown, handle.element, 1);
+      dispatchPointer(handle.element, "pointermove", { pointerId: 1, clientX: 100 });
+      dispatchPointer(handle.element, "pointerup", { pointerId: 1 });
+    });
     expect(collapsed.result.current.panelWidth).toBe(912);
     expect(readSessionWorkspaceState(SESSION).widthPx).toBe(912);
     collapsed.unmount();
@@ -159,11 +198,12 @@ describe("useResizableInlinePanel reserved width (sidebar)", () => {
       { initialProps: { reserved: reservedPx } },
     );
     // Drag the rail out to its widest at this viewport.
-    act(() =>
-      result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
-    );
-    act(() => window.dispatchEvent(new MouseEvent("mousemove", { clientX: 0 })));
-    act(() => window.dispatchEvent(new MouseEvent("mouseup")));
+    const handle = createPointerHandle();
+    act(() => {
+      startPointerDrag(result.current.handleProps.onPointerDown, handle.element, 1);
+      dispatchPointer(handle.element, "pointermove", { pointerId: 1, clientX: 0 });
+      dispatchPointer(handle.element, "pointerup", { pointerId: 1 });
+    });
 
     // Now shrink the viewport hard. Even though the stored (no-reserve) width may
     // still fit its own ceiling, the render-time reserve clamp must re-run.
@@ -175,37 +215,153 @@ describe("useResizableInlinePanel reserved width (sidebar)", () => {
   });
 });
 
-describe("useResizableInlinePanel drag overlay", () => {
-  const overlaySelector = () =>
-    [...document.body.children].find(
-      (c): c is HTMLElement =>
-        c instanceof HTMLElement && c.style.position === "fixed" && c.style.zIndex === "2147483647",
-    ) ?? null;
+describe("useResizableInlinePanel pointer drag", () => {
+  it("captures the pointer and persists the final width on release", () => {
+    // Without setPointerCapture, a drag that leaves the 1px handle (or crosses
+    // the HTML-preview iframe) loses the pointer stream and the rail sticks.
+    const { result } = renderHook(() => useResizableInlinePanel(SESSION));
+    const handle = createPointerHandle();
 
-  it("mounts a full-window overlay during a drag so mouseup isn't lost to an iframe", () => {
-    // The panel sits beside the sandboxed HTML-preview iframe. Without an
-    // overlay, dragging over the frame routes mousemove/mouseup into it and the
-    // parent never sees the release, so the drag sticks to the cursor.
+    act(() => {
+      startPointerDrag(result.current.handleProps.onPointerDown, handle.element, 7);
+    });
+    expect(handle.setPointerCapture).toHaveBeenCalledWith(7);
+
+    act(() => {
+      // 2000px viewport, cursor at 1200 → width = innerWidth - clientX = 800.
+      dispatchPointer(handle.element, "pointermove", { pointerId: 7, clientX: 1200 });
+    });
+
+    // Live width tracks the drag, but nothing is written to storage mid-drag —
+    // persisting per pointermove would fire a synchronous write on every frame.
+    expect(result.current.panelWidth).toBe(800);
+    expect(readSessionWorkspaceState(SESSION).widthPx).toBeUndefined();
+
+    act(() => {
+      dispatchPointer(handle.element, "pointerup", { pointerId: 7 });
+    });
+
+    expect(readSessionWorkspaceState(SESSION).widthPx).toBe(800);
+    expect(handle.releasePointerCapture).toHaveBeenCalledWith(7);
+  });
+
+  it("aborts cleanly on pointercancel without persisting further moves", () => {
+    // Browser gesture arbitration (scroll, pinch) fires pointercancel. The
+    // drag must stop at the last applied size — never leave listeners live
+    // so a later move can keep mutating width after the abort.
+    const { result } = renderHook(() => useResizableInlinePanel(SESSION));
+    const handle = createPointerHandle();
+
+    act(() => {
+      startPointerDrag(result.current.handleProps.onPointerDown, handle.element, 11);
+      dispatchPointer(handle.element, "pointermove", { pointerId: 11, clientX: 1200 });
+    });
+    expect(result.current.panelWidth).toBe(800);
+
+    act(() => {
+      dispatchPointer(handle.element, "pointercancel", { pointerId: 11 });
+      dispatchPointer(handle.element, "pointermove", { pointerId: 11, clientX: 1400 });
+    });
+
+    expect(result.current.panelWidth).toBe(800);
+    expect(readSessionWorkspaceState(SESSION).widthPx).toBeUndefined();
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
+  });
+
+  it("aborts cleanly on lostpointercapture without persisting further moves", () => {
+    // Capture can drop without pointercancel (element removal, another
+    // capture). Same abort contract as pointercancel: last applied size,
+    // listeners gone, no persist of a half-finished drag.
+    const { result } = renderHook(() => useResizableInlinePanel(SESSION));
+    const handle = createPointerHandle();
+
+    act(() => {
+      startPointerDrag(result.current.handleProps.onPointerDown, handle.element, 11);
+      dispatchPointer(handle.element, "pointermove", { pointerId: 11, clientX: 1200 });
+    });
+    expect(result.current.panelWidth).toBe(800);
+
+    act(() => {
+      dispatchPointer(handle.element, "lostpointercapture", { pointerId: 11 });
+      dispatchPointer(handle.element, "pointermove", { pointerId: 11, clientX: 1400 });
+    });
+
+    expect(result.current.panelWidth).toBe(800);
+    expect(readSessionWorkspaceState(SESSION).widthPx).toBeUndefined();
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
+  });
+
+  it("ignores additional pointers until the active drag ends", () => {
+    // A second finger joining a live resize must not steal the stream —
+    // first pointer wins until that drag ends.
+    const { result } = renderHook(() => useResizableInlinePanel(SESSION));
+    const firstHandle = createPointerHandle();
+    const secondHandle = createPointerHandle();
+
+    act(() => {
+      startPointerDrag(result.current.handleProps.onPointerDown, firstHandle.element, 1);
+      startPointerDrag(result.current.handleProps.onPointerDown, secondHandle.element, 2);
+      dispatchPointer(secondHandle.element, "pointermove", { pointerId: 2, clientX: 1400 });
+    });
+
+    expect(firstHandle.setPointerCapture).toHaveBeenCalledWith(1);
+    expect(secondHandle.setPointerCapture).not.toHaveBeenCalled();
+    expect(result.current.panelWidth).toBe(600);
+
+    act(() => {
+      dispatchPointer(firstHandle.element, "pointermove", { pointerId: 1, clientX: 1200 });
+    });
+    expect(result.current.panelWidth).toBe(800);
+  });
+
+  it("returns touch-action none and a 44px cross-axis hit target on handleProps", () => {
+    // WorkspacePanel spreads handleProps onto a 4px visual handle (w-1).
+    // The invisible hit target has to live in the returned style — 20px
+    // padding each side + content-box sizing = 44px without changing the
+    // painted width (background-clip: content-box).
+    const { result } = renderHook(() => useResizableInlinePanel(SESSION));
+
+    expect(result.current.handleProps.style).toMatchObject({
+      touchAction: "none",
+      boxSizing: "content-box",
+      paddingInline: 20,
+      marginInline: -20,
+      backgroundClip: "content-box",
+    });
+  });
+});
+
+describe("useResizableInlinePanel drag overlay", () => {
+  it("mounts a full-window overlay during a drag so moves aren't lost to an iframe", () => {
+    // The panel sits beside the sandboxed HTML-preview iframe. Capture plus
+    // a shielding overlay keeps the parent receiving the pointer stream when
+    // the drag crosses the frame.
     const { result, unmount } = renderHook(() => useResizableInlinePanel(SESSION));
     expect(overlaySelector()).toBeNull();
 
-    act(() =>
-      result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
-    );
+    const handle = createPointerHandle();
+    act(() => {
+      startPointerDrag(result.current.handleProps.onPointerDown, handle.element, 1);
+    });
     const overlay = overlaySelector();
     expect(overlay).not.toBeNull();
     expect(overlay?.style.cursor).toBe("col-resize");
 
-    act(() => window.dispatchEvent(new MouseEvent("mouseup")));
+    act(() => {
+      dispatchPointer(handle.element, "pointerup", { pointerId: 1 });
+    });
     expect(overlaySelector()).toBeNull();
     unmount();
   });
 
   it("removes the overlay if unmounted mid-drag", () => {
     const { result, unmount } = renderHook(() => useResizableInlinePanel(SESSION));
-    act(() =>
-      result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
-    );
+    const handle = createPointerHandle();
+    act(() => {
+      startPointerDrag(result.current.handleProps.onPointerDown, handle.element, 1);
+    });
     expect(overlaySelector()).not.toBeNull();
 
     // Panel closes (e.g. tab switch) while still dragging — cleanup must not
