@@ -176,10 +176,10 @@ describe("useResizableSidebar", () => {
     expect(result.current.handleProps.style).toEqual({
       touchAction: "none",
       boxSizing: "content-box",
-      paddingInlineStart: 4,
-      paddingInlineEnd: 16,
-      marginInlineStart: -4,
-      marginInlineEnd: -16,
+      paddingInlineStart: 9,
+      paddingInlineEnd: 11,
+      marginInlineStart: -8,
+      marginInlineEnd: -10,
       backgroundClip: "content-box",
     });
 
@@ -217,13 +217,13 @@ describe("useResizableSidebar", () => {
     const matchMedia = vi.spyOn(window, "matchMedia").mockReturnValue(query);
     const { result, unmount } = renderHook(() => useResizableSidebar());
 
-    expect(result.current.handleProps.style.paddingInlineStart).toBe(4);
-    expect(result.current.handleProps.style.paddingInlineEnd).toBe(16);
+    expect(result.current.handleProps.style.paddingInlineStart).toBe(9);
+    expect(result.current.handleProps.style.paddingInlineEnd).toBe(11);
 
     coarse = true;
     act(() => listeners.forEach((listener) => listener()));
-    expect(result.current.handleProps.style.paddingInlineStart).toBe(8);
-    expect(result.current.handleProps.style.paddingInlineEnd).toBe(32);
+    expect(result.current.handleProps.style.paddingInlineStart).toBe(10);
+    expect(result.current.handleProps.style.paddingInlineEnd).toBe(12);
 
     unmount();
     expect(query.removeEventListener).toHaveBeenCalledWith("change", expect.any(Function));
