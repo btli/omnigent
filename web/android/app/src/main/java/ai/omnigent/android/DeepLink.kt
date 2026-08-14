@@ -4,9 +4,9 @@ import android.net.Uri
 import java.net.IDN
 
 /**
- * A parsed `omnigent://<host>[:port]/c/<id>` deep link (see
- * docs/android-deep-link-design.md). Stricter than iOS/desktop: userinfo,
- * query, or fragment on the link is rejected outright, not silently stripped.
+ * A parsed `omnigent://<host>[:port]/c/<id>` deep link. Stricter than
+ * iOS/desktop: userinfo, query, or fragment on the link is rejected outright,
+ * not silently stripped.
  */
 data class DeepLink(
     /** `originOf`-canonical http(s) origin, no trailing slash. */

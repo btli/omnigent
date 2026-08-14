@@ -7,38 +7,44 @@ shipping a duplicate copy of the SPA. It is a native _shell_, not a rewrite.
 ## Development
 
 Open `web/android` in Android Studio Meerkat (AGP 9.1+) and run the `app`
-configuration on an API 36 emulator. Requires JDK 17 and the Android SDK
-(`compileSdk 36`, `targetSdk 36`, `minSdk 28`).
+configuration on an API 36 emulator. You need the Android SDK
+(`compileSdk 36`, `targetSdk 36`, `minSdk 28`) and **JDK 21**: the Robolectric
+unit tests — and `bundleRelease`, which runs them — resolve a Java 21 toolchain,
+so Gradle must run under, or be able to discover, a JDK 21. `just ensure` does
+not install one; set it up yourself, e.g.:
+
+```sh
+brew install openjdk@21                         # or any JDK 21 distribution
+export JAVA_HOME="$(brew --prefix openjdk@21)/libexec/openjdk.jdk/Contents/Home"
+./gradlew --version                             # confirm "JVM: 21.x"
+```
 
 Debug builds permit cleartext (`http://`) to localhost and private-range hosts
 via `res/xml/network_security_config.xml` for local development; release builds
 are HTTPS-only except device-local loopback (for omnigent:// deep links — see
 _Deep links_ below), mirroring the iOS `NSAllowsArbitraryLoadsInWebContent`
-debug-only posture.
-
-The release configuration explicitly allowlists `::1`, but IPv6 loopback
-loading still needs verification with a release build on a device or emulator;
-unit tests cannot demonstrate WebView's platform policy enforcement.
+debug-only posture. The release allowlist includes IPv6 loopback (`::1`);
+WebView's enforcement of that on a release device build has not been verified.
 
 ## Deep links
 
-The app handles `omnigent://<host>[:port]/c/<id>` links. The manifest's
-intent filter lives on `DeepLinkActivity`, a trampoline that forwards to
-`MainActivity`; `DeepLink.kt` parses and `MainActivity` routes (design:
-`docs/android-deep-link-design.md`):
-same-origin links navigate in place, previously-connected servers switch
-directly, and never-connected servers require a consent dialog before any
-network request — the server is remembered only after its first successful
-page load. Links carrying a query, fragment, or userinfo are rejected.
+The app handles `omnigent://<host>[:port]/c/<id>` links. The manifest's intent
+filter lives on `DeepLinkActivity`, a trampoline that forwards to
+`MainActivity`; `DeepLink.kt` parses and `MainActivity` routes. Same-origin
+links navigate in place, and a previously-connected server switches directly.
+Links carrying a query, fragment, or userinfo are rejected.
 
-Known gap: unlike iOS/desktop, there is no workspace-mount discovery
-(`WorkspaceURLExpander` equivalent), so a consented **unknown** Databricks
-workspace host connects to the bare origin without probing `/ml/omnigents`.
-Links to already-connected workspaces work (the stored URL keeps the mount).
-Follow-up: port the mount probe, and consider verified Android App Links
-for operator-controlled domains.
+**Consent invariant:** a deep link never triggers a network request to a server
+the user has not already connected to. A never-connected host requires an
+explicit consent dialog first, and is remembered only after its first
+successful page load.
 
-Try it: `adb shell am start -a android.intent.action.VIEW -d "omnigent://<host>/c/<id>"`.
+Limitation: unlike iOS/desktop there is no workspace-mount discovery, so a
+consented **unknown** Databricks workspace host connects to the bare origin
+without probing `/ml/omnigents`. Links to already-connected workspaces keep the
+stored URL's mount.
+
+Manual test: `adb shell am start -a android.intent.action.VIEW -d "omnigent://<host>/c/<id>"`.
 
 ## How it relates to the web bundle
 
