@@ -100,9 +100,13 @@ The menu opens AT `MENU_HOLD_MS` while the finger is still down (TR-12),
 with a haptic cue — not on release. Award is exclusive and
 first-crossed-wins per TR-11 — there is no geometric disjointness between
 hold and swipe. On a hold-offering surface TR-11's two-radius rule
-replaces the first two branches above: nothing awards inside the
-`HOLD_DRIFT_PX` circle, exiting it pre-arm awards by dominant axis, and
-the activation radii govern only motion-trending (no-hold) surfaces. A
+replaces the first two branches above: no motion-based award inside the
+`HOLD_DRIFT_PX` circle, exiting it pre-arm awards by dominant axis
+(horizontal-first falls back to scroll release where the surface offers
+no swipe; |dx| == |dy| ties resolve vertical-first), a native `pan-y`
+`pointercancel` still releases to scroll earlier than the circle bound
+(TR-11's caveat from `c21fec929`), and the activation radii govern only
+motion-trending (no-hold) surfaces. A
 second touch pointer joining an undecided sequence cancels it and yields
 to browser pinch-zoom; one joining an already-awarded sequence is ignored
 — first pointer keeps ownership (TR-11, TR-28). While undecided the

@@ -135,11 +135,22 @@ changes bindings, not the spec (TR-30).
   MOTION-TRENDING: `SCROLL_ACTIVATION_PX` / `SWIPE_ACTIVATION_PX` decide
   directly per TR-13. On a surface that offers a hold intent the sequence
   is STATIONARY-TRENDING: while total travel stays inside the
-  `HOLD_DRIFT_PX` circle nothing awards (finger wobble can never demote a
-  forming hold to scroll), hold arms at `HOLD_MS` per TR-12, and crossing
-  the circle before arming ends hold eligibility and awards by dominant
-  axis at the crossing — vertical-first releases to native scroll,
-  horizontal-first awards `swipe` where the surface offers it. Invariants
+  `HOLD_DRIFT_PX` circle no motion-based award occurs and the dispatcher
+  does not release the sequence to scroll — time-based arming (`HOLD_MS`),
+  the menu award (`MENU_HOLD_MS`), and post-arm drag conversion
+  (`DRAG_TOLERANCE_PX`) proceed per TR-12. Crossing the circle before
+  arming ends hold eligibility and awards by dominant axis at the
+  crossing: vertical-first releases to native scroll; horizontal-first
+  awards `swipe` where the surface offers it and releases to native
+  scroll (no award) where it does not; an exact tie (|dx| == |dy|)
+  resolves as vertical-first. This bound covers the dispatcher's OWN
+  arbitration only: on surfaces declaring `touch-action: pan-y` (TR-28)
+  the browser may claim a vertical pan at its native slop (≈10 px) and
+  fire `pointercancel` before the circle bound is reached — `c21fec929`'s
+  own caveat ("native pan-y still wins earlier"). The dispatcher MUST
+  treat that `pointercancel` as a release to scroll; surfaces MUST NOT
+  suppress native vertical pan during the undecided phase to defeat this,
+  since TR-16(a)'s passive-listener gate forbids it. Invariants
   DOMINATE tuning ranges: a retune is legal only if it satisfies every
   invariant AND passes the device-matrix retest required by the design
   doc; the ranges are guidance, not a grant.
@@ -155,7 +166,7 @@ changes bindings, not the spec (TR-30).
   | `SWIPE_ACTIVATION_PX` | 12 | horizontal travel that awards `swipe` when horizontal-first on a motion-trending sequence (see TR-13) | 8–16 | `> DRAG_TOLERANCE_PX`; `< HOLD_DRIFT_PX` |
   | `SCROLL_ACTIVATION_PX` | 10 | vertical travel that releases a motion-trending sequence to native scroll when vertical-first (see TR-13); inert inside a hold circle | 8–16 | `< HOLD_DRIFT_PX` |
   | `HOLD_MS` | 250 | stationary hold that arms drag-or-menu (dnd-kit parity on main) | 200–350 | `< MENU_HOLD_MS` |
-  | `HOLD_DRIFT_PX` | 20 | radius of the hold circle on hold-offering surfaces (the train's hold tolerance in `c21fec929`; its 25 px circle was the separate scroll-fallback radius): nothing awards inside it; crossing it pre-arm ends hold eligibility and awards by dominant axis | 16–24 | `> max(SCROLL_ACTIVATION_PX, SWIPE_ACTIVATION_PX)` |
+  | `HOLD_DRIFT_PX` | 20 | radius of the hold circle on hold-offering surfaces (the train's hold tolerance in `c21fec929`; its 25 px circle was the separate scroll-fallback radius): no motion-based award inside it; crossing it pre-arm ends hold eligibility and awards by dominant axis, with the no-swipe fallback and tie-break per the two-radius rule | 16–24 | `> max(SCROLL_ACTIVATION_PX, SWIPE_ACTIVATION_PX)` |
   | `MENU_HOLD_MS` | 500 | stationary hold that opens the context menu (replaces Radix's ~700 ms default) | 400–700 | `> HOLD_MS` |
   | `DRAG_TOLERANCE_PX` | 8 | movement after arming that converts hold → drag (dnd-kit parity) | 5–10 | `< SWIPE_ACTIVATION_PX` |
   | `EDGE_ZONE_PX` | 24 | width of the screen-edge strip that recognizes edge-swipe | 16–32 | — |
