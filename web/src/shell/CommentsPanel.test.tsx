@@ -511,3 +511,58 @@ describe("CommentsPanel active-comment reveal", () => {
     expect(screen.getByText("Comment c2")).toBeInTheDocument();
   });
 });
+
+// ── Resize handle geometry ────────────────────────────────────────────────────
+
+describe("CommentsPanel resize handle geometry", () => {
+  const getSeparator = () => screen.getByRole("separator", { name: "Resize comments panel" });
+  const dragOverlayPresent = () =>
+    [...document.body.children].some(
+      (c) => c instanceof HTMLElement && c.style.zIndex === "2147483647",
+    );
+
+  it("leaves the handle's viewer-side hit pad unclipped by the panel root", () => {
+    const { container } = renderPanel([makeComment("c1")], []);
+    const root = container.firstElementChild as HTMLElement;
+    const separator = getSeparator();
+
+    // The root must not clip: the hit pad extends past the panel's left edge
+    // over the viewer — the natural grab side. Clipping lives on an inner
+    // content wrapper that does NOT contain the handle.
+    expect(root.className).not.toMatch(/overflow-hidden/);
+    const wrapper = root.querySelector(":scope > .overflow-hidden");
+    expect(wrapper).not.toBeNull();
+    expect(wrapper?.contains(separator)).toBe(false);
+
+    // The negative margin pushes the pad's footprint over the viewer side.
+    expect(separator.style.marginLeft).toBe(`-${separator.style.paddingLeft}`);
+  });
+
+  it("keeps taps and scrolls on the panel content out of the handle", () => {
+    renderPanel([makeComment("c1")], [makeComment("c2", "addressed")]);
+
+    // The inward pad stays small so it only overlaps the header/list gutter,
+    // never the tappable content.
+    expect(parseFloat(getSeparator().style.paddingRight)).toBeLessThanOrEqual(8);
+
+    // Pressing and tapping a tab must interact with the tab, not the handle:
+    // no drag overlay appears and the tab actually switches.
+    const addressedTab = screen.getByRole("button", { name: /addressed/i });
+    fireEvent.pointerDown(addressedTab);
+    expect(dragOverlayPresent()).toBe(false);
+    fireEvent.click(addressedTab);
+    expect(screen.getByText("Comment c2")).toBeInTheDocument();
+  });
+
+  it("keeps the visible handle strip unchanged by the hit padding", () => {
+    renderPanel([], []);
+    const separator = getSeparator();
+
+    // 1px-ish painted strip: the pads are invisible (content-box background)
+    // and their footprint is cancelled by the matching negative margins.
+    expect(separator.className).toMatch(/\bw-1\b/);
+    expect(separator.style.boxSizing).toBe("content-box");
+    expect(separator.style.backgroundClip).toBe("content-box");
+    expect(separator.style.marginRight).toBe(`-${separator.style.paddingRight}`);
+  });
+});

@@ -1,5 +1,5 @@
 import { act, renderHook } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readPanelSizePreference } from "@/lib/panelSizePreferences";
 import {
   resetCommentsWidthStoreForTesting,
@@ -12,6 +12,85 @@ function setInnerWidth(px: number): void {
   Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: px });
 }
 
+// jsdom has no pointer capture, so tests drive the returned handlers directly
+// with a stub handle element that tracks capture state.
+function makeHandleTarget() {
+  const captured = new Set<number>();
+  return {
+    setPointerCapture: vi.fn((id: number) => captured.add(id)),
+    releasePointerCapture: vi.fn((id: number) => captured.delete(id)),
+    hasPointerCapture: (id: number) => captured.has(id),
+  };
+}
+
+type HandleTarget = ReturnType<typeof makeHandleTarget>;
+
+function pointerEvent(
+  target: HandleTarget,
+  overrides: Partial<{ pointerId: number; pointerType: string; button: number; clientX: number }>,
+): React.PointerEvent {
+  return {
+    pointerId: 1,
+    pointerType: "touch",
+    button: 0,
+    clientX: 0,
+    preventDefault: () => {},
+    currentTarget: target,
+    ...overrides,
+  } as unknown as React.PointerEvent;
+}
+
+const originalMatchMedia = window.matchMedia;
+
+type MediaListener = (e: MediaQueryListEvent) => void;
+
+/** Controllable matchMedia mock: per-query matches plus a change-event firer. */
+function mockMatchMedia(matches: Record<string, boolean> = {}) {
+  const listeners = new Map<string, Set<MediaListener>>();
+  window.matchMedia = ((query: string) => ({
+    matches: matches[query] ?? false,
+    media: query,
+    onchange: null,
+    addEventListener: (_: string, cb: MediaListener) => {
+      if (!listeners.has(query)) listeners.set(query, new Set());
+      listeners.get(query)?.add(cb);
+    },
+    removeEventListener: (_: string, cb: MediaListener) => listeners.get(query)?.delete(cb),
+    addListener: () => {},
+    removeListener: () => {},
+    dispatchEvent: () => false,
+  })) as typeof window.matchMedia;
+  return {
+    fire(query: string, value: boolean) {
+      for (const cb of listeners.get(query) ?? new Set<MediaListener>()) {
+        cb({ matches: value } as MediaQueryListEvent);
+      }
+    },
+  };
+}
+
+/** jsdom has no PointerEvent constructor; a plain Event with pointerId works
+ * for the hook's document-level fallback listeners. */
+function docPointerEvent(type: string, pointerId: number): Event {
+  return Object.assign(new Event(type), { pointerId });
+}
+
+const overlaySelector = () =>
+  [...document.body.children].find(
+    (c): c is HTMLElement =>
+      c instanceof HTMLElement && c.style.position === "fixed" && c.style.zIndex === "2147483647",
+  ) ?? null;
+
+/** Panel root whose right edge sits at x=1000 inside a 2000px-wide row. */
+function attachContainer(ref: React.MutableRefObject<HTMLDivElement | null>): void {
+  const parent = document.createElement("div");
+  const panel = document.createElement("div");
+  parent.appendChild(panel);
+  vi.spyOn(parent, "getBoundingClientRect").mockReturnValue({ width: 2000 } as DOMRect);
+  vi.spyOn(panel, "getBoundingClientRect").mockReturnValue({ right: 1000 } as DOMRect);
+  ref.current = panel;
+}
+
 beforeEach(() => {
   setInnerWidth(2000);
 });
@@ -20,6 +99,7 @@ afterEach(() => {
   localStorage.clear();
   resetCommentsWidthStoreForTesting();
   setInnerWidth(originalInnerWidth);
+  window.matchMedia = originalMatchMedia;
 });
 
 describe("useResizableCommentsPanel persistence", () => {
@@ -48,40 +128,313 @@ describe("useResizableCommentsPanel persistence", () => {
   });
 });
 
-describe("useResizableCommentsPanel drag overlay", () => {
-  const overlaySelector = () =>
-    [...document.body.children].find(
-      (c): c is HTMLElement =>
-        c instanceof HTMLElement && c.style.position === "fixed" && c.style.zIndex === "2147483647",
-    ) ?? null;
-
-  it("mounts a full-window overlay during a drag so mouseup isn't lost to the preview iframe", () => {
-    // The divider sits between the HTML-preview iframe and this panel. Without
-    // an overlay, dragging over the frame routes mousemove/mouseup into it and
-    // the parent never sees the release, so the drag sticks to the cursor.
+describe("useResizableCommentsPanel pointer drag", () => {
+  it("captures the pointer on pointerdown and resizes from pointermove", () => {
     const { result, unmount } = renderHook(() => useResizableCommentsPanel());
-    expect(overlaySelector()).toBeNull();
+    attachContainer(result.current.containerRef);
+    const target = makeHandleTarget();
+
+    act(() => result.current.handleProps.onPointerDown(pointerEvent(target, { pointerId: 7 })));
+    // Capture keeps the drag alive when the pointer leaves the 1px handle.
+    expect(target.setPointerCapture).toHaveBeenCalledWith(7);
+
+    // Panel right edge is at 1000, so a move to x=700 means a 300px width.
+    act(() =>
+      result.current.handleProps.onPointerMove(
+        pointerEvent(target, { pointerId: 7, clientX: 700 }),
+      ),
+    );
+    expect(result.current.width).toBe(300);
+
+    // Live moves must not persist; only the release does.
+    expect(readPanelSizePreference("commentsPanelWidthPx")).toBeNull();
+    act(() =>
+      result.current.handleProps.onPointerUp(pointerEvent(target, { pointerId: 7, clientX: 700 })),
+    );
+    expect(target.releasePointerCapture).toHaveBeenCalledWith(7);
+    expect(readPanelSizePreference("commentsPanelWidthPx")).toBe(300);
+    unmount();
+  });
+
+  it("ignores a second concurrent pointer — first pointer wins", () => {
+    const { result, unmount } = renderHook(() => useResizableCommentsPanel());
+    attachContainer(result.current.containerRef);
+    const target = makeHandleTarget();
+
+    act(() => result.current.handleProps.onPointerDown(pointerEvent(target, { pointerId: 1 })));
+    act(() => result.current.handleProps.onPointerDown(pointerEvent(target, { pointerId: 2 })));
+    // A second finger neither captures nor steals the drag.
+    expect(target.setPointerCapture).toHaveBeenCalledTimes(1);
 
     act(() =>
-      result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
+      result.current.handleProps.onPointerMove(
+        pointerEvent(target, { pointerId: 2, clientX: 500 }),
+      ),
     );
-    const overlay = overlaySelector();
-    expect(overlay).not.toBeNull();
-    expect(overlay?.style.cursor).toBe("col-resize");
+    expect(result.current.width).toBe(240);
 
-    act(() => window.dispatchEvent(new MouseEvent("mouseup")));
+    act(() =>
+      result.current.handleProps.onPointerMove(
+        pointerEvent(target, { pointerId: 1, clientX: 700 }),
+      ),
+    );
+    expect(result.current.width).toBe(300);
+    unmount();
+  });
+
+  it("ends the drag from the document fallback when capture delivery fails", () => {
+    // A browser can drop capture without firing the handle's own pointerup
+    // (tab switch, node detach). The document-level fallback still ends the
+    // drag — a release, so it persists — and the max-z overlay comes down.
+    const { result, unmount } = renderHook(() => useResizableCommentsPanel());
+    attachContainer(result.current.containerRef);
+    const target = makeHandleTarget();
+
+    act(() => result.current.handleProps.onPointerDown(pointerEvent(target, { pointerId: 5 })));
+    act(() =>
+      result.current.handleProps.onPointerMove(
+        pointerEvent(target, { pointerId: 5, clientX: 700 }),
+      ),
+    );
+    act(() => void document.dispatchEvent(docPointerEvent("pointerup", 5)));
+
+    expect(overlaySelector()).toBeNull();
+    expect(document.body.style.cursor).toBe("");
+    expect(readPanelSizePreference("commentsPanelWidthPx")).toBe(300);
+    unmount();
+  });
+
+  it("aborts without persisting from the document pointercancel fallback", () => {
+    const { result, unmount } = renderHook(() => useResizableCommentsPanel());
+    attachContainer(result.current.containerRef);
+    const target = makeHandleTarget();
+
+    act(() => result.current.handleProps.onPointerDown(pointerEvent(target, { pointerId: 5 })));
+    act(() =>
+      result.current.handleProps.onPointerMove(
+        pointerEvent(target, { pointerId: 5, clientX: 700 }),
+      ),
+    );
+    act(() => void document.dispatchEvent(docPointerEvent("pointercancel", 5)));
+
+    expect(overlaySelector()).toBeNull();
+    expect(result.current.width).toBe(300);
+    expect(readPanelSizePreference("commentsPanelWidthPx")).toBeNull();
+    unmount();
+  });
+
+  it("aborts the drag when the layout flips below the md breakpoint", () => {
+    // Flipping to mobile unmounts the handle, so its up/cancel can never
+    // arrive; the drag must end (unpersisted) or the overlay would wedge.
+    const mm = mockMatchMedia();
+    const { result, unmount } = renderHook(() => useResizableCommentsPanel());
+    attachContainer(result.current.containerRef);
+    const target = makeHandleTarget();
+
+    act(() => result.current.handleProps.onPointerDown(pointerEvent(target, { pointerId: 4 })));
+    expect(overlaySelector()).not.toBeNull();
+
+    act(() => mm.fire("(min-width: 768px)", false));
+    expect(result.current.isDesktop).toBe(false);
+    expect(overlaySelector()).toBeNull();
+    expect(document.body.style.cursor).toBe("");
+    expect(readPanelSizePreference("commentsPanelWidthPx")).toBeNull();
+    unmount();
+  });
+
+  it("stays fully idle when pointer capture throws", () => {
+    // If capture fails, publishing drag state anyway would leave a stale
+    // activePointerId that a later reused pointerId could match — ending
+    // (and persisting) a drag that never started.
+    const { result, unmount } = renderHook(() => useResizableCommentsPanel());
+    attachContainer(result.current.containerRef);
+    const target = makeHandleTarget();
+    target.setPointerCapture.mockImplementation(() => {
+      throw new Error("InvalidPointerId");
+    });
+
+    act(() => result.current.handleProps.onPointerDown(pointerEvent(target, { pointerId: 9 })));
+    expect(overlaySelector()).toBeNull();
+    expect(document.body.style.cursor).toBe("");
+
+    act(() =>
+      result.current.handleProps.onPointerMove(
+        pointerEvent(target, { pointerId: 9, clientX: 700 }),
+      ),
+    );
+    expect(result.current.width).toBe(240);
+
+    act(() => void document.dispatchEvent(docPointerEvent("pointerup", 9)));
+    expect(readPanelSizePreference("commentsPanelWidthPx")).toBeNull();
+    unmount();
+  });
+
+  it("does not start a drag from a pen barrel button", () => {
+    // A pen barrel press dispatches pointerType "pen" with button 2; only
+    // the primary button/tip (button 0) may start a drag.
+    const { result, unmount } = renderHook(() => useResizableCommentsPanel());
+    attachContainer(result.current.containerRef);
+    const target = makeHandleTarget();
+
+    act(() =>
+      result.current.handleProps.onPointerDown(
+        pointerEvent(target, { pointerType: "pen", button: 2 }),
+      ),
+    );
+    expect(target.setPointerCapture).not.toHaveBeenCalled();
     expect(overlaySelector()).toBeNull();
     unmount();
   });
 
-  it("removes the overlay if unmounted mid-drag", () => {
+  it("does not start a drag from a secondary mouse button", () => {
     const { result, unmount } = renderHook(() => useResizableCommentsPanel());
+    attachContainer(result.current.containerRef);
+    const target = makeHandleTarget();
+
     act(() =>
-      result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
+      result.current.handleProps.onPointerDown(
+        pointerEvent(target, { pointerType: "mouse", button: 2 }),
+      ),
     );
+    expect(target.setPointerCapture).not.toHaveBeenCalled();
+
+    act(() => result.current.handleProps.onPointerMove(pointerEvent(target, { clientX: 700 })));
+    expect(result.current.width).toBe(240);
+    unmount();
+  });
+
+  it.each([
+    ["pointercancel", "onPointerCancel"],
+    ["lostpointercapture", "onLostPointerCapture"],
+  ] as const)("aborts cleanly at the last applied width on %s", (_name, handler) => {
+    const { result, unmount } = renderHook(() => useResizableCommentsPanel());
+    attachContainer(result.current.containerRef);
+    const target = makeHandleTarget();
+
+    act(() => result.current.handleProps.onPointerDown(pointerEvent(target, { pointerId: 3 })));
+    act(() =>
+      result.current.handleProps.onPointerMove(
+        pointerEvent(target, { pointerId: 3, clientX: 700 }),
+      ),
+    );
+    act(() => result.current.handleProps[handler](pointerEvent(target, { pointerId: 3 })));
+
+    // Never a half-state: width settles, body styles restore, drag is over so
+    // later moves from the same pointer are inert. An abort is not a choice —
+    // the last applied width stays on screen but is never persisted.
+    expect(result.current.width).toBe(300);
+    expect(readPanelSizePreference("commentsPanelWidthPx")).toBeNull();
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
+    act(() =>
+      result.current.handleProps.onPointerMove(
+        pointerEvent(target, { pointerId: 3, clientX: 500 }),
+      ),
+    );
+    expect(result.current.width).toBe(300);
+    unmount();
+  });
+});
+
+describe("useResizableCommentsPanel touch affordances", () => {
+  it("declares touch-action none and an invisible asymmetric hit target", () => {
+    const { result, unmount } = renderHook(() => useResizableCommentsPanel());
+    const { style } = result.current.handleProps;
+
+    // No scroll/swipe may start from the handle during a potential drag.
+    expect(style.touchAction).toBe("none");
+
+    // Fine pointer (the matchMedia stub reports no coarse pointer): >=24px
+    // total, weighted toward the viewer side where nothing interactive sits.
+    const viewerPad = Number(style.paddingLeft);
+    const inwardPad = Number(style.paddingRight);
+    expect(viewerPad + 4 + inwardPad).toBeGreaterThanOrEqual(24);
+    expect(viewerPad).toBeGreaterThan(inwardPad);
+
+    // Negative margins cancel the pads' footprint and content-box keeps
+    // hover/active backgrounds off them — the visible strip is unchanged.
+    expect(Number(style.marginLeft)).toBe(-viewerPad);
+    expect(Number(style.marginRight)).toBe(-inwardPad);
+    expect(style.boxSizing).toBe("content-box");
+    expect(style.backgroundClip).toBe("content-box");
+
+    // The affordance is pure style — nothing is rendered into the handle.
+    expect("children" in result.current.handleProps).toBe(false);
+    unmount();
+  });
+
+  it("widens the hit target to >=44px total on coarse-pointer devices", () => {
+    mockMatchMedia({ "(pointer: coarse)": true });
+    const { result, unmount } = renderHook(() => useResizableCommentsPanel());
+    const { style } = result.current.handleProps;
+
+    const viewerPad = Number(style.paddingLeft);
+    const inwardPad = Number(style.paddingRight);
+    expect(viewerPad + 4 + inwardPad).toBeGreaterThanOrEqual(44);
+    // The natural grab side (over the viewer) must be >=24px on its own; the
+    // inward pad stays small so header/tab/card taps aren't stolen.
+    expect(viewerPad).toBeGreaterThanOrEqual(24);
+    expect(inwardPad).toBeLessThanOrEqual(8);
+    expect(Number(style.marginLeft)).toBe(-viewerPad);
+    expect(Number(style.marginRight)).toBe(-inwardPad);
+    unmount();
+  });
+
+  it("exposes the width to assistive tech via aria value attributes", () => {
+    const { result, unmount } = renderHook(() => useResizableCommentsPanel());
+    expect(result.current.handleProps["aria-valuenow"]).toBe(240);
+    expect(result.current.handleProps["aria-valuemin"]).toBe(200);
+    expect(result.current.handleProps["aria-valuemax"]).toBe(640);
+
+    // The value tracks live resizes.
+    act(() => {
+      result.current.handleProps.onKeyDown({
+        key: "ArrowLeft",
+        preventDefault: () => {},
+      } as React.KeyboardEvent);
+    });
+    expect(result.current.handleProps["aria-valuenow"]).toBe(260);
+    unmount();
+  });
+
+  it("keeps the separator contract the consumer's markup relies on", () => {
+    const { result, unmount } = renderHook(() => useResizableCommentsPanel());
+    expect(result.current.handleProps.role).toBe("separator");
+    expect(result.current.handleProps["aria-label"]).toBe("Resize comments panel");
+    expect(result.current.handleProps.tabIndex).toBe(0);
+    unmount();
+  });
+});
+
+describe("useResizableCommentsPanel drag overlay", () => {
+  it("shields iframes with a full-window overlay for the duration of the drag", () => {
+    // The divider sits beside the HTML-preview iframe. If capture is lost,
+    // the overlay keeps the pointer stream in the parent document so the
+    // release is never swallowed by the frame.
+    const { result, unmount } = renderHook(() => useResizableCommentsPanel());
+    const target = makeHandleTarget();
+    expect(overlaySelector()).toBeNull();
+
+    act(() => result.current.handleProps.onPointerDown(pointerEvent(target, {})));
+    const overlay = overlaySelector();
+    expect(overlay).not.toBeNull();
+    expect(overlay?.style.cursor).toBe("col-resize");
+
+    act(() => result.current.handleProps.onPointerUp(pointerEvent(target, {})));
+    expect(overlaySelector()).toBeNull();
+    unmount();
+  });
+
+  it("removes the overlay and restores body styles if unmounted mid-drag", () => {
+    const { result, unmount } = renderHook(() => useResizableCommentsPanel());
+    const target = makeHandleTarget();
+    act(() => result.current.handleProps.onPointerDown(pointerEvent(target, {})));
     expect(overlaySelector()).not.toBeNull();
+    expect(document.body.style.cursor).toBe("col-resize");
 
     unmount();
     expect(overlaySelector()).toBeNull();
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
   });
 });
