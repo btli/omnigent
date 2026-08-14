@@ -22,6 +22,7 @@ deterministic.
 from __future__ import annotations
 
 import re
+import time
 
 import httpx
 from playwright.sync_api import Page, ViewportSize, expect
@@ -48,6 +49,44 @@ def _launch_terminal(base_url: str, session_id: str, session_key: str) -> None:
     resp.raise_for_status()
 
 
+def _force_chat_first(base_url: str, session_id: str, timeout_s: float = 15.0) -> None:
+    """Pin the session to the chat-first presentation before the page loads.
+
+    When the runner starts hosting an SDK session it auto-creates an
+    embedded Omnigent REPL terminal and stamps ``omnigent.ui: terminal``
+    on the session. A session carrying that label renders terminal-first:
+    tapping a shell row opens the shell in the MAIN view and the
+    full-screen ``TerminalsPanel`` (the surface with the resizable column
+    split under test) never mounts — so whether this test's entry path
+    works depends on a race between the runner's stamp and the page load.
+    Wait briefly for the one-time stamp (the terminal launches already
+    forced the runner's session init, which runs the REPL ensure + stamp
+    inline, so it lands within seconds when it lands at all), then delete
+    the label (empty value clears it; the runner never re-stamps — the
+    REPL-terminal ensure is guarded) so the entry path is
+    deterministically chat-first.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        resp = httpx.get(f"{base_url}/v1/sessions/{session_id}/labels", timeout=10.0)
+        resp.raise_for_status()
+        if resp.json().get("labels", {}).get("omnigent.ui") == "terminal":
+            break
+        time.sleep(0.5)
+    # Delete regardless: if the stamp never landed (REPL creation failed,
+    # a logged warning path that also never retries), the label is simply
+    # absent and the delete is a no-op — either way chat-first from here.
+    resp = httpx.patch(
+        f"{base_url}/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.ui": ""}},
+        timeout=10.0,
+    )
+    resp.raise_for_status()
+    resp = httpx.get(f"{base_url}/v1/sessions/{session_id}/labels", timeout=10.0)
+    resp.raise_for_status()
+    assert resp.json().get("labels", {}).get("omnigent.ui") != "terminal"
+
+
 def _open_terminals_panel_on_desktop(page: Page, base_url: str, session_id: str) -> None:
     """Open the full-screen Shells panel, then widen to a desktop viewport.
 
@@ -58,7 +97,9 @@ def _open_terminals_panel_on_desktop(page: Page, base_url: str, session_id: str)
     page.set_viewport_size(_MOBILE_VIEWPORT)
     page.goto(f"{base_url}/c/{session_id}")
 
-    page.get_by_role("button", name="Open session menu").click()
+    fab = page.get_by_role("button", name="Open session menu")
+    expect(fab).to_be_visible(timeout=15_000)
+    fab.click()
     # Accessible name includes the shell-count badge (e.g. "Shells 2").
     shells_entry = page.get_by_role("menuitem", name=re.compile(r"^Shells\b"))
     expect(shells_entry).to_be_visible(timeout=10_000)
@@ -104,6 +145,7 @@ def test_terminals_column_resizes_by_pointer_and_keyboard(
     # (tapping the active row toggles the xterm closed, hiding the handle).
     _launch_terminal(base_url, session_id, "main")
     _launch_terminal(base_url, session_id, "aux")
+    _force_chat_first(base_url, session_id)
 
     _open_terminals_panel_on_desktop(page, base_url, session_id)
 
