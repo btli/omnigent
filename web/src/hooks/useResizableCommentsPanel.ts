@@ -14,14 +14,7 @@
 // file is opened, matching the other panel-resize hooks. Explicit user
 // resizes are also persisted so a full page reload restores the width.
 
-import {
-  createElement,
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-  useSyncExternalStore,
-} from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
 
 const DEFAULT_WIDTH_PX = 240; // matches the previous fixed `md:w-60`
@@ -31,8 +24,9 @@ const MAX_WIDTH_PX = 640;
 const MIN_VIEWER_PX = 240;
 /** Tailwind `md` breakpoint — must track the value in tailwind.config. */
 const MD_BREAKPOINT = 768;
-/** Invisible touch hit target centered on the 1px visual handle. */
-const HIT_TARGET_PX = 44;
+/** Invisible padding on each side of the 1px visual handle, widening the hit
+ * target for touch/pen without changing its visual weight. */
+const HANDLE_HIT_PAD_PX = 20;
 
 // ---------------------------------------------------------------------------
 // Module-level width store (shared across panel remounts within a session)
@@ -151,17 +145,21 @@ export function useResizableCommentsPanel() {
   }, []);
 
   // Ends the drag at the last applied width (never a half-state): clears the
-  // active pointer, drops the overlay, persists once, and restores the body
-  // cursor/selection. Idempotent so pointerup + the lostpointercapture it
-  // triggers don't double-run.
-  const endDrag = useCallback(() => {
-    if (activePointerId.current === null) return;
-    activePointerId.current = null;
-    removeDragOverlay();
-    persistStoredWidth();
-    document.body.style.cursor = "";
-    document.body.style.userSelect = "";
-  }, [removeDragOverlay]);
+  // active pointer, drops the overlay, and restores the body cursor/selection.
+  // Only a deliberate release persists; aborts (cancel, capture loss, unmount)
+  // keep the width on screen but don't write storage. Idempotent so pointerup
+  // + the lostpointercapture it triggers don't double-run.
+  const endDrag = useCallback(
+    (persist: boolean) => {
+      if (activePointerId.current === null) return;
+      activePointerId.current = null;
+      removeDragOverlay();
+      if (persist) persistStoredWidth();
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    },
+    [removeDragOverlay],
+  );
 
   const onPointerDown = useCallback(
     (e: React.PointerEvent) => {
@@ -197,17 +195,17 @@ export function useResizableCommentsPanel() {
       if (e.currentTarget.hasPointerCapture?.(e.pointerId)) {
         e.currentTarget.releasePointerCapture(e.pointerId);
       }
-      endDrag();
+      endDrag(true);
     },
     [endDrag],
   );
 
   // pointercancel (e.g. the browser reclaims the touch) and capture loss
-  // both abort cleanly to the last applied width.
+  // both abort cleanly to the last applied width, without persisting it.
   const onPointerCancel = useCallback(
     (e: React.PointerEvent) => {
       if (e.pointerId !== activePointerId.current) return;
-      endDrag();
+      endDrag(false);
     },
     [endDrag],
   );
@@ -227,8 +225,8 @@ export function useResizableCommentsPanel() {
     [clampWidth],
   );
 
-  // Unmount mid-drag: abort and clean up body/overlay state.
-  useEffect(() => endDrag, [endDrag]);
+  // Unmount mid-drag: abort (no persist) and clean up body/overlay state.
+  useEffect(() => () => endDrag(false), [endDrag]);
 
   // Re-clamp the stored width when the viewport resizes so a width chosen on
   // a wider layout doesn't crowd out the viewer after the window shrinks.
@@ -264,25 +262,20 @@ export function useResizableCommentsPanel() {
       "aria-orientation": "vertical" as const,
       "aria-label": "Resize comments panel",
       tabIndex: 0,
-      // The handle owns its touches outright — no scroll/selection may start
-      // from it while a drag is possible.
-      style: { touchAction: "none" } as React.CSSProperties,
-      // Invisible widened hit target: the visual handle is 1px, far too thin
-      // to acquire by touch or pen. Rendered as the handle's child so events
-      // from it hit the handlers above without changing the visual weight.
-      children: createElement("span", {
-        "aria-hidden": true,
-        style: {
-          position: "absolute",
-          top: 0,
-          bottom: 0,
-          left: "50%",
-          width: HIT_TARGET_PX,
-          transform: "translateX(-50%)",
-          touchAction: "none",
-          cursor: "col-resize",
-        } as React.CSSProperties,
-      }),
+      // The handle owns its touches outright (no scroll/selection may start
+      // from it), and invisible padding widens the too-thin visual handle
+      // into a touch-acquirable hit target. Negative margins cancel the
+      // padding's footprint and content-box keeps hover/active backgrounds
+      // painting only the visible sliver, so the visual weight is unchanged.
+      style: {
+        touchAction: "none",
+        boxSizing: "content-box",
+        paddingLeft: HANDLE_HIT_PAD_PX,
+        paddingRight: HANDLE_HIT_PAD_PX,
+        marginLeft: -HANDLE_HIT_PAD_PX,
+        marginRight: -HANDLE_HIT_PAD_PX,
+        backgroundClip: "content-box",
+      } as React.CSSProperties,
     },
   };
 }

@@ -174,8 +174,10 @@ describe("useResizableCommentsPanel pointer drag", () => {
     act(() => result.current.handleProps[handler](pointerEvent(target, { pointerId: 3 })));
 
     // Never a half-state: width settles, body styles restore, drag is over so
-    // later moves from the same pointer are inert.
+    // later moves from the same pointer are inert. An abort is not a choice —
+    // the last applied width stays on screen but is never persisted.
     expect(result.current.width).toBe(300);
+    expect(readPanelSizePreference("commentsPanelWidthPx")).toBeNull();
     expect(document.body.style.cursor).toBe("");
     expect(document.body.style.userSelect).toBe("");
     act(() =>
@@ -191,15 +193,23 @@ describe("useResizableCommentsPanel pointer drag", () => {
 describe("useResizableCommentsPanel touch affordances", () => {
   it("declares touch-action none and a >=44px invisible hit target", () => {
     const { result, unmount } = renderHook(() => useResizableCommentsPanel());
+    const { style } = result.current.handleProps;
 
     // No scroll/swipe may start from the handle during a potential drag.
-    expect(result.current.handleProps.style.touchAction).toBe("none");
+    expect(style.touchAction).toBe("none");
 
-    // The 1px visual handle carries an invisible child widened for touch/pen.
-    const hit = result.current.handleProps.children;
-    expect(hit.props["aria-hidden"]).toBe(true);
-    expect(hit.props.style.width).toBeGreaterThanOrEqual(44);
-    expect(hit.props.style.touchAction).toBe("none");
+    // Invisible padding widens the ~1px visual handle to >=44px; negative
+    // margins cancel its footprint and content-box keeps backgrounds off it.
+    const pad = Number(style.paddingLeft);
+    expect(pad).toBe(Number(style.paddingRight));
+    expect(pad * 2 + 4).toBeGreaterThanOrEqual(44);
+    expect(Number(style.marginLeft)).toBe(-pad);
+    expect(Number(style.marginRight)).toBe(-pad);
+    expect(style.boxSizing).toBe("content-box");
+    expect(style.backgroundClip).toBe("content-box");
+
+    // The affordance is pure style — nothing is rendered into the handle.
+    expect("children" in result.current.handleProps).toBe(false);
     unmount();
   });
 
