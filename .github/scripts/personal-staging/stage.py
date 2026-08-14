@@ -43,7 +43,7 @@ EXTRAS_FILE = Path(__file__).resolve().parent / "extras.txt"
 # invites editing the manifest, and only a failure to reach the remote blocks
 # the push (dropping a required pin would silently regress staging).
 EXTRA_MISSING = "extra unfetchable (likely deleted; remove from extras.txt)"
-EXTRA_FETCH_FAILED = "extra fetch failed (cannot reach upstream; pin kept, staging not advanced)"
+EXTRA_FETCH_FAILED = "extra fetch failed (cannot reach remote; pin kept, staging not advanced)"
 EXTRA_FETCH_ATTEMPTS = 3
 EXTRA_FETCH_BACKOFF_S = 2
 # Subject line minted below for every staging merge commit; also decoded to
@@ -757,7 +757,7 @@ def main(argv: list[str] | None = None) -> int:
     append_summary(summarize(report))
     if report.get("blocked"):
         print(
-            "::warning::could not reach upstream for extras "
+            "::warning::could not reach remote for extras "
             + ", ".join(_blocked_label(n) for n in report["blocked"])
             + " — staging left unchanged; this is an infrastructure failure, not a deleted ref"
         )

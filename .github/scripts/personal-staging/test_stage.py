@@ -78,6 +78,12 @@ class Env:
         git(self.seed, "push", str(self.fork), f"{name}:refs/heads/{name}")
         return oid
 
+    def advance_fork_branch(self, name: str, filename: str, content: str) -> str:
+        git(self.seed, "checkout", "-q", name)
+        oid = commit_file(self.seed, filename, content, f"fork branch {name} update")
+        git(self.seed, "push", str(self.fork), f"{name}:refs/heads/{name}")
+        return oid
+
     def advance_pr(self, number: int, filename: str, content: str) -> dict:
         """New head on an existing PR branch, force-pushed to its pull ref."""
         branch = f"pr-{number}"
@@ -855,6 +861,80 @@ def test_branch_pin_merges_from_fork_and_records_sha(env, tmp_path):
     ]
     assert report["skipped"] == []
     assert git(env.work, "show", f"{report['staging_sha']}:homelab.txt").stdout == "lab\n"
+
+
+def test_branch_pin_composition_decodes_and_reruns_reproducibly(env):
+    oid = env.add_fork_branch("homelab", "homelab.txt", "lab\n")
+    pin = {"source": "extra-branch", "headRefName": "homelab", "number": None}
+
+    first = env.run([pin], staging_only=True)
+    assert stage_mod.composition_of(env.work, first["staging_sha"]) == (
+        first["upstream_sha"],
+        {"branch:homelab": ("homelab", oid[:12])},
+    )
+
+    same = env.run([pin], staging_only=True)
+    assert same["pushed"] is False
+    assert same["staging_sha"] == first["staging_sha"]
+
+    env.advance_fork_branch("homelab", "homelab-2.txt", "lab 2\n")
+    changed = env.run([pin], staging_only=True)
+    assert changed["pushed"] is True
+    assert changed["causes"] == ["extras"]
+
+
+def test_branch_pin_transport_failure_blocks_push(env, tmp_path, monkeypatch, capsys):
+    oid = env.add_fork_branch("homelab", "homelab.txt", "lab\n")
+    pin = {"source": "extra-branch", "headRefName": "homelab", "number": None}
+    first = env.run([pin], staging_only=True)
+    assert first["applied"][0]["oid"] == oid
+
+    extras = tmp_path / "extras.txt"
+    extras.write_text("branch:homelab\n")
+    prs_json = tmp_path / "prs.json"
+    prs_json.write_text("[]")
+    report_path = tmp_path / "r.json"
+    _break_ref(monkeypatch, "refs/heads/homelab", commands=("fetch", "ls-remote"), fail_times=99)
+
+    assert (
+        stage_mod.main(
+            [
+                "stage",
+                "--workdir",
+                str(env.work),
+                "--date",
+                STAMP,
+                "--prs-json",
+                str(prs_json),
+                "--extras",
+                str(extras),
+                "--staging-only",
+                "--report",
+                str(report_path),
+            ]
+        )
+        == 0
+    )
+    report = json.loads(report_path.read_text())
+    assert report["blocked"] == ["homelab"]
+    assert report["pushed"] is False
+    assert report["skipped"] == [
+        {
+            "pr": None,
+            "branch": "homelab",
+            "conflict_paths": [],
+            "reason": stage_mod.EXTRA_FETCH_FAILED,
+            "source": "extra-branch",
+        }
+    ]
+    assert env.fork_ref("refs/heads/staging") == first["staging_sha"]
+    warning = capsys.readouterr().out
+    assert "could not reach remote for extras branch:homelab" in warning
+    assert "could not reach upstream" not in warning
+
+    with pytest.raises(stage_mod.StageError, match="branch:homelab"):
+        env.run([pin])
+    assert env.fork_ref("refs/heads/staging") == first["staging_sha"]
 
 
 def test_branch_pin_missing_is_loud_advisory_skip(env, tmp_path):
