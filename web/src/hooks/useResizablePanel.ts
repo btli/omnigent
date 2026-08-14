@@ -79,7 +79,7 @@ export function resetSharedWidthStoreForTesting(): void {
 }
 
 /**
- * Hook for making a right-side panel resizable via mouse drag on its left edge.
+ * Hook for making a right-side panel resizable via pointer drag on its left edge.
  *
  * On desktop (`≥ md`) the panel width is controlled via an inline style
  * driven by drag state. On mobile (`< md`) the panel is a full-screen
@@ -99,7 +99,12 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
     getSharedWidthSnapshot,
     getSharedWidthServerSnapshot,
   );
-  const dragging = useRef(false);
+  const activePointerRef = useRef<{
+    element: HTMLElement;
+    pointerId: number;
+    cleanup: () => void;
+  } | null>(null);
+  const overlayRef = useRef<HTMLDivElement | null>(null);
   const minWidthRef = useRef(minWidthPx);
   minWidthRef.current = minWidthPx;
 
@@ -147,15 +152,69 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
     minWidthPx,
   );
 
-  const onMouseDown = useCallback(
-    (e: React.MouseEvent) => {
+  const addDragOverlay = useCallback(() => {
+    if (overlayRef.current || typeof document === "undefined") return;
+    const element = document.createElement("div");
+    element.style.cssText =
+      "position:fixed;inset:0;z-index:2147483647;cursor:col-resize;background:transparent;";
+    document.body.appendChild(element);
+    overlayRef.current = element;
+  }, []);
+
+  const removeDragOverlay = useCallback(() => {
+    overlayRef.current?.remove();
+    overlayRef.current = null;
+  }, []);
+
+  const finishDrag = useCallback(
+    (pointerId: number, persist: boolean) => {
+      const activePointer = activePointerRef.current;
+      if (activePointer === null || pointerId !== activePointer.pointerId) return;
+      activePointerRef.current = null;
+      activePointer.cleanup();
+      if (persist) persistSharedWidth();
+      if (activePointer.element.hasPointerCapture(activePointer.pointerId)) {
+        activePointer.element.releasePointerCapture(activePointer.pointerId);
+      }
+      removeDragOverlay();
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    },
+    [removeDragOverlay],
+  );
+
+  const onPointerDown = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
       if (!open || !isDesktop) return;
+      if (activePointerRef.current !== null) return;
       e.preventDefault();
-      dragging.current = true;
+      const element = e.currentTarget;
+      const pointerId = e.pointerId;
+      const onPointerMove = (event: PointerEvent) => {
+        if (event.pointerId !== pointerId) return;
+        // Update the live width only; persisting on every move would fire a
+        // synchronous localStorage write per pointermove. Snapshot once on release.
+        setSharedWidth(clampWidth(window.innerWidth - event.clientX, minWidthRef.current));
+      };
+      const onPointerUp = (event: PointerEvent) => finishDrag(event.pointerId, true);
+      const onPointerAbort = (event: PointerEvent) => finishDrag(event.pointerId, false);
+      const cleanup = () => {
+        element.removeEventListener("pointermove", onPointerMove);
+        element.removeEventListener("pointerup", onPointerUp);
+        element.removeEventListener("pointercancel", onPointerAbort);
+        element.removeEventListener("lostpointercapture", onPointerAbort);
+      };
+      activePointerRef.current = { element, pointerId, cleanup };
+      element.addEventListener("pointermove", onPointerMove);
+      element.addEventListener("pointerup", onPointerUp);
+      element.addEventListener("pointercancel", onPointerAbort);
+      element.addEventListener("lostpointercapture", onPointerAbort);
+      element.setPointerCapture(pointerId);
+      addDragOverlay();
       document.body.style.cursor = "col-resize";
       document.body.style.userSelect = "none";
     },
-    [open, isDesktop],
+    [addDragOverlay, finishDrag, open, isDesktop],
   );
 
   // Keyboard resize: left/right arrow keys adjust width by 20px.
@@ -181,35 +240,20 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
   );
 
   useEffect(() => {
-    function onMouseMove(e: MouseEvent) {
-      if (!dragging.current) return;
-      // Update the live width only; persisting on every move would fire a
-      // synchronous localStorage write per mousemove. We snapshot once on release.
-      setSharedWidth(clampWidth(window.innerWidth - e.clientX, minWidthRef.current));
-    }
-
-    function onMouseUp() {
-      if (!dragging.current) return;
-      dragging.current = false;
-      persistSharedWidth();
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    }
-
-    window.addEventListener("mousemove", onMouseMove);
-    window.addEventListener("mouseup", onMouseUp);
     return () => {
-      window.removeEventListener("mousemove", onMouseMove);
-      window.removeEventListener("mouseup", onMouseUp);
-      // Reset body styles if unmounted mid-drag (e.g. panel closed
-      // via Escape while dragging).
-      if (dragging.current) {
-        dragging.current = false;
+      const activePointer = activePointerRef.current;
+      if (activePointer !== null) {
+        activePointerRef.current = null;
+        activePointer.cleanup();
+        if (activePointer.element.hasPointerCapture(activePointer.pointerId)) {
+          activePointer.element.releasePointerCapture(activePointer.pointerId);
+        }
+        removeDragOverlay();
         document.body.style.cursor = "";
         document.body.style.userSelect = "";
       }
     };
-  }, []);
+  }, [removeDragOverlay]);
 
   // On mobile the panel is a fixed full-screen overlay — no inline width.
   const panelWidth = isDesktop ? (open ? resolvedWidth : 0) : undefined;
@@ -219,8 +263,15 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
     panelWidth,
     /** Props to spread onto the resize handle element. */
     handleProps: {
-      onMouseDown,
+      onPointerDown,
       onKeyDown,
+      style: {
+        touchAction: "none",
+        boxSizing: "content-box" as const,
+        paddingInline: 20,
+        marginInline: -20,
+        backgroundClip: "content-box",
+      },
       role: "separator" as const,
       "aria-orientation": "vertical" as const,
       "aria-label": "Resize panel",
