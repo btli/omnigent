@@ -110,8 +110,8 @@ class OidcLoginManager {
                 if (result != null && !current.cancelled.get()) {
                     onSession(origin, result)
                 }
-                // Free the slot for the next login — unless onSession already
-                // started one (a re-login) or cancel() moved on to another flow.
+                // Free the slot after delivery. A re-entrant start from onSession
+                // is refused while this completed flow still owns the slot.
                 if (flow === current) flow = null
             }
         }
