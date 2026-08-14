@@ -353,6 +353,9 @@ describe("useResizablePanel persistence", () => {
       backgroundClip: "content-box",
     });
     expect(4 + Number(style.paddingInlineStart) + Number(style.paddingInlineEnd)).toBe(target);
+    // The transcript scrollbar thumb occupies the 6–12px band from this seam;
+    // keep the handle out of that band so touch-scroll starts remain available.
+    expect(-Number(style.marginInlineStart)).toBeLessThanOrEqual(6);
     expect(
       4 +
         Number(style.paddingInlineStart) +
@@ -365,12 +368,12 @@ describe("useResizablePanel persistence", () => {
   it("updates the gutter when primary pointer coarseness changes", () => {
     const { result } = renderHook(() => useResizablePanel(true));
     expect(result.current.handleProps.style.marginInlineStart).toBe(-HANDLE_OUTWARD_SLIVER_PX);
-    expect(result.current.handleProps.style.paddingInlineStart).toBe(11);
+    expect(result.current.handleProps.style.paddingInlineStart).toBe(7);
 
     act(() => setCoarseMatch(true));
 
     expect(result.current.handleProps.style.marginInlineStart).toBe(-HANDLE_OUTWARD_SLIVER_PX);
-    expect(result.current.handleProps.style.paddingInlineStart).toBe(12);
+    expect(result.current.handleProps.style.paddingInlineStart).toBe(8);
   });
 
   it("notifies multiple mounted subscribers from the shared width store", () => {

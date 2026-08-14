@@ -6,8 +6,8 @@ const MAX_WIDTH_RATIO = 0.8; // 80% of viewport
 /** Tailwind `md` breakpoint — must track the value in tailwind.config. */
 const MD_BREAKPOINT = 768;
 const PAINTED_HANDLE_WIDTH_PX = 4;
-export const HANDLE_OUTWARD_SLIVER_PX = 10;
-export const HANDLE_INWARD_SLIVER_PX = 8;
+export const HANDLE_OUTWARD_SLIVER_PX = 6;
+export const HANDLE_INWARD_SLIVER_PX = 12;
 export const HANDLE_COARSE_GUTTER_PX = 8;
 export const HANDLE_FINE_GUTTER_PX = 6;
 
