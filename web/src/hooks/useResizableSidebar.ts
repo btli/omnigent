@@ -91,7 +91,12 @@ export function resetSidebarWidthStoreForTesting(): void {
 export function useResizableSidebar() {
   const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
   const width = clamp(raw ?? DEFAULT_WIDTH_PX);
-  const dragging = useRef(false);
+  const activeDragRef = useRef<{
+    element: HTMLElement;
+    pointerId: number;
+    startWidth: number;
+    cleanup: () => void;
+  } | null>(null);
 
   // Re-clamp on viewport resize so a shrunken window pulls the sidebar back
   // under the ceiling; widening re-derives from the persisted preference so the
@@ -104,12 +109,67 @@ export function useResizableSidebar() {
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
-  const onMouseDown = useCallback((e: React.MouseEvent) => {
-    e.preventDefault();
-    dragging.current = true;
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
+  const finishDrag = useCallback((persist: boolean, restoreStart: boolean) => {
+    const activeDrag = activeDragRef.current;
+    if (!activeDrag) return;
+
+    activeDragRef.current = null;
+    activeDrag.cleanup();
+    if (restoreStart) {
+      setStoredWidthRaw(activeDrag.startWidth);
+    } else if (persist) {
+      persistWidth(storedWidth);
+    }
+    if (activeDrag.element.hasPointerCapture(activeDrag.pointerId)) {
+      activeDrag.element.releasePointerCapture(activeDrag.pointerId);
+    }
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
   }, []);
+
+  const onPointerDown = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
+      // A resize owns exactly one pointer stream until it ends.
+      if (activeDragRef.current) return;
+
+      e.preventDefault();
+      const element = e.currentTarget;
+      const pointerId = e.pointerId;
+      const startWidth = storedWidth ?? width;
+
+      function onPointerMove(event: PointerEvent) {
+        if (event.pointerId !== pointerId) return;
+        setStoredWidth(clamp(event.clientX));
+      }
+
+      function onPointerUp(event: PointerEvent) {
+        if (event.pointerId !== pointerId) return;
+        finishDrag(true, false);
+      }
+
+      function onPointerAbort(event: PointerEvent) {
+        if (event.pointerId !== pointerId) return;
+        finishDrag(false, true);
+      }
+
+      function cleanup() {
+        element.removeEventListener("pointermove", onPointerMove);
+        element.removeEventListener("pointerup", onPointerUp);
+        element.removeEventListener("pointercancel", onPointerAbort);
+        element.removeEventListener("lostpointercapture", onPointerAbort);
+      }
+
+      activeDragRef.current = { element, pointerId, startWidth, cleanup };
+      element.addEventListener("pointermove", onPointerMove);
+      element.addEventListener("pointerup", onPointerUp);
+      element.addEventListener("pointercancel", onPointerAbort);
+      element.addEventListener("lostpointercapture", onPointerAbort);
+      element.setPointerCapture(pointerId);
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+    },
+    [finishDrag, width],
+  );
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -126,46 +186,22 @@ export function useResizableSidebar() {
     [width],
   );
 
-  useEffect(() => {
-    function onMouseMove(e: MouseEvent) {
-      if (!dragging.current) return;
-      // Left panel: width is the cursor's distance from the viewport's left
-      // edge. Update the live width only; persist once on release to avoid a
-      // synchronous localStorage write per mousemove.
-      setStoredWidth(clamp(e.clientX));
-    }
-
-    function onMouseUp() {
-      if (!dragging.current) return;
-      dragging.current = false;
-      persistWidth(storedWidth);
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    }
-
-    window.addEventListener("mousemove", onMouseMove);
-    window.addEventListener("mouseup", onMouseUp);
-    return () => {
-      window.removeEventListener("mousemove", onMouseMove);
-      window.removeEventListener("mouseup", onMouseUp);
-      if (dragging.current) {
-        dragging.current = false;
-        document.body.style.cursor = "";
-        document.body.style.userSelect = "";
-      }
-    };
-  }, []);
+  useEffect(() => () => finishDrag(false, true), [finishDrag]);
 
   return {
     /** Current sidebar width in px (already viewport-clamped). */
     width,
     handleProps: {
-      onMouseDown,
+      onPointerDown,
       onKeyDown,
       role: "separator" as const,
       "aria-orientation": "vertical" as const,
       "aria-label": "Resize sidebar",
       tabIndex: 0,
+      style: {
+        touchAction: "none",
+        width: 44,
+      },
     },
   };
 }
