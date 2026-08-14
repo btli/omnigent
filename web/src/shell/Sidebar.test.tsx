@@ -279,6 +279,56 @@ function seedPins(ids: string[]) {
 }
 afterEach(cleanup);
 
+describe("Sidebar resize handle geometry", () => {
+  it("keeps the chat-side hit pad outside the clipped content region", () => {
+    mockConversations([]);
+    renderSidebar();
+
+    const sidebar = screen.getByLabelText("Conversations");
+    const handle = screen.getByTestId("sidebar-resize-handle");
+    const clippedContent = screen.getByTestId("sidebar-clipped-content");
+
+    expect(handle.parentElement).toBe(sidebar);
+    expect(clippedContent.parentElement).toBe(sidebar);
+    expect(sidebar).not.toHaveClass("md:overflow-hidden");
+    expect(clippedContent).toHaveClass("md:overflow-hidden");
+  });
+
+  it("limits fine-pointer row intrusion while preserving the outward grab area", () => {
+    mockConversations([conv("edge-session", "Claude Code")]);
+    renderSidebar();
+
+    const handle = screen.getByTestId("sidebar-resize-handle");
+    expect(handle.style.paddingInlineStart).toBe("4px");
+    expect(handle.style.paddingInlineEnd).toBe("16px");
+    expect(handle.style.marginInlineStart).toBe("-4px");
+    expect(handle.style.marginInlineEnd).toBe("-16px");
+    expect(screen.getByText("edge-session")).not.toBe(handle);
+  });
+
+  it("keeps the painted separator strip unchanged", () => {
+    mockConversations([]);
+    renderSidebar();
+
+    const handle = screen.getByTestId("sidebar-resize-handle");
+    expect(handle).toHaveClass(
+      "absolute",
+      "inset-y-0",
+      "right-0",
+      "z-10",
+      "hidden",
+      "w-1",
+      "cursor-col-resize",
+      "transition-colors",
+      "hover:bg-primary/30",
+      "active:bg-primary/50",
+      "md:block",
+    );
+    expect(handle.style.width).toBe("");
+    expect(handle.style.backgroundClip).toBe("content-box");
+  });
+});
+
 describe("Sidebar session list", () => {
   it("uses the interface text token for the empty session-list state", () => {
     mockConversations([]);
