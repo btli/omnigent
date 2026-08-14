@@ -20,6 +20,13 @@ class OriginsTest {
     }
 
     @Test
+    fun `unicode server origin matches its punycode form`() {
+        val punycodeOrigin = originOf("https://xn--bcher-kva.example")
+        assertEquals(punycodeOrigin, originOf("https://bücher.example"))
+        assertEquals(punycodeOrigin, canonicalOrigin("https", "bücher.example"))
+    }
+
+    @Test
     fun `canonical origin and default port helpers share normalization`() {
         assertEquals("https://example.com", canonicalOrigin("HTTPS", "Example.COM", 443))
         assertEquals("http://[::1]:8000", canonicalOrigin("http", "::1", 8000))
