@@ -1,7 +1,11 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readPanelSizePreference } from "@/lib/panelSizePreferences";
-import { resetSharedWidthStoreForTesting, useResizablePanel } from "./useResizablePanel";
+import {
+  HANDLE_HIT_PAD_PX,
+  resetSharedWidthStoreForTesting,
+  useResizablePanel,
+} from "./useResizablePanel";
 
 const originalInnerWidth = window.innerWidth;
 
@@ -19,29 +23,30 @@ function createPointerHandle() {
   return { element, setPointerCapture, releasePointerCapture };
 }
 
-function dispatchPointer(
+function pointerEvent(
   element: HTMLElement,
-  type: string,
-  { pointerId, clientX = 0 }: { pointerId: number; clientX?: number },
-): void {
-  const event = new Event(type, { bubbles: true });
-  Object.defineProperties(event, {
-    pointerId: { value: pointerId },
-    clientX: { value: clientX },
-  });
-  element.dispatchEvent(event);
-}
-
-function startPointerDrag(
-  onPointerDown: React.PointerEventHandler<HTMLElement>,
-  element: HTMLElement,
-  pointerId: number,
-): void {
-  onPointerDown({
+  {
+    pointerId,
+    clientX = 0,
+    pointerType = "touch",
+    button = 0,
+    preventDefault = () => {},
+  }: {
+    pointerId: number;
+    clientX?: number;
+    pointerType?: string;
+    button?: number;
+    preventDefault?: () => void;
+  },
+): React.PointerEvent<HTMLElement> {
+  return {
     currentTarget: element,
     pointerId,
-    preventDefault: () => {},
-  } as React.PointerEvent<HTMLElement>);
+    clientX,
+    pointerType,
+    button,
+    preventDefault,
+  } as React.PointerEvent<HTMLElement>;
 }
 
 beforeEach(() => {
@@ -114,13 +119,15 @@ describe("useResizablePanel persistence", () => {
     const handle = createPointerHandle();
 
     act(() => {
-      startPointerDrag(result.current.handleProps.onPointerDown, handle.element, 7);
+      result.current.handleProps.onPointerDown(pointerEvent(handle.element, { pointerId: 7 }));
     });
     expect(handle.setPointerCapture).toHaveBeenCalledWith(7);
 
     act(() => {
       // 2000px viewport, cursor at 1200 → width = innerWidth - clientX = 800.
-      dispatchPointer(handle.element, "pointermove", { pointerId: 7, clientX: 1200 });
+      result.current.handleProps.onPointerMove(
+        pointerEvent(handle.element, { pointerId: 7, clientX: 1200 }),
+      );
     });
 
     // Live width tracks the drag, but nothing is written to storage mid-drag —
@@ -129,7 +136,7 @@ describe("useResizablePanel persistence", () => {
     expect(readPanelSizePreference("pushPanelWidthPx")).toBeNull();
 
     act(() => {
-      dispatchPointer(handle.element, "pointerup", { pointerId: 7 });
+      result.current.handleProps.onPointerUp(pointerEvent(handle.element, { pointerId: 7 }));
     });
 
     // Release snapshots the final width exactly once.
@@ -137,21 +144,25 @@ describe("useResizablePanel persistence", () => {
     expect(handle.releasePointerCapture).toHaveBeenCalledWith(7);
   });
 
-  it.each(["pointercancel", "lostpointercapture"])(
-    "aborts cleanly on %s without persisting",
-    (abortEvent) => {
+  it.each(["onPointerCancel", "onLostPointerCapture"] as const)(
+    "aborts cleanly via %s without persisting",
+    (abortHandler) => {
       const { result } = renderHook(() => useResizablePanel(true));
       const handle = createPointerHandle();
 
       act(() => {
-        startPointerDrag(result.current.handleProps.onPointerDown, handle.element, 11);
-        dispatchPointer(handle.element, "pointermove", { pointerId: 11, clientX: 1200 });
+        result.current.handleProps.onPointerDown(pointerEvent(handle.element, { pointerId: 11 }));
+        result.current.handleProps.onPointerMove(
+          pointerEvent(handle.element, { pointerId: 11, clientX: 1200 }),
+        );
       });
       expect(result.current.panelWidth).toBe(800);
 
       act(() => {
-        dispatchPointer(handle.element, abortEvent, { pointerId: 11 });
-        dispatchPointer(handle.element, "pointermove", { pointerId: 11, clientX: 1400 });
+        result.current.handleProps[abortHandler](pointerEvent(handle.element, { pointerId: 11 }));
+        result.current.handleProps.onPointerMove(
+          pointerEvent(handle.element, { pointerId: 11, clientX: 1400 }),
+        );
       });
 
       expect(result.current.panelWidth).toBe(800);
@@ -167,9 +178,13 @@ describe("useResizablePanel persistence", () => {
     const secondHandle = createPointerHandle();
 
     act(() => {
-      startPointerDrag(result.current.handleProps.onPointerDown, firstHandle.element, 1);
-      startPointerDrag(result.current.handleProps.onPointerDown, secondHandle.element, 2);
-      dispatchPointer(secondHandle.element, "pointermove", { pointerId: 2, clientX: 1400 });
+      result.current.handleProps.onPointerDown(pointerEvent(firstHandle.element, { pointerId: 1 }));
+      result.current.handleProps.onPointerDown(
+        pointerEvent(secondHandle.element, { pointerId: 2 }),
+      );
+      result.current.handleProps.onPointerMove(
+        pointerEvent(secondHandle.element, { pointerId: 2, clientX: 1400 }),
+      );
     });
 
     expect(firstHandle.setPointerCapture).toHaveBeenCalledWith(1);
@@ -177,9 +192,35 @@ describe("useResizablePanel persistence", () => {
     expect(result.current.panelWidth).toBe(1000);
 
     act(() => {
-      dispatchPointer(firstHandle.element, "pointermove", { pointerId: 1, clientX: 1200 });
+      result.current.handleProps.onPointerMove(
+        pointerEvent(firstHandle.element, { pointerId: 1, clientX: 1200 }),
+      );
     });
     expect(result.current.panelWidth).toBe(800);
+  });
+
+  it("ignores secondary mouse buttons", () => {
+    const { result } = renderHook(() => useResizablePanel(true));
+    const handle = createPointerHandle();
+    const preventDefault = vi.fn();
+
+    act(() => {
+      result.current.handleProps.onPointerDown(
+        pointerEvent(handle.element, {
+          pointerId: 3,
+          pointerType: "mouse",
+          button: 2,
+          preventDefault,
+        }),
+      );
+      result.current.handleProps.onPointerMove(
+        pointerEvent(handle.element, { pointerId: 3, clientX: 1200 }),
+      );
+    });
+
+    expect(handle.setPointerCapture).not.toHaveBeenCalled();
+    expect(preventDefault).not.toHaveBeenCalled();
+    expect(result.current.panelWidth).toBe(1000);
   });
 
   it("returns touch-action and a 44px cross-axis hit target", () => {
@@ -188,8 +229,8 @@ describe("useResizablePanel persistence", () => {
     expect(result.current.handleProps.style).toMatchObject({
       touchAction: "none",
       boxSizing: "content-box",
-      paddingInline: 20,
-      marginInline: -20,
+      paddingInline: HANDLE_HIT_PAD_PX,
+      marginInline: -HANDLE_HIT_PAD_PX,
       backgroundClip: "content-box",
     });
   });

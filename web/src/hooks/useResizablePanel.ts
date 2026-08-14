@@ -5,6 +5,8 @@ const MIN_WIDTH_PX = 320;
 const MAX_WIDTH_RATIO = 0.8; // 80% of viewport
 /** Tailwind `md` breakpoint — must track the value in tailwind.config. */
 const MD_BREAKPOINT = 768;
+/** Padding that expands the visual 4px handle to a 44px hit target. */
+export const HANDLE_HIT_PAD_PX = 20;
 
 /** Clamp a width value to the allowed range for the current viewport. */
 function clampWidth(w: number, minPx = MIN_WIDTH_PX): number {
@@ -99,11 +101,7 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
     getSharedWidthSnapshot,
     getSharedWidthServerSnapshot,
   );
-  const activePointerRef = useRef<{
-    element: HTMLElement;
-    pointerId: number;
-    cleanup: () => void;
-  } | null>(null);
+  const activePointerId = useRef<number | null>(null);
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const minWidthRef = useRef(minWidthPx);
   minWidthRef.current = minWidthPx;
@@ -166,16 +164,11 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
     overlayRef.current = null;
   }, []);
 
-  const finishDrag = useCallback(
-    (pointerId: number, persist: boolean) => {
-      const activePointer = activePointerRef.current;
-      if (activePointer === null || pointerId !== activePointer.pointerId) return;
-      activePointerRef.current = null;
-      activePointer.cleanup();
+  const endDrag = useCallback(
+    (persist: boolean) => {
+      if (activePointerId.current === null) return;
+      activePointerId.current = null;
       if (persist) persistSharedWidth();
-      if (activePointer.element.hasPointerCapture(activePointer.pointerId)) {
-        activePointer.element.releasePointerCapture(activePointer.pointerId);
-      }
       removeDragOverlay();
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
@@ -186,35 +179,42 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
   const onPointerDown = useCallback(
     (e: React.PointerEvent<HTMLElement>) => {
       if (!open || !isDesktop) return;
-      if (activePointerRef.current !== null) return;
+      if (activePointerId.current !== null) return;
+      if (e.pointerType === "mouse" && e.button !== 0) return;
       e.preventDefault();
-      const element = e.currentTarget;
-      const pointerId = e.pointerId;
-      const onPointerMove = (event: PointerEvent) => {
-        if (event.pointerId !== pointerId) return;
-        // Update the live width only; persisting on every move would fire a
-        // synchronous localStorage write per pointermove. Snapshot once on release.
-        setSharedWidth(clampWidth(window.innerWidth - event.clientX, minWidthRef.current));
-      };
-      const onPointerUp = (event: PointerEvent) => finishDrag(event.pointerId, true);
-      const onPointerAbort = (event: PointerEvent) => finishDrag(event.pointerId, false);
-      const cleanup = () => {
-        element.removeEventListener("pointermove", onPointerMove);
-        element.removeEventListener("pointerup", onPointerUp);
-        element.removeEventListener("pointercancel", onPointerAbort);
-        element.removeEventListener("lostpointercapture", onPointerAbort);
-      };
-      activePointerRef.current = { element, pointerId, cleanup };
-      element.addEventListener("pointermove", onPointerMove);
-      element.addEventListener("pointerup", onPointerUp);
-      element.addEventListener("pointercancel", onPointerAbort);
-      element.addEventListener("lostpointercapture", onPointerAbort);
-      element.setPointerCapture(pointerId);
+      activePointerId.current = e.pointerId;
+      e.currentTarget.setPointerCapture?.(e.pointerId);
       addDragOverlay();
       document.body.style.cursor = "col-resize";
       document.body.style.userSelect = "none";
     },
-    [addDragOverlay, finishDrag, open, isDesktop],
+    [addDragOverlay, open, isDesktop],
+  );
+
+  const onPointerMove = useCallback((e: React.PointerEvent<HTMLElement>) => {
+    if (e.pointerId !== activePointerId.current) return;
+    // Update the live width only; persist once on pointerup to avoid a
+    // synchronous localStorage write per pointermove.
+    setSharedWidth(clampWidth(window.innerWidth - e.clientX, minWidthRef.current));
+  }, []);
+
+  const onPointerUp = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
+      if (e.pointerId !== activePointerId.current) return;
+      endDrag(true);
+      if (e.currentTarget.hasPointerCapture?.(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+    },
+    [endDrag],
+  );
+
+  const onPointerCancel = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
+      if (e.pointerId !== activePointerId.current) return;
+      endDrag(false);
+    },
+    [endDrag],
   );
 
   // Keyboard resize: left/right arrow keys adjust width by 20px.
@@ -239,21 +239,7 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
     [open, isDesktop, resolvedWidth],
   );
 
-  useEffect(() => {
-    return () => {
-      const activePointer = activePointerRef.current;
-      if (activePointer !== null) {
-        activePointerRef.current = null;
-        activePointer.cleanup();
-        if (activePointer.element.hasPointerCapture(activePointer.pointerId)) {
-          activePointer.element.releasePointerCapture(activePointer.pointerId);
-        }
-        removeDragOverlay();
-        document.body.style.cursor = "";
-        document.body.style.userSelect = "";
-      }
-    };
-  }, [removeDragOverlay]);
+  useEffect(() => () => endDrag(false), [endDrag]);
 
   // On mobile the panel is a fixed full-screen overlay — no inline width.
   const panelWidth = isDesktop ? (open ? resolvedWidth : 0) : undefined;
@@ -264,12 +250,16 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
     /** Props to spread onto the resize handle element. */
     handleProps: {
       onPointerDown,
+      onPointerMove,
+      onPointerUp,
+      onPointerCancel,
+      onLostPointerCapture: onPointerCancel,
       onKeyDown,
       style: {
         touchAction: "none",
         boxSizing: "content-box" as const,
-        paddingInline: 20,
-        marginInline: -20,
+        paddingInline: HANDLE_HIT_PAD_PX,
+        marginInline: -HANDLE_HIT_PAD_PX,
         backgroundClip: "content-box",
       },
       role: "separator" as const,
