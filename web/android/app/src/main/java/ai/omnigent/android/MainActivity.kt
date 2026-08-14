@@ -67,7 +67,7 @@ class MainActivity : AppCompatActivity() {
     // Origin the pending path belongs to, captured when the path is set. A
     // pending path never flushes cross-origin; null means nothing is pending.
     private var pendingNavigateOrigin: String? = null
-    private val pendingNotificationPaths = ArrayDeque<String>()
+    private val pendingNotifications = ArrayDeque<PendingNotification>()
 
     // Consent-approved server URL awaiting its first successful load; only
     // then does it become a trusted recent (an unreachable or hostile link
@@ -681,6 +681,8 @@ class MainActivity : AppCompatActivity() {
         if (delivered && deepLinkAwaitingNavigation) {
             deepLinkAwaitingNavigation = false
             resumeDeepLinkQueue()
+        } else if (delivered) {
+            processNextNotification()
         }
     }
 
@@ -720,7 +722,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun setDeepLinkPath(link: DeepLink) {
         if (!deepLinkAwaitingNavigation) {
-            pendingNavigatePath?.let(pendingNotificationPaths::addFirst)
+            pendingNavigatePath?.let {
+                pendingNotifications.addFirst(PendingNotification(it, pendingNavigateOrigin))
+            }
         }
         pendingNavigatePath = link.path
         pendingNavigateOrigin = link.origin
@@ -729,22 +733,28 @@ class MainActivity : AppCompatActivity() {
 
     private fun enqueueNotificationPath(path: String) {
         if (processingDeepLink || pendingNavigatePath != null) {
-            pendingNotificationPaths.addLast(path)
+            pendingNotifications.addLast(PendingNotification(path, pinnedOrigin))
             return
         }
         pendingNavigatePath = path
         pendingNavigateOrigin = pinnedOrigin
-        if (pageLoaded) flushPendingActivation()
+        if (pageLoaded && flushPendingActivation()) processNextNotification()
     }
 
     private fun processNextNotification() {
         while (true) {
-            val path = pendingNotificationPaths.removeFirstOrNull() ?: return
-            pendingNavigatePath = path
-            pendingNavigateOrigin = pinnedOrigin
+            val notification = pendingNotifications.removeFirstOrNull() ?: return
+            if (notification.origin != pinnedOrigin) continue
+            pendingNavigatePath = notification.path
+            pendingNavigateOrigin = notification.origin
             if (!pageLoaded || !flushPendingActivation()) return
         }
     }
+
+    private data class PendingNotification(
+        val path: String,
+        val origin: String?,
+    )
 
     private fun enqueueDeepLink(intent: Intent?) {
         if (intent?.action != Intent.ACTION_VIEW) return
