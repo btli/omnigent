@@ -49,9 +49,10 @@ def test_sidebar_resize_persists_without_annexing_chat_scroll(
     assert abs(persisted_width - resized_width) < 2, (persisted_width, resized_width)
 
     # A scroll start beside the handle belongs to chat and must not resize.
+    sidebar_box = sidebar.bounding_box()
     handle_box = handle.bounding_box()
-    assert handle_box is not None
-    chat_x = handle_box["x"] + handle_box["width"] + 12
+    assert sidebar_box is not None and handle_box is not None
+    chat_x = sidebar_box["x"] + sidebar_box["width"] + 10
     scroll_y = handle_box["y"] + handle_box["height"] / 2
     page.mouse.move(chat_x, scroll_y)
     page.mouse.down()
