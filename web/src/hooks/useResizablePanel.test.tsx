@@ -342,17 +342,15 @@ describe("useResizablePanel persistence", () => {
     const { result } = renderHook(() => useResizablePanel(true));
     const style = result.current.handleProps.style;
     const inset = (gutter - 4) / 2;
-    const totalPadding = HANDLE_OUTWARD_SLIVER_PX + HANDLE_INWARD_SLIVER_PX + 2 * inset;
 
     expect(style).toMatchObject({
       touchAction: "none",
       boxSizing: "content-box",
-      paddingInlineStart: gutter,
-      paddingInlineEnd: totalPadding - gutter,
+      paddingInlineStart: HANDLE_OUTWARD_SLIVER_PX + inset,
+      paddingInlineEnd: HANDLE_INWARD_SLIVER_PX + inset,
       marginInlineStart: -HANDLE_OUTWARD_SLIVER_PX,
       marginInlineEnd: -HANDLE_INWARD_SLIVER_PX,
       backgroundClip: "content-box",
-      clipPath: `inset(0 0 0 ${gutter}px)`,
     });
     expect(4 + Number(style.paddingInlineStart) + Number(style.paddingInlineEnd)).toBe(target);
     // The transcript scrollbar thumb occupies the 6–12px band from this seam;
@@ -373,12 +371,12 @@ describe("useResizablePanel persistence", () => {
   it("updates the gutter when primary pointer coarseness changes", () => {
     const { result } = renderHook(() => useResizablePanel(true));
     expect(result.current.handleProps.style.marginInlineStart).toBe(-HANDLE_OUTWARD_SLIVER_PX);
-    expect(result.current.handleProps.style.paddingInlineStart).toBe(10);
+    expect(result.current.handleProps.style.paddingInlineStart).toBe(9);
 
     act(() => setCoarseMatch(true));
 
     expect(result.current.handleProps.style.marginInlineStart).toBe(-HANDLE_OUTWARD_SLIVER_PX);
-    expect(result.current.handleProps.style.paddingInlineStart).toBe(12);
+    expect(result.current.handleProps.style.paddingInlineStart).toBe(10);
   });
 
   it("notifies multiple mounted subscribers from the shared width store", () => {

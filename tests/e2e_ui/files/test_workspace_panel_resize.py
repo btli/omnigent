@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from playwright.sync_api import Page, expect
 
+_FINE_GUTTER_PX = 10
+
 
 def _open_execution_logs_panel(page: Page) -> None:
     expect(page.get_by_test_id("execution-logs-card")).to_be_visible(timeout=30_000)
@@ -35,7 +37,7 @@ def test_workspace_panel_pointer_resize_persists_without_annexing_chat(
     assert resized_width >= initial_width + 70
 
     panel_box = panel.bounding_box()
-    probe_x = panel_box["x"] - 8
+    probe_x = panel_box["x"] - _FINE_GUTTER_PX - 8
     probe_y = panel_box["y"] + panel_box["height"] / 2
     assert panel.evaluate(
         """(panel, point) => {
@@ -51,7 +53,7 @@ def test_workspace_panel_pointer_resize_persists_without_annexing_chat(
             return true;
         }""",
         {"x": probe_x, "y": probe_y},
-    )
+    ), "chat-side probe landed on the panel resize handle"
     page.mouse.move(probe_x, probe_y)
     page.mouse.down()
     page.mouse.move(probe_x - 12, probe_y, steps=2)

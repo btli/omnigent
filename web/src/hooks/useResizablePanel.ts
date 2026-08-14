@@ -14,16 +14,14 @@ export const HANDLE_FINE_GUTTER_PX = 10;
 function handleGutterStyle(isCoarse: boolean): React.CSSProperties {
   const gutter = isCoarse ? HANDLE_COARSE_GUTTER_PX : HANDLE_FINE_GUTTER_PX;
   const inset = (gutter - PAINTED_HANDLE_WIDTH_PX) / 2;
-  const totalPadding = HANDLE_OUTWARD_SLIVER_PX + HANDLE_INWARD_SLIVER_PX + 2 * inset;
   return {
     touchAction: "none",
     boxSizing: "content-box",
-    paddingInlineStart: gutter,
-    paddingInlineEnd: totalPadding - gutter,
+    paddingInlineStart: HANDLE_OUTWARD_SLIVER_PX + inset,
+    paddingInlineEnd: HANDLE_INWARD_SLIVER_PX + inset,
     marginInlineStart: -HANDLE_OUTWARD_SLIVER_PX,
     marginInlineEnd: -HANDLE_INWARD_SLIVER_PX,
     backgroundClip: "content-box",
-    clipPath: `inset(0 0 0 ${gutter}px)`,
   };
 }
 
