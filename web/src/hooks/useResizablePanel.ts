@@ -102,6 +102,7 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
     getSharedWidthServerSnapshot,
   );
   const activePointerId = useRef<number | null>(null);
+  const documentFallbackCleanupRef = useRef<(() => void) | null>(null);
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const minWidthRef = useRef(minWidthPx);
   minWidthRef.current = minWidthPx;
@@ -168,6 +169,8 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
     (persist: boolean) => {
       if (activePointerId.current === null) return;
       activePointerId.current = null;
+      documentFallbackCleanupRef.current?.();
+      documentFallbackCleanupRef.current = null;
       if (persist) persistSharedWidth();
       removeDragOverlay();
       document.body.style.cursor = "";
@@ -180,15 +183,31 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
     (e: React.PointerEvent<HTMLElement>) => {
       if (!open || !isDesktop) return;
       if (activePointerId.current !== null) return;
-      if (e.pointerType === "mouse" && e.button !== 0) return;
+      if (e.button !== 0) return;
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId);
+      } catch {
+        return;
+      }
       e.preventDefault();
       activePointerId.current = e.pointerId;
-      e.currentTarget.setPointerCapture?.(e.pointerId);
+      const onDocumentPointerUp = (event: PointerEvent) => {
+        if (event.pointerId === activePointerId.current) endDrag(true);
+      };
+      const onDocumentPointerCancel = (event: PointerEvent) => {
+        if (event.pointerId === activePointerId.current) endDrag(false);
+      };
+      document.addEventListener("pointerup", onDocumentPointerUp);
+      document.addEventListener("pointercancel", onDocumentPointerCancel);
+      documentFallbackCleanupRef.current = () => {
+        document.removeEventListener("pointerup", onDocumentPointerUp);
+        document.removeEventListener("pointercancel", onDocumentPointerCancel);
+      };
       addDragOverlay();
       document.body.style.cursor = "col-resize";
       document.body.style.userSelect = "none";
     },
-    [addDragOverlay, open, isDesktop],
+    [addDragOverlay, endDrag, open, isDesktop],
   );
 
   const onPointerMove = useCallback((e: React.PointerEvent<HTMLElement>) => {
@@ -240,6 +259,10 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
   );
 
   useEffect(() => () => endDrag(false), [endDrag]);
+
+  useEffect(() => {
+    if (!open || !isDesktop) endDrag(false);
+  }, [endDrag, isDesktop, open]);
 
   // On mobile the panel is a fixed full-screen overlay — no inline width.
   const panelWidth = isDesktop ? (open ? resolvedWidth : 0) : undefined;

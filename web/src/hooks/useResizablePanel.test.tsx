@@ -49,6 +49,12 @@ function pointerEvent(
   } as React.PointerEvent<HTMLElement>;
 }
 
+function dispatchDocumentPointer(type: "pointerup" | "pointercancel", pointerId: number): void {
+  const event = new Event(type);
+  Object.defineProperty(event, "pointerId", { value: pointerId });
+  document.dispatchEvent(event);
+}
+
 beforeEach(() => {
   setInnerWidth(2000);
 });
@@ -144,6 +150,35 @@ describe("useResizablePanel persistence", () => {
     expect(handle.releasePointerCapture).toHaveBeenCalledWith(7);
   });
 
+  it("stays idle when pointer capture throws", () => {
+    const { result } = renderHook(() => useResizablePanel(true));
+    const failedHandle = createPointerHandle();
+    const nextHandle = createPointerHandle();
+    failedHandle.setPointerCapture.mockImplementation(() => {
+      throw new Error("capture failed");
+    });
+    const preventDefault = vi.fn();
+
+    act(() => {
+      result.current.handleProps.onPointerDown(
+        pointerEvent(failedHandle.element, { pointerId: 8, preventDefault }),
+      );
+      result.current.handleProps.onPointerMove(
+        pointerEvent(failedHandle.element, { pointerId: 8, clientX: 1200 }),
+      );
+    });
+
+    expect(preventDefault).not.toHaveBeenCalled();
+    expect(result.current.panelWidth).toBe(1000);
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
+
+    act(() => {
+      result.current.handleProps.onPointerDown(pointerEvent(nextHandle.element, { pointerId: 9 }));
+    });
+    expect(nextHandle.setPointerCapture).toHaveBeenCalledWith(9);
+  });
+
   it.each(["onPointerCancel", "onLostPointerCapture"] as const)(
     "aborts cleanly via %s without persisting",
     (abortHandler) => {
@@ -199,7 +234,54 @@ describe("useResizablePanel persistence", () => {
     expect(result.current.panelWidth).toBe(800);
   });
 
-  it("ignores secondary mouse buttons", () => {
+  it("recovers when the handle unmounts mid-drag", () => {
+    const { result } = renderHook(() => useResizablePanel(true));
+    const removedHandle = createPointerHandle();
+    const nextHandle = createPointerHandle();
+    document.body.appendChild(removedHandle.element);
+
+    act(() => {
+      result.current.handleProps.onPointerDown(
+        pointerEvent(removedHandle.element, { pointerId: 4 }),
+      );
+      result.current.handleProps.onPointerMove(
+        pointerEvent(removedHandle.element, { pointerId: 4, clientX: 1200 }),
+      );
+      removedHandle.element.remove();
+      dispatchDocumentPointer("pointercancel", 4);
+    });
+
+    expect(result.current.panelWidth).toBe(800);
+    expect(readPanelSizePreference("pushPanelWidthPx")).toBeNull();
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
+
+    act(() => {
+      result.current.handleProps.onPointerDown(pointerEvent(nextHandle.element, { pointerId: 5 }));
+    });
+    expect(nextHandle.setPointerCapture).toHaveBeenCalledWith(5);
+  });
+
+  it("aborts when the desktop/open gate flips during a drag", () => {
+    const { result, rerender } = renderHook(({ open }) => useResizablePanel(open), {
+      initialProps: { open: true },
+    });
+    const handle = createPointerHandle();
+
+    act(() => {
+      result.current.handleProps.onPointerDown(pointerEvent(handle.element, { pointerId: 6 }));
+      result.current.handleProps.onPointerMove(
+        pointerEvent(handle.element, { pointerId: 6, clientX: 1200 }),
+      );
+    });
+    rerender({ open: false });
+
+    expect(readPanelSizePreference("pushPanelWidthPx")).toBeNull();
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
+  });
+
+  it("ignores non-primary pen buttons", () => {
     const { result } = renderHook(() => useResizablePanel(true));
     const handle = createPointerHandle();
     const preventDefault = vi.fn();
@@ -208,7 +290,7 @@ describe("useResizablePanel persistence", () => {
       result.current.handleProps.onPointerDown(
         pointerEvent(handle.element, {
           pointerId: 3,
-          pointerType: "mouse",
+          pointerType: "pen",
           button: 2,
           preventDefault,
         }),
