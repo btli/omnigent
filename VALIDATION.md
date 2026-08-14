@@ -43,7 +43,7 @@ NODE_OPTIONS="--no-experimental-webstorage" ./node_modules/.bin/vitest run
 
 If the worktree package links are missing, run `pnpm install --frozen-lockfile` from the repository root first, then invoke `./node_modules/.bin` tools directly.
 
-Baseline on 2026-08-14: 289 files (286 passed, 2 failed, 1 skipped), 5,813 tests (5,805 passed, 4 failed, 3 expected failures, 1 skipped). The three `NewChatDialog.test.tsx` failures that cannot find `This machine` reproduce on `origin/main`. The `useResizableInlinePanel.test.tsx` persistence failure does not exist on main and belongs to the integrated touch branches.
+Final-head run on 2026-08-14: 290 files (287 passed, 2 failed, 1 skipped), 5,827 tests (5,819 passed, 4 failed, 3 expected failures, 1 skipped). Three `NewChatDialog.test.tsx` failures that cannot find `This machine` reproduce on `origin/main`. The integration-only failure is `AppShell.test.tsx > Right workspace card visibility > aborts an active resize when the workspace panel closes`, which cannot find the `Resize panel` separator.
 
 ## Build once and serve live code
 
@@ -201,7 +201,7 @@ xcrun simctl list runtimes
 xcodebuild -downloadPlatform iOS
 ```
 
-As of 2026-08-14 on the validation host, the license is accepted but the runtime is still absent. The download is blocked by only 8.3 GB free on the data volume versus 8.49 GB required. Free sufficient space, run the download above, and confirm `xcrun simctl list runtimes` before continuing.
+As of 2026-08-14, Xcode 26.6 and the iOS 26.5 runtime (`23F77`) are installed on the validation host. Keep several GiB free for the simulator build; Xcode DerivedData and `~/Library/Caches` are regenerable if space is tight.
 
 Then create/boot an iPhone, build without signing, install, and launch:
 
@@ -221,10 +221,11 @@ xcodebuild -project Omnigent.xcodeproj -scheme Omnigent -configuration Debug \
   -destination "platform=iOS Simulator,id=$IOS_UDID" \
   -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
 xcrun simctl install "$IOS_UDID" build/Build/Products/Debug-iphonesimulator/Omnigent.app
-xcrun simctl launch "$IOS_UDID" ai.omnigent.ios
+xcrun simctl launch --terminate-running-process "$IOS_UDID" ai.omnigent.ios \
+  --omnigent-reset-state --omnigent-server-url http://127.0.0.1:5173
 ```
 
-Connect the native shell to `http://localhost:5173`; the iOS Simulator shares the Mac loopback, so no `adb reverse` equivalent is needed. Confirm the live new-chat UI loads.
+The iOS Simulator shares the Mac loopback, so no `adb reverse` equivalent is needed. Use `127.0.0.1`, not `localhost`, when another Vite server is bound on IPv6 loopback. Dismiss the first-launch notification prompt and confirm the live new-chat UI loads.
 
 Record to `validation-artifacts/ios-phone.mov` in one terminal, perform the gesture in Simulator, and press Ctrl-C:
 
@@ -232,8 +233,10 @@ Record to `validation-artifacts/ios-phone.mov` in one terminal, perform the gest
 cd /Users/bryan.li/Projects/omnigent/.worktrees/touch-validation
 xcrun simctl io "$IOS_UDID" recordVideo --codec=h264 validation-artifacts/ios-phone.mov
 ffmpeg -v error -i validation-artifacts/ios-phone.mov -f null -
-ffprobe -v error -show_entries format=duration,size -of default=noprint_wrappers=1 validation-artifacts/ios-phone.mov
+ffprobe -v error -show_entries stream=width,height,codec_name -show_entries format=duration,size -of default=noprint_wrappers=1 validation-artifacts/ios-phone.mov
 ```
+
+The checked-in smoke proof is `validation-artifacts/ios-phone.mov` (10.147 seconds, H.264, 1206x2622). `validation-artifacts/ios-phone-loaded.png` proves the integration new-chat UI loaded in the shell. At the iPhone's below-`md` viewport, desktop resize seams are intentionally absent; use the touch/adjacent-scroll gesture as the iOS transport smoke and validate the actual seams on the unfolded foldable and tablet.
 
 ## Per-PR touch checks
 
@@ -302,9 +305,9 @@ Make one recording per form factor. A complete demo may use several sessions or 
 ### iOS phone checklist
 
 - Show the below-`md` iPhone layout and live web UI inside the native shell.
-- Touch-drag every seam the phone layout exposes; show desktop-only seams remain absent for drawer-style surfaces.
-- Adjacent-scroll beside each exposed seam without resizing, including the transcript scrollbar seam.
-- Demonstrate second-finger-ignored, cancellation recovery, and breakpoint-correct layout after rotation.
+- Show that all five desktop seams (sidebar edge, right panel, inline rail, comments gutter, and terminals column) are absent or drawer-style at the below-`md` viewport; they are not iPhone drag targets.
+- Adjacent-scroll on each corresponding mobile surface without an accidental resize, including the transcript scrollbar area.
+- If a seam becomes exposed after landscape rotation reaches `md`, drag it and demonstrate second-finger-ignored plus cancellation recovery; otherwise record these as not applicable and demonstrate them on foldable/tablet.
 - Exercise iOS navigation/back behavior with an open drawer/modal and confirm the topmost surface dismisses first.
 
 For adb-driven smoke motion, run `adb shell input swipe START_X START_Y END_X END_Y 900` while `screenrecord` is active. This proves the transport/recording pipeline only; it does not replace the multi-touch human checks above.

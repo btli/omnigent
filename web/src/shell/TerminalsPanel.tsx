@@ -196,8 +196,17 @@ export function TerminalsPanel({
           Desktop: flex-row — list on left, xterm on right. */}
         <div
           ref={splitRef as React.RefObject<HTMLDivElement>}
-          className="flex min-h-0 flex-1 flex-col md:flex-row overflow-hidden"
+          className="relative flex min-h-0 flex-1 flex-col overflow-hidden md:flex-row"
         >
+          {/* Keep the divider outside the vertically scrolling list so its
+              touch target cannot create horizontal overflow. */}
+          {activeTerminal && isDesktop && (
+            <div
+              {...columnHandleProps}
+              style={{ ...columnHandleProps.style, left: listWidth }}
+              className="absolute inset-y-0 z-10 w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50"
+            />
+          )}
           {/* List panel */}
           <div
             className={cn(
@@ -207,13 +216,6 @@ export function TerminalsPanel({
             // Width only meaningful on desktop (horizontal split).
             style={activeTerminal && isDesktop ? { width: listWidth } : undefined}
           >
-            {/* Column resize handle — desktop only */}
-            {activeTerminal && isDesktop && (
-              <div
-                {...columnHandleProps}
-                className="absolute inset-y-0 right-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
-              />
-            )}
             {terminals.map((t) => {
               const key = terminalTabKey(t);
               const isActive = key === activeKey;
