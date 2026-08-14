@@ -34,6 +34,7 @@ _DESKTOP_VIEWPORT: ViewportSize = {"width": 1400, "height": 900}
 # useResizableColumn defaults: initial 176, clamps [100, 480], 20px/keypress.
 _DEFAULT_WIDTH = 176
 _KEY_STEP = 20
+_MAX_WIDTH = 480
 _DRAG_TARGET_WIDTH = 256
 
 
@@ -148,6 +149,16 @@ def test_terminals_column_resizes_by_pointer_and_keyboard(
     expect(handle).to_have_attribute("aria-valuenow", str(keyboard_width))
     assert abs(_list_panel_width(page) - keyboard_width) < 2
 
+    # Clamp: enough presses to overshoot maxWidth (480) pin the width there;
+    # one more press must not push past it.
+    for _ in range((_MAX_WIDTH - keyboard_width) // _KEY_STEP + 2):
+        page.keyboard.press("ArrowRight")
+    expect(handle).to_have_attribute("aria-valuenow", str(_MAX_WIDTH))
+    page.keyboard.press("ArrowRight")
+    expect(handle).to_have_attribute("aria-valuenow", str(_MAX_WIDTH))
+    assert abs(_list_panel_width(page) - _MAX_WIDTH) < 2
+    keyboard_width = _MAX_WIDTH
+
     # --- Negative: interacting with the list next to the handle must not
     # resize. Tapping the ``aux`` row (its center, well clear of the handle's
     # invisible hit pad at the column boundary) selects that shell...
@@ -155,7 +166,9 @@ def test_terminals_column_resizes_by_pointer_and_keyboard(
     aux_row = panel.get_by_role("button").filter(has_text="aux").filter(has_text="zsh")
     expect(aux_row.first).to_be_visible()
     aux_row.first.click()
-    expect(aux_row.first).to_have_class(re.compile("bg-accent"))  # now active
+    # Anchored: the inactive row carries hover:bg-accent/60, which a bare
+    # "bg-accent" substring would also match.
+    expect(aux_row.first).to_have_class(re.compile(r"(?:^|\s)bg-accent(?:\s|$)"))
 
     # ...and a wheel scroll over the list is plain scrolling, not a resize.
     row_box = aux_row.first.bounding_box()
