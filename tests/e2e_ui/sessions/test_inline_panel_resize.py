@@ -95,9 +95,23 @@ def test_touch_resize_persists_without_stealing_transcript_scroll(
         arg=resized_width,
     )
 
-    # Start a scroll beside the six-pixel gutter sliver, not on the resize hit area.
     transcript_box = page.get_by_role("log").bounding_box()
     assert transcript_box is not None
+    # The 8px hit test catches a widened gutter without dragging the scrollbar
+    # thumb; the 16px gesture separately proves transcript scrolling stays owned.
+    hit = page.evaluate(
+        """([x, y]) => {
+          const target = document.elementFromPoint(x, y);
+          return {
+            isGutter: target?.closest('[data-workspace-panel-resize-gutter]') !== null,
+            touchAction: target ? getComputedStyle(target).touchAction : null,
+          };
+        }""",
+        arg=[transcript_box["x"] + transcript_box["width"] - 8, transcript_box["y"] + 400],
+    )
+    assert hit["isGutter"] is False
+    assert hit["touchAction"] != "none"
+
     scroll_top = page.evaluate(
         """() => {
           const log = document.querySelector('[role="log"]');
