@@ -34,12 +34,30 @@ def test_workspace_panel_pointer_resize_persists_without_annexing_chat(
     resized_width = panel.bounding_box()["width"]
     assert resized_width >= initial_width + 70
 
-    chat = page.locator("main").first
-    chat_box = chat.bounding_box()
-    page.mouse.move(chat_box["x"] + chat_box["width"] / 2, chat_box["y"] + 200)
-    page.mouse.wheel(0, 200)
-    page.mouse.click(chat_box["x"] + chat_box["width"] / 2, chat_box["y"] + 200)
-    expect(panel).to_have_js_property("offsetWidth", round(resized_width))
+    panel_box = panel.bounding_box()
+    probe_x = panel_box["x"] - 8
+    probe_y = panel_box["y"] + panel_box["height"] / 2
+    assert panel.evaluate(
+        """(panel, point) => {
+            const target = document.elementFromPoint(point.x, point.y);
+            if (!target || panel.contains(target) || target.closest('[role="separator"]')) {
+                return false;
+            }
+            target.addEventListener(
+                'pointerdown',
+                () => document.documentElement.dataset.resizeProbeReceived = 'true',
+                { once: true },
+            );
+            return true;
+        }""",
+        {"x": probe_x, "y": probe_y},
+    )
+    page.mouse.move(probe_x, probe_y)
+    page.mouse.down()
+    page.mouse.move(probe_x - 12, probe_y, steps=2)
+    page.mouse.up()
+    expect(page.locator("html")).to_have_attribute("data-resize-probe-received", "true")
+    assert abs(panel.bounding_box()["width"] - resized_width) <= 1
 
     page.reload()
     _open_execution_logs_panel(page)
