@@ -4,6 +4,7 @@ import android.net.Uri
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -15,6 +16,11 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class OmnigentWebViewHttpErrorTest {
+    @Test
+    fun `ERR_ABORTED does not classify a rendered page as failed`() {
+        assertFalse(isBlockingLoadError(WebViewClient.ERROR_UNKNOWN, "net::ERR_ABORTED"))
+    }
+
     @Test
     fun `main frame HTTP errors fail persistence without becoming load errors`() {
         val webView = WebView(ApplicationProvider.getApplicationContext())
