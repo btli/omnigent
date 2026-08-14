@@ -1,0 +1,151 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# ArgoCD-ready overlay for the kubernetes sandbox provider. Layers sync-wave
+# annotations onto sandbox-runners so ArgoCD applies resources in dependency
+# order: namespaces first, then RBAC, then config + the server Deployment.
+
+resources:
+  - ../sandbox-runners
+
+# Sync-wave ordering: ArgoCD applies lower waves first and waits for health
+# before proceeding. This prevents transient failures (SA not yet created when
+# the Deployment rolls out, RoleBinding targeting a missing namespace, etc.).
+patches:
+  # ── Wave 0: namespaces ──
+  - target:
+      kind: Namespace
+      name: omnigent
+    patch: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: omnigent
+        annotations:
+          argocd.argoproj.io/sync-wave: "0"
+  - target:
+      kind: Namespace
+      name: omnigent-sandboxes
+    patch: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: omnigent-sandboxes
+        annotations:
+          argocd.argoproj.io/sync-wave: "0"
+
+  # ── Wave 1: ServiceAccounts + RBAC ──
+  - target:
+      kind: ServiceAccount
+      name: omnigent-server
+    patch: |
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: omnigent-server
+        annotations:
+          argocd.argoproj.io/sync-wave: "1"
+  - target:
+      kind: ServiceAccount
+      name: omnigent-runner
+    patch: |
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: omnigent-runner
+        annotations:
+          argocd.argoproj.io/sync-wave: "1"
+  - target:
+      kind: Role
+      name: omnigent-sandbox-manager
+    patch: |
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: Role
+      metadata:
+        name: omnigent-sandbox-manager
+        annotations:
+          argocd.argoproj.io/sync-wave: "1"
+  - target:
+      kind: RoleBinding
+      name: omnigent-sandbox-manager
+    patch: |
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: omnigent-sandbox-manager
+        annotations:
+          argocd.argoproj.io/sync-wave: "1"
+
+  # ── Wave 2: PVC, ConfigMaps, Secrets, Service ──
+  - target:
+      kind: PersistentVolumeClaim
+      name: omnigent-artifacts
+    patch: |
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: omnigent-artifacts
+        annotations:
+          argocd.argoproj.io/sync-wave: "2"
+  - target:
+      kind: ConfigMap
+      name: omnigent-config
+    patch: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: omnigent-config
+        annotations:
+          argocd.argoproj.io/sync-wave: "2"
+  - target:
+      kind: ConfigMap
+      name: omnigent-sandbox-config
+    patch: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: omnigent-sandbox-config
+        annotations:
+          argocd.argoproj.io/sync-wave: "2"
+  - target:
+      kind: Secret
+      name: omnigent-secrets
+    patch: |
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: omnigent-secrets
+        annotations:
+          argocd.argoproj.io/sync-wave: "2"
+  - target:
+      kind: Service
+      name: omnigent
+    patch: |
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: omnigent
+        annotations:
+          argocd.argoproj.io/sync-wave: "2"
+  - target:
+      kind: Ingress
+      name: omnigent
+    patch: |
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: omnigent
+        annotations:
+          argocd.argoproj.io/sync-wave: "2"
+
+  # ── Wave 3: Deployment (needs SA, config, PVC) ──
+  - target:
+      kind: Deployment
+      name: omnigent
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: omnigent
+        annotations:
+          argocd.argoproj.io/sync-wave: "3"

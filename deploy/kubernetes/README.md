@@ -270,6 +270,27 @@ kubectl apply -k deploy/kubernetes/overlays/sandbox-runners
 Both are detailed in
 [`overlays/sandbox-runners/README.md`](overlays/sandbox-runners/README.md#server-auth-managed-hosts).
 
+## Deploy with ArgoCD
+
+The `overlays/argocd/` overlay layers sync-wave annotations onto `sandbox-runners`
+so ArgoCD applies resources in dependency order (namespaces → RBAC → config →
+Deployment). ArgoCD renders Kustomize natively — no plugin or Helm chart needed.
+
+```bash
+# Edit application.yaml — set repoURL/targetRevision to your fork, then:
+kubectl apply -f deploy/kubernetes/overlays/argocd/application.yaml
+
+# Create the harness-credentials Secret out of band (see sandbox-runners README):
+kubectl create secret generic omnigent-creds -n omnigent-sandboxes \
+  --from-literal=ANTHROPIC_API_KEY=sk-ant-... \
+  --from-literal=OPENAI_API_KEY=sk-...
+```
+
+For production, manage `omnigent-creds` with
+[sealed-secrets](https://github.com/bitnami-labs/sealed-secrets) or
+[external-secrets](https://external-secrets.io/). See
+[`overlays/argocd/README.md`](overlays/argocd/README.md) for the full guide.
+
 ## Verify the deployment
 
 Check the rollout and reach the server without a public domain:

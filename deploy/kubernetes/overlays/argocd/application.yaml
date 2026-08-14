@@ -1,0 +1,47 @@
+---
+# Sample ArgoCD Application CR for deploying Omnigent with the kubernetes
+# sandbox provider. Apply this to the namespace where ArgoCD runs (typically
+# `argocd`). Adjust repoURL and targetRevision to match your fork/branch.
+#
+# This Application points at the argocd overlay, which layers sync-wave
+# ordering onto the sandbox-runners overlay. ArgoCD renders the Kustomize
+# output natively — no Helm chart or plugin needed.
+#
+# The harness-credentials Secret (omnigent-creds) is NOT managed by this
+# Application — create it out of band or use sealed-secrets / external-secrets
+# (see README.md).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: omnigent
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    # Point at your fork or the upstream repo.
+    repoURL: https://github.com/omnigent-ai/omnigent.git
+    targetRevision: HEAD
+    path: deploy/kubernetes/overlays/argocd
+  destination:
+    # The overlay's resources set their own namespaces explicitly (omnigent and
+    # omnigent-sandboxes), so the Application destination namespace is not
+    # injected — it only tells ArgoCD which cluster to target.
+    server: https://kubernetes.default.svc
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      # Required: the overlay creates two namespaces (omnigent, omnigent-sandboxes),
+      # and ArgoCD must be allowed to create them.
+      - CreateNamespace=true
+      # Respect the sync-wave annotations so resources deploy in order.
+      - RespectIgnoreDifferences=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m
