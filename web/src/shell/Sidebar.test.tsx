@@ -211,13 +211,13 @@ function mockConversations(convs: Conversation[]) {
   useConvMock.mockImplementation(() => result(convs));
 }
 
-function renderSidebar(open = true, initialEntry = "/", onOpenSearch?: () => void) {
+function renderSidebar(open = true, initialEntry = "/", onOpenSearch?: () => void, peek = false) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
       <TooltipProvider>
         <MemoryRouter initialEntries={[initialEntry]}>
-          <Sidebar open={open} onClose={vi.fn()} onOpenSearch={onOpenSearch} />
+          <Sidebar open={open} peek={peek} onClose={vi.fn()} onOpenSearch={onOpenSearch} />
         </MemoryRouter>
       </TooltipProvider>
     </QueryClientProvider>,
@@ -280,7 +280,7 @@ function seedPins(ids: string[]) {
 afterEach(cleanup);
 
 describe("Sidebar resize handle geometry", () => {
-  it("keeps the chat-side hit pad outside the clipped content region", () => {
+  it("renders a dedicated seam gutter outside the clipped content region", () => {
     mockConversations([]);
     renderSidebar();
 
@@ -290,19 +290,26 @@ describe("Sidebar resize handle geometry", () => {
 
     expect(handle.parentElement).toBe(sidebar);
     expect(clippedContent.parentElement).toBe(sidebar);
+    expect(sidebar).toHaveClass("md:flex-row");
     expect(sidebar).not.toHaveClass("md:overflow-hidden");
     expect(clippedContent).toHaveClass("md:overflow-hidden");
+    expect(handle).toHaveClass("relative", "shrink-0", "md:order-2");
+    expect(clippedContent).toHaveClass("md:order-1");
   });
 
-  it("limits fine-pointer row intrusion while preserving the outward grab area", () => {
+  it("caps transcript annexation at 10px while keeping a real gutter footprint", () => {
     mockConversations([conv("edge-session", "Claude Code")]);
     renderSidebar();
 
     const handle = screen.getByTestId("sidebar-resize-handle");
-    expect(handle.style.paddingInlineStart).toBe("4px");
-    expect(handle.style.paddingInlineEnd).toBe("16px");
-    expect(handle.style.marginInlineStart).toBe("-4px");
-    expect(handle.style.marginInlineEnd).toBe("-16px");
+    expect(handle.style.paddingInlineStart).toBe("9px");
+    expect(handle.style.paddingInlineEnd).toBe("11px");
+    expect(handle.style.marginInlineStart).toBe("-8px");
+    expect(handle.style.marginInlineEnd).toBe("-10px");
+    // -8 + 9 + 4 + 11 - 10 = 6px reserved flex footprint; only the
+    // 10px negative end margin can overlap the adjacent transcript.
+    expect(-8 + 9 + 4 + 11 - 10).toBe(6);
+    expect(Math.abs(Number.parseInt(handle.style.marginInlineEnd, 10))).toBeLessThanOrEqual(10);
     expect(screen.getByText("edge-session")).not.toBe(handle);
   });
 
@@ -312,20 +319,30 @@ describe("Sidebar resize handle geometry", () => {
 
     const handle = screen.getByTestId("sidebar-resize-handle");
     expect(handle).toHaveClass(
-      "absolute",
-      "inset-y-0",
-      "right-0",
+      "relative",
       "z-10",
       "hidden",
       "w-1",
+      "shrink-0",
       "cursor-col-resize",
       "transition-colors",
       "hover:bg-primary/30",
       "active:bg-primary/50",
+      "md:order-2",
       "md:block",
     );
+    expect(handle).not.toHaveClass("absolute", "inset-y-0", "right-0");
     expect(handle.style.width).toBe("");
     expect(handle.style.backgroundClip).toBe("content-box");
+  });
+
+  it("restores desktop overflow clipping for the rounded peek card", () => {
+    mockConversations([]);
+    renderSidebar(false, "/", undefined, true);
+
+    const sidebar = screen.getByLabelText("Conversations");
+    expect(sidebar).toHaveClass("is-peek", "rounded-xl", "md:overflow-hidden");
+    expect(screen.queryByTestId("sidebar-resize-handle")).toBeNull();
   });
 });
 

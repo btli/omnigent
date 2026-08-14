@@ -19,8 +19,11 @@ import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSi
 const DEFAULT_WIDTH_PX = 320;
 const MIN_WIDTH_PX = 220;
 const MAX_WIDTH_RATIO = 0.5;
-const COARSE_HANDLE_PAD_PX = { inward: 8, outward: 32 }; // 8 + 4 + 32 = 44px
-const FINE_HANDLE_PAD_PX = { inward: 4, outward: 16 }; // 4 + 4 + 16 = 24px
+const PAINTED_STRIP_PX = 4; // must match the handle's `w-1` class
+const COARSE_GUTTER_PX = 8;
+const FINE_GUTTER_PX = 6;
+const INWARD_SLIVER_PX = 8;
+const OUTWARD_SLIVER_PX = 10;
 
 function hasCoarsePrimaryPointer(): boolean {
   return (
@@ -28,6 +31,20 @@ function hasCoarsePrimaryPointer(): boolean {
     typeof window.matchMedia === "function" &&
     window.matchMedia("(pointer: coarse)").matches
   );
+}
+
+function gutterStyle(coarsePointer: boolean): React.CSSProperties {
+  const gutter = coarsePointer ? COARSE_GUTTER_PX : FINE_GUTTER_PX;
+  const inset = (gutter - PAINTED_STRIP_PX) / 2;
+  return {
+    touchAction: "none",
+    boxSizing: "content-box",
+    paddingInlineStart: INWARD_SLIVER_PX + inset,
+    paddingInlineEnd: OUTWARD_SLIVER_PX + inset,
+    marginInlineStart: -INWARD_SLIVER_PX,
+    marginInlineEnd: -OUTWARD_SLIVER_PX,
+    backgroundClip: "content-box",
+  };
 }
 
 function clamp(w: number): number {
@@ -230,8 +247,6 @@ export function useResizableSidebar() {
 
   useEffect(() => () => finishDrag(false), [finishDrag]);
 
-  const handlePad = coarsePointer ? COARSE_HANDLE_PAD_PX : FINE_HANDLE_PAD_PX;
-
   return {
     /** Current sidebar width in px (already viewport-clamped). */
     width,
@@ -246,15 +261,7 @@ export function useResizableSidebar() {
       "aria-orientation": "vertical" as const,
       "aria-label": "Resize sidebar",
       tabIndex: 0,
-      style: {
-        touchAction: "none",
-        boxSizing: "content-box" as const,
-        paddingInlineStart: handlePad.inward,
-        paddingInlineEnd: handlePad.outward,
-        marginInlineStart: -handlePad.inward,
-        marginInlineEnd: -handlePad.outward,
-        backgroundClip: "content-box",
-      },
+      style: gutterStyle(coarsePointer),
     },
   };
 }
