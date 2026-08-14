@@ -9,6 +9,8 @@
 
 import { useSyncExternalStore } from "react";
 
+import { subscribeMatchMedia } from "@/lib/breakpoints";
+
 export interface InputCapabilities {
   /** Primary pointer is coarse — `(pointer: coarse)`. */
   coarsePrimary: boolean;
@@ -42,7 +44,7 @@ function read(): InputCapabilities {
     coarsePrimary: coarse,
     anyCoarse,
     hoverPrimary: hover,
-    hasTouch: typeof navigator !== "undefined" && navigator.maxTouchPoints > 0,
+    hasTouch: navigator.maxTouchPoints > 0,
   };
 }
 
@@ -64,12 +66,7 @@ function getSnapshot(): InputCapabilities {
 }
 
 function subscribe(callback: () => void): () => void {
-  if (typeof window === "undefined" || !window.matchMedia) return () => {};
-  const lists = CAPABILITY_QUERIES.map((q) => window.matchMedia(q));
-  for (const mql of lists) mql.addEventListener("change", callback);
-  return () => {
-    for (const mql of lists) mql.removeEventListener("change", callback);
-  };
+  return subscribeMatchMedia(CAPABILITY_QUERIES, callback);
 }
 
 /**

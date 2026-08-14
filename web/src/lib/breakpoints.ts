@@ -10,16 +10,26 @@
 export const MD_BREAKPOINT_PX = 768;
 
 /** `(min-width: …)` media query — matches Tailwind's `md:` variant. */
-export function minWidthQuery(px: number = MD_BREAKPOINT_PX): string {
-  return `(min-width: ${px}px)`;
-}
+export const MD_MIN_WIDTH_QUERY = `(min-width: ${MD_BREAKPOINT_PX}px)`;
 
 /**
  * `(max-width: …)` media query — matches Tailwind's `max-md:` variant, whose
  * upper bound is exclusive (768 - 0.02 = 767.98px).
  */
-export function maxWidthQuery(px: number = MD_BREAKPOINT_PX): string {
-  return `(max-width: ${px - 0.02}px)`;
+export const MD_MAX_WIDTH_QUERY = `(max-width: ${MD_BREAKPOINT_PX - 0.02}px)`;
+
+/**
+ * Subscribe to change events on a set of media queries. SSR-safe (no-op
+ * teardown when matchMedia is unavailable). Returns the unsubscribe function
+ * expected by `useSyncExternalStore` subscribe callbacks.
+ */
+export function subscribeMatchMedia(queries: readonly string[], callback: () => void): () => void {
+  if (typeof window === "undefined" || !window.matchMedia) return () => {};
+  const lists = queries.map((q) => window.matchMedia(q));
+  for (const mql of lists) mql.addEventListener("change", callback);
+  return () => {
+    for (const mql of lists) mql.removeEventListener("change", callback);
+  };
 }
 
 /**
@@ -30,7 +40,7 @@ export function maxWidthQuery(px: number = MD_BREAKPOINT_PX): string {
  */
 export function isMobileViewport(): boolean {
   if (typeof window === "undefined" || !window.matchMedia) return false;
-  return !window.matchMedia(minWidthQuery()).matches;
+  return !window.matchMedia(MD_MIN_WIDTH_QUERY).matches;
 }
 
 declare global {

@@ -16,9 +16,6 @@ function installMatchMedia(state: Record<string, boolean>) {
         return state[query] ?? false;
       },
       media: query,
-      onchange: null,
-      addListener: () => {},
-      removeListener: () => {},
       addEventListener: (_: string, cb: () => void) => {
         if (!listeners.has(query)) listeners.set(query, new Set());
         listeners.get(query)!.add(cb);
@@ -26,7 +23,6 @@ function installMatchMedia(state: Record<string, boolean>) {
       removeEventListener: (_: string, cb: () => void) => {
         listeners.get(query)?.delete(cb);
       },
-      dispatchEvent: () => false,
     })),
   });
   return {

@@ -8,22 +8,15 @@
 
 import { useSyncExternalStore } from "react";
 
-import { maxWidthQuery } from "@/lib/breakpoints";
-
-// Mirror Tailwind's `max-md` variant exactly so this hook stays in lockstep
-// with the `max-md:` / `md:` classes already used across the shell.
-const MOBILE_QUERY = maxWidthQuery();
+import { MD_MAX_WIDTH_QUERY, subscribeMatchMedia } from "@/lib/breakpoints";
 
 function subscribe(callback: () => void): () => void {
-  if (typeof window === "undefined" || !window.matchMedia) return () => {};
-  const mql = window.matchMedia(MOBILE_QUERY);
-  mql.addEventListener("change", callback);
-  return () => mql.removeEventListener("change", callback);
+  return subscribeMatchMedia([MD_MAX_WIDTH_QUERY], callback);
 }
 
 function getSnapshot(): boolean {
   if (typeof window === "undefined" || !window.matchMedia) return false;
-  return window.matchMedia(MOBILE_QUERY).matches;
+  return window.matchMedia(MD_MAX_WIDTH_QUERY).matches;
 }
 
 /**
