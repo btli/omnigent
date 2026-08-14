@@ -8,15 +8,16 @@
 
 import { useSyncExternalStore } from "react";
 
-import { MD_MAX_WIDTH_QUERY, subscribeMatchMedia } from "@/lib/breakpoints";
+import { MD_MAX_WIDTH_QUERY, isMobileViewport, subscribeMatchMedia } from "@/lib/breakpoints";
 
 function subscribe(callback: () => void): () => void {
   return subscribeMatchMedia([MD_MAX_WIDTH_QUERY], callback);
 }
 
+// One canonical predicate: the snapshot IS the imperative helper, so the
+// reactive and point-in-time answers can never diverge.
 function getSnapshot(): boolean {
-  if (typeof window === "undefined" || !window.matchMedia) return false;
-  return window.matchMedia(MD_MAX_WIDTH_QUERY).matches;
+  return isMobileViewport();
 }
 
 /**

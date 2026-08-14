@@ -1459,6 +1459,31 @@ describe("Composer reply-quote focus", () => {
     expect(document.activeElement).toBe(ta);
   });
 
+  // The mobile boundary is the canonical md query (max-width: 767.98px), not
+  // the historical bespoke 767px — 767.5px sits between the two, so this test
+  // pins the migrated boundary: suppression must apply there.
+  it("suppresses mount autofocus at 767.5px (below the canonical md boundary)", () => {
+    const original = window.matchMedia;
+    Object.defineProperty(window, "matchMedia", {
+      writable: true,
+      configurable: true,
+      value: (query: string) => ({
+        // Simulate a 767.5px-wide viewport: only (max-width: 767.98px)
+        // matches; (min-width: 768px) and friends do not.
+        matches: query === "(max-width: 767.98px)",
+        media: query,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      }),
+    });
+    try {
+      render(<Composer {...composerProps()} />);
+      expect(document.activeElement).not.toBe(textarea());
+    } finally {
+      window.matchMedia = original;
+    }
+  });
+
   it("does not steal focus when a quote is removed", () => {
     // Removing a chip (the X button) shrinks the count — the effect only
     // fires when the count grows, so focus must stay put.

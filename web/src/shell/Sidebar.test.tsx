@@ -1385,27 +1385,43 @@ describe("Sidebar project sections", () => {
   });
 
   it("closes the mobile overlay when the project pencil is tapped", () => {
-    // jsdom's matchMedia mock reports non-desktop, so isMobileViewport() is
-    // true: a plain pencil tap must close the full-screen sidebar overlay,
-    // otherwise the pre-filed new-session page is left hidden behind it.
+    // Pin a mobile-width viewport (the canonical max-md query matches) so
+    // isMobileViewport() is true: a plain pencil tap must close the
+    // full-screen sidebar overlay, otherwise the pre-filed new-session page
+    // is left hidden behind it.
+    const originalMatchMedia = window.matchMedia;
+    Object.defineProperty(window, "matchMedia", {
+      writable: true,
+      configurable: true,
+      value: (query: string) => ({
+        matches: query === "(max-width: 767.98px)",
+        media: query,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      }),
+    });
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
     ]);
     const onClose = vi.fn();
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    render(
-      <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/"]}>
-            <Sidebar open onClose={onClose} />
-          </MemoryRouter>
-        </TooltipProvider>
-      </QueryClientProvider>,
-    );
+    try {
+      render(
+        <QueryClientProvider client={qc}>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/"]}>
+              <Sidebar open onClose={onClose} />
+            </MemoryRouter>
+          </TooltipProvider>
+        </QueryClientProvider>,
+      );
 
-    fireEvent.click(screen.getByTestId("project-new-session").closest("a")!);
-    expect(onClose).toHaveBeenCalled();
+      fireEvent.click(screen.getByTestId("project-new-session").closest("a")!);
+      expect(onClose).toHaveBeenCalled();
+    } finally {
+      window.matchMedia = originalMatchMedia;
+    }
   });
 
   it("starts a project folder collapsed with its rows hidden", () => {

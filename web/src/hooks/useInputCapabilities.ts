@@ -18,7 +18,11 @@ export interface InputCapabilities {
   anyCoarse: boolean;
   /** Primary pointer can hover — `(hover: hover)`. */
   hoverPrimary: boolean;
-  /** A touch digitizer is present — `navigator.maxTouchPoints > 0`. */
+  /**
+   * A touch digitizer is present — `navigator.maxTouchPoints > 0`. Re-read
+   * only when a capability media query fires; a digitizer change that flips
+   * no query is not observed (accepted point-in-time limitation).
+   */
   hasTouch: boolean;
 }
 

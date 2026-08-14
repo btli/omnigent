@@ -35,12 +35,14 @@ export function subscribeMatchMedia(queries: readonly string[], callback: () => 
 /**
  * True on mobile viewports (below the `md` breakpoint). Non-reactive
  * point-in-time check for event handlers; components that must re-render on
- * breakpoint crossings use `useIsMobileViewport` instead. SSR-safe (returns
- * false when window is undefined).
+ * breakpoint crossings use `useIsMobileViewport` instead — both evaluate the
+ * SAME `MD_MAX_WIDTH_QUERY`, so they can never disagree, even at fractional
+ * widths inside the (767.98, 768) sliver where max-md and min-width:768 both
+ * fail to match. SSR-safe (returns false when window is undefined).
  */
 export function isMobileViewport(): boolean {
   if (typeof window === "undefined" || !window.matchMedia) return false;
-  return !window.matchMedia(MD_MIN_WIDTH_QUERY).matches;
+  return window.matchMedia(MD_MAX_WIDTH_QUERY).matches;
 }
 
 declare global {

@@ -4628,6 +4628,9 @@ export function Composer({
   // On mobile, programmatic focus immediately summons the software keyboard.
   // Keep desktop's fast-type affordance, but let mobile users explicitly tap
   // the composer when switching back from Terminal or changing sessions.
+  // "Mobile" is deliberately the canonical md query (max-width: 767.98px),
+  // so the keyboard-suppression boundary tracks the shell's layout pivot
+  // rather than a bespoke 767px threshold.
   const isMobile = useIsMobileViewport();
   const isMobileRef = useRef(isMobile);
   isMobileRef.current = isMobile;
