@@ -2,15 +2,54 @@ import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readPanelSizePreference } from "@/lib/panelSizePreferences";
 import {
-  HANDLE_HIT_PAD_PX,
+  HANDLE_COARSE_GUTTER_PX,
+  HANDLE_FINE_GUTTER_PX,
+  HANDLE_INWARD_SLIVER_PX,
+  HANDLE_OUTWARD_SLIVER_PX,
   resetSharedWidthStoreForTesting,
   useResizablePanel,
 } from "./useResizablePanel";
 
 const originalInnerWidth = window.innerWidth;
+const originalMatchMedia = window.matchMedia;
+let desktopMatches = true;
+let coarsePointer = false;
+const desktopChangeListeners = new Set<(event: MediaQueryListEvent) => void>();
+const coarseChangeListeners = new Set<(event: MediaQueryListEvent) => void>();
 
 function setInnerWidth(px: number): void {
   Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: px });
+}
+
+function installMatchMedia(): void {
+  window.matchMedia = vi.fn((query: string) => ({
+    matches: query === "(pointer: coarse)" ? coarsePointer : desktopMatches,
+    media: query,
+    onchange: null,
+    addListener: () => {},
+    removeListener: () => {},
+    addEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => {
+      if (query === "(pointer: coarse)") coarseChangeListeners.add(listener);
+      else if (query.includes("min-width")) desktopChangeListeners.add(listener);
+    },
+    removeEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => {
+      if (query === "(pointer: coarse)") coarseChangeListeners.delete(listener);
+      else desktopChangeListeners.delete(listener);
+    },
+    dispatchEvent: () => false,
+  })) as typeof window.matchMedia;
+}
+
+function setCoarseMatch(matches: boolean): void {
+  coarsePointer = matches;
+  const event = { matches } as MediaQueryListEvent;
+  for (const listener of coarseChangeListeners) listener(event);
+}
+
+function setDesktopMatch(matches: boolean): void {
+  desktopMatches = matches;
+  const event = { matches } as MediaQueryListEvent;
+  for (const listener of desktopChangeListeners) listener(event);
 }
 
 function createPointerHandle() {
@@ -49,20 +88,22 @@ function pointerEvent(
   } as React.PointerEvent<HTMLElement>;
 }
 
-function dispatchDocumentPointer(type: "pointerup" | "pointercancel", pointerId: number): void {
-  const event = new Event(type);
-  Object.defineProperty(event, "pointerId", { value: pointerId });
-  document.dispatchEvent(event);
-}
-
 beforeEach(() => {
   setInnerWidth(2000);
+  desktopMatches = true;
+  coarsePointer = false;
+  desktopChangeListeners.clear();
+  coarseChangeListeners.clear();
+  installMatchMedia();
 });
 
 afterEach(() => {
   localStorage.clear();
   resetSharedWidthStoreForTesting();
   setInnerWidth(originalInnerWidth);
+  window.matchMedia = originalMatchMedia;
+  desktopChangeListeners.clear();
+  coarseChangeListeners.clear();
 });
 
 describe("useResizablePanel persistence", () => {
@@ -234,38 +275,25 @@ describe("useResizablePanel persistence", () => {
     expect(result.current.panelWidth).toBe(800);
   });
 
-  it("recovers when the handle unmounts mid-drag", () => {
-    const { result } = renderHook(() => useResizablePanel(true));
-    const removedHandle = createPointerHandle();
-    const nextHandle = createPointerHandle();
-    document.body.appendChild(removedHandle.element);
+  it("aborts without persisting when the hook unmounts mid-drag", () => {
+    const { result, unmount } = renderHook(() => useResizablePanel(true));
+    const handle = createPointerHandle();
 
     act(() => {
-      result.current.handleProps.onPointerDown(
-        pointerEvent(removedHandle.element, { pointerId: 4 }),
-      );
+      result.current.handleProps.onPointerDown(pointerEvent(handle.element, { pointerId: 4 }));
       result.current.handleProps.onPointerMove(
-        pointerEvent(removedHandle.element, { pointerId: 4, clientX: 1200 }),
+        pointerEvent(handle.element, { pointerId: 4, clientX: 1200 }),
       );
-      removedHandle.element.remove();
-      dispatchDocumentPointer("pointercancel", 4);
+      unmount();
     });
 
-    expect(result.current.panelWidth).toBe(800);
     expect(readPanelSizePreference("pushPanelWidthPx")).toBeNull();
     expect(document.body.style.cursor).toBe("");
     expect(document.body.style.userSelect).toBe("");
-
-    act(() => {
-      result.current.handleProps.onPointerDown(pointerEvent(nextHandle.element, { pointerId: 5 }));
-    });
-    expect(nextHandle.setPointerCapture).toHaveBeenCalledWith(5);
   });
 
-  it("aborts when the desktop/open gate flips during a drag", () => {
-    const { result, rerender } = renderHook(({ open }) => useResizablePanel(open), {
-      initialProps: { open: true },
-    });
+  it("aborts when the desktop media query flips during a drag", () => {
+    const { result } = renderHook(() => useResizablePanel(true));
     const handle = createPointerHandle();
 
     act(() => {
@@ -274,8 +302,9 @@ describe("useResizablePanel persistence", () => {
         pointerEvent(handle.element, { pointerId: 6, clientX: 1200 }),
       );
     });
-    rerender({ open: false });
+    act(() => setDesktopMatch(false));
 
+    expect(result.current.isDesktop).toBe(false);
     expect(readPanelSizePreference("pushPanelWidthPx")).toBeNull();
     expect(document.body.style.cursor).toBe("");
     expect(document.body.style.userSelect).toBe("");
@@ -305,16 +334,49 @@ describe("useResizablePanel persistence", () => {
     expect(result.current.panelWidth).toBe(1000);
   });
 
-  it("returns touch-action and a 44px cross-axis hit target", () => {
+  it.each([
+    ["fine", false, HANDLE_FINE_GUTTER_PX, 24],
+    ["coarse", true, HANDLE_COARSE_GUTTER_PX, 26],
+  ] as const)("returns the budgeted %s seam gutter", (_, coarse, gutter, target) => {
+    coarsePointer = coarse;
     const { result } = renderHook(() => useResizablePanel(true));
+    const style = result.current.handleProps.style;
+    const inset = (gutter - 4) / 2;
 
-    expect(result.current.handleProps.style).toMatchObject({
+    expect(style).toMatchObject({
       touchAction: "none",
       boxSizing: "content-box",
-      paddingInline: HANDLE_HIT_PAD_PX,
-      marginInline: -HANDLE_HIT_PAD_PX,
+      paddingInlineStart: HANDLE_OUTWARD_SLIVER_PX + inset,
+      paddingInlineEnd: HANDLE_INWARD_SLIVER_PX + inset,
+      marginInlineStart: -HANDLE_OUTWARD_SLIVER_PX,
+      marginInlineEnd: -HANDLE_INWARD_SLIVER_PX,
       backgroundClip: "content-box",
     });
+    expect(4 + Number(style.paddingInlineStart) + Number(style.paddingInlineEnd)).toBe(target);
+    // The transcript scrollbar thumb occupies the 6–12px band from this seam;
+    // keep the handle out of that band so touch-scroll starts remain available.
+    expect(-Number(style.marginInlineStart)).toBeLessThanOrEqual(6);
+    // FilesPanel's toolbar uses px-2 (8px); do not annex beyond that gutter
+    // into its search control or other panel-side interactive content.
+    expect(-Number(style.marginInlineEnd)).toBeLessThanOrEqual(8);
+    expect(
+      4 +
+        Number(style.paddingInlineStart) +
+        Number(style.paddingInlineEnd) +
+        Number(style.marginInlineStart) +
+        Number(style.marginInlineEnd),
+    ).toBe(gutter);
+  });
+
+  it("updates the gutter when primary pointer coarseness changes", () => {
+    const { result } = renderHook(() => useResizablePanel(true));
+    expect(result.current.handleProps.style.marginInlineStart).toBe(-HANDLE_OUTWARD_SLIVER_PX);
+    expect(result.current.handleProps.style.paddingInlineStart).toBe(9);
+
+    act(() => setCoarseMatch(true));
+
+    expect(result.current.handleProps.style.marginInlineStart).toBe(-HANDLE_OUTWARD_SLIVER_PX);
+    expect(result.current.handleProps.style.paddingInlineStart).toBe(10);
   });
 
   it("notifies multiple mounted subscribers from the shared width store", () => {
