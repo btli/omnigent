@@ -6,10 +6,13 @@ function pointerEvent(
   pointerId: number,
   clientX = 0,
   setPointerCapture = vi.fn(),
+  { button = 0, pointerType = "touch" } = {},
 ): React.PointerEvent & { setPointerCapture: ReturnType<typeof vi.fn> } {
   return {
     pointerId,
     clientX,
+    button,
+    pointerType,
     preventDefault: vi.fn(),
     currentTarget: { setPointerCapture },
     setPointerCapture,
@@ -137,6 +140,26 @@ describe("useResizableColumn pointer dragging", () => {
     expect(result.current.width).toBe(200);
     act(() => result.current.handleProps.onPointerUp(pointerEvent(6)));
   });
+
+  it.each(["mouse", "pen"] as const)(
+    "ignores a secondary-button (%s) pointerdown entirely",
+    (pointerType) => {
+      const { result } = renderColumn(0);
+
+      // Right-click / pen barrel button (button 2) must not arm a drag,
+      // capture the pointer, or flip body styles.
+      const down = pointerEvent(11, 0, vi.fn(), { button: 2, pointerType });
+      act(() => result.current.handleProps.onPointerDown(down));
+      expect(down.setPointerCapture).not.toHaveBeenCalled();
+      expect(down.preventDefault).not.toHaveBeenCalled();
+      expect(document.body.style.cursor).toBe("");
+      expect(document.body.style.userSelect).toBe("");
+
+      // No activePointerId was published: moves from that pointer are inert.
+      act(() => result.current.handleProps.onPointerMove(pointerEvent(11, 300)));
+      expect(result.current.width).toBe(176);
+    },
+  );
 
   it("stays idle when pointer capture fails", () => {
     const { result } = renderColumn(0);

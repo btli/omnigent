@@ -48,6 +48,9 @@ export function useResizableColumn(defaultWidth = 176, minWidth = 100, maxWidth 
 
   const onPointerDown = useCallback(
     (e: React.PointerEvent) => {
+      // Only the primary button starts a drag — right-click / pen barrel
+      // button must not capture the pointer or flip body styles.
+      if (e.button !== 0) return;
       if (activePointerId.current !== null) return;
       e.preventDefault();
       // Capture so moves keep arriving when the pointer leaves the handle (or
