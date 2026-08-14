@@ -11,6 +11,8 @@ import android.view.ViewGroup
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebView
 import android.widget.TextView
+import android.widget.Button
+import android.widget.EditText
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
@@ -31,6 +33,17 @@ import java.time.Duration
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class MainActivityTest {
+    @Test
+    fun `connect activity marks its handoff as an explicit server change`() {
+        val activity = Robolectric.buildActivity(ConnectActivity::class.java).setup().get()
+        activity.findViewById<EditText>(R.id.server_url).setText("https://new.example")
+
+        activity.findViewById<Button>(R.id.connect).performClick()
+
+        val intent = shadowOf(activity).nextStartedActivity
+        assertTrue(intent.getBooleanExtra(ConnectActivity.EXTRA_SERVER_CHANGED, false))
+    }
+
     @Test
     fun `webview leaves algorithmic darkening disabled`() {
         testStore().connect("https://example.com")

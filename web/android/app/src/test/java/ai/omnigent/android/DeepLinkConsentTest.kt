@@ -68,7 +68,7 @@ class DeepLinkConsentTest {
     }
 
     @Test
-    fun `consent open whose load fails never persists the server`() {
+    fun `consent open persists after a failed load is retried successfully`() {
         val activity = launchWithLink("omnigent://new.example/c/$hex")
         latestDialog().getButton(DialogInterface.BUTTON_POSITIVE).performClick()
         idle()
@@ -84,16 +84,17 @@ class DeepLinkConsentTest {
         assertEquals("https://current.example", store().currentServerUrl())
         assertFalse(store().recentServers().any { it.contains("new.example") })
         assertEquals("/c/$hex", activity.privateField("pendingNavigatePath"))
-        assertNull(activity.privateField("pendingPersistUrl"))
+        assertEquals("https://new.example", activity.privateField("pendingPersistUrl"))
         assertFalse(activity.privateField("pageLoaded") as Boolean)
 
         activity.invokeOnPageReady("https://new.example/", mainFrameLoadFailed = false)
         assertNull(activity.privateField("pendingNavigatePath"))
-        assertFalse(store().recentServers().any { it.contains("new.example") })
+        assertEquals("https://new.example", store().currentServerUrl())
+        assertTrue(store().recentServers().contains("https://new.example"))
     }
 
     @Test
-    fun `main frame HTTP error does not persist a consented server`() {
+    fun `main frame HTTP error retains activation and persistence until retry succeeds`() {
         val activity = launchWithLink("omnigent://new.example/c/$hex")
         latestDialog().getButton(DialogInterface.BUTTON_POSITIVE).performClick()
         idle()
@@ -105,7 +106,15 @@ class DeepLinkConsentTest {
 
         assertEquals("https://current.example", store().currentServerUrl())
         assertFalse(store().recentServers().any { it.contains("new.example") })
-        assertNull(activity.privateField("pendingPersistUrl"))
+        assertEquals("/c/$hex", activity.privateField("pendingNavigatePath"))
+        assertEquals("https://new.example", activity.privateField("pendingPersistUrl"))
+        assertTrue(activity.privateField("processingDeepLink") as Boolean)
+
+        activity.invokeOnPageReady("https://new.example/")
+
+        assertNull(activity.privateField("pendingNavigatePath"))
+        assertEquals("https://new.example", store().currentServerUrl())
+        assertFalse(activity.privateField("processingDeepLink") as Boolean)
     }
 
     @Test
@@ -134,6 +143,42 @@ class DeepLinkConsentTest {
     }
 
     @Test
+    fun `ordinary intent cannot revert a consented transition before persistence`() {
+        val controller =
+            Robolectric.buildActivity(
+                MainActivity::class.java,
+                viewIntent("omnigent://new.example/c/$hex"),
+            )
+        store().connect("https://current.example")
+        val activity = controller.setup().get()
+        latestDialog().getButton(DialogInterface.BUTTON_POSITIVE).performClick()
+        idle()
+
+        controller.newIntent(android.content.Intent())
+
+        assertEquals("https://new.example", activity.privateField("pinnedOrigin"))
+        assertEquals("https://new.example", activity.privateField("pendingPersistUrl"))
+        assertEquals("/c/$hex", activity.privateField("pendingNavigatePath"))
+    }
+
+    @Test
+    fun `ordinary intent cannot redirect a serverless consented cold start`() {
+        val controller =
+            Robolectric.buildActivity(
+                MainActivity::class.java,
+                viewIntent("omnigent://new.example/c/$hex"),
+            )
+        val activity = controller.setup().get()
+        latestDialog().getButton(DialogInterface.BUTTON_POSITIVE).performClick()
+        idle()
+
+        controller.newIntent(android.content.Intent())
+
+        assertEquals("https://new.example", activity.privateField("pinnedOrigin"))
+        assertEquals("https://new.example", shadowOf(activity.testWebView()).lastLoadedUrl)
+    }
+
+    @Test
     fun `second link waits for the first consent (FIFO)`() {
         store().connect("https://current.example")
         val controller =
@@ -152,6 +197,27 @@ class DeepLinkConsentTest {
         // First resolved -> second dequeues and asks.
         val second = ShadowDialog.getLatestDialog() as AlertDialog
         assertTrue(second !== first && second.isShowing)
+    }
+
+    @Test
+    fun `serverless decline stops queued consent work on the finishing activity`() {
+        val controller =
+            Robolectric.buildActivity(
+                MainActivity::class.java,
+                viewIntent("omnigent://first.example/c/$hex"),
+            )
+        val activity = controller.setup().get()
+        val first = latestDialog()
+        controller.newIntent(viewIntent("omnigent://second.example/c/$hex"))
+
+        first.getButton(DialogInterface.BUTTON_NEGATIVE).performClick()
+        idle()
+
+        assertTrue(activity.isFinishing)
+        assertEquals(first, ShadowDialog.getLatestDialog())
+        assertNull(activity.privateField("deepLinkDialog"))
+        assertTrue((activity.privateField("deepLinkQueue") as ArrayDeque<*>).isEmpty())
+        assertFalse(activity.privateField("processingDeepLink") as Boolean)
     }
 
     @Test

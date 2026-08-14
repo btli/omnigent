@@ -210,4 +210,5 @@ class OidcLoginManagerTest {
         // not affect the synchronous state transitions tested here.
         const val UNREACHABLE = "http://127.0.0.1:1"
     }
+
 }

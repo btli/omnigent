@@ -110,6 +110,60 @@ class DeepLinkRoutingTest {
     }
 
     @Test
+    fun `manual server switch supersedes a stale path and resumes FIFO`() {
+        store().connect("https://h.example")
+        val controller =
+            Robolectric
+                .buildActivity(
+                    MainActivity::class.java,
+                    viewIntent("omnigent://h.example/c/first-$hex"),
+                ).setup()
+        val activity = controller.get()
+        controller.newIntent(viewIntent("omnigent://next.example/c/second-$hex"))
+        store().connect("https://next.example/mount")
+
+        controller.newIntent(
+            Intent().putExtra(ConnectActivity.EXTRA_SERVER_CHANGED, true),
+        )
+
+        assertEquals("https://next.example", activity.privateField("pinnedOrigin"))
+        assertEquals("/c/second-$hex", activity.privateField("pendingNavigatePath"))
+        assertTrue(activity.privateField("processingDeepLink") as Boolean)
+
+        activity.invokeOnPageReady("https://next.example/mount")
+        assertFalse(activity.privateField("processingDeepLink") as Boolean)
+    }
+
+    @Test
+    fun `notification activation waits behind an in-flight deep link`() {
+        store().connect("https://h.example")
+        val controller =
+            Robolectric
+                .buildActivity(
+                    MainActivity::class.java,
+                    viewIntent("omnigent://h.example/c/$hex"),
+                ).setup()
+        val activity = controller.get()
+        val notificationPath = "/c/notification-$hex"
+
+        controller.newIntent(
+            Intent().putExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH, notificationPath),
+        )
+
+        assertEquals("/c/$hex", activity.privateField("pendingNavigatePath"))
+        assertEquals(
+            listOf(notificationPath),
+            (activity.privateField("pendingNotificationPaths") as ArrayDeque<*>).toList(),
+        )
+
+        activity.invokeOnPageReady("https://h.example")
+        assertTrue(
+            shadowOf(activity.testWebView()).lastEvaluatedJavascript.contains(notificationPath),
+        )
+        assertFalse(activity.privateField("processingDeepLink") as Boolean)
+    }
+
+    @Test
     fun `rejected link is ignored`() {
         store().connect("https://h.example")
         val activity =
