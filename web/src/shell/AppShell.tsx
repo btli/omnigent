@@ -80,7 +80,8 @@ import { FileViewerContext } from "./FileViewerContext";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
-import { isMobileViewport, Sidebar } from "./Sidebar";
+import { isMobileViewport } from "@/lib/breakpoints";
+import { Sidebar } from "./Sidebar";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
 import { useSettingsRoute } from "./settingsNav";
 import { SubagentsPanel } from "./SubagentsPanel";
@@ -1892,12 +1893,11 @@ export function AppShell() {
 }
 
 /**
- * Initial sidebar open state — open on desktop, closed on mobile. SSR-
- * safe (returns false when window is undefined). The threshold (`md`)
- * matches Tailwind's default 768px, used in the Sidebar's responsive
- * classes.
+ * Initial sidebar open state — open on desktop, closed on mobile, per the
+ * one canonical layout predicate ("mobile unless provably md+"). SSR-safe
+ * (returns false when window is undefined).
  */
 function initialSidebarOpen(): boolean {
   if (typeof window === "undefined") return false;
-  return window.matchMedia("(min-width: 768px)").matches;
+  return !isMobileViewport();
 }
