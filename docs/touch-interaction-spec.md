@@ -149,8 +149,10 @@ changes bindings, not the spec (TR-30).
   fire `pointercancel` before the circle bound is reached — `c21fec929`'s
   own caveat ("native pan-y still wins earlier"). The dispatcher MUST
   treat that `pointercancel` as a release to scroll; surfaces MUST NOT
-  suppress native vertical pan during the undecided phase to defeat this,
-  since TR-16(a)'s passive-listener gate forbids it. Invariants
+  suppress native vertical pan during the undecided phase to defeat this
+  — TR-28's normative `pan-y pinch-zoom` baseline for these surfaces
+  forbids that suppression via `touch-action`, and TR-16(a) separately
+  forbids the non-passive-listener equivalent. Invariants
   DOMINATE tuning ranges: a retune is legal only if it satisfies every
   invariant AND passes the device-matrix retest required by the design
   doc; the ranges are guidance, not a grant.
