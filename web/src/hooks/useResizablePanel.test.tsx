@@ -1,9 +1,11 @@
-import { act, render, renderHook, screen } from "@testing-library/react";
+import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readPanelSizePreference } from "@/lib/panelSizePreferences";
 import {
-  HANDLE_FINE_HIT_PAD_PX,
-  HANDLE_HIT_PAD_PX,
+  HANDLE_COARSE_GUTTER_PX,
+  HANDLE_FINE_GUTTER_PX,
+  HANDLE_INWARD_SLIVER_PX,
+  HANDLE_OUTWARD_SLIVER_PX,
   resetSharedWidthStoreForTesting,
   useResizablePanel,
 } from "./useResizablePanel";
@@ -13,6 +15,7 @@ const originalMatchMedia = window.matchMedia;
 let desktopMatches = true;
 let coarsePointer = false;
 const desktopChangeListeners = new Set<(event: MediaQueryListEvent) => void>();
+const coarseChangeListeners = new Set<(event: MediaQueryListEvent) => void>();
 
 function setInnerWidth(px: number): void {
   Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: px });
@@ -26,13 +29,21 @@ function installMatchMedia(): void {
     addListener: () => {},
     removeListener: () => {},
     addEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => {
-      if (query.includes("min-width")) desktopChangeListeners.add(listener);
+      if (query === "(pointer: coarse)") coarseChangeListeners.add(listener);
+      else if (query.includes("min-width")) desktopChangeListeners.add(listener);
     },
     removeEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => {
-      desktopChangeListeners.delete(listener);
+      if (query === "(pointer: coarse)") coarseChangeListeners.delete(listener);
+      else desktopChangeListeners.delete(listener);
     },
     dispatchEvent: () => false,
   })) as typeof window.matchMedia;
+}
+
+function setCoarseMatch(matches: boolean): void {
+  coarsePointer = matches;
+  const event = { matches } as MediaQueryListEvent;
+  for (const listener of coarseChangeListeners) listener(event);
 }
 
 function setDesktopMatch(matches: boolean): void {
@@ -82,6 +93,7 @@ beforeEach(() => {
   desktopMatches = true;
   coarsePointer = false;
   desktopChangeListeners.clear();
+  coarseChangeListeners.clear();
   installMatchMedia();
 });
 
@@ -91,6 +103,7 @@ afterEach(() => {
   setInnerWidth(originalInnerWidth);
   window.matchMedia = originalMatchMedia;
   desktopChangeListeners.clear();
+  coarseChangeListeners.clear();
 });
 
 describe("useResizablePanel persistence", () => {
@@ -322,50 +335,43 @@ describe("useResizablePanel persistence", () => {
   });
 
   it.each([
-    ["fine", false, HANDLE_FINE_HIT_PAD_PX, 24],
-    ["coarse", true, HANDLE_HIT_PAD_PX, 44],
-  ] as const)("returns a centered zero-footprint %s hit target", (_, coarse, pad, target) => {
+    ["fine", false, HANDLE_FINE_GUTTER_PX, 24],
+    ["coarse", true, HANDLE_COARSE_GUTTER_PX, 26],
+  ] as const)("returns the budgeted %s seam gutter", (_, coarse, gutter, target) => {
     coarsePointer = coarse;
     const { result } = renderHook(() => useResizablePanel(true));
     const style = result.current.handleProps.style;
+    const inset = (gutter - 4) / 2;
 
     expect(style).toMatchObject({
       touchAction: "none",
       boxSizing: "content-box",
-      paddingInline: pad,
-      marginInline: -(pad + 2),
+      paddingInlineStart: HANDLE_OUTWARD_SLIVER_PX + inset,
+      paddingInlineEnd: HANDLE_INWARD_SLIVER_PX + inset,
+      marginInlineStart: -HANDLE_OUTWARD_SLIVER_PX,
+      marginInlineEnd: -HANDLE_INWARD_SLIVER_PX,
       backgroundClip: "content-box",
     });
-    expect(4 + 2 * Number(style.paddingInline)).toBe(target);
-    expect(4 + 2 * Number(style.paddingInline) + 2 * Number(style.marginInline)).toBe(0);
+    expect(4 + Number(style.paddingInlineStart) + Number(style.paddingInlineEnd)).toBe(target);
+    expect(
+      4 +
+        Number(style.paddingInlineStart) +
+        Number(style.paddingInlineEnd) +
+        Number(style.marginInlineStart) +
+        Number(style.marginInlineEnd),
+    ).toBe(gutter);
   });
 
-  it.each(["FilesPanelDrawer", "FileViewer", "ExecutionLogsPanel", "TerminalsPanel"])(
-    "keeps the %s boundary handle outside the clipping panel",
-    (consumer) => {
-      const { result } = renderHook(() => useResizablePanel(true));
-      render(
-        <div className="flex" data-testid={`${consumer}-row`}>
-          <div
-            {...result.current.handleProps}
-            className="relative z-10 w-1 shrink-0 self-stretch"
-          />
-          <aside className="overflow-hidden" data-testid={`${consumer}-panel`} />
-        </div>,
-      );
+  it("updates the gutter when primary pointer coarseness changes", () => {
+    const { result } = renderHook(() => useResizablePanel(true));
+    expect(result.current.handleProps.style.marginInlineStart).toBe(-HANDLE_OUTWARD_SLIVER_PX);
+    expect(result.current.handleProps.style.paddingInlineStart).toBe(11);
 
-      const panel = screen.getByTestId(`${consumer}-panel`);
-      const handle = screen.getByRole("separator", { name: "Resize panel" });
-      expect(handle.nextElementSibling).toBe(panel);
-      expect(panel.contains(handle)).toBe(false);
-      expect(handle.closest("aside, .overflow-auto, .overflow-hidden")).toBeNull();
-      expect(handle.className).toMatch(/\bw-1\b/);
-      expect(handle.style.backgroundClip).toBe("content-box");
-      expect(
-        4 + 2 * parseFloat(handle.style.paddingInline) + 2 * parseFloat(handle.style.marginInline),
-      ).toBe(0);
-    },
-  );
+    act(() => setCoarseMatch(true));
+
+    expect(result.current.handleProps.style.marginInlineStart).toBe(-HANDLE_OUTWARD_SLIVER_PX);
+    expect(result.current.handleProps.style.paddingInlineStart).toBe(12);
+  });
 
   it("notifies multiple mounted subscribers from the shared width store", () => {
     const first = renderHook(() => useResizablePanel(true));

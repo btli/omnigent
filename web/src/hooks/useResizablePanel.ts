@@ -6,17 +6,23 @@ const MAX_WIDTH_RATIO = 0.8; // 80% of viewport
 /** Tailwind `md` breakpoint — must track the value in tailwind.config. */
 const MD_BREAKPOINT = 768;
 const PAINTED_HANDLE_WIDTH_PX = 4;
-/** Per-side padding for the preferred 44px coarse-pointer hit target. */
-export const HANDLE_HIT_PAD_PX = 20;
-/** Per-side padding for the 24px fine-pointer hit target. */
-export const HANDLE_FINE_HIT_PAD_PX = 10;
+export const HANDLE_OUTWARD_SLIVER_PX = 10;
+export const HANDLE_INWARD_SLIVER_PX = 8;
+export const HANDLE_COARSE_GUTTER_PX = 8;
+export const HANDLE_FINE_GUTTER_PX = 6;
 
-function handleHitPad(): number {
-  const isCoarse =
-    typeof window !== "undefined" &&
-    typeof window.matchMedia === "function" &&
-    window.matchMedia("(pointer: coarse)").matches;
-  return isCoarse ? HANDLE_HIT_PAD_PX : HANDLE_FINE_HIT_PAD_PX;
+function handleGutterStyle(isCoarse: boolean): React.CSSProperties {
+  const gutter = isCoarse ? HANDLE_COARSE_GUTTER_PX : HANDLE_FINE_GUTTER_PX;
+  const inset = (gutter - PAINTED_HANDLE_WIDTH_PX) / 2;
+  return {
+    touchAction: "none",
+    boxSizing: "content-box",
+    paddingInlineStart: HANDLE_OUTWARD_SLIVER_PX + inset,
+    paddingInlineEnd: HANDLE_INWARD_SLIVER_PX + inset,
+    marginInlineStart: -HANDLE_OUTWARD_SLIVER_PX,
+    marginInlineEnd: -HANDLE_INWARD_SLIVER_PX,
+    backgroundClip: "content-box",
+  };
 }
 
 /** Clamp a width value to the allowed range for the current viewport. */
@@ -115,7 +121,6 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
   const activePointerId = useRef<number | null>(null);
   const documentFallbackCleanupRef = useRef<(() => void) | null>(null);
   const overlayRef = useRef<HTMLDivElement | null>(null);
-  const hitPad = useRef(handleHitPad()).current;
   const minWidthRef = useRef(minWidthPx);
   minWidthRef.current = minWidthPx;
 
@@ -127,6 +132,18 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
   useEffect(() => {
     const mql = window.matchMedia(`(min-width: ${MD_BREAKPOINT}px)`);
     const handler = (e: MediaQueryListEvent) => setIsDesktop(e.matches);
+    mql.addEventListener("change", handler);
+    return () => mql.removeEventListener("change", handler);
+  }, []);
+
+  const [isCoarse, setIsCoarse] = useState(
+    () => typeof window !== "undefined" && !!window.matchMedia?.("(pointer: coarse)").matches,
+  );
+
+  useEffect(() => {
+    const mql = window.matchMedia?.("(pointer: coarse)");
+    if (!mql) return;
+    const handler = (e: MediaQueryListEvent) => setIsCoarse(e.matches);
     mql.addEventListener("change", handler);
     return () => mql.removeEventListener("change", handler);
   }, []);
@@ -290,13 +307,7 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
       onPointerCancel,
       onLostPointerCapture: onPointerCancel,
       onKeyDown,
-      style: {
-        touchAction: "none",
-        boxSizing: "content-box" as const,
-        paddingInline: hitPad,
-        marginInline: -(hitPad + PAINTED_HANDLE_WIDTH_PX / 2),
-        backgroundClip: "content-box",
-      },
+      style: handleGutterStyle(isCoarse),
       role: "separator" as const,
       "aria-orientation": "vertical" as const,
       "aria-label": "Resize panel",
