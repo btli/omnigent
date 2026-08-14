@@ -18,9 +18,9 @@ const GAP_PX = 8;
 // scroll containers. The painted `w-1` strip is centered in a small layout
 // gutter, with tightly bounded overhangs that avoid owning either surface.
 const PAINTED_STRIP_PX = 4;
-const COARSE_GUTTER_PX = 8;
-const FINE_GUTTER_PX = 6;
-const CHAT_SLIVER_PX = 10;
+const COARSE_GUTTER_PX = 12;
+const FINE_GUTTER_PX = 10;
+const CHAT_SLIVER_PX = 6;
 const PANEL_SLIVER_PX = 8;
 
 function gutterStyle(isCoarse: boolean): React.CSSProperties {
@@ -274,6 +274,7 @@ export function useResizableInlinePanel(
   const onPointerDown = useCallback(
     (e: React.PointerEvent<HTMLElement>) => {
       // First pointer wins; secondary buttons do not start a resize.
+      if (!enabled || resolvedWidth === 0) return;
       if (activePointerIdRef.current !== null) return;
       if (e.button !== 0) return;
       try {
@@ -287,7 +288,7 @@ export function useResizableInlinePanel(
       document.body.style.cursor = "col-resize";
       document.body.style.userSelect = "none";
     },
-    [addDragOverlay],
+    [addDragOverlay, enabled, resolvedWidth],
   );
 
   const onPointerMove = useCallback((e: React.PointerEvent<HTMLElement>) => {
@@ -336,6 +337,7 @@ export function useResizableInlinePanel(
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
+      if (!enabled || resolvedWidth === 0) return;
       const step = 20;
       if (e.key === "ArrowLeft") {
         e.preventDefault();
@@ -351,7 +353,7 @@ export function useResizableInlinePanel(
         );
       }
     },
-    [resolvedWidth],
+    [enabled, resolvedWidth],
   );
 
   useEffect(() => () => endDrag(false), [endDrag]);
@@ -369,6 +371,7 @@ export function useResizableInlinePanel(
       role: "separator" as const,
       "aria-orientation": "vertical" as const,
       "aria-label": "Resize panel",
+      "aria-disabled": !enabled || resolvedWidth === 0,
       tabIndex: 0,
     },
   };

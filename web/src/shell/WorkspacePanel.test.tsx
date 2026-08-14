@@ -677,9 +677,9 @@ describe("WorkspacePanel resize handle geometry", () => {
   const handleStyle = {
     touchAction: "none",
     boxSizing: "content-box",
-    paddingLeft: 12,
-    paddingRight: 10,
-    marginLeft: -10,
+    paddingLeft: 10,
+    paddingRight: 12,
+    marginLeft: -6,
     marginRight: -8,
     backgroundClip: "content-box",
   } as React.CSSProperties;
@@ -717,7 +717,7 @@ describe("WorkspacePanel resize handle geometry", () => {
     });
 
     const separator = screen.getByRole("separator", { name: "Resize panel" });
-    expect(Math.abs(parseFloat(separator.style.marginLeft))).toBeLessThanOrEqual(10);
+    expect(Math.abs(parseFloat(separator.style.marginLeft))).toBeLessThanOrEqual(6);
     expect(Math.abs(parseFloat(separator.style.marginRight))).toBeLessThanOrEqual(8);
 
     const filesTab = screen.getByRole("tab", { name: "Files" });
@@ -738,9 +738,23 @@ describe("WorkspacePanel resize handle geometry", () => {
 
     const separator = screen.getByRole("separator", { name: "Resize panel" });
     expect(separator.className).toBe(
-      "relative z-10 w-1 shrink-0 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors",
+      "relative z-10 hidden w-1 shrink-0 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block",
     );
     expect(separator.style.boxSizing).toBe("content-box");
     expect(separator.style.backgroundClip).toBe("content-box");
+  });
+
+  it("does not render the gutter when the hook marks it disabled", () => {
+    renderWorkspace({
+      handleProps: {
+        tabIndex: 0,
+        role: "separator",
+        "aria-label": "Resize panel",
+        "aria-disabled": true,
+        style: handleStyle,
+      },
+    });
+
+    expect(screen.queryByRole("separator", { name: "Resize panel" })).toBeNull();
   });
 });

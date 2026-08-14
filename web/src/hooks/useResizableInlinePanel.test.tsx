@@ -377,6 +377,47 @@ describe("useResizableInlinePanel pointer drag", () => {
     expect(document.body.style.userSelect).toBe("");
   });
 
+  it("does not start pointer or keyboard resize while disabled", () => {
+    const { result } = renderHook(() => useResizableInlinePanel(SESSION, undefined, 0, false));
+    const handle = createPointerHandle();
+
+    act(() => {
+      result.current.handleProps.onPointerDown(pointerEvent(handle.element));
+      result.current.handleProps.onPointerMove(pointerEvent(handle.element, { clientX: 1200 }));
+      result.current.handleProps.onPointerUp(pointerEvent(handle.element));
+      result.current.handleProps.onKeyDown({
+        key: "ArrowLeft",
+        preventDefault: () => {},
+      } as React.KeyboardEvent);
+    });
+
+    expect(handle.setPointerCapture).not.toHaveBeenCalled();
+    expect(result.current.handleProps["aria-disabled"]).toBe(true);
+    expect(result.current.panelWidth).toBe(600);
+    expect(readSessionWorkspaceState(SESSION).widthPx).toBeUndefined();
+    expect(overlaySelector()).toBeNull();
+  });
+
+  it("does not start pointer or keyboard resize at a zero-width clamp", () => {
+    setInnerWidth(0);
+    const { result } = renderHook(() => useResizableInlinePanel(SESSION));
+    const handle = createPointerHandle();
+
+    act(() => {
+      result.current.handleProps.onPointerDown(pointerEvent(handle.element));
+      result.current.handleProps.onKeyDown({
+        key: "ArrowLeft",
+        preventDefault: () => {},
+      } as React.KeyboardEvent);
+    });
+
+    expect(result.current.panelWidth).toBe(0);
+    expect(result.current.handleProps["aria-disabled"]).toBe(true);
+    expect(handle.setPointerCapture).not.toHaveBeenCalled();
+    expect(readSessionWorkspaceState(SESSION).widthPx).toBeUndefined();
+    expect(overlaySelector()).toBeNull();
+  });
+
   it("aborts the old drag before loading a new session", () => {
     const { result, rerender } = renderHook(({ sessionId }) => useResizableInlinePanel(sessionId), {
       initialProps: { sessionId: "conv_old" },
@@ -429,15 +470,15 @@ describe("useResizableInlinePanel pointer drag", () => {
     expect(result.current.panelWidth).toBe(800);
   });
 
-  it("returns a 24px fine-pointer target with a 6px gutter footprint", () => {
+  it("returns a 24px fine-pointer target with a 10px gutter footprint", () => {
     const { result } = renderHook(() => useResizableInlinePanel(SESSION));
 
     expect(result.current.handleProps.style).toMatchObject({
       touchAction: "none",
       boxSizing: "content-box",
-      paddingLeft: 11,
-      paddingRight: 9,
-      marginLeft: -10,
+      paddingLeft: 9,
+      paddingRight: 11,
+      marginLeft: -6,
       marginRight: -8,
       backgroundClip: "content-box",
     });
@@ -466,14 +507,22 @@ describe("useResizableInlinePanel pointer drag", () => {
       act(() => onChange?.({ matches: true } as MediaQueryListEvent));
 
       expect(result.current.handleProps.style).toMatchObject({
-        paddingLeft: 12,
-        paddingRight: 10,
-        marginLeft: -10,
+        paddingLeft: 10,
+        paddingRight: 12,
+        marginLeft: -6,
         marginRight: -8,
       });
     } finally {
       window.matchMedia = originalMatchMedia;
     }
+  });
+
+  it("caps the chat-side sliver before the transcript scrollbar thumb", () => {
+    const { result } = renderHook(() => useResizableInlinePanel(SESSION));
+
+    // TranscriptScrollbar's resting thumb occupies the 6–12px band from the
+    // chat edge, so the resize target must stop at or before 6px.
+    expect(Math.abs(Number(result.current.handleProps.style?.marginLeft))).toBeLessThanOrEqual(6);
   });
 });
 
