@@ -171,11 +171,7 @@ export function useResizableInlinePanel(
   // could dip below its minimum on a shrink. This tick forces a recompute on
   // every resize regardless of whether the stored width moved.
   const [, bumpViewport] = useReducer((n: number) => n + 1, 0);
-  const activePointerRef = useRef<{
-    element: HTMLElement;
-    pointerId: number;
-    cleanup: () => void;
-  } | null>(null);
+  const activePointerIdRef = useRef<number | null>(null);
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const minWidthRef = useRef(minWidthPx);
   minWidthRef.current = minWidthPx;
@@ -230,16 +226,11 @@ export function useResizableInlinePanel(
   // The resolvedWidth formula already enforces the visual minimum. No effect
   // needed — this lets the panel shrink back when minWidthPx drops.
 
-  const finishDrag = useCallback(
-    (pointerId: number, persist: boolean) => {
-      const activePointer = activePointerRef.current;
-      if (activePointer === null || pointerId !== activePointer.pointerId) return;
-      activePointerRef.current = null;
-      activePointer.cleanup();
+  const endDrag = useCallback(
+    (persist: boolean) => {
+      if (activePointerIdRef.current === null) return;
+      activePointerIdRef.current = null;
       if (persist) persistStoredWidth();
-      if (activePointer.element.hasPointerCapture(activePointer.pointerId)) {
-        activePointer.element.releasePointerCapture(activePointer.pointerId);
-      }
       removeDragOverlay();
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
@@ -249,38 +240,42 @@ export function useResizableInlinePanel(
 
   const onPointerDown = useCallback(
     (e: React.PointerEvent<HTMLElement>) => {
-      // A resize owns exactly one pointer stream until it ends.
-      if (activePointerRef.current !== null) return;
+      // First pointer wins; secondary mouse buttons do not start a resize.
+      if (activePointerIdRef.current !== null) return;
+      if (e.pointerType === "mouse" && e.button !== 0) return;
       e.preventDefault();
-      const element = e.currentTarget;
-      const pointerId = e.pointerId;
-      const onPointerMove = (event: PointerEvent) => {
-        if (event.pointerId !== pointerId) return;
-        // Live width only; persisting per pointermove would write storage
-        // every frame. Snapshot once on release.
-        setStoredWidth(
-          clamp(window.innerWidth - event.clientX, minWidthRef.current, reservedRef.current),
-        );
-      };
-      const onPointerUp = (event: PointerEvent) => finishDrag(event.pointerId, true);
-      const onPointerAbort = (event: PointerEvent) => finishDrag(event.pointerId, false);
-      const cleanup = () => {
-        element.removeEventListener("pointermove", onPointerMove);
-        element.removeEventListener("pointerup", onPointerUp);
-        element.removeEventListener("pointercancel", onPointerAbort);
-        element.removeEventListener("lostpointercapture", onPointerAbort);
-      };
-      activePointerRef.current = { element, pointerId, cleanup };
-      element.addEventListener("pointermove", onPointerMove);
-      element.addEventListener("pointerup", onPointerUp);
-      element.addEventListener("pointercancel", onPointerAbort);
-      element.addEventListener("lostpointercapture", onPointerAbort);
-      element.setPointerCapture(pointerId);
+      activePointerIdRef.current = e.pointerId;
+      e.currentTarget.setPointerCapture(e.pointerId);
       addDragOverlay();
       document.body.style.cursor = "col-resize";
       document.body.style.userSelect = "none";
     },
-    [addDragOverlay, finishDrag],
+    [addDragOverlay],
+  );
+
+  const onPointerMove = useCallback((e: React.PointerEvent<HTMLElement>) => {
+    if (e.pointerId !== activePointerIdRef.current) return;
+    // Live width only; persist once on release to avoid a storage write per move.
+    setStoredWidth(clamp(window.innerWidth - e.clientX, minWidthRef.current, reservedRef.current));
+  }, []);
+
+  const onPointerUp = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
+      if (e.pointerId !== activePointerIdRef.current) return;
+      endDrag(true);
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+    },
+    [endDrag],
+  );
+
+  const onPointerCancel = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
+      if (e.pointerId !== activePointerIdRef.current) return;
+      endDrag(false);
+    },
+    [endDrag],
   );
 
   const onKeyDown = useCallback(
@@ -303,27 +298,16 @@ export function useResizableInlinePanel(
     [resolvedWidth],
   );
 
-  useEffect(() => {
-    return () => {
-      const activePointer = activePointerRef.current;
-      if (activePointer === null) return;
-      // Unmounted mid-drag (panel closed via tab switch): drop listeners,
-      // capture, cursor, and overlay so none of them outlive the handle.
-      activePointerRef.current = null;
-      activePointer.cleanup();
-      if (activePointer.element.hasPointerCapture(activePointer.pointerId)) {
-        activePointer.element.releasePointerCapture(activePointer.pointerId);
-      }
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-      removeDragOverlay();
-    };
-  }, [removeDragOverlay]);
+  useEffect(() => () => endDrag(false), [endDrag]);
 
   return {
     panelWidth: resolvedWidth,
     handleProps: {
       onPointerDown,
+      onPointerMove,
+      onPointerUp,
+      onPointerCancel,
+      onLostPointerCapture: onPointerCancel,
       onKeyDown,
       style: {
         touchAction: "none",
