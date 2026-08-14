@@ -523,7 +523,10 @@ beforeEach(() => {
   });
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 describe("AppShell header", () => {
   it("renders the sidebar toggle on all pages", () => {
@@ -2065,6 +2068,7 @@ describe("FilesPanel visibility", () => {
 
 describe("Right workspace card visibility", () => {
   it("aborts an active resize when the workspace panel closes", () => {
+    vi.stubGlobal("innerWidth", 1024);
     useEnvironmentMock.mockReturnValue({
       data: { available: false, root: null, home: null },
       isLoading: false,
