@@ -94,6 +94,8 @@ export function useResizableSidebar() {
   const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
   const width = clamp(raw ?? DEFAULT_WIDTH_PX);
   const activePointerId = useRef<number | null>(null);
+  const activeHandle = useRef<HTMLElement | null>(null);
+  const dragCleanup = useRef<(() => void) | null>(null);
 
   // Re-clamp on viewport resize so a shrunken window pulls the sidebar back
   // under the ceiling; widening re-derives from the persisted preference so the
@@ -108,26 +110,71 @@ export function useResizableSidebar() {
 
   // No iframe shield: the sidebar never adjoins the preview iframe, so capture suffices.
   const finishDrag = useCallback((commit: boolean) => {
-    if (activePointerId.current === null) return;
+    const pointerId = activePointerId.current;
+    const handle = activeHandle.current;
+    if (pointerId === null) return;
     activePointerId.current = null;
+    activeHandle.current = null;
+    dragCleanup.current?.();
+    dragCleanup.current = null;
     if (commit) {
       persistWidth(storedWidth);
+    }
+    try {
+      if (handle?.hasPointerCapture(pointerId)) {
+        handle.releasePointerCapture(pointerId);
+      }
+    } catch {
+      // The handle may already be detached when a responsive render gate flips.
     }
     document.body.style.cursor = "";
     document.body.style.userSelect = "";
   }, []);
 
-  const onPointerDown = useCallback((e: React.PointerEvent<HTMLElement>) => {
-    // First pointer wins; a right/middle mouse press doesn't start a drag.
-    if (activePointerId.current !== null) return;
-    if (e.pointerType === "mouse" && e.button !== 0) return;
+  const onPointerDown = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
+      // First pointer wins; a right/middle mouse press doesn't start a drag.
+      if (activePointerId.current !== null) return;
+      if (e.button !== 0) return;
 
-    e.preventDefault();
-    activePointerId.current = e.pointerId;
-    e.currentTarget.setPointerCapture(e.pointerId);
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-  }, []);
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId);
+      } catch {
+        return;
+      }
+
+      e.preventDefault();
+      const handle = e.currentTarget;
+      const pointerId = e.pointerId;
+      activePointerId.current = pointerId;
+      activeHandle.current = handle;
+
+      function onDocumentPointerUp(event: PointerEvent) {
+        if (event.pointerId === activePointerId.current) finishDrag(true);
+      }
+
+      function onDocumentPointerCancel(event: PointerEvent) {
+        if (event.pointerId === activePointerId.current) finishDrag(false);
+      }
+
+      const observer = new MutationObserver(() => {
+        if (activeHandle.current && !activeHandle.current.isConnected) {
+          finishDrag(false);
+        }
+      });
+      observer.observe(document.documentElement, { childList: true, subtree: true });
+      document.addEventListener("pointerup", onDocumentPointerUp);
+      document.addEventListener("pointercancel", onDocumentPointerCancel);
+      dragCleanup.current = () => {
+        observer.disconnect();
+        document.removeEventListener("pointerup", onDocumentPointerUp);
+        document.removeEventListener("pointercancel", onDocumentPointerCancel);
+      };
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+    },
+    [finishDrag],
+  );
 
   const onPointerMove = useCallback((e: React.PointerEvent<HTMLElement>) => {
     if (e.pointerId !== activePointerId.current) return;
@@ -138,9 +185,6 @@ export function useResizableSidebar() {
     (e: React.PointerEvent<HTMLElement>) => {
       if (e.pointerId !== activePointerId.current) return;
       finishDrag(true);
-      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
-        e.currentTarget.releasePointerCapture(e.pointerId);
-      }
     },
     [finishDrag],
   );

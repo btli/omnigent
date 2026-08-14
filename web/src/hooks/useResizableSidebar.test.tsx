@@ -1,4 +1,4 @@
-import { act, renderHook } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readPanelSizePreference } from "@/lib/panelSizePreferences";
 import { resetSidebarWidthStoreForTesting, useResizableSidebar } from "./useResizableSidebar";
@@ -30,6 +30,8 @@ function nudge(
 
 function createHandle() {
   const handle = document.createElement("div");
+  handle.dataset.testResizeHandle = "true";
+  document.body.appendChild(handle);
   const capturedPointers = new Set<number>();
   handle.setPointerCapture = vi.fn((pointerId: number) => capturedPointers.add(pointerId));
   handle.hasPointerCapture = vi.fn((pointerId: number) => capturedPointers.has(pointerId));
@@ -55,6 +57,15 @@ function pointerEvent(
     preventDefault: () => {},
     ...overrides,
   } as unknown as React.PointerEvent<HTMLElement>;
+}
+
+function documentPointerEvent(
+  type: "pointerup" | "pointercancel",
+  pointerId: number,
+): PointerEvent {
+  const event = new Event(type) as PointerEvent;
+  Object.defineProperty(event, "pointerId", { value: pointerId });
+  return event;
 }
 
 function startDrag(
@@ -83,6 +94,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  document.querySelectorAll("[data-test-resize-handle]").forEach((handle) => handle.remove());
   localStorage.clear();
   resetSidebarWidthStoreForTesting();
   setInnerWidth(originalInnerWidth);
@@ -183,6 +195,28 @@ describe("useResizableSidebar", () => {
     expect(document.body.style.userSelect).toBe("");
   });
 
+  it("stays idle when pointer capture throws", () => {
+    const { result } = renderHook(() => useResizableSidebar());
+    const handle = createHandle();
+    handle.setPointerCapture = vi.fn(() => {
+      throw new DOMException("capture failed");
+    });
+    const preventDefault = vi.fn();
+
+    act(() =>
+      result.current.handleProps.onPointerDown({
+        ...pointerEvent(handle),
+        preventDefault,
+      } as React.PointerEvent<HTMLElement>),
+    );
+
+    expect(preventDefault).not.toHaveBeenCalled();
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
+    act(() => result.current.handleProps.onPointerMove(pointerEvent(handle, { clientX: 500 })));
+    expect(result.current.width).toBe(320);
+  });
+
   it("ignores concurrent pointers until the captured pointer ends", () => {
     const { result } = renderHook(() => useResizableSidebar());
     const handle = createHandle();
@@ -205,11 +239,11 @@ describe("useResizableSidebar", () => {
     expect(result.current.width).toBe(450);
   });
 
-  it("does not start a drag from a secondary mouse button", () => {
+  it("does not start a drag from a pen barrel button", () => {
     const { result } = renderHook(() => useResizableSidebar());
     const handle = createHandle();
 
-    startDrag(result, handle, { pointerType: "mouse", button: 2 });
+    startDrag(result, handle, { pointerType: "pen", button: 2 });
     expect(handle.setPointerCapture).not.toHaveBeenCalled();
     expect(document.body.style.cursor).toBe("");
 
@@ -259,5 +293,42 @@ describe("useResizableSidebar", () => {
     const remounted = renderHook(() => useResizableSidebar());
     expect(remounted.result.current.width).toBe(560);
     remounted.unmount();
+  });
+
+  it("aborts when the handle unmounts mid-drag and allows the next drag", async () => {
+    const { result } = renderHook(() => useResizableSidebar());
+    const firstHandle = createHandle();
+
+    startDrag(result, firstHandle, { pointerId: 11 });
+    expect(document.body.style.cursor).toBe("col-resize");
+    firstHandle.remove();
+
+    await waitFor(() => expect(document.body.style.cursor).toBe(""));
+    expect(document.body.style.userSelect).toBe("");
+    expect(readPanelSizePreference("sidebarWidthPx")).toBeNull();
+
+    const nextHandle = createHandle();
+    startDrag(result, nextHandle, { pointerId: 12 });
+    expect(nextHandle.setPointerCapture).toHaveBeenCalledWith(12);
+    expect(document.body.style.cursor).toBe("col-resize");
+    act(() =>
+      result.current.handleProps.onPointerCancel(pointerEvent(nextHandle, { pointerId: 12 })),
+    );
+  });
+
+  it("uses document fallbacks when the captured handle misses the terminal event", () => {
+    const { result } = renderHook(() => useResizableSidebar());
+    const handle = createHandle();
+
+    startDrag(result, handle, { pointerId: 13 });
+    act(() =>
+      result.current.handleProps.onPointerMove(
+        pointerEvent(handle, { pointerId: 13, clientX: 620 }),
+      ),
+    );
+    act(() => document.dispatchEvent(documentPointerEvent("pointerup", 13)));
+
+    expect(readPanelSizePreference("sidebarWidthPx")).toBe(620);
+    expect(document.body.style.cursor).toBe("");
   });
 });
