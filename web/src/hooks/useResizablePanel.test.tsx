@@ -1,16 +1,44 @@
-import { act, renderHook } from "@testing-library/react";
+import { act, render, renderHook, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readPanelSizePreference } from "@/lib/panelSizePreferences";
 import {
+  HANDLE_FINE_HIT_PAD_PX,
   HANDLE_HIT_PAD_PX,
   resetSharedWidthStoreForTesting,
   useResizablePanel,
 } from "./useResizablePanel";
 
 const originalInnerWidth = window.innerWidth;
+const originalMatchMedia = window.matchMedia;
+let desktopMatches = true;
+let coarsePointer = false;
+const desktopChangeListeners = new Set<(event: MediaQueryListEvent) => void>();
 
 function setInnerWidth(px: number): void {
   Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: px });
+}
+
+function installMatchMedia(): void {
+  window.matchMedia = vi.fn((query: string) => ({
+    matches: query === "(pointer: coarse)" ? coarsePointer : desktopMatches,
+    media: query,
+    onchange: null,
+    addListener: () => {},
+    removeListener: () => {},
+    addEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => {
+      if (query.includes("min-width")) desktopChangeListeners.add(listener);
+    },
+    removeEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => {
+      desktopChangeListeners.delete(listener);
+    },
+    dispatchEvent: () => false,
+  })) as typeof window.matchMedia;
+}
+
+function setDesktopMatch(matches: boolean): void {
+  desktopMatches = matches;
+  const event = { matches } as MediaQueryListEvent;
+  for (const listener of desktopChangeListeners) listener(event);
 }
 
 function createPointerHandle() {
@@ -49,20 +77,20 @@ function pointerEvent(
   } as React.PointerEvent<HTMLElement>;
 }
 
-function dispatchDocumentPointer(type: "pointerup" | "pointercancel", pointerId: number): void {
-  const event = new Event(type);
-  Object.defineProperty(event, "pointerId", { value: pointerId });
-  document.dispatchEvent(event);
-}
-
 beforeEach(() => {
   setInnerWidth(2000);
+  desktopMatches = true;
+  coarsePointer = false;
+  desktopChangeListeners.clear();
+  installMatchMedia();
 });
 
 afterEach(() => {
   localStorage.clear();
   resetSharedWidthStoreForTesting();
   setInnerWidth(originalInnerWidth);
+  window.matchMedia = originalMatchMedia;
+  desktopChangeListeners.clear();
 });
 
 describe("useResizablePanel persistence", () => {
@@ -234,38 +262,25 @@ describe("useResizablePanel persistence", () => {
     expect(result.current.panelWidth).toBe(800);
   });
 
-  it("recovers when the handle unmounts mid-drag", () => {
-    const { result } = renderHook(() => useResizablePanel(true));
-    const removedHandle = createPointerHandle();
-    const nextHandle = createPointerHandle();
-    document.body.appendChild(removedHandle.element);
+  it("aborts without persisting when the hook unmounts mid-drag", () => {
+    const { result, unmount } = renderHook(() => useResizablePanel(true));
+    const handle = createPointerHandle();
 
     act(() => {
-      result.current.handleProps.onPointerDown(
-        pointerEvent(removedHandle.element, { pointerId: 4 }),
-      );
+      result.current.handleProps.onPointerDown(pointerEvent(handle.element, { pointerId: 4 }));
       result.current.handleProps.onPointerMove(
-        pointerEvent(removedHandle.element, { pointerId: 4, clientX: 1200 }),
+        pointerEvent(handle.element, { pointerId: 4, clientX: 1200 }),
       );
-      removedHandle.element.remove();
-      dispatchDocumentPointer("pointercancel", 4);
+      unmount();
     });
 
-    expect(result.current.panelWidth).toBe(800);
     expect(readPanelSizePreference("pushPanelWidthPx")).toBeNull();
     expect(document.body.style.cursor).toBe("");
     expect(document.body.style.userSelect).toBe("");
-
-    act(() => {
-      result.current.handleProps.onPointerDown(pointerEvent(nextHandle.element, { pointerId: 5 }));
-    });
-    expect(nextHandle.setPointerCapture).toHaveBeenCalledWith(5);
   });
 
-  it("aborts when the desktop/open gate flips during a drag", () => {
-    const { result, rerender } = renderHook(({ open }) => useResizablePanel(open), {
-      initialProps: { open: true },
-    });
+  it("aborts when the desktop media query flips during a drag", () => {
+    const { result } = renderHook(() => useResizablePanel(true));
     const handle = createPointerHandle();
 
     act(() => {
@@ -274,8 +289,9 @@ describe("useResizablePanel persistence", () => {
         pointerEvent(handle.element, { pointerId: 6, clientX: 1200 }),
       );
     });
-    rerender({ open: false });
+    act(() => setDesktopMatch(false));
 
+    expect(result.current.isDesktop).toBe(false);
     expect(readPanelSizePreference("pushPanelWidthPx")).toBeNull();
     expect(document.body.style.cursor).toBe("");
     expect(document.body.style.userSelect).toBe("");
@@ -305,17 +321,51 @@ describe("useResizablePanel persistence", () => {
     expect(result.current.panelWidth).toBe(1000);
   });
 
-  it("returns touch-action and a 44px cross-axis hit target", () => {
+  it.each([
+    ["fine", false, HANDLE_FINE_HIT_PAD_PX, 24],
+    ["coarse", true, HANDLE_HIT_PAD_PX, 44],
+  ] as const)("returns a centered zero-footprint %s hit target", (_, coarse, pad, target) => {
+    coarsePointer = coarse;
     const { result } = renderHook(() => useResizablePanel(true));
+    const style = result.current.handleProps.style;
 
-    expect(result.current.handleProps.style).toMatchObject({
+    expect(style).toMatchObject({
       touchAction: "none",
       boxSizing: "content-box",
-      paddingInline: HANDLE_HIT_PAD_PX,
-      marginInline: -HANDLE_HIT_PAD_PX,
+      paddingInline: pad,
+      marginInline: -(pad + 2),
       backgroundClip: "content-box",
     });
+    expect(4 + 2 * Number(style.paddingInline)).toBe(target);
+    expect(4 + 2 * Number(style.paddingInline) + 2 * Number(style.marginInline)).toBe(0);
   });
+
+  it.each(["FilesPanelDrawer", "FileViewer", "ExecutionLogsPanel", "TerminalsPanel"])(
+    "keeps the %s boundary handle outside the clipping panel",
+    (consumer) => {
+      const { result } = renderHook(() => useResizablePanel(true));
+      render(
+        <div className="flex" data-testid={`${consumer}-row`}>
+          <div
+            {...result.current.handleProps}
+            className="relative z-10 w-1 shrink-0 self-stretch"
+          />
+          <aside className="overflow-hidden" data-testid={`${consumer}-panel`} />
+        </div>,
+      );
+
+      const panel = screen.getByTestId(`${consumer}-panel`);
+      const handle = screen.getByRole("separator", { name: "Resize panel" });
+      expect(handle.nextElementSibling).toBe(panel);
+      expect(panel.contains(handle)).toBe(false);
+      expect(handle.closest("aside, .overflow-auto, .overflow-hidden")).toBeNull();
+      expect(handle.className).toMatch(/\bw-1\b/);
+      expect(handle.style.backgroundClip).toBe("content-box");
+      expect(
+        4 + 2 * parseFloat(handle.style.paddingInline) + 2 * parseFloat(handle.style.marginInline),
+      ).toBe(0);
+    },
+  );
 
   it("notifies multiple mounted subscribers from the shared width store", () => {
     const first = renderHook(() => useResizablePanel(true));

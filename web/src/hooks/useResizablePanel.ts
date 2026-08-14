@@ -5,8 +5,19 @@ const MIN_WIDTH_PX = 320;
 const MAX_WIDTH_RATIO = 0.8; // 80% of viewport
 /** Tailwind `md` breakpoint — must track the value in tailwind.config. */
 const MD_BREAKPOINT = 768;
-/** Padding that expands the visual 4px handle to a 44px hit target. */
+const PAINTED_HANDLE_WIDTH_PX = 4;
+/** Per-side padding for the preferred 44px coarse-pointer hit target. */
 export const HANDLE_HIT_PAD_PX = 20;
+/** Per-side padding for the 24px fine-pointer hit target. */
+export const HANDLE_FINE_HIT_PAD_PX = 10;
+
+function handleHitPad(): number {
+  const isCoarse =
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(pointer: coarse)").matches;
+  return isCoarse ? HANDLE_HIT_PAD_PX : HANDLE_FINE_HIT_PAD_PX;
+}
 
 /** Clamp a width value to the allowed range for the current viewport. */
 function clampWidth(w: number, minPx = MIN_WIDTH_PX): number {
@@ -104,6 +115,7 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
   const activePointerId = useRef<number | null>(null);
   const documentFallbackCleanupRef = useRef<(() => void) | null>(null);
   const overlayRef = useRef<HTMLDivElement | null>(null);
+  const hitPad = useRef(handleHitPad()).current;
   const minWidthRef = useRef(minWidthPx);
   minWidthRef.current = minWidthPx;
 
@@ -281,8 +293,8 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
       style: {
         touchAction: "none",
         boxSizing: "content-box" as const,
-        paddingInline: HANDLE_HIT_PAD_PX,
-        marginInline: -HANDLE_HIT_PAD_PX,
+        paddingInline: hitPad,
+        marginInline: -(hitPad + PAINTED_HANDLE_WIDTH_PX / 2),
         backgroundClip: "content-box",
       },
       role: "separator" as const,
