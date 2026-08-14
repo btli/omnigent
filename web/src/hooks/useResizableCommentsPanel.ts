@@ -14,7 +14,14 @@
 // file is opened, matching the other panel-resize hooks. Explicit user
 // resizes are also persisted so a full page reload restores the width.
 
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import {
+  createElement,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
 
 const DEFAULT_WIDTH_PX = 240; // matches the previous fixed `md:w-60`
@@ -24,6 +31,8 @@ const MAX_WIDTH_PX = 640;
 const MIN_VIEWER_PX = 240;
 /** Tailwind `md` breakpoint — must track the value in tailwind.config. */
 const MD_BREAKPOINT = 768;
+/** Invisible touch hit target centered on the 1px visual handle. */
+const HIT_TARGET_PX = 44;
 
 // ---------------------------------------------------------------------------
 // Module-level width store (shared across panel remounts within a session)
@@ -97,14 +106,16 @@ export function resetCommentsWidthStoreForTesting(): void {
 export function useResizableCommentsPanel() {
   const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
   const width = Math.max(MIN_WIDTH_PX, Math.min(raw ?? DEFAULT_WIDTH_PX, MAX_WIDTH_PX));
-  const dragging = useRef(false);
+  // Pointer id of the active drag; null when idle. A second concurrent
+  // pointer (e.g. another finger) is ignored — first pointer wins.
+  const activePointerId = useRef<number | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const overlayRef = useRef<HTMLDivElement | null>(null);
 
   // While dragging, a transparent full-window overlay sits above the panel so
-  // the pointer stream keeps reaching the parent document. Without it, dragging
-  // over a cross-origin/sandboxed iframe (e.g. the HTML preview) routes mousemove
-  // /mouseup into the frame, the parent never sees mouseup, and the drag sticks.
+  // the pointer stream keeps reaching the parent document even if capture is
+  // lost. Without it, dragging over a cross-origin/sandboxed iframe (e.g. the
+  // HTML preview) routes moves into the frame and the drag sticks.
   const addDragOverlay = useCallback(() => {
     if (overlayRef.current || typeof document === "undefined") return;
     const el = document.createElement("div");
@@ -139,15 +150,66 @@ export function useResizableCommentsPanel() {
     return Math.max(MIN_WIDTH_PX, Math.min(candidate, max));
   }, []);
 
-  const onMouseDown = useCallback(
-    (e: React.MouseEvent) => {
+  // Ends the drag at the last applied width (never a half-state): clears the
+  // active pointer, drops the overlay, persists once, and restores the body
+  // cursor/selection. Idempotent so pointerup + the lostpointercapture it
+  // triggers don't double-run.
+  const endDrag = useCallback(() => {
+    if (activePointerId.current === null) return;
+    activePointerId.current = null;
+    removeDragOverlay();
+    persistStoredWidth();
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+  }, [removeDragOverlay]);
+
+  const onPointerDown = useCallback(
+    (e: React.PointerEvent) => {
+      // First pointer wins; a right/middle mouse press doesn't start a drag.
+      if (activePointerId.current !== null) return;
+      if (e.pointerType === "mouse" && e.button !== 0) return;
       e.preventDefault();
-      dragging.current = true;
+      activePointerId.current = e.pointerId;
+      // Capture routes every move/up to the handle even when the pointer
+      // leaves it mid-drag. Optional-chained: jsdom lacks pointer capture.
+      e.currentTarget.setPointerCapture?.(e.pointerId);
       addDragOverlay();
       document.body.style.cursor = "col-resize";
       document.body.style.userSelect = "none";
     },
     [addDragOverlay],
+  );
+
+  const onPointerMove = useCallback(
+    (e: React.PointerEvent) => {
+      if (e.pointerId !== activePointerId.current || !containerRef.current) return;
+      const right = containerRef.current.getBoundingClientRect().right;
+      // Update the live width only; persist once on release to avoid a
+      // synchronous localStorage write per move.
+      setStoredWidth(clampWidth(right - e.clientX));
+    },
+    [clampWidth],
+  );
+
+  const onPointerUp = useCallback(
+    (e: React.PointerEvent) => {
+      if (e.pointerId !== activePointerId.current) return;
+      if (e.currentTarget.hasPointerCapture?.(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+      endDrag();
+    },
+    [endDrag],
+  );
+
+  // pointercancel (e.g. the browser reclaims the touch) and capture loss
+  // both abort cleanly to the last applied width.
+  const onPointerCancel = useCallback(
+    (e: React.PointerEvent) => {
+      if (e.pointerId !== activePointerId.current) return;
+      endDrag();
+    },
+    [endDrag],
   );
 
   // Keyboard resize: left/right arrows widen/narrow by 20px.
@@ -165,35 +227,8 @@ export function useResizableCommentsPanel() {
     [clampWidth],
   );
 
-  useEffect(() => {
-    function onMouseMove(e: MouseEvent) {
-      if (!dragging.current || !containerRef.current) return;
-      const right = containerRef.current.getBoundingClientRect().right;
-      // Update the live width only; persist once on release to avoid a
-      // synchronous localStorage write per mousemove.
-      setStoredWidth(clampWidth(right - e.clientX));
-    }
-    function onMouseUp() {
-      if (!dragging.current) return;
-      dragging.current = false;
-      removeDragOverlay();
-      persistStoredWidth();
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    }
-    window.addEventListener("mousemove", onMouseMove);
-    window.addEventListener("mouseup", onMouseUp);
-    return () => {
-      window.removeEventListener("mousemove", onMouseMove);
-      window.removeEventListener("mouseup", onMouseUp);
-      if (dragging.current) {
-        dragging.current = false;
-        document.body.style.cursor = "";
-        document.body.style.userSelect = "";
-      }
-      removeDragOverlay();
-    };
-  }, [clampWidth, removeDragOverlay]);
+  // Unmount mid-drag: abort and clean up body/overlay state.
+  useEffect(() => endDrag, [endDrag]);
 
   // Re-clamp the stored width when the viewport resizes so a width chosen on
   // a wider layout doesn't crowd out the viewer after the window shrinks.
@@ -219,12 +254,35 @@ export function useResizableCommentsPanel() {
     isDesktop,
     /** Props to spread onto the resize handle element. */
     handleProps: {
-      onMouseDown,
+      onPointerDown,
+      onPointerMove,
+      onPointerUp,
+      onPointerCancel,
+      onLostPointerCapture: onPointerCancel,
       onKeyDown,
       role: "separator" as const,
       "aria-orientation": "vertical" as const,
       "aria-label": "Resize comments panel",
       tabIndex: 0,
+      // The handle owns its touches outright — no scroll/selection may start
+      // from it while a drag is possible.
+      style: { touchAction: "none" } as React.CSSProperties,
+      // Invisible widened hit target: the visual handle is 1px, far too thin
+      // to acquire by touch or pen. Rendered as the handle's child so events
+      // from it hit the handlers above without changing the visual weight.
+      children: createElement("span", {
+        "aria-hidden": true,
+        style: {
+          position: "absolute",
+          top: 0,
+          bottom: 0,
+          left: "50%",
+          width: HIT_TARGET_PX,
+          transform: "translateX(-50%)",
+          touchAction: "none",
+          cursor: "col-resize",
+        } as React.CSSProperties,
+      }),
     },
   };
 }
