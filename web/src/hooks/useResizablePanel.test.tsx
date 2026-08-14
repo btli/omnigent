@@ -356,6 +356,9 @@ describe("useResizablePanel persistence", () => {
     // The transcript scrollbar thumb occupies the 6–12px band from this seam;
     // keep the handle out of that band so touch-scroll starts remain available.
     expect(-Number(style.marginInlineStart)).toBeLessThanOrEqual(6);
+    // FilesPanel's toolbar uses px-2 (8px); do not annex beyond that gutter
+    // into its search control or other panel-side interactive content.
+    expect(-Number(style.marginInlineEnd)).toBeLessThanOrEqual(8);
     expect(
       4 +
         Number(style.paddingInlineStart) +
@@ -368,12 +371,12 @@ describe("useResizablePanel persistence", () => {
   it("updates the gutter when primary pointer coarseness changes", () => {
     const { result } = renderHook(() => useResizablePanel(true));
     expect(result.current.handleProps.style.marginInlineStart).toBe(-HANDLE_OUTWARD_SLIVER_PX);
-    expect(result.current.handleProps.style.paddingInlineStart).toBe(7);
+    expect(result.current.handleProps.style.paddingInlineStart).toBe(9);
 
     act(() => setCoarseMatch(true));
 
     expect(result.current.handleProps.style.marginInlineStart).toBe(-HANDLE_OUTWARD_SLIVER_PX);
-    expect(result.current.handleProps.style.paddingInlineStart).toBe(8);
+    expect(result.current.handleProps.style.paddingInlineStart).toBe(10);
   });
 
   it("notifies multiple mounted subscribers from the shared width store", () => {
