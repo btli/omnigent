@@ -45,6 +45,7 @@ function pointerEvent(
     pointerType: string;
     button: number;
     clientX: number;
+    preventDefault: () => void;
   }> = {},
 ): React.PointerEvent<HTMLElement> {
   return {
@@ -56,6 +57,12 @@ function pointerEvent(
     preventDefault: () => {},
     ...overrides,
   } as React.PointerEvent<HTMLElement>;
+}
+
+function dispatchDocumentPointer(type: "pointerup" | "pointercancel", pointerId: number): void {
+  const event = new Event(type, { bubbles: true });
+  Object.defineProperty(event, "pointerId", { value: pointerId });
+  document.dispatchEvent(event);
 }
 
 const overlaySelector = () =>
@@ -244,6 +251,33 @@ describe("useResizableInlinePanel pointer drag", () => {
     expect(handle.releasePointerCapture).toHaveBeenCalledWith(7);
   });
 
+  it("stays idle when pointer capture throws", () => {
+    const { result } = renderHook(() => useResizableInlinePanel(SESSION));
+    const handle = createPointerHandle();
+    const preventDefault = vi.fn();
+    handle.setPointerCapture.mockImplementationOnce(() => {
+      throw new DOMException("capture unavailable");
+    });
+
+    act(() =>
+      result.current.handleProps.onPointerDown(
+        pointerEvent(handle.element, { pointerId: 7, preventDefault }),
+      ),
+    );
+
+    expect(preventDefault).not.toHaveBeenCalled();
+    expect(overlaySelector()).toBeNull();
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
+
+    act(() =>
+      result.current.handleProps.onPointerMove(
+        pointerEvent(handle.element, { pointerId: 7, clientX: 1200 }),
+      ),
+    );
+    expect(result.current.panelWidth).toBe(600);
+  });
+
   it.each(["onPointerCancel", "onLostPointerCapture"] as const)(
     "aborts cleanly without persisting through %s",
     (abortHandler) => {
@@ -274,13 +308,13 @@ describe("useResizableInlinePanel pointer drag", () => {
     },
   );
 
-  it("does not start a drag from a secondary mouse button", () => {
+  it("does not start a drag from a secondary pen button", () => {
     const { result } = renderHook(() => useResizableInlinePanel(SESSION));
     const handle = createPointerHandle();
 
     act(() =>
       result.current.handleProps.onPointerDown(
-        pointerEvent(handle.element, { pointerType: "mouse", button: 2 }),
+        pointerEvent(handle.element, { pointerType: "pen", button: 2 }),
       ),
     );
     expect(handle.setPointerCapture).not.toHaveBeenCalled();
@@ -289,6 +323,56 @@ describe("useResizableInlinePanel pointer drag", () => {
       result.current.handleProps.onPointerMove(pointerEvent(handle.element, { clientX: 1200 })),
     );
     expect(result.current.panelWidth).toBe(600);
+  });
+
+  it("finishes through the document fallback if the handle unmounts mid-drag", () => {
+    const { result } = renderHook(() => useResizableInlinePanel(SESSION));
+    const firstHandle = createPointerHandle();
+
+    act(() => {
+      result.current.handleProps.onPointerDown(pointerEvent(firstHandle.element, { pointerId: 5 }));
+      result.current.handleProps.onPointerMove(
+        pointerEvent(firstHandle.element, { pointerId: 5, clientX: 1200 }),
+      );
+      firstHandle.element.remove();
+      dispatchDocumentPointer("pointerup", 5);
+    });
+
+    expect(result.current.panelWidth).toBe(800);
+    expect(readSessionWorkspaceState(SESSION).widthPx).toBe(800);
+    expect(overlaySelector()).toBeNull();
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
+
+    const nextHandle = createPointerHandle();
+    act(() => {
+      result.current.handleProps.onPointerDown(pointerEvent(nextHandle.element, { pointerId: 6 }));
+      result.current.handleProps.onPointerMove(
+        pointerEvent(nextHandle.element, { pointerId: 6, clientX: 1100 }),
+      );
+    });
+    expect(nextHandle.setPointerCapture).toHaveBeenCalledWith(6);
+    expect(result.current.panelWidth).toBe(900);
+  });
+
+  it("aborts without persisting when the width gate collapses mid-drag", () => {
+    const { result } = renderHook(() => useResizableInlinePanel(SESSION));
+    const handle = createPointerHandle();
+
+    act(() => {
+      result.current.handleProps.onPointerDown(pointerEvent(handle.element));
+      result.current.handleProps.onPointerMove(pointerEvent(handle.element, { clientX: 1200 }));
+    });
+    expect(result.current.panelWidth).toBe(800);
+
+    setInnerWidth(0);
+    act(() => window.dispatchEvent(new Event("resize")));
+
+    expect(result.current.panelWidth).toBe(0);
+    expect(readSessionWorkspaceState(SESSION).widthPx).toBeUndefined();
+    expect(overlaySelector()).toBeNull();
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
   });
 
   it("ignores additional pointers until the active drag ends", () => {

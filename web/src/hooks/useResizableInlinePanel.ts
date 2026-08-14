@@ -6,6 +6,7 @@
 // while the inline panel starts at a compact sidebar width.
 
 import { useCallback, useEffect, useReducer, useRef, useSyncExternalStore } from "react";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
 const MIN_WIDTH_PX = 240;
@@ -151,6 +152,7 @@ export function useResizableInlinePanel(
   reservedPx = 0,
 ) {
   const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
+  const isMobileViewport = useIsMobileViewport();
   // On a session switch the module store still holds the previous session's
   // width until the effect below re-seeds it after commit. Derive this render's
   // width straight from the incoming session's saved value so the panel doesn't
@@ -240,12 +242,16 @@ export function useResizableInlinePanel(
 
   const onPointerDown = useCallback(
     (e: React.PointerEvent<HTMLElement>) => {
-      // First pointer wins; secondary mouse buttons do not start a resize.
+      // First pointer wins; secondary buttons do not start a resize.
       if (activePointerIdRef.current !== null) return;
-      if (e.pointerType === "mouse" && e.button !== 0) return;
+      if (e.button !== 0) return;
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId);
+      } catch {
+        return;
+      }
       e.preventDefault();
       activePointerIdRef.current = e.pointerId;
-      e.currentTarget.setPointerCapture(e.pointerId);
       addDragOverlay();
       document.body.style.cursor = "col-resize";
       document.body.style.userSelect = "none";
@@ -277,6 +283,25 @@ export function useResizableInlinePanel(
     },
     [endDrag],
   );
+
+  useEffect(() => {
+    const onDocumentPointerUp = (e: PointerEvent) => {
+      if (e.pointerId === activePointerIdRef.current) endDrag(true);
+    };
+    const onDocumentPointerCancel = (e: PointerEvent) => {
+      if (e.pointerId === activePointerIdRef.current) endDrag(false);
+    };
+    document.addEventListener("pointerup", onDocumentPointerUp);
+    document.addEventListener("pointercancel", onDocumentPointerCancel);
+    return () => {
+      document.removeEventListener("pointerup", onDocumentPointerUp);
+      document.removeEventListener("pointercancel", onDocumentPointerCancel);
+    };
+  }, [endDrag]);
+
+  useEffect(() => {
+    if (isMobileViewport || resolvedWidth === 0) endDrag(false);
+  }, [endDrag, isMobileViewport, resolvedWidth]);
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
