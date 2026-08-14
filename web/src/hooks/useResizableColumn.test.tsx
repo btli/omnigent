@@ -113,6 +113,55 @@ describe("useResizableColumn pointer dragging", () => {
     expect(document.body.style.cursor).toBe("");
     expect(document.body.style.userSelect).toBe("");
   });
+
+  it("ends the drag via the document fallback when the handle element is gone", () => {
+    const { result } = renderColumn(0);
+
+    act(() => result.current.handleProps.onPointerDown(pointerEvent(5)));
+    expect(document.body.style.cursor).toBe("col-resize");
+
+    // If the handle unmounts mid-drag (breakpoint flip, terminal exit) its
+    // React handlers never fire — the document-level pointerup fallback must
+    // still end the drag instead of wedging body styles + activePointerId.
+    act(() => {
+      const up = new Event("pointerup");
+      Object.defineProperty(up, "pointerId", { value: 5 });
+      document.dispatchEvent(up);
+    });
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
+
+    // The drag state is fully released: a fresh pointer can start a new drag.
+    act(() => result.current.handleProps.onPointerDown(pointerEvent(6)));
+    act(() => result.current.handleProps.onPointerMove(pointerEvent(6, 200)));
+    expect(result.current.width).toBe(200);
+    act(() => result.current.handleProps.onPointerUp(pointerEvent(6)));
+  });
+
+  it("stays idle when pointer capture fails", () => {
+    const { result } = renderColumn(0);
+    const failing = pointerEvent(
+      9,
+      0,
+      vi.fn(() => {
+        throw new DOMException("InvalidPointerId");
+      }),
+    );
+
+    act(() => result.current.handleProps.onPointerDown(failing));
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
+
+    // No drag was armed by the failed capture...
+    act(() => result.current.handleProps.onPointerMove(pointerEvent(9, 300)));
+    expect(result.current.width).toBe(176);
+
+    // ...and a later pointer can still start one.
+    act(() => result.current.handleProps.onPointerDown(pointerEvent(10)));
+    act(() => result.current.handleProps.onPointerMove(pointerEvent(10, 300)));
+    expect(result.current.width).toBe(300);
+    act(() => result.current.handleProps.onPointerUp(pointerEvent(10)));
+  });
 });
 
 describe("useResizableColumn keyboard resizing", () => {
@@ -163,18 +212,35 @@ describe("useResizableColumn keyboard resizing", () => {
 });
 
 describe("useResizableColumn touch affordances", () => {
-  it("disables touch-action and widens the hit target to >=44px without repainting it", () => {
+  // The painted strip the consumer renders is 4px wide (`w-1`); the hit box
+  // is that strip plus the invisible padding on each side.
+  const PAINTED = 4;
+
+  it("disables touch-action and keeps a >=24px hit target on fine pointers", () => {
+    // jsdom's matchMedia never matches "(pointer: coarse)" → fine-pointer pad.
     const { result } = renderColumn(0);
     const style = result.current.handleProps.style;
 
     expect(style.touchAction).toBe("none");
+    expect(style.paddingLeft + PAINTED + style.paddingRight).toBeGreaterThanOrEqual(24);
 
-    // Symmetric padding gives a >=44px hit box; matching negative margins keep
-    // the layout box in place and background-clip keeps the padding unpainted.
-    expect(style.paddingLeft + style.paddingRight).toBeGreaterThanOrEqual(44);
-    expect(style.marginLeft).toBe(-style.paddingLeft);
-    expect(style.marginRight).toBe(-style.paddingRight);
+    // The negative margin anchors the painted strip's right edge to the
+    // consumer-provided `left` boundary; background-clip keeps the pad
+    // unpainted so the visual weight stays a 4px line.
+    expect(style.marginLeft).toBe(-(style.paddingLeft + PAINTED));
     expect(style.backgroundClip).toBe("content-box");
     expect(style.boxSizing).toBe("content-box");
+  });
+
+  it("widens the hit target to >=44px on coarse pointers", () => {
+    const spy = vi.spyOn(window, "matchMedia").mockReturnValue({ matches: true } as MediaQueryList);
+    const { result } = renderColumn(0);
+    const style = result.current.handleProps.style;
+    spy.mockRestore();
+
+    expect(style.paddingLeft + PAINTED + style.paddingRight).toBeGreaterThanOrEqual(44);
+    // Pad biased toward the terminal pane so the list rows' trailing status
+    // badges keep more of their tappable area.
+    expect(style.paddingRight).toBeGreaterThan(style.paddingLeft);
   });
 });

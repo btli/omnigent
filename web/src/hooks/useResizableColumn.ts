@@ -1,11 +1,26 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 const KEYBOARD_STEP_PX = 20;
-// Padding on each side of the visual handle so the touch/pen hit target is at
-// least 44px wide without changing the handle's painted width (the matching
-// negative margins keep the layout box where it was, and background-clip:
-// content-box keeps hover/active backgrounds off the padded area).
-const HIT_TARGET_PAD_PX = 22;
+// Width of the painted separator strip (the consumer's `w-1` element).
+const PAINTED_WIDTH_PX = 4;
+
+// Invisible hit-target padding around the painted strip. The handle sits over
+// the boundary between the terminal list and the xterm pane, so the pad is
+// biased toward the terminal side: list rows end with a status badge flush
+// against the boundary (taps there must select the row), while the xterm's
+// leftmost pixels are rarely interactive. Coarse pointers get a 44px total
+// target; fine pointers get the 24px minimum so the pad steals less hover
+// area from the row badges.
+const COARSE_PAD = { left: 12, right: 28 }; // 12 + 4 + 28 = 44px
+const FINE_PAD = { left: 6, right: 14 }; // 6 + 4 + 14 = 24px
+
+function hitTargetPad() {
+  const coarse =
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(pointer: coarse)").matches;
+  return coarse ? COARSE_PAD : FINE_PAD;
+}
 
 export function useResizableColumn(defaultWidth = 176, minWidth = 100, maxWidth = 480) {
   const [width, setWidth] = useState(defaultWidth);
@@ -13,6 +28,9 @@ export function useResizableColumn(defaultWidth = 176, minWidth = 100, maxWidth 
   // second concurrent pointer is ignored until the first drag ends.
   const activePointerId = useRef<number | null>(null);
   const containerRef = useRef<HTMLElement | null>(null);
+  // Removes the document-level fallback listeners for the active drag.
+  const removeDocListeners = useRef<(() => void) | null>(null);
+  const pad = useRef(hitTargetPad()).current;
 
   const clamp = useCallback(
     (w: number) => Math.max(minWidth, Math.min(maxWidth, w)),
@@ -22,20 +40,43 @@ export function useResizableColumn(defaultWidth = 176, minWidth = 100, maxWidth 
   const endDrag = useCallback(() => {
     if (activePointerId.current === null) return;
     activePointerId.current = null;
+    removeDocListeners.current?.();
+    removeDocListeners.current = null;
     document.body.style.cursor = "";
     document.body.style.userSelect = "";
   }, []);
 
-  const onPointerDown = useCallback((e: React.PointerEvent) => {
-    if (activePointerId.current !== null) return;
-    e.preventDefault();
-    activePointerId.current = e.pointerId;
-    // Capture so moves keep arriving when the pointer leaves the handle (or
-    // crosses an iframe), and so no other gesture consumer sees the stream.
-    e.currentTarget.setPointerCapture(e.pointerId);
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-  }, []);
+  const onPointerDown = useCallback(
+    (e: React.PointerEvent) => {
+      if (activePointerId.current !== null) return;
+      e.preventDefault();
+      // Capture so moves keep arriving when the pointer leaves the handle (or
+      // crosses an iframe), and so no other gesture consumer sees the stream.
+      // Capture first: if it throws (pointer already gone), stay idle rather
+      // than publishing a drag that can never receive its end events.
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId);
+      } catch {
+        return;
+      }
+      activePointerId.current = e.pointerId;
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+      // Document-level fallback: if the handle element unmounts mid-drag
+      // (breakpoint flip, active terminal exits) its React handlers never
+      // fire, which would leave the drag armed and body styles stuck.
+      const onDocEnd = (ev: PointerEvent) => {
+        if (ev.pointerId === activePointerId.current) endDrag();
+      };
+      document.addEventListener("pointerup", onDocEnd);
+      document.addEventListener("pointercancel", onDocEnd);
+      removeDocListeners.current = () => {
+        document.removeEventListener("pointerup", onDocEnd);
+        document.removeEventListener("pointercancel", onDocEnd);
+      };
+    },
+    [endDrag],
+  );
 
   const onPointerMove = useCallback(
     (e: React.PointerEvent) => {
@@ -71,8 +112,7 @@ export function useResizableColumn(defaultWidth = 176, minWidth = 100, maxWidth 
     [clamp],
   );
 
-  // Reset body cursor/selection if the component unmounts mid-drag (the
-  // element's capture is released implicitly when it leaves the DOM).
+  // Reset body cursor/selection if the hook itself unmounts mid-drag.
   useEffect(() => endDrag, [endDrag]);
 
   return {
@@ -80,7 +120,14 @@ export function useResizableColumn(defaultWidth = 176, minWidth = 100, maxWidth 
     width,
     /** Attach to the flex-row container to anchor drag calculations. */
     containerRef,
-    /** Spread onto the resize handle element at the right edge of the left column. */
+    /**
+     * Spread onto the resize handle. Render the handle as a direct child of
+     * the (overflow-hidden, relative) split row — NOT inside the scrollable
+     * list panel, where the invisible pad would be clipped and add horizontal
+     * overflow — absolutely positioned with `left: width`. The negative
+     * margin then aligns the painted strip's right edge to the boundary,
+     * with the invisible pad straddling it.
+     */
     handleProps: {
       onPointerDown,
       onPointerMove,
@@ -98,10 +145,9 @@ export function useResizableColumn(defaultWidth = 176, minWidth = 100, maxWidth 
       style: {
         touchAction: "none",
         boxSizing: "content-box",
-        paddingLeft: HIT_TARGET_PAD_PX,
-        paddingRight: HIT_TARGET_PAD_PX,
-        marginLeft: -HIT_TARGET_PAD_PX,
-        marginRight: -HIT_TARGET_PAD_PX,
+        paddingLeft: pad.left,
+        paddingRight: pad.right,
+        marginLeft: -(pad.left + PAINTED_WIDTH_PX),
         backgroundClip: "content-box",
       } as const,
     },
