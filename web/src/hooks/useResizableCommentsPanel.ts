@@ -180,10 +180,16 @@ export function useResizableCommentsPanel() {
 
   // Clamp a candidate width to [MIN, dynamic max], leaving MIN_VIEWER_PX for
   // the sibling code/diff viewer so the panel can't swallow the whole row.
+  // The divider gutter is a third flex child in the row, so its footprint
+  // comes out of the budget too — always the coarse 8px, so a pointer-type
+  // flip mid-session can never shrink the viewer below its minimum.
   const clampWidth = useCallback((candidate: number): number => {
     const parent = containerRef.current?.parentElement;
     const parentWidth = parent?.getBoundingClientRect().width ?? window.innerWidth;
-    const max = Math.max(MIN_WIDTH_PX, Math.min(MAX_WIDTH_PX, parentWidth - MIN_VIEWER_PX));
+    const max = Math.max(
+      MIN_WIDTH_PX,
+      Math.min(MAX_WIDTH_PX, parentWidth - MIN_VIEWER_PX - GUTTER_COARSE_PX),
+    );
     return Math.max(MIN_WIDTH_PX, Math.min(candidate, max));
   }, []);
 

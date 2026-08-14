@@ -81,13 +81,16 @@ const overlaySelector = () =>
       c instanceof HTMLElement && c.style.position === "fixed" && c.style.zIndex === "2147483647",
   ) ?? null;
 
-/** Panel root whose right edge sits at x=1000 inside a 2000px-wide row. */
-function attachContainer(ref: React.MutableRefObject<HTMLDivElement | null>): void {
+/** Panel root inside the split row; defaults to right edge x=1000, row 2000px. */
+function attachContainer(
+  ref: React.MutableRefObject<HTMLDivElement | null>,
+  { parentWidth = 2000, panelRight = 1000 } = {},
+): void {
   const parent = document.createElement("div");
   const panel = document.createElement("div");
   parent.appendChild(panel);
-  vi.spyOn(parent, "getBoundingClientRect").mockReturnValue({ width: 2000 } as DOMRect);
-  vi.spyOn(panel, "getBoundingClientRect").mockReturnValue({ right: 1000 } as DOMRect);
+  vi.spyOn(parent, "getBoundingClientRect").mockReturnValue({ width: parentWidth } as DOMRect);
+  vi.spyOn(panel, "getBoundingClientRect").mockReturnValue({ right: panelRight } as DOMRect);
   ref.current = panel;
 }
 
@@ -179,6 +182,32 @@ describe("useResizableCommentsPanel pointer drag", () => {
       ),
     );
     expect(result.current.width).toBe(300);
+    unmount();
+  });
+
+  it("leaves at least 240px for the viewer at maximum width with the gutter present", () => {
+    const { result, unmount } = renderHook(() => useResizableCommentsPanel());
+    // Full row is [viewer, gutter, panel]: a 500px row with the panel's right
+    // edge flush at x=500, so every pixel the panel takes comes out of the
+    // viewer+gutter budget.
+    attachContainer(result.current.containerRef, { parentWidth: 500, panelRight: 500 });
+    const target = makeHandleTarget();
+
+    act(() => result.current.handleProps.onPointerDown(pointerEvent(target, { pointerId: 6 })));
+    // Drag all the way left — the clamp, not the pointer, decides the max.
+    act(() =>
+      result.current.handleProps.onPointerMove(pointerEvent(target, { pointerId: 6, clientX: 0 })),
+    );
+
+    // The dynamic max must budget the gutter's footprint (always the coarse
+    // 8px) on top of the viewer's 240px minimum: 500 − 240 − 8 = 252.
+    const width = result.current.width as number;
+    expect(width).toBe(252);
+    expect(500 - width - 8).toBeGreaterThanOrEqual(240);
+
+    act(() =>
+      result.current.handleProps.onPointerUp(pointerEvent(target, { pointerId: 6, clientX: 0 })),
+    );
     unmount();
   });
 
