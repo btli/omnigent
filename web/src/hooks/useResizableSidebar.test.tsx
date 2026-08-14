@@ -176,8 +176,10 @@ describe("useResizableSidebar", () => {
     expect(result.current.handleProps.style).toEqual({
       touchAction: "none",
       boxSizing: "content-box",
-      paddingInline: 20,
-      marginInline: -20,
+      paddingInlineStart: 4,
+      paddingInlineEnd: 16,
+      marginInlineStart: -4,
+      marginInlineEnd: -16,
       backgroundClip: "content-box",
     });
 
@@ -193,6 +195,39 @@ describe("useResizableSidebar", () => {
     expect(handle.releasePointerCapture).toHaveBeenCalledWith(7);
     expect(document.body.style.cursor).toBe("");
     expect(document.body.style.userSelect).toBe("");
+  });
+
+  it("reacts to primary-pointer coarseness with asymmetric hit padding", () => {
+    let coarse = false;
+    const listeners = new Set<() => void>();
+    const query = {
+      get matches() {
+        return coarse;
+      },
+      media: "(pointer: coarse)",
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn((_type: string, listener: () => void) => listeners.add(listener)),
+      removeEventListener: vi.fn((_type: string, listener: () => void) =>
+        listeners.delete(listener),
+      ),
+      dispatchEvent: vi.fn(() => false),
+    } as MediaQueryList;
+    const matchMedia = vi.spyOn(window, "matchMedia").mockReturnValue(query);
+    const { result, unmount } = renderHook(() => useResizableSidebar());
+
+    expect(result.current.handleProps.style.paddingInlineStart).toBe(4);
+    expect(result.current.handleProps.style.paddingInlineEnd).toBe(16);
+
+    coarse = true;
+    act(() => listeners.forEach((listener) => listener()));
+    expect(result.current.handleProps.style.paddingInlineStart).toBe(8);
+    expect(result.current.handleProps.style.paddingInlineEnd).toBe(32);
+
+    unmount();
+    expect(query.removeEventListener).toHaveBeenCalledWith("change", expect.any(Function));
+    matchMedia.mockRestore();
   });
 
   it("stays idle when pointer capture throws", () => {

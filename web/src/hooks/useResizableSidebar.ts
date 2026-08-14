@@ -9,7 +9,7 @@
 // Unlike the inline panel this has no "boost" machinery — nothing auto-widens
 // the sidebar — so the store is just a persisted, viewport-clamped width.
 
-import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
 
 // Default 320px (20rem) — wider than the old fixed ``md:w-64`` (256px) sidebar
@@ -19,8 +19,16 @@ import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSi
 const DEFAULT_WIDTH_PX = 320;
 const MIN_WIDTH_PX = 220;
 const MAX_WIDTH_RATIO = 0.5;
-/** Invisible cross-axis padding so the 4px visual handle still hits 44px. */
-const HANDLE_HIT_PAD_PX = 20;
+const COARSE_HANDLE_PAD_PX = { inward: 8, outward: 32 }; // 8 + 4 + 32 = 44px
+const FINE_HANDLE_PAD_PX = { inward: 4, outward: 16 }; // 4 + 4 + 16 = 24px
+
+function hasCoarsePrimaryPointer(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(pointer: coarse)").matches
+  );
+}
 
 function clamp(w: number): number {
   // No viewport available off the DOM (SSR / node test env) — this runs during
@@ -93,6 +101,7 @@ export function resetSidebarWidthStoreForTesting(): void {
 export function useResizableSidebar() {
   const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
   const width = clamp(raw ?? DEFAULT_WIDTH_PX);
+  const [coarsePointer, setCoarsePointer] = useState(hasCoarsePrimaryPointer);
   const activePointerId = useRef<number | null>(null);
   const activeHandle = useRef<HTMLElement | null>(null);
   const dragCleanup = useRef<(() => void) | null>(null);
@@ -106,6 +115,13 @@ export function useResizableSidebar() {
     }
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  useEffect(() => {
+    const query = window.matchMedia("(pointer: coarse)");
+    const onChange = () => setCoarsePointer(query.matches);
+    query.addEventListener("change", onChange);
+    return () => query.removeEventListener("change", onChange);
   }, []);
 
   // No iframe shield: the sidebar never adjoins the preview iframe, so capture suffices.
@@ -214,6 +230,8 @@ export function useResizableSidebar() {
 
   useEffect(() => () => finishDrag(false), [finishDrag]);
 
+  const handlePad = coarsePointer ? COARSE_HANDLE_PAD_PX : FINE_HANDLE_PAD_PX;
+
   return {
     /** Current sidebar width in px (already viewport-clamped). */
     width,
@@ -231,8 +249,10 @@ export function useResizableSidebar() {
       style: {
         touchAction: "none",
         boxSizing: "content-box" as const,
-        paddingInline: HANDLE_HIT_PAD_PX,
-        marginInline: -HANDLE_HIT_PAD_PX,
+        paddingInlineStart: handlePad.inward,
+        paddingInlineEnd: handlePad.outward,
+        marginInlineStart: -handlePad.inward,
+        marginInlineEnd: -handlePad.outward,
         backgroundClip: "content-box",
       },
     },

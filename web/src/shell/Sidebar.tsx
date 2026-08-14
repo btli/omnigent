@@ -730,7 +730,7 @@ export function Sidebar({
         // divider — no outer margin or rounding. Width (the user-resizable
         // variable) animates →0 to push main; when closed the border
         // collapses too so nothing lingers.
-        "md:translate-x-0 md:overflow-hidden",
+        "md:translate-x-0",
         // Normal desktop flow: relative panel that pushes main. Suppressed while
         // peeking so its `md:inset-auto`/`md:relative` don't override the
         // floating-card positioning below (same `md:` layer, source order wins).
@@ -769,222 +769,231 @@ export function Sidebar({
       {!peek && (
         <div
           {...resizeHandleProps}
+          data-testid="sidebar-resize-handle"
           className="absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
         />
       )}
-      {inSettings ? (
-        <SettingsSidebarBody onNavClick={onNavClick} />
-      ) : (
-        <>
-          {/* sidebar-header-row is the hook for the macOS Electron shell, where
+      {/* Clip scrolling sidebar content without clipping the boundary handle's
+          chat-side hit pad; keeping the handle as a sibling also limits its
+          inward overlap to the hook's small, intentional row-side padding. */}
+      <div
+        data-testid="sidebar-clipped-content"
+        className="flex min-h-0 flex-1 flex-col md:overflow-hidden"
+      >
+        {inSettings ? (
+          <SettingsSidebarBody onNavClick={onNavClick} />
+        ) : (
+          <>
+            {/* sidebar-header-row is the hook for the macOS Electron shell, where
           this row shares the window's top strip with the traffic lights: the
           brand mark is dropped and the actions slide left to sit beside the
           window controls (see the [data-electron-mac] rules in index.css).
           Inert in a browser and on other platforms, which keep the row below. */}
-          <div className="sidebar-header-row flex h-12 shrink-0 items-center justify-between pr-3 pl-4">
-            {/* Brand mark doubles as the "home" affordance: clicking it
+            <div className="sidebar-header-row flex h-12 shrink-0 items-center justify-between pr-3 pl-4">
+              {/* Brand mark doubles as the "home" affordance: clicking it
             returns to `/`, the new-session composer. Without this there
             is no way back to the landing composer once you're inside a
             session. Reuses onNavClick so a plain primary click closes
             the sidebar on mobile (where it's a full-screen overlay) but
             modifier/middle clicks still open `/` in a new tab. */}
-            <Link
-              to="/"
-              onClick={onNavClick}
-              data-testid="sidebar-brand"
-              className="sidebar-brand rounded-none transition-opacity duration-200 ease-[var(--ease-otto)] hover:opacity-70"
-            >
-              <img
-                src={omnigentWordmark}
-                alt="Omnigent"
-                data-testid="sidebar-wordmark"
-                className="h-[15px] w-auto shrink-0 translate-y-px dark:invert"
-              />
-            </Link>
-            {/* On the macOS shell this copy is hidden and an identical cluster
+              <Link
+                to="/"
+                onClick={onNavClick}
+                data-testid="sidebar-brand"
+                className="sidebar-brand rounded-none transition-opacity duration-200 ease-[var(--ease-otto)] hover:opacity-70"
+              >
+                <img
+                  src={omnigentWordmark}
+                  alt="Omnigent"
+                  data-testid="sidebar-wordmark"
+                  className="h-[15px] w-auto shrink-0 translate-y-px dark:invert"
+                />
+              </Link>
+              {/* On the macOS shell this copy is hidden and an identical cluster
             renders in the title-bar strip instead (see AppShell), so the icons
             keep their place when the sidebar collapses or peeks. Everywhere
             else this is the only copy. */}
-            <SidebarHeaderActions
-              expanded={!peek}
-              // onOpen is optional (the sidebar renders standalone in tests), so
-              // fall back to a no-op rather than widening the child's contract.
-              onToggle={peek ? () => onOpen?.() : onClose}
-              onOpenSearch={onOpenSearch}
-            />
-          </div>
+              <SidebarHeaderActions
+                expanded={!peek}
+                // onOpen is optional (the sidebar renders standalone in tests), so
+                // fall back to a no-op rather than widening the child's contract.
+                onToggle={peek ? () => onOpen?.() : onClose}
+                onOpenSearch={onOpenSearch}
+              />
+            </div>
 
-          <div className="flex flex-col gap-0 px-2 pt-2 pb-0" data-testid="sidebar-primary-nav">
-            {/* "New session" routes to the home composer ("/"), which now owns
+            <div className="flex flex-col gap-0 px-2 pt-2 pb-0" data-testid="sidebar-primary-nav">
+              {/* "New session" routes to the home composer ("/"), which now owns
             session creation end-to-end (host/workspace/worktree chips +
             send). Rendered as a Link so cmd/middle-click opens it in a new
             tab; onNavClick still closes the sidebar on a plain mobile tap. */}
-            <Button
-              asChild
-              className={cn(
-                // px-2 + gap-2 puts the icon on the sidebar's left (red) column
-                // and the label on the label (blue) column — matching section
-                // headers and project folders. border-0 drops the Button base's
-                // transparent 1px border so the icon lands exactly on that
-                // column, flush with the Inbox row and folder rows.
-                SIDEBAR_ROW,
-                "w-full justify-start border-0 font-normal",
-                SIDEBAR_HOVER_HIGHLIGHT,
-                isNewChatPage && SIDEBAR_ACTIVE_HIGHLIGHT,
-              )}
-              variant="ghost"
-              data-testid="new-chat-button"
-            >
-              {/* New session always creates a session the viewer owns, which
+              <Button
+                asChild
+                className={cn(
+                  // px-2 + gap-2 puts the icon on the sidebar's left (red) column
+                  // and the label on the label (blue) column — matching section
+                  // headers and project folders. border-0 drops the Button base's
+                  // transparent 1px border so the icon lands exactly on that
+                  // column, flush with the Inbox row and folder rows.
+                  SIDEBAR_ROW,
+                  "w-full justify-start border-0 font-normal",
+                  SIDEBAR_HOVER_HIGHLIGHT,
+                  isNewChatPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                )}
+                variant="ghost"
+                data-testid="new-chat-button"
+              >
+                {/* New session always creates a session the viewer owns, which
               lands under "My sessions" — so snap the tab back there on click
               (the button stays visible on both tabs). */}
-              <Link
-                to="/"
-                onClick={(e) => {
-                  switchTab("mine");
-                  onNavClick(e);
-                }}
-              >
-                <SquarePenIcon
-                  className={cn(
-                    "ui-icon",
-                    isNewChatPage
-                      ? "text-[var(--sidebar-active-foreground)]"
-                      : "text-muted-foreground",
-                  )}
-                />
-                New session
-              </Link>
-            </Button>
-            {/* Keep Scheduled in the primary nav group with the same row treatment as New session. */}
-            <Button
-              asChild
-              className={cn(
-                // Same shared nav-row construct as "New session" / "Inbox" so
-                // the active-pill, hover, insets, icon column, and text weight
-                // all match post-refactor.
-                SIDEBAR_ROW,
-                "w-full justify-start border-0 font-normal",
-                SIDEBAR_HOVER_HIGHLIGHT,
-                isTasksPage && SIDEBAR_ACTIVE_HIGHLIGHT,
-              )}
-              variant="ghost"
-              data-testid="scheduled-tasks-nav"
-            >
-              <Link to="/tasks" onClick={onNavClick}>
-                <ClockIcon
-                  className={cn(
-                    "ui-icon",
-                    isTasksPage
-                      ? "text-[var(--sidebar-active-foreground)]"
-                      : "text-muted-foreground",
-                  )}
-                />
-                Automations
-              </Link>
-            </Button>
-            <Button
-              asChild
-              variant="ghost"
-              className={cn(
-                SIDEBAR_ROW,
-                "w-full justify-start border-0 font-normal",
-                SIDEBAR_HOVER_HIGHLIGHT,
-                isInboxPage && SIDEBAR_ACTIVE_HIGHLIGHT,
-              )}
-              data-testid="inbox-button"
-            >
-              <Link to="/inbox" onClick={onNavClick}>
-                <InboxIcon
-                  className={cn(
-                    "ui-icon",
-                    isInboxPage
-                      ? "text-[var(--sidebar-active-foreground)]"
-                      : "text-muted-foreground",
-                  )}
-                />
-                Inbox
-                {inboxCount > 0 && (
-                  <span
-                    aria-label={
-                      inboxCount === 1
-                        ? "1 inbox item waiting"
-                        : `${inboxCount} inbox items waiting`
-                    }
+                <Link
+                  to="/"
+                  onClick={(e) => {
+                    switchTab("mine");
+                    onNavClick(e);
+                  }}
+                >
+                  <SquarePenIcon
                     className={cn(
-                      "ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-10 font-medium text-[var(--sidebar-active-foreground)] tabular-nums",
-                      // The active Inbox row already paints the translucent
-                      // --sidebar-active wash; repainting it on the nested
-                      // badge would double-composite to a darker fill.
-                      isInboxPage ? "bg-transparent" : "bg-[var(--sidebar-active)]",
+                      "ui-icon",
+                      isNewChatPage
+                        ? "text-[var(--sidebar-active-foreground)]"
+                        : "text-muted-foreground",
                     )}
-                  >
-                    {inboxCount}
-                  </span>
+                  />
+                  New session
+                </Link>
+              </Button>
+              {/* Keep Scheduled in the primary nav group with the same row treatment as New session. */}
+              <Button
+                asChild
+                className={cn(
+                  // Same shared nav-row construct as "New session" / "Inbox" so
+                  // the active-pill, hover, insets, icon column, and text weight
+                  // all match post-refactor.
+                  SIDEBAR_ROW,
+                  "w-full justify-start border-0 font-normal",
+                  SIDEBAR_HOVER_HIGHLIGHT,
+                  isTasksPage && SIDEBAR_ACTIVE_HIGHLIGHT,
                 )}
-              </Link>
-            </Button>
-            <Button
-              asChild
-              variant="ghost"
-              className={cn(
-                SIDEBAR_ROW,
-                "w-full justify-start border-0 font-normal",
-                SIDEBAR_HOVER_HIGHLIGHT,
-                isUsagePage && SIDEBAR_ACTIVE_HIGHLIGHT,
-              )}
-              data-testid="usage-nav"
-            >
-              <Link to="/usage" onClick={onNavClick}>
-                <WalletIcon
-                  className={cn(
-                    "ui-icon",
-                    isUsagePage
-                      ? "text-[var(--sidebar-active-foreground)]"
-                      : "text-muted-foreground",
+                variant="ghost"
+                data-testid="scheduled-tasks-nav"
+              >
+                <Link to="/tasks" onClick={onNavClick}>
+                  <ClockIcon
+                    className={cn(
+                      "ui-icon",
+                      isTasksPage
+                        ? "text-[var(--sidebar-active-foreground)]"
+                        : "text-muted-foreground",
+                    )}
+                  />
+                  Automations
+                </Link>
+              </Button>
+              <Button
+                asChild
+                variant="ghost"
+                className={cn(
+                  SIDEBAR_ROW,
+                  "w-full justify-start border-0 font-normal",
+                  SIDEBAR_HOVER_HIGHLIGHT,
+                  isInboxPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                )}
+                data-testid="inbox-button"
+              >
+                <Link to="/inbox" onClick={onNavClick}>
+                  <InboxIcon
+                    className={cn(
+                      "ui-icon",
+                      isInboxPage
+                        ? "text-[var(--sidebar-active-foreground)]"
+                        : "text-muted-foreground",
+                    )}
+                  />
+                  Inbox
+                  {inboxCount > 0 && (
+                    <span
+                      aria-label={
+                        inboxCount === 1
+                          ? "1 inbox item waiting"
+                          : `${inboxCount} inbox items waiting`
+                      }
+                      className={cn(
+                        "ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-10 font-medium text-[var(--sidebar-active-foreground)] tabular-nums",
+                        // The active Inbox row already paints the translucent
+                        // --sidebar-active wash; repainting it on the nested
+                        // badge would double-composite to a darker fill.
+                        isInboxPage ? "bg-transparent" : "bg-[var(--sidebar-active)]",
+                      )}
+                    >
+                      {inboxCount}
+                    </span>
                   )}
-                />
-                Usage
-              </Link>
-            </Button>
-          </div>
+                </Link>
+              </Button>
+              <Button
+                asChild
+                variant="ghost"
+                className={cn(
+                  SIDEBAR_ROW,
+                  "w-full justify-start border-0 font-normal",
+                  SIDEBAR_HOVER_HIGHLIGHT,
+                  isUsagePage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                )}
+                data-testid="usage-nav"
+              >
+                <Link to="/usage" onClick={onNavClick}>
+                  <WalletIcon
+                    className={cn(
+                      "ui-icon",
+                      isUsagePage
+                        ? "text-[var(--sidebar-active-foreground)]"
+                        : "text-muted-foreground",
+                    )}
+                  />
+                  Usage
+                </Link>
+              </Button>
+            </div>
 
-          <nav
-            ref={scrollContainerRef}
-            // Keep wheel/touch scrolling without letting classic-scrollbar
-            // platforms reserve a wide, permanently visible Sidebar gutter.
-            className="relative flex-1 overflow-y-auto px-2 pt-4 pb-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
-          >
-            <ConversationList
-              conversationsQuery={conversationsQuery}
-              scrollContainerRef={scrollContainerRef}
-              onRowClick={onNavClick}
-              searchQuery=""
-              newSessionProjectName={newSessionProjectName}
-              activeTab={activeTab}
-              onActiveTabChange={switchTab}
-              multiUser={multiUser}
-              pinnedConversationIds={pinnedConversationIds}
-              pinnedConversations={pinnedConversations}
-              onTogglePinned={togglePinnedConversation}
-              onEnterSelectionMode={enterSelectionMode}
-              selectionMode={selectionMode}
-              selectionScope={selectionScope}
-              selectedIds={selectedIds}
-              onToggleSelected={toggleSelected}
-              onDeselectAll={deselectAll}
-              onExitSelectionMode={exitSelectionMode}
-              getVisibleIdsRef={getVisibleIdsRef}
-            />
-          </nav>
+            <nav
+              ref={scrollContainerRef}
+              // Keep wheel/touch scrolling without letting classic-scrollbar
+              // platforms reserve a wide, permanently visible Sidebar gutter.
+              className="relative flex-1 overflow-y-auto px-2 pt-4 pb-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+            >
+              <ConversationList
+                conversationsQuery={conversationsQuery}
+                scrollContainerRef={scrollContainerRef}
+                onRowClick={onNavClick}
+                searchQuery=""
+                newSessionProjectName={newSessionProjectName}
+                activeTab={activeTab}
+                onActiveTabChange={switchTab}
+                multiUser={multiUser}
+                pinnedConversationIds={pinnedConversationIds}
+                pinnedConversations={pinnedConversations}
+                onTogglePinned={togglePinnedConversation}
+                onEnterSelectionMode={enterSelectionMode}
+                selectionMode={selectionMode}
+                selectionScope={selectionScope}
+                selectedIds={selectedIds}
+                onToggleSelected={toggleSelected}
+                onDeselectAll={deselectAll}
+                onExitSelectionMode={exitSelectionMode}
+                getVisibleIdsRef={getVisibleIdsRef}
+              />
+            </nav>
 
-          {/* Desktop server picker, pinned below the scrolling session list.
+            {/* Desktop server picker, pinned below the scrolling session list.
           Self-hiding: renders nothing outside the Electron shell (see
           SidebarServerPicker), so browsers keep an unchanged sidebar that ends
           with the list. */}
-          <SidebarServerPicker />
-        </>
-      )}
+            <SidebarServerPicker />
+          </>
+        )}
+      </div>
     </aside>
   );
 }
