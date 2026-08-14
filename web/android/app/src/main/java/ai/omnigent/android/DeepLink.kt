@@ -1,7 +1,6 @@
 package ai.omnigent.android
 
 import android.net.Uri
-import java.net.IDN
 
 /**
  * A parsed `omnigent://<host>[:port]/c/<id>` deep link. Stricter than
@@ -100,17 +99,5 @@ data class DeepLink(
             val origin = canonicalOrigin(scheme, host, port)
             return DeepLink(origin, "/c/$id")
         }
-
-        /**
-         * IDNA-normalize to a lowercase ASCII host, or null if impossible.
-         * Caller has already stripped brackets and vetted any ':' as
-         * legitimate IPv6, not a malformed authority.
-         */
-        private fun canonicalHost(host: String): String? =
-            try {
-                IDN.toASCII(host.lowercase()).takeIf { it.isNotEmpty() }
-            } catch (_: IllegalArgumentException) {
-                null
-            }
     }
 }

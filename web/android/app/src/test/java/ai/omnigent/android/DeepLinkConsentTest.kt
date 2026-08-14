@@ -221,6 +221,29 @@ class DeepLinkConsentTest {
     }
 
     @Test
+    fun `finishing before queued consent dequeues does not show another dialog`() {
+        store().connect("https://current.example")
+        val controller =
+            Robolectric.buildActivity(
+                MainActivity::class.java,
+                viewIntent("omnigent://first.example/c/$hex"),
+            )
+        val activity = controller.setup().get()
+        val first = latestDialog()
+        controller.newIntent(viewIntent("omnigent://second.example/c/$hex"))
+        activity.finish()
+
+        first.getButton(DialogInterface.BUTTON_NEGATIVE).performClick()
+        idle()
+
+        assertTrue(activity.isFinishing)
+        assertEquals(first, ShadowDialog.getLatestDialog())
+        assertNull(activity.privateField("deepLinkDialog"))
+        assertTrue((activity.privateField("deepLinkQueue") as ArrayDeque<*>).isEmpty())
+        assertFalse(activity.privateField("processingDeepLink") as Boolean)
+    }
+
+    @Test
     fun `an exception mid-accept still resets processingDeepLink so later links aren't wedged`() {
         store().connect("https://current.example")
         val controller =
