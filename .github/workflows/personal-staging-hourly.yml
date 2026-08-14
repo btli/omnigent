@@ -150,7 +150,7 @@ jobs:
           enable-cache: false
 
       - name: Test the staging composer
-        run: uv run --frozen --extra dev python -m pytest .github/scripts/personal-staging/
+        run: uv run --frozen --group dev python -m pytest .github/scripts/personal-staging/
 
   # Privileged (pushes refs/heads/staging) but runs ONLY the stdlib composer.
   # Independent of sync-main by design: staging stacks from upstream HEAD,

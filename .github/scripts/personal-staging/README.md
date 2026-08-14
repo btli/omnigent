@@ -203,5 +203,5 @@ is protected for real by the `staging-signing` Environment above.
 Offline (local temp git repos, no network, no gh):
 
 ```sh
-uv run --frozen --extra dev python -m pytest .github/scripts/personal-staging/
+uv run --frozen --group dev python -m pytest .github/scripts/personal-staging/
 ```
