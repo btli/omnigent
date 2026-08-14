@@ -123,12 +123,23 @@ changes bindings, not the spec (TR-30).
   long-press-drag (reorder), edge-swipe, or resize.
 - **TR-11** Recognition thresholds are normative, defined once in an
   exported constants module. Award is EXCLUSIVE and first-crossed-wins:
-  the dispatcher evaluates each move against the thresholds below, the
+  the dispatcher evaluates each move against the thresholds below and the
   first award (scroll release, swipe, drag, menu) ends arbitration for the
-  sequence, and hold arming is eligible only while no award has occurred
-  and total travel stays within `HOLD_DRIFT_PX`. There is NO geometric
-  disjointness guarantee between hold and swipe regions — exclusivity
-  comes from this precedence rule, not from region math. Invariants
+  sequence. There is NO geometric disjointness guarantee between hold and
+  swipe regions — exclusivity comes from this precedence rule, not from
+  region math.
+
+  Two-radius rule (the train's model in `c21fec929`): which radii govern
+  an undecided sequence depends on the surface's intent set. On a surface
+  with NO hold intent (no drag, no long-press menu) the sequence is
+  MOTION-TRENDING: `SCROLL_ACTIVATION_PX` / `SWIPE_ACTIVATION_PX` decide
+  directly per TR-13. On a surface that offers a hold intent the sequence
+  is STATIONARY-TRENDING: while total travel stays inside the
+  `HOLD_DRIFT_PX` circle nothing awards (finger wobble can never demote a
+  forming hold to scroll), hold arms at `HOLD_MS` per TR-12, and crossing
+  the circle before arming ends hold eligibility and awards by dominant
+  axis at the crossing — vertical-first releases to native scroll,
+  horizontal-first awards `swipe` where the surface offers it. Invariants
   DOMINATE tuning ranges: a retune is legal only if it satisfies every
   invariant AND passes the device-matrix retest required by the design
   doc; the ranges are guidance, not a grant.
@@ -141,10 +152,10 @@ changes bindings, not the spec (TR-30).
 
   | Constant | Value | Meaning | Tuning range | Invariant |
   |---|---|---|---|---|
-  | `SWIPE_ACTIVATION_PX` | 12 | horizontal travel that awards `swipe` when horizontal-first (see TR-13) | 8–16 | `> DRAG_TOLERANCE_PX` |
-  | `SCROLL_ACTIVATION_PX` | 10 | vertical travel that releases an undecided sequence to native scroll when vertical-first (see TR-13) | 8–16 | crossing it cancels hold eligibility |
+  | `SWIPE_ACTIVATION_PX` | 12 | horizontal travel that awards `swipe` when horizontal-first on a motion-trending sequence (see TR-13) | 8–16 | `> DRAG_TOLERANCE_PX`; `< HOLD_DRIFT_PX` |
+  | `SCROLL_ACTIVATION_PX` | 10 | vertical travel that releases a motion-trending sequence to native scroll when vertical-first (see TR-13); inert inside a hold circle | 8–16 | `< HOLD_DRIFT_PX` |
   | `HOLD_MS` | 250 | stationary hold that arms drag-or-menu (dnd-kit parity on main) | 200–350 | `< MENU_HOLD_MS` |
-  | `HOLD_DRIFT_PX` | 20 | total travel that cancels hold eligibility (the train's hold tolerance in `c21fec929`; its 25 px circle was the separate scroll-fallback radius) | 16–24 | crossing any award threshold also cancels hold |
+  | `HOLD_DRIFT_PX` | 20 | radius of the hold circle on hold-offering surfaces (the train's hold tolerance in `c21fec929`; its 25 px circle was the separate scroll-fallback radius): nothing awards inside it; crossing it pre-arm ends hold eligibility and awards by dominant axis | 16–24 | `> max(SCROLL_ACTIVATION_PX, SWIPE_ACTIVATION_PX)` |
   | `MENU_HOLD_MS` | 500 | stationary hold that opens the context menu (replaces Radix's ~700 ms default) | 400–700 | `> HOLD_MS` |
   | `DRAG_TOLERANCE_PX` | 8 | movement after arming that converts hold → drag (dnd-kit parity) | 5–10 | `< SWIPE_ACTIVATION_PX` |
   | `EDGE_ZONE_PX` | 24 | width of the screen-edge strip that recognizes edge-swipe | 16–32 | — |
@@ -161,10 +172,12 @@ changes bindings, not the spec (TR-30).
   (right-click parity) — the current main-branch behavior, where dnd-kit's
   250 ms sensor permanently shadows Radix's long-press, is a defect this
   requirement forbids.
-- **TR-13** Axis lock: while a sequence is undecided, vertical-first
-  movement of at least `SCROLL_ACTIVATION_PX` releases it to native scroll
-  and horizontal-first movement
-  (|dx| > |dy| at award time) is eligible for `swipe`. A slow or hesitant
+- **TR-13** Axis lock: while a motion-trending sequence is undecided,
+  vertical-first movement of at least `SCROLL_ACTIVATION_PX` releases it
+  to native scroll and horizontal-first movement
+  (|dx| > |dy| at award time) is eligible for `swipe`; on hold-offering
+  surfaces the `HOLD_DRIFT_PX` circle governs the undecided phase first
+  (TR-11's two-radius rule). A slow or hesitant
   swipe MUST NOT convert into a drag, and vertical scrolling MUST never be
   hijacked by a horizontal consumer.
 - **TR-14** Edge and back ownership is a single normative table; native
@@ -174,6 +187,7 @@ changes bindings, not the spec (TR-30).
   | Input | Owner | Notes |
   |---|---|---|
   | Start-edge swipe (within `EDGE_ZONE_PX`) | Rail/sidebar open (dispatcher) | iOS `UIScreenEdgePanGestureRecognizer` delegates its drag here; WebKit back-forward gestures stay disabled |
+  | Start-directed swipe on the open rail/sidebar or its scrim | Rail/sidebar close (dispatcher) | On-surface gesture, not an edge zone — it does not contend with OS edge gestures, so it applies on every platform including iOS; the dismissal consumes the layer's history entry per the close-path reconciliation below |
   | End-edge swipe | Released to browser/OS (back-forward where the platform provides it) | No app consumer may claim it without amending this table |
   | Android hardware/system back | Dismissal stack below, then WebView history | Routed via `__omnigentNativeHandleBack` (Android shell only) |
   | Browser back (`popstate`) | Topmost history-participating layer, else normal history navigation | Each dismissible layer pushes ONE history entry on open; `popstate` closes exactly one layer, matched by a state token so re-entrant pops cannot loop; transient popovers that don't push are not browser-back-dismissible. Close-path reconciliation: any NON-popstate dismissal of a history-participating layer (scrim tap, Escape, close button, Android back) MUST also consume that layer's history entry — e.g. `history.back()` with the resulting token-matched pop treated as already-handled — so no orphaned entry survives and a later back press never visibly no-ops |
@@ -189,6 +203,7 @@ changes bindings, not the spec (TR-30).
   | Long-press drag (reorder) | Move up/down commands in the row menu |
   | Drag-to-ungroup | Ungroup command in the row/folder menu |
   | Edge-swipe rail open | Tap on the persistent rail anchor; keyboard shortcut |
+  | Swipe-to-close rail | Scrim tap; close button; `Escape` |
   | Resize drag | Arrow keys on the focusable separator |
   | Back/dismiss gestures | Visible close/back buttons on each layer |
 
@@ -252,14 +267,17 @@ changes bindings, not the spec (TR-30).
   mobile (full-screen panel), not silently dropped.
 - **TR-23** The rail MUST be a narrow collapsed anchor on phones (not the
   current full-screen `fixed inset-0` session list pinned open), expanding
-  into the content panel; expansion/collapse is reachable by tap, by
-  start-edge swipe (via the dispatcher, per TR-14), and by keyboard.
+  into the content panel; expansion is reachable by tap, by start-edge
+  swipe (via the dispatcher, per TR-14), and by keyboard; collapse by
+  tap, by a start-directed swipe on the open rail or its scrim (TR-14,
+  all platforms), and by keyboard.
 - **TR-24** Hardware/system back (Android) and browser back (via the
   history participation defined in TR-14) MUST dismiss rail layers in the
-  order defined by TR-14's dismissal stack. iOS has NO edge dismissal
+  order defined by TR-14's dismissal stack. iOS has NO EDGE dismissal
   gesture — TR-14 assigns the start edge exclusively to opening the rail
-  and releases the end edge to the OS — so on iOS dismissal is by tap on
-  the scrim or rail anchor, the close button, or keyboard.
+  and releases the end edge to the OS — but the on-surface swipe-to-close
+  (TR-14) applies on iOS like every other platform; dismissal is also by
+  tap on the scrim or rail anchor, the close button, or keyboard.
 - **TR-25** The rail MUST inherit the tab semantics, ARIA labels, and
   roving-tabindex keyboard behavior of the existing `WorkspacePanel` Radix
   tabs; screen-reader users get one nav landmark, not a stack of bespoke
@@ -282,8 +300,9 @@ changes bindings, not the spec (TR-30).
   | Surface | `touch-action` | `overscroll-behavior` | Notes |
   |---|---|---|---|
   | Chat transcript scroller | `pan-y pinch-zoom` | `contain` | no pull-to-refresh reload mid-session |
-  | Session list rows | `pan-y pinch-zoom` (dispatcher claims horizontal) | `contain` | swipe/hold per TR-11..13; a second pointer joining cancels the sequence and yields to pinch-zoom |
-  | Rail anchor + edge zone | `pan-y pinch-zoom` | `contain` | start-edge swipe per TR-14; second pointer yields to pinch-zoom |
+  | Session list rows | `pan-y pinch-zoom` (dispatcher claims horizontal) | `contain` | swipe/hold per TR-11..13; second pointer per TR-11's multi-pointer rule (undecided → yields to pinch-zoom; awarded → ignored) |
+  | Rail anchor + edge zone | `pan-y pinch-zoom` | `contain` | start-edge swipe per TR-14; second pointer per TR-11's multi-pointer rule |
+  | Open rail/sidebar overlay + scrim | `pan-y pinch-zoom` | `contain` | start-directed swipe-to-close per TR-14 |
   | Resize handles | `none` | — | TR-9 |
   | Text/editor content | browser default | default | selection untouched |
   | Embedded browser panel | browser default inside the frame | `contain` at the boundary | |

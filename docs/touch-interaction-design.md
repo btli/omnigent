@@ -99,7 +99,10 @@ pointerdown (pointerType touch|pen; mouse passes through unchanged)
 The menu opens AT `MENU_HOLD_MS` while the finger is still down (TR-12),
 with a haptic cue — not on release. Award is exclusive and
 first-crossed-wins per TR-11 — there is no geometric disjointness between
-hold and swipe; crossing any award threshold cancels hold eligibility. A
+hold and swipe. On a hold-offering surface TR-11's two-radius rule
+replaces the first two branches above: nothing awards inside the
+`HOLD_DRIFT_PX` circle, exiting it pre-arm awards by dominant axis, and
+the activation radii govern only motion-trending (no-hold) surfaces. A
 second touch pointer joining an undecided sequence cancels it and yields
 to browser pinch-zoom; one joining an already-awarded sequence is ignored
 — first pointer keeps ownership (TR-11, TR-28). While undecided the
@@ -123,7 +126,8 @@ Integration points, in order:
    — consume their layer's entry so back never no-ops on an orphan).
    `__omnigentNativeHandleBack` (Android) and the iOS edge-pan handoff
    both resolve through it (TR-28); iOS edge-pan only ever OPENS the rail
-   — dismissal on iOS is tap/scrim/keyboard per TR-24.
+   — closing is the on-surface start-directed swipe (all platforms,
+   TR-14) or tap/scrim/keyboard per TR-24.
    Per-surface `touch-action`/`overscroll-behavior` claims land per TR-28's
    baseline table.
 3. **Editor/table surfaces** — `TableBubbleMenu`'s mouse-only table
@@ -165,13 +169,15 @@ extensions above it; it does not fork the contract. Mobile gets:
   FAB→tab mappings in `AppShell` and the per-tool `MobilePanelDrawer`
   states collapse into one open/close machine;
 - expansion by tap / start-edge swipe (dispatcher client, TR-14) /
-  keyboard, with `WorkspacePanel`'s ARIA + roving tabindex inherited
-  (TR-25);
+  keyboard, and collapse by tap / start-directed swipe on the open rail
+  or scrim (TR-14) / keyboard, with `WorkspacePanel`'s ARIA + roving
+  tabindex inherited (TR-25);
 - safe-area insets applied once at the rail boundary from the existing
   `--omnigent-safe-*` vars (TR-26);
 - Android back and browser back dismiss rail layers per TR-14's dismissal
-  stack; iOS has no edge-dismissal gesture — dismissal there is scrim tap,
-  rail anchor, close button, or keyboard (TR-24); displaced header
+  stack; iOS has no edge-dismissal gesture, but the on-surface
+  swipe-to-close applies there too (TR-14) — plus scrim tap, rail anchor,
+  close button, or keyboard (TR-24); displaced header
   controls (the #3589/#4551 strip) get rail homes (TR-27).
 
 Migration runs the rail behind a temporary fallback alongside the FAB/drawer
