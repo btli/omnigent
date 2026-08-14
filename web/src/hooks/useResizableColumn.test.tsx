@@ -2,8 +2,6 @@ import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useResizableColumn } from "./useResizableColumn";
 
-type Handle = ReturnType<typeof useResizableColumn>["handleProps"];
-
 function pointerEvent(
   pointerId: number,
   clientX = 0,
@@ -19,8 +17,9 @@ function pointerEvent(
 }
 
 function keyEvent(key: string) {
-  const preventDefault = vi.fn();
-  return { event: { key, preventDefault } as unknown as React.KeyboardEvent, preventDefault };
+  return { key, preventDefault: vi.fn() } as unknown as React.KeyboardEvent & {
+    preventDefault: ReturnType<typeof vi.fn>;
+  };
 }
 
 /** Render the hook with a container anchored at the given viewport left edge. */
@@ -85,24 +84,24 @@ describe("useResizableColumn pointer dragging", () => {
     expect(result.current.width).toBe(300);
   });
 
-  it.each([
-    ["onPointerCancel", (h: Handle) => h.onPointerCancel],
-    ["onLostPointerCapture", (h: Handle) => h.onLostPointerCapture],
-  ])("aborts cleanly on %s, keeping the last applied width", (_name, pick) => {
-    const { result } = renderColumn(0);
+  it.each(["onPointerCancel", "onLostPointerCapture"] as const)(
+    "aborts cleanly on %s, keeping the last applied width",
+    (name) => {
+      const { result } = renderColumn(0);
 
-    act(() => result.current.handleProps.onPointerDown(pointerEvent(3)));
-    act(() => result.current.handleProps.onPointerMove(pointerEvent(3, 250)));
-    expect(result.current.width).toBe(250);
+      act(() => result.current.handleProps.onPointerDown(pointerEvent(3)));
+      act(() => result.current.handleProps.onPointerMove(pointerEvent(3, 250)));
+      expect(result.current.width).toBe(250);
 
-    act(() => pick(result.current.handleProps)(pointerEvent(3)));
-    expect(document.body.style.cursor).toBe("");
-    expect(document.body.style.userSelect).toBe("");
+      act(() => result.current.handleProps[name](pointerEvent(3)));
+      expect(document.body.style.cursor).toBe("");
+      expect(document.body.style.userSelect).toBe("");
 
-    // The aborted pointer is dead: further moves must not resize.
-    act(() => result.current.handleProps.onPointerMove(pointerEvent(3, 400)));
-    expect(result.current.width).toBe(250);
-  });
+      // The aborted pointer is dead: further moves must not resize.
+      act(() => result.current.handleProps.onPointerMove(pointerEvent(3, 400)));
+      expect(result.current.width).toBe(250);
+    },
+  );
 
   it("resets body cursor/selection when unmounted mid-drag", () => {
     const { result, unmount } = renderColumn(0);
@@ -121,28 +120,28 @@ describe("useResizableColumn keyboard resizing", () => {
     const { result } = renderColumn(0);
 
     const right = keyEvent("ArrowRight");
-    act(() => result.current.handleProps.onKeyDown(right.event));
+    act(() => result.current.handleProps.onKeyDown(right));
     expect(result.current.width).toBe(196);
     expect(right.preventDefault).toHaveBeenCalled();
 
-    act(() => result.current.handleProps.onKeyDown(keyEvent("ArrowLeft").event));
+    act(() => result.current.handleProps.onKeyDown(keyEvent("ArrowLeft")));
     expect(result.current.width).toBe(176);
 
     // Repeated ArrowLeft stops at minWidth (100).
     for (let i = 0; i < 10; i++) {
-      act(() => result.current.handleProps.onKeyDown(keyEvent("ArrowLeft").event));
+      act(() => result.current.handleProps.onKeyDown(keyEvent("ArrowLeft")));
     }
     expect(result.current.width).toBe(100);
 
     // Repeated ArrowRight stops at maxWidth (480).
     for (let i = 0; i < 30; i++) {
-      act(() => result.current.handleProps.onKeyDown(keyEvent("ArrowRight").event));
+      act(() => result.current.handleProps.onKeyDown(keyEvent("ArrowRight")));
     }
     expect(result.current.width).toBe(480);
 
     // Unrelated keys neither resize nor swallow the event.
     const other = keyEvent("Enter");
-    act(() => result.current.handleProps.onKeyDown(other.event));
+    act(() => result.current.handleProps.onKeyDown(other));
     expect(result.current.width).toBe(480);
     expect(other.preventDefault).not.toHaveBeenCalled();
   });
@@ -158,7 +157,7 @@ describe("useResizableColumn keyboard resizing", () => {
     expect(props["aria-valuemin"]).toBe(100);
     expect(props["aria-valuemax"]).toBe(480);
 
-    act(() => result.current.handleProps.onKeyDown(keyEvent("ArrowRight").event));
+    act(() => result.current.handleProps.onKeyDown(keyEvent("ArrowRight")));
     expect(result.current.handleProps["aria-valuenow"]).toBe(196);
   });
 });

@@ -13,14 +13,10 @@ export function useResizableColumn(defaultWidth = 176, minWidth = 100, maxWidth 
   // second concurrent pointer is ignored until the first drag ends.
   const activePointerId = useRef<number | null>(null);
   const containerRef = useRef<HTMLElement | null>(null);
-  const minRef = useRef(minWidth);
-  const maxRef = useRef(maxWidth);
-  minRef.current = minWidth;
-  maxRef.current = maxWidth;
 
   const clamp = useCallback(
-    (w: number) => Math.max(minRef.current, Math.min(maxRef.current, w)),
-    [],
+    (w: number) => Math.max(minWidth, Math.min(maxWidth, w)),
+    [minWidth, maxWidth],
   );
 
   const endDrag = useCallback(() => {
