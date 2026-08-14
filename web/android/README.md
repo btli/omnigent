@@ -176,6 +176,9 @@ verbatim via Managed App Configuration.
 
 ### Known parity gaps
 
+- A failed deep-link load is dropped so later queued links continue processing;
+  retrying the failed destination is an explicit user action.
+
 - **App badge count.** Android has no universal numeric badge API. We set
   `NotificationCompat.setNumber()` (shown by some launchers; AOSP/Pixel shows
   only a dot) and treat the notification dot as the guaranteed surface.

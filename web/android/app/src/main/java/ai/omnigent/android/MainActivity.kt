@@ -708,6 +708,10 @@ class MainActivity : AppCompatActivity() {
         if (delivered && deepLinkAwaitingNavigation) {
             deepLinkAwaitingNavigation = false
             resumeDeepLinkQueue()
+        } else if (!pageLoaded && deepLinkAwaitingNavigation) {
+            clearPendingNavigate()
+            deepLinkAwaitingNavigation = false
+            resumeDeepLinkQueue()
         } else if (delivered) {
             processNextNotification()
         }
