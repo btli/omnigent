@@ -191,6 +191,18 @@ On this machine, first accept the Xcode license in a human terminal (requires ad
 sudo DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild -license
 ```
 
+Verify that a simulator runtime is installed. `xcodebuild -showsdks` listing an iOS Simulator SDK is not sufficient; `simctl` must list an available runtime:
+
+```sh
+export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+xcodebuild -version
+xcrun simctl list runtimes
+# If the runtimes list is empty (about 8.49 GB for iOS 26.5):
+xcodebuild -downloadPlatform iOS
+```
+
+As of 2026-08-14 on the validation host, the license is accepted but the runtime is still absent. The download is blocked by only 8.3 GB free on the data volume versus 8.49 GB required. Free sufficient space, run the download above, and confirm `xcrun simctl list runtimes` before continuing.
+
 Then create/boot an iPhone, build without signing, install, and launch:
 
 ```sh
