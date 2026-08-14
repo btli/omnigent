@@ -96,8 +96,8 @@ def test_touch_resize_persists_without_stealing_transcript_scroll(
     )
 
     # Start a scroll beside the six-pixel gutter sliver, not on the resize hit area.
-    gutter_box = page.locator(_GUTTER).bounding_box()
-    assert gutter_box is not None
+    transcript_box = page.get_by_role("log").bounding_box()
+    assert transcript_box is not None
     scroll_top = page.evaluate(
         """() => {
           const log = document.querySelector('[role="log"]');
@@ -114,12 +114,10 @@ def test_touch_resize_persists_without_stealing_transcript_scroll(
     width_before_scroll = _panel_width(page)
     _touch_drag(
         page,
-        start=(gutter_box["x"] - 16, gutter_box["y"] + 400),
-        end=(gutter_box["x"] - 16, gutter_box["y"] + 280),
+        start=(transcript_box["x"] + transcript_box["width"] - 16, transcript_box["y"] + 400),
+        end=(transcript_box["x"] + transcript_box["width"] - 16, transcript_box["y"] + 280),
     )
 
-    page.wait_for_function(
-        "document.querySelector('[data-inline-resize-scroller]').scrollTop > 0"
-    )
+    page.wait_for_function("document.querySelector('[data-inline-resize-scroller]').scrollTop > 0")
     assert _panel_width(page) == width_before_scroll
     assert _stored_width(page, session_id) == resized_width
