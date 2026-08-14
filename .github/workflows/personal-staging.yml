@@ -11,7 +11,9 @@
 # credentials unpersisted and may not write shared caches. The privileged
 # integrate job runs only the stdlib composer; the keystore only ever appears
 # in android-sign, which re-signs the APK unconditionally so the untrusted
-# build's own signature never ships.
+# build's own signature never ships. PAT-bearing jobs use the main-only
+# staging-push environment so staging-tree workflows cannot receive the PAT;
+# dev-tag pushes may enqueue release/image workflows, whose repo guards skip.
 name: Personal Staging Nightly
 
 on:
@@ -35,8 +37,9 @@ jobs:
   # HEAD directly and never reads fork main.
   sync-main:
     # Fork-only, mirroring upstream's `if: github.repository == 'omnigent-ai/omnigent'` guards.
-    if: github.repository == 'btli/omnigent'
+    if: github.repository == 'btli/omnigent' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    environment: staging-push
     timeout-minutes: 10
     permissions:
       contents: write
@@ -44,17 +47,27 @@ jobs:
       - name: Checkout fork main with full history
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          # App tokens cannot push workflow-file changes; prefer the
+          # workflows-scoped PAT, with GitHub token as fallback.
+          token: ${{ secrets.STAGING_PUSH_TOKEN || github.token }}
           ref: main
           fetch-depth: 0
 
       - name: Merge upstream main and push
+        env:
+          HAS_PAT: ${{ secrets.STAGING_PUSH_TOKEN != '' }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/omnigent-ai/omnigent.git
           git fetch upstream main
-          if ! git merge --no-edit FETCH_HEAD; then
+          if [ "$HAS_PAT" = "true" ]; then
+            merge_command=(git merge --no-ff -m "Merge upstream main [skip ci]" FETCH_HEAD)
+          else
+            merge_command=(git merge --no-edit FETCH_HEAD)
+          fi
+          if ! "${merge_command[@]}"; then
             {
               echo "## sync-main: merge conflict with upstream main"
               echo ""
@@ -113,6 +126,7 @@ jobs:
     # server-enforced staging-signing Environment on android-sign.
     if: always() && needs.test-composer.result == 'success' && needs.sync-main.result != 'cancelled' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    environment: staging-push
     timeout-minutes: 20
     permissions:
       contents: write
@@ -124,6 +138,9 @@ jobs:
       - name: Checkout fork with full history
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          # App tokens cannot push workflow-file changes; prefer the
+          # workflows-scoped PAT, with GitHub token as fallback.
+          token: ${{ secrets.STAGING_PUSH_TOKEN || github.token }}
           fetch-depth: 0
 
       - name: Compose staging from upstream main + open btli PRs
@@ -350,6 +367,7 @@ jobs:
     needs: [integrate, android-sign]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    environment: staging-push
     timeout-minutes: 15
     permissions:
       contents: write
@@ -415,6 +433,10 @@ jobs:
       # commit; the release is then edited in place (no delete/recreate, so
       # the stable releases/download/nightly-latest/<asset> URL never 404s).
       - name: Update nightly-latest
+        env:
+          # App tokens cannot update refs containing workflow-file changes;
+          # prefer the workflows-scoped PAT, with GitHub token as fallback.
+          GH_TOKEN: ${{ secrets.STAGING_PUSH_TOKEN || github.token }}
         run: |
           set -euo pipefail
           gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/nightly-latest" \
