@@ -67,6 +67,7 @@ class MainActivity : AppCompatActivity() {
     // Origin the pending path belongs to, captured when the path is set. A
     // pending path never flushes cross-origin; null means nothing is pending.
     private var pendingNavigateOrigin: String? = null
+    private val pendingNotificationPaths = ArrayDeque<String>()
 
     // Consent-approved server URL awaiting its first successful load; only
     // then does it become a trusted recent (an unreachable or hostile link
@@ -315,7 +316,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        applySystemBarContrast()
+        applySystemBarContrast(newConfig)
         if (::webView.isInitialized) {
             // Notify matchMedia listeners without reloading the SPA.
             webView.dispatchConfigurationChanged(newConfig)
@@ -362,9 +363,9 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun applySystemBarContrast() {
+    private fun applySystemBarContrast(configuration: Configuration = resources.configuration) {
         val isLightMode =
-            resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK !=
+            configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK !=
                 Configuration.UI_MODE_NIGHT_YES
         WindowInsetsControllerCompat(window, window.decorView).apply {
             isAppearanceLightStatusBars = isLightMode
@@ -540,34 +541,31 @@ class MainActivity : AppCompatActivity() {
         // CLEAR_TOP|SINGLE_TOP after the user picks a different server. The
         // bridge is origin-allowlisted, so a server switch without re-registering
         // leaves the bridge dead for the new origin.
-        val store = ServerStore(this)
-        val newServerUrl = store.currentServerUrl()
-        val newOrigin = originOf(newServerUrl)
-        if (newOrigin != null && newOrigin != pinnedOrigin) {
-            reloadWithNewServer(newServerUrl, newOrigin)
+        if (intent.getBooleanExtra(ConnectActivity.EXTRA_SERVER_CHANGED, false)) {
+            val newServerUrl = ServerStore(this).currentServerUrl()
+            val newOrigin = originOf(newServerUrl)
+            if (newOrigin != null && newOrigin != pinnedOrigin) {
+                val resumeQueue = supersedePendingNavigation()
+                reloadWithNewServer(newServerUrl, newOrigin)
+                if (resumeQueue) processNextDeepLink()
+            }
         }
 
-        val path = navigatePathOf(intent)
-        if (path != null) {
-            pendingNavigatePath = path
-            pendingNavigateOrigin = pinnedOrigin
-            // Replay now if the page is up; otherwise onPageReady will flush it.
-            if (pageLoaded) flushPendingActivation()
-        }
+        navigatePathOf(intent)?.let(::enqueueNotificationPath)
         enqueueDeepLink(intent)
     }
 
     /**
      * Swap to a new pinned server: remove the old bridge (allowlisted to the
      * old origin), update [pinnedOrigin], re-install the bridge for the new
-     * origin, reset page state, and reload. Called from [onNewIntent] when
-     * ConnectActivity returns with a different server.
+     * origin, reset page state, and reload. Callers own any pending-navigation
+     * state so deep-link transitions can retain their queued path.
      */
     private fun reloadWithNewServer(
         serverUrl: String,
         newOrigin: String,
     ) {
-        pendingPersistUrl = null // superseded: a newer switch owns persistence now
+        pendingPersistUrl = null
         loginManager.cancel() // a login for the old origin must not outlive the switch
         removeBridge()
         pinnedOrigin = newOrigin
@@ -633,7 +631,11 @@ class MainActivity : AppCompatActivity() {
                 in 100..Int.MAX_VALUE -> {
                     val url = otherServers[item.itemId - 100]
                     store.connect(url)
-                    originOf(url)?.let { reloadWithNewServer(url, it) }
+                    originOf(url)?.let {
+                        val resumeQueue = supersedePendingNavigation()
+                        reloadWithNewServer(url, it)
+                        if (resumeQueue) processNextDeepLink()
+                    }
                     true
                 }
 
@@ -663,20 +665,13 @@ class MainActivity : AppCompatActivity() {
             historyCleared = true
             webView.clearHistory()
         }
-        if (mainFrameLoadFailed) {
-            // Keep the path queued for a successful retry; this callback carries
-            // the original URL even though WebView rendered an error page.
-            pageLoaded = false
-            pendingPersistUrl = null
-        } else {
-            pageLoaded = true
+        pageLoaded = !mainFrameLoadFailed && !mainFramePersistenceFailed
+        if (pageLoaded) {
             // First successful load of a consent-approved server: only now does it
             // become the stored current server / a trusted recent.
-            if (!mainFramePersistenceFailed) {
-                pendingPersistUrl?.takeIf { originOf(it) == pinnedOrigin }?.let {
-                    ServerStore(this).connect(it)
-                    (switchButton as? TextView)?.text = hostLabelOf(it)
-                }
+            pendingPersistUrl?.takeIf { originOf(it) == pinnedOrigin }?.let {
+                ServerStore(this).connect(it)
+                (switchButton as? TextView)?.text = hostLabelOf(it)
             }
             pendingPersistUrl = null
         }
@@ -697,6 +692,10 @@ class MainActivity : AppCompatActivity() {
         // it) — drop it rather than navigate the wrong server.
         if (pendingNavigateOrigin != pinnedOrigin) {
             clearPendingNavigate()
+            if (deepLinkAwaitingNavigation) {
+                deepLinkAwaitingNavigation = false
+                resumeDeepLinkQueue()
+            }
             return false
         }
         if (pendingNavigatePath == null) return false
@@ -708,6 +707,43 @@ class MainActivity : AppCompatActivity() {
     private fun clearPendingNavigate() {
         pendingNavigatePath = null
         pendingNavigateOrigin = null
+    }
+
+    private fun supersedePendingNavigation(): Boolean {
+        clearPendingNavigate()
+        pendingPersistUrl = null
+        if (!deepLinkAwaitingNavigation) return false
+        deepLinkAwaitingNavigation = false
+        processingDeepLink = false
+        return true
+    }
+
+    private fun setDeepLinkPath(link: DeepLink) {
+        if (!deepLinkAwaitingNavigation) {
+            pendingNavigatePath?.let(pendingNotificationPaths::addFirst)
+        }
+        pendingNavigatePath = link.path
+        pendingNavigateOrigin = link.origin
+        deepLinkAwaitingNavigation = true
+    }
+
+    private fun enqueueNotificationPath(path: String) {
+        if (processingDeepLink || pendingNavigatePath != null) {
+            pendingNotificationPaths.addLast(path)
+            return
+        }
+        pendingNavigatePath = path
+        pendingNavigateOrigin = pinnedOrigin
+        if (pageLoaded) flushPendingActivation()
+    }
+
+    private fun processNextNotification() {
+        while (true) {
+            val path = pendingNotificationPaths.removeFirstOrNull() ?: return
+            pendingNavigatePath = path
+            pendingNavigateOrigin = pinnedOrigin
+            if (!pageLoaded || !flushPendingActivation()) return
+        }
     }
 
     private fun enqueueDeepLink(intent: Intent?) {
@@ -729,12 +765,11 @@ class MainActivity : AppCompatActivity() {
                 val link = deepLinkQueue.removeFirstOrNull()
                 if (link == null) {
                     processingDeepLink = false
+                    processNextNotification()
                     return
                 }
                 if (link.origin == pinnedOrigin) {
-                    pendingNavigatePath = link.path
-                    pendingNavigateOrigin = link.origin
-                    deepLinkAwaitingNavigation = true
+                    setDeepLinkPath(link)
                     if (pageLoaded && flushPendingActivation()) {
                         deepLinkAwaitingNavigation = false
                         continue
@@ -745,9 +780,7 @@ class MainActivity : AppCompatActivity() {
                     val known = store.knownServers().firstOrNull { originOf(it) == link.origin }
                     if (known != null) {
                         store.connect(known)
-                        pendingNavigatePath = link.path
-                        pendingNavigateOrigin = link.origin
-                        deepLinkAwaitingNavigation = true
+                        setDeepLinkPath(link)
                         reloadWithNewServer(known, link.origin)
                         return
                     } else {
@@ -778,23 +811,25 @@ class MainActivity : AppCompatActivity() {
                 answered = true
                 deepLinkDialog = null
                 var awaitingNavigation = false
+                var stopProcessing = false
                 try {
                     if (accepted) {
                         // reload first: it clears any superseded pendingPersistUrl,
                         // then this link's own pending state is installed.
                         reloadWithNewServer(link.origin, link.origin)
-                        pendingNavigatePath = link.path
-                        pendingNavigateOrigin = link.origin
+                        setDeepLinkPath(link)
                         pendingPersistUrl = link.origin
-                        deepLinkAwaitingNavigation = true
                         awaitingNavigation = true
                     } else if (!ServerStore(this).hasServer()) {
-                        // Cold-start link was the only way in; fall back to setup.
+                        deepLinkQueue.clear()
+                        processingDeepLink = false
+                        deepLinkAwaitingNavigation = false
+                        stopProcessing = true
                         startActivity(Intent(this, ConnectActivity::class.java))
                         finish()
                     }
                 } finally {
-                    if (!awaitingNavigation) resumeDeepLinkQueue()
+                    if (!awaitingNavigation && !stopProcessing) resumeDeepLinkQueue()
                 }
             }
         }
