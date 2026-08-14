@@ -2,6 +2,8 @@ package ai.omnigent.android
 
 import android.content.Intent
 import android.net.Uri
+import android.webkit.ValueCallback
+import android.webkit.WebView
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -152,8 +154,8 @@ class DeepLinkRoutingTest {
 
         assertEquals("/c/$hex", activity.privateField("pendingNavigatePath"))
         assertEquals(
-            listOf(notificationPath),
-            (activity.privateField("pendingNotificationPaths") as ArrayDeque<*>).toList(),
+            1,
+            (activity.privateField("pendingNotifications") as ArrayDeque<*>).size,
         )
 
         activity.invokeOnPageReady("https://h.example")
@@ -161,6 +163,63 @@ class DeepLinkRoutingTest {
             shadowOf(activity.testWebView()).lastEvaluatedJavascript.contains(notificationPath),
         )
         assertFalse(activity.privateField("processingDeepLink") as Boolean)
+    }
+
+    @Test
+    fun `stacked notifications drain after the page becomes ready`() {
+        store().connect("https://h.example")
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        val first = "/c/first-notification-$hex"
+        val second = "/c/second-notification-$hex"
+        controller.newIntent(
+            Intent().putExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH, first),
+        )
+        controller.newIntent(
+            Intent().putExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH, second),
+        )
+
+        activity.invokeOnPageReady("https://h.example")
+
+        assertNull(activity.privateField("pendingNavigatePath"))
+        assertTrue((activity.privateField("pendingNotifications") as ArrayDeque<*>).isEmpty())
+        assertTrue(shadowOf(activity.testWebView()).lastEvaluatedJavascript.contains(second))
+    }
+
+    @Test
+    fun `queued notifications do not cross a deep-link server switch`() {
+        store().connect("https://next.example/mount")
+        store().connect("https://h.example")
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        val first = "/c/first-notification-$hex"
+        val second = "/c/second-notification-$hex"
+        val scripts = mutableListOf<String>()
+        activity.setPrivateField(
+            "webView",
+            object : WebView(activity) {
+                override fun evaluateJavascript(
+                    script: String,
+                    resultCallback: ValueCallback<String>?,
+                ) {
+                    scripts.add(script)
+                    super.evaluateJavascript(script, resultCallback)
+                }
+            },
+        )
+
+        controller.newIntent(
+            Intent().putExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH, first),
+        )
+        controller.newIntent(
+            Intent().putExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH, second),
+        )
+        controller.newIntent(viewIntent("omnigent://next.example/c/deep-link-$hex"))
+        activity.invokeOnPageReady("https://next.example/mount")
+
+        assertTrue((activity.privateField("pendingNotifications") as ArrayDeque<*>).isEmpty())
+        assertTrue(scripts.any { it.contains("deep-link-$hex") })
+        assertFalse(scripts.any { it.contains("notification-$hex") })
     }
 
     @Test
