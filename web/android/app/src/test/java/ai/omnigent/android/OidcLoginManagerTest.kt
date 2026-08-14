@@ -98,4 +98,50 @@ class OidcLoginManagerTest {
 
         assertNull(delivered)
     }
+
+    @Test
+    fun `cancel invalidates a browser launch already posted to the main looper`() {
+        val activity = activity()
+        val manager = OidcLoginManager()
+        val polling = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        manager.requestTicket = { OidcLoginManager.Ticket("ticket-1", "/auth/login?t=1") }
+        manager.pollForToken = { _, _ ->
+            polling.countDown()
+            release.await(2, TimeUnit.SECONDS)
+            null
+        }
+
+        assertTrue(manager.start(activity, origin) { _, _ -> })
+        assertTrue(polling.await(2, TimeUnit.SECONDS))
+        manager.cancel()
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertNull(shadowOf(activity).nextStartedActivity)
+        release.countDown()
+    }
+
+    @Test
+    fun `destroyed activity cannot launch a posted browser handoff`() {
+        val controller = Robolectric.buildActivity(Activity::class.java).setup()
+        val activity = controller.get()
+        val manager = OidcLoginManager()
+        val ticketRequested = CountDownLatch(1)
+        val releaseTicket = CountDownLatch(1)
+        manager.requestTicket = {
+            ticketRequested.countDown()
+            releaseTicket.await(2, TimeUnit.SECONDS)
+            OidcLoginManager.Ticket("ticket-1", "/auth/login?t=1")
+        }
+        manager.pollForToken = { _, _ -> null }
+
+        assertTrue(manager.start(activity, origin) { _, _ -> })
+        assertTrue(ticketRequested.await(2, TimeUnit.SECONDS))
+        controller.destroy()
+        releaseTicket.countDown()
+        drainMain()
+
+        assertNull(shadowOf(activity).nextStartedActivity)
+        manager.shutdown()
+    }
 }
