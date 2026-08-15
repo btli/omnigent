@@ -1,5 +1,6 @@
 package ai.omnigent.android
 
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.webkit.WebView
@@ -33,6 +34,7 @@ fun MainActivity.invokeOnPageReady(
     url: String,
     mainFrameLoadFailed: Boolean = false,
     mainFramePersistenceFailed: Boolean = false,
+    loadGeneration: Long = privateField("loadGeneration") as Long,
 ) {
     MainActivity::class
         .java
@@ -41,8 +43,9 @@ fun MainActivity.invokeOnPageReady(
             String::class.java,
             Boolean::class.java,
             Boolean::class.java,
+            Long::class.javaObjectType,
         ).apply { isAccessible = true }
-        .invoke(this, url, mainFrameLoadFailed, mainFramePersistenceFailed)
+        .invoke(this, url, mainFrameLoadFailed, mainFramePersistenceFailed, loadGeneration)
 }
 
 fun MainActivity.invokeRetryPinnedOrigin() {
@@ -51,4 +54,23 @@ fun MainActivity.invokeRetryPinnedOrigin() {
         .getDeclaredMethod("retryPinnedOrigin")
         .apply { isAccessible = true }
         .invoke(this)
+}
+
+class RecordingLoadWebView(
+    context: Context,
+    var currentUrl: String?,
+) : WebView(context) {
+    val loadedUrls = mutableListOf<String>()
+    var reloadCount = 0
+
+    override fun getUrl(): String? = currentUrl
+
+    override fun loadUrl(url: String) {
+        loadedUrls += url
+        currentUrl = url
+    }
+
+    override fun reload() {
+        reloadCount++
+    }
 }

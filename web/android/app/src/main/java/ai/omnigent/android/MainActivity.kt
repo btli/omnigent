@@ -51,6 +51,7 @@ import org.json.JSONObject
  */
 class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
+    private lateinit var omnigentWebViewClient: OmnigentWebViewClient
     private lateinit var notifications: NativeNotificationManager
     private lateinit var blobSaver: BlobSaver
     private val loginManager = OidcLoginManager()
@@ -83,10 +84,11 @@ class MainActivity : AppCompatActivity() {
     private var lastInsets: Insets? = null
     private var pageLoaded = false
 
-    // Invariant: a terminal failure belongs to the currently pinned origin.
-    // A same-origin link or explicit retry starts a real reload, an origin switch
-    // clears the failure, and either success or another terminal failure resolves
-    // the awaiting FIFO head so processing can never remain wedged in this state.
+    // Invariant: every app-initiated load owns a monotonic generation, and only a
+    // callback carrying the current generation may change page/failure state or
+    // resolve an awaiting FIFO head. A callback from any superseded same-origin,
+    // cross-origin, retry, or failed load is inert with respect to newer work.
+    private var loadGeneration = 0L
     private var pinnedOriginLoadFailed = false
     private var bridgeTransportInstalled = false
     private var bridgeScriptHandler: ScriptHandler? = null
@@ -266,7 +268,7 @@ class MainActivity : AppCompatActivity() {
         )
 
         ensureNotificationPermission()
-        if (serverUrl != null) webView.loadUrl(serverUrl)
+        if (serverUrl != null) loadUrlWithGeneration(serverUrl)
         enqueueDeepLink(coldDeepLink)
     }
 
@@ -349,7 +351,7 @@ class MainActivity : AppCompatActivity() {
             settings.domStorageEnabled = true
             settings.mediaPlaybackRequiresUserGesture = false
 
-            webViewClient =
+            omnigentWebViewClient =
                 OmnigentWebViewClient(
                     pinnedOrigin = { pinnedOrigin },
                     shouldInjectBridgeAtPageReady = {
@@ -359,7 +361,9 @@ class MainActivity : AppCompatActivity() {
                     onNavigationStarted = ::armServerSwitcherWatchdog,
                     onLoginRequired = ::startLogin,
                     onRendererGone = ::recoverFromRendererDeath,
+                    loadUrl = { _, url -> loadUrlWithGeneration(url) },
                 )
+            webViewClient = omnigentWebViewClient
             webChromeClient =
                 OmnigentWebChromeClient(
                     onChooseFiles = ::chooseFiles,
@@ -672,7 +676,7 @@ class MainActivity : AppCompatActivity() {
             // budget on a failure that retrying can't fix. Stay put instead.
             if (!accepted) return@setCookie
             cookies.flush()
-            webView.loadUrl(origin)
+            loadUrlWithGeneration(origin)
         }
         startActivity(
             Intent(this, MainActivity::class.java)
@@ -785,7 +789,7 @@ class MainActivity : AppCompatActivity() {
         loginAttempts = 0
         switchButton.text = hostLabelOf(serverUrl)
         installBridge()
-        webView.loadUrl(serverUrl)
+        loadUrlWithGeneration(serverUrl)
     }
 
     private fun updateServerSwitcherWidth(containerWidthPx: Int) {
@@ -870,11 +874,13 @@ class MainActivity : AppCompatActivity() {
         url: String?,
         mainFrameLoadFailed: Boolean,
         mainFramePersistenceFailed: Boolean,
+        callbackGeneration: Long?,
     ) {
         // Only a real pinned-origin load carries the injected facade — an error
         // page (chrome-error://) or a foreign redirect must NOT drain
         // pendingNavigatePath or push insets into a page that can't consume them.
         if (originOf(url) != pinnedOrigin) return
+        if (callbackGeneration != loadGeneration) return
         // First authenticated app page: drop everything before it from the
         // back/forward list — the pre-auth root, any IdP pages, and the post-login
         // reload all bounce to login or show a blank if Back reaches them. After
@@ -939,6 +945,18 @@ class MainActivity : AppCompatActivity() {
     private fun retryPinnedOrigin() {
         pinnedOriginLoadFailed = false
         pageLoaded = false
+        reloadWithGeneration()
+    }
+
+    private fun loadUrlWithGeneration(url: String) {
+        loadGeneration++
+        omnigentWebViewClient.expectLoad(loadGeneration)
+        webView.loadUrl(url)
+    }
+
+    private fun reloadWithGeneration() {
+        loadGeneration++
+        omnigentWebViewClient.expectLoad(loadGeneration)
         webView.reload()
     }
 

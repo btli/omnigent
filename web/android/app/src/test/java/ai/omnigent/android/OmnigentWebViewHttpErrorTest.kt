@@ -27,7 +27,7 @@ class OmnigentWebViewHttpErrorTest {
         var loadFailed = true
         var persistenceFailed = false
         val client =
-            client { _, load, persistence ->
+            client { _, load, persistence, _ ->
                 loadFailed = load
                 persistenceFailed = persistence
             }
@@ -48,7 +48,7 @@ class OmnigentWebViewHttpErrorTest {
     fun `subresource HTTP errors do not fail persistence`() {
         val webView = WebView(ApplicationProvider.getApplicationContext())
         var persistenceFailed = true
-        val client = client { _, _, persistence -> persistenceFailed = persistence }
+        val client = client { _, _, persistence, _ -> persistenceFailed = persistence }
 
         client.onPageStarted(webView, PINNED_URL, null)
         client.onReceivedHttpError(
@@ -67,7 +67,7 @@ class OmnigentWebViewHttpErrorTest {
         // (observed on device) — a start-time flag reset would erase it.
         val webView = WebView(ApplicationProvider.getApplicationContext())
         var persistenceFailed = false
-        val client = client { _, _, persistence -> persistenceFailed = persistence }
+        val client = client { _, _, persistence, _ -> persistenceFailed = persistence }
 
         client.onReceivedHttpError(
             webView,
@@ -86,7 +86,7 @@ class OmnigentWebViewHttpErrorTest {
         var loadFailed = true
         var persistenceFailed = true
         val client =
-            client { _, load, persistence ->
+            client { _, load, persistence, _ ->
                 loadFailed = load
                 persistenceFailed = persistence
             }
@@ -125,7 +125,7 @@ class OmnigentWebViewHttpErrorTest {
 
     private fun client(
         onLoginRequired: () -> Unit = {},
-        onPageReady: (String?, Boolean, Boolean) -> Unit = { _, _, _ -> },
+        onPageReady: (String?, Boolean, Boolean, Long?) -> Unit = { _, _, _, _ -> },
     ) = OmnigentWebViewClient(
         pinnedOrigin = { PINNED_ORIGIN },
         shouldInjectBridgeAtPageReady = { false },
