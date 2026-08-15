@@ -1246,7 +1246,7 @@ describe("touch swipe actions", () => {
   // The reveal sitting behind the row is inert and shows only the icon for the
   // action that direction commits to.
   function expectRevealIcons(li: Element, icons: { shows: string; hides: string }) {
-    const reveal = li.firstElementChild!;
+    const reveal = within(li as HTMLElement).getByTestId("conversation-swipe-reveal");
     expect(reveal).toHaveClass("pointer-events-none");
     expect(reveal.querySelector(icons.shows)).not.toBeNull();
     expect(reveal.querySelector(icons.hides)).toBeNull();
@@ -1441,45 +1441,92 @@ describe("touch swipe actions", () => {
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
   });
 
-  it("keeps the inert delete reveal geometrically disjoint from the accessible overflow target", () => {
-    writeSwipeActions({ left: "delete", right: "none" });
-    renderSidebar();
+  it.each([
+    { direction: "left", action: "delete", rowWidth: 280, partial: -40, threshold: -72 },
+    { direction: "left", action: "delete", rowWidth: 412, partial: -40, threshold: -72 },
+    { direction: "right", action: "archive", rowWidth: 280, partial: 40, threshold: 72 },
+    { direction: "right", action: "archive", rowWidth: 412, partial: 40, threshold: 72 },
+  ] as const)(
+    "fills the vacated strip for $direction/$action at a $rowWidth px row",
+    ({ direction, action, rowWidth, partial, threshold }) => {
+      writeSwipeActions(
+        direction === "left" ? { left: action, right: "none" } : { left: "none", right: action },
+      );
+      const view = renderSidebar();
+      const overflow = screen.getByTestId("conversation-actions");
+      expect(screen.queryByTestId("conversation-swipe-reveal")).toBeNull();
 
-    expect(screen.queryByTestId("conversation-swipe-reveal")).toBeNull();
-    expect(screen.getByTestId("conversation-actions")).toHaveAccessibleName("Conversation actions");
+      const swipe = moveSwipeRow(partial);
+      const frame = screen.getByTestId("conversation-swipe-frame");
+      const reveal = screen.getByTestId("conversation-swipe-reveal");
+      const surface = screen.getByTestId("conversation-swipe-surface");
+      const rowLeft = 20;
+      const inset = frame.classList.contains("mx-1") ? 4 : 0;
+      const frameLeft = rowLeft + inset;
+      const frameRight = rowLeft + rowWidth - inset;
+      const surfaceLeft = rowLeft + 4;
+      const surfaceRight = rowLeft + rowWidth - 4;
 
-    const swipe = moveSwipeRow(-40);
-    const reveal = screen.getByTestId("conversation-swipe-reveal");
-    const surface = screen.getByTestId("conversation-swipe-surface");
-    const overflow = screen.getByTestId("conversation-actions");
+      function rect(left: number, right: number): DOMRect {
+        return {
+          x: left,
+          y: 100,
+          left,
+          top: 100,
+          right,
+          bottom: 128,
+          width: right - left,
+          height: 28,
+          toJSON: () => ({}),
+        };
+      }
 
-    function expectDisjointTrailingGeometry(width: number) {
-      // The reveal is clipped to exactly the strip vacated by the surface. The
-      // overflow target remains inside that inset surface, so the two regions
-      // cannot render over or claim the same pixels at any reveal distance.
+      vi.spyOn(frame, "getBoundingClientRect").mockReturnValue(rect(frameLeft, frameRight));
+      vi.spyOn(surface, "getBoundingClientRect").mockImplementation(() => {
+        const left = surfaceLeft + Number.parseFloat(surface.style.marginLeft || "0");
+        const right = surfaceRight - Number.parseFloat(surface.style.marginRight || "0");
+        return rect(left, right);
+      });
+      vi.spyOn(reveal, "getBoundingClientRect").mockImplementation(() => {
+        const width = Number.parseFloat(reveal.style.width);
+        return direction === "left"
+          ? rect(frameRight - width, frameRight)
+          : rect(frameLeft, frameLeft + width);
+      });
+
+      function expectAdjacentAndDisjoint() {
+        const revealRect = reveal.getBoundingClientRect();
+        const surfaceRect = surface.getBoundingClientRect();
+        expect(frame.getBoundingClientRect()).toMatchObject({ left: frameLeft, right: frameRight });
+        if (direction === "left") {
+          expect(surfaceRect.right).toBe(revealRect.left);
+          expect(surfaceRect.right).toBeLessThanOrEqual(revealRect.left);
+        } else {
+          expect(revealRect.right).toBe(surfaceRect.left);
+          expect(revealRect.right).toBeLessThanOrEqual(surfaceRect.left);
+        }
+      }
+
       expect(reveal).toHaveAttribute("aria-hidden", "true");
       expect(reveal).toHaveClass("pointer-events-none", "overflow-hidden");
-      expect(reveal).toHaveStyle({ right: "0px", width: `${width}px` });
-      expect(surface).toHaveStyle({ marginRight: `${width}px` });
-      expect(reveal).not.toContainElement(overflow);
+      expect(reveal.querySelector("button, a, [tabindex]")).toBeNull();
       expect(surface).toContainElement(overflow);
+      expectAdjacentAndDisjoint();
+
+      fireEvent.pointerMove(swipe.li, { ...POINTER, clientX: 100 + threshold, clientY: 100 });
+      expectAdjacentAndDisjoint();
+      expect(reveal.firstElementChild).toHaveClass("scale-110");
+
+      fireEvent.pointerCancel(swipe.li, POINTER);
+      expect(screen.queryByTestId("conversation-swipe-reveal")).toBeNull();
+      expect(surface.style.marginLeft).toBe("");
+      expect(surface.style.marginRight).toBe("");
       expect(overflow).toHaveAccessibleName("Conversation actions");
-    }
-
-    expectDisjointTrailingGeometry(40);
-    expect(reveal.querySelector("svg.lucide-trash-2")).not.toBeNull();
-    expect(reveal.querySelector("button, a, [tabindex]")).toBeNull();
-
-    fireEvent.pointerMove(swipe.li, { ...POINTER, clientX: 28, clientY: 100 });
-    expectDisjointTrailingGeometry(72);
-    expect(reveal.firstElementChild).toHaveClass("scale-110");
-
-    fireEvent.pointerCancel(swipe.li, POINTER);
-    expect(screen.queryByTestId("conversation-swipe-reveal")).toBeNull();
-    expect(surface.style.marginRight).toBe("");
-    expect(overflow).toHaveAccessibleName("Conversation actions");
-    expect(mocks.del.mutate).not.toHaveBeenCalled();
-  });
+      expect(mocks.archive.mutate).not.toHaveBeenCalled();
+      expect(mocks.del.mutate).not.toHaveBeenCalled();
+      view.unmount();
+    },
+  );
 
   it("resets an armed swipe when pointer capture is unexpectedly lost", () => {
     renderSidebar();
