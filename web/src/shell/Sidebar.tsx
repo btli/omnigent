@@ -3745,6 +3745,7 @@ function ConversationRow({
     // it. `setRowRef` merges the drag node ref with the scroll-into-view ref.
     <li
       ref={setRowRef}
+      data-testid="conversation-swipe-frame"
       {...dragListeners}
       onPointerDown={swipe.onPointerDown}
       onPointerMove={swipe.onPointerMove}
@@ -3754,7 +3755,7 @@ function ConversationRow({
       onClickCapture={swipe.onClickCapture}
       style={{ touchAction: swipeEnabled ? "pan-y" : undefined }}
       className={cn(
-        "group relative",
+        "group relative mx-1",
         isDragging && "opacity-40",
         // Keep vertical scrolling native while claiming the horizontal axis for
         // the swipe: without this the browser can take the horizontal pan (or
@@ -3762,6 +3763,8 @@ function ConversationRow({
         // a swipe can actually fire, so rows without one keep default behavior.
       )}
     >
+      {/* The row is the shared inset containing block for the reveal and surface,
+          keeping their edges adjacent with the accepted #3985 geometry. */}
       {/* Swipe reveal hint: sits behind the moving surface, showing the
           configured action's icon only inside the strip the surface vacates.
           Clipping that strip keeps the hint disjoint from the moving overflow
