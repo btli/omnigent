@@ -2437,8 +2437,6 @@ function SectionGroup({
           onToggleCollapsed={onToggleCollapsed}
         />
         {headerAction && (
-          // Always visible on mobile, matching section header actions. Desktop
-          // keeps the hover/keyboard-focus reveal behavior.
           <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity md:opacity-0 md:has-[:focus-visible]:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100 md:group-hover/header:opacity-100">
             {headerAction}
           </div>
