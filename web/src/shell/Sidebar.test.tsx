@@ -690,6 +690,19 @@ describe("Sidebar session list", () => {
     expect(within(sessionsSection!).queryByRole("button", { name: "Select sessions" })).toBeNull();
   });
 
+  it("keeps project header actions rendered on mobile", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    const projectsSection = screen.getByText("Projects").closest("section");
+    expect(projectsSection).not.toBeNull();
+
+    const newProject = within(projectsSection!).getByRole("button", { name: "New project" });
+    const projectActions = newProject.parentElement?.parentElement;
+    expect(projectActions).toHaveClass("flex", "md:opacity-0");
+    expect(projectActions).not.toHaveClass("hidden");
+  });
+
   it("renders the 'Automations' nav row directly under 'New session' and routes to /tasks", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
