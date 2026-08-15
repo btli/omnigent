@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { useInputCapabilities } from "@/hooks/useInputCapabilities";
+
 const KEYBOARD_STEP_PX = 20;
 // Width of the painted separator strip (the consumer's `w-1` element).
 const PAINTED_WIDTH_PX = 4;
@@ -14,15 +16,8 @@ const PAINTED_WIDTH_PX = 4;
 const COARSE_PAD = { left: 12, right: 28 }; // 12 + 4 + 28 = 44px
 const FINE_PAD = { left: 6, right: 14 }; // 6 + 4 + 14 = 24px
 
-function hitTargetPad() {
-  const coarse =
-    typeof window !== "undefined" &&
-    typeof window.matchMedia === "function" &&
-    window.matchMedia("(pointer: coarse)").matches;
-  return coarse ? COARSE_PAD : FINE_PAD;
-}
-
 export function useResizableColumn(defaultWidth = 176, minWidth = 100, maxWidth = 480) {
+  const { coarsePrimary } = useInputCapabilities();
   const [width, setWidth] = useState(defaultWidth);
   // Pointer id of the active drag; null when idle. First pointer wins — a
   // second concurrent pointer is ignored until the first drag ends.
@@ -30,7 +25,7 @@ export function useResizableColumn(defaultWidth = 176, minWidth = 100, maxWidth 
   const containerRef = useRef<HTMLElement | null>(null);
   // Removes the document-level fallback listeners for the active drag.
   const removeDocListeners = useRef<(() => void) | null>(null);
-  const pad = useRef(hitTargetPad()).current;
+  const pad = coarsePrimary ? COARSE_PAD : FINE_PAD;
 
   const clamp = useCallback(
     (w: number) => Math.max(minWidth, Math.min(maxWidth, w)),
