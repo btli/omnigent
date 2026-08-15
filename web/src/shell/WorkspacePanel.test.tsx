@@ -688,7 +688,7 @@ describe("WorkspacePanel resize handle geometry", () => {
     backgroundClip: "content-box",
   } as React.CSSProperties;
 
-  it("renders the resize target as a dedicated flex gutter beside the clipped panel", () => {
+  it("positions the resize target over the seam without consuming flex width", () => {
     renderWorkspace({
       handleProps: {
         tabIndex: 0,
@@ -705,7 +705,9 @@ describe("WorkspacePanel resize handle geometry", () => {
     expect(separator.nextElementSibling).toBe(panel);
     expect(panel).toHaveClass("md:overflow-hidden");
     expect(panel).not.toContainElement(separator);
-    expect(separator).toHaveClass("shrink-0");
+    expect(separator).toHaveClass("md:absolute", "md:inset-y-0");
+    expect(separator).not.toHaveClass("shrink-0");
+    expect(separator.style.right).toBe("360px");
   });
 
   it("keeps adjacent scroll surfaces outside the gutter ownership", () => {
@@ -742,7 +744,7 @@ describe("WorkspacePanel resize handle geometry", () => {
 
     const separator = screen.getByRole("separator", { name: "Resize panel" });
     expect(separator.className).toBe(
-      "relative z-10 hidden w-1 shrink-0 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block",
+      "z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:absolute md:inset-y-0 md:block",
     );
     expect(separator.style.boxSizing).toBe("content-box");
     expect(separator.style.backgroundClip).toBe("content-box");

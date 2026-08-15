@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useInputCapabilities } from "@/hooks/useInputCapabilities";
 import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
 
 const MIN_WIDTH_PX = 320;
@@ -113,6 +114,7 @@ export function resetSharedWidthStoreForTesting(): void {
  * props to spread onto the resize handle element.
  */
 export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx = MIN_WIDTH_PX) {
+  const { coarsePrimary } = useInputCapabilities();
   const width = useSyncExternalStore(
     subscribeSharedWidth,
     getSharedWidthSnapshot,
@@ -132,18 +134,6 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
   useEffect(() => {
     const mql = window.matchMedia(`(min-width: ${MD_BREAKPOINT}px)`);
     const handler = (e: MediaQueryListEvent) => setIsDesktop(e.matches);
-    mql.addEventListener("change", handler);
-    return () => mql.removeEventListener("change", handler);
-  }, []);
-
-  const [isCoarse, setIsCoarse] = useState(
-    () => typeof window !== "undefined" && !!window.matchMedia?.("(pointer: coarse)").matches,
-  );
-
-  useEffect(() => {
-    const mql = window.matchMedia?.("(pointer: coarse)");
-    if (!mql) return;
-    const handler = (e: MediaQueryListEvent) => setIsCoarse(e.matches);
     mql.addEventListener("change", handler);
     return () => mql.removeEventListener("change", handler);
   }, []);
@@ -307,10 +297,16 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
       onPointerCancel,
       onLostPointerCapture: onPointerCancel,
       onKeyDown,
-      style: handleGutterStyle(isCoarse),
+      style: handleGutterStyle(coarsePrimary),
       role: "separator" as const,
       "aria-orientation": "vertical" as const,
       "aria-label": "Resize panel",
+      "aria-valuenow": resolvedWidth,
+      "aria-valuemin": minWidthPx,
+      "aria-valuemax":
+        typeof window === "undefined"
+          ? resolvedWidth
+          : Math.max(minWidthPx, window.innerWidth * MAX_WIDTH_RATIO),
       tabIndex: 0,
     },
     /** Whether the resize handle should be visible (desktop only). */

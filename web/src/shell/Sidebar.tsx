@@ -778,13 +778,13 @@ export function Sidebar({
         <div
           {...resizeHandleProps}
           data-testid="sidebar-resize-handle"
-          className="relative z-10 hidden w-1 shrink-0 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:order-2 md:block"
+          className="z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:absolute md:inset-y-0 md:right-0 md:block"
         />
       )}
-      {/* The content wrapper owns clipping while the handle stays a real seam
-          gutter; only its tightly budgeted slivers overlap either neighbor. */}
+      {/* The content wrapper owns clipping while the absolutely positioned
+          handle enlarges the seam without consuming sidebar layout width. */}
       {/* prettier-ignore */}
-      <div data-testid="sidebar-clipped-content" className="flex min-h-0 flex-1 flex-col md:order-1 md:overflow-hidden">
+      <div data-testid="sidebar-clipped-content" className="flex min-h-0 flex-1 flex-col md:overflow-hidden">
       {inSettings ? (
         <SettingsSidebarBody onNavClick={onNavClick} />
       ) : (
