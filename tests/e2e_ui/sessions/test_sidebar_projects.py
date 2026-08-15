@@ -233,6 +233,21 @@ def test_remove_session_from_project(
 _MOBILE_VIEWPORT = {"width": 390, "height": 780}
 
 
+def test_project_header_action_is_clickable_on_mobile(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The Projects header keeps its new-project action visible on mobile."""
+    base_url, session_id = seeded_session
+    page.set_viewport_size(_MOBILE_VIEWPORT)
+    page.goto(f"{base_url}/c/{session_id}?sidebar=open")
+
+    new_project = page.get_by_test_id("new-project")
+    expect(new_project).to_be_visible()
+    new_project.click()
+    expect(page.get_by_placeholder("Project name…")).to_be_visible()
+
+
 def test_project_new_session_folds_into_kebab_on_mobile(
     page: Page,
     seeded_session: tuple[str, str],
