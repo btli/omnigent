@@ -33,7 +33,7 @@ class OmnigentWebViewClientTest {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
         var readyUrl: String? = null
         val client =
-            client(shouldInjectBridgeAtPageReady = true) { url, _, _ ->
+            client(shouldInjectBridgeAtPageReady = true) { url, _, _, _ ->
                 readyUrl = url
             }
 
@@ -49,6 +49,22 @@ class OmnigentWebViewClientTest {
 
         webView.completeEvaluation()
         assertEquals(PINNED_URL, readyUrl)
+    }
+
+    @Test
+    fun `same-url finishes retain their initiating load generations`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val generations = mutableListOf<Long?>()
+        val client = client(onPageReady = { _, _, _, generation -> generations += generation })
+        client.expectLoad(1)
+        client.onPageStarted(webView, PINNED_URL, null)
+        client.expectLoad(2)
+        client.onPageStarted(webView, PINNED_URL, null)
+
+        client.onPageFinished(webView, PINNED_URL)
+        client.onPageFinished(webView, PINNED_URL)
+
+        assertEquals(listOf(1L, 2L), generations)
     }
 
     @Test
@@ -295,7 +311,7 @@ class OmnigentWebViewClientTest {
         shouldInjectBridgeAtPageReady: Boolean = false,
         pinnedOrigin: String = PINNED_ORIGIN,
         onLoginRequired: () -> Unit = {},
-        onPageReady: (String?, Boolean, Boolean) -> Unit = { _, _, _ -> },
+        onPageReady: (String?, Boolean, Boolean, Long?) -> Unit = { _, _, _, _ -> },
     ) = OmnigentWebViewClient(
         pinnedOrigin = { pinnedOrigin },
         shouldInjectBridgeAtPageReady = { shouldInjectBridgeAtPageReady },
