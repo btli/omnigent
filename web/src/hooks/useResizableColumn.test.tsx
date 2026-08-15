@@ -2,6 +2,35 @@ import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useResizableColumn } from "./useResizableColumn";
 
+const defaultMatchMedia = window.matchMedia;
+
+function installMatchMedia(state: Record<string, boolean>) {
+  const listeners = new Map<string, Set<() => void>>();
+  Object.defineProperty(window, "matchMedia", {
+    configurable: true,
+    writable: true,
+    value: vi.fn((query: string) => ({
+      get matches() {
+        return state[query] ?? false;
+      },
+      media: query,
+      addEventListener: (_: string, callback: () => void) => {
+        if (!listeners.has(query)) listeners.set(query, new Set());
+        listeners.get(query)!.add(callback);
+      },
+      removeEventListener: (_: string, callback: () => void) => {
+        listeners.get(query)?.delete(callback);
+      },
+    })),
+  });
+  return {
+    set(query: string, matches: boolean) {
+      state[query] = matches;
+      for (const callback of listeners.get(query) ?? []) callback();
+    },
+  };
+}
+
 function pointerEvent(
   pointerId: number,
   clientX = 0,
@@ -37,6 +66,7 @@ function renderColumn(containerLeft = 0) {
 afterEach(() => {
   document.body.style.cursor = "";
   document.body.style.userSelect = "";
+  window.matchMedia = defaultMatchMedia;
 });
 
 describe("useResizableColumn pointer dragging", () => {
@@ -256,14 +286,32 @@ describe("useResizableColumn touch affordances", () => {
   });
 
   it("widens the hit target to >=44px on coarse pointers", () => {
-    const spy = vi.spyOn(window, "matchMedia").mockReturnValue({ matches: true } as MediaQueryList);
+    installMatchMedia({ "(pointer: coarse)": true });
     const { result } = renderColumn(0);
     const style = result.current.handleProps.style;
-    spy.mockRestore();
 
     expect(style.paddingLeft + PAINTED + style.paddingRight).toBeGreaterThanOrEqual(44);
     // Pad biased toward the terminal pane so the list rows' trailing status
     // badges keep more of their tappable area.
     expect(style.paddingRight).toBeGreaterThan(style.paddingLeft);
+  });
+
+  it("updates the hit target when the primary pointer capability changes at runtime", () => {
+    const media = installMatchMedia({ "(pointer: coarse)": false });
+    const { result } = renderColumn(0);
+
+    expect(result.current.handleProps.style).toMatchObject({
+      paddingLeft: 6,
+      paddingRight: 14,
+      marginLeft: -10,
+    });
+
+    act(() => media.set("(pointer: coarse)", true));
+
+    expect(result.current.handleProps.style).toMatchObject({
+      paddingLeft: 12,
+      paddingRight: 28,
+      marginLeft: -16,
+    });
   });
 });
