@@ -68,6 +68,39 @@ class OmnigentWebViewClientTest {
     }
 
     @Test
+    fun `superseding an unfinished load attributes the next finish to the new generation`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val generations = mutableListOf<Long?>()
+        val client = client(onPageReady = { _, _, _, generation -> generations += generation })
+        client.expectLoad(1)
+        client.onPageStarted(webView, PINNED_URL, null)
+
+        client.supersedePendingLoads()
+        client.expectLoad(2)
+        client.onPageStarted(webView, PINNED_URL, null)
+        client.onPageFinished(webView, PINNED_URL)
+
+        assertEquals(listOf(2L), generations)
+    }
+
+    @Test
+    fun `superseded finish is inert before the current load starts`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val generations = mutableListOf<Long?>()
+        val client = client(onPageReady = { _, _, _, generation -> generations += generation })
+        client.expectLoad(1)
+        client.onPageStarted(webView, PINNED_URL, null)
+
+        client.supersedePendingLoads()
+        client.onPageFinished(webView, PINNED_URL)
+        client.expectLoad(2)
+        client.onPageStarted(webView, PINNED_URL, null)
+        client.onPageFinished(webView, PINNED_URL)
+
+        assertEquals(listOf(null, 2L), generations)
+    }
+
+    @Test
     fun `pinned page finish hides the workspace chrome without the facade fallback`() {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
         val client = client(shouldInjectBridgeAtPageReady = false)
