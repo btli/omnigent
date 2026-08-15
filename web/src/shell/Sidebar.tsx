@@ -715,7 +715,7 @@ export function Sidebar({
         // conversations-sidebar only matters under the macOS Electron
         // shell, where it pushes the card below the traffic lights
         // (see the [data-electron-mac] rules in index.css).
-        "conversations-sidebar flex flex-col bg-card md:select-none",
+        "conversations-sidebar flex flex-col bg-card md:flex-row md:select-none",
         // Mobile (default): fixed full-screen overlay, slide via
         // translate-x. Stays edge-to-edge — the floating-card
         // treatment below is desktop-only.
@@ -739,7 +739,7 @@ export function Sidebar({
         // divider — no outer margin or rounding. Width (the user-resizable
         // variable) animates →0 to push main; when closed the border
         // collapses too so nothing lingers.
-        "md:translate-x-0 md:overflow-hidden",
+        "md:translate-x-0",
         // Normal desktop flow: relative panel that pushes main. Suppressed while
         // peeking so its `md:inset-auto`/`md:relative` don't override the
         // floating-card positioning below (same `md:` layer, source order wins).
@@ -749,7 +749,7 @@ export function Sidebar({
         // ringed and shadowed, sliding+fading in from the left so it reads as an
         // overlay rather than a push.
         peek &&
-          "is-peek md:absolute md:inset-2 p-0 md:max-w-[400px] ring-1 ring-border rounded-xl md:shadow-xl animate-in fade-in slide-in-from-left-4 duration-200 ease-out",
+          "is-peek md:absolute md:inset-2 p-0 md:max-w-[400px] md:overflow-hidden ring-1 ring-border rounded-xl md:shadow-xl animate-in fade-in slide-in-from-left-4 duration-200 ease-out",
       )}
       style={
         {
@@ -775,12 +775,17 @@ export function Sidebar({
           when closed also keeps it from being draggable while collapsed.
           Hidden while peeking too — the peek card is a fixed-width flyout, not
           a resizable panel. */}
-      {!peek && (
+      {open && !peek && (
         <div
           {...resizeHandleProps}
-          className="absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
+          data-testid="sidebar-resize-handle"
+          className="relative z-10 hidden w-1 shrink-0 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:order-2 md:block"
         />
       )}
+      {/* The content wrapper owns clipping while the handle stays a real seam
+          gutter; only its tightly budgeted slivers overlap either neighbor. */}
+      {/* prettier-ignore */}
+      <div data-testid="sidebar-clipped-content" className="flex min-h-0 flex-1 flex-col md:order-1 md:overflow-hidden">
       {inSettings ? (
         <SettingsSidebarBody onNavClick={onNavClick} />
       ) : (
@@ -1004,6 +1009,7 @@ export function Sidebar({
           <SidebarServerPicker />
         </>
       )}
+      </div>
     </aside>
   );
 }
