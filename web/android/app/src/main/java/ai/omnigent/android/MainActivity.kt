@@ -736,12 +736,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun loadUrlWithGeneration(url: String) {
+        omnigentWebViewClient.supersedePendingLoads()
         loadGeneration++
         omnigentWebViewClient.expectLoad(loadGeneration)
         webView.loadUrl(url)
     }
 
     private fun reloadWithGeneration() {
+        omnigentWebViewClient.supersedePendingLoads()
         loadGeneration++
         omnigentWebViewClient.expectLoad(loadGeneration)
         webView.reload()
