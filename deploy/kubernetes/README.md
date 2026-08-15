@@ -272,15 +272,26 @@ Both are detailed in
 
 ## Deploy with ArgoCD
 
-The `overlays/argocd/` overlay layers sync-wave annotations onto `sandbox-runners`
-so ArgoCD applies resources in dependency order (namespaces → RBAC → config →
-Deployment). ArgoCD renders Kustomize natively — no plugin or Helm chart needed.
+The `overlays/argocd/` overlay adds ArgoCD safety annotations (`Prune=false` on
+stateful resources, `ignoreDifferences` for operator-managed Secrets) onto
+`sandbox-runners`. ArgoCD renders Kustomize natively — no plugin needed.
+
+**Prerequisites:** fork the repo and replace the placeholder values in
+`base/secret.yaml` in your fork (ArgoCD reads from Git, not your disk). The
+default `accounts` auth provider refuses the managed runner dial-back — use
+header/OIDC auth or single-user (see
+[sandbox-runners README § Server auth](overlays/sandbox-runners/README.md#server-auth-managed-hosts)).
 
 ```bash
-# Edit application.yaml — set repoURL/targetRevision to your fork, then:
+# 1. Edit application.yaml — set repoURL to your fork, targetRevision to your
+#    branch — then apply:
 kubectl apply -f deploy/kubernetes/overlays/argocd/application.yaml
 
-# Create the harness-credentials Secret out of band (see sandbox-runners README):
+# 2. Wait for ArgoCD to create the runner namespace (up to 3 min without a webhook):
+kubectl wait --for=jsonpath='{.status.phase}'=Active \
+  namespace/omnigent-sandboxes --timeout=300s
+
+# 3. Create the harness-credentials Secret (see sandbox-runners README):
 kubectl create secret generic omnigent-creds -n omnigent-sandboxes \
   --from-literal=ANTHROPIC_API_KEY=sk-ant-... \
   --from-literal=OPENAI_API_KEY=sk-...

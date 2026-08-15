@@ -1,15 +1,28 @@
 ---
 # Sample ArgoCD Application CR for deploying Omnigent with the kubernetes
-# sandbox provider. Apply this to the namespace where ArgoCD runs (typically
-# `argocd`). Adjust repoURL and targetRevision to match your fork/branch.
+# sandbox provider. Fork the repo, edit config/secrets in your fork, then
+# set repoURL and targetRevision below. Apply to the argocd namespace.
 #
-# This Application points at the argocd overlay, which layers sync-wave
-# ordering onto the sandbox-runners overlay. ArgoCD renders the Kustomize
-# output natively — no Helm chart or plugin needed.
+# ArgoCD renders the Kustomize output natively — no Helm chart or plugin needed.
 #
-# The harness-credentials Secret (omnigent-creds) is NOT managed by this
-# Application — create it out of band or use sealed-secrets / external-secrets
-# (see README.md).
+# TWO SECRETS ARE NOT IN GIT and must be created out of band (or via
+# sealed-secrets / external-secrets):
+#
+#   1. omnigent-secrets  — DATABASE_URL + cookie secret (see base/secret.yaml
+#      for the keys; replace the placeholder values in your fork, or manage
+#      the Secret externally and remove secret.yaml from the overlay render
+#      with a $patch: delete — see openshift/kustomization.yaml for the
+#      pattern).
+#   2. omnigent-creds    — harness LLM API keys for runner Pods (see the
+#      sandbox-runners README).
+#
+# DELETION WARNING: the resources-finalizer below means
+# `kubectl delete application omnigent` deletes every tracked resource,
+# including both Namespace objects and the artifact PVC. The overlay's
+# Prune=false annotations prevent accidental pruning during sync, but the
+# finalizer bypasses them on Application deletion. Remove the finalizer
+# if you want `kubectl delete application` to orphan resources instead of
+# cascading.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
@@ -20,24 +33,40 @@ metadata:
 spec:
   project: default
   source:
-    # Point at your fork or the upstream repo.
     repoURL: https://github.com/omnigent-ai/omnigent.git
     targetRevision: HEAD
     path: deploy/kubernetes/overlays/argocd
   destination:
-    # The overlay's resources set their own namespaces explicitly (omnigent and
-    # omnigent-sandboxes), so the Application destination namespace is not
-    # injected — it only tells ArgoCD which cluster to target.
+    # Resources set their own namespaces explicitly (omnigent and
+    # omnigent-sandboxes), so destination.namespace is not injected.
     server: https://kubernetes.default.svc
+  ignoreDifferences:
+    # The checked-in secret.yaml ships placeholder values. Operators replace
+    # them out of band (kubectl edit, sealed-secrets, external-secrets), and
+    # selfHeal must not revert those edits. Without this, selfHeal
+    # continuously overwrites live credentials with the placeholder.
+    - group: ""
+      kind: Secret
+      name: omnigent-secrets
+      namespace: omnigent
+      jsonPointers:
+        - /data
+    # The API server mutates spec.resources.requests.storage on PVC creation
+    # (rounding, defaulting). selfHeal would report a perpetual diff.
+    - group: ""
+      kind: PersistentVolumeClaim
+      name: omnigent-artifacts
+      namespace: omnigent
+      jsonPointers:
+        - /spec/resources/requests/storage
   syncPolicy:
     automated:
       prune: true
       selfHeal: true
     syncOptions:
-      # Required: the overlay creates two namespaces (omnigent, omnigent-sandboxes),
-      # and ArgoCD must be allowed to create them.
-      - CreateNamespace=true
-      # Respect the sync-wave annotations so resources deploy in order.
+      # Honour the ignoreDifferences entries above during sync, not just
+      # during diff. Without this, a manual sync still overwrites the live
+      # secret values even though the diff view hides them.
       - RespectIgnoreDifferences=true
     retry:
       limit: 3
