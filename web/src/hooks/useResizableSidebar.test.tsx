@@ -108,6 +108,20 @@ describe("useResizableSidebar", () => {
     expect(readPanelSizePreference("sidebarWidthPx")).toBeNull();
   });
 
+  it("exposes separator value semantics that track keyboard resizing", () => {
+    const { result } = renderHook(() => useResizableSidebar());
+
+    expect(result.current.handleProps).toMatchObject({
+      role: "separator",
+      "aria-valuenow": 320,
+      "aria-valuemin": 220,
+      "aria-valuemax": 1000,
+    });
+
+    expect(nudge(result, "ArrowRight")).toBe(340);
+    expect(result.current.handleProps["aria-valuenow"]).toBe(340);
+  });
+
   it("widens on ArrowRight and narrows on ArrowLeft, persisting each step", () => {
     const { result } = renderHook(() => useResizableSidebar());
 
