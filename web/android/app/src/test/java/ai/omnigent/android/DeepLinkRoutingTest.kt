@@ -96,7 +96,7 @@ class DeepLinkRoutingTest {
     }
 
     @Test
-    fun `same-origin link after a failed load waits for a successful retry`() {
+    fun `same-origin link after a failed load starts a retry and drains`() {
         store().connect("https://h.example")
         val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
         val activity = controller.get()
@@ -105,10 +105,69 @@ class DeepLinkRoutingTest {
         controller.newIntent(viewIntent("omnigent://h.example/c/$hex"))
 
         assertFalse(activity.privateField("pageLoaded") as Boolean)
+        assertFalse(activity.privateField("pinnedOriginLoadFailed") as Boolean)
         assertEquals("/c/$hex", activity.privateField("pendingNavigatePath"))
 
         activity.invokeOnPageReady("https://h.example")
         assertNull(activity.privateField("pendingNavigatePath"))
+        assertFalse(activity.privateField("processingDeepLink") as Boolean)
+    }
+
+    @Test
+    fun `different-origin link clears a pinned-origin failure and drains`() {
+        store().connect("https://next.example/mount")
+        store().connect("https://h.example")
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        activity.invokeOnPageReady("https://h.example", mainFrameLoadFailed = true)
+
+        controller.newIntent(viewIntent("omnigent://next.example/c/$hex"))
+
+        assertEquals("https://next.example", activity.privateField("pinnedOrigin"))
+        assertFalse(activity.privateField("pinnedOriginLoadFailed") as Boolean)
+        activity.invokeOnPageReady("https://next.example/mount")
+        assertFalse(activity.privateField("processingDeepLink") as Boolean)
+    }
+
+    @Test
+    fun `explicit retry clears a pinned-origin failure and drains`() {
+        store().connect("https://h.example")
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        activity.invokeOnPageReady("https://h.example", mainFrameLoadFailed = true)
+
+        activity.invokeRetryPinnedOrigin()
+
+        assertFalse(activity.privateField("pinnedOriginLoadFailed") as Boolean)
+        activity.invokeOnPageReady("https://h.example")
+        assertTrue(activity.privateField("pageLoaded") as Boolean)
+        assertFalse(activity.privateField("processingDeepLink") as Boolean)
+    }
+
+    @Test
+    fun `failed head then same-origin retry then different-origin link drains FIFO`() {
+        store().connect("https://next.example/mount")
+        store().connect("https://h.example")
+        val controller =
+            Robolectric.buildActivity(
+                MainActivity::class.java,
+                viewIntent("omnigent://h.example/c/first-$hex"),
+            )
+        val activity = controller.setup().get()
+        controller.newIntent(viewIntent("omnigent://h.example/c/second-$hex"))
+        controller.newIntent(viewIntent("omnigent://next.example/c/third-$hex"))
+
+        activity.invokeOnPageReady("https://h.example", mainFrameLoadFailed = true)
+        assertEquals("/c/second-$hex", activity.privateField("pendingNavigatePath"))
+        assertFalse(activity.privateField("pinnedOriginLoadFailed") as Boolean)
+
+        activity.invokeOnPageReady("https://h.example", mainFrameLoadFailed = true)
+        assertEquals("https://next.example", activity.privateField("pinnedOrigin"))
+        assertFalse(activity.privateField("pinnedOriginLoadFailed") as Boolean)
+
+        activity.invokeOnPageReady("https://next.example/mount")
+        assertTrue((activity.privateField("deepLinkQueue") as ArrayDeque<*>).isEmpty())
+        assertFalse(activity.privateField("processingDeepLink") as Boolean)
     }
 
     @Test

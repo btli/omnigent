@@ -44,3 +44,11 @@ fun MainActivity.invokeOnPageReady(
         ).apply { isAccessible = true }
         .invoke(this, url, mainFrameLoadFailed, mainFramePersistenceFailed)
 }
+
+fun MainActivity.invokeRetryPinnedOrigin() {
+    MainActivity::class
+        .java
+        .getDeclaredMethod("retryPinnedOrigin")
+        .apply { isAccessible = true }
+        .invoke(this)
+}

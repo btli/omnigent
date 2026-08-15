@@ -82,6 +82,12 @@ class MainActivity : AppCompatActivity() {
     private var deepLinkDialog: AlertDialog? = null
     private var lastInsets: Insets? = null
     private var pageLoaded = false
+
+    // Invariant: a terminal failure belongs to the currently pinned origin.
+    // A same-origin link or explicit retry starts a real reload, an origin switch
+    // clears the failure, and either success or another terminal failure resolves
+    // the awaiting FIFO head so processing can never remain wedged in this state.
+    private var pinnedOriginLoadFailed = false
     private var bridgeTransportInstalled = false
     private var bridgeScriptHandler: ScriptHandler? = null
     private var loginAttempts = 0 // capped browser-login retries; reset in onPageReady
@@ -766,6 +772,7 @@ class MainActivity : AppCompatActivity() {
         newOrigin: String,
     ) {
         pendingPersistUrl = null
+        pinnedOriginLoadFailed = false
         // Cancel any in-flight login before pinning the new origin: the poll runs
         // against the old server and its token must never land on the new origin's
         // cookie store. cancel() also resets inFlight so the new server can start
@@ -830,7 +837,7 @@ class MainActivity : AppCompatActivity() {
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 3 -> {
-                    webView.reload()
+                    retryPinnedOrigin()
                     true
                 }
 
@@ -877,6 +884,7 @@ class MainActivity : AppCompatActivity() {
             webView.clearHistory()
         }
         pageLoaded = !mainFrameLoadFailed && !mainFramePersistenceFailed
+        pinnedOriginLoadFailed = !pageLoaded
         if (pageLoaded) {
             // First successful load of a consent-approved server: only now does it
             // become the stored current server / a trusted recent.
@@ -926,6 +934,12 @@ class MainActivity : AppCompatActivity() {
     private fun clearPendingNavigate() {
         pendingNavigatePath = null
         pendingNavigateOrigin = null
+    }
+
+    private fun retryPinnedOrigin() {
+        pinnedOriginLoadFailed = false
+        pageLoaded = false
+        webView.reload()
     }
 
     private fun supersedePendingNavigation(): Boolean {
@@ -1001,6 +1015,7 @@ class MainActivity : AppCompatActivity() {
                         deepLinkAwaitingNavigation = false
                         continue
                     }
+                    if (pinnedOriginLoadFailed) retryPinnedOrigin()
                     return
                 } else {
                     val store = ServerStore(this)
