@@ -3865,9 +3865,10 @@ function ConversationRow({
       )}
     >
       {/* Swipe reveal hint: sits behind the moving surface, showing the
-          configured action's icon on the side being revealed. Inert (no pointer
-          events) and only rendered mid-swipe, so at rest the row markup is
-          exactly what it was before the gesture existed.
+          configured action's icon only inside the strip the surface vacates.
+          Clipping that strip keeps the hint disjoint from the moving overflow
+          target at every offset. It is inert and only rendered mid-swipe, so at
+          rest the row markup is exactly what it was before the gesture existed.
           Archive uses the accent pair (blue in both modes) rather than
           `--primary`, which is near-black in light mode and reads as a flat grey
           button instead of a revealed surface. Passing the commit threshold
@@ -3876,9 +3877,9 @@ function ConversationRow({
       {isSwiping && (
         <div
           aria-hidden
+          data-testid="conversation-swipe-reveal"
           className={cn(
-            "pointer-events-none absolute inset-0 flex items-center rounded-[var(--radius-otto-sm)] px-4",
-            swipe.dx > 0 ? "justify-start" : "justify-end",
+            "pointer-events-none absolute inset-y-0 flex items-center justify-center overflow-hidden rounded-[var(--radius-otto-sm)]",
             "transition-colors",
             swipingAction === "delete"
               ? swipeCommitted
@@ -3888,6 +3889,7 @@ function ConversationRow({
                 ? "bg-accent text-accent-foreground"
                 : "bg-accent/50 text-accent-foreground/70",
           )}
+          style={swipe.dx > 0 ? { left: 0, width: swipe.dx } : { right: 0, width: -swipe.dx }}
         >
           <span
             className={cn(
@@ -3918,6 +3920,7 @@ function ConversationRow({
           `bg-sidebar` only while mid-swipe: an unconditional background would
           plate every row and cover the sidebar canvas. */}
       <div
+        data-testid="conversation-swipe-surface"
         className={cn(
           "relative",
           isSwiping && "rounded-[var(--radius-otto-sm)] bg-sidebar",

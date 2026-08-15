@@ -1441,6 +1441,30 @@ describe("touch swipe actions", () => {
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
   });
 
+  it("keeps the delete reveal outside the overflow target through reveal, threshold, and cancel", () => {
+    writeSwipeActions({ left: "delete", right: "none" });
+    renderSidebar();
+
+    expect(screen.queryByTestId("conversation-swipe-reveal")).toBeNull();
+
+    const swipe = moveSwipeRow(-40);
+    const reveal = screen.getByTestId("conversation-swipe-reveal");
+    const surface = screen.getByTestId("conversation-swipe-surface");
+    const overflow = screen.getByTestId("conversation-actions");
+    expect(reveal).toHaveStyle({ right: "0px", width: "40px" });
+    expect(surface).toHaveStyle({ marginRight: "40px" });
+    expect(surface).toContainElement(overflow);
+
+    fireEvent.pointerMove(swipe.li, { ...POINTER, clientX: 28, clientY: 100 });
+    expect(reveal).toHaveStyle({ right: "0px", width: "72px" });
+    expect(surface).toHaveStyle({ marginRight: "72px" });
+
+    fireEvent.pointerCancel(swipe.li, POINTER);
+    expect(screen.queryByTestId("conversation-swipe-reveal")).toBeNull();
+    expect(surface.style.marginRight).toBe("");
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
+  });
+
   it("resets an armed swipe when pointer capture is unexpectedly lost", () => {
     renderSidebar();
 
