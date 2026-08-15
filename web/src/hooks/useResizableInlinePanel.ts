@@ -5,7 +5,8 @@
 // ExecutionLogsPanel / FilesPanelDrawer — those open at ~50 % by default
 // while the inline panel starts at a compact sidebar width.
 
-import { useCallback, useEffect, useReducer, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useReducer, useRef, useSyncExternalStore } from "react";
+import { useInputCapabilities } from "@/hooks/useInputCapabilities";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
 const MIN_WIDTH_PX = 240;
@@ -171,10 +172,8 @@ export function useResizableInlinePanel(
   reservedPx = 0,
   enabled = true,
 ) {
+  const { coarsePrimary } = useInputCapabilities();
   const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
-  const [isCoarsePointer, setIsCoarsePointer] = useState(
-    () => typeof window !== "undefined" && !!window.matchMedia?.("(pointer: coarse)").matches,
-  );
   // On a session switch the module store still holds the previous session's
   // width until the effect below re-seeds it after commit. Derive this render's
   // width straight from the incoming session's saved value so the panel doesn't
@@ -218,14 +217,6 @@ export function useResizableInlinePanel(
   const removeDragOverlay = useCallback(() => {
     overlayRef.current?.remove();
     overlayRef.current = null;
-  }, []);
-
-  useEffect(() => {
-    const media = window.matchMedia?.("(pointer: coarse)");
-    if (!media) return;
-    const onChange = (event: MediaQueryListEvent) => setIsCoarsePointer(event.matches);
-    media.addEventListener("change", onChange);
-    return () => media.removeEventListener("change", onChange);
   }, []);
 
   // Re-clamp on viewport resize so the panel can't overflow a shrunken window.
@@ -367,10 +358,13 @@ export function useResizableInlinePanel(
       onPointerCancel,
       onLostPointerCapture: onPointerCancel,
       onKeyDown,
-      style: gutterStyle(isCoarsePointer),
+      style: gutterStyle(coarsePrimary),
       role: "separator" as const,
       "aria-orientation": "vertical" as const,
       "aria-label": "Resize panel",
+      "aria-valuenow": resolvedWidth,
+      "aria-valuemin": Math.min(minWidthPx, resolvedWidth),
+      "aria-valuemax": clamp(Number.POSITIVE_INFINITY, minWidthPx, reservedPx),
       "aria-disabled": !enabled || resolvedWidth === 0,
       tabIndex: 0,
     },
