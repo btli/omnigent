@@ -32,8 +32,10 @@ class OmnigentWebViewClient(
         url: String?,
         mainFrameLoadFailed: Boolean,
         mainFramePersistenceFailed: Boolean,
+        loadGeneration: Long?,
     ) -> Unit,
     private val onLoginRequired: () -> Unit,
+    private val loadUrl: (WebView, String) -> Unit = WebView::loadUrl,
 ) : WebViewClient() {
     // Bare-root -> /omnigent bounces since the last app page loaded; see
     // workspaceRootTarget for why they're capped.
@@ -51,6 +53,12 @@ class OmnigentWebViewClient(
     // erase the error before the load it belongs to finishes.
     private var mainFrameLoadFailed = false
     private var mainFramePersistenceFailed = false
+    private val expectedLoadGenerations = ArrayDeque<Long>()
+    private val startedLoads = ArrayDeque<StartedLoad>()
+
+    fun expectLoad(generation: Long) {
+        expectedLoadGenerations.addLast(generation)
+    }
 
     override fun onPageStarted(
         view: WebView,
@@ -58,6 +66,7 @@ class OmnigentWebViewClient(
         favicon: Bitmap?,
     ) {
         super.onPageStarted(view, url, favicon)
+        startedLoads.addLast(StartedLoad(expectedLoadGenerations.removeFirstOrNull()))
 
         val origin = originOf(url)
         val scheme = url?.let { Uri.parse(it).scheme?.lowercase() }
@@ -145,6 +154,7 @@ class OmnigentWebViewClient(
         // that fails safe — it can only skip one persist, never allow one.
         val loadFailed = mainFrameLoadFailed
         val persistenceFailed = mainFramePersistenceFailed
+        val loadGeneration = startedLoads.removeFirstOrNull()?.generation
         mainFrameLoadFailed = false
         mainFramePersistenceFailed = false
         val onPinnedOrigin = originOf(url) == pinnedOrigin()
@@ -164,10 +174,10 @@ class OmnigentWebViewClient(
         if (onPinnedOrigin && shouldInjectBridgeAtPageReady()) {
             view.evaluateJavascript(
                 NativeBridgeScript.source,
-            ) { onPageReady(url, loadFailed, persistenceFailed) }
+            ) { onPageReady(url, loadFailed, persistenceFailed, loadGeneration) }
             return
         }
-        onPageReady(url, loadFailed, persistenceFailed)
+        onPageReady(url, loadFailed, persistenceFailed, loadGeneration)
     }
 
     override fun shouldOverrideUrlLoading(
@@ -250,8 +260,12 @@ class OmnigentWebViewClient(
         view: WebView,
         target: String,
     ) {
-        mainHandler.post { view.loadUrl(target) }
+        mainHandler.post { loadUrl(view, target) }
     }
+
+    private data class StartedLoad(
+        val generation: Long?,
+    )
 
     private companion object {
         const val MAX_ROOT_BOUNCES = 1
