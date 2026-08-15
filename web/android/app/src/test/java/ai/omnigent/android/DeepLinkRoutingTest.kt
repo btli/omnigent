@@ -100,6 +100,8 @@ class DeepLinkRoutingTest {
         store().connect("https://h.example")
         val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
         val activity = controller.get()
+        val recording = RecordingLoadWebView(activity, "https://h.example")
+        activity.setPrivateField("webView", recording)
         activity.invokeOnPageReady("https://h.example", mainFrameLoadFailed = true)
 
         controller.newIntent(viewIntent("omnigent://h.example/c/$hex"))
@@ -107,6 +109,7 @@ class DeepLinkRoutingTest {
         assertFalse(activity.privateField("pageLoaded") as Boolean)
         assertFalse(activity.privateField("pinnedOriginLoadFailed") as Boolean)
         assertEquals("/c/$hex", activity.privateField("pendingNavigatePath"))
+        assertEquals(1, recording.reloadCount)
 
         activity.invokeOnPageReady("https://h.example")
         assertNull(activity.privateField("pendingNavigatePath"))
@@ -119,12 +122,15 @@ class DeepLinkRoutingTest {
         store().connect("https://h.example")
         val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
         val activity = controller.get()
+        val recording = RecordingLoadWebView(activity, "https://h.example")
+        activity.setPrivateField("webView", recording)
         activity.invokeOnPageReady("https://h.example", mainFrameLoadFailed = true)
 
         controller.newIntent(viewIntent("omnigent://next.example/c/$hex"))
 
         assertEquals("https://next.example", activity.privateField("pinnedOrigin"))
         assertFalse(activity.privateField("pinnedOriginLoadFailed") as Boolean)
+        assertEquals(listOf("https://next.example/mount"), recording.loadedUrls)
         activity.invokeOnPageReady("https://next.example/mount")
         assertFalse(activity.privateField("processingDeepLink") as Boolean)
     }
@@ -134,11 +140,14 @@ class DeepLinkRoutingTest {
         store().connect("https://h.example")
         val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
         val activity = controller.get()
+        val recording = RecordingLoadWebView(activity, "https://h.example")
+        activity.setPrivateField("webView", recording)
         activity.invokeOnPageReady("https://h.example", mainFrameLoadFailed = true)
 
         activity.invokeRetryPinnedOrigin()
 
         assertFalse(activity.privateField("pinnedOriginLoadFailed") as Boolean)
+        assertEquals(1, recording.reloadCount)
         activity.invokeOnPageReady("https://h.example")
         assertTrue(activity.privateField("pageLoaded") as Boolean)
         assertFalse(activity.privateField("processingDeepLink") as Boolean)
@@ -154,19 +163,49 @@ class DeepLinkRoutingTest {
                 viewIntent("omnigent://h.example/c/first-$hex"),
             )
         val activity = controller.setup().get()
+        val recording = RecordingLoadWebView(activity, "https://h.example")
+        activity.setPrivateField("webView", recording)
         controller.newIntent(viewIntent("omnigent://h.example/c/second-$hex"))
         controller.newIntent(viewIntent("omnigent://next.example/c/third-$hex"))
 
         activity.invokeOnPageReady("https://h.example", mainFrameLoadFailed = true)
         assertEquals("/c/second-$hex", activity.privateField("pendingNavigatePath"))
         assertFalse(activity.privateField("pinnedOriginLoadFailed") as Boolean)
+        assertEquals(1, recording.reloadCount)
 
         activity.invokeOnPageReady("https://h.example", mainFrameLoadFailed = true)
         assertEquals("https://next.example", activity.privateField("pinnedOrigin"))
         assertFalse(activity.privateField("pinnedOriginLoadFailed") as Boolean)
+        assertEquals(listOf("https://next.example/mount"), recording.loadedUrls)
 
         activity.invokeOnPageReady("https://next.example/mount")
         assertTrue((activity.privateField("deepLinkQueue") as ArrayDeque<*>).isEmpty())
+        assertFalse(activity.privateField("processingDeepLink") as Boolean)
+    }
+
+    @Test
+    fun `stale same-origin failure cannot resolve a newer retry head`() {
+        store().connect("https://h.example")
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        val initialGeneration = activity.privateField("loadGeneration") as Long
+        val recording = RecordingLoadWebView(activity, "https://h.example")
+        activity.setPrivateField("webView", recording)
+        controller.newIntent(viewIntent("omnigent://h.example/c/$hex"))
+
+        activity.invokeRetryPinnedOrigin()
+        val retryGeneration = activity.privateField("loadGeneration") as Long
+        assertEquals(1, recording.reloadCount)
+        activity.invokeOnPageReady(
+            "https://h.example",
+            mainFrameLoadFailed = true,
+            loadGeneration = initialGeneration,
+        )
+
+        assertEquals("/c/$hex", activity.privateField("pendingNavigatePath"))
+        assertTrue(activity.privateField("processingDeepLink") as Boolean)
+        activity.invokeOnPageReady("https://h.example", loadGeneration = retryGeneration)
+        assertNull(activity.privateField("pendingNavigatePath"))
         assertFalse(activity.privateField("processingDeepLink") as Boolean)
     }
 
