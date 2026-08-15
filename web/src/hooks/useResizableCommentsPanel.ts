@@ -15,6 +15,7 @@
 // resizes are also persisted so a full page reload restores the width.
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useInputCapabilities } from "@/hooks/useInputCapabilities";
 import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
 
 const DEFAULT_WIDTH_PX = 240; // matches the previous fixed `md:w-60`
@@ -124,6 +125,7 @@ export function resetCommentsWidthStoreForTesting(): void {
  * sibling viewer.
  */
 export function useResizableCommentsPanel() {
+  const { coarsePrimary } = useInputCapabilities();
   const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
   const width = Math.max(MIN_WIDTH_PX, Math.min(raw ?? DEFAULT_WIDTH_PX, MAX_WIDTH_PX));
   // Pointer id of the active drag; null when idle. A second concurrent
@@ -164,19 +166,8 @@ export function useResizableCommentsPanel() {
     return () => mql.removeEventListener("change", handler);
   }, []);
 
-  // Coarse pointers (fingers) get the full 44px hit box; fine pointers
-  // (mouse, trackpad, pen tip) can acquire a 24px one.
-  const [isCoarse, setIsCoarse] = useState(
-    () => typeof window !== "undefined" && !!window.matchMedia?.("(pointer: coarse)").matches,
-  );
-
-  useEffect(() => {
-    const mql = window.matchMedia?.("(pointer: coarse)");
-    if (!mql) return;
-    const handler = (e: MediaQueryListEvent) => setIsCoarse(e.matches);
-    mql.addEventListener("change", handler);
-    return () => mql.removeEventListener("change", handler);
-  }, []);
+  // Coarse pointers get the deliberate capped 26px target; fine pointers
+  // (mouse, trackpad, pen tip) get a 24px target.
 
   // Clamp a candidate width to [MIN, dynamic max], leaving MIN_VIEWER_PX for
   // the sibling code/diff viewer so the panel can't swallow the whole row.
@@ -356,7 +347,7 @@ export function useResizableCommentsPanel() {
       // slivers, whose footprint the negative margins cancel — so the
       // element occupies exactly the gutter width and the hover/active
       // background (content-box clipped) never widens visually.
-      style: gutterStyle(isCoarse),
+      style: gutterStyle(coarsePrimary),
     },
   };
 }
