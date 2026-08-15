@@ -8,6 +8,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import java.util.Locale
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -30,6 +31,17 @@ class OriginsTest {
     fun `uses WebView compatible nontransitional IDNA`() {
         assertEquals("xn--fa-hia.de", canonicalHost("faß.de"))
         assertFalse(canonicalHost("faß.de") == canonicalHost("fass.de"))
+    }
+
+    @Test
+    fun `host canonicalization is independent of the default locale`() {
+        val previous = Locale.getDefault()
+        try {
+            Locale.setDefault(Locale.forLanguageTag("tr-TR"))
+            assertEquals("i.example", canonicalHost("I.example"))
+        } finally {
+            Locale.setDefault(previous)
+        }
     }
 
     @Test
