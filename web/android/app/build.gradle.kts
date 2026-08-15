@@ -111,7 +111,9 @@ tasks.withType<Test>().configureEach {
 
 // Plain release bundles run unit tests for CI coverage. Publishing is kept out
 // of that graph because its process may hold Play service-account credentials.
-if (gradle.startParameter.taskNames.none { it.contains("publish", ignoreCase = true) }) {
+val publishingReleaseBundle =
+    gradle.startParameter.taskNames.any { it.substringAfterLast(':') == "publishReleaseBundle" }
+if (!publishingReleaseBundle) {
     tasks.matching { it.name == "bundleRelease" }.configureEach {
         dependsOn("testDebugUnitTest")
     }
