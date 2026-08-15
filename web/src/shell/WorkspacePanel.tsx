@@ -698,14 +698,14 @@ export function WorkspacePanel({
   );
   return (
     <>
-      {/* Dedicated resize gutter between chat and rail. Keeping it outside
-          both scroll containers prevents its hit slivers from covering the
-          transcript scrollbar or the rail's tabs/content. */}
+      {/* The resize target overlays the seam without taking flex width. Its
+          bounded slivers stay outside both scroll containers. */}
       {!maximized && handleProps["aria-disabled"] !== true && (
         <div
           {...handleProps}
           data-workspace-panel-resize-gutter
-          className="relative z-10 hidden w-1 shrink-0 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
+          className="z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:absolute md:inset-y-0 md:block"
+          style={{ ...handleProps.style, right: width }}
         />
       )}
       <aside

@@ -368,6 +368,25 @@ describe("useResizablePanel persistence", () => {
     ).toBe(gutter);
   });
 
+  it("exposes separator value semantics that track keyboard resizing", () => {
+    const { result } = renderHook(() => useResizablePanel(true));
+
+    expect(result.current.handleProps).toMatchObject({
+      role: "separator",
+      "aria-valuenow": 1000,
+      "aria-valuemin": 320,
+      "aria-valuemax": 1600,
+    });
+
+    act(() =>
+      result.current.handleProps.onKeyDown({
+        key: "ArrowRight",
+        preventDefault: vi.fn(),
+      } as unknown as React.KeyboardEvent),
+    );
+    expect(result.current.handleProps["aria-valuenow"]).toBe(980);
+  });
+
   it("updates the gutter when primary pointer coarseness changes", () => {
     const { result } = renderHook(() => useResizablePanel(true));
     expect(result.current.handleProps.style.marginInlineStart).toBe(-HANDLE_OUTWARD_SLIVER_PX);

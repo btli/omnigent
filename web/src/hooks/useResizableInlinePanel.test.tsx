@@ -484,6 +484,20 @@ describe("useResizableInlinePanel pointer drag", () => {
     });
   });
 
+  it("exposes separator value semantics that track keyboard resizing", () => {
+    const { result } = renderHook(() => useResizableInlinePanel(SESSION));
+
+    expect(result.current.handleProps).toMatchObject({
+      role: "separator",
+      "aria-valuenow": 600,
+      "aria-valuemin": 240,
+      "aria-valuemax": 1512,
+    });
+
+    expect(nudgeWiderOnce(result)).toBe(620);
+    expect(result.current.handleProps["aria-valuenow"]).toBe(620);
+  });
+
   it("reacts to coarse-pointer changes with a tightly bounded 26px target", () => {
     const originalMatchMedia = window.matchMedia;
     let coarse = false;
