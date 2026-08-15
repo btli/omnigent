@@ -106,6 +106,19 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+describe("TerminalsPanel resize handle geometry", () => {
+  it("renders the handle as the panel's unclipped boundary sibling", () => {
+    renderPanel();
+    const handle = screen.getByRole("separator", { name: "Resize panel" });
+    const panel = screen.getByTestId("terminals-panel");
+
+    expect(handle.nextElementSibling).toBe(panel);
+    expect(panel.contains(handle)).toBe(false);
+    expect(handle.closest(".overflow-hidden, .overflow-auto, .overflow-y-auto")).toBeNull();
+    expect(handle.className).toMatch(/\bz-10\b/);
+  });
+});
+
 describe("TerminalsPanel navigation", () => {
   it("opens to the list view with all terminals visible and no terminal mounted", () => {
     renderPanel();
@@ -237,5 +250,68 @@ describe("TerminalsPanel navigation", () => {
       "data-terminal-id",
       "terminal_main",
     );
+  });
+});
+
+describe("TerminalsPanel column resize handle", () => {
+  // jsdom has no layout engine, so these tests assert the structural
+  // invariants that produce the desired geometry in a real browser: the
+  // handle must live OUTSIDE the vertically scrolling list panel (a pad
+  // inside it gets clipped and makes the list pannable horizontally) and
+  // sit on the column boundary via `left: <list width>`.
+  function getHandle() {
+    return screen.getByRole("separator", { name: /resize terminal list/i });
+  }
+
+  function getListPanel() {
+    // The list panel is the scrollable element containing the row buttons.
+    const row = screen.getByRole("button", { name: /main/i });
+    const panel = row.parentElement as HTMLElement;
+    expect(panel.className).toContain("overflow-y-auto");
+    return panel;
+  }
+
+  it("renders the handle at the boundary, outside the scrollable list panel", () => {
+    renderPanel({ initialTerminalKey: "terminal:terminal_main" });
+
+    const handle = getHandle();
+    const listPanel = getListPanel();
+
+    // Sibling of the list panel inside the overflow-hidden split row — never
+    // a descendant of the scroll container that would clip its hit pad.
+    expect(listPanel.contains(handle)).toBe(false);
+    expect(handle.parentElement).toBe(listPanel.parentElement);
+
+    // Anchored on the column boundary with the drag/touch affordances live.
+    expect(handle.style.left).toBe("176px");
+    expect(handle.style.touchAction).toBe("none");
+    expect(handle.style.paddingLeft).not.toBe("");
+  });
+
+  it("keeps terminal rows selectable outside the handle pad", () => {
+    renderPanel({ initialTerminalKey: "terminal:terminal_main" });
+
+    // Tapping the body of another row (well clear of the boundary pad) must
+    // still switch the active terminal.
+    fireEvent.click(screen.getByRole("button", { name: /worker/i }));
+    act(() => {
+      vi.advanceTimersByTime(200); // past the layout-settle mount deferral
+    });
+    expect(screen.getByTestId("terminal-view")).toHaveAttribute(
+      "data-terminal-id",
+      "terminal_worker",
+    );
+  });
+
+  it("adds no horizontally overflowing content to the list panel", () => {
+    renderPanel({ initialTerminalKey: "terminal:terminal_main" });
+
+    // The only element wider than the column (the invisible hit pad) must not
+    // be inside the list panel; everything the panel contains is w-full rows.
+    const listPanel = getListPanel();
+    for (const child of Array.from(listPanel.children)) {
+      expect((child as HTMLElement).style.paddingLeft).toBe("");
+      expect(child.getAttribute("role")).not.toBe("separator");
+    }
   });
 });
