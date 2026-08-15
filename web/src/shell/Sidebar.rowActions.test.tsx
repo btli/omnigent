@@ -1391,6 +1391,26 @@ describe("touch swipe actions", () => {
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
   });
 
+  it("resets an armed swipe when pointer capture is unexpectedly lost", () => {
+    renderSidebar();
+
+    const link = screen.getByRole("link", { name: /My Session/ });
+    const li = link.closest("li")!;
+    fireEvent.pointerDown(li, { ...POINTER, clientX: 200, clientY: 100 });
+    fireEvent.pointerMove(li, { ...POINTER, clientX: 180, clientY: 100 });
+    fireEvent.pointerMove(li, { ...POINTER, clientX: 100, clientY: 100 });
+    expect(li.querySelector('[style*="margin-right"]')).toHaveStyle({
+      marginRight: "81.33333333333333px",
+    });
+
+    fireEvent.lostPointerCapture(li, POINTER);
+
+    expect(li.querySelector('[style*="margin-right"]')).toBeNull();
+    fireEvent.pointerUp(li, { ...POINTER, clientX: 100, clientY: 100 });
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
+  });
+
   it("does not fire at 71px, immediately below the commit boundary", () => {
     renderSidebar();
 
