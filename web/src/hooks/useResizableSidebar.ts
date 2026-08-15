@@ -9,7 +9,8 @@
 // Unlike the inline panel this has no "boost" machinery — nothing auto-widens
 // the sidebar — so the store is just a persisted, viewport-clamped width.
 
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
+import { useInputCapabilities } from "@/hooks/useInputCapabilities";
 import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
 
 // Default 320px (20rem) — wider than the old fixed ``md:w-64`` (256px) sidebar
@@ -24,14 +25,6 @@ const COARSE_GUTTER_PX = 8;
 const FINE_GUTTER_PX = 6;
 const INWARD_SLIVER_PX = 8;
 const OUTWARD_SLIVER_PX = 10;
-
-function hasCoarsePrimaryPointer(): boolean {
-  return (
-    typeof window !== "undefined" &&
-    typeof window.matchMedia === "function" &&
-    window.matchMedia("(pointer: coarse)").matches
-  );
-}
 
 function gutterStyle(coarsePointer: boolean): React.CSSProperties {
   const gutter = coarsePointer ? COARSE_GUTTER_PX : FINE_GUTTER_PX;
@@ -116,9 +109,9 @@ export function resetSidebarWidthStoreForTesting(): void {
  * mobile (where the sidebar is a full-screen overlay).
  */
 export function useResizableSidebar() {
+  const { coarsePrimary } = useInputCapabilities();
   const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
   const width = clamp(raw ?? DEFAULT_WIDTH_PX);
-  const [coarsePointer, setCoarsePointer] = useState(hasCoarsePrimaryPointer);
   const activePointerId = useRef<number | null>(null);
   const activeHandle = useRef<HTMLElement | null>(null);
   const dragCleanup = useRef<(() => void) | null>(null);
@@ -132,13 +125,6 @@ export function useResizableSidebar() {
     }
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
-  }, []);
-
-  useEffect(() => {
-    const query = window.matchMedia("(pointer: coarse)");
-    const onChange = () => setCoarsePointer(query.matches);
-    query.addEventListener("change", onChange);
-    return () => query.removeEventListener("change", onChange);
   }, []);
 
   // No iframe shield: the sidebar never adjoins the preview iframe, so capture suffices.
@@ -260,8 +246,14 @@ export function useResizableSidebar() {
       role: "separator" as const,
       "aria-orientation": "vertical" as const,
       "aria-label": "Resize sidebar",
+      "aria-valuenow": width,
+      "aria-valuemin": MIN_WIDTH_PX,
+      "aria-valuemax":
+        typeof window === "undefined"
+          ? width
+          : Math.max(MIN_WIDTH_PX, window.innerWidth * MAX_WIDTH_RATIO),
       tabIndex: 0,
-      style: gutterStyle(coarsePointer),
+      style: gutterStyle(coarsePrimary),
     },
   };
 }
