@@ -60,6 +60,11 @@ class OmnigentWebViewClient(
         expectedLoadGenerations.addLast(generation)
     }
 
+    fun supersedePendingLoads() {
+        expectedLoadGenerations.clear()
+        startedLoads.clear()
+    }
+
     override fun onPageStarted(
         view: WebView,
         url: String?,
@@ -260,6 +265,7 @@ class OmnigentWebViewClient(
         view: WebView,
         target: String,
     ) {
+        // MainActivity injects a generation-stamped loader for this app navigation.
         mainHandler.post { loadUrl(view, target) }
     }
 
