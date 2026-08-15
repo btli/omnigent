@@ -1424,27 +1424,43 @@ describe("touch swipe actions", () => {
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
   });
 
-  it("keeps the delete reveal outside the overflow target through reveal, threshold, and cancel", () => {
+  it("keeps the inert delete reveal geometrically disjoint from the accessible overflow target", () => {
     writeSwipeActions({ left: "delete", right: "none" });
     renderSidebar();
 
     expect(screen.queryByTestId("conversation-swipe-reveal")).toBeNull();
+    expect(screen.getByTestId("conversation-actions")).toHaveAccessibleName("Conversation actions");
 
     const swipe = moveSwipeRow(-40);
     const reveal = screen.getByTestId("conversation-swipe-reveal");
     const surface = screen.getByTestId("conversation-swipe-surface");
     const overflow = screen.getByTestId("conversation-actions");
-    expect(reveal).toHaveStyle({ right: "0px", width: "40px" });
-    expect(surface).toHaveStyle({ marginRight: "40px" });
-    expect(surface).toContainElement(overflow);
+
+    function expectDisjointTrailingGeometry(width: number) {
+      // The reveal is clipped to exactly the strip vacated by the surface. The
+      // overflow target remains inside that inset surface, so the two regions
+      // cannot render over or claim the same pixels at any reveal distance.
+      expect(reveal).toHaveAttribute("aria-hidden", "true");
+      expect(reveal).toHaveClass("pointer-events-none", "overflow-hidden");
+      expect(reveal).toHaveStyle({ right: "0px", width: `${width}px` });
+      expect(surface).toHaveStyle({ marginRight: `${width}px` });
+      expect(reveal).not.toContainElement(overflow);
+      expect(surface).toContainElement(overflow);
+      expect(overflow).toHaveAccessibleName("Conversation actions");
+    }
+
+    expectDisjointTrailingGeometry(40);
+    expect(reveal.querySelector("svg.lucide-trash-2")).not.toBeNull();
+    expect(reveal.querySelector("button, a, [tabindex]")).toBeNull();
 
     fireEvent.pointerMove(swipe.li, { ...POINTER, clientX: 28, clientY: 100 });
-    expect(reveal).toHaveStyle({ right: "0px", width: "72px" });
-    expect(surface).toHaveStyle({ marginRight: "72px" });
+    expectDisjointTrailingGeometry(72);
+    expect(reveal.firstElementChild).toHaveClass("scale-110");
 
     fireEvent.pointerCancel(swipe.li, POINTER);
     expect(screen.queryByTestId("conversation-swipe-reveal")).toBeNull();
     expect(surface.style.marginRight).toBe("");
+    expect(overflow).toHaveAccessibleName("Conversation actions");
     expect(mocks.del.mutate).not.toHaveBeenCalled();
   });
 
