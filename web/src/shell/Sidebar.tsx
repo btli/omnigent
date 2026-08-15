@@ -3862,7 +3862,7 @@ function ConversationRow({
       )}
     >
       {/* The row is the shared inset containing block for the reveal and surface,
-          keeping their edges adjacent with the accepted #3985 geometry. */}
+          keeping their edges adjacent throughout a partial swipe. */}
       {/* Swipe reveal hint: sits behind the moving surface, showing the
           configured action's icon only inside the strip the surface vacates.
           Clipping that strip keeps the hint disjoint from the moving overflow
