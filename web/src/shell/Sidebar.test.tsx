@@ -699,7 +699,12 @@ describe("Sidebar session list", () => {
 
     const newProject = within(projectsSection!).getByRole("button", { name: "New project" });
     const projectActions = newProject.parentElement?.parentElement;
-    expect(projectActions).toHaveClass("flex", "md:opacity-0");
+    expect(projectActions).toHaveClass(
+      "flex",
+      "md:opacity-0",
+      "md:group-hover/header:opacity-100",
+      "md:has-[:focus-visible]:opacity-100",
+    );
     expect(projectActions).not.toHaveClass("hidden");
   });
 

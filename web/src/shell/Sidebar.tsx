@@ -2420,7 +2420,8 @@ function SectionGroup({
   collapsed: boolean;
   onToggleCollapsed: () => void;
   /** Optional control overlaid at the group header's right edge (e.g. the
-      "collapse all projects" toggle). Hover/focus-revealed on desktop. */
+      "collapse all projects" toggle). Always shown on mobile and
+      hover/focus-revealed on desktop. */
   headerAction?: ReactNode;
   /** Optional content rendered directly under the header, above the children
       (and shown even when collapsed) — e.g. the bulk-selection action bar. */
@@ -2437,6 +2438,7 @@ function SectionGroup({
           onToggleCollapsed={onToggleCollapsed}
         />
         {headerAction && (
+          // :focus-visible (not :focus-within) so a mouse-clicked action doesn't stay revealed on desktop.
           <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity md:opacity-0 md:has-[:focus-visible]:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100 md:group-hover/header:opacity-100">
             {headerAction}
           </div>
