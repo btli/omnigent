@@ -2,6 +2,7 @@ package ai.omnigent.android
 
 import android.icu.text.IDNA
 import android.net.Uri
+import java.util.Locale
 
 /**
  * Normalizes a URL to its origin (`scheme://host[:port]`), the unit of trust
@@ -17,7 +18,7 @@ fun originOf(url: String?): String? {
 
 /** IDNA-normalize a host to the lowercase ASCII form used for origin comparisons. */
 fun canonicalHost(host: String): String? {
-    val normalized = host.lowercase().removeSurrounding("[", "]")
+    val normalized = host.lowercase(Locale.ROOT).removeSurrounding("[", "]")
     if (":" in normalized) return normalized
     val info = IDNA.Info()
     val ascii = StringBuilder()
