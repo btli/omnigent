@@ -3765,7 +3765,8 @@ function ConversationRow({
       onClickCapture={swipe.onClickCapture}
       style={{ touchAction: swipeEnabled ? "pan-y" : undefined }}
       className={cn(
-        "group relative mx-1",
+        "group relative",
+        isSwiping && "mx-1",
         isDragging && "opacity-40",
         // Keep vertical scrolling native while claiming the horizontal axis for
         // the swipe: without this the browser can take the horizontal pan (or
