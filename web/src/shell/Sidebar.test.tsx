@@ -319,7 +319,7 @@ function seedPins(ids: string[]) {
 afterEach(cleanup);
 
 describe("Sidebar resize handle geometry", () => {
-  it("renders a dedicated seam gutter outside the clipped content region", () => {
+  it("positions the seam handle outside flex layout and the clipped content", () => {
     mockConversations([]);
     renderSidebar();
 
@@ -332,11 +332,12 @@ describe("Sidebar resize handle geometry", () => {
     expect(sidebar).toHaveClass("md:flex-row");
     expect(sidebar).not.toHaveClass("md:overflow-hidden");
     expect(clippedContent).toHaveClass("md:overflow-hidden");
-    expect(handle).toHaveClass("relative", "shrink-0", "md:order-2");
-    expect(clippedContent).toHaveClass("md:order-1");
+    expect(handle).toHaveClass("md:absolute", "md:inset-y-0", "md:right-0");
+    expect(handle).not.toHaveClass("shrink-0", "md:order-2");
+    expect(clippedContent).not.toHaveClass("md:order-1");
   });
 
-  it("caps transcript annexation at 10px while keeping a real gutter footprint", () => {
+  it("caps transcript annexation at 10px without reserving flex space", () => {
     mockConversations([conv("edge-session", "Claude Code")]);
     renderSidebar();
 
@@ -345,9 +346,7 @@ describe("Sidebar resize handle geometry", () => {
     expect(handle.style.paddingInlineEnd).toBe("11px");
     expect(handle.style.marginInlineStart).toBe("-8px");
     expect(handle.style.marginInlineEnd).toBe("-10px");
-    // -8 + 9 + 4 + 11 - 10 = 6px reserved flex footprint; only the
-    // 10px negative end margin can overlap the adjacent transcript.
-    expect(-8 + 9 + 4 + 11 - 10).toBe(6);
+    expect(handle).toHaveClass("md:absolute");
     expect(Math.abs(Number.parseInt(handle.style.marginInlineEnd, 10))).toBeLessThanOrEqual(10);
     expect(screen.getByText("edge-session")).not.toBe(handle);
   });
@@ -358,16 +357,16 @@ describe("Sidebar resize handle geometry", () => {
 
     const handle = screen.getByTestId("sidebar-resize-handle");
     expect(handle).toHaveClass(
-      "relative",
       "z-10",
       "hidden",
       "w-1",
-      "shrink-0",
       "cursor-col-resize",
       "transition-colors",
       "hover:bg-primary/30",
       "active:bg-primary/50",
-      "md:order-2",
+      "md:absolute",
+      "md:inset-y-0",
+      "md:right-0",
       "md:block",
     );
     expect(handle).not.toHaveClass("absolute", "inset-y-0", "right-0");
