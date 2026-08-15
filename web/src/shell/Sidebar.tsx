@@ -294,11 +294,21 @@ export function useRowSwipe({
 
   const reset = useCallback(() => {
     const s = state.current;
+    // Clear first: releasePointerCapture dispatches lostpointercapture, which
+    // must be a no-op for this intentional teardown.
+    state.current = null;
     // Release pointer capture if we took it — guarded so it's safe when we
     // never captured (vertical/none gestures) or the element is already gone.
     if (s?.target && s.target.hasPointerCapture(s.pointerId)) {
       s.target.releasePointerCapture(s.pointerId);
     }
+    setDx(0);
+  }, []);
+
+  const onLostPointerCapture = useCallback((e: ReactPointerEvent) => {
+    const s = state.current;
+    if (!s || s.pointerId !== e.pointerId) return;
+    // Capture is already gone, so reset without attempting another release.
     state.current = null;
     setDx(0);
   }, []);
@@ -395,7 +405,15 @@ export function useRowSwipe({
     e.stopPropagation();
   }, []);
 
-  return { dx, onPointerDown, onPointerMove, onPointerUp, onPointerCancel: reset, onClickCapture };
+  return {
+    dx,
+    onPointerDown,
+    onPointerMove,
+    onPointerUp,
+    onPointerCancel: reset,
+    onLostPointerCapture,
+    onClickCapture,
+  };
 }
 
 // Match the Settings sidebar's ghost-button hover treatment across every home
@@ -3834,6 +3852,7 @@ function ConversationRow({
       onPointerMove={swipe.onPointerMove}
       onPointerUp={swipe.onPointerUp}
       onPointerCancel={swipe.onPointerCancel}
+      onLostPointerCapture={swipe.onLostPointerCapture}
       onClickCapture={swipe.onClickCapture}
       style={{ touchAction: swipeEnabled ? "pan-y" : undefined }}
       className={cn(
