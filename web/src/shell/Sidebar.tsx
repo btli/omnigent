@@ -291,6 +291,10 @@ export function useRowSwipe({
     setDx(0);
   }, []);
 
+  useEffect(() => {
+    if (!enabled) reset();
+  }, [enabled, reset]);
+
   const onLostPointerCapture = useCallback((e: ReactPointerEvent) => {
     const s = state.current;
     if (!s || s.pointerId !== e.pointerId) return;
@@ -3505,6 +3509,8 @@ function ConversationRow({
   // runArchive; swipe→delete opens the same confirm dialog the kebab uses
   // (never an immediate delete).
   const swipeActions = useSwipeActions();
+  const [contextMenuOpen, setContextMenuOpen] = useState(false);
+  const contextMenuTouchStartRef = useRef<{ x: number; y: number } | null>(null);
   // useRowSwipe accepts only touch pointers, so a touchscreen laptop's mouse
   // path stays untouched. With both directions mapped to "none" the gesture is
   // fully disarmed — no handlers fire and the touch-action override below is
@@ -3514,6 +3520,7 @@ function ConversationRow({
     !selectionMode &&
     isOwner &&
     !isEditing &&
+    !contextMenuOpen &&
     (swipeActions.left !== "none" || swipeActions.right !== "none");
   const swipe = useRowSwipe({
     enabled: swipeEnabled,
@@ -3759,10 +3766,32 @@ function ConversationRow({
       ref={setRowRef}
       data-testid="conversation-swipe-frame"
       {...dragListeners}
-      onPointerDown={swipe.onPointerDown}
-      onPointerMove={swipe.onPointerMove}
-      onPointerUp={swipe.onPointerUp}
-      onPointerCancel={swipe.onPointerCancel}
+      onPointerDown={(e) => {
+        if (e.pointerType === "touch") {
+          contextMenuTouchStartRef.current = { x: e.clientX, y: e.clientY };
+        }
+        swipe.onPointerDown(e);
+      }}
+      onPointerMove={(e) => {
+        const start = contextMenuTouchStartRef.current;
+        if (
+          contextMenuOpen &&
+          start &&
+          Math.hypot(e.clientX - start.x, e.clientY - start.y) >= SWIPE_ACTIVATE_PX
+        ) {
+          setContextMenuOpen(false);
+          return;
+        }
+        swipe.onPointerMove(e);
+      }}
+      onPointerUp={(e) => {
+        contextMenuTouchStartRef.current = null;
+        swipe.onPointerUp(e);
+      }}
+      onPointerCancel={() => {
+        contextMenuTouchStartRef.current = null;
+        swipe.onPointerCancel();
+      }}
       onLostPointerCapture={swipe.onLostPointerCapture}
       onClickCapture={swipe.onClickCapture}
       style={{ touchAction: swipeEnabled ? "pan-y" : undefined }}
@@ -3879,7 +3908,7 @@ function ConversationRow({
           )
         ) : projectFlyoutName ? (
           <HoverCard openDelay={150} closeDelay={0}>
-            <ContextMenu>
+            <ContextMenu open={contextMenuOpen} onOpenChange={setContextMenuOpen}>
               <ContextMenuTrigger asChild>
                 <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
               </ContextMenuTrigger>
@@ -3898,7 +3927,7 @@ function ConversationRow({
             />
           </HoverCard>
         ) : isMobile ? (
-          <ContextMenu>
+          <ContextMenu open={contextMenuOpen} onOpenChange={setContextMenuOpen}>
             <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
             <ContextMenuContent className="min-w-44">
               <ConversationMenuItems
@@ -3910,7 +3939,7 @@ function ConversationRow({
           </ContextMenu>
         ) : (
           <Tooltip>
-            <ContextMenu>
+            <ContextMenu open={contextMenuOpen} onOpenChange={setContextMenuOpen}>
               <ContextMenuTrigger asChild>
                 <div className="w-full">
                   <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
