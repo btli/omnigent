@@ -1014,6 +1014,49 @@ describe("mark as unread", () => {
 });
 
 describe("right-click context menu", () => {
+  it("dismisses a touch-opened menu when the same finger drags away", async () => {
+    mocks.isMobile = true;
+    mocks.anyCoarse = true;
+    writeSwipeActions({ left: "archive", right: "delete" });
+    renderSidebar();
+
+    const link = screen.getByRole("link", { name: /My Session/ });
+    fireEvent.pointerDown(link, {
+      pointerId: 1,
+      pointerType: "touch",
+      isPrimary: true,
+      button: 0,
+      clientX: 200,
+      clientY: 100,
+    });
+    await act(
+      () =>
+        new Promise((resolve) => {
+          setTimeout(resolve, 750);
+        }),
+    );
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+
+    fireEvent.pointerMove(link, {
+      pointerId: 1,
+      pointerType: "touch",
+      isPrimary: true,
+      clientX: 20,
+      clientY: 100,
+    });
+    fireEvent.pointerUp(link, {
+      pointerId: 1,
+      pointerType: "touch",
+      isPrimary: true,
+      clientX: 20,
+      clientY: 100,
+    });
+
+    expect(screen.queryByTestId("rename-conversation")).toBeNull();
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
+  });
+
   it("opens the same action items as the kebab and drives the same handlers", () => {
     renderSidebar();
 
