@@ -308,6 +308,8 @@ export function useRowSwipe({
   const onLostPointerCapture = useCallback((e: ReactPointerEvent) => {
     const s = state.current;
     if (!s || s.pointerId !== e.pointerId) return;
+    // Ignore the touched child's implicit capture ending as capture moves here.
+    if (e.nativeEvent.composedPath()[0] !== s.target) return;
     // Capture is already gone, so reset without attempting another release.
     state.current = null;
     setDx(0);
