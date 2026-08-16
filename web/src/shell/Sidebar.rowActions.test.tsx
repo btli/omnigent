@@ -1461,6 +1461,48 @@ describe("touch swipe actions", () => {
     expect(mocks.del.mutate).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { deltaX: -90, action: "delete" },
+    { deltaX: 90, action: "archive" },
+  ] as const)(
+    "ignores a descendant's implicit capture loss before completing $action",
+    ({ deltaX, action }) => {
+      writeSwipeActions({ left: "delete", right: "archive" });
+      renderSidebar();
+
+      const link = screen.getByRole("link", { name: /My Session/ });
+      const li = link.closest("li")!;
+      let captured = false;
+      li.setPointerCapture = () => {
+        captured = true;
+      };
+      li.hasPointerCapture = () => captured;
+      li.releasePointerCapture = () => {
+        captured = false;
+      };
+      fireEvent.pointerDown(link, { ...POINTER, clientX: 200, clientY: 100 });
+      fireEvent.pointerMove(link, {
+        ...POINTER,
+        clientX: 200 + Math.sign(deltaX) * 20,
+        clientY: 100,
+      });
+      fireEvent.lostPointerCapture(link, POINTER);
+      expect(captured).toBe(true);
+      fireEvent.pointerMove(li, { ...POINTER, clientX: 200 + deltaX, clientY: 100 });
+      fireEvent.pointerUp(li, { ...POINTER, clientX: 200 + deltaX, clientY: 100 });
+      expect(captured).toBe(false);
+
+      if (action === "delete") {
+        expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
+      } else {
+        expect(mocks.archive.mutate).toHaveBeenCalledWith(
+          { id: "conv_1", archived: true },
+          expect.anything(),
+        );
+      }
+    },
+  );
+
   it("does not fire at 71px, immediately below the commit boundary", () => {
     renderSidebar();
 
