@@ -1167,7 +1167,6 @@ async function runWindowOidcBrowserHandoff(win, serverUrl) {
     pagePath: OIDC_LOGIN_PAGE,
     preloadPath: OIDC_LOGIN_PRELOAD,
     runAttempt: async ({ signal, updateMessage }) => {
-      const host = new URL(serverUrl).host;
       const result = await runOidcBrowserLogin(
         session.defaultSession,
         serverUrl,
@@ -1176,6 +1175,7 @@ async function runWindowOidcBrowserHandoff(win, serverUrl) {
           timeoutMs: OIDC_LOGIN_TIMEOUT_MS,
           signal,
           onPollError: () => {
+            const host = new URL(serverUrl).host;
             updateMessage(`Still waiting — the last attempt failed to reach ${host}. Retrying…`);
           },
         },
