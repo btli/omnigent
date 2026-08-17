@@ -808,6 +808,52 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     assert.equal(state.pendingServerLoads, 0);
   });
 
+  it("rejects ambiguous WebAuthn server URLs before the authenticated probe", async () => {
+    const invalidServerUrls = [
+      "https://server.example/base?workspace=one",
+      "https://server.example/base?",
+      "https://server.example/base#workspace",
+      "https://server.example/base#",
+      "https://server.example/base/../other",
+      "https://server.example/base/%2e%2e/other",
+      "https://server.example/base/%252e%252e/other",
+      "https://server.example/base\\other",
+      "https://server.example/base//other",
+      "https://server.example/base/%2fother",
+      "https://server.example/base/%252fother",
+    ];
+
+    await Promise.all(
+      invalidServerUrls.map(async (serverUrl) => {
+        const win = {
+          isDestroyed: () => false,
+          webContents: { getURL: () => "https://idp.example/passkey" },
+        };
+        const state = { serverUrl, pendingServerLoads: 0 };
+        let handoffs = 0;
+        const showWebAuthnTimeout = runInNewContext(`${webAuthnTimeoutCode}; showWebAuthnTimeout`, {
+          WEB_SCHEMES: new Set(["https:"]),
+          URL,
+          dialog: { showMessageBox: async () => ({ response: 0 }) },
+          oidcServerUrlError,
+          probeServerAuth: async () => assert.fail("sent an authenticated probe"),
+          runWindowOidcBrowserHandoff: async () => {
+            handoffs += 1;
+            return false;
+          },
+          session: { defaultSession: {} },
+          windows: new Map([[win, state]]),
+          withServerLoad,
+        });
+
+        await showWebAuthnTimeout(win);
+
+        assert.equal(handoffs, 1);
+        assert.equal(state.pendingServerLoads, 0);
+      }),
+    );
+  });
+
   it("cancels the real ticket composition without installing or reloading", async () => {
     const controller = new AbortController();
     const electronSession = {

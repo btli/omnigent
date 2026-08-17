@@ -12,6 +12,7 @@ const cookieMutationQueues = new WeakMap();
 
 // Keep API routes under workspace mounts, matching the CLI.
 function serverRoute(serverUrl, routePath) {
+  if (oidcServerUrlError(serverUrl)) throw new Error("Invalid server URL.");
   return serverUrl.replace(/\/+$/, "") + (routePath.startsWith("/") ? routePath : `/${routePath}`);
 }
 
@@ -59,6 +60,14 @@ function isUserAbort(signal) {
 }
 
 function oidcServerUrlError(serverUrl) {
+  if (
+    typeof serverUrl !== "string" ||
+    serverUrl.includes("\\") ||
+    serverUrl.includes("?") ||
+    serverUrl.includes("#")
+  ) {
+    return "invalid_server_url";
+  }
   let parsed;
   try {
     parsed = new URL(serverUrl);
@@ -68,9 +77,33 @@ function oidcServerUrlError(serverUrl) {
   if (
     (parsed.protocol !== "https:" && parsed.protocol !== "http:") ||
     parsed.username ||
-    parsed.password
+    parsed.password ||
+    parsed.search ||
+    parsed.hash
   ) {
     return "invalid_server_url";
+  }
+  const serialized = parsed.toString();
+  const rootWithoutSlash = parsed.pathname === "/" ? serialized.slice(0, -1) : null;
+  if (serverUrl !== serialized && serverUrl !== rootWithoutSlash) {
+    return "invalid_server_url";
+  }
+  if (parsed.pathname.includes("//")) return "invalid_server_url";
+  for (const segment of parsed.pathname.split("/")) {
+    let decoded = segment;
+    for (let depth = 0; depth < 3; depth += 1) {
+      let next;
+      try {
+        next = decodeURIComponent(decoded);
+      } catch {
+        return "invalid_server_url";
+      }
+      if (next === "." || next === ".." || next.includes("/") || next.includes("\\")) {
+        return "invalid_server_url";
+      }
+      if (next === decoded) break;
+      decoded = next;
+    }
   }
   if (parsed.protocol === "http:" && !isLoopbackServer(serverUrl)) {
     return "insecure_transport";
@@ -78,21 +111,18 @@ function oidcServerUrlError(serverUrl) {
   return null;
 }
 
+// Match Python urllib.parse.urlencode's quote_plus encoding.
+function encodeTicket(ticket) {
+  return encodeURIComponent(ticket)
+    .replace(/%20/g, "+")
+    .replace(/%7E/gi, "~")
+    .replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
 function canonicalTicketLoginUrl(serverUrl, loginPath, ticket) {
-  if (
-    typeof loginPath !== "string" ||
-    typeof ticket !== "string" ||
-    !loginPath.startsWith("/") ||
-    loginPath.startsWith("//") ||
-    loginPath.includes("#") ||
-    loginPath.split("?", 1)[0] !== "/auth/login"
-  ) {
-    return null;
-  }
-  const questionMark = loginPath.indexOf("?");
-  if (questionMark < 0 || loginPath.slice(questionMark + 1).split("&").length !== 1) {
-    return null;
-  }
+  if (typeof loginPath !== "string" || typeof ticket !== "string") return null;
+  const expectedPath = `/auth/login?ticket=${encodeTicket(ticket)}`;
+  if (loginPath !== expectedPath) return null;
   const loginUrl = serverRoute(serverUrl, loginPath);
   let parsed;
   let expected;
@@ -102,14 +132,7 @@ function canonicalTicketLoginUrl(serverUrl, loginPath, ticket) {
   } catch {
     return null;
   }
-  const parameters = [...parsed.searchParams];
-  if (
-    parsed.origin !== expected.origin ||
-    parsed.pathname !== expected.pathname ||
-    parameters.length !== 1 ||
-    parameters[0][0] !== "ticket" ||
-    parameters[0][1] !== ticket
-  ) {
+  if (parsed.origin !== expected.origin || parsed.pathname !== expected.pathname) {
     return null;
   }
   return loginUrl;
