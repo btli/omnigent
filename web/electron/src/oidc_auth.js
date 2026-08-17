@@ -89,6 +89,10 @@ function canonicalTicketLoginUrl(serverUrl, loginPath, ticket) {
   ) {
     return null;
   }
+  const questionMark = loginPath.indexOf("?");
+  if (questionMark < 0 || loginPath.slice(questionMark + 1).split("&").length !== 1) {
+    return null;
+  }
   const loginUrl = serverRoute(serverUrl, loginPath);
   let parsed;
   let expected;
