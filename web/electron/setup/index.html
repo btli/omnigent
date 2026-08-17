@@ -583,7 +583,10 @@
           // window to it. Connecting this machine as a runner is done later from
           // the host menu, not here.
           const result = await setup.setServerUrl(value);
-          if (result && result.loaded === false) button.disabled = false;
+          if (result && result.loaded === false) {
+            err.textContent = result.error || "Could not connect to the server.";
+            button.disabled = false;
+          }
         } catch (e) {
           err.textContent = String(e && e.message ? e.message : e);
           button.disabled = false;
