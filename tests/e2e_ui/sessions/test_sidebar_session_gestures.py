@@ -16,9 +16,18 @@ from playwright.sync_api import Browser, BrowserContext, CDPSession, Locator, Pa
 _MOBILE_VIEWPORT = {"width": 390, "height": 844}
 _UNEXPECTED_EVENT_SCRIPT = """
 window.__rowGestureUnexpected = [];
+window.__rowGestureCaptureEvents = [];
 window.__rowGesturePointerId = null;
 document.addEventListener('pointerdown', event => {
   window.__rowGesturePointerId = event.pointerId;
+  window.__rowGesturePointerDownAt = performance.now();
+}, true);
+document.addEventListener('lostpointercapture', event => {
+  window.__rowGestureCaptureEvents.push({
+    pointerId: event.pointerId,
+    target: event.target.tagName,
+    trusted: event.isTrusted,
+  });
 }, true);
 for (const type of ['dragstart', 'pointercancel']) {
   document.addEventListener(
@@ -212,6 +221,10 @@ def test_horizontal_swipe_wins_before_hold_while_vertical_motion_yields_to_scrol
         cdp = page.context.new_cdp_session(page)
         try:
             _touch(cdp, "touchStart", x, y)
+            page.wait_for_function("performance.now() - window.__rowGesturePointerDownAt >= 350")
+            expect(page.get_by_test_id("rename-conversation")).to_have_count(0)
+            expect(row).not_to_have_class(re.compile(r"\bscale-\[1\.01\]\b"))
+            expect(row).not_to_have_class(re.compile(r"\bopacity-40\b"))
             _touch(cdp, "touchMove", x - 11, y)
             expect(row).not_to_have_class(re.compile(r"\bmx-1\b"))
             _touch(cdp, "touchMove", x - 13, y)
@@ -295,12 +308,32 @@ def test_lost_pointer_capture_resets_swipe_and_allows_another_swipe(
             _touch(cdp, "touchStart", x, y)
             _touch(cdp, "touchMove", x - 40, y)
             expect(row).to_have_class(re.compile(r"\bmx-1\b"))
-            row.evaluate(
-                """element => element.dispatchEvent(new PointerEvent(
-                    'lostpointercapture',
-                    {pointerId: window.__rowGesturePointerId, bubbles: true},
-                ))"""
+            _touch(cdp, "touchMove", x - 41, y)
+            page.wait_for_function("window.__rowGestureCaptureEvents.length > 0")
+            assert page.evaluate("window.__rowGestureCaptureEvents")[0]["target"] == "SPAN"
+            capture = row.evaluate(
+                """element => {
+                    const pointerId = window.__rowGesturePointerId;
+                    const link = element.querySelector('a');
+                    const state = {
+                      pointerId,
+                      row: element.hasPointerCapture(pointerId),
+                      link: link.hasPointerCapture(pointerId),
+                    };
+                    if (state.row) element.releasePointerCapture(pointerId);
+                    else if (state.link) link.releasePointerCapture(pointerId);
+                    return state;
+                }"""
             )
+            assert capture["row"] is True, capture
+            _touch(cdp, "touchMove", x - 42, y)
+            page.wait_for_function("window.__rowGestureCaptureEvents.length > 1")
+            capture_events = page.evaluate("window.__rowGestureCaptureEvents")
+            assert capture_events[1] == {
+                "pointerId": capture["pointerId"],
+                "target": "LI",
+                "trusted": True,
+            }
             expect(row).not_to_have_class(re.compile(r"\bmx-1\b"))
             _touch(cdp, "touchEnd")
 
