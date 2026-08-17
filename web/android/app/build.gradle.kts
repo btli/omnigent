@@ -136,16 +136,23 @@ fun releaseVerificationFingerprint(): String {
 }
 
 val verifyReleaseUnitTests =
-    tasks.register("verifyReleaseUnitTests") {
+    tasks.register<Exec>("verifyReleaseUnitTests") {
         group = "verification"
         description =
             "Runs release unit tests without Play credentials and records the verified tree."
-        dependsOn("testDebugUnitTest")
         inputs.files(releaseVerificationInputs)
         inputs.property("versionCode", appVersionCode)
         inputs.property("versionName", appVersionName)
         outputs.file(releaseVerificationReceipt)
         outputs.upToDateWhen { false }
+        workingDir(rootProject.projectDir)
+        commandLine(
+            rootProject.file("gradlew").absolutePath,
+            "--no-build-cache",
+            "--rerun-tasks",
+            "testDebugUnitTest",
+        )
+        environment.remove("PLAY_SERVICE_ACCOUNT_JSON")
         doFirst {
             check(System.getenv("PLAY_SERVICE_ACCOUNT_JSON") == null) {
                 "Run verifyReleaseUnitTests before exporting PLAY_SERVICE_ACCOUNT_JSON."
