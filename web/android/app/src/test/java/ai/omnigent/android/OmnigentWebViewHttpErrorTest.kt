@@ -38,6 +38,7 @@ class OmnigentWebViewHttpErrorTest {
             request(PINNED_URL, mainFrame = true),
             WebResourceResponse("text/html", "UTF-8", null),
         )
+        client.onPageCommitVisible(webView, PINNED_URL)
         client.onPageFinished(webView, PINNED_URL)
 
         assertFalse(loadFailed)
@@ -56,6 +57,7 @@ class OmnigentWebViewHttpErrorTest {
             request("$PINNED_ORIGIN/image.png", mainFrame = false),
             WebResourceResponse("image/png", null, null),
         )
+        client.onPageCommitVisible(webView, PINNED_URL)
         client.onPageFinished(webView, PINNED_URL)
 
         assertFalse(persistenceFailed)
@@ -100,6 +102,7 @@ class OmnigentWebViewHttpErrorTest {
         client.onPageFinished(webView, PINNED_URL)
         // Retry succeeds: the consumed flags must not leak into this load.
         client.onPageStarted(webView, PINNED_URL, null)
+        client.onPageCommitVisible(webView, PINNED_URL)
         client.onPageFinished(webView, PINNED_URL)
 
         assertFalse(loadFailed)

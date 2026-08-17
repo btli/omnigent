@@ -109,14 +109,11 @@ tasks.withType<Test>().configureEach {
     )
 }
 
-// Plain release bundles run unit tests for CI coverage. Publishing is kept out
-// of that graph because its process may hold Play service-account credentials.
-val publishingReleaseBundle =
-    gradle.startParameter.taskNames.any { it.substringAfterLast(':') == "publishReleaseBundle" }
-if (!publishingReleaseBundle) {
-    tasks.matching { it.name == "bundleRelease" }.configureEach {
-        dependsOn("testDebugUnitTest")
-    }
+// Every shipping bundle, including the bundle built by publishReleaseBundle,
+// is gated on the unit suite. CI builds remain credential-free; publishing is
+// an explicit trusted invocation that supplies Play credentials only locally.
+tasks.matching { it.name == "bundleRelease" || it.name == "publishReleaseBundle" }.configureEach {
+    dependsOn("testDebugUnitTest")
 }
 
 // Gradle Play Publisher: `./gradlew publishReleaseBundle` builds the signed AAB
