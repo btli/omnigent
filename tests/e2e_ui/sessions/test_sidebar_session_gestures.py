@@ -11,10 +11,29 @@ import re
 import uuid
 
 import httpx
-from playwright.sync_api import Browser, Locator, Page, expect
-
+from playwright.sync_api import Browser, BrowserContext, Locator, Page, expect
 
 _MOBILE_VIEWPORT = {"width": 390, "height": 844}
+_UNEXPECTED_EVENT_SCRIPT = """
+window.__rowGestureUnexpected = [];
+for (const type of ['dragstart', 'pointercancel']) {
+  document.addEventListener(
+    type,
+    () => window.__rowGestureUnexpected.push(type),
+    true,
+  );
+}
+"""
+
+
+def _new_touch_context(browser: Browser) -> BrowserContext:
+    context = browser.new_context(
+        has_touch=True,
+        is_mobile=True,
+        viewport=_MOBILE_VIEWPORT,
+    )
+    context.add_init_script(_UNEXPECTED_EVENT_SCRIPT)
+    return context
 
 
 def _set_title(base_url: str, session_id: str, title: str) -> None:
@@ -40,9 +59,7 @@ def _row_link(page: Page, session_id: str) -> Locator:
 
 def _section(page: Page, title: str) -> Locator:
     """Locate the sidebar section headed by ``title``."""
-    return page.locator("section").filter(
-        has=page.get_by_role("button", name=title, exact=True)
-    )
+    return page.locator("section").filter(has=page.get_by_role("button", name=title, exact=True))
 
 
 def test_still_touch_opens_session_context_menu_without_dragging(
@@ -54,18 +71,9 @@ def test_still_touch_opens_session_context_menu_without_dragging(
     title = f"e2e-touch-hold-{uuid.uuid4().hex[:8]}"
     _set_title(base_url, session_id, title)
 
-    context = browser.new_context(
-        has_touch=True,
-        is_mobile=True,
-        viewport=_MOBILE_VIEWPORT,
-    )
+    context = _new_touch_context(browser)
     try:
         page = context.new_page()
-        page.add_init_script(
-            """window.__rowGestureUnexpected = [];
-            document.addEventListener('dragstart', () => window.__rowGestureUnexpected.push('dragstart'), true);
-            document.addEventListener('pointercancel', () => window.__rowGestureUnexpected.push('pointercancel'), true);"""
-        )
         page.goto(f"{base_url}/c/{session_id}?sidebar=open")
 
         link = _row_link(page, session_id)
@@ -110,18 +118,9 @@ def test_vertical_touch_scroll_still_works_on_session_row(
     base_url, session_id = seeded_session
     _set_title(base_url, session_id, f"e2e-touch-scroll-{uuid.uuid4().hex[:8]}")
 
-    context = browser.new_context(
-        has_touch=True,
-        is_mobile=True,
-        viewport=_MOBILE_VIEWPORT,
-    )
+    context = _new_touch_context(browser)
     try:
         page = context.new_page()
-        page.add_init_script(
-            """window.__rowGestureUnexpected = [];
-            document.addEventListener('dragstart', () => window.__rowGestureUnexpected.push('dragstart'), true);
-            document.addEventListener('pointercancel', () => window.__rowGestureUnexpected.push('pointercancel'), true);"""
-        )
         page.goto(f"{base_url}/c/{session_id}?sidebar=open")
 
         link = _row_link(page, session_id)
@@ -177,18 +176,9 @@ def test_touch_drag_moves_session_into_project(
     project = f"Project {uuid.uuid4().hex[:6]}"
     _create_project(base_url, project)
 
-    context = browser.new_context(
-        has_touch=True,
-        is_mobile=True,
-        viewport=_MOBILE_VIEWPORT,
-    )
+    context = _new_touch_context(browser)
     try:
         page = context.new_page()
-        page.add_init_script(
-            """window.__rowGestureUnexpected = [];
-            document.addEventListener('dragstart', () => window.__rowGestureUnexpected.push('dragstart'), true);
-            document.addEventListener('pointercancel', () => window.__rowGestureUnexpected.push('pointercancel'), true);"""
-        )
         page.goto(f"{base_url}/c/{session_id}?sidebar=open")
 
         link = _row_link(page, session_id)
