@@ -1,6 +1,7 @@
 "use strict";
 
 const { setTimeout: delay } = require("node:timers/promises");
+const { isLoopbackServer } = require("./omnigent_cli");
 
 const AUTH_PROBE_TIMEOUT_MS = 10000;
 const OIDC_LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
@@ -57,6 +58,26 @@ function isUserAbort(signal) {
   return signal?.aborted === true;
 }
 
+function oidcServerUrlError(serverUrl) {
+  let parsed;
+  try {
+    parsed = new URL(serverUrl);
+  } catch {
+    return "invalid_server_url";
+  }
+  if (
+    (parsed.protocol !== "https:" && parsed.protocol !== "http:") ||
+    parsed.username ||
+    parsed.password
+  ) {
+    return "invalid_server_url";
+  }
+  if (parsed.protocol === "http:" && !isLoopbackServer(serverUrl)) {
+    return "insecure_transport";
+  }
+  return null;
+}
+
 // The ticket stays in memory; only the system browser renders its URL.
 async function runOidcBrowserLogin(
   electronSession,
@@ -69,6 +90,9 @@ async function runOidcBrowserLogin(
     onPollError,
   } = {},
 ) {
+  const serverUrlError = oidcServerUrlError(serverUrl);
+  if (serverUrlError) return { ok: false, reason: serverUrlError };
+
   const deadline = Date.now() + timeoutMs;
   let ticket;
   let loginUrl;
@@ -259,6 +283,14 @@ async function installAndVerifySessionCookie(
   token,
   { verificationAttempts = 3, retryDelayMs = 250, signal, assertCanCommit = () => {} } = {},
 ) {
+  const serverUrlError = oidcServerUrlError(serverUrl);
+  if (serverUrlError) {
+    throw new Error(
+      serverUrlError === "insecure_transport"
+        ? "Remote session cookies require HTTPS."
+        : "The server URL is invalid.",
+    );
+  }
   const details = sessionCookieDetails(serverUrl, token);
   return serializeCookieMutation(electronSession, serverUrl, details, async () => {
     const existing = await electronSession.cookies.get({ url: serverUrl, name: details.name });
