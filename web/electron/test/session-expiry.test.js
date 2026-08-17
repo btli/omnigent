@@ -176,6 +176,20 @@ describe("self-hosted OIDC session expiry", () => {
       isOidcLoginNavigation("https://idp.example/auth/login", "https://server.example"),
       false,
     );
+    assert.equal(
+      isOidcLoginNavigation(
+        "https://server.example/baseball/auth/login",
+        "https://server.example/base",
+      ),
+      false,
+    );
+    assert.equal(
+      isOidcLoginNavigation(
+        "https://server.example:444/base/auth/login",
+        "https://server.example/base",
+      ),
+      false,
+    );
   });
 
   it("blocks live-renderer login navigation and preserves the exact current route", async () => {
@@ -259,5 +273,36 @@ describe("self-hosted OIDC session expiry", () => {
     assert.equal(subframeEvent.prevented, false);
     assert.equal(mainEvent.prevented, true);
     assert.equal(handoffs, 1);
+  });
+
+  it("deduplicates repeated expiry navigation while a handoff is in flight", async () => {
+    class FakeWebContents extends EventEmitter {
+      getURL() {
+        return "https://server.example/base/c/current";
+      }
+    }
+    const webContents = new FakeWebContents();
+    const pending = Promise.withResolvers();
+    let handoffs = 0;
+    registerOidcSessionExpiryHandoff(
+      webContents,
+      () => "https://server.example/base",
+      async () => {
+        handoffs += 1;
+        await pending.promise;
+      },
+    );
+    const event = () => ({ preventDefault() {} });
+
+    webContents.emit("will-navigate", event(), "https://server.example/base/auth/login");
+    webContents.emit("will-navigate", event(), "https://server.example/base/auth/login");
+    await new Promise(setImmediate);
+    assert.equal(handoffs, 1);
+
+    pending.resolve();
+    await new Promise(setImmediate);
+    webContents.emit("will-navigate", event(), "https://server.example/base/auth/login");
+    await new Promise(setImmediate);
+    assert.equal(handoffs, 2);
   });
 });
