@@ -47,7 +47,7 @@ interface ActiveRowGesture {
 }
 
 interface RowGestureDndState {
-  shouldStartDrag: (point: { clientX: number; clientY: number }) => boolean;
+  shouldStartDrag: () => boolean;
 }
 
 export interface RowGestureDndData {
@@ -93,9 +93,7 @@ const rowGestureActivators = [
     ) => {
       if (event.pointerType !== "touch" || !event.isPrimary) return false;
       const data = active.data.current as Partial<RowGestureDndData> | undefined;
-      if (!data?.rowGesture?.shouldStartDrag({ clientX: event.clientX, clientY: event.clientY })) {
-        return false;
-      }
+      if (!data?.rowGesture?.shouldStartDrag()) return false;
       onActivation?.({ event });
       return true;
     },
@@ -438,24 +436,8 @@ export function useRowGesture({
   );
 
   const dndData = useMemo<RowGestureDndState>(
-    () => ({
-      shouldStartDrag: (point) => {
-        const gesture = state.current;
-        if (!gesture) return false;
-        if (gesture.phase === "drag") return true;
-        if (gesture.phase !== "armed" || !dragEnabled) return false;
-        if (
-          Math.hypot(point.clientX - gesture.armX, point.clientY - gesture.armY) <
-          ROW_DRAG_ACTIVATE_PX
-        ) {
-          return false;
-        }
-        onDragStart?.();
-        setGesturePhase(gesture, "drag");
-        return true;
-      },
-    }),
-    [dragEnabled, onDragStart, setGesturePhase],
+    () => ({ shouldStartDrag: () => state.current?.phase === "drag" }),
+    [],
   );
 
   const bindListeners = useCallback(
