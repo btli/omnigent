@@ -5,6 +5,7 @@ import android.net.Uri
 import android.os.Looper
 import android.webkit.ValueCallback
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
@@ -52,7 +53,7 @@ class OmnigentWebViewClientTest {
     }
 
     @Test
-    fun `stale finish after a new start cannot complete the current generation`() {
+    fun `stale same-url finish and error after commit cannot alter the replacement`() {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
         val generations = mutableListOf<Long?>()
         val client = client(onPageReady = { _, _, _, generation -> generations += generation })
@@ -62,11 +63,14 @@ class OmnigentWebViewClientTest {
         client.expectLoad(2)
         client.onPageStarted(webView, PINNED_URL, null)
 
-        // The superseded document finishes after the replacement starts.
-        client.onPageFinished(webView, PINNED_URL)
-        assertTrue(generations.isEmpty())
-
         client.onPageCommitVisible(webView, PINNED_URL)
+        client.onReceivedHttpError(
+            webView,
+            request(PINNED_URL),
+            WebResourceResponse("text/html", "UTF-8", null),
+        )
+        // Both the superseded and current documents report the same URL.
+        client.onPageFinished(webView, PINNED_URL)
         client.onPageFinished(webView, PINNED_URL)
 
         assertEquals(listOf(2L), generations)
@@ -119,11 +123,17 @@ class OmnigentWebViewClientTest {
         val appUrl = "$DATABRICKS_ORIGIN/omnigent/c/abc"
 
         client.expectLoad(7)
-        client.onPageStarted(webView, "$DATABRICKS_ORIGIN/omnigent", null)
+        client.onPageStarted(webView, appUrl, null)
         client.onPageStarted(webView, IDP_URL, null)
         client.onPageFinished(webView, IDP_URL)
         client.onPageStarted(webView, appUrl, null)
         client.onPageCommitVisible(webView, appUrl)
+        client.onReceivedHttpError(
+            webView,
+            request(appUrl),
+            WebResourceResponse("text/html", "UTF-8", null),
+        )
+        client.onPageFinished(webView, appUrl)
         client.onPageFinished(webView, appUrl)
 
         assertEquals(listOf(appUrl to 7L), ready)
