@@ -314,10 +314,13 @@ describe("OIDC session cookie installation", () => {
         fetch: async () => {
           const next = probes.shift();
           if (next instanceof Error) throw next;
-          return next;
+          return typeof next === "function" ? next() : next;
         },
       },
       getStored: () => stored,
+      setStored: (cookie) => {
+        stored = cookie ? { ...cookie } : null;
+      },
       removals,
       sets,
     };
@@ -424,6 +427,33 @@ describe("OIDC session cookie installation", () => {
       state.sets.map(({ value }) => value),
       ["new-session", "prior-session"],
     );
+  });
+
+  it("does not roll back a cookie replaced by another login", async () => {
+    const replacement = {
+      name: "__Host-ap_session",
+      value: "newer-session",
+      domain: "server.example",
+      path: "/",
+      httpOnly: true,
+      secure: true,
+      sameSite: "lax",
+    };
+    let state;
+    state = cookieSession(null, [
+      () => {
+        state.setStored(replacement);
+        return response(401, { login_url: "/auth/login" });
+      },
+    ]);
+
+    await assert.rejects(
+      installAndVerifySessionCookie(state.electronSession, "https://server.example", "session-jwt"),
+      /did not accept/,
+    );
+
+    assert.equal(state.getStored().value, "newer-session");
+    assert.deepEqual(state.removals, []);
   });
 
   it("retries transient verification before accepting the installed session", async () => {
