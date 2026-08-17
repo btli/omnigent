@@ -20,7 +20,6 @@ window.__rowGestureCaptureEvents = [];
 window.__rowGesturePointerId = null;
 document.addEventListener('pointerdown', event => {
   window.__rowGesturePointerId = event.pointerId;
-  window.__rowGesturePointerDownAt = performance.now();
 }, true);
 document.addEventListener('lostpointercapture', event => {
   window.__rowGestureCaptureEvents.push({
@@ -220,16 +219,31 @@ def test_horizontal_swipe_wins_before_hold_while_vertical_motion_yields_to_scrol
 
         cdp = page.context.new_cdp_session(page)
         try:
+            cdp.send("Emulation.setVirtualTimePolicy", {"policy": "pause"})
             _touch(cdp, "touchStart", x, y)
-            page.wait_for_function("performance.now() - window.__rowGesturePointerDownAt >= 350")
+            cdp.send(
+                "Emulation.setVirtualTimePolicy",
+                {"policy": "advance", "budget": 350},
+            )
             expect(page.get_by_test_id("rename-conversation")).to_have_count(0)
             expect(row).not_to_have_class(re.compile(r"\bscale-\[1\.01\]\b"))
             expect(row).not_to_have_class(re.compile(r"\bopacity-40\b"))
             _touch(cdp, "touchMove", x - 11, y)
+            cdp.send(
+                "Emulation.setVirtualTimePolicy",
+                {"policy": "advance", "budget": 1},
+            )
             expect(row).not_to_have_class(re.compile(r"\bmx-1\b"))
             _touch(cdp, "touchMove", x - 13, y)
+            cdp.send(
+                "Emulation.setVirtualTimePolicy",
+                {"policy": "advance", "budget": 1},
+            )
             expect(row).to_have_class(re.compile(r"\bmx-1\b"))
-            page.wait_for_timeout(500)
+            cdp.send(
+                "Emulation.setVirtualTimePolicy",
+                {"policy": "advance", "budget": 500},
+            )
             expect(page.get_by_test_id("rename-conversation")).to_have_count(0)
             expect(row).not_to_have_class(re.compile(r"\bscale-\[1\.01\]\b"))
             _touch(cdp, "touchEnd")
