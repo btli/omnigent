@@ -180,6 +180,75 @@ class OmnigentWebViewHttpErrorTest {
         assertFalse(persistenceFailed)
     }
 
+    @Test
+    fun `superseded network error before replacement start is ignored`() {
+        val webView = WebView(ApplicationProvider.getApplicationContext())
+        var loadFailed = true
+        val client = client { _, load, _, _ -> loadFailed = load }
+        client.expectLoad(1)
+        client.onPageStarted(webView, PINNED_URL, null)
+
+        client.supersedePendingLoads()
+        client.expectLoad(2)
+        client.onReceivedError(webView, request(PINNED_URL, true), error())
+        client.onPageStarted(webView, PINNED_URL, null)
+        client.onPageCommitVisible(webView, PINNED_URL)
+        client.onPageFinished(webView, PINNED_URL)
+
+        assertFalse(loadFailed)
+    }
+
+    @Test
+    fun `superseded HTTP error before replacement start is ignored`() {
+        val webView = WebView(ApplicationProvider.getApplicationContext())
+        var persistenceFailed = true
+        val client = client { _, _, persistence, _ -> persistenceFailed = persistence }
+        client.expectLoad(1)
+        client.onPageStarted(webView, PINNED_URL, null)
+
+        client.supersedePendingLoads()
+        client.expectLoad(2)
+        client.onReceivedHttpError(
+            webView,
+            request(PINNED_URL, true),
+            WebResourceResponse("text/html", "UTF-8", null),
+        )
+        client.onPageStarted(webView, PINNED_URL, null)
+        client.onPageCommitVisible(webView, PINNED_URL)
+        client.onPageFinished(webView, PINNED_URL)
+
+        assertFalse(persistenceFailed)
+    }
+
+    @Test
+    fun `replacement errors before its page start remain attributed`() {
+        val webView = WebView(ApplicationProvider.getApplicationContext())
+        var loadFailed = false
+        var persistenceFailed = false
+        val replacement = "$PINNED_ORIGIN/replacement"
+        val client =
+            client { _, load, persistence, _ ->
+                loadFailed = load
+                persistenceFailed = persistence
+            }
+        client.expectLoad(1)
+        client.onPageStarted(webView, PINNED_URL, null)
+
+        client.supersedePendingLoads()
+        client.expectLoad(2)
+        client.onReceivedError(webView, request(replacement, true), error())
+        client.onReceivedHttpError(
+            webView,
+            request(replacement, true),
+            WebResourceResponse("text/html", "UTF-8", null),
+        )
+        client.onPageStarted(webView, replacement, null)
+        client.onPageFinished(webView, replacement)
+
+        assertTrue(loadFailed)
+        assertTrue(persistenceFailed)
+    }
+
     private fun error(): WebResourceError = TestWebResourceError()
 
     private fun client(
