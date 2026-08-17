@@ -1126,6 +1126,7 @@ async function runWindowOidcBrowserHandoff(win, serverUrl) {
       try {
         await installAndVerifySessionCookie(session.defaultSession, serverUrl, result.token, {
           signal,
+          assertCanCommit: () => signal.throwIfAborted(),
         });
       } catch {
         return {
