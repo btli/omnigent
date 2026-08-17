@@ -723,6 +723,7 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
         OIDC_LOGIN_PAGE: "/oidc_login.html",
         OIDC_LOGIN_PRELOAD: "/oidc_login_preload.js",
         OIDC_LOGIN_TIMEOUT_MS: 100,
+        oidcServerUrlError,
         oidcLoginFlows: new WeakMap(),
         probeServerAuth: async () => ({ kind: "oidc", status: 401 }),
         runOidcBrowserLogin: (...args) => {
@@ -763,6 +764,7 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
       WEB_SCHEMES: new Set(["https:"]),
       URL,
       dialog: { showMessageBox: async () => ({ response: 0 }) },
+      oidcServerUrlError,
       probeServerAuth: async () => ({ kind: "accounts", status: 401 }),
       runWindowOidcBrowserHandoff: async () => {
         handoffs += 1;
@@ -775,6 +777,34 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     await showWebAuthnTimeout(win);
 
     assert.equal(handoffs, 0);
+    assert.equal(state.pendingServerLoads, 0);
+  });
+
+  it("rejects an unsafe WebAuthn handoff before the authenticated probe", async () => {
+    const win = {
+      isDestroyed: () => false,
+      webContents: { getURL: () => "https://idp.example/passkey" },
+    };
+    const state = { serverUrl: "http://server.example", pendingServerLoads: 0 };
+    let handoffs = 0;
+    const showWebAuthnTimeout = runInNewContext(`${webAuthnTimeoutCode}; showWebAuthnTimeout`, {
+      WEB_SCHEMES: new Set(["https:"]),
+      URL,
+      dialog: { showMessageBox: async () => ({ response: 0 }) },
+      oidcServerUrlError,
+      probeServerAuth: async () => assert.fail("sent an authenticated probe"),
+      runWindowOidcBrowserHandoff: async () => {
+        handoffs += 1;
+        return false;
+      },
+      session: { defaultSession: {} },
+      windows: new Map([[win, state]]),
+      withServerLoad,
+    });
+
+    await showWebAuthnTimeout(win);
+
+    assert.equal(handoffs, 1);
     assert.equal(state.pendingServerLoads, 0);
   });
 
@@ -812,6 +842,7 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
         OIDC_LOGIN_PAGE: "/oidc_login.html",
         OIDC_LOGIN_PRELOAD: "/oidc_login_preload.js",
         OIDC_LOGIN_TIMEOUT_MS: 100,
+        oidcServerUrlError,
         oidcLoginFlows: new WeakMap(),
         probeServerAuth: async () => ({ kind: "oidc", status: 401 }),
         runOidcBrowserLogin,
