@@ -294,6 +294,35 @@ describe("OIDC browser ticket flow", () => {
 });
 
 describe("OIDC session cookie installation", () => {
+  function cookieSession(initialCookie, probes) {
+    let stored = initialCookie ? { ...initialCookie } : null;
+    const sets = [];
+    const removals = [];
+    return {
+      electronSession: {
+        cookies: {
+          get: async () => (stored ? [{ ...stored }] : []),
+          set: async (details) => {
+            sets.push({ ...details });
+            stored = { ...details };
+          },
+          remove: async (url, name) => {
+            removals.push({ url, name });
+            stored = null;
+          },
+        },
+        fetch: async () => {
+          const next = probes.shift();
+          if (next instanceof Error) throw next;
+          return next;
+        },
+      },
+      getStored: () => stored,
+      removals,
+      sets,
+    };
+  }
+
   it("builds a valid __Host- cookie on HTTPS with no Domain", () => {
     const details = sessionCookieDetails("https://server.example", "token");
     assert.deepEqual(details, {
@@ -314,25 +343,17 @@ describe("OIDC session cookie installation", () => {
   });
 
   it("proves Chromium accepted the cookie and the server accepted the session", async () => {
-    let stored = null;
-    const electronSession = {
-      cookies: {
-        set: async (details) => {
-          stored = { ...details };
-        },
-        get: async () => [stored],
-      },
-      fetch: async () => response(200),
-    };
+    const state = cookieSession(null, [response(200)]);
 
     const result = await installAndVerifySessionCookie(
-      electronSession,
+      state.electronSession,
       "https://server.example",
       "session-jwt",
     );
 
     assert.equal(result, undefined);
-    assert.equal(stored.value, "session-jwt");
+    assert.equal(state.getStored().value, "session-jwt");
+    assert.deepEqual(state.removals, []);
   });
 
   it("fails loudly when Electron silently rejects the __Host- cookie", async () => {
@@ -340,6 +361,7 @@ describe("OIDC session cookie installation", () => {
       cookies: {
         set: async () => {},
         get: async () => [],
+        remove: async () => {},
       },
       fetch: async () => response(200),
     };
@@ -351,20 +373,56 @@ describe("OIDC session cookie installation", () => {
   });
 
   it("fails when the server still reports an unauthenticated OIDC session", async () => {
-    let stored = null;
-    const electronSession = {
-      cookies: {
-        set: async (details) => {
-          stored = { ...details };
-        },
-        get: async () => [stored],
-      },
-      fetch: async () => response(401, { login_url: "/auth/login" }),
-    };
+    const state = cookieSession(null, [response(401, { login_url: "/auth/login" })]);
 
     await assert.rejects(
-      installAndVerifySessionCookie(electronSession, "https://server.example", "session-jwt"),
+      installAndVerifySessionCookie(state.electronSession, "https://server.example", "session-jwt"),
       /did not accept/,
+    );
+    assert.equal(state.getStored(), null);
+  });
+
+  it("removes the installed cookie after transient verification exhaustion", async () => {
+    const state = cookieSession(null, [response(503), response(503)]);
+
+    await assert.rejects(
+      installAndVerifySessionCookie(
+        state.electronSession,
+        "https://server.example",
+        "session-jwt",
+        { verificationAttempts: 2, retryDelayMs: 1 },
+      ),
+      /did not accept/,
+    );
+
+    assert.equal(state.getStored(), null);
+    assert.equal(state.removals.length, 1);
+  });
+
+  it("restores the prior matching cookie after unsuccessful verification", async () => {
+    const priorCookie = {
+      name: "__Host-ap_session",
+      value: "prior-session",
+      domain: "server.example",
+      path: "/",
+      httpOnly: true,
+      secure: true,
+      sameSite: "lax",
+      expirationDate: 2000000000,
+    };
+    const state = cookieSession(priorCookie, [response(401, { login_url: "/auth/login" })]);
+
+    await assert.rejects(
+      installAndVerifySessionCookie(state.electronSession, "https://server.example", "new-session"),
+      /did not accept/,
+    );
+
+    assert.equal(state.getStored().value, "prior-session");
+    assert.equal(state.getStored().expirationDate, 2000000000);
+    assert.equal(Object.hasOwn(state.getStored(), "domain"), false);
+    assert.deepEqual(
+      state.sets.map(({ value }) => value),
+      ["new-session", "prior-session"],
     );
   });
 
@@ -377,6 +435,9 @@ describe("OIDC session cookie installation", () => {
           stored = { ...details };
         },
         get: async () => [stored],
+        remove: async () => {
+          stored = null;
+        },
       },
       fetch: async () => probes.shift(),
     };
@@ -397,6 +458,9 @@ describe("OIDC session cookie installation", () => {
           stored = { ...details };
         },
         get: async () => [stored],
+        remove: async () => {
+          stored = null;
+        },
       },
       fetch: async () => {
         probes += 1;
@@ -412,19 +476,10 @@ describe("OIDC session cookie installation", () => {
   });
 
   it("cancels a transient verification delay promptly", async () => {
-    let stored = null;
     const controller = new AbortController();
-    const electronSession = {
-      cookies: {
-        set: async (details) => {
-          stored = { ...details };
-        },
-        get: async () => [stored],
-      },
-      fetch: async () => response(503),
-    };
+    const state = cookieSession(null, [response(503)]);
     const verification = installAndVerifySessionCookie(
-      electronSession,
+      state.electronSession,
       "https://server.example",
       "session-jwt",
       { retryDelayMs: 50, signal: controller.signal },
@@ -432,5 +487,6 @@ describe("OIDC session cookie installation", () => {
     controller.abort();
 
     await assert.rejects(verification, { name: "AbortError" });
+    assert.equal(state.getStored(), null);
   });
 });
