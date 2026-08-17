@@ -100,6 +100,63 @@ describe("OIDC browser ticket flow", () => {
     );
   });
 
+  it("rejects ambiguous configured server URLs before any side effect", async () => {
+    const invalidServerUrls = [
+      "https://server.example/base?workspace=one",
+      "https://server.example/base?",
+      "https://server.example/base#workspace",
+      "https://server.example/base#",
+      "https://server.example/base/../other",
+      "https://server.example/base/%2e%2e/other",
+      "https://server.example/base/%252e%252e/other",
+      "https://server.example/base\\other",
+      "https://server.example/base//other",
+      "https://server.example/base/%2fother",
+      "https://server.example/base/%252fother",
+      "https://server.example:/base",
+      "https://server.example:443/base",
+    ];
+
+    await Promise.all(
+      invalidServerUrls.map(async (serverUrl) => {
+        let fetches = 0;
+        let opens = 0;
+        const result = await runOidcBrowserLogin(
+          {
+            fetch: async () => {
+              fetches += 1;
+              return response(200, { ticket: "secret", login_url: "/auth/login?ticket=secret" });
+            },
+          },
+          serverUrl,
+          async () => {
+            opens += 1;
+          },
+        );
+
+        assert.deepEqual(result, { ok: false, reason: "invalid_server_url" });
+        assert.equal(fetches, 0);
+        assert.equal(opens, 0);
+
+        await assert.rejects(
+          installAndVerifySessionCookie(
+            {
+              cookies: {
+                get: async () => assert.fail("read cookies for an invalid server URL"),
+                set: async () => assert.fail("set cookies for an invalid server URL"),
+                remove: async () => assert.fail("removed cookies for an invalid server URL"),
+              },
+              fetch: async () => assert.fail("probed an invalid server URL"),
+            },
+            serverUrl,
+            "session-jwt",
+          ),
+          /server URL is invalid/,
+        );
+      }),
+    );
+  });
+
   it("preserves OIDC ticket login over loopback HTTP, including IPv6", async () => {
     await Promise.all(
       ["http://localhost:6767", "http://127.0.0.1:6767", "http://[::1]:6767"].map(
@@ -233,6 +290,8 @@ describe("OIDC browser ticket flow", () => {
       "/auth/login?ticket=other",
       "/auth/login?ticket=secret&ticket=secret",
       "/auth/login?ticket=secret&",
+      "/auth/login?%74icket=secret",
+      "/auth/login?ticket=%73ecret",
       "/auth/login/../login?ticket=secret",
       "/auth/login#ticket=secret",
       "/auth/other?ticket=secret",
@@ -263,9 +322,12 @@ describe("OIDC browser ticket flow", () => {
     );
   });
 
-  it("accepts the canonical mounted login route with a decoded matching ticket", async () => {
+  it("accepts the exact canonically encoded login route for a special-character ticket", async () => {
     const responses = [
-      response(200, { ticket: "secret", login_url: "/auth/login?ticket=%73ecret" }),
+      response(200, {
+        ticket: "special /~!*",
+        login_url: "/auth/login?ticket=special+%2F~%21%2A",
+      }),
       response(200, { token: "session-jwt" }),
     ];
     const opened = [];
@@ -278,7 +340,7 @@ describe("OIDC browser ticket flow", () => {
     );
 
     assert.deepEqual(result, { ok: true, token: "session-jwt" });
-    assert.deepEqual(opened, ["https://server.example/base/auth/login?ticket=%73ecret"]);
+    assert.deepEqual(opened, ["https://server.example/base/auth/login?ticket=special+%2F~%21%2A"]);
   });
 
   it("cancels polling without redeeming the ticket", async () => {
