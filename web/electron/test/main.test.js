@@ -23,6 +23,7 @@ const os = require("node:os");
 const { createRequire } = require("node:module");
 const path = require("node:path");
 const vm = require("node:vm");
+
 const { runInNewContext } = vm;
 
 const { isSetupIdle, withServerLoad } = require("../src/server_load");
@@ -244,11 +245,25 @@ function loadNavigationHarness({
       createBrowserViewBoundsController: () => ({ attach: () => {}, detach: () => {} }),
     },
     "./browserIpc": { registerBrowserIpc: () => {} },
-    "./session-expiry": { registerSessionExpiryReload: () => {} },
+    "./session-expiry": {
+      registerSessionExpiryReload: () => {},
+      registerOidcSessionExpiryHandoff: () => {},
+    },
     "./popupPolicy": {
       decideWindowOpen: () => ({ kind: "ignore" }),
       stripCrossOriginOpenerHeaders: () => {},
       WEB_SCHEMES: new Set(),
+    },
+    "./oidc_auth": {
+      OIDC_LOGIN_TIMEOUT_MS: 300_000,
+      probeServerAuth: async () => ({ kind: "other" }),
+      runOidcBrowserLogin: async () => ({ ok: false, reason: "cancelled" }),
+      installAndVerifySessionCookie: async () => {},
+    },
+    "./oidc_login_dialog": { runOidcLoginDialog: async () => false },
+    "./webauthn_timeout": {
+      isWebAuthnEscapePage: () => false,
+      registerWebAuthnTimeout: () => {},
     },
     "./omnigent_cli": {
       isExecutableFile: () => false,
@@ -550,10 +565,11 @@ describe("workspace chrome injection wiring (src/main.js)", () => {
 });
 
 describe("navigation fallback wiring (src/main.js)", () => {
-  it("registers navigation fallbacks when createWindow builds a window", () => {
+  it("registers navigation fallbacks when createWindow builds a window", async () => {
     const harness = loadNavigationHarness({ registerFallbacks: false });
 
     const win = harness.api.createWindow("https://host.example/ml/omnigents");
+    await new Promise(setImmediate);
     harness.emit("did-navigate", "https://host.example/ml/omnigents/", 503, "Unavailable");
 
     assert.equal(win, harness.win);
