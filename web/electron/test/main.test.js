@@ -128,6 +128,7 @@ async function runConsentUnknownDeepLink(
 function loadNavigationHarness({
   serverUrl = "https://host.example/ml/omnigents",
   registerFallbacks = true,
+  rejectAuthSideEffects = false,
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   const listeners = new Map();
@@ -162,7 +163,10 @@ function loadNavigationHarness({
       calls.loadFile.push(args);
       return Promise.resolve();
     },
-    loadURL: () => Promise.resolve(),
+    loadURL: () =>
+      rejectAuthSideEffects
+        ? Promise.reject(new Error("invalid server URL reached navigation"))
+        : Promise.resolve(),
   };
 
   function createDesktopUpdater() {
@@ -265,11 +269,22 @@ function loadNavigationHarness({
     },
     "./oidc_auth": {
       OIDC_LOGIN_TIMEOUT_MS: 300_000,
-      probeServerAuth: async () => ({ kind: "other" }),
+      oidcServerUrlError,
+      probeServerAuth: async () => {
+        if (rejectAuthSideEffects) assert.fail("invalid server URL reached authentication probe");
+        return { kind: "other" };
+      },
       runOidcBrowserLogin: async () => ({ ok: false, reason: "cancelled" }),
-      installAndVerifySessionCookie: async () => {},
+      installAndVerifySessionCookie: async () => {
+        if (rejectAuthSideEffects) assert.fail("invalid server URL reached cookie installation");
+      },
     },
-    "./oidc_login_dialog": { runOidcLoginDialog: async () => false },
+    "./oidc_login_dialog": {
+      runOidcLoginDialog: async () => {
+        if (rejectAuthSideEffects) assert.fail("invalid server URL constructed the OIDC modal");
+        return false;
+      },
+    },
     "./webauthn_timeout": {
       isWebAuthnEscapePage: () => false,
       registerWebAuthnTimeout: () => {},
@@ -586,6 +601,25 @@ describe("navigation fallback wiring (src/main.js)", () => {
     assert.equal(harness.hasListener("did-navigate"), true);
     assert.equal(harness.calls.loadFile.length, 1);
     assert.equal(harness.calls.loadFile[0][0], harness.api.SETUP_PAGE);
+    harness.cleanup();
+  });
+
+  it("surfaces an unsafe saved server URL without authentication side effects", async () => {
+    const serverUrl = "https://host.example/ml/omnigents?workspace=one";
+    const harness = loadNavigationHarness({
+      serverUrl,
+      registerFallbacks: false,
+      rejectAuthSideEffects: true,
+    });
+
+    harness.api.createWindow(serverUrl);
+    await new Promise(setImmediate);
+
+    assert.equal(harness.calls.loadFile.length, 1);
+    const [, options] = harness.calls.loadFile[0];
+    const search = new URLSearchParams(options.search);
+    assert.match(search.get("error"), /server address is invalid/i);
+    assert.equal(search.get("url"), serverUrl);
     harness.cleanup();
   });
 });
