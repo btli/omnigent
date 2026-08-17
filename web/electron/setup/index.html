@@ -448,7 +448,7 @@
     <script>
       // Shared URL helpers (electron/src/url.js), exposed as window.omnigentUrl
       // — the same module the main process uses, so the two never drift.
-      const { isPlainHttpRemote, serverDisplayLabel } = window.omnigentUrl;
+      const { serverDisplayLabel } = window.omnigentUrl;
       // Uses the Electron preload bridge (electron/src/preload.js).
       const setup = window.omnigentSetup;
       const input = document.getElementById("url");
@@ -562,21 +562,9 @@
         .then((servers) => renderServerList(servers, "recents", "recents-list", "recent"))
         .catch(() => {});
 
-      // The exact URL value the user has already been warned about — a
-      // second Connect click on the same value proceeds; editing the input
-      // re-arms the warning.
-      let warnedFor = null;
-
       async function connect() {
         err.textContent = "";
         const value = input.value;
-        if (isPlainHttpRemote(value) && warnedFor !== value) {
-          warnedFor = value;
-          err.textContent =
-            "Warning: unencrypted http:// to a remote host — anyone on the " +
-            "network path can act as this server. Click Connect again to proceed.";
-          return;
-        }
         button.disabled = true;
         try {
           // setServerUrl authenticates, then persists the URL and navigates this
