@@ -27,7 +27,11 @@ const vm = require("node:vm");
 const { runInNewContext } = vm;
 
 const { isSetupIdle, withServerLoad } = require("../src/server_load");
-const { runOidcBrowserLogin, installAndVerifySessionCookie } = require("../src/oidc_auth");
+const {
+  oidcServerUrlError,
+  runOidcBrowserLogin,
+  installAndVerifySessionCookie,
+} = require("../src/oidc_auth");
 
 const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
 const preloadSource = readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
@@ -479,6 +483,77 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
       liveCode,
       /oidcLoginFlows\.get\(win\)[\s\S]{0,180}existingFlow\?\.serverUrl === serverUrl[\s\S]{0,80}existingFlow\.promise/,
     );
+  });
+
+  it("rejects unsafe OIDC server URLs before the authenticated probe", async () => {
+    const ensureWindowOidcSession = runInNewContext(`${oidcSessionCode}; ensureWindowOidcSession`, {
+      AbortController,
+      BrowserWindow: function BrowserWindow() {},
+      installAndVerifySessionCookie: async () => assert.fail("installed a cookie"),
+      ipcMain: {},
+      OIDC_LOGIN_PAGE: "/oidc_login.html",
+      OIDC_LOGIN_PRELOAD: "/oidc_login_preload.js",
+      OIDC_LOGIN_TIMEOUT_MS: 100,
+      oidcLoginFlows: new WeakMap(),
+      oidcServerUrlError,
+      omnigentCli: { isLoopbackServer: () => false },
+      probeServerAuth: async () => assert.fail("sent an authenticated probe"),
+      runOidcBrowserLogin,
+      runOidcLoginDialog: async ({ runAttempt }) =>
+        runAttempt({ signal: new AbortController().signal, updateMessage() {} }),
+      session: { defaultSession: { fetch: async () => assert.fail("made a request") } },
+      setWindowAuthenticationNavigation() {},
+      shell: { openExternal: async () => assert.fail("opened a URL") },
+      URL,
+    });
+
+    await Promise.all(
+      [
+        [
+          "http://server.example",
+          "Browser sign-in requires HTTPS for remote servers. Update the server URL and retry.",
+        ],
+        [
+          "https://user:secret@server.example",
+          "The server address is invalid. Return to setup, correct it, and retry.",
+        ],
+        [
+          "ftp://server.example",
+          "The server address is invalid. Return to setup, correct it, and retry.",
+        ],
+        ["not a url", "The server address is invalid. Return to setup, correct it, and retry."],
+      ].map(async ([serverUrl, error]) => {
+        const result = await ensureWindowOidcSession({}, serverUrl);
+        assert.equal(result.ok, false);
+        assert.equal(result.error, error);
+      }),
+    );
+  });
+
+  it("preserves canonical loopback HTTP and HTTPS session detection", async () => {
+    const probes = [];
+    const ensureWindowOidcSession = runInNewContext(`${oidcSessionCode}; ensureWindowOidcSession`, {
+      oidcServerUrlError,
+      omnigentCli: require("../src/omnigent_cli"),
+      probeServerAuth: async (_session, serverUrl) => {
+        probes.push(serverUrl);
+        return { kind: "other" };
+      },
+      session: { defaultSession: {} },
+      setWindowAuthenticationNavigation() {},
+    });
+
+    const results = await Promise.all(
+      [
+        "http://localhost:6767",
+        "http://127.0.0.1:6767",
+        "http://[::1]:6767",
+        "https://server.example",
+      ].map((serverUrl) => ensureWindowOidcSession({}, serverUrl)),
+    );
+
+    assert.deepEqual(results, [true, true, true, true]);
+    assert.deepEqual(probes, ["https://server.example"]);
   });
 
   it("completes the WebAuthn escape through ticket, cookie verification, and one reload", async () => {
