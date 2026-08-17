@@ -5,7 +5,9 @@ import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 
@@ -26,8 +28,14 @@ import android.webkit.WebViewClient
 class OmnigentWebViewClient(
     private val pinnedOrigin: () -> String?,
     private val shouldInjectBridgeAtPageReady: () -> Boolean,
-    private val onPageReady: (url: String?) -> Unit,
+    private val onPageReady: (
+        url: String?,
+        mainFrameLoadFailed: Boolean,
+        mainFramePersistenceFailed: Boolean,
+        loadGeneration: Long?,
+    ) -> Unit,
     private val onLoginRequired: () -> Unit,
+    private val loadUrl: (WebView, String) -> Unit = WebView::loadUrl,
 ) : WebViewClient() {
     // Bare-root -> /omnigent bounces since the last app page loaded; see
     // workspaceRootTarget for why they're capped.
@@ -35,12 +43,35 @@ class OmnigentWebViewClient(
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    // Set when the main frame's current load errors out (network/TLS, or an
+    // HTTP >=400 respectively); consumed by onPageFinished. WebView calls
+    // onPageFinished with the ORIGINAL url after such an error — never a
+    // chrome-error:// one — so callers can't tell success from failure from
+    // the url alone; these flags are the only signal. They must NOT be reset
+    // in onPageStarted: Chromium delivers a main-frame onReceivedHttpError
+    // BEFORE onPageStarted (observed on device), so a start-time reset would
+    // erase the error before the load it belongs to finishes.
+    private var mainFrameLoadFailed = false
+    private var mainFramePersistenceFailed = false
+    private val expectedLoadGenerations = ArrayDeque<Long>()
+    private val startedLoads = ArrayDeque<StartedLoad>()
+
+    fun expectLoad(generation: Long) {
+        expectedLoadGenerations.addLast(generation)
+    }
+
+    fun supersedePendingLoads() {
+        expectedLoadGenerations.clear()
+        startedLoads.clear()
+    }
+
     override fun onPageStarted(
         view: WebView,
         url: String?,
         favicon: Bitmap?,
     ) {
         super.onPageStarted(view, url, favicon)
+        startedLoads.addLast(StartedLoad(expectedLoadGenerations.removeFirstOrNull()))
 
         val origin = originOf(url)
         val scheme = url?.let { Uri.parse(it).scheme?.lowercase() }
@@ -95,11 +126,42 @@ class OmnigentWebViewClient(
         bounce(view, target)
     }
 
+    // request.isForMainFrame is only meaningful on this (API 23+, our floor
+    // is 28) overload — the deprecated int/String one can't distinguish a
+    // subframe (an embedded image, an iframe) failure from the page's own.
+    override fun onReceivedError(
+        view: WebView,
+        request: WebResourceRequest,
+        error: WebResourceError,
+    ) {
+        super.onReceivedError(view, request, error)
+        if (request.isForMainFrame && isBlockingLoadError(error.errorCode, error.description)) {
+            mainFrameLoadFailed = true
+        }
+    }
+
+    override fun onReceivedHttpError(
+        view: WebView,
+        request: WebResourceRequest,
+        errorResponse: WebResourceResponse,
+    ) {
+        super.onReceivedHttpError(view, request, errorResponse)
+        if (request.isForMainFrame) mainFramePersistenceFailed = true
+    }
+
     override fun onPageFinished(
         view: WebView,
         url: String?,
     ) {
         super.onPageFinished(view, url)
+        // Consume the error flags for the load that just finished. A stopped
+        // load (no onPageFinished) can leave a flag armed for the NEXT finish;
+        // that fails safe — it can only skip one persist, never allow one.
+        val loadFailed = mainFrameLoadFailed
+        val persistenceFailed = mainFramePersistenceFailed
+        val loadGeneration = startedLoads.removeFirstOrNull()?.generation
+        mainFrameLoadFailed = false
+        mainFramePersistenceFailed = false
         val onPinnedOrigin = originOf(url) == pinnedOrigin()
         // An app page loaded, so the mount works: re-arm the bounce budget for
         // the next time the user lands back on the workspace root.
@@ -115,10 +177,12 @@ class OmnigentWebViewClient(
             view.evaluateJavascript(WorkspaceChromeScript.source, null)
         }
         if (onPinnedOrigin && shouldInjectBridgeAtPageReady()) {
-            view.evaluateJavascript(NativeBridgeScript.source) { onPageReady(url) }
+            view.evaluateJavascript(
+                NativeBridgeScript.source,
+            ) { onPageReady(url, loadFailed, persistenceFailed, loadGeneration) }
             return
         }
-        onPageReady(url)
+        onPageReady(url, loadFailed, persistenceFailed, loadGeneration)
     }
 
     override fun shouldOverrideUrlLoading(
@@ -201,10 +265,20 @@ class OmnigentWebViewClient(
         view: WebView,
         target: String,
     ) {
-        mainHandler.post { view.loadUrl(target) }
+        // MainActivity injects a generation-stamped loader for this app navigation.
+        mainHandler.post { loadUrl(view, target) }
     }
+
+    private data class StartedLoad(
+        val generation: Long?,
+    )
 
     private companion object {
         const val MAX_ROOT_BOUNCES = 1
     }
 }
+
+internal fun isBlockingLoadError(
+    errorCode: Int,
+    description: CharSequence,
+): Boolean = errorCode != WebViewClient.ERROR_UNKNOWN || !description.contains("ERR_ABORTED")
