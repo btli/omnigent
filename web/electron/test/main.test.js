@@ -823,9 +823,9 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
       "https://server.example/base/%2fother",
       "https://server.example/base/%252fother",
       "https://server.example/base/%2525252fother",
+      `https://server.example/base/%${"25".repeat(40)}2fother`,
       "https://server.example/base/%",
       "https://server.example/base/%C0%AF",
-      `https://server.example/${"a".repeat(2048)}`,
     ];
 
     await Promise.all(
