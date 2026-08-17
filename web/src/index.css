@@ -908,25 +908,9 @@ aside[aria-label="Workspace"][data-maximized] {
   }
 }
 
-/* Full-height native surfaces — the Workspace rail (md+ only), the sidebar,
- * push panels (full-screen overlays below md, docked edge panels above), and
- * rail-tab drawers (md:hidden) — touch screen edges at every width, so one
- * ungated rule folds the OS safe area into all four padding edges. Physical
- * (not logical) edges keep RTL correct. iOS is included at md+ too: the shell
- * WebView is edge-to-edge there as well.
- * Tradeoff of the single ungated rule: without per-slot edge exclusions the
- * padding also lands on edges FACING CONTENT — docked md+ push panels get it
- * on their inner edge, the fluid TerminalsPanel on both lateral edges — and
- * a real display cutout is ~30-48px, so on cutout devices that is visible
- * dead space. Deliberate: one ungated rule over a per-panel edge matrix.
- * :not([data-collapsed]): closed panels stay mounted at w-0, and with
- * border-box sizing lateral padding would give them real width — cutout-sized
- * gaps in the layout.
- * :not(.is-peek): the peeking sidebar is a floating card inset 8px off every
- * screen edge (md:absolute md:inset-2 p-0) — it touches neither bar, so
- * padding it would just dent the card and override its p-0.
- * :not(aside[aria-label="Workspace"] *): panels docked inside the
- * already-padded rail would double the inset. */
+/* Full-height native surfaces touch screen edges at every width. Collapsed
+ * panels must remain zero-width, peeking sidebars are already inset, and
+ * panels inside the padded Workspace rail must not receive the inset twice. */
 :is([data-ios-native], [data-android-native])
   :is(
     aside[aria-label="Workspace"],
