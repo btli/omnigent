@@ -3254,7 +3254,6 @@ function ConversationRow({
         ? { kind: "unseen" as const }
         : (derivedState ?? (isStartingUp ? { kind: "starting" as const } : null));
 
-  // One recognizer owns touch swipe, scroll, hold, context menu, and drag.
   const dragEnabled = isOwner && !selectionMode && !isArchived && !isEditing;
   const swipeActions = useSwipeActions();
   const swipeEnabled =
