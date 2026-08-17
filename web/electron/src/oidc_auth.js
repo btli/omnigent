@@ -78,6 +78,39 @@ function oidcServerUrlError(serverUrl) {
   return null;
 }
 
+function canonicalTicketLoginUrl(serverUrl, loginPath, ticket) {
+  if (
+    typeof loginPath !== "string" ||
+    typeof ticket !== "string" ||
+    !loginPath.startsWith("/") ||
+    loginPath.startsWith("//") ||
+    loginPath.includes("#") ||
+    loginPath.split("?", 1)[0] !== "/auth/login"
+  ) {
+    return null;
+  }
+  const loginUrl = serverRoute(serverUrl, loginPath);
+  let parsed;
+  let expected;
+  try {
+    parsed = new URL(loginUrl);
+    expected = new URL(serverRoute(serverUrl, "/auth/login"));
+  } catch {
+    return null;
+  }
+  const parameters = [...parsed.searchParams];
+  if (
+    parsed.origin !== expected.origin ||
+    parsed.pathname !== expected.pathname ||
+    parameters.length !== 1 ||
+    parameters[0][0] !== "ticket" ||
+    parameters[0][1] !== ticket
+  ) {
+    return null;
+  }
+  return loginUrl;
+}
+
 // The ticket stays in memory; only the system browser renders its URL.
 async function runOidcBrowserLogin(
   electronSession,
@@ -121,11 +154,8 @@ async function runOidcBrowserLogin(
     const body = await response.json();
     ticket = body && typeof body.ticket === "string" ? body.ticket : "";
     const loginPath = body && typeof body.login_url === "string" ? body.login_url : "";
-    if (!ticket || !loginPath.startsWith("/") || loginPath.startsWith("//")) {
-      return { ok: false, reason: "failed" };
-    }
-    loginUrl = serverRoute(serverUrl, loginPath);
-    if (new URL(loginUrl).origin !== new URL(serverUrl).origin) {
+    loginUrl = canonicalTicketLoginUrl(serverUrl, loginPath, ticket);
+    if (!ticket || !loginUrl) {
       return { ok: false, reason: "failed" };
     }
     await openExternal(loginUrl);
@@ -345,6 +375,7 @@ module.exports = {
   OIDC_LOGIN_TIMEOUT_MS,
   OIDC_POLL_INTERVAL_MS,
   OIDC_REQUEST_TIMEOUT_MS,
+  oidcServerUrlError,
   serverRoute,
   classifyAuthProbe,
   probeServerAuth,
