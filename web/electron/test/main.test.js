@@ -597,6 +597,38 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     assert.equal(state.pendingServerLoads, 0);
   });
 
+  it("rejects remote HTTP browser login without network, shell, or cookie side effects", async () => {
+    const runWindowOidcBrowserHandoff = runInNewContext(
+      `${oidcSessionCode}; runWindowOidcBrowserHandoff`,
+      {
+        AbortController,
+        BrowserWindow: function BrowserWindow() {},
+        installAndVerifySessionCookie: async () => assert.fail("installed a plaintext cookie"),
+        ipcMain: {},
+        OIDC_LOGIN_PAGE: "/oidc_login.html",
+        OIDC_LOGIN_PRELOAD: "/oidc_login_preload.js",
+        OIDC_LOGIN_TIMEOUT_MS: 100,
+        oidcLoginFlows: new WeakMap(),
+        runOidcBrowserLogin,
+        runOidcLoginDialog: async ({ runAttempt }) =>
+          runAttempt({ signal: new AbortController().signal, updateMessage() {} }),
+        session: {
+          defaultSession: { fetch: async () => assert.fail("made a plaintext request") },
+        },
+        shell: { openExternal: async () => assert.fail("opened a plaintext ticket URL") },
+        URL,
+      },
+    );
+
+    const result = await runWindowOidcBrowserHandoff({}, "http://server.example");
+
+    assert.equal(result.ok, false);
+    assert.equal(
+      result.error,
+      "Browser sign-in requires HTTPS for remote servers. Update the server URL and retry.",
+    );
+  });
+
   it("rolls back when runAttempt is cancelled after cookie verification", async () => {
     const controller = new AbortController();
     let stored = null;

@@ -1123,6 +1123,19 @@ async function runWindowOidcBrowserHandoff(win, serverUrl) {
       if (signal.aborted || (!result.ok && result.reason === "cancelled")) {
         return { ok: false, error: "Sign-in was cancelled." };
       }
+      if (!result.ok && result.reason === "insecure_transport") {
+        return {
+          ok: false,
+          error:
+            "Browser sign-in requires HTTPS for remote servers. Update the server URL and retry.",
+        };
+      }
+      if (!result.ok && result.reason === "invalid_server_url") {
+        return {
+          ok: false,
+          error: "The server address is invalid. Return to setup, correct it, and retry.",
+        };
+      }
       if (!result.ok && result.reason === "timed_out") {
         return {
           ok: false,
