@@ -3381,6 +3381,7 @@ function ConversationRow({
     },
     onLongPress: openContextMenuAt,
     onDragStart: () => setContextMenuOpen(false),
+    onCancel: () => setContextMenuOpen(false),
   });
 
   const {
