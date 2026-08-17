@@ -75,6 +75,20 @@ const { isWebAuthnEscapePage, registerWebAuthnTimeout } = require("./webauthn_ti
 const omnigentCli = require("./omnigent_cli");
 const serverManager = require("./server_manager");
 
+function configuredServerUrlErrorMessage(reason) {
+  return reason === "insecure_transport"
+    ? "Remote servers require HTTPS. Update the server address and try again."
+    : "The server address is invalid. Correct it and try again.";
+}
+
+function configuredServerUrlError(raw, normalized) {
+  const trimmed = String(raw ?? "").trim();
+  const validationUrl = trimmed.includes("://")
+    ? trimmed
+    : `${new URL(normalized).protocol}//${trimmed}`;
+  return oidcServerUrlError(validationUrl);
+}
+
 /** Absolute path to the bundled setup page (the "connect to server" form). */
 const SETUP_PAGE = path.join(__dirname, "..", "setup", "index.html");
 
@@ -1091,10 +1105,7 @@ async function showWebAuthnTimeout(win) {
   const state = windows.get(win);
   const serverUrl = state?.serverUrl;
   if (!serverUrl) return;
-  if (oidcServerUrlError(serverUrl)) {
-    await withServerLoad(state, () => runWindowOidcBrowserHandoff(win, serverUrl));
-    return;
-  }
+  if (oidcServerUrlError(serverUrl)) return;
   let probe;
   try {
     probe = await probeServerAuth(session.defaultSession, serverUrl);
@@ -1219,9 +1230,7 @@ async function runWindowOidcBrowserHandoff(win, serverUrl) {
 }
 
 async function ensureWindowOidcSession(win, serverUrl) {
-  if (oidcServerUrlError(serverUrl)) {
-    return runWindowOidcBrowserHandoff(win, serverUrl);
-  }
+  if (oidcServerUrlError(serverUrl)) return false;
   if (omnigentCli.isLoopbackServer(serverUrl)) {
     setWindowAuthenticationNavigation(win, false);
     return true;
@@ -2467,11 +2476,17 @@ function registerIpc() {
       // A server page must never be able to re-point which server is saved.
       throw new Error("set-server-url is only available to the setup page");
     }
-    // A managed choice is already validated and may name a workspace mount;
-    // preserve it exactly. The shared expansion is a no-op for paths, while a
-    // managed workspace root still gets the normal mount discovery.
-    const managedTarget = managedServerUrls().find((candidate) => candidate === url);
-    const normalized = managedTarget ?? normalizeUrl(url); // throws → setup page shows error
+    let normalized;
+    try {
+      const managedTarget = managedServerUrls().find((candidate) => candidate === url);
+      normalized = managedTarget ?? normalizeUrl(url);
+    } catch {
+      return { loaded: false, error: configuredServerUrlErrorMessage("invalid_server_url") };
+    }
+    const serverUrlError = configuredServerUrlError(url, normalized);
+    if (serverUrlError) {
+      return { loaded: false, error: configuredServerUrlErrorMessage(serverUrlError) };
+    }
     const win = BrowserWindow.fromWebContents(event.sender) ?? activeWindow();
     const state = win && windows.get(win);
     if (!state || state.pendingServerLoads) return { loaded: false };
