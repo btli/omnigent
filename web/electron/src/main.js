@@ -1443,15 +1443,17 @@ function createWindow(targetUrl, opts = {}) {
     (typeof opts.serverUrl === "string" && opts.serverUrl.length > 0 ? opts.serverUrl : null) ??
     explicit ??
     (ephemeral ? null : typeof saved === "string" && saved.length > 0 ? saved : null);
+  const serverUrlError = serverUrl ? oidcServerUrlError(serverUrl) : null;
   // loadUrl: what the webContents actually loads. A deep-link path resolves
   // under the server URL (mount-aware — see resolveServerPath); an explicit
   // target (New Window) loads that exact URL; otherwise load the server URL.
-  const loadUrl =
-    (typeof opts.path === "string" && opts.path.length > 0 && serverUrl
-      ? resolveServerPath(serverUrl, opts.path)
-      : null) ??
-    explicit ??
-    serverUrl;
+  const loadUrl = serverUrlError
+    ? null
+    : ((typeof opts.path === "string" && opts.path.length > 0 && serverUrl
+        ? resolveServerPath(serverUrl, opts.path)
+        : null) ??
+      explicit ??
+      serverUrl);
   // A serverUrl that doesn't parse (hand-edited/corrupt settings.json) is
   // treated as "no server configured" rather than crashing window creation.
   const destinationOrigin = serverUrl ? originOf(serverUrl) : null;
@@ -1496,7 +1498,12 @@ function createWindow(targetUrl, opts = {}) {
       })
       .catch(() => loadSetupPage(win));
   } else {
-    if (serverUrl && !destinationOrigin) {
+    if (serverUrlError) {
+      void loadSetupPage(win, {
+        error: configuredServerUrlErrorMessage(serverUrlError),
+        url: serverUrl,
+      });
+    } else if (serverUrl && !destinationOrigin) {
       // Fail loud on a corrupt hand-edited settings.json: show WHY the
       // window landed on setup instead of silently presenting a blank form.
       void loadSetupPage(win, {
