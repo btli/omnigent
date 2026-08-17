@@ -55,6 +55,75 @@ describe("OIDC provider detection", () => {
 });
 
 describe("OIDC browser ticket flow", () => {
+  it("rejects non-loopback HTTP before any authentication side effect", async () => {
+    let fetches = 0;
+    let opens = 0;
+    const result = await runOidcBrowserLogin(
+      {
+        fetch: async () => {
+          fetches += 1;
+          return response(200, { ticket: "secret", login_url: "/auth/login?ticket=secret" });
+        },
+      },
+      "http://server.example",
+      async () => {
+        opens += 1;
+      },
+    );
+
+    assert.deepEqual(result, { ok: false, reason: "insecure_transport" });
+    assert.equal(fetches, 0);
+    assert.equal(opens, 0);
+  });
+
+  it("fails closed on malformed and credentialed server URLs", async () => {
+    await Promise.all(
+      ["not a url", "https://user:secret@server.example"].map(async (serverUrl) => {
+        let fetches = 0;
+        let opens = 0;
+        const result = await runOidcBrowserLogin(
+          {
+            fetch: async () => {
+              fetches += 1;
+            },
+          },
+          serverUrl,
+          async () => {
+            opens += 1;
+          },
+        );
+
+        assert.deepEqual(result, { ok: false, reason: "invalid_server_url" });
+        assert.equal(fetches, 0);
+        assert.equal(opens, 0);
+      }),
+    );
+  });
+
+  it("preserves OIDC ticket login over loopback HTTP, including IPv6", async () => {
+    await Promise.all(
+      ["http://localhost:6767", "http://127.0.0.1:6767", "http://[::1]:6767"].map(
+        async (serverUrl) => {
+          const responses = [
+            response(200, { ticket: "secret", login_url: "/auth/login?ticket=secret" }),
+            response(200, { token: "session-jwt" }),
+          ];
+          const opened = [];
+
+          const result = await runOidcBrowserLogin(
+            { fetch: async () => responses.shift() },
+            serverUrl,
+            async (url) => opened.push(url),
+            { pollIntervalMs: 1, timeoutMs: 100 },
+          );
+
+          assert.deepEqual(result, { ok: true, token: "session-jwt" });
+          assert.deepEqual(opened, [`${serverUrl}/auth/login?ticket=secret`]);
+        },
+      ),
+    );
+  });
+
   it("retries transient ticket creation statuses before opening the browser", async () => {
     const responses = [
       ...[429, 502, 503, 504].map((status) => response(status)),
@@ -343,6 +412,21 @@ describe("OIDC session cookie installation", () => {
   it("uses the non-Host cookie on HTTP", () => {
     assert.equal(sessionCookieDetails("http://remote.example", "token").name, "ap_session");
     assert.equal(sessionCookieDetails("http://remote.example", "token").secure, false);
+  });
+
+  it("rejects a remote HTTP session before touching the cookie jar", async () => {
+    const electronSession = {
+      cookies: {
+        get: async () => assert.fail("read cookies for remote HTTP"),
+        set: async () => assert.fail("installed a remote plaintext cookie"),
+        remove: async () => assert.fail("removed cookies for remote HTTP"),
+      },
+    };
+
+    await assert.rejects(
+      installAndVerifySessionCookie(electronSession, "http://server.example", "session-jwt"),
+      /require HTTPS/,
+    );
   });
 
   it("proves Chromium accepted the cookie and the server accepted the session", async () => {
