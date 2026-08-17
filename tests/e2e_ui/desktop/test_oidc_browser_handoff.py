@@ -33,16 +33,21 @@ window.omnigentOidcLogin = {
 """
 
 _TICKET_CLIENT = """
-const { runOidcBrowserLogin } = require("./web/electron/src/oidc_auth");
-const opened = [];
-const statuses = [];
-const result = await runOidcBrowserLogin(
-  { fetch },
-  process.env.OIDC_STUB_URL,
-  async (url) => { opened.push(url); await fetch(url); },
-  { pollIntervalMs: 1, timeoutMs: 1000, onPollError: (status) => statuses.push(status) },
-);
-console.log(JSON.stringify({ result, opened, statuses }));
+(async () => {
+  const { runOidcBrowserLogin } = require("./web/electron/src/oidc_auth");
+  const opened = [];
+  const statuses = [];
+  const result = await runOidcBrowserLogin(
+    { fetch },
+    process.env.OIDC_STUB_URL,
+    async (url) => { opened.push(url); await fetch(url); },
+    { pollIntervalMs: 1, timeoutMs: 1000, onPollError: (status) => statuses.push(status) },
+  );
+  console.log(JSON.stringify({ result, opened, statuses }));
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
 """
 
 
@@ -84,7 +89,7 @@ def _run_ticket_flow(statuses: list[int]) -> dict[str, object]:
     env = {**os.environ, "OIDC_STUB_URL": f"http://127.0.0.1:{server.server_port}"}
     try:
         result = subprocess.run(
-            ["bun", "--eval", _TICKET_CLIENT],
+            ["node", "--eval", _TICKET_CLIENT],
             cwd=_OIDC_LOGIN_PAGE.parents[3],
             env=env,
             check=True,
