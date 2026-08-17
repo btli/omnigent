@@ -38,7 +38,10 @@ const startLocalHandlerSource = setupSource.match(
 // Strip block comments, then line comments (leaving `://` in URLs intact).
 const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
 const oidcSessionCode = liveCode.match(
-  /async function ensureWindowOidcSession[\s\S]*?(?=async function loadAuthenticatedServerUrl)/,
+  /async function runWindowOidcBrowserHandoff[\s\S]*?(?=async function loadAuthenticatedServerUrl)/,
+)?.[0];
+const webAuthnTimeoutCode = liveCode.match(
+  /async function showWebAuthnTimeout[\s\S]*?(?=function resolveServerPath)/,
 )?.[0];
 const switchServerCode = liveCode.match(
   /ipcMain\.handle\("omnigent:switch-server"[\s\S]*?(?=ipcMain\.on\("omnigent:open-server-setup")/,
@@ -582,7 +585,7 @@ describe("navigation fallback wiring (src/main.js)", () => {
 });
 
 describe("remote OIDC browser handoff wiring (src/main.js)", () => {
-  it("uses the main-process ticket client without requiring the CLI", () => {
+  it("wiring-only: uses the main-process ticket client without requiring the CLI", () => {
     assert.ok(oidcSessionCode);
     assert.match(oidcSessionCode, /runOidcBrowserLogin\(/);
     assert.match(oidcSessionCode, /onPollError:[\s\S]{0,180}updateMessage\(/);
@@ -590,12 +593,42 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     assert.doesNotMatch(oidcSessionCode, /storeServerAuthToken|auth_tokens\.json/);
   });
 
-  it("deduplicates concurrent OIDC flows per shell window", () => {
+  it("wiring-only: deduplicates concurrent OIDC flows per shell window", () => {
     assert.match(liveCode, /const oidcLoginFlows = new WeakMap\(\)/);
     assert.match(
       liveCode,
       /oidcLoginFlows\.get\(win\)[\s\S]{0,180}existingFlow\?\.serverUrl === serverUrl[\s\S]{0,80}existingFlow\.promise/,
     );
+  });
+
+  it("routes the WebAuthn escape through ticket handoff, cookie verification, and reload", async () => {
+    assert.ok(webAuthnTimeoutCode);
+    const win = {
+      isDestroyed: () => false,
+      webContents: { getURL: () => "https://idp.example/passkey" },
+    };
+    const state = { serverUrl: "https://server.example", pendingServerLoads: 0 };
+    const calls = [];
+    const showWebAuthnTimeout = runInNewContext(`${webAuthnTimeoutCode}; showWebAuthnTimeout`, {
+      WEB_SCHEMES: new Set(["https:"]),
+      URL,
+      dialog: { showMessageBox: async () => ({ response: 0 }) },
+      loadAuthenticatedServerUrl: async (...args) => calls.push(["load", ...args]),
+      runWindowOidcBrowserHandoff: async (...args) => {
+        calls.push(["handoff", ...args]);
+        return true;
+      },
+      windows: new Map([[win, state]]),
+      withServerLoad,
+    });
+
+    await showWebAuthnTimeout(win);
+
+    assert.deepEqual(calls, [
+      ["handoff", win, "https://server.example"],
+      ["load", win, "https://server.example"],
+    ]);
+    assert.equal(state.pendingServerLoads, 0);
   });
 
   it("routes the saved cold-launch destination through loadServerUrl", () => {
@@ -736,14 +769,14 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     assert.equal(loadFileCalls, 1);
   });
 
-  it("intercepts live OIDC expiry before the renderer reaches /auth/login", () => {
+  it("wiring-only: routes intercepted OIDC expiry through the single-load path", () => {
     assert.match(
       liveCode,
-      /registerOidcSessionExpiryHandoff\([\s\S]{0,700}ensureWindowOidcSession\([\s\S]{0,250}loadAuthenticatedServerUrl\(win, expiredServerUrl, undefined, returnUrl\)/,
+      /registerOidcSessionExpiryHandoff\([\s\S]{0,700}loadServerUrl\(win, expiredServerUrl, undefined, returnUrl\)/,
     );
   });
 
-  it("limits the fail-loud WebAuthn guard to main-window fallback authentication", () => {
+  it("wiring-only: limits the fail-loud WebAuthn guard to main-window fallback authentication", () => {
     assert.ok(oauthPopupCode);
     assert.doesNotMatch(oauthPopupCode, /registerWebAuthnTimeout|showWebAuthnTimeout/);
     assert.match(
