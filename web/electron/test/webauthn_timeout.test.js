@@ -53,6 +53,28 @@ describe("modal WebAuthn timeout", () => {
     assert.equal(isWebAuthnEscapePage("file:///tmp/login.html", "https://server.example"), false);
   });
 
+  it("matches mounted accounts routes without accepting origin or path lookalikes", () => {
+    assert.equal(
+      isWebAuthnEscapePage("https://server.example/base/login", "https://server.example/base/"),
+      true,
+    );
+    assert.equal(
+      isWebAuthnEscapePage(
+        "https://server.example/base/login/extra",
+        "https://server.example/base",
+      ),
+      false,
+    );
+    assert.equal(
+      isWebAuthnEscapePage("https://server.example/baseball/login", "https://server.example/base"),
+      false,
+    );
+    assert.equal(
+      isWebAuthnEscapePage("https://server.example:444/base/login", "https://server.example/base"),
+      false,
+    );
+  });
+
   it("reports a slow discoverable request without changing its Promise", async () => {
     const originalRequest = new Promise(() => {});
     const { report, credentials } = installGuard(() => originalRequest);
@@ -77,6 +99,22 @@ describe("modal WebAuthn timeout", () => {
 
     assert.equal(request, originalRequest);
     assert.equal(await request, "conditional");
+  });
+
+  it("does not arm for non-public-key credential requests", async () => {
+    const originalRequest = new Promise(() => {});
+    const { report, credentials } = installGuard(() => originalRequest, 1);
+
+    assert.equal(credentials.get({ password: true }), originalRequest);
+    assert.equal(
+      await Promise.race([
+        report.then(() => "armed"),
+        new Promise((resolve) => {
+          setTimeout(() => resolve("untouched"), 10);
+        }),
+      ]),
+      "untouched",
+    );
   });
 
   it("adds no page-global or shell-identifying marker", () => {
