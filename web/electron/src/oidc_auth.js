@@ -7,6 +7,7 @@ const AUTH_PROBE_TIMEOUT_MS = 10000;
 const OIDC_LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 const OIDC_POLL_INTERVAL_MS = 2000;
 const OIDC_REQUEST_TIMEOUT_MS = 10000;
+const MAX_SERVER_URL_LENGTH = 2048;
 const TRANSIENT_AUTH_STATUSES = new Set([429, 502, 503, 504]);
 const cookieMutationQueues = new WeakMap();
 
@@ -62,6 +63,7 @@ function isUserAbort(signal) {
 function oidcServerUrlError(serverUrl) {
   if (
     typeof serverUrl !== "string" ||
+    serverUrl.length > MAX_SERVER_URL_LENGTH ||
     serverUrl.includes("\\") ||
     serverUrl.includes("?") ||
     serverUrl.includes("#")
