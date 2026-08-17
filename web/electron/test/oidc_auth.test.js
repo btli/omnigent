@@ -227,6 +227,59 @@ describe("OIDC browser ticket flow", () => {
     assert.equal(opened, false);
   });
 
+  it("rejects login URLs that do not exactly bind the canonical route to the ticket", async () => {
+    const invalidLoginUrls = [
+      "/auth/login",
+      "/auth/login?ticket=other",
+      "/auth/login?ticket=secret&ticket=secret",
+      "/auth/login/../login?ticket=secret",
+      "/auth/login#ticket=secret",
+      "/auth/other?ticket=secret",
+      "/auth/login?ticket=secret&next=%2F",
+    ];
+
+    await Promise.all(
+      invalidLoginUrls.map(async (loginUrl) => {
+        let fetches = 0;
+        let opens = 0;
+        const result = await runOidcBrowserLogin(
+          {
+            fetch: async () => {
+              fetches += 1;
+              return response(200, { ticket: "secret", login_url: loginUrl });
+            },
+          },
+          "https://server.example/base",
+          async () => {
+            opens += 1;
+          },
+        );
+
+        assert.deepEqual(result, { ok: false, reason: "failed" });
+        assert.equal(fetches, 1);
+        assert.equal(opens, 0);
+      }),
+    );
+  });
+
+  it("accepts the canonical mounted login route with a decoded matching ticket", async () => {
+    const responses = [
+      response(200, { ticket: "secret", login_url: "/auth/login?ticket=%73ecret" }),
+      response(200, { token: "session-jwt" }),
+    ];
+    const opened = [];
+
+    const result = await runOidcBrowserLogin(
+      { fetch: async () => responses.shift() },
+      "https://server.example/base",
+      async (url) => opened.push(url),
+      { pollIntervalMs: 1, timeoutMs: 100 },
+    );
+
+    assert.deepEqual(result, { ok: true, token: "session-jwt" });
+    assert.deepEqual(opened, ["https://server.example/base/auth/login?ticket=%73ecret"]);
+  });
+
   it("cancels polling without redeeming the ticket", async () => {
     const controller = new AbortController();
     let fetches = 0;
