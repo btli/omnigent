@@ -73,7 +73,7 @@ const deepLinkHandlerCode = liveCode.match(
 
 async function runConsentUnknownDeepLink(
   initialPendingLoads,
-  { closeDuringExpansion = false } = {},
+  { closeDuringExpansion = false, expandedServerUrl = "https://unknown.example" } = {},
 ) {
   const state = { origin: null, pendingServerLoads: initialPendingLoads, serverUrl: null };
   let destroyed = false;
@@ -85,6 +85,7 @@ async function runConsentUnknownDeepLink(
   const parentLoads = [];
   const created = [];
   const pendingDuringExpansion = [];
+  const remembered = [];
   const handler = runInNewContext(`${deepLinkHandlerCode}; handleDeepLink`, {
     BrowserWindow: { getFocusedWindow: () => parent },
     activeWindow: () => parent,
@@ -101,7 +102,7 @@ async function runConsentUnknownDeepLink(
         destroyed = true;
         windowStates.delete(parent);
       }
-      return "https://unknown.example";
+      return expandedServerUrl;
     },
     findKnownServerUrl: () => null,
     focusAndRestore: () => {},
@@ -118,14 +119,15 @@ async function runConsentUnknownDeepLink(
         return null;
       }
     },
+    oidcServerUrlError,
     parseOmnigentDeepLink: () => ({ origin: "https://unknown.example", path: "/c/1" }),
-    rememberServerUrl: () => {},
+    rememberServerUrl: (url) => remembered.push(url),
     windows: windowStates,
     withServerLoad,
   });
 
   await handler("omnigent://unknown.example/c/1");
-  return { created, parent, parentLoads, pendingDuringExpansion, state };
+  return { created, parent, parentLoads, pendingDuringExpansion, remembered, state };
 }
 
 function loadNavigationHarness({
@@ -730,10 +732,13 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
       webContents: { getURL: () => "https://idp.example/passkey" },
     };
     const state = { serverUrl: "http://server.example", pendingServerLoads: 0 };
+    const setupLoads = [];
     const showWebAuthnTimeout = runInNewContext(`${webAuthnTimeoutCode}; showWebAuthnTimeout`, {
       WEB_SCHEMES: new Set(["https:"]),
       URL,
-      dialog: { showMessageBox: async () => ({ response: 0 }) },
+      configuredServerUrlErrorMessage: () => "Remote servers require HTTPS.",
+      dialog: { showMessageBox: async () => assert.fail("constructed a confirmation modal") },
+      loadSetupPage: async (...args) => setupLoads.push(args),
       oidcServerUrlError,
       probeServerAuth: async () => assert.fail("sent an authenticated probe"),
       runWindowOidcBrowserHandoff: async () => assert.fail("constructed the OIDC modal"),
@@ -744,6 +749,10 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
 
     await showWebAuthnTimeout(win);
 
+    assert.equal(setupLoads.length, 1);
+    assert.equal(setupLoads[0][0], win);
+    assert.equal(setupLoads[0][1].error, "Remote servers require HTTPS.");
+    assert.equal(setupLoads[0][1].url, "http://server.example");
     assert.equal(state.pendingServerLoads, 0);
   });
 
@@ -774,10 +783,13 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
           webContents: { getURL: () => "https://idp.example/passkey" },
         };
         const state = { serverUrl, pendingServerLoads: 0 };
+        const setupLoads = [];
         const showWebAuthnTimeout = runInNewContext(`${webAuthnTimeoutCode}; showWebAuthnTimeout`, {
           WEB_SCHEMES: new Set(["https:"]),
           URL,
-          dialog: { showMessageBox: async () => ({ response: 0 }) },
+          configuredServerUrlErrorMessage: () => "Invalid server URL.",
+          dialog: { showMessageBox: async () => assert.fail("constructed a confirmation modal") },
+          loadSetupPage: async (...args) => setupLoads.push(args),
           oidcServerUrlError,
           probeServerAuth: async () => assert.fail("sent an authenticated probe"),
           runWindowOidcBrowserHandoff: async () => assert.fail("constructed the OIDC modal"),
@@ -788,6 +800,10 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
 
         await showWebAuthnTimeout(win);
 
+        assert.equal(setupLoads.length, 1);
+        assert.equal(setupLoads[0][0], win);
+        assert.equal(setupLoads[0][1].error, "Invalid server URL.");
+        assert.equal(setupLoads[0][1].url, serverUrl);
         assert.equal(state.pendingServerLoads, 0);
       }),
     );
@@ -1500,6 +1516,35 @@ describe("deep-link ingestion wiring (src/main.js)", () => {
     const result = await runConsentUnknownDeepLink(0);
     assert.deepEqual(result.pendingDuringExpansion, [1]);
     assert.equal(result.state.pendingServerLoads, 0);
+  });
+
+  it("rejects unsafe expanded server URLs before load or persistence", async () => {
+    await Promise.all(
+      [
+        "https://user:secret@unknown.example/ml/omnigents",
+        "https://unknown.example/ml/omnigents?workspace=one",
+        "https://unknown.example/ml/omnigents#fragment",
+        "http://unknown.example/ml/omnigents",
+        "https://different.example/ml/omnigents",
+        "https://unknown.example/ml//omnigents",
+        "https://unknown.example/ml/%252fomnigents",
+      ].map(async (expandedServerUrl) => {
+        const result = await runConsentUnknownDeepLink(0, { expandedServerUrl });
+        assert.deepEqual(result.parentLoads, []);
+        assert.deepEqual(result.created, []);
+        assert.deepEqual(result.remembered, []);
+        assert.equal(result.state.pendingServerLoads, 0);
+      }),
+    );
+  });
+
+  it("loads and remembers a canonical expanded server URL", async () => {
+    const result = await runConsentUnknownDeepLink(0, {
+      expandedServerUrl: "https://unknown.example/ml/omnigents",
+    });
+
+    assert.deepEqual(result.parentLoads, [result.parent]);
+    assert.deepEqual(result.remembered, ["https://unknown.example/ml/omnigents"]);
   });
 
   it("reuses an idle setup parent but not a busy one", async () => {
