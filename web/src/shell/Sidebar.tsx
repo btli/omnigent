@@ -3348,7 +3348,6 @@ function ConversationRow({
   const showDraftIndicator = hasDraft && !isActive;
   const hasTrailingIndicator = sessionState !== null || showDraftIndicator;
 
-  // One recognizer owns touch swipe, scroll, hold, context menu, and drag.
   const dragEnabled = isOwner && !selectionMode && !isArchived && !isEditing;
   const swipeActions = useSwipeActions();
   const swipeEnabled =
