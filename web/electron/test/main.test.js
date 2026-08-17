@@ -27,6 +27,7 @@ const vm = require("node:vm");
 const { runInNewContext } = vm;
 
 const { isSetupIdle, withServerLoad } = require("../src/server_load");
+const { normalizeUrl } = require("../src/url");
 const {
   oidcServerUrlError,
   runOidcBrowserLogin,
@@ -499,8 +500,7 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
       omnigentCli: { isLoopbackServer: () => false },
       probeServerAuth: async () => assert.fail("sent an authenticated probe"),
       runOidcBrowserLogin,
-      runOidcLoginDialog: async ({ runAttempt }) =>
-        runAttempt({ signal: new AbortController().signal, updateMessage() {} }),
+      runOidcLoginDialog: async () => assert.fail("constructed the OIDC modal"),
       session: { defaultSession: { fetch: async () => assert.fail("made a request") } },
       setWindowAuthenticationNavigation() {},
       shell: { openExternal: async () => assert.fail("opened a URL") },
@@ -522,10 +522,9 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
           "The server address is invalid. Return to setup, correct it, and retry.",
         ],
         ["not a url", "The server address is invalid. Return to setup, correct it, and retry."],
-      ].map(async ([serverUrl, error]) => {
+      ].map(async ([serverUrl]) => {
         const result = await ensureWindowOidcSession({}, serverUrl);
-        assert.equal(result.ok, false);
-        assert.equal(result.error, error);
+        assert.equal(result, false);
       }),
     );
   });
@@ -665,17 +664,13 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
       webContents: { getURL: () => "https://idp.example/passkey" },
     };
     const state = { serverUrl: "http://server.example", pendingServerLoads: 0 };
-    let handoffs = 0;
     const showWebAuthnTimeout = runInNewContext(`${webAuthnTimeoutCode}; showWebAuthnTimeout`, {
       WEB_SCHEMES: new Set(["https:"]),
       URL,
       dialog: { showMessageBox: async () => ({ response: 0 }) },
       oidcServerUrlError,
       probeServerAuth: async () => assert.fail("sent an authenticated probe"),
-      runWindowOidcBrowserHandoff: async () => {
-        handoffs += 1;
-        return false;
-      },
+      runWindowOidcBrowserHandoff: async () => assert.fail("constructed the OIDC modal"),
       session: { defaultSession: {} },
       windows: new Map([[win, state]]),
       withServerLoad,
@@ -683,7 +678,6 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
 
     await showWebAuthnTimeout(win);
 
-    assert.equal(handoffs, 1);
     assert.equal(state.pendingServerLoads, 0);
   });
 
@@ -714,17 +708,13 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
           webContents: { getURL: () => "https://idp.example/passkey" },
         };
         const state = { serverUrl, pendingServerLoads: 0 };
-        let handoffs = 0;
         const showWebAuthnTimeout = runInNewContext(`${webAuthnTimeoutCode}; showWebAuthnTimeout`, {
           WEB_SCHEMES: new Set(["https:"]),
           URL,
           dialog: { showMessageBox: async () => ({ response: 0 }) },
           oidcServerUrlError,
           probeServerAuth: async () => assert.fail("sent an authenticated probe"),
-          runWindowOidcBrowserHandoff: async () => {
-            handoffs += 1;
-            return false;
-          },
+          runWindowOidcBrowserHandoff: async () => assert.fail("constructed the OIDC modal"),
           session: { defaultSession: {} },
           windows: new Map([[win, state]]),
           withServerLoad,
@@ -732,7 +722,6 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
 
         await showWebAuthnTimeout(win);
 
-        assert.equal(handoffs, 1);
         assert.equal(state.pendingServerLoads, 0);
       }),
     );
@@ -925,6 +914,87 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     assert.doesNotMatch(beforeTransaction, /settings\.server_url = target/);
   });
 
+  it("rejects invalid Setup URLs before workspace expansion or authentication", async () => {
+    const state = { serverUrl: null };
+    const win = {};
+    const handlerSource = setupServerCode.slice(
+      setupServerCode.indexOf("async"),
+      setupServerCode.lastIndexOf(");"),
+    );
+    const handler = runInNewContext(`(${handlerSource})`, {
+      BrowserWindow: { fromWebContents: () => win },
+      configuredServerUrlErrorMessage: (reason) =>
+        reason === "insecure_transport" ? "Remote servers require HTTPS." : "Invalid server.",
+      configuredServerUrlError: (raw, normalized) => {
+        const trimmed = String(raw).trim();
+        return oidcServerUrlError(
+          trimmed.includes("://") ? trimmed : `${new URL(normalized).protocol}//${trimmed}`,
+        );
+      },
+      expandDatabricksWorkspaceUrl: async () => assert.fail("expanded an invalid URL"),
+      isSetupPageSender: () => true,
+      normalizeUrl,
+      oidcServerUrlError,
+      windows: new Map([[win, state]]),
+      withServerLoad,
+    });
+
+    await Promise.all(
+      [
+        "http://server.example",
+        "https://user:secret@server.example",
+        "https://server.example/base?workspace=one",
+        "https://server.example/base/../other",
+        "server.example/base/../other",
+        "ftp://server.example",
+        "not a url",
+      ].map(async (url) => {
+        const result = await handler({ sender: {} }, url);
+        assert.equal(result.loaded, false);
+        assert.match(result.error, /server|HTTPS/i);
+      }),
+    );
+    assert.equal(state.pendingServerLoads, undefined);
+  });
+
+  it("keeps valid Setup URL expansion before loading", async () => {
+    const state = { serverUrl: null };
+    const win = {};
+    const calls = [];
+    const handlerSource = setupServerCode.slice(
+      setupServerCode.indexOf("async"),
+      setupServerCode.lastIndexOf(");"),
+    );
+    const handler = runInNewContext(`(${handlerSource})`, {
+      BrowserWindow: { fromWebContents: () => win },
+      expandDatabricksWorkspaceUrl: async (url) => {
+        calls.push(["expand", url]);
+        return `${url}/ml/omnigents`;
+      },
+      fetchServerManifest: async () => ({}),
+      configuredServerUrlError: (_raw, normalized) => oidcServerUrlError(normalized),
+      isSetupPageSender: () => true,
+      loadServerUrl: async (_win, url) => {
+        calls.push(["load", url]);
+        return true;
+      },
+      loadSettings: () => ({}),
+      normalizeUrl: (url) => url,
+      oidcServerUrlError,
+      rememberRecentServer() {},
+      saveSettings() {},
+      windows: new Map([[win, { ...state, ephemeral: true }]]),
+      withServerLoad,
+    });
+
+    const result = await handler({ sender: {} }, "https://ws.cloud.databricks.com");
+    assert.equal(result.loaded, true);
+    assert.deepEqual(calls, [
+      ["expand", "https://ws.cloud.databricks.com"],
+      ["load", "https://ws.cloud.databricks.com/ml/omnigents"],
+    ]);
+  });
+
   it("blocks deep-link reuse during Setup workspace expansion", async () => {
     const state = { serverUrl: null };
     const win = {};
@@ -935,9 +1005,11 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     );
     const handler = runInNewContext(`(${handlerSource})`, {
       BrowserWindow: { fromWebContents: () => win },
+      configuredServerUrlError: (_raw, normalized) => oidcServerUrlError(normalized),
       expandDatabricksWorkspaceUrl: () => expansion.promise,
       isSetupPageSender: () => true,
       normalizeUrl: (url) => url,
+      oidcServerUrlError,
       windows: new Map([[win, state]]),
       withServerLoad,
     });
@@ -959,12 +1031,14 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     );
     const handler = runInNewContext(`(${handlerSource})`, {
       BrowserWindow: { fromWebContents: () => win },
+      configuredServerUrlError: (_raw, normalized) => oidcServerUrlError(normalized),
       expandDatabricksWorkspaceUrl: async () => {
         expansionCalled = true;
         throw new Error("unexpected expansion");
       },
       isSetupPageSender: () => true,
       normalizeUrl: (url) => url,
+      oidcServerUrlError,
       windows: new Map([[win, state]]),
       withServerLoad,
     });
