@@ -6,22 +6,9 @@
 //      `onDoubleClick`), gated on edit permission.
 // See ConversationRow / ConversationEditRow in Sidebar.tsx.
 
-import {
-  type PointerEvent as ReactPointerEvent,
-  type ReactElement,
-  type ReactNode,
-  useSyncExternalStore,
-} from "react";
+import { type ReactElement, type ReactNode, useSyncExternalStore } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import {
-  act,
-  cleanup,
-  fireEvent,
-  render,
-  renderHook,
-  screen,
-  within,
-} from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -224,7 +211,7 @@ import {
   writeSwipeActions,
 } from "@/lib/swipeActionPreferences";
 import { SettingsPage } from "@/pages/SettingsPage";
-import { Sidebar, useRowSwipe } from "./Sidebar";
+import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
 
@@ -384,7 +371,13 @@ beforeEach(() => {
   mockConversations([CONV]);
 });
 
-afterEach(cleanup);
+afterEach(async () => {
+  cleanup();
+  // dnd-kit removes its capture-phase click blocker on a delayed task.
+  await new Promise((resolve) => {
+    setTimeout(resolve, 60);
+  });
+});
 
 describe("quick pin/unpin hover button", () => {
   it("keeps the row full-width and the trailing controls inset from the right edge", () => {
@@ -1051,6 +1044,9 @@ describe("right-click context menu", () => {
       clientX: 20,
       clientY: 100,
     });
+    // The production browser follows pointerup with touchend; dnd-kit's
+    // TouchSensor detaches from that native touch event.
+    fireEvent.touchEnd(link, { touches: [] });
 
     expect(screen.queryByTestId("rename-conversation")).toBeNull();
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
@@ -1384,14 +1380,14 @@ describe("touch swipe actions", () => {
     // doesn't take the horizontal pan mid-gesture...
     const { unmount } = renderSidebar();
     const li = () => screen.getByRole("link", { name: /My Session/ }).closest("li")!;
-    expect(li()).toHaveStyle({ touchAction: "pan-y" });
+    expect(li()).toHaveClass("touch-pan-y");
     unmount();
 
     // ...but with BOTH directions inert there is no gesture to protect, so the
     // override is dropped and the browser keeps its own horizontal gestures.
     writeSwipeActions({ left: "none", right: "none" });
     renderSidebar();
-    expect(li()).not.toHaveStyle({ touchAction: "pan-y" });
+    expect(li()).not.toHaveClass("touch-pan-y");
   });
 
   it("does nothing when swiping a direction mapped to none", () => {
@@ -1563,267 +1559,11 @@ describe("touch swipe actions", () => {
   });
 });
 
-describe("useRowSwipe — dnd coexistence", () => {
-  // Focused hook tests: driving real dnd-kit dragging in jsdom is unreliable,
-  // so control `isDragging` directly to prove the swipe yields to the drag.
-  const ACTIONS = { left: "archive", right: "none" } as const;
-
-  // Row stand-in: pointer-capture no-ops (jsdom's are stubbed in test-setup)
-  // plus `contains`, which the hook uses to reject events bubbling out of a
-  // portal. Defaults to containing everything (the normal in-row case).
-  const PORTAL_ROW = {
-    setPointerCapture: () => {},
-    releasePointerCapture: () => {},
-    hasPointerCapture: () => false,
-    contains: () => true,
-  };
-
-  function makePointer(over: {
-    pointerId: number;
-    clientX: number;
-    clientY: number;
-    target?: unknown;
-    currentTarget?: unknown;
-  }) {
-    // Minimal ReactPointerEvent stand-in — only the fields useRowSwipe reads.
-    return {
-      pointerType: "touch",
-      isPrimary: true,
-      preventDefault: () => {},
-      target: document.createElement("div"),
-      currentTarget: PORTAL_ROW,
-      ...over,
-    } as unknown as ReactPointerEvent;
-  }
-
-  it("(a) yields a primarily-vertical move: decided=other, no translate, no action", () => {
-    const onAction = vi.fn();
-    const { result } = renderHook(() =>
-      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging: false, onAction }),
-    );
-
-    act(() => {
-      result.current.onPointerDown(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
-    });
-    act(() => {
-      // Vertical dominates → the gesture hands off to scroll/drag.
-      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 105, clientY: 140 }));
-    });
-    // No translate offset accumulated.
-    expect(result.current.dx).toBe(0);
-
-    act(() => {
-      result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 105, clientY: 140 }));
-    });
-    expect(onAction).not.toHaveBeenCalled();
-  });
-
-  it("(b) bails once a dnd-kit drag begins mid-gesture: dx resets, no action on release", () => {
-    const onAction = vi.fn();
-    let isDragging = false;
-    const { result, rerender } = renderHook(() =>
-      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging, onAction }),
-    );
-
-    act(() => {
-      result.current.onPointerDown(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
-    });
-    act(() => {
-      // A real horizontal swipe left (the archive-configured direction) locks
-      // in and translates the row.
-      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 70, clientY: 100 }));
-    });
-    expect(result.current.dx).not.toBe(0);
-
-    // dnd-kit's long-press drag activates; re-render with isDragging=true.
-    isDragging = true;
-    rerender();
-    act(() => {
-      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 20, clientY: 100 }));
-    });
-    // The swipe bailed: translate snaps back to rest.
-    expect(result.current.dx).toBe(0);
-
-    act(() => {
-      result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 20, clientY: 100 }));
-    });
-    expect(onAction).not.toHaveBeenCalled();
-  });
-
-  it("(c) commits a fast flick that releases before the last move renders", () => {
-    // A quick flick can lift the finger before React commits the render for the
-    // final pointermove. Release must decide on where the finger actually ended,
-    // so the move + up are dispatched inside ONE act() — no render in between.
-    const onAction = vi.fn();
-    const { result } = renderHook(() =>
-      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging: false, onAction }),
-    );
-
-    act(() => {
-      result.current.onPointerDown(makePointer({ pointerId: 1, clientX: 200, clientY: 100 }));
-      // Lock the gesture, then travel well past the 72px commit threshold and
-      // release — all before the hook re-renders with the final offset.
-      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 180, clientY: 100 }));
-      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
-      result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
-    });
-
-    // -100px past the threshold in the archive-configured direction.
-    expect(onAction).toHaveBeenCalledWith("archive");
-    expect(onAction).toHaveBeenCalledTimes(1);
-    expect(result.current.dx).toBe(0);
-  });
-
-  it("(d) does not commit a flick that snaps back under the threshold before release", () => {
-    // The mirror case: travel past the threshold, then return under it and
-    // release, again with no render between the moves. Nothing should fire.
-    const onAction = vi.fn();
-    const { result } = renderHook(() =>
-      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging: false, onAction }),
-    );
-
-    act(() => {
-      result.current.onPointerDown(makePointer({ pointerId: 1, clientX: 200, clientY: 100 }));
-      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
-      // Back to only -10px: under the commit threshold at the moment of release.
-      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 190, clientY: 100 }));
-      result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 190, clientY: 100 }));
-    });
-
-    expect(onAction).not.toHaveBeenCalled();
-  });
-
-  it("cancels an armed swipe and releases pointer capture without firing", () => {
-    const onAction = vi.fn();
-    const releasePointerCapture = vi.fn();
-    const row = {
-      ...PORTAL_ROW,
-      hasPointerCapture: () => true,
-      releasePointerCapture,
-    };
-    const { result } = renderHook(() =>
-      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging: false, onAction }),
-    );
-
-    act(() => {
-      result.current.onPointerDown(
-        makePointer({ pointerId: 7, clientX: 200, clientY: 100, currentTarget: row }),
-      );
-      result.current.onPointerMove(
-        makePointer({ pointerId: 7, clientX: 100, clientY: 100, currentTarget: row }),
-      );
-    });
-    expect(result.current.dx).toBe(-81.33333333333333);
-
-    act(() => result.current.onPointerCancel());
-
-    expect(result.current.dx).toBe(0);
-    expect(releasePointerCapture).toHaveBeenCalledWith(7);
-    expect(onAction).not.toHaveBeenCalled();
-  });
-
-  it("(f) tracks 1:1 to the commit point, then resists so the title stays in panel", () => {
-    const onAction = vi.fn();
-    const { result } = renderHook(() =>
-      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging: false, onAction }),
-    );
-
-    act(() => {
-      result.current.onPointerDown(makePointer({ pointerId: 1, clientX: 400, clientY: 100 }));
-    });
-    // Up to the threshold the row follows the finger exactly.
-    act(() => {
-      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 340, clientY: 100 }));
-    });
-    expect(result.current.dx).toBe(-60);
-
-    // A 300px drag is damped and hard-capped — the row can't be dragged far
-    // enough to push its title out of the panel.
-    act(() => {
-      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
-    });
-    expect(result.current.dx).toBe(-96);
-
-    // Still commits — damping is visual only.
-    act(() => {
-      result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
-    });
-    expect(onAction).toHaveBeenCalledWith("archive");
-  });
-
-  it("(g) rests at 0 when a locked swipe reverses into a direction mapped to none", () => {
-    // ACTIONS maps right to "none": a swipe locked going left that overshoots
-    // back past its origin must clamp at rest, not slide the row rightward over
-    // bare canvas with no hint behind it (release there already no-ops).
-    const onAction = vi.fn();
-    const { result } = renderHook(() =>
-      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging: false, onAction }),
-    );
-
-    act(() => {
-      result.current.onPointerDown(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
-    });
-    act(() => {
-      // Lock the gesture leftward (the archive direction).
-      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 70, clientY: 100 }));
-    });
-    expect(result.current.dx).toBe(-30);
-
-    act(() => {
-      // Reverse well past the origin into the inert right direction.
-      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 150, clientY: 100 }));
-    });
-    expect(result.current.dx).toBe(0);
-
-    act(() => {
-      result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 150, clientY: 100 }));
-    });
-    expect(onAction).not.toHaveBeenCalled();
-  });
-
-  it("(e) ignores a pointerdown that bubbled out of a portal (open dialog)", () => {
-    // The row's dialogs render in portals but are React children, so their
-    // events bubble to the row's handlers. A drag inside the open delete dialog
-    // must not start a swipe on the row behind it.
-    const onAction = vi.fn();
-    const { result } = renderHook(() =>
-      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging: false, onAction }),
-    );
-
-    // currentTarget is the row; target is portal content it does NOT contain.
-    const outside = document.createElement("div");
-    act(() => {
-      result.current.onPointerDown(
-        makePointer({
-          pointerId: 1,
-          clientX: 200,
-          clientY: 100,
-          target: outside,
-          currentTarget: { ...PORTAL_ROW, contains: () => false },
-        }),
-      );
-    });
-    act(() => {
-      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
-      result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
-    });
-
-    expect(result.current.dx).toBe(0);
-    expect(onAction).not.toHaveBeenCalled();
-  });
-});
-
 describe("sharing kill switch", () => {
   it("disables the row's Share item for a manager when sharing_mode is off", () => {
-    // CONV is owner-level (permission_level null → canManage), yet a server
-    // reporting sharing_mode off must gray out Share for everyone.
     mockConversations([CONV]);
     renderSidebar(undefined, serverInfo({ sharing_mode: "off" }));
-
     fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
-
-    // Radix marks a disabled menu item with data-disabled; the enabled
-    // (on / read_only) branch renders a plain selectable item without it.
     expect(screen.getByTestId("share-conversation")).toHaveAttribute("data-disabled");
   });
 
