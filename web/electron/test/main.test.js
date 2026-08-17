@@ -668,6 +668,36 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     );
   });
 
+  it("reports a malformed OIDC server URL without authentication side effects", async () => {
+    const runWindowOidcBrowserHandoff = runInNewContext(
+      `${oidcSessionCode}; runWindowOidcBrowserHandoff`,
+      {
+        AbortController,
+        BrowserWindow: function BrowserWindow() {},
+        installAndVerifySessionCookie: async () => assert.fail("installed a cookie"),
+        ipcMain: {},
+        OIDC_LOGIN_PAGE: "/oidc_login.html",
+        OIDC_LOGIN_PRELOAD: "/oidc_login_preload.js",
+        OIDC_LOGIN_TIMEOUT_MS: 100,
+        oidcLoginFlows: new WeakMap(),
+        runOidcBrowserLogin,
+        runOidcLoginDialog: async ({ runAttempt }) =>
+          runAttempt({ signal: new AbortController().signal, updateMessage() {} }),
+        session: { defaultSession: { fetch: async () => assert.fail("made a request") } },
+        shell: { openExternal: async () => assert.fail("opened a URL") },
+        URL,
+      },
+    );
+
+    const result = await runWindowOidcBrowserHandoff({}, "not a url");
+
+    assert.equal(result.ok, false);
+    assert.equal(
+      result.error,
+      "The server address is invalid. Return to setup, correct it, and retry.",
+    );
+  });
+
   it("rolls back when runAttempt is cancelled after cookie verification", async () => {
     const controller = new AbortController();
     let stored = null;
