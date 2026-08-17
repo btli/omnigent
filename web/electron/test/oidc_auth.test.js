@@ -179,6 +179,49 @@ describe("OIDC browser ticket flow", () => {
     assert.equal(pollErrors, 1);
   });
 
+  it("retries rate limits and transient gateway statuses", async () => {
+    const responses = [
+      response(200, { ticket: "secret", login_url: "/auth/login?ticket=secret" }),
+      ...[429, 502, 503, 504].map((status) => response(status)),
+      response(200, { token: "session-jwt" }),
+    ];
+    const statuses = [];
+    const result = await runOidcBrowserLogin(
+      { fetch: async () => responses.shift() },
+      "https://server.example",
+      async () => {},
+      {
+        pollIntervalMs: 1,
+        timeoutMs: 100,
+        onPollError: (status) => statuses.push(status),
+      },
+    );
+
+    assert.deepEqual(result, { ok: true, token: "session-jwt" });
+    assert.deepEqual(statuses, [429, 502, 503, 504]);
+  });
+
+  it("treats authorization failures as fatal ticket responses", async () => {
+    const results = await Promise.all(
+      [401, 403].map((status) => {
+        const responses = [
+          response(200, { ticket: "secret", login_url: "/auth/login?ticket=secret" }),
+          response(status),
+        ];
+        return runOidcBrowserLogin(
+          { fetch: async () => responses.shift() },
+          "https://server.example",
+          async () => {},
+          { pollIntervalMs: 1, timeoutMs: 100 },
+        );
+      }),
+    );
+    assert.deepEqual(results, [
+      { ok: false, reason: "failed" },
+      { ok: false, reason: "failed" },
+    ]);
+  });
+
   it("bounds a pending ticket without relying on a CLI subprocess timeout", async () => {
     let fetches = 0;
     const electronSession = {
@@ -273,5 +316,25 @@ describe("OIDC session cookie installation", () => {
       installAndVerifySessionCookie(electronSession, "https://server.example", "session-jwt"),
       /did not accept/,
     );
+  });
+
+  it("retries transient verification before accepting the installed session", async () => {
+    let stored = null;
+    const probes = [response(503), response(429), response(200)];
+    const electronSession = {
+      cookies: {
+        set: async (details) => {
+          stored = { ...details };
+        },
+        get: async () => [stored],
+      },
+      fetch: async () => probes.shift(),
+    };
+
+    await installAndVerifySessionCookie(electronSession, "https://server.example", "session-jwt", {
+      retryDelayMs: 1,
+    });
+
+    assert.equal(probes.length, 0);
   });
 });

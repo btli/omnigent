@@ -6,6 +6,7 @@ const AUTH_PROBE_TIMEOUT_MS = 10000;
 const OIDC_LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 const OIDC_POLL_INTERVAL_MS = 2000;
 const OIDC_REQUEST_TIMEOUT_MS = 10000;
+const TRANSIENT_AUTH_STATUSES = new Set([429, 502, 503, 504]);
 
 // Keep API routes under workspace mounts, matching the CLI.
 function serverRoute(serverUrl, routePath) {
@@ -127,6 +128,14 @@ async function runOidcBrowserLogin(
       return pollForCompletion();
     }
     if (response.status === 202) return pollForCompletion();
+    if (TRANSIENT_AUTH_STATUSES.has(response.status)) {
+      try {
+        onPollError?.(response.status);
+      } catch {
+        // Progress reporting must never terminate an otherwise recoverable poll.
+      }
+      return pollForCompletion();
+    }
     if (response.status === 410) return { ok: false, reason: "expired" };
     if (response.status !== 200) return { ok: false, reason: "failed" };
 
@@ -158,7 +167,12 @@ function sessionCookieDetails(serverUrl, token) {
 }
 
 // Prove both Chromium and the server accepted the installed session.
-async function installAndVerifySessionCookie(electronSession, serverUrl, token) {
+async function installAndVerifySessionCookie(
+  electronSession,
+  serverUrl,
+  token,
+  { verificationAttempts = 3, retryDelayMs = 250 } = {},
+) {
   const details = sessionCookieDetails(serverUrl, token);
   await electronSession.cookies.set(details);
   const accepted = await electronSession.cookies.get({ url: serverUrl, name: details.name });
@@ -174,10 +188,23 @@ async function installAndVerifySessionCookie(electronSession, serverUrl, token) 
     throw new Error("Electron rejected the session cookie.");
   }
 
-  const probe = await probeServerAuth(electronSession, serverUrl);
-  if (probe.kind !== "authenticated") {
-    throw new Error("The server did not accept the installed session cookie.");
-  }
+  const verify = async (attempt) => {
+    let probe;
+    try {
+      probe = await probeServerAuth(electronSession, serverUrl);
+    } catch (error) {
+      if (attempt >= verificationAttempts) throw error;
+      await delay(retryDelayMs);
+      return verify(attempt + 1);
+    }
+    if (probe.kind === "authenticated") return;
+    if (!TRANSIENT_AUTH_STATUSES.has(probe.status) || attempt >= verificationAttempts) {
+      throw new Error("The server did not accept the installed session cookie.");
+    }
+    await delay(retryDelayMs);
+    return verify(attempt + 1);
+  };
+  await verify(1);
 }
 
 module.exports = {
