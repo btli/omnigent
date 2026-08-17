@@ -97,6 +97,28 @@ android {
     }
 }
 
+// The JVM unit tests run on a Java 21 toolchain (Robolectric's SDK 35 image
+// needs a 21 runtime) even though the module compiles to JDK 17 bytecode.
+// Gradle satisfies the toolchain with the running JVM when it is already 21,
+// otherwise with a JDK 21 discovered via JAVA_HOME_21_* (see gradle.properties).
+tasks.withType<Test>().configureEach {
+    javaLauncher.set(
+        javaToolchains.launcherFor {
+            languageVersion.set(JavaLanguageVersion.of(21))
+        },
+    )
+}
+
+// Plain release bundles run unit tests for CI coverage. Publishing is kept out
+// of that graph because its process may hold Play service-account credentials.
+val publishingReleaseBundle =
+    gradle.startParameter.taskNames.any { it.substringAfterLast(':') == "publishReleaseBundle" }
+if (!publishingReleaseBundle) {
+    tasks.matching { it.name == "bundleRelease" }.configureEach {
+        dependsOn("testDebugUnitTest")
+    }
+}
+
 // Gradle Play Publisher: `./gradlew publishReleaseBundle` builds the signed AAB
 // and uploads it to the internal track. The service-account JSON is a secret —
 // point PLAY_SERVICE_ACCOUNT_JSON at it, or drop it at web/android/
