@@ -181,13 +181,6 @@ val requireReleaseUnitTests =
         }
     }
 
-tasks.matching { it.name == "bundleRelease" }.configureEach {
-    dependsOn(verifyReleaseUnitTests)
-}
-tasks.matching { it.name == "publishReleaseBundle" }.configureEach {
-    dependsOn(requireReleaseUnitTests)
-}
-
 // Gradle Play Publisher: `./gradlew publishReleaseBundle` builds the signed AAB
 // and uploads it to the internal track. The service-account JSON is a secret —
 // point PLAY_SERVICE_ACCOUNT_JSON at it, or drop it at web/android/
@@ -196,6 +189,18 @@ tasks.matching { it.name == "publishReleaseBundle" }.configureEach {
 val playCredentialsFile =
     (System.getenv("PLAY_SERVICE_ACCOUNT_JSON")?.let { file(it) })
         ?: rootProject.file("play-credentials.json")
+
+// A local unsigned bundle is the credential-free verification gate. Signed
+// artifact and publisher paths consume the source/version-bound receipt.
+tasks.matching { it.name == "bundleRelease" }.configureEach {
+    dependsOn(if (playCredentialsFile.exists()) requireReleaseUnitTests else verifyReleaseUnitTests)
+}
+tasks.matching { it.name == "packageReleaseBundle" }.configureEach {
+    if (playCredentialsFile.exists()) dependsOn(requireReleaseUnitTests)
+}
+tasks.matching { it.name == "publishReleaseBundle" }.configureEach {
+    dependsOn(requireReleaseUnitTests)
+}
 
 play {
     enabled.set(playCredentialsFile.exists())
