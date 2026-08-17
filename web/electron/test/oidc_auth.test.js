@@ -232,6 +232,7 @@ describe("OIDC browser ticket flow", () => {
       "/auth/login",
       "/auth/login?ticket=other",
       "/auth/login?ticket=secret&ticket=secret",
+      "/auth/login?ticket=secret&",
       "/auth/login/../login?ticket=secret",
       "/auth/login#ticket=secret",
       "/auth/other?ticket=secret",
