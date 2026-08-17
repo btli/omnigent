@@ -1111,6 +1111,13 @@ async function showWebAuthnTimeout(win) {
   const state = windows.get(win);
   const serverUrl = state?.serverUrl;
   if (!serverUrl) return;
+  let probe;
+  try {
+    probe = await probeServerAuth(session.defaultSession, serverUrl);
+  } catch {
+    return;
+  }
+  if (probe.kind !== "oidc") return;
   await withServerLoad(state, async () => {
     const authenticated = await runWindowOidcBrowserHandoff(win, serverUrl);
     if (!authenticated || win.isDestroyed()) return;
@@ -1195,7 +1202,9 @@ async function runWindowOidcBrowserHandoff(win, serverUrl) {
         };
       }
       try {
-        await installAndVerifySessionCookie(session.defaultSession, serverUrl, result.token);
+        await installAndVerifySessionCookie(session.defaultSession, serverUrl, result.token, {
+          signal,
+        });
       } catch {
         return {
           ok: false,
@@ -1254,15 +1263,21 @@ async function loadAuthenticatedServerUrl(win, serverUrl, routePath, exactLoadUr
   await win.loadURL(destination);
 }
 
-async function loadServerUrl(win, serverUrl, routePath, exactLoadUrl, { beforeLoad } = {}) {
-  return withServerLoad(windows.get(win), () =>
+async function loadServerUrl(
+  win,
+  serverUrl,
+  routePath,
+  exactLoadUrl,
+  { beforeLoad, alreadyGated = false } = {},
+) {
+  const load = () =>
     loadServerAfterAuth({
       authenticate: async () =>
         (await ensureWindowOidcSession(win, serverUrl)) && !win.isDestroyed(),
       beforeLoad,
       load: () => loadAuthenticatedServerUrl(win, serverUrl, routePath, exactLoadUrl),
-    }),
-  );
+    });
+  return alreadyGated ? load() : withServerLoad(windows.get(win), load);
 }
 
 async function loadSetupPage(win, { error, url } = {}) {
@@ -2487,6 +2502,7 @@ function registerIpc() {
       // connecting. fetchServerManifest never rejects — it resolves to the
       // pre-manifest baseline — so no catch is needed here.
       const loaded = await loadServerUrl(win, target, undefined, undefined, {
+        alreadyGated: true,
         beforeLoad: () => {
           if (!ephemeral) {
             const settings = loadSettings();
@@ -3206,14 +3222,16 @@ async function handleDeepLink(raw) {
       const state = windows.get(parent);
       if (!state) return;
       const reuseParent = isSetupIdle(state);
-      return withServerLoad(state, async () => {
+      const openAfterExpansion = async () => {
         // Consent given — NOW probe to discover the workspace mount. The origin
         // is unchanged (the probe only appends a path under it), so the consent
         // decision stands; the user approved connecting to this host.
         const serverUrl = await expandDatabricksWorkspaceUrl(targetOrigin);
         if (!originOf(serverUrl)) return; // expansion yielded an unparseable URL
         if (reuseParent && !parent.isDestroyed() && windows.get(parent) === state) {
-          await loadServerUrl(parent, serverUrl, parsed.path).catch(() => {});
+          await loadServerUrl(parent, serverUrl, parsed.path, undefined, {
+            alreadyGated: true,
+          }).catch(() => {});
           focusAndRestore(parent);
         } else {
           const win = createWindow(undefined, { serverUrl, path: parsed.path });
@@ -3222,7 +3240,8 @@ async function handleDeepLink(raw) {
         // Record explicit origin consent independently of login completion.
         // Unlike Setup Connect, this never changes the launch default.
         rememberServerUrl(serverUrl);
-      });
+      };
+      return reuseParent ? withServerLoad(state, openAfterExpansion) : openAfterExpansion();
     }
   }
 }
