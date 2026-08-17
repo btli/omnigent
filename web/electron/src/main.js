@@ -1091,6 +1091,10 @@ async function showWebAuthnTimeout(win) {
   const state = windows.get(win);
   const serverUrl = state?.serverUrl;
   if (!serverUrl) return;
+  if (oidcServerUrlError(serverUrl)) {
+    await withServerLoad(state, () => runWindowOidcBrowserHandoff(win, serverUrl));
+    return;
+  }
   let probe;
   try {
     probe = await probeServerAuth(session.defaultSession, serverUrl);
