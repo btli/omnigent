@@ -61,6 +61,7 @@ const {
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
 const {
   OIDC_LOGIN_TIMEOUT_MS,
+  oidcServerUrlError,
   probeServerAuth,
   runOidcBrowserLogin,
   installAndVerifySessionCookie,
@@ -1235,6 +1236,9 @@ async function runWindowOidcBrowserHandoff(win, serverUrl) {
 }
 
 async function ensureWindowOidcSession(win, serverUrl) {
+  if (oidcServerUrlError(serverUrl)) {
+    return runWindowOidcBrowserHandoff(win, serverUrl);
+  }
   if (omnigentCli.isLoopbackServer(serverUrl)) {
     setWindowAuthenticationNavigation(win, false);
     return true;
