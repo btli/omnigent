@@ -130,6 +130,7 @@ export function useRowGesture({
   onAction,
   onLongPress,
   onDragStart,
+  onCancel,
   onPickUp,
 }: {
   enabled: boolean;
@@ -139,6 +140,7 @@ export function useRowGesture({
   onAction: (action: Exclude<SwipeAction, "none">) => void;
   onLongPress: (point: { clientX: number; clientY: number }) => void;
   onDragStart?: () => void;
+  onCancel?: () => void;
   onPickUp?: () => void;
 }) {
   const [dx, setDx] = useState(0);
@@ -215,13 +217,14 @@ export function useRowGesture({
       state.current = null;
       setDx(0);
       setPhase("idle");
+      if (cancelDrag) onCancel?.();
       if (cancelDrag && gesture.phase === "drag") {
         gesture.sensorTarget.dispatchEvent(
           new Event("touchcancel", { bubbles: true, cancelable: true }),
         );
       }
     },
-    [clearHoldTimer, disarmTouchMoveGuard, releaseCapture],
+    [clearHoldTimer, disarmTouchMoveGuard, onCancel, releaseCapture],
   );
 
   // Armed until the trailing click arrives or the next press clears it. A timer
