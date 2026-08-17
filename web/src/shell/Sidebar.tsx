@@ -3365,18 +3365,22 @@ function ConversationRow({
     Object.assign(event, { [ROW_MENU_SYNTHETIC]: true });
     rowLinkRef.current?.dispatchEvent(event);
   }, []);
+  const runArchiveRef = useRef(runArchive);
+  runArchiveRef.current = runArchive;
+  const handleGestureAction = useCallback((action: Exclude<SwipeAction, "none">) => {
+    if (action === "archive") runArchiveRef.current();
+    else setDeleteOpen(true);
+  }, []);
+  const closeContextMenu = useCallback(() => setContextMenuOpen(false), []);
   const gesture = useRowGesture({
     enabled: gestureEnabled,
     swipeEnabled,
     dragEnabled: hasTouch && dragEnabled,
     actions: swipeActions,
-    onAction: (action) => {
-      if (action === "archive") runArchive();
-      else setDeleteOpen(true);
-    },
+    onAction: handleGestureAction,
     onLongPress: openContextMenuAt,
-    onDragStart: () => setContextMenuOpen(false),
-    onCancel: () => setContextMenuOpen(false),
+    onDragStart: closeContextMenu,
+    onCancel: closeContextMenu,
   });
 
   const {
