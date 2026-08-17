@@ -247,12 +247,16 @@ service-account key:
    `web/android/play-credentials.json` (both gitignored).
 
 ```sh
+unset PLAY_SERVICE_ACCOUNT_JSON
+./gradlew verifyReleaseUnitTests -PversionCode=10 -PversionName=0.2.0
 export PLAY_SERVICE_ACCOUNT_JSON=/path/to/play-credentials.json
-./gradlew publishReleaseBundle   # signs + uploads to the internal track
+./gradlew publishReleaseBundle -PversionCode=10 -PversionName=0.2.0
 ```
 
-The publish tasks are inert when no credentials file is present, so ordinary
-builds are unaffected. Change the target track via `track.set(...)` in
+The first invocation records a source/version fingerprint under `build/`; the
+separate publish invocation refuses stale or missing verification. The publish
+tasks are inert when no credentials file is present, so ordinary builds are
+unaffected. Change the target track via `track.set(...)` in
 `app/build.gradle.kts` (`internal` → `alpha` → `beta` → `production`).
 
 > Status: builds clean — `gradlew :app:assembleDebug :app:lintDebug` produces a

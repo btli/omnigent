@@ -18,7 +18,7 @@ class DeepLinkTest {
     // --- valid links ---
 
     @Test
-    fun `loopback hosts infer http`() {
+    fun `release cleartext hosts infer http`() {
         assertEquals(
             DeepLink("http://localhost:8000", "/c/$hex"),
             parse("omnigent://localhost:8000/c/$hex"),
@@ -27,8 +27,12 @@ class DeepLinkTest {
             DeepLink("http://127.0.0.1:8000", "/c/$hex"),
             parse("omnigent://127.0.0.1:8000/c/$hex"),
         )
+    }
+
+    @Test
+    fun `IPv6 loopback fails safe to https`() {
         assertEquals(
-            DeepLink("http://[::1]:8000", "/c/$hex"),
+            DeepLink("https://[::1]:8000", "/c/$hex"),
             parse("omnigent://[::1]:8000/c/$hex"),
         )
     }
