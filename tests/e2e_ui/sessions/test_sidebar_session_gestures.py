@@ -8,6 +8,7 @@ sequence; synthetic pointer events do not arm dnd-kit's ``TouchSensor``.
 from __future__ import annotations
 
 import re
+import time
 import uuid
 
 import httpx
@@ -53,6 +54,28 @@ def _touch(
 ) -> None:
     points = [] if x is None or y is None else [{"x": x, "y": y}]
     cdp.send("Input.dispatchTouchEvent", {"type": event_type, "touchPoints": points})
+
+
+def _advance_virtual_time(cdp: CDPSession, budget: int, timeout: float = 5.0) -> None:
+    expired = False
+
+    def on_expired(_: object) -> None:
+        nonlocal expired
+        expired = True
+
+    cdp.on("Emulation.virtualTimeBudgetExpired", on_expired)
+    try:
+        cdp.send(
+            "Emulation.setVirtualTimePolicy",
+            {"policy": "advance", "budget": budget},
+        )
+        deadline = time.monotonic() + timeout
+        while not expired:
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"virtual-time budget did not expire within {timeout}s")
+            cdp.send("Runtime.evaluate", {"expression": "0"})
+    finally:
+        cdp.remove_listener("Emulation.virtualTimeBudgetExpired", on_expired)
 
 
 def _center(locator: Locator) -> tuple[float, float]:
@@ -221,29 +244,17 @@ def test_horizontal_swipe_wins_before_hold_while_vertical_motion_yields_to_scrol
         try:
             cdp.send("Emulation.setVirtualTimePolicy", {"policy": "pause"})
             _touch(cdp, "touchStart", x, y)
-            cdp.send(
-                "Emulation.setVirtualTimePolicy",
-                {"policy": "advance", "budget": 350},
-            )
+            _advance_virtual_time(cdp, 350)
             expect(page.get_by_test_id("rename-conversation")).to_have_count(0)
             expect(row).not_to_have_class(re.compile(r"\bscale-\[1\.01\]\b"))
             expect(row).not_to_have_class(re.compile(r"\bopacity-40\b"))
             _touch(cdp, "touchMove", x - 11, y)
-            cdp.send(
-                "Emulation.setVirtualTimePolicy",
-                {"policy": "advance", "budget": 1},
-            )
+            _advance_virtual_time(cdp, 1)
             expect(row).not_to_have_class(re.compile(r"\bmx-1\b"))
             _touch(cdp, "touchMove", x - 13, y)
-            cdp.send(
-                "Emulation.setVirtualTimePolicy",
-                {"policy": "advance", "budget": 1},
-            )
+            _advance_virtual_time(cdp, 1)
             expect(row).to_have_class(re.compile(r"\bmx-1\b"))
-            cdp.send(
-                "Emulation.setVirtualTimePolicy",
-                {"policy": "advance", "budget": 500},
-            )
+            _advance_virtual_time(cdp, 500)
             expect(page.get_by_test_id("rename-conversation")).to_have_count(0)
             expect(row).not_to_have_class(re.compile(r"\bscale-\[1\.01\]\b"))
             _touch(cdp, "touchEnd")
