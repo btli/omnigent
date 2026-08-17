@@ -175,6 +175,37 @@ describe("OIDC login modal", () => {
     assert.equal(await flow, false);
   });
 
+  it("shows a recoverable error for a malformed server URL", async () => {
+    const ipcMain = new EventEmitter();
+    const flow = runOidcLoginDialog({
+      BrowserWindow: FakeBrowserWindow,
+      ipcMain,
+      parent: {},
+      serverUrl: "not a url",
+      pagePath: "/app/oidc_login.html",
+      preloadPath: "/app/oidc_login_preload.js",
+      runAttempt: async () => ({
+        ok: false,
+        error: "The server address is invalid. Return to setup, correct it, and retry.",
+      }),
+    });
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    const loginWindow = latestWindow();
+    const errorState = loginWindow.webContents.sent.find(
+      ({ channel, payload }) => channel === OIDC_LOGIN_STATE_CHANNEL && payload.phase === "error",
+    );
+
+    assert.equal(errorState.payload.host, "the configured server");
+    assert.equal(
+      errorState.payload.message,
+      "The server address is invalid. Return to setup, correct it, and retry.",
+    );
+    ipcMain.emit(OIDC_LOGIN_ACTION_CHANNEL, { sender: loginWindow.webContents }, "cancel");
+    assert.equal(await flow, false);
+  });
+
   it("allows only its exact local document and denies all window opens", async () => {
     const ipcMain = new EventEmitter();
     const pagePath = "/app/oidc_login.html";
