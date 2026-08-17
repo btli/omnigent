@@ -1,5 +1,7 @@
 "use strict";
 
+const { setTimeout: delay } = require("node:timers/promises");
+
 const AUTH_PROBE_TIMEOUT_MS = 10000;
 const OIDC_LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 const OIDC_POLL_INTERVAL_MS = 2000;
@@ -47,24 +49,6 @@ async function probeServerAuth(
 function requestSignal(signal, timeoutMs = OIDC_REQUEST_TIMEOUT_MS) {
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
   return signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-}
-
-function waitForPoll(delayMs, signal) {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
-      return;
-    }
-    const onAbort = () => {
-      clearTimeout(timer);
-      reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
-    };
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, delayMs);
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
 }
 
 function isUserAbort(signal) {
@@ -117,7 +101,7 @@ async function runOidcBrowserLogin(
       return { ok: false, reason: isUserAbort(signal) ? "cancelled" : "timed_out" };
     }
     try {
-      await waitForPoll(pollIntervalMs, signal);
+      await delay(pollIntervalMs, undefined, { signal });
     } catch {
       return { ok: false, reason: "cancelled" };
     }
