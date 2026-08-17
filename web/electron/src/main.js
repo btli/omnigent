@@ -1021,9 +1021,7 @@ function hardenOauthPopup(child) {
 }
 
 /**
- * Surface a WebAuthn request that Electron could not service. Opening the
- * current sign-in URL is a native, user-confirmed action; page content gets no
- * shell bridge and cannot trigger shell.openExternal directly.
+ * Surface a WebAuthn request that Electron could not service.
  *
  * @param {Electron.BrowserWindow} win
  */
@@ -1049,7 +1047,15 @@ async function showWebAuthnTimeout(win) {
     cancelId: 1,
     noLink: true,
   });
-  if (response === 0) void shell.openExternal(signInUrl);
+  if (response !== 0 || win.isDestroyed()) return;
+  const state = windows.get(win);
+  const serverUrl = state?.serverUrl;
+  if (!serverUrl) return;
+  await withServerLoad(state, async () => {
+    const authenticated = await runWindowOidcBrowserHandoff(win, serverUrl);
+    if (!authenticated || win.isDestroyed()) return;
+    await loadAuthenticatedServerUrl(win, serverUrl);
+  });
 }
 
 /**
@@ -1082,37 +1088,7 @@ function resolveServerPath(serverUrl, routePath) {
  * @param {string} [routePath] Optional basename-less in-app path (e.g. ``/c/<id>``).
  * @returns {Promise<void>}
  */
-async function ensureWindowOidcSession(win, serverUrl) {
-  if (omnigentCli.isLoopbackServer(serverUrl)) {
-    setWindowAuthenticationNavigation(win, false);
-    return true;
-  }
-
-  let probe;
-  try {
-    probe = await probeServerAuth(session.defaultSession, serverUrl);
-  } catch {
-    // Preserve the existing load/failure behavior for unreachable or unknown
-    // servers. did-fail-load will surface the actionable connection error.
-    setWindowAuthenticationNavigation(win, true);
-    return true;
-  }
-  setWindowAuthenticationNavigation(win, probe.kind === "other");
-  if (probe.kind !== "oidc") return true;
-
-  const cachedAuth = omnigentCli.serverAuthEntry(serverUrl);
-  if (typeof cachedAuth?.token === "string") {
-    try {
-      await installAndVerifySessionCookie(session.defaultSession, serverUrl, cachedAuth.token);
-      console.log(
-        `[omnigent] OIDC session cookie accepted and verified for ${new URL(serverUrl).host}`,
-      );
-      return true;
-    } catch {
-      // A rejected cookie falls through to a fresh browser flow.
-    }
-  }
-
+async function runWindowOidcBrowserHandoff(win, serverUrl) {
   const existingFlow = oidcLoginFlows.get(win);
   if (existingFlow?.serverUrl === serverUrl) return existingFlow.promise;
 
@@ -1173,6 +1149,40 @@ async function ensureWindowOidcSession(win, serverUrl) {
   });
   oidcLoginFlows.set(win, { serverUrl, promise });
   return promise;
+}
+
+async function ensureWindowOidcSession(win, serverUrl) {
+  if (omnigentCli.isLoopbackServer(serverUrl)) {
+    setWindowAuthenticationNavigation(win, false);
+    return true;
+  }
+
+  let probe;
+  try {
+    probe = await probeServerAuth(session.defaultSession, serverUrl);
+  } catch {
+    // Preserve the existing load/failure behavior for unreachable or unknown
+    // servers. did-fail-load will surface the actionable connection error.
+    setWindowAuthenticationNavigation(win, true);
+    return true;
+  }
+  setWindowAuthenticationNavigation(win, probe.kind === "other");
+  if (probe.kind !== "oidc") return true;
+
+  const cachedAuth = omnigentCli.serverAuthEntry(serverUrl);
+  if (typeof cachedAuth?.token === "string") {
+    try {
+      await installAndVerifySessionCookie(session.defaultSession, serverUrl, cachedAuth.token);
+      console.log(
+        `[omnigent] OIDC session cookie accepted and verified for ${new URL(serverUrl).host}`,
+      );
+      return true;
+    } catch {
+      // A rejected cookie falls through to a fresh browser flow.
+    }
+  }
+
+  return runWindowOidcBrowserHandoff(win, serverUrl);
 }
 
 async function loadAuthenticatedServerUrl(win, serverUrl, routePath, exactLoadUrl) {
@@ -1464,9 +1474,7 @@ function createWindow(targetUrl, opts = {}) {
         : null;
     },
     async ({ serverUrl: expiredServerUrl, returnUrl }) => {
-      const authenticated = await ensureWindowOidcSession(win, expiredServerUrl);
-      if (!authenticated || win.isDestroyed()) return;
-      await loadAuthenticatedServerUrl(win, expiredServerUrl, undefined, returnUrl);
+      await loadServerUrl(win, expiredServerUrl, undefined, returnUrl);
     },
   );
 
