@@ -7,6 +7,7 @@ const OIDC_LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 const OIDC_POLL_INTERVAL_MS = 2000;
 const OIDC_REQUEST_TIMEOUT_MS = 10000;
 const TRANSIENT_AUTH_STATUSES = new Set([429, 502, 503, 504]);
+const cookieMutationQueues = new WeakMap();
 
 // Keep API routes under workspace mounts, matching the CLI.
 function serverRoute(serverUrl, routePath) {
@@ -207,6 +208,21 @@ function sessionCookieRestoreDetails(serverUrl, cookie) {
   return details;
 }
 
+function serializeCookieMutation(electronSession, serverUrl, details, mutation) {
+  let queues = cookieMutationQueues.get(electronSession);
+  if (!queues) {
+    queues = new Map();
+    cookieMutationQueues.set(electronSession, queues);
+  }
+  const key = `${new URL(serverUrl).hostname}\0${details.name}\0${details.path}`;
+  const previous = queues.get(key) ?? Promise.resolve();
+  const current = previous.catch(() => {}).then(mutation);
+  queues.set(key, current);
+  return current.finally(() => {
+    if (queues.get(key) === current) queues.delete(key);
+  });
+}
+
 async function rollbackSessionCookie(electronSession, serverUrl, details, priorCookie) {
   const current = await electronSession.cookies.get({ url: serverUrl, name: details.name });
   const installedCookie = priorSessionCookie(current, serverUrl, details);
@@ -241,48 +257,55 @@ async function installAndVerifySessionCookie(
   electronSession,
   serverUrl,
   token,
-  { verificationAttempts = 3, retryDelayMs = 250, signal } = {},
+  { verificationAttempts = 3, retryDelayMs = 250, signal, assertCanCommit = () => {} } = {},
 ) {
   const details = sessionCookieDetails(serverUrl, token);
-  const existing = await electronSession.cookies.get({ url: serverUrl, name: details.name });
-  const priorCookie = priorSessionCookie(existing, serverUrl, details);
-  await electronSession.cookies.set(details);
-  try {
-    const accepted = await electronSession.cookies.get({ url: serverUrl, name: details.name });
-    const cookie = accepted.find(
-      (candidate) =>
-        candidate.name === details.name &&
-        candidate.value === token &&
-        candidate.path === "/" &&
-        candidate.httpOnly === true &&
-        candidate.secure === details.secure,
-    );
-    if (!cookie) {
-      throw new Error("Electron rejected the session cookie.");
-    }
-
-    const verify = async (attempt) => {
-      const probe = await probeServerAuth(electronSession, serverUrl, { signal });
-      if (probe.kind === "authenticated") return;
-      if (!TRANSIENT_AUTH_STATUSES.has(probe.status) || attempt >= verificationAttempts) {
-        throw new Error("The server did not accept the installed session cookie.");
-      }
-      await delay(retryDelayMs, undefined, { signal });
-      return verify(attempt + 1);
-    };
-    await verify(1);
-  } catch (verificationError) {
+  return serializeCookieMutation(electronSession, serverUrl, details, async () => {
+    const existing = await electronSession.cookies.get({ url: serverUrl, name: details.name });
+    const priorCookie = priorSessionCookie(existing, serverUrl, details);
+    await electronSession.cookies.set(details);
     try {
-      await rollbackSessionCookie(electronSession, serverUrl, details, priorCookie);
-    } catch (cleanupError) {
-      const error = new Error("Session cookie verification failed and cleanup did not complete.", {
-        cause: cleanupError,
-      });
-      error.verificationError = verificationError;
-      throw error;
+      const accepted = await electronSession.cookies.get({ url: serverUrl, name: details.name });
+      const cookie = accepted.find(
+        (candidate) =>
+          candidate.name === details.name &&
+          candidate.value === token &&
+          candidate.path === "/" &&
+          candidate.httpOnly === true &&
+          candidate.secure === details.secure,
+      );
+      if (!cookie) {
+        throw new Error("Electron rejected the session cookie.");
+      }
+
+      const verify = async (attempt) => {
+        const probe = await probeServerAuth(electronSession, serverUrl, { signal });
+        if (probe.kind === "authenticated") return;
+        if (!TRANSIENT_AUTH_STATUSES.has(probe.status) || attempt >= verificationAttempts) {
+          throw new Error("The server did not accept the installed session cookie.");
+        }
+        await delay(retryDelayMs, undefined, { signal });
+        return verify(attempt + 1);
+      };
+      await verify(1);
+      signal?.throwIfAborted();
+      assertCanCommit();
+    } catch (verificationError) {
+      try {
+        await rollbackSessionCookie(electronSession, serverUrl, details, priorCookie);
+      } catch (cleanupError) {
+        const error = new Error(
+          "Session cookie verification failed and cleanup did not complete.",
+          {
+            cause: cleanupError,
+          },
+        );
+        error.verificationError = verificationError;
+        throw error;
+      }
+      throw verificationError;
     }
-    throw verificationError;
-  }
+  });
 }
 
 module.exports = {
