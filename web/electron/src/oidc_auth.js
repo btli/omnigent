@@ -7,7 +7,7 @@ const AUTH_PROBE_TIMEOUT_MS = 10000;
 const OIDC_LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 const OIDC_POLL_INTERVAL_MS = 2000;
 const OIDC_REQUEST_TIMEOUT_MS = 10000;
-const MAX_SERVER_URL_LENGTH = 2048;
+const MAX_PATH_DECODE_PASSES = 32;
 const TRANSIENT_AUTH_STATUSES = new Set([429, 502, 503, 504]);
 const cookieMutationQueues = new WeakMap();
 
@@ -63,7 +63,6 @@ function isUserAbort(signal) {
 function oidcServerUrlError(serverUrl) {
   if (
     typeof serverUrl !== "string" ||
-    serverUrl.length > MAX_SERVER_URL_LENGTH ||
     serverUrl.includes("\\") ||
     serverUrl.includes("?") ||
     serverUrl.includes("#")
@@ -93,7 +92,8 @@ function oidcServerUrlError(serverUrl) {
   if (parsed.pathname.includes("//")) return "invalid_server_url";
   for (const segment of parsed.pathname.split("/")) {
     let decoded = segment;
-    while (true) {
+    let stabilized = false;
+    for (let pass = 0; pass < MAX_PATH_DECODE_PASSES; pass += 1) {
       let next;
       try {
         next = decodeURIComponent(decoded);
@@ -103,9 +103,13 @@ function oidcServerUrlError(serverUrl) {
       if (next === "." || next === ".." || next.includes("/") || next.includes("\\")) {
         return "invalid_server_url";
       }
-      if (next === decoded) break;
+      if (next === decoded) {
+        stabilized = true;
+        break;
+      }
       decoded = next;
     }
+    if (!stabilized) return "invalid_server_url";
   }
   if (parsed.protocol === "http:" && !isLoopbackServer(serverUrl)) {
     return "insecure_transport";
