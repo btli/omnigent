@@ -66,4 +66,22 @@ describe("transactional server loading", () => {
     await connecting;
     assert.equal(isSetupIdle(state), true);
   });
+
+  it("rejects a competing expiry load while navigation is in flight", async () => {
+    const state = { pendingServerLoads: 0 };
+    const navigation = Promise.withResolvers();
+    const events = [];
+    const first = withServerLoad(state, async () => {
+      events.push("navigation");
+      await navigation.promise;
+    });
+
+    const expiry = await withServerLoad(state, async () => events.push("expiry"));
+
+    assert.equal(expiry, false);
+    assert.deepEqual(events, ["navigation"]);
+    navigation.resolve();
+    await first;
+    assert.equal(state.pendingServerLoads, 0);
+  });
 });
