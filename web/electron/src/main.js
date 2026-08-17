@@ -64,8 +64,12 @@ const {
   installAndVerifySessionCookie,
 } = require("./oidc_auth");
 const { runOidcLoginDialog } = require("./oidc_login_dialog");
-const { loadServerAfterAuth, loadInitialDestination } = require("./server_load");
-const { isSetupIdle, withServerLoad } = require("./server_load");
+const {
+  loadServerAfterAuth,
+  loadInitialDestination,
+  isSetupIdle,
+  withServerLoad,
+} = require("./server_load");
 const { isWebAuthnEscapePage, registerWebAuthnTimeout } = require("./webauthn_timeout");
 const omnigentCli = require("./omnigent_cli");
 const serverManager = require("./server_manager");
@@ -1135,20 +1139,17 @@ async function ensureWindowOidcSession(win, serverUrl) {
   setWindowAuthenticationNavigation(win, probe.kind === "other");
   if (probe.kind !== "oidc") return true;
 
-  const installCachedSession = async () => {
-    const entry = omnigentCli.serverAuthEntry(serverUrl);
-    if (!entry || typeof entry.token !== "string") return false;
-    await installAndVerifySessionCookie(session.defaultSession, serverUrl, entry.token);
-    console.log(
-      `[omnigent] OIDC session cookie accepted and verified for ${new URL(serverUrl).host}`,
-    );
-    return true;
-  };
-
-  try {
-    if (await installCachedSession()) return true;
-  } catch {
-    // A present-but-rejected/expired cookie should trigger a fresh browser flow.
+  const cachedAuth = omnigentCli.serverAuthEntry(serverUrl);
+  if (typeof cachedAuth?.token === "string") {
+    try {
+      await installAndVerifySessionCookie(session.defaultSession, serverUrl, cachedAuth.token);
+      console.log(
+        `[omnigent] OIDC session cookie accepted and verified for ${new URL(serverUrl).host}`,
+      );
+      return true;
+    } catch {
+      // A rejected cookie falls through to a fresh browser flow.
+    }
   }
 
   const existingFlow = oidcLoginFlows.get(win);
