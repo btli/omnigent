@@ -11,11 +11,15 @@ import re
 import uuid
 
 import httpx
-from playwright.sync_api import Browser, BrowserContext, Locator, Page, expect
+from playwright.sync_api import Browser, BrowserContext, CDPSession, Locator, Page, expect
 
 _MOBILE_VIEWPORT = {"width": 390, "height": 844}
 _UNEXPECTED_EVENT_SCRIPT = """
 window.__rowGestureUnexpected = [];
+window.__rowGesturePointerId = null;
+document.addEventListener('pointerdown', event => {
+  window.__rowGesturePointerId = event.pointerId;
+}, true);
 for (const type of ['dragstart', 'pointercancel']) {
   document.addEventListener(
     type,
@@ -34,6 +38,23 @@ def _new_touch_context(browser: Browser) -> BrowserContext:
     )
     context.add_init_script(_UNEXPECTED_EVENT_SCRIPT)
     return context
+
+
+def _touch(
+    cdp: CDPSession, event_type: str, x: float | None = None, y: float | None = None
+) -> None:
+    points = [] if x is None or y is None else [{"x": x, "y": y}]
+    cdp.send("Input.dispatchTouchEvent", {"type": event_type, "touchPoints": points})
+
+
+def _center(locator: Locator) -> tuple[float, float]:
+    box = locator.bounding_box()
+    assert box is not None, "element has no touchable bounding box"
+    return box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+
+
+def _unexpected_events(page: Page) -> list[str]:
+    return page.evaluate("window.__rowGestureUnexpected")
 
 
 def _set_title(base_url: str, session_id: str, title: str) -> None:
@@ -78,9 +99,6 @@ def test_still_touch_opens_session_context_menu_without_dragging(
 
         link = _row_link(page, session_id)
         expect(link).to_be_visible()
-        # This DOM contract removes Chrome Android's native link-drag claimant;
-        # the touch sequence below proves the recognizer then survives the hold.
-        assert link.evaluate("element => element.draggable") is False
         row = link.locator("xpath=ancestor::li[1]")
         box = link.bounding_box()
         assert box is not None, "session row has no touchable bounding box"
@@ -99,6 +117,11 @@ def test_still_touch_opens_session_context_menu_without_dragging(
             expect(row).to_have_class(re.compile(r"\bscale-\[1\.01\]"), timeout=2000)
             expect(row).not_to_have_class(re.compile(r"\bopacity-40\b"))
             expect(page.get_by_test_id("rename-conversation")).to_have_count(1)
+            _touch(cdp, "touchMove", x + 1, y)
+            page.wait_for_timeout(100)
+            expect(page.get_by_test_id("rename-conversation")).to_have_count(1)
+            assert _unexpected_events(page) == []
+            assert link.evaluate("element => element.draggable") is False
 
             cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
             expect(page.get_by_test_id("rename-conversation")).to_have_count(1, timeout=2000)
@@ -162,6 +185,134 @@ def test_vertical_touch_scroll_still_works_on_session_row(
         )
         assert "opacity-40" not in (row.get_attribute("class") or "")
         expect(page.get_by_test_id("rename-conversation")).to_have_count(0)
+        events = _unexpected_events(page)
+        assert "dragstart" not in events
+        assert events in ([], ["pointercancel"])
+    finally:
+        context.close()
+
+
+def test_horizontal_swipe_wins_before_hold_while_vertical_motion_yields_to_scroll(
+    browser: Browser,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Axis ownership resolves before the competing hold can arm."""
+    base_url, session_id = seeded_session
+    _set_title(base_url, session_id, f"e2e-touch-axis-{uuid.uuid4().hex[:8]}")
+
+    context = _new_touch_context(browser)
+    try:
+        page = context.new_page()
+        page.goto(f"{base_url}/c/{session_id}?sidebar=open")
+        link = _row_link(page, session_id)
+        expect(link).to_be_visible()
+        row = link.locator("xpath=ancestor::li[1]")
+        x, y = _center(link)
+
+        cdp = page.context.new_cdp_session(page)
+        try:
+            _touch(cdp, "touchStart", x, y)
+            _touch(cdp, "touchMove", x - 11, y)
+            expect(row).not_to_have_class(re.compile(r"\bmx-1\b"))
+            _touch(cdp, "touchMove", x - 13, y)
+            expect(row).to_have_class(re.compile(r"\bmx-1\b"))
+            page.wait_for_timeout(500)
+            expect(page.get_by_test_id("rename-conversation")).to_have_count(0)
+            expect(row).not_to_have_class(re.compile(r"\bscale-\[1\.01\]\b"))
+            _touch(cdp, "touchEnd")
+        finally:
+            cdp.detach()
+
+        expect(row).not_to_have_class(re.compile(r"\bmx-1\b"))
+        assert _unexpected_events(page) == []
+    finally:
+        context.close()
+
+
+def test_pointercancel_resets_menu_and_drag_then_allows_another_hold(
+    browser: Browser,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Cancellation returns an armed or dragging row to a reusable idle state."""
+    base_url, session_id = seeded_session
+    _set_title(base_url, session_id, f"e2e-touch-cancel-{uuid.uuid4().hex[:8]}")
+
+    context = _new_touch_context(browser)
+    try:
+        page = context.new_page()
+        page.goto(f"{base_url}/c/{session_id}?sidebar=open")
+        link = _row_link(page, session_id)
+        expect(link).to_be_visible()
+        row = link.locator("xpath=ancestor::li[1]")
+        x, y = _center(link)
+
+        cdp = page.context.new_cdp_session(page)
+        try:
+            _touch(cdp, "touchStart", x, y)
+            expect(page.get_by_test_id("rename-conversation")).to_have_count(1, timeout=2000)
+            _touch(cdp, "touchCancel")
+            expect(page.get_by_test_id("rename-conversation")).to_have_count(0)
+            expect(row).not_to_have_class(re.compile(r"\bscale-\[1\.01\]\b"))
+
+            _touch(cdp, "touchStart", x, y)
+            expect(page.get_by_test_id("rename-conversation")).to_have_count(1, timeout=2000)
+            _touch(cdp, "touchMove", x, y + 12)
+            expect(page.get_by_test_id("rename-conversation")).to_have_count(0)
+            expect(row).to_have_class(re.compile(r"\bopacity-40\b"))
+            _touch(cdp, "touchCancel")
+            expect(row).not_to_have_class(re.compile(r"\bopacity-40\b"))
+
+            _touch(cdp, "touchStart", x, y)
+            expect(page.get_by_test_id("rename-conversation")).to_have_count(1, timeout=2000)
+            _touch(cdp, "touchEnd")
+        finally:
+            cdp.detach()
+
+        assert _unexpected_events(page) == ["pointercancel", "pointercancel"]
+    finally:
+        context.close()
+
+
+def test_lost_pointer_capture_resets_swipe_and_allows_another_swipe(
+    browser: Browser,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Unexpected capture loss clears translation without poisoning the next touch."""
+    base_url, session_id = seeded_session
+    _set_title(base_url, session_id, f"e2e-touch-capture-{uuid.uuid4().hex[:8]}")
+
+    context = _new_touch_context(browser)
+    try:
+        page = context.new_page()
+        page.goto(f"{base_url}/c/{session_id}?sidebar=open")
+        link = _row_link(page, session_id)
+        expect(link).to_be_visible()
+        row = link.locator("xpath=ancestor::li[1]")
+        x, y = _center(link)
+
+        cdp = page.context.new_cdp_session(page)
+        try:
+            _touch(cdp, "touchStart", x, y)
+            _touch(cdp, "touchMove", x - 40, y)
+            expect(row).to_have_class(re.compile(r"\bmx-1\b"))
+            row.evaluate(
+                """element => element.dispatchEvent(new PointerEvent(
+                    'lostpointercapture',
+                    {pointerId: window.__rowGesturePointerId, bubbles: true},
+                ))"""
+            )
+            expect(row).not_to_have_class(re.compile(r"\bmx-1\b"))
+            _touch(cdp, "touchEnd")
+
+            _touch(cdp, "touchStart", x, y)
+            _touch(cdp, "touchMove", x - 40, y)
+            expect(row).to_have_class(re.compile(r"\bmx-1\b"))
+            _touch(cdp, "touchEnd")
+            expect(row).not_to_have_class(re.compile(r"\bmx-1\b"))
+        finally:
+            cdp.detach()
+
+        assert _unexpected_events(page) == []
     finally:
         context.close()
 
@@ -205,13 +356,21 @@ def test_touch_drag_moves_session_into_project(
                     "touchPoints": [{"x": start_x, "y": start_y}],
                 },
             )
+            page.wait_for_timeout(200)
+            _touch(cdp, "touchMove", start_x, start_y + 8)
+            expect(page.get_by_test_id("rename-conversation")).to_have_count(0)
             # Hold until the row lifts, then the first move picks it up as a drag.
             expect(row).to_have_class(re.compile(r"\bscale-\[1\.01\]"), timeout=2000)
             expect(page.get_by_test_id("rename-conversation")).to_have_count(1)
 
-            # A deterministic 12px pull crosses the 10px drag threshold on the
-            # same pointer that opened the menu.
-            pull_y = start_y + (12 if end_y >= start_y else -12)
+            direction = 1 if end_y >= start_y else -1
+            _touch(cdp, "touchMove", start_x, start_y + 8 + direction * 9)
+            expect(page.get_by_test_id("rename-conversation")).to_have_count(1)
+            expect(row).not_to_have_class(re.compile(r"\bopacity-40\b"))
+
+            # The first move across the threshold must both dismiss the menu
+            # and reach dnd-kit on this same pointer.
+            pull_y = start_y + 8 + direction * 11
             cdp.send(
                 "Input.dispatchTouchEvent",
                 {"type": "touchMove", "touchPoints": [{"x": start_x, "y": pull_y}]},
