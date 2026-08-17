@@ -456,6 +456,76 @@ describe("OIDC session cookie installation", () => {
     assert.deepEqual(state.removals, []);
   });
 
+  it("serializes a newer login across an in-flight rollback", async () => {
+    const priorCookie = {
+      name: "__Host-ap_session",
+      value: "prior-session",
+      domain: "server.example",
+      path: "/",
+      httpOnly: true,
+      secure: true,
+      sameSite: "lax",
+    };
+    let stored = { ...priorCookie };
+    const removeStarted = Promise.withResolvers();
+    const finishRemove = Promise.withResolvers();
+    const probes = [response(401, { login_url: "/auth/login" }), response(200)];
+    const electronSession = {
+      cookies: {
+        get: async () => (stored ? [{ ...stored }] : []),
+        set: async (details) => {
+          stored = { ...details };
+        },
+        remove: async () => {
+          removeStarted.resolve();
+          await finishRemove.promise;
+          stored = null;
+        },
+      },
+      fetch: async () => probes.shift(),
+    };
+
+    const rejectedLogin = installAndVerifySessionCookie(
+      electronSession,
+      "https://server.example",
+      "rejected-session",
+    );
+    await removeStarted.promise;
+    const acceptedLogin = installAndVerifySessionCookie(
+      electronSession,
+      "https://server.example",
+      "accepted-session",
+    );
+    await new Promise(setImmediate);
+    finishRemove.resolve();
+
+    await assert.rejects(rejectedLogin, /did not accept/);
+    await acceptedLogin;
+    assert.equal(stored.value, "accepted-session");
+  });
+
+  it("rolls back when cancellation wins after verification", async () => {
+    const controller = new AbortController();
+    const state = cookieSession(null, [response(200)]);
+
+    await assert.rejects(
+      installAndVerifySessionCookie(
+        state.electronSession,
+        "https://server.example",
+        "session-jwt",
+        {
+          assertCanCommit: () => {
+            controller.abort();
+            throw controller.signal.reason;
+          },
+        },
+      ),
+      { name: "AbortError" },
+    );
+
+    assert.equal(state.getStored(), null);
+  });
+
   it("retries transient verification before accepting the installed session", async () => {
     let stored = null;
     const probes = [response(503), response(429), response(200)];

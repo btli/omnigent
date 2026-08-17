@@ -757,6 +757,54 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     assert.equal(state.pendingServerLoads, 0);
   });
 
+  it("rolls back when runAttempt is cancelled after cookie verification", async () => {
+    const controller = new AbortController();
+    let stored = null;
+    const electronSession = {
+      cookies: {
+        get: async () => (stored ? [{ ...stored }] : []),
+        set: async (details) => {
+          stored = { ...details };
+        },
+        remove: async () => {
+          stored = null;
+        },
+      },
+      fetch: async () => {
+        queueMicrotask(() => controller.abort());
+        return { status: 200, json: async () => ({ id: "user" }) };
+      },
+    };
+    let attemptResult;
+    const runWindowOidcBrowserHandoff = runInNewContext(
+      `${oidcSessionCode}; runWindowOidcBrowserHandoff`,
+      {
+        AbortController,
+        BrowserWindow: function BrowserWindow() {},
+        installAndVerifySessionCookie,
+        ipcMain: {},
+        OIDC_LOGIN_PAGE: "/oidc_login.html",
+        OIDC_LOGIN_PRELOAD: "/oidc_login_preload.js",
+        OIDC_LOGIN_TIMEOUT_MS: 100,
+        oidcLoginFlows: new WeakMap(),
+        runOidcBrowserLogin: async () => ({ ok: true, token: "session-token" }),
+        runOidcLoginDialog: async ({ runAttempt }) => {
+          attemptResult = await runAttempt({ signal: controller.signal, updateMessage() {} });
+          return attemptResult.ok;
+        },
+        session: { defaultSession: electronSession },
+        shell: { openExternal: async () => {} },
+        URL,
+      },
+    );
+
+    const authenticated = await runWindowOidcBrowserHandoff({}, "https://server.example");
+
+    assert.equal(authenticated, false);
+    assert.equal(attemptResult.ok, false);
+    assert.equal(stored, null);
+  });
+
   it("routes the saved cold-launch destination through loadServerUrl", () => {
     assert.ok(createWindowCode);
     assert.match(
