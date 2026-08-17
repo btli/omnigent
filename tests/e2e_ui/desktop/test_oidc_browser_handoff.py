@@ -19,6 +19,7 @@ from playwright.sync_api import Page, expect
 _OIDC_LOGIN_PAGE = (
     Path(__file__).resolve().parents[3] / "web" / "electron" / "src" / "oidc_login.html"
 )
+_ELECTRON_DIR = _OIDC_LOGIN_PAGE.parents[1]
 
 _PRELOAD_STUB = """
 window.__oidc = { calls: [], listener: null };
@@ -34,7 +35,7 @@ window.omnigentOidcLogin = {
 
 _TICKET_CLIENT = """
 (async () => {
-  const { runOidcBrowserLogin } = require("./web/electron/src/oidc_auth");
+  const { runOidcBrowserLogin } = require("./src/oidc_auth");
   const opened = [];
   const statuses = [];
   const result = await runOidcBrowserLogin(
@@ -90,7 +91,7 @@ def _run_ticket_flow(statuses: list[int]) -> dict[str, object]:
     try:
         result = subprocess.run(
             ["node", "--eval", _TICKET_CLIENT],
-            cwd=_OIDC_LOGIN_PAGE.parents[3],
+            cwd=_ELECTRON_DIR,
             env=env,
             check=True,
             capture_output=True,
