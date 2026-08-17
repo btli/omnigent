@@ -181,9 +181,9 @@ class OmnigentWebViewHttpErrorTest {
     }
 
     @Test
-    fun `superseded network error before replacement start is ignored`() {
+    fun `ambiguous same URL network error fails closed`() {
         val webView = WebView(ApplicationProvider.getApplicationContext())
-        var loadFailed = true
+        var loadFailed = false
         val client = client { _, load, _, _ -> loadFailed = load }
         client.expectLoad(1)
         client.onPageStarted(webView, PINNED_URL, null)
@@ -195,13 +195,15 @@ class OmnigentWebViewHttpErrorTest {
         client.onPageCommitVisible(webView, PINNED_URL)
         client.onPageFinished(webView, PINNED_URL)
 
-        assertFalse(loadFailed)
+        // WebView supplies no navigation identity here, so this could be either
+        // the superseded request or generation 2. Never report ambiguous readiness.
+        assertTrue(loadFailed)
     }
 
     @Test
-    fun `superseded HTTP error before replacement start is ignored`() {
+    fun `ambiguous same URL HTTP error fails closed`() {
         val webView = WebView(ApplicationProvider.getApplicationContext())
-        var persistenceFailed = true
+        var persistenceFailed = false
         val client = client { _, _, persistence, _ -> persistenceFailed = persistence }
         client.expectLoad(1)
         client.onPageStarted(webView, PINNED_URL, null)
@@ -217,7 +219,47 @@ class OmnigentWebViewHttpErrorTest {
         client.onPageCommitVisible(webView, PINNED_URL)
         client.onPageFinished(webView, PINNED_URL)
 
-        assertFalse(persistenceFailed)
+        // A retry gets a fresh generation; generation 2 must not persist an
+        // unverified server when callback attribution is ambiguous.
+        assertTrue(persistenceFailed)
+    }
+
+    @Test
+    fun `same URL replacement network failure before page start is not reported ready`() {
+        val webView = WebView(ApplicationProvider.getApplicationContext())
+        var loadFailed = false
+        val client = client { _, load, _, _ -> loadFailed = load }
+        client.expectLoad(1)
+        client.onPageStarted(webView, PINNED_URL, null)
+
+        client.supersedePendingLoads()
+        client.expectLoad(2)
+        client.onReceivedError(webView, request(PINNED_URL, true), error())
+        client.onPageStarted(webView, PINNED_URL, null)
+        client.onPageFinished(webView, PINNED_URL)
+
+        assertTrue(loadFailed)
+    }
+
+    @Test
+    fun `same URL replacement HTTP failure before page start is not reported ready`() {
+        val webView = WebView(ApplicationProvider.getApplicationContext())
+        var persistenceFailed = false
+        val client = client { _, _, persistence, _ -> persistenceFailed = persistence }
+        client.expectLoad(1)
+        client.onPageStarted(webView, PINNED_URL, null)
+
+        client.supersedePendingLoads()
+        client.expectLoad(2)
+        client.onReceivedHttpError(
+            webView,
+            request(PINNED_URL, true),
+            WebResourceResponse("text/html", "UTF-8", null),
+        )
+        client.onPageStarted(webView, PINNED_URL, null)
+        client.onPageFinished(webView, PINNED_URL)
+
+        assertTrue(persistenceFailed)
     }
 
     @Test

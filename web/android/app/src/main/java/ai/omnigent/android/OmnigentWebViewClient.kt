@@ -47,7 +47,6 @@ class OmnigentWebViewClient(
     private var activeLoad: ActiveLoad? = null
     private var preStartLoadFailed = false
     private var preStartPersistenceFailed = false
-    private var supersededLoadUrl: String? = null
     private var ignoreUnmatchedFinish = false
     private var tracksDocuments = false
 
@@ -57,7 +56,6 @@ class OmnigentWebViewClient(
 
     fun supersedePendingLoads() {
         ignoreUnmatchedFinish = activeLoad != null
-        supersededLoadUrl = activeLoad?.url
         expectedLoadGeneration = null
         activeLoad = null
         preStartLoadFailed = false
@@ -83,7 +81,6 @@ class OmnigentWebViewClient(
             expectedLoadGeneration = null
             preStartLoadFailed = false
             preStartPersistenceFailed = false
-            supersededLoadUrl = null
         } else {
             // Redirect starts belong to the navigation already in flight.
             activeLoad?.apply {
@@ -186,13 +183,9 @@ class OmnigentWebViewClient(
     }
 
     private fun isPinnedLoadError(url: Uri): Boolean {
-        val errorUrl = url.toString()
-        if (originOf(errorUrl) != pinnedOrigin()) return false
-        val load =
-            activeLoad
-                ?: return (expectedLoadGeneration != null && errorUrl != supersededLoadUrl) ||
-                    !tracksDocuments
-        return load.url == errorUrl
+        if (originOf(url.toString()) != pinnedOrigin()) return false
+        val load = activeLoad ?: return expectedLoadGeneration != null || !tracksDocuments
+        return load.url == url.toString()
     }
 
     override fun onPageCommitVisible(
