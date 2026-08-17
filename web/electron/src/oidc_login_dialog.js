@@ -56,7 +56,12 @@ function runOidcLoginDialog({
         nodeIntegration: false,
       },
     });
-    const host = new URL(serverUrl).host;
+    let host = "the configured server";
+    try {
+      host = new URL(serverUrl).host;
+    } catch {
+      // The attempt reports the actionable validation error.
+    }
     const allowedPageUrl = pathToFileURL(pagePath).toString();
     let lastState = {
       phase: "waiting",
