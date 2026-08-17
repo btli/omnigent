@@ -183,6 +183,9 @@ class OmnigentWebViewClient(
         url: String?,
     ) {
         super.onPageCommitVisible(view, url)
+        // Inline-auth documents belong to the navigation in flight, but only
+        // the returning app document may complete its load generation.
+        if (originOf(url) != pinnedOrigin()) return
         val load = activeLoad?.takeIf { it.url == url } ?: return
         if (load.loadFailed || load.persistenceFailed) return
         completeLoad(view, url, load)

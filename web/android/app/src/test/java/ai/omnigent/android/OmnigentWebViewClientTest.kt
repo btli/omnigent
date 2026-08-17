@@ -125,6 +125,7 @@ class OmnigentWebViewClientTest {
         client.expectLoad(7)
         client.onPageStarted(webView, appUrl, null)
         client.onPageStarted(webView, IDP_URL, null)
+        client.onPageCommitVisible(webView, IDP_URL)
         client.onPageFinished(webView, IDP_URL)
         client.onPageStarted(webView, appUrl, null)
         client.onPageCommitVisible(webView, appUrl)
