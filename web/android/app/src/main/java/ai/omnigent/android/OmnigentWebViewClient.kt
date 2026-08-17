@@ -43,26 +43,22 @@ class OmnigentWebViewClient(
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    // Set when the main frame's current load errors out (network/TLS, or an
-    // HTTP >=400 respectively); consumed by onPageFinished. WebView calls
-    // onPageFinished with the ORIGINAL url after such an error — never a
-    // chrome-error:// one — so callers can't tell success from failure from
-    // the url alone; these flags are the only signal. They must NOT be reset
-    // in onPageStarted: Chromium delivers a main-frame onReceivedHttpError
-    // BEFORE onPageStarted (observed on device), so a start-time reset would
-    // erase the error before the load it belongs to finishes.
-    private var mainFrameLoadFailed = false
-    private var mainFramePersistenceFailed = false
-    private val expectedLoadGenerations = ArrayDeque<Long>()
-    private val startedLoads = ArrayDeque<StartedLoad>()
+    private var expectedLoadGeneration: Long? = null
+    private var activeLoad: ActiveLoad? = null
+    private var preStartLoadFailed = false
+    private var preStartPersistenceFailed = false
+    private var ignoreUnmatchedFinish = false
 
     fun expectLoad(generation: Long) {
-        expectedLoadGenerations.addLast(generation)
+        expectedLoadGeneration = generation
     }
 
     fun supersedePendingLoads() {
-        expectedLoadGenerations.clear()
-        startedLoads.clear()
+        ignoreUnmatchedFinish = activeLoad != null
+        expectedLoadGeneration = null
+        activeLoad = null
+        preStartLoadFailed = false
+        preStartPersistenceFailed = false
     }
 
     override fun onPageStarted(
@@ -71,7 +67,26 @@ class OmnigentWebViewClient(
         favicon: Bitmap?,
     ) {
         super.onPageStarted(view, url, favicon)
-        startedLoads.addLast(StartedLoad(expectedLoadGenerations.removeFirstOrNull()))
+        val generation = expectedLoadGeneration
+        if (generation != null || activeLoad == null) {
+            activeLoad =
+                ActiveLoad(
+                    generation = generation,
+                    url = url,
+                    loadFailed = preStartLoadFailed,
+                    persistenceFailed = preStartPersistenceFailed,
+                )
+            expectedLoadGeneration = null
+            preStartLoadFailed = false
+            preStartPersistenceFailed = false
+        } else {
+            // Redirect starts belong to the navigation already in flight.
+            activeLoad?.apply {
+                this.url = url
+                committedUrl = null
+            }
+        }
+        ignoreUnmatchedFinish = false
 
         val origin = originOf(url)
         val scheme = url?.let { Uri.parse(it).scheme?.lowercase() }
@@ -136,7 +151,7 @@ class OmnigentWebViewClient(
     ) {
         super.onReceivedError(view, request, error)
         if (request.isForMainFrame && isBlockingLoadError(error.errorCode, error.description)) {
-            mainFrameLoadFailed = true
+            if (activeLoad == null) preStartLoadFailed = true else activeLoad?.loadFailed = true
         }
     }
 
@@ -146,7 +161,21 @@ class OmnigentWebViewClient(
         errorResponse: WebResourceResponse,
     ) {
         super.onReceivedHttpError(view, request, errorResponse)
-        if (request.isForMainFrame) mainFramePersistenceFailed = true
+        if (request.isForMainFrame) {
+            if (activeLoad == null) {
+                preStartPersistenceFailed = true
+            } else {
+                activeLoad?.persistenceFailed = true
+            }
+        }
+    }
+
+    override fun onPageCommitVisible(
+        view: WebView,
+        url: String?,
+    ) {
+        super.onPageCommitVisible(view, url)
+        activeLoad?.takeIf { it.url == url }?.committedUrl = url
     }
 
     override fun onPageFinished(
@@ -154,15 +183,26 @@ class OmnigentWebViewClient(
         url: String?,
     ) {
         super.onPageFinished(view, url)
-        // Consume the error flags for the load that just finished. A stopped
-        // load (no onPageFinished) can leave a flag armed for the NEXT finish;
-        // that fails safe — it can only skip one persist, never allow one.
-        val loadFailed = mainFrameLoadFailed
-        val persistenceFailed = mainFramePersistenceFailed
-        val loadGeneration = startedLoads.removeFirstOrNull()?.generation
-        mainFrameLoadFailed = false
-        mainFramePersistenceFailed = false
+        val load = activeLoad
         val onPinnedOrigin = originOf(url) == pinnedOrigin()
+        // Inline authentication can finish foreign documents before returning
+        // to the app. They remain part of the current app navigation.
+        if (load != null && !onPinnedOrigin) return
+        if (load == null && ignoreUnmatchedFinish) {
+            ignoreUnmatchedFinish = false
+            return
+        }
+        if (load != null && !load.loadFailed && !load.persistenceFailed &&
+            load.committedUrl != url
+        ) {
+            return
+        }
+        val loadFailed = load?.loadFailed ?: preStartLoadFailed
+        val persistenceFailed = load?.persistenceFailed ?: preStartPersistenceFailed
+        val loadGeneration = load?.generation
+        activeLoad = null
+        preStartLoadFailed = false
+        preStartPersistenceFailed = false
         // An app page loaded, so the mount works: re-arm the bounce budget for
         // the next time the user lands back on the workspace root.
         if (onPinnedOrigin && databricksWorkspaceUiUrl(url) == null) rootBounces = 0
@@ -269,8 +309,12 @@ class OmnigentWebViewClient(
         mainHandler.post { loadUrl(view, target) }
     }
 
-    private data class StartedLoad(
+    private data class ActiveLoad(
         val generation: Long?,
+        var url: String?,
+        var committedUrl: String? = null,
+        var loadFailed: Boolean = false,
+        var persistenceFailed: Boolean = false,
     )
 
     private companion object {

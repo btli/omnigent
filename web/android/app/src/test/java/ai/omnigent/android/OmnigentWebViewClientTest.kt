@@ -52,19 +52,24 @@ class OmnigentWebViewClientTest {
     }
 
     @Test
-    fun `same-url finishes retain their initiating load generations`() {
+    fun `stale finish after a new start cannot complete the current generation`() {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
         val generations = mutableListOf<Long?>()
         val client = client(onPageReady = { _, _, _, generation -> generations += generation })
         client.expectLoad(1)
         client.onPageStarted(webView, PINNED_URL, null)
+        client.supersedePendingLoads()
         client.expectLoad(2)
         client.onPageStarted(webView, PINNED_URL, null)
 
+        // The superseded document finishes after the replacement starts.
         client.onPageFinished(webView, PINNED_URL)
+        assertTrue(generations.isEmpty())
+
+        client.onPageCommitVisible(webView, PINNED_URL)
         client.onPageFinished(webView, PINNED_URL)
 
-        assertEquals(listOf(1L, 2L), generations)
+        assertEquals(listOf(2L), generations)
     }
 
     @Test
@@ -78,6 +83,7 @@ class OmnigentWebViewClientTest {
         client.supersedePendingLoads()
         client.expectLoad(2)
         client.onPageStarted(webView, PINNED_URL, null)
+        client.onPageCommitVisible(webView, PINNED_URL)
         client.onPageFinished(webView, PINNED_URL)
 
         assertEquals(listOf(2L), generations)
@@ -95,9 +101,32 @@ class OmnigentWebViewClientTest {
         client.onPageFinished(webView, PINNED_URL)
         client.expectLoad(2)
         client.onPageStarted(webView, PINNED_URL, null)
+        client.onPageCommitVisible(webView, PINNED_URL)
         client.onPageFinished(webView, PINNED_URL)
 
-        assertEquals(listOf(null, 2L), generations)
+        assertEquals(listOf(2L), generations)
+    }
+
+    @Test
+    fun `redirect starts retain the current generation until the app document commits`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val ready = mutableListOf<Pair<String?, Long?>>()
+        val client =
+            client(
+                pinnedOrigin = DATABRICKS_ORIGIN,
+                onPageReady = { url, _, _, generation -> ready += url to generation },
+            )
+        val appUrl = "$DATABRICKS_ORIGIN/omnigent/c/abc"
+
+        client.expectLoad(7)
+        client.onPageStarted(webView, "$DATABRICKS_ORIGIN/omnigent", null)
+        client.onPageStarted(webView, IDP_URL, null)
+        client.onPageFinished(webView, IDP_URL)
+        client.onPageStarted(webView, appUrl, null)
+        client.onPageCommitVisible(webView, appUrl)
+        client.onPageFinished(webView, appUrl)
+
+        assertEquals(listOf(appUrl to 7L), ready)
     }
 
     @Test
