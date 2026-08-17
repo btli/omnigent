@@ -6,6 +6,7 @@ import java.net.Socket
 import java.net.URI
 import java.nio.file.Files
 import java.nio.file.Path
+import java.security.MessageDigest
 import java.util.Properties
 import java.util.concurrent.TimeUnit
 
@@ -109,11 +110,75 @@ tasks.withType<Test>().configureEach {
     )
 }
 
-// Every shipping bundle, including the bundle built by publishReleaseBundle,
-// is gated on the unit suite. CI builds remain credential-free; publishing is
-// an explicit trusted invocation that supplies Play credentials only locally.
-tasks.matching { it.name == "bundleRelease" || it.name == "publishReleaseBundle" }.configureEach {
-    dependsOn("testDebugUnitTest")
+val releaseVerificationInputs =
+    files(
+        fileTree("src"),
+        file("build.gradle.kts"),
+        rootProject.file("build.gradle.kts"),
+        rootProject.file("settings.gradle.kts"),
+        rootProject.file("gradle.properties"),
+        rootProject.file("gradle/libs.versions.toml"),
+        rootProject.file("gradle/wrapper/gradle-wrapper.properties"),
+    )
+val releaseVerificationReceipt =
+    layout.buildDirectory.file(
+        "verification/release-unit-tests.sha256",
+    )
+
+fun releaseVerificationFingerprint(): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    releaseVerificationInputs.files.sortedBy { it.absolutePath }.forEach { input ->
+        digest.update(input.relativeTo(rootProject.projectDir).path.toByteArray())
+        digest.update(input.readBytes())
+    }
+    digest.update("$appVersionCode\u0000$appVersionName".toByteArray())
+    return digest.digest().joinToString("") { "%02x".format(it) }
+}
+
+val verifyReleaseUnitTests =
+    tasks.register("verifyReleaseUnitTests") {
+        group = "verification"
+        description =
+            "Runs release unit tests without Play credentials and records the verified tree."
+        dependsOn("testDebugUnitTest")
+        inputs.files(releaseVerificationInputs)
+        inputs.property("versionCode", appVersionCode)
+        inputs.property("versionName", appVersionName)
+        outputs.file(releaseVerificationReceipt)
+        outputs.upToDateWhen { false }
+        doFirst {
+            check(System.getenv("PLAY_SERVICE_ACCOUNT_JSON") == null) {
+                "Run verifyReleaseUnitTests before exporting PLAY_SERVICE_ACCOUNT_JSON."
+            }
+            check(!rootProject.file("play-credentials.json").exists()) {
+                "Temporarily remove play-credentials.json before release verification."
+            }
+        }
+        doLast {
+            releaseVerificationReceipt.get().asFile.apply {
+                parentFile.mkdirs()
+                writeText(releaseVerificationFingerprint())
+            }
+        }
+    }
+
+val requireReleaseUnitTests =
+    tasks.register("requireReleaseUnitTests") {
+        group = "verification"
+        description = "Requires a credential-free unit-test receipt for the current release tree."
+        doLast {
+            val receipt = releaseVerificationReceipt.get().asFile
+            check(receipt.isFile && receipt.readText() == releaseVerificationFingerprint()) {
+                "Run ./gradlew verifyReleaseUnitTests with no Play credentials, then publish separately."
+            }
+        }
+    }
+
+tasks.matching { it.name == "bundleRelease" }.configureEach {
+    dependsOn(verifyReleaseUnitTests)
+}
+tasks.matching { it.name == "publishReleaseBundle" }.configureEach {
+    dependsOn(requireReleaseUnitTests)
 }
 
 // Gradle Play Publisher: `./gradlew publishReleaseBundle` builds the signed AAB

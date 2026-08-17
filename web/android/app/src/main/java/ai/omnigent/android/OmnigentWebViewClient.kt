@@ -48,6 +48,7 @@ class OmnigentWebViewClient(
     private var preStartLoadFailed = false
     private var preStartPersistenceFailed = false
     private var ignoreUnmatchedFinish = false
+    private var tracksDocuments = false
 
     fun expectLoad(generation: Long) {
         expectedLoadGeneration = generation
@@ -67,6 +68,7 @@ class OmnigentWebViewClient(
         favicon: Bitmap?,
     ) {
         super.onPageStarted(view, url, favicon)
+        tracksDocuments = true
         val generation = expectedLoadGeneration
         if (generation != null || activeLoad == null) {
             activeLoad =
@@ -83,7 +85,6 @@ class OmnigentWebViewClient(
             // Redirect starts belong to the navigation already in flight.
             activeLoad?.apply {
                 this.url = url
-                committedUrl = null
             }
         }
         ignoreUnmatchedFinish = false
@@ -151,7 +152,10 @@ class OmnigentWebViewClient(
     ) {
         super.onReceivedError(view, request, error)
         if (request.isForMainFrame && isBlockingLoadError(error.errorCode, error.description)) {
-            if (activeLoad == null) preStartLoadFailed = true else activeLoad?.loadFailed = true
+            when {
+                activeLoad != null -> activeLoad?.loadFailed = true
+                expectedLoadGeneration != null || !tracksDocuments -> preStartLoadFailed = true
+            }
         }
     }
 
@@ -162,10 +166,14 @@ class OmnigentWebViewClient(
     ) {
         super.onReceivedHttpError(view, request, errorResponse)
         if (request.isForMainFrame) {
-            if (activeLoad == null) {
-                preStartPersistenceFailed = true
-            } else {
-                activeLoad?.persistenceFailed = true
+            when {
+                activeLoad != null -> {
+                    activeLoad?.persistenceFailed = true
+                }
+
+                expectedLoadGeneration != null || !tracksDocuments -> {
+                    preStartPersistenceFailed = true
+                }
             }
         }
     }
@@ -175,7 +183,9 @@ class OmnigentWebViewClient(
         url: String?,
     ) {
         super.onPageCommitVisible(view, url)
-        activeLoad?.takeIf { it.url == url }?.committedUrl = url
+        val load = activeLoad?.takeIf { it.url == url } ?: return
+        if (load.loadFailed || load.persistenceFailed) return
+        completeLoad(view, url, load)
     }
 
     override fun onPageFinished(
@@ -188,21 +198,27 @@ class OmnigentWebViewClient(
         // Inline authentication can finish foreign documents before returning
         // to the app. They remain part of the current app navigation.
         if (load != null && !onPinnedOrigin) return
-        if (load == null && ignoreUnmatchedFinish) {
+        if (load == null && (ignoreUnmatchedFinish || tracksDocuments)) {
             ignoreUnmatchedFinish = false
             return
         }
-        if (load != null && !load.loadFailed && !load.persistenceFailed &&
-            load.committedUrl != url
-        ) {
-            return
-        }
+        if (load != null && !load.loadFailed && !load.persistenceFailed) return
+        completeLoad(view, url, load)
+    }
+
+    private fun completeLoad(
+        view: WebView,
+        url: String?,
+        load: ActiveLoad?,
+    ) {
         val loadFailed = load?.loadFailed ?: preStartLoadFailed
         val persistenceFailed = load?.persistenceFailed ?: preStartPersistenceFailed
         val loadGeneration = load?.generation
         activeLoad = null
         preStartLoadFailed = false
         preStartPersistenceFailed = false
+        ignoreUnmatchedFinish = tracksDocuments
+        val onPinnedOrigin = originOf(url) == pinnedOrigin()
         // An app page loaded, so the mount works: re-arm the bounce budget for
         // the next time the user lands back on the workspace root.
         if (onPinnedOrigin && databricksWorkspaceUiUrl(url) == null) rootBounces = 0
@@ -312,7 +328,6 @@ class OmnigentWebViewClient(
     private data class ActiveLoad(
         val generation: Long?,
         var url: String?,
-        var committedUrl: String? = null,
         var loadFailed: Boolean = false,
         var persistenceFailed: Boolean = false,
     )

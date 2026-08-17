@@ -16,9 +16,8 @@ data class DeepLink(
     companion object {
         private const val MAX_LINK_LENGTH = 2048
 
-        // Hosts that resolve to the local machine — http (local dev is plain
-        // http); everything else https. Mirrors iOS/desktop `localHosts`.
-        private val LOCAL_HOSTS = setOf("localhost", "127.0.0.1", "::1")
+        // Verified release cleartext hosts; everything else fails safe to https.
+        private val LOCAL_HOSTS = setOf("localhost", "127.0.0.1")
 
         // Denylist, not a grammar: characters that smuggle URL structure,
         // enable traversal, or signal a malformed escape. The SPA's /c/:id
