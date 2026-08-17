@@ -1,6 +1,8 @@
 package ai.omnigent.android
 
 import android.net.Uri
+import android.webkit.TestWebResourceError
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -125,6 +127,60 @@ class OmnigentWebViewHttpErrorTest {
 
         assertTrue(loginRequired)
     }
+
+    @Test
+    fun `foreign main frame errors do not poison the pinned load`() {
+        val webView = WebView(ApplicationProvider.getApplicationContext())
+        var loadFailed = true
+        var persistenceFailed = true
+        val client =
+            client { _, load, persistence, _ ->
+                loadFailed = load
+                persistenceFailed = persistence
+            }
+
+        client.onPageStarted(webView, PINNED_URL, null)
+        client.onReceivedError(webView, request("https://login.example/oidc", true), error())
+        client.onReceivedHttpError(
+            webView,
+            request("https://login.example/oidc", true),
+            WebResourceResponse("text/html", "UTF-8", null),
+        )
+        client.onPageCommitVisible(webView, PINNED_URL)
+        client.onPageFinished(webView, PINNED_URL)
+
+        assertFalse(loadFailed)
+        assertFalse(persistenceFailed)
+    }
+
+    @Test
+    fun `stale pinned document errors do not poison a replacement path`() {
+        val webView = WebView(ApplicationProvider.getApplicationContext())
+        var loadFailed = true
+        var persistenceFailed = true
+        val replacement = "$PINNED_ORIGIN/replacement"
+        val client =
+            client { _, load, persistence, _ ->
+                loadFailed = load
+                persistenceFailed = persistence
+            }
+
+        client.onPageStarted(webView, PINNED_URL, null)
+        client.onPageStarted(webView, replacement, null)
+        client.onReceivedError(webView, request(PINNED_URL, true), error())
+        client.onReceivedHttpError(
+            webView,
+            request(PINNED_URL, true),
+            WebResourceResponse("text/html", "UTF-8", null),
+        )
+        client.onPageCommitVisible(webView, replacement)
+        client.onPageFinished(webView, replacement)
+
+        assertFalse(loadFailed)
+        assertFalse(persistenceFailed)
+    }
+
+    private fun error(): WebResourceError = TestWebResourceError()
 
     private fun client(
         onLoginRequired: () -> Unit = {},

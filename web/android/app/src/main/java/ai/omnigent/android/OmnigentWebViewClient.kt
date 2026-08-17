@@ -151,7 +151,11 @@ class OmnigentWebViewClient(
         error: WebResourceError,
     ) {
         super.onReceivedError(view, request, error)
-        if (request.isForMainFrame && isBlockingLoadError(error.errorCode, error.description)) {
+        if (
+            request.isForMainFrame &&
+            isPinnedLoadError(request.url) &&
+            isBlockingLoadError(error.errorCode, error.description)
+        ) {
             when {
                 activeLoad != null -> activeLoad?.loadFailed = true
                 expectedLoadGeneration != null || !tracksDocuments -> preStartLoadFailed = true
@@ -165,7 +169,7 @@ class OmnigentWebViewClient(
         errorResponse: WebResourceResponse,
     ) {
         super.onReceivedHttpError(view, request, errorResponse)
-        if (request.isForMainFrame) {
+        if (request.isForMainFrame && isPinnedLoadError(request.url)) {
             when {
                 activeLoad != null -> {
                     activeLoad?.persistenceFailed = true
@@ -176,6 +180,12 @@ class OmnigentWebViewClient(
                 }
             }
         }
+    }
+
+    private fun isPinnedLoadError(url: Uri): Boolean {
+        if (originOf(url.toString()) != pinnedOrigin()) return false
+        val load = activeLoad ?: return expectedLoadGeneration != null || !tracksDocuments
+        return load.url == url.toString()
     }
 
     override fun onPageCommitVisible(
