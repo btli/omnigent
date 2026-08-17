@@ -179,6 +179,59 @@ function sessionCookieDetails(serverUrl, token) {
   };
 }
 
+function priorSessionCookie(cookies, serverUrl, details) {
+  const hostname = new URL(serverUrl).hostname;
+  return cookies.find(
+    (cookie) =>
+      cookie &&
+      cookie.name === details.name &&
+      cookie.path === details.path &&
+      cookie.secure === details.secure &&
+      (!cookie.domain || cookie.domain === hostname),
+  );
+}
+
+function sessionCookieRestoreDetails(serverUrl, cookie) {
+  const details = {
+    url: serverUrl,
+    name: cookie.name,
+    value: cookie.value,
+    path: cookie.path,
+    secure: cookie.secure,
+    httpOnly: cookie.httpOnly,
+    sameSite: cookie.sameSite,
+  };
+  if (typeof cookie.expirationDate === "number") {
+    details.expirationDate = cookie.expirationDate;
+  }
+  return details;
+}
+
+async function rollbackSessionCookie(electronSession, serverUrl, details, priorCookie) {
+  let removalError = null;
+  try {
+    await electronSession.cookies.remove(serverUrl, details.name);
+  } catch (error) {
+    removalError = error;
+  }
+
+  if (priorCookie) {
+    try {
+      await electronSession.cookies.set(sessionCookieRestoreDetails(serverUrl, priorCookie));
+      return;
+    } catch (restoreError) {
+      const error = new Error("Could not restore the prior session cookie.", {
+        cause: restoreError,
+      });
+      if (removalError) error.removalError = removalError;
+      throw error;
+    }
+  }
+  if (removalError) {
+    throw new Error("Could not remove the unverified session cookie.", { cause: removalError });
+  }
+}
+
 // Prove both Chromium and the server accepted the installed session.
 async function installAndVerifySessionCookie(
   electronSession,
@@ -187,30 +240,45 @@ async function installAndVerifySessionCookie(
   { verificationAttempts = 3, retryDelayMs = 250, signal } = {},
 ) {
   const details = sessionCookieDetails(serverUrl, token);
+  const existing = await electronSession.cookies.get({ url: serverUrl, name: details.name });
+  const priorCookie = priorSessionCookie(existing, serverUrl, details);
   await electronSession.cookies.set(details);
-  const accepted = await electronSession.cookies.get({ url: serverUrl, name: details.name });
-  const cookie = accepted.find(
-    (candidate) =>
-      candidate.name === details.name &&
-      candidate.value === token &&
-      candidate.path === "/" &&
-      candidate.httpOnly === true &&
-      candidate.secure === details.secure,
-  );
-  if (!cookie) {
-    throw new Error("Electron rejected the session cookie.");
-  }
-
-  const verify = async (attempt) => {
-    const probe = await probeServerAuth(electronSession, serverUrl, { signal });
-    if (probe.kind === "authenticated") return;
-    if (!TRANSIENT_AUTH_STATUSES.has(probe.status) || attempt >= verificationAttempts) {
-      throw new Error("The server did not accept the installed session cookie.");
+  try {
+    const accepted = await electronSession.cookies.get({ url: serverUrl, name: details.name });
+    const cookie = accepted.find(
+      (candidate) =>
+        candidate.name === details.name &&
+        candidate.value === token &&
+        candidate.path === "/" &&
+        candidate.httpOnly === true &&
+        candidate.secure === details.secure,
+    );
+    if (!cookie) {
+      throw new Error("Electron rejected the session cookie.");
     }
-    await delay(retryDelayMs, undefined, { signal });
-    return verify(attempt + 1);
-  };
-  await verify(1);
+
+    const verify = async (attempt) => {
+      const probe = await probeServerAuth(electronSession, serverUrl, { signal });
+      if (probe.kind === "authenticated") return;
+      if (!TRANSIENT_AUTH_STATUSES.has(probe.status) || attempt >= verificationAttempts) {
+        throw new Error("The server did not accept the installed session cookie.");
+      }
+      await delay(retryDelayMs, undefined, { signal });
+      return verify(attempt + 1);
+    };
+    await verify(1);
+  } catch (verificationError) {
+    try {
+      await rollbackSessionCookie(electronSession, serverUrl, details, priorCookie);
+    } catch (cleanupError) {
+      const error = new Error("Session cookie verification failed and cleanup did not complete.", {
+        cause: cleanupError,
+      });
+      error.verificationError = verificationError;
+      throw error;
+    }
+    throw verificationError;
+  }
 }
 
 module.exports = {
