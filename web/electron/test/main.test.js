@@ -40,6 +40,9 @@ const setupSource = readFileSync(path.join(__dirname, "../setup/index.html"), "u
 const startLocalHandlerSource = setupSource.match(
   /startLocalBtn\.addEventListener\("click",\s*(async \(\) => \{[\s\S]*?\n        \})\);/,
 )?.[1];
+const setupConnectSource = setupSource.match(
+  /async function connect\(\) \{[\s\S]*?\n      \}/,
+)?.[0];
 
 // Strip block comments, then line comments (leaving `://` in URLs intact).
 const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
@@ -394,6 +397,35 @@ describe("setup Start locally", () => {
     assert.equal(startLocalBtn.disabled, false);
     assert.equal(startLocalBtn.textContent, "Start locally");
     assert.equal(err.textContent, "");
+  });
+});
+
+describe("setup Connect", () => {
+  it("surfaces the canonical remote HTTP rejection on the first attempt", async () => {
+    assert.ok(setupConnectSource);
+    const button = { disabled: false };
+    const err = { textContent: "" };
+    const input = { value: "http://server.example" };
+    let attempts = 0;
+    const connect = runInNewContext(`${setupConnectSource}; connect`, {
+      button,
+      err,
+      input,
+      isPlainHttpRemote: () => true,
+      setup: {
+        setServerUrl: async () => {
+          attempts += 1;
+          return { loaded: false, error: "Remote servers require HTTPS." };
+        },
+      },
+      warnedFor: null,
+    });
+
+    await connect();
+
+    assert.equal(attempts, 1);
+    assert.equal(err.textContent, "Remote servers require HTTPS.");
+    assert.equal(button.disabled, false);
   });
 });
 
