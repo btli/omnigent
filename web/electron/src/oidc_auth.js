@@ -91,7 +91,7 @@ function oidcServerUrlError(serverUrl) {
   if (parsed.pathname.includes("//")) return "invalid_server_url";
   for (const segment of parsed.pathname.split("/")) {
     let decoded = segment;
-    for (let depth = 0; depth < 3; depth += 1) {
+    while (true) {
       let next;
       try {
         next = decodeURIComponent(decoded);
