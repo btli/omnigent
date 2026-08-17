@@ -26,14 +26,14 @@ function classifyAuthProbe(status, loginUrl) {
 async function probeServerAuth(
   electronSession,
   serverUrl,
-  { timeoutMs = AUTH_PROBE_TIMEOUT_MS } = {},
+  { timeoutMs = AUTH_PROBE_TIMEOUT_MS, signal } = {},
 ) {
   const response = await electronSession.fetch(serverRoute(serverUrl, "/v1/me"), {
     method: "GET",
     redirect: "manual",
     cache: "no-store",
     credentials: "include",
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: requestSignal(signal, timeoutMs),
   });
   let loginUrl = null;
   if (response.status === 401) {
@@ -68,16 +68,30 @@ async function runOidcBrowserLogin(
     onPollError,
   } = {},
 ) {
+  const deadline = Date.now() + timeoutMs;
   let ticket;
   let loginUrl;
   try {
-    const response = await electronSession.fetch(serverRoute(serverUrl, "/auth/cli-login"), {
-      method: "POST",
-      body: "",
-      redirect: "manual",
-      cache: "no-store",
-      signal: requestSignal(signal),
-    });
+    const createTicket = async () => {
+      const response = await electronSession.fetch(serverRoute(serverUrl, "/auth/cli-login"), {
+        method: "POST",
+        body: "",
+        redirect: "manual",
+        cache: "no-store",
+        signal: requestSignal(signal),
+      });
+      if (!TRANSIENT_AUTH_STATUSES.has(response.status)) return response;
+      try {
+        onPollError?.(response.status);
+      } catch {
+        // Progress reporting cannot terminate authentication.
+      }
+      if (Date.now() >= deadline) return null;
+      await delay(pollIntervalMs, undefined, { signal });
+      return Date.now() < deadline ? createTicket() : null;
+    };
+    const response = await createTicket();
+    if (!response) return { ok: false, reason: "timed_out" };
     if (response.status !== 200) return { ok: false, reason: "failed" };
     const body = await response.json();
     ticket = body && typeof body.ticket === "string" ? body.ticket : "";
@@ -96,7 +110,6 @@ async function runOidcBrowserLogin(
 
   const pollUrl = new URL(serverRoute(serverUrl, "/auth/cli-poll"));
   pollUrl.searchParams.set("ticket", ticket);
-  const deadline = Date.now() + timeoutMs;
   const pollForCompletion = async () => {
     if (Date.now() >= deadline) {
       return { ok: false, reason: isUserAbort(signal) ? "cancelled" : "timed_out" };
@@ -171,7 +184,7 @@ async function installAndVerifySessionCookie(
   electronSession,
   serverUrl,
   token,
-  { verificationAttempts = 3, retryDelayMs = 250 } = {},
+  { verificationAttempts = 3, retryDelayMs = 250, signal } = {},
 ) {
   const details = sessionCookieDetails(serverUrl, token);
   await electronSession.cookies.set(details);
@@ -189,19 +202,12 @@ async function installAndVerifySessionCookie(
   }
 
   const verify = async (attempt) => {
-    let probe;
-    try {
-      probe = await probeServerAuth(electronSession, serverUrl);
-    } catch (error) {
-      if (attempt >= verificationAttempts) throw error;
-      await delay(retryDelayMs);
-      return verify(attempt + 1);
-    }
+    const probe = await probeServerAuth(electronSession, serverUrl, { signal });
     if (probe.kind === "authenticated") return;
     if (!TRANSIENT_AUTH_STATUSES.has(probe.status) || attempt >= verificationAttempts) {
       throw new Error("The server did not accept the installed session cookie.");
     }
-    await delay(retryDelayMs);
+    await delay(retryDelayMs, undefined, { signal });
     return verify(attempt + 1);
   };
   await verify(1);

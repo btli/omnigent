@@ -34,10 +34,11 @@ function isSetupIdle(state) {
 }
 
 function withServerLoad(state, load) {
-  state.pendingServerLoads = (state.pendingServerLoads || 0) + 1;
+  if (!state || state.pendingServerLoads) return Promise.resolve(false);
+  state.pendingServerLoads = 1;
   return Promise.resolve()
     .then(load)
-    .finally(() => (state.pendingServerLoads -= 1));
+    .finally(() => (state.pendingServerLoads = 0));
 }
 
 module.exports = { loadServerAfterAuth, loadInitialDestination, isSetupIdle, withServerLoad };

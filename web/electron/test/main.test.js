@@ -27,6 +27,7 @@ const vm = require("node:vm");
 const { runInNewContext } = vm;
 
 const { isSetupIdle, withServerLoad } = require("../src/server_load");
+const { runOidcBrowserLogin, installAndVerifySessionCookie } = require("../src/oidc_auth");
 
 const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
 const preloadSource = readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
@@ -480,33 +481,158 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     );
   });
 
-  it("routes the WebAuthn escape through ticket handoff, cookie verification, and reload", async () => {
+  it("completes the WebAuthn escape through ticket, cookie verification, and one reload", async () => {
     assert.ok(webAuthnTimeoutCode);
+    let stored = null;
+    const fetches = [];
+    const electronSession = {
+      cookies: {
+        set: async (details) => {
+          stored = { ...details };
+        },
+        get: async () => [stored],
+      },
+      fetch: async (url) => {
+        fetches.push(url);
+        if (url.endsWith("/auth/cli-login")) {
+          return {
+            status: 200,
+            json: async () => ({ ticket: "one-time", login_url: "/auth/login?ticket=one-time" }),
+          };
+        }
+        if (url.includes("/auth/cli-poll")) {
+          return { status: 200, json: async () => ({ token: "session-token" }) };
+        }
+        return { status: 200, json: async () => ({ id: "user" }) };
+      },
+    };
     const win = {
       isDestroyed: () => false,
       webContents: { getURL: () => "https://idp.example/passkey" },
     };
     const state = { serverUrl: "https://server.example", pendingServerLoads: 0 };
-    const calls = [];
+    const reloads = [];
+    const opened = [];
+    const showWebAuthnTimeout = runInNewContext(
+      `${oidcSessionCode}; ${webAuthnTimeoutCode}; showWebAuthnTimeout`,
+      {
+        AbortController,
+        BrowserWindow: function BrowserWindow() {},
+        WEB_SCHEMES: new Set(["https:"]),
+        URL,
+        dialog: { showMessageBox: async () => ({ response: 0 }) },
+        installAndVerifySessionCookie,
+        ipcMain: {},
+        loadAuthenticatedServerUrl: async (...args) => reloads.push(args),
+        OIDC_LOGIN_PAGE: "/oidc_login.html",
+        OIDC_LOGIN_PRELOAD: "/oidc_login_preload.js",
+        OIDC_LOGIN_TIMEOUT_MS: 100,
+        oidcLoginFlows: new WeakMap(),
+        probeServerAuth: async () => ({ kind: "oidc", status: 401 }),
+        runOidcBrowserLogin: (...args) => {
+          const options = args[3];
+          return runOidcBrowserLogin(...args.slice(0, 3), { ...options, pollIntervalMs: 1 });
+        },
+        runOidcLoginDialog: async ({ runAttempt }) => {
+          const result = await runAttempt({
+            signal: new AbortController().signal,
+            updateMessage() {},
+          });
+          return result.ok;
+        },
+        session: { defaultSession: electronSession },
+        shell: { openExternal: async (url) => opened.push(url) },
+        windows: new Map([[win, state]]),
+        withServerLoad,
+      },
+    );
+
+    await showWebAuthnTimeout(win);
+
+    assert.equal(opened.length, 1);
+    assert.equal(stored.value, "session-token");
+    assert.equal(fetches.at(-1), "https://server.example/v1/me");
+    assert.deepEqual(reloads, [[win, "https://server.example"]]);
+    assert.equal(state.pendingServerLoads, 0);
+  });
+
+  it("does not attempt ticket login for an accounts-mode passkey page", async () => {
+    const win = {
+      isDestroyed: () => false,
+      webContents: { getURL: () => "https://server.example/login" },
+    };
+    const state = { serverUrl: "https://server.example", pendingServerLoads: 0 };
+    let handoffs = 0;
     const showWebAuthnTimeout = runInNewContext(`${webAuthnTimeoutCode}; showWebAuthnTimeout`, {
       WEB_SCHEMES: new Set(["https:"]),
       URL,
       dialog: { showMessageBox: async () => ({ response: 0 }) },
-      loadAuthenticatedServerUrl: async (...args) => calls.push(["load", ...args]),
-      runWindowOidcBrowserHandoff: async (...args) => {
-        calls.push(["handoff", ...args]);
-        return true;
+      probeServerAuth: async () => ({ kind: "accounts", status: 401 }),
+      runWindowOidcBrowserHandoff: async () => {
+        handoffs += 1;
       },
+      session: { defaultSession: {} },
       windows: new Map([[win, state]]),
       withServerLoad,
     });
 
     await showWebAuthnTimeout(win);
 
-    assert.deepEqual(calls, [
-      ["handoff", win, "https://server.example"],
-      ["load", win, "https://server.example"],
-    ]);
+    assert.equal(handoffs, 0);
+    assert.equal(state.pendingServerLoads, 0);
+  });
+
+  it("cancels the real ticket composition without installing or reloading", async () => {
+    const controller = new AbortController();
+    const electronSession = {
+      cookies: {
+        set: async () => assert.fail("cancelled login installed a cookie"),
+        get: async () => [],
+      },
+      fetch: async () => ({
+        status: 200,
+        json: async () => ({ ticket: "one-time", login_url: "/auth/login?ticket=one-time" }),
+      }),
+    };
+    const win = {
+      isDestroyed: () => false,
+      webContents: { getURL: () => "https://idp.example/passkey" },
+    };
+    const state = { serverUrl: "https://server.example", pendingServerLoads: 0 };
+    let reloads = 0;
+    const showWebAuthnTimeout = runInNewContext(
+      `${oidcSessionCode}; ${webAuthnTimeoutCode}; showWebAuthnTimeout`,
+      {
+        AbortController,
+        BrowserWindow: function BrowserWindow() {},
+        WEB_SCHEMES: new Set(["https:"]),
+        URL,
+        dialog: { showMessageBox: async () => ({ response: 0 }) },
+        installAndVerifySessionCookie,
+        ipcMain: {},
+        loadAuthenticatedServerUrl: async () => {
+          reloads += 1;
+        },
+        OIDC_LOGIN_PAGE: "/oidc_login.html",
+        OIDC_LOGIN_PRELOAD: "/oidc_login_preload.js",
+        OIDC_LOGIN_TIMEOUT_MS: 100,
+        oidcLoginFlows: new WeakMap(),
+        probeServerAuth: async () => ({ kind: "oidc", status: 401 }),
+        runOidcBrowserLogin,
+        runOidcLoginDialog: async ({ runAttempt }) => {
+          const result = await runAttempt({ signal: controller.signal, updateMessage() {} });
+          return result.ok;
+        },
+        session: { defaultSession: electronSession },
+        shell: { openExternal: async () => controller.abort() },
+        windows: new Map([[win, state]]),
+        withServerLoad,
+      },
+    );
+
+    await showWebAuthnTimeout(win);
+
+    assert.equal(reloads, 0);
     assert.equal(state.pendingServerLoads, 0);
   });
 

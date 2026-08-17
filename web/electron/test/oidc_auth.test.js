@@ -55,6 +55,56 @@ describe("OIDC provider detection", () => {
 });
 
 describe("OIDC browser ticket flow", () => {
+  it("retries transient ticket creation statuses before opening the browser", async () => {
+    const responses = [
+      ...[429, 502, 503, 504].map((status) => response(status)),
+      response(200, { ticket: "secret", login_url: "/auth/login?ticket=secret" }),
+      response(200, { token: "session-jwt" }),
+    ];
+    const statuses = [];
+
+    const result = await runOidcBrowserLogin(
+      { fetch: async () => responses.shift() },
+      "https://server.example",
+      async () => {},
+      {
+        pollIntervalMs: 1,
+        timeoutMs: 100,
+        onPollError: (status) => statuses.push(status),
+      },
+    );
+
+    assert.deepEqual(result, { ok: true, token: "session-jwt" });
+    assert.deepEqual(statuses, [429, 502, 503, 504]);
+  });
+
+  it("does not retry permanent ticket creation failures", async () => {
+    const results = await Promise.all(
+      [401, 403, 400].map(async (status) => {
+        let requests = 0;
+        const result = await runOidcBrowserLogin(
+          {
+            fetch: async () => {
+              requests += 1;
+              return response(status);
+            },
+          },
+          "https://server.example",
+          async () => {},
+          { pollIntervalMs: 1, timeoutMs: 100 },
+        );
+        return { requests, result };
+      }),
+    );
+    assert.deepEqual(
+      results,
+      [401, 403, 400].map(() => ({
+        requests: 1,
+        result: { ok: false, reason: "failed" },
+      })),
+    );
+  });
+
   it("requests a ticket, opens the pinned-server URL, and polls to completion", async () => {
     const calls = [];
     const responses = [
@@ -336,5 +386,51 @@ describe("OIDC session cookie installation", () => {
     });
 
     assert.equal(probes.length, 0);
+  });
+
+  it("does not retry a network failure during cookie verification", async () => {
+    let stored = null;
+    let probes = 0;
+    const electronSession = {
+      cookies: {
+        set: async (details) => {
+          stored = { ...details };
+        },
+        get: async () => [stored],
+      },
+      fetch: async () => {
+        probes += 1;
+        throw new Error("offline");
+      },
+    };
+
+    await assert.rejects(
+      installAndVerifySessionCookie(electronSession, "https://server.example", "session-jwt"),
+      /offline/,
+    );
+    assert.equal(probes, 1);
+  });
+
+  it("cancels a transient verification delay promptly", async () => {
+    let stored = null;
+    const controller = new AbortController();
+    const electronSession = {
+      cookies: {
+        set: async (details) => {
+          stored = { ...details };
+        },
+        get: async () => [stored],
+      },
+      fetch: async () => response(503),
+    };
+    const verification = installAndVerifySessionCookie(
+      electronSession,
+      "https://server.example",
+      "session-jwt",
+      { retryDelayMs: 50, signal: controller.signal },
+    );
+    controller.abort();
+
+    await assert.rejects(verification, { name: "AbortError" });
   });
 });
