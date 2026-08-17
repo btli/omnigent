@@ -16,6 +16,7 @@
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useInputCapabilities } from "@/hooks/useInputCapabilities";
+import { MD_BREAKPOINT_PX, MD_MIN_WIDTH_QUERY } from "@/lib/breakpoints";
 import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
 
 const DEFAULT_WIDTH_PX = 240; // matches the previous fixed `md:w-60`
@@ -23,8 +24,6 @@ const MIN_WIDTH_PX = 200;
 const MAX_WIDTH_PX = 640;
 /** Keep at least this much room for the code/diff viewer beside the panel. */
 const MIN_VIEWER_PX = 240;
-/** Tailwind `md` breakpoint — must track the value in tailwind.config. */
-const MD_BREAKPOINT = 768;
 // The handle is a dedicated divider gutter between the viewer and the panel —
 // a real flex child outside both scroll containers, so its hit area overlays
 // almost no content. The painted strip (`w-1`) sits centered in the gutter;
@@ -156,11 +155,11 @@ export function useResizableCommentsPanel() {
   }, []);
 
   const [isDesktop, setIsDesktop] = useState(
-    () => typeof window !== "undefined" && window.innerWidth >= MD_BREAKPOINT,
+    () => typeof window !== "undefined" && window.innerWidth >= MD_BREAKPOINT_PX,
   );
 
   useEffect(() => {
-    const mql = window.matchMedia(`(min-width: ${MD_BREAKPOINT}px)`);
+    const mql = window.matchMedia(MD_MIN_WIDTH_QUERY);
     const handler = (e: MediaQueryListEvent) => setIsDesktop(e.matches);
     mql.addEventListener("change", handler);
     return () => mql.removeEventListener("change", handler);

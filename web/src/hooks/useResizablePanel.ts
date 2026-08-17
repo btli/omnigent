@@ -1,11 +1,10 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useInputCapabilities } from "@/hooks/useInputCapabilities";
+import { MD_BREAKPOINT_PX, MD_MIN_WIDTH_QUERY } from "@/lib/breakpoints";
 import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
 
 const MIN_WIDTH_PX = 320;
 const MAX_WIDTH_RATIO = 0.8; // 80% of viewport
-/** Tailwind `md` breakpoint — must track the value in tailwind.config. */
-const MD_BREAKPOINT = 768;
 const PAINTED_HANDLE_WIDTH_PX = 4;
 export const HANDLE_OUTWARD_SLIVER_PX = 6;
 export const HANDLE_INWARD_SLIVER_PX = 8;
@@ -128,11 +127,11 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
 
   // Track whether we're on desktop — only apply inline width there.
   const [isDesktop, setIsDesktop] = useState(
-    () => typeof window !== "undefined" && window.innerWidth >= MD_BREAKPOINT,
+    () => typeof window !== "undefined" && window.innerWidth >= MD_BREAKPOINT_PX,
   );
 
   useEffect(() => {
-    const mql = window.matchMedia(`(min-width: ${MD_BREAKPOINT}px)`);
+    const mql = window.matchMedia(MD_MIN_WIDTH_QUERY);
     const handler = (e: MediaQueryListEvent) => setIsDesktop(e.matches);
     mql.addEventListener("change", handler);
     return () => mql.removeEventListener("change", handler);
