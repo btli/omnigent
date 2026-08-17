@@ -1102,6 +1102,17 @@ function hardenOauthPopup(child) {
  */
 async function showWebAuthnTimeout(win) {
   if (!win || win.isDestroyed()) return;
+  const state = windows.get(win);
+  const serverUrl = state?.serverUrl;
+  if (!serverUrl) return;
+  const serverUrlError = oidcServerUrlError(serverUrl);
+  if (serverUrlError) {
+    await loadSetupPage(win, {
+      error: configuredServerUrlErrorMessage(serverUrlError),
+      url: serverUrl,
+    });
+    return;
+  }
   const signInUrl = win.webContents.getURL();
   let protocol;
   try {
@@ -1123,10 +1134,6 @@ async function showWebAuthnTimeout(win) {
     noLink: true,
   });
   if (response !== 0 || win.isDestroyed()) return;
-  const state = windows.get(win);
-  const serverUrl = state?.serverUrl;
-  if (!serverUrl) return;
-  if (oidcServerUrlError(serverUrl)) return;
   let probe;
   try {
     probe = await probeServerAuth(session.defaultSession, serverUrl);
@@ -3271,7 +3278,7 @@ async function handleDeepLink(raw) {
         // is unchanged (the probe only appends a path under it), so the consent
         // decision stands; the user approved connecting to this host.
         const serverUrl = await expandDatabricksWorkspaceUrl(targetOrigin);
-        if (!originOf(serverUrl)) return; // expansion yielded an unparseable URL
+        if (oidcServerUrlError(serverUrl) || originOf(serverUrl) !== targetOrigin) return;
         if (reuseParent && !parent.isDestroyed() && windows.get(parent) === state) {
           await loadServerUrl(parent, serverUrl, parsed.path, undefined, {
             alreadyGated: true,
