@@ -2,6 +2,7 @@ const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 
 const {
+  oidcServerUrlError,
   serverRoute,
   classifyAuthProbe,
   probeServerAuth,
@@ -55,6 +56,18 @@ describe("OIDC provider detection", () => {
 });
 
 describe("OIDC browser ticket flow", () => {
+  it("accepts canonical mounted, IPv6, IDNA, and UTF-8 server paths", () => {
+    for (const serverUrl of [
+      "https://server.example/base/path",
+      "https://[2001:db8::1]:8443/base",
+      "http://[::1]:6767/base",
+      "https://xn--bcher-kva.example/base/%E2%9C%93",
+    ]) {
+      assert.equal(oidcServerUrlError(serverUrl), null);
+      assert.equal(serverRoute(serverUrl, "/v1/me"), `${serverUrl}/v1/me`);
+    }
+  });
+
   it("rejects non-loopback HTTP before any authentication side effect", async () => {
     let fetches = 0;
     let opens = 0;
@@ -115,8 +128,11 @@ describe("OIDC browser ticket flow", () => {
       "https://server.example/base/%2fother",
       "https://server.example/base/%252fother",
       "https://server.example/base/%2525252fother",
+      "https://server.example/base/%",
+      "https://server.example/base/%C0%AF",
       "https://server.example:/base",
       "https://server.example:443/base",
+      `https://server.example/${"a".repeat(2048)}`,
     ];
 
     await Promise.all(
