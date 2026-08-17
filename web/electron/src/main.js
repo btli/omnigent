@@ -88,6 +88,13 @@ function configuredServerUrlError(raw, normalized) {
   return oidcServerUrlError(validationUrl);
 }
 
+function expandedServerUrlError(serverUrl, expectedOrigin) {
+  return (
+    oidcServerUrlError(serverUrl) ??
+    (originOf(serverUrl) === expectedOrigin ? null : "invalid_server_url")
+  );
+}
+
 /** Absolute path to the bundled setup page (the "connect to server" form). */
 const SETUP_PAGE = path.join(__dirname, "..", "setup", "index.html");
 
@@ -2466,6 +2473,7 @@ function registerIpc() {
     if (serverUrlError) {
       return { loaded: false, error: configuredServerUrlErrorMessage(serverUrlError) };
     }
+    const validatedOrigin = originOf(normalized);
     const win = BrowserWindow.fromWebContents(event.sender) ?? activeWindow();
     const state = win && windows.get(win);
     if (!state || state.pendingServerLoads) return { loaded: false };
@@ -2473,6 +2481,10 @@ function registerIpc() {
       // Bare Databricks workspace URLs serve a 404 at the root; expand them to
       // the Omnigent UI mount so the user can paste just the workspace host.
       const target = await expandDatabricksWorkspaceUrl(normalized);
+      const targetError = expandedServerUrlError(target, validatedOrigin);
+      if (targetError) {
+        return { loaded: false, error: configuredServerUrlErrorMessage(targetError) };
+      }
       // Multi-server windows connect without touching the saved server —
       // the connection lives and dies with the window.
       const ephemeral = Boolean(windows.get(win)?.ephemeral);
@@ -3194,7 +3206,7 @@ async function handleDeepLink(raw) {
         // is unchanged (the probe only appends a path under it), so the consent
         // decision stands; the user approved connecting to this host.
         const serverUrl = await expandDatabricksWorkspaceUrl(targetOrigin);
-        if (oidcServerUrlError(serverUrl) || originOf(serverUrl) !== targetOrigin) return;
+        if (expandedServerUrlError(serverUrl, targetOrigin)) return;
         if (reuseParent && !parent.isDestroyed() && windows.get(parent) === state) {
           await loadServerUrl(parent, serverUrl, parsed.path, undefined, {
             alreadyGated: true,

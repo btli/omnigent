@@ -104,6 +104,9 @@ async function runConsentUnknownDeepLink(
       }
       return expandedServerUrl;
     },
+    expandedServerUrlError: (serverUrl, expectedOrigin) =>
+      oidcServerUrlError(serverUrl) ??
+      (new URL(serverUrl).origin === expectedOrigin ? null : "invalid_server_url"),
     findKnownServerUrl: () => null,
     focusAndRestore: () => {},
     isSetupIdle,
@@ -1000,6 +1003,48 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     assert.equal(state.pendingServerLoads, undefined);
   });
 
+  it("rejects unsafe Setup expansion output before load or persistence", async () => {
+    await Promise.all(
+      [
+        "https://different.example/ml/omnigents",
+        "https://workspace.example/ml/omnigents?workspace=one",
+        "https://workspace.example/ml/omnigents#fragment",
+        "https://user:secret@workspace.example/ml/omnigents",
+        "http://workspace.example/ml/omnigents",
+        "https://workspace.example/ml//omnigents",
+        "https://workspace.example/ml/%252fomnigents",
+      ].map(async (expandedTarget) => {
+        const state = { serverUrl: null };
+        const win = {};
+        const handlerSource = setupServerCode.slice(
+          setupServerCode.indexOf("async"),
+          setupServerCode.lastIndexOf(");"),
+        );
+        const handler = runInNewContext(`(${handlerSource})`, {
+          BrowserWindow: { fromWebContents: () => win },
+          configuredServerUrlError: () => null,
+          configuredServerUrlErrorMessage: () => "The server address is invalid.",
+          expandDatabricksWorkspaceUrl: async () => expandedTarget,
+          expandedServerUrlError: (serverUrl, expectedOrigin) =>
+            oidcServerUrlError(serverUrl) ??
+            (new URL(serverUrl).origin === expectedOrigin ? null : "invalid_server_url"),
+          isSetupPageSender: () => true,
+          loadServerUrl: async () => assert.fail("loaded an unsafe expanded URL"),
+          normalizeUrl: () => "https://workspace.example",
+          originOf: (url) => new URL(url).origin,
+          windows: new Map([[win, state]]),
+          withServerLoad,
+        });
+
+        const result = await handler({ sender: {} }, "https://workspace.example");
+
+        assert.equal(result.loaded, false);
+        assert.equal(result.error, "The server address is invalid.");
+        assert.equal(state.pendingServerLoads, 0);
+      }),
+    );
+  });
+
   it("keeps valid Setup URL expansion before loading", async () => {
     const state = { serverUrl: null };
     const win = {};
@@ -1014,6 +1059,9 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
         calls.push(["expand", url]);
         return `${url}/ml/omnigents`;
       },
+      expandedServerUrlError: (serverUrl, expectedOrigin) =>
+        oidcServerUrlError(serverUrl) ??
+        (new URL(serverUrl).origin === expectedOrigin ? null : "invalid_server_url"),
       fetchServerManifest: async () => ({}),
       configuredServerUrlError: (_raw, normalized) => oidcServerUrlError(normalized),
       isSetupPageSender: () => true,
@@ -1024,6 +1072,7 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
       loadSettings: () => ({}),
       normalizeUrl: (url) => url,
       oidcServerUrlError,
+      originOf: (url) => new URL(url).origin,
       rememberRecentServer() {},
       saveSettings() {},
       windows: new Map([[win, { ...state, ephemeral: true }]]),
@@ -1053,6 +1102,7 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
       isSetupPageSender: () => true,
       normalizeUrl: (url) => url,
       oidcServerUrlError,
+      originOf: (url) => new URL(url).origin,
       windows: new Map([[win, state]]),
       withServerLoad,
     });
@@ -1082,6 +1132,7 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
       isSetupPageSender: () => true,
       normalizeUrl: (url) => url,
       oidcServerUrlError,
+      originOf: (url) => new URL(url).origin,
       windows: new Map([[win, state]]),
       withServerLoad,
     });
