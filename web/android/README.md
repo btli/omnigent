@@ -23,8 +23,8 @@ Debug builds permit cleartext (`http://`) to localhost and private-range hosts
 via `res/xml/network_security_config.xml` for local development; release builds
 are HTTPS-only except device-local loopback (for omnigent:// deep links — see
 _Deep links_ below), mirroring the iOS `NSAllowsArbitraryLoadsInWebContent`
-debug-only posture. The release allowlist includes IPv6 loopback (`::1`);
-WebView's enforcement of that on a release device build has not been verified.
+debug-only posture. Release IPv6 loopback remains HTTPS-only until WebView's
+cleartext enforcement is verified on a physical release device.
 
 ## Deep links
 
