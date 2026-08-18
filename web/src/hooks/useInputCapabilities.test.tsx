@@ -64,4 +64,17 @@ describe("useInputCapabilities", () => {
     rerender();
     expect(result.current).toBe(first);
   });
+
+  it("shares one media-query subscription across concurrent consumers and rerenders", () => {
+    installMatchMedia({ "(hover: hover)": true });
+    const matchMedia = vi.mocked(window.matchMedia);
+    const { rerender } = renderHook(() => {
+      useInputCapabilities();
+      useInputCapabilities();
+    });
+
+    expect(matchMedia).toHaveBeenCalledTimes(1);
+    rerender();
+    expect(matchMedia).toHaveBeenCalledTimes(1);
+  });
 });
