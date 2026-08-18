@@ -107,6 +107,15 @@ afterEach(() => {
 });
 
 describe("useResizablePanel persistence", () => {
+  it("seeds desktop state from the canonical media query, not innerWidth", () => {
+    setInnerWidth(2000);
+    desktopMatches = false;
+    const { result } = renderHook(() => useResizablePanel(true));
+
+    expect(result.current.isDesktop).toBe(false);
+    expect(result.current.panelWidth).toBeUndefined();
+  });
+
   it("persists explicit keyboard resize and restores it after store reset", () => {
     const { result, unmount } = renderHook(() => useResizablePanel(true));
 
