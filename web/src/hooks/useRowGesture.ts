@@ -49,6 +49,7 @@ interface ActiveRowGesture {
   sensorTarget: Element;
   offset: number;
   actions: SwipeActionPreferences;
+  swipeEnabled: boolean;
   movementSamples: RowMovementSample[];
 }
 
@@ -183,6 +184,23 @@ export function useRowGesture({
   const holdTimer = useRef<number | null>(null);
   const suppressClick = useRef(false);
   const touchMoveGuard = useRef<(() => void) | null>(null);
+  const dxFrame = useRef<number | null>(null);
+  const pendingDx = useRef(0);
+
+  const cancelDxFrame = useCallback(() => {
+    if (dxFrame.current === null) return;
+    cancelAnimationFrame(dxFrame.current);
+    dxFrame.current = null;
+  }, []);
+
+  const scheduleDx = useCallback((next: number) => {
+    pendingDx.current = next;
+    if (dxFrame.current !== null) return;
+    dxFrame.current = requestAnimationFrame(() => {
+      dxFrame.current = null;
+      setDx(pendingDx.current);
+    });
+  }, []);
 
   const clearHoldTimer = useCallback(() => {
     if (holdTimer.current === null) return;
@@ -248,6 +266,7 @@ export function useRowGesture({
       clearHoldTimer();
       releaseCapture(gesture);
       disarmTouchMoveGuard();
+      cancelDxFrame();
       state.current = null;
       setDx(0);
       setPhase("idle");
@@ -259,7 +278,7 @@ export function useRowGesture({
         );
       }
     },
-    [clearHoldTimer, disarmTouchMoveGuard, onCancel, releaseCapture],
+    [cancelDxFrame, clearHoldTimer, disarmTouchMoveGuard, onCancel, releaseCapture],
   );
 
   // Armed until the trailing click arrives or the next press clears it. A timer
@@ -319,6 +338,7 @@ export function useRowGesture({
         // A live Settings change must affect the next gesture, not change the
         // meaning of a finger that is already down.
         actions,
+        swipeEnabled,
         movementSamples: [{ x: event.clientX, at: event.timeStamp }],
       };
       state.current = gesture;
@@ -354,6 +374,7 @@ export function useRowGesture({
       onPickUp,
       reset,
       setGesturePhase,
+      swipeEnabled,
     ],
   );
 
@@ -382,6 +403,7 @@ export function useRowGesture({
         } else {
           setGesturePhase(gesture, "scroll");
           releaseCapture(gesture);
+          disarmTouchMoveGuard();
         }
         return;
       }
@@ -393,12 +415,12 @@ export function useRowGesture({
         const reversedInto = deltaX < 0 ? gesture.actions.left : gesture.actions.right;
         if (reversedInto === "none") {
           gesture.offset = 0;
-          setDx(0);
+          scheduleDx(0);
           return;
         }
         event.preventDefault();
         gesture.offset = swipeOffset(deltaX);
-        setDx(gesture.offset);
+        scheduleDx(gesture.offset);
         return;
       }
 
@@ -409,7 +431,7 @@ export function useRowGesture({
       // swipe precedence; everything it declines waits for the 25px circle.
       if (horizontal >= ROW_SWIPE_ACTIVATE_PX && horizontal > vertical) {
         const action = deltaX < 0 ? gesture.actions.left : gesture.actions.right;
-        if (!swipeEnabled || action === "none") {
+        if (!gesture.swipeEnabled || action === "none") {
           clearHoldTimer();
           setGesturePhase(gesture, "scroll");
           return;
@@ -431,10 +453,11 @@ export function useRowGesture({
       capturePointer,
       clearHoldTimer,
       dragEnabled,
+      disarmTouchMoveGuard,
       onDragStart,
       releaseCapture,
+      scheduleDx,
       setGesturePhase,
-      swipeEnabled,
     ],
   );
 
@@ -452,7 +475,7 @@ export function useRowGesture({
         Math.abs(deltaX) > Math.abs(deltaY)
       ) {
         const releaseAction = deltaX < 0 ? gesture.actions.left : gesture.actions.right;
-        if (swipeEnabled && releaseAction !== "none") resolvedPhase = "swipe";
+        if (gesture.swipeEnabled && releaseAction !== "none") resolvedPhase = "swipe";
       }
       const offset = resolvedPhase === "swipe" && hasReleasePoint ? swipeOffset(deltaX) : 0;
       const action =
@@ -475,7 +498,7 @@ export function useRowGesture({
         onAction(action);
       }
     },
-    [onAction, reset, suppressTrailingClick, swipeEnabled],
+    [onAction, reset, suppressTrailingClick],
   );
 
   const onPointerCancel = useCallback(
@@ -545,10 +568,11 @@ export function useRowGesture({
   useEffect(
     () => () => {
       clearHoldTimer();
+      cancelDxFrame();
       releaseCapture(state.current);
       disarmTouchMoveGuard();
     },
-    [clearHoldTimer, disarmTouchMoveGuard, releaseCapture],
+    [cancelDxFrame, clearHoldTimer, disarmTouchMoveGuard, releaseCapture],
   );
 
   return {

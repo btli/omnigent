@@ -9,8 +9,6 @@
 
 import { useSyncExternalStore } from "react";
 
-import { subscribeMatchMedia } from "@/lib/breakpoints";
-
 export interface InputCapabilities {
   /** ANY attached pointer is coarse — `(any-pointer: coarse)`. */
   anyCoarse: boolean;
@@ -24,10 +22,17 @@ const SERVER_SNAPSHOT: InputCapabilities = {
   anyCoarse: false,
 };
 
+let mediaLists: MediaQueryList[] | null = null;
+const subscribers = new Set<() => void>();
+
+function lists(): MediaQueryList[] {
+  return (mediaLists ??= CAPABILITY_QUERIES.map((query) => window.matchMedia(query)));
+}
+
 function read(): InputCapabilities {
   if (typeof window === "undefined" || !window.matchMedia) return SERVER_SNAPSHOT;
   return {
-    anyCoarse: window.matchMedia(CAPABILITY_QUERIES[0]).matches,
+    anyCoarse: lists()[0].matches,
   };
 }
 
@@ -44,7 +49,21 @@ function getSnapshot(): InputCapabilities {
 }
 
 function subscribe(callback: () => void): () => void {
-  return subscribeMatchMedia(CAPABILITY_QUERIES, callback);
+  if (typeof window === "undefined" || !window.matchMedia) return () => {};
+  if (subscribers.size === 0) {
+    for (const list of lists()) list.addEventListener("change", emit);
+  }
+  subscribers.add(callback);
+  return () => {
+    subscribers.delete(callback);
+    if (subscribers.size !== 0 || !mediaLists) return;
+    for (const list of mediaLists) list.removeEventListener("change", emit);
+    mediaLists = null;
+  };
+}
+
+function emit() {
+  for (const subscriber of subscribers) subscriber();
 }
 
 /**
