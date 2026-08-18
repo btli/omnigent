@@ -2,8 +2,8 @@ import {
   BotIcon,
   CheckIcon,
   FileIcon,
-  FilesIcon,
-  GitCompareIcon,
+  FolderTreeIcon,
+  FileDiffIcon,
   GlobeIcon,
   ListTodoIcon,
   Loader2Icon,
@@ -43,6 +43,7 @@ import { SubagentsPanel } from "./SubagentsPanel";
 import { TodoPanel } from "./TodoPanel";
 import { useTerminalStatuses } from "./useTerminalStatuses";
 import { type RightRailTab, TAB_BADGE_BASE } from "./railTabs";
+import { Button } from "../components/ui/button";
 
 function WorkspaceTabTooltip({
   label,
@@ -201,9 +202,9 @@ function NewTabMenu({
             type="button"
             aria-label="Open new"
             disabled={create.isPending}
-            className="flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50"
+            className="cursor-pointer flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50"
           >
-            <PlusIcon className="size-4" />
+            <PlusIcon className="size-5" />
           </button>
         </DropdownMenuTrigger>
       </WorkspaceTabTooltip>
@@ -323,13 +324,13 @@ function FileTabsStrip({
               }
             }}
             className={cn(
-              // Match the fixed TabsTrigger pill's box metrics (h-32 / px-12 /
+              // Match the fixed TabsTrigger pill's box metrics (h-24 / px-8 /
               // rounded-8 / 13px medium) so file tabs and Files/Terminals tabs
               // are the same height and the active chip lines up across both
               // sets. `group/tab` drives the hover-revealed close overlay below.
               // `overflow-hidden` clips the hover-close gradient overlay to the
               // pill's rounded corners so its rectangular edges can't poke out.
-              "group/tab relative flex h-[32px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-[8px] px-[12px] text-ui font-medium leading-5 transition-colors",
+              "group/tab relative flex h-[24px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-md px-2 text-ui font-medium leading-5 transition-colors",
               active
                 ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
                 : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
@@ -344,7 +345,7 @@ function FileTabsStrip({
                 selection surface — fade to that exact color. (A translucent
                 fade like var(--muted) would stack over the hover background and
                 darken the right edge into a visible gradient patch.) */}
-            <span className="absolute inset-y-0 right-[2px] flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100 [background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]">
+            <span className="absolute inset-y-0 right-0 flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100 [background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]">
               <button
                 type="button"
                 aria-label={`Close ${name}`}
@@ -426,9 +427,9 @@ function TerminalTabsStrip({
               }
             }}
             className={cn(
-              // Match FileTabsStrip's pill metrics so shell and file tabs line
-              // up in the same strip.
-              "group/tab relative flex h-[32px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-[8px] px-[12px] text-ui font-medium leading-5 transition-colors",
+              // Match FileTabsStrip's pill metrics (h-24 / px-8 / rounded-md)
+              // so shell and file tabs line up in the same strip.
+              "group/tab relative flex h-[24px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-md px-2 text-ui font-medium leading-5 transition-colors",
               active
                 ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
                 : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
@@ -436,7 +437,7 @@ function TerminalTabsStrip({
           >
             <TerminalIcon className="size-4 shrink-0" />
             <span className="min-w-0 truncate text-sm">{name}</span>
-            <span className="absolute inset-y-0 right-[2px] flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100 [background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]">
+            <span className="absolute inset-y-0 right-0 flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100 [background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]">
               <button
                 type="button"
                 aria-label={`Close ${name}`}
@@ -668,44 +669,40 @@ export function WorkspacePanel({
     [terminals],
   );
   return (
-    <>
-      {/* The resize target overlays the seam without taking flex width. Its
-          bounded slivers stay outside both scroll containers. */}
-      {!maximized && handleProps["aria-disabled"] !== true && (
+    <aside
+      aria-label="Workspace"
+      inert={inert}
+      // Full-height desktop surface flush to the window edge, separated from
+      // the main content by a left divider — no outer margin, rounding, or
+      // shadow (mirrors the left sidebar). AppShell reserves the panel width
+      // from ChatHeader, so the pane extends to the top without sitting under
+      // the existing session action cluster.
+      // ``@container/rail`` makes the rail a named container-query context so
+      // the tab strip can switch scroll behavior on the rail's own width
+      // (see the strip below) without a JS width listener.
+      //
+      // Maximized: break out of the flex row and stretch across the content
+      // region (absolute inset-0) so the rail owns the full width, keeping the
+      // same flush/bordered styling — only the width changes. The resize
+      // handle is suppressed in that state — there's no neighbor to resize
+      // against.
+      data-maximized={maximized || undefined}
+      className={cn(
+        "@container/rail relative z-40 hidden md:flex md:min-h-0 md:flex-col md:overflow-hidden md:border-l md:border-border md:bg-card",
+        maximized ? "md:absolute md:inset-0" : "md:shrink-0",
+      )}
+      // Width is fixed by the resize handle normally; maximized ignores it and
+      // stretches to the absolute inset instead.
+      style={maximized ? undefined : { width }}
+    >
+      {/* Left-edge horizontal resize handle — suppressed while maximized. */}
+      {!maximized && (
         <div
           {...handleProps}
-          data-workspace-panel-resize-gutter
-          className="z-50 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:absolute md:inset-y-0 md:block"
-          style={{ ...handleProps.style, right: width }}
+          className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
         />
       )}
-      <aside
-        aria-label="Workspace"
-        inert={inert}
-        // Full-height desktop surface flush to the window edge, separated from
-        // the main content by a left divider — no outer margin, rounding, or
-        // shadow (mirrors the left sidebar). AppShell reserves the panel width
-        // from ChatHeader, so the pane extends to the top without sitting under
-        // the existing session action cluster.
-        // ``@container/rail`` makes the rail a named container-query context so
-        // the tab strip can switch scroll behavior on the rail's own width
-        // (see the strip below) without a JS width listener.
-        //
-        // Maximized: break out of the flex row and stretch across the content
-        // region (absolute inset-0) so the rail owns the full width, keeping the
-        // same flush/bordered styling — only the width changes. The resize
-        // handle is suppressed in that state — there's no neighbor to resize
-        // against.
-        data-maximized={maximized || undefined}
-        className={cn(
-          "@container/rail relative z-40 hidden md:flex md:min-h-0 md:flex-col md:overflow-hidden md:border-l md:border-border md:bg-card",
-          maximized ? "md:absolute md:inset-0" : "md:shrink-0",
-        )}
-        // Width is fixed by the resize handle normally; maximized ignores it and
-        // stretches to the absolute inset instead.
-        style={maximized ? undefined : { width }}
-      >
-        {/* Tab strip, in display order Files · Changes · Agents · Shells · Tasks.
+      {/* Tab strip, in display order Files · Changes · Agents · Shells · Tasks.
           Files (full folder tree) and Changes (changed-files-only list) are
           two peer tabs — same gate (an on-disk workspace), same FilesPanel,
           each pinned to one scope. Agents is always present (the Agents panel
@@ -715,196 +712,191 @@ export function WorkspacePanel({
           affordance, so an empty tab is an entry point, not a dead end.
           The Agents tab keys off ``rootSessionId``, so inside a child
           it lists the siblings + a "main" link back to the parent. */}
-        {/* Tab strip: the static nav tabs + divider stay pinned on the left at
+      {/* Tab strip: the static nav tabs + divider stay pinned on the left at
           every rail width, and ONLY the file-tabs region scrolls (it owns the
           horizontal scroller — see below). The outer row never scrolls
           (overflow-x-hidden), so the divider is a fixed boundary that doesn't
           drift when the tabs scroll. */}
-        <div className="workspace-tab-strip shrink-0 flex items-center overflow-x-hidden border-b border-border px-2 py-2">
-          <Tabs
-            // Static group — never compresses (shrink-0) and stays anchored on
-            // the LEFT whether or not tabs are open. The open tabs render to its
-            // right; the maximize button owns the row's single ml-auto and pins
-            // to the right edge.
-            className="shrink-0"
-            // When a file or shell tab is active no fixed trigger should
-            // highlight, so feed the radix group a sentinel that matches none of
-            // them. The active file/shell tab carries its own highlight.
-            value={
-              selectedFilePath !== null || selectedTerminalKey !== null ? "__tab__" : rightRailTab
-            }
-            onValueChange={(v) => onRightRailTabChange(v as RightRailTab)}
-          >
-            <TabsList variant="pill" className="gap-1">
-              {showFilesPanel && (
-                <WorkspaceTabTooltip label="Files">
-                  <TabsTrigger
-                    value="files"
-                    aria-label="Files"
-                    className="size-8 shrink-0 rounded-md p-0 hover:bg-muted"
-                  >
-                    <FilesIcon className="size-4" />
-                    <span className="sr-only">Files</span>
-                  </TabsTrigger>
-                </WorkspaceTabTooltip>
-              )}
-              {showFilesPanel && (
-                <WorkspaceTabTooltip label="Changes">
-                  <TabsTrigger
-                    value="changes"
-                    aria-label={changedCount > 0 ? `Changes ${changedCount} changed` : "Changes"}
-                    className="size-8 shrink-0 rounded-md p-0 hover:bg-muted"
-                  >
-                    <GitCompareIcon className="size-4" />
-                    <span className="sr-only">Changes</span>
-                    {changedCount > 0 && <span className="sr-only">{changedCount}</span>}
-                  </TabsTrigger>
-                </WorkspaceTabTooltip>
-              )}
-              <WorkspaceTabTooltip label="Agents">
+      <div className="workspace-tab-strip shrink-0 flex items-center overflow-x-hidden border-b border-border px-2 py-3">
+        <Tabs
+          // Static group — never compresses (shrink-0) and stays anchored on
+          // the LEFT whether or not tabs are open. The open tabs render to its
+          // right; the maximize button owns the row's single ml-auto and pins
+          // to the right edge.
+          className="shrink-0"
+          // When a file or shell tab is active no fixed trigger should
+          // highlight, so feed the radix group a sentinel that matches none of
+          // them. The active file/shell tab carries its own highlight.
+          value={
+            selectedFilePath !== null || selectedTerminalKey !== null ? "__tab__" : rightRailTab
+          }
+          onValueChange={(v) => onRightRailTabChange(v as RightRailTab)}
+        >
+          <TabsList variant="pill" className="gap-1">
+            {showFilesPanel && (
+              <WorkspaceTabTooltip label="Files">
                 <TabsTrigger
-                  value="subagents"
-                  aria-label={
-                    subagentsWorking > 0
-                      ? `Agents ${subagentsWorking}/${agentCount}`
-                      : `Agents ${agentCount}`
-                  }
-                  className="size-8 shrink-0 rounded-md p-0 hover:bg-muted"
+                  value="files"
+                  aria-label="Files"
+                  className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
                 >
-                  <BotIcon className="size-4" />
-                  <span className="sr-only">Agents</span>
-                  <span
-                    className={cn(
-                      TAB_BADGE_BASE,
-                      "sr-only",
-                      subagentsWorking > 0 ? "text-success" : "text-muted-foreground",
-                    )}
-                  >
-                    {subagentsWorking > 0 ? `${subagentsWorking}/${agentCount}` : agentCount}
+                  <FolderTreeIcon />
+                  <span className="sr-only">Files</span>
+                </TabsTrigger>
+              </WorkspaceTabTooltip>
+            )}
+            {showFilesPanel && (
+              <WorkspaceTabTooltip label="Changes">
+                <TabsTrigger
+                  value="changes"
+                  aria-label={changedCount > 0 ? `Changes ${changedCount} changed` : "Changes"}
+                  className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
+                >
+                  <FileDiffIcon />
+                  <span className="sr-only">Changes</span>
+                  {changedCount > 0 && <span className="sr-only">{changedCount}</span>}
+                </TabsTrigger>
+              </WorkspaceTabTooltip>
+            )}
+            <WorkspaceTabTooltip label="Agents">
+              <TabsTrigger
+                value="subagents"
+                aria-label={
+                  subagentsWorking > 0
+                    ? `Agents ${subagentsWorking}/${agentCount}`
+                    : `Agents ${agentCount}`
+                }
+                className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
+              >
+                <BotIcon />
+                <span className="sr-only">Agents</span>
+                <span
+                  className={cn(
+                    TAB_BADGE_BASE,
+                    "sr-only",
+                    subagentsWorking > 0 ? "text-success" : "text-muted-foreground",
+                  )}
+                >
+                  {subagentsWorking > 0 ? `${subagentsWorking}/${agentCount}` : agentCount}
+                </span>
+              </TabsTrigger>
+            </WorkspaceTabTooltip>
+            {showShellsTab && (
+              <WorkspaceTabTooltip label="Shells">
+                <TabsTrigger
+                  value="terminals"
+                  aria-label={terminalsLength > 0 ? `Shells ${terminalsLength}` : "Shells"}
+                  className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
+                >
+                  <SquareTerminalIcon />
+                  <span className="sr-only">Shells</span>
+                  {terminalsLength > 0 && (
+                    <span className="sr-only text-muted-foreground">{terminalsLength}</span>
+                  )}
+                </TabsTrigger>
+              </WorkspaceTabTooltip>
+            )}
+            {todosSupported && todosTotal > 0 && (
+              <WorkspaceTabTooltip label="Tasks">
+                <TabsTrigger
+                  value="todos"
+                  aria-label={`Tasks ${todosCompleted} of ${todosTotal} completed`}
+                  className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
+                >
+                  <ListTodoIcon />
+                  <span className="sr-only">Tasks</span>
+                  <span className="sr-only">
+                    {todosCompleted}/{todosTotal}
                   </span>
                 </TabsTrigger>
               </WorkspaceTabTooltip>
-              {showShellsTab && (
-                <WorkspaceTabTooltip label="Shells">
-                  <TabsTrigger
-                    value="terminals"
-                    aria-label={terminalsLength > 0 ? `Shells ${terminalsLength}` : "Shells"}
-                    className="size-8 shrink-0 rounded-md p-0 hover:bg-muted"
-                  >
-                    <SquareTerminalIcon className="size-4" />
-                    <span className="sr-only">Shells</span>
-                    {terminalsLength > 0 && (
-                      <span className="sr-only text-muted-foreground">{terminalsLength}</span>
-                    )}
-                  </TabsTrigger>
-                </WorkspaceTabTooltip>
-              )}
-              {todosSupported && todosTotal > 0 && (
-                <WorkspaceTabTooltip label="Tasks">
-                  <TabsTrigger
-                    value="todos"
-                    aria-label={`Tasks ${todosCompleted} of ${todosTotal} completed`}
-                    className="size-8 shrink-0 rounded-md p-0 hover:bg-muted"
-                  >
-                    <ListTodoIcon className="size-4" />
-                    <span className="sr-only">Tasks</span>
-                    <span className="sr-only">
-                      {todosCompleted}/{todosTotal}
-                    </span>
-                  </TabsTrigger>
-                </WorkspaceTabTooltip>
-              )}
-              {showBrowserTab && (
-                <WorkspaceTabTooltip label="Browser">
-                  <TabsTrigger
-                    value="browser"
-                    aria-label="Browser"
-                    className="size-8 shrink-0 rounded-md p-0 hover:bg-muted"
-                  >
-                    <GlobeIcon className="size-4" />
-                    <span className="sr-only">Browser</span>
-                  </TabsTrigger>
-                </WorkspaceTabTooltip>
-              )}
-            </TabsList>
-          </Tabs>
-          {(openFiles.length > 0 || openTerminals.length > 0) && (
-            <>
-              {/* 1px divider separating the static nav tabs from the open tabs.
+            )}
+            {showBrowserTab && (
+              <WorkspaceTabTooltip label="Browser">
+                <TabsTrigger
+                  value="browser"
+                  aria-label="Browser"
+                  className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
+                >
+                  <GlobeIcon />
+                  <span className="sr-only">Browser</span>
+                </TabsTrigger>
+              </WorkspaceTabTooltip>
+            )}
+          </TabsList>
+        </Tabs>
+        {/* 1px divider separating the static nav tabs from the open tabs.
                 Pinned (outside the scrolling file-tabs region), so it stays put
                 at every rail width while the tabs scroll past it. */}
-              <div
-                aria-hidden
-                className="mx-[4px] h-[14px] w-px shrink-0 self-center bg-border-strong"
-              />
-              {/* Open-tabs region (file tabs + shell tabs) — the horizontal
+        <div aria-hidden className="mx-[8px] h-[14px] w-px shrink-0 self-center bg-border-strong" />
+        {(openFiles.length > 0 || openTerminals.length > 0) && (
+          <>
+            {/* Open-tabs region (file tabs + shell tabs) — the horizontal
                 scroller. It sizes to its content and shrinks+scrolls only when
                 the tabs would overflow (min-w-0, no flex-1), so the "+" outside
                 it hugs the last tab when they fit and stays pinned when they
                 don't. overflow-y-hidden stops overflow-x:auto from spawning a
                 vertical scrollbar that eats horizontal space. */}
-              <div className="flex min-w-0 items-center gap-0.5 overflow-x-auto overflow-y-hidden [scrollbar-width:thin] [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent">
-                <FileTabsStrip
-                  openFiles={openFiles}
-                  activeFilePath={selectedFilePath}
-                  onFileSelect={openFileViewer}
-                  onCloseFile={onCloseFile}
-                />
-                <TerminalTabsStrip
-                  openTerminals={openTerminals}
-                  activeTerminalKey={selectedTerminalKey}
-                  labelFor={terminalLabelFor}
-                  onSelect={openTerminalTab}
-                  onClose={onCloseTerminal}
-                />
-              </div>
-              {/* "+" trails the last tab but sits OUTSIDE the scroller, so it
+            <div className="flex min-w-0 items-center gap-0.5 overflow-x-auto overflow-y-hidden [scrollbar-width:thin] [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent">
+              <FileTabsStrip
+                openFiles={openFiles}
+                activeFilePath={selectedFilePath}
+                onFileSelect={openFileViewer}
+                onCloseFile={onCloseFile}
+              />
+              <TerminalTabsStrip
+                openTerminals={openTerminals}
+                activeTerminalKey={selectedTerminalKey}
+                labelFor={terminalLabelFor}
+                onSelect={openTerminalTab}
+                onClose={onCloseTerminal}
+              />
+            </div>
+            {/* "+" trails the last tab but sits OUTSIDE the scroller, so it
                 stays pinned (never scrolls under / overlaps the tabs) when they
                 overflow, and hugs the last tab when they fit. ml-[2px] keeps the
                 same gap the scroller's gap-0.5 gives between tabs. */}
-              <NewTabMenu
-                conversationId={conversationId}
-                onOpenTerminal={openTerminalTab}
-                triggerClassName="ml-[2px]"
-                liveness={liveness}
-              />
-            </>
-          )}
-          {/* "+" — open a new Shell tab. With no open tabs it sits here, right
-            after the nav tabs (next to Shells); once tabs exist it moves into
-            the open-tabs region to trail the last tab (see above). Self-gates
-            to nothing when the agent has no terminal access. */}
-          {openFiles.length === 0 && openTerminals.length === 0 && (
             <NewTabMenu
               conversationId={conversationId}
               onOpenTerminal={openTerminalTab}
+              triggerClassName="ml-[2px]"
               liveness={liveness}
             />
-          )}
-          {/* Maximize/minimize toggle, pinned to the rightmost edge via ml-auto,
+          </>
+        )}
+        {/* "+" — open a new Shell tab. With no open tabs it sits here, right
+            after the nav tabs (next to Shells); once tabs exist it moves into
+            the open-tabs region to trail the last tab (see above). Self-gates
+            to nothing when the agent has no terminal access. */}
+        {openFiles.length === 0 && openTerminals.length === 0 && (
+          <NewTabMenu
+            conversationId={conversationId}
+            onOpenTerminal={openTerminalTab}
+            liveness={liveness}
+          />
+        )}
+        {/* Maximize/minimize toggle, pinned to the rightmost edge via ml-auto,
             which absorbs the free space before it. When open tabs exist their
             ≥500px flex-1 region absorbs the space instead, so the button still
             hugs the right. */}
-          <WorkspaceTabTooltip
-            label={maximized ? "Exit full screen" : "Full screen"}
-            className="ml-auto"
+        <WorkspaceTabTooltip
+          label={maximized ? "Exit full screen" : "Full screen"}
+          className="ml-auto"
+        >
+          <Button
+            // type="button"
+            variant="ghost"
+            aria-label={maximized ? "Exit full screen" : "Full screen"}
+            aria-pressed={maximized}
+            onClick={onToggleMaximized}
+            size="icon-xs"
+            className="flex size-6"
           >
-            <button
-              type="button"
-              aria-label={maximized ? "Exit full screen" : "Full screen"}
-              aria-pressed={maximized}
-              onClick={onToggleMaximized}
-              className="flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-            >
-              {maximized ? (
-                <MinimizeIcon className="size-4" />
-              ) : (
-                <MaximizeIcon className="size-4" />
-              )}
-            </button>
-          </WorkspaceTabTooltip>
-        </div>
-        {/* Tab content — single slot. An open shell tab holds its xterm; a
+            {maximized ? <MinimizeIcon className="size-4" /> : <MaximizeIcon className="size-4" />}
+          </Button>
+        </WorkspaceTabTooltip>
+      </div>
+      {/* Tab content — single slot. An open shell tab holds its xterm; a
           file tab holds FileViewer; the Files/Changes tabs show FilesPanel
           (tree vs changed-only list); the
           Shells tab holds the list-only inline section (clicking a row
@@ -912,51 +904,50 @@ export function WorkspacePanel({
           Subagents lists the root's children + a "main" link back to the
           parent. The Shells branch is unreachable when its tab is hidden —
           native wrappers, claude-native sub-agents, or no shell attached. */}
-        <div data-workspace-panel-content className="flex min-h-0 flex-1 flex-col overflow-hidden">
-          {selectedTerminalKey !== null ? (
-            <RailTerminalView
-              conversationId={conversationId}
-              terminalKey={selectedTerminalKey}
-              readOnly={!isOwnerLevel(permissionLevel)}
-            />
-          ) : selectedFilePath !== null ? (
-            <FileViewer
+      <div data-workspace-panel-content className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        {selectedTerminalKey !== null ? (
+          <RailTerminalView
+            conversationId={conversationId}
+            terminalKey={selectedTerminalKey}
+            readOnly={!isOwnerLevel(permissionLevel)}
+          />
+        ) : selectedFilePath !== null ? (
+          <FileViewer
+            frameless
+            open
+            conversationId={conversationId}
+            path={selectedFilePath}
+            onClose={onShowScopeView}
+            onCloseTab={handleCloseTab}
+            onNavigateTo={openFileViewer}
+            permissionLevel={permissionLevel}
+            onCommentsOpenChange={onCommentsOpenChange}
+            sort={filesPanelSort}
+          />
+        ) : rightRailTab === "browser" && showBrowserTab ? (
+          // Embedded browser (Electron only) — BrowserPane self-gates and
+          // measures this rail slot to position the native view over it.
+          <BrowserPane conversationId={conversationId} className="min-h-0 flex-1" />
+        ) : rightRailTab === "subagents" && rootSessionId ? (
+          <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+        ) : rightRailTab === "todos" && todosSupported ? (
+          <TodoPanel frameless />
+        ) : rightRailTab === "terminals" && showShellsTab ? (
+          <InlineTerminalsSection conversationId={conversationId} onExpand={openTerminalTab} />
+        ) : (
+          showFilesPanel && (
+            <FilesPanel
               frameless
-              open
-              conversationId={conversationId}
-              path={selectedFilePath}
-              onClose={onShowScopeView}
-              onCloseTab={handleCloseTab}
-              onNavigateTo={openFileViewer}
-              permissionLevel={permissionLevel}
-              onCommentsOpenChange={onCommentsOpenChange}
+              onFileSelect={openFileViewer}
+              flatView={rightRailTab === "changes"}
+              showHidden={filesPanelShowHidden}
+              onShowHiddenChange={onShowHiddenChange}
               sort={filesPanelSort}
+              onSortChange={onSortChange}
             />
-          ) : rightRailTab === "browser" && showBrowserTab ? (
-            // Embedded browser (Electron only) — BrowserPane self-gates and
-            // measures this rail slot to position the native view over it.
-            <BrowserPane conversationId={conversationId} className="min-h-0 flex-1" />
-          ) : rightRailTab === "subagents" && rootSessionId ? (
-            <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
-          ) : rightRailTab === "todos" && todosSupported ? (
-            <TodoPanel frameless />
-          ) : rightRailTab === "terminals" && showShellsTab ? (
-            <InlineTerminalsSection conversationId={conversationId} onExpand={openTerminalTab} />
-          ) : (
-            showFilesPanel && (
-              <FilesPanel
-                frameless
-                onFileSelect={openFileViewer}
-                flatView={rightRailTab === "changes"}
-                showHidden={filesPanelShowHidden}
-                onShowHiddenChange={onShowHiddenChange}
-                sort={filesPanelSort}
-                onSortChange={onSortChange}
-              />
-            )
-          )}
-        </div>
-      </aside>
-    </>
+          )
+        )}
+      </div>
+    </aside>
   );
 }
