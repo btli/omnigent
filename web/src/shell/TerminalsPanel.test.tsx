@@ -127,19 +127,6 @@ describe("TerminalsPanel resize handle geometry", () => {
   });
 });
 
-describe("TerminalsPanel resize handle geometry", () => {
-  it("renders the handle as the panel's unclipped boundary sibling", () => {
-    renderPanel();
-    const handle = screen.getByRole("separator", { name: "Resize panel" });
-    const panel = screen.getByTestId("terminals-panel");
-
-    expect(handle.nextElementSibling).toBe(panel);
-    expect(panel.contains(handle)).toBe(false);
-    expect(handle.closest(".overflow-hidden, .overflow-auto, .overflow-y-auto")).toBeNull();
-    expect(handle.className).toMatch(/\bz-10\b/);
-  });
-});
-
 describe("TerminalsPanel navigation", () => {
   it("opens to the list view with all terminals visible and no terminal mounted", () => {
     renderPanel();
