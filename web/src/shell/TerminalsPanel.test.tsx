@@ -53,6 +53,7 @@ vi.mock("./NewTerminalButton", () => ({
 }));
 
 const useTerminalsMock = vi.mocked(useTerminals);
+const originalMatchMedia = window.matchMedia;
 
 function makeTerminal(id: string, name: string, session: string): TerminalInfo {
   return {
@@ -98,12 +99,19 @@ function renderPanel({
 beforeEach(() => {
   vi.useFakeTimers();
   useTerminalsMock.mockReset();
+  window.matchMedia = vi.fn((query: string) => ({
+    matches: query === "(min-width: 768px)",
+    media: query,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  })) as unknown as typeof window.matchMedia;
 });
 
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   vi.useRealTimers();
+  window.matchMedia = originalMatchMedia;
 });
 
 describe("TerminalsPanel resize handle geometry", () => {
