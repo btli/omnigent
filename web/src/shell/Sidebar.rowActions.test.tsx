@@ -1485,6 +1485,59 @@ describe("touch swipe actions", () => {
     }
   });
 
+  it.each([
+    { dx: -50, action: "archive" },
+    { dx: 50, action: "delete" },
+  ] as const)("commits a pause-then-fast flick toward $action", ({ dx, action }) => {
+    writeSwipeActions({ left: "archive", right: "delete" });
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    // The pause must not dilute the velocity of the final 50ms movement window.
+    pointerEventAt("pointerMove", li, { clientX: 100, clientY: 100 }, 1_500);
+    pointerEventAt("pointerMove", li, { clientX: 100 + Math.sign(dx) * 20, clientY: 100 }, 1_525);
+    pointerEventAt("pointerMove", li, { clientX: 100 + dx, clientY: 100 }, 1_550);
+    pointerEventAt("pointerUp", li, { clientX: 100 + dx, clientY: 100 }, 1_550);
+
+    if (action === "archive") {
+      expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+      expect(screen.queryByText("Delete conversation?")).toBeNull();
+    } else {
+      expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
+      expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each([-50, 50] as const)("does not commit a single-event short swipe at %dpx", (dx) => {
+    writeSwipeActions({ left: "archive", right: "delete" });
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerMove", li, { clientX: 100 + dx, clientY: 100 }, 1_500);
+    pointerEventAt("pointerUp", li, { clientX: 100 + dx, clientY: 100 }, 1_510);
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(screen.queryByText("Delete conversation?")).toBeNull();
+  });
+
+  it.each([-50, 50] as const)("does not commit a noisy slow short swipe at %dpx", (dx) => {
+    writeSwipeActions({ left: "archive", right: "delete" });
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    const direction = Math.sign(dx);
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerMove", li, { clientX: 100 + direction * 20, clientY: 100 }, 1_300);
+    pointerEventAt("pointerMove", li, { clientX: 100 + direction * 55, clientY: 100 }, 1_350);
+    pointerEventAt("pointerMove", li, { clientX: 100 + dx, clientY: 100 }, 1_400);
+    pointerEventAt("pointerUp", li, { clientX: 100 + dx, clientY: 100 }, 1_400);
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(screen.queryByText("Delete conversation?")).toBeNull();
+  });
+
   it.each([-40, 40] as const)("does not commit a slow short drag at %dpx", (dx) => {
     writeSwipeActions({ left: "archive", right: "delete" });
     renderSidebar();
