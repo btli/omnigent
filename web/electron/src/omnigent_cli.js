@@ -21,7 +21,6 @@ const { execFile, execFileSync } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const yaml = require("js-yaml");
 const url = require("./url");
 
 /** Default timeout for the short status commands. */
@@ -126,6 +125,20 @@ function stateDir() {
 
 /** Memoized machine host id (stable once generated; never cache a null). */
 let cachedHostId = null;
+let yamlParser = null;
+
+function loadYamlParser() {
+  if (yamlParser) return yamlParser;
+  try {
+    yamlParser = require("js-yaml");
+    return yamlParser;
+  } catch (error) {
+    throw new Error(
+      "Reading the CLI machine identity requires js-yaml. Reinstall Omnigent Desktop or install the Electron dependencies, then retry.",
+      { cause: error },
+    );
+  }
+}
 
 /**
  * This machine's Omnigent host id (bare 32-char hex, e.g. "ab12…"), read from
@@ -145,12 +158,19 @@ let cachedHostId = null;
  */
 function localHostId() {
   if (cachedHostId) return cachedHostId;
+  let contents;
   try {
-    const parsed = yaml.load(fs.readFileSync(path.join(localConfigDir(), "config.yaml"), "utf8"));
+    contents = fs.readFileSync(path.join(localConfigDir(), "config.yaml"), "utf8");
+  } catch {
+    return null;
+  }
+  const yaml = loadYamlParser();
+  try {
+    const parsed = yaml.load(contents);
     const id = parsed && typeof parsed === "object" ? parsed.host?.host_id : null;
     if (typeof id === "string" && id) cachedHostId = id.replace(/^host_/, "");
   } catch {
-    // No config yet, or unparseable.
+    // The config exists but is not valid YAML yet.
   }
   return cachedHostId;
 }
