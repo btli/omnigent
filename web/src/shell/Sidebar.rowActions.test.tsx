@@ -1279,6 +1279,15 @@ describe("touch swipe actions", () => {
     fireEvent(target, event);
   }
 
+  function pointerUpWithoutUsableX(target: Element, timeStamp: number) {
+    const event = createEvent.pointerUp(target, POINTER);
+    Object.defineProperties(event, {
+      clientX: { value: Number.NaN },
+      timeStamp: { value: timeStamp },
+    });
+    fireEvent(target, event);
+  }
+
   function moveSwipeRow(dx: number, durationMs = 500) {
     const link = screen.getByRole("link", { name: /My Session/ });
     const li = link.closest("li")!;
@@ -1557,6 +1566,91 @@ describe("touch swipe actions", () => {
       expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
       expect(mocks.archive.mutate).not.toHaveBeenCalled();
     }
+  });
+
+  it("commits when the final release-only segment crosses the distance threshold", () => {
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerMove", li, { clientX: 80, clientY: 100 }, 1_300);
+    pointerEventAt("pointerMove", li, { clientX: 40, clientY: 100 }, 1_500);
+    pointerEventAt("pointerUp", li, { clientX: 20, clientY: 100 }, 1_700);
+
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { dx: -50, action: "archive" },
+    { dx: 50, action: "delete" },
+  ] as const)("commits a release-only short flick toward $action", ({ dx, action }) => {
+    writeSwipeActions({ left: "archive", right: "delete" });
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerMove", li, { clientX: 100 + Math.sign(dx) * 20, clientY: 100 }, 1_500);
+    pointerEventAt("pointerUp", li, { clientX: 100 + dx, clientY: 100 }, 1_550);
+
+    if (action === "archive") {
+      expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+      expect(screen.queryByText("Delete conversation?")).toBeNull();
+    } else {
+      expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
+      expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    }
+  });
+
+  it("uses the release-time direction and snapshot action after a reversal", () => {
+    writeSwipeActions({ left: "archive", right: "delete" });
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerMove", li, { clientX: 80, clientY: 100 }, 1_300);
+    pointerEventAt("pointerMove", li, { clientX: 40, clientY: 100 }, 1_500);
+    act(() => writeSwipeActions({ left: "delete", right: "archive" }));
+    pointerEventAt("pointerUp", li, { clientX: 180, clientY: 100 }, 1_550);
+
+    expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  });
+
+  it("does not commit a noisy slow release-only segment", () => {
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerMove", li, { clientX: 80, clientY: 100 }, 1_300);
+    pointerEventAt("pointerMove", li, { clientX: 45, clientY: 100 }, 1_350);
+    pointerEventAt("pointerUp", li, { clientX: 50, clientY: 100 }, 1_400);
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(screen.queryByText("Delete conversation?")).toBeNull();
+  });
+
+  it("does not create a flick from an unusable pointer-up coordinate", () => {
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerMove", li, { clientX: 80, clientY: 100 }, 1_300);
+    pointerEventAt("pointerMove", li, { clientX: 50, clientY: 100 }, 1_500);
+    pointerUpWithoutUsableX(li, 1_510);
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  });
+
+  it("retains a valid distance commit when the pointer-up coordinate is unusable", () => {
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerMove", li, { clientX: 80, clientY: 100 }, 1_300);
+    pointerEventAt("pointerMove", li, { clientX: 20, clientY: 100 }, 1_500);
+    pointerUpWithoutUsableX(li, 1_510);
+
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
   });
 
   it.each([-50, 50] as const)("does not commit a single-event short swipe at %dpx", (dx) => {
