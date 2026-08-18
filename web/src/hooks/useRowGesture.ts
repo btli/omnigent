@@ -442,15 +442,24 @@ export function useRowGesture({
     (event: ReactPointerEvent) => {
       const gesture = state.current;
       if (!gesture || gesture.pointerId !== event.pointerId) return;
-      const resolvedPhase = gesture.phase;
-      const releaseX = Number.isFinite(event.clientX) ? event.clientX : null;
-      const offset =
-        resolvedPhase === "swipe" && releaseX !== null
-          ? swipeOffset(releaseX - gesture.startX)
-          : gesture.offset;
+      let resolvedPhase = gesture.phase;
+      const hasReleasePoint = Number.isFinite(event.clientX) && Number.isFinite(event.clientY);
+      const deltaX = hasReleasePoint ? event.clientX - gesture.startX : 0;
+      const deltaY = hasReleasePoint ? event.clientY - gesture.startY : 0;
+      if (
+        resolvedPhase === "pending" &&
+        Math.abs(deltaX) >= ROW_SWIPE_ACTIVATE_PX &&
+        Math.abs(deltaX) > Math.abs(deltaY)
+      ) {
+        const releaseAction = deltaX < 0 ? gesture.actions.left : gesture.actions.right;
+        if (swipeEnabled && releaseAction !== "none") resolvedPhase = "swipe";
+      }
+      const offset = resolvedPhase === "swipe" && hasReleasePoint ? swipeOffset(deltaX) : 0;
       const action =
         offset < 0 ? gesture.actions.left : offset > 0 ? gesture.actions.right : "none";
-      const velocity = releaseX === null ? 0 : releaseVelocity(gesture, releaseX, event.timeStamp);
+      const velocity = hasReleasePoint
+        ? releaseVelocity(gesture, event.clientX, event.timeStamp)
+        : 0;
       const isFlick =
         Math.abs(offset) >= ROW_SWIPE_FLICK_MIN_PX &&
         Math.sign(velocity) === Math.sign(offset) &&
@@ -466,7 +475,7 @@ export function useRowGesture({
         onAction(action);
       }
     },
-    [onAction, reset, suppressTrailingClick],
+    [onAction, reset, suppressTrailingClick, swipeEnabled],
   );
 
   const onPointerCancel = useCallback(
