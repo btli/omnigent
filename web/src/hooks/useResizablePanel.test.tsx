@@ -23,7 +23,9 @@ function setInnerWidth(px: number): void {
 
 function installMatchMedia(): void {
   window.matchMedia = vi.fn((query: string) => ({
-    matches: query === "(pointer: coarse)" ? coarsePointer : desktopMatches,
+    get matches() {
+      return query === "(pointer: coarse)" ? coarsePointer : desktopMatches;
+    },
     media: query,
     onchange: null,
     addListener: () => {},

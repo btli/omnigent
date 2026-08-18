@@ -503,7 +503,9 @@ describe("useResizableInlinePanel pointer drag", () => {
     let coarse = false;
     let onChange: ((event: MediaQueryListEvent) => void) | undefined;
     window.matchMedia = ((query: string) => ({
-      matches: query === "(pointer: coarse)" ? coarse : false,
+      get matches() {
+        return query === "(pointer: coarse)" ? coarse : false;
+      },
       media: query,
       onchange: null,
       addListener: () => {},
