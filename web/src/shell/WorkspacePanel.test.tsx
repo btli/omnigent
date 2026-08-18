@@ -706,6 +706,8 @@ describe("WorkspacePanel resize handle geometry", () => {
     expect(panel).toHaveClass("md:overflow-hidden");
     expect(panel).not.toContainElement(separator);
     expect(separator).toHaveClass("md:absolute", "md:inset-y-0");
+    expect(separator).toHaveClass("z-50");
+    expect(panel).toHaveClass("z-40");
     expect(separator).not.toHaveClass("shrink-0");
     expect(separator.style.right).toBe("360px");
   });
@@ -744,7 +746,7 @@ describe("WorkspacePanel resize handle geometry", () => {
 
     const separator = screen.getByRole("separator", { name: "Resize panel" });
     expect(separator.className).toBe(
-      "z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:absolute md:inset-y-0 md:block",
+      "z-50 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:absolute md:inset-y-0 md:block",
     );
     expect(separator.style.boxSizing).toBe("content-box");
     expect(separator.style.backgroundClip).toBe("content-box");
