@@ -6,7 +6,32 @@
 
 const { describe, it, mock, afterEach } = require("node:test");
 const assert = require("node:assert/strict");
+const { spawnSync } = require("node:child_process");
 const fs = require("fs");
+const path = require("node:path");
+
+const CLI_MODULE = path.resolve(__dirname, "../src/omnigent_cli.js");
+
+function runWithoutYaml(source) {
+  return spawnSync(
+    process.execPath,
+    [
+      "--eval",
+      `const Module = require("node:module");
+const load = Module._load;
+Module._load = function(request, ...args) {
+  if (request === "js-yaml") {
+    const error = new Error("Cannot find module 'js-yaml'");
+    error.code = "MODULE_NOT_FOUND";
+    throw error;
+  }
+  return load.call(this, request, ...args);
+};
+${source}`,
+    ],
+    { encoding: "utf8" },
+  );
+}
 
 const {
   normalizeServerUrl,
@@ -36,6 +61,34 @@ describe("normalizeServerUrl", () => {
     assert.equal(normalizeServerUrl(undefined), "");
     assert.equal(normalizeServerUrl(null), "");
     assert.equal(normalizeServerUrl(42), "");
+  });
+});
+
+describe("optional YAML dependency", () => {
+  it("loads general CLI helpers when js-yaml is unavailable", () => {
+    const result = runWithoutYaml(`
+const cli = require(${JSON.stringify(CLI_MODULE)});
+console.log(cli.normalizeServerUrl("https://server.example/"));
+`);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), "https://server.example");
+  });
+
+  it("reports an actionable error when machine identity needs missing js-yaml", () => {
+    const result = runWithoutYaml(`
+try {
+  const cli = require(${JSON.stringify(CLI_MODULE)});
+  require("node:fs").readFileSync = () => "host:\\n  host_id: host_abc123\\n";
+  cli.localHostId();
+  process.exitCode = 2;
+} catch (error) {
+  console.log(error.message);
+}
+`);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /machine identity.*js-yaml.*Electron dependencies/i);
   });
 });
 
@@ -455,6 +508,7 @@ describe("localHostId", () => {
   // The id is memoized process-wide, so this is the ONLY case that may call
   // localHostId — a second one would read the cache, not the mocked file.
   it("strips the legacy host_ prefix so the id matches a /v1/hosts row", () => {
+    require("js-yaml");
     mock.method(fs, "readFileSync", () => "host:\n  host_id: host_abc123\n  name: laptop\n");
 
     // The renderer compares this against host_id as a plain string, so the
