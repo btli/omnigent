@@ -3359,14 +3359,16 @@ function ConversationRow({
   const gestureEnabled = hasTouch && !selectionMode && !isEditing;
   const [contextMenuOpen, setContextMenuOpen] = useState(false);
   const rowLinkRef = useRef<HTMLAnchorElement>(null);
-  const handleContextMenuOpenChange = useCallback(
-    (open: boolean) => {
-      setContextMenuOpen(open);
-      if (!open && !isMobile) rowLinkRef.current?.focus({ preventScroll: true });
-    },
-    [isMobile],
-  );
+  const touchContextMenuRef = useRef(false);
+  const handleContextMenuOpenChange = useCallback((open: boolean) => {
+    setContextMenuOpen(open);
+    if (!open) {
+      if (!touchContextMenuRef.current) rowLinkRef.current?.focus({ preventScroll: true });
+      touchContextMenuRef.current = false;
+    }
+  }, []);
   const openContextMenuAt = useCallback((point: { clientX: number; clientY: number }) => {
+    touchContextMenuRef.current = true;
     const event = new MouseEvent("contextmenu", {
       bubbles: true,
       cancelable: true,
@@ -3676,6 +3678,9 @@ function ConversationRow({
       ref={setRowRef}
       data-testid="conversation-swipe-frame"
       {...rowGestureListeners}
+      onContextMenuCapture={(e) => {
+        if (!(ROW_MENU_SYNTHETIC in e.nativeEvent)) touchContextMenuRef.current = false;
+      }}
       onContextMenu={(e) => {
         if (ROW_MENU_SYNTHETIC in e.nativeEvent) return;
         if (ownsPointer || isDragging) e.preventDefault();
