@@ -1540,6 +1540,51 @@ describe("touch swipe actions", () => {
     expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
   });
 
+  it("promotes a pending release-only gesture and commits by distance", () => {
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerUp", li, { clientX: 20, clientY: 100 }, 1_500);
+
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { dx: -50, action: "archive" },
+    { dx: 50, action: "delete" },
+  ] as const)("promotes a pending release-only flick toward $action", ({ dx, action }) => {
+    writeSwipeActions({ left: "archive", right: "delete" });
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerUp", li, { clientX: 100 + dx, clientY: 100 }, 1_050);
+
+    if (action === "archive") {
+      expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+      expect(screen.queryByText("Delete conversation?")).toBeNull();
+    } else {
+      expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
+      expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each([
+    { dx: -80, dy: 90 },
+    { dx: 80, dy: 80 },
+  ])("does not promote a pending $dx,$dy release without horizontal intent", ({ dx, dy }) => {
+    writeSwipeActions({ left: "archive", right: "delete" });
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerUp", li, { clientX: 100 + dx, clientY: 100 + dy }, 1_050);
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(screen.queryByText("Delete conversation?")).toBeNull();
+  });
+
   it.each([
     { dx: -50, action: "archive" },
     { dx: 50, action: "delete" },
@@ -1601,7 +1646,7 @@ describe("touch swipe actions", () => {
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
   });
 
-  it("retains a valid distance commit when the pointer-up coordinate is unusable", () => {
+  it("does not commit a stale distance when the pointer-up coordinate is unusable", () => {
     renderSidebar();
     const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
 
@@ -1610,7 +1655,7 @@ describe("touch swipe actions", () => {
     pointerEventAt("pointerMove", li, { clientX: 20, clientY: 100 }, 1_500);
     pointerUpWithoutUsableX(li, 1_510);
 
-    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
   });
 
   it.each([-50, 50] as const)("does not commit a single-event short swipe at %dpx", (dx) => {
