@@ -75,6 +75,7 @@ export function TerminalsPanel({
 }: TerminalsPanelProps) {
   const [expanded, setExpanded] = useState(false);
   const ref = useRef<HTMLElement>(null);
+  const { panelWidth, handleProps, isDesktop } = useResizablePanel(open);
   const {
     terminals,
     activeKey,
@@ -86,8 +87,7 @@ export function TerminalsPanel({
     listWidth,
     splitRef,
     columnHandleProps,
-  } = useTerminalSplit(conversationId);
-  const { panelWidth, handleProps, isDesktop } = useResizablePanel(open);
+  } = useTerminalSplit(conversationId, isDesktop && open);
   const keyboardInset = useIOSNativeKeyboardInset(open);
   const panelStyle: CSSProperties | undefined =
     fluid || keyboardInset > 0

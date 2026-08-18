@@ -7,7 +7,7 @@
 //   4. No link button is rendered when onCopyCommentLink is omitted.
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Comment } from "@/hooks/useComments";
 import { getCurrentAuthorId } from "@/lib/identity";
 import type { ActiveSelection } from "./codeViewerHelpers";
@@ -22,6 +22,16 @@ vi.mock("@/lib/identity", () => ({
   getCurrentAuthorId: vi.fn<() => string | null>(() => null),
 }));
 const mockGetCurrentAuthorId = vi.mocked(getCurrentAuthorId);
+const originalMatchMedia = window.matchMedia;
+
+function setDesktopViewport(matches: boolean): void {
+  window.matchMedia = vi.fn((query: string) => ({
+    matches: query === "(min-width: 768px)" ? matches : false,
+    media: query,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  })) as unknown as typeof window.matchMedia;
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -68,7 +78,12 @@ function renderPanel(
   );
 }
 
-afterEach(cleanup);
+beforeEach(() => setDesktopViewport(true));
+
+afterEach(() => {
+  cleanup();
+  window.matchMedia = originalMatchMedia;
+});
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -408,7 +423,7 @@ describe("CommentsPanel show more / less", () => {
 //
 // The panel is resizable on desktop via a left-edge drag handle, and stacks
 // full-width (no inline width, no handle) on a narrow/mobile viewport. Desktop
-// vs mobile is decided from window.innerWidth (jsdom defaults to 1024 ≥ md).
+// vs mobile is decided from the canonical md media query.
 
 describe("CommentsPanel resize affordance", () => {
   it("renders a resize handle and applies an inline width on desktop", () => {
@@ -423,6 +438,7 @@ describe("CommentsPanel resize affordance", () => {
   it("omits the handle and inline width on a narrow (mobile) viewport", () => {
     const orig = window.innerWidth;
     Object.defineProperty(window, "innerWidth", { configurable: true, value: 500 });
+    setDesktopViewport(false);
     try {
       renderPanel([makeComment("c1")], []);
       // No drag handle, and the panel falls back to the w-full class (no inline width).
