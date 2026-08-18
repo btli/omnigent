@@ -3233,6 +3233,13 @@ function ConversationRow({
   const gestureEnabled = hasTouch && !selectionMode && !isEditing;
   const [contextMenuOpen, setContextMenuOpen] = useState(false);
   const rowLinkRef = useRef<HTMLAnchorElement>(null);
+  const handleContextMenuOpenChange = useCallback(
+    (open: boolean) => {
+      setContextMenuOpen(open);
+      if (!open && !isMobile) rowLinkRef.current?.focus({ preventScroll: true });
+    },
+    [isMobile],
+  );
   const openContextMenuAt = useCallback((point: { clientX: number; clientY: number }) => {
     const event = new MouseEvent("contextmenu", {
       bubbles: true,
@@ -3666,7 +3673,11 @@ function ConversationRow({
           )
         ) : projectFlyoutName ? (
           <HoverCard openDelay={150} closeDelay={0}>
-            <ContextMenu modal={false} open={contextMenuOpen} onOpenChange={setContextMenuOpen}>
+            <ContextMenu
+              modal={false}
+              open={contextMenuOpen}
+              onOpenChange={handleContextMenuOpenChange}
+            >
               <ContextMenuTrigger asChild>
                 <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
               </ContextMenuTrigger>
@@ -3685,7 +3696,11 @@ function ConversationRow({
             />
           </HoverCard>
         ) : isMobile ? (
-          <ContextMenu modal={false} open={contextMenuOpen} onOpenChange={setContextMenuOpen}>
+          <ContextMenu
+            modal={false}
+            open={contextMenuOpen}
+            onOpenChange={handleContextMenuOpenChange}
+          >
             <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
             <ContextMenuContent className="min-w-44">
               <ConversationMenuItems
@@ -3697,7 +3712,11 @@ function ConversationRow({
           </ContextMenu>
         ) : (
           <Tooltip>
-            <ContextMenu modal={false} open={contextMenuOpen} onOpenChange={setContextMenuOpen}>
+            <ContextMenu
+              modal={false}
+              open={contextMenuOpen}
+              onOpenChange={handleContextMenuOpenChange}
+            >
               <ContextMenuTrigger asChild>
                 <div className="w-full">
                   <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
