@@ -1015,6 +1015,17 @@ describe("mark as unread", () => {
 });
 
 describe("right-click context menu", () => {
+  it("returns keyboard focus to the row after a desktop context menu closes", () => {
+    renderSidebar();
+    const link = screen.getByRole("link", { name: /My Session/ });
+
+    fireEvent.contextMenu(link);
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+    fireEvent.keyDown(screen.getByTestId("rename-conversation"), { key: "Escape" });
+
+    expect(link).toHaveFocus();
+  });
+
   it("dismisses a touch-opened menu when the same finger drags away", async () => {
     mocks.isMobile = true;
     mocks.anyCoarse = true;
@@ -1468,6 +1479,62 @@ describe("touch swipe actions", () => {
     expect(screen.queryByText("Delete conversation?")).toBeNull();
   });
 
+  it("uses pointer-down eligibility when settings disable swipe before a pending release", () => {
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    act(() => writeSwipeActions({ left: "none", right: "none" }));
+    pointerEventAt("pointerUp", li, { clientX: 20, clientY: 100 }, 1_500);
+
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it("bounds raw swipe-move rendering to one animation frame", () => {
+    const frames: FrameRequestCallback[] = [];
+    const requestFrame = vi
+      .spyOn(window, "requestAnimationFrame")
+      .mockImplementation((callback) => (frames.push(callback), frames.length));
+    const cancelFrame = vi.spyOn(window, "cancelAnimationFrame").mockImplementation(() => {});
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerMove", li, { clientX: 80, clientY: 100 }, 1_010);
+    pointerEventAt("pointerMove", li, { clientX: 60, clientY: 100 }, 1_020);
+    pointerEventAt("pointerMove", li, { clientX: 40, clientY: 100 }, 1_030);
+
+    expect(requestFrame).toHaveBeenCalledTimes(1);
+    expect(frames).toHaveLength(1);
+    act(() => frames[0](1_040));
+    expect(li.querySelector('[style*="margin-right"]')).toHaveStyle({ marginRight: "60px" });
+    requestFrame.mockRestore();
+    cancelFrame.mockRestore();
+  });
+
+  it("releases the armed touch guard when an ineligible row yields to scroll", () => {
+    vi.useFakeTimers();
+    mockConversations([{ ...CONV, owner: "other@example.com" }]);
+    renderSidebar();
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-shared"));
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    act(() => vi.advanceTimersByTime(400));
+    pointerEventAt("pointerMove", li, { clientX: 115, clientY: 100 }, 1_410);
+    const touchMove = new TouchEvent("touchmove", { bubbles: true, cancelable: true });
+    document.dispatchEvent(touchMove);
+    const prevented = touchMove.defaultPrevented;
+    vi.useRealTimers();
+
+    expect(prevented).toBe(false);
+  });
+
   it("does not fire the action for a short swipe below the commit threshold", () => {
     renderSidebar();
 
@@ -1701,6 +1768,10 @@ describe("touch swipe actions", () => {
   });
 
   it("resets an armed swipe when pointer capture is unexpectedly lost", () => {
+    const frames: FrameRequestCallback[] = [];
+    const requestFrame = vi
+      .spyOn(window, "requestAnimationFrame")
+      .mockImplementation((callback) => (frames.push(callback), frames.length));
     renderSidebar();
 
     const link = screen.getByRole("link", { name: /My Session/ });
@@ -1708,6 +1779,7 @@ describe("touch swipe actions", () => {
     fireEvent.pointerDown(li, { ...POINTER, clientX: 200, clientY: 100 });
     fireEvent.pointerMove(li, { ...POINTER, clientX: 180, clientY: 100 });
     fireEvent.pointerMove(li, { ...POINTER, clientX: 100, clientY: 100 });
+    act(() => frames[0](performance.now()));
     expect(li.querySelector('[style*="margin-right"]')).toHaveStyle({
       marginRight: "81.33333333333333px",
     });
@@ -1718,6 +1790,7 @@ describe("touch swipe actions", () => {
     fireEvent.pointerUp(li, { ...POINTER, clientX: 100, clientY: 100 });
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
     expect(mocks.del.mutate).not.toHaveBeenCalled();
+    requestFrame.mockRestore();
   });
 
   it.each([
