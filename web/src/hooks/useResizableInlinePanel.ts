@@ -26,14 +26,17 @@ const PANEL_SLIVER_PX = 8;
 
 function gutterStyle(isCoarse: boolean): React.CSSProperties {
   const gutter = isCoarse ? COARSE_GUTTER_PX : FINE_GUTTER_PX;
-  const inset = (gutter - PAINTED_STRIP_PX) / 2;
+  const panelPad = PANEL_SLIVER_PX + gutter - PAINTED_STRIP_PX;
   return {
     touchAction: "none",
     boxSizing: "content-box",
-    paddingLeft: CHAT_SLIVER_PX + inset,
-    paddingRight: PANEL_SLIVER_PX + inset,
+    // Absolute positioning resolves the negative end margin against the panel
+    // seam. Keep only the bounded sliver on the transcript side; place the
+    // gutter footprint inward so transcript scrolling retains the next pixel.
+    paddingLeft: CHAT_SLIVER_PX,
+    paddingRight: panelPad,
     marginLeft: -CHAT_SLIVER_PX,
-    marginRight: -PANEL_SLIVER_PX,
+    marginRight: -(PAINTED_STRIP_PX + panelPad),
     backgroundClip: "content-box",
   };
 }

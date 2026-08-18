@@ -470,16 +470,16 @@ describe("useResizableInlinePanel pointer drag", () => {
     expect(result.current.panelWidth).toBe(800);
   });
 
-  it("returns a 24px fine-pointer target with a 10px gutter footprint", () => {
+  it("returns a 24px fine-pointer target without annexing the transcript", () => {
     const { result } = renderHook(() => useResizableInlinePanel(SESSION));
 
     expect(result.current.handleProps.style).toMatchObject({
       touchAction: "none",
       boxSizing: "content-box",
-      paddingLeft: 9,
-      paddingRight: 11,
+      paddingLeft: 6,
+      paddingRight: 14,
       marginLeft: -6,
-      marginRight: -8,
+      marginRight: -18,
       backgroundClip: "content-box",
     });
   });
@@ -521,10 +521,10 @@ describe("useResizableInlinePanel pointer drag", () => {
       act(() => onChange?.({ matches: true } as MediaQueryListEvent));
 
       expect(result.current.handleProps.style).toMatchObject({
-        paddingLeft: 10,
-        paddingRight: 12,
+        paddingLeft: 6,
+        paddingRight: 16,
         marginLeft: -6,
-        marginRight: -8,
+        marginRight: -20,
       });
     } finally {
       window.matchMedia = originalMatchMedia;
@@ -536,7 +536,10 @@ describe("useResizableInlinePanel pointer drag", () => {
 
     // TranscriptScrollbar's resting thumb occupies the 6–12px band from the
     // chat edge, so the resize target must stop at or before 6px.
-    expect(Math.abs(Number(result.current.handleProps.style?.marginLeft))).toBeLessThanOrEqual(6);
+    const style = result.current.handleProps.style;
+    const targetWidth = 4 + Number(style?.paddingLeft ?? 0) + Number(style?.paddingRight ?? 0);
+    const chatOverlap = targetWidth + Number(style?.marginRight ?? 0);
+    expect(chatOverlap).toBeLessThanOrEqual(6);
   });
 });
 
