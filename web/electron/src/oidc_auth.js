@@ -1,7 +1,7 @@
 "use strict";
 
 const { setTimeout: delay } = require("node:timers/promises");
-const { isLoopbackServer } = require("./omnigent_cli");
+const { isLoopbackServer } = require("./url");
 
 const AUTH_PROBE_TIMEOUT_MS = 10000;
 const OIDC_LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
