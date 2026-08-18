@@ -3562,7 +3562,11 @@ function ConversationRow({
   // icon and tint). `isSwiping` gates every bit of swipe-only markup/styling, so
   // a row at rest renders exactly as it did before the gesture existed.
   const swipingAction: SwipeAction =
-    gesture.dx < 0 ? swipeActions.left : gesture.dx > 0 ? swipeActions.right : "none";
+    gesture.dx < 0
+      ? (gesture.actions?.left ?? swipeActions.left)
+      : gesture.dx > 0
+        ? (gesture.actions?.right ?? swipeActions.right)
+        : "none";
   const isSwiping = gesture.dx !== 0 && swipingAction !== "none";
   const swipeCommitted = Math.abs(gesture.dx) >= ROW_SWIPE_COMMIT_PX;
   const ownsPointer = gesture.phase === "armed" || gesture.phase === "drag";
