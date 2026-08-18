@@ -33,6 +33,10 @@ ${source}`,
   );
 }
 
+function runIsolated(source) {
+  return spawnSync(process.execPath, ["--eval", source], { encoding: "utf8" });
+}
+
 const {
   normalizeServerUrl,
   isLoopbackServer,
@@ -89,6 +93,53 @@ try {
 
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /machine identity.*js-yaml.*Electron dependencies/i);
+  });
+
+  it("does not misreport an unrelated js-yaml initialization failure as missing", () => {
+    const result = runIsolated(`
+const Module = require("node:module");
+const load = Module._load;
+Module._load = function(request, ...args) {
+  if (request === "js-yaml") throw new Error("parser initialization failed");
+  return load.call(this, request, ...args);
+};
+const cli = require(${JSON.stringify(CLI_MODULE)});
+require("node:fs").readFileSync = () => "host:\\n  host_id: host_abc123\\n";
+try { cli.localHostId(); } catch (error) { console.log(error.message); }
+`);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), "parser initialization failed");
+  });
+
+  it("returns null for a missing config but preserves unrelated read errors", () => {
+    const missing = runIsolated(`
+const cli = require(${JSON.stringify(CLI_MODULE)});
+require("node:fs").readFileSync = () => { const error = new Error("missing"); error.code = "ENOENT"; throw error; };
+console.log(cli.localHostId() === null);
+`);
+    assert.equal(missing.status, 0, missing.stderr);
+    assert.equal(missing.stdout.trim(), "true");
+
+    const denied = runIsolated(`
+const cli = require(${JSON.stringify(CLI_MODULE)});
+require("node:fs").readFileSync = () => { const error = new Error("permission denied"); error.code = "EACCES"; throw error; };
+try { cli.localHostId(); } catch (error) { console.log(error.message); }
+`);
+    assert.equal(denied.status, 0, denied.stderr);
+    assert.equal(denied.stdout.trim(), "permission denied");
+  });
+
+  it("returns null for malformed YAML", () => {
+    const result = runIsolated(`
+const cli = require(${JSON.stringify(CLI_MODULE)});
+require("js-yaml");
+require("node:fs").readFileSync = () => "host: [unterminated";
+console.log(cli.localHostId() === null);
+`);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), "true");
   });
 });
 
