@@ -44,6 +44,7 @@ interface ActiveRowGesture {
   target: Element;
   sensorTarget: Element;
   offset: number;
+  actions: SwipeActionPreferences;
 }
 
 interface RowGestureDndState {
@@ -281,6 +282,9 @@ export function useRowGesture({
         target: event.currentTarget,
         sensorTarget: target instanceof Element ? target : event.currentTarget,
         offset: 0,
+        // A live Settings change must affect the next gesture, not change the
+        // meaning of a finger that is already down.
+        actions,
       };
       state.current = gesture;
       setPhase("pending");
@@ -305,7 +309,16 @@ export function useRowGesture({
         onLongPress({ clientX: gesture.lastX, clientY: gesture.lastY });
       }, ROW_GESTURE_HOLD_MS);
     },
-    [armTouchMoveGuard, capturePointer, enabled, onLongPress, onPickUp, reset, setGesturePhase],
+    [
+      actions,
+      armTouchMoveGuard,
+      capturePointer,
+      enabled,
+      onLongPress,
+      onPickUp,
+      reset,
+      setGesturePhase,
+    ],
   );
 
   const onPointerMove = useCallback(
@@ -340,7 +353,7 @@ export function useRowGesture({
         // Reversing past the origin crosses into the other direction, which may
         // be configured inert. Rest the row there and stop claiming the gesture,
         // rather than translating with nothing revealed behind it.
-        const reversedInto = deltaX < 0 ? actions.left : actions.right;
+        const reversedInto = deltaX < 0 ? gesture.actions.left : gesture.actions.right;
         if (reversedInto === "none") {
           gesture.offset = 0;
           setDx(0);
@@ -358,7 +371,7 @@ export function useRowGesture({
       // (e.g. 18,17.5 satisfies both) — this check running first is what gives
       // swipe precedence; everything it declines waits for the 25px circle.
       if (horizontal >= ROW_SWIPE_ACTIVATE_PX && horizontal > vertical) {
-        const action = deltaX < 0 ? actions.left : actions.right;
+        const action = deltaX < 0 ? gesture.actions.left : gesture.actions.right;
         if (!swipeEnabled || action === "none") {
           clearHoldTimer();
           setGesturePhase(gesture, "scroll");
@@ -378,8 +391,6 @@ export function useRowGesture({
       }
     },
     [
-      actions.left,
-      actions.right,
       capturePointer,
       clearHoldTimer,
       dragEnabled,
@@ -396,7 +407,7 @@ export function useRowGesture({
       if (!gesture || gesture.pointerId !== event.pointerId) return;
       const resolvedPhase = gesture.phase;
       const offset = gesture.offset;
-      const action = offset < 0 ? actions.left : actions.right;
+      const action = offset < 0 ? gesture.actions.left : gesture.actions.right;
       reset();
 
       if (resolvedPhase !== "pending") suppressTrailingClick();
@@ -408,7 +419,7 @@ export function useRowGesture({
         onAction(action);
       }
     },
-    [actions.left, actions.right, onAction, reset, suppressTrailingClick],
+    [onAction, reset, suppressTrailingClick],
   );
 
   const onPointerCancel = useCallback(
