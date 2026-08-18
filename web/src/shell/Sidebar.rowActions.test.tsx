@@ -1060,6 +1060,35 @@ describe("right-click context menu", () => {
     expect(link).toHaveFocus();
   });
 
+  it("does not force focus to the row after a touch long-press menu closes", () => {
+    vi.useFakeTimers();
+    try {
+      mocks.isMobile = true;
+      mocks.anyCoarse = true;
+      renderSidebar();
+      const link = screen.getByRole("link", { name: /My Session/ });
+      const pointer = {
+        pointerId: 1,
+        pointerType: "touch",
+        isPrimary: true,
+        button: 0,
+        clientX: 200,
+        clientY: 100,
+      };
+
+      fireEvent.pointerDown(link, pointer);
+      act(() => vi.advanceTimersByTime(400));
+      expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+
+      fireEvent.keyDown(screen.getByTestId("rename-conversation"), { key: "Escape" });
+
+      expect(screen.queryByTestId("rename-conversation")).toBeNull();
+      expect(link).not.toHaveFocus();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("dismisses a touch-opened menu when the same finger drags away", async () => {
     mocks.isMobile = true;
     mocks.anyCoarse = true;
