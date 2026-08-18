@@ -20,6 +20,7 @@ export const ROW_SWIPE_ACTIVATE_PX = 12;
 export const ROW_SWIPE_COMMIT_PX = 72;
 export const ROW_SWIPE_FLICK_MIN_PX = 48;
 export const ROW_SWIPE_FLICK_VELOCITY_PX_MS = 0.5;
+export const ROW_SWIPE_FLICK_WINDOW_MS = 100;
 // Native touch slop is typically 8-10dp; 10px filters hold tremble while
 // keeping a deliberate pull immediate.
 export const ROW_DRAG_ACTIVATE_PX = 10;
@@ -31,6 +32,7 @@ const ROW_SCROLL_ACTIVATE_PX = 25;
 const ROW_HOLD_TOLERANCE_PX = 20;
 const ROW_SWIPE_MAX_PX = 96;
 const ROW_SWIPE_RESIST = 1 / 3;
+const ROW_SWIPE_MAX_SAMPLES = 8;
 
 export type RowGesturePhase = "idle" | "pending" | "swipe" | "scroll" | "armed" | "drag";
 
@@ -38,7 +40,6 @@ interface ActiveRowGesture {
   pointerId: number;
   startX: number;
   startY: number;
-  startedAt: number;
   lastX: number;
   lastY: number;
   armX: number;
@@ -48,6 +49,12 @@ interface ActiveRowGesture {
   sensorTarget: Element;
   offset: number;
   actions: SwipeActionPreferences;
+  movementSamples: RowMovementSample[];
+}
+
+interface RowMovementSample {
+  x: number;
+  at: number;
 }
 
 interface RowGestureDndState {
@@ -115,6 +122,28 @@ function swipeOffset(deltaX: number): number {
   if (travel <= ROW_SWIPE_COMMIT_PX) return deltaX;
   const damped = ROW_SWIPE_COMMIT_PX + (travel - ROW_SWIPE_COMMIT_PX) * ROW_SWIPE_RESIST;
   return direction * Math.min(damped, ROW_SWIPE_MAX_PX);
+}
+
+function recordMovementSample(gesture: ActiveRowGesture, x: number, at: number) {
+  const samples = gesture.movementSamples;
+  const previous = samples.at(-1);
+  if (previous?.at === at) {
+    previous.x = x;
+  } else {
+    samples.push({ x, at });
+  }
+  const cutoff = at - ROW_SWIPE_FLICK_WINDOW_MS;
+  while (samples.length > ROW_SWIPE_MAX_SAMPLES || (samples.length > 1 && samples[0].at < cutoff)) {
+    samples.shift();
+  }
+}
+
+function releaseVelocity(gesture: ActiveRowGesture, x: number, at: number): number {
+  recordMovementSample(gesture, x, at);
+  const first = gesture.movementSamples[0];
+  const last = gesture.movementSamples.at(-1);
+  if (!first || !last || first === last || last.at <= first.at) return 0;
+  return (last.x - first.x) / (last.at - first.at);
 }
 
 function callDndListener(
@@ -279,7 +308,6 @@ export function useRowGesture({
         pointerId: event.pointerId,
         startX: event.clientX,
         startY: event.clientY,
-        startedAt: event.timeStamp,
         lastX: event.clientX,
         lastY: event.clientY,
         armX: event.clientX,
@@ -291,6 +319,7 @@ export function useRowGesture({
         // A live Settings change must affect the next gesture, not change the
         // meaning of a finger that is already down.
         actions,
+        movementSamples: [{ x: event.clientX, at: event.timeStamp }],
       };
       state.current = gesture;
       setActiveActions(actions);
@@ -335,6 +364,7 @@ export function useRowGesture({
       const deltaX = event.clientX - gesture.startX;
       const deltaY = event.clientY - gesture.startY;
       const moved = event.clientX !== gesture.lastX || event.clientY !== gesture.lastY;
+      recordMovementSample(gesture, event.clientX, event.timeStamp);
       gesture.lastX = event.clientX;
       gesture.lastY = event.clientY;
 
@@ -415,10 +445,11 @@ export function useRowGesture({
       const resolvedPhase = gesture.phase;
       const offset = gesture.offset;
       const action = offset < 0 ? gesture.actions.left : gesture.actions.right;
-      const elapsedMs = Math.max(event.timeStamp - gesture.startedAt, 1);
+      const velocity = releaseVelocity(gesture, event.clientX, event.timeStamp);
       const isFlick =
         Math.abs(offset) >= ROW_SWIPE_FLICK_MIN_PX &&
-        Math.abs(offset) / elapsedMs >= ROW_SWIPE_FLICK_VELOCITY_PX_MS;
+        Math.sign(velocity) === Math.sign(offset) &&
+        Math.abs(velocity) >= ROW_SWIPE_FLICK_VELOCITY_PX_MS;
       reset();
 
       if (resolvedPhase !== "pending") suppressTrailingClick();
