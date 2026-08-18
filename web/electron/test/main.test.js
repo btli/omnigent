@@ -35,6 +35,7 @@ const {
 } = require("../src/oidc_auth");
 
 const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
+const omnigentCliSource = readFileSync(path.join(__dirname, "../src/omnigent_cli.js"), "utf8");
 const preloadSource = readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
 const setupSource = readFileSync(path.join(__dirname, "../setup/index.html"), "utf8");
 const startLocalHandlerSource = setupSource.match(
@@ -502,6 +503,14 @@ describe("navigation fallback wiring (src/main.js)", () => {
 });
 
 describe("remote OIDC browser handoff wiring (src/main.js)", () => {
+  it("keeps js-yaml outside the main process startup import path", () => {
+    assert.match(mainSource, /const omnigentCli = require\("\.\/omnigent_cli"\)/);
+    const loaderIndex = omnigentCliSource.indexOf("function loadYamlParser");
+    assert.notEqual(loaderIndex, -1);
+    assert.doesNotMatch(omnigentCliSource.slice(0, loaderIndex), /require\("js-yaml"\)/);
+    assert.match(omnigentCliSource.slice(loaderIndex), /require\("js-yaml"\)/);
+  });
+
   it("wiring-only: uses the main-process ticket client without requiring the CLI", () => {
     assert.ok(oidcSessionCode);
     assert.match(oidcSessionCode, /runOidcBrowserLogin\(/);
