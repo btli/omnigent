@@ -8,7 +8,15 @@
 
 import { type ReactElement, type ReactNode, useSyncExternalStore } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  createEvent,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -1210,17 +1218,33 @@ describe("touch swipe actions", () => {
 
   // Drag the row and hold at `dx`, so a test can inspect the reveal mid-gesture.
   // `release` finishes it, carrying the same dx the drag ended on.
-  function moveSwipeRow(dx: number) {
+  function pointerEventAt(
+    type: "pointerDown" | "pointerMove" | "pointerUp",
+    target: Element,
+    init: Record<string, unknown>,
+    timeStamp: number,
+  ) {
+    const event = createEvent[type](target, { ...POINTER, ...init });
+    Object.defineProperty(event, "timeStamp", { value: timeStamp });
+    fireEvent(target, event);
+  }
+
+  function moveSwipeRow(dx: number, durationMs = 500) {
     const link = screen.getByRole("link", { name: /My Session/ });
     const li = link.closest("li")!;
-    fireEvent.pointerDown(li, { ...POINTER, clientX: 100, clientY: 100 });
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
     // First move locks the axis; the second carries it past the commit point.
-    fireEvent.pointerMove(li, { ...POINTER, clientX: 100 + Math.sign(dx) * 20, clientY: 100 });
-    fireEvent.pointerMove(li, { ...POINTER, clientX: 100 + dx, clientY: 100 });
+    pointerEventAt(
+      "pointerMove",
+      li,
+      { clientX: 100 + Math.sign(dx) * 20, clientY: 100 },
+      1_000 + durationMs / 2,
+    );
+    pointerEventAt("pointerMove", li, { clientX: 100 + dx, clientY: 100 }, 1_000 + durationMs);
     return {
       li,
       release() {
-        fireEvent.pointerUp(li, { ...POINTER, clientX: 100 + dx, clientY: 100 });
+        pointerEventAt("pointerUp", li, { clientX: 100 + dx, clientY: 100 }, 1_000 + durationMs);
         // Include the browser's trailing click, un-prevented: the row itself
         // must suppress it (see the trailing-click tests) — never the test.
         fireEvent.click(link);
@@ -1228,8 +1252,8 @@ describe("touch swipe actions", () => {
     };
   }
 
-  function swipeRow(dx: number) {
-    moveSwipeRow(dx).release();
+  function swipeRow(dx: number, durationMs = 500) {
+    moveSwipeRow(dx, durationMs).release();
   }
 
   // The reveal sitting behind the row is inert and shows only the icon for the
@@ -1426,7 +1450,9 @@ describe("touch swipe actions", () => {
     renderSidebar();
 
     const swipe = moveSwipeRow(-90);
+    expectRevealIcons(swipe.li, { shows: ".lucide-archive", hides: ".lucide-trash-2" });
     act(() => writeSwipeActions({ left: "delete", right: "none" }));
+    expectRevealIcons(swipe.li, { shows: ".lucide-archive", hides: ".lucide-trash-2" });
     swipe.release();
 
     expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
@@ -1439,6 +1465,47 @@ describe("touch swipe actions", () => {
     // Past the activation lock (20px) but short of the commit distance (72px).
     swipeRow(-40);
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { dx: -50, action: "archive" },
+    { dx: 50, action: "delete" },
+  ] as const)("commits a fast short flick toward $action", ({ dx, action }) => {
+    writeSwipeActions({ left: "archive", right: "delete" });
+    renderSidebar();
+
+    swipeRow(dx, 50);
+
+    if (action === "archive") {
+      expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+      expect(screen.queryByText("Delete conversation?")).toBeNull();
+    } else {
+      expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
+      expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each([-40, 40] as const)("does not commit a slow short drag at %dpx", (dx) => {
+    writeSwipeActions({ left: "archive", right: "delete" });
+    renderSidebar();
+
+    swipeRow(dx, 500);
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(screen.queryByText("Delete conversation?")).toBeNull();
+  });
+
+  it("does not treat fast vertical-dominant travel as a flick", () => {
+    writeSwipeActions({ left: "archive", right: "delete" });
+    renderSidebar();
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerMove", li, { clientX: 140, clientY: 160 }, 1_025);
+    pointerEventAt("pointerUp", li, { clientX: 140, clientY: 160 }, 1_050);
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(screen.queryByText("Delete conversation?")).toBeNull();
   });
 
   it("resets an armed swipe when pointer capture is unexpectedly lost", () => {

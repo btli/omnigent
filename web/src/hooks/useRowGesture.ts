@@ -18,6 +18,8 @@ import type { SwipeAction, SwipeActionPreferences } from "@/lib/swipeActionPrefe
 export const ROW_GESTURE_HOLD_MS = 400;
 export const ROW_SWIPE_ACTIVATE_PX = 12;
 export const ROW_SWIPE_COMMIT_PX = 72;
+export const ROW_SWIPE_FLICK_MIN_PX = 48;
+export const ROW_SWIPE_FLICK_VELOCITY_PX_MS = 0.5;
 // Native touch slop is typically 8-10dp; 10px filters hold tremble while
 // keeping a deliberate pull immediate.
 export const ROW_DRAG_ACTIVATE_PX = 10;
@@ -36,6 +38,7 @@ interface ActiveRowGesture {
   pointerId: number;
   startX: number;
   startY: number;
+  startedAt: number;
   lastX: number;
   lastY: number;
   armX: number;
@@ -146,6 +149,7 @@ export function useRowGesture({
 }) {
   const [dx, setDx] = useState(0);
   const [phase, setPhase] = useState<RowGesturePhase>("idle");
+  const [activeActions, setActiveActions] = useState<SwipeActionPreferences | null>(null);
   const state = useRef<ActiveRowGesture | null>(null);
   const holdTimer = useRef<number | null>(null);
   const suppressClick = useRef(false);
@@ -218,6 +222,7 @@ export function useRowGesture({
       state.current = null;
       setDx(0);
       setPhase("idle");
+      setActiveActions(null);
       if (cancelDrag) onCancel?.();
       if (cancelDrag && gesture.phase === "drag") {
         gesture.sensorTarget.dispatchEvent(
@@ -274,6 +279,7 @@ export function useRowGesture({
         pointerId: event.pointerId,
         startX: event.clientX,
         startY: event.clientY,
+        startedAt: event.timeStamp,
         lastX: event.clientX,
         lastY: event.clientY,
         armX: event.clientX,
@@ -287,6 +293,7 @@ export function useRowGesture({
         actions,
       };
       state.current = gesture;
+      setActiveActions(actions);
       setPhase("pending");
       holdTimer.current = window.setTimeout(() => {
         if (state.current !== gesture || gesture.phase !== "pending") return;
@@ -408,12 +415,16 @@ export function useRowGesture({
       const resolvedPhase = gesture.phase;
       const offset = gesture.offset;
       const action = offset < 0 ? gesture.actions.left : gesture.actions.right;
+      const elapsedMs = Math.max(event.timeStamp - gesture.startedAt, 1);
+      const isFlick =
+        Math.abs(offset) >= ROW_SWIPE_FLICK_MIN_PX &&
+        Math.abs(offset) / elapsedMs >= ROW_SWIPE_FLICK_VELOCITY_PX_MS;
       reset();
 
       if (resolvedPhase !== "pending") suppressTrailingClick();
       if (
         resolvedPhase === "swipe" &&
-        Math.abs(offset) >= ROW_SWIPE_COMMIT_PX &&
+        (Math.abs(offset) >= ROW_SWIPE_COMMIT_PX || isFlick) &&
         action !== "none"
       ) {
         onAction(action);
@@ -498,6 +509,7 @@ export function useRowGesture({
   return {
     dx,
     phase,
+    actions: activeActions,
     listeners: bindListeners,
     dndData,
     consumeClick,
