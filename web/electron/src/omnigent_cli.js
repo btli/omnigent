@@ -133,6 +133,12 @@ function loadYamlParser() {
     yamlParser = require("js-yaml");
     return yamlParser;
   } catch (error) {
+    if (
+      error?.code !== "MODULE_NOT_FOUND" ||
+      !/Cannot find module ['"]js-yaml['"]/.test(error.message)
+    ) {
+      throw error;
+    }
     throw new Error(
       "Reading the CLI machine identity requires js-yaml. Reinstall Omnigent Desktop or install the Electron dependencies, then retry.",
       { cause: error },
@@ -161,16 +167,17 @@ function localHostId() {
   let contents;
   try {
     contents = fs.readFileSync(path.join(localConfigDir(), "config.yaml"), "utf8");
-  } catch {
-    return null;
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
   }
   const yaml = loadYamlParser();
   try {
     const parsed = yaml.load(contents);
     const id = parsed && typeof parsed === "object" ? parsed.host?.host_id : null;
     if (typeof id === "string" && id) cachedHostId = id.replace(/^host_/, "");
-  } catch {
-    // The config exists but is not valid YAML yet.
+  } catch (error) {
+    if (!(error instanceof yaml.YAMLException)) throw error;
   }
   return cachedHostId;
 }
