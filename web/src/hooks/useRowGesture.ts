@@ -443,9 +443,14 @@ export function useRowGesture({
       const gesture = state.current;
       if (!gesture || gesture.pointerId !== event.pointerId) return;
       const resolvedPhase = gesture.phase;
-      const offset = gesture.offset;
-      const action = offset < 0 ? gesture.actions.left : gesture.actions.right;
-      const velocity = releaseVelocity(gesture, event.clientX, event.timeStamp);
+      const releaseX = Number.isFinite(event.clientX) ? event.clientX : null;
+      const offset =
+        resolvedPhase === "swipe" && releaseX !== null
+          ? swipeOffset(releaseX - gesture.startX)
+          : gesture.offset;
+      const action =
+        offset < 0 ? gesture.actions.left : offset > 0 ? gesture.actions.right : "none";
+      const velocity = releaseX === null ? 0 : releaseVelocity(gesture, releaseX, event.timeStamp);
       const isFlick =
         Math.abs(offset) >= ROW_SWIPE_FLICK_MIN_PX &&
         Math.sign(velocity) === Math.sign(offset) &&
