@@ -96,6 +96,7 @@ function attachContainer(
 
 beforeEach(() => {
   setInnerWidth(2000);
+  mockMatchMedia({ "(min-width: 768px)": true });
 });
 
 afterEach(() => {
@@ -255,7 +256,7 @@ describe("useResizableCommentsPanel pointer drag", () => {
   it("aborts the drag when the layout flips below the md breakpoint", () => {
     // Flipping to mobile unmounts the handle, so its up/cancel can never
     // arrive; the drag must end (unpersisted) or the overlay would wedge.
-    const mm = mockMatchMedia();
+    const mm = mockMatchMedia({ "(min-width: 768px)": true });
     const { result, unmount } = renderHook(() => useResizableCommentsPanel());
     attachContainer(result.current.containerRef);
     const target = makeHandleTarget();
@@ -423,7 +424,7 @@ describe("useResizableCommentsPanel touch affordances", () => {
   });
 
   it("exposes the width to assistive tech via aria value attributes", () => {
-    const { result, unmount } = renderHook(() => useResizableCommentsPanel());
+    const { result, rerender, unmount } = renderHook(() => useResizableCommentsPanel());
     expect(result.current.handleProps["aria-valuenow"]).toBe(240);
     expect(result.current.handleProps["aria-valuemin"]).toBe(200);
     expect(result.current.handleProps["aria-valuemax"]).toBe(640);
@@ -436,6 +437,20 @@ describe("useResizableCommentsPanel touch affordances", () => {
       } as React.KeyboardEvent);
     });
     expect(result.current.handleProps["aria-valuenow"]).toBe(260);
+
+    attachContainer(result.current.containerRef, { parentWidth: 500, panelRight: 500 });
+    rerender();
+    expect(result.current.handleProps["aria-valuemax"]).toBe(252);
+    unmount();
+  });
+
+  it("seeds desktop state from the canonical media query, not innerWidth", () => {
+    setInnerWidth(2000);
+    mockMatchMedia({ "(min-width: 768px)": false });
+    const { result, unmount } = renderHook(() => useResizableCommentsPanel());
+
+    expect(result.current.isDesktop).toBe(false);
+    expect(result.current.width).toBeUndefined();
     unmount();
   });
 

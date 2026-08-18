@@ -16,7 +16,7 @@
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useInputCapabilities } from "@/hooks/useInputCapabilities";
-import { MD_BREAKPOINT_PX, MD_MIN_WIDTH_QUERY } from "@/lib/breakpoints";
+import { MD_MIN_WIDTH_QUERY, isMobileViewport } from "@/lib/breakpoints";
 import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
 
 const DEFAULT_WIDTH_PX = 240; // matches the previous fixed `md:w-60`
@@ -155,7 +155,7 @@ export function useResizableCommentsPanel() {
   }, []);
 
   const [isDesktop, setIsDesktop] = useState(
-    () => typeof window !== "undefined" && window.innerWidth >= MD_BREAKPOINT_PX,
+    () => typeof window !== "undefined" && !isMobileViewport(),
   );
 
   useEffect(() => {
@@ -173,15 +173,38 @@ export function useResizableCommentsPanel() {
   // The divider gutter is a third flex child in the row, so its footprint
   // comes out of the budget too — always the coarse 8px, so a pointer-type
   // flip mid-session can never shrink the viewer below its minimum.
-  const clampWidth = useCallback((candidate: number): number => {
+  const reachableMax = useCallback((): number => {
     const parent = containerRef.current?.parentElement;
-    const parentWidth = parent?.getBoundingClientRect().width ?? window.innerWidth;
-    const max = Math.max(
+    const parentWidth =
+      parent?.getBoundingClientRect().width ??
+      (typeof window === "undefined" ? MAX_WIDTH_PX : window.innerWidth);
+    return Math.max(
       MIN_WIDTH_PX,
       Math.min(MAX_WIDTH_PX, parentWidth - MIN_VIEWER_PX - GUTTER_COARSE_PX),
     );
-    return Math.max(MIN_WIDTH_PX, Math.min(candidate, max));
   }, []);
+
+  const clampWidth = useCallback(
+    (candidate: number): number => Math.max(MIN_WIDTH_PX, Math.min(candidate, reachableMax())),
+    [reachableMax],
+  );
+
+  // A row can resize without the window changing (for example, the sidebar
+  // opens). Re-render so the separator's reachable ARIA maximum stays in sync.
+  const [, setConstraintVersion] = useState(0);
+  useEffect(() => {
+    const parent = containerRef.current?.parentElement;
+    if (!parent || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      setStoredWidth((prev) => {
+        const base = preferredWidth ?? prev;
+        return base !== null ? clampWidth(base) : prev;
+      });
+      setConstraintVersion((version) => version + 1);
+    });
+    observer.observe(parent);
+    return () => observer.disconnect();
+  }, [clampWidth]);
 
   // Ends the drag at the last applied width (never a half-state): clears the
   // active pointer, drops the overlay, and restores the body cursor/selection.
@@ -338,7 +361,7 @@ export function useResizableCommentsPanel() {
       "aria-label": "Resize comments panel",
       "aria-valuenow": width,
       "aria-valuemin": MIN_WIDTH_PX,
-      "aria-valuemax": MAX_WIDTH_PX,
+      "aria-valuemax": reachableMax(),
       tabIndex: 0,
       // The gutter owns its touches outright (no scroll/selection may start
       // from it). With content-box sizing the `w-1` class is the painted

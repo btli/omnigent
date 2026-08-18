@@ -704,7 +704,7 @@ export function WorkspacePanel({
         <div
           {...handleProps}
           data-workspace-panel-resize-gutter
-          className="z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:absolute md:inset-y-0 md:block"
+          className="z-50 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:absolute md:inset-y-0 md:block"
           style={{ ...handleProps.style, right: width }}
         />
       )}
@@ -835,7 +835,10 @@ export function WorkspacePanel({
           {/* 1px divider separating the static nav tabs from the open tabs.
                   Pinned (outside the scrolling file-tabs region), so it stays put
                   at every rail width while the tabs scroll past it. */}
-          <div aria-hidden className="mx-[8px] h-[14px] w-px shrink-0 self-center bg-border-strong" />
+          <div
+            aria-hidden
+            className="mx-[8px] h-[14px] w-px shrink-0 self-center bg-border-strong"
+          />
           {(openFiles.length > 0 || openTerminals.length > 0) && (
             <>
               {/* Open-tabs region (file tabs + shell tabs) — the horizontal
@@ -905,7 +908,11 @@ export function WorkspacePanel({
               size="icon-xs"
               className="flex size-6"
             >
-              {maximized ? <MinimizeIcon className="size-4" /> : <MaximizeIcon className="size-4" />}
+              {maximized ? (
+                <MinimizeIcon className="size-4" />
+              ) : (
+                <MaximizeIcon className="size-4" />
+              )}
             </Button>
           </WorkspaceTabTooltip>
         </div>
