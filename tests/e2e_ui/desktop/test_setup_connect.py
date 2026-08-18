@@ -1,15 +1,11 @@
 """Desktop setup-page connect flow (Electron shell).
 
 The desktop shell's setup page (``web/electron/setup/index.html``) is the
-user-facing "connect to a server" screen. This exercises it in a real browser:
-the scheme-defaulting this change added means a bare (or ``/omnigent``)
-Databricks workspace URL now connects over https on the first click instead of
-tripping the unencrypted-http warning that the old http:// default produced.
+user-facing "connect to a server" screen. This exercises its preload contract
+in a real browser, including recoverable main-process URL rejection.
 
-The setup page and the Electron main process share one module
-(``web/electron/src/url.js``), loaded here as ``window.omnigentUrl``, so the
-same ``normalizeUrl`` the main process navigates with is also verified in the
-browser — coverage the web-only harness cannot otherwise reach.
+URL normalization belongs to the Electron main process. It is exercised at its
+CommonJS module boundary rather than exposed to the setup renderer.
 
 These tests drive only the static page plus that shared module; they do not need
 the ``live_server`` omnigent backend.
@@ -18,15 +14,14 @@ the ``live_server`` omnigent backend.
 from __future__ import annotations
 
 import json
+import subprocess
 from collections.abc import Sequence
 from pathlib import Path
 
 from playwright.sync_api import Page, expect
 
-# Repo-root-relative path to the Electron setup page. Loading it via file://
-# resolves the page's relative ``<script src="../src/url.js">`` against
-# web/electron/src/url.js, so window.omnigentUrl is the real shared module.
 _SETUP_PAGE = Path(__file__).resolve().parents[3] / "web" / "electron" / "setup" / "index.html"
+_ELECTRON_DIR = _SETUP_PAGE.parent.parent
 
 # The setup page expects the Electron preload bridge (window.omnigentSetup),
 # which is absent in a plain browser. Stub it: reads feed page load, while
@@ -38,7 +33,16 @@ _PRELOAD_STUB = """
   window.omnigentSetup = {
     getServerUrl: () => Promise.resolve(""),
     getRecentServers: () => Promise.resolve(__RECENT_SERVERS__),
-    setServerUrl: (value) => { window.__connectCalls.push(value); return Promise.resolve(); },
+    setServerUrl: (value) => {
+      window.__connectCalls.push(value);
+      if (value === "http://example.databricks.com") {
+        return Promise.resolve({
+          loaded: false,
+          error: "Remote servers require HTTPS. Update the server address and try again.",
+        });
+      }
+      return Promise.resolve({ loaded: true });
+    },
     copyText: (value) => { window.__copiedTexts.push(value); return Promise.resolve(); },
   };
 """
@@ -79,26 +83,19 @@ def test_bare_workspace_url_connects_without_http_warning(page: Page) -> None:
     expect(page.locator("#err")).to_have_text("")
 
 
-def test_explicit_http_remote_still_warns_then_proceeds(page: Page) -> None:
-    """Explicit ``http://`` to a remote host still warns once, then proceeds.
-
-    The security warning must survive the scheme-default change: a user who
-    types ``http://`` to a remote host is warned on the first click and only
-    connects when they click again.
-    """
+def test_explicit_http_remote_surfaces_main_process_rejection(page: Page) -> None:
+    """The setup renderer surfaces a recoverable ``setServerUrl`` rejection."""
     _open_setup_page(page)
 
     page.fill("#url", "http://example.databricks.com")
     page.click("#connect")
 
-    # First click: warned, not connected.
-    expect(page.locator("#err")).to_contain_text("unencrypted")
-    assert page.evaluate("() => window.__connectCalls") == []
-
-    # Second click on the same value: proceeds past the warning.
-    page.click("#connect")
     page.wait_for_function("() => window.__connectCalls.length === 1")
     assert page.evaluate("() => window.__connectCalls") == ["http://example.databricks.com"]
+    expect(page.locator("#err")).to_have_text(
+        "Remote servers require HTTPS. Update the server address and try again."
+    )
+    expect(page.locator("#connect")).to_be_enabled()
 
 
 def test_loopback_connects_over_http_without_warning(page: Page) -> None:
@@ -138,25 +135,24 @@ def test_recent_server_connect_and_copy_actions_are_independent(page: Page) -> N
     assert page.evaluate("() => window.__connectCalls") == [recent_url]
 
 
-def test_shared_url_module_defaults_scheme_in_browser(page: Page) -> None:
-    """The shared url.js (also used by the main process) defaults the scheme.
-
-    The setup page loads ``web/electron/src/url.js`` as
-    ``window.omnigentUrl`` — the exact module the Electron main process uses to
-    normalize the URL it navigates to. Exercising it here covers the
-    main-process scheme logic the web-only e2e harness cannot otherwise reach.
-    """
-    _open_setup_page(page)
-
-    # Remote host → https; the guide's /omnigent suffix is preserved.
-    assert (
-        page.evaluate(
-            "() => window.omnigentUrl.normalizeUrl('dbc-x.cloud.databricks.com/omnigent')"
-        )
-        == "https://dbc-x.cloud.databricks.com/omnigent"
+def test_main_process_url_module_defaults_scheme() -> None:
+    """The main process's owning URL module preserves remote/local defaults."""
+    script = """
+const { normalizeUrl } = require("./src/url");
+console.log(JSON.stringify([
+  normalizeUrl("dbc-x.cloud.databricks.com/omnigent"),
+  normalizeUrl("localhost:6767"),
+]));
+"""
+    result = subprocess.run(
+        ["node", "--eval", script],
+        cwd=_ELECTRON_DIR,
+        check=True,
+        capture_output=True,
+        text=True,
     )
-    # Loopback stays http for local dev.
-    assert (
-        page.evaluate("() => window.omnigentUrl.normalizeUrl('localhost:6767')")
-        == "http://localhost:6767/"
-    )
+
+    assert json.loads(result.stdout) == [
+        "https://dbc-x.cloud.databricks.com/omnigent",
+        "http://localhost:6767/",
+    ]
