@@ -1025,7 +1025,8 @@ describe("mark as unread", () => {
 });
 
 describe("right-click context menu", () => {
-  it("returns keyboard focus to the row after a desktop context menu closes", () => {
+  it("returns focus after a desktop context menu closes at a narrow viewport", () => {
+    mocks.isMobile = true;
     renderSidebar();
     const link = screen.getByRole("link", { name: /My Session/ });
 
