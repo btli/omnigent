@@ -22,7 +22,6 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const yaml = require("js-yaml");
-
 const url = require("./url");
 
 /** Default timeout for the short status commands. */
@@ -56,13 +55,7 @@ function normalizeServerUrl(value) {
  * @param {string} serverUrl
  * @returns {boolean}
  */
-function isLoopbackServer(serverUrl) {
-  try {
-    return url.LOCAL_HOSTS.has(new URL(serverUrl).hostname);
-  } catch {
-    return false;
-  }
-}
+const { isLoopbackServer } = url;
 
 /**
  * True when two URLs refer to the same local server — both loopback hosts on
