@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useInputCapabilities } from "@/hooks/useInputCapabilities";
-import { MD_BREAKPOINT_PX, MD_MIN_WIDTH_QUERY } from "@/lib/breakpoints";
+import { MD_MIN_WIDTH_QUERY, isMobileViewport } from "@/lib/breakpoints";
 import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
 
 const MIN_WIDTH_PX = 320;
@@ -127,7 +127,7 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
 
   // Track whether we're on desktop — only apply inline width there.
   const [isDesktop, setIsDesktop] = useState(
-    () => typeof window !== "undefined" && window.innerWidth >= MD_BREAKPOINT_PX,
+    () => typeof window !== "undefined" && !isMobileViewport(),
   );
 
   useEffect(() => {

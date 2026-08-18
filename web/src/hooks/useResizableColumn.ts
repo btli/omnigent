@@ -16,7 +16,12 @@ const PAINTED_WIDTH_PX = 4;
 const COARSE_PAD = { left: 12, right: 28 }; // 12 + 4 + 28 = 44px
 const FINE_PAD = { left: 6, right: 14 }; // 6 + 4 + 14 = 24px
 
-export function useResizableColumn(defaultWidth = 176, minWidth = 100, maxWidth = 480) {
+export function useResizableColumn(
+  defaultWidth = 176,
+  minWidth = 100,
+  maxWidth = 480,
+  enabled = true,
+) {
   const { coarsePrimary } = useInputCapabilities();
   const [width, setWidth] = useState(defaultWidth);
   // Pointer id of the active drag; null when idle. First pointer wins — a
@@ -45,9 +50,8 @@ export function useResizableColumn(defaultWidth = 176, minWidth = 100, maxWidth 
     (e: React.PointerEvent) => {
       // Only the primary button starts a drag — right-click / pen barrel
       // button must not capture the pointer or flip body styles.
-      if (e.button !== 0) return;
+      if (!enabled || e.button !== 0) return;
       if (activePointerId.current !== null) return;
-      e.preventDefault();
       // Capture so moves keep arriving when the pointer leaves the handle (or
       // crosses an iframe), and so no other gesture consumer sees the stream.
       // Capture first: if it throws (pointer already gone), stay idle rather
@@ -57,6 +61,7 @@ export function useResizableColumn(defaultWidth = 176, minWidth = 100, maxWidth 
       } catch {
         return;
       }
+      e.preventDefault();
       activePointerId.current = e.pointerId;
       document.body.style.cursor = "col-resize";
       document.body.style.userSelect = "none";
@@ -73,7 +78,7 @@ export function useResizableColumn(defaultWidth = 176, minWidth = 100, maxWidth 
         document.removeEventListener("pointercancel", onDocEnd);
       };
     },
-    [endDrag],
+    [enabled, endDrag],
   );
 
   const onPointerMove = useCallback(
@@ -112,6 +117,13 @@ export function useResizableColumn(defaultWidth = 176, minWidth = 100, maxWidth 
 
   // Reset body cursor/selection if the hook itself unmounts mid-drag.
   useEffect(() => endDrag, [endDrag]);
+
+  // The handle is conditionally rendered at desktop widths with an active
+  // terminal. If that gate closes mid-drag, no element remains to deliver an
+  // up/cancel event, so abort immediately.
+  useEffect(() => {
+    if (!enabled) endDrag();
+  }, [enabled, endDrag]);
 
   return {
     /** Pixel width for the left column (apply as inline style). */

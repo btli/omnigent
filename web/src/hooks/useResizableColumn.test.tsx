@@ -202,6 +202,7 @@ describe("useResizableColumn pointer dragging", () => {
     );
 
     act(() => result.current.handleProps.onPointerDown(failing));
+    expect(failing.preventDefault).not.toHaveBeenCalled();
     expect(document.body.style.cursor).toBe("");
     expect(document.body.style.userSelect).toBe("");
 
@@ -214,6 +215,29 @@ describe("useResizableColumn pointer dragging", () => {
     act(() => result.current.handleProps.onPointerMove(pointerEvent(10, 300)));
     expect(result.current.width).toBe(300);
     act(() => result.current.handleProps.onPointerUp(pointerEvent(10)));
+  });
+
+  it("aborts when the handle render gate closes mid-drag", () => {
+    const rendered = renderHook(
+      ({ enabled }) => useResizableColumn(undefined, undefined, undefined, enabled),
+      {
+        initialProps: { enabled: true },
+      },
+    );
+    rendered.result.current.containerRef.current = {
+      getBoundingClientRect: () => ({ left: 0 }),
+    } as HTMLElement;
+
+    act(() => rendered.result.current.handleProps.onPointerDown(pointerEvent(12)));
+    act(() => rendered.result.current.handleProps.onPointerMove(pointerEvent(12, 260)));
+    expect(document.body.style.cursor).toBe("col-resize");
+
+    rendered.rerender({ enabled: false });
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
+
+    act(() => rendered.result.current.handleProps.onPointerMove(pointerEvent(12, 400)));
+    expect(rendered.result.current.width).toBe(260);
   });
 });
 
