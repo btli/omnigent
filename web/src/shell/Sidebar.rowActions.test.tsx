@@ -1422,6 +1422,17 @@ describe("touch swipe actions", () => {
     );
   });
 
+  it("keeps the action captured when the gesture began if Settings changes mid-swipe", () => {
+    renderSidebar();
+
+    const swipe = moveSwipeRow(-90);
+    act(() => writeSwipeActions({ left: "delete", right: "none" }));
+    swipe.release();
+
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Delete conversation?")).toBeNull();
+  });
+
   it("does not fire the action for a short swipe below the commit threshold", () => {
     renderSidebar();
 
