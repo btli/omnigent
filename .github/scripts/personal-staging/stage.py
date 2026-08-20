@@ -24,6 +24,7 @@ import re
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 # Resolved and cached at module load, while sys.path[0] (this script's dir)
@@ -46,10 +47,51 @@ EXTRA_MISSING = "extra unfetchable (likely deleted; remove from extras.txt)"
 EXTRA_FETCH_FAILED = "extra fetch failed (cannot reach remote; pin kept, staging not advanced)"
 EXTRA_FETCH_ATTEMPTS = 3
 EXTRA_FETCH_BACKOFF_S = 2
-# Subject line minted below for every staging merge commit; also decoded to
-# diff two compositions (what changed between the old and new staging).
-STAGING_MERGE_RE = re.compile(r"staging: merge PR #(\d+) \((.+) @ ([0-9a-f]{12})\)")
-STAGING_BRANCH_MERGE_RE = re.compile(r"staging: merge branch (.+) \((.+) @ ([0-9a-f]{12})\)")
+@dataclass(frozen=True)
+class Ring:
+    """A promotion ring the composer can build. Every branch-name, pin-tag
+    prefix, and merge-subject string the composer mints or decodes is derived
+    from here, so a second ring (e.g. production) reuses the same code path
+    with different identity. ``use_extras``/``exclude_drafts``/``mint_dev_tag``
+    are composition switches consumed by the CLI."""
+
+    name: str
+    branch: str
+    merge_subject_prefix: str
+    pin_prefix: str
+    use_extras: bool
+    exclude_drafts: bool
+    mint_dev_tag: bool
+
+
+# The staging ring — the composer's only ring today; every function defaults to
+# it so existing callers (and main()) are unchanged.
+STAGING = Ring(
+    name="staging",
+    branch="staging",
+    merge_subject_prefix="staging",
+    pin_prefix="nightly-",
+    use_extras=True,
+    exclude_drafts=False,
+    mint_dev_tag=True,
+)
+
+
+# Subject line minted for every merge commit; also decoded to diff two
+# compositions (what changed between the old and new tip). Built from the ring
+# so the prefix follows the ring's identity.
+def merge_re(ring: Ring = STAGING) -> re.Pattern[str]:
+    return re.compile(
+        re.escape(ring.merge_subject_prefix) + r": merge PR #(\d+) \((.+) @ ([0-9a-f]{12})\)"
+    )
+
+
+def branch_merge_re(ring: Ring = STAGING) -> re.Pattern[str]:
+    return re.compile(
+        re.escape(ring.merge_subject_prefix) + r": merge branch (.+) \((.+) @ ([0-9a-f]{12})\)"
+    )
+
+
 # Fixed identity, no gpg signature: the merge commit must be byte-reproducible
 # so an unchanged same-day rerun lands on the identical sha (no-op detection).
 COMMIT_IDENT = [
@@ -165,18 +207,18 @@ def check_not_truncated(prs: list[dict]) -> list[dict]:
     return prs
 
 
-def _validate_branch_pin(name: str) -> str | None:
+def _validate_branch_pin(name: str, ring: Ring = STAGING) -> str | None:
     """Return a fail-loud reason, or None if ``name`` is a legal fork-branch pin.
 
     Reject ``-`` prefixes before any git argv so a crafted name cannot be
     parsed as an option; then ``git check-ref-format --branch`` (name is now
-    a positional value, not a flag). ``main`` and ``staging`` are the
+    a positional value, not a flag). ``main`` and the ring's own branch are the
     composition's own refs — pinning them would self-merge."""
     if not name:
         return "invalid branch name"
     if name.startswith("-"):
         return "branch name must not start with '-'"
-    if name in {"main", "staging"}:
+    if name in {"main", ring.branch}:
         return f"branch {name!r} is a composition self-reference"
     # name is a single argv after --branch and does not start with '-'.
     proc = subprocess.run(
@@ -190,7 +232,7 @@ def _validate_branch_pin(name: str) -> str | None:
     return None
 
 
-def parse_extras(path: Path) -> tuple[list[int], list[str]]:
+def parse_extras(path: Path, ring: Ring = STAGING) -> tuple[list[int], list[str]]:
     """PR numbers and ``branch:<name>`` pins from the extras manifest: one
     per line, blank lines and ``#``-to-end-of-line comments allowed; a
     missing file means no extras. Anything else is a config error — fail
@@ -210,7 +252,7 @@ def parse_extras(path: Path) -> tuple[list[int], list[str]]:
             continue
         if entry.startswith("branch:"):
             name = entry[len("branch:") :]
-            reason = _validate_branch_pin(name)
+            reason = _validate_branch_pin(name, ring)
             if reason:
                 raise StageError(f"{path}:{lineno}: {reason} {entry!r}")
             branches.append(name)
@@ -281,7 +323,7 @@ def _pin_label(p: dict) -> str:
 
 
 def merge_prs(
-    cwd: str | Path, prs: list[dict], upstream: str, fork: str = "origin"
+    cwd: str | Path, prs: list[dict], upstream: str, fork: str = "origin", ring: Ring = STAGING
 ) -> tuple[list[dict], list[dict]]:
     applied: list[dict] = []
     skipped: list[dict] = []
@@ -356,9 +398,9 @@ def merge_prs(
             # nothing new is detected as a no-op instead of minting -rerunN.
             when = git(cwd, "show", "-s", "--format=%cI", oid).stdout.strip()
             subject = (
-                f"staging: merge branch {branch} ({branch} @ {oid[:12]})"
+                f"{ring.merge_subject_prefix}: merge branch {branch} ({branch} @ {oid[:12]})"
                 if source == "extra-branch"
-                else f"staging: merge PR #{num} ({branch} @ {oid[:12]})"
+                else f"{ring.merge_subject_prefix}: merge PR #{num} ({branch} @ {oid[:12]})"
             )
             git(
                 cwd,
@@ -377,22 +419,24 @@ def merge_prs(
 
 
 def composition_of(
-    cwd: str | Path, sha: str
+    cwd: str | Path, sha: str, ring: Ring = STAGING
 ) -> tuple[str, dict[int | str, tuple[str, str]]] | None:
-    """Decode a pushed staging commit into (upstream base sha, {pr: (branch,
+    """Decode a pushed ring-tip commit into (upstream base sha, {pr: (branch,
     head12)}) from its first-parent merge subjects, walking to the real base —
     the merge count is unbounded. None when the sha isn't readable."""
     if not sha or git(cwd, "cat-file", "-e", f"{sha}^{{commit}}", check=False).returncode != 0:
         return None
+    pr_re = merge_re(ring)
+    br_re = branch_merge_re(ring)
     merges: dict[int | str, tuple[str, str]] = {}
     out = git(cwd, "log", "--first-parent", "--format=%H%x09%s", sha).stdout
     for line in out.splitlines():
         commit, _, subject = line.partition("\t")
-        m = STAGING_MERGE_RE.fullmatch(subject)
+        m = pr_re.fullmatch(subject)
         if m:
             merges[int(m.group(1))] = (m.group(2), m.group(3))
             continue
-        b = STAGING_BRANCH_MERGE_RE.fullmatch(subject)
+        b = br_re.fullmatch(subject)
         if b:
             merges[f"branch:{b.group(1)}"] = (b.group(2), b.group(3))
             continue
@@ -447,12 +491,14 @@ def push_causes(
     return causes or ["composition changed (cause unknown)"]
 
 
-def pin_name(cwd: str | Path, fork: str, datestamp: str, sha: str) -> tuple[str, bool]:
-    """Immutable name for tonight's pin: nightly-YYYYMMDD, -rerunN if the day
+def pin_name(
+    cwd: str | Path, fork: str, datestamp: str, sha: str, ring: Ring = STAGING
+) -> tuple[str, bool]:
+    """Immutable name for tonight's pin: ``<prefix>YYYYMMDD``, -rerunN if the day
     already has a pin at a different commit, no-op if it already points here."""
     n = 0
     while True:
-        cand = f"nightly-{datestamp}" + (f"-rerun{n}" if n else "")
+        cand = f"{ring.pin_prefix}{datestamp}" + (f"-rerun{n}" if n else "")
         existing = remote_ref(cwd, fork, f"refs/tags/{cand}")
         if not existing:
             return cand, True
@@ -468,6 +514,7 @@ def stage(
     upstream: str = "upstream",
     fork: str = "origin",
     staging_only: bool = False,
+    ring: Ring = STAGING,
 ) -> dict:
     datestamp = date.strftime("%Y%m%d")
 
@@ -475,7 +522,7 @@ def stage(
     upstream_sha = git(cwd, "rev-parse", "FETCH_HEAD").stdout.strip()
     git(cwd, "checkout", "--detach", upstream_sha)
 
-    applied, skipped = merge_prs(cwd, prs, upstream, fork)
+    applied, skipped = merge_prs(cwd, prs, upstream, fork, ring)
     staging_sha = git(cwd, "rev-parse", "HEAD").stdout.strip()
 
     # An extra we could not even reach is an infrastructure failure, not a
@@ -490,7 +537,7 @@ def stage(
         # Hourly mode: only refs/heads/staging moves — no pins, no tags.
         # Composition is byte-reproducible, so an identical remote sha means
         # nothing changed and the push is skipped outright.
-        expected_staging = remote_ref(cwd, fork, "refs/heads/staging")
+        expected_staging = remote_ref(cwd, fork, f"refs/heads/{ring.branch}")
         report = {
             "date": datestamp,
             "upstream_sha": upstream_sha,
@@ -508,16 +555,16 @@ def stage(
         }
         if not report["pushed"]:
             return report
-        git(cwd, "fetch", fork, "refs/heads/staging", check=False)
+        git(cwd, "fetch", fork, f"refs/heads/{ring.branch}", check=False)
         report["causes"] = push_causes(
-            composition_of(cwd, expected_staging), upstream_sha, applied
+            composition_of(cwd, expected_staging, ring), upstream_sha, applied
         )
         git(
             cwd,
             "push",
-            f"--force-with-lease=refs/heads/staging:{expected_staging}",
+            f"--force-with-lease=refs/heads/{ring.branch}:{expected_staging}",
             fork,
-            f"{staging_sha}:refs/heads/staging",
+            f"{staging_sha}:refs/heads/{ring.branch}",
         )
         return report
 
@@ -532,17 +579,17 @@ def stage(
         )
 
     dev_tag = dev_version(cwd, upstream_sha, datestamp)
-    name, created = pin_name(cwd, fork, datestamp, staging_sha)
+    name, created = pin_name(cwd, fork, datestamp, staging_sha, ring)
 
     # One atomic push for every ref: a partial failure can't leave the fork
     # with mixed staging/pin/dev-tag state. Leases pin the values we just
     # observed so a concurrent push loses loudly instead of being clobbered.
     refspecs: list[str] = []
     leases: list[str] = []
-    expected_staging = remote_ref(cwd, fork, "refs/heads/staging")
+    expected_staging = remote_ref(cwd, fork, f"refs/heads/{ring.branch}")
     if expected_staging != staging_sha:
-        refspecs.append(f"{staging_sha}:refs/heads/staging")
-        leases.append(f"--force-with-lease=refs/heads/staging:{expected_staging}")
+        refspecs.append(f"{staging_sha}:refs/heads/{ring.branch}")
+        leases.append(f"--force-with-lease=refs/heads/{ring.branch}:{expected_staging}")
     if created:
         refspecs += [f"{staging_sha}:refs/heads/{name}", f"{staging_sha}:refs/tags/{name}"]
     else:
@@ -583,12 +630,12 @@ def _skip_reason(p: dict) -> str:
     return f"merge conflict: {paths or 'unknown paths'}"
 
 
-def notes(report: dict, signed: bool) -> str:
+def notes(report: dict, signed: bool, ring: Ring = STAGING) -> str:
     lines = [
-        f"Nightly personal staging ring for {report['date']} (UTC).",
+        f"Nightly personal {ring.name} ring for {report['date']} (UTC).",
         "",
         f"- Upstream main: `{report['upstream_sha']}`",
-        f"- Staging commit: `{report['staging_sha']}`",
+        f"- {ring.name.capitalize()} commit: `{report['staging_sha']}`",
         f"- Dev tag: `{report['dev_tag']}`",
         "",
         f"## Applied PRs ({len(report['applied'])})",
@@ -615,7 +662,8 @@ def notes(report: dict, signed: bool) -> str:
     return "\n".join(lines) + "\n"
 
 
-def summarize(report: dict) -> str:
+def summarize(report: dict, ring: Ring = STAGING) -> str:
+    tier = ring.name.capitalize()
     if report.get("staging_only"):
         # A no-op hour produces the same ~19-row skip table every time; collapse
         # it to a one-line count so the few lines that matter stay visible.
@@ -635,15 +683,15 @@ def summarize(report: dict) -> str:
                 f"{len(report['skipped'])} skipped"
             )
         if report["pushed"]:
-            sha_rows = [f"| Staging | `{report['staging_sha']}` |"]
+            sha_rows = [f"| {tier} | `{report['staging_sha']}` |"]
         else:
             remote = report.get("remote_staging_sha") or "(none)"
             sha_rows = [
                 f"| candidate (not pushed) | `{report['staging_sha']}` |",
-                f"| Remote staging | `{remote}` |",
+                f"| Remote {ring.name} | `{remote}` |",
             ]
         rows = [
-            "## Personal staging hourly",
+            f"## Personal {ring.name} hourly",
             "",
             "| | |",
             "| --- | --- |",
@@ -661,12 +709,12 @@ def summarize(report: dict) -> str:
 
     pin_note = "" if report["pin_created"] else " (already pinned — rerun no-op)"
     rows = [
-        "## Personal staging nightly",
+        f"## Personal {ring.name} nightly",
         "",
         "| | |",
         "| --- | --- |",
         f"| Upstream main | `{report['upstream_sha']}` |",
-        f"| Staging | `{report['staging_sha']}` |",
+        f"| {tier} | `{report['staging_sha']}` |",
         f"| Pin | `{report['tag']}`{pin_note} |",
         f"| Dev tag | `{report['dev_tag']}` |",
         f"| Applied / skipped | {len(report['applied'])} / {len(report['skipped'])} |",
