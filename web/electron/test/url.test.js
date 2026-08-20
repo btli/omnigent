@@ -1,7 +1,7 @@
 // Tests for the shared desktop URL helpers (src/url.js), run with
 // `node --test` (no extra deps). Covers the scheme-defaulting that lets a
-// pasted workspace URL (schemeless, /omnigent suffix from the internal user
-// guide) connect, the plain-http warning, and the workspace probe/expansion.
+// pasted workspace URL (including paths copied from the browser) connect, the
+// plain-http warning, and the workspace probe/expansion.
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
@@ -9,6 +9,8 @@ const assert = require("node:assert/strict");
 const {
   defaultSchemeFor,
   normalizeUrl,
+  normalizeRecentServers,
+  serverDisplayLabel,
   isPlainHttpRemote,
   databricksWorkspaceUiUrl,
   expandDatabricksWorkspaceUrl,
@@ -35,10 +37,10 @@ describe("defaultSchemeFor", () => {
 });
 
 describe("normalizeUrl", () => {
-  it("defaults a schemeless workspace /omnigent URL to https", () => {
+  it("defaults a schemeless workspace URL to https and removes its path", () => {
     assert.equal(
       normalizeUrl("dbc-a5d4177a-49dc.cloud.databricks.com/omnigent"),
-      "https://dbc-a5d4177a-49dc.cloud.databricks.com/omnigent",
+      "https://dbc-a5d4177a-49dc.cloud.databricks.com/",
     );
   });
 
@@ -61,8 +63,24 @@ describe("normalizeUrl", () => {
     assert.equal(normalizeUrl("http://example.databricks.com"), "http://example.databricks.com/");
   });
 
-  it("trims surrounding whitespace", () => {
-    assert.equal(normalizeUrl("  example.com/omnigent  "), "https://example.com/omnigent");
+  it("preserves the Databricks organization while removing other URL state", () => {
+    assert.equal(
+      normalizeUrl(
+        "  https://isaac.databricks.com/omnigent/c/123?view=chat&o=1965859176160743#latest  ",
+      ),
+      "https://isaac.databricks.com/?o=1965859176160743",
+    );
+  });
+
+  it("removes every query parameter for non-Databricks hosts", () => {
+    assert.equal(
+      normalizeUrl("example.com/path?o=1965859176160743&view=chat#latest"),
+      "https://example.com/",
+    );
+    assert.equal(
+      normalizeUrl("https://my-app.aws.databricksapps.com/?o=1965859176160743"),
+      "https://my-app.aws.databricksapps.com/",
+    );
   });
 
   it("rejects empty input", () => {
@@ -83,6 +101,47 @@ describe("normalizeUrl", () => {
         return true;
       },
     );
+  });
+});
+
+describe("normalizeRecentServers", () => {
+  it("shows root URLs, preserves organizations, and deduplicates", () => {
+    assert.deepEqual(
+      normalizeRecentServers([
+        "https://isaac.databricks.com/omnigent?o=1965859176160743",
+        "https://isaac.databricks.com/c/123?ignored=yes&o=1965859176160743",
+        "http://localhost:6767/conversation/123",
+        "not a URL",
+        null,
+      ]),
+      ["https://isaac.databricks.com/?o=1965859176160743", "http://localhost:6767/"],
+    );
+  });
+
+  it("returns an empty list for a malformed setting", () => {
+    assert.deepEqual(normalizeRecentServers("https://example.com"), []);
+  });
+});
+
+describe("serverDisplayLabel", () => {
+  it("shows only the host and optional Databricks organization", () => {
+    assert.equal(
+      serverDisplayLabel("https://isaac.databricks.com/omnigent?o=1965859176160743"),
+      "isaac.databricks.com/?o=1965859176160743",
+    );
+    assert.equal(serverDisplayLabel("http://localhost:6767/sessions"), "localhost:6767");
+  });
+
+  it("does not show organization queries for non-workspace hosts", () => {
+    assert.equal(serverDisplayLabel("https://example.com/?o=123"), "example.com");
+    assert.equal(
+      serverDisplayLabel("https://my-app.aws.databricksapps.com/?o=123"),
+      "my-app.aws.databricksapps.com",
+    );
+  });
+
+  it("falls back to the raw value when the URL is invalid", () => {
+    assert.equal(serverDisplayLabel("not a URL"), "not a URL");
   });
 });
 
@@ -168,7 +227,7 @@ describe("databricksWorkspaceUiUrl", () => {
 });
 
 describe("expandDatabricksWorkspaceUrl", () => {
-  it("expands a bare https Databricks workspace root to the UI mount", async () => {
+  it("normalizes a pasted workspace path and expands to the canonical UI mount", async () => {
     const calls = [];
     await withFetch(
       async (url, opts) => {
@@ -176,8 +235,15 @@ describe("expandDatabricksWorkspaceUrl", () => {
         return fakeResponse("databricks");
       },
       async () => {
-        const out = await expandDatabricksWorkspaceUrl("https://ws.cloud.databricks.com/");
-        assert.equal(out, `https://ws.cloud.databricks.com${WORKSPACE_UI_PATH}`);
+        const normalized = normalizeUrl(
+          "https://ws.cloud.databricks.com/some/copied/path?o=123#fragment",
+        );
+        assert.equal(normalized, "https://ws.cloud.databricks.com/?o=123");
+        assert.equal(WORKSPACE_UI_PATH, "/omnigent");
+        assert.equal(
+          await expandDatabricksWorkspaceUrl(normalized),
+          "https://ws.cloud.databricks.com/omnigent?o=123",
+        );
       },
     );
     // Probed the root with a HEAD request.
