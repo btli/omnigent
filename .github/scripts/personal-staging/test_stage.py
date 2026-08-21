@@ -1150,9 +1150,9 @@ def test_production_commit_identity(env):
     assert "committer omnigent-staging <staging@invalid>" in obj
 
 
-def test_notes_production_ring_no_apk_section(tmp_path, capsys):
-    """Production mints no dev tag and ships no APK: its notes are the
-    minimal variant — no APK-signing section either way — and the notes CLI
+def test_notes_production_ring_has_apk_section(tmp_path, capsys):
+    """Production ships a re-signed debug APK like staging, so its notes
+    carry the APK-signing section in both variants — and the notes CLI
     routes there via --ring (default stays staging, golden-locked)."""
     report = {
         "date": STAMP,
@@ -1161,10 +1161,11 @@ def test_notes_production_ring_no_apk_section(tmp_path, capsys):
         "applied": [],
         "skipped": [],
     }
-    for signed in (True, False):
-        out = stage_mod.notes(report, signed=signed, ring=stage_mod.PRODUCTION)
-        assert "production ring" in out
-        assert "APK" not in out and "keystore" not in out
+    out = stage_mod.notes(report, signed=True, ring=stage_mod.PRODUCTION)
+    assert "production ring" in out
+    assert "## APK signing" in out and "shared debug keystore" in out
+    out = stage_mod.notes(report, signed=False, ring=stage_mod.PRODUCTION)
+    assert "## APK signing" in out and "runner-ephemeral keystore" in out
 
     report_path = tmp_path / "r.json"
     report_path.write_text(json.dumps(report))
@@ -1173,7 +1174,7 @@ def test_notes_production_ring_no_apk_section(tmp_path, capsys):
     )
     assert rc == 0
     out = capsys.readouterr().out
-    assert "production ring" in out and "APK" not in out
+    assert "production ring" in out and "## APK signing" in out
 
     rc = stage_mod.main(["notes", "--report", str(report_path), "--signed", "false"])
     assert rc == 0
@@ -1273,9 +1274,7 @@ def test_production_migration_gate_approval_publishes(env):
     blocked = env.run([pr], ring=stage_mod.PRODUCTION)
     assert blocked["migration_gate"]["blocked"] is True
 
-    report = env.run(
-        [pr], ring=stage_mod.PRODUCTION, migration_approval=blocked["staging_sha"]
-    )
+    report = env.run([pr], ring=stage_mod.PRODUCTION, migration_approval=blocked["staging_sha"])
     assert report["staging_sha"] == blocked["staging_sha"]
     assert report["migration_gate"]["blocked"] is False
     assert report["tag"] == f"production-{STAMP}"

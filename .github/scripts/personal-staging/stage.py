@@ -52,6 +52,8 @@ EXTRA_MISSING = "extra unfetchable (likely deleted; remove from extras.txt)"
 EXTRA_FETCH_FAILED = "extra fetch failed (cannot reach remote; pin kept, staging not advanced)"
 EXTRA_FETCH_ATTEMPTS = 3
 EXTRA_FETCH_BACKOFF_S = 2
+
+
 @dataclass(frozen=True)
 class Ring:
     """A promotion ring the composer can build. Every branch-name, pin-tag
@@ -763,10 +765,8 @@ def notes(report: dict, signed: bool, ring: Ring = STAGING) -> str:
     lines += [
         f"- {_pin_label(p)} {md_code(p['branch'])} — {_skip_reason(p)}" for p in report["skipped"]
     ] or ["- none"]
-    # Only rings that mint a dev tag ship a nightly APK; other rings
-    # (production) render the minimal variant with no signing section.
-    if not ring.mint_dev_tag:
-        return "\n".join(lines) + "\n"
+    # Every ring ships a re-signed debug APK on its release, so the signing
+    # section renders for all of them.
     lines += ["", "## APK signing"]
     if signed:
         lines.append(
