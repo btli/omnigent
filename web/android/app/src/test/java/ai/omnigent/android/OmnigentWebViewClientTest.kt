@@ -20,6 +20,67 @@ import org.robolectric.Shadows.shadowOf
 @RunWith(RobolectricTestRunner::class)
 class OmnigentWebViewClientTest {
     @Test
+    fun `main-frame auth navigation reports leaving and returning to pinned origin`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val origins = mutableListOf<String?>()
+        val client =
+            client(
+                pinnedOrigin = DATABRICKS_ORIGIN,
+                onMainFrameOriginChanged = { origins += originOf(it) },
+            )
+
+        client.onPageStarted(webView, IDP_URL, null)
+        client.onPageStarted(webView, "$DATABRICKS_ORIGIN/omnigent", null)
+
+        assertEquals(listOf(originOf(IDP_URL), DATABRICKS_ORIGIN), origins)
+    }
+
+    @Test
+    fun `same-origin document start resets liveness but auth return does not`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val scheduler = TestWatchdogScheduler()
+        var failures = 0
+        val watchdog = LivenessWatchdog(scheduler, onTimeout = { failures++ })
+        val client =
+            client(
+                pinnedOrigin = DATABRICKS_ORIGIN,
+                onMainFrameOriginChanged = {
+                    watchdog.setOnPinnedOrigin(originOf(it) == DATABRICKS_ORIGIN)
+                },
+                onPinnedDocumentStarted = watchdog::beginInitialWindow,
+            )
+
+        watchdog.beginInitialWindow()
+        watchdog.protocolReady(1, 1)
+        client.onPageStarted(webView, "$DATABRICKS_ORIGIN/omnigent", null)
+        client.onPageStarted(webView, "$DATABRICKS_ORIGIN/omnigent/c/new", null)
+        scheduler.advanceBy(10_000)
+        watchdog.heartbeat() // outgoing document
+        scheduler.advanceBy(10_000)
+        assertEquals(1, failures)
+
+        watchdog.protocolReady(1, 1)
+        client.onPageStarted(webView, IDP_URL, null)
+        client.onPageStarted(webView, "$DATABRICKS_ORIGIN/omnigent", null)
+        scheduler.advanceBy(14_000)
+        watchdog.heartbeat()
+        scheduler.advanceBy(14_000)
+        assertEquals(1, failures)
+    }
+
+    @Test
+    fun `renderer termination routes to full-screen recovery callback`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val failures = mutableListOf<String>()
+        val client = client(onLoadFailure = failures::add)
+
+        val handled = client.onRenderProcessGone(webView, TestRenderProcessGoneDetail())
+
+        assertTrue(handled)
+        assertEquals(listOf("The server UI process stopped unexpectedly."), failures)
+    }
+
+    @Test
     fun `page start does not inject into the outgoing document`() {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
         val client = client(shouldInjectBridgeAtPageReady = false)
@@ -43,7 +104,7 @@ class OmnigentWebViewClientTest {
         // Chrome-hide CSS first, then the facade — the facade's callback is what
         // declares the page ready, so it has to be the last script evaluated.
         assertEquals(
-            listOf(WorkspaceChromeScript.source, NativeBridgeScript.source),
+            listOf(WorkspaceChromeScript.source, TEST_BRIDGE_SCRIPT),
             webView.evaluatedScripts,
         )
         assertNull(readyUrl)
@@ -604,6 +665,9 @@ class OmnigentWebViewClientTest {
         shouldInjectBridgeAtPageReady: Boolean = false,
         pinnedOrigin: String = PINNED_ORIGIN,
         onLoginRequired: () -> Unit = {},
+        onLoadFailure: (String) -> Unit = {},
+        onMainFrameOriginChanged: (String?) -> Unit = {},
+        onPinnedDocumentStarted: () -> Unit = {},
         authTabCapability: Boolean? = false,
         onAuthTabCapabilityRequired: () -> Unit = {},
         useAuthTab: Boolean = false,
@@ -612,13 +676,45 @@ class OmnigentWebViewClientTest {
     ) = OmnigentWebViewClient(
         pinnedOrigin = { pinnedOrigin },
         shouldInjectBridgeAtPageReady = { shouldInjectBridgeAtPageReady },
+        bridgeScriptSource = { TEST_BRIDGE_SCRIPT },
         onPageReady = onPageReady,
+        onMainFrameOriginChanged = onMainFrameOriginChanged,
+        onPinnedDocumentStarted = onPinnedDocumentStarted,
+        onLoadFailure = onLoadFailure,
         onLoginRequired = onLoginRequired,
         authTabCapability = { authTabCapability },
         onAuthTabCapabilityRequired = onAuthTabCapabilityRequired,
         shouldUseAuthTabLogin = { useAuthTab },
         onProxyLoginRequired = onProxyLoginRequired,
     )
+
+    private class TestWatchdogScheduler : WatchdogScheduler {
+        private var now = 0L
+        private var due: Long? = null
+        private var action: (() -> Unit)? = null
+
+        override fun schedule(
+            delayMs: Long,
+            action: () -> Unit,
+        ) {
+            due = now + delayMs
+            this.action = action
+        }
+
+        override fun cancel() {
+            due = null
+            action = null
+        }
+
+        fun advanceBy(ms: Long) {
+            now += ms
+            if (due?.let { now >= it } == true) {
+                val pending = action
+                cancel()
+                pending?.invoke()
+            }
+        }
+    }
 
     private fun request(
         url: String,
@@ -672,6 +768,10 @@ class OmnigentWebViewClientTest {
     private companion object {
         const val PINNED_ORIGIN = "https://example.com"
         const val PINNED_URL = "$PINNED_ORIGIN/app"
+
+        // Stand-in for the picker-payload-bearing facade; the client treats the
+        // script as opaque, so any marker string proves what was injected.
+        const val TEST_BRIDGE_SCRIPT = "/* bridge facade */"
         const val DATABRICKS_ORIGIN = "https://myshard.cloud.databricks.com"
         const val IDP_URL = "https://databricks.okta.com/authorize?state=abc"
     }
