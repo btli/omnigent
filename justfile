@@ -110,28 +110,28 @@ lint-ts:
 normalize-locks: _ensure-uv
     uv run --no-sync scripts/normalize_uv_lock_registry.py uv.lock || true
 
-# ─── homelab test env (omni-test.bryanli.net) ── NOT upstream ─────────────
-# The `testing` branch on origin (btli/omnigent) IS the deployment: any push
+# ─── homelab dev env (dev.omni.bryanli.net) ── NOT upstream ─────────────
+# The `development` branch on origin (btli/omnigent) IS the deployment: any push
 # to it fires a GitHub webhook -> hooks.bryanli.net -> the omnigent-test pod
 # redeploys from source (k3s-infra k8s/omnigent-test + k8s/webhooks). These
 # recipes just compose and push that branch — no SSH needed to deploy.
 # Spec: homelab docs/superpowers/specs/2026-08-04-*.md
 
-TEST_KUBECTL := "ssh bli@host.k3s.joyful.house kubectl -n omnigent-test"
-TEST_BASE := env("OMNIGENT_TEST_BASE", "main")
+DEV_KUBECTL := "ssh bli@host.k3s.joyful.house kubectl -n omnigent-test"
+DEV_BASE := env("OMNIGENT_DEV_BASE", "main")
 
-# Compose upstream {{ TEST_BASE }} + the given PR numbers (upstream GitHub
-# PRs; none = plain upstream HEAD) and force-push it to `testing`, which
+# Compose upstream {{ DEV_BASE }} + the given PR numbers (upstream GitHub
+# PRs; none = plain upstream HEAD) and force-push it to `development`, which
 # auto-deploys. Aborts loudly on merge conflicts.
-[group('test-env')]
-test-branch *prs:
+[group('dev-env')]
+dev-branch *prs:
     #!/usr/bin/env bash
     set -euo pipefail
     ids="$(echo "{{ prs }}" | tr ' ' '-')"
-    wt="$(git rev-parse --show-toplevel)/../omnigent-worktrees/testing${ids:+-$ids}"
-    git fetch upstream {{ TEST_BASE }}
+    wt="$(git rev-parse --show-toplevel)/../omnigent-worktrees/development${ids:+-$ids}"
+    git fetch upstream {{ DEV_BASE }}
     rm -rf "$wt" && git worktree prune
-    git worktree add --detach "$wt" "upstream/{{ TEST_BASE }}"
+    git worktree add --detach "$wt" "upstream/{{ DEV_BASE }}"
     cd "$wt"
     for pr in {{ prs }}; do
       echo "── merging upstream PR #$pr"
@@ -139,24 +139,24 @@ test-branch *prs:
       git merge --no-edit FETCH_HEAD \
         || { echo "CONFLICT merging PR #$pr — resolve in $wt"; exit 1; }
     done
-    git push -f origin HEAD:refs/heads/testing
-    echo "pushed $(git rev-parse --short HEAD) → testing; deploying → https://omni-test.bryanli.net"
+    git push -f origin HEAD:refs/heads/development
+    echo "pushed $(git rev-parse --short HEAD) → development; deploying → https://dev.omni.bryanli.net"
 
 # Deploy the CURRENT tree, uncommitted changes included, via a throwaway
 # snapshot commit (`git stash create` — leaves your working tree untouched;
 # brand-new files must be `git add`ed to ride along).
-[group('test-env')]
-test-sync:
+[group('dev-env')]
+dev-sync:
     #!/usr/bin/env bash
     set -euo pipefail
     sha="$(git stash create || true)"
     sha="${sha:-$(git rev-parse HEAD)}"
-    git push -f origin "$sha":refs/heads/testing
-    echo "pushed snapshot ${sha:0:8} → testing; deploying → https://omni-test.bryanli.net"
+    git push -f origin "$sha":refs/heads/development
+    echo "pushed snapshot ${sha:0:8} → development; deploying → https://dev.omni.bryanli.net"
 
-# Park the test env (any later push to `testing` wakes it back up — the
+# Park the dev env (any later push to `development` wakes it back up — the
 # webhook patches replicas back to 1).
-[group('test-env')]
-test-down:
-    {{ TEST_KUBECTL }} scale deploy/omnigent-test --replicas=0
-# ─── end homelab test env ─────────────────────────────────────────────────────
+[group('dev-env')]
+dev-down:
+    {{ DEV_KUBECTL }} scale deploy/omnigent-test --replicas=0
+# ─── end homelab dev env ─────────────────────────────────────────────────────
