@@ -8,7 +8,9 @@ PRs are skipped and reported). The nightly mode then pins an immutable
 at the same commit; ``--staging-only`` (the hourly mode) pushes only
 ``staging`` and skips the push entirely when the composition is unchanged.
 The only refs ever pushed are ``staging``, the ``nightly-*`` pin, and the
-dev tag.
+dev tag. ``--ring production`` composes the production ring instead: open
+non-draft PRs only, no extras, branch ``production`` + immutable
+``production-YYYYMMDD`` pins, and no dev tag.
 
 Stdlib + git subprocess only; the gh CLI is used solely to list PRs and can
 be bypassed with --prs-json (how the tests stay offline).
@@ -75,6 +77,22 @@ STAGING = Ring(
     exclude_drafts=False,
     mint_dev_tag=True,
 )
+
+
+# The production ring: upstream main + open NON-draft PRs only — draft status
+# is the promotion gate. No extras (nothing hand-pinned reaches prod), no dev
+# tag (nothing downstream consumes one), immutable production-YYYYMMDD pins.
+PRODUCTION = Ring(
+    name="production",
+    branch="production",
+    merge_subject_prefix="production",
+    pin_prefix="production-",
+    use_extras=False,
+    exclude_drafts=True,
+    mint_dev_tag=False,
+)
+
+RINGS = {r.name: r for r in (STAGING, PRODUCTION)}
 
 
 # Subject line minted for every merge commit; also decoded to diff two
@@ -189,13 +207,19 @@ def list_prs() -> list[dict]:
             "--limit",
             str(PR_LIST_LIMIT),
             "--json",
-            "number,headRefName,headRefOid",
+            "number,headRefName,headRefOid,isDraft",
         ],
         check=True,
         text=True,
         capture_output=True,
     ).stdout
     return check_not_truncated(json.loads(out))
+
+
+def filter_drafts(prs: list[dict]) -> list[dict]:
+    """Drop draft PRs — the production ring's promotion gate (decision 2:
+    draft status, not a review/CI check, decides readiness)."""
+    return [p for p in prs if not p.get("isDraft")]
 
 
 def check_not_truncated(prs: list[dict]) -> list[dict]:
@@ -578,7 +602,7 @@ def stage(
             + "; refusing to publish a composition without them"
         )
 
-    dev_tag = dev_version(cwd, upstream_sha, datestamp)
+    dev_tag = dev_version(cwd, upstream_sha, datestamp) if ring.mint_dev_tag else None
     name, created = pin_name(cwd, fork, datestamp, staging_sha, ring)
 
     # One atomic push for every ref: a partial failure can't leave the fork
@@ -602,11 +626,12 @@ def stage(
         elif branch_sha != staging_sha:
             raise StageError(f"pin branch {name} points at {branch_sha}, expected {staging_sha}")
     # The dev tag floats within the day: a rerun repoints it (fork-local tag,
-    # nothing downstream pins to it mid-day).
-    expected_dev = remote_ref(cwd, fork, f"refs/tags/{dev_tag}")
-    if expected_dev != staging_sha:
-        refspecs.append(f"{staging_sha}:refs/tags/{dev_tag}")
-        leases.append(f"--force-with-lease=refs/tags/{dev_tag}:{expected_dev}")
+    # nothing downstream pins to it mid-day). Rings without one push nothing.
+    if dev_tag:
+        expected_dev = remote_ref(cwd, fork, f"refs/tags/{dev_tag}")
+        if expected_dev != staging_sha:
+            refspecs.append(f"{staging_sha}:refs/tags/{dev_tag}")
+            leases.append(f"--force-with-lease=refs/tags/{dev_tag}:{expected_dev}")
     if refspecs:
         git(cwd, "push", "--atomic", *leases, fork, *refspecs)
 
@@ -616,7 +641,7 @@ def stage(
         "staging_sha": staging_sha,
         "branch": name,
         "tag": name,
-        "dev_tag": dev_tag,
+        **({"dev_tag": dev_tag} if dev_tag else {}),
         "pin_created": created,
         "applied": applied,
         "skipped": skipped,
@@ -636,7 +661,7 @@ def notes(report: dict, signed: bool, ring: Ring = STAGING) -> str:
         "",
         f"- Upstream main: `{report['upstream_sha']}`",
         f"- {ring.name.capitalize()} commit: `{report['staging_sha']}`",
-        f"- Dev tag: `{report['dev_tag']}`",
+        *([f"- Dev tag: `{report['dev_tag']}`"] if report.get("dev_tag") else []),
         "",
         f"## Applied PRs ({len(report['applied'])})",
     ]
@@ -716,7 +741,7 @@ def summarize(report: dict, ring: Ring = STAGING) -> str:
         f"| Upstream main | `{report['upstream_sha']}` |",
         f"| {tier} | `{report['staging_sha']}` |",
         f"| Pin | `{report['tag']}`{pin_note} |",
-        f"| Dev tag | `{report['dev_tag']}` |",
+        *([f"| Dev tag | `{report['dev_tag']}` |"] if report.get("dev_tag") else []),
         f"| Applied / skipped | {len(report['applied'])} / {len(report['skipped'])} |",
     ]
     rows += [f"| Skipped {_pin_label(p)} | {_skip_reason(p)} |" for p in report["skipped"]]
@@ -727,8 +752,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_stage = sub.add_parser("stage", help="build and push the staging ring")
+    p_stage = sub.add_parser("stage", help="build and push a promotion ring")
     p_stage.add_argument("--workdir", default=".")
+    p_stage.add_argument(
+        "--ring",
+        choices=list(RINGS),
+        default=STAGING.name,
+        help="which ring to compose (default: staging)",
+    )
     p_stage.add_argument("--upstream-remote", default="upstream")
     p_stage.add_argument("--fork-remote", default="origin")
     p_stage.add_argument("--date", help="UTC datestamp YYYYMMDD (default: today)")
@@ -773,7 +804,8 @@ def main(argv: list[str] | None = None) -> int:
         date = dt.date(int(args.date[:4]), int(args.date[4:6]), int(args.date[6:8]))
     else:
         date = dt.datetime.now(dt.timezone.utc).date()
-    title = "Personal staging hourly" if args.staging_only else "Personal staging nightly"
+    ring = RINGS[args.ring]
+    title = f"Personal {ring.name} " + ("hourly" if args.staging_only else "nightly")
     try:
         # Fail the stage path before any fetch/merge if the parser is absent.
         if tomllib is None:
@@ -783,9 +815,14 @@ def main(argv: list[str] | None = None) -> int:
             if args.prs_json
             else list_prs()
         )
+        if ring.exclude_drafts:
+            prs = filter_drafts(prs)
         # Extras are read here, before any merge touches the worktree, so the
-        # manifest always comes from the trusted checkout.
-        pr_extras, branch_extras = parse_extras(Path(args.extras))
+        # manifest always comes from the trusted checkout. A ring without
+        # extras never opens the manifest at all.
+        pr_extras, branch_extras = (
+            parse_extras(Path(args.extras), ring) if ring.use_extras else ([], [])
+        )
         prs = merge_stream(prs, pr_extras)
         for name in dict.fromkeys(branch_extras):
             prs.append({"source": "extra-branch", "headRefName": name, "number": None})
@@ -796,13 +833,14 @@ def main(argv: list[str] | None = None) -> int:
             upstream=args.upstream_remote,
             fork=args.fork_remote,
             staging_only=args.staging_only,
+            ring=ring,
         )
     except Exception as e:
         # The step summary is the failure surface — never exit without one.
         append_summary(f"## {title}\n\n**FAILED:** {e}\n")
         raise
     Path(args.report).write_text(json.dumps(report, indent=2) + "\n")
-    append_summary(summarize(report))
+    append_summary(summarize(report, ring))
     if report.get("blocked"):
         print(
             "::warning::could not reach remote for extras "
