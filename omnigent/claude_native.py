@@ -399,13 +399,16 @@ class ClaudeNativeUcodeConfig:
     routable_models: tuple[str, ...] = ()
 
 
-def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> bool:
+def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig | None) -> bool:
     """Whether the config's endpoint accepts canonical Anthropic ids and aliases.
 
     Bedrock and custom gateways route their own model ids only; the Anthropic
-    API (and a config with no endpoint override) resolves family aliases
-    natively, so aliases must not be rewritten for it.
+    API (a direct login's ``None`` config, or a config with no endpoint
+    override) resolves family aliases natively, so aliases must not be
+    rewritten for it.
     """
+    if claude_config is None:
+        return True
     if claude_config.env.get(_ANTHROPIC_BEDROCK_BASE_URL_ENV):
         return False
     base_url = claude_config.env.get(_UCODE_CLAUDE_BASE_URL_ENV)
@@ -1087,7 +1090,7 @@ async def claude_model_catalog(
     if probe is None:
         return None
     rows = list(probe.alias_rows)
-    if claude_config is not None and not _serves_canonical_anthropic_ids(claude_config):
+    if not _serves_canonical_anthropic_ids(claude_config):
         rows = [row for row in rows if not str(row.get("model", "")).startswith("claude-")]
 
     configured_pin = claude_config.model if claude_config is not None else None
@@ -1109,10 +1112,8 @@ async def claude_model_catalog(
         # Append the observed default as its own honest row — but never
         # claim a bare Anthropic id is launchable on an endpoint that
         # rejects that spelling.
-        servable = (
-            claude_config is None
-            or _serves_canonical_anthropic_ids(claude_config)
-            or not default_model.startswith("claude-")
+        servable = _serves_canonical_anthropic_ids(claude_config) or not default_model.startswith(
+            "claude-"
         )
         if servable:
             # The probe's printed label describes the ENUMERATION run's
@@ -1153,6 +1154,46 @@ async def claude_launch_catalog(
     return await model_catalog_store.ensure_catalog(
         "claude-native", fingerprint, lambda: claude_model_catalog(claude_config)
     )
+
+
+def claude_catalog_accepts(
+    rows: list[dict[str, object]],
+    token: str,
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> bool:
+    """Whether *token* names a model this launch config can start.
+
+    An exact catalog row is authoritative. Beyond that, a canonical
+    Anthropic id launches verbatim (``--model`` takes any string) on an
+    endpoint that serves canonical spellings — and a live ``/model``
+    persists exactly that spelling, so the exact-row test alone strands a
+    resumed session whose catalog lists only the family aliases. Accept
+    the id when its family alias-folds onto a catalog row; a gateway that
+    rejects canonical spellings vouches for nothing here. The fold cannot
+    tell a retired generation from a live one (the catalog spells neither),
+    so a stale ``claude-*`` id passes the gate and fails visibly at the
+    pane instead — the deliberate trade-off, since the reverse (rejecting
+    every unspelled canonical id) strands resumable sessions.
+
+    :param rows: Catalog rows from :func:`claude_launch_catalog`.
+    :param token: A picker row id, family alias, or canonical model id.
+    :param claude_config: The resolved launch config, or ``None`` for a
+        direct Claude login.
+    :returns: ``True`` when the launch should proceed with *token*.
+    """
+    from omnigent.claude_model_vocabulary import claude_model_alias
+    from omnigent.model_catalog_store import catalog_contains
+
+    if catalog_contains(rows, token):
+        return True
+    if not _serves_canonical_anthropic_ids(claude_config):
+        return False
+    # Case-sensitive on purpose: canonical ids are lowercase, and vouching
+    # for a respelled variant would launch a spelling nothing validated.
+    if not token.startswith("claude-"):
+        return False
+    alias = claude_model_alias(token, claude_config.env if claude_config else {})
+    return alias is not None and catalog_contains(rows, alias)
 
 
 def build_native_claude_terminal_env(

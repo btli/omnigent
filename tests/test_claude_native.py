@@ -9488,6 +9488,118 @@ async def test_claude_model_catalog_never_appends_an_unservable_default(
     assert all(row.get("isDefault") is not True for row in rows)
 
 
+def _direct_login_catalog() -> list[dict[str, object]]:
+    """The catalog a direct Claude login's probe yields: aliases + default."""
+    return [
+        {"id": "sonnet", "model": "sonnet", "displayName": "sonnet"},
+        {"id": "opus", "model": "opus", "displayName": "opus"},
+        {"id": "fable", "model": "fable", "displayName": "fable"},
+        {"id": "fable[1m]", "model": "fable[1m]", "displayName": "fable[1m]"},
+        {
+            "id": "claude-opus-4-8[1m]",
+            "model": "claude-opus-4-8[1m]",
+            "displayName": "Opus 4.8 (1M context)",
+            "isDefault": True,
+        },
+    ]
+
+
+def test_claude_catalog_accepts_exact_rows() -> None:
+    """An exact row hit accepts, on any config shape."""
+    rows = _direct_login_catalog()
+    assert claude_native.claude_catalog_accepts(rows, "fable", None)
+    assert claude_native.claude_catalog_accepts(rows, "claude-opus-4-8[1m]", None)
+    assert claude_native.claude_catalog_accepts(rows, "fable", _gateway_probe_config())
+
+
+def test_claude_catalog_accepts_canonical_id_on_direct_login() -> None:
+    """A persisted canonical id relaunches when its family alias is a row.
+
+    A live ``/model fable`` echoes the pane's resolved ``claude-fable-5``
+    into the session's model override, but the direct-login catalog only
+    lists the family aliases — the exact-row test alone strands the session
+    at cold resume even though ``--model claude-fable-5`` launches verbatim.
+    """
+    rows = _direct_login_catalog()
+    assert claude_native.claude_catalog_accepts(rows, "claude-fable-5", None)
+    assert claude_native.claude_catalog_accepts(rows, "claude-fable-5[1m]", None)
+
+
+def test_claude_catalog_rejects_canonical_id_on_a_gateway() -> None:
+    """A gateway endpoint rejects canonical spellings, so the gate must too."""
+    rows = _direct_login_catalog()
+    assert not claude_native.claude_catalog_accepts(
+        rows, "claude-fable-5", _gateway_probe_config()
+    )
+
+
+def test_claude_catalog_rejects_ids_with_no_catalog_family() -> None:
+    """Alias-folding cannot vouch for a family the catalog does not list."""
+    rows = _direct_login_catalog()
+    assert not claude_native.claude_catalog_accepts(rows, "claude-nova-1", None)
+    assert not claude_native.claude_catalog_accepts(rows, "gpt-5.4", None)
+
+
+def test_claude_catalog_rejects_respelled_canonical_ids() -> None:
+    """A non-lowercase ``claude-*`` spelling is nothing the API serves.
+
+    The exact-row test is case-sensitive, so vouching for a respelled
+    variant via the (internally lowercasing) alias fold would pass the gate
+    for a spelling the launch then hands over unvalidated.
+    """
+    rows = _direct_login_catalog()
+    assert not claude_native.claude_catalog_accepts(rows, "Claude-Fable-5", None)
+    assert not claude_native.claude_catalog_accepts(rows, "CLAUDE-FABLE-5", None)
+
+
+def test_claude_catalog_accepts_unspelled_generations_by_design() -> None:
+    """Any generation of a catalog family passes; staleness fails at the pane.
+
+    The fold has no oracle for live generations (the catalog spells only the
+    aliases — the very gap that strands resumed sessions), so a stale or
+    fabricated id of a listed family passes the gate and fails visibly at
+    inference rather than fast. Deliberate: the reverse re-strands sessions.
+    """
+    rows = _direct_login_catalog()
+    assert claude_native.claude_catalog_accepts(rows, "claude-opus-0-0", None)
+
+
+def test_claude_catalog_pin_normalization_is_symmetric() -> None:
+    """``[1m]`` spellings normalize the same in the token and in the pin."""
+    rows = _direct_login_catalog()
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable-5[1m]"},
+    )
+    assert claude_native.claude_catalog_accepts(rows, "claude-fable-5", config)
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable-5"},
+    )
+    assert claude_native.claude_catalog_accepts(rows, "claude-fable-5[1m]", config)
+
+
+def test_claude_catalog_ignores_empty_pin_values() -> None:
+    """An empty-string pin is no pin: segment fallback still vouches."""
+    rows = _direct_login_catalog()
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_DEFAULT_OPUS_MODEL": ""},
+    )
+    assert claude_native.claude_catalog_accepts(rows, "claude-fable-5", config)
+
+
+def test_claude_catalog_accepts_canonical_id_matching_a_pin() -> None:
+    """On a pinned canonical endpoint, an exact pin match vouches for the id."""
+    rows = _direct_login_catalog()
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable-5"},
+    )
+    assert claude_native.claude_catalog_accepts(rows, "claude-fable-5", config)
+    # A MISMATCHED pin means the alias resolves elsewhere; no vouching.
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable-6"},
+    )
+    assert not claude_native.claude_catalog_accepts(rows, "claude-fable-5", config)
+
+
 async def test_claude_model_catalog_marks_the_launch_pin_as_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
