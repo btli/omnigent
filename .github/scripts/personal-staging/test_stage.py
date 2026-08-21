@@ -1356,7 +1356,10 @@ def _record_seed(tmp_path: Path, env: Env, pr: dict, resolutions: dict[str, str]
     conflicts with *resolutions* ({path: content}), and return an rr-cache
     seed directory holding the recorded entries."""
     clone = tmp_path / f"seedgen-{pr['number']}"
-    git(tmp_path, "clone", str(env.upstream), str(clone))
+    # -b: the bare upstream's HEAD may name a branch that was never pushed
+    # (init.defaultBranch vs the harness's "main"), which some git versions
+    # clone as an unborn checkout — the merge below would silently no-op.
+    git(tmp_path, "clone", "-b", "main", str(env.upstream), str(clone))
     git(clone, "config", "user.name", "t")
     git(clone, "config", "user.email", "t@t")
     git(clone, "config", "rerere.enabled", "true")
@@ -1368,6 +1371,7 @@ def _record_seed(tmp_path: Path, env: Env, pr: dict, resolutions: dict[str, str]
     git(clone, "commit", "--no-verify", "-m", "record resolution")
     seed = tmp_path / f"rr-seed-{pr['number']}"
     shutil.copytree(clone / ".git" / "rr-cache", seed)
+    assert any(seed.iterdir()), "seed recording produced no rr-cache entries"
     return seed
 
 
