@@ -44,7 +44,7 @@ except ImportError:
 
 UPSTREAM_REPO = "omnigent-ai/omnigent"
 PR_AUTHOR = "btli"
-PR_LIST_LIMIT = 100
+PR_LIST_LIMIT = 300
 EXTRAS_FILE = Path(__file__).resolve().parent / "extras.txt"
 # Two different answers about a pinned extra: only a ref confirmed absent
 # invites editing the manifest, and only a failure to reach the remote blocks
@@ -221,13 +221,38 @@ def list_prs() -> list[dict]:
             "--limit",
             str(PR_LIST_LIMIT),
             "--json",
-            "number,headRefName,headRefOid,isDraft",
+            "number,headRefName,headRefOid,isDraft,author",
         ],
         check=True,
         text=True,
         capture_output=True,
     ).stdout
-    return check_not_truncated(json.loads(out))
+    return own_prs(check_not_truncated(json.loads(out)))
+
+
+def own_prs(prs: list[dict]) -> list[dict]:
+    """Keep only records actually authored by ``PR_AUTHOR``, dropping the
+    author field from the survivors.
+
+    gh delegates ``--author`` to GitHub's search API; observed to come back
+    UNFILTERED (a plain listing of every open PR), which below the truncation
+    guard would silently compose other people's PRs into the ring. Filter
+    locally on the record's own author instead of trusting the flag; a record
+    with no author login is indeterminate and fails loud rather than passing
+    as ours."""
+    mine: list[dict] = []
+    for p in prs:
+        author = p.get("author")
+        login = author.get("login") if isinstance(author, dict) else None
+        if not isinstance(login, str) or not login:
+            raise StageError(
+                f"PR #{p.get('number')} carries no author login; "
+                "refusing to guess whose PR this is"
+            )
+        if login.lower() != PR_AUTHOR.lower():
+            continue
+        mine.append({k: v for k, v in p.items() if k != "author"})
+    return mine
 
 
 def filter_drafts(prs: list[dict]) -> list[dict]:

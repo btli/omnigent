@@ -86,7 +86,11 @@ def build_scenario(tmp_path: Path):
     seed.mkdir()
     git(seed, "init", "-b", "main")
     commit_file(
-        seed, "pyproject.toml", '[project]\nname = "x"\nversion = "1.2.3.dev0"\n', "base", BASE_DATE
+        seed,
+        "pyproject.toml",
+        '[project]\nname = "x"\nversion = "1.2.3.dev0"\n',
+        "base",
+        BASE_DATE,
     )
     commit_file(seed, "a.txt", "base\n", "add a", BASE_DATE)
     git(seed, "push", str(upstream), "main")
@@ -137,7 +141,11 @@ def compose_snapshot(tmp_path: Path, monkeypatch) -> dict:
     # Minted merge commits, oldest-first, dumped whole (tree/parents/author/
     # committer/message) so any drift in identity, date, or ordering is caught.
     shas = real_git(
-        work, "rev-list", "--first-parent", "--reverse", f"{report['upstream_sha']}..{report['staging_sha']}"
+        work,
+        "rev-list",
+        "--first-parent",
+        "--reverse",
+        f"{report['upstream_sha']}..{report['staging_sha']}",
     ).stdout.split()
     merge_commits = [real_git(work, "cat-file", "-p", sha).stdout for sha in shas]
 

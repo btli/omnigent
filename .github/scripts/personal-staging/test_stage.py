@@ -1478,3 +1478,22 @@ def test_cli_rr_cache_flag_is_plumbed(env, tmp_path, capsys):
     capsys.readouterr()
     report = json.loads(report_path.read_text())
     assert report["applied"][0]["rerere_paths"] == ["a.txt"]
+
+
+def test_own_prs_filters_on_the_records_author():
+    """An ignored --author flag (observed: gh's search-backed filter coming
+    back as a plain unfiltered listing) must never compose someone else's PR."""
+    mine = {"number": 7, "headRefName": "b7", "author": {"login": "btli"}}
+    upper = {"number": 8, "headRefName": "b8", "author": {"login": "BTLI"}}
+    foreign = {"number": 9, "headRefName": "b9", "author": {"login": "mallory"}}
+
+    kept = stage_mod.own_prs([mine, upper, foreign])
+
+    assert [p["number"] for p in kept] == [7, 8]
+    assert all("author" not in p for p in kept)
+
+
+def test_own_prs_fails_loud_on_missing_author():
+    for record in ({"number": 7}, {"number": 7, "author": {}}, {"number": 7, "author": "btli"}):
+        with pytest.raises(stage_mod.StageError, match="no author login"):
+            stage_mod.own_prs([record])
