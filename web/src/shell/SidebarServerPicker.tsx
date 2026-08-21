@@ -66,7 +66,9 @@ export function SidebarServerPicker() {
   const [info, setInfo] = useState<ServerPickerInfo | null>(null);
 
   const refresh = () => {
-    void getServerPicker().then(setInfo);
+    void getServerPicker().then((result) => {
+      if (result) setInfo(result);
+    });
   };
 
   useEffect(() => {

@@ -21,15 +21,13 @@ struct OmnigentWebView: UIViewRepresentable {
   func makeUIView(context: Context) -> WKWebView {
     let contentController = WKUserContentController()
     contentController.add(context.coordinator, name: "omnigentNative")
-    let bridgeScriptSource = nativeBridgeScriptSource
     contentController.addUserScript(
       WKUserScript(
-        source: bridgeScriptSource,
+        source: Self.nativeBridgeScript(),
         injectionTime: .atDocumentStart,
         forMainFrameOnly: true
       )
     )
-    context.coordinator.bridgeScriptSource = bridgeScriptSource
 
     let configuration = WKWebViewConfiguration()
     configuration.userContentController = contentController
@@ -75,19 +73,6 @@ struct OmnigentWebView: UIViewRepresentable {
   func updateUIView(_ webView: WKWebView, context: Context) {
     context.coordinator.parent = self
     model.webView = webView
-    let bridgeScriptSource = nativeBridgeScriptSource
-    if context.coordinator.bridgeScriptSource != bridgeScriptSource {
-      let contentController = webView.configuration.userContentController
-      contentController.removeAllUserScripts()
-      contentController.addUserScript(
-        WKUserScript(
-          source: bridgeScriptSource,
-          injectionTime: .atDocumentStart,
-          forMainFrameOnly: true
-        )
-      )
-      context.coordinator.bridgeScriptSource = bridgeScriptSource
-    }
     if context.coordinator.pinnedURL != initialURL {
       context.coordinator.load(initialURL, in: webView)
     }
@@ -96,10 +81,6 @@ struct OmnigentWebView: UIViewRepresentable {
   static func dismantleUIView(_ uiView: WKWebView, coordinator: Coordinator) {
     uiView.configuration.userContentController.removeScriptMessageHandler(forName: "omnigentNative")
     coordinator.detach()
-  }
-
-  private var nativeBridgeScriptSource: String {
-    Self.nativeBridgeScript()
   }
 
   static func nativeBridgeScript() -> String {
@@ -245,7 +226,7 @@ struct OmnigentWebView: UIViewRepresentable {
         });
         window.omnigentNative = Object.freeze({
           kind: "ios",
-          nativeBridgeVersion: 1,
+          nativeBridgeVersion: \(NativeBridgeProtocol.version),
           nativeWebReady(version) {
             window.webkit.messageHandlers.omnigentNative.postMessage({
               method: "nativeWebReady", version,
@@ -354,7 +335,6 @@ struct OmnigentWebView: UIViewRepresentable {
     UIGestureRecognizerDelegate
   {
     var parent: OmnigentWebView
-    var bridgeScriptSource: String?
     private weak var webView: WKWebView?
     /// The server this web view is pinned to; nil before the first load. Doubles as
     /// the identity `updateUIView` compares against, so a re-render only reloads
@@ -368,10 +348,16 @@ struct OmnigentWebView: UIViewRepresentable {
     private var rootBounces = 0
     private static let maxRootBounces = 1
     private var urlObservation: NSKeyValueObservation?
-    private var livenessTask: Task<Void, Never>?
+    private var lifecycleObservers: [NSObjectProtocol] = []
     private var compatibilityReady = false
     private var recoveryShown = false
-    private static let protocolVersion = 1
+    private lazy var livenessWatchdog = MobileLivenessWatchdog(
+      onTimeout: { [weak self] in
+        self?.showFullScreenRecovery("The server UI stopped responding.")
+      },
+      onIncompatible: { [weak self] in
+        self?.showFullScreenRecovery("The server UI is incompatible with this app version.")
+      })
 
     init(_ parent: OmnigentWebView) {
       self.parent = parent
@@ -379,6 +365,24 @@ struct OmnigentWebView: UIViewRepresentable {
 
     func attach(_ webView: WKWebView) {
       self.webView = webView
+      let center = NotificationCenter.default
+      lifecycleObservers = [
+        center.addObserver(
+          forName: UIApplication.willResignActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+          Task { @MainActor in self?.livenessWatchdog.setActive(false) }
+        },
+        center.addObserver(
+          forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+          Task { @MainActor in
+            guard let self else { return }
+            self.livenessWatchdog.setOnPinnedOrigin(
+              self.webView?.url?.omnigentOrigin == self.pinnedOrigin)
+            self.livenessWatchdog.setActive(true)
+          }
+        },
+      ]
       // In-page navigation: the SPA swapped the URL with pushState / replaceState,
       // or the user moved through history. No page is loaded, so no navigation
       // delegate callback runs — KVO on `url` is the only way to observe the user
@@ -392,7 +396,9 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     func detach() {
-      livenessTask?.cancel()
+      livenessWatchdog.cancel()
+      lifecycleObservers.forEach(NotificationCenter.default.removeObserver)
+      lifecycleObservers.removeAll()
       urlObservation = nil
       webView = nil
     }
@@ -474,7 +480,7 @@ struct OmnigentWebView: UIViewRepresentable {
       rootBounces = 0
       compatibilityReady = false
       recoveryShown = false
-      armLivenessTimeout(seconds: 20)
+      livenessWatchdog.beginInitialWindow()
       publishModelChanges { $0.currentURL = url }
       webView.load(URLRequest(url: url))
     }
@@ -490,19 +496,16 @@ struct OmnigentWebView: UIViewRepresentable {
       switch method {
       case "nativeWebReady":
         guard let version = (body["version"] as? NSNumber)?.intValue,
-          version == Self.protocolVersion
-        else {
-          showFullScreenRecovery("The server UI is incompatible with this app version.")
-          return
-        }
+          livenessWatchdog.protocolReady(
+            version: version, expectedVersion: NativeBridgeProtocol.version)
+        else { return }
         compatibilityReady = true
-        armLivenessTimeout(seconds: 15)
         parent.loadSucceeded()
       case "nativeHeartbeat":
         guard compatibilityReady,
-          (body["version"] as? NSNumber)?.intValue == Self.protocolVersion
+          (body["version"] as? NSNumber)?.intValue == NativeBridgeProtocol.version
         else { return }
-        armLivenessTimeout(seconds: 15)
+        livenessWatchdog.receivedHeartbeat()
       case "getServerPicker":
         guard let requestID = (body["requestId"] as? NSNumber)?.intValue else { return }
         emitServerPicker(requestID: requestID)
@@ -550,11 +553,13 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+      livenessWatchdog.setOnPinnedOrigin(webView.url?.omnigentOrigin == pinnedOrigin)
       parent.model.isLoading = true
       parent.model.currentURL = webView.url ?? parent.model.currentURL
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+      livenessWatchdog.setOnPinnedOrigin(webView.url?.omnigentOrigin == pinnedOrigin)
       parent.model.currentURL = webView.url ?? parent.model.currentURL
       // Workspace roots are caught here too, not only in decidePolicyFor: that
       // callback is skipped for loads the shell starts itself, and the Databricks
@@ -764,21 +769,10 @@ struct OmnigentWebView: UIViewRepresentable {
       webView.evaluateJavaScript("window.__omnigentNativeEmitServerPicker?.(\(requestID),\(json));")
     }
 
-    private func armLivenessTimeout(seconds: UInt64) {
-      livenessTask?.cancel()
-      livenessTask = Task { [weak self] in
-        try? await Task.sleep(for: .seconds(seconds))
-        guard !Task.isCancelled else { return }
-        await MainActor.run {
-          self?.showFullScreenRecovery("The server UI stopped responding.")
-        }
-      }
-    }
-
     private func showFullScreenRecovery(_ message: String) {
       guard !recoveryShown else { return }
       recoveryShown = true
-      livenessTask?.cancel()
+      livenessWatchdog.cancel()
       parent.loadFailed(parent.serverURL, message)
     }
 

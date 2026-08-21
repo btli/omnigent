@@ -5,6 +5,31 @@ import XCTest
 
 @MainActor
 final class NativeBridgeTests: XCTestCase {
+  func testRendererTerminationRoutesToFullScreenRecovery() {
+    let suite = "NativeBridgeTests.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let url = URL(string: "https://server.example.com/app")!
+    var failure: (URL, String)?
+    let parent = OmnigentWebView(
+      serverURL: url,
+      initialURL: url,
+      managedServers: [],
+      recentServers: [],
+      model: WebViewModel(),
+      settings: SettingsStore(defaults: defaults),
+      switchToServer: { _ in },
+      connectToNewServer: {},
+      loadFailed: { failure = ($0, $1) },
+      loadSucceeded: {})
+    let coordinator = OmnigentWebView.Coordinator(parent)
+
+    coordinator.webViewWebContentProcessDidTerminate(WKWebView())
+
+    XCTAssertEqual(failure?.0, url)
+    XCTAssertEqual(failure?.1, "The server UI process stopped unexpectedly.")
+  }
+
   func testGeneratedBridgeExecutesLivePickerRoundTripInWKWebView() async throws {
     let handler = MessageHandler()
     let configuration = WKWebViewConfiguration()

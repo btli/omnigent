@@ -29,6 +29,7 @@ class OmnigentWebViewClient(
     private val pinnedOrigin: () -> String?,
     private val shouldInjectBridgeAtPageReady: () -> Boolean,
     private val onPageReady: (url: String?) -> Unit,
+    private val onMainFrameOriginChanged: (url: String?) -> Unit = {},
     private val onLoadFailure: (String) -> Unit = {},
     private val onLoginRequired: () -> Unit,
     private val bridgeScriptSource: () -> String = { NativeBridgeScript.source },
@@ -49,6 +50,7 @@ class OmnigentWebViewClient(
         val origin = originOf(url)
         val scheme = url?.let { Uri.parse(it).scheme?.lowercase() }
         val pinned = pinnedOrigin()
+        onMainFrameOriginChanged(url)
 
         // A real http(s) navigation to a foreign origin means the server bounced
         // us to the IdP and shouldOverrideUrlLoading didn't catch the redirect.
@@ -104,6 +106,7 @@ class OmnigentWebViewClient(
         url: String?,
     ) {
         super.onPageFinished(view, url)
+        onMainFrameOriginChanged(url)
         val onPinnedOrigin = originOf(url) == pinnedOrigin()
         // An app page loaded, so the mount works: re-arm the bounce budget for
         // the next time the user lands back on the workspace root.

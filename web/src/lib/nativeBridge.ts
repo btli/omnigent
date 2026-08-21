@@ -58,6 +58,8 @@ interface NativeShellApi {
   nativeWebReady?: (version: number) => void;
   /** Keep the mobile shell's loaded-page liveness watchdog armed. */
   nativeHeartbeat?: (version: number) => void;
+  /** Old iOS shells only: keep their obsolete native picker hidden. */
+  setServerSwitcherHidden?: (hidden: boolean) => void;
   /**
    * Paint the dock/taskbar badge; 0 clears it. `activation` is consumed only by
    * the Android shell, which renders the badge as a tray notification and needs
@@ -306,16 +308,49 @@ export interface ServerPickerInfo {
 /** Current mobile shell/web compatibility protocol. */
 export const NATIVE_WEB_PROTOCOL_VERSION = 1;
 
+function showNativeShellIncompatibility(native: NativeShellApi): void {
+  try {
+    native.setServerSwitcherHidden?.(true);
+  } catch (err) {
+    console.warn("[nativeBridge] failed to hide legacy server switcher:", err);
+  }
+  const render = () => {
+    if (!document.body || document.getElementById("omnigent-native-incompatible")) return;
+    const page = document.createElement("main");
+    page.id = "omnigent-native-incompatible";
+    page.setAttribute("role", "alert");
+    page.style.cssText =
+      "position:fixed;inset:0;z-index:2147483647;display:grid;place-items:center;padding:32px;background:#fff;color:#27272a;font:16px system-ui;text-align:center";
+    page.innerHTML =
+      '<section style="max-width:32rem"><h1 style="font-size:24px;margin:0 0 12px">App update required</h1><p style="line-height:1.5;margin:0">This version of the mobile app cannot safely switch servers. Update Omnigent, then reconnect to your server.</p></section>';
+    document.body.replaceChildren(page);
+  };
+  if (document.body) render();
+  else window.addEventListener("DOMContentLoaded", render, { once: true });
+}
+
 /**
  * Start the mobile shell compatibility handshake and liveness heartbeat.
- * Older shells expose neither method and keep their legacy behavior.
+ * Older mobile shells cannot host the consolidated picker. Their legacy native
+ * picker stays hidden while the web surface shows an explicit update outcome.
  */
 export function startNativeShellLiveness(): () => void {
   let timer: number | null = null;
   const start = () => {
     if (timer !== null) return;
     const native = nativeApi();
-    if (!native?.nativeWebReady || !native.nativeHeartbeat) return;
+    if (!native || native.kind === "electron") return;
+    if (
+      native.nativeBridgeVersion !== NATIVE_WEB_PROTOCOL_VERSION ||
+      !native.nativeWebReady ||
+      !native.nativeHeartbeat ||
+      !native.getServerPicker ||
+      !native.switchServer ||
+      !native.openServerSetup
+    ) {
+      showNativeShellIncompatibility(native);
+      return;
+    }
     try {
       native.nativeWebReady(NATIVE_WEB_PROTOCOL_VERSION);
     } catch (err) {

@@ -167,7 +167,7 @@ describe("isNativeShell / isElectronShell", () => {
   });
 
   it("treats the Android bridge as native but not Electron or iOS", () => {
-    setAndroid(true);
+    setAndroid(true, true, true);
     expect(isElectronShell()).toBe(false);
     expect(isIOSShell()).toBe(false);
     expect(isAndroidShell()).toBe(true);
@@ -178,7 +178,7 @@ describe("isNativeShell / isElectronShell", () => {
     setIOS(true);
     expect(isAndroidShell()).toBe(false);
     setIOS(false);
-    setAndroid(true);
+    setAndroid(true, true, true);
     expect(isIOSShell()).toBe(false);
   });
 
@@ -298,7 +298,7 @@ describe("setThemeSource", () => {
   });
 
   it("routes the selected theme through the Android bridge", () => {
-    setAndroid(true);
+    setAndroid(true, true, true);
     setThemeSource("light");
     expect(androidSetColorScheme).toHaveBeenCalledWith("light");
   });
@@ -343,7 +343,7 @@ describe("nativeNotify", () => {
   });
 
   it("routes the notification through the Android bridge when present", async () => {
-    setAndroid(true);
+    setAndroid(true, true, true);
     await expect(nativeNotify({ title: "Session 1", body: "done" })).resolves.toBe(true);
     expect(androidNotify).toHaveBeenCalledWith({
       title: "Session 1",
@@ -554,7 +554,7 @@ describe("mobile shell compatibility handshake", () => {
   it("announces readiness and keeps a protocol-1 shell alive", () => {
     const ready = vi.fn();
     const heartbeat = vi.fn();
-    setAndroid(true);
+    setAndroid(true, true, true);
     Object.assign((window as unknown as Record<string, unknown>).omnigentNative as object, {
       nativeBridgeVersion: 1,
       nativeWebReady: ready,
@@ -574,7 +574,7 @@ describe("mobile shell compatibility handshake", () => {
     const ready = vi.fn();
     const heartbeat = vi.fn();
     const stop = startNativeShellLiveness();
-    setAndroid(true);
+    setAndroid(true, true, true);
     Object.assign((window as unknown as Record<string, unknown>).omnigentNative as object, {
       nativeBridgeVersion: 1,
       nativeWebReady: ready,
@@ -586,11 +586,18 @@ describe("mobile shell compatibility handshake", () => {
     stop();
   });
 
-  it("is inert in browsers and old shells", () => {
+  it("is inert in browsers and replaces an old shell with full-screen incompatibility", () => {
     const stopBrowser = startNativeShellLiveness();
     setIOS(true);
+    const legacy = (window as unknown as Record<string, Record<string, unknown>>).omnigentNative;
+    const hideLegacy = vi.fn();
+    legacy.setServerSwitcherHidden = hideLegacy;
     const stopOldShell = startNativeShellLiveness();
     expect(vi.getTimerCount()).toBe(0);
+    expect(hideLegacy).toHaveBeenCalledWith(true);
+    expect(document.getElementById("omnigent-native-incompatible")).toHaveTextContent(
+      "App update required",
+    );
     stopBrowser();
     stopOldShell();
   });

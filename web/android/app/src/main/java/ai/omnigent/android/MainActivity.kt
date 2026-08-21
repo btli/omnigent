@@ -63,8 +63,32 @@ class MainActivity : AppCompatActivity() {
     private val livenessHandler = Handler(Looper.getMainLooper())
     private var compatibilityReady = false
     private var recoveryShown = false
-    private val livenessTimeout =
-        Runnable { showFullScreenRecovery("The server UI stopped responding.") }
+    private val livenessWatchdog by lazy {
+        LivenessWatchdog(
+            scheduler =
+                object : WatchdogScheduler {
+                    private var pending: Runnable? = null
+
+                    override fun schedule(
+                        delayMs: Long,
+                        action: () -> Unit,
+                    ) {
+                        val runnable = Runnable(action)
+                        pending = runnable
+                        livenessHandler.postDelayed(runnable, delayMs)
+                    }
+
+                    override fun cancel() {
+                        pending?.let(livenessHandler::removeCallbacks)
+                        pending = null
+                    }
+                },
+            onTimeout = { showFullScreenRecovery("The server UI stopped responding.") },
+            onIncompatible = {
+                showFullScreenRecovery("The server UI is incompatible with this app version.")
+            },
+        )
+    }
 
     // WebChromeClient affordances that need Activity-scoped result launchers.
     // Transient by design: rotation is covered by configChanges (no recreation),
@@ -142,6 +166,7 @@ class MainActivity : AppCompatActivity() {
                             bridgeTransportInstalled && bridgeScriptHandler == null
                         },
                         onPageReady = ::onPageReady,
+                        onMainFrameOriginChanged = ::onMainFrameOriginChanged,
                         onLoadFailure = ::showFullScreenRecovery,
                         onLoginRequired = ::startLogin,
                         bridgeScriptSource = ::nativeBridgeScriptSource,
@@ -245,8 +270,21 @@ class MainActivity : AppCompatActivity() {
         )
 
         ensureNotificationPermission()
-        armLivenessTimeout(INITIAL_READY_TIMEOUT_MS)
+        livenessWatchdog.beginInitialWindow()
         webView.loadUrl(serverUrl)
+    }
+
+    override fun onPause() {
+        livenessWatchdog.setActive(false)
+        super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (::webView.isInitialized) {
+            livenessWatchdog.setOnPinnedOrigin(originOf(webView.url) == pinnedOrigin)
+            livenessWatchdog.setActive(true)
+        }
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -306,28 +344,19 @@ class MainActivity : AppCompatActivity() {
     private fun nativeBridgeScriptSource(): String = NativeBridgeScript.source
 
     private fun onNativeWebReady(version: Int) {
-        if (version != NativeBridgeScript.PROTOCOL_VERSION) {
-            showFullScreenRecovery("The server UI is incompatible with this app version.")
-            return
-        }
+        if (!livenessWatchdog.protocolReady(version, NativeBridgeScript.PROTOCOL_VERSION)) return
         compatibilityReady = true
-        armLivenessTimeout(HEARTBEAT_TIMEOUT_MS)
     }
 
     private fun onNativeHeartbeat(version: Int) {
         if (!compatibilityReady || version != NativeBridgeScript.PROTOCOL_VERSION) return
-        armLivenessTimeout(HEARTBEAT_TIMEOUT_MS)
-    }
-
-    private fun armLivenessTimeout(delayMs: Long) {
-        livenessHandler.removeCallbacks(livenessTimeout)
-        livenessHandler.postDelayed(livenessTimeout, delayMs)
+        livenessWatchdog.heartbeat()
     }
 
     private fun showFullScreenRecovery(message: String) {
         if (recoveryShown || isFinishing || isDestroyed) return
         recoveryShown = true
-        livenessHandler.removeCallbacks(livenessTimeout)
+        livenessWatchdog.cancel()
         val prefill = runCatching { ServerStore(this).currentServerUrl() }.getOrNull()
         startActivity(
             Intent(this, ConnectActivity::class.java)
@@ -496,7 +525,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        livenessHandler.removeCallbacks(livenessTimeout)
+        livenessWatchdog.cancel()
         // Unblock a pending file input / mic request, then release WebView + worker.
         pendingFileCallback?.onReceiveValue(null)
         pendingFileCallback = null
@@ -554,7 +583,7 @@ class MainActivity : AppCompatActivity() {
             showFullScreenRecovery("This Android WebView cannot run the required secure bridge.")
             return
         }
-        armLivenessTimeout(INITIAL_READY_TIMEOUT_MS)
+        livenessWatchdog.beginInitialWindow()
         webView.loadUrl(serverUrl)
     }
 
@@ -590,6 +619,10 @@ class MainActivity : AppCompatActivity() {
         loginAttempts = 0 // reached a pinned-origin page — we're past the login redirect
         flushPendingActivation()
         emitInsets()
+    }
+
+    private fun onMainFrameOriginChanged(url: String?) {
+        livenessWatchdog.setOnPinnedOrigin(originOf(url) == pinnedOrigin)
     }
 
     private fun flushPendingActivation() {
@@ -762,7 +795,5 @@ class MainActivity : AppCompatActivity() {
         // (a few ms) always wins the race, short enough to not feel stuck if it
         // doesn't answer. Only the timer ever fires when the renderer is gone.
         const val BACK_FALLBACK_MS = 600L
-        const val INITIAL_READY_TIMEOUT_MS = 20_000L
-        const val HEARTBEAT_TIMEOUT_MS = 15_000L
     }
 }

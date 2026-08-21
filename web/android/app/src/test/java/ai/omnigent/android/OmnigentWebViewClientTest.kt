@@ -19,6 +19,22 @@ import org.robolectric.Shadows.shadowOf
 @RunWith(RobolectricTestRunner::class)
 class OmnigentWebViewClientTest {
     @Test
+    fun `main-frame auth navigation reports leaving and returning to pinned origin`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val origins = mutableListOf<String?>()
+        val client =
+            client(
+                pinnedOrigin = DATABRICKS_ORIGIN,
+                onMainFrameOriginChanged = { origins += originOf(it) },
+            )
+
+        client.onPageStarted(webView, IDP_URL, null)
+        client.onPageStarted(webView, "$DATABRICKS_ORIGIN/omnigent", null)
+
+        assertEquals(listOf(originOf(IDP_URL), DATABRICKS_ORIGIN), origins)
+    }
+
+    @Test
     fun `renderer termination routes to full-screen recovery callback`() {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
         val failures = mutableListOf<String>()
@@ -308,11 +324,13 @@ class OmnigentWebViewClientTest {
         pinnedOrigin: String = PINNED_ORIGIN,
         onLoginRequired: () -> Unit = {},
         onLoadFailure: (String) -> Unit = {},
+        onMainFrameOriginChanged: (String?) -> Unit = {},
         onPageReady: (String?) -> Unit = {},
     ) = OmnigentWebViewClient(
         pinnedOrigin = { pinnedOrigin },
         shouldInjectBridgeAtPageReady = { shouldInjectBridgeAtPageReady },
         onPageReady = onPageReady,
+        onMainFrameOriginChanged = onMainFrameOriginChanged,
         onLoadFailure = onLoadFailure,
         onLoginRequired = onLoginRequired,
     )

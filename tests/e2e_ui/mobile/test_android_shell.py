@@ -43,6 +43,12 @@ _MOBILE_VIEWPORT: ViewportSize = {"width": 390, "height": 844}
 _ANDROID_SHELL_INIT_SCRIPT = """
 window.omnigentNative = {
   kind: "android",
+  nativeBridgeVersion: 1,
+  nativeWebReady: function () {},
+  nativeHeartbeat: function () {},
+  getServerPicker: function () { return Promise.resolve(null); },
+  switchServer: function () { return Promise.resolve(); },
+  openServerSetup: function () {},
   setBadgeCount: function () {},
   notify: function () { return Promise.resolve(false); },
   onNotificationActivated: function () { return function () {}; },
@@ -54,6 +60,9 @@ _ANDROID_SERVER_PICKER_INIT_SCRIPT = """
 window.__serverPickerActions = [];
 window.omnigentNative = {
   kind: "android",
+  nativeBridgeVersion: 1,
+  nativeWebReady: function () {},
+  nativeHeartbeat: function () {},
   getServerPicker: function () {
     return Promise.resolve({
       currentOrigin: "https://current.example.com",

@@ -129,6 +129,21 @@ describe("SidebarServerPicker", () => {
     await waitFor(() => expect(getServerPicker).toHaveBeenCalledTimes(2));
   });
 
+  it("keeps the last good menu when a live refresh times out", async () => {
+    getServerPicker
+      .mockResolvedValueOnce({
+        currentOrigin: "https://current.example.com",
+        recentServers: ["https://recent.example.com"],
+      })
+      .mockResolvedValueOnce(null);
+    renderPicker();
+
+    await openMenu();
+    await waitFor(() => expect(getServerPicker).toHaveBeenCalledTimes(2));
+    expect(screen.getByText("recent.example.com")).toBeInTheDocument();
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+  });
+
   it("switches to a recent server on select", async () => {
     getServerPicker.mockResolvedValue({
       currentOrigin: "http://localhost:8000",
