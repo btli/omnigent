@@ -8,7 +8,12 @@ PRs are skipped and reported). The nightly mode then pins an immutable
 at the same commit; ``--staging-only`` (the hourly mode) pushes only
 ``staging`` and skips the push entirely when the composition is unchanged.
 The only refs ever pushed are ``staging``, the ``nightly-*`` pin, and the
-dev tag.
+dev tag. ``--ring production`` composes the production ring instead: open
+non-draft PRs only, no extras, branch ``production`` + immutable
+``production-YYYYMMDD`` pins, no dev tag, and no hourly mode
+(``--staging-only`` is rejected for it). A production composition
+that touches DB migrations is BLOCKED before any ref moves unless
+``--migration-approval`` names the exact candidate sha.
 
 Stdlib + git subprocess only; the gh CLI is used solely to list PRs and can
 be bypassed with --prs-json (how the tests stay offline).
@@ -24,6 +29,7 @@ import re
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 # Resolved and cached at module load, while sys.path[0] (this script's dir)
@@ -46,20 +52,79 @@ EXTRA_MISSING = "extra unfetchable (likely deleted; remove from extras.txt)"
 EXTRA_FETCH_FAILED = "extra fetch failed (cannot reach remote; pin kept, staging not advanced)"
 EXTRA_FETCH_ATTEMPTS = 3
 EXTRA_FETCH_BACKOFF_S = 2
-# Subject line minted below for every staging merge commit; also decoded to
-# diff two compositions (what changed between the old and new staging).
-STAGING_MERGE_RE = re.compile(r"staging: merge PR #(\d+) \((.+) @ ([0-9a-f]{12})\)")
-STAGING_BRANCH_MERGE_RE = re.compile(r"staging: merge branch (.+) \((.+) @ ([0-9a-f]{12})\)")
-# Fixed identity, no gpg signature: the merge commit must be byte-reproducible
-# so an unchanged same-day rerun lands on the identical sha (no-op detection).
-COMMIT_IDENT = [
-    "-c",
-    "user.name=omnigent-staging",
-    "-c",
-    "user.email=staging@invalid",
-    "-c",
-    "commit.gpgsign=false",
-]
+@dataclass(frozen=True)
+class Ring:
+    """A promotion ring the composer can build. Every branch-name, pin-tag
+    prefix, and merge-subject string the composer mints or decodes is derived
+    from here, so a second ring (e.g. production) reuses the same code path
+    with different identity. ``use_extras``/``exclude_drafts``/``mint_dev_tag``
+    are composition switches consumed by the CLI."""
+
+    name: str
+    branch: str
+    merge_subject_prefix: str
+    pin_prefix: str
+    use_extras: bool
+    exclude_drafts: bool
+    mint_dev_tag: bool
+
+
+# The staging ring — the composer's only ring today; every function defaults to
+# it so existing callers (and main()) are unchanged.
+STAGING = Ring(
+    name="staging",
+    branch="staging",
+    merge_subject_prefix="staging",
+    pin_prefix="nightly-",
+    use_extras=True,
+    exclude_drafts=False,
+    mint_dev_tag=True,
+)
+
+
+# The production ring: upstream main + open NON-draft PRs only — draft status
+# is the promotion gate. No extras (nothing hand-pinned reaches prod), no dev
+# tag (nothing downstream consumes one), immutable production-YYYYMMDD pins.
+PRODUCTION = Ring(
+    name="production",
+    branch="production",
+    merge_subject_prefix="production",
+    pin_prefix="production-",
+    use_extras=False,
+    exclude_drafts=True,
+    mint_dev_tag=False,
+)
+
+RINGS = {r.name: r for r in (STAGING, PRODUCTION)}
+
+
+# Subject line minted for every merge commit; also decoded to diff two
+# compositions (what changed between the old and new tip). Built from the ring
+# so the prefix follows the ring's identity.
+def merge_re(ring: Ring = STAGING) -> re.Pattern[str]:
+    return re.compile(
+        re.escape(ring.merge_subject_prefix) + r": merge PR #(\d+) \((.+) @ ([0-9a-f]{12})\)"
+    )
+
+
+def branch_merge_re(ring: Ring = STAGING) -> re.Pattern[str]:
+    return re.compile(
+        re.escape(ring.merge_subject_prefix) + r": merge branch (.+) \((.+) @ ([0-9a-f]{12})\)"
+    )
+
+
+# Fixed per-ring identity, no gpg signature: the merge commit must be
+# byte-reproducible so an unchanged same-day rerun lands on the identical sha
+# (no-op detection). Staging's exact values are locked by the golden.
+def commit_ident(ring: Ring = STAGING) -> list[str]:
+    return [
+        "-c",
+        f"user.name=omnigent-{ring.name}",
+        "-c",
+        f"user.email={ring.name}@invalid",
+        "-c",
+        "commit.gpgsign=false",
+    ]
 
 
 class StageError(RuntimeError):
@@ -147,13 +212,27 @@ def list_prs() -> list[dict]:
             "--limit",
             str(PR_LIST_LIMIT),
             "--json",
-            "number,headRefName,headRefOid",
+            "number,headRefName,headRefOid,isDraft",
         ],
         check=True,
         text=True,
         capture_output=True,
     ).stdout
     return check_not_truncated(json.loads(out))
+
+
+def filter_drafts(prs: list[dict]) -> list[dict]:
+    """Drop draft PRs — the production ring's promotion gate (decision 2:
+    draft status, not a review/CI check, decides readiness). The gate fails
+    CLOSED: a record whose isDraft is missing or non-boolean is indeterminate
+    and raises rather than passing as ready."""
+    for p in prs:
+        if not isinstance(p.get("isDraft"), bool):
+            raise StageError(
+                f"PR #{p.get('number')} carries no boolean isDraft field; "
+                "refusing to guess draft state for a production composition"
+            )
+    return [p for p in prs if p["isDraft"] is False]
 
 
 def check_not_truncated(prs: list[dict]) -> list[dict]:
@@ -165,18 +244,18 @@ def check_not_truncated(prs: list[dict]) -> list[dict]:
     return prs
 
 
-def _validate_branch_pin(name: str) -> str | None:
+def _validate_branch_pin(name: str, ring: Ring = STAGING) -> str | None:
     """Return a fail-loud reason, or None if ``name`` is a legal fork-branch pin.
 
     Reject ``-`` prefixes before any git argv so a crafted name cannot be
     parsed as an option; then ``git check-ref-format --branch`` (name is now
-    a positional value, not a flag). ``main`` and ``staging`` are the
+    a positional value, not a flag). ``main`` and the ring's own branch are the
     composition's own refs — pinning them would self-merge."""
     if not name:
         return "invalid branch name"
     if name.startswith("-"):
         return "branch name must not start with '-'"
-    if name in {"main", "staging"}:
+    if name in {"main", ring.branch}:
         return f"branch {name!r} is a composition self-reference"
     # name is a single argv after --branch and does not start with '-'.
     proc = subprocess.run(
@@ -190,7 +269,7 @@ def _validate_branch_pin(name: str) -> str | None:
     return None
 
 
-def parse_extras(path: Path) -> tuple[list[int], list[str]]:
+def parse_extras(path: Path, ring: Ring = STAGING) -> tuple[list[int], list[str]]:
     """PR numbers and ``branch:<name>`` pins from the extras manifest: one
     per line, blank lines and ``#``-to-end-of-line comments allowed; a
     missing file means no extras. Anything else is a config error — fail
@@ -210,7 +289,7 @@ def parse_extras(path: Path) -> tuple[list[int], list[str]]:
             continue
         if entry.startswith("branch:"):
             name = entry[len("branch:") :]
-            reason = _validate_branch_pin(name)
+            reason = _validate_branch_pin(name, ring)
             if reason:
                 raise StageError(f"{path}:{lineno}: {reason} {entry!r}")
             branches.append(name)
@@ -281,7 +360,7 @@ def _pin_label(p: dict) -> str:
 
 
 def merge_prs(
-    cwd: str | Path, prs: list[dict], upstream: str, fork: str = "origin"
+    cwd: str | Path, prs: list[dict], upstream: str, fork: str = "origin", ring: Ring = STAGING
 ) -> tuple[list[dict], list[dict]]:
     applied: list[dict] = []
     skipped: list[dict] = []
@@ -356,13 +435,13 @@ def merge_prs(
             # nothing new is detected as a no-op instead of minting -rerunN.
             when = git(cwd, "show", "-s", "--format=%cI", oid).stdout.strip()
             subject = (
-                f"staging: merge branch {branch} ({branch} @ {oid[:12]})"
+                f"{ring.merge_subject_prefix}: merge branch {branch} ({branch} @ {oid[:12]})"
                 if source == "extra-branch"
-                else f"staging: merge PR #{num} ({branch} @ {oid[:12]})"
+                else f"{ring.merge_subject_prefix}: merge PR #{num} ({branch} @ {oid[:12]})"
             )
             git(
                 cwd,
-                *COMMIT_IDENT,
+                *commit_ident(ring),
                 "commit",
                 "--no-verify",
                 "-m",
@@ -377,22 +456,24 @@ def merge_prs(
 
 
 def composition_of(
-    cwd: str | Path, sha: str
+    cwd: str | Path, sha: str, ring: Ring = STAGING
 ) -> tuple[str, dict[int | str, tuple[str, str]]] | None:
-    """Decode a pushed staging commit into (upstream base sha, {pr: (branch,
+    """Decode a pushed ring-tip commit into (upstream base sha, {pr: (branch,
     head12)}) from its first-parent merge subjects, walking to the real base —
     the merge count is unbounded. None when the sha isn't readable."""
     if not sha or git(cwd, "cat-file", "-e", f"{sha}^{{commit}}", check=False).returncode != 0:
         return None
+    pr_re = merge_re(ring)
+    br_re = branch_merge_re(ring)
     merges: dict[int | str, tuple[str, str]] = {}
     out = git(cwd, "log", "--first-parent", "--format=%H%x09%s", sha).stdout
     for line in out.splitlines():
         commit, _, subject = line.partition("\t")
-        m = STAGING_MERGE_RE.fullmatch(subject)
+        m = pr_re.fullmatch(subject)
         if m:
             merges[int(m.group(1))] = (m.group(2), m.group(3))
             continue
-        b = STAGING_BRANCH_MERGE_RE.fullmatch(subject)
+        b = br_re.fullmatch(subject)
         if b:
             merges[f"branch:{b.group(1)}"] = (b.group(2), b.group(3))
             continue
@@ -447,18 +528,65 @@ def push_causes(
     return causes or ["composition changed (cause unknown)"]
 
 
-def pin_name(cwd: str | Path, fork: str, datestamp: str, sha: str) -> tuple[str, bool]:
-    """Immutable name for tonight's pin: nightly-YYYYMMDD, -rerunN if the day
+def pin_name(
+    cwd: str | Path, fork: str, datestamp: str, sha: str, ring: Ring = STAGING
+) -> tuple[str, bool]:
+    """Immutable name for tonight's pin: ``<prefix>YYYYMMDD``, -rerunN if the day
     already has a pin at a different commit, no-op if it already points here."""
     n = 0
     while True:
-        cand = f"nightly-{datestamp}" + (f"-rerun{n}" if n else "")
+        cand = f"{ring.pin_prefix}{datestamp}" + (f"-rerun{n}" if n else "")
         existing = remote_ref(cwd, fork, f"refs/tags/{cand}")
         if not existing:
             return cand, True
         if existing == sha:
             return cand, False
         n += 1
+
+
+# Alembic migrations live here; a composition that touches (or drops) a file
+# under this prefix must not auto-promote to production (locked decision 11).
+MIGRATIONS_PATH_PREFIX = "omnigent/db/migrations/versions/"
+
+
+def migration_touched(
+    cwd: str | Path,
+    candidate_sha: str,
+    upstream_sha: str,
+    prev_pin_sha: str | None,
+    prefix: str = MIGRATIONS_PATH_PREFIX,
+) -> bool:
+    """True when the candidate composition carries a schema change: either
+    ``upstream..candidate`` touches the migrations path (a composed PR adds,
+    edits, or deletes one) or ``prev_pin..candidate`` does (a migration-bearing
+    PR *removed* between compositions — invisible to the upstream leg). With no
+    previous pin only the upstream diff is consulted."""
+    for base in (upstream_sha, prev_pin_sha):
+        if not base:
+            continue
+        out = git(cwd, "diff", "--name-only", f"{base}..{candidate_sha}").stdout
+        if any(line.startswith(prefix) for line in out.splitlines()):
+            return True
+    return False
+
+
+def latest_pin_sha(cwd: str | Path, fork: str, ring: Ring) -> str | None:
+    """Commit of the newest ``<prefix>YYYYMMDD[-rerunN]`` pin tag on the fork
+    — the previous composition the migration gate diffs against. None when
+    the ring has never pinned: a bootstrap compose is gated on the upstream
+    leg only. Pins are lightweight tags (pushed as commit-sha refspecs), so
+    the ls-remote sha IS the commit; a peeled ``^{}`` line never fullmatches."""
+    pin_re = re.compile(re.escape(ring.pin_prefix) + r"(\d{8})(?:-rerun(\d+))?")
+    latest: tuple[tuple[str, int], str] | None = None
+    for line in git(cwd, "ls-remote", "--tags", fork).stdout.splitlines():
+        sha, _, ref = line.partition("\t")
+        m = pin_re.fullmatch(ref.removeprefix("refs/tags/"))
+        if not m:
+            continue
+        key = (m.group(1), int(m.group(2) or 0))
+        if latest is None or key > latest[0]:
+            latest = (key, sha)
+    return latest[1] if latest else None
 
 
 def stage(
@@ -468,6 +596,8 @@ def stage(
     upstream: str = "upstream",
     fork: str = "origin",
     staging_only: bool = False,
+    ring: Ring = STAGING,
+    migration_approval: str = "",
 ) -> dict:
     datestamp = date.strftime("%Y%m%d")
 
@@ -475,7 +605,7 @@ def stage(
     upstream_sha = git(cwd, "rev-parse", "FETCH_HEAD").stdout.strip()
     git(cwd, "checkout", "--detach", upstream_sha)
 
-    applied, skipped = merge_prs(cwd, prs, upstream, fork)
+    applied, skipped = merge_prs(cwd, prs, upstream, fork, ring)
     staging_sha = git(cwd, "rev-parse", "HEAD").stdout.strip()
 
     # An extra we could not even reach is an infrastructure failure, not a
@@ -490,7 +620,7 @@ def stage(
         # Hourly mode: only refs/heads/staging moves — no pins, no tags.
         # Composition is byte-reproducible, so an identical remote sha means
         # nothing changed and the push is skipped outright.
-        expected_staging = remote_ref(cwd, fork, "refs/heads/staging")
+        expected_staging = remote_ref(cwd, fork, f"refs/heads/{ring.branch}")
         report = {
             "date": datestamp,
             "upstream_sha": upstream_sha,
@@ -508,16 +638,16 @@ def stage(
         }
         if not report["pushed"]:
             return report
-        git(cwd, "fetch", fork, "refs/heads/staging", check=False)
+        git(cwd, "fetch", fork, f"refs/heads/{ring.branch}", check=False)
         report["causes"] = push_causes(
-            composition_of(cwd, expected_staging), upstream_sha, applied
+            composition_of(cwd, expected_staging, ring), upstream_sha, applied
         )
         git(
             cwd,
             "push",
-            f"--force-with-lease=refs/heads/staging:{expected_staging}",
+            f"--force-with-lease=refs/heads/{ring.branch}:{expected_staging}",
             fork,
-            f"{staging_sha}:refs/heads/staging",
+            f"{staging_sha}:refs/heads/{ring.branch}",
         )
         return report
 
@@ -531,18 +661,48 @@ def stage(
             + "; refusing to publish a composition without them"
         )
 
-    dev_tag = dev_version(cwd, upstream_sha, datestamp)
-    name, created = pin_name(cwd, fork, datestamp, staging_sha)
+    # Migration gate — production pins only (locked decision 11): a candidate
+    # touching the migrations path must not auto-publish. Checked BEFORE any
+    # ref moves — the atomic push below is the only publish, so returning here
+    # leaves the fork untouched. Approval is the exact candidate sha, minted
+    # by an operator re-dispatch after the CNPG backup checkpoint; a drifted
+    # composition mints a different sha and blocks again.
+    gate: dict | None = None
+    if ring.pin_prefix == "production-":
+        prev_pin_sha = latest_pin_sha(cwd, fork, ring)
+        gate = {
+            "blocked": False,
+            "candidate": staging_sha,
+            "prev_pin": prev_pin_sha,
+        }
+        if (
+            migration_touched(cwd, staging_sha, upstream_sha, prev_pin_sha)
+            and migration_approval != staging_sha
+        ):
+            gate["blocked"] = True
+            gate["approval_hint"] = f"re-dispatch with approve_migration={staging_sha}"
+            return {
+                "date": datestamp,
+                "upstream_sha": upstream_sha,
+                "staging_sha": staging_sha,
+                "pushed": False,
+                "migration_gate": gate,
+                "applied": applied,
+                "skipped": skipped,
+            }
+
+    dev_tag = dev_version(cwd, upstream_sha, datestamp) if ring.mint_dev_tag else None
+    name, created = pin_name(cwd, fork, datestamp, staging_sha, ring)
 
     # One atomic push for every ref: a partial failure can't leave the fork
     # with mixed staging/pin/dev-tag state. Leases pin the values we just
     # observed so a concurrent push loses loudly instead of being clobbered.
     refspecs: list[str] = []
     leases: list[str] = []
-    expected_staging = remote_ref(cwd, fork, "refs/heads/staging")
+    expected_staging = remote_ref(cwd, fork, f"refs/heads/{ring.branch}")
     if expected_staging != staging_sha:
-        refspecs.append(f"{staging_sha}:refs/heads/staging")
-        leases.append(f"--force-with-lease=refs/heads/staging:{expected_staging}")
+        refspecs.append(f"{staging_sha}:refs/heads/{ring.branch}")
+        leases.append(f"--force-with-lease=refs/heads/{ring.branch}:{expected_staging}")
     if created:
         refspecs += [f"{staging_sha}:refs/heads/{name}", f"{staging_sha}:refs/tags/{name}"]
     else:
@@ -555,11 +715,12 @@ def stage(
         elif branch_sha != staging_sha:
             raise StageError(f"pin branch {name} points at {branch_sha}, expected {staging_sha}")
     # The dev tag floats within the day: a rerun repoints it (fork-local tag,
-    # nothing downstream pins to it mid-day).
-    expected_dev = remote_ref(cwd, fork, f"refs/tags/{dev_tag}")
-    if expected_dev != staging_sha:
-        refspecs.append(f"{staging_sha}:refs/tags/{dev_tag}")
-        leases.append(f"--force-with-lease=refs/tags/{dev_tag}:{expected_dev}")
+    # nothing downstream pins to it mid-day). Rings without one push nothing.
+    if dev_tag:
+        expected_dev = remote_ref(cwd, fork, f"refs/tags/{dev_tag}")
+        if expected_dev != staging_sha:
+            refspecs.append(f"{staging_sha}:refs/tags/{dev_tag}")
+            leases.append(f"--force-with-lease=refs/tags/{dev_tag}:{expected_dev}")
     if refspecs:
         git(cwd, "push", "--atomic", *leases, fork, *refspecs)
 
@@ -569,8 +730,9 @@ def stage(
         "staging_sha": staging_sha,
         "branch": name,
         "tag": name,
-        "dev_tag": dev_tag,
+        **({"dev_tag": dev_tag} if dev_tag else {}),
         "pin_created": created,
+        **({"migration_gate": gate} if gate else {}),
         "applied": applied,
         "skipped": skipped,
     }
@@ -583,13 +745,13 @@ def _skip_reason(p: dict) -> str:
     return f"merge conflict: {paths or 'unknown paths'}"
 
 
-def notes(report: dict, signed: bool) -> str:
+def notes(report: dict, signed: bool, ring: Ring = STAGING) -> str:
     lines = [
-        f"Nightly personal staging ring for {report['date']} (UTC).",
+        f"Nightly personal {ring.name} ring for {report['date']} (UTC).",
         "",
         f"- Upstream main: `{report['upstream_sha']}`",
-        f"- Staging commit: `{report['staging_sha']}`",
-        f"- Dev tag: `{report['dev_tag']}`",
+        f"- {ring.name.capitalize()} commit: `{report['staging_sha']}`",
+        *([f"- Dev tag: `{report['dev_tag']}`"] if report.get("dev_tag") else []),
         "",
         f"## Applied PRs ({len(report['applied'])})",
     ]
@@ -601,6 +763,10 @@ def notes(report: dict, signed: bool) -> str:
     lines += [
         f"- {_pin_label(p)} {md_code(p['branch'])} — {_skip_reason(p)}" for p in report["skipped"]
     ] or ["- none"]
+    # Only rings that mint a dev tag ship a nightly APK; other rings
+    # (production) render the minimal variant with no signing section.
+    if not ring.mint_dev_tag:
+        return "\n".join(lines) + "\n"
     lines += ["", "## APK signing"]
     if signed:
         lines.append(
@@ -615,7 +781,8 @@ def notes(report: dict, signed: bool) -> str:
     return "\n".join(lines) + "\n"
 
 
-def summarize(report: dict) -> str:
+def summarize(report: dict, ring: Ring = STAGING) -> str:
+    tier = ring.name.capitalize()
     if report.get("staging_only"):
         # A no-op hour produces the same ~19-row skip table every time; collapse
         # it to a one-line count so the few lines that matter stay visible.
@@ -635,15 +802,15 @@ def summarize(report: dict) -> str:
                 f"{len(report['skipped'])} skipped"
             )
         if report["pushed"]:
-            sha_rows = [f"| Staging | `{report['staging_sha']}` |"]
+            sha_rows = [f"| {tier} | `{report['staging_sha']}` |"]
         else:
             remote = report.get("remote_staging_sha") or "(none)"
             sha_rows = [
                 f"| candidate (not pushed) | `{report['staging_sha']}` |",
-                f"| Remote staging | `{remote}` |",
+                f"| Remote {ring.name} | `{remote}` |",
             ]
         rows = [
-            "## Personal staging hourly",
+            f"## Personal {ring.name} hourly",
             "",
             "| | |",
             "| --- | --- |",
@@ -659,16 +826,38 @@ def summarize(report: dict) -> str:
         rows += [f"| Skipped {_pin_label(p)} | {_skip_reason(p)} |" for p in report["skipped"]]
         return "\n".join(rows) + "\n"
 
+    # A migration-gated production run publishes nothing: no pin row, a loud
+    # BLOCKED result carrying the exact approval instruction.
+    gate = report.get("migration_gate") or {}
+    if gate.get("blocked"):
+        rows = [
+            f"## Personal {ring.name} nightly",
+            "",
+            "| | |",
+            "| --- | --- |",
+            f"| Upstream main | `{report['upstream_sha']}` |",
+            f"| candidate (not pushed) | `{report['staging_sha']}` |",
+            f"| Previous pin | `{gate.get('prev_pin') or '(none)'}` |",
+            (
+                "| Result | **BLOCKED — migration gate**: the composition touches "
+                f"`{MIGRATIONS_PATH_PREFIX}`; no refs were pushed. "
+                f"{gate['approval_hint']} |"
+            ),
+            f"| Applied / skipped | {len(report['applied'])} / {len(report['skipped'])} |",
+        ]
+        rows += [f"| Skipped {_pin_label(p)} | {_skip_reason(p)} |" for p in report["skipped"]]
+        return "\n".join(rows) + "\n"
+
     pin_note = "" if report["pin_created"] else " (already pinned — rerun no-op)"
     rows = [
-        "## Personal staging nightly",
+        f"## Personal {ring.name} nightly",
         "",
         "| | |",
         "| --- | --- |",
         f"| Upstream main | `{report['upstream_sha']}` |",
-        f"| Staging | `{report['staging_sha']}` |",
+        f"| {tier} | `{report['staging_sha']}` |",
         f"| Pin | `{report['tag']}`{pin_note} |",
-        f"| Dev tag | `{report['dev_tag']}` |",
+        *([f"| Dev tag | `{report['dev_tag']}` |"] if report.get("dev_tag") else []),
         f"| Applied / skipped | {len(report['applied'])} / {len(report['skipped'])} |",
     ]
     rows += [f"| Skipped {_pin_label(p)} | {_skip_reason(p)} |" for p in report["skipped"]]
@@ -679,8 +868,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_stage = sub.add_parser("stage", help="build and push the staging ring")
+    p_stage = sub.add_parser("stage", help="build and push a promotion ring")
     p_stage.add_argument("--workdir", default=".")
+    p_stage.add_argument(
+        "--ring",
+        choices=list(RINGS),
+        default=STAGING.name,
+        help="which ring to compose (default: staging)",
+    )
     p_stage.add_argument("--upstream-remote", default="upstream")
     p_stage.add_argument("--fork-remote", default="origin")
     p_stage.add_argument("--date", help="UTC datestamp YYYYMMDD (default: today)")
@@ -696,10 +891,23 @@ def main(argv: list[str] | None = None) -> int:
         default=str(EXTRAS_FILE),
         help="extras manifest path (missing file == no extras)",
     )
+    p_stage.add_argument(
+        "--migration-approval",
+        default="",
+        metavar="SHA",
+        help="full candidate sha approving a migration-touching production "
+        "composition (only meaningful with --ring production)",
+    )
 
     p_notes = sub.add_parser("notes", help="render release notes from a merge report")
     p_notes.add_argument("--report", default="merge-report.json")
     p_notes.add_argument("--signed", choices=["true", "false"], required=True)
+    p_notes.add_argument(
+        "--ring",
+        choices=list(RINGS),
+        default=STAGING.name,
+        help="ring whose notes variant to render (default: staging)",
+    )
 
     p_stale = sub.add_parser(
         "is-stale-ref-rejection",
@@ -718,14 +926,20 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "notes":
         report = json.loads(Path(args.report).read_text())
-        sys.stdout.write(notes(report, signed=args.signed == "true"))
+        sys.stdout.write(notes(report, signed=args.signed == "true", ring=RINGS[args.ring]))
         return 0
 
     if args.date:
         date = dt.date(int(args.date[:4]), int(args.date[4:6]), int(args.date[6:8]))
     else:
         date = dt.datetime.now(dt.timezone.utc).date()
-    title = "Personal staging hourly" if args.staging_only else "Personal staging nightly"
+    ring = RINGS[args.ring]
+    # The hourly mode force-pushes the ring branch with none of the nightly's
+    # gates (production's migration gate above all) — it exists for staging
+    # only. Rejected here, before any fetch or push can move a ref.
+    if args.staging_only and ring is not STAGING:
+        parser.error("--staging-only is only valid for --ring staging")
+    title = f"Personal {ring.name} " + ("hourly" if args.staging_only else "nightly")
     try:
         # Fail the stage path before any fetch/merge if the parser is absent.
         if tomllib is None:
@@ -735,9 +949,14 @@ def main(argv: list[str] | None = None) -> int:
             if args.prs_json
             else list_prs()
         )
+        if ring.exclude_drafts:
+            prs = filter_drafts(prs)
         # Extras are read here, before any merge touches the worktree, so the
-        # manifest always comes from the trusted checkout.
-        pr_extras, branch_extras = parse_extras(Path(args.extras))
+        # manifest always comes from the trusted checkout. A ring without
+        # extras never opens the manifest at all.
+        pr_extras, branch_extras = (
+            parse_extras(Path(args.extras), ring) if ring.use_extras else ([], [])
+        )
         prs = merge_stream(prs, pr_extras)
         for name in dict.fromkeys(branch_extras):
             prs.append({"source": "extra-branch", "headRefName": name, "number": None})
@@ -748,13 +967,15 @@ def main(argv: list[str] | None = None) -> int:
             upstream=args.upstream_remote,
             fork=args.fork_remote,
             staging_only=args.staging_only,
+            ring=ring,
+            migration_approval=args.migration_approval,
         )
     except Exception as e:
         # The step summary is the failure surface — never exit without one.
         append_summary(f"## {title}\n\n**FAILED:** {e}\n")
         raise
     Path(args.report).write_text(json.dumps(report, indent=2) + "\n")
-    append_summary(summarize(report))
+    append_summary(summarize(report, ring))
     if report.get("blocked"):
         print(
             "::warning::could not reach remote for extras "

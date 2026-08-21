@@ -937,6 +937,384 @@ def test_branch_pin_transport_failure_blocks_push(env, tmp_path, monkeypatch, ca
     assert env.fork_ref("refs/heads/staging") == first["staging_sha"]
 
 
+def test_production_excludes_drafts(env, tmp_path, monkeypatch, capsys):
+    """isDraft is the production gate: a draft PR never reaches the production
+    composition, while the very same list still fully composes for staging."""
+    ready = {**env.add_pr(3, "ready.txt", "r\n"), "isDraft": False}
+    draft = {**env.add_pr(5, "draft.txt", "d\n"), "isDraft": True}
+    prs_json = tmp_path / "prs.json"
+    prs_json.write_text(json.dumps([ready, draft]))
+    no_extras = tmp_path / "no-extras.txt"  # missing file == no extras
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    report_path = tmp_path / "r.json"
+
+    rc = stage_mod.main(
+        [
+            "stage",
+            "--workdir",
+            str(env.work),
+            "--date",
+            STAMP,
+            "--ring",
+            "production",
+            "--prs-json",
+            str(prs_json),
+            "--extras",
+            str(no_extras),
+            "--report",
+            str(report_path),
+        ]
+    )
+    assert rc == 0
+    report = json.loads(report_path.read_text())
+    assert [p["pr"] for p in report["applied"]] == [3]
+    assert report["skipped"] == []
+    assert "merge PR #5" not in env.fork_log("production")
+    assert "## Personal production nightly" in summary.read_text()
+
+    # same list, staging ring: a draft is composed like any other open PR
+    rc = stage_mod.main(
+        [
+            "stage",
+            "--workdir",
+            str(env.work),
+            "--date",
+            STAMP,
+            "--prs-json",
+            str(prs_json),
+            "--extras",
+            str(no_extras),
+            "--report",
+            str(report_path),
+        ]
+    )
+    assert rc == 0
+    report = json.loads(report_path.read_text())
+    assert [p["pr"] for p in report["applied"]] == [3, 5]
+    capsys.readouterr()
+
+
+def test_production_reads_no_extras(env, tmp_path, monkeypatch, capsys):
+    """A present extras manifest with a valid pin is not consulted at all for
+    production: nothing fetched, nothing merged, nothing reported."""
+    open_pr = {**env.add_pr(11, "i.txt", "i\n"), "isDraft": False}
+    env.add_pr(12, "j.txt", "j\n")  # reachable only through the manifest
+    prs_json = tmp_path / "prs.json"
+    prs_json.write_text(json.dumps([open_pr]))
+    extras = tmp_path / "extras.txt"
+    extras.write_text("12\n")
+    report_path = tmp_path / "r.json"
+
+    fetched: list[tuple] = []
+    real_fetch = stage_mod.fetch_extra
+    monkeypatch.setattr(
+        stage_mod, "fetch_extra", lambda *a, **k: (fetched.append(a), real_fetch(*a, **k))[1]
+    )
+
+    rc = stage_mod.main(
+        [
+            "stage",
+            "--workdir",
+            str(env.work),
+            "--date",
+            STAMP,
+            "--ring",
+            "production",
+            "--prs-json",
+            str(prs_json),
+            "--extras",
+            str(extras),
+            "--report",
+            str(report_path),
+        ]
+    )
+    assert rc == 0
+    report = json.loads(report_path.read_text())
+    assert [(p["pr"], p["source"]) for p in report["applied"]] == [(11, "open")]
+    assert report["skipped"] == []
+    assert fetched == []
+    # were extras ever consulted, the ring's own branch is still a self-reference
+    assert "self-reference" in stage_mod._validate_branch_pin("production", stage_mod.PRODUCTION)
+    capsys.readouterr()
+
+
+def test_production_pin_prefix(env):
+    """The production nightly mints production-YYYYMMDD (branch + tag) at the
+    composed sha — no nightly-* ref anywhere."""
+    pr = env.add_pr(7, "c.txt", "7\n")
+    report = env.run([pr], ring=stage_mod.PRODUCTION)
+    assert report["tag"] == f"production-{STAMP}"
+    assert report["branch"] == f"production-{STAMP}"
+    assert report["pin_created"] is True
+    assert env.fork_ref(f"refs/tags/production-{STAMP}") == report["staging_sha"]
+    assert env.fork_ref(f"refs/heads/production-{STAMP}") == report["staging_sha"]
+    assert env.fork_ref("refs/heads/production") == report["staging_sha"]
+    refs = [
+        line.split("\t")[1]
+        for line in git(env.work, "ls-remote", str(env.fork)).stdout.strip().splitlines()
+    ]
+    assert not any("nightly" in r for r in refs), refs
+
+
+def test_production_subject_roundtrip(env):
+    """Minted subjects carry the production prefix, decode via
+    composition_of(ring=PRODUCTION), and are opaque to the staging regexes."""
+    pr = env.add_pr(6, "h.txt", "h\n")
+    report = env.run([pr], ring=stage_mod.PRODUCTION)
+    subject = env.fork_log("production").splitlines()[0]
+    assert subject == f"production: merge PR #6 (pr-6 @ {pr['headRefOid'][:12]})"
+    assert stage_mod.composition_of(env.work, report["staging_sha"], stage_mod.PRODUCTION) == (
+        report["upstream_sha"],
+        {6: ("pr-6", pr["headRefOid"][:12])},
+    )
+    assert stage_mod.merge_re().fullmatch(subject) is None
+    assert stage_mod.branch_merge_re().fullmatch(subject) is None
+
+
+def test_production_mints_no_dev_tag(env):
+    """mint_dev_tag=False: no vX.Y.Z.devYYYYMMDD ref is pushed, the report
+    carries no dev_tag, and the human surfaces render without a Dev-tag row."""
+    pr = env.add_pr(8, "g.txt", "g\n")
+    report = env.run([pr], ring=stage_mod.PRODUCTION)
+    assert "dev_tag" not in report
+    refs = [
+        line.split("\t")[1]
+        for line in git(env.work, "ls-remote", str(env.fork)).stdout.strip().splitlines()
+    ]
+    assert not any(".dev" in r for r in refs), refs
+    assert "Dev tag" not in stage_mod.notes(report, signed=True, ring=stage_mod.PRODUCTION)
+    assert "Dev tag" not in stage_mod.summarize(report, stage_mod.PRODUCTION)
+
+
+def test_production_rejects_staging_only(env, tmp_path, capsys):
+    """--staging-only is the hourly staging mode; production has no hourly
+    path by design, and letting the combination through would force-push
+    refs/heads/production BEFORE the migration gate. Rejected at the parser,
+    before any fetch or push."""
+    prs_json = tmp_path / "prs.json"
+    prs_json.write_text("[]")
+    with pytest.raises(SystemExit) as exc:
+        stage_mod.main(
+            [
+                "stage",
+                "--workdir",
+                str(env.work),
+                "--date",
+                STAMP,
+                "--ring",
+                "production",
+                "--staging-only",
+                "--prs-json",
+                str(prs_json),
+                "--report",
+                str(tmp_path / "r.json"),
+            ]
+        )
+    assert exc.value.code == 2
+    assert "--staging-only is only valid for --ring staging" in capsys.readouterr().err
+    # rejected before any git work: nothing fetched, no ref reached the fork
+    assert git(env.work, "ls-remote", str(env.fork)).stdout.strip() == ""
+    assert git(env.work, "rev-parse", "-q", "--verify", "FETCH_HEAD", check=False).returncode != 0
+
+
+def test_production_rejects_missing_isdraft():
+    """The draft gate must fail CLOSED: a record whose isDraft is missing or
+    non-boolean is indeterminate and must raise (naming the PR), never pass
+    as non-draft into the production composition."""
+    ok = {"number": 1, "isDraft": False}
+    assert stage_mod.filter_drafts([ok, {"number": 2, "isDraft": True}]) == [ok]
+    for bad in (
+        {"number": 7, "headRefName": "b", "headRefOid": "a" * 40},  # missing
+        {"number": 7, "isDraft": None},
+        {"number": 7, "isDraft": "false"},
+    ):
+        with pytest.raises(stage_mod.StageError, match=r"#7"):
+            stage_mod.filter_drafts([ok, bad])
+
+
+def test_production_commit_identity(env):
+    """Merge commits carry the ring's own identity — a production merge is
+    authored omnigent-production, not the staging identity; staging's exact
+    bytes are separately locked by the golden."""
+    pr = {**env.add_pr(6, "h.txt", "h\n"), "isDraft": False}
+    report = env.run([pr], ring=stage_mod.PRODUCTION)
+    obj = git(env.work, "cat-file", "-p", report["staging_sha"]).stdout
+    assert "author omnigent-production <production@invalid>" in obj
+    assert "committer omnigent-production <production@invalid>" in obj
+    assert "staging" not in obj
+
+    staging = env.run([pr])
+    obj = git(env.work, "cat-file", "-p", staging["staging_sha"]).stdout
+    assert "author omnigent-staging <staging@invalid>" in obj
+    assert "committer omnigent-staging <staging@invalid>" in obj
+
+
+def test_notes_production_ring_no_apk_section(tmp_path, capsys):
+    """Production mints no dev tag and ships no APK: its notes are the
+    minimal variant — no APK-signing section either way — and the notes CLI
+    routes there via --ring (default stays staging, golden-locked)."""
+    report = {
+        "date": STAMP,
+        "upstream_sha": "u" * 40,
+        "staging_sha": "s" * 40,
+        "applied": [],
+        "skipped": [],
+    }
+    for signed in (True, False):
+        out = stage_mod.notes(report, signed=signed, ring=stage_mod.PRODUCTION)
+        assert "production ring" in out
+        assert "APK" not in out and "keystore" not in out
+
+    report_path = tmp_path / "r.json"
+    report_path.write_text(json.dumps(report))
+    rc = stage_mod.main(
+        ["notes", "--report", str(report_path), "--ring", "production", "--signed", "false"]
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "production ring" in out and "APK" not in out
+
+    rc = stage_mod.main(["notes", "--report", str(report_path), "--signed", "false"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "staging ring" in out and "## APK signing" in out
+
+
+MIGRATIONS_DIR = "omnigent/db/migrations/versions"
+
+
+def test_migration_touched_on_add(env):
+    """A composition whose upstream..candidate diff adds a migration file is
+    schema-changing — caught even with no previous pin to compare against."""
+    (env.seed / MIGRATIONS_DIR).mkdir(parents=True)
+    pr = env.add_pr(3, f"{MIGRATIONS_DIR}/0001_add.py", "rev\n")
+    report = env.run([pr], ring=stage_mod.PRODUCTION)
+    assert (
+        stage_mod.migration_touched(env.work, report["staging_sha"], report["upstream_sha"], None)
+        is True
+    )
+
+
+def test_migration_touched_on_removal(env):
+    """A candidate that DROPS a migration present in the previous pin is
+    schema-changing even though upstream..candidate is clean — the second
+    diff leg exists precisely for this."""
+    (env.seed / MIGRATIONS_DIR).mkdir(parents=True)
+    mig = env.add_pr(4, f"{MIGRATIONS_DIR}/0002_drop.py", "rev\n")
+    prev = env.run([mig], ring=stage_mod.PRODUCTION)
+
+    other = env.add_pr(5, "plain.txt", "p\n")
+    env.advance_main("bump.txt", "b\n")
+    cur = env.run([other], ring=stage_mod.PRODUCTION)
+    # the upstream leg alone is clean...
+    assert (
+        stage_mod.migration_touched(env.work, cur["staging_sha"], cur["upstream_sha"], None)
+        is False
+    )
+    # ...but prev_pin..candidate shows the dropped migration
+    assert (
+        stage_mod.migration_touched(
+            env.work, cur["staging_sha"], cur["upstream_sha"], prev["staging_sha"]
+        )
+        is True
+    )
+
+
+def test_no_migration_change(env):
+    """Code-only candidates auto-promote: neither diff leg touches the
+    migrations path."""
+    pr = env.add_pr(6, "feat.txt", "f\n")
+    prev = env.run([pr], ring=stage_mod.PRODUCTION)
+    env.advance_main("more.txt", "m\n")
+    cur = env.run([pr], ring=stage_mod.PRODUCTION)
+    assert (
+        stage_mod.migration_touched(
+            env.work, cur["staging_sha"], cur["upstream_sha"], prev["staging_sha"]
+        )
+        is False
+    )
+    # the watched path prefix is a parameter, not a baked-in constant
+    assert (
+        stage_mod.migration_touched(
+            env.work, cur["staging_sha"], cur["upstream_sha"], None, prefix="feat.txt"
+        )
+        is True
+    )
+
+
+def test_production_migration_gate_blocks_push(env):
+    """A schema-changing composition must not auto-publish (decision 11): the
+    nightly stops before its atomic push, so NOTHING lands on the fork, and
+    the report says exactly which sha to approve."""
+    (env.seed / MIGRATIONS_DIR).mkdir(parents=True)
+    pr = env.add_pr(3, f"{MIGRATIONS_DIR}/0001_add.py", "rev\n")
+    report = env.run([pr], ring=stage_mod.PRODUCTION)
+
+    assert report["pushed"] is False
+    gate = report["migration_gate"]
+    assert gate["blocked"] is True
+    assert gate["candidate"] == report["staging_sha"]
+    assert gate["prev_pin"] is None  # bootstrap: gated on the upstream leg only
+    assert f"approve_migration={report['staging_sha']}" in gate["approval_hint"]
+    # nothing was pinned, so the report carries no pin fields at all
+    assert "tag" not in report and "pin_created" not in report
+    # the fork fixture remote received no refs whatsoever
+    assert git(env.work, "ls-remote", str(env.fork)).stdout.strip() == ""
+    text = stage_mod.summarize(report, stage_mod.PRODUCTION)
+    assert "BLOCKED" in text and report["staging_sha"] in text
+
+
+def test_production_migration_gate_approval_publishes(env):
+    """The operator re-dispatch carries the exact candidate sha; composition
+    is byte-reproducible, so the approved rerun mints that sha and pushes."""
+    (env.seed / MIGRATIONS_DIR).mkdir(parents=True)
+    pr = env.add_pr(4, f"{MIGRATIONS_DIR}/0002_add.py", "rev\n")
+    blocked = env.run([pr], ring=stage_mod.PRODUCTION)
+    assert blocked["migration_gate"]["blocked"] is True
+
+    report = env.run(
+        [pr], ring=stage_mod.PRODUCTION, migration_approval=blocked["staging_sha"]
+    )
+    assert report["staging_sha"] == blocked["staging_sha"]
+    assert report["migration_gate"]["blocked"] is False
+    assert report["tag"] == f"production-{STAMP}"
+    assert env.fork_ref("refs/heads/production") == report["staging_sha"]
+    assert env.fork_ref(f"refs/tags/production-{STAMP}") == report["staging_sha"]
+
+
+def test_production_migration_gate_clean_composes(env):
+    """Code-only candidates auto-promote: the gate reports blocked=False and
+    the push happens exactly as before the gate existed. The second night
+    diffs against the previous production pin (latest tag wins)."""
+    pr = env.add_pr(5, "code.txt", "c\n")
+    report = env.run([pr], ring=stage_mod.PRODUCTION)
+    assert report["migration_gate"] == {
+        "blocked": False,
+        "candidate": report["staging_sha"],
+        "prev_pin": None,
+    }
+    assert report["tag"] == f"production-{STAMP}"
+    assert env.fork_ref("refs/heads/production") == report["staging_sha"]
+
+    env.advance_main("more.txt", "m\n")
+    second = env.run([pr], ring=stage_mod.PRODUCTION)
+    assert second["migration_gate"]["blocked"] is False
+    assert second["migration_gate"]["prev_pin"] == report["staging_sha"]
+    assert second["tag"] == f"production-{STAMP}-rerun1"
+    assert env.fork_ref("refs/heads/production") == second["staging_sha"]
+
+
+def test_staging_report_has_no_migration_gate_key(env):
+    """The gate is production-only surface: staging reports (nightly and
+    hourly) carry no migration_gate key — the golden enforces the bytes."""
+    pr = env.add_pr(6, "s.txt", "s\n")
+    nightly = env.run([pr])
+    assert "migration_gate" not in nightly and "pushed" not in nightly
+    hourly = env.run([pr], staging_only=True)
+    assert "migration_gate" not in hourly
+
+
 def test_branch_pin_missing_is_loud_advisory_skip(env, tmp_path):
     extras = tmp_path / "extras.txt"
     extras.write_text("branch:no-such-branch\n")

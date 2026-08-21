@@ -37,9 +37,10 @@ It:
    workflow isn't on main yet, the run warns in the summary instead of
    failing.
 
-**This never touches branch `testing`** — that remains the manually composed
-homelab deploy branch driven by `just test-branch`. Nothing here flips any
-existing behavior.
+**This never touches branch `development`** — that remains the manually
+composed homelab dev-env deploy branch driven by `just dev-branch` (the
+[dev auto-rebase](#development-auto-rebase-personal-dev-rebaseyml) only
+rebases it, never recomposes it). Nothing here flips any existing behavior.
 
 ## Hourly staging refresh (`personal-staging-hourly.yml`)
 
@@ -74,6 +75,62 @@ The workflow uses its own concurrency group (`personal-staging-hourly`,
 `cancel-in-progress: true`) so stale hourly runs coalesce and can never
 cancel a running nightly; if an hourly push loses a `--force-with-lease`
 race with the nightly, the next hour retries.
+
+## Personal production nightly (`personal-production.yml`)
+
+`Personal Production Nightly` (cron `30 10 * * *`, plus `workflow_dispatch`)
+runs the same composer with `--ring production`: fork branch `production` =
+upstream main + every open **non-draft** btli PR — **no extras** (nothing
+hand-pinned reaches prod) and no dev tag. Draft status is the promotion
+gate: mark a PR draft to keep it out of production while staging still
+carries it. Each run mints an immutable `production-YYYYMMDD` branch + tag
+pin (same rerun/no-op semantics as `nightly-*`), which homelab's
+`build-omnigent-production.yml` resolves at 11:10 UTC to build and
+digest-pin the prod server + host images. Compose + pin only: no
+APK/releases/images. Its concurrency group (`personal-production`,
+`cancel-in-progress: false`) is disjoint from the staging groups, so the
+rings can never cancel each other.
+
+### Migration gate
+
+A candidate that touches `omnigent/db/migrations/versions/**` — on EITHER
+`upstream/main..candidate` OR `previous-production-pin..candidate` (the
+second leg catches a migration-bearing PR *removed* between compositions) —
+is never auto-published. `stage.py` itself refuses the atomic push, so **no
+refs move at all**: the run stays green (blocked is a success outcome), the
+step summary shows a BLOCKED row with the candidate sha, and a best-effort
+HMAC-signed alert goes to `hooks.bryanli.net/hooks/ha-notify` (repo secret
+`HA_NOTIFY_HMAC`; absent secret or unreachable receiver only warns — CI
+never holds an HA API token). To promote, take the CNPG backup checkpoint
+per the homelab runbook, then re-dispatch with the exact candidate sha:
+
+```sh
+gh workflow run personal-production.yml -R btli/omnigent --ref main \
+  -f approve_migration=<full-40-hex-candidate-sha>
+```
+
+The approval publishes exactly that sha: if the composition drifted in the
+meantime (a PR or upstream moved), the rerun mints a different candidate,
+the approval no longer matches, and the gate blocks again with the new sha.
+
+## Development auto-rebase (`personal-dev-rebase.yml`)
+
+`Personal Dev Rebase` (cron `45 10 * * *`, plus `workflow_dispatch`) keeps
+branch `development` (the live dev.omni deploy branch) based on upstream
+main while preserving its experiment commits. **Never-clobber semantics**:
+every outcome other than a clean rebase leaves the branch bit-for-bit
+untouched and exits green —
+
+- already based on upstream main → no-op;
+- rebase conflict → `git rebase --abort`, `::warning::` + ha-notify with
+  the conflicting paths, no push (resolve manually or via `just dev-sync`);
+- upstream main advanced mid-rebase → nothing pushed, next run retries;
+- `--force-with-lease` rejected (a concurrent `just dev-sync` or human
+  push won the race) → nothing overwritten, next run retries;
+- branch `development` doesn't exist yet (pre-cutover) → green no-op.
+
+Only genuine infrastructure failures (auth, transport, a broken probe) go
+red — and those also ha-notify.
 
 ## `staging` is ephemeral — do not track it
 
