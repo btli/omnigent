@@ -45,6 +45,12 @@ _MOBILE_VIEWPORT: ViewportSize = {"width": 390, "height": 844}
 _ANDROID_SHELL_INIT_SCRIPT = """
 window.omnigentNative = {
   kind: "android",
+  nativeBridgeVersion: 1,
+  nativeWebReady: function () {},
+  nativeHeartbeat: function () {},
+  getServerPicker: function () { return Promise.resolve(null); },
+  switchServer: function () { return Promise.resolve(); },
+  openServerSetup: function () {},
   setBadgeCount: function () {},
   notify: function () { return Promise.resolve(false); },
   onNotificationActivated: function () { return function () {}; },
@@ -96,6 +102,67 @@ def test_android_shell_tags_root_and_folds_os_inset(
     # No native inset injected yet: env(safe-area-inset-top) is 0 in a plain
     # browser and the Android var is unset, so the fold resolves to 0.
     assert page.evaluate(_READ_SAFE_TOP_PX) == "0px"
+
+
+_ANDROID_SERVER_PICKER_INIT_SCRIPT = """
+window.__serverPickerActions = [];
+window.omnigentNative = {
+  kind: "android",
+  nativeBridgeVersion: 1,
+  nativeWebReady: function () {},
+  nativeHeartbeat: function () {},
+  getServerPicker: function () {
+    return Promise.resolve({
+      currentOrigin: "https://current.example.com",
+      recentServers: [
+        "https://managed.example.com/",
+        "https://recent.example.com/"
+      ]
+    });
+  },
+  switchServer: function (url) {
+    window.__serverPickerActions.push(["switch", url]);
+    return Promise.resolve();
+  },
+  openServerSetup: function () {
+    window.__serverPickerActions.push(["setup"]);
+  }
+};
+"""
+
+
+def test_android_uses_single_sidebar_server_picker(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The mobile shell exposes one touch-sized picker in the sidebar."""
+    base_url, _session_id = seeded_session
+
+    page.set_viewport_size(_MOBILE_VIEWPORT)
+    page.add_init_script(_ANDROID_SERVER_PICKER_INIT_SCRIPT)
+    page.goto(f"{base_url}/?sidebar=open")
+
+    picker = page.get_by_test_id("sidebar-server-picker")
+    expect(picker).to_have_count(1)
+    expect(picker).to_be_visible()
+    picker_box = picker.bounding_box()
+    assert picker_box is not None
+    assert picker_box["height"] >= 44
+
+    picker.click()
+    menu = page.get_by_role("menu")
+    expect(menu).to_be_visible()
+    expect(menu).to_have_attribute("data-side", "top")
+    expect(menu.get_by_text("managed.example.com")).to_be_visible()
+    expect(menu.get_by_text("recent.example.com")).to_be_visible()
+    menu_text = menu.inner_text()
+    assert menu_text.index("managed.example.com") < menu_text.index("recent.example.com")
+
+    menu.get_by_text("managed.example.com").click()
+    expect(page.get_by_test_id("sidebar-server-picker")).to_be_visible()
+    assert page.evaluate("window.__serverPickerActions") == [
+        ["switch", "https://managed.example.com/"]
+    ]
 
     # The native layer pushes the measured OS inset as
     # --omnigent-android-safe-area-top; index.css folds it into
@@ -323,6 +390,12 @@ _ANDROID_ACTIVATION_INIT_SCRIPT = """
 window.__omnigentActivations = [];
 window.omnigentNative = {
   kind: "android",
+  nativeBridgeVersion: 1,
+  nativeWebReady: function () {},
+  nativeHeartbeat: function () {},
+  getServerPicker: function () { return Promise.resolve(null); },
+  switchServer: function () { return Promise.resolve(); },
+  openServerSetup: function () {},
   setBadgeCount: function () {},
   notify: function () { return Promise.resolve(false); },
   onNotificationActivated: function (cb) {
