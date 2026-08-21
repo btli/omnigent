@@ -531,6 +531,32 @@ def pin_name(
         n += 1
 
 
+# Alembic migrations live here; a composition that touches (or drops) a file
+# under this prefix must not auto-promote to production (locked decision 11).
+MIGRATIONS_PATH_PREFIX = "omnigent/db/migrations/versions/"
+
+
+def migration_touched(
+    cwd: str | Path,
+    candidate_sha: str,
+    upstream_sha: str,
+    prev_pin_sha: str | None,
+    prefix: str = MIGRATIONS_PATH_PREFIX,
+) -> bool:
+    """True when the candidate composition carries a schema change: either
+    ``upstream..candidate`` touches the migrations path (a composed PR adds,
+    edits, or deletes one) or ``prev_pin..candidate`` does (a migration-bearing
+    PR *removed* between compositions — invisible to the upstream leg). With no
+    previous pin only the upstream diff is consulted."""
+    for base in (upstream_sha, prev_pin_sha):
+        if not base:
+            continue
+        out = git(cwd, "diff", "--name-only", f"{base}..{candidate_sha}").stdout
+        if any(line.startswith(prefix) for line in out.splitlines()):
+            return True
+    return False
+
+
 def stage(
     cwd: str | Path,
     prs: list[dict],

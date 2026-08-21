@@ -1087,6 +1087,68 @@ def test_production_mints_no_dev_tag(env):
     assert "Dev tag" not in stage_mod.summarize(report, stage_mod.PRODUCTION)
 
 
+MIGRATIONS_DIR = "omnigent/db/migrations/versions"
+
+
+def test_migration_touched_on_add(env):
+    """A composition whose upstream..candidate diff adds a migration file is
+    schema-changing — caught even with no previous pin to compare against."""
+    (env.seed / MIGRATIONS_DIR).mkdir(parents=True)
+    pr = env.add_pr(3, f"{MIGRATIONS_DIR}/0001_add.py", "rev\n")
+    report = env.run([pr], ring=stage_mod.PRODUCTION)
+    assert (
+        stage_mod.migration_touched(env.work, report["staging_sha"], report["upstream_sha"], None)
+        is True
+    )
+
+
+def test_migration_touched_on_removal(env):
+    """A candidate that DROPS a migration present in the previous pin is
+    schema-changing even though upstream..candidate is clean — the second
+    diff leg exists precisely for this."""
+    (env.seed / MIGRATIONS_DIR).mkdir(parents=True)
+    mig = env.add_pr(4, f"{MIGRATIONS_DIR}/0002_drop.py", "rev\n")
+    prev = env.run([mig], ring=stage_mod.PRODUCTION)
+
+    other = env.add_pr(5, "plain.txt", "p\n")
+    env.advance_main("bump.txt", "b\n")
+    cur = env.run([other], ring=stage_mod.PRODUCTION)
+    # the upstream leg alone is clean...
+    assert (
+        stage_mod.migration_touched(env.work, cur["staging_sha"], cur["upstream_sha"], None)
+        is False
+    )
+    # ...but prev_pin..candidate shows the dropped migration
+    assert (
+        stage_mod.migration_touched(
+            env.work, cur["staging_sha"], cur["upstream_sha"], prev["staging_sha"]
+        )
+        is True
+    )
+
+
+def test_no_migration_change(env):
+    """Code-only candidates auto-promote: neither diff leg touches the
+    migrations path."""
+    pr = env.add_pr(6, "feat.txt", "f\n")
+    prev = env.run([pr], ring=stage_mod.PRODUCTION)
+    env.advance_main("more.txt", "m\n")
+    cur = env.run([pr], ring=stage_mod.PRODUCTION)
+    assert (
+        stage_mod.migration_touched(
+            env.work, cur["staging_sha"], cur["upstream_sha"], prev["staging_sha"]
+        )
+        is False
+    )
+    # the watched path prefix is a parameter, not a baked-in constant
+    assert (
+        stage_mod.migration_touched(
+            env.work, cur["staging_sha"], cur["upstream_sha"], None, prefix="feat.txt"
+        )
+        is True
+    )
+
+
 def test_branch_pin_missing_is_loud_advisory_skip(env, tmp_path):
     extras = tmp_path / "extras.txt"
     extras.write_text("branch:no-such-branch\n")
