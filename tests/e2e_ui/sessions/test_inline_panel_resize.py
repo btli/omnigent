@@ -7,6 +7,9 @@ from playwright.sync_api import Page, expect
 from tests.e2e_ui.conftest import open_right_rail, seed_committed_turn
 
 _VIEWPORT = {"width": 1280, "height": 700}
+# Tablet / unfolded-foldable width: md+ layout with the sidebar open by
+# default, where the old clamp left the rail no drag range at all.
+_TABLET_VIEWPORT = {"width": 1024, "height": 720}
 _GUTTER = "[data-workspace-panel-resize-gutter]"
 _STORAGE_KEY = "omnigent:session-workspace-state"
 
@@ -135,3 +138,46 @@ def test_touch_resize_persists_without_stealing_transcript_scroll(
     page.wait_for_function("document.querySelector('[data-inline-resize-scroller]').scrollTop > 0")
     assert _panel_width(page) == width_before_scroll
     assert _stored_width(page, session_id) == resized_width
+
+
+def test_touch_resize_keeps_drag_range_on_tablet_width(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The rail must stay touch-resizable at tablet width with the sidebar open.
+
+    On unfolded-foldable viewports the sidebar defaults open, and reserving it
+    plus the chat's full comfort minimum used to pin the clamp's floor onto its
+    ceiling — the gutter rendered but every touch drag was a no-op.
+    """
+    base_url, session_id = seeded_session
+
+    page.set_viewport_size(_TABLET_VIEWPORT)
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+
+    gutter = page.locator(_GUTTER)
+    expect(gutter).to_be_visible()
+    gutter_box = gutter.bounding_box()
+    assert gutter_box is not None
+    initial_width = _panel_width(page)
+
+    # Shrink toward the rail's floor…
+    _touch_drag(
+        page,
+        start=(gutter_box["x"] + gutter_box["width"] / 2, gutter_box["y"] + 200),
+        end=(gutter_box["x"] + 150, gutter_box["y"] + 200),
+    )
+    shrunk_width = _panel_width(page)
+    assert shrunk_width <= initial_width - 60
+
+    # …then widen back out: the move that used to be a pinned no-op.
+    gutter_box = gutter.bounding_box()
+    assert gutter_box is not None
+    _touch_drag(
+        page,
+        start=(gutter_box["x"] + gutter_box["width"] / 2, gutter_box["y"] + 200),
+        end=(gutter_box["x"] - 200, gutter_box["y"] + 200),
+    )
+    widened_width = _panel_width(page)
+    assert widened_width >= shrunk_width + 60
