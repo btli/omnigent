@@ -371,7 +371,9 @@ jobs:
         run: |
           set -euo pipefail
           pnpm --filter web run build:overlay
-          pnpm --filter web/electron exec electron-builder --mac dmg zip --arm64 -c.mac.identity=null
+          # --dir, not --filter: a filter that matches nothing makes pnpm
+          # exec a silent no-op, and this build must never no-op quietly.
+          pnpm --dir web/electron exec electron-builder --mac dmg zip --arm64 -c.mac.identity=null
 
       # Hand off exactly two files under fixed names from a fresh dir —
       # stable release-asset URLs, and no smuggling across the boundary.
