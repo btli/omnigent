@@ -209,6 +209,12 @@ _ANDROID_ACTIVATION_INIT_SCRIPT = """
 window.__omnigentActivations = [];
 window.omnigentNative = {
   kind: "android",
+  nativeBridgeVersion: 1,
+  nativeWebReady: function () {},
+  nativeHeartbeat: function () {},
+  getServerPicker: function () { return Promise.resolve(null); },
+  switchServer: function () { return Promise.resolve(); },
+  openServerSetup: function () {},
   setBadgeCount: function () {},
   notify: function () { return Promise.resolve(false); },
   onNotificationActivated: function (cb) {
