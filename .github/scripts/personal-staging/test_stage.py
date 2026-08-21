@@ -163,6 +163,77 @@ def test_conflicting_pr_skipped_with_paths(env):
     assert "merge PR #2" in env.fork_log("staging")
 
 
+def _rescuable_pr(env) -> dict:
+    """A PR whose MERGE conflicts but whose REBASE succeeds.
+
+    Commit A's patch later lands upstream verbatim and then evolves on the
+    same lines, so merging the head three-ways conflicts on ``a.txt``;
+    replaying commit by commit drops A by patch-id and applies B cleanly.
+    """
+    env.add_pr(5, "a.txt", "fixed\n")  # commit A: base -> fixed
+    git(env.seed, "checkout", "-q", "pr-5")
+    oid = commit_file(env.seed, "b5.txt", "5\n", "pr 5 b")  # commit B: new file
+    git(env.seed, "push", "-f", str(env.upstream), "pr-5:refs/pull/5/head")
+    git(env.seed, "push", str(env.fork), "pr-5:refs/heads/pr-5")
+    env.advance_main("a.txt", "fixed\n")  # upstream lands A's content…
+    env.advance_main("a.txt", "fixed more\n")  # …then evolves it
+    return {"number": 5, "headRefName": "pr-5", "headRefOid": oid}
+
+
+def test_conflicting_pr_rescued_by_rebase(env):
+    pr = _rescuable_pr(env)
+
+    report = env.run([pr])
+    [entry] = report["applied"]
+    assert entry["pr"] == 5
+    assert entry["rebased_from"] == pr["headRefOid"]
+    assert entry["pushed_back"] is True
+    assert report["skipped"] == []
+    # the fork branch was refreshed to the rescued head this run composed
+    assert env.fork_ref("refs/heads/pr-5") == entry["oid"]
+    assert "merge PR #5" in env.fork_log("staging")
+
+
+def test_rescue_is_reproducible_and_leased(env):
+    pr = _rescuable_pr(env)
+
+    first = env.run([pr], staging_only=True)
+    [e1] = first["applied"]
+    assert e1["pushed_back"] is True
+
+    # A rerun with the same (now stale) listing rebuilds the byte-identical
+    # rescue: the push-back is an up-to-date no-op and the unchanged
+    # composition is detected, so no ref actually moves.
+    second = env.run([pr], staging_only=True)
+    [e2] = second["applied"]
+    assert e2["oid"] == e1["oid"]
+    assert env.fork_ref("refs/heads/pr-5") == e1["oid"]
+    assert second["staging_sha"] == first["staging_sha"]
+    assert second["pushed"] is False
+
+
+def test_rescue_lease_spares_a_branch_that_moved(env):
+    pr = _rescuable_pr(env)
+    moved = env.advance_fork_branch("pr-5", "newer.txt", "human work\n")
+
+    report = env.run([pr])
+    [entry] = report["applied"]
+    # the rescue still composed, but the moved branch kept its newer work
+    assert entry["rebased_from"] == pr["headRefOid"]
+    assert entry["pushed_back"] is False
+    assert env.fork_ref("refs/heads/pr-5") == moved
+
+
+def test_production_ring_never_rescues(env):
+    pr = _rescuable_pr(env)
+
+    report = env.run([pr], ring=stage_mod.PRODUCTION)
+    assert report["applied"] == []
+    assert [p["pr"] for p in report["skipped"]] == [5]
+    # the PR branch is untouched — production composes what the PRs say
+    assert env.fork_ref("refs/heads/pr-5") == pr["headRefOid"]
+
+
 def test_all_prs_conflicting_is_not_a_failure(env):
     bad = env.add_pr(5, "a.txt", "clash\n")
     env.advance_main("a.txt", "diverged\n")
