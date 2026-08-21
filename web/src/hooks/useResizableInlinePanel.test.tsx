@@ -122,12 +122,13 @@ describe("useResizableInlinePanel persistence", () => {
     expect(readSessionWorkspaceState(SESSION).widthPx).toBe(620);
 
     // Shrinking the viewport clamps the live width to the chat-preserving
-    // ceiling (700 - 480 chat - 8 gap = 212). The chat's 480 floor wins over
-    // the panel's own 240 comfort minimum, so the panel yields below 240 rather
-    // than squeeze the chat. The saved 620 preference is untouched.
+    // ceiling. At 700px the chat cedes below its 480 comfort minimum down
+    // toward its hard floor so the rail keeps a drag range: the ceiling is
+    // 240 rail floor + 120 travel = 360 (chat keeps 700 - 360 - 8 = 332).
+    // The saved 620 preference is untouched.
     setInnerWidth(700);
     act(() => window.dispatchEvent(new Event("resize")));
-    expect(result.current.panelWidth).toBe(212);
+    expect(result.current.panelWidth).toBe(360);
     expect(readSessionWorkspaceState(SESSION).widthPx).toBe(620);
 
     // Widening again re-derives from the preference, restoring 620 in-session.
@@ -189,12 +190,14 @@ describe("useResizableInlinePanel reserved width (sidebar)", () => {
     unmount();
   });
 
-  it("keeps the chat >= 480px when the viewport shrinks with both sidebars open", () => {
+  it("keeps the chat above its hard floor when the viewport shrinks with both sidebars open", () => {
     // The reported bug: with the left sidebar open (reserved) AND the rail wide,
-    // shrinking the window let the chat fall under 480 — the panel's own 240
+    // shrinking the window let the chat collapse entirely — the panel's own 240
     // comfort minimum was overriding the chat-preserving ceiling, and a resize
     // that didn't move the stored width never re-rendered. The chat floor must
-    // win and the recompute must fire on every resize.
+    // win and the recompute must fire on every resize. At 1000px with the
+    // sidebar open the row is tablet-cramped, so the chat holds its 240 hard
+    // floor (not the 480 comfort minimum) while the rail keeps its drag range.
     setInnerWidth(1400);
     const reservedPx = 320; // open left sidebar
     const { result, rerender } = renderHook(
@@ -215,7 +218,60 @@ describe("useResizableInlinePanel reserved width (sidebar)", () => {
     act(() => window.dispatchEvent(new Event("resize")));
     rerender({ reserved: reservedPx });
     // chat = viewport - sidebar - gap - panel.
-    expect(1000 - reservedPx - 8 - result.current.panelWidth).toBeGreaterThanOrEqual(480);
+    expect(1000 - reservedPx - 8 - result.current.panelWidth).toBeGreaterThanOrEqual(240);
+  });
+});
+
+describe("useResizableInlinePanel tablet-width viewports", () => {
+  // On unfolded-foldable / tablet widths (~768–1100px) the sidebar defaults
+  // open, and reserving it plus the chat's full 480px comfort minimum used to
+  // consume the whole row: the clamp's floor collapsed onto its ceiling, so
+  // every drag computed the same width and resize gestures were no-ops. The
+  // chat must cede below its comfort minimum (down to a hard floor) before
+  // the rail loses its drag range.
+  it("keeps a usable drag range at 1024px with the sidebar open", () => {
+    setInnerWidth(1024);
+    const { result } = renderHook(() => useResizableInlinePanel(SESSION, undefined, 320));
+    const handle = createPointerHandle();
+
+    // Shrink toward the rail's floor…
+    act(() => {
+      result.current.handleProps.onPointerDown(pointerEvent(handle.element));
+      result.current.handleProps.onPointerMove(pointerEvent(handle.element, { clientX: 784 }));
+    });
+    const narrow = result.current.panelWidth;
+    expect(narrow).toBe(240);
+
+    // …then widen back out. Before the tablet-aware clamp this move was a
+    // no-op: floor and ceiling had collapsed onto the same pinned value.
+    act(() => {
+      result.current.handleProps.onPointerMove(pointerEvent(handle.element, { clientX: 600 }));
+      result.current.handleProps.onPointerUp(pointerEvent(handle.element));
+    });
+    expect(result.current.panelWidth).toBeGreaterThan(narrow + 100);
+
+    // The chat still keeps its hard floor at the rail's widest.
+    expect(1024 - 320 - 8 - result.current.panelWidth).toBeGreaterThanOrEqual(240);
+  });
+
+  it("keeps the resize handle live at 840px with the sidebar open", () => {
+    // 840px is an unfolded Pixel Fold. With a 320px sidebar the old ceiling
+    // was 32px: the rail rendered as a crushed sliver with a dead handle.
+    setInnerWidth(840);
+    const { result } = renderHook(() => useResizableInlinePanel(SESSION, undefined, 320));
+
+    expect(result.current.handleProps["aria-disabled"]).toBe(false);
+    expect(result.current.panelWidth).toBeGreaterThanOrEqual(240);
+
+    const handle = createPointerHandle();
+    const widest = result.current.panelWidth;
+    act(() => {
+      result.current.handleProps.onPointerDown(pointerEvent(handle.element));
+      result.current.handleProps.onPointerMove(pointerEvent(handle.element, { clientX: 600 }));
+      result.current.handleProps.onPointerUp(pointerEvent(handle.element));
+    });
+    expect(result.current.panelWidth).toBe(240);
+    expect(result.current.panelWidth).toBeLessThan(widest);
   });
 });
 
