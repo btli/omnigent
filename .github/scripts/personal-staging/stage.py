@@ -10,7 +10,8 @@ at the same commit; ``--staging-only`` (the hourly mode) pushes only
 The only refs ever pushed are ``staging``, the ``nightly-*`` pin, and the
 dev tag. ``--ring production`` composes the production ring instead: open
 non-draft PRs only, no extras, branch ``production`` + immutable
-``production-YYYYMMDD`` pins, and no dev tag. A production composition
+``production-YYYYMMDD`` pins, no dev tag, and no hourly mode
+(``--staging-only`` is rejected for it). A production composition
 that touches DB migrations is BLOCKED before any ref moves unless
 ``--migration-approval`` names the exact candidate sha.
 
@@ -112,16 +113,18 @@ def branch_merge_re(ring: Ring = STAGING) -> re.Pattern[str]:
     )
 
 
-# Fixed identity, no gpg signature: the merge commit must be byte-reproducible
-# so an unchanged same-day rerun lands on the identical sha (no-op detection).
-COMMIT_IDENT = [
-    "-c",
-    "user.name=omnigent-staging",
-    "-c",
-    "user.email=staging@invalid",
-    "-c",
-    "commit.gpgsign=false",
-]
+# Fixed per-ring identity, no gpg signature: the merge commit must be
+# byte-reproducible so an unchanged same-day rerun lands on the identical sha
+# (no-op detection). Staging's exact values are locked by the golden.
+def commit_ident(ring: Ring = STAGING) -> list[str]:
+    return [
+        "-c",
+        f"user.name=omnigent-{ring.name}",
+        "-c",
+        f"user.email={ring.name}@invalid",
+        "-c",
+        "commit.gpgsign=false",
+    ]
 
 
 class StageError(RuntimeError):
@@ -220,8 +223,16 @@ def list_prs() -> list[dict]:
 
 def filter_drafts(prs: list[dict]) -> list[dict]:
     """Drop draft PRs — the production ring's promotion gate (decision 2:
-    draft status, not a review/CI check, decides readiness)."""
-    return [p for p in prs if not p.get("isDraft")]
+    draft status, not a review/CI check, decides readiness). The gate fails
+    CLOSED: a record whose isDraft is missing or non-boolean is indeterminate
+    and raises rather than passing as ready."""
+    for p in prs:
+        if not isinstance(p.get("isDraft"), bool):
+            raise StageError(
+                f"PR #{p.get('number')} carries no boolean isDraft field; "
+                "refusing to guess draft state for a production composition"
+            )
+    return [p for p in prs if p["isDraft"] is False]
 
 
 def check_not_truncated(prs: list[dict]) -> list[dict]:
@@ -430,7 +441,7 @@ def merge_prs(
             )
             git(
                 cwd,
-                *COMMIT_IDENT,
+                *commit_ident(ring),
                 "commit",
                 "--no-verify",
                 "-m",
@@ -752,6 +763,10 @@ def notes(report: dict, signed: bool, ring: Ring = STAGING) -> str:
     lines += [
         f"- {_pin_label(p)} {md_code(p['branch'])} — {_skip_reason(p)}" for p in report["skipped"]
     ] or ["- none"]
+    # Only rings that mint a dev tag ship a nightly APK; other rings
+    # (production) render the minimal variant with no signing section.
+    if not ring.mint_dev_tag:
+        return "\n".join(lines) + "\n"
     lines += ["", "## APK signing"]
     if signed:
         lines.append(
@@ -887,6 +902,12 @@ def main(argv: list[str] | None = None) -> int:
     p_notes = sub.add_parser("notes", help="render release notes from a merge report")
     p_notes.add_argument("--report", default="merge-report.json")
     p_notes.add_argument("--signed", choices=["true", "false"], required=True)
+    p_notes.add_argument(
+        "--ring",
+        choices=list(RINGS),
+        default=STAGING.name,
+        help="ring whose notes variant to render (default: staging)",
+    )
 
     p_stale = sub.add_parser(
         "is-stale-ref-rejection",
@@ -905,7 +926,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "notes":
         report = json.loads(Path(args.report).read_text())
-        sys.stdout.write(notes(report, signed=args.signed == "true"))
+        sys.stdout.write(notes(report, signed=args.signed == "true", ring=RINGS[args.ring]))
         return 0
 
     if args.date:
@@ -913,6 +934,11 @@ def main(argv: list[str] | None = None) -> int:
     else:
         date = dt.datetime.now(dt.timezone.utc).date()
     ring = RINGS[args.ring]
+    # The hourly mode force-pushes the ring branch with none of the nightly's
+    # gates (production's migration gate above all) — it exists for staging
+    # only. Rejected here, before any fetch or push can move a ref.
+    if args.staging_only and ring is not STAGING:
+        parser.error("--staging-only is only valid for --ring staging")
     title = f"Personal {ring.name} " + ("hourly" if args.staging_only else "nightly")
     try:
         # Fail the stage path before any fetch/merge if the parser is absent.

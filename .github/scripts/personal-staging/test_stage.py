@@ -940,7 +940,7 @@ def test_branch_pin_transport_failure_blocks_push(env, tmp_path, monkeypatch, ca
 def test_production_excludes_drafts(env, tmp_path, monkeypatch, capsys):
     """isDraft is the production gate: a draft PR never reaches the production
     composition, while the very same list still fully composes for staging."""
-    ready = env.add_pr(3, "ready.txt", "r\n")
+    ready = {**env.add_pr(3, "ready.txt", "r\n"), "isDraft": False}
     draft = {**env.add_pr(5, "draft.txt", "d\n"), "isDraft": True}
     prs_json = tmp_path / "prs.json"
     prs_json.write_text(json.dumps([ready, draft]))
@@ -998,7 +998,7 @@ def test_production_excludes_drafts(env, tmp_path, monkeypatch, capsys):
 def test_production_reads_no_extras(env, tmp_path, monkeypatch, capsys):
     """A present extras manifest with a valid pin is not consulted at all for
     production: nothing fetched, nothing merged, nothing reported."""
-    open_pr = env.add_pr(11, "i.txt", "i\n")
+    open_pr = {**env.add_pr(11, "i.txt", "i\n"), "isDraft": False}
     env.add_pr(12, "j.txt", "j\n")  # reachable only through the manifest
     prs_json = tmp_path / "prs.json"
     prs_json.write_text(json.dumps([open_pr]))
@@ -1085,6 +1085,100 @@ def test_production_mints_no_dev_tag(env):
     assert not any(".dev" in r for r in refs), refs
     assert "Dev tag" not in stage_mod.notes(report, signed=True, ring=stage_mod.PRODUCTION)
     assert "Dev tag" not in stage_mod.summarize(report, stage_mod.PRODUCTION)
+
+
+def test_production_rejects_staging_only(env, tmp_path, capsys):
+    """--staging-only is the hourly staging mode; production has no hourly
+    path by design, and letting the combination through would force-push
+    refs/heads/production BEFORE the migration gate. Rejected at the parser,
+    before any fetch or push."""
+    prs_json = tmp_path / "prs.json"
+    prs_json.write_text("[]")
+    with pytest.raises(SystemExit) as exc:
+        stage_mod.main(
+            [
+                "stage",
+                "--workdir",
+                str(env.work),
+                "--date",
+                STAMP,
+                "--ring",
+                "production",
+                "--staging-only",
+                "--prs-json",
+                str(prs_json),
+                "--report",
+                str(tmp_path / "r.json"),
+            ]
+        )
+    assert exc.value.code == 2
+    assert "--staging-only is only valid for --ring staging" in capsys.readouterr().err
+    # rejected before any git work: nothing fetched, no ref reached the fork
+    assert git(env.work, "ls-remote", str(env.fork)).stdout.strip() == ""
+    assert git(env.work, "rev-parse", "-q", "--verify", "FETCH_HEAD", check=False).returncode != 0
+
+
+def test_production_rejects_missing_isdraft():
+    """The draft gate must fail CLOSED: a record whose isDraft is missing or
+    non-boolean is indeterminate and must raise (naming the PR), never pass
+    as non-draft into the production composition."""
+    ok = {"number": 1, "isDraft": False}
+    assert stage_mod.filter_drafts([ok, {"number": 2, "isDraft": True}]) == [ok]
+    for bad in (
+        {"number": 7, "headRefName": "b", "headRefOid": "a" * 40},  # missing
+        {"number": 7, "isDraft": None},
+        {"number": 7, "isDraft": "false"},
+    ):
+        with pytest.raises(stage_mod.StageError, match=r"#7"):
+            stage_mod.filter_drafts([ok, bad])
+
+
+def test_production_commit_identity(env):
+    """Merge commits carry the ring's own identity — a production merge is
+    authored omnigent-production, not the staging identity; staging's exact
+    bytes are separately locked by the golden."""
+    pr = {**env.add_pr(6, "h.txt", "h\n"), "isDraft": False}
+    report = env.run([pr], ring=stage_mod.PRODUCTION)
+    obj = git(env.work, "cat-file", "-p", report["staging_sha"]).stdout
+    assert "author omnigent-production <production@invalid>" in obj
+    assert "committer omnigent-production <production@invalid>" in obj
+    assert "staging" not in obj
+
+    staging = env.run([pr])
+    obj = git(env.work, "cat-file", "-p", staging["staging_sha"]).stdout
+    assert "author omnigent-staging <staging@invalid>" in obj
+    assert "committer omnigent-staging <staging@invalid>" in obj
+
+
+def test_notes_production_ring_no_apk_section(tmp_path, capsys):
+    """Production mints no dev tag and ships no APK: its notes are the
+    minimal variant — no APK-signing section either way — and the notes CLI
+    routes there via --ring (default stays staging, golden-locked)."""
+    report = {
+        "date": STAMP,
+        "upstream_sha": "u" * 40,
+        "staging_sha": "s" * 40,
+        "applied": [],
+        "skipped": [],
+    }
+    for signed in (True, False):
+        out = stage_mod.notes(report, signed=signed, ring=stage_mod.PRODUCTION)
+        assert "production ring" in out
+        assert "APK" not in out and "keystore" not in out
+
+    report_path = tmp_path / "r.json"
+    report_path.write_text(json.dumps(report))
+    rc = stage_mod.main(
+        ["notes", "--report", str(report_path), "--ring", "production", "--signed", "false"]
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "production ring" in out and "APK" not in out
+
+    rc = stage_mod.main(["notes", "--report", str(report_path), "--signed", "false"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "staging ring" in out and "## APK signing" in out
 
 
 MIGRATIONS_DIR = "omnigent/db/migrations/versions"
