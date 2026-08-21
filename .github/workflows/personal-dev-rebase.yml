@@ -88,6 +88,13 @@ jobs:
           git remote add upstream https://github.com/omnigent-ai/omnigent.git
           git fetch upstream main
 
+          # The push classifier lives on the fork's main; this checkout is
+          # `development` (upstream-based, may not carry it). fetch-depth: 0
+          # brought every branch, so extract the trusted copy up front — a
+          # missing script is a loud infrastructure failure, not a soft skip.
+          CLASSIFIER="$RUNNER_TEMP/stage-classify.py"
+          git show origin/main:.github/scripts/personal-staging/stage.py > "$CLASSIFIER"
+
           summary() { printf '%s\n' "$@" >> "$GITHUB_STEP_SUMMARY"; }
 
           # Best-effort by contract (spec decision 13): the receiver may not
@@ -139,9 +146,21 @@ jobs:
           fi
 
           # The lease pins the pre-rebase sha: a concurrent dev-sync (or any
-          # human push) wins and this run backs off — never clobber.
-          if ! git push --force-with-lease=refs/heads/development:"$OLD" \
-              origin HEAD:refs/heads/development; then
+          # human push) wins and this run backs off — never clobber. Soft-fail
+          # ONLY a confirmed stale-ref/lease rejection on refs/heads/development,
+          # classified from `git push --porcelain` status lines (stdout — never
+          # free-form stderr prose). Auth, transport, or [remote rejected] hooks
+          # must fail the step so alert-failure fires.
+          if ! push_out=$(git push --porcelain \
+              --force-with-lease=refs/heads/development:"$OLD" \
+              origin HEAD:refs/heads/development 2>"$RUNNER_TEMP/push_err.txt"); then
+            cat "$RUNNER_TEMP/push_err.txt" >&2
+            printf '%s\n' "$push_out" >&2
+            if ! printf '%s\n' "$push_out" | python3 "$CLASSIFIER" \
+                is-stale-ref-rejection --ref refs/heads/development; then
+              echo "::error::development push failed (not a lease race)"
+              exit 1
+            fi
             summary "## Personal dev rebase" "" \
               "Lease push rejected (concurrent push to \`development\`) — nothing overwritten; next run retries."
             echo "::warning::development lease push rejected — a concurrent update won; this run changed nothing"
