@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -35,8 +36,12 @@ class OmnigentWebViewClient(
         mainFramePersistenceFailed: Boolean,
         loadGeneration: Long?,
     ) -> Unit,
+    private val onMainFrameOriginChanged: (url: String?) -> Unit = {},
+    private val onPinnedDocumentStarted: () -> Unit = {},
+    private val onLoadFailure: (String) -> Unit = {},
     private val onLoginRequired: () -> Unit,
     private val loadUrl: (WebView, String) -> Unit = WebView::loadUrl,
+    private val bridgeScriptSource: () -> String = { NativeBridgeScript.source },
     private val authTabCapability: () -> Boolean? = { false },
     private val onAuthTabCapabilityRequired: () -> Unit = {},
     private val shouldUseAuthTabLogin: () -> Boolean = { false },
@@ -45,6 +50,7 @@ class OmnigentWebViewClient(
     // Bare-root -> /omnigent bounces since the last app page loaded; see
     // workspaceRootTarget for why they're capped.
     private var rootBounces = 0
+    private var mainFrameOnPinnedOrigin = false
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -97,6 +103,10 @@ class OmnigentWebViewClient(
         val origin = originOf(url)
         val scheme = url?.let { Uri.parse(it).scheme?.lowercase() }
         val pinned = pinnedOrigin()
+        val startsPinnedDocument = origin == pinned && mainFrameOnPinnedOrigin
+        mainFrameOnPinnedOrigin = origin == pinned
+        onMainFrameOriginChanged(url)
+        if (startsPinnedDocument) onPinnedDocumentStarted()
 
         // A real http(s) navigation to a foreign origin means the server bounced
         // us to the IdP and shouldOverrideUrlLoading didn't catch the redirect.
@@ -181,6 +191,14 @@ class OmnigentWebViewClient(
                 activeLoad != null -> activeLoad?.loadFailed = true
                 expectedLoadGeneration != null || !tracksDocuments -> preStartLoadFailed = true
             }
+            // Escalate too: with the native switcher gone, an unrecoverable
+            // pinned-origin failure must offer the full-screen recovery path.
+            onLoadFailure(
+                error.description
+                    ?.toString()
+                    .orEmpty()
+                    .ifBlank { "The server failed to load." },
+            )
         }
     }
 
@@ -227,6 +245,7 @@ class OmnigentWebViewClient(
         url: String?,
     ) {
         super.onPageFinished(view, url)
+        onMainFrameOriginChanged(url)
         val load = activeLoad
         val onPinnedOrigin = originOf(url) == pinnedOrigin()
         // Inline authentication can finish foreign documents before returning
@@ -268,11 +287,19 @@ class OmnigentWebViewClient(
         }
         if (onPinnedOrigin && shouldInjectBridgeAtPageReady()) {
             view.evaluateJavascript(
-                NativeBridgeScript.source,
+                bridgeScriptSource(),
             ) { onPageReady(url, loadFailed, persistenceFailed, loadGeneration) }
             return
         }
         onPageReady(url, loadFailed, persistenceFailed, loadGeneration)
+    }
+
+    override fun onRenderProcessGone(
+        view: WebView,
+        detail: RenderProcessGoneDetail,
+    ): Boolean {
+        onLoadFailure("The server UI process stopped unexpectedly.")
+        return true
     }
 
     override fun shouldOverrideUrlLoading(
