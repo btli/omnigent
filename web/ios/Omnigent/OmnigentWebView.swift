@@ -359,6 +359,7 @@ struct OmnigentWebView: UIViewRepresentable {
       onIncompatible: { [weak self] in
         self?.showFullScreenRecovery("The server UI is incompatible with this app version.")
       })
+    private let oidcLoginManager = OidcLoginManager()
 
     init(_ parent: OmnigentWebView) {
       self.parent = parent
@@ -399,6 +400,7 @@ struct OmnigentWebView: UIViewRepresentable {
       lifecycleObservers.forEach(NotificationCenter.default.removeObserver)
       lifecycleObservers.removeAll()
       urlObservation = nil
+      oidcLoginManager.cancel()
       webView = nil
     }
 
@@ -567,6 +569,14 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+      if let url = webView.url,
+        ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+        url.omnigentOrigin != pinnedOrigin
+      {
+        webView.stopLoading()
+        startLogin(in: webView)
+        return
+      }
       parent.model.isLoading = true
       parent.model.currentURL = webView.url ?? parent.model.currentURL
     }
@@ -648,6 +658,19 @@ struct OmnigentWebView: UIViewRepresentable {
         return
       }
 
+      if navigationAction.targetFrame?.isMainFrame == true,
+        ["http", "https"].contains(scheme),
+        url.omnigentOrigin != pinnedOrigin
+      {
+        if navigationAction.navigationType == .linkActivated {
+          openExternal(url)
+        } else {
+          startLogin(in: webView)
+        }
+        decisionHandler(.cancel)
+        return
+      }
+
       if ["http", "https", "about", "blob", "data"].contains(scheme) {
         if navigationAction.targetFrame?.isMainFrame == true {
           mainFrameNavigationStarted(url: url)
@@ -718,6 +741,17 @@ struct OmnigentWebView: UIViewRepresentable {
         return
       }
       promptForExternalURL(url, scheme: scheme)
+    }
+
+    private func startLogin(in webView: WKWebView) {
+      guard let pinnedOrigin else { return }
+      oidcLoginManager.start(
+        origin: pinnedOrigin,
+        cookieStore: webView.configuration.websiteDataStore.httpCookieStore
+      ) { [weak self, weak webView] in
+        guard let self, let webView, let pinnedURL = self.pinnedURL else { return }
+        webView.load(URLRequest(url: pinnedURL))
+      }
     }
 
     private func promptForExternalURL(_ url: URL, scheme: String) {
