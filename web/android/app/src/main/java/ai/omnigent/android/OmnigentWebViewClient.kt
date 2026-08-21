@@ -30,6 +30,7 @@ class OmnigentWebViewClient(
     private val shouldInjectBridgeAtPageReady: () -> Boolean,
     private val onPageReady: (url: String?) -> Unit,
     private val onMainFrameOriginChanged: (url: String?) -> Unit = {},
+    private val onPinnedDocumentStarted: () -> Unit = {},
     private val onLoadFailure: (String) -> Unit = {},
     private val onLoginRequired: () -> Unit,
     private val bridgeScriptSource: () -> String = { NativeBridgeScript.source },
@@ -37,6 +38,7 @@ class OmnigentWebViewClient(
     // Bare-root -> /omnigent bounces since the last app page loaded; see
     // workspaceRootTarget for why they're capped.
     private var rootBounces = 0
+    private var mainFrameOnPinnedOrigin = false
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -50,7 +52,10 @@ class OmnigentWebViewClient(
         val origin = originOf(url)
         val scheme = url?.let { Uri.parse(it).scheme?.lowercase() }
         val pinned = pinnedOrigin()
+        val startsPinnedDocument = origin == pinned && mainFrameOnPinnedOrigin
+        mainFrameOnPinnedOrigin = origin == pinned
         onMainFrameOriginChanged(url)
+        if (startsPinnedDocument) onPinnedDocumentStarted()
 
         // A real http(s) navigation to a foreign origin means the server bounced
         // us to the IdP and shouldOverrideUrlLoading didn't catch the redirect.

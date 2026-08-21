@@ -81,7 +81,7 @@ final class MobileLivenessWatchdogTests: XCTestCase {
 }
 
 @MainActor
-private final class ManualWatchdogClock {
+final class ManualWatchdogClock {
   private var now: TimeInterval = 0
   private var deadline: TimeInterval?
   private var action: (() -> Void)?

@@ -35,6 +35,39 @@ class OmnigentWebViewClientTest {
     }
 
     @Test
+    fun `same-origin document start resets liveness but auth return does not`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val scheduler = TestWatchdogScheduler()
+        var failures = 0
+        val watchdog = LivenessWatchdog(scheduler, onTimeout = { failures++ })
+        val client =
+            client(
+                pinnedOrigin = DATABRICKS_ORIGIN,
+                onMainFrameOriginChanged = {
+                    watchdog.setOnPinnedOrigin(originOf(it) == DATABRICKS_ORIGIN)
+                },
+                onPinnedDocumentStarted = watchdog::beginInitialWindow,
+            )
+
+        watchdog.beginInitialWindow()
+        watchdog.protocolReady(1, 1)
+        client.onPageStarted(webView, "$DATABRICKS_ORIGIN/omnigent", null)
+        client.onPageStarted(webView, "$DATABRICKS_ORIGIN/omnigent/c/new", null)
+        scheduler.advanceBy(10_000)
+        watchdog.heartbeat() // outgoing document
+        scheduler.advanceBy(10_000)
+        assertEquals(1, failures)
+
+        watchdog.protocolReady(1, 1)
+        client.onPageStarted(webView, IDP_URL, null)
+        client.onPageStarted(webView, "$DATABRICKS_ORIGIN/omnigent", null)
+        scheduler.advanceBy(14_000)
+        watchdog.heartbeat()
+        scheduler.advanceBy(14_000)
+        assertEquals(1, failures)
+    }
+
+    @Test
     fun `renderer termination routes to full-screen recovery callback`() {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
         val failures = mutableListOf<String>()
@@ -325,15 +358,45 @@ class OmnigentWebViewClientTest {
         onLoginRequired: () -> Unit = {},
         onLoadFailure: (String) -> Unit = {},
         onMainFrameOriginChanged: (String?) -> Unit = {},
+        onPinnedDocumentStarted: () -> Unit = {},
         onPageReady: (String?) -> Unit = {},
     ) = OmnigentWebViewClient(
         pinnedOrigin = { pinnedOrigin },
         shouldInjectBridgeAtPageReady = { shouldInjectBridgeAtPageReady },
         onPageReady = onPageReady,
         onMainFrameOriginChanged = onMainFrameOriginChanged,
+        onPinnedDocumentStarted = onPinnedDocumentStarted,
         onLoadFailure = onLoadFailure,
         onLoginRequired = onLoginRequired,
     )
+
+    private class TestWatchdogScheduler : WatchdogScheduler {
+        private var now = 0L
+        private var due: Long? = null
+        private var action: (() -> Unit)? = null
+
+        override fun schedule(
+            delayMs: Long,
+            action: () -> Unit,
+        ) {
+            due = now + delayMs
+            this.action = action
+        }
+
+        override fun cancel() {
+            due = null
+            action = null
+        }
+
+        fun advanceBy(ms: Long) {
+            now += ms
+            if (due?.let { now >= it } == true) {
+                val pending = action
+                cancel()
+                pending?.invoke()
+            }
+        }
+    }
 
     private fun request(
         url: String,

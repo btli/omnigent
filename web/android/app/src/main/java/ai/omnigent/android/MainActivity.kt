@@ -167,6 +167,7 @@ class MainActivity : AppCompatActivity() {
                         },
                         onPageReady = ::onPageReady,
                         onMainFrameOriginChanged = ::onMainFrameOriginChanged,
+                        onPinnedDocumentStarted = ::onPinnedDocumentStarted,
                         onLoadFailure = ::showFullScreenRecovery,
                         onLoginRequired = ::startLogin,
                         bridgeScriptSource = ::nativeBridgeScriptSource,
@@ -623,6 +624,11 @@ class MainActivity : AppCompatActivity() {
 
     private fun onMainFrameOriginChanged(url: String?) {
         livenessWatchdog.setOnPinnedOrigin(originOf(url) == pinnedOrigin)
+    }
+
+    private fun onPinnedDocumentStarted() {
+        compatibilityReady = false
+        livenessWatchdog.beginInitialWindow()
     }
 
     private fun flushPendingActivation() {

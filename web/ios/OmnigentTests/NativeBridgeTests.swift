@@ -5,6 +5,52 @@ import XCTest
 
 @MainActor
 final class NativeBridgeTests: XCTestCase {
+  func testNavigationDelegateResetsPinnedDocumentsButPreservesAuthReturn() {
+    let (coordinator, webView) = makeCoordinator()
+    let clock = ManualWatchdogClock()
+    var failures = 0
+    coordinator.livenessWatchdog = MobileLivenessWatchdog(schedule: clock.schedule) {
+      failures += 1
+    }
+    let pinned = URL(string: "https://server.example.com/app")!
+    coordinator.load(pinned, in: webView)
+    coordinator.mainFrameNavigationStarted(url: pinned)
+    XCTAssertTrue(coordinator.livenessWatchdog.protocolReady(version: 1, expectedVersion: 1))
+
+    coordinator.mainFrameNavigationStarted(
+      url: URL(string: "https://server.example.com/replacement"))
+    clock.advance(by: 10)
+    coordinator.livenessWatchdog.receivedHeartbeat()  // outgoing document
+    clock.advance(by: 10)
+    XCTAssertEqual(failures, 1)
+
+    XCTAssertTrue(coordinator.livenessWatchdog.protocolReady(version: 1, expectedVersion: 1))
+    coordinator.mainFrameNavigationStarted(url: URL(string: "https://idp.example.com/login"))
+    coordinator.mainFrameNavigationStarted(url: pinned)
+    clock.advance(by: 14)
+    coordinator.livenessWatchdog.receivedHeartbeat()
+    clock.advance(by: 14)
+    XCTAssertEqual(failures, 1)
+  }
+
+  func testCoordinatorResumePreservesCompatibilityDuringGrace() {
+    let (coordinator, webView) = makeCoordinator()
+    let clock = ManualWatchdogClock()
+    var failures = 0
+    coordinator.livenessWatchdog = MobileLivenessWatchdog(schedule: clock.schedule) {
+      failures += 1
+    }
+    let pinned = URL(string: "https://server.example.com/app")!
+    coordinator.load(pinned, in: webView)
+    XCTAssertTrue(coordinator.livenessWatchdog.protocolReady(version: 1, expectedVersion: 1))
+    coordinator.livenessWatchdog.setActive(false)
+    coordinator.appBecameActive(url: pinned)
+    clock.advance(by: 14)
+    coordinator.livenessWatchdog.receivedHeartbeat()
+    clock.advance(by: 14)
+    XCTAssertEqual(failures, 0)
+  }
+
   func testRendererTerminationRoutesToFullScreenRecovery() {
     let suite = "NativeBridgeTests.\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: suite)!
@@ -57,6 +103,15 @@ final class NativeBridgeTests: XCTestCase {
 
     XCTAssertEqual(result?["currentServerUrl"] as? String, "https://current.example.com/app")
     XCTAssertTrue(handler.messages.contains { $0["method"] as? String == "nativeWebReady" })
+  }
+
+  private func makeCoordinator() -> (OmnigentWebView.Coordinator, WKWebView) {
+    let url = URL(string: "https://server.example.com/app")!
+    let parent = OmnigentWebView(
+      serverURL: url, initialURL: url, managedServers: [], recentServers: [],
+      model: WebViewModel(), settings: SettingsStore(), switchToServer: { _ in },
+      connectToNewServer: {}, loadFailed: { _, _ in }, loadSucceeded: {})
+    return (OmnigentWebView.Coordinator(parent), WKWebView())
   }
 }
 

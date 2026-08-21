@@ -350,8 +350,9 @@ struct OmnigentWebView: UIViewRepresentable {
     private var urlObservation: NSKeyValueObservation?
     private var lifecycleObservers: [NSObjectProtocol] = []
     private var compatibilityReady = false
+    private var mainFrameOnPinnedOrigin = false
     private var recoveryShown = false
-    private lazy var livenessWatchdog = MobileLivenessWatchdog(
+    lazy var livenessWatchdog = MobileLivenessWatchdog(
       onTimeout: { [weak self] in
         self?.showFullScreenRecovery("The server UI stopped responding.")
       },
@@ -377,9 +378,7 @@ struct OmnigentWebView: UIViewRepresentable {
         ) { [weak self] _ in
           Task { @MainActor in
             guard let self else { return }
-            self.livenessWatchdog.setOnPinnedOrigin(
-              self.webView?.url?.omnigentOrigin == self.pinnedOrigin)
-            self.livenessWatchdog.setActive(true)
+            self.appBecameActive(url: self.webView?.url)
           }
         },
       ]
@@ -485,6 +484,21 @@ struct OmnigentWebView: UIViewRepresentable {
       webView.load(URLRequest(url: url))
     }
 
+    func appBecameActive(url: URL?) {
+      livenessWatchdog.setOnPinnedOrigin(url?.omnigentOrigin == pinnedOrigin)
+      livenessWatchdog.setActive(true)
+    }
+
+    func mainFrameNavigationStarted(url: URL?) {
+      let startsPinnedDocument = url?.omnigentOrigin == pinnedOrigin
+      if startsPinnedDocument && mainFrameOnPinnedOrigin {
+        compatibilityReady = false
+        livenessWatchdog.beginInitialWindow()
+      }
+      mainFrameOnPinnedOrigin = startsPinnedDocument
+      livenessWatchdog.setOnPinnedOrigin(startsPinnedDocument)
+    }
+
     func userContentController(
       _ userContentController: WKUserContentController, didReceive message: WKScriptMessage
     ) {
@@ -553,7 +567,6 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
-      livenessWatchdog.setOnPinnedOrigin(webView.url?.omnigentOrigin == pinnedOrigin)
       parent.model.isLoading = true
       parent.model.currentURL = webView.url ?? parent.model.currentURL
     }
@@ -636,6 +649,9 @@ struct OmnigentWebView: UIViewRepresentable {
       }
 
       if ["http", "https", "about", "blob", "data"].contains(scheme) {
+        if navigationAction.targetFrame?.isMainFrame == true {
+          mainFrameNavigationStarted(url: url)
+        }
         decisionHandler(.allow)
         return
       }
