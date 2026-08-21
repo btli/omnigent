@@ -1155,6 +1155,40 @@ async def claude_launch_catalog(
     )
 
 
+def claude_catalog_accepts(
+    rows: list[dict[str, object]],
+    token: str,
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> bool:
+    """Whether *token* names a model this launch config can start.
+
+    An exact catalog row is authoritative. Beyond that, a canonical
+    Anthropic id launches verbatim (``--model`` takes any string) on an
+    endpoint that serves canonical spellings — and a live ``/model``
+    persists exactly that spelling, so the exact-row test alone strands a
+    resumed session whose catalog lists only the family aliases. Accept
+    the id when its family alias-folds onto a catalog row; a gateway that
+    rejects canonical spellings vouches for nothing here.
+
+    :param rows: Catalog rows from :func:`claude_launch_catalog`.
+    :param token: A picker row id, family alias, or canonical model id.
+    :param claude_config: The resolved launch config, or ``None`` for a
+        direct Claude login.
+    :returns: ``True`` when the launch should proceed with *token*.
+    """
+    from omnigent.claude_model_vocabulary import claude_model_alias
+    from omnigent.model_catalog_store import catalog_contains
+
+    if catalog_contains(rows, token):
+        return True
+    if claude_config is not None and not _serves_canonical_anthropic_ids(claude_config):
+        return False
+    if not token.lower().startswith("claude-"):
+        return False
+    alias = claude_model_alias(token, claude_config.env if claude_config else {})
+    return alias is not None and catalog_contains(rows, alias)
+
+
 def build_native_claude_terminal_env(
     claude_config: ClaudeNativeUcodeConfig | None,
 ) -> dict[str, str]:
