@@ -365,7 +365,7 @@ jobs:
       # arm64-only keeps the job light; the dmg installs, the zip feeds
       # drag-free upgrades. Identity is nulled because the config pins the
       # Databricks signing cert, which this ring must never hold.
-      - name: Build macOS desktop app (unsigned, arm64)
+      - name: Build macOS desktop app (ad-hoc signed, arm64)
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: |
@@ -373,7 +373,14 @@ jobs:
           pnpm --filter web run build:overlay
           # --dir, not --filter: a filter that matches nothing makes pnpm
           # exec a silent no-op, and this build must never no-op quietly.
-          pnpm --dir web/electron exec electron-builder --mac dmg zip --arm64 -c.mac.identity=null
+          # Two phases with an ad-hoc re-sign between: a fully unsigned (or
+          # stale-sealed) arm64 app dies as "damaged" even after the user
+          # strips quarantine; ad-hoc keeps it launchable after xattr -dr.
+          pnpm --dir web/electron exec electron-builder --mac dir --arm64 -c.mac.identity=null
+          codesign --force --deep --sign - web/electron/dist/mac-arm64/Omnigent.app
+          codesign --verify --deep --strict web/electron/dist/mac-arm64/Omnigent.app
+          pnpm --dir web/electron exec electron-builder --mac dmg zip --arm64 -c.mac.identity=null \
+            --prepackaged dist/mac-arm64/Omnigent.app
 
       # Hand off exactly two files under fixed names from a fresh dir —
       # stable release-asset URLs, and no smuggling across the boundary.
@@ -455,6 +462,12 @@ jobs:
             desktop/omnigent-production-arm64-mac.zip dist/
           python3 .github/scripts/personal-staging/stage.py notes \
             --report dist/merge-report.json --signed "$SIGNED" --ring production > notes.md
+          cat >> notes.md <<'DESKTOP_NOTES'
+
+          ## macOS desktop
+          Ad-hoc signed, not notarized. After installing from the dmg, clear
+          quarantine once: `xattr -dr com.apple.quarantine /Applications/Omnigent.app`
+          DESKTOP_NOTES
           (cd dist && sha256sum ./* > ../SHA256SUMS && mv ../SHA256SUMS .)
           cat notes.md >> "$GITHUB_STEP_SUMMARY"
 
