@@ -52,6 +52,12 @@ export interface BadgeActivation {
 interface NativeShellApi {
   /** Discriminator so feature detection is unambiguous. */
   kind: "electron" | "ios" | "android";
+  /** Version of the mobile shell/web compatibility protocol. */
+  nativeBridgeVersion?: number;
+  /** Declare the mounted web app's compatibility protocol version. */
+  nativeWebReady?: (version: number) => void;
+  /** Keep the mobile shell's loaded-page liveness watchdog armed. */
+  nativeHeartbeat?: (version: number) => void;
   /**
    * Paint the dock/taskbar badge; 0 clears it. `activation` is consumed only by
    * the Android shell, which renders the badge as a tray notification and needs
@@ -278,10 +284,14 @@ export interface ElectronUpdateBridge {
 export interface ServerPickerInfo {
   /** Origin this shell is connected to, e.g. `"http://localhost:8000"`. */
   currentOrigin: string;
+  /** Full connected server URL, including a path-based deployment mount. */
+  currentServerUrl?: string;
+  /** Managed/MDM servers, in administrator order. */
+  managedServers?: string[];
   /**
    * Server URLs on offer, in the shell's display order: managed/MDM presets
    * first (where the platform has them), then recents, most recent first.
-   * The shell dedupes by origin before sending.
+   * Managed duplicates are removed without collapsing path-distinct servers.
    */
   recentServers: string[];
   /**
@@ -291,6 +301,69 @@ export interface ServerPickerInfo {
    * pre-manifest baseline so callers never handle `undefined`.
    */
   serverManifest?: ServerManifest;
+}
+
+/** Current mobile shell/web compatibility protocol. */
+export const NATIVE_WEB_PROTOCOL_VERSION = 1;
+
+function showNativeShellIncompatibility(): void {
+  const render = () => {
+    if (!document.body || document.getElementById("omnigent-native-incompatible")) return;
+    const page = document.createElement("main");
+    page.id = "omnigent-native-incompatible";
+    page.setAttribute("role", "alert");
+    page.style.cssText =
+      "position:fixed;inset:0;z-index:2147483647;display:grid;place-items:center;padding:32px;background:#fff;color:#27272a;font:16px system-ui;text-align:center";
+    page.innerHTML =
+      '<section style="max-width:32rem"><h1 style="font-size:24px;margin:0 0 12px">App update required</h1><p style="line-height:1.5;margin:0">This version of the mobile app cannot safely switch servers. Update Omnigent, then reconnect to your server.</p></section>';
+    document.body.replaceChildren(page);
+  };
+  if (document.body) render();
+  else window.addEventListener("DOMContentLoaded", render, { once: true });
+}
+
+/**
+ * Start the mobile shell compatibility handshake and liveness heartbeat.
+ * Pre-protocol mobile shells are unsupported, so web shows an explicit update
+ * outcome without invoking any obsolete native picker API.
+ */
+export function startNativeShellLiveness(): () => void {
+  let timer: number | null = null;
+  const start = () => {
+    if (timer !== null) return;
+    const native = nativeApi();
+    if (!native || native.kind === "electron") return;
+    if (
+      native.nativeBridgeVersion !== NATIVE_WEB_PROTOCOL_VERSION ||
+      !native.nativeWebReady ||
+      !native.nativeHeartbeat ||
+      !native.getServerPicker ||
+      !native.switchServer ||
+      !native.openServerSetup
+    ) {
+      showNativeShellIncompatibility();
+      return;
+    }
+    try {
+      native.nativeWebReady(NATIVE_WEB_PROTOCOL_VERSION);
+    } catch (err) {
+      console.warn("[nativeBridge] native compatibility handshake failed:", err);
+      return;
+    }
+    timer = window.setInterval(() => {
+      try {
+        native.nativeHeartbeat?.(NATIVE_WEB_PROTOCOL_VERSION);
+      } catch (err) {
+        console.warn("[nativeBridge] native heartbeat failed:", err);
+      }
+    }, 5_000);
+  };
+  start();
+  window.addEventListener("omnigent-native-bridge-ready", start);
+  return () => {
+    window.removeEventListener("omnigent-native-bridge-ready", start);
+    if (timer !== null) window.clearInterval(timer);
+  };
 }
 
 /**

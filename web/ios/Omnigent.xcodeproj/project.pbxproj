@@ -25,12 +25,15 @@
 		B10000000000000000000015 /* ManagedConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000015 /* ManagedConfiguration.swift */; };
 		B10000000000000000000016 /* ManagedConfigurationProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000016 /* ManagedConfigurationProvider.swift */; };
 		B10000000000000000000017 /* WorkspaceChromeScript.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000017 /* WorkspaceChromeScript.swift */; };
+		B10000000000000000000018 /* MobileLivenessWatchdog.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000018 /* MobileLivenessWatchdog.swift */; };
 		B1000000000000000000000D /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000D /* Assets.xcassets */; };
 		B1000000000000000000000E /* AppIcon.icon in Resources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000E /* AppIcon.icon */; };
 		B10000000000000000000013 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000013 /* PrivacyInfo.xcprivacy */; };
 		B20000000000000000000001 /* ServerURLTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000001 /* ServerURLTests.swift */; };
 		B20000000000000000000002 /* SettingsStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000002 /* SettingsStoreTests.swift */; };
 		B20000000000000000000008 /* WorkspaceChromeScriptTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000008 /* WorkspaceChromeScriptTests.swift */; };
+		B20000000000000000000009 /* NativeBridgeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000009 /* NativeBridgeTests.swift */; };
+		B2000000000000000000000A /* MobileLivenessWatchdogTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000A /* MobileLivenessWatchdogTests.swift */; };
 		B20000000000000000000003 /* WorkspaceURLExpanderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */; };
 		B20000000000000000000004 /* DeepLinkTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000004 /* DeepLinkTests.swift */; };
 		B20000000000000000000005 /* WorkspaceURLExpanderRedirectTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000005 /* WorkspaceURLExpanderRedirectTests.swift */; };
@@ -70,6 +73,7 @@
 		A10000000000000000000014 /* DeepLink.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepLink.swift; sourceTree = "<group>"; };
 		A10000000000000000000007 /* WorkspaceURLExpander.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceURLExpander.swift; sourceTree = "<group>"; };
 		A10000000000000000000017 /* WorkspaceChromeScript.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceChromeScript.swift; sourceTree = "<group>"; };
+		A10000000000000000000018 /* MobileLivenessWatchdog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileLivenessWatchdog.swift; sourceTree = "<group>"; };
 		A10000000000000000000008 /* NativeNotificationManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeNotificationManager.swift; sourceTree = "<group>"; };
 		A10000000000000000000009 /* WebShellView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebShellView.swift; sourceTree = "<group>"; };
 		A1000000000000000000000A /* WebViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebViewModel.swift; sourceTree = "<group>"; };
@@ -91,6 +95,8 @@
 		A20000000000000000000005 /* WorkspaceURLExpanderRedirectTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceURLExpanderRedirectTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000007 /* ManagedConfigurationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManagedConfigurationTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000008 /* WorkspaceChromeScriptTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceChromeScriptTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000009 /* NativeBridgeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeBridgeTests.swift; sourceTree = "<group>"; };
+		A2000000000000000000000A /* MobileLivenessWatchdogTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileLivenessWatchdogTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000006 /* MockHTTPServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MockHTTPServer.swift; sourceTree = "<group>"; };
 		A30000000000000000000003 /* OmnigentUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OmnigentUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		A40000000000000000000001 /* OmnigentUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OmnigentUITests.swift; sourceTree = "<group>"; };
@@ -159,6 +165,7 @@
 				A10000000000000000000014 /* DeepLink.swift */,
 				A10000000000000000000007 /* WorkspaceURLExpander.swift */,
 				A10000000000000000000017 /* WorkspaceChromeScript.swift */,
+				A10000000000000000000018 /* MobileLivenessWatchdog.swift */,
 				A10000000000000000000008 /* NativeNotificationManager.swift */,
 				A10000000000000000000009 /* WebShellView.swift */,
 				A1000000000000000000000A /* WebViewModel.swift */,
@@ -186,6 +193,8 @@
 				A20000000000000000000005 /* WorkspaceURLExpanderRedirectTests.swift */,
 				A20000000000000000000007 /* ManagedConfigurationTests.swift */,
 				A20000000000000000000008 /* WorkspaceChromeScriptTests.swift */,
+				A20000000000000000000009 /* NativeBridgeTests.swift */,
+				A2000000000000000000000A /* MobileLivenessWatchdogTests.swift */,
 				A20000000000000000000006 /* MockHTTPServer.swift */,
 			);
 			path = OmnigentTests;
@@ -350,6 +359,7 @@
 				B10000000000000000000014 /* DeepLink.swift in Sources */,
 				B10000000000000000000007 /* WorkspaceURLExpander.swift in Sources */,
 				B10000000000000000000017 /* WorkspaceChromeScript.swift in Sources */,
+				B10000000000000000000018 /* MobileLivenessWatchdog.swift in Sources */,
 				B10000000000000000000008 /* NativeNotificationManager.swift in Sources */,
 				B10000000000000000000009 /* WebShellView.swift in Sources */,
 				B1000000000000000000000A /* WebViewModel.swift in Sources */,
@@ -373,6 +383,8 @@
 				B20000000000000000000005 /* WorkspaceURLExpanderRedirectTests.swift in Sources */,
 				B20000000000000000000007 /* ManagedConfigurationTests.swift in Sources */,
 				B20000000000000000000008 /* WorkspaceChromeScriptTests.swift in Sources */,
+				B20000000000000000000009 /* NativeBridgeTests.swift in Sources */,
+				B2000000000000000000000A /* MobileLivenessWatchdogTests.swift in Sources */,
 				B20000000000000000000006 /* MockHTTPServer.swift in Sources (OmnigentTests) */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
