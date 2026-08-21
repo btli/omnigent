@@ -58,6 +58,9 @@ describe("SidebarServerPicker", () => {
       "max-h-[var(--radix-dropdown-menu-content-available-height)]",
       "overflow-y-auto",
     );
+    for (const row of screen.getAllByRole("menuitem")) {
+      expect(row).toHaveClass("min-h-11", "md:min-h-0");
+    }
   });
 
   it("renders nothing in a plain browser (bridge resolves null)", async () => {
@@ -84,7 +87,7 @@ describe("SidebarServerPicker", () => {
     const trigger = await openMenu();
     expect(trigger).toHaveAttribute("aria-label", "Server: localhost:8000. Switch server");
 
-    expect(await screen.findByText("Recents")).toBeInTheDocument();
+    expect(await screen.findByText("Recent")).toBeInTheDocument();
     // localhost:8000 shows twice by design — once as the row's own label, once
     // as the menu's leading checked entry — and NOT a third time from recents,
     // which collapses into that entry.
@@ -95,6 +98,35 @@ describe("SidebarServerPicker", () => {
     expect(
       screen.getByText("omnigents-9147263058412098.aws.databricksapps.com"),
     ).toBeInTheDocument();
+  });
+
+  it("keeps path-distinct servers and collapses default-port duplicates", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "https://apps.example.com",
+      currentServerUrl: "https://apps.example.com/first",
+      managedServers: ["https://apps.example.com:443/first/", "https://apps.example.com/second"],
+      recentServers: ["https://apps.example.com:443/second/", "https://apps.example.com/third"],
+    });
+    renderPicker();
+
+    await openMenu();
+    expect(await screen.findByText("Managed")).toBeInTheDocument();
+    expect(screen.getByText("Recent")).toBeInTheDocument();
+    expect(screen.getAllByText("apps.example.com/first")).toHaveLength(2);
+    expect(screen.getByText("apps.example.com/second")).toBeInTheDocument();
+    expect(screen.getByText("apps.example.com/third")).toBeInTheDocument();
+    expect(screen.getAllByRole("menuitem")).toHaveLength(4);
+  });
+
+  it("refreshes native managed and recent data when the menu opens", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "https://current.example.com",
+      recentServers: [],
+    });
+    renderPicker();
+
+    await openMenu();
+    await waitFor(() => expect(getServerPicker).toHaveBeenCalledTimes(2));
   });
 
   it("switches to a recent server on select", async () => {

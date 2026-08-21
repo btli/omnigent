@@ -5,6 +5,8 @@ import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.webkit.RenderProcessGoneDetail
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -27,6 +29,7 @@ class OmnigentWebViewClient(
     private val pinnedOrigin: () -> String?,
     private val shouldInjectBridgeAtPageReady: () -> Boolean,
     private val onPageReady: (url: String?) -> Unit,
+    private val onLoadFailure: (String) -> Unit = {},
     private val onLoginRequired: () -> Unit,
     private val bridgeScriptSource: () -> String = { NativeBridgeScript.source },
 ) : WebViewClient() {
@@ -120,6 +123,30 @@ class OmnigentWebViewClient(
             return
         }
         onPageReady(url)
+    }
+
+    override fun onReceivedError(
+        view: WebView,
+        request: WebResourceRequest,
+        error: WebResourceError,
+    ) {
+        super.onReceivedError(view, request, error)
+        if (request.isForMainFrame && originOf(request.url.toString()) == pinnedOrigin()) {
+            onLoadFailure(
+                error.description
+                    ?.toString()
+                    .orEmpty()
+                    .ifBlank { "The server failed to load." },
+            )
+        }
+    }
+
+    override fun onRenderProcessGone(
+        view: WebView,
+        detail: RenderProcessGoneDetail,
+    ): Boolean {
+        onLoadFailure("The server UI process stopped unexpectedly.")
+        return true
     }
 
     override fun shouldOverrideUrlLoading(

@@ -3,8 +3,10 @@ import UIKit
 import WebKit
 
 struct OmnigentWebView: UIViewRepresentable {
+  let serverURL: URL
   let initialURL: URL
-  let offeredServers: [String]
+  let managedServers: [String]
+  let recentServers: [String]
   @ObservedObject var model: WebViewModel
   @ObservedObject var settings: SettingsStore
   let switchToServer: (URL) -> Void
@@ -97,18 +99,10 @@ struct OmnigentWebView: UIViewRepresentable {
   }
 
   private var nativeBridgeScriptSource: String {
-    Self.nativeBridgeScript(
-      currentOrigin: initialURL.omnigentOrigin ?? initialURL.absoluteString,
-      recentServers: offeredServers
-    )
+    Self.nativeBridgeScript()
   }
 
-  static func nativeBridgeScript(
-    currentOrigin: String,
-    recentServers: [String]
-  ) -> String {
-    let recentsLiteral =
-      recentServers.map(WebViewModel.javascriptString).joined(separator: ", ")
+  static func nativeBridgeScript() -> String {
     return """
       (() => {
         if (window.omnigentNative && window.omnigentNative.kind === "ios") return;
@@ -184,8 +178,8 @@ struct OmnigentWebView: UIViewRepresentable {
         const callbacks = new Set();
         const openPathCallbacks = new Set();
         const viewModeCallbacks = new Set();
-        const pickerCurrentOrigin = \(WebViewModel.javascriptString(currentOrigin));
-        const pickerRecentServers = [\(recentsLiteral)];
+        const pickerRequests = new Map();
+        let nextPickerRequest = 1;
         const defineEmit = (name, fn) => {
           Object.defineProperty(window, name, {
             configurable: false,
@@ -226,6 +220,13 @@ struct OmnigentWebView: UIViewRepresentable {
             try { callback(insets); } catch {}
           }
         });
+        defineEmit("__omnigentNativeEmitServerPicker", (requestId, info) => {
+          const pending = pickerRequests.get(requestId);
+          if (!pending) return;
+          pickerRequests.delete(requestId);
+          clearTimeout(pending.timer);
+          pending.resolve(info && typeof info === "object" ? info : null);
+        });
         const sidebarDragCallbacks = new Set();
         Object.defineProperty(window, "__omnigentNativeEmitSidebarDrag", {
           configurable: false,
@@ -244,6 +245,17 @@ struct OmnigentWebView: UIViewRepresentable {
         });
         window.omnigentNative = Object.freeze({
           kind: "ios",
+          nativeBridgeVersion: 1,
+          nativeWebReady(version) {
+            window.webkit.messageHandlers.omnigentNative.postMessage({
+              method: "nativeWebReady", version,
+            });
+          },
+          nativeHeartbeat(version) {
+            window.webkit.messageHandlers.omnigentNative.postMessage({
+              method: "nativeHeartbeat", version,
+            });
+          },
           setColorScheme(scheme) {
             if (scheme !== "light" && scheme !== "dark" && scheme !== "system") return;
             window.webkit.messageHandlers.omnigentNative.postMessage({
@@ -306,15 +318,20 @@ struct OmnigentWebView: UIViewRepresentable {
             return () => insetCallbacks.delete(callback);
           },
           getServerPicker() {
-            return Promise.resolve({
-              currentOrigin: pickerCurrentOrigin,
-              recentServers: [...pickerRecentServers],
+            const requestId = nextPickerRequest++;
+            return new Promise((resolve) => {
+              const timer = setTimeout(() => {
+                pickerRequests.delete(requestId);
+                resolve(null);
+              }, 3000);
+              pickerRequests.set(requestId, { resolve, timer });
+              window.webkit.messageHandlers.omnigentNative.postMessage({
+                method: "getServerPicker", requestId,
+              });
             });
           },
           switchServer(url) {
-            if (typeof url !== "string" || !pickerRecentServers.includes(url)) {
-              return Promise.reject(new Error("switchServer target must be an offered server"));
-            }
+            if (typeof url !== "string") return Promise.reject(new Error("invalid server"));
             window.webkit.messageHandlers.omnigentNative.postMessage({
               method: "switchServer",
               url,
@@ -327,6 +344,7 @@ struct OmnigentWebView: UIViewRepresentable {
             });
           },
         });
+        window.dispatchEvent(new Event("omnigent-native-bridge-ready"));
       })();
       """
   }
@@ -350,6 +368,10 @@ struct OmnigentWebView: UIViewRepresentable {
     private var rootBounces = 0
     private static let maxRootBounces = 1
     private var urlObservation: NSKeyValueObservation?
+    private var livenessTask: Task<Void, Never>?
+    private var compatibilityReady = false
+    private var recoveryShown = false
+    private static let protocolVersion = 1
 
     init(_ parent: OmnigentWebView) {
       self.parent = parent
@@ -370,6 +392,7 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     func detach() {
+      livenessTask?.cancel()
       urlObservation = nil
       webView = nil
     }
@@ -449,6 +472,9 @@ struct OmnigentWebView: UIViewRepresentable {
       // A new pin is a new server: the previous one's exhausted bounce budget must
       // not suppress the first bounce here.
       rootBounces = 0
+      compatibilityReady = false
+      recoveryShown = false
+      armLivenessTimeout(seconds: 20)
       publishModelChanges { $0.currentURL = url }
       webView.load(URLRequest(url: url))
     }
@@ -462,6 +488,24 @@ struct OmnigentWebView: UIViewRepresentable {
       else { return }
 
       switch method {
+      case "nativeWebReady":
+        guard let version = (body["version"] as? NSNumber)?.intValue,
+          version == Self.protocolVersion
+        else {
+          showFullScreenRecovery("The server UI is incompatible with this app version.")
+          return
+        }
+        compatibilityReady = true
+        armLivenessTimeout(seconds: 15)
+        parent.loadSucceeded()
+      case "nativeHeartbeat":
+        guard compatibilityReady,
+          (body["version"] as? NSNumber)?.intValue == Self.protocolVersion
+        else { return }
+        armLivenessTimeout(seconds: 15)
+      case "getServerPicker":
+        guard let requestID = (body["requestId"] as? NSNumber)?.intValue else { return }
+        emitServerPicker(requestID: requestID)
       case "setColorScheme":
         guard let scheme = body["scheme"] as? String,
           let source = ThemeSource(rawValue: scheme)
@@ -482,9 +526,14 @@ struct OmnigentWebView: UIViewRepresentable {
         )
       case "switchServer":
         guard let value = body["url"] as? String,
-          parent.offeredServers.contains(value),
-          let url = URL(string: value)
+          let requested = URL(string: value),
+          let requestedKey = requested.omnigentServerKey
         else { return }
+        guard let url = offeredServers.first(where: { $0.omnigentServerKey == requestedKey }) else {
+          showFullScreenRecovery(
+            "That server is no longer available. Choose a server to reconnect.")
+          return
+        }
         parent.switchToServer(url)
       case "openServerSetup":
         parent.connectToNewServer()
@@ -535,7 +584,6 @@ struct OmnigentWebView: UIViewRepresentable {
       // stylesheet persists across in-app navigation.
       if pinnedOrigin != nil, webView.url?.omnigentOrigin == pinnedOrigin {
         webView.evaluateJavaScript(WorkspaceChromeScript.source)
-        parent.loadSucceeded()
       }
     }
 
@@ -551,7 +599,7 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-      webView.reload()
+      showFullScreenRecovery("The server UI process stopped unexpectedly.")
     }
 
     func webView(
@@ -690,7 +738,48 @@ struct OmnigentWebView: UIViewRepresentable {
 
       let failedURL = failedURL(from: nsError) ?? webView.url ?? pinnedURL ?? parent.initialURL
       guard failedURL.omnigentOrigin == pinnedOrigin else { return }
-      parent.loadFailed(failedURL, error.localizedDescription)
+      showFullScreenRecovery(error.localizedDescription)
+    }
+
+    private var offeredServers: [URL] {
+      let values = parent.managedServers + parent.recentServers
+      var seen = Set<String>()
+      return values.compactMap(URL.init(string:)).filter { url in
+        guard let key = url.omnigentServerKey else { return false }
+        return seen.insert(key).inserted
+      }
+    }
+
+    private func emitServerPicker(requestID: Int) {
+      guard let webView else { return }
+      let payload: [String: Any] = [
+        "currentOrigin": parent.serverURL.omnigentOrigin ?? parent.serverURL.absoluteString,
+        "currentServerUrl": parent.serverURL.absoluteString,
+        "managedServers": parent.managedServers,
+        "recentServers": parent.recentServers,
+      ]
+      guard let data = try? JSONSerialization.data(withJSONObject: payload),
+        let json = String(data: data, encoding: .utf8)
+      else { return }
+      webView.evaluateJavaScript("window.__omnigentNativeEmitServerPicker?.(\(requestID),\(json));")
+    }
+
+    private func armLivenessTimeout(seconds: UInt64) {
+      livenessTask?.cancel()
+      livenessTask = Task { [weak self] in
+        try? await Task.sleep(for: .seconds(seconds))
+        guard !Task.isCancelled else { return }
+        await MainActor.run {
+          self?.showFullScreenRecovery("The server UI stopped responding.")
+        }
+      }
+    }
+
+    private func showFullScreenRecovery(_ message: String) {
+      guard !recoveryShown else { return }
+      recoveryShown = true
+      livenessTask?.cancel()
+      parent.loadFailed(parent.serverURL, message)
     }
 
     private func publishModelChanges(_ update: @escaping @MainActor (WebViewModel) -> Void) {

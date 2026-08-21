@@ -10,6 +10,8 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
@@ -31,6 +33,8 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.webkit.ScriptHandler
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * The single WebView host. Mirrors the iOS `WebShellView` + `OmnigentWebView`:
@@ -56,6 +60,11 @@ class MainActivity : AppCompatActivity() {
     private var bridgeScriptHandler: ScriptHandler? = null
     private var loginAttempts = 0 // capped browser-login retries; reset in onPageReady
     private var historyCleared = false // drop pre-auth/login-redirect history once
+    private val livenessHandler = Handler(Looper.getMainLooper())
+    private var compatibilityReady = false
+    private var recoveryShown = false
+    private val livenessTimeout =
+        Runnable { showFullScreenRecovery("The server UI stopped responding.") }
 
     // WebChromeClient affordances that need Activity-scoped result launchers.
     // Transient by design: rotation is covered by configChanges (no recreation),
@@ -133,6 +142,7 @@ class MainActivity : AppCompatActivity() {
                             bridgeTransportInstalled && bridgeScriptHandler == null
                         },
                         onPageReady = ::onPageReady,
+                        onLoadFailure = ::showFullScreenRecovery,
                         onLoginRequired = ::startLogin,
                         bridgeScriptSource = ::nativeBridgeScriptSource,
                     )
@@ -148,6 +158,10 @@ class MainActivity : AppCompatActivity() {
         setContentView(webView)
         applySystemBarContrast()
         installBridge()
+        if (!bridgeTransportInstalled) {
+            showFullScreenRecovery("This Android WebView cannot run the required secure bridge.")
+            return
+        }
 
         // Measure the OS safe area and push it into the page as CSS custom
         // properties — Android WebView can't rely on `env(safe-area-inset-*)`
@@ -231,12 +245,13 @@ class MainActivity : AppCompatActivity() {
         )
 
         ensureNotificationPermission()
+        armLivenessTimeout(INITIAL_READY_TIMEOUT_MS)
         webView.loadUrl(serverUrl)
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        applySystemBarContrast()
+        applySystemBarContrast(newConfig)
         if (::webView.isInitialized) {
             // Notify matchMedia listeners without reloading the SPA.
             webView.dispatchConfigurationChanged(newConfig)
@@ -262,6 +277,9 @@ class MainActivity : AppCompatActivity() {
                 OmnigentBridgeListener(
                     notifications = notifications,
                     blobSaver = blobSaver,
+                    onNativeWebReady = ::onNativeWebReady,
+                    onNativeHeartbeat = ::onNativeHeartbeat,
+                    onGetServerPicker = ::emitServerPicker,
                     onSwitchServer = ::switchServerFromBridge,
                     onOpenServerSetup = ::openServerSetupFromBridge,
                 ),
@@ -285,29 +303,77 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun nativeBridgeScriptSource(): String {
+    private fun nativeBridgeScriptSource(): String = NativeBridgeScript.source
+
+    private fun onNativeWebReady(version: Int) {
+        if (version != NativeBridgeScript.PROTOCOL_VERSION) {
+            showFullScreenRecovery("The server UI is incompatible with this app version.")
+            return
+        }
+        compatibilityReady = true
+        armLivenessTimeout(HEARTBEAT_TIMEOUT_MS)
+    }
+
+    private fun onNativeHeartbeat(version: Int) {
+        if (!compatibilityReady || version != NativeBridgeScript.PROTOCOL_VERSION) return
+        armLivenessTimeout(HEARTBEAT_TIMEOUT_MS)
+    }
+
+    private fun armLivenessTimeout(delayMs: Long) {
+        livenessHandler.removeCallbacks(livenessTimeout)
+        livenessHandler.postDelayed(livenessTimeout, delayMs)
+    }
+
+    private fun showFullScreenRecovery(message: String) {
+        if (recoveryShown || isFinishing || isDestroyed) return
+        recoveryShown = true
+        livenessHandler.removeCallbacks(livenessTimeout)
+        val prefill = runCatching { ServerStore(this).currentServerUrl() }.getOrNull()
+        startActivity(
+            Intent(this, ConnectActivity::class.java)
+                .putExtra(ConnectActivity.EXTRA_PREFILL, prefill)
+                .putExtra(ConnectActivity.EXTRA_ERROR, message),
+        )
+        finish()
+    }
+
+    private fun emitServerPicker(requestId: Int) {
+        if (!::webView.isInitialized || recoveryShown) return
         val store = ServerStore(this)
-        return NativeBridgeScript.source(
-            currentOrigin = pinnedOrigin.orEmpty(),
-            recentServers = store.offeredServers(),
+        val info =
+            JSONObject()
+                .put("currentOrigin", pinnedOrigin.orEmpty())
+                .put("currentServerUrl", store.currentServerUrl())
+                .put("managedServers", JSONArray(store.managedServers()))
+                .put("recentServers", JSONArray(store.recentServersForPicker()))
+        webView.evaluateJavascript(
+            "window.__omnigentNativeEmitServerPicker?.($requestId,$info);",
+            null,
         )
     }
 
     private fun switchServerFromBridge(url: String) {
         val store = ServerStore(this)
-        if (url !in store.offeredServers()) return
-        val newOrigin = originOf(url) ?: return
-        store.connect(url)
-        reloadWithNewServer(url, newOrigin)
+        val requestedKey = serverKey(url)
+        val offered = store.offeredServers().firstOrNull { serverKey(it) == requestedKey }
+        if (offered == null) {
+            showFullScreenRecovery(
+                "That server is no longer available. Choose a server to reconnect.",
+            )
+            return
+        }
+        val newOrigin = originOf(offered) ?: return
+        store.connect(offered)
+        reloadWithNewServer(offered, newOrigin)
     }
 
     private fun openServerSetupFromBridge() {
         startActivity(Intent(this, ConnectActivity::class.java))
     }
 
-    private fun applySystemBarContrast() {
+    private fun applySystemBarContrast(configuration: Configuration = resources.configuration) {
         val isLightMode =
-            resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK !=
+            configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK !=
                 Configuration.UI_MODE_NIGHT_YES
         WindowInsetsControllerCompat(window, window.decorView).apply {
             isAppearanceLightStatusBars = isLightMode
@@ -430,6 +496,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        livenessHandler.removeCallbacks(livenessTimeout)
         // Unblock a pending file input / mic request, then release WebView + worker.
         pendingFileCallback?.onReceiveValue(null)
         pendingFileCallback = null
@@ -478,9 +545,16 @@ class MainActivity : AppCompatActivity() {
         removeBridge()
         pinnedOrigin = newOrigin
         pageLoaded = false
+        compatibilityReady = false
+        recoveryShown = false
         historyCleared = false
         loginAttempts = 0
         installBridge()
+        if (!bridgeTransportInstalled) {
+            showFullScreenRecovery("This Android WebView cannot run the required secure bridge.")
+            return
+        }
+        armLivenessTimeout(INITIAL_READY_TIMEOUT_MS)
         webView.loadUrl(serverUrl)
     }
 
@@ -688,5 +762,7 @@ class MainActivity : AppCompatActivity() {
         // (a few ms) always wins the race, short enough to not feel stuck if it
         // doesn't answer. Only the timer ever fires when the renderer is gone.
         const val BACK_FALLBACK_MS = 600L
+        const val INITIAL_READY_TIMEOUT_MS = 20_000L
+        const val HEARTBEAT_TIMEOUT_MS = 15_000L
     }
 }

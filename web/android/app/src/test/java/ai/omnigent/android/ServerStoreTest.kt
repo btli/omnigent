@@ -79,13 +79,16 @@ class ServerStoreTest {
     }
 
     @Test
-    fun `offered servers dedupe recent paths by origin`() {
+    fun `offered servers preserve path-distinct deployments`() {
         val store = storeWithPresets()
         store.connect("https://recent.example.com/first")
         store.connect("https://recent.example.com/second")
 
         assertEquals(
-            listOf("https://recent.example.com/second"),
+            listOf(
+                "https://recent.example.com/second",
+                "https://recent.example.com/first",
+            ),
             store.offeredServers(),
         )
     }

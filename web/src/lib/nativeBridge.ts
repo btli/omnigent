@@ -52,6 +52,12 @@ export interface BadgeActivation {
 interface NativeShellApi {
   /** Discriminator so feature detection is unambiguous. */
   kind: "electron" | "ios" | "android";
+  /** Version of the mobile shell/web compatibility protocol. */
+  nativeBridgeVersion?: number;
+  /** Declare the mounted web app's compatibility protocol version. */
+  nativeWebReady?: (version: number) => void;
+  /** Keep the mobile shell's loaded-page liveness watchdog armed. */
+  nativeHeartbeat?: (version: number) => void;
   /**
    * Paint the dock/taskbar badge; 0 clears it. `activation` is consumed only by
    * the Android shell, which renders the badge as a tray notification and needs
@@ -278,10 +284,14 @@ export interface ElectronUpdateBridge {
 export interface ServerPickerInfo {
   /** Origin this shell is connected to, e.g. `"http://localhost:8000"`. */
   currentOrigin: string;
+  /** Full connected server URL, including a path-based deployment mount. */
+  currentServerUrl?: string;
+  /** Managed/MDM servers, in administrator order. */
+  managedServers?: string[];
   /**
    * Server URLs on offer, in the shell's display order: managed/MDM presets
    * first (where the platform has them), then recents, most recent first.
-   * The shell dedupes by origin before sending.
+   * Managed duplicates are removed without collapsing path-distinct servers.
    */
   recentServers: string[];
   /**
@@ -291,6 +301,41 @@ export interface ServerPickerInfo {
    * pre-manifest baseline so callers never handle `undefined`.
    */
   serverManifest?: ServerManifest;
+}
+
+/** Current mobile shell/web compatibility protocol. */
+export const NATIVE_WEB_PROTOCOL_VERSION = 1;
+
+/**
+ * Start the mobile shell compatibility handshake and liveness heartbeat.
+ * Older shells expose neither method and keep their legacy behavior.
+ */
+export function startNativeShellLiveness(): () => void {
+  let timer: number | null = null;
+  const start = () => {
+    if (timer !== null) return;
+    const native = nativeApi();
+    if (!native?.nativeWebReady || !native.nativeHeartbeat) return;
+    try {
+      native.nativeWebReady(NATIVE_WEB_PROTOCOL_VERSION);
+    } catch (err) {
+      console.warn("[nativeBridge] native compatibility handshake failed:", err);
+      return;
+    }
+    timer = window.setInterval(() => {
+      try {
+        native.nativeHeartbeat?.(NATIVE_WEB_PROTOCOL_VERSION);
+      } catch (err) {
+        console.warn("[nativeBridge] native heartbeat failed:", err);
+      }
+    }, 5_000);
+  };
+  start();
+  window.addEventListener("omnigent-native-bridge-ready", start);
+  return () => {
+    window.removeEventListener("omnigent-native-bridge-ready", start);
+    if (timer !== null) window.clearInterval(timer);
+  };
 }
 
 /**

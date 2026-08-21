@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct WebShellView: View {
+  let serverURL: URL
   let initialURL: URL
   let connectToNewServer: () -> Void
   let switchToServer: (URL) -> Void
@@ -19,24 +20,21 @@ struct WebShellView: View {
   @State private var deferredOpenPath: String?
 
   var body: some View {
-    GeometryReader { _ in
-      ZStack {
-        let offeredServers = ManagedServers.merged(
-          managed: managedConfiguration.serverURLs,
-          recents: settings.recentServers
-        )
-        OmnigentWebView(
-          initialURL: initialURL,
-          offeredServers: offeredServers,
-          model: model,
-          settings: settings,
-          switchToServer: switchToServer,
-          connectToNewServer: connectToNewServer,
-          loadFailed: loadFailed,
-          loadSucceeded: loadSucceeded
-        )
-        .ignoresSafeArea()
-      }
+    ZStack {
+      OmnigentWebView(
+        serverURL: serverURL,
+        initialURL: initialURL,
+        managedServers: managedConfiguration.serverURLs.map(\.absoluteString),
+        recentServers: ManagedServers.recents(
+          settings.recentServers, excludingManaged: managedConfiguration.serverURLs),
+        model: model,
+        settings: settings,
+        switchToServer: switchToServer,
+        connectToNewServer: connectToNewServer,
+        loadFailed: loadFailed,
+        loadSucceeded: loadSucceeded
+      )
+      .ignoresSafeArea()
       .ignoresSafeArea(.keyboard)
       .background(DesignTokens.background(colorScheme).ignoresSafeArea())
       .overlay(alignment: .bottom) {

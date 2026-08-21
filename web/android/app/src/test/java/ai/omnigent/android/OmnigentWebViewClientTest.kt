@@ -19,6 +19,18 @@ import org.robolectric.Shadows.shadowOf
 @RunWith(RobolectricTestRunner::class)
 class OmnigentWebViewClientTest {
     @Test
+    fun `renderer termination routes to full-screen recovery callback`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val failures = mutableListOf<String>()
+        val client = client(onLoadFailure = failures::add)
+
+        val handled = client.onRenderProcessGone(webView, TestRenderProcessGoneDetail())
+
+        assertTrue(handled)
+        assertEquals(listOf("The server UI process stopped unexpectedly."), failures)
+    }
+
+    @Test
     fun `page start does not inject into the outgoing document`() {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
         val client = client(shouldInjectBridgeAtPageReady = false)
@@ -295,11 +307,13 @@ class OmnigentWebViewClientTest {
         shouldInjectBridgeAtPageReady: Boolean = false,
         pinnedOrigin: String = PINNED_ORIGIN,
         onLoginRequired: () -> Unit = {},
+        onLoadFailure: (String) -> Unit = {},
         onPageReady: (String?) -> Unit = {},
     ) = OmnigentWebViewClient(
         pinnedOrigin = { pinnedOrigin },
         shouldInjectBridgeAtPageReady = { shouldInjectBridgeAtPageReady },
         onPageReady = onPageReady,
+        onLoadFailure = onLoadFailure,
         onLoginRequired = onLoginRequired,
     )
 

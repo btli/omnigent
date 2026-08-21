@@ -60,6 +60,20 @@ final class ManagedConfigurationTests: XCTestCase {
       ["https://a.example.com", "https://b.example.com"])
   }
 
+  func testDefaultPortDuplicatesCollapseButDistinctMountPathsRemain() throws {
+    let config = try decode([
+      "serverUrls": [
+        "https://apps.example.com:443/first/",
+        "https://apps.example.com/first",
+        "https://apps.example.com/second",
+      ]
+    ])
+
+    XCTAssertEqual(
+      config.serverURLs.map(\.absoluteString),
+      ["https://apps.example.com:443/first/", "https://apps.example.com/second"])
+  }
+
   func testMaximumEntriesIsAccepted() throws {
     let entries = (1...OmnigentManagedConfiguration.maxServerURLs).map {
       "https://s\($0).example.com"
@@ -264,11 +278,12 @@ final class ManagedServersTests: XCTestCase {
     XCTAssertEqual(merged, ["https://corp.example.com", "https://mine.example.com"])
   }
 
-  func testMergedServersDedupeRecentPathsByOrigin() {
+  func testMergedServersPreservePathDistinctRecents() {
     let merged = ManagedServers.merged(
       managed: [],
       recents: ["https://mine.example.com/first", "https://mine.example.com/second"])
 
-    XCTAssertEqual(merged, ["https://mine.example.com/first"])
+    XCTAssertEqual(
+      merged, ["https://mine.example.com/first", "https://mine.example.com/second"])
   }
 }

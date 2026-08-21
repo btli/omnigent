@@ -15,6 +15,7 @@ import {
   serverManifestOf,
   setBadgeCount as bridgeSetBadge,
   setThemeSource,
+  startNativeShellLiveness,
   supportsBrowser,
   switchServer,
 } from "./nativeBridge";
@@ -543,5 +544,54 @@ describe("server picker trio (getServerPicker / switchServer / openServerSetup)"
     install();
     openServerSetup();
     expect(shellOpenServerSetup).toHaveBeenCalledOnce();
+  });
+});
+
+describe("mobile shell compatibility handshake", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it("announces readiness and keeps a protocol-1 shell alive", () => {
+    const ready = vi.fn();
+    const heartbeat = vi.fn();
+    setAndroid(true);
+    Object.assign((window as unknown as Record<string, unknown>).omnigentNative as object, {
+      nativeBridgeVersion: 1,
+      nativeWebReady: ready,
+      nativeHeartbeat: heartbeat,
+    });
+
+    const stop = startNativeShellLiveness();
+    expect(ready).toHaveBeenCalledWith(1);
+    vi.advanceTimersByTime(5_000);
+    expect(heartbeat).toHaveBeenCalledWith(1);
+    stop();
+    vi.advanceTimersByTime(5_000);
+    expect(heartbeat).toHaveBeenCalledOnce();
+  });
+
+  it("handshakes when Android installs its fallback bridge after mount", () => {
+    const ready = vi.fn();
+    const heartbeat = vi.fn();
+    const stop = startNativeShellLiveness();
+    setAndroid(true);
+    Object.assign((window as unknown as Record<string, unknown>).omnigentNative as object, {
+      nativeBridgeVersion: 1,
+      nativeWebReady: ready,
+      nativeHeartbeat: heartbeat,
+    });
+
+    window.dispatchEvent(new Event("omnigent-native-bridge-ready"));
+    expect(ready).toHaveBeenCalledWith(1);
+    stop();
+  });
+
+  it("is inert in browsers and old shells", () => {
+    const stopBrowser = startNativeShellLiveness();
+    setIOS(true);
+    const stopOldShell = startNativeShellLiveness();
+    expect(vi.getTimerCount()).toBe(0);
+    stopBrowser();
+    stopOldShell();
   });
 });

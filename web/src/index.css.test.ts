@@ -600,10 +600,14 @@ describe("index.css electron-mac sidebar header", () => {
 describe("index.css native conversation breadcrumb", () => {
   it("does not hide the parent-session link on iOS/Android native shells", () => {
     // Native back is off and edge-pan opens the sidebar, so a blanket hide
-    // would drop the only in-header climb-out of a sub-agent.
+    // would drop the only in-header climb-out of a sub-agent. Other segments
+    // keep their established native-shell suppression.
     const blanket = cssSource.match(
       /\[data-ios-native\] \.conversation-breadcrumb\s*,\s*\[data-android-native\] \.conversation-breadcrumb\s*\{[^}]*display:\s*none/,
     );
     expect(blanket).toBeNull();
+    expect(cssSource).toMatch(
+      /\[data-ios-native\][\s\S]*breadcrumb-parent-link[\s\S]*\[data-android-native\][\s\S]*breadcrumb-parent-link/,
+    );
   });
 });

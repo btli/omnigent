@@ -762,6 +762,17 @@ aside[aria-label="Workspace"][data-maximized] {
   -webkit-app-region: no-drag;
 }
 
+/* Native navigation keeps the parent-session link as the only in-header
+ * climb-out from a child while suppressing redundant title segments. */
+[data-ios-native] .conversation-breadcrumb:not(:has(> a.breadcrumb-parent-link)),
+[data-android-native] .conversation-breadcrumb:not(:has(> a.breadcrumb-parent-link)) {
+  display: none;
+}
+[data-ios-native] .conversation-breadcrumb > :not(a.breadcrumb-parent-link),
+[data-android-native] .conversation-breadcrumb > :not(a.breadcrumb-parent-link) {
+  display: none;
+}
+
 /* iOS native shell (SwiftUI/WKWebView) runs the webview full-screen under the
  * system status bar and home indicator. Keep the web app visually full-bleed,
  * but move interactive mobile chrome out of unsafe areas. Scoped to the native
