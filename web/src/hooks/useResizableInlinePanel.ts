@@ -11,8 +11,12 @@ import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/ses
 
 const MIN_WIDTH_PX = 240;
 const MAX_WIDTH_RATIO = 0.99;
-/** The center chat column never shrinks past this, whatever the rail wants. */
+/** Comfortable chat-column minimum — held whenever the row has room for it. */
 const CHAT_MIN_WIDTH_PX = 480;
+/** Hard chat floor on cramped (tablet-width) rows; the chat never goes lower. */
+const CHAT_HARD_MIN_WIDTH_PX = 240;
+/** Drag travel the rail keeps above its own floor before the chat stops ceding. */
+const MIN_DRAG_RANGE_PX = 120;
 /** Visual gap between the chat column and the rail. */
 const GAP_PX = 8;
 // The handle is a dedicated flex gutter between chat and panel, outside both
@@ -61,18 +65,25 @@ function clamp(w: number, minPx = MIN_WIDTH_PX, reservedPx = 0): number {
   // No viewport ceiling available off the DOM (SSR / node test env) — this runs
   // during render, so guard before reading `window` to avoid a hard throw.
   if (typeof window === "undefined") return Math.max(minPx, w);
-  // 99vw is the nominal ceiling, but the chat column's minimum (plus the gap
+  const available = window.innerWidth - reservedPx - GAP_PX;
+  // The chat holds its comfortable minimum only while the row also fits the
+  // rail's floor plus a usable drag range. On tablet-width rows (an unfolded
+  // foldable with the sidebar open) reserving the full 480px pinned the clamp's
+  // floor onto its ceiling — every drag computed the same width — so the chat
+  // cedes down to its hard floor before the rail loses its travel.
+  const chatReserve = Math.min(
+    CHAT_MIN_WIDTH_PX,
+    Math.max(CHAT_HARD_MIN_WIDTH_PX, available - minPx - MIN_DRAG_RANGE_PX),
+  );
+  // 99vw is the nominal ceiling, but the chat reservation (plus the gap
   // between the two) is the one that actually binds on a normal desktop.
   const ceiling = Math.max(
     0,
-    Math.min(
-      window.innerWidth * MAX_WIDTH_RATIO,
-      window.innerWidth - reservedPx - CHAT_MIN_WIDTH_PX - GAP_PX,
-    ),
+    Math.min(window.innerWidth * MAX_WIDTH_RATIO, available - chatReserve),
   );
-  // The chat's 480px floor wins over the panel's own comfort minimum: when the
+  // The chat's hard floor wins over the panel's own comfort minimum: when the
   // viewport (with the sidebar open) is too small to grant both, the panel
-  // yields below `minPx` rather than let the chat break its minimum. Clamping
+  // yields below `minPx` rather than let the chat break its floor. Clamping
   // the floor to the ceiling keeps the range valid so `Math.max` can't push the
   // width back up past the chat-preserving cap.
   return Math.max(Math.min(minPx, ceiling), Math.min(w, ceiling));
