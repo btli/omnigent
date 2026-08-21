@@ -34,8 +34,18 @@ object SessionPollScheduler {
             PeriodicWorkRequestBuilder<SessionPollWorker>(15, TimeUnit.MINUTES)
                 .setConstraints(constraints)
                 .build()
-        WorkManager
-            .getInstance(context)
-            .enqueueUniquePeriodicWork(UNIQUE_WORK_NAME, ExistingPeriodicWorkPolicy.KEEP, request)
+        try {
+            WorkManager
+                .getInstance(context)
+                .enqueueUniquePeriodicWork(
+                    UNIQUE_WORK_NAME,
+                    ExistingPeriodicWorkPolicy.KEEP,
+                    request,
+                )
+        } catch (e: IllegalStateException) {
+            // WorkManager has no initializer in this process (JVM unit tests).
+            // The poll is a best-effort convenience; never fail activity start.
+            android.util.Log.w("SessionPollScheduler", "WorkManager unavailable; poll not scheduled", e)
+        }
     }
 }
