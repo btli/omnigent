@@ -26,6 +26,7 @@ import datetime as dt
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -52,6 +53,12 @@ EXTRA_MISSING = "extra unfetchable (likely deleted; remove from extras.txt)"
 EXTRA_FETCH_FAILED = "extra fetch failed (cannot reach remote; pin kept, staging not advanced)"
 EXTRA_FETCH_ATTEMPTS = 3
 EXTRA_FETCH_BACKOFF_S = 2
+# Committed conflict resolutions in git's own rr-cache layout (one <40-hex>/
+# directory holding preimage+postimage per recorded conflict). Seeded into the
+# compose workspace so a PR whose conflicts are fully covered merges instead of
+# being skipped. The seed is a composition input like extras.txt: identical
+# seeds + identical heads reproduce identical staging bytes.
+RR_CACHE_DIR = Path(__file__).resolve().parent / "rr-cache"
 
 
 @dataclass(frozen=True)
@@ -339,6 +346,66 @@ def conflict_paths(cwd: str | Path) -> list[str]:
     return sorted(p for p in out.splitlines() if p)
 
 
+def seed_rerere(cwd: str | Path, seed_dir: Path | None) -> int:
+    """Copy committed conflict resolutions into the workspace's rr-cache.
+
+    Returns the count of seeded entries. Must run BEFORE the compose detaches
+    onto upstream HEAD: the seed lives on fork main and leaves the worktree at
+    that point (the same reason extras are read early). A malformed entry
+    fails loud — silently dropping one would turn a resolved PR back into a
+    skip."""
+    if seed_dir is None:
+        return 0
+    try:
+        entries = sorted(p for p in seed_dir.iterdir() if p.is_dir())
+    except (FileNotFoundError, NotADirectoryError):
+        return 0
+    git_dir = Path(git(cwd, "rev-parse", "--absolute-git-dir").stdout.strip())
+    count = 0
+    for entry in entries:
+        if not re.fullmatch(r"[0-9a-f]{40}", entry.name):
+            raise StageError(f"rr-cache seed {entry.name!r} is not a conflict-hash directory")
+        if not (entry / "preimage").is_file() or not (entry / "postimage").is_file():
+            raise StageError(f"rr-cache seed {entry.name} lacks a preimage/postimage pair")
+        dest = git_dir / "rr-cache" / entry.name
+        dest.mkdir(parents=True, exist_ok=True)
+        for name in ("preimage", "postimage"):
+            shutil.copyfile(entry / name, dest / name)
+        count += 1
+    return count
+
+
+_CONFLICT_MARKER_RE = re.compile(r"^(<{7}( |$)|={7}$|>{7}( |$))", re.M)
+
+
+def _rerere_resolved_paths(cwd: str | Path, paths: list[str]) -> list[str] | None:
+    """*paths* iff rerere auto-resolved every conflict in the merge, else None.
+
+    Trust is positive and layered: rerere itself must report nothing left
+    (``rerere remaining``); every unmerged path must be a two-sided content
+    conflict (rerere never handles delete/rename conflicts, and it stays
+    SILENT about them — an empty ``remaining`` alone proves nothing); and the
+    worktree copy must carry no conflict markers."""
+    if git(cwd, "-c", "rerere.enabled=true", "rerere", "remaining").stdout.strip():
+        return None
+    stages: dict[str, set[int]] = {}
+    for line in git(cwd, "ls-files", "-u", "-z").stdout.split("\0"):
+        if not line:
+            continue
+        meta, _, path = line.partition("\t")
+        stages.setdefault(path, set()).add(int(meta.split()[2]))
+    if not stages or any(not {2, 3} <= present for present in stages.values()):
+        return None
+    for path in paths:
+        try:
+            text = (Path(cwd) / path).read_text(errors="replace")
+        except OSError:
+            return None
+        if _CONFLICT_MARKER_RE.search(text):
+            return None
+    return paths
+
+
 def dev_version(cwd: str | Path, upstream_sha: str, datestamp: str) -> str:
     """Mirror nightly-release.yml's scheme, but read the version from the
     UPSTREAM commit — a merged PR must not control the tag we mint."""
@@ -413,7 +480,18 @@ def merge_prs(
                     }
                 )
                 continue
-        merge = git(cwd, "merge", "--no-ff", "--no-commit", "--", oid, check=False)
+        merge = git(
+            cwd,
+            "-c",
+            "rerere.enabled=true",
+            "merge",
+            "--no-ff",
+            "--no-commit",
+            "--",
+            oid,
+            check=False,
+        )
+        rerere_paths: list[str] = []
         if merge.returncode != 0:
             # Only a genuine content conflict (unmerged index entries) is
             # skippable; anything else is a broken workspace — fail loud.
@@ -423,11 +501,17 @@ def merge_prs(
                     f"merge of {what} failed without conflicts: {merge.stderr.strip()}"
                 )
             paths = conflict_paths(cwd)
-            git(cwd, "merge", "--abort")
-            skipped.append(
-                {"pr": num, "branch": branch, "conflict_paths": paths, "source": source}
-            )
-            continue
+            # A seeded rr-cache resolution (seed_rerere) may cover the whole
+            # merge; anything short of full, verified coverage skips as before.
+            resolved = _rerere_resolved_paths(cwd, paths)
+            if resolved is None:
+                git(cwd, "merge", "--abort")
+                skipped.append(
+                    {"pr": num, "branch": branch, "conflict_paths": paths, "source": source}
+                )
+                continue
+            git(cwd, "add", "--", *resolved)
+            rerere_paths = resolved
         # --no-commit leaves MERGE_HEAD behind on a real merge; an
         # already-merged PR returns 0 with nothing to commit.
         minted = False
@@ -452,7 +536,14 @@ def merge_prs(
             )
             minted = True
         applied.append(
-            {"pr": num, "branch": branch, "oid": oid, "source": source, "minted": minted}
+            {
+                "pr": num,
+                "branch": branch,
+                "oid": oid,
+                "source": source,
+                "minted": minted,
+                **({"rerere_paths": rerere_paths} if rerere_paths else {}),
+            }
         )
     return applied, skipped
 
@@ -600,9 +691,13 @@ def stage(
     staging_only: bool = False,
     ring: Ring = STAGING,
     migration_approval: str = "",
+    rr_cache_dir: Path | None = None,
 ) -> dict:
     datestamp = date.strftime("%Y%m%d")
 
+    # Seed before the detach: the seed directory is part of the trusted fork
+    # checkout and disappears from the worktree once HEAD moves to upstream.
+    seed_rerere(cwd, rr_cache_dir)
     git(cwd, "fetch", upstream, "main")
     upstream_sha = git(cwd, "rev-parse", "FETCH_HEAD").stdout.strip()
     git(cwd, "checkout", "--detach", upstream_sha)
@@ -759,6 +854,12 @@ def notes(report: dict, signed: bool, ring: Ring = STAGING) -> str:
     ]
     lines += [
         f"- {_pin_label(p)} {md_code(p['branch'])} @ `{str(p['oid'])[:12]}`"
+        + (
+            " — conflicts resolved from rr-cache: "
+            + ", ".join(md_code(x) for x in p["rerere_paths"])
+            if p.get("rerere_paths")
+            else ""
+        )
         for p in report["applied"]
     ] or ["- none"]
     lines += ["", f"## Skipped PRs ({len(report['skipped'])})"]
@@ -892,6 +993,11 @@ def main(argv: list[str] | None = None) -> int:
         help="extras manifest path (missing file == no extras)",
     )
     p_stage.add_argument(
+        "--rr-cache",
+        default=str(RR_CACHE_DIR),
+        help="committed rr-cache seed directory (missing dir == no resolutions)",
+    )
+    p_stage.add_argument(
         "--migration-approval",
         default="",
         metavar="SHA",
@@ -969,6 +1075,7 @@ def main(argv: list[str] | None = None) -> int:
             staging_only=args.staging_only,
             ring=ring,
             migration_approval=args.migration_approval,
+            rr_cache_dir=Path(args.rr_cache),
         )
     except Exception as e:
         # The step summary is the failure surface — never exit without one.

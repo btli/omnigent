@@ -1349,3 +1349,128 @@ def test_branch_pin_missing_is_loud_advisory_skip(env, tmp_path):
             "source": "extra-branch",
         }
     ]
+
+
+def _record_seed(tmp_path: Path, env: Env, pr: dict, resolutions: dict[str, str]) -> Path:
+    """Merge *pr* onto current upstream main in a throwaway clone, resolve the
+    conflicts with *resolutions* ({path: content}), and return an rr-cache
+    seed directory holding the recorded entries."""
+    clone = tmp_path / f"seedgen-{pr['number']}"
+    git(tmp_path, "clone", str(env.upstream), str(clone))
+    git(clone, "config", "user.name", "t")
+    git(clone, "config", "user.email", "t@t")
+    git(clone, "config", "rerere.enabled", "true")
+    git(clone, "fetch", "origin", f"refs/pull/{pr['number']}/head")
+    git(clone, "merge", "--no-ff", "--no-commit", pr["headRefOid"], check=False)
+    for path, content in resolutions.items():
+        (clone / path).write_text(content)
+        git(clone, "add", path)
+    git(clone, "commit", "--no-verify", "-m", "record resolution")
+    seed = tmp_path / f"rr-seed-{pr['number']}"
+    shutil.copytree(clone / ".git" / "rr-cache", seed)
+    return seed
+
+
+def test_rr_cache_seed_resolves_conflicting_pr(env, tmp_path):
+    pr = env.add_pr(3, "a.txt", "pr side\n")
+    env.advance_main("a.txt", "main side\n")
+    seed = _record_seed(tmp_path, env, pr, {"a.txt": "reconciled\n"})
+
+    report = env.run([pr], rr_cache_dir=seed)
+
+    assert report["skipped"] == []
+    (applied,) = report["applied"]
+    assert applied["pr"] == 3
+    assert applied["rerere_paths"] == ["a.txt"]
+    assert git(env.fork, "show", "staging:a.txt").stdout == "reconciled\n"
+    # The resolution is a composition input: a rerun reproduces the same sha.
+    rerun = env.run([pr], rr_cache_dir=seed)
+    assert rerun["staging_sha"] == report["staging_sha"]
+    # Notes call out which paths the committed resolution covered.
+    assert "resolved from rr-cache: `a.txt`" in stage_mod.notes(report, signed=True)
+
+
+def test_rr_cache_partial_coverage_still_skips(env, tmp_path):
+    branch = "pr-3"
+    git(env.seed, "checkout", "-q", "main")
+    git(env.seed, "checkout", "-q", "-b", branch)
+    commit_file(env.seed, "a.txt", "pr alpha\n", "pr 3 a")
+    oid = commit_file(env.seed, "b.txt", "pr beta\n", "pr 3 b")
+    git(env.seed, "push", str(env.upstream), f"{branch}:refs/pull/3/head")
+    pr = {"number": 3, "headRefName": branch, "headRefOid": oid}
+    env.advance_main("a.txt", "main alpha\n")
+    env.advance_main("b.txt", "main beta\n")
+    seed = _record_seed(tmp_path, env, pr, {"a.txt": "res a\n", "b.txt": "res b\n"})
+    # Drop the b.txt entry so the seed covers only half the merge.
+    for entry in list(seed.iterdir()):
+        if "beta" in (entry / "preimage").read_text():
+            shutil.rmtree(entry)
+
+    report = env.run([pr], rr_cache_dir=seed)
+
+    assert report["applied"] == []
+    (skipped,) = report["skipped"]
+    assert skipped["conflict_paths"] == ["a.txt", "b.txt"]
+
+
+def test_delete_modify_conflict_never_auto_resolves(env, tmp_path):
+    pr = env.add_pr(3, "a.txt", "pr side\n")
+    git(env.seed, "checkout", "-q", "main")
+    git(env.seed, "rm", "-q", "a.txt")
+    git(env.seed, "commit", "--no-verify", "-m", "main: drop a.txt")
+    git(env.seed, "push", str(env.upstream), "main")
+    seed = tmp_path / "rr-seed"
+    seed.mkdir()
+
+    report = env.run([pr], rr_cache_dir=seed)
+
+    assert report["applied"] == []
+    (skipped,) = report["skipped"]
+    assert skipped["conflict_paths"] == ["a.txt"]
+
+
+def test_seed_rerere_rejects_malformed_entries(env, tmp_path):
+    missing = tmp_path / "no-such-dir"
+    assert stage_mod.seed_rerere(env.work, missing) == 0
+    assert stage_mod.seed_rerere(env.work, None) == 0
+
+    bad_name = tmp_path / "seed-bad-name"
+    (bad_name / "not-a-hash").mkdir(parents=True)
+    with pytest.raises(stage_mod.StageError, match="not a conflict-hash"):
+        stage_mod.seed_rerere(env.work, bad_name)
+
+    half = tmp_path / "seed-half"
+    entry = half / ("ab" * 20)
+    entry.mkdir(parents=True)
+    (entry / "preimage").write_text("x")
+    with pytest.raises(stage_mod.StageError, match="preimage/postimage"):
+        stage_mod.seed_rerere(env.work, half)
+
+
+def test_cli_rr_cache_flag_is_plumbed(env, tmp_path, capsys):
+    pr = env.add_pr(3, "a.txt", "pr side\n")
+    env.advance_main("a.txt", "main side\n")
+    seed = _record_seed(tmp_path, env, pr, {"a.txt": "reconciled\n"})
+    prs_json = tmp_path / "prs.json"
+    prs_json.write_text(json.dumps([pr]))
+    report_path = tmp_path / "merge-report.json"
+
+    rc = stage_mod.main(
+        [
+            "stage",
+            "--workdir",
+            str(env.work),
+            "--date",
+            STAMP,
+            "--prs-json",
+            str(prs_json),
+            "--report",
+            str(report_path),
+            "--rr-cache",
+            str(seed),
+        ]
+    )
+    assert rc == 0
+    capsys.readouterr()
+    report = json.loads(report_path.read_text())
+    assert report["applied"][0]["rerere_paths"] == ["a.txt"]
