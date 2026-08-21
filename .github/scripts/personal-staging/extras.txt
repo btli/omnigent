@@ -17,4 +17,3 @@
 # 1234              # keep the composer hotfix until upstream merges it
 # branch:homelab    # fork-only justfile recipes, not an upstream PR
 branch:homelab    # fork-only dev-env justfile recipes + agy regression test
-4788              # upstream ArgoCD overlay for k8s sandbox provider (omnigent-ai/omnigent#4788)
