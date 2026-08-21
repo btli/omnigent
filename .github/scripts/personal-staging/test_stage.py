@@ -1149,6 +1149,78 @@ def test_no_migration_change(env):
     )
 
 
+def test_production_migration_gate_blocks_push(env):
+    """A schema-changing composition must not auto-publish (decision 11): the
+    nightly stops before its atomic push, so NOTHING lands on the fork, and
+    the report says exactly which sha to approve."""
+    (env.seed / MIGRATIONS_DIR).mkdir(parents=True)
+    pr = env.add_pr(3, f"{MIGRATIONS_DIR}/0001_add.py", "rev\n")
+    report = env.run([pr], ring=stage_mod.PRODUCTION)
+
+    assert report["pushed"] is False
+    gate = report["migration_gate"]
+    assert gate["blocked"] is True
+    assert gate["candidate"] == report["staging_sha"]
+    assert gate["prev_pin"] is None  # bootstrap: gated on the upstream leg only
+    assert f"approve_migration={report['staging_sha']}" in gate["approval_hint"]
+    # nothing was pinned, so the report carries no pin fields at all
+    assert "tag" not in report and "pin_created" not in report
+    # the fork fixture remote received no refs whatsoever
+    assert git(env.work, "ls-remote", str(env.fork)).stdout.strip() == ""
+    text = stage_mod.summarize(report, stage_mod.PRODUCTION)
+    assert "BLOCKED" in text and report["staging_sha"] in text
+
+
+def test_production_migration_gate_approval_publishes(env):
+    """The operator re-dispatch carries the exact candidate sha; composition
+    is byte-reproducible, so the approved rerun mints that sha and pushes."""
+    (env.seed / MIGRATIONS_DIR).mkdir(parents=True)
+    pr = env.add_pr(4, f"{MIGRATIONS_DIR}/0002_add.py", "rev\n")
+    blocked = env.run([pr], ring=stage_mod.PRODUCTION)
+    assert blocked["migration_gate"]["blocked"] is True
+
+    report = env.run(
+        [pr], ring=stage_mod.PRODUCTION, migration_approval=blocked["staging_sha"]
+    )
+    assert report["staging_sha"] == blocked["staging_sha"]
+    assert report["migration_gate"]["blocked"] is False
+    assert report["tag"] == f"production-{STAMP}"
+    assert env.fork_ref("refs/heads/production") == report["staging_sha"]
+    assert env.fork_ref(f"refs/tags/production-{STAMP}") == report["staging_sha"]
+
+
+def test_production_migration_gate_clean_composes(env):
+    """Code-only candidates auto-promote: the gate reports blocked=False and
+    the push happens exactly as before the gate existed. The second night
+    diffs against the previous production pin (latest tag wins)."""
+    pr = env.add_pr(5, "code.txt", "c\n")
+    report = env.run([pr], ring=stage_mod.PRODUCTION)
+    assert report["migration_gate"] == {
+        "blocked": False,
+        "candidate": report["staging_sha"],
+        "prev_pin": None,
+    }
+    assert report["tag"] == f"production-{STAMP}"
+    assert env.fork_ref("refs/heads/production") == report["staging_sha"]
+
+    env.advance_main("more.txt", "m\n")
+    second = env.run([pr], ring=stage_mod.PRODUCTION)
+    assert second["migration_gate"]["blocked"] is False
+    assert second["migration_gate"]["prev_pin"] == report["staging_sha"]
+    assert second["tag"] == f"production-{STAMP}-rerun1"
+    assert env.fork_ref("refs/heads/production") == second["staging_sha"]
+
+
+def test_staging_report_has_no_migration_gate_key(env):
+    """The gate is production-only surface: staging reports (nightly and
+    hourly) carry no migration_gate key — the golden enforces the bytes."""
+    pr = env.add_pr(6, "s.txt", "s\n")
+    nightly = env.run([pr])
+    assert "migration_gate" not in nightly and "pushed" not in nightly
+    hourly = env.run([pr], staging_only=True)
+    assert "migration_gate" not in hourly
+
+
 def test_branch_pin_missing_is_loud_advisory_skip(env, tmp_path):
     extras = tmp_path / "extras.txt"
     extras.write_text("branch:no-such-branch\n")

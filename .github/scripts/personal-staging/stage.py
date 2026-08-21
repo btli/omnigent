@@ -10,7 +10,9 @@ at the same commit; ``--staging-only`` (the hourly mode) pushes only
 The only refs ever pushed are ``staging``, the ``nightly-*`` pin, and the
 dev tag. ``--ring production`` composes the production ring instead: open
 non-draft PRs only, no extras, branch ``production`` + immutable
-``production-YYYYMMDD`` pins, and no dev tag.
+``production-YYYYMMDD`` pins, and no dev tag. A production composition
+that touches DB migrations is BLOCKED before any ref moves unless
+``--migration-approval`` names the exact candidate sha.
 
 Stdlib + git subprocess only; the gh CLI is used solely to list PRs and can
 be bypassed with --prs-json (how the tests stay offline).
@@ -557,6 +559,25 @@ def migration_touched(
     return False
 
 
+def latest_pin_sha(cwd: str | Path, fork: str, ring: Ring) -> str | None:
+    """Commit of the newest ``<prefix>YYYYMMDD[-rerunN]`` pin tag on the fork
+    — the previous composition the migration gate diffs against. None when
+    the ring has never pinned: a bootstrap compose is gated on the upstream
+    leg only. Pins are lightweight tags (pushed as commit-sha refspecs), so
+    the ls-remote sha IS the commit; a peeled ``^{}`` line never fullmatches."""
+    pin_re = re.compile(re.escape(ring.pin_prefix) + r"(\d{8})(?:-rerun(\d+))?")
+    latest: tuple[tuple[str, int], str] | None = None
+    for line in git(cwd, "ls-remote", "--tags", fork).stdout.splitlines():
+        sha, _, ref = line.partition("\t")
+        m = pin_re.fullmatch(ref.removeprefix("refs/tags/"))
+        if not m:
+            continue
+        key = (m.group(1), int(m.group(2) or 0))
+        if latest is None or key > latest[0]:
+            latest = (key, sha)
+    return latest[1] if latest else None
+
+
 def stage(
     cwd: str | Path,
     prs: list[dict],
@@ -565,6 +586,7 @@ def stage(
     fork: str = "origin",
     staging_only: bool = False,
     ring: Ring = STAGING,
+    migration_approval: str = "",
 ) -> dict:
     datestamp = date.strftime("%Y%m%d")
 
@@ -628,6 +650,36 @@ def stage(
             + "; refusing to publish a composition without them"
         )
 
+    # Migration gate — production pins only (locked decision 11): a candidate
+    # touching the migrations path must not auto-publish. Checked BEFORE any
+    # ref moves — the atomic push below is the only publish, so returning here
+    # leaves the fork untouched. Approval is the exact candidate sha, minted
+    # by an operator re-dispatch after the CNPG backup checkpoint; a drifted
+    # composition mints a different sha and blocks again.
+    gate: dict | None = None
+    if ring.pin_prefix == "production-":
+        prev_pin_sha = latest_pin_sha(cwd, fork, ring)
+        gate = {
+            "blocked": False,
+            "candidate": staging_sha,
+            "prev_pin": prev_pin_sha,
+        }
+        if (
+            migration_touched(cwd, staging_sha, upstream_sha, prev_pin_sha)
+            and migration_approval != staging_sha
+        ):
+            gate["blocked"] = True
+            gate["approval_hint"] = f"re-dispatch with approve_migration={staging_sha}"
+            return {
+                "date": datestamp,
+                "upstream_sha": upstream_sha,
+                "staging_sha": staging_sha,
+                "pushed": False,
+                "migration_gate": gate,
+                "applied": applied,
+                "skipped": skipped,
+            }
+
     dev_tag = dev_version(cwd, upstream_sha, datestamp) if ring.mint_dev_tag else None
     name, created = pin_name(cwd, fork, datestamp, staging_sha, ring)
 
@@ -669,6 +721,7 @@ def stage(
         "tag": name,
         **({"dev_tag": dev_tag} if dev_tag else {}),
         "pin_created": created,
+        **({"migration_gate": gate} if gate else {}),
         "applied": applied,
         "skipped": skipped,
     }
@@ -758,6 +811,28 @@ def summarize(report: dict, ring: Ring = STAGING) -> str:
         rows += [f"| Skipped {_pin_label(p)} | {_skip_reason(p)} |" for p in report["skipped"]]
         return "\n".join(rows) + "\n"
 
+    # A migration-gated production run publishes nothing: no pin row, a loud
+    # BLOCKED result carrying the exact approval instruction.
+    gate = report.get("migration_gate") or {}
+    if gate.get("blocked"):
+        rows = [
+            f"## Personal {ring.name} nightly",
+            "",
+            "| | |",
+            "| --- | --- |",
+            f"| Upstream main | `{report['upstream_sha']}` |",
+            f"| candidate (not pushed) | `{report['staging_sha']}` |",
+            f"| Previous pin | `{gate.get('prev_pin') or '(none)'}` |",
+            (
+                "| Result | **BLOCKED — migration gate**: the composition touches "
+                f"`{MIGRATIONS_PATH_PREFIX}`; no refs were pushed. "
+                f"{gate['approval_hint']} |"
+            ),
+            f"| Applied / skipped | {len(report['applied'])} / {len(report['skipped'])} |",
+        ]
+        rows += [f"| Skipped {_pin_label(p)} | {_skip_reason(p)} |" for p in report["skipped"]]
+        return "\n".join(rows) + "\n"
+
     pin_note = "" if report["pin_created"] else " (already pinned — rerun no-op)"
     rows = [
         f"## Personal {ring.name} nightly",
@@ -800,6 +875,13 @@ def main(argv: list[str] | None = None) -> int:
         "--extras",
         default=str(EXTRAS_FILE),
         help="extras manifest path (missing file == no extras)",
+    )
+    p_stage.add_argument(
+        "--migration-approval",
+        default="",
+        metavar="SHA",
+        help="full candidate sha approving a migration-touching production "
+        "composition (only meaningful with --ring production)",
     )
 
     p_notes = sub.add_parser("notes", help="render release notes from a merge report")
@@ -860,6 +942,7 @@ def main(argv: list[str] | None = None) -> int:
             fork=args.fork_remote,
             staging_only=args.staging_only,
             ring=ring,
+            migration_approval=args.migration_approval,
         )
     except Exception as e:
         # The step summary is the failure surface — never exit without one.
