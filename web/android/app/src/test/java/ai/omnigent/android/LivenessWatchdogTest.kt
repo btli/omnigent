@@ -40,23 +40,47 @@ class LivenessWatchdogTest {
     }
 
     @Test
-    fun `background and auth navigation suspend then grant fresh readiness windows`() {
+    fun `resume and auth return preserve compatibility through grace with heartbeats`() {
         val scheduler = FakeScheduler()
         var failures = 0
         val watchdog = LivenessWatchdog(scheduler, onTimeout = { failures++ })
 
         watchdog.beginInitialWindow()
+        watchdog.protocolReady(1, 1)
         watchdog.setActive(false)
         scheduler.advanceBy(60_000)
         assertEquals(0, failures)
         watchdog.setActive(true)
         assertEquals(LivenessWatchdog.INITIAL_READY_TIMEOUT_MS, scheduler.remaining())
+        scheduler.advanceBy(14_000)
+        watchdog.heartbeat()
+        scheduler.advanceBy(14_000)
+        assertEquals(0, failures)
 
         watchdog.setOnPinnedOrigin(false)
         scheduler.advanceBy(60_000)
         assertEquals(0, failures)
         watchdog.setOnPinnedOrigin(true)
         assertEquals(LivenessWatchdog.INITIAL_READY_TIMEOUT_MS, scheduler.remaining())
+        scheduler.advanceBy(14_000)
+        watchdog.heartbeat()
+        scheduler.advanceBy(14_000)
+        assertEquals(0, failures)
+    }
+
+    @Test
+    fun `new document resets compatibility and requires readiness`() {
+        val scheduler = FakeScheduler()
+        var failures = 0
+        val watchdog = LivenessWatchdog(scheduler, onTimeout = { failures++ })
+
+        watchdog.beginInitialWindow()
+        watchdog.protocolReady(1, 1)
+        watchdog.beginInitialWindow()
+        scheduler.advanceBy(10_000)
+        watchdog.heartbeat()
+        scheduler.advanceBy(10_000)
+        assertEquals(1, failures)
     }
 
     private class FakeScheduler : WatchdogScheduler {

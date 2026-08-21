@@ -37,23 +37,46 @@ final class MobileLivenessWatchdogTests: XCTestCase {
     XCTAssertNil(clock.remaining)
   }
 
-  func testLifecycleAndAuthNavigationSuspendWithFreshReadinessWindow() {
+  func testResumeAndAuthReturnPreserveCompatibilityThroughGraceWithHeartbeats() {
     let clock = ManualWatchdogClock()
     var failures = 0
     let watchdog = MobileLivenessWatchdog(schedule: clock.schedule) { failures += 1 }
 
     watchdog.beginInitialWindow()
+    XCTAssertTrue(watchdog.protocolReady(version: 1, expectedVersion: 1))
     watchdog.setActive(false)
     clock.advance(by: 60)
     XCTAssertEqual(failures, 0)
     watchdog.setActive(true)
     XCTAssertEqual(clock.remaining, MobileLivenessWatchdog.initialReadiness)
+    clock.advance(by: 14)
+    watchdog.receivedHeartbeat()
+    clock.advance(by: 14)
+    XCTAssertEqual(failures, 0)
 
     watchdog.setOnPinnedOrigin(false)
     clock.advance(by: 60)
     XCTAssertEqual(failures, 0)
     watchdog.setOnPinnedOrigin(true)
     XCTAssertEqual(clock.remaining, MobileLivenessWatchdog.initialReadiness)
+    clock.advance(by: 14)
+    watchdog.receivedHeartbeat()
+    clock.advance(by: 14)
+    XCTAssertEqual(failures, 0)
+  }
+
+  func testNewDocumentResetsCompatibilityAndRequiresReadiness() {
+    let clock = ManualWatchdogClock()
+    var failures = 0
+    let watchdog = MobileLivenessWatchdog(schedule: clock.schedule) { failures += 1 }
+
+    watchdog.beginInitialWindow()
+    XCTAssertTrue(watchdog.protocolReady(version: 1, expectedVersion: 1))
+    watchdog.beginInitialWindow()
+    clock.advance(by: 10)
+    watchdog.receivedHeartbeat()
+    clock.advance(by: 10)
+    XCTAssertEqual(failures, 1)
   }
 }
 

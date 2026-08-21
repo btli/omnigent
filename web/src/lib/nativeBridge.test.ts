@@ -589,12 +589,8 @@ describe("mobile shell compatibility handshake", () => {
   it("is inert in browsers and replaces an old shell with full-screen incompatibility", () => {
     const stopBrowser = startNativeShellLiveness();
     setIOS(true);
-    const legacy = (window as unknown as Record<string, Record<string, unknown>>).omnigentNative;
-    const hideLegacy = vi.fn();
-    legacy.setServerSwitcherHidden = hideLegacy;
     const stopOldShell = startNativeShellLiveness();
     expect(vi.getTimerCount()).toBe(0);
-    expect(hideLegacy).toHaveBeenCalledWith(true);
     expect(document.getElementById("omnigent-native-incompatible")).toHaveTextContent(
       "App update required",
     );

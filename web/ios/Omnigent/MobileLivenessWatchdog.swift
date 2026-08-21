@@ -60,13 +60,13 @@ final class MobileLivenessWatchdog {
   func setActive(_ value: Bool) {
     guard active != value else { return }
     active = value
-    value ? beginInitialWindow() : cancel()
+    value ? arm(after: Self.initialReadiness) : cancel()
   }
 
   func setOnPinnedOrigin(_ value: Bool) {
     guard onPinnedOrigin != value else { return }
     onPinnedOrigin = value
-    value ? beginInitialWindow() : cancel()
+    value ? arm(after: Self.initialReadiness) : cancel()
   }
 
   func cancel() {

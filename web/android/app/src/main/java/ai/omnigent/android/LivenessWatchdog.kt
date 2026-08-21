@@ -44,13 +44,13 @@ internal class LivenessWatchdog(
     fun setActive(value: Boolean) {
         if (active == value) return
         active = value
-        if (value) beginInitialWindow() else scheduler.cancel()
+        if (value) arm(INITIAL_READY_TIMEOUT_MS) else scheduler.cancel()
     }
 
     fun setOnPinnedOrigin(value: Boolean) {
         if (onPinnedOrigin == value) return
         onPinnedOrigin = value
-        if (value) beginInitialWindow() else scheduler.cancel()
+        if (value) arm(INITIAL_READY_TIMEOUT_MS) else scheduler.cancel()
     }
 
     fun cancel() = scheduler.cancel()

@@ -58,8 +58,6 @@ interface NativeShellApi {
   nativeWebReady?: (version: number) => void;
   /** Keep the mobile shell's loaded-page liveness watchdog armed. */
   nativeHeartbeat?: (version: number) => void;
-  /** Old iOS shells only: keep their obsolete native picker hidden. */
-  setServerSwitcherHidden?: (hidden: boolean) => void;
   /**
    * Paint the dock/taskbar badge; 0 clears it. `activation` is consumed only by
    * the Android shell, which renders the badge as a tray notification and needs
@@ -308,12 +306,7 @@ export interface ServerPickerInfo {
 /** Current mobile shell/web compatibility protocol. */
 export const NATIVE_WEB_PROTOCOL_VERSION = 1;
 
-function showNativeShellIncompatibility(native: NativeShellApi): void {
-  try {
-    native.setServerSwitcherHidden?.(true);
-  } catch (err) {
-    console.warn("[nativeBridge] failed to hide legacy server switcher:", err);
-  }
+function showNativeShellIncompatibility(): void {
   const render = () => {
     if (!document.body || document.getElementById("omnigent-native-incompatible")) return;
     const page = document.createElement("main");
@@ -331,8 +324,8 @@ function showNativeShellIncompatibility(native: NativeShellApi): void {
 
 /**
  * Start the mobile shell compatibility handshake and liveness heartbeat.
- * Older mobile shells cannot host the consolidated picker. Their legacy native
- * picker stays hidden while the web surface shows an explicit update outcome.
+ * Pre-protocol mobile shells are unsupported, so web shows an explicit update
+ * outcome without invoking any obsolete native picker API.
  */
 export function startNativeShellLiveness(): () => void {
   let timer: number | null = null;
@@ -348,7 +341,7 @@ export function startNativeShellLiveness(): () => void {
       !native.switchServer ||
       !native.openServerSetup
     ) {
-      showNativeShellIncompatibility(native);
+      showNativeShellIncompatibility();
       return;
     }
     try {
