@@ -206,12 +206,31 @@ jobs:
 
       # Datestamp as versionCode keeps nightly installs monotonically
       # upgradeable on-device (fits comfortably under Android's 2.1e9 cap).
+      # The .dev id suffix keeps the nightly installable alongside the
+      # store-signed app; versionName carries the pin for provenance.
       - name: Build debug APK
         env:
           VERSION_CODE: ${{ needs.compose.outputs.date }}
+          VERSION_NAME: ${{ needs.compose.outputs.tag }}
         run: |
           ./gradlew assembleDebug --no-daemon --console=plain \
-            -PversionCode="$VERSION_CODE"
+            -PversionCode="$VERSION_CODE" \
+            -PversionName="$VERSION_NAME" \
+            -PapplicationIdSuffix=.dev
+
+      # Gradle silently ignores unknown -P properties, so a composition that
+      # dropped the applicationIdSuffix support would rebuild the colliding
+      # store id — fail loud instead of publishing that.
+      - name: Verify package id
+        run: |
+          set -euo pipefail
+          bt="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          pkg="$("$bt/aapt2" dump badging app/build/outputs/apk/debug/app-debug.apk \
+            | sed -n "s/^package: name='\([^']*\)'.*/\1/p")"
+          if [ "$pkg" != "ai.omnigent.android.dev" ]; then
+            echo "::error::expected package id ai.omnigent.android.dev, got '$pkg' — applicationIdSuffix support missing from the composition?"
+            exit 1
+          fi
 
       # Hand off exactly one named file from a freshly created dir — the
       # build must not be able to smuggle extra files across the boundary.
