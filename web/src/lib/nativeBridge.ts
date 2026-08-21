@@ -89,15 +89,17 @@ interface NativeShellApi {
    */
   onSidebarDrag?: (callback: (phase: SidebarDragPhase, progress: number) => void) => () => void;
   /**
-   * Let native chrome react to web UI state. The iOS shell uses this to show
-   * its floating server switcher only when the chat transcript is visible.
+   * Current server origin + the ordered servers on offer (managed presets
+   * first, then recents), or null on a foreign page. Optional: the SPA is
+   * server-served and may be newer than the installed shell. Present on
+   * Electron, iOS, and Android shells; absent in a plain browser, which is
+   * what keeps the sidebar picker off browser-only deployments.
    */
-  setServerSwitcherHidden?: (hidden: boolean) => void;
-  /**
-   * Legacy iOS bridge name from the sidebar-only implementation. Kept as a
-   * fallback so a newer SPA can still ask an older shell to hide the switcher.
-   */
-  setSidebarOpen?: (open: boolean) => void;
+  getServerPicker?: () => Promise<ServerPickerInfo | null>;
+  /** Re-point this shell to a previously-connected server URL. */
+  switchServer?: (url: string) => Promise<void>;
+  /** Return this shell to its "connect to server" setup page. */
+  openServerSetup?: () => void;
   /**
    * Drive the native Chat/Terminal switcher (iOS). The web app owns the truth
    * and pushes the current mode, whether the terminal is reachable / booting,
@@ -119,10 +121,8 @@ interface NativeShellApi {
 
 export type ThemeSource = "light" | "dark" | "system";
 
-/** Footprints (CSS px) of the native floating bars, reported by the shell. */
+/** Footprint (CSS px) of the native floating bottom bar, reported by the shell. */
 export interface NativeInsets {
-  /** Server switcher pill height + its top padding. */
-  topBar: number;
   /** Chat/Terminal bar capsule height + its bottom padding. */
   bottomBar: number;
 }
@@ -141,9 +141,9 @@ export interface NativeViewModeParams {
 }
 
 /**
- * Electron-specific bridge. The server-picker trio is optional: the SPA is
- * server-served and may be newer than the installed shell, whose preload then
- * lacks these methods.
+ * Electron-specific bridge. Every method beyond the shared shell surface is
+ * optional: the SPA is server-served and may be newer than the installed
+ * shell, whose preload then lacks these methods.
  */
 interface ElectronDesktopApi extends NativeShellApi {
   kind: "electron";
@@ -156,12 +156,6 @@ interface ElectronDesktopApi extends NativeShellApi {
    * idle, so the web never shows a (duplicate) banner. Absent on older shells.
    */
   updates?: ElectronUpdateBridge;
-  /** Current server origin + recent servers, or null on a foreign page. */
-  getServerPicker?: () => Promise<ServerPickerInfo | null>;
-  /** Re-point this window to a previously-connected server URL. */
-  switchServer?: (url: string) => Promise<void>;
-  /** Return this window to the shell's "connect to server" setup page. */
-  openServerSetup?: () => void;
   /** This machine's identity (CLI installed + host id) — fast, no subprocess. */
   getHostIdentity?: () => Promise<HostIdentity | null>;
   /** Start / stop / restart this machine's host daemon for the window's server. */
@@ -280,11 +274,15 @@ export interface ElectronUpdateBridge {
   onStatus: (callback: (status: UpdateStatus) => void) => () => void;
 }
 
-/** Data backing the title-bar server picker, from the Electron shell. */
+/** Data backing the sidebar server picker, from a native shell. */
 export interface ServerPickerInfo {
-  /** Origin this window is connected to, e.g. `"http://localhost:8000"`. */
+  /** Origin this shell is connected to, e.g. `"http://localhost:8000"`. */
   currentOrigin: string;
-  /** Recently-connected server URLs, most recent first. */
+  /**
+   * Server URLs on offer, in the shell's display order: managed/MDM presets
+   * first (where the platform has them), then recents, most recent first.
+   * The shell dedupes by origin before sending.
+   */
   recentServers: string[];
   /**
    * The connected server's version manifest (`/.well-known/omnigent.json`),
@@ -421,9 +419,9 @@ export function isIOSShell(): boolean {
 /**
  * True when running inside the native Android WebView shell. A sibling to
  * {@link isIOSShell} — deliberately NOT folded into it, since the iOS-only
- * chrome (viewport lock, native keyboard inset, server switcher) keys off
- * `isIOSShell()` and must stay off on Android, which uses its own WebView
- * keyboard/inset behavior and the web in-page fallbacks.
+ * chrome (viewport lock, native keyboard inset) keys off `isIOSShell()` and
+ * must stay off on Android, which uses its own WebView keyboard/inset
+ * behavior and the web in-page fallbacks.
  */
 export function isAndroidShell(): boolean {
   return nativeApi()?.kind === "android";
@@ -585,36 +583,16 @@ export async function setBadgeCount(count: number, activation?: BadgeActivation)
 
 /**
  * Set one of the inset-system CSS variables on the document root. Visibility of
- * the native bars is web-owned (the web app is what shows/hides them), so the
- * setters below fold it into `--omnigent-*-bar-visible`; the bars' size comes
- * from the native bridge (see {@link onNativeInsets} / nativeInsets.ts). Both
- * combine in `--omnigent-inset-*` (index.css). Harmless off-shell — the size
- * vars stay 0 there, so a stray visibility flag contributes nothing.
+ * the native bottom bar is web-owned (the web app is what shows/hides it), so
+ * {@link setNativeViewMode} folds it into `--omnigent-bottom-bar-visible`; the
+ * bar's size comes from the native bridge (see {@link onNativeInsets} /
+ * nativeInsets.ts). Both combine in `--omnigent-inset-bottom` (index.css).
+ * Harmless off-shell — the size var stays 0 there, so a stray visibility flag
+ * contributes nothing.
  */
 function setInsetVar(name: string, value: string): void {
   if (typeof document === "undefined") return;
   document.documentElement.style.setProperty(name, value);
-}
-
-/**
- * Inform a native shell that its server switcher should hide. Older shells
- * simply lack this optional method, so this degrades to a no-op.
- */
-export function setNativeServerSwitcherHidden(hidden: boolean): void {
-  setInsetVar("--omnigent-top-bar-visible", hidden ? "0" : "1");
-  const native = nativeApi();
-  const setter = native?.setServerSwitcherHidden ?? native?.setSidebarOpen;
-  if (!setter) return;
-  try {
-    setter(hidden);
-  } catch (err) {
-    console.warn("[nativeBridge] native setServerSwitcherHidden failed:", err);
-  }
-}
-
-/** @deprecated Use setNativeServerSwitcherHidden. */
-export function setNativeSidebarOpen(open: boolean): void {
-  setNativeServerSwitcherHidden(open);
 }
 
 /**
@@ -652,11 +630,11 @@ export function onNativeViewModeChanged(callback: (mode: NativeViewMode) => void
 }
 
 /**
- * Subscribe to the native bars' footprint from the shell. The shell pushes the
- * current value immediately on subscribe (it caches the last emit), then again
- * on any change. Returns an unsubscribe; a no-op outside a shell that reports
- * insets (Electron, plain browser, older iOS shells), where the bars don't
- * exist and the inset CSS vars stay 0.
+ * Subscribe to the native bottom bar's footprint from the shell. The shell
+ * pushes the current value immediately on subscribe (it caches the last emit),
+ * then again on any change. Returns an unsubscribe; a no-op outside a shell
+ * that reports insets (Electron, plain browser, older iOS shells), where the
+ * bar doesn't exist and the inset CSS vars stay 0.
  */
 export function onNativeInsets(callback: (insets: NativeInsets) => void): () => void {
   const native = nativeApi();
@@ -670,51 +648,53 @@ export function onNativeInsets(callback: (insets: NativeInsets) => void): () => 
 }
 
 /**
- * Fetch the title-bar server picker data from the Electron shell: the
- * window's current server origin plus the recently-connected server list.
+ * Fetch the server picker data from the native shell (Electron, iOS, or
+ * Android): the current server origin plus the ordered servers on offer
+ * (managed presets first, then recents).
  *
- * Resolves `null` outside the Electron shell, under a shell too old to
- * support the picker, or on a page the shell doesn't recognize as a
- * connected server — callers hide the picker in all of those cases.
+ * Resolves `null` in a plain browser, under a shell too old to support the
+ * picker, or on a page the shell doesn't recognize as a connected server —
+ * callers hide the picker in all of those cases.
  */
 export async function getServerPicker(): Promise<ServerPickerInfo | null> {
-  const electron = electronApi();
-  if (!electron?.getServerPicker) return null;
+  const native = nativeApi();
+  if (!native?.getServerPicker) return null;
   try {
-    return await electron.getServerPicker();
+    return await native.getServerPicker();
   } catch (err) {
-    console.warn("[nativeBridge] electron getServerPicker failed:", err);
+    console.warn("[nativeBridge] native getServerPicker failed:", err);
     return null;
   }
 }
 
 /**
- * Ask the Electron shell to re-point this window to another
- * previously-connected server URL (one of `ServerPickerInfo.recentServers`).
- * The shell navigates the whole window, so on success this page unloads.
+ * Ask the native shell to re-point itself to another previously-connected
+ * server URL (one of `ServerPickerInfo.recentServers`). Shells restrict this
+ * to servers they already know (managed presets + recents) and navigate the
+ * whole surface, so on success this page unloads.
  */
 export async function switchServer(url: string): Promise<void> {
-  const electron = electronApi();
-  if (!electron?.switchServer) return;
+  const native = nativeApi();
+  if (!native?.switchServer) return;
   try {
-    await electron.switchServer(url);
+    await native.switchServer(url);
   } catch (err) {
-    console.warn("[nativeBridge] electron switchServer failed:", err);
+    console.warn("[nativeBridge] native switchServer failed:", err);
   }
 }
 
 /**
- * Ask the Electron shell to return this window to its "connect to server"
- * setup page (the picker's "+ Connect to new server…" action). The window
- * navigates away on success.
+ * Ask the native shell to return to its "connect to server" setup page (the
+ * picker's "+ Connect to new server…" action). The shell navigates away from
+ * this page on success.
  */
 export function openServerSetup(): void {
-  const electron = electronApi();
-  if (!electron?.openServerSetup) return;
+  const native = nativeApi();
+  if (!native?.openServerSetup) return;
   try {
-    electron.openServerSetup();
+    native.openServerSetup();
   } catch (err) {
-    console.warn("[nativeBridge] electron openServerSetup failed:", err);
+    console.warn("[nativeBridge] native openServerSetup failed:", err);
   }
 }
 

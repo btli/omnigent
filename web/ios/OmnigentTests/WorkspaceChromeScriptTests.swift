@@ -42,3 +42,27 @@ final class WorkspaceChromeScriptTests: XCTestCase {
     )
   }
 }
+
+final class NativeBridgeScriptTests: XCTestCase {
+  func testServerPickerBridgeExposesOfferedServersAndNativeActions() {
+    let source = OmnigentWebView.nativeBridgeScript(
+      currentOrigin: "https://current.example.com",
+      recentServers: [
+        "https://managed.example.com/path",
+        "https://quote.example.com/\"quoted\"",
+      ]
+    )
+
+    XCTAssertTrue(source.contains("getServerPicker()"))
+    XCTAssertTrue(source.contains("switchServer(url)"))
+    XCTAssertTrue(source.contains("openServerSetup()"))
+    XCTAssertTrue(source.contains("currentOrigin: pickerCurrentOrigin"))
+    XCTAssertTrue(source.contains("recentServers: [...pickerRecentServers]"))
+    XCTAssertTrue(source.contains("return Promise.reject(new Error("))
+    XCTAssertTrue(source.contains(#"method: "switchServer""#))
+    XCTAssertTrue(source.contains(#"method: "openServerSetup""#))
+    XCTAssertTrue(source.contains("current.example.com"))
+    XCTAssertTrue(source.contains(#"\"quoted\""#))
+    XCTAssertFalse(source.contains("setServerSwitcherHidden"))
+  }
+}

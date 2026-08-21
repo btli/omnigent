@@ -79,6 +79,18 @@ class ServerStoreTest {
     }
 
     @Test
+    fun `offered servers dedupe recent paths by origin`() {
+        val store = storeWithPresets()
+        store.connect("https://recent.example.com/first")
+        store.connect("https://recent.example.com/second")
+
+        assertEquals(
+            listOf("https://recent.example.com/second"),
+            store.offeredServers(),
+        )
+    }
+
+    @Test
     fun `a databricks workspace connects to its omnigent mount`() {
         val store = storeWithPresets()
 

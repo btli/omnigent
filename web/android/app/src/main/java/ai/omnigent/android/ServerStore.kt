@@ -41,8 +41,12 @@ class ServerStore(
      * they don't already cover. Presets join the one list rather than getting a
      * section of their own.
      */
-    fun offeredServers(): List<String> =
-        managed.serverUrls + recentServers().filterNot(managed::includes)
+    fun offeredServers(): List<String> {
+        val seenOrigins = mutableSetOf<String>()
+        return (managed.serverUrls + recentServers()).filter { url ->
+            originOf(url)?.let(seenOrigins::add) ?: false
+        }
+    }
 
     /** Recently-connected servers, most recent first. */
     fun recentServers(): List<String> =

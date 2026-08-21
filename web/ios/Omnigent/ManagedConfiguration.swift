@@ -151,7 +151,11 @@ enum ManagedServers {
 
   /// Every server to offer, administrator-preset ones first.
   static func merged(managed: [URL], recents: [String]) -> [String] {
-    managed.map(\.absoluteString) + Self.recents(recents, excludingManaged: managed)
+    var seenOrigins = Set<String>()
+    return (managed.map(\.absoluteString) + recents).filter { value in
+      guard let origin = URL(string: value)?.omnigentOrigin else { return false }
+      return seenOrigins.insert(origin).inserted
+    }
   }
 
   /// Picks between the two configuration channels. A declarative configuration

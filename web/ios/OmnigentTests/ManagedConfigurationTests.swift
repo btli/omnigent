@@ -227,7 +227,7 @@ final class ManagedConfigurationTests: XCTestCase {
   }
 }
 
-/// The merge that decides what the connect screen and the server switcher show.
+/// The merge that decides what the connect screen and sidebar server picker show.
 final class ManagedServersTests: XCTestCase {
   private let managed = [URL(string: "https://corp.example.com")!]
 
@@ -262,5 +262,13 @@ final class ManagedServersTests: XCTestCase {
       managed: managed, recents: ["https://mine.example.com", "https://corp.example.com"])
 
     XCTAssertEqual(merged, ["https://corp.example.com", "https://mine.example.com"])
+  }
+
+  func testMergedServersDedupeRecentPathsByOrigin() {
+    let merged = ManagedServers.merged(
+      managed: [],
+      recents: ["https://mine.example.com/first", "https://mine.example.com/second"])
+
+    XCTAssertEqual(merged, ["https://mine.example.com/first"])
   }
 }

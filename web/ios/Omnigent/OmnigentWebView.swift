@@ -4,8 +4,11 @@ import WebKit
 
 struct OmnigentWebView: UIViewRepresentable {
   let initialURL: URL
+  let offeredServers: [String]
   @ObservedObject var model: WebViewModel
   @ObservedObject var settings: SettingsStore
+  let switchToServer: (URL) -> Void
+  let connectToNewServer: () -> Void
   let loadFailed: (URL, String) -> Void
   let loadSucceeded: () -> Void
 
@@ -16,13 +19,15 @@ struct OmnigentWebView: UIViewRepresentable {
   func makeUIView(context: Context) -> WKWebView {
     let contentController = WKUserContentController()
     contentController.add(context.coordinator, name: "omnigentNative")
+    let bridgeScriptSource = nativeBridgeScriptSource
     contentController.addUserScript(
       WKUserScript(
-        source: Self.nativeBridgeScript,
+        source: bridgeScriptSource,
         injectionTime: .atDocumentStart,
         forMainFrameOnly: true
       )
     )
+    context.coordinator.bridgeScriptSource = bridgeScriptSource
 
     let configuration = WKWebViewConfiguration()
     configuration.userContentController = contentController
@@ -68,6 +73,19 @@ struct OmnigentWebView: UIViewRepresentable {
   func updateUIView(_ webView: WKWebView, context: Context) {
     context.coordinator.parent = self
     model.webView = webView
+    let bridgeScriptSource = nativeBridgeScriptSource
+    if context.coordinator.bridgeScriptSource != bridgeScriptSource {
+      let contentController = webView.configuration.userContentController
+      contentController.removeAllUserScripts()
+      contentController.addUserScript(
+        WKUserScript(
+          source: bridgeScriptSource,
+          injectionTime: .atDocumentStart,
+          forMainFrameOnly: true
+        )
+      )
+      context.coordinator.bridgeScriptSource = bridgeScriptSource
+    }
     if context.coordinator.pinnedURL != initialURL {
       context.coordinator.load(initialURL, in: webView)
     }
@@ -78,222 +96,247 @@ struct OmnigentWebView: UIViewRepresentable {
     coordinator.detach()
   }
 
-  private static let nativeBridgeScript = """
-    (() => {
-      if (window.omnigentNative && window.omnigentNative.kind === "ios") return;
-      const ensureViewportFit = () => {
-        let meta = document.querySelector('meta[name="viewport"]');
-        if (!meta) {
-          meta = document.createElement("meta");
-          meta.name = "viewport";
-          (document.head || document.documentElement).appendChild(meta);
-        }
-        const content = meta.getAttribute("content") || "width=device-width, initial-scale=1.0";
-        const managedKeys = new Set([
-          "width",
-          "initial-scale",
-          "minimum-scale",
-          "maximum-scale",
-          "user-scalable",
-          "viewport-fit",
-        ]);
-        const preserved = content
-          .split(",")
-          .map((part) => part.trim())
-          .filter((part) => {
-            const key = part.split("=")[0]?.trim().toLowerCase();
-            return key && !managedKeys.has(key);
+  private var nativeBridgeScriptSource: String {
+    Self.nativeBridgeScript(
+      currentOrigin: initialURL.omnigentOrigin ?? initialURL.absoluteString,
+      recentServers: offeredServers
+    )
+  }
+
+  static func nativeBridgeScript(
+    currentOrigin: String,
+    recentServers: [String]
+  ) -> String {
+    let recentsLiteral =
+      recentServers.map(WebViewModel.javascriptString).joined(separator: ", ")
+    return """
+      (() => {
+        if (window.omnigentNative && window.omnigentNative.kind === "ios") return;
+        const ensureViewportFit = () => {
+          let meta = document.querySelector('meta[name="viewport"]');
+          if (!meta) {
+            meta = document.createElement("meta");
+            meta.name = "viewport";
+            (document.head || document.documentElement).appendChild(meta);
+          }
+          const content = meta.getAttribute("content") || "width=device-width, initial-scale=1.0";
+          const managedKeys = new Set([
+            "width",
+            "initial-scale",
+            "minimum-scale",
+            "maximum-scale",
+            "user-scalable",
+            "viewport-fit",
+          ]);
+          const preserved = content
+            .split(",")
+            .map((part) => part.trim())
+            .filter((part) => {
+              const key = part.split("=")[0]?.trim().toLowerCase();
+              return key && !managedKeys.has(key);
+            });
+          meta.setAttribute(
+            "content",
+            [
+              "width=device-width",
+              "initial-scale=1.0",
+              "minimum-scale=1.0",
+              "maximum-scale=1.0",
+              "user-scalable=no",
+              "viewport-fit=cover",
+              ...preserved,
+            ].join(", ")
+          );
+        };
+        // A workspace-hosted page reassigns the whole `content` attribute after it
+        // mounts, dropping `viewport-fit=cover` — and with it every
+        // `env(safe-area-inset-*)` the web layer pads with, so content lands under the
+        // status bar. One-shot injection isn't enough: the host rewrites again on its
+        // own re-renders, so re-assert whenever the token goes missing.
+        const hasViewportFitCover = () => {
+          const meta = document.querySelector('meta[name="viewport"]');
+          if (!meta) return false;
+          const content = (meta.getAttribute("content") || "").toLowerCase();
+          return content.split(" ").join("").includes("viewport-fit=cover");
+        };
+        const watchViewportFit = () => {
+          if (!document.head || typeof MutationObserver === "undefined") return;
+          // `ensureViewportFit` writes the attribute we're observing; the guard turns
+          // that re-entry into a no-op rather than a loop.
+          new MutationObserver(() => {
+            if (!hasViewportFitCover()) ensureViewportFit();
+          }).observe(document.head, {
+            childList: true, // the host may replace the tag instead of editing it
+            subtree: true,
+            attributes: true,
+            attributeFilter: ["content"],
           });
-        meta.setAttribute(
-          "content",
-          [
-            "width=device-width",
-            "initial-scale=1.0",
-            "minimum-scale=1.0",
-            "maximum-scale=1.0",
-            "user-scalable=no",
-            "viewport-fit=cover",
-            ...preserved,
-          ].join(", ")
-        );
-      };
-      // A workspace-hosted page reassigns the whole `content` attribute after it
-      // mounts, dropping `viewport-fit=cover` — and with it every
-      // `env(safe-area-inset-*)` the web layer pads with, so content lands under the
-      // status bar. One-shot injection isn't enough: the host rewrites again on its
-      // own re-renders, so re-assert whenever the token goes missing.
-      const hasViewportFitCover = () => {
-        const meta = document.querySelector('meta[name="viewport"]');
-        if (!meta) return false;
-        const content = (meta.getAttribute("content") || "").toLowerCase();
-        return content.split(" ").join("").includes("viewport-fit=cover");
-      };
-      const watchViewportFit = () => {
-        if (!document.head || typeof MutationObserver === "undefined") return;
-        // `ensureViewportFit` writes the attribute we're observing; the guard turns
-        // that re-entry into a no-op rather than a loop.
-        new MutationObserver(() => {
-          if (!hasViewportFitCover()) ensureViewportFit();
-        }).observe(document.head, {
-          childList: true, // the host may replace the tag instead of editing it
-          subtree: true,
-          attributes: true,
-          attributeFilter: ["content"],
+        };
+        const applyViewportFit = () => {
+          ensureViewportFit();
+          watchViewportFit();
+        };
+        if (document.head) {
+          applyViewportFit();
+        } else {
+          document.addEventListener("DOMContentLoaded", applyViewportFit, { once: true });
+        }
+        const callbacks = new Set();
+        const openPathCallbacks = new Set();
+        const viewModeCallbacks = new Set();
+        const pickerCurrentOrigin = \(WebViewModel.javascriptString(currentOrigin));
+        const pickerRecentServers = [\(recentsLiteral)];
+        const defineEmit = (name, fn) => {
+          Object.defineProperty(window, name, {
+            configurable: false,
+            enumerable: false,
+            writable: false,
+            value: fn,
+          });
+        };
+        defineEmit("__omnigentNativeEmitNotificationActivated", (path) => {
+          if (typeof path !== "string" || !path.startsWith("/")) return;
+          for (const callback of callbacks) {
+            try { callback(path); } catch {}
+          }
         });
-      };
-      const applyViewportFit = () => {
-        ensureViewportFit();
-        watchViewportFit();
-      };
-      if (document.head) {
-        applyViewportFit();
-      } else {
-        document.addEventListener("DOMContentLoaded", applyViewportFit, { once: true });
-      }
-      const callbacks = new Set();
-      const openPathCallbacks = new Set();
-      const viewModeCallbacks = new Set();
-      const defineEmit = (name, fn) => {
-        Object.defineProperty(window, name, {
+        defineEmit("__omnigentNativeEmitOpenPath", (path) => {
+          if (typeof path !== "string" || !path.startsWith("/")) return;
+          for (const callback of openPathCallbacks) {
+            try { callback(path); } catch {}
+          }
+        });
+        defineEmit("__omnigentNativeEmitViewModeChanged", (mode) => {
+          if (mode !== "chat" && mode !== "terminal") return;
+          for (const callback of viewModeCallbacks) {
+            try { callback(mode); } catch {}
+          }
+        });
+        const insetCallbacks = new Set();
+        // Cache the last footprint so a subscriber that registers AFTER native
+        // first emitted (the React app mounts later than document-start) still
+        // gets the current value immediately on subscribe.
+        let lastInsets = null;
+        defineEmit("__omnigentNativeEmitInsets", (bottomBar) => {
+          const insets = {
+            bottomBar: typeof bottomBar === "number" && Number.isFinite(bottomBar) ? bottomBar : 0,
+          };
+          lastInsets = insets;
+          for (const callback of insetCallbacks) {
+            try { callback(insets); } catch {}
+          }
+        });
+        const sidebarDragCallbacks = new Set();
+        Object.defineProperty(window, "__omnigentNativeEmitSidebarDrag", {
           configurable: false,
           enumerable: false,
           writable: false,
-          value: fn,
+          value(phase, progress) {
+            if (typeof phase !== "string") return;
+            const fraction =
+              typeof progress === "number" && Number.isFinite(progress)
+                ? Math.max(0, Math.min(1, progress))
+                : 0;
+            for (const callback of sidebarDragCallbacks) {
+              try { callback(phase, fraction); } catch {}
+            }
+          },
         });
-      };
-      defineEmit("__omnigentNativeEmitNotificationActivated", (path) => {
-        if (typeof path !== "string" || !path.startsWith("/")) return;
-        for (const callback of callbacks) {
-          try { callback(path); } catch {}
-        }
-      });
-      defineEmit("__omnigentNativeEmitOpenPath", (path) => {
-        if (typeof path !== "string" || !path.startsWith("/")) return;
-        for (const callback of openPathCallbacks) {
-          try { callback(path); } catch {}
-        }
-      });
-      defineEmit("__omnigentNativeEmitViewModeChanged", (mode) => {
-        if (mode !== "chat" && mode !== "terminal") return;
-        for (const callback of viewModeCallbacks) {
-          try { callback(mode); } catch {}
-        }
-      });
-      const insetCallbacks = new Set();
-      // Cache the last footprint so a subscriber that registers AFTER native
-      // first emitted (the React app mounts later than document-start) still
-      // gets the current value immediately on subscribe.
-      let lastInsets = null;
-      defineEmit("__omnigentNativeEmitInsets", (topBar, bottomBar) => {
-        const insets = {
-          topBar: typeof topBar === "number" && Number.isFinite(topBar) ? topBar : 0,
-          bottomBar: typeof bottomBar === "number" && Number.isFinite(bottomBar) ? bottomBar : 0,
-        };
-        lastInsets = insets;
-        for (const callback of insetCallbacks) {
-          try { callback(insets); } catch {}
-        }
-      });
-      const sidebarDragCallbacks = new Set();
-      Object.defineProperty(window, "__omnigentNativeEmitSidebarDrag", {
-        configurable: false,
-        enumerable: false,
-        writable: false,
-        value(phase, progress) {
-          if (typeof phase !== "string") return;
-          const fraction =
-            typeof progress === "number" && Number.isFinite(progress)
-              ? Math.max(0, Math.min(1, progress))
-              : 0;
-          for (const callback of sidebarDragCallbacks) {
-            try { callback(phase, fraction); } catch {}
-          }
-        },
-      });
-      window.omnigentNative = Object.freeze({
-        kind: "ios",
-        setColorScheme(scheme) {
-          if (scheme !== "light" && scheme !== "dark" && scheme !== "system") return;
-          window.webkit.messageHandlers.omnigentNative.postMessage({
-            method: "setColorScheme",
-            scheme,
-          });
-        },
-        setBadgeCount(count) {
-          window.webkit.messageHandlers.omnigentNative.postMessage({
-            method: "setBadgeCount",
-            count: Number.isFinite(count) ? count : 0,
-          });
-        },
-        notify(params) {
-          window.webkit.messageHandlers.omnigentNative.postMessage({
-            method: "notify",
-            params: {
-              title: params && typeof params.title === "string" ? params.title : "",
-              body: params && typeof params.body === "string" ? params.body : "",
-              navigatePath:
-                params && typeof params.navigatePath === "string" ? params.navigatePath : "",
-            },
-          });
-          return Promise.resolve(true);
-        },
-        onNotificationActivated(callback) {
-          if (typeof callback !== "function") return () => {};
-          callbacks.add(callback);
-          return () => callbacks.delete(callback);
-        },
-        onOpenPath(callback) {
-          if (typeof callback !== "function") return () => {};
-          openPathCallbacks.add(callback);
-          return () => openPathCallbacks.delete(callback);
-        },
-        onSidebarDrag(callback) {
-          if (typeof callback !== "function") return () => {};
-          sidebarDragCallbacks.add(callback);
-          return () => sidebarDragCallbacks.delete(callback);
-        },
-        setServerSwitcherHidden(hidden) {
-          window.webkit.messageHandlers.omnigentNative.postMessage({
-            method: "setServerSwitcherHidden",
-            hidden: hidden === true,
-          });
-        },
-        setSidebarOpen(open) {
-          window.webkit.messageHandlers.omnigentNative.postMessage({
-            method: "setServerSwitcherHidden",
-            hidden: open === true,
-          });
-        },
-        setViewMode(params) {
-          const mode = params && params.mode === "terminal" ? "terminal" : "chat";
-          window.webkit.messageHandlers.omnigentNative.postMessage({
-            method: "setViewMode",
-            mode,
-            terminalEnabled: !!(params && params.terminalEnabled),
-            terminalStartingUp: !!(params && params.terminalStartingUp),
-            visible: !!(params && params.visible),
-          });
-        },
-        onViewModeChanged(callback) {
-          if (typeof callback !== "function") return () => {};
-          viewModeCallbacks.add(callback);
-          return () => viewModeCallbacks.delete(callback);
-        },
-        onNativeInsets(callback) {
-          if (typeof callback !== "function") return () => {};
-          insetCallbacks.add(callback);
-          if (lastInsets) { try { callback(lastInsets); } catch {} }
-          return () => insetCallbacks.delete(callback);
-        },
-      });
-    })();
-    """
+        window.omnigentNative = Object.freeze({
+          kind: "ios",
+          setColorScheme(scheme) {
+            if (scheme !== "light" && scheme !== "dark" && scheme !== "system") return;
+            window.webkit.messageHandlers.omnigentNative.postMessage({
+              method: "setColorScheme",
+              scheme,
+            });
+          },
+          setBadgeCount(count) {
+            window.webkit.messageHandlers.omnigentNative.postMessage({
+              method: "setBadgeCount",
+              count: Number.isFinite(count) ? count : 0,
+            });
+          },
+          notify(params) {
+            window.webkit.messageHandlers.omnigentNative.postMessage({
+              method: "notify",
+              params: {
+                title: params && typeof params.title === "string" ? params.title : "",
+                body: params && typeof params.body === "string" ? params.body : "",
+                navigatePath:
+                  params && typeof params.navigatePath === "string" ? params.navigatePath : "",
+              },
+            });
+            return Promise.resolve(true);
+          },
+          onNotificationActivated(callback) {
+            if (typeof callback !== "function") return () => {};
+            callbacks.add(callback);
+            return () => callbacks.delete(callback);
+          },
+          onOpenPath(callback) {
+            if (typeof callback !== "function") return () => {};
+            openPathCallbacks.add(callback);
+            return () => openPathCallbacks.delete(callback);
+          },
+          onSidebarDrag(callback) {
+            if (typeof callback !== "function") return () => {};
+            sidebarDragCallbacks.add(callback);
+            return () => sidebarDragCallbacks.delete(callback);
+          },
+          setViewMode(params) {
+            const mode = params && params.mode === "terminal" ? "terminal" : "chat";
+            window.webkit.messageHandlers.omnigentNative.postMessage({
+              method: "setViewMode",
+              mode,
+              terminalEnabled: !!(params && params.terminalEnabled),
+              terminalStartingUp: !!(params && params.terminalStartingUp),
+              visible: !!(params && params.visible),
+            });
+          },
+          onViewModeChanged(callback) {
+            if (typeof callback !== "function") return () => {};
+            viewModeCallbacks.add(callback);
+            return () => viewModeCallbacks.delete(callback);
+          },
+          onNativeInsets(callback) {
+            if (typeof callback !== "function") return () => {};
+            insetCallbacks.add(callback);
+            if (lastInsets) { try { callback(lastInsets); } catch {} }
+            return () => insetCallbacks.delete(callback);
+          },
+          getServerPicker() {
+            return Promise.resolve({
+              currentOrigin: pickerCurrentOrigin,
+              recentServers: [...pickerRecentServers],
+            });
+          },
+          switchServer(url) {
+            if (typeof url !== "string" || !pickerRecentServers.includes(url)) {
+              return Promise.reject(new Error("switchServer target must be an offered server"));
+            }
+            window.webkit.messageHandlers.omnigentNative.postMessage({
+              method: "switchServer",
+              url,
+            });
+            return Promise.resolve();
+          },
+          openServerSetup() {
+            window.webkit.messageHandlers.omnigentNative.postMessage({
+              method: "openServerSetup",
+            });
+          },
+        });
+      })();
+      """
+  }
 
   @MainActor
   final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler,
     UIGestureRecognizerDelegate
   {
     var parent: OmnigentWebView
+    var bridgeScriptSource: String?
     private weak var webView: WKWebView?
     /// The server this web view is pinned to; nil before the first load. Doubles as
     /// the identity `updateUIView` compares against, so a re-render only reloads
@@ -327,7 +370,6 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     func detach() {
-      parent.model.cancelServerSwitcherWatchdog()
       urlObservation = nil
       webView = nil
     }
@@ -407,10 +449,7 @@ struct OmnigentWebView: UIViewRepresentable {
       // A new pin is a new server: the previous one's exhausted bounce budget must
       // not suppress the first bounce here.
       rootBounces = 0
-      publishModelChanges { model in
-        model.currentURL = url
-        model.serverSwitcherHidden = true
-      }
+      publishModelChanges { $0.currentURL = url }
       webView.load(URLRequest(url: url))
     }
 
@@ -418,9 +457,6 @@ struct OmnigentWebView: UIViewRepresentable {
       _ userContentController: WKUserContentController, didReceive message: WKScriptMessage
     ) {
       guard isTrustedBridgeMessage(message) else { return }
-      // Any trusted message proves the page is alive and driving the bridge, so
-      // stand down the liveness watchdog — the page owns the switcher from here.
-      parent.model.cancelServerSwitcherWatchdog()
       guard let body = message.body as? [String: Any],
         let method = body["method"] as? String
       else { return }
@@ -444,10 +480,14 @@ struct OmnigentWebView: UIViewRepresentable {
           body: params["body"] as? String,
           navigatePath: params["navigatePath"] as? String
         )
-      case "setServerSwitcherHidden":
-        parent.model.serverSwitcherHidden = (body["hidden"] as? NSNumber)?.boolValue ?? true
-      case "setSidebarOpen":
-        parent.model.serverSwitcherHidden = (body["open"] as? NSNumber)?.boolValue ?? true
+      case "switchServer":
+        guard let value = body["url"] as? String,
+          parent.offeredServers.contains(value),
+          let url = URL(string: value)
+        else { return }
+        parent.switchToServer(url)
+      case "openServerSetup":
+        parent.connectToNewServer()
       case "setViewMode":
         let mode: WebViewMode = (body["mode"] as? String) == "terminal" ? .terminal : .chat
         parent.model.viewMode = mode
@@ -463,8 +503,6 @@ struct OmnigentWebView: UIViewRepresentable {
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
       parent.model.isLoading = true
       parent.model.currentURL = webView.url ?? parent.model.currentURL
-      parent.model.serverSwitcherHidden = true
-      parent.model.armServerSwitcherWatchdog()
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
@@ -649,7 +687,6 @@ struct OmnigentWebView: UIViewRepresentable {
       let nsError = error as NSError
       guard nsError.code != NSURLErrorCancelled else { return }
       parent.model.isLoading = false
-      parent.model.cancelServerSwitcherWatchdog()
 
       let failedURL = failedURL(from: nsError) ?? webView.url ?? pinnedURL ?? parent.initialURL
       guard failedURL.omnigentOrigin == pinnedOrigin else { return }

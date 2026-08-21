@@ -43,6 +43,23 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("SidebarServerPicker", () => {
+  it("keeps one touch-sized trigger and a contained upward menu", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "http://localhost:8000",
+      recentServers: ["https://other.example.com/"],
+    });
+    renderPicker();
+
+    const trigger = await openMenu();
+    expect(trigger).toHaveClass("min-h-11", "md:min-h-0");
+    const menu = await screen.findByRole("menu");
+    expect(menu).toHaveAttribute("data-side", "top");
+    expect(menu).toHaveClass(
+      "max-h-[var(--radix-dropdown-menu-content-available-height)]",
+      "overflow-y-auto",
+    );
+  });
+
   it("renders nothing in a plain browser (bridge resolves null)", async () => {
     getServerPicker.mockResolvedValue(null);
     const { container } = renderPicker();
