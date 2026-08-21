@@ -1504,13 +1504,14 @@ describe("recent-server startup wiring (src/main.js)", () => {
   it("backfills a saved server only after its cold load succeeds", () => {
     assert.match(
       liveCode,
-      /loadURL\(destination\)\s*\.then\(\(\)\s*=>\s*\{\s*if\s*\(!ephemeral\s*&&\s*!explicit\s*&&\s*serverUrl\)[\s\S]{0,200}rememberRecentServer\(settings,\s*serverUrl\)/,
+      /loadInitialDestination\(\{[\s\S]{0,800}\.then\(\(loaded\)\s*=>\s*\{[\s\S]{0,200}if\s*\(loaded\s*&&\s*!ephemeral\s*&&\s*!explicit\s*&&\s*serverUrl\)[\s\S]{0,200}rememberRecentServer\(settings,\s*serverUrl\)/,
       [
         "createWindow no longer backfills a successfully loaded saved server into",
         "recent_servers. Existing installs can have server_url without recent_servers,",
         "so the setup page would show no recents after leaving that server. Keep the",
-        "backfill in loadURL(destination).then, gated away from ephemeral windows and",
-        "explicit target URLs (which may include a conversation path).",
+        "backfill in loadInitialDestination(...).then((loaded) => ...), gated on a",
+        "successful load and away from ephemeral windows and explicit target URLs",
+        "(which may include a conversation path).",
       ].join(" "),
     );
   });
