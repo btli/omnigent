@@ -515,8 +515,10 @@ describe("probeServerAuth — /v1/me auth gate", () => {
     const url = "https://app.example.com";
 
     // Session-token record → Authorization attached, so an authed OIDC/accounts
-    // server can answer 200 and skip a needless login.
-    mock.method(fs, "readFileSync", () =>
+    // server can answer 200 and skip a needless login. Re-point one mock rather
+    // than stacking a second: restoreAll unwinds stacked mocks in creation
+    // order, which would leave the first mock installed after this test.
+    const readMock = mock.method(fs, "readFileSync", () =>
       JSON.stringify({ [url]: { token: "sess-123", expires_at: Date.now() / 1000 + 3600 } }),
     );
     let seen;
@@ -529,7 +531,7 @@ describe("probeServerAuth — /v1/me auth gate", () => {
 
     // Databricks pointer → no in-process token → no Authorization header (the
     // unauthenticated probe correctly yields not-authed and defers to login).
-    mock.method(fs, "readFileSync", () =>
+    readMock.mock.mockImplementation(() =>
       JSON.stringify({ [url]: { auth_type: "databricks", workspace_host: "https://ws" } }),
     );
     seen = undefined;
