@@ -14,20 +14,88 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import click
 import pytest
 
 from omnigent.claude_native import (
     ClaudeNativeUcodeConfig,
     build_native_claude_terminal_env,
 )
+from omnigent.model_catalog_store import CatalogFreshness, CatalogResult
 from omnigent.runner.app import _build_claude_native_base_args, _claude_terminal_env_unset
 from omnigent.runner.native.orchestration import (
     _ROUTED_SPAWN_ALLOWED_TOOLS,
     _claude_launch_metadata_from_envelope,
     _load_legacy_claude_launch_metadata,
     _routed_spawn_launch_args,
+    _select_authoritative_claude_launch_model,
 )
 from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
+
+
+def _catalog(freshness: CatalogFreshness) -> CatalogResult:
+    return CatalogResult(
+        [{"id": "fable", "model": "claude-fable-5", "isDefault": True}],
+        freshness,
+        "provider credentials expired" if freshness is CatalogFreshness.STALE else None,
+    )
+
+
+def test_stale_implicit_subscription_default_omits_model() -> None:
+    selected = _select_authoritative_claude_launch_model(
+        explicit_model=None,
+        configured_model=None,
+        claude_config=None,
+        catalog=_catalog(CatalogFreshness.STALE),
+    )
+
+    args = _build_claude_native_base_args(
+        reasoning_effort=None,
+        model_override=selected,
+        terminal_launch_args=None,
+    )
+    assert "--model" not in args
+
+
+def test_stale_unvalidated_explicit_model_fails_without_substitution() -> None:
+    with pytest.raises(click.ClickException, match=r"Pick again.*restoring provider credentials"):
+        _select_authoritative_claude_launch_model(
+            explicit_model="gateway-fable-5",
+            configured_model=None,
+            claude_config=ClaudeNativeUcodeConfig(
+                env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}
+            ),
+            catalog=_catalog(CatalogFreshness.STALE),
+        )
+
+
+def test_configured_gateway_pin_survives_a_stale_catalog() -> None:
+    config = ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"},
+        model="gateway-opus-5",
+    )
+
+    assert (
+        _select_authoritative_claude_launch_model(
+            explicit_model=None,
+            configured_model=config.model,
+            claude_config=config,
+            catalog=_catalog(CatalogFreshness.STALE),
+        )
+        == "gateway-opus-5"
+    )
+
+
+def test_unpinned_gateway_with_stale_catalog_fails_actionably() -> None:
+    with pytest.raises(click.ClickException, match="provider credentials expired"):
+        _select_authoritative_claude_launch_model(
+            explicit_model=None,
+            configured_model=None,
+            claude_config=ClaudeNativeUcodeConfig(
+                env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}
+            ),
+            catalog=_catalog(CatalogFreshness.STALE),
+        )
 
 
 @pytest.mark.parametrize(
