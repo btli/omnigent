@@ -10,6 +10,7 @@ import {
   type ChangeEvent,
   type FormEvent,
   type KeyboardEvent,
+  type ReactNode,
   forwardRef,
   memo,
   useCallback,
@@ -261,6 +262,19 @@ import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { ConnectionIndicator } from "./ChatIndicators";
 import { Transcript } from "@/components/chat/Transcript";
+
+export function TerminalSurface({ isShown, children }: { isShown: boolean; children: ReactNode }) {
+  return (
+    <div
+      data-testid="terminal-surface"
+      className={cn("absolute inset-0 flex flex-col", !isShown && "pointer-events-none opacity-0")}
+      aria-hidden={!isShown}
+      inert={!isShown ? ("" as unknown as boolean) : undefined}
+    >
+      {children}
+    </div>
+  );
+}
 
 /** Server-info as consumers see it: the probe's result, or "loading". */
 type ServerInfoValue = ServerInfo | "loading";
@@ -1819,13 +1833,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
     const isActive = mountTerminal && entry.conversationId === conversationId;
     const isShown = isActive && showTerminal;
     return (
-      <div
-        key={entry.conversationId}
-        // xterm's .visible scrollbar overrides inherited visibility. Opacity
-        // hides the entire subtree without disturbing its layout or connection.
-        className={cn("absolute inset-0 flex flex-col", !isShown && "invisible opacity-0")}
-        aria-hidden={!isShown}
-      >
+      <TerminalSurface key={entry.conversationId} isShown={isShown}>
         <MainTerminalView
           conversationId={entry.conversationId}
           initialTerminalKey={isActive ? terminalFirst?.terminalViewKey : null}
@@ -1838,7 +1846,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
         {isShown && (
           <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
         )}
-      </div>
+      </TerminalSurface>
     );
   });
 
