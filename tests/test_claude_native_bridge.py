@@ -13,7 +13,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -3693,36 +3693,6 @@ def test_inject_user_message_raises_when_draft_never_submits(
         r"Waited 0\.2s\.",
     ):
         inject_user_message(bridge_dir, content="fix the flaky test")
-
-
-def test_inject_user_message_submit_verify_honors_the_budget_override(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The verify loop keeps re-sending Enter for the configured budget.
-
-    The draft never clears here, so the loop re-sends Enter once per
-    retry interval until the budget expires: a wider budget must draw
-    strictly more retries before failing. A loop that ignored the
-    override would give up at the same point in both runs.
-    """
-
-    def _enters_for_budget(budget_s: float) -> list[list[str]]:
-        monkeypatch.setattr(claude_native_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", budget_s)
-        sends = _fake_tmux(monkeypatch, [_draft_pane("fix the flaky test")])
-        with pytest.raises(RuntimeError, match=r"hasn't accepted the message"):
-            claude_native_bridge.inject_user_message(
-                _picker_bridge_dir(tmp_path / f"b{budget_s}"),
-                content="fix the flaky test",
-            )
-        return [args for args in sends if args[-1] == "Enter"]
-
-    tight = _enters_for_budget(2.0)
-    generous = _enters_for_budget(6.0)
-    assert len(tight) < len(generous), (
-        f"a wider budget must retry the swallowed Enter more times; "
-        f"got {len(tight)} vs {len(generous)} Enter(s)"
-    )
 
 
 def test_inject_interrupt_sends_escape_keystroke(
@@ -8094,25 +8064,25 @@ def test_a_slash_command_draft_that_never_renders_submits_blind(
     )
 
 
-def test_a_slash_command_submit_verify_honors_the_budget_override(
+@pytest.mark.parametrize(
+    ("inject", "argument", "draft"),
+    [
+        (claude_native_bridge.inject_user_message, "content", "fix the flaky test"),
+        (claude_native_bridge.inject_slash_command, "command", "/effort high"),
+    ],
+)
+def test_submit_verify_honors_the_budget_override(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    inject: Callable[..., None],
+    argument: str,
+    draft: str,
 ) -> None:
-    """The command-path verify loop also retries for the configured budget.
-
-    Same budget, second call site: the stuck command must keep drawing
-    retries for as long as the override says before failing, so both
-    injection paths widen together when an operator raises it.
-    """
-
     def _enters_for_budget(budget_s: float) -> list[list[str]]:
         monkeypatch.setattr(claude_native_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", budget_s)
-        sends = _fake_tmux(monkeypatch, [_draft_pane("/effort high")])
-        with pytest.raises(RuntimeError, match=r"hasn't accepted the slash command"):
-            claude_native_bridge.inject_slash_command(
-                _picker_bridge_dir(tmp_path / f"b{budget_s}"),
-                command="/effort high",
-            )
+        sends = _fake_tmux(monkeypatch, [_composer_pane(draft)])
+        with pytest.raises(RuntimeError, match=r"hasn't accepted"):
+            inject(_picker_bridge_dir(tmp_path / f"b{budget_s}"), **{argument: draft})
         return [args for args in sends if args[-1] == "Enter"]
 
     tight = _enters_for_budget(2.0)
@@ -8121,6 +8091,24 @@ def test_a_slash_command_submit_verify_honors_the_budget_override(
         f"a wider budget must retry the swallowed Enter more times; "
         f"got {len(tight)} vs {len(generous)} Enter(s)"
     )
+
+
+def test_invalid_submit_verify_budget_uses_default() -> None:
+    env = os.environ | {"OMNIGENT_CLAUDE_SUBMIT_VERIFY_TIMEOUT_S": "invalid"}
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import omnigent.claude_native_bridge as bridge; "
+            "print(bridge._SUBMIT_VERIFY_TIMEOUT_S)",
+        ],
+        check=True,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+
+    assert result.stdout.strip() == "30.0"
 
 
 def test_an_effort_switch_with_a_swallowed_confirm_leaves_the_pane_usable(
