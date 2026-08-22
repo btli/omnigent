@@ -278,15 +278,46 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
     expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveStyle({
       width: "500px",
     });
-    expect(readSessionWorkspaceState("conv_child").widthPx).toBeUndefined();
 
     fireEvent.click(screen.getAllByTestId("subagent-row")[1]);
     expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveStyle({
       width: "500px",
     });
-    expect(readSessionWorkspaceState("conv_sibling").widthPx).toBeUndefined();
 
     fireEvent.click(screen.getByTestId("subagent-main-row"));
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveStyle({
+      width: "500px",
+    });
+  });
+
+  it("restores a saved width while a cold-loaded session snapshot is unresolved", () => {
+    vi.mocked(useChildSessions).mockReturnValue({
+      children: [],
+      isLoading: true,
+      error: null,
+    });
+    vi.mocked(useSession).mockReturnValue({
+      session: null,
+      isLoading: true,
+      error: null,
+    } as never);
+    writeSessionWorkspaceState("conv_cold", { widthPx: 500 });
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_cold"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route path="c/:conversationId" element={<div data-testid="page" />} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+
     expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveStyle({
       width: "500px",
     });

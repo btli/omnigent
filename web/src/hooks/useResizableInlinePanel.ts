@@ -142,11 +142,14 @@ function getServerSnapshot(): number | null {
  * tightens the ceiling without touching the persisted preference, so opening
  * the sidebar temporarily shrinks the panel and collapsing it restores the
  * user's width.
+ *
+ * `persistEnabled` disables manual resizing while the storage key is tentative.
  */
 export function useResizableInlinePanel(
   sessionId: string | null,
   minWidthPx = MIN_WIDTH_PX,
   reservedPx = 0,
+  persistEnabled = true,
 ) {
   const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
   // On a session switch the module store still holds the previous session's
@@ -178,6 +181,8 @@ export function useResizableInlinePanel(
   minWidthRef.current = minWidthPx;
   const reservedRef = useRef(reservedPx);
   reservedRef.current = reservedPx;
+  const persistEnabledRef = useRef(persistEnabled);
+  persistEnabledRef.current = persistEnabled;
 
   // While dragging, a transparent full-window overlay sits above the panel so
   // the pointer stream keeps reaching the parent document. Without it, dragging
@@ -229,17 +234,19 @@ export function useResizableInlinePanel(
 
   const onMouseDown = useCallback(
     (e: React.MouseEvent) => {
+      if (!persistEnabled) return;
       e.preventDefault();
       setIsDragging(true);
       addDragOverlay();
       document.body.style.cursor = "col-resize";
       document.body.style.userSelect = "none";
     },
-    [addDragOverlay],
+    [addDragOverlay, persistEnabled],
   );
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
+      if (!persistEnabled) return;
       const step = 20;
       if (e.key === "ArrowLeft") {
         e.preventDefault();
@@ -255,7 +262,7 @@ export function useResizableInlinePanel(
         );
       }
     },
-    [resolvedWidth],
+    [persistEnabled, resolvedWidth],
   );
 
   // Drag listeners live only while a drag is active — no idle window-level
@@ -269,7 +276,7 @@ export function useResizableInlinePanel(
 
     function flush() {
       frame = 0;
-      if (pending === null) return;
+      if (pending === null || !persistEnabledRef.current) return;
       setStoredWidth(clamp(pending, minWidthRef.current, reservedRef.current));
       pending = null;
     }
@@ -284,7 +291,7 @@ export function useResizableInlinePanel(
       flush();
       setIsDragging(false);
       removeDragOverlay();
-      persistStoredWidth();
+      if (persistEnabledRef.current) persistStoredWidth();
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
     }

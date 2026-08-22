@@ -621,9 +621,10 @@ export function AppShell() {
   }, [rootSessionId, rootSessionResolved]);
   const { panelWidth: inlinePanelWidth, handleProps: inlinePanelHandleProps } =
     useResizableInlinePanel(
-      rootSessionResolved ? rootSessionId : null,
+      rootSessionId,
       inlinePanelMinWidth,
       sidebarOpen ? sidebarWidth : 0,
+      rootSessionResolved,
     );
   // How many children are actively working — surfaced in the tab badge so
   // "something's happening" is visible without opening the panel.

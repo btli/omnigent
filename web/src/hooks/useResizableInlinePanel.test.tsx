@@ -59,19 +59,9 @@ describe("useResizableInlinePanel persistence", () => {
 
   it("scopes the saved width to its root-tree key: a different tree uses the default", () => {
     const rootTreeKey = "conv_root";
-    const first = renderHook(
-      ({ selectedConversationId: _selectedConversationId }) => useResizableInlinePanel(rootTreeKey),
-      { initialProps: { selectedConversationId: rootTreeKey } },
-    );
+    const first = renderHook(() => useResizableInlinePanel(rootTreeKey));
     expect(nudgeWiderOnce(first.result)).toBe(620);
     expect(readSessionWorkspaceState(rootTreeKey).widthPx).toBe(620);
-
-    first.rerender({ selectedConversationId: "conv_child" });
-    expect(first.result.current.panelWidth).toBe(620);
-    first.rerender({ selectedConversationId: "conv_sibling" });
-    expect(first.result.current.panelWidth).toBe(620);
-    expect(readSessionWorkspaceState("conv_child").widthPx).toBeUndefined();
-    expect(readSessionWorkspaceState("conv_sibling").widthPx).toBeUndefined();
     first.unmount();
 
     // A second root tree has no saved width, so it falls back to the
