@@ -47,6 +47,7 @@ from omnigent.codex_native_bridge import (
 )
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.inner.terminal import TerminalInstance
+from omnigent.model_catalog_store import CatalogFreshness, CatalogResult
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import (
     ResolvedSpec,
@@ -3225,9 +3226,9 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         },
     ]
 
-    async def _catalog(config: object) -> list[dict[str, object]]:
+    async def _catalog(config: object) -> CatalogResult:
         del config
-        return catalog
+        return CatalogResult(catalog, CatalogFreshness.FRESH)
 
     monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", _catalog)
 
@@ -3291,7 +3292,7 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         args = captured["spec"].args
         assert args[args.index("--model") + 1] == "claude-opus-4-8"
     else:
-        with pytest.raises(click.ClickException, match="not in this host's current model list"):
+        with pytest.raises(click.ClickException, match="could not be validated"):
             await _auto_create_claude_terminal(
                 session_id,
                 _FakeResourceRegistry(),

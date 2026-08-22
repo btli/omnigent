@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import fcntl
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -60,3 +64,134 @@ def test_catalog_age_reports_and_misses() -> None:
     store.write_catalog("claude-native", "abc123", _ROWS)
     age = store.catalog_age_s("claude-native", "abc123")
     assert age is not None and age >= 0.0
+
+
+@pytest.mark.asyncio
+async def test_stale_catalog_is_returned_with_failed_refresh_marked_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store.write_catalog("claude-native", "abc123", _ROWS)
+    path = store.catalog_path("claude-native", "abc123")
+    old = time.time() - store.CATALOG_STALE_AFTER_S - 1
+    os.utime(path, (old, old))
+
+    async def _offline() -> None:
+        raise OSError("offline")
+
+    result = await store.ensure_catalog("claude-native", "abc123", _offline)
+
+    assert result.rows == _ROWS
+    assert result.freshness is store.CatalogFreshness.STALE
+    assert result.refresh_error == "provider credentials or network unavailable"
+
+
+@pytest.mark.asyncio
+async def test_hanging_stale_refresh_is_bounded_and_single_flight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store.write_catalog("claude-native", "abc123", _ROWS)
+    path = store.catalog_path("claude-native", "abc123")
+    old = time.time() - store.CATALOG_STALE_AFTER_S - 1
+    os.utime(path, (old, old))
+    monkeypatch.setattr(store, "CATALOG_REFRESH_TIMEOUT_S", 0.02)
+    calls = 0
+
+    async def _hang() -> None:
+        nonlocal calls
+        calls += 1
+        await asyncio.Event().wait()
+
+    first, second = await asyncio.gather(
+        store.ensure_catalog("claude-native", "abc123", _hang),
+        store.ensure_catalog("claude-native", "abc123", _hang),
+    )
+
+    assert calls == 1
+    assert first.rows == second.rows == _ROWS
+    assert first.freshness is second.freshness is store.CatalogFreshness.STALE
+    assert first.refresh_error == second.refresh_error == "model catalog refresh timed out"
+
+
+@pytest.mark.asyncio
+async def test_cross_process_lock_wait_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store.write_catalog("claude-native", "abc123", _ROWS)
+    path = store.catalog_path("claude-native", "abc123")
+    old = time.time() - store.CATALOG_STALE_AFTER_S - 1
+    os.utime(path, (old, old))
+    monkeypatch.setattr(store, "CATALOG_LOCK_TIMEOUT_S", 0.02)
+    lock_path = path.with_suffix(".lock")
+    lock_path.touch()
+    lock_handle = lock_path.open("a+")
+    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    called = False
+
+    async def _refresh() -> list[dict[str, object]]:
+        nonlocal called
+        called = True
+        return []
+
+    try:
+        result = await store.ensure_catalog("claude-native", "abc123", _refresh)
+    finally:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        lock_handle.close()
+
+    assert result.rows == _ROWS
+    assert result.freshness is store.CatalogFreshness.STALE
+    assert result.refresh_error == "model catalog refresh lock timed out"
+    assert not called
+
+
+@pytest.mark.asyncio
+async def test_future_mtime_is_stale_until_revalidated() -> None:
+    store.write_catalog("claude-native", "abc123", _ROWS)
+    path = store.catalog_path("claude-native", "abc123")
+    future = time.time() + store.CATALOG_CLOCK_SKEW_TOLERANCE_S + 1
+    os.utime(path, (future, future))
+    refreshed = [{"id": "haiku", "model": "claude-haiku-5", "isDefault": True}]
+
+    async def _refresh() -> list[dict[str, object]]:
+        return refreshed
+
+    result = await store.ensure_catalog("claude-native", "abc123", _refresh)
+
+    assert result.rows == refreshed
+    assert result.freshness is store.CatalogFreshness.FRESH
+
+
+@pytest.mark.asyncio
+async def test_small_future_mtime_is_clamped_fresh() -> None:
+    store.write_catalog("claude-native", "abc123", _ROWS)
+    path = store.catalog_path("claude-native", "abc123")
+    os.utime(path, (time.time() + 1, time.time() + 1))
+    calls = 0
+
+    async def _refresh() -> None:
+        nonlocal calls
+        calls += 1
+
+    result = await store.ensure_catalog("claude-native", "abc123", _refresh)
+
+    assert result.rows == _ROWS
+    assert result.freshness is store.CatalogFreshness.FRESH
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_successful_empty_catalog_is_fresh_and_persisted() -> None:
+    calls = 0
+
+    async def _empty() -> list[dict[str, object]]:
+        nonlocal calls
+        calls += 1
+        return []
+
+    first = await store.ensure_catalog("claude-native", "abc123", _empty)
+    second = await store.ensure_catalog("claude-native", "abc123", _empty)
+
+    assert first.rows == second.rows == []
+    assert first.freshness is second.freshness is store.CatalogFreshness.FRESH
+    assert first.refresh_error is second.refresh_error is None
+    assert calls == 1

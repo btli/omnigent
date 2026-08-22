@@ -9548,7 +9548,8 @@ async def test_claude_launch_catalog_reads_the_store_then_probes_once(
     monkeypatch.setattr(claude_native, "claude_model_catalog", _fake_catalog)
     first = await claude_native.claude_launch_catalog(None)
     second = await claude_native.claude_launch_catalog(None)
-    assert first == second == [{"id": "sonnet", "model": "claude-sonnet-5", "isDefault": True}]
+    assert first == second
+    assert first.rows == [{"id": "sonnet", "model": "claude-sonnet-5", "isDefault": True}]
     assert len(calls) == 1, "the second read must come from the store, not a re-probe"
 
 

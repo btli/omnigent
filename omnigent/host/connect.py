@@ -794,6 +794,7 @@ class ModelOptionsResult:
 
     models: list[dict[str, object]]
     routable_models: list[str]
+    error: str | None = None
 
 
 @dataclass
@@ -2382,14 +2383,26 @@ class HostProcess:
         from omnigent.codex_native_app_server import codex_launch_catalog
 
         try:
-            rows = await codex_launch_catalog()
+            catalog = await codex_launch_catalog()
         except Exception:  # noqa: BLE001 — no catalog, never a crash
             _logger.warning("Codex model catalog unavailable", exc_info=True)
             return None
-        if rows is None:
+        if catalog is None:
             return None
+        rows = catalog.rows
+        if rows is None:
+            return ModelOptionsResult(
+                models=[],
+                routable_models=[],
+                error=catalog.refresh_error or "the codex model probe failed",
+            )
         routable = [row["id"] for row in rows if isinstance(row.get("id"), str) and row["id"]]
-        return ModelOptionsResult(models=rows, routable_models=routable)
+        error = (
+            f"stale model catalog: {catalog.refresh_error or 'refresh failed'}"
+            if catalog.freshness.value == "stale"
+            else None
+        )
+        return ModelOptionsResult(models=rows, routable_models=routable, error=error)
 
     async def _probed_claude_model_options(self) -> ModelOptionsResult | None:
         """
@@ -2406,14 +2419,26 @@ class HostProcess:
 
         try:
             config = await asyncio.to_thread(resolve_native_claude_config, spec=None)
-            rows = await claude_launch_catalog(config)
+            catalog = await claude_launch_catalog(config)
         except Exception:  # noqa: BLE001 — no catalog, never a crash
             _logger.warning("Claude model catalog unavailable", exc_info=True)
             return None
-        if rows is None:
+        if catalog is None:
             return None
+        rows = catalog.rows
+        if rows is None:
+            return ModelOptionsResult(
+                models=[],
+                routable_models=[],
+                error="the claude model probe failed — see the host log",
+            )
         routable = list(config.routable_models) if config is not None else []
-        return ModelOptionsResult(models=rows, routable_models=routable)
+        error = (
+            f"stale model catalog: {catalog.refresh_error or 'refresh failed'}"
+            if catalog.freshness.value == "stale"
+            else None
+        )
+        return ModelOptionsResult(models=rows, routable_models=routable, error=error)
 
     async def _handle_model_options(
         self,
@@ -2439,6 +2464,7 @@ class HostProcess:
                     request_id=frame.request_id,
                     status="ok",
                     models=probed.models,
+                    error=probed.error,
                     routable_models=probed.routable_models,
                 )
             return HostModelOptionsResultFrame(
@@ -2500,6 +2526,7 @@ class HostProcess:
                         request_id=frame.request_id,
                         status="ok",
                         models=probed.models,
+                        error=probed.error,
                         routable_models=probed.routable_models,
                     )
             return HostModelOptionsResultFrame(
@@ -2520,6 +2547,7 @@ class HostProcess:
                 request_id=frame.request_id,
                 status="ok",
                 models=probed.models,
+                error=probed.error,
                 routable_models=probed.routable_models,
             )
         return HostModelOptionsResultFrame(

@@ -11,10 +11,24 @@ from __future__ import annotations
 
 from typing import Any
 
+import click
 import httpx
 import pytest
 
+from omnigent.model_catalog_store import CatalogFreshness, CatalogResult
 from omnigent.runner.app import _codex_native_launch_config
+from omnigent.runner.native.orchestration import _validate_explicit_codex_launch_model
+
+
+def test_stale_catalog_cannot_authorize_an_explicit_codex_model() -> None:
+    catalog = CatalogResult(
+        [{"id": "removed-model", "model": "removed-model"}],
+        CatalogFreshness.STALE,
+        "provider credentials expired",
+    )
+
+    with pytest.raises(click.ClickException, match="provider credentials expired"):
+        _validate_explicit_codex_launch_model("removed-model", catalog)
 
 
 class _Resp:
