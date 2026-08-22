@@ -3655,8 +3655,9 @@ def test_inject_user_message_raises_when_draft_never_submits(
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
     monkeypatch.setattr("omnigent.claude_native_bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
-    monkeypatch.setattr("omnigent.claude_native_bridge._SUBMIT_VERIFY_TIMEOUT_S", 0.2)
+    monkeypatch.setattr("omnigent.claude_native_bridge._SUBMIT_VERIFY_TIMEOUT_S", 30.0)
     monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr("omnigent.claude_native_bridge.time", _VirtualClock())
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
         bridge_dir,
@@ -3690,7 +3691,7 @@ def test_inject_user_message_raises_when_draft_never_submits(
         RuntimeError,
         match=r"Claude Code hasn't accepted the message yet — your text is still in the "
         r"sub-agent's input box\. Open the Subagents panel and press Enter to send it\. "
-        r"Waited 0\.2s\.",
+        r"Waited 30s\.",
     ):
         inject_user_message(bridge_dir, content="fix the flaky test")
 
@@ -8027,14 +8028,14 @@ def test_a_slash_command_stuck_in_the_composer_fails_loud(
     the authoritative fallback — an honest failure, not a silent divergence.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
-    monkeypatch.setattr(claude_native_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(claude_native_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 30.0)
     _fake_tmux(monkeypatch, [_composer_pane("/effort high")])
 
     with pytest.raises(
         RuntimeError,
         match=r"Claude Code hasn't accepted the slash command yet — it is still in the "
         r"sub-agent's input box\. Open the Subagents panel and press Enter to send it\. "
-        r"Waited 0\.2s\.",
+        r"Waited 30s\.",
     ):
         claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
@@ -8093,8 +8094,33 @@ def test_submit_verify_honors_the_budget_override(
     )
 
 
-def test_invalid_submit_verify_budget_uses_default() -> None:
-    env = os.environ | {"OMNIGENT_CLAUDE_SUBMIT_VERIFY_TIMEOUT_S": "invalid"}
+@pytest.mark.parametrize(("value", "expected"), [(None, "30.0"), ("45", "45.0")])
+def test_submit_verify_budget_reads_environment(value: str | None, expected: str) -> None:
+    env = os.environ.copy()
+    if value is None:
+        env.pop("OMNIGENT_CLAUDE_SUBMIT_VERIFY_TIMEOUT_S", None)
+    else:
+        env["OMNIGENT_CLAUDE_SUBMIT_VERIFY_TIMEOUT_S"] = value
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import omnigent.claude_native_bridge as bridge; "
+            "print(bridge._SUBMIT_VERIFY_TIMEOUT_S)",
+        ],
+        check=True,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+
+    assert result.stdout.strip() == expected
+
+
+@pytest.mark.parametrize("value", ["inf", "nan", "0", "-5", "invalid"])
+def test_invalid_submit_verify_budget_warns_and_uses_default(value: str) -> None:
+    variable = "OMNIGENT_CLAUDE_SUBMIT_VERIFY_TIMEOUT_S"
+    env = os.environ | {variable: value}
     result = subprocess.run(
         [
             sys.executable,
@@ -8109,6 +8135,8 @@ def test_invalid_submit_verify_budget_uses_default() -> None:
     )
 
     assert result.stdout.strip() == "30.0"
+    assert f"{variable}={value!r}" in result.stderr
+    assert "using 30s" in result.stderr
 
 
 def test_an_effort_switch_with_a_swallowed_confirm_leaves_the_pane_usable(
