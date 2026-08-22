@@ -170,7 +170,12 @@ _PASTE_COMMIT_TIMEOUT_S = 5.0
 # After the submit Enter, how long to keep checking that the draft
 # actually left the input box (re-sending Enter while it hasn't) before
 # failing loud. OMNIGENT_CLAUDE_SUBMIT_VERIFY_TIMEOUT_S overrides it.
-_SUBMIT_VERIFY_TIMEOUT_S = float(os.environ.get("OMNIGENT_CLAUDE_SUBMIT_VERIFY_TIMEOUT_S", "30"))
+_SUBMIT_VERIFY_TIMEOUT_ENV = "OMNIGENT_CLAUDE_SUBMIT_VERIFY_TIMEOUT_S"
+try:
+    _SUBMIT_VERIFY_TIMEOUT_S = float(os.environ.get(_SUBMIT_VERIFY_TIMEOUT_ENV, "30"))
+except ValueError:
+    _logger.warning("Ignoring invalid %s; using 30s", _SUBMIT_VERIFY_TIMEOUT_ENV)
+    _SUBMIT_VERIFY_TIMEOUT_S = 30.0
 # Minimum spacing between repeated submit Enters during verification.
 # Long enough for the TUI to clear the box after a successful submit
 # (so a slow-but-successful first Enter isn't double-tapped), short
