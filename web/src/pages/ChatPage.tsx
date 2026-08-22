@@ -227,6 +227,19 @@ import { ConnectionIndicator } from "./ChatIndicators";
 import { CHAT_COLUMN_WIDTH } from "./chatLayout";
 import { Transcript } from "@/components/chat/Transcript";
 
+export function TerminalSurface({ isShown, children }: { isShown: boolean; children: ReactNode }) {
+  return (
+    <div
+      data-testid="terminal-surface"
+      className={cn("absolute inset-0 flex flex-col", !isShown && "pointer-events-none opacity-0")}
+      aria-hidden={!isShown}
+      inert={!isShown ? ("" as unknown as boolean) : undefined}
+    >
+      {children}
+    </div>
+  );
+}
+
 /** Server-info as consumers see it: the probe's result, or "loading". */
 type ServerInfoValue = ServerInfo | "loading";
 
@@ -1540,10 +1553,9 @@ function MainAgentSurface({
   // + full repaint) pre-warms in the background and survives both
   // Chat/Terminal flips AND session switches: a small LRU keeps the last
   // few sessions' surfaces alive after navigating away, so coming back is
-  // near-instant instead of re-dialing from scratch. `invisible` (not
-  // display:none) keeps a hidden overlay's layout size, so FitAddon
-  // geometry stays correct and no resize churn hits tmux; hidden elements
-  // don't paint, hit-test, or take focus. The chat surface still unmounts
+  // near-instant instead of re-dialing from scratch. Opacity keeps hidden
+  // overlays laid out for stable FitAddon geometry; inert prevents interaction.
+  // The chat surface still unmounts
   // while the terminal is shown — a heavy transcript shouldn't render
   // behind a live terminal.
   const mountTerminal = shouldMountTerminalSurface(conversationId, terminalFirst);
@@ -1578,11 +1590,7 @@ function MainAgentSurface({
     const isActive = mountTerminal && entry.conversationId === conversationId;
     const isShown = isActive && showTerminal;
     return (
-      <div
-        key={entry.conversationId}
-        className={cn("absolute inset-0 flex flex-col", !isShown && "invisible")}
-        aria-hidden={!isShown}
-      >
+      <TerminalSurface key={entry.conversationId} isShown={isShown}>
         <MainTerminalView
           conversationId={entry.conversationId}
           initialTerminalKey={isActive ? terminalFirst?.terminalViewKey : null}
@@ -1595,7 +1603,7 @@ function MainAgentSurface({
         {isShown && (
           <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
         )}
-      </div>
+      </TerminalSurface>
     );
   });
 
