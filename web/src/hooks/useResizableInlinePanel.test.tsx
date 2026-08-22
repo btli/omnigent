@@ -1,4 +1,4 @@
-import { act, renderHook } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { readSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { resetWidthStoreForTesting, useResizableInlinePanel } from "./useResizableInlinePanel";
@@ -189,6 +189,8 @@ describe("useResizableInlinePanel drag overlay", () => {
       useResizableInlinePanel(sessionId, undefined, 0, false),
     );
     const initialWidth = result.current.panelWidth;
+    expect(result.current.handleProps["aria-disabled"]).toBe(true);
+    expect(result.current.handleProps.tabIndex).toBe(-1);
 
     act(() =>
       result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
@@ -200,6 +202,30 @@ describe("useResizableInlinePanel drag overlay", () => {
       window.dispatchEvent(new MouseEvent("mouseup"));
     });
     expect(result.current.panelWidth).toBe(initialWidth);
+    expect(readSessionWorkspaceState(sessionId).widthPx).toBeUndefined();
+    unmount();
+  });
+
+  it("freezes and does not persist a drag when its key becomes tentative", async () => {
+    const sessionId = "conv_mid_drag";
+    const { result, rerender, unmount } = renderHook(
+      ({ persistEnabled }) => useResizableInlinePanel(sessionId, undefined, 0, persistEnabled),
+      { initialProps: { persistEnabled: true } },
+    );
+
+    act(() =>
+      result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
+    );
+    act(() => window.dispatchEvent(new MouseEvent("mousemove", { clientX: 1200 })));
+    await waitFor(() => expect(result.current.panelWidth).toBe(800));
+    expect(readSessionWorkspaceState(sessionId).widthPx).toBeUndefined();
+
+    rerender({ persistEnabled: false });
+    act(() => {
+      window.dispatchEvent(new MouseEvent("mousemove", { clientX: 1000 }));
+      window.dispatchEvent(new MouseEvent("mouseup"));
+    });
+    expect(result.current.panelWidth).toBe(800);
     expect(readSessionWorkspaceState(sessionId).widthPx).toBeUndefined();
     unmount();
   });

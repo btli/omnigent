@@ -318,7 +318,8 @@ export function useResizableInlinePanel(
       role: "separator" as const,
       "aria-orientation": "vertical" as const,
       "aria-label": "Resize panel",
-      tabIndex: 0,
+      "aria-disabled": !persistEnabled,
+      tabIndex: persistEnabled ? 0 : -1,
     },
   };
 }
