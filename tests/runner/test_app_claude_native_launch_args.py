@@ -86,8 +86,8 @@ def test_configured_gateway_pin_survives_a_stale_catalog() -> None:
     )
 
 
-def test_offline_gateway_without_a_pin_remains_launchable() -> None:
-    assert (
+def test_unpinned_gateway_with_stale_catalog_fails_actionably() -> None:
+    with pytest.raises(click.ClickException, match="provider credentials expired"):
         _select_authoritative_claude_launch_model(
             explicit_model=None,
             configured_model=None,
@@ -96,8 +96,6 @@ def test_offline_gateway_without_a_pin_remains_launchable() -> None:
             ),
             catalog=_catalog(CatalogFreshness.STALE),
         )
-        is None
-    )
 
 
 @pytest.mark.parametrize(

@@ -3759,11 +3759,11 @@ async def _auto_create_codex_terminal(
     # Resolved before the fork/cold-resume branches below so any rollout
     # synthesis can stamp session_meta.model_provider with the provider
     # this launch actually routes through.
-    default_model = launch_config.model_override or _codex_native_model_from_spec(agent_spec)
+    explicit_model = launch_config.model_override or _codex_native_model_from_spec(agent_spec)
     # Thread the spec so its executor.auth / legacy profile win over
     # machine-level config, parity with the in-process harness (#2744).
     _launch_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
-    _codex_launch = resolve_native_codex_launch(model=default_model, spec=_launch_spec)
+    _codex_launch = resolve_native_codex_launch(model=explicit_model, spec=_launch_spec)
     _session_meta_provider = codex_session_meta_model_provider(_codex_launch)
     from omnigent.inner.codex_executor import _find_codex_cli
 
@@ -3774,31 +3774,21 @@ async def _auto_create_codex_terminal(
     # the user's shared config can never govern a session (the stale-gpt-5.4
     # 400 class). Profile-backed shapes already resolve their default at
     # materialization time and are left alone.
-    if launch_config.model_override or (
-        _codex_launch.model is None and _codex_launch.profile is None
-    ):
+    if explicit_model or (_codex_launch.model is None and _codex_launch.profile is None):
         from dataclasses import replace as _dataclass_replace
 
         from omnigent.codex_native_app_server import codex_launch_catalog
-        from omnigent.model_catalog_store import CatalogFreshness, catalog_contains, default_row
+        from omnigent.model_catalog_store import CatalogFreshness, default_row
 
         _codex_catalog_result = await codex_launch_catalog(codex_path=_codex_cli_path)
-        _codex_catalog = _codex_catalog_result.rows
-        if (
-            launch_config.model_override
-            and _codex_catalog
-            and _codex_catalog_result.freshness is CatalogFreshness.FRESH
-        ):
-            if not catalog_contains(_codex_catalog, launch_config.model_override):
-                raise click.ClickException(
-                    f"the requested model {launch_config.model_override!r} is not in "
-                    "this host's current model list — it may have changed since the "
-                    "pick. Pick again from the model menu."
-                )
+        _codex_catalog = _codex_catalog_result.rows if _codex_catalog_result is not None else None
+        if explicit_model:
+            _validate_explicit_codex_launch_model(explicit_model, _codex_catalog_result)
         if (
             _codex_launch.model is None
             and _codex_launch.profile is None
             and _codex_catalog
+            and _codex_catalog_result is not None
             and _codex_catalog_result.freshness is CatalogFreshness.FRESH
         ):
             _catalog_default = default_row(_codex_catalog)
@@ -6062,6 +6052,25 @@ async def _load_claude_launch_metadata(
     return metadata
 
 
+def _validate_explicit_codex_launch_model(model: str, catalog: Any) -> None:
+    """Require fresh catalog authority for a persisted Codex model."""
+    from omnigent.model_catalog_store import CatalogFreshness, catalog_contains
+
+    if catalog is None:
+        return
+    if catalog.freshness is not CatalogFreshness.FRESH:
+        raise click.ClickException(
+            f"the requested model {model!r} could not be validated against a fresh model "
+            f"list ({catalog.refresh_error or 'catalog refresh failed'}). Pick again after "
+            "restoring provider credentials."
+        )
+    if catalog.rows is None or not catalog_contains(catalog.rows, model):
+        raise click.ClickException(
+            f"the requested model {model!r} is not in this host's current model list — it "
+            "may have changed since the pick. Pick again from the model menu."
+        )
+
+
 def _select_authoritative_claude_launch_model(
     *,
     explicit_model: str | None,
@@ -6114,6 +6123,12 @@ def _select_authoritative_claude_launch_model(
             "Claude provider configuration and the fresh model list are unavailable. "
             "Restore provider credentials and retry; for Databricks, run "
             "`databricks auth login --profile <PROFILE>`."
+        )
+    if claude_config is not None and catalog is not None:
+        raise click.ClickException(
+            "the configured Claude gateway has no authoritative launch model "
+            f"({catalog.refresh_error or 'model catalog unavailable'}). Restore provider "
+            "credentials and retry."
         )
     return None
 

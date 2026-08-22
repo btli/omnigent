@@ -177,3 +177,21 @@ async def test_small_future_mtime_is_clamped_fresh() -> None:
     assert result.rows == _ROWS
     assert result.freshness is store.CatalogFreshness.FRESH
     assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_successful_empty_catalog_is_fresh_and_persisted() -> None:
+    calls = 0
+
+    async def _empty() -> list[dict[str, object]]:
+        nonlocal calls
+        calls += 1
+        return []
+
+    first = await store.ensure_catalog("claude-native", "abc123", _empty)
+    second = await store.ensure_catalog("claude-native", "abc123", _empty)
+
+    assert first.rows == second.rows == []
+    assert first.freshness is second.freshness is store.CatalogFreshness.FRESH
+    assert first.refresh_error is second.refresh_error is None
+    assert calls == 1

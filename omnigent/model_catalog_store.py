@@ -231,7 +231,7 @@ async def ensure_catalog(
                 ):
                     return CatalogResult(post_lock, CatalogFreshness.FRESH)
                 rows = await asyncio.wait_for(resolve(), timeout=CATALOG_REFRESH_TIMEOUT_S)
-                if rows:
+                if rows is not None:
                     write_catalog(harness, fingerprint, rows)
                     return CatalogResult(rows, CatalogFreshness.FRESH)
                 return _failed_refresh(cached, "model catalog refresh returned no models")

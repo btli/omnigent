@@ -8887,8 +8887,16 @@ def create_runner_app(
                     "detail": "the harness model probe is still resolving",
                 },
             )
+        if catalog is None:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "claude_native_model_options_failed",
+                    "detail": "the harness model probe failed; retrying",
+                },
+            )
         rows = catalog.rows
-        if not rows:
+        if rows is None:
             return JSONResponse(
                 status_code=503,
                 content={

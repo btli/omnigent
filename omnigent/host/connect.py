@@ -794,6 +794,7 @@ class ModelOptionsResult:
 
     models: list[dict[str, object]]
     routable_models: list[str]
+    error: str | None = None
 
 
 @dataclass
@@ -2316,11 +2317,22 @@ class HostProcess:
         except Exception:  # noqa: BLE001 — no catalog, never a crash
             _logger.warning("Codex model catalog unavailable", exc_info=True)
             return None
+        if catalog is None:
+            return None
         rows = catalog.rows
         if rows is None:
-            return None
+            return ModelOptionsResult(
+                models=[],
+                routable_models=[],
+                error=catalog.refresh_error or "the codex model probe failed",
+            )
         routable = [row["id"] for row in rows if isinstance(row.get("id"), str) and row["id"]]
-        return ModelOptionsResult(models=rows, routable_models=routable)
+        error = (
+            f"stale model catalog: {catalog.refresh_error or 'refresh failed'}"
+            if catalog.freshness.value == "stale"
+            else None
+        )
+        return ModelOptionsResult(models=rows, routable_models=routable, error=error)
 
     async def _probed_claude_model_options(self) -> ModelOptionsResult | None:
         """
@@ -2341,11 +2353,22 @@ class HostProcess:
         except Exception:  # noqa: BLE001 — no catalog, never a crash
             _logger.warning("Claude model catalog unavailable", exc_info=True)
             return None
+        if catalog is None:
+            return None
         rows = catalog.rows
         if rows is None:
-            return None
+            return ModelOptionsResult(
+                models=[],
+                routable_models=[],
+                error="the claude model probe failed — see the host log",
+            )
         routable = list(config.routable_models) if config is not None else []
-        return ModelOptionsResult(models=rows, routable_models=routable)
+        error = (
+            f"stale model catalog: {catalog.refresh_error or 'refresh failed'}"
+            if catalog.freshness.value == "stale"
+            else None
+        )
+        return ModelOptionsResult(models=rows, routable_models=routable, error=error)
 
     async def _handle_model_options(
         self,
@@ -2371,6 +2394,7 @@ class HostProcess:
                     request_id=frame.request_id,
                     status="ok",
                     models=probed.models,
+                    error=probed.error,
                     routable_models=probed.routable_models,
                 )
             return HostModelOptionsResultFrame(
@@ -2432,6 +2456,7 @@ class HostProcess:
                         request_id=frame.request_id,
                         status="ok",
                         models=probed.models,
+                        error=probed.error,
                         routable_models=probed.routable_models,
                     )
             return HostModelOptionsResultFrame(
@@ -2452,6 +2477,7 @@ class HostProcess:
                 request_id=frame.request_id,
                 status="ok",
                 models=probed.models,
+                error=probed.error,
                 routable_models=probed.routable_models,
             )
         return HostModelOptionsResultFrame(
