@@ -168,9 +168,9 @@ _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit E
 # the handoff deterministic where the old fixed sleep raced it.
 _PASTE_COMMIT_TIMEOUT_S = 5.0
 # After the submit Enter, how long to keep checking that the draft
-# actually left the input box (re-sending Enter while it hasn't)
-# before failing loud.
-_SUBMIT_VERIFY_TIMEOUT_S = 10.0
+# actually left the input box (re-sending Enter while it hasn't) before
+# failing loud. OMNIGENT_CLAUDE_SUBMIT_VERIFY_TIMEOUT_S overrides it.
+_SUBMIT_VERIFY_TIMEOUT_S = float(os.environ.get("OMNIGENT_CLAUDE_SUBMIT_VERIFY_TIMEOUT_S", "30"))
 # Minimum spacing between repeated submit Enters during verification.
 # Long enough for the TUI to clear the box after a successful submit
 # (so a slow-but-successful first Enter isn't double-tapped), short
@@ -3189,24 +3189,17 @@ def inject_user_message(
         # verification would trivially "pass". Submit blind as before.
         return
     # Verify the submit took: a successful Enter clears the input box.
-    # If the draft is still sitting there the Enter was swallowed into
-    # the paste burst as a newline — re-send it (the retry lands well
-    # after the burst, so it submits). Each Enter only fires while the
-    # draft is verifiably still present, so a retry can never hit an
-    # empty prompt or a permission dialog of the started turn.
-    deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
-    last_enter = time.monotonic()
-    while time.monotonic() < deadline:
-        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-        pane = _capture_pane(info["socket_path"], info["tmux_target"])
-        if not _draft_in_input_box(pane, needle):
-            return
-        if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
-            _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
-            last_enter = time.monotonic()
-    raise RuntimeError(
-        f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
-        "(the draft is still in the input box). The message was not delivered."
+    # A draft still sitting there means the Enter was swallowed into the
+    # paste burst as a newline, so it is re-sent until the box clears.
+    _verify_draft_submitted(
+        info["socket_path"],
+        info["tmux_target"],
+        needle,
+        failure_message=(
+            "Claude Code hasn't accepted the message yet — your text is still in the "
+            "sub-agent's input box. Open the Subagents panel and press Enter to send it. "
+            f"Waited {_SUBMIT_VERIFY_TIMEOUT_S}s."
+        ),
     )
 
 
@@ -3406,28 +3399,18 @@ def inject_slash_command(
     time.sleep(_PASTE_SETTLE_S)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     if draft_seen:
-        # Re-send only while the command verifiably still sits in the box —
-        # a one-poll-stale retry can at worst hit the empty composer (no-op)
-        # or our own confirm dialog (the intended answer), never a foreign
-        # surface. The command leaving the box is the submit signal; the
-        # dialog replacing the composer counts, since submission pops it.
-        deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
-        last_enter = time.monotonic()
-        submitted = False
-        while time.monotonic() < deadline:
-            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-            if not _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
-                submitted = True
-                break
-            if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
-                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-                last_enter = time.monotonic()
-        if not submitted:
-            raise RuntimeError(
-                f"Claude Code did not accept the slash command within "
-                f"{_SUBMIT_VERIFY_TIMEOUT_S}s (the command is still in the "
-                "input box). The command was not delivered."
-            )
+        # The command leaving the box is the submit signal; the dialog
+        # replacing the composer counts, since submission pops it.
+        _verify_draft_submitted(
+            socket_path,
+            tmux_target,
+            needle,
+            failure_message=(
+                "Claude Code hasn't accepted the slash command yet — it is still in the "
+                "sub-agent's input box. Open the Subagents panel and press Enter to send it."
+                f" Waited {_SUBMIT_VERIFY_TIMEOUT_S}s."
+            ),
+        )
     if dialog_hint is not None:
         _confirm_tui_dialog(socket_path, tmux_target, hint=dialog_hint)
 
@@ -4133,6 +4116,26 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
     if _PASTED_PLACEHOLDER_PREFIX in tail:
         return True
     return bool(needle) and needle in tail
+
+
+def _verify_draft_submitted(
+    socket_path: str,
+    tmux_target: str,
+    needle: str,
+    *,
+    failure_message: str,
+) -> None:
+    """Re-send Enter while the draft verifiably remains in the input box."""
+    deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
+    last_enter = time.monotonic()
+    while time.monotonic() < deadline:
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+        if not _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
+            return
+        if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+            last_enter = time.monotonic()
+    raise RuntimeError(failure_message)
 
 
 def _format_terminal_failure_tail(pane: str) -> str:
