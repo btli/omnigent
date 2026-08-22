@@ -8882,7 +8882,7 @@ def create_runner_app(
             # (ensure_catalog shields it), so a 503 here is genuinely
             # "pending", not "restarted".
             async with asyncio.timeout(_CLAUDE_MODEL_OPTIONS_INLINE_WAIT_S):
-                rows = await claude_launch_catalog(claude_config)
+                catalog = await claude_launch_catalog(claude_config)
         except TimeoutError:
             return JSONResponse(
                 status_code=503,
@@ -8891,7 +8891,16 @@ def create_runner_app(
                     "detail": "the harness model probe is still resolving",
                 },
             )
-        if not rows:
+        if catalog is None:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "claude_native_model_options_failed",
+                    "detail": "the harness model probe failed; retrying",
+                },
+            )
+        rows = catalog.rows
+        if rows is None:
             return JSONResponse(
                 status_code=503,
                 content={

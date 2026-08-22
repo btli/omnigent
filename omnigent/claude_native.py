@@ -63,7 +63,7 @@ from omnigent_client._http import is_loopback_url
 from websockets.exceptions import ConnectionClosed, ConnectionClosedError, WebSocketException
 from websockets.frames import Close
 
-from omnigent import model_catalog
+from omnigent import model_catalog, model_catalog_store
 from omnigent._native_resume_hint import echo_native_resume_hint
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._startup_profile import StartupProfiler
@@ -413,6 +413,13 @@ def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> b
         return True
     host = (urlparse(base_url).hostname or "").lower()
     return host == "anthropic.com" or host.endswith(".anthropic.com")
+
+
+def claude_config_serves_canonical_ids(
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> bool:
+    """Whether a launch config accepts canonical Anthropic model ids."""
+    return claude_config is None or _serves_canonical_anthropic_ids(claude_config)
 
 
 def _claude_family(token: str) -> str | None:
@@ -1187,7 +1194,7 @@ async def claude_model_catalog(
 
 async def claude_launch_catalog(
     claude_config: ClaudeNativeUcodeConfig | None,
-) -> list[dict[str, object]] | None:
+) -> model_catalog_store.CatalogResult:
     """
     The shared catalog for this launch config: read the store, probe on miss.
 
@@ -1196,10 +1203,8 @@ async def claude_launch_catalog(
     the answer for every later consumer.
 
     :param claude_config: The resolved launch config, or ``None``.
-    :returns: Catalog rows, or ``None`` when no catalog could be obtained.
+    :returns: Catalog rows with freshness and any sanitized refresh error.
     """
-    from omnigent import model_catalog_store
-
     fingerprint = claude_catalog_fingerprint(claude_config)
     return await model_catalog_store.ensure_catalog(
         "claude-native", fingerprint, lambda: claude_model_catalog(claude_config)

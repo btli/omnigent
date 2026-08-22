@@ -279,6 +279,31 @@ async def test_handle_model_options_codex_probe_failure_is_an_honest_empty(
     _cleanup_host(host)
 
 
+async def test_handle_model_options_labels_stale_codex_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent import codex_native_app_server
+    from omnigent.model_catalog_store import CatalogFreshness, CatalogResult
+
+    async def _stale_catalog(**_kwargs: object) -> CatalogResult:
+        return CatalogResult(
+            [{"id": "removed-model", "model": "removed-model"}],
+            CatalogFreshness.STALE,
+            "provider credentials expired",
+        )
+
+    monkeypatch.setattr(codex_native_app_server, "codex_launch_catalog", _stale_catalog)
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_stale", harness="codex-native"),
+    )
+
+    assert result.models == [{"id": "removed-model", "model": "removed-model"}]
+    assert result.error == "stale model catalog: provider credentials expired"
+    _cleanup_host(host)
+
+
 async def test_handle_model_options_rejects_unsupported_harness() -> None:
     """Only launch paths with host-resolved model catalogs are accepted."""
     host = _make_host_process()

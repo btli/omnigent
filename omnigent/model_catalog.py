@@ -34,6 +34,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 from dataclasses import dataclass, field, replace
@@ -961,6 +962,18 @@ def _redacted_failure_reason(exc: Exception) -> str:
         # secret-free messages (no credential / no base_url / empty token).
         return str(exc)
     if isinstance(exc, OSError):
+        error_text = str(exc)
+        if re.search(r"(?i)(?:--token\b|token\s*=|\b(?:dapi|sk-)[A-Za-z0-9_-]+)", error_text):
+            return "provider credentials or network unavailable"
+        match = re.search(
+            r"(?<!\S)databricks auth login --profile ([A-Za-z0-9_.-]+)(?!\S)",
+            error_text,
+        )
+        if match is not None:
+            return (
+                "provider credentials expired; run "
+                f"`databricks auth login --profile {match.group(1)}`"
+            )
         return "provider credentials or network unavailable"
     return type(exc).__name__
 

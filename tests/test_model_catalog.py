@@ -1236,6 +1236,31 @@ def test_failed_auth_command_note_never_leaks_the_command(
     assert secret not in json.dumps(catalog)
 
 
+def test_databricks_reauth_guidance_survives_failure_redaction() -> None:
+    exc = OSError("refresh expired; run databricks auth login --profile DEFAULT")
+
+    assert model_catalog._redacted_failure_reason(exc) == (
+        "provider credentials expired; run `databricks auth login --profile DEFAULT`"
+    )
+    fake_token = "dapiFAKEFAKEFAKE0000"
+    exc = OSError(
+        f"token={fake_token}; databricks auth login --profile DEFAULT --token {fake_token}"
+    )
+    reason = model_catalog._redacted_failure_reason(exc)
+    assert reason == "provider credentials or network unavailable"
+    assert fake_token not in reason
+
+
+def test_databricks_reauth_guidance_does_not_echo_token_shaped_profile() -> None:
+    fake_profile = "dapiFAKEPROFILE0000"
+    exc = OSError(f"databricks auth login --profile {fake_profile}")
+
+    reason = model_catalog._redacted_failure_reason(exc)
+
+    assert reason == "provider credentials or network unavailable"
+    assert fake_profile not in reason
+
+
 # ── catalog_for_spec (the tool payload) ────────────────────
 
 
