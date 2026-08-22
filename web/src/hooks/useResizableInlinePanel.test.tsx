@@ -183,6 +183,27 @@ describe("useResizableInlinePanel drag overlay", () => {
         c instanceof HTMLElement && c.style.position === "fixed" && c.style.zIndex === "2147483647",
     ) ?? null;
 
+  it("ignores drag input while persistence is disabled for a tentative key", () => {
+    const sessionId = "conv_tentative";
+    const { result, unmount } = renderHook(() =>
+      useResizableInlinePanel(sessionId, undefined, 0, false),
+    );
+    const initialWidth = result.current.panelWidth;
+
+    act(() =>
+      result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
+    );
+    expect(overlaySelector()).toBeNull();
+
+    act(() => {
+      window.dispatchEvent(new MouseEvent("mousemove", { clientX: 100 }));
+      window.dispatchEvent(new MouseEvent("mouseup"));
+    });
+    expect(result.current.panelWidth).toBe(initialWidth);
+    expect(readSessionWorkspaceState(sessionId).widthPx).toBeUndefined();
+    unmount();
+  });
+
   it("mounts a full-window overlay during a drag so mouseup isn't lost to an iframe", () => {
     // The panel sits beside the sandboxed HTML-preview iframe. Without an
     // overlay, dragging over the frame routes mousemove/mouseup into it and the
