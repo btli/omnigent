@@ -29,7 +29,7 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
 // Match the AppShell.test.tsx mocks except DO NOT mock SubagentsPanel —
 // we want the real one so its <Link> renders.
@@ -216,11 +216,9 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
           error: null,
         } as never;
       }
-      // Simulate the real-world race: when the user navigates to a
-      // child, ``useSession(conv_child)`` is loading on first render
-      // — so ``activeSession`` is null. AppShell's
-      // ``rootSessionId = activeSession?.parentSessionId ?? conversationId``
-      // therefore briefly resolves to ``conv_child`` itself.
+      // Simulate the real-world race: when the user navigates to a child,
+      // ``useSession(conv_child)`` is loading on first render. Without the
+      // sticky root, the fallback would briefly resolve to the child itself.
       if (id === "conv_child" || id === "conv_sibling") {
         return { session: null, isLoading: true, error: null } as never;
       }
@@ -280,16 +278,51 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
     expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveStyle({
       width: "500px",
     });
+    expect(readSessionWorkspaceState("conv_child").widthPx).toBeUndefined();
 
     fireEvent.click(screen.getAllByTestId("subagent-row")[1]);
     expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveStyle({
       width: "500px",
     });
+    expect(readSessionWorkspaceState("conv_sibling").widthPx).toBeUndefined();
 
     fireEvent.click(screen.getByTestId("subagent-main-row"));
     expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveStyle({
       width: "500px",
     });
+  });
+
+  it("does not persist width under a cold-loaded child's tentative key", () => {
+    vi.mocked(useChildSessions).mockReturnValue({
+      children: [],
+      isLoading: true,
+      error: null,
+    });
+    vi.mocked(useSession).mockReturnValue({
+      session: null,
+      isLoading: true,
+      error: null,
+    } as never);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_cold_child"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route path="c/:conversationId" element={<div data-testid="page" />} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.keyDown(screen.getByRole("separator", { name: "Resize panel" }), {
+      key: "ArrowLeft",
+    });
+    expect(readSessionWorkspaceState("conv_cold_child").widthPx).toBeUndefined();
   });
 
   it("shows the Agents tab with count 1 while a childless session's initial fetch is loading", () => {
