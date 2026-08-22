@@ -181,6 +181,92 @@ async def _post_native_idle(
     return resp.status_code, items
 
 
+async def _post_native_failed(
+    *,
+    child_body: dict[str, Any],
+    output: str | None,
+) -> list[dict[str, Any]]:
+    """POST a native ``external_session_status: failed`` and return inbox items.
+
+    Seeds the parent inbox and a registered work entry (the healthy path) so the
+    failed edge delivers. ``output=None`` omits the field entirely, modelling a
+    ``StopFailure`` the bridge could not extract a detail from — the runner must
+    then substitute the generic string.
+    """
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    runner_app.register_subagent_work(
+        parent_session_id=PARENT_SESSION_ID,
+        child_session_id=CHILD_SESSION_ID,
+        agent="reviewer",
+        title="review",
+    )
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="reviewer",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+        )
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=_SnapshotServerClient(child_body),  # type: ignore[arg-type]
+    )
+    data: dict[str, Any] = {"status": "failed"}
+    if output is not None:
+        data["output"] = output
+    async with _runner_client(app) as client:
+        await client.post(
+            f"/v1/sessions/{CHILD_SESSION_ID}/events",
+            json={"type": "external_session_status", "data": data},
+        )
+
+    inbox = runner_app._session_inboxes_ref.get(PARENT_SESSION_ID)
+    items: list[dict[str, Any]] = []
+    if inbox is not None:
+        while not inbox.empty():
+            items.append(inbox.get_nowait())
+    return items
+
+
+@pytest.mark.asyncio
+async def test_native_failure_forwards_provider_detail_as_output(
+    _clean_subagent_registry: None,
+) -> None:
+    """A failed edge carrying provider detail delivers that detail to the parent.
+
+    The forwarder posts the ``StopFailure`` failure text as ``output``; the
+    runner must surface it verbatim instead of the generic string.
+    """
+    detail = "model_not_found: There's an issue with the selected model (claude-fable-5)."
+    items = await _post_native_failed(
+        child_body=_child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID),
+        output=detail,
+    )
+    assert items and items[0]["status"] == "failed"
+    assert items[0]["output"] == detail
+
+
+@pytest.mark.asyncio
+async def test_native_failure_without_detail_falls_back_to_generic(
+    _clean_subagent_registry: None,
+) -> None:
+    """A failed edge with no detail falls back to the generic failure string.
+
+    The generic string is the correct output ONLY when the provider gave no
+    actionable detail — it must not shadow a real one (see the sibling test).
+    """
+    items = await _post_native_failed(
+        child_body=_child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID),
+        output=None,
+    )
+    assert items and items[0]["status"] == "failed"
+    assert items[0]["output"] == "Error: native sub-agent turn failed"
+
+
 @pytest.mark.asyncio
 async def test_native_completion_recovers_reconnect_wiped_work_entry(
     _clean_subagent_registry: None,
