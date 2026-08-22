@@ -2766,6 +2766,12 @@ _TERMINAL_BACKGROUND_TASK_STATUSES: frozenset[str] = frozenset(
 # Upper bound on the failure detail carried to a parent session. A few hundred
 # chars keeps the surfaced error readable while refusing an entire stack trace.
 _HOOK_FAILURE_DETAIL_MAX_CHARS = 500
+# Explicit marker appended when the detail is truncated.
+_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER = "… [truncated]"
+# Hard cap on the RAW payload scanned, so a multi-megabyte provider blob is
+# never fully regex-scanned or walked char-by-char. A generous multiple of the
+# output cap leaves headroom for ANSI/control bytes that shrink after stripping.
+_HOOK_FAILURE_DETAIL_RAW_LIMIT = _HOOK_FAILURE_DETAIL_MAX_CHARS * 8
 # ANSI CSI/OSC escape sequences a provider may embed in hook text.
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 
@@ -2774,15 +2780,26 @@ def _sanitize_hook_failure_detail(text: str) -> str | None:
     """
     Scrub and cap untrusted hook failure text for a parent session ``output``.
 
-    Hook text is provider-controlled: strip ANSI escapes and control bytes to a
-    single line, redact secret-shaped substrings (reusing the CLI diagnostics
-    redactor), then cap the length with an explicit truncation marker.
+    Hook text is provider-controlled, so it is bounded and scrubbed:
+
+    1. The raw input is bounded up front, so a huge blob is never fully scanned.
+    2. ANSI escapes and control bytes are stripped to a single line, so the
+       detail cannot corrupt a terminal or log.
+    3. Secrets are redacted BEFORE the length cap, so a length-gated pattern
+       (e.g. ``sk-…{10,}``) matches whole tokens — a boundary token becomes
+       ``[REDACTED]`` before truncation can split it into a usable prefix.
+    4. The redacted text is capped with an explicit marker, then redacted once
+       more so the FINAL emitted string is itself the output of the redactor.
+
+    Guarantee: no secret the redactor recognizes can appear in the result,
+    including one that straddled the truncation boundary. (An unrecognized
+    secret cut mid-token is inherent to any cap and unaffected by ordering.)
 
     :param text: Raw failure text from a ``StopFailure`` hook payload.
     :returns: Sanitized single-line detail, or ``None`` when nothing usable
         remains.
     """
-    without_ansi = _ANSI_ESCAPE_RE.sub("", text)
+    without_ansi = _ANSI_ESCAPE_RE.sub("", text[:_HOOK_FAILURE_DETAIL_RAW_LIMIT])
     # Non-printable control bytes (and newlines/tabs) become spaces so the detail
     # cannot corrupt a terminal or log; whitespace runs then collapse to one.
     stripped = "".join(ch if ch.isprintable() else " " for ch in without_ansi)
@@ -2791,7 +2808,8 @@ def _sanitize_hook_failure_detail(text: str) -> str | None:
         return None
     redacted = redact_secrets(collapsed)
     if len(redacted) > _HOOK_FAILURE_DETAIL_MAX_CHARS:
-        redacted = redacted[:_HOOK_FAILURE_DETAIL_MAX_CHARS].rstrip() + "… [truncated]"
+        capped = redacted[:_HOOK_FAILURE_DETAIL_MAX_CHARS].rstrip()
+        redacted = redact_secrets(capped) + _HOOK_FAILURE_DETAIL_TRUNCATION_MARKER
     return redacted or None
 
 
