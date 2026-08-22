@@ -3664,8 +3664,43 @@ def test_inject_user_message_raises_when_draft_never_submits(
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    with pytest.raises(RuntimeError, match="message was not delivered"):
+    with pytest.raises(
+        RuntimeError,
+        match=r"Claude Code hasn't accepted the message yet — your text is still in the "
+        r"sub-agent's input box\. Open the Subagents panel and press Enter to send it\. "
+        r"Waited 0\.2s\.",
+    ):
         inject_user_message(bridge_dir, content="fix the flaky test")
+
+
+def test_inject_user_message_submit_verify_honors_the_budget_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The verify loop keeps re-sending Enter for the configured budget.
+
+    The draft never clears here, so the loop re-sends Enter once per
+    retry interval until the budget expires: a wider budget must draw
+    strictly more retries before failing. A loop that ignored the
+    override would give up at the same point in both runs.
+    """
+
+    def _enters_for_budget(budget_s: float) -> list[list[str]]:
+        monkeypatch.setattr(claude_native_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", budget_s)
+        sends = _fake_tmux(monkeypatch, [_draft_pane("fix the flaky test")])
+        with pytest.raises(RuntimeError, match=r"hasn't accepted the message"):
+            claude_native_bridge.inject_user_message(
+                _picker_bridge_dir(tmp_path / f"b{budget_s}"),
+                content="fix the flaky test",
+            )
+        return [args for args in sends if args[-1] == "Enter"]
+
+    tight = _enters_for_budget(2.0)
+    generous = _enters_for_budget(6.0)
+    assert len(tight) < len(generous), (
+        f"a wider budget must retry the swallowed Enter more times; "
+        f"got {len(tight)} vs {len(generous)} Enter(s)"
+    )
 
 
 def test_inject_interrupt_sends_escape_keystroke(
@@ -7867,9 +7902,15 @@ def test_a_slash_command_stuck_in_the_composer_fails_loud(
     the authoritative fallback — an honest failure, not a silent divergence.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.2)
     _fake_tmux(monkeypatch, [_draft_pane("/effort high")])
 
-    with pytest.raises(RuntimeError, match="was not delivered"):
+    with pytest.raises(
+        RuntimeError,
+        match=r"Claude Code hasn't accepted the slash command yet — it is still in the "
+        r"sub-agent's input box\. Open the Subagents panel and press Enter to send it\. "
+        r"Waited 0\.2s\.",
+    ):
         claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
 
@@ -7895,6 +7936,35 @@ def test_a_slash_command_draft_that_never_renders_submits_blind(
     tails = [args[-1] for args in sends]
     assert tails == ["C-u", "/effort high", "Enter"], (
         f"An unverifiable draft must submit blind exactly once; got {tails}."
+    )
+
+
+def test_a_slash_command_submit_verify_honors_the_budget_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The command-path verify loop also retries for the configured budget.
+
+    Same budget, second call site: the stuck command must keep drawing
+    retries for as long as the override says before failing, so both
+    injection paths widen together when an operator raises it.
+    """
+
+    def _enters_for_budget(budget_s: float) -> list[list[str]]:
+        monkeypatch.setattr(claude_native_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", budget_s)
+        sends = _fake_tmux(monkeypatch, [_draft_pane("/effort high")])
+        with pytest.raises(RuntimeError, match=r"hasn't accepted the slash command"):
+            claude_native_bridge.inject_slash_command(
+                _picker_bridge_dir(tmp_path / f"b{budget_s}"),
+                command="/effort high",
+            )
+        return [args for args in sends if args[-1] == "Enter"]
+
+    tight = _enters_for_budget(2.0)
+    generous = _enters_for_budget(6.0)
+    assert len(tight) < len(generous), (
+        f"a wider budget must retry the swallowed Enter more times; "
+        f"got {len(tight)} vs {len(generous)} Enter(s)"
     )
 
 
