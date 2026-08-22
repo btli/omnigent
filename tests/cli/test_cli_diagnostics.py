@@ -152,6 +152,57 @@ def test_redirect_stderr_to_log_redacts_direct_stderr_writes(
     )
 
 
+def test_redact_secrets_scrubs_opaque_authorization_bearer_token() -> None:
+    """
+    ``Authorization: Bearer <opaque>`` must be fully scrubbed.
+
+    Regression guard: the ``authorization`` pattern must consume the scheme AND
+    the credential. When it consumed only the scheme word, the opaque token
+    (matched by no standalone key rule) survived in the clear —
+    ``Authorization: [REDACTED] eyJ...``. Uses a token caught by no other rule
+    so this fails if the Authorization/bearer path ever regresses.
+    """
+    scrubbed = cli_diagnostics.redact_secrets(
+        "Authorization: Bearer eyJhbGciOiJexposedOPAQUE12345"
+    )
+    assert "eyJhbGciOiJexposedOPAQUE12345" not in scrubbed
+    assert "[REDACTED]" in scrubbed
+
+
+def test_redact_secrets_scrubs_basic_authorization_credential() -> None:
+    """``Authorization: Basic <blob>`` must not leave the base64 credential."""
+    scrubbed = cli_diagnostics.redact_secrets("Authorization: Basic dXNlcjpodW50ZXIy")
+    assert "dXNlcjpodW50ZXIy" not in scrubbed
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        # Built by concatenation so the literal secret never appears in source
+        # (both the repo and GitHub push-protection scanners would otherwise
+        # flag these synthetic tokens).
+        "xoxb" + "-1234567890-abcdefslacktoken",  # Slack bot token
+        "ghp_" + "a1b2c3d4e5" * 3 + "abcdef",  # GitHub token
+        "AKIA" + "QWERTYUIOP123456",  # AWS access key id
+    ],
+)
+def test_redact_secrets_scrubs_new_shapes(secret: str) -> None:
+    """Slack / GitHub / AWS credential shapes are redacted."""
+    scrubbed = cli_diagnostics.redact_secrets(f"boot failed: {secret} rejected")
+    assert secret not in scrubbed
+    assert "[REDACTED]" in scrubbed
+
+
+def test_redact_secrets_scrubs_url_basic_auth_userinfo() -> None:
+    """URL-embedded basic-auth userinfo is redacted; the host survives."""
+    scrubbed = cli_diagnostics.redact_secrets(
+        "clone failed for https://alice:s3cr3tpassw0rd@registry.internal/repo"
+    )
+    assert "s3cr3tpassw0rd" not in scrubbed
+    assert "alice" not in scrubbed
+    assert "registry.internal" in scrubbed
+
+
 def test_setup_cli_logging_uses_data_dir_cli_destination(
     isolated_cli_diagnostics: None,
     monkeypatch: pytest.MonkeyPatch,
