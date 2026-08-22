@@ -32,6 +32,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -171,11 +172,24 @@ _PASTE_COMMIT_TIMEOUT_S = 5.0
 # actually left the input box (re-sending Enter while it hasn't) before
 # failing loud. OMNIGENT_CLAUDE_SUBMIT_VERIFY_TIMEOUT_S overrides it.
 _SUBMIT_VERIFY_TIMEOUT_ENV = "OMNIGENT_CLAUDE_SUBMIT_VERIFY_TIMEOUT_S"
+_SUBMIT_VERIFY_TIMEOUT_DEFAULT_S = 30.0
+_submit_verify_timeout_raw = os.environ.get(_SUBMIT_VERIFY_TIMEOUT_ENV)
 try:
-    _SUBMIT_VERIFY_TIMEOUT_S = float(os.environ.get(_SUBMIT_VERIFY_TIMEOUT_ENV, "30"))
+    _SUBMIT_VERIFY_TIMEOUT_S = (
+        float(_submit_verify_timeout_raw)
+        if _submit_verify_timeout_raw is not None
+        else _SUBMIT_VERIFY_TIMEOUT_DEFAULT_S
+    )
 except ValueError:
-    _logger.warning("Ignoring invalid %s; using 30s", _SUBMIT_VERIFY_TIMEOUT_ENV)
-    _SUBMIT_VERIFY_TIMEOUT_S = 30.0
+    _SUBMIT_VERIFY_TIMEOUT_S = math.nan
+if not math.isfinite(_SUBMIT_VERIFY_TIMEOUT_S) or _SUBMIT_VERIFY_TIMEOUT_S <= 0:
+    _logger.warning(
+        "Ignoring invalid %s=%r; using %gs",
+        _SUBMIT_VERIFY_TIMEOUT_ENV,
+        _submit_verify_timeout_raw,
+        _SUBMIT_VERIFY_TIMEOUT_DEFAULT_S,
+    )
+    _SUBMIT_VERIFY_TIMEOUT_S = _SUBMIT_VERIFY_TIMEOUT_DEFAULT_S
 # Minimum spacing between repeated submit Enters during verification.
 # Long enough for the TUI to clear the box after a successful submit
 # (so a slow-but-successful first Enter isn't double-tapped), short
@@ -3203,7 +3217,7 @@ def inject_user_message(
         failure_message=(
             "Claude Code hasn't accepted the message yet — your text is still in the "
             "sub-agent's input box. Open the Subagents panel and press Enter to send it. "
-            f"Waited {_SUBMIT_VERIFY_TIMEOUT_S}s."
+            f"Waited {_SUBMIT_VERIFY_TIMEOUT_S:g}s."
         ),
     )
 
@@ -3413,7 +3427,7 @@ def inject_slash_command(
             failure_message=(
                 "Claude Code hasn't accepted the slash command yet — it is still in the "
                 "sub-agent's input box. Open the Subagents panel and press Enter to send it."
-                f" Waited {_SUBMIT_VERIFY_TIMEOUT_S}s."
+                f" Waited {_SUBMIT_VERIFY_TIMEOUT_S:g}s."
             ),
         )
     if dialog_hint is not None:
@@ -4135,6 +4149,7 @@ def _verify_draft_submitted(
     last_enter = time.monotonic()
     while time.monotonic() < deadline:
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+        # Retry only while the draft guard confirms Enter cannot reach a new surface.
         if not _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
             return
         if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
