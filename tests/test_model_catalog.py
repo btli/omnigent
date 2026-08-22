@@ -1236,6 +1236,19 @@ def test_failed_auth_command_note_never_leaks_the_command(
     assert secret not in json.dumps(catalog)
 
 
+def test_databricks_reauth_guidance_survives_failure_redaction() -> None:
+    exc = OSError("refresh expired; run databricks auth login --profile DEFAULT")
+
+    assert model_catalog._redacted_failure_reason(exc) == (
+        "provider credentials expired; run `databricks auth login --profile DEFAULT`"
+    )
+    secret = "dapi0123456789abcdef"
+    exc = OSError(f"token={secret}; databricks auth login --profile DEFAULT --token {secret}")
+    reason = model_catalog._redacted_failure_reason(exc)
+    assert reason == "provider credentials or network unavailable"
+    assert secret not in reason
+
+
 # ── catalog_for_spec (the tool payload) ────────────────────
 
 

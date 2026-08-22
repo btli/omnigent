@@ -2312,10 +2312,11 @@ class HostProcess:
         from omnigent.codex_native_app_server import codex_launch_catalog
 
         try:
-            rows = await codex_launch_catalog()
+            catalog = await codex_launch_catalog()
         except Exception:  # noqa: BLE001 — no catalog, never a crash
             _logger.warning("Codex model catalog unavailable", exc_info=True)
             return None
+        rows = catalog.rows
         if rows is None:
             return None
         routable = [row["id"] for row in rows if isinstance(row.get("id"), str) and row["id"]]
@@ -2336,10 +2337,11 @@ class HostProcess:
 
         try:
             config = await asyncio.to_thread(resolve_native_claude_config, spec=None)
-            rows = await claude_launch_catalog(config)
+            catalog = await claude_launch_catalog(config)
         except Exception:  # noqa: BLE001 — no catalog, never a crash
             _logger.warning("Claude model catalog unavailable", exc_info=True)
             return None
+        rows = catalog.rows
         if rows is None:
             return None
         routable = list(config.routable_models) if config is not None else []

@@ -701,7 +701,7 @@ async def test_codex_launch_catalog_reads_the_store_then_probes_once(
     first = await codex_native_app_server.codex_launch_catalog()
     second = await codex_native_app_server.codex_launch_catalog()
     assert first == second
-    assert first == [{"id": "gpt-5.6-terra", "model": "gpt-5.6-terra", "isDefault": True}]
+    assert first.rows == [{"id": "gpt-5.6-terra", "model": "gpt-5.6-terra", "isDefault": True}]
     assert len(calls) == 1, "the second read must come from the store, not a re-probe"
 
 

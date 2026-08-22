@@ -24,7 +24,7 @@ import websockets
 from cachetools import TTLCache
 from websockets.asyncio.client import ClientConnection
 
-from omnigent import model_catalog
+from omnigent import model_catalog, model_catalog_store
 from omnigent.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -988,7 +988,9 @@ def codex_catalog_fingerprint(launch: NativeCodexLaunch) -> str:
     )
 
 
-async def codex_launch_catalog(*, codex_path: str | None = None) -> list[_JsonObject] | None:
+async def codex_launch_catalog(
+    *, codex_path: str | None = None
+) -> model_catalog_store.CatalogResult:
     """
     The shared codex catalog for this host's default shape: store, then probe.
 
@@ -997,15 +999,17 @@ async def codex_launch_catalog(*, codex_path: str | None = None) -> list[_JsonOb
     answer for every later consumer.
 
     :param codex_path: Optional Codex executable override.
-    :returns: Catalog rows, or ``None`` when no catalog could be obtained.
+    :returns: Catalog rows with freshness and any sanitized refresh error.
     """
-    from omnigent import model_catalog_store
-
     try:
         launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
     except Exception:  # noqa: BLE001 — a broken provider config means no catalog
         _logger.warning("codex catalog: launch shape resolution failed", exc_info=True)
-        return None
+        return model_catalog_store.CatalogResult(
+            None,
+            model_catalog_store.CatalogFreshness.MISSING,
+            "launch configuration unavailable",
+        )
     fingerprint = codex_catalog_fingerprint(launch)
 
     async def _probe() -> list[_JsonObject] | None:

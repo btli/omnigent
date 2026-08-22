@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import hashlib
 import json
 import logging
@@ -24,6 +25,8 @@ import os
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -45,9 +48,28 @@ def fingerprint_of(*parts: object) -> str:
     return digest.hexdigest()[:16]
 
 
-#: Catalog entries older than this get a background refresh on read (the
-#: readers decide; the store only reports staleness).
+#: Catalog entries older than this are revalidated on read.
 CATALOG_STALE_AFTER_S = 3600.0
+CATALOG_REFRESH_TIMEOUT_S = 10.0
+CATALOG_LOCK_TIMEOUT_S = 2.0
+CATALOG_CLOCK_SKEW_TOLERANCE_S = 5.0
+
+
+class CatalogFreshness(Enum):
+    """Authority state of catalog rows returned by the store."""
+
+    FRESH = "fresh"
+    STALE = "stale"
+    MISSING = "missing"
+
+
+@dataclass(frozen=True)
+class CatalogResult:
+    """Catalog rows together with their launch-authority state."""
+
+    rows: list[dict[str, Any]] | None
+    freshness: CatalogFreshness
+    refresh_error: str | None = None
 
 
 def _data_dir() -> Path:
@@ -95,7 +117,10 @@ def catalog_age_s(harness: str, fingerprint: str) -> float | None:
     """Age of the stored catalog in seconds, or ``None`` on a miss."""
     path = catalog_path(harness, fingerprint)
     try:
-        return max(0.0, time.time() - path.stat().st_mtime)
+        delta = time.time() - path.stat().st_mtime
+        if delta < -CATALOG_CLOCK_SKEW_TOLERANCE_S:
+            return float("inf")
+        return max(0.0, delta)
     except OSError:
         return None
 
@@ -132,14 +157,38 @@ def write_catalog(harness: str, fingerprint: str, rows: list[dict[str, Any]]) ->
 #: In-flight probes, keyed (harness, fingerprint) — the thin single-flight
 #: wrapper the design keeps process-side: concurrent misses join one probe
 #: instead of each spawning CLI processes.
-_inflight: dict[tuple[str, str], asyncio.Task[list[dict[str, Any]] | None]] = {}
+_inflight: dict[tuple[str, str], asyncio.Task[CatalogResult]] = {}
+
+
+def _refresh_failure(exc: Exception) -> str:
+    if isinstance(exc, TimeoutError):
+        return "model catalog refresh timed out"
+    if isinstance(exc, OSError):
+        return "provider credentials or network unavailable"
+    return f"model catalog refresh failed ({type(exc).__name__})"
+
+
+async def _acquire_lock(path: Path) -> Any | None:
+    """Acquire the per-catalog advisory lock without blocking indefinitely."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    handle = path.open("a+")
+    deadline = time.monotonic() + CATALOG_LOCK_TIMEOUT_S
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                handle.close()
+                return None
+            await asyncio.sleep(0.05)
 
 
 async def ensure_catalog(
     harness: str,
     fingerprint: str,
     resolve: Callable[[], Awaitable[list[dict[str, Any]] | None]],
-) -> list[dict[str, Any]] | None:
+) -> CatalogResult:
     """Store-first catalog access with a single probe in flight per key.
 
     A hit serves immediately; a miss runs *resolve* once (concurrent
@@ -148,23 +197,58 @@ async def ensure_catalog(
     :param harness: Canonical harness name.
     :param fingerprint: The launch-config fingerprint.
     :param resolve: Probe coroutine factory producing verbatim rows.
-    :returns: Catalog rows, or ``None`` when no catalog could be obtained.
+    :returns: Rows together with freshness and any sanitized refresh error.
     """
     cached = read_catalog(harness, fingerprint)
-    if cached is not None:
-        return cached
+    age = catalog_age_s(harness, fingerprint) if cached is not None else None
+    if cached is not None and age is not None and age <= CATALOG_STALE_AFTER_S:
+        return CatalogResult(cached, CatalogFreshness.FRESH)
     key = (harness, fingerprint)
     task = _inflight.get(key)
     if task is None or task.done():
 
-        async def _run() -> list[dict[str, Any]] | None:
+        async def _run() -> CatalogResult:
+            lock_handle = None
             try:
-                rows = await resolve()
+                lock_path = catalog_path(harness, fingerprint).with_suffix(".lock")
+                lock_handle = await _acquire_lock(lock_path)
+                if lock_handle is None:
+                    return CatalogResult(
+                        cached,
+                        CatalogFreshness.STALE if cached is not None else CatalogFreshness.MISSING,
+                        "model catalog refresh lock timed out",
+                    )
+                # Another process may have refreshed while this process waited.
+                post_lock = read_catalog(harness, fingerprint)
+                post_lock_age = (
+                    catalog_age_s(harness, fingerprint) if post_lock is not None else None
+                )
+                if (
+                    post_lock is not None
+                    and post_lock_age is not None
+                    and post_lock_age <= CATALOG_STALE_AFTER_S
+                ):
+                    return CatalogResult(post_lock, CatalogFreshness.FRESH)
+                rows = await asyncio.wait_for(resolve(), timeout=CATALOG_REFRESH_TIMEOUT_S)
+                if rows:
+                    write_catalog(harness, fingerprint, rows)
+                    return CatalogResult(rows, CatalogFreshness.FRESH)
+                return CatalogResult(
+                    cached,
+                    CatalogFreshness.STALE if cached is not None else CatalogFreshness.MISSING,
+                    "model catalog refresh returned no models",
+                )
+            except Exception as exc:  # noqa: BLE001 — stale rows remain available
+                return CatalogResult(
+                    cached,
+                    CatalogFreshness.STALE if cached is not None else CatalogFreshness.MISSING,
+                    _refresh_failure(exc),
+                )
             finally:
                 _inflight.pop(key, None)
-            if rows:
-                write_catalog(harness, fingerprint, rows)
-            return rows
+                if lock_handle is not None:
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+                    lock_handle.close()
 
         task = asyncio.create_task(_run(), name=f"model-catalog-{harness}")
         _inflight[key] = task
@@ -192,6 +276,8 @@ def catalog_contains(rows: list[dict[str, Any]], token: str) -> bool:
 
 __all__ = [
     "CATALOG_STALE_AFTER_S",
+    "CatalogFreshness",
+    "CatalogResult",
     "catalog_age_s",
     "catalog_contains",
     "catalog_path",
