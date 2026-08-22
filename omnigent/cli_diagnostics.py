@@ -110,8 +110,13 @@ _redirected_logging_streams: list[_LoggingStreamSnapshot] = []
 #: Patterns that match values likely to be secrets.  Applied to every
 #: log record's formatted message before it hits the file.
 _SECRET_PATTERNS: list[re.Pattern[str]] = [
-    # Header values: "Authorization: Bearer xxx" or "bearer xxx"
-    re.compile(r"(?i)(authorization\s*[:=]\s*)\S+"),
+    # Authorization header: consume the scheme AND the credential together so
+    # "Authorization: Bearer <token>" / "Authorization: Basic <blob>" leave no
+    # credential behind. Must precede the bare-bearer rule; the optional second
+    # token stays on the same line ([ \t], not \s) so it never eats across a
+    # newline into unrelated log text.
+    re.compile(r"(?i)(authorization\s*[:=]\s*)\S+(?:[ \t]+\S+)?"),
+    # Bare bearer token with no Authorization prefix.
     re.compile(r"(?i)(bearer\s+)\S+"),
     # Env-var style keys: FOO_TOKEN=xxx, FOO_API_KEY=xxx, ...
     re.compile(r"(?i)(\b\w*(?:token|api_key|secret|password)\s*[:=]\s*)\S+"),
@@ -119,11 +124,19 @@ _SECRET_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\bsk-[A-Za-z0-9_-]{10,}\b"),
     # Databricks PATs
     re.compile(r"\bdapi[A-Za-z0-9]{10,}\b"),
+    # Slack tokens (xoxb-/xoxa-/xoxp-/xoxr-/xoxs-)
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),
+    # GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_)
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
+    # AWS access key ids (long-term AKIA, temporary ASIA)
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    # URL-embedded basic-auth userinfo: https://user:pass@host → redact userinfo
+    re.compile(r"(?i)(https?://)[^/\s:@]+:[^/\s@]+(?=@)"),
 ]
 _REDACTED = "[REDACTED]"
 
 
-def _redact(text: str) -> str:
+def redact_secrets(text: str) -> str:
     """
     Replace secret-shaped substrings in *text* with :data:`_REDACTED`.
 
@@ -160,7 +173,7 @@ class _RedactingFormatter(TerminalLogFormatter):
         :param record: The log record to format.
         :returns: Formatted, redacted string ready for the handler.
         """
-        return _redact(super().format(record))
+        return redact_secrets(super().format(record))
 
 
 class _RedactingStderr(io.TextIOBase):
@@ -189,7 +202,7 @@ class _RedactingStderr(io.TextIOBase):
         :param text: Text sent to ``sys.stderr.write``.
         :returns: The length of the caller's original text.
         """
-        self._inner.write(_redact(text))
+        self._inner.write(redact_secrets(text))
         return len(text)
 
     def flush(self) -> None:

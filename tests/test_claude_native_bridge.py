@@ -23,11 +23,15 @@ import pytest
 
 from omnigent import claude_native_bridge, native_cost_popup
 from omnigent.claude_native_bridge import (
+    _HOOK_FAILURE_DETAIL_MAX_CHARS,
+    _HOOK_FAILURE_DETAIL_RAW_LIMIT,
+    _HOOK_FAILURE_DETAIL_TRUNCATION_MARKER,
     _build_tools,
     _claude_prompt_rendered,
     _escape_unsupported_slash_command,
     _hook_record_from_jsonl_record,
     _JsonlRecord,
+    _sanitize_hook_failure_detail,
     augment_claude_args,
     count_hook_events,
     display_cost_approval_popup,
@@ -7312,6 +7316,208 @@ def test_hook_record_non_stop_event_has_zero_background_tasks() -> None:
         )
     )
     assert record.background_task_count == 0
+
+
+# ── _hook_record_from_jsonl_record: StopFailure detail ───────────────────────
+
+
+def test_hook_record_parses_stop_failure_detail() -> None:
+    """
+    ``StopFailure`` → ``record.failure_detail`` carries the provider text.
+
+    The real incident shape: a stale model catalog pinned an unservable model
+    and the provider returned ``model_not_found``. The hook's ``error`` +
+    ``last_assistant_message`` is the actionable text that must survive parsing
+    instead of being dropped for the generic "turn failed" string.
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "StopFailure",
+                "error": "model_not_found",
+                "last_assistant_message": (
+                    "There's an issue with the selected model (claude-fable-5). "
+                    "It may not exist or you may not have access to it."
+                ),
+            }
+        )
+    )
+    assert record.event_name == "StopFailure"
+    assert record.failure_detail is not None
+    assert record.failure_detail.startswith("model_not_found: ")
+    assert "claude-fable-5" in record.failure_detail
+
+
+def test_hook_record_stop_failure_without_detail_is_none() -> None:
+    """
+    A ``StopFailure`` with no ``error``/``last_assistant_message`` → ``None``.
+
+    With no usable text the generic fallback string is the correct output, so
+    the record must not fabricate a detail.
+    """
+    record = _hook_record_from_jsonl_record(_make_jsonl_record({"hook_event_name": "StopFailure"}))
+    assert record.event_name == "StopFailure"
+    assert record.failure_detail is None
+
+
+def test_hook_record_non_stop_failure_event_has_no_failure_detail() -> None:
+    """
+    Only ``StopFailure`` carries a detail — a successful ``Stop`` does not.
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "Stop",
+                "last_assistant_message": "all done",
+            }
+        )
+    )
+    assert record.event_name == "Stop"
+    assert record.failure_detail is None
+
+
+# ── _sanitize_hook_failure_detail: untrusted text hardening ──────────────────
+
+
+def test_sanitize_hook_failure_detail_truncates_overlong() -> None:
+    """
+    Over-long text is capped with an explicit truncation marker.
+
+    Secret-free input passes through the redactor unchanged, so the emitted
+    length is exactly the head cap plus the marker — a loose bound (``< 600``)
+    would still pass if the head cap silently widened. The input stays under the
+    raw bound so this exercises the output cap, not raw truncation.
+    """
+    detail = _sanitize_hook_failure_detail("x" * 1000)
+    assert detail is not None
+    assert detail.endswith(_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER)
+    assert len(detail) == _HOOK_FAILURE_DETAIL_MAX_CHARS + len(
+        _HOOK_FAILURE_DETAIL_TRUNCATION_MARKER
+    )
+
+
+def test_sanitize_hook_failure_detail_redacts_secret_straddling_truncation() -> None:
+    """
+    A secret that straddles the truncation boundary is still fully redacted.
+
+    Redaction runs BEFORE the length cap, so a length-gated pattern matches the
+    whole token and scrubs it to ``[REDACTED]`` before truncation can split it
+    into a sub-threshold, un-matchable prefix. Capping first (then redacting)
+    would leave e.g. ``dapiAAAAA`` in the clear.
+    """
+    secret = "dapi" + "A" * 40
+    padding = "x" * (_HOOK_FAILURE_DETAIL_MAX_CHARS - 10)
+    detail = _sanitize_hook_failure_detail(f"{padding} {secret}")
+    assert detail is not None
+    assert "dapi" not in detail
+
+
+def test_sanitize_hook_failure_detail_redacts_secret_straddling_raw_bound() -> None:
+    """
+    A secret bisected by the RAW input bound cannot leak as a prefix.
+
+    Heavy leading control bytes (which collapse away) push a length-gated token
+    across the raw bound, so only a short, sub-threshold prefix is retained.
+    Dropping the trailing bisected token on raw truncation prevents that prefix
+    from surviving; without it, ``dapiA`` would reach the output. Legitimate
+    leading text is preserved.
+    """
+    prefix = "boot error: "
+    token = "dapi" + "A" * 40
+    pad = "\x00" * (_HOOK_FAILURE_DETAIL_RAW_LIMIT - len(prefix) - 6)
+    detail = _sanitize_hook_failure_detail(f"{prefix}{pad} {token}")
+    assert detail == "boot error:"
+    assert "dapi" not in detail
+
+
+def test_sanitize_hook_failure_detail_second_pass_catches_cap_created_boundary() -> None:
+    """
+    The post-cap re-scan catches a secret the length cap newly exposes.
+
+    AWS key ids are a FIXED-count pattern (``AKIA`` + ``{16}`` + ``\\b``). A
+    token with 17 trailing chars has no valid boundary, so the pre-cap redact
+    misses it; the length cap can slice it to exactly ``AKIA`` + 16 chars,
+    creating a trailing boundary that only the defensive re-scan matches. This
+    is why the second ``redact_secrets`` call is kept, not dropped.
+    """
+    token = "AKIA" + "A" * 17
+    padding = "x" * (_HOOK_FAILURE_DETAIL_MAX_CHARS - 21)
+    detail = _sanitize_hook_failure_detail(f"{padding} {token}")
+    assert detail is not None
+    assert "AKIA" not in detail
+
+
+def test_sanitize_hook_failure_detail_strips_control_and_ansi() -> None:
+    """
+    ANSI escapes and control bytes are removed so the detail cannot corrupt a
+    terminal or log; the text collapses to a single line.
+    """
+    detail = _sanitize_hook_failure_detail("\x1b[31mred\x1b[0m\x07 line one\nline two\tcol\x00nul")
+    assert detail == "red line one line two col nul"
+    assert "\x1b" not in detail
+    assert "\n" not in detail and "\t" not in detail and "\x00" not in detail
+
+
+def test_sanitize_hook_failure_detail_redacts_opaque_authorization_token() -> None:
+    """
+    An OPAQUE credential after ``Authorization: Bearer`` must be redacted.
+
+    This is the adversarial case: the token matches no standalone
+    (``sk-``/``dapi``) rule, so it survives only if the Authorization/bearer
+    path fully consumes the scheme AND the credential. A leaky pattern order
+    (authorization consuming only the scheme word) would leave it in the clear.
+    """
+    detail = _sanitize_hook_failure_detail(
+        "launch failed: Authorization: Bearer eyJhbGciOiJexposedOPAQUE12345 rejected"
+    )
+    assert detail is not None
+    assert "eyJhbGciOiJexposedOPAQUE12345" not in detail
+    assert "[REDACTED]" in detail
+
+
+def test_sanitize_hook_failure_detail_redacts_basic_authorization_credential() -> None:
+    """
+    ``Authorization: Basic <blob>`` must not leave the base64 credential behind.
+    """
+    detail = _sanitize_hook_failure_detail("Authorization: Basic dXNlcjpodW50ZXIy failed")
+    assert detail is not None
+    assert "dXNlcjpodW50ZXIy" not in detail
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "dapiabcdef0123456789",  # Databricks PAT
+        "sk-abcdef0123456789ABCDEF",  # OpenAI-style key
+        # Built by concatenation so the literal secret never appears in source
+        # (both the repo and GitHub push-protection scanners would otherwise
+        # flag these synthetic tokens).
+        "xoxb" + "-1234567890-abcdefslacktoken",  # Slack bot token
+        "ghp_" + "a1b2c3d4e5" * 3 + "abcdef",  # GitHub token
+        "AKIA" + "QWERTYUIOP123456",  # AWS access key id
+    ],
+)
+def test_sanitize_hook_failure_detail_redacts_secret_shapes(secret: str) -> None:
+    """
+    Each supported secret shape is redacted out of the surfaced detail.
+    """
+    detail = _sanitize_hook_failure_detail(f"model launch failed: token {secret} was rejected")
+    assert detail is not None
+    assert secret not in detail
+    assert "[REDACTED]" in detail
+
+
+def test_sanitize_hook_failure_detail_redacts_url_basic_auth() -> None:
+    """
+    URL-embedded basic-auth userinfo is redacted; the host stays readable.
+    """
+    detail = _sanitize_hook_failure_detail(
+        "fetch failed for https://alice:s3cr3tpassw0rd@registry.internal/models"
+    )
+    assert detail is not None
+    assert "s3cr3tpassw0rd" not in detail
+    assert "alice" not in detail
+    assert "registry.internal" in detail
 
 
 # ── /model switching + pane readiness ───────────────────────────────────
