@@ -168,6 +168,11 @@ def _refresh_failure(exc: Exception) -> str:
     return f"model catalog refresh failed ({type(exc).__name__})"
 
 
+def _failed_refresh(cached: list[dict[str, Any]] | None, reason: str) -> CatalogResult:
+    freshness = CatalogFreshness.STALE if cached is not None else CatalogFreshness.MISSING
+    return CatalogResult(cached, freshness, reason)
+
+
 async def _acquire_lock(path: Path) -> Any | None:
     """Acquire the per-catalog advisory lock without blocking indefinitely."""
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -213,11 +218,7 @@ async def ensure_catalog(
                 lock_path = catalog_path(harness, fingerprint).with_suffix(".lock")
                 lock_handle = await _acquire_lock(lock_path)
                 if lock_handle is None:
-                    return CatalogResult(
-                        cached,
-                        CatalogFreshness.STALE if cached is not None else CatalogFreshness.MISSING,
-                        "model catalog refresh lock timed out",
-                    )
+                    return _failed_refresh(cached, "model catalog refresh lock timed out")
                 # Another process may have refreshed while this process waited.
                 post_lock = read_catalog(harness, fingerprint)
                 post_lock_age = (
@@ -233,17 +234,9 @@ async def ensure_catalog(
                 if rows:
                     write_catalog(harness, fingerprint, rows)
                     return CatalogResult(rows, CatalogFreshness.FRESH)
-                return CatalogResult(
-                    cached,
-                    CatalogFreshness.STALE if cached is not None else CatalogFreshness.MISSING,
-                    "model catalog refresh returned no models",
-                )
+                return _failed_refresh(cached, "model catalog refresh returned no models")
             except Exception as exc:  # noqa: BLE001 — stale rows remain available
-                return CatalogResult(
-                    cached,
-                    CatalogFreshness.STALE if cached is not None else CatalogFreshness.MISSING,
-                    _refresh_failure(exc),
-                )
+                return _failed_refresh(cached, _refresh_failure(exc))
             finally:
                 _inflight.pop(key, None)
                 if lock_handle is not None:
