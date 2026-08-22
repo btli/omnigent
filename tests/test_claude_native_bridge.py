@@ -30,6 +30,7 @@ from omnigent.claude_native_bridge import (
     _hook_record_from_jsonl_record,
     _JsonlRecord,
     _occupying_surface,
+    _sanitize_hook_failure_detail,
     augment_claude_args,
     count_hook_events,
     display_cost_approval_popup,
@@ -7420,6 +7421,101 @@ def test_hook_record_non_stop_event_has_no_background_task_detail() -> None:
         _make_jsonl_record({"hook_event_name": "PostToolUse", "tool_name": "Bash"})
     )
     assert record.background_tasks is None
+
+
+# ── _hook_record_from_jsonl_record: StopFailure detail ───────────────────────
+
+
+def test_hook_record_parses_stop_failure_detail() -> None:
+    """
+    ``StopFailure`` → ``record.failure_detail`` carries the provider text.
+
+    The real incident shape: a stale model catalog pinned an unservable model
+    and the provider returned ``model_not_found``. The hook's ``error`` +
+    ``last_assistant_message`` is the actionable text that must survive parsing
+    instead of being dropped for the generic "turn failed" string.
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "StopFailure",
+                "error": "model_not_found",
+                "last_assistant_message": (
+                    "There's an issue with the selected model (claude-fable-5). "
+                    "It may not exist or you may not have access to it."
+                ),
+            }
+        )
+    )
+    assert record.event_name == "StopFailure"
+    assert record.failure_detail is not None
+    assert record.failure_detail.startswith("model_not_found: ")
+    assert "claude-fable-5" in record.failure_detail
+
+
+def test_hook_record_stop_failure_without_detail_is_none() -> None:
+    """
+    A ``StopFailure`` with no ``error``/``last_assistant_message`` → ``None``.
+
+    With no usable text the generic fallback string is the correct output, so
+    the record must not fabricate a detail.
+    """
+    record = _hook_record_from_jsonl_record(_make_jsonl_record({"hook_event_name": "StopFailure"}))
+    assert record.event_name == "StopFailure"
+    assert record.failure_detail is None
+
+
+def test_hook_record_non_stop_failure_event_has_no_failure_detail() -> None:
+    """
+    Only ``StopFailure`` carries a detail — a successful ``Stop`` does not.
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "Stop",
+                "last_assistant_message": "all done",
+            }
+        )
+    )
+    assert record.event_name == "Stop"
+    assert record.failure_detail is None
+
+
+# ── _sanitize_hook_failure_detail: untrusted text hardening ──────────────────
+
+
+def test_sanitize_hook_failure_detail_truncates_overlong() -> None:
+    """
+    Over-long text is capped with an explicit truncation marker.
+    """
+    detail = _sanitize_hook_failure_detail("x" * 5000)
+    assert detail is not None
+    assert detail.endswith("… [truncated]")
+    # The capped body plus the marker — never the full 5000 chars.
+    assert len(detail) < 600
+
+
+def test_sanitize_hook_failure_detail_strips_control_and_ansi() -> None:
+    """
+    ANSI escapes and control bytes are removed so the detail cannot corrupt a
+    terminal or log; the text collapses to a single line.
+    """
+    detail = _sanitize_hook_failure_detail("\x1b[31mred\x1b[0m\x07 line one\nline two\tcol\x00nul")
+    assert detail == "red line one line two col nul"
+    assert "\x1b" not in detail
+    assert "\n" not in detail and "\t" not in detail and "\x00" not in detail
+
+
+def test_sanitize_hook_failure_detail_redacts_secret() -> None:
+    """
+    Secret-shaped substrings are redacted before the text leaves the parser.
+    """
+    detail = _sanitize_hook_failure_detail(
+        "auth failed with Authorization: Bearer dapiabcdef0123456789 while launching"
+    )
+    assert detail is not None
+    assert "dapiabcdef0123456789" not in detail
+    assert "[REDACTED]" in detail
 
 
 # ── /model switching + pane readiness ───────────────────────────────────

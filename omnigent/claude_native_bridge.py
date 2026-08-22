@@ -56,6 +56,7 @@ from omnigent._platform import stable_user_id
 from omnigent.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.claude_native_status import CONTEXT_RAW_FILE
+from omnigent.cli_diagnostics import _redact as _redact_secrets
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.kiro_native_bridge import bridge_root as kiro_bridge_root
 
@@ -545,6 +546,12 @@ class ClaudeHookRecord:
         each counted entry (see :func:`_normalize_background_task`), so the UI
         can name them. ``None`` for non-``Stop`` events, when the array is
         absent, or when no counted entry carried a usable field.
+    :param failure_detail: Sanitized, capped failure text from a
+        ``StopFailure`` hook event — the ``error`` code and
+        ``last_assistant_message`` the provider reported, e.g.
+        ``"model_not_found: There's an issue with the selected model."``.
+        ``None`` for all other events or when the payload carried no usable
+        detail.
     """
 
     event_cursor: int
@@ -565,6 +572,7 @@ class ClaudeHookRecord:
     task_status: str | None = None
     background_task_count: int = 0
     background_tasks: list[_JsonObject] | None = None
+    failure_detail: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2777,6 +2785,62 @@ def _normalize_background_task(raw: object) -> _JsonObject | None:
     return out or None
 
 
+# Upper bound on the failure detail carried to a parent session. A few hundred
+# chars keeps the surfaced error readable while refusing an entire stack trace.
+_HOOK_FAILURE_DETAIL_MAX_CHARS = 500
+# ANSI CSI/OSC escape sequences a provider may embed in hook text.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+
+def _sanitize_hook_failure_detail(text: str) -> str | None:
+    """
+    Scrub and cap untrusted hook failure text for a parent session ``output``.
+
+    Hook text is provider-controlled: strip ANSI escapes and control bytes to a
+    single line, redact secret-shaped substrings (reusing the CLI diagnostics
+    redactor), then cap the length with an explicit truncation marker.
+
+    :param text: Raw failure text from a ``StopFailure`` hook payload.
+    :returns: Sanitized single-line detail, or ``None`` when nothing usable
+        remains.
+    """
+    without_ansi = _ANSI_ESCAPE_RE.sub("", text)
+    # Non-printable control bytes (and newlines/tabs) become spaces so the detail
+    # cannot corrupt a terminal or log; whitespace runs then collapse to one.
+    stripped = "".join(ch if ch.isprintable() else " " for ch in without_ansi)
+    collapsed = " ".join(stripped.split())
+    if not collapsed:
+        return None
+    redacted = _redact_secrets(collapsed)
+    if len(redacted) > _HOOK_FAILURE_DETAIL_MAX_CHARS:
+        redacted = redacted[:_HOOK_FAILURE_DETAIL_MAX_CHARS].rstrip() + "… [truncated]"
+    return redacted or None
+
+
+def _hook_failure_detail(payload: _JsonObject) -> str | None:
+    """
+    Build a sanitized failure detail from a ``StopFailure`` hook payload.
+
+    Prefers the human-readable ``last_assistant_message`` and prefixes the
+    ``error`` code when both are present, so the parent session surfaces
+    actionable text instead of the generic failure string.
+
+    :param payload: ``StopFailure`` hook payload.
+    :returns: Sanitized detail, or ``None`` when the payload carried none.
+    """
+    raw_error = payload.get("error")
+    raw_message = payload.get("last_assistant_message")
+    error = raw_error.strip() if isinstance(raw_error, str) else ""
+    message = raw_message.strip() if isinstance(raw_message, str) else ""
+    if error and message:
+        combined = f"{error}: {message}"
+    else:
+        combined = error or message
+    if not combined:
+        return None
+    return _sanitize_hook_failure_detail(combined)
+
+
 def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
     """
     Convert one complete hook JSONL line into a hook record.
@@ -2878,6 +2942,9 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
                 if (detail := _normalize_background_task(task)) is not None
             ]
             background_tasks = details or None
+    failure_detail: str | None = None
+    if event_name == "StopFailure" and isinstance(payload, dict):
+        failure_detail = _hook_failure_detail(payload)
     return ClaudeHookRecord(
         event_cursor=record.line_number,
         byte_offset=record.next_byte_offset,
@@ -2921,6 +2988,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         task_status=task_status,
         background_task_count=background_task_count,
         background_tasks=background_tasks,
+        failure_detail=failure_detail,
     )
 
 
