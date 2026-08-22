@@ -2782,33 +2782,45 @@ def _sanitize_hook_failure_detail(text: str) -> str | None:
 
     Hook text is provider-controlled, so it is bounded and scrubbed:
 
-    1. The raw input is bounded up front, so a huge blob is never fully scanned.
+    1. The raw input is bounded up front so a huge blob is never fully scanned.
+       That bound is itself a pre-redaction cut, so when it actually truncates,
+       the trailing (possibly bisected) token is dropped — otherwise the raw
+       cut could leave a length-gated secret as a sub-threshold, un-matchable
+       prefix.
     2. ANSI escapes and control bytes are stripped to a single line, so the
        detail cannot corrupt a terminal or log.
     3. Secrets are redacted BEFORE the length cap, so a length-gated pattern
        (e.g. ``sk-…{10,}``) matches whole tokens — a boundary token becomes
        ``[REDACTED]`` before truncation can split it into a usable prefix.
-    4. The redacted text is capped with an explicit marker, then redacted once
-       more so the FINAL emitted string is itself the output of the redactor.
 
-    Guarantee: no secret the redactor recognizes can appear in the result,
-    including one that straddled the truncation boundary. (An unrecognized
-    secret cut mid-token is inherent to any cap and unaffected by ordering.)
+    The no-leak guarantee is provided by steps 1 and 3: no secret the redactor
+    recognizes can appear in the result, including one straddling the raw bound
+    or the length cap. (An unrecognized token cut mid-string is inherent to any
+    cap.) The post-cap re-scan below is defensive only.
 
     :param text: Raw failure text from a ``StopFailure`` hook payload.
     :returns: Sanitized single-line detail, or ``None`` when nothing usable
         remains.
     """
+    raw_truncated = len(text) > _HOOK_FAILURE_DETAIL_RAW_LIMIT
     without_ansi = _ANSI_ESCAPE_RE.sub("", text[:_HOOK_FAILURE_DETAIL_RAW_LIMIT])
     # Non-printable control bytes (and newlines/tabs) become spaces so the detail
     # cannot corrupt a terminal or log; whitespace runs then collapse to one.
     stripped = "".join(ch if ch.isprintable() else " " for ch in without_ansi)
+    if raw_truncated:
+        # The raw bound may have bisected the final token; drop that trailing
+        # non-space run so a length-gated secret cannot survive as a prefix.
+        stripped = re.sub(r"\S+$", "", stripped)
     collapsed = " ".join(stripped.split())
     if not collapsed:
         return None
     redacted = redact_secrets(collapsed)
     if len(redacted) > _HOOK_FAILURE_DETAIL_MAX_CHARS:
         capped = redacted[:_HOOK_FAILURE_DETAIL_MAX_CHARS].rstrip()
+        # Defensive re-scan: truncation can introduce a new trailing word
+        # boundary that lets a fixed-count pattern (e.g. AWS ``AKIA…{16}\b``)
+        # match the capped form though the longer string did not. A no-op for
+        # open-ended shapes under idempotent global redaction.
         redacted = redact_secrets(capped) + _HOOK_FAILURE_DETAIL_TRUNCATION_MARKER
     return redacted or None
 

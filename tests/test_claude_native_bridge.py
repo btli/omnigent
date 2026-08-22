@@ -24,6 +24,7 @@ import pytest
 from omnigent import claude_native_bridge, native_cost_popup
 from omnigent.claude_native_bridge import (
     _HOOK_FAILURE_DETAIL_MAX_CHARS,
+    _HOOK_FAILURE_DETAIL_RAW_LIMIT,
     _HOOK_FAILURE_DETAIL_TRUNCATION_MARKER,
     _build_tools,
     _claude_prompt_rendered,
@@ -7384,9 +7385,10 @@ def test_sanitize_hook_failure_detail_truncates_overlong() -> None:
 
     Secret-free input passes through the redactor unchanged, so the emitted
     length is exactly the head cap plus the marker — a loose bound (``< 600``)
-    would still pass if the head cap silently widened.
+    would still pass if the head cap silently widened. The input stays under the
+    raw bound so this exercises the output cap, not raw truncation.
     """
-    detail = _sanitize_hook_failure_detail("x" * 5000)
+    detail = _sanitize_hook_failure_detail("x" * 1000)
     assert detail is not None
     assert detail.endswith(_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER)
     assert len(detail) == _HOOK_FAILURE_DETAIL_MAX_CHARS + len(
@@ -7408,6 +7410,41 @@ def test_sanitize_hook_failure_detail_redacts_secret_straddling_truncation() -> 
     detail = _sanitize_hook_failure_detail(f"{padding} {secret}")
     assert detail is not None
     assert "dapi" not in detail
+
+
+def test_sanitize_hook_failure_detail_redacts_secret_straddling_raw_bound() -> None:
+    """
+    A secret bisected by the RAW input bound cannot leak as a prefix.
+
+    Heavy leading control bytes (which collapse away) push a length-gated token
+    across the raw bound, so only a short, sub-threshold prefix is retained.
+    Dropping the trailing bisected token on raw truncation prevents that prefix
+    from surviving; without it, ``dapiA`` would reach the output. Legitimate
+    leading text is preserved.
+    """
+    prefix = "boot error: "
+    token = "dapi" + "A" * 40
+    pad = "\x00" * (_HOOK_FAILURE_DETAIL_RAW_LIMIT - len(prefix) - 6)
+    detail = _sanitize_hook_failure_detail(f"{prefix}{pad} {token}")
+    assert detail == "boot error:"
+    assert "dapi" not in detail
+
+
+def test_sanitize_hook_failure_detail_second_pass_catches_cap_created_boundary() -> None:
+    """
+    The post-cap re-scan catches a secret the length cap newly exposes.
+
+    AWS key ids are a FIXED-count pattern (``AKIA`` + ``{16}`` + ``\\b``). A
+    token with 17 trailing chars has no valid boundary, so the pre-cap redact
+    misses it; the length cap can slice it to exactly ``AKIA`` + 16 chars,
+    creating a trailing boundary that only the defensive re-scan matches. This
+    is why the second ``redact_secrets`` call is kept, not dropped.
+    """
+    token = "AKIA" + "A" * 17
+    padding = "x" * (_HOOK_FAILURE_DETAIL_MAX_CHARS - 21)
+    detail = _sanitize_hook_failure_detail(f"{padding} {token}")
+    assert detail is not None
+    assert "AKIA" not in detail
 
 
 def test_sanitize_hook_failure_detail_strips_control_and_ansi() -> None:
