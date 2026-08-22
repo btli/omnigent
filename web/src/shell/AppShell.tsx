@@ -213,12 +213,6 @@ export function AppShell() {
   // Reads the same module-level store Sidebar drives, so the rail's ceiling
   // tracks the live sidebar width (including a drag) rather than a guess.
   const { width: sidebarWidth } = useResizableSidebar();
-  const { panelWidth: inlinePanelWidth, handleProps: inlinePanelHandleProps } =
-    useResizableInlinePanel(
-      conversationId ?? null,
-      inlinePanelMinWidth,
-      sidebarOpen ? sidebarWidth : 0,
-    );
   // ?sidebar=open surfaces the session list on phone-width shells where the
   // sidebar is closed by default — the destination for a "N sessions need
   // your attention" notification tap, which would otherwise land on a bare
@@ -618,6 +612,12 @@ export function AppShell() {
   useEffect(() => {
     stickyRootRef.current = rootSessionId;
   }, [rootSessionId]);
+  const { panelWidth: inlinePanelWidth, handleProps: inlinePanelHandleProps } =
+    useResizableInlinePanel(
+      rootSessionId ?? conversationId ?? null,
+      inlinePanelMinWidth,
+      sidebarOpen ? sidebarWidth : 0,
+    );
   // How many children are actively working — surfaced in the tab badge so
   // "something's happening" is visible without opening the panel.
   const subagentsWorking = childSessions.filter((c) => c.busy).length;

@@ -29,6 +29,7 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
 // Match the AppShell.test.tsx mocks except DO NOT mock SubagentsPanel —
 // we want the real one so its <Link> renders.
@@ -144,8 +145,8 @@ beforeEach(() => {
 });
 
 describe("click sub-agent in rail (real SubagentsPanel)", () => {
-  it("keeps the right-rail tab on Subagents (does NOT shift to Files)", async () => {
-    // Setup: parent has one child sub-agent. User starts on parent
+  it("keeps the Agents tab and rail width across root, child, and sibling navigation", async () => {
+    // Setup: parent has two child sub-agents. User starts on parent
     // with the Agents tab selected; URL has ?file=foo.txt (stale from
     // a previous file-viewer interaction).
     //
@@ -164,6 +165,17 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
           children: [
             {
               id: "conv_child",
+              title: null,
+              task_summary: null,
+              tool: "researcher",
+              session_name: null,
+              current_task_status: null,
+              busy: false,
+              last_message_preview: null,
+              pending_elicitations_count: 0,
+            },
+            {
+              id: "conv_sibling",
               title: null,
               task_summary: null,
               tool: "researcher",
@@ -208,7 +220,7 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
       // — so ``activeSession`` is null. AppShell's
       // ``rootSessionId = activeSession?.parentSessionId ?? conversationId``
       // therefore briefly resolves to ``conv_child`` itself.
-      if (id === "conv_child") {
+      if (id === "conv_child" || id === "conv_sibling") {
         return { session: null, isLoading: true, error: null } as never;
       }
       return { session: null, isLoading: false, error: null };
@@ -231,7 +243,19 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
         last_message_preview: null,
         pending_elicitations_count: 0,
       },
+      {
+        id: "conv_sibling",
+        title: null,
+        task_summary: null,
+        tool: "researcher",
+        session_name: null,
+        current_task_status: null,
+        busy: false,
+        last_message_preview: null,
+        pending_elicitations_count: 0,
+      },
     ]);
+    writeSessionWorkspaceState("conv_root", { widthPx: 500 });
     render(
       <QueryClientProvider client={qc}>
         <TooltipProvider>
@@ -264,17 +288,30 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
 
     // SubagentsPanel renders now that the tab is selected.
     const childRows = screen.getAllByTestId("subagent-row");
-    // Exactly one child row should render for this fixture's one child;
-    // zero means the panel never loaded, and more than one means duplicate
-    // or unrelated rows could hide the navigation target.
-    expect(childRows).toHaveLength(1);
+    expect(childRows).toHaveLength(2);
     expect(childRows[0]).toHaveAttribute("href", "/c/conv_child");
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveStyle({
+      width: "500px",
+    });
     fireEvent.click(childRows[0]);
 
     // After navigation: the same rail Agents tab we clicked must STILL be
     // mounted and selected, not just any matching tab elsewhere in the shell.
     expect(agentsTab.isConnected).toBe(true);
     expect(agentsTab).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveStyle({
+      width: "500px",
+    });
+
+    fireEvent.click(screen.getAllByTestId("subagent-row")[1]);
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveStyle({
+      width: "500px",
+    });
+
+    fireEvent.click(screen.getByTestId("subagent-main-row"));
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveStyle({
+      width: "500px",
+    });
   });
 
   it("shows the Agents tab with count 1 while a childless session's initial fetch is loading", () => {
