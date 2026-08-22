@@ -227,12 +227,12 @@ import { ConnectionIndicator } from "./ChatIndicators";
 import { CHAT_COLUMN_WIDTH } from "./chatLayout";
 import { Transcript } from "@/components/chat/Transcript";
 
-export function TerminalSurface({ isShown, children }: { isShown: boolean; children: ReactNode }) {
+export function TerminalSurface({ isShown, children }: { isShown: boolean; children?: ReactNode }) {
   return (
     <div
-      data-testid="terminal-surface"
       className={cn("absolute inset-0 flex flex-col", !isShown && "pointer-events-none opacity-0")}
       aria-hidden={!isShown}
+      // React 18 drops a boolean `inert`, so the attribute is forced through as an empty string.
       inert={!isShown ? ("" as unknown as boolean) : undefined}
     >
       {children}
