@@ -671,12 +671,16 @@ export function AppShell() {
   const stickyRootRef = useRef<string | null>(null);
   const queryClient = useQueryClient();
   const walkedRoot = useRootSessionId(conversationId ?? null, activeSession?.parentSessionId);
-  const rootSessionId = useMemo(() => {
-    if (!conversationId) return null;
+  const { rootSessionId, rootSessionResolved } = useMemo(() => {
+    if (!conversationId) return { rootSessionId: null, rootSessionResolved: false };
     // Snapshot resolved for a top-level session → it is its own root.
-    if (activeSession && activeSession.parentSessionId == null) return conversationId;
+    if (activeSession && activeSession.parentSessionId == null) {
+      return { rootSessionId: conversationId, rootSessionResolved: true };
+    }
     // Snapshot resolved for a descendant + walk complete → authoritative.
-    if (activeSession && walkedRoot) return walkedRoot;
+    if (activeSession && walkedRoot) {
+      return { rootSessionId: walkedRoot, rootSessionResolved: true };
+    }
     // Snapshot or walk still loading → hold the last root while the target
     // is that root itself or a known member of its cached tree.
     const sticky = stickyRootRef.current;
@@ -685,11 +689,14 @@ export function AppShell() {
       (sticky === conversationId ||
         cachedTreeContains(queryClient, sticky, conversationId, MAX_TREE_DEPTH))
     ) {
-      return sticky;
+      return { rootSessionId: sticky, rootSessionResolved: true };
     }
     // No sticky context (e.g. a deep link straight into a sub-agent):
     // fall back one hop until the walk resolves the true root.
-    return activeSession?.parentSessionId ?? conversationId;
+    return {
+      rootSessionId: activeSession?.parentSessionId ?? conversationId,
+      rootSessionResolved: false,
+    };
   }, [conversationId, activeSession, walkedRoot, queryClient]);
   // One-shot fetch (no polling) for the Subagents tab's count badge.
   // SubagentsPanel mounts its own polling usage of the hook against
@@ -698,8 +705,8 @@ export function AppShell() {
   // Remember the resolved root so a later click into one of its tree
   // members can hold it steady (see ``rootSessionId`` above).
   useEffect(() => {
-    stickyRootRef.current = rootSessionId;
-  }, [rootSessionId]);
+    if (rootSessionResolved) stickyRootRef.current = rootSessionId;
+  }, [rootSessionId, rootSessionResolved]);
   // How many children are actively working — surfaced in the tab badge so
   // "something's happening" is visible without opening the panel.
   const subagentsWorking = childSessions.filter((c) => c.busy).length;
@@ -1687,12 +1694,15 @@ export function AppShell() {
     !executionLogsOpen &&
     !filesPanelOpen,
   );
+  // Width is keyed by the ROOT session so one agent tree shares a rail width;
+  // resizing stays disabled until the root resolves so a tentative key can't
+  // persist a width under the wrong session.
   const { panelWidth: inlinePanelWidth, handleProps: inlinePanelHandleProps } =
     useResizableInlinePanel(
-      conversationId ?? null,
+      rootSessionId,
       inlinePanelMinWidth,
       sidebarOpen ? sidebarWidth : 0,
-      workspacePanelVisible && !mobileViewport,
+      workspacePanelVisible && !mobileViewport && rootSessionResolved,
     );
 
   return (
