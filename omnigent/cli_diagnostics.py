@@ -123,7 +123,7 @@ _SECRET_PATTERNS: list[re.Pattern[str]] = [
 _REDACTED = "[REDACTED]"
 
 
-def _redact(text: str) -> str:
+def redact_secrets(text: str) -> str:
     """
     Replace secret-shaped substrings in *text* with :data:`_REDACTED`.
 
@@ -160,7 +160,7 @@ class _RedactingFormatter(TerminalLogFormatter):
         :param record: The log record to format.
         :returns: Formatted, redacted string ready for the handler.
         """
-        return _redact(super().format(record))
+        return redact_secrets(super().format(record))
 
 
 class _RedactingStderr(io.TextIOBase):
@@ -189,7 +189,7 @@ class _RedactingStderr(io.TextIOBase):
         :param text: Text sent to ``sys.stderr.write``.
         :returns: The length of the caller's original text.
         """
-        self._inner.write(_redact(text))
+        self._inner.write(redact_secrets(text))
         return len(text)
 
     def flush(self) -> None:

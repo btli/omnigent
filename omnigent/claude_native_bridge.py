@@ -56,7 +56,7 @@ from omnigent._platform import stable_user_id
 from omnigent.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.claude_native_status import CONTEXT_RAW_FILE
-from omnigent.cli_diagnostics import _redact as _redact_secrets
+from omnigent.cli_diagnostics import redact_secrets
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.kiro_native_bridge import bridge_root as kiro_bridge_root
 
@@ -2811,7 +2811,7 @@ def _sanitize_hook_failure_detail(text: str) -> str | None:
     collapsed = " ".join(stripped.split())
     if not collapsed:
         return None
-    redacted = _redact_secrets(collapsed)
+    redacted = redact_secrets(collapsed)
     if len(redacted) > _HOOK_FAILURE_DETAIL_MAX_CHARS:
         redacted = redacted[:_HOOK_FAILURE_DETAIL_MAX_CHARS].rstrip() + "… [truncated]"
     return redacted or None
