@@ -146,6 +146,30 @@ beforeEach(() => {
 
 describe("click sub-agent in rail (real SubagentsPanel)", () => {
   it("keeps the Agents tab and rail width across root, child, and sibling navigation", async () => {
+    const children = [
+      {
+        id: "conv_child",
+        title: null,
+        task_summary: null,
+        tool: "researcher",
+        session_name: null,
+        current_task_status: null,
+        busy: false,
+        last_message_preview: null,
+        pending_elicitations_count: 0,
+      },
+      {
+        id: "conv_sibling",
+        title: null,
+        task_summary: null,
+        tool: "researcher",
+        session_name: null,
+        current_task_status: null,
+        busy: false,
+        last_message_preview: null,
+        pending_elicitations_count: 0,
+      },
+    ];
     // Setup: parent has two child sub-agents. User starts on parent
     // with the Agents tab selected; URL has ?file=foo.txt (stale from
     // a previous file-viewer interaction).
@@ -162,30 +186,7 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
     vi.mocked(useChildSessions).mockImplementation((id) => {
       if (id === "conv_root") {
         return {
-          children: [
-            {
-              id: "conv_child",
-              title: null,
-              task_summary: null,
-              tool: "researcher",
-              session_name: null,
-              current_task_status: null,
-              busy: false,
-              last_message_preview: null,
-              pending_elicitations_count: 0,
-            },
-            {
-              id: "conv_sibling",
-              title: null,
-              task_summary: null,
-              tool: "researcher",
-              session_name: null,
-              current_task_status: null,
-              busy: false,
-              last_message_preview: null,
-              pending_elicitations_count: 0,
-            },
-          ],
+          children,
           isLoading: false,
           error: null,
         };
@@ -231,30 +232,7 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
     // production (its useChildSessions queries write here). The sticky
     // root holds across the parent→child click only while the target is
     // a known member of the last root's cached tree.
-    qc.setQueryData(childSessionsQueryKey("conv_root"), [
-      {
-        id: "conv_child",
-        title: null,
-        task_summary: null,
-        tool: "researcher",
-        session_name: null,
-        current_task_status: null,
-        busy: false,
-        last_message_preview: null,
-        pending_elicitations_count: 0,
-      },
-      {
-        id: "conv_sibling",
-        title: null,
-        task_summary: null,
-        tool: "researcher",
-        session_name: null,
-        current_task_status: null,
-        busy: false,
-        last_message_preview: null,
-        pending_elicitations_count: 0,
-      },
-    ]);
+    qc.setQueryData(childSessionsQueryKey("conv_root"), children);
     writeSessionWorkspaceState("conv_root", { widthPx: 500 });
     render(
       <QueryClientProvider client={qc}>

@@ -613,11 +613,7 @@ export function AppShell() {
     stickyRootRef.current = rootSessionId;
   }, [rootSessionId]);
   const { panelWidth: inlinePanelWidth, handleProps: inlinePanelHandleProps } =
-    useResizableInlinePanel(
-      rootSessionId ?? conversationId ?? null,
-      inlinePanelMinWidth,
-      sidebarOpen ? sidebarWidth : 0,
-    );
+    useResizableInlinePanel(rootSessionId, inlinePanelMinWidth, sidebarOpen ? sidebarWidth : 0);
   // How many children are actively working — surfaced in the tab badge so
   // "something's happening" is visible without opening the panel.
   const subagentsWorking = childSessions.filter((c) => c.busy).length;
