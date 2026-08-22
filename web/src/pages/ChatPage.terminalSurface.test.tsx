@@ -5,7 +5,9 @@ import { TerminalSurface } from "./ChatPage";
 afterEach(cleanup);
 
 describe("TerminalSurface", () => {
-  it("keeps a hidden terminal laid out without exposing visible descendants", () => {
+  it("hides via opacity-0/pointer-events-none/inert instead of the invisible class, and clears them when shown", () => {
+    // jsdom cannot compute Tailwind styles or compositing, so this structurally guards against
+    // reverting to `invisible`; scrollbar-bleed behavior belongs in e2e/Playwright.
     const { container, rerender } = render(<TerminalSurface isShown={false} />);
     const surface = container.firstChild as HTMLElement;
 
