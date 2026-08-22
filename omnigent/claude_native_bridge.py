@@ -4124,7 +4124,7 @@ def _verify_draft_submitted(
     last_enter = time.monotonic()
     while time.monotonic() < deadline:
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-        # Retry only while the draft guard confirms Enter cannot reach a new surface.
+        # Best-effort: re-check the draft before each Enter to narrow the capture-to-send race.
         if not _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
             return
         if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
