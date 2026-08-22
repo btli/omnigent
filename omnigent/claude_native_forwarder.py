@@ -2956,10 +2956,9 @@ async def _forward_available_status_events(
                 session_id=session_id,
                 status=status,
                 response_id=response_id,
-                # A ``StopFailure`` carries provider failure text (sanitized in
-                # the bridge parser); forward it so the parent surfaces a real
-                # detail instead of the generic "turn failed" string. ``None``
-                # for every other event, which the helper ignores.
+                # A ``StopFailure`` carries sanitized provider failure text;
+                # forward it so the parent surfaces a real detail instead of the
+                # generic "turn failed" string (``None`` for other events).
                 output=record.failure_detail,
                 # Only the ``Stop`` (idle) edge carries an authoritative
                 # background-shell count — ``0`` clears the tally, ``N`` sets it.

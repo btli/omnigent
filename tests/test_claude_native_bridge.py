@@ -24,6 +24,8 @@ import pytest
 from omnigent import claude_native_bridge, native_cost_popup
 from omnigent.claude_native_bridge import (
     _BACKGROUND_TASK_FIELD_MAX_CHARS,
+    _HOOK_FAILURE_DETAIL_MAX_CHARS,
+    _HOOK_FAILURE_DETAIL_TRUNCATION_MARKER,
     _build_tools,
     _claude_prompt_rendered,
     _escape_unsupported_slash_command,
@@ -7487,12 +7489,33 @@ def test_hook_record_non_stop_failure_event_has_no_failure_detail() -> None:
 def test_sanitize_hook_failure_detail_truncates_overlong() -> None:
     """
     Over-long text is capped with an explicit truncation marker.
+
+    Secret-free input passes through the redactor unchanged, so the emitted
+    length is exactly the head cap plus the marker — a loose bound (``< 600``)
+    would still pass if the head cap silently widened.
     """
     detail = _sanitize_hook_failure_detail("x" * 5000)
     assert detail is not None
-    assert detail.endswith("… [truncated]")
-    # The capped body plus the marker — never the full 5000 chars.
-    assert len(detail) < 600
+    assert detail.endswith(_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER)
+    assert len(detail) == _HOOK_FAILURE_DETAIL_MAX_CHARS + len(
+        _HOOK_FAILURE_DETAIL_TRUNCATION_MARKER
+    )
+
+
+def test_sanitize_hook_failure_detail_redacts_secret_straddling_truncation() -> None:
+    """
+    A secret that straddles the truncation boundary is still fully redacted.
+
+    Redaction runs BEFORE the length cap, so a length-gated pattern matches the
+    whole token and scrubs it to ``[REDACTED]`` before truncation can split it
+    into a sub-threshold, un-matchable prefix. Capping first (then redacting)
+    would leave e.g. ``dapiAAAAA`` in the clear.
+    """
+    secret = "dapi" + "A" * 40
+    padding = "x" * (_HOOK_FAILURE_DETAIL_MAX_CHARS - 10)
+    detail = _sanitize_hook_failure_detail(f"{padding} {secret}")
+    assert detail is not None
+    assert "dapi" not in detail
 
 
 def test_sanitize_hook_failure_detail_strips_control_and_ansi() -> None:
@@ -7506,16 +7529,66 @@ def test_sanitize_hook_failure_detail_strips_control_and_ansi() -> None:
     assert "\n" not in detail and "\t" not in detail and "\x00" not in detail
 
 
-def test_sanitize_hook_failure_detail_redacts_secret() -> None:
+def test_sanitize_hook_failure_detail_redacts_opaque_authorization_token() -> None:
     """
-    Secret-shaped substrings are redacted before the text leaves the parser.
+    An OPAQUE credential after ``Authorization: Bearer`` must be redacted.
+
+    This is the adversarial case: the token matches no standalone
+    (``sk-``/``dapi``) rule, so it survives only if the Authorization/bearer
+    path fully consumes the scheme AND the credential. A leaky pattern order
+    (authorization consuming only the scheme word) would leave it in the clear.
     """
     detail = _sanitize_hook_failure_detail(
-        "auth failed with Authorization: Bearer dapiabcdef0123456789 while launching"
+        "launch failed: Authorization: Bearer eyJhbGciOiJexposedOPAQUE12345 rejected"
     )
     assert detail is not None
-    assert "dapiabcdef0123456789" not in detail
+    assert "eyJhbGciOiJexposedOPAQUE12345" not in detail
     assert "[REDACTED]" in detail
+
+
+def test_sanitize_hook_failure_detail_redacts_basic_authorization_credential() -> None:
+    """
+    ``Authorization: Basic <blob>`` must not leave the base64 credential behind.
+    """
+    detail = _sanitize_hook_failure_detail("Authorization: Basic dXNlcjpodW50ZXIy failed")
+    assert detail is not None
+    assert "dXNlcjpodW50ZXIy" not in detail
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "dapiabcdef0123456789",  # Databricks PAT
+        "sk-abcdef0123456789ABCDEF",  # OpenAI-style key
+        # Built by concatenation so the literal secret never appears in source
+        # (both the repo and GitHub push-protection scanners would otherwise
+        # flag these synthetic tokens).
+        "xoxb" + "-1234567890-abcdefslacktoken",  # Slack bot token
+        "ghp_" + "a1b2c3d4e5" * 3 + "abcdef",  # GitHub token
+        "AKIA" + "QWERTYUIOP123456",  # AWS access key id
+    ],
+)
+def test_sanitize_hook_failure_detail_redacts_secret_shapes(secret: str) -> None:
+    """
+    Each supported secret shape is redacted out of the surfaced detail.
+    """
+    detail = _sanitize_hook_failure_detail(f"model launch failed: token {secret} was rejected")
+    assert detail is not None
+    assert secret not in detail
+    assert "[REDACTED]" in detail
+
+
+def test_sanitize_hook_failure_detail_redacts_url_basic_auth() -> None:
+    """
+    URL-embedded basic-auth userinfo is redacted; the host stays readable.
+    """
+    detail = _sanitize_hook_failure_detail(
+        "fetch failed for https://alice:s3cr3tpassw0rd@registry.internal/models"
+    )
+    assert detail is not None
+    assert "s3cr3tpassw0rd" not in detail
+    assert "alice" not in detail
+    assert "registry.internal" in detail
 
 
 # ── /model switching + pane readiness ───────────────────────────────────
