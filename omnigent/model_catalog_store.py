@@ -47,8 +47,8 @@ def fingerprint_of(*parts: object) -> str:
     return digest.hexdigest()[:16]
 
 
-#: Catalog entries older than this get a background refresh on read, and
-#: launch paths stop treating their ``isDefault`` row as launch authority.
+#: Catalog entries at or below this age are authoritative cache hits. Older
+#: entries are retained only as a fallback while the store refreshes them.
 CATALOG_STALE_AFTER_S = 3600.0
 
 
@@ -60,13 +60,32 @@ class CatalogFreshness(Enum):
     MISSING = "missing"
 
 
+class CatalogRefreshFailureKind(Enum):
+    """Sanitized reason a live catalog refresh did not produce rows."""
+
+    AUTH = "auth"
+    TIMEOUT = "timeout"
+    CLI_ABSENT = "cli_absent"
+    EMPTY = "empty"
+    OTHER = "other"
+
+
+class CatalogRefreshError(Exception):
+    """Structured refresh failure safe to surface in launch diagnostics."""
+
+    def __init__(self, kind: CatalogRefreshFailureKind, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.message = message
+
+
 @dataclass(frozen=True)
 class CatalogResult:
     """Catalog rows together with their authority state."""
 
     rows: list[dict[str, Any]] | None
     freshness: CatalogFreshness
-    refresh_error: str | None = None
+    refresh_error: CatalogRefreshError | None = None
 
 
 def _data_dir() -> Path:
@@ -173,24 +192,65 @@ async def ensure_catalog(
     fingerprint: str,
     resolve: Callable[[], Awaitable[list[dict[str, Any]] | None]],
 ) -> list[dict[str, Any]] | None:
-    """Store-first catalog access with a single probe in flight per key.
+    """Return rows from the freshness-aware shared catalog store.
 
-    A hit serves immediately; a miss runs *resolve* once (concurrent
-    callers join it), persists a non-empty answer, and returns it. A hit
-    older than :data:`CATALOG_STALE_AFTER_S` still serves immediately but
-    kicks *resolve* in the background so the store converges — the probe's
-    own internal budgets bound it, so nothing here waits on it.
+    Recent cache hits serve immediately. Missing or over-age entries run
+    *resolve* once (concurrent callers join it); stale rows remain available
+    when that refresh fails.
 
     :param harness: Canonical harness name.
     :param fingerprint: The launch-config fingerprint.
     :param resolve: Probe coroutine factory producing verbatim rows.
     :returns: Catalog rows, or ``None`` when no catalog could be obtained.
     """
+    return (await ensure_catalog_result(harness, fingerprint, resolve)).rows
+
+
+def _refresh_failure(
+    exc: CatalogRefreshError | TimeoutError | OSError,
+) -> CatalogRefreshError:
+    """Return a structured failure without provider response contents."""
+    if isinstance(exc, CatalogRefreshError):
+        return exc
+    if isinstance(exc, TimeoutError):
+        return CatalogRefreshError(
+            CatalogRefreshFailureKind.TIMEOUT,
+            "model catalog refresh timed out",
+        )
+    if isinstance(exc, FileNotFoundError):
+        return CatalogRefreshError(
+            CatalogRefreshFailureKind.CLI_ABSENT,
+            "model catalog refresh could not launch the provider CLI",
+        )
+    return CatalogRefreshError(
+        CatalogRefreshFailureKind.OTHER,
+        "model catalog refresh could not reach the provider",
+    )
+
+
+def _empty_refresh_failure() -> CatalogRefreshError:
+    return CatalogRefreshError(
+        CatalogRefreshFailureKind.EMPTY,
+        "model catalog refresh returned no models",
+    )
+
+
+async def ensure_catalog_result(
+    harness: str,
+    fingerprint: str,
+    resolve: Callable[[], Awaitable[list[dict[str, Any]] | None]],
+) -> CatalogResult:
+    """Return rows with authoritative cache and refresh provenance.
+
+    A recent cache or successful live probe is fresh. An over-age cache is
+    re-probed; if the probe fails, its existing rows are returned stale with
+    the sanitized failure. A failed cold probe is missing with that failure.
+    """
     cached = read_catalog(harness, fingerprint)
-    if cached is not None:
-        if catalog_is_stale(harness, fingerprint):
-            _refresh_in_background(harness, fingerprint, resolve)
-        return cached
+    age = catalog_age_s(harness, fingerprint) if cached is not None else None
+    if cached is not None and age is not None and age <= CATALOG_STALE_AFTER_S:
+        return CatalogResult(cached, CatalogFreshness.FRESH)
+
     key = (harness, fingerprint)
     task = _inflight.get(key)
     if task is None or task.done():
@@ -206,40 +266,17 @@ async def ensure_catalog(
 
         task = asyncio.create_task(_run(), name=f"model-catalog-{harness}")
         _inflight[key] = task
-    return await asyncio.shield(task)
-
-
-def _refresh_failure(exc: Exception) -> str:
-    """Return a sanitized catalog-refresh failure for launch diagnostics."""
-    if isinstance(exc, TimeoutError):
-        return "model catalog refresh timed out"
-    if isinstance(exc, OSError):
-        return "provider credentials or network unavailable"
-    return f"model catalog refresh failed ({type(exc).__name__})"
-
-
-async def ensure_catalog_result(
-    harness: str,
-    fingerprint: str,
-    resolve: Callable[[], Awaitable[list[dict[str, Any]] | None]],
-) -> CatalogResult:
-    """Return catalog rows with whether the probe produced fresh authority."""
-    outcomes = await asyncio.gather(
-        ensure_catalog(harness, fingerprint, resolve),
-        return_exceptions=True,
-    )
-    rows = outcomes[0]
-    if isinstance(rows, Exception):
-        return CatalogResult(None, CatalogFreshness.MISSING, _refresh_failure(rows))
-    if isinstance(rows, BaseException):
-        raise rows
-    if rows is None:
-        return CatalogResult(
-            None,
-            CatalogFreshness.MISSING,
-            "model catalog refresh returned no models",
-        )
-    return CatalogResult(rows, CatalogFreshness.FRESH)
+    try:
+        rows = await asyncio.shield(task)
+    except (CatalogRefreshError, TimeoutError, OSError) as exc:
+        failure = _refresh_failure(exc)
+    else:
+        if rows:
+            return CatalogResult(rows, CatalogFreshness.FRESH)
+        failure = _empty_refresh_failure()
+    if cached is not None:
+        return CatalogResult(cached, CatalogFreshness.STALE, failure)
+    return CatalogResult(None, CatalogFreshness.MISSING, failure)
 
 
 def default_row(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -264,6 +301,8 @@ def catalog_contains(rows: list[dict[str, Any]], token: str) -> bool:
 __all__ = [
     "CATALOG_STALE_AFTER_S",
     "CatalogFreshness",
+    "CatalogRefreshError",
+    "CatalogRefreshFailureKind",
     "CatalogResult",
     "catalog_age_s",
     "catalog_contains",

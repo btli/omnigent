@@ -17,6 +17,7 @@ from omnigent import (
     claude_native_bridge,
     cursor_native_bridge,
     kiro_native_bridge,
+    model_catalog_store,
 )
 from omnigent.antigravity_native_bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -46,7 +47,6 @@ from omnigent.codex_native_bridge import (
 )
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.inner.terminal import TerminalInstance
-from omnigent.model_catalog_store import CatalogFreshness, CatalogResult
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import (
     ResolvedSpec,
@@ -3187,10 +3187,13 @@ def test_routed_spawn_launch_args_need_a_router() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("endpoint", ["subscription", "gateway"])
+@pytest.mark.parametrize("pin_source", ["session", "spec"])
 async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_override(
     endpoint: str,
+    pin_source: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A persisted model id the catalog lists in equivalent vocabulary launches.
@@ -3224,9 +3227,15 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         },
     ]
 
-    async def _catalog(config: object) -> CatalogResult:
+    async def _catalog(config: object) -> model_catalog_store.CatalogResult:
         del config
-        return CatalogResult(catalog, CatalogFreshness.FRESH)
+
+        async def _resolve() -> list[dict[str, object]]:
+            return catalog
+
+        return await model_catalog_store.ensure_catalog_result(
+            "claude-native", f"autocreate-{endpoint}-{pin_source}", _resolve
+        )
 
     monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog_result", _catalog)
 
@@ -3263,7 +3272,13 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
     )
 
     def _handle_request(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"model_override": model_override, "labels": {}})
+        return httpx.Response(
+            200,
+            json={
+                "model_override": model_override if pin_source == "session" else None,
+                "labels": {},
+            },
+        )
 
     fake_client = httpx.AsyncClient(
         base_url="http://test-server",
@@ -3282,43 +3297,53 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
     async def _resolve() -> ClaudeNativeUcodeConfig | None:
         return config
 
-    session_id = "0f2d3d5c9a6b4e1f8c7d6e5f4a3b2c1d"
-    await _auto_create_claude_terminal(
-        session_id,
-        _FakeResourceRegistry(),
-        lambda _sid, _evt: None,
-        server_client=fake_client,
-        resolve_launch_config=_resolve,
+    agent_spec = (
+        AgentSpec(
+            spec_version=1,
+            name="claude",
+            executor=ExecutorSpec(
+                type="omnigent",
+                model=model_override,
+                config={"harness": "claude-native"},
+            ),
+        )
+        if pin_source == "spec"
+        else None
     )
+    session_id = "0f2d3d5c9a6b4e1f8c7d6e5f4a3b2c1d"
+    with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+        await _auto_create_claude_terminal(
+            session_id,
+            _FakeResourceRegistry(),
+            lambda _sid, _evt: None,
+            server_client=fake_client,
+            resolve_launch_config=_resolve,
+            agent_spec=agent_spec,
+        )
     args = captured["spec"].args
     expected = "claude-opus-4-8" if endpoint == "subscription" else "system.ai.claude-opus-4-8[1m]"
     assert args[args.index("--model") + 1] == expected
+    assert "catalog_freshness=fresh" in caplog.text
 
     await fake_client.aclose()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("freshness", ["fresh", "stale"])
-async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
+async def test_auto_create_claude_terminal_default_pin_uses_authoritative_catalog(
     freshness: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A Default launch pins the stored default only while the entry is fresh.
-
-    The store never forgets an entry, so its ``isDefault`` row can outlive
-    the model it names (a retirement or an entitlement change); pinning it
-    as ``--model`` then hard-fails every Default launch on the host. A
-    stale entry defers to the CLI's own default — no ``--model`` at all —
-    while the store re-probes in the background.
+    A Default launch uses a fresh cache or synchronously refreshed default.
     """
     import os
     import time
 
     from omnigent import model_catalog_store
     from omnigent.claude_native import claude_catalog_fingerprint
-    from tests.runner.conftest import REAL_CLAUDE_LAUNCH_CATALOG
+    from tests.runner.conftest import REAL_CLAUDE_LAUNCH_CATALOG_RESULT
 
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
@@ -3331,9 +3356,11 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
         "omnigent.claude_native_forwarder.supervise_forwarder",
         _no_op_forwarder,
     )
-    # The real store-backed resolver, against the conftest-isolated store
-    # dir; the background re-probe is stubbed so no real CLI ever runs.
-    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG)
+    # Exercise the real store path; stub only its live provider probe.
+    monkeypatch.setattr(
+        "omnigent.claude_native.claude_launch_catalog_result",
+        REAL_CLAUDE_LAUNCH_CATALOG_RESULT,
+    )
     refreshed = [{"id": "sonnet", "model": "claude-sonnet-5", "isDefault": True}]
 
     async def _fake_probe_catalog(config: object) -> list[dict[str, object]]:
@@ -3407,14 +3434,9 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
         resolve_launch_config=_resolve,
     )
     args = captured["spec"].args
-    if freshness == "fresh":
-        assert args[args.index("--model") + 1] == "claude-3-5-sonnet-20241022"
-    else:
-        assert "--model" not in args, f"a stale default was still pinned: {args}"
-        task = model_catalog_store._inflight.get(("claude-native", fingerprint))
-        if task is not None:
-            await task
-        # The background re-probe healed the store for the next launch.
+    expected_model = "claude-3-5-sonnet-20241022" if freshness == "fresh" else "claude-sonnet-5"
+    assert args[args.index("--model") + 1] == expected_model
+    if freshness == "stale":
         assert model_catalog_store.read_catalog("claude-native", fingerprint) == refreshed
 
     await fake_client.aclose()

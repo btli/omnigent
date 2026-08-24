@@ -42,6 +42,7 @@ import click
 import httpx
 from fastapi.responses import JSONResponse, Response
 
+from omnigent import model_catalog_store
 from omnigent._platform import IS_WINDOWS
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.entities.session_resources import (
@@ -6128,49 +6129,70 @@ async def _load_claude_launch_metadata(
     return metadata
 
 
+_CLAUDE_CATALOG_AUTH_REMEDIATION = "Restore provider credentials and retry."
+_CLAUDE_CATALOG_DATABRICKS_AUTH_REMEDIATION = (
+    " For Databricks, run `databricks auth login --profile <PROFILE>`."
+)
+_CLAUDE_CATALOG_RETRY_REMEDIATION = (
+    "Retry after checking Claude CLI availability and provider connectivity."
+)
+
+
+def _claude_catalog_refresh_remediation(
+    error: model_catalog_store.CatalogRefreshError,
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> str:
+    """Return endpoint-specific guidance for a sanitized refresh failure."""
+    from omnigent.claude_native import claude_config_uses_databricks
+
+    if error.kind is not model_catalog_store.CatalogRefreshFailureKind.AUTH:
+        return _CLAUDE_CATALOG_RETRY_REMEDIATION
+    remediation = _CLAUDE_CATALOG_AUTH_REMEDIATION
+    if claude_config_uses_databricks(claude_config):
+        remediation += _CLAUDE_CATALOG_DATABRICKS_AUTH_REMEDIATION
+    return remediation
+
+
 def _select_authoritative_claude_launch_model(
     *,
     explicit_model: str | None,
     configured_model: str | None,
-    claude_config: Any,
-    catalog: Any,
-    implicit_cli_default_allowed: bool = True,
+    claude_config: ClaudeNativeUcodeConfig | None,
+    catalog: model_catalog_store.CatalogResult | None,
 ) -> str | None:
     """Select a launch model from an explicit pin or authoritative catalog."""
     from omnigent.claude_native import (
+        claude_catalog_serves_model,
         claude_config_serves_canonical_ids,
         resolve_claude_catalog_model,
         resolve_claude_native_model_selection,
     )
-    from omnigent.model_catalog_store import CatalogFreshness, default_row
-
-    if explicit_model:
-        resolved = (
-            resolve_claude_native_model_selection(explicit_model, claude_config) or explicit_model
-        )
-        if resolved.lower().startswith("claude-") and claude_config_serves_canonical_ids(
-            claude_config
-        ):
-            return resolved
-    elif configured_model:
-        return resolve_claude_native_model_selection(configured_model, claude_config)
-    else:
-        resolved = None
 
     fresh_rows = (
         catalog.rows
         if catalog is not None
-        and catalog.freshness is CatalogFreshness.FRESH
+        and catalog.freshness is model_catalog_store.CatalogFreshness.FRESH
         and catalog.rows is not None
         else None
     )
-    if resolved is not None:
+
+    if explicit_model is not None:
+        resolved = (
+            resolve_claude_native_model_selection(explicit_model, claude_config) or explicit_model
+        )
         if fresh_rows is not None:
-            catalog_model = resolve_claude_catalog_model(fresh_rows, explicit_model or resolved)
-            if catalog_model is None and resolved != explicit_model:
-                catalog_model = resolve_claude_catalog_model(fresh_rows, resolved)
-            if catalog_model is not None:
-                return catalog_model
+            if (
+                resolved.lower().startswith("claude-")
+                and claude_config_serves_canonical_ids(claude_config)
+                and claude_catalog_serves_model(fresh_rows, resolved, claude_config)
+            ):
+                return resolved
+            for candidate in dict.fromkeys((explicit_model, resolved)):
+                catalog_model = resolve_claude_catalog_model(fresh_rows, candidate)
+                if catalog_model is not None:
+                    return catalog_model
+            if claude_catalog_serves_model(fresh_rows, resolved, claude_config):
+                return resolved
             launchable = sorted(
                 {
                     str(token)
@@ -6185,44 +6207,37 @@ def _select_authoritative_claude_launch_model(
                 "list — it may have changed since the pick. Launchable model ids: "
                 f"{launchable_text}. Pick again from the model menu."
             )
+        if claude_config_serves_canonical_ids(claude_config):
+            return resolved
         refresh_error = catalog.refresh_error if catalog is not None else None
         if refresh_error is not None:
             raise click.ClickException(
                 f"the requested model {explicit_model!r} could not be validated against a "
-                f"fresh model list ({refresh_error}). Pick again from the model menu after "
-                "restoring provider credentials; for Databricks, run "
-                "`databricks auth login --profile <PROFILE>`."
+                f"fresh model list ({refresh_error}). "
+                f"{_claude_catalog_refresh_remediation(refresh_error, claude_config)}"
             )
         raise click.ClickException(
             f"the requested model {explicit_model!r} could not be validated because this "
             "host has no fresh model list. Pick again from the model menu."
         )
+
+    configured = resolve_claude_native_model_selection(configured_model, claude_config)
     if fresh_rows is not None:
-        row = default_row(fresh_rows)
+        if configured is not None:
+            for candidate in dict.fromkeys((configured_model, configured)):
+                if candidate is None:
+                    continue
+                catalog_model = resolve_claude_catalog_model(fresh_rows, candidate)
+                if catalog_model is not None:
+                    return catalog_model
+            if claude_catalog_serves_model(fresh_rows, configured, claude_config):
+                return configured
+        row = model_catalog_store.default_row(fresh_rows)
         if row is not None:
             return str(row.get("model") or row.get("id") or "") or None
-    refresh_error = catalog.refresh_error if catalog is not None else None
-    if claude_config is None and not implicit_cli_default_allowed:
-        if refresh_error is not None:
-            raise click.ClickException(
-                "Claude provider configuration and the fresh model list are unavailable "
-                f"({refresh_error}). Restore provider credentials and retry; for "
-                "Databricks, run `databricks auth login --profile <PROFILE>`."
-            )
-        raise click.ClickException(
-            "Claude provider configuration and the fresh model list are unavailable. Retry "
-            "after this host has refreshed its model list."
-        )
-    if claude_config is not None and catalog is not None:
-        if refresh_error is not None:
-            raise click.ClickException(
-                "the configured Claude gateway has no authoritative launch model "
-                f"({refresh_error}). Restore provider credentials and retry."
-            )
-        raise click.ClickException(
-            "the configured Claude gateway has no authoritative launch model in this host's "
-            "current model list."
-        )
+        return None
+    if configured is not None:
+        return configured
     return None
 
 
@@ -6420,7 +6435,6 @@ async def _auto_create_claude_terminal(
         build_native_claude_terminal_env,
         claude_config_with_launch_model_pinned,
         claude_config_with_routed_arms_pinned,
-        resolve_claude_native_model_selection,
         resolve_native_claude_config,
     )
 
@@ -6630,13 +6644,11 @@ async def _auto_create_claude_terminal(
     # provider selection just like the in-process claude-sdk harness and the
     # CLI path.
     claude_config: ClaudeNativeUcodeConfig | None = None
-    claude_config_resolved = False
     try:
         if resolve_launch_config is not None:
             claude_config = await resolve_launch_config()
         else:
             claude_config = await asyncio.to_thread(resolve_native_claude_config, spec=None)
-        claude_config_resolved = True
     except click.ClickException:
         # An authoritative Databricks response with no Claude models is a
         # configuration failure, not permission to bypass the gateway.
@@ -6661,34 +6673,24 @@ async def _auto_create_claude_terminal(
     spec_model = _claude_native_model_from_spec(agent_spec)
     explicit_model = session_model_override or spec_model
     configured_model = claude_config.model if claude_config is not None else None
-    launch_model = resolve_claude_native_model_selection(
-        explicit_model or configured_model,
-        claude_config,
-    )
-    # Explicit launches (model-flows design §4): consult the shared catalog
-    # only when it can change the outcome — to validate an explicit request,
-    # or to resolve a Default launch that would otherwise pass no ``--model``
-    # and leave the model to invisible CLI-private state.
-    if explicit_model or launch_model is None:
-        from omnigent.claude_native import claude_launch_catalog_result
+    from omnigent.claude_native import claude_launch_catalog_result
 
-        launch_catalog_result = None
-        try:
-            launch_catalog_result = await claude_launch_catalog_result(claude_config)
-        except Exception:  # noqa: BLE001 — no catalog means no validation/default
-            _logger.warning(
-                "claude launch catalog unavailable for session=%s",
-                session_id,
-                exc_info=True,
-                extra={"session_id": session_id},
-            )
-        launch_model = _select_authoritative_claude_launch_model(
-            explicit_model=explicit_model,
-            configured_model=configured_model,
-            claude_config=claude_config,
-            catalog=launch_catalog_result,
-            implicit_cli_default_allowed=claude_config_resolved and claude_config is None,
+    launch_catalog_result = None
+    try:
+        launch_catalog_result = await claude_launch_catalog_result(claude_config)
+    except Exception:  # noqa: BLE001 — no catalog means no validation/default
+        _logger.warning(
+            "claude launch catalog unavailable for session=%s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
         )
+    launch_model = _select_authoritative_claude_launch_model(
+        explicit_model=explicit_model,
+        configured_model=configured_model,
+        claude_config=claude_config,
+        catalog=launch_catalog_result,
+    )
     # Give an exact launch model (a Smart Routing pick is resolved before the
     # terminal exists) a spelling of its own in the picker, so a later
     # ``/model`` can return to it instead of stepping onto whatever the family
@@ -6714,13 +6716,19 @@ async def _auto_create_claude_terminal(
     )
     _logger.info(
         "Claude terminal provider config resolved: session=%s configured=%s "
-        "env_keys=%s api_key_helper_set=%s model_set=%s launch_model=%s",
+        "env_keys=%s api_key_helper_set=%s model_set=%s launch_model=%s "
+        "catalog_freshness=%s",
         session_id,
         claude_config is not None,
         sorted(claude_config.env) if claude_config is not None else [],
         bool(claude_config.api_key_helper) if claude_config is not None else False,
         bool(claude_config.model) if claude_config is not None else False,
         launch_model,
+        (
+            launch_catalog_result.freshness.value
+            if launch_catalog_result is not None
+            else "unavailable"
+        ),
         extra={"session_id": session_id},
     )
     base_claude_args = _build_claude_native_base_args(
