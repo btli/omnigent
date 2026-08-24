@@ -440,21 +440,7 @@ def create_runner_tunnel_router(
 
         await ws.accept()
         session: RunnerSession | None = None
-        disconnect_notified = False
-
-        async def _notify_runner_disconnect() -> None:
-            # finally + outer except paths can both see one teardown.
-            nonlocal disconnect_notified
-            if disconnect_notified or on_runner_disconnect is None:
-                return
-            disconnect_notified = True
-            try:
-                await on_runner_disconnect(runner_id)
-            except Exception:
-                _logger.exception(
-                    "on_runner_disconnect callback failed for %s",
-                    runner_id,
-                )
+        notify_disconnect = False
 
         try:
             # 3. Receive hello frame.
@@ -585,9 +571,11 @@ def create_runner_tunnel_router(
                     return_exceptions=True,
                 )
                 registry.deregister(runner_id, session)
-                await _notify_runner_disconnect()
+                session = None
+                notify_disconnect = True
 
         except WebSocketDisconnect as exc:
+            notify_disconnect = True
             shutdown_state.note_tunnel_close_code(getattr(exc, "code", None))
             _logger.warning(
                 "Runner %s websocket disconnected (code=%s, reason=%r)",
@@ -595,14 +583,20 @@ def create_runner_tunnel_router(
                 getattr(exc, "code", None),
                 getattr(exc, "reason", None),
             )
-            await _notify_runner_disconnect()
         except Exception:
+            notify_disconnect = True
             _logger.exception("Tunnel error for runner %s", runner_id)
-            # Only deregister the generation this handler registered; a
-            # pre-hello failure must not pop another live tunnel's session.
             if session is not None:
                 registry.deregister(runner_id, session)
-            await _notify_runner_disconnect()
+        finally:
+            if notify_disconnect and on_runner_disconnect is not None:
+                try:
+                    await on_runner_disconnect(runner_id)
+                except Exception:
+                    _logger.exception(
+                        "on_runner_disconnect callback failed for %s",
+                        runner_id,
+                    )
 
     return router
 
