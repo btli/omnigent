@@ -7619,8 +7619,27 @@ def test_sanitize_hook_failure_detail_redacts_secret_straddling_raw_bound() -> N
     token = "dapi" + "A" * 40
     pad = "\x00" * (_HOOK_FAILURE_DETAIL_RAW_LIMIT - len(prefix) - 6)
     detail = _sanitize_hook_failure_detail(f"{prefix}{pad} {token}")
-    assert detail == f"boot error: [REDACTED] {_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER}"
+    assert detail == f"boot error: {_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER}"
     assert "dapi" not in detail
+
+
+def test_sanitize_hook_failure_detail_drops_partial_authorization_tail() -> None:
+    """A raw cut inside a folded header cannot retain an unprefixed credential."""
+    secret = "0123456789abcdef0123"
+    header = f'Authorization: Digest realm="{"a" * 2100}", response="{secret}"\n'
+    text = (
+        "Traceback starts here\n"
+        + "h" * 3000
+        + "\n"
+        + header
+        + "FinalCause: provider rejected credentials"
+    )
+    detail = _sanitize_hook_failure_detail(text)
+    assert detail == (
+        f"Traceback starts here FinalCause: provider rejected credentials "
+        f"{_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER}"
+    )
+    assert secret not in detail
 
 
 def test_sanitize_hook_failure_detail_redacts_overlong_aws_key_straddling_cap() -> None:
@@ -7675,6 +7694,33 @@ def test_sanitize_hook_failure_detail_deobfuscates_unicode_secrets(secret: str) 
     assert detail is not None
     assert "dapi" not in detail
     assert "[REDACTED]" in detail
+
+
+def test_sanitize_hook_failure_detail_redacts_thin_space_github_token() -> None:
+    """An exotic separator cannot split a GitHub-shaped credential."""
+    detail = _sanitize_hook_failure_detail("launch rejected ghp_abcdefghij\u2009klmnopqrst")
+    assert detail == "launch rejected [REDACTED]"
+
+
+def test_sanitize_hook_failure_detail_preserves_nfkc_diagnostics() -> None:
+    """The emitted detail preserves scripts, accents, joiners, and modifiers."""
+    detail = _sanitize_hook_failure_detail("München réessayer क्ष 👩\u200d💻 ｶﾞ")
+    assert detail == "München réessayer क्ष 👩\u200d💻 ガ"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("https://user:pass@[::1]/path", "https://[REDACTED]@(::1)/path"),
+        ("provider said [REDACTED]", "provider said (REDACTED)"),
+    ],
+    ids=["ipv6-userinfo", "planted-marker"],
+)
+def test_sanitize_hook_failure_detail_orders_redaction_before_framing(
+    text: str, expected: str
+) -> None:
+    """URL redaction stays trusted while planted markers are neutralized."""
+    assert _sanitize_hook_failure_detail(text) == expected
 
 
 def test_sanitize_hook_failure_detail_marks_removed_single_token() -> None:

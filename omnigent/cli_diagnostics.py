@@ -109,79 +109,22 @@ _redirected_logging_streams: list[_LoggingStreamSnapshot] = []
 
 #: Patterns that match values likely to be secrets.  Applied to every
 #: log record's formatted message before it hits the file.
-_AUTHORIZATION_FIELD_RE = re.compile(r'(?i)(["\']?authorization["\']?\s*[:=]\s*)')
-_AUTHORIZATION_TOKEN_RE = re.compile(
-    r"(?i)(?:bearer[ \t]+[A-Za-z0-9._~+/=-]{8,}|basic[ \t]+[A-Za-z0-9+/]{8,}={0,2})"
-    r"(?=\s|$)"
-)
-
-
-def _redact_authorization_value(value: str) -> str | None:
-    """Redact a recognized Authorization value, preserving trailing context."""
-    unfolded = re.sub(r"\r?\n[ \t]+", " ", value).strip()
-    if re.match(r"(?i)(?:digest|aws4-hmac-sha256)\b", unfolded):
-        return _REDACTED
-    match = _AUTHORIZATION_TOKEN_RE.match(unfolded)
-    if match is None:
-        return None
-    return f"{_REDACTED}{unfolded[match.end() :]}"
-
-
-def _quoted_value_end(text: str, start: int, quote: str) -> int:
-    """Find the next unescaped quote, or the end of *text*."""
-    escaped = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if char == quote and not escaped:
-            return index
-        escaped = char == "\\" and not escaped
-        if char != "\\":
-            escaped = False
-    return len(text)
-
-
-def _header_value_end(text: str, start: int) -> int:
-    """Include obsolete folded continuation lines in one header value."""
-    end = text.find("\n", start)
-    if end < 0:
-        return len(text)
-    while end + 1 < len(text) and text[end + 1] in " \t":
-        next_end = text.find("\n", end + 1)
-        if next_end < 0:
-            return len(text)
-        end = next_end
-    return end
-
-
-def _redact_authorization_headers(text: str) -> str:
-    """Redact complete recognized Authorization header values."""
-    parts: list[str] = []
-    cursor = 0
-    while match := _AUTHORIZATION_FIELD_RE.search(text, cursor):
-        parts.append(text[cursor : match.end()])
-        value_start = match.end()
-        if value_start < len(text) and text[value_start] in {'"', "'"}:
-            quote = text[value_start]
-            content_start = value_start + 1
-            value_end = _quoted_value_end(text, content_start, quote)
-            value = text[content_start:value_end]
-            redacted = _redact_authorization_value(value)
-            parts.append(quote)
-            parts.append(redacted if redacted is not None else value)
-            cursor = value_end
-        else:
-            value_end = _header_value_end(text, value_start)
-            value = text[value_start:value_end]
-            redacted = _redact_authorization_value(value)
-            parts.append(redacted if redacted is not None else value)
-            cursor = value_end
-    parts.append(text[cursor:])
-    return "".join(parts)
-
-
 _SECRET_PATTERNS: list[re.Pattern[str]] = [
+    # Any Authorization scheme or opaque value; structured parameters consume the line.
+    re.compile(
+        r'(?i)(["\']?authorization["\']?\s*[:=]\s*["\']?)'
+        r"(?!\[REDACTED\])(?:"
+        r"(?=[A-Za-z][A-Za-z0-9_-]*(?:[ \t]+|\r?\n[ \t]+)"
+        r"[A-Za-z][A-Za-z0-9_-]*\s*=\s*\S)(?:[^\r\n]|\r?\n[ \t]+)+"
+        r"|(?:[A-Za-z][A-Za-z0-9_-]*(?:[ \t]+|\r?\n[ \t]+))?"
+        r"[A-Za-z0-9._~+/=-]{8,}(?![A-Za-z0-9._~+/=-])"
+        r")"
+    ),
     # Bare bearer token; the length floor avoids prose such as "bearer of news".
-    re.compile(r"(?i)(\bbearer[ \t]+)(?!\[REDACTED\])[A-Za-z0-9._~+/=-]{8,}(?=\s|$)"),
+    re.compile(
+        r"(?i)(\bbearer[ \t]+)(?!\[REDACTED\])"
+        r"[A-Za-z0-9._~+/=-]{8,}(?![A-Za-z0-9._~+/=-])"
+    ),
     # Env-var style keys: FOO_TOKEN=xxx, FOO_API_KEY=xxx, ...
     re.compile(r"(?i)(\b\w*(?:token|api_key|secret|password)\s*[:=]\s*)\S+"),
     # Anthropic / OpenAI style keys
@@ -194,9 +137,9 @@ _SECRET_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
     # AWS access key ids (long-term AKIA, temporary ASIA)
     re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16,}"),
-    # URL userinfo is confined to the authority; user or password may be empty.
+    # URL userinfo is confined to one whitespace-bounded authority.
     re.compile(
-        r"(?i)(https?://)[^/?#\r\n]*:[^/?#\r\n]*"
+        r"(?i)(https?://)[^/\s@?#:]*(?::[^/\s@?#]*)?"
         r"(?=@(?:\[[0-9a-f:.%]+\]|[a-z0-9.-]+)(?::[0-9]+)?(?:[/?#\s]|$))"
     ),
 ]
@@ -210,7 +153,6 @@ def redact_secrets(text: str) -> str:
     :param text: Arbitrary log text (may include tracebacks).
     :returns: Scrubbed text.
     """
-    text = _redact_authorization_headers(text)
     for pat in _SECRET_PATTERNS:
         text = pat.sub(
             lambda m: m.group(1) + _REDACTED if m.lastindex else _REDACTED,

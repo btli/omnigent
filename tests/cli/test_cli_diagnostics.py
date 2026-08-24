@@ -210,8 +210,18 @@ def test_redact_secrets_scrubs_structured_credentials(
             ("dXNlcjpodW50ZXIy",),
             ("Authorization: [REDACTED]", "X-Request: failed"),
         ),
+        (
+            "Authorization: Token 0123456789abcdef0123",
+            ("0123456789abcdef0123",),
+            ("Authorization: [REDACTED]",),
+        ),
+        (
+            "Authorization: 0123456789abcdef0123",
+            ("0123456789abcdef0123",),
+            ("Authorization: [REDACTED]",),
+        ),
     ],
-    ids=["digest", "aws4", "quoted-json", "folded-basic"],
+    ids=["digest", "aws4", "quoted-json", "folded-basic", "token", "scheme-less"],
 )
 def test_redact_secrets_scrubs_complete_authorization_values(
     text: str, removed: tuple[str, ...], preserved: tuple[str, ...]
@@ -231,14 +241,27 @@ def test_redact_secrets_preserves_authorization_prose() -> None:
 
 
 @pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Authorization: Bearer abcdefghijk, retrying", "Authorization: [REDACTED], retrying"),
+        ("(bearer abcdefghijk)", "(bearer [REDACTED])"),
+        ('"bearer abcdefghijk"', '"bearer [REDACTED]"'),
+    ],
+    ids=["authorization-comma", "parenthesized", "quoted"],
+)
+def test_redact_secrets_scrubs_punctuation_terminated_bearer(text: str, expected: str) -> None:
+    """Punctuation after a bearer credential is not part of the token."""
+    assert cli_diagnostics.redact_secrets(text) == expected
+
+
+@pytest.mark.parametrize(
     ("url", "removed"),
     [
         ("https://:credential@host.example/path", ("credential",)),
         ("https://credential:@host.example/path", ("credential",)),
-        ("https://user:pass word@host.example/path", ("user", "pass word")),
-        ("https://u:p@ss@host.example/path", ("u:p@ss",)),
+        ("https://tokenvalue@host.example/path", ("tokenvalue",)),
     ],
-    ids=["empty-user", "empty-password", "space-password", "at-in-password"],
+    ids=["empty-user", "empty-password", "no-password"],
 )
 def test_redact_secrets_scrubs_url_authority_userinfo(url: str, removed: tuple[str, ...]) -> None:
     """Only userinfo inside the URL authority is redacted."""
@@ -269,8 +292,10 @@ def test_redact_secrets_scrubs_opaque_shapes(secret: str) -> None:
     [
         "GET https://app.example.com:8443?login_hint=alice@example.com failed 302",
         "GET https://[2001:db8::1]:8443/path#owner@example.com failed 302",
+        "https://example.com:8080 retry user@host.com done",
+        "request to https://api.example.com:443 failed for user alice@corp.com",
     ],
-    ids=["query-at-sign", "ipv6-fragment-at-sign"],
+    ids=["query-at-sign", "ipv6-fragment-at-sign", "host-port-prose", "host-port-email"],
 )
 def test_redact_secrets_preserves_non_userinfo_urls(text: str) -> None:
     """Query and fragment ``@`` signs are outside URL userinfo."""

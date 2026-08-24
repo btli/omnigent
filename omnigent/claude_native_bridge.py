@@ -2816,8 +2816,10 @@ _ANSI_ESCAPE_RE = re.compile(
     r")",
     re.DOTALL,
 )
-_HOOK_FAILURE_IGNORED_UNICODE_CATEGORIES = frozenset({"Cf", "Cs", "Mn", "Me"})
+_HOOK_FAILURE_IGNORED_UNICODE_CATEGORIES = frozenset({"Cf", "Cs"})
 _HOOK_FAILURE_FRAME_TRANSLATION = str.maketrans({"[": "(", "]": ")"})
+_HOOK_FAILURE_REDACTION_MARKER = "[REDACTED]"
+_HOOK_FAILURE_PLANTED_REDACTION_RE = re.compile(r"(?i)\[REDACTED\]")
 
 
 def _raw_hook_failure_window(text: str) -> tuple[str, bool]:
@@ -2825,8 +2827,56 @@ def _raw_hook_failure_window(text: str) -> tuple[str, bool]:
     if len(text) <= _HOOK_FAILURE_DETAIL_RAW_LIMIT:
         return text, False
     head = re.sub(r"\S+$", "", text[:_HOOK_FAILURE_DETAIL_RAW_HEAD_CHARS])
-    tail = re.sub(r"^\S+", "", text[-_HOOK_FAILURE_DETAIL_RAW_TAIL_CHARS:])
-    return " ".join(part.strip() for part in (head, tail) if part.strip()), True
+    tail = text[-_HOOK_FAILURE_DETAIL_RAW_TAIL_CHARS:]
+    while tail:
+        _, separator, tail = tail.partition("\n")
+        if not separator or not tail.startswith((" ", "\t")):
+            break
+    return "\n".join(part.strip() for part in (head, tail) if part.strip()), True
+
+
+def _redact_hook_failure_shadow(text: str) -> str:
+    """Apply redaction matches from a deobfuscated shadow to readable text."""
+    prepared = "".join(
+        "\x00" if unicodedata.category(ch).startswith("Z") and ch != " " else ch for ch in text
+    )
+    canonical = unicodedata.normalize("NFKC", prepared)
+    visible_chars: list[str] = []
+    shadow_chars: list[str] = []
+    shadow_to_visible: list[int] = []
+    for ch in canonical:
+        visible_chars.append(ch if ch.isprintable() or ch in "\u200c\u200d" else " ")
+        for match_char in unicodedata.normalize("NFKD", ch):
+            category = unicodedata.category(match_char)
+            if (
+                match_char != "\x00"
+                and category not in _HOOK_FAILURE_IGNORED_UNICODE_CATEGORIES
+                and not category.startswith("M")
+            ):
+                shadow_chars.append(match_char if match_char.isprintable() else " ")
+                shadow_to_visible.append(len(visible_chars) - 1)
+    visible = "".join(visible_chars)
+    shadow = "".join(shadow_chars)
+    visible = _HOOK_FAILURE_PLANTED_REDACTION_RE.sub("(REDACTED)", visible)
+    shadow = _HOOK_FAILURE_PLANTED_REDACTION_RE.sub("(REDACTED)", shadow)
+    redacted = redact_secrets(shadow)
+    if redacted == shadow:
+        return " ".join(visible.split())
+    parts = redacted.split(_HOOK_FAILURE_REDACTION_MARKER)
+    pattern = r"\A" + r"(.*?)".join(re.escape(part) for part in parts) + r"\Z"
+    match = re.match(pattern, shadow, re.DOTALL)
+    if match is None:
+        return _HOOK_FAILURE_REDACTION_MARKER
+    spans = [
+        (
+            shadow_to_visible[match.start(index)],
+            shadow_to_visible[match.end(index) - 1] + 1,
+        )
+        for index in range(1, len(parts))
+    ]
+    for start, end in reversed(spans):
+        visible = f"{visible[:start]}{_HOOK_FAILURE_REDACTION_MARKER}{visible[end:]}"
+    return " ".join(visible.split())
 
 
 def _cap_hook_failure_detail(text: str, *, raw_truncated: bool) -> str:
@@ -2848,9 +2898,10 @@ def _sanitize_hook_failure_detail(text: str) -> str | None:
     """
     Scrub and cap untrusted hook failure text for a parent session ``output``.
 
-    Long raw input retains both ends, with cut-edge tokens removed. Unicode
-    obfuscators, ANSI sequences, controls, and model-visible frame delimiters
-    are neutralized before secrets are redacted and the global cap is applied.
+    Long raw input retains complete lines from both ends. A deobfuscated
+    matching shadow drives redaction while the readable NFKC text is emitted.
+    Square brackets are neutralized to prevent model-visible frame injection,
+    including the accepted trade-off that ordinary bracketed text is rewritten.
 
     :param text: Raw failure text from a ``StopFailure`` hook payload.
     :returns: Sanitized single-line detail, or ``None`` when nothing usable
@@ -2860,19 +2911,12 @@ def _sanitize_hook_failure_detail(text: str) -> str | None:
     if raw_truncated and not bounded:
         return _HOOK_FAILURE_DETAIL_REMOVED_SENTINEL
     without_ansi = _ANSI_ESCAPE_RE.sub("", bounded)
-    decomposed = unicodedata.normalize("NFKD", without_ansi)
-    deobfuscated = "".join(
-        ch
-        for ch in decomposed
-        if unicodedata.category(ch) not in _HOOK_FAILURE_IGNORED_UNICODE_CATEGORIES
-    )
-    canonical = unicodedata.normalize("NFKC", deobfuscated)
-    stripped = "".join(ch if ch.isprintable() else " " for ch in canonical)
-    collapsed = " ".join(stripped.split())
-    if not collapsed:
+    redacted = _redact_hook_failure_shadow(without_ansi)
+    if not redacted:
         return _HOOK_FAILURE_DETAIL_REMOVED_SENTINEL if raw_truncated else None
-    neutralized = collapsed.translate(_HOOK_FAILURE_FRAME_TRANSLATION)
-    redacted = redact_secrets(neutralized)
+    protected = redacted.replace(_HOOK_FAILURE_REDACTION_MARKER, "\x00")
+    neutralized = protected.translate(_HOOK_FAILURE_FRAME_TRANSLATION)
+    redacted = neutralized.replace("\x00", _HOOK_FAILURE_REDACTION_MARKER)
     return _cap_hook_failure_detail(redacted, raw_truncated=raw_truncated)
 
 
