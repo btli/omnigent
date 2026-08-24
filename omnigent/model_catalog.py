@@ -965,8 +965,12 @@ def _redacted_failure_reason(exc: Exception) -> str:
         error_text = str(exc)
         if re.search(r"(?i)(?:--token\b|token\s*=|\b(?:dapi|sk-)[A-Za-z0-9_-]+)", error_text):
             return "provider credentials or network unavailable"
+        # The production remedy wraps the command in markdown backticks (see
+        # omnigent/runtime/credentials/databricks.py), so a whitespace-only
+        # boundary never matches it. Anchor on an identifier boundary instead;
+        # the profile capture stops at the closing backtick on its own.
         match = re.search(
-            r"(?<!\S)databricks auth login --profile ([A-Za-z0-9_.-]+)(?!\S)",
+            r"(?<![A-Za-z0-9_.-])databricks auth login --profile ([A-Za-z0-9_.-]+)",
             error_text,
         )
         if match is not None:

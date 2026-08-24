@@ -145,6 +145,67 @@ async def test_cross_process_lock_wait_is_bounded(
 
 
 @pytest.mark.asyncio
+async def test_lock_holder_refresh_is_picked_up_without_reprobe() -> None:
+    store.write_catalog("claude-native", "abc123", _ROWS)
+    path = store.catalog_path("claude-native", "abc123")
+    old = time.time() - store.CATALOG_STALE_AFTER_S - 1
+    os.utime(path, (old, old))
+    lock_path = path.with_suffix(".lock")
+    lock_handle = lock_path.open("a+")
+    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+    called = False
+
+    async def _refresh() -> list[dict[str, object]]:
+        nonlocal called
+        called = True
+        return [{"id": "should-not-run", "model": "should-not-run"}]
+
+    task = asyncio.create_task(store.ensure_catalog("claude-native", "abc123", _refresh))
+    # Let the task block acquiring the lock this test still holds.
+    await asyncio.sleep(0.15)
+    fresh_rows = [{"id": "haiku", "model": "claude-haiku-5", "isDefault": True}]
+    store.write_catalog("claude-native", "abc123", fresh_rows)
+    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+    lock_handle.close()
+
+    result = await task
+
+    # The refresh another process wrote while we waited is served; the lock
+    # would accomplish nothing if the cache were not re-checked after acquiring it.
+    assert result.freshness is store.CatalogFreshness.FRESH
+    assert result.rows == fresh_rows
+    assert not called
+
+
+@pytest.mark.asyncio
+async def test_successful_probe_leaves_no_lockfile_behind() -> None:
+    path = store.catalog_path("claude-native", "abc123")
+    lock_path = path.with_suffix(".lock")
+
+    async def _refresh() -> list[dict[str, object]]:
+        return _ROWS
+
+    result = await store.ensure_catalog("claude-native", "abc123", _refresh)
+
+    assert result.freshness is store.CatalogFreshness.FRESH
+    assert not lock_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_failed_probe_leaves_no_lockfile_behind() -> None:
+    path = store.catalog_path("claude-native", "abc123")
+    lock_path = path.with_suffix(".lock")
+
+    async def _boom() -> list[dict[str, object]]:
+        raise OSError("offline")
+
+    result = await store.ensure_catalog("claude-native", "abc123", _boom)
+
+    assert result.freshness is store.CatalogFreshness.MISSING
+    assert not lock_path.exists()
+
+
+@pytest.mark.asyncio
 async def test_future_mtime_is_stale_until_revalidated() -> None:
     store.write_catalog("claude-native", "abc123", _ROWS)
     path = store.catalog_path("claude-native", "abc123")

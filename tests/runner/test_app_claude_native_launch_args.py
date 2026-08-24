@@ -12,6 +12,7 @@ passed. See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import click
@@ -57,15 +58,37 @@ def test_stale_implicit_subscription_default_omits_model() -> None:
     assert "--model" not in args
 
 
-def test_stale_unvalidated_explicit_model_fails_without_substitution() -> None:
-    with pytest.raises(click.ClickException, match=r"Pick again.*restoring provider credentials"):
-        _select_authoritative_claude_launch_model(
+def test_stale_catalog_does_not_strand_an_explicit_claude_pin(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A stale catalog means validation could not run against a fresh list.
+    # Honor the explicit gateway pin rather than stranding the session, but
+    # surface the probe's real reason so a dead provider stays visible.
+    with caplog.at_level(logging.WARNING):
+        selected = _select_authoritative_claude_launch_model(
             explicit_model="gateway-fable-5",
             configured_model=None,
             claude_config=ClaudeNativeUcodeConfig(
                 env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}
             ),
             catalog=_catalog(CatalogFreshness.STALE),
+        )
+
+    assert selected == "gateway-fable-5"
+    assert "provider credentials expired" in caplog.text
+
+
+def test_fresh_catalog_refuses_an_absent_explicit_claude_model() -> None:
+    # Validation ran against a fresh list and the pin is genuinely absent —
+    # a legitimate refusal, symmetric with the codex path.
+    with pytest.raises(click.ClickException, match="not in this host's current model list"):
+        _select_authoritative_claude_launch_model(
+            explicit_model="gateway-ghost-5",
+            configured_model=None,
+            claude_config=ClaudeNativeUcodeConfig(
+                env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}
+            ),
+            catalog=_catalog(CatalogFreshness.FRESH),
         )
 
 

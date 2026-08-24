@@ -6053,17 +6053,28 @@ async def _load_claude_launch_metadata(
 
 
 def _validate_explicit_codex_launch_model(model: str, catalog: Any) -> None:
-    """Require fresh catalog authority for a persisted Codex model."""
+    """Gate a persisted Codex model against the shared catalog by provenance.
+
+    Two outcomes must stay distinct. When a *fresh* list was obtained and it
+    does not name the pin, the pick genuinely changed since it was made — a
+    legitimate refusal. When validation *could not run* (a stale or missing
+    catalog because the probe failed), refusing would strand a user's explicit
+    pin on a transient probe defect; honor the pin instead and surface the
+    probe's real reason so a dead provider stays visible rather than silent.
+    The stale/missing catalog still never *originates* a model — that
+    implicit-default path stays fresh-gated at the call site.
+    """
     from omnigent.model_catalog_store import CatalogFreshness, catalog_contains
 
     if catalog is None:
         return
     if catalog.freshness is not CatalogFreshness.FRESH:
-        raise click.ClickException(
-            f"the requested model {model!r} could not be validated against a fresh model "
-            f"list ({catalog.refresh_error or 'catalog refresh failed'}). Pick again after "
-            "restoring provider credentials."
+        _logger.warning(
+            "Codex launch honoring explicit model %r without fresh catalog validation: %s",
+            model,
+            catalog.refresh_error or "catalog refresh failed",
         )
+        return
     if catalog.rows is None or not catalog_contains(catalog.rows, model):
         raise click.ClickException(
             f"the requested model {model!r} is not in this host's current model list — it "
@@ -6094,23 +6105,32 @@ def _select_authoritative_claude_launch_model(
         canonical_allowed = resolved.lower().startswith(
             "claude-"
         ) and claude_config_serves_canonical_ids(claude_config)
-        freshly_validated = bool(
-            catalog is not None
-            and catalog.freshness is CatalogFreshness.FRESH
-            and catalog.rows
-            and (
-                claude_catalog_serves_model(catalog.rows, explicit_model, claude_config)
-                or claude_catalog_serves_model(catalog.rows, resolved, claude_config)
-            )
+        fresh_rows = (
+            catalog.rows
+            if catalog is not None and catalog.freshness is CatalogFreshness.FRESH and catalog.rows
+            else None
         )
-        if not freshly_validated and not canonical_allowed:
-            detail = catalog.refresh_error if catalog is not None else "model catalog unavailable"
+        served_by_fresh = fresh_rows is not None and (
+            claude_catalog_serves_model(fresh_rows, explicit_model, claude_config)
+            or claude_catalog_serves_model(fresh_rows, resolved, claude_config)
+        )
+        if served_by_fresh or canonical_allowed:
+            return resolved
+        # Provenance decides, symmetric with the codex path: a fresh list that
+        # omits the pin is a legitimate refusal (the pick changed); a catalog
+        # that could not be validated must not strand the explicit pin on a
+        # probe failure — honor it and surface the probe's real reason.
+        if fresh_rows is not None:
             raise click.ClickException(
-                f"the requested model {explicit_model!r} could not be validated against a "
-                f"fresh model list ({detail}). Pick again from the model menu after restoring "
-                "provider credentials; for Databricks, run "
-                "`databricks auth login --profile <PROFILE>`."
+                f"the requested model {explicit_model!r} is not in this host's current model "
+                "list — it may have changed since the pick. Pick again from the model menu."
             )
+        detail = catalog.refresh_error if catalog is not None else "model catalog unavailable"
+        _logger.warning(
+            "Claude launch honoring explicit model %r without fresh catalog validation: %s",
+            explicit_model,
+            detail,
+        )
         return resolved
     if configured_model:
         return resolve_claude_native_model_selection(configured_model, claude_config)

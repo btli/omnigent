@@ -9,6 +9,7 @@ function with a stub async client returning controlled snapshots.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import click
@@ -20,14 +21,50 @@ from omnigent.runner.app import _codex_native_launch_config
 from omnigent.runner.native.orchestration import _validate_explicit_codex_launch_model
 
 
-def test_stale_catalog_cannot_authorize_an_explicit_codex_model() -> None:
+def test_stale_catalog_does_not_strand_an_explicit_codex_pin(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A stale catalog means validation could not run against a fresh list — not
+    # that the pinned model is gone. Honor the explicit pin instead of refusing.
     catalog = CatalogResult(
         [{"id": "removed-model", "model": "removed-model"}],
         CatalogFreshness.STALE,
         "provider credentials expired",
     )
 
-    with pytest.raises(click.ClickException, match="provider credentials expired"):
+    with caplog.at_level(logging.WARNING):
+        _validate_explicit_codex_launch_model("removed-model", catalog)
+
+    assert "provider credentials expired" in caplog.text
+
+
+def test_missing_catalog_does_not_strand_an_explicit_codex_pin(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The probe could not run at all (the incident: `codex model discovery exited
+    # early`). A dead probe must not turn a user's explicit pin into a dead session.
+    catalog = CatalogResult(
+        None,
+        CatalogFreshness.MISSING,
+        "model catalog refresh returned no models",
+    )
+
+    with caplog.at_level(logging.WARNING):
+        _validate_explicit_codex_launch_model("gpt-5.6-sol", catalog)
+
+    assert "model catalog refresh returned no models" in caplog.text
+
+
+def test_fresh_catalog_still_refuses_an_absent_explicit_codex_model() -> None:
+    # Validation ran against a fresh list and the model is genuinely absent —
+    # a legitimate refusal that stays closed.
+    catalog = CatalogResult(
+        [{"id": "kept-model", "model": "kept-model"}],
+        CatalogFreshness.FRESH,
+        None,
+    )
+
+    with pytest.raises(click.ClickException, match="not in this host's current model list"):
         _validate_explicit_codex_launch_model("removed-model", catalog)
 
 

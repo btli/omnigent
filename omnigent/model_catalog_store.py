@@ -214,8 +214,8 @@ async def ensure_catalog(
 
         async def _run() -> CatalogResult:
             lock_handle = None
+            lock_path = catalog_path(harness, fingerprint).with_suffix(".lock")
             try:
-                lock_path = catalog_path(harness, fingerprint).with_suffix(".lock")
                 lock_handle = await _acquire_lock(lock_path)
                 if lock_handle is None:
                     return _failed_refresh(cached, "model catalog refresh lock timed out")
@@ -240,6 +240,13 @@ async def ensure_catalog(
             finally:
                 _inflight.pop(key, None)
                 if lock_handle is not None:
+                    # Drop our lockfile while still holding the lock so a crash
+                    # or normal exit never leaves a stale lockfile behind. A
+                    # racing waiter that already opened the same path may then
+                    # re-probe — benign for a best-effort cache (atomic writes,
+                    # at most a duplicate probe).
+                    with contextlib.suppress(OSError):
+                        lock_path.unlink()
                     fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
                     lock_handle.close()
 

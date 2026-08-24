@@ -1237,7 +1237,17 @@ def test_failed_auth_command_note_never_leaks_the_command(
 
 
 def test_databricks_reauth_guidance_survives_failure_redaction() -> None:
-    exc = OSError("refresh expired; run databricks auth login --profile DEFAULT")
+    # The verbatim production remedy wraps the command in markdown backticks
+    # (omnigent/runtime/credentials/databricks.py); the redaction must extract
+    # the profile-specific guidance from that exact shape, not only from a
+    # synthetic backtick-free string.
+    exc = OSError(
+        "Databricks profile [DEFAULT] in ~/.databrickscfg is a token-less "
+        "SDK-only profile: the databricks-sdk path could not mint a token for "
+        "it. Ensure the `databricks` CLI is installed and on PATH, and that the "
+        "OAuth session is valid (run `databricks auth login --profile DEFAULT`). "
+        "See the cli-*.log for the underlying SDK error."
+    )
 
     assert model_catalog._redacted_failure_reason(exc) == (
         "provider credentials expired; run `databricks auth login --profile DEFAULT`"
