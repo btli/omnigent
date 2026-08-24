@@ -19,6 +19,7 @@ edit/read access to.
 
 from __future__ import annotations
 
+import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
@@ -110,6 +111,37 @@ def test_file_and_unfile_session_single_user(db_uri: str) -> None:
     assert client.get("/v1/sessions?project=Work").json()["data"] == []
     unfiled = client.get("/v1/sessions?project=")
     assert conv.id in [s["id"] for s in unfiled.json()["data"]]
+
+
+def test_session_filing_uses_shared_project_resolver(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Interactive filing delegates ownership checks to the shared resolver."""
+    _ensure_agent(db_uri)
+    conv = SqlAlchemyConversationStore(db_uri).create_conversation(title="s", agent_id=AGENT_ID)
+    client = TestClient(_single_user_app(db_uri))
+    requested_id = "A" * 32
+    canonical_id = "a" * 32
+    calls: list[tuple[str, str | None]] = []
+
+    def _resolve(project_store: object, project_id: str, *, user_id: str | None) -> str:
+        del project_store
+        calls.append((project_id, user_id))
+        return canonical_id
+
+    monkeypatch.setattr(
+        "omnigent.server.project_assignment.resolve_owned_project_id",
+        _resolve,
+    )
+    response = client.patch(
+        f"/v1/sessions/{conv.id}",
+        json={"project_id": requested_id},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["project_id"] == canonical_id
+    assert calls == [(requested_id, None)]
 
 
 def test_omitting_project_id_leaves_membership_unchanged(db_uri: str) -> None:
