@@ -323,10 +323,8 @@ async def test_ws_tunnel_route_round_trips_request_to_runner(
 async def test_on_runner_disconnect_fires_once_per_teardown() -> None:
     """Tunnel teardown invokes ``on_runner_disconnect`` exactly once.
 
-    Helper-task disconnect raises into the wait loop; the inner
-    ``finally`` and the outer ``WebSocketDisconnect`` handler both see
-    the drop. Without a handler-local guard that double-fires the
-    callback for one teardown.
+    A helper-task disconnect passes through task cleanup and route-level
+    exception handling but still represents one teardown.
     """
     disconnect_calls: list[str] = []
 
