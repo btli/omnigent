@@ -26,8 +26,10 @@ or body stalls past it while the tunnel stays up → raise
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
 from collections.abc import AsyncIterator
+from typing import NoReturn
 
 import httpx
 
@@ -41,9 +43,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 )
 from omnigent.runner.transports.ws_tunnel.registry import RequestState, TunnelRegistry
 
-# Bound on the best-effort request.cancel send: the send awaits an ack
-# from the session's owner loop, and a wedged loop never acks — the
-# timeout that triggered the cancel must still surface to the caller.
+# Keep a wedged session-owner loop from blocking timeout cleanup.
 _CANCEL_SEND_TIMEOUT_S = 1.0
 
 
@@ -53,17 +53,10 @@ async def _send_cancel_frame(
     req_id: str,
     reason: str,
 ) -> None:
-    """Best-effort request.cancel so the runner stops its dispatch task.
-
-    Without it the runner's stream generator leaks and keeps consuming
-    from the session's shared event queue, starving a restarted stream.
-    Must run while the request is still open; send failures and a send
-    that outlasts :data:`_CANCEL_SEND_TIMEOUT_S` are ignored (the
-    tunnel may already be dying or its owner loop wedged).
-    """
+    """Best-effort request.cancel so the runner stops its dispatch task."""
     if not registry.request_is_open(state.session, req_id):
         return
-    try:  # noqa: SIM105 — contextlib.suppress doesn't work with await
+    with contextlib.suppress(Exception):
         await asyncio.wait_for(
             registry.send_text(
                 state.session,
@@ -71,8 +64,28 @@ async def _send_cancel_frame(
             ),
             _CANCEL_SEND_TIMEOUT_S,
         )
-    except Exception:  # noqa: BLE001 — best-effort cleanup
-        pass
+
+
+async def _raise_read_timeout(
+    registry: TunnelRegistry,
+    state: RequestState,
+    runner_id: str,
+    req_id: str,
+    request: httpx.Request | None,
+    read_timeout: float,
+    response_description: str,
+) -> NoReturn:
+    """Cancel a stalled request and classify its tunnel generation."""
+    await _send_cancel_frame(registry, state, req_id, "read_timeout")
+    if registry.get(runner_id) is not state.session:
+        raise ConnectionError(
+            f"runner {runner_id!r} tunnel was replaced during a stalled read"
+        ) from None
+    raise httpx.ReadTimeout(
+        f"{response_description} from runner {runner_id!r} "
+        f"stalled beyond {read_timeout}s read timeout",
+        request=request,
+    ) from None
 
 
 def _request_read_timeout(request: httpx.Request) -> float | None:
@@ -115,25 +128,15 @@ class _TunneledByteStream(httpx.AsyncByteStream):
                     try:
                         item = await asyncio.wait_for(get, self._read_timeout)
                     except TimeoutError:
-                        await _send_cancel_frame(
-                            self._registry, state, self._req_id, "read_timeout"
+                        await _raise_read_timeout(
+                            self._registry,
+                            state,
+                            self._runner_id,
+                            self._req_id,
+                            self._request,
+                            self._read_timeout,
+                            "tunneled response",
                         )
-                        # Replacement racing the stall: this request's
-                        # generation is gone even though a runner is
-                        # registered, so it's a tunnel transition, not a
-                        # live-stream loss.
-                        if self._registry.get(self._runner_id) is not state.session:
-                            raise ConnectionError(
-                                f"runner {self._runner_id!r} tunnel was replaced "
-                                "during a stalled read"
-                            ) from None
-                        # Silent stream on a live tunnel: surface a read
-                        # timeout; the tunnel itself stays registered.
-                        raise httpx.ReadTimeout(
-                            f"tunneled response from runner {self._runner_id!r} "
-                            f"stalled beyond {self._read_timeout}s read timeout",
-                            request=self._request,
-                        ) from None
                 if state.aborted_with is not None:
                     raise state.aborted_with
                 if item is None:
@@ -242,18 +245,15 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
                 try:
                     head = await asyncio.wait_for(state.head_future, read_timeout)
                 except TimeoutError:
-                    await _send_cancel_frame(self._registry, state, req_id, "read_timeout")
-                    # Replacement racing the stall: stale generation is a
-                    # tunnel transition, not a live-stream loss.
-                    if self._registry.get(self._runner_id) is not state.session:
-                        raise ConnectionError(
-                            f"runner {self._runner_id!r} tunnel was replaced during a stalled read"
-                        ) from None
-                    raise httpx.ReadTimeout(
-                        f"response head from runner {self._runner_id!r} "
-                        f"stalled beyond {read_timeout}s read timeout",
-                        request=request,
-                    ) from None
+                    await _raise_read_timeout(
+                        self._registry,
+                        state,
+                        self._runner_id,
+                        req_id,
+                        request,
+                        read_timeout,
+                        "response head",
+                    )
         except BaseException:
             # If we failed before getting head, clean up the slot so
             # we don't leak in_flight state.
