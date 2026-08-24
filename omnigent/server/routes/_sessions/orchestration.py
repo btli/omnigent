@@ -5923,11 +5923,6 @@ async def _runner_drop_interrupted_turn(
 _RELAY_STREAM_READ_TIMEOUT_S = 45.0
 
 
-def _is_tunnel_transition_error(exc: BaseException) -> bool:
-    """True for bare tunnel close/replacement ConnectionErrors (not httpx)."""
-    return isinstance(exc, ConnectionError) and not isinstance(exc, httpx.HTTPError)
-
-
 def _runner_tunnel_alive(runner_client: httpx.AsyncClient, runner_id: str | None) -> bool:
     """True when ``runner_id`` is still registered on a WS tunnel transport.
 
@@ -5979,7 +5974,6 @@ async def _relay_runner_stream(
         stream loss from tunnel close/replacement, e.g.
         ``"runner_abc123"``. ``None`` skips the live-tunnel check.
     """
-    loop = asyncio.get_running_loop()
     deadline: float | None = None
     while True:
         try:
@@ -5992,7 +5986,7 @@ async def _relay_runner_stream(
             )
             return
         except _RelayTransportLost as lost:
-            now = loop.time()
+            now = time.monotonic()
             # An attempt that made progress (received a stream event)
             # was a live stream dropping anew — give the new outage a
             # fresh window. So was an idle attempt whose stream stayed
@@ -6224,7 +6218,7 @@ async def _relay_runner_stream_once(
                         if banner_at is not None:
                             made_progress = True
                         else:
-                            banner_at = asyncio.get_running_loop().time()
+                            banner_at = time.monotonic()
                         continue
 
                     # Any non-heartbeat event is real stream progress.
@@ -6660,7 +6654,7 @@ async def _relay_runner_stream_once(
         raise _RelayTransportLost(
             intentional=session_id in _intentional_stop_sessions,
             stream_lost=(
-                not _is_tunnel_transition_error(exc)
+                isinstance(exc, httpx.HTTPError)
                 and not isinstance(exc, httpx.ConnectError)
                 and _runner_tunnel_alive(runner_client, runner_id)
             ),
