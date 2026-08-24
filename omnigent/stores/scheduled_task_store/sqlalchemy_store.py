@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import builtins
-from typing import Any
+from typing import Any, cast
 
-from sqlalchemy import and_, asc, delete, desc, func, or_, select, tuple_
+from sqlalchemy import and_, asc, delete, desc, func, or_, select, tuple_, update
+from sqlalchemy.engine import CursorResult
 
 from omnigent.db.db_models import (
     DEFAULT_WORKSPACE_ID,
+    SqlProject,
     SqlScheduledTask,
     SqlScheduledTaskRun,
     current_workspace_id,
@@ -59,6 +61,7 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         base_branch=row.base_branch,
         execution_target=decode_scheduled_task_execution_target(row.execution_target),
         host_id=row.host_id,
+        project_id=row.project_id,
         state=decode_scheduled_task_state(row.state),
         last_run_at=row.last_run_at,
         last_run_conversation_id=row.last_run_conversation_id,
@@ -133,6 +136,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         max_cost_usd: float | None = None,
         workspace: str | None = None,
         host_id: str | None = None,
+        project_id: str | None = None,
         state: str = "active",
     ) -> ScheduledTask:
         """Insert a new scheduled task with a required recurring ``rrule``."""
@@ -152,6 +156,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             base_branch=None,
             execution_target=encode_scheduled_task_execution_target("connected_host"),
             host_id=host_id,
+            project_id=project_id,
             state=encode_scheduled_task_state(state),
             last_run_at=None,
             last_run_conversation_id=None,
@@ -171,19 +176,40 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 return None
             return _to_entity(row)
 
-    def list(self, *, owner_user_id: str | None = None) -> list[ScheduledTask]:
+    def list(
+        self,
+        *,
+        owner_user_id: str | None = _UNSET,
+        project_id: str | None = _UNSET,
+    ) -> list[ScheduledTask]:
         """List all scheduled tasks ordered by ``created_at ASC, id ASC``.
 
         When *owner_user_id* is given, only tasks owned by that user are returned.
         """
-        with self._session("list_tasks") as session:
+        operation_name = "list_tasks_by_project" if project_id is not _UNSET else "list_tasks"
+        with self._session(operation_name) as session:
             stmt = (
                 select(SqlScheduledTask)
                 .where(SqlScheduledTask.workspace_id == current_workspace_id())
                 .order_by(asc(SqlScheduledTask.created_at), asc(SqlScheduledTask.id))
             )
-            if owner_user_id is not None:
+            if owner_user_id is not _UNSET:
                 stmt = stmt.where(SqlScheduledTask.user_id == owner_user_id)
+            if project_id is None:
+                stmt = stmt.outerjoin(
+                    SqlProject,
+                    and_(
+                        SqlProject.workspace_id == SqlScheduledTask.workspace_id,
+                        SqlProject.id == SqlScheduledTask.project_id,
+                    ),
+                ).where(
+                    or_(
+                        SqlScheduledTask.project_id.is_(None),
+                        SqlProject.id.is_(None),
+                    )
+                )
+            elif project_id is not _UNSET:
+                stmt = stmt.where(SqlScheduledTask.project_id == project_id)
             rows = session.execute(stmt).scalars().all()
             return [_to_entity(r) for r in rows]
 
@@ -257,6 +283,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         max_cost_usd: float | None = _UNSET,
         workspace: str | None = None,
         host_id: str | None = _UNSET,
+        project_id: str | None = _UNSET,
         state: str | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
@@ -312,6 +339,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             if host_id is not _UNSET and row.host_id != host_id:
                 row.host_id = host_id
                 changed = True
+            if project_id is not _UNSET and row.project_id != project_id:
+                row.project_id = project_id
+                changed = True
             if state is not None:
                 encoded_state = encode_scheduled_task_state(state)
                 if row.state != encoded_state:
@@ -329,6 +359,29 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 row.updated_at = now_epoch()
             session.flush()
             return _to_entity(row)
+
+    def compare_and_set_project(
+        self,
+        scheduled_task_id: str,
+        *,
+        expected_project_id: str,
+        project_id: str | None,
+    ) -> bool:
+        """Replace a Project id only while the expected assignment is current."""
+        with self._session("compare_and_set_task_project") as session:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlScheduledTask)
+                    .where(
+                        SqlScheduledTask.workspace_id == current_workspace_id(),
+                        SqlScheduledTask.id == scheduled_task_id,
+                        SqlScheduledTask.project_id == expected_project_id,
+                    )
+                    .values(project_id=project_id, updated_at=now_epoch())
+                ),
+            )
+            return result.rowcount == 1
 
     def delete(self, scheduled_task_id: str) -> bool:
         """Delete a scheduled task and all of its runs. Idempotent: returns ``False`` if not
