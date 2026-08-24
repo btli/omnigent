@@ -19,10 +19,8 @@ const CHAT_MIN_WIDTH_PX = 480;
 const CHAT_HARD_MIN_WIDTH_PX = 240;
 /** Drag travel the rail keeps above its own floor before the chat stops ceding. */
 const MIN_DRAG_RANGE_PX = 120;
-/** Visual gap between the chat column and the rail. */
-const GAP_PX = 8;
 // The handle is a dedicated flex gutter between chat and panel, outside both
-// scroll containers. The painted `w-1` strip is centered in a small layout
+// scroll containers. The painted `w-1` strip is centered in a real layout
 // gutter, with tightly bounded overhangs that avoid owning either surface.
 const PAINTED_STRIP_PX = 4;
 const COARSE_GUTTER_PX = 12;
@@ -32,17 +30,14 @@ const PANEL_SLIVER_PX = 8;
 
 function gutterStyle(isCoarse: boolean): React.CSSProperties {
   const gutter = isCoarse ? COARSE_GUTTER_PX : FINE_GUTTER_PX;
-  const panelPad = PANEL_SLIVER_PX + gutter - PAINTED_STRIP_PX;
+  const inset = (gutter - PAINTED_STRIP_PX) / 2;
   return {
     touchAction: "none",
     boxSizing: "content-box",
-    // Absolute positioning resolves the negative end margin against the panel
-    // seam. Keep only the bounded sliver on the transcript side; place the
-    // gutter footprint inward so transcript scrolling retains the next pixel.
-    paddingLeft: CHAT_SLIVER_PX,
-    paddingRight: panelPad,
+    paddingLeft: CHAT_SLIVER_PX + inset,
+    paddingRight: PANEL_SLIVER_PX + inset,
     marginLeft: -CHAT_SLIVER_PX,
-    marginRight: -(PAINTED_STRIP_PX + panelPad),
+    marginRight: -PANEL_SLIVER_PX,
     backgroundClip: "content-box",
   };
 }
@@ -66,7 +61,9 @@ function clamp(w: number, minPx = MIN_WIDTH_PX, reservedPx = 0): number {
   // No viewport ceiling available off the DOM (SSR / node test env) — this runs
   // during render, so guard before reading `window` to avoid a hard throw.
   if (typeof window === "undefined") return Math.max(minPx, w);
-  const available = window.innerWidth - reservedPx - GAP_PX;
+  // Reserve the largest possible gutter footprint so a pointer-capability
+  // change cannot pull the chat below its floor.
+  const available = window.innerWidth - reservedPx - COARSE_GUTTER_PX;
   // The chat holds its comfortable minimum only while the row also fits the
   // rail's floor plus a usable drag range. On tablet-width rows (an unfolded
   // foldable with the sidebar open) reserving the full 480px pinned the clamp's
@@ -152,7 +149,7 @@ export function useResizableInlinePanel(
   reservedPx = 0,
   enabled = true,
 ) {
-  const { coarsePrimary } = useInputCapabilities();
+  const { anyCoarse } = useInputCapabilities();
   const raw = useSyncExternalStore(
     widthStore.subscribe,
     widthStore.getSnapshot,
@@ -249,7 +246,7 @@ export function useResizableInlinePanel(
     handleProps: {
       ...resizeDrag.handleProps,
       onKeyDown,
-      style: gutterStyle(coarsePrimary),
+      style: gutterStyle(anyCoarse),
       role: "separator" as const,
       "aria-orientation": "vertical" as const,
       "aria-label": "Resize panel",

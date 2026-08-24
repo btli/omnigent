@@ -23,17 +23,24 @@ function setInnerWidth(px: number): void {
 
 function installMatchMedia(): void {
   window.matchMedia = vi.fn((query: string) => ({
-    matches: query === "(pointer: coarse)" ? coarsePointer : desktopMatches,
+    matches:
+      query === "(any-pointer: coarse)"
+        ? coarsePointer
+        : query === "(pointer: coarse)"
+          ? false
+          : query.includes("min-width")
+            ? desktopMatches
+            : false,
     media: query,
     onchange: null,
     addListener: () => {},
     removeListener: () => {},
     addEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => {
-      if (query === "(pointer: coarse)") coarseChangeListeners.add(listener);
+      if (query === "(any-pointer: coarse)") coarseChangeListeners.add(listener);
       else if (query.includes("min-width")) desktopChangeListeners.add(listener);
     },
     removeEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => {
-      if (query === "(pointer: coarse)") coarseChangeListeners.delete(listener);
+      if (query === "(any-pointer: coarse)") coarseChangeListeners.delete(listener);
       else desktopChangeListeners.delete(listener);
     },
     dispatchEvent: () => false,
@@ -168,6 +175,20 @@ describe("useResizablePanel persistence", () => {
       window.dispatchEvent(new Event("resize"));
     });
     expect(result.current.panelWidth).toBe(980);
+  });
+
+  it("recomputes a viewport-derived default and aria maximum on every resize", () => {
+    const { result } = renderHook(() => useResizablePanel(true));
+    expect(result.current.panelWidth).toBe(1000);
+    expect(result.current.handleProps["aria-valuemax"]).toBe(1600);
+
+    setInnerWidth(1000);
+    act(() => window.dispatchEvent(new Event("resize")));
+
+    // No preference exists, so the width store remains null; the viewport
+    // signal must still force both render-time values to update.
+    expect(result.current.panelWidth).toBe(500);
+    expect(result.current.handleProps["aria-valuemax"]).toBe(800);
   });
 
   it("captures the pointer and persists the final width on release", () => {
@@ -396,7 +417,7 @@ describe("useResizablePanel persistence", () => {
     expect(result.current.handleProps["aria-valuenow"]).toBe(980);
   });
 
-  it("updates the gutter when primary pointer coarseness changes", () => {
+  it("updates the gutter when an attached coarse pointer changes", () => {
     const { result } = renderHook(() => useResizablePanel(true));
     expect(result.current.handleProps.style.marginInlineStart).toBe(-HANDLE_OUTWARD_SLIVER_PX);
     expect(result.current.handleProps.style.paddingInlineStart).toBe(9);

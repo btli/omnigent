@@ -28,13 +28,10 @@ def _rail_width(page: Page) -> float:
 
 
 def _chat_width(page: Page) -> float:
-    """Horizontal space left for the chat: from the sidebar's right edge to the
-    rail's left edge."""
-    conversations = page.locator(_CONVERSATIONS).bounding_box()
-    rail = page.get_by_role("complementary", name="Workspace").bounding_box()
-    assert conversations is not None and rail is not None
-    sidebar_right = conversations["x"] + conversations["width"]
-    return rail["x"] - sidebar_right
+    """Width of the center chat surface, excluding the resize gutter."""
+    chat = page.locator("main").bounding_box()
+    assert chat is not None
+    return chat["width"]
 
 
 def test_sidebar_toggle_preserves_widths(
@@ -94,8 +91,9 @@ def test_shrinking_viewport_keeps_chat_minimum_with_sidebar_open(
     expect(conversations).not_to_have_attribute("data-collapsed", "true")
     assert _chat_width(page) >= _CHAT_MIN_PX - 1, _chat_width(page)
 
-    # At tablet width the chat may cede below its 480px comfort minimum so the
-    # rail keeps drag travel, but it must retain its 240px hard floor.
-    page.set_viewport_size({"width": 1000, "height": 800})
+    # At this tablet width the rail clamp binds exactly at the 240px hard floor.
+    page.set_viewport_size({"width": 928, "height": 800})
     expect(conversations).not_to_have_attribute("data-collapsed", "true")
-    assert _chat_width(page) >= _CHAT_HARD_MIN_PX - 1, _chat_width(page)
+    chat_width = _chat_width(page)
+    assert abs(chat_width - _CHAT_HARD_MIN_PX) <= 2, chat_width
+    assert chat_width < _CHAT_MIN_PX, chat_width

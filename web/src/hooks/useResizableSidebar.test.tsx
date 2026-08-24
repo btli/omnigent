@@ -179,6 +179,22 @@ describe("useResizableSidebar", () => {
     expect(result.current.width).toBe(900);
   });
 
+  it("refreshes aria maximum when viewport resizes leave the width unchanged", () => {
+    const { result } = renderHook(() => useResizableSidebar());
+    expect(result.current.width).toBe(320);
+    expect(result.current.handleProps["aria-valuemax"]).toBe(1000);
+
+    setInnerWidth(1800);
+    act(() => window.dispatchEvent(new Event("resize")));
+    expect(result.current.width).toBe(320);
+    expect(result.current.handleProps["aria-valuemax"]).toBe(900);
+
+    setInnerWidth(1600);
+    act(() => window.dispatchEvent(new Event("resize")));
+    expect(result.current.width).toBe(320);
+    expect(result.current.handleProps["aria-valuemax"]).toBe(800);
+  });
+
   it("captures pointer drags on the handle and exposes touch-safe affordances", () => {
     const { result } = renderHook(() => useResizableSidebar());
     const handle = createHandle();
@@ -211,14 +227,14 @@ describe("useResizableSidebar", () => {
     expect(document.body.style.userSelect).toBe("");
   });
 
-  it("reacts to primary-pointer coarseness with asymmetric hit padding", () => {
+  it("reacts to an attached coarse pointer with asymmetric hit padding", () => {
     let coarse = false;
     const listeners = new Set<() => void>();
     const query = {
       get matches() {
         return coarse;
       },
-      media: "(pointer: coarse)",
+      media: "(any-pointer: coarse)",
       onchange: null,
       addListener: vi.fn(),
       removeListener: vi.fn(),
@@ -228,7 +244,16 @@ describe("useResizableSidebar", () => {
       ),
       dispatchEvent: vi.fn(() => false),
     } as MediaQueryList;
-    const matchMedia = vi.spyOn(window, "matchMedia").mockReturnValue(query);
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((media) =>
+      media === "(any-pointer: coarse)"
+        ? query
+        : ({
+            matches: false,
+            media,
+            addEventListener: vi.fn(),
+            removeEventListener: vi.fn(),
+          } as unknown as MediaQueryList),
+    );
     const { result, unmount } = renderHook(() => useResizableSidebar());
 
     expect(result.current.handleProps.style.paddingInlineStart).toBe(9);
