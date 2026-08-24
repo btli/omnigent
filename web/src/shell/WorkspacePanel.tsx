@@ -630,11 +630,9 @@ interface WorkspacePanelProps {
 }
 
 /**
- * WorkspacePanel — the desktop right "Workspace" rail, rendered as a
- * floating card (bg-card, rounded, bordered, shadowed) sitting below the
- * full-width chat header band. Internally tabbed between Files, Changes,
- * Terminals and Agents so each can claim the full rail height
- * instead of competing for a vertically-split slot.
+ * WorkspacePanel — the desktop right "Workspace" rail. Internally tabbed
+ * between Files, Changes, Terminals and Agents so each can claim the full
+ * rail height.
  *
  * Desktop-only (``hidden md:flex``): on mobile the rail's contents are
  * reached via the header's session-menu FAB → full-screen drawers. The
@@ -695,6 +693,17 @@ export function WorkspacePanel({
       return t.session ? `${t.name} · ${t.session}` : t.name;
     },
     [terminals],
+  );
+  const hasOpenTabs = openFiles.length > 0 || openTerminals.length > 0;
+  const newTabMenu = (
+    <NewTabMenu
+      conversationId={conversationId}
+      onOpenTerminal={openTerminalTab}
+      onCreateStart={onShellCreateStart}
+      onCreateError={onShellCreateFailed}
+      triggerClassName={hasOpenTabs ? "ml-[2px]" : undefined}
+      liveness={liveness}
+    />
   );
   return (
     <>
@@ -839,14 +848,9 @@ export function WorkspacePanel({
             aria-hidden
             className="mx-[8px] h-[14px] w-px shrink-0 self-center bg-border-strong"
           />
-          {(openFiles.length > 0 || openTerminals.length > 0) && (
+          {hasOpenTabs && (
             <>
-              {/* Open-tabs region (file tabs + shell tabs) — the horizontal
-                  scroller. It sizes to its content and shrinks+scrolls only when
-                  the tabs would overflow (min-w-0, no flex-1), so the "+" outside
-                  it hugs the last tab when they fit and stays pinned when they
-                  don't. overflow-y-hidden stops overflow-x:auto from spawning a
-                  vertical scrollbar that eats horizontal space. */}
+              {/* Open tabs scroll independently so the trailing controls stay pinned. */}
               <div className="flex min-w-0 items-center gap-0.5 overflow-x-auto overflow-y-hidden [scrollbar-width:thin] [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent">
                 <FileTabsStrip
                   openFiles={openFiles}
@@ -864,33 +868,10 @@ export function WorkspacePanel({
                   onClose={onCloseTerminal}
                 />
               </div>
-              {/* "+" trails the last tab but sits OUTSIDE the scroller, so it
-                  stays pinned (never scrolls under / overlaps the tabs) when they
-                  overflow, and hugs the last tab when they fit. ml-[2px] keeps the
-                  same gap the scroller's gap-0.5 gives between tabs. */}
-              <NewTabMenu
-                conversationId={conversationId}
-                onCreateError={onShellCreateFailed}
-                onOpenTerminal={openTerminalTab}
-                onCreateStart={onShellCreateStart}
-                triggerClassName="ml-[2px]"
-                liveness={liveness}
-              />
+              {newTabMenu}
             </>
           )}
-          {/* "+" — open a new Shell tab. With no open tabs it sits here, right
-              after the nav tabs (next to Shells); once tabs exist it moves into
-              the open-tabs region to trail the last tab (see above). Self-gates
-              to nothing when the agent has no terminal access. */}
-          {openFiles.length === 0 && openTerminals.length === 0 && (
-            <NewTabMenu
-              conversationId={conversationId}
-              onOpenTerminal={openTerminalTab}
-              onCreateStart={onShellCreateStart}
-              onCreateError={onShellCreateFailed}
-              liveness={liveness}
-            />
-          )}
+          {!hasOpenTabs && newTabMenu}
           {/* Maximize/minimize toggle, pinned to the rightmost edge via ml-auto,
               which absorbs the free space before it. When open tabs exist their
               ≥500px flex-1 region absorbs the space instead, so the button still
