@@ -337,6 +337,14 @@ async def test_no_project_store_rejects_assignment_and_project_filter_but_all_un
         "/v1/scheduled-tasks", params={"project_id": "a" * 32}, headers=_headers()
     )
     assert filtered.status_code == 400
+    for malformed_project_id in ("", "malformed"):
+        malformed = await no_project_store_client.get(
+            "/v1/scheduled-tasks",
+            params={"project_id": malformed_project_id},
+            headers=_headers(),
+        )
+        assert malformed.status_code == 404
+        assert malformed.json()["error"]["message"] == "Not found."
     assert (
         await no_project_store_client.get("/v1/scheduled-tasks", headers=_headers())
     ).status_code == 200

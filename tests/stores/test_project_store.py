@@ -12,7 +12,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 
-from omnigent.db.db_models import SqlConversationMetadata, SqlScheduledTask
+from omnigent.db.db_models import SqlConversationMetadata, SqlScheduledTask, workspace_scope
 from omnigent.db.enum_codecs import (
     encode_scheduled_task_execution_target,
     encode_scheduled_task_state,
@@ -366,10 +366,16 @@ def test_delete_scoped_to_owner(store: SqlAlchemyProjectStore) -> None:
     assert store.get(_uid("p1"), user_id="alice@example.com") is not None
 
 
-def test_delete_returns_false_when_owned_project_is_absent(
+def test_exists_is_owner_agnostic_and_workspace_scoped(
     store: SqlAlchemyProjectStore,
 ) -> None:
-    assert store.delete(_uid("absent"), user_id="alice@example.com") is False
+    project_id = _uid("exists")
+    store.create(project_id, "Exists", "alice@example.com")
+
+    assert store.exists(project_id) is True
+    assert store.exists(_uid("absent")) is False
+    with workspace_scope(1):
+        assert store.exists(project_id) is False
 
 
 def test_delete_removes_only_project_row_and_leaves_member_pointers_untouched(
