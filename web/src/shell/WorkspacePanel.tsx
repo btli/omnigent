@@ -707,14 +707,13 @@ export function WorkspacePanel({
   );
   return (
     <>
-      {/* The resize target overlays the seam without taking flex width. Its
-          bounded slivers stay outside both scroll containers. */}
+      {/* The resize target is a real flex gutter. Its bounded slivers stay
+          outside both scroll containers. */}
       {!maximized && handleProps["aria-disabled"] !== true && (
         <div
           {...handleProps}
           data-workspace-panel-resize-gutter
-          className="z-50 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:absolute md:inset-y-0 md:block"
-          style={{ ...handleProps.style, right: width }}
+          className="z-50 hidden w-1 shrink-0 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
         />
       )}
       <aside

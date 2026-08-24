@@ -309,8 +309,8 @@ describe("useResizableColumn touch affordances", () => {
     expect(style.boxSizing).toBe("content-box");
   });
 
-  it("widens the hit target to >=44px on coarse pointers", () => {
-    installMatchMedia({ "(pointer: coarse)": true });
+  it("widens the hit target to >=44px on a fine-primary touch device", () => {
+    installMatchMedia({ "(pointer: coarse)": false, "(any-pointer: coarse)": true });
     const { result } = renderColumn(0);
     const style = result.current.handleProps.style;
 
@@ -320,8 +320,11 @@ describe("useResizableColumn touch affordances", () => {
     expect(style.paddingRight).toBeGreaterThan(style.paddingLeft);
   });
 
-  it("updates the hit target when the primary pointer capability changes at runtime", () => {
-    const media = installMatchMedia({ "(pointer: coarse)": false });
+  it("updates the hit target when an attached coarse pointer changes at runtime", () => {
+    const media = installMatchMedia({
+      "(pointer: coarse)": false,
+      "(any-pointer: coarse)": false,
+    });
     const { result } = renderColumn(0);
 
     expect(result.current.handleProps.style).toMatchObject({
@@ -330,7 +333,7 @@ describe("useResizableColumn touch affordances", () => {
       marginLeft: -10,
     });
 
-    act(() => media.set("(pointer: coarse)", true));
+    act(() => media.set("(any-pointer: coarse)", true));
 
     expect(result.current.handleProps.style).toMatchObject({
       paddingLeft: 12,

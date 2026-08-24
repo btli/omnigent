@@ -9,7 +9,7 @@
 // Unlike the inline panel this has no "boost" machinery — nothing auto-widens
 // the sidebar — so the store is just a persisted, viewport-clamped width.
 
-import { useCallback, useEffect, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useReducer, useSyncExternalStore } from "react";
 import { createResizableWidthStore } from "@/hooks/resizableWidthStore";
 import { useInputCapabilities } from "@/hooks/useInputCapabilities";
 import { useResizeDrag } from "@/hooks/useResizeDrag";
@@ -75,13 +75,14 @@ export function resetSidebarWidthStoreForTesting(): void {
  * mobile (where the sidebar is a full-screen overlay).
  */
 export function useResizableSidebar() {
-  const { coarsePrimary } = useInputCapabilities();
+  const { anyCoarse } = useInputCapabilities();
   const raw = useSyncExternalStore(
     widthStore.subscribe,
     widthStore.getSnapshot,
     widthStore.getServerSnapshot,
   );
   const width = clamp(raw ?? DEFAULT_WIDTH_PX);
+  const [, bumpViewport] = useReducer((version: number) => version + 1, 0);
 
   // Re-clamp on viewport resize so a shrunken window pulls the sidebar back
   // under the ceiling; widening re-derives from the persisted preference so the
@@ -89,6 +90,7 @@ export function useResizableSidebar() {
   useEffect(() => {
     function onResize() {
       widthStore.set((prev) => clamp(widthStore.getPreferred() ?? prev ?? DEFAULT_WIDTH_PX));
+      bumpViewport();
     }
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
@@ -100,7 +102,6 @@ export function useResizableSidebar() {
       widthStore.set(clamp(e.clientX));
     }, []),
     observeHandleRemoval: true,
-    releaseCaptureOnFinish: true,
   });
 
   const onKeyDown = useCallback(
@@ -134,7 +135,7 @@ export function useResizableSidebar() {
           ? width
           : Math.max(MIN_WIDTH_PX, window.innerWidth * MAX_WIDTH_RATIO),
       tabIndex: 0,
-      style: gutterStyle(coarsePrimary),
+      style: gutterStyle(anyCoarse),
     },
   };
 }

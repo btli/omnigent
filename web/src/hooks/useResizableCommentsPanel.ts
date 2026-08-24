@@ -14,7 +14,7 @@
 // file is opened, matching the other panel-resize hooks. Explicit user
 // resizes are also persisted so a full page reload restores the width.
 
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { createResizableWidthStore } from "@/hooks/resizableWidthStore";
 import { useInputCapabilities } from "@/hooks/useInputCapabilities";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -83,7 +83,7 @@ export function resetCommentsWidthStoreForTesting(): void {
  * sibling viewer.
  */
 export function useResizableCommentsPanel() {
-  const { coarsePrimary } = useInputCapabilities();
+  const { anyCoarse } = useInputCapabilities();
   const mobileViewport = useIsMobileViewport();
   const isDesktop = typeof window !== "undefined" && !mobileViewport;
   const raw = useSyncExternalStore(
@@ -117,7 +117,7 @@ export function useResizableCommentsPanel() {
 
   // A row can resize without the window changing (for example, the sidebar
   // opens). Re-render so the separator's reachable ARIA maximum stays in sync.
-  const [, setConstraintVersion] = useState(0);
+  const [constraintVersion, setConstraintVersion] = useState(0);
   useEffect(() => {
     const parent = containerRef.current?.parentElement;
     if (!parent || typeof ResizeObserver === "undefined") return;
@@ -133,7 +133,6 @@ export function useResizableCommentsPanel() {
   }, [clampWidth]);
 
   const resizeDrag = useResizeDrag({
-    captureRequired: false,
     enabled: isDesktop,
     overlay: true,
     onCommit: widthStore.persist,
@@ -172,10 +171,17 @@ export function useResizableCommentsPanel() {
         const base = widthStore.getPreferred() ?? prev;
         return base !== null ? clampWidth(base) : prev;
       });
+      setConstraintVersion((version) => version + 1);
     }
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
   }, [clampWidth]);
+
+  const ariaValueMax = useMemo(() => {
+    // Row-size signals invalidate the cached layout measurement.
+    void constraintVersion;
+    return reachableMax();
+  }, [constraintVersion, reachableMax]);
 
   return {
     /** Pixel width to apply as an inline style (undefined on mobile). */
@@ -198,7 +204,7 @@ export function useResizableCommentsPanel() {
       "aria-label": "Resize comments panel",
       "aria-valuenow": width,
       "aria-valuemin": MIN_WIDTH_PX,
-      "aria-valuemax": reachableMax(),
+      "aria-valuemax": ariaValueMax,
       tabIndex: 0,
       // The gutter owns its touches outright (no scroll/selection may start
       // from it). With content-box sizing the `w-1` class is the painted
@@ -206,7 +212,7 @@ export function useResizableCommentsPanel() {
       // slivers, whose footprint the negative margins cancel — so the
       // element occupies exactly the gutter width and the hover/active
       // background (content-box clipped) never widens visually.
-      style: gutterStyle(coarsePrimary),
+      style: gutterStyle(anyCoarse),
     },
   };
 }

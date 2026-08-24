@@ -23,10 +23,10 @@ export function useResizableColumn(
   maxWidth = 480,
   enabled = true,
 ) {
-  const { coarsePrimary } = useInputCapabilities();
+  const { anyCoarse } = useInputCapabilities();
   const [width, setWidth] = useState(defaultWidth);
   const containerRef = useRef<HTMLElement | null>(null);
-  const pad = coarsePrimary ? COARSE_PAD : FINE_PAD;
+  const pad = anyCoarse ? COARSE_PAD : FINE_PAD;
 
   const clamp = useCallback(
     (w: number) => Math.max(minWidth, Math.min(maxWidth, w)),

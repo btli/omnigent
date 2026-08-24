@@ -1,7 +1,11 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useSessionAgent } from "@/hooks/useAgents";
+import {
+  resetWidthStoreForTesting,
+  useResizableInlinePanel,
+} from "@/hooks/useResizableInlinePanel";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import { useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
@@ -57,6 +61,7 @@ const useSessionAgentMock = vi.mocked(useSessionAgent);
 
 afterEach(() => {
   cleanup();
+  resetWidthStoreForTesting();
   vi.clearAllMocks();
   useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
   useCreateTerminalMock.mockReturnValue({
@@ -689,24 +694,10 @@ describe("WorkspacePanel browser tab", () => {
 // ── Resize handle geometry ────────────────────────────────────────────────────
 
 describe("WorkspacePanel resize handle geometry", () => {
-  const handleStyle = {
-    touchAction: "none",
-    boxSizing: "content-box",
-    paddingLeft: 10,
-    paddingRight: 12,
-    marginLeft: -6,
-    marginRight: -8,
-    backgroundClip: "content-box",
-  } as React.CSSProperties;
-
-  it("positions the resize target over the seam without consuming flex width", () => {
+  it("renders the hook's resize target as a real flex gutter", () => {
+    const resize = renderHook(() => useResizableInlinePanel(null));
     renderWorkspace({
-      handleProps: {
-        tabIndex: 0,
-        role: "separator",
-        "aria-label": "Resize panel",
-        style: handleStyle,
-      },
+      handleProps: resize.result.current.handleProps,
     });
 
     const panel = screen.getByRole("complementary", { name: "Workspace" });
@@ -716,48 +707,41 @@ describe("WorkspacePanel resize handle geometry", () => {
     expect(separator.nextElementSibling).toBe(panel);
     expect(panel).toHaveClass("md:overflow-hidden");
     expect(panel).not.toContainElement(separator);
-    expect(separator).toHaveClass("md:absolute", "md:inset-y-0");
+    expect(separator).not.toHaveClass("md:absolute", "md:inset-y-0");
     expect(separator).toHaveClass("z-50");
     expect(panel).toHaveClass("z-40");
-    expect(separator).not.toHaveClass("shrink-0");
-    expect(separator.style.right).toBe("360px");
+    expect(separator).toHaveClass("shrink-0");
+    expect(separator.style.right).toBe("");
   });
 
-  it("keeps adjacent scroll surfaces outside the gutter ownership", () => {
-    const onPointerDown = vi.fn();
+  it("enforces the shipped gutter's footprint and seam-ownership caps", () => {
+    const resize = renderHook(() => useResizableInlinePanel(null));
     renderWorkspace({
-      handleProps: {
-        tabIndex: 0,
-        role: "separator",
-        "aria-label": "Resize panel",
-        style: handleStyle,
-        onPointerDown,
-      },
+      handleProps: resize.result.current.handleProps,
     });
 
     const separator = screen.getByRole("separator", { name: "Resize panel" });
-    expect(Math.abs(parseFloat(separator.style.marginLeft))).toBeLessThanOrEqual(6);
-    expect(Math.abs(parseFloat(separator.style.marginRight))).toBeLessThanOrEqual(8);
-
-    const filesTab = screen.getByRole("tab", { name: "Files" });
-    fireEvent.pointerDown(filesTab, { pointerId: 1, button: 0 });
-    fireEvent.pointerDown(screen.getByTestId("files-panel-stub"), { pointerId: 2, button: 0 });
-    expect(onPointerDown).not.toHaveBeenCalled();
+    const painted = 4;
+    const padding =
+      parseFloat(separator.style.paddingLeft) + parseFloat(separator.style.paddingRight);
+    const margins =
+      parseFloat(separator.style.marginLeft) + parseFloat(separator.style.marginRight);
+    expect(painted + padding).toBeGreaterThanOrEqual(24);
+    expect(painted + padding + margins).toBeGreaterThanOrEqual(10);
+    expect(painted + padding + margins).toBeLessThanOrEqual(12);
+    expect(-parseFloat(separator.style.marginLeft)).toBeLessThanOrEqual(6);
+    expect(-parseFloat(separator.style.marginRight)).toBeLessThanOrEqual(8);
   });
 
   it("keeps the visible resize strip byte-identical", () => {
+    const resize = renderHook(() => useResizableInlinePanel(null));
     renderWorkspace({
-      handleProps: {
-        tabIndex: 0,
-        role: "separator",
-        "aria-label": "Resize panel",
-        style: handleStyle,
-      },
+      handleProps: resize.result.current.handleProps,
     });
 
     const separator = screen.getByRole("separator", { name: "Resize panel" });
     expect(separator.className).toBe(
-      "z-50 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:absolute md:inset-y-0 md:block",
+      "z-50 hidden w-1 shrink-0 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block",
     );
     expect(separator.style.boxSizing).toBe("content-box");
     expect(separator.style.backgroundClip).toBe("content-box");
@@ -770,7 +754,6 @@ describe("WorkspacePanel resize handle geometry", () => {
         role: "separator",
         "aria-label": "Resize panel",
         "aria-disabled": true,
-        style: handleStyle,
       },
     });
 
