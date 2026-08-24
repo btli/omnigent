@@ -139,7 +139,13 @@ _REDACTED = "[REDACTED]"
 
 
 def _authorization_value_end(text: str, start: int, quote: str | None) -> tuple[int, bool]:
-    """Find one Authorization value boundary with a forward-only scan."""
+    """
+    Find one Authorization value boundary with a forward-only scan.
+
+    Quoted values end at an unescaped matching quote; unquoted values end at
+    end-of-line. In either form, CR, LF, or CRLF followed by indentation
+    continues the value; an unclosed quote stops at the first non-folded line end.
+    """
     index = start
     while index < len(text):
         char = text[index]
@@ -153,7 +159,7 @@ def _authorization_value_end(text: str, start: int, quote: str | None) -> tuple[
             newline_end = index + 1
             if char == "\r" and newline_end < len(text) and text[newline_end] == "\n":
                 newline_end += 1
-            if quote is None and newline_end < len(text) and text[newline_end] in " \t":
+            if newline_end < len(text) and text[newline_end] in " \t":
                 index = newline_end
                 continue
             return index, False

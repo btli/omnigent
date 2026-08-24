@@ -7764,6 +7764,38 @@ def test_sanitize_hook_failure_detail_redacts_after_planted_marker() -> None:
     assert detail == "Bearer (REDACTED) [REDACTED]"
 
 
+def test_sanitize_hook_failure_detail_redacts_thin_space_bearer() -> None:
+    """A Unicode separator remains recognizable as a bearer-token gap."""
+    detail = _sanitize_hook_failure_detail("Bearer\u2009abcdefghijk")
+    assert detail == "Bearer [REDACTED]"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Authorization:", "Authorization:[REDACTED]"),
+        ("Authorization:   ", "Authorization: [REDACTED]"),
+    ],
+    ids=["empty", "whitespace-only"],
+)
+def test_sanitize_hook_failure_detail_redacts_empty_authorization(
+    text: str, expected: str
+) -> None:
+    """An empty explicit value inserts its marker at a safe end boundary."""
+    assert _sanitize_hook_failure_detail(text) == expected
+
+
+def test_sanitize_hook_failure_detail_maps_empty_url_userinfo() -> None:
+    """Empty URL userinfo safely covers a visible-only joiner."""
+    assert _sanitize_hook_failure_detail("https://\u200d@host") == "https://[REDACTED]@host"
+
+
+def test_sanitize_hook_failure_detail_preserves_lines_after_authorization() -> None:
+    """Authorization redaction stops before a following diagnostic line."""
+    detail = _sanitize_hook_failure_detail("Authorization: abcdefghijk\nNext-Line: ok")
+    assert detail == "Authorization: [REDACTED] Next-Line: ok"
+
+
 def test_sanitize_hook_failure_detail_marks_removed_single_token() -> None:
     """A raw-bound single token yields an explicit safe sentinel."""
     detail = _sanitize_hook_failure_detail("x" * (_HOOK_FAILURE_DETAIL_RAW_LIMIT + 1))

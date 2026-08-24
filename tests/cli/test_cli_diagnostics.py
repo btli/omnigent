@@ -283,6 +283,13 @@ def test_redact_secrets_handles_unterminated_quoted_authorization_linearly() -> 
     assert elapsed < 0.5
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_redact_secrets_scrubs_folded_quoted_authorization(newline: str) -> None:
+    """Indented LF and CRLF continuations remain inside a quoted value."""
+    text = f'Authorization: "abc{newline} secretcredential"'
+    assert cli_diagnostics.redact_secrets(text) == 'Authorization: "[REDACTED]"'
+
+
 def test_redact_secrets_scrubs_after_planted_authorization_marker() -> None:
     """A planted marker cannot shield a later Authorization credential."""
     text = "Authorization: [REDACTED] actualcredential"

@@ -2850,39 +2850,49 @@ def _redact_hook_failure_shadow(text: str) -> str:
     shadow_chars: list[str] = []
     shadow_to_visible: list[int] = []
     for ch in canonical:
-        visible_chars.append(ch if ch.isprintable() or ch in "\u200c\u200d" else " ")
+        visible_chars.append(ch if ch.isprintable() or ch in "\r\n\u200c\u200d" else " ")
         for match_char in unicodedata.normalize("NFKD", ch):
             category = unicodedata.category(match_char)
+            if match_char == "\x00":
+                if "".join(shadow_chars[-6:]).casefold() == "bearer":
+                    shadow_chars.append(" ")
+                    shadow_to_visible.append(len(visible_chars) - 1)
+                continue
             if (
-                match_char != "\x00"
-                and category not in _HOOK_FAILURE_IGNORED_UNICODE_CATEGORIES
+                category not in _HOOK_FAILURE_IGNORED_UNICODE_CATEGORIES
                 and not category.startswith("M")
             ):
-                shadow_chars.append(match_char if match_char.isprintable() else " ")
+                shadow_chars.append(
+                    match_char if match_char.isprintable() or match_char in "\r\n" else " "
+                )
                 shadow_to_visible.append(len(visible_chars) - 1)
     visible = "".join(visible_chars)
     shadow = "".join(shadow_chars)
     visible = _HOOK_FAILURE_PLANTED_REDACTION_RE.sub("(REDACTED)", visible)
     shadow = _HOOK_FAILURE_PLANTED_REDACTION_RE.sub(lambda match: " " * len(match.group()), shadow)
     redacted = redact_secrets(shadow)
-    if redacted == shadow:
-        return " ".join(visible.split())
-    parts = redacted.split(_HOOK_FAILURE_REDACTION_MARKER)
-    pattern = r"\A" + r"(.*?)".join(re.escape(part) for part in parts) + r"\Z"
-    match = re.match(pattern, shadow, re.DOTALL)
-    if match is None:
-        return _HOOK_FAILURE_REDACTION_MARKER
-    spans = [
-        (
-            shadow_to_visible[match.start(index)],
-            shadow_to_visible[match.end(index) - 1] + 1,
-        )
-        for index in range(1, len(parts))
-    ]
-    for start, end in reversed(spans):
-        # Defensive only: current redactors do not emit zero-width spans.
-        start, end = sorted((start, end))
-        visible = f"{visible[:start]}{_HOOK_FAILURE_REDACTION_MARKER}{visible[end:]}"
+    if redacted != shadow:
+        parts = redacted.split(_HOOK_FAILURE_REDACTION_MARKER)
+        pattern = r"\A" + r"(.*?)".join(re.escape(part) for part in parts) + r"\Z"
+        match = re.match(pattern, shadow, re.DOTALL)
+        if match is None:
+            return _HOOK_FAILURE_REDACTION_MARKER
+        spans: list[tuple[int, int]] = []
+        for index in range(1, len(parts)):
+            shadow_start = match.start(index)
+            shadow_end = match.end(index)
+            if shadow_start < len(shadow_to_visible):
+                visible_start = shadow_to_visible[shadow_start]
+            elif shadow_to_visible:
+                visible_start = shadow_to_visible[-1] + 1
+            else:
+                visible_start = 0
+            visible_end = shadow_to_visible[shadow_end - 1] + 1 if shadow_end else visible_start
+            spans.append((visible_start, visible_end))
+        for start, end in reversed(spans):
+            # Empty matches can bracket visible-only characters; order the mapped span.
+            start, end = sorted((start, end))
+            visible = f"{visible[:start]}{_HOOK_FAILURE_REDACTION_MARKER}{visible[end:]}"
     return " ".join(visible.split())
 
 
