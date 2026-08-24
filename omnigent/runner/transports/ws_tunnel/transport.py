@@ -250,6 +250,15 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
                         read_timeout,
                         "response head",
                     )
+        except asyncio.CancelledError:
+            await _send_cancel_frame(
+                self._registry,
+                state,
+                req_id,
+                "client_disconnected",
+            )
+            self._registry.close_request(self._runner_id, req_id, session=state.session)
+            raise
         except BaseException:
             # If we failed before getting head, clean up the slot so
             # we don't leak in_flight state.
