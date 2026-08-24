@@ -15,6 +15,7 @@ projects share that scope.
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from typing import Any
 
@@ -30,6 +31,8 @@ from omnigent.server.schemas import (
     UpdateProjectRequest,
 )
 from omnigent.stores.project_store import ProjectStore
+
+_logger = logging.getLogger(__name__)
 
 
 def _to_response(project: Project) -> dict[str, Any]:
@@ -166,6 +169,10 @@ def create_projects_router(
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         # Drop the folder from the owner's other connected clients live.
         announce_projects_changed(user_id)
+        _logger.info(
+            "project deletion: project %s deleted; unresolved first-class members read as unfiled",
+            project_id,
+        )
         return {"id": project_id, "object": "project.deleted", "deleted": True}
 
     return router
