@@ -42,6 +42,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.parse
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass
@@ -2788,63 +2789,119 @@ def _normalize_background_task(raw: object) -> _JsonObject | None:
 # Bound provider failure text before forwarding it to a parent session.
 _HOOK_FAILURE_DETAIL_MAX_CHARS = 500
 _HOOK_FAILURE_DETAIL_TRUNCATION_MARKER = "… [truncated]"
+_HOOK_FAILURE_DETAIL_REMOVED_SENTINEL = (
+    f"Provider detail removed at safety limit {_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER}"
+)
 # Preserve the traceback framing and its final, actionable line.
 _HOOK_FAILURE_DETAIL_HEAD_CHARS = 150
-_HOOK_FAILURE_DETAIL_TAIL_CHARS = _HOOK_FAILURE_DETAIL_MAX_CHARS - _HOOK_FAILURE_DETAIL_HEAD_CHARS
+_HOOK_FAILURE_DETAIL_WINDOW_SEPARATOR = f" {_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER} "
+_HOOK_FAILURE_DETAIL_TAIL_CHARS = (
+    _HOOK_FAILURE_DETAIL_MAX_CHARS
+    - _HOOK_FAILURE_DETAIL_HEAD_CHARS
+    - len(_HOOK_FAILURE_DETAIL_WINDOW_SEPARATOR)
+)
 # Bound regex and character scanning before controls are stripped.
 _HOOK_FAILURE_DETAIL_RAW_LIMIT = _HOOK_FAILURE_DETAIL_MAX_CHARS * 8
-_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+_HOOK_FAILURE_DETAIL_RAW_HEAD_CHARS = _HOOK_FAILURE_DETAIL_RAW_LIMIT // 2
+_HOOK_FAILURE_DETAIL_RAW_TAIL_CHARS = (
+    _HOOK_FAILURE_DETAIL_RAW_LIMIT - _HOOK_FAILURE_DETAIL_RAW_HEAD_CHARS
+)
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1b(?:"
+    r"\[[0-?]*[ -/]*[@-~]"
+    r"|\][^\x07\x1b]*(?:\x07|\x1b\\)"
+    r"|[PX^_].*?\x1b\\"
+    r"|[()][0-2A-Z]"
+    r"|[@-Z\\-_]"
+    r")",
+    re.DOTALL,
+)
+_HOOK_FAILURE_IGNORED_UNICODE_CATEGORIES = frozenset({"Cf", "Cs", "Mn", "Me"})
+_HOOK_FAILURE_FRAME_TRANSLATION = str.maketrans({"[": "(", "]": ")"})
+
+
+def _raw_hook_failure_window(text: str) -> tuple[str, bool]:
+    """Bound raw text while retaining both ends of a long provider error."""
+    if len(text) <= _HOOK_FAILURE_DETAIL_RAW_LIMIT:
+        return text, False
+    head = re.sub(r"\S+$", "", text[:_HOOK_FAILURE_DETAIL_RAW_HEAD_CHARS])
+    tail = re.sub(r"^\S+", "", text[-_HOOK_FAILURE_DETAIL_RAW_TAIL_CHARS:])
+    return " ".join(part.strip() for part in (head, tail) if part.strip()), True
+
+
+def _cap_hook_failure_detail(text: str, *, raw_truncated: bool) -> str:
+    """Fit sanitized detail and its truncation marker inside the global cap."""
+    raw_suffix = f" {_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER}"
+    needs_window = len(text) > _HOOK_FAILURE_DETAIL_MAX_CHARS or (
+        raw_truncated and len(text) + len(raw_suffix) > _HOOK_FAILURE_DETAIL_MAX_CHARS
+    )
+    if needs_window:
+        head = text[:_HOOK_FAILURE_DETAIL_HEAD_CHARS].rstrip()
+        tail = text[-_HOOK_FAILURE_DETAIL_TAIL_CHARS:].lstrip()
+        return f"{head}{_HOOK_FAILURE_DETAIL_WINDOW_SEPARATOR}{tail}"
+    if raw_truncated:
+        return f"{text}{raw_suffix}"
+    return text
 
 
 def _sanitize_hook_failure_detail(text: str) -> str | None:
     """
     Scrub and cap untrusted hook failure text for a parent session ``output``.
 
-    ANSI escapes and controls are removed before whitespace is collapsed.
-    Secrets are redacted before the head/tail window is selected so the cap
-    cannot expose a token prefix. A raw cut drops its potentially partial final
-    token and always carries a truncation marker.
+    Long raw input retains both ends, with cut-edge tokens removed. Unicode
+    obfuscators, ANSI sequences, controls, and model-visible frame delimiters
+    are neutralized before secrets are redacted and the global cap is applied.
 
     :param text: Raw failure text from a ``StopFailure`` hook payload.
     :returns: Sanitized single-line detail, or ``None`` when nothing usable
         remains.
     """
-    raw_truncated = len(text) > _HOOK_FAILURE_DETAIL_RAW_LIMIT
-    without_ansi = _ANSI_ESCAPE_RE.sub("", text[:_HOOK_FAILURE_DETAIL_RAW_LIMIT])
-    stripped = "".join(ch if ch.isprintable() else " " for ch in without_ansi)
-    if raw_truncated:
-        # The raw bound may bisect a secret-shaped token.
-        stripped = re.sub(r"\S+$", "", stripped)
+    bounded, raw_truncated = _raw_hook_failure_window(text)
+    if raw_truncated and not bounded:
+        return _HOOK_FAILURE_DETAIL_REMOVED_SENTINEL
+    without_ansi = _ANSI_ESCAPE_RE.sub("", bounded)
+    decomposed = unicodedata.normalize("NFKD", without_ansi)
+    deobfuscated = "".join(
+        ch
+        for ch in decomposed
+        if unicodedata.category(ch) not in _HOOK_FAILURE_IGNORED_UNICODE_CATEGORIES
+    )
+    canonical = unicodedata.normalize("NFKC", deobfuscated)
+    stripped = "".join(ch if ch.isprintable() else " " for ch in canonical)
     collapsed = " ".join(stripped.split())
     if not collapsed:
-        return None
-    redacted = redact_secrets(collapsed)
-    if len(redacted) > _HOOK_FAILURE_DETAIL_MAX_CHARS:
-        head = redacted[:_HOOK_FAILURE_DETAIL_HEAD_CHARS].rstrip()
-        tail = redacted[-_HOOK_FAILURE_DETAIL_TAIL_CHARS:].lstrip()
-        return f"{head} {_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER} {tail}"
-    if raw_truncated:
-        return f"{redacted} {_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER}"
-    return redacted
+        return _HOOK_FAILURE_DETAIL_REMOVED_SENTINEL if raw_truncated else None
+    neutralized = collapsed.translate(_HOOK_FAILURE_FRAME_TRANSLATION)
+    redacted = redact_secrets(neutralized)
+    return _cap_hook_failure_detail(redacted, raw_truncated=raw_truncated)
 
 
 def _hook_failure_detail(payload: _JsonObject) -> str | None:
     """
     Build a sanitized failure detail from a ``StopFailure`` hook payload.
 
-    Each field is sanitized separately so control-only values do not leave a
-    dangling separator or shadow the generic failure fallback.
+    Fields are composed before one sanitize/redact/cap pass so credentials
+    split across the field boundary cannot bypass matching.
 
     :param payload: ``StopFailure`` hook payload.
     :returns: Sanitized detail, or ``None`` when the payload carried none.
     """
     raw_error = payload.get("error")
     raw_message = payload.get("last_assistant_message")
-    error = _sanitize_hook_failure_detail(raw_error) if isinstance(raw_error, str) else None
-    message = _sanitize_hook_failure_detail(raw_message) if isinstance(raw_message, str) else None
+    error = raw_error.strip() if isinstance(raw_error, str) else ""
+    message = raw_message.strip() if isinstance(raw_message, str) else ""
     if error and message:
-        return f"{error}: {message}"
-    return error or message
+        combined = f"{error}: {message}"
+    else:
+        combined = error or message
+    if not combined:
+        return None
+    detail = _sanitize_hook_failure_detail(combined)
+    if detail is None:
+        return None
+    if error and message:
+        detail = detail.strip(": ")
+    return detail or None
 
 
 def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:

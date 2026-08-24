@@ -185,6 +185,70 @@ def test_redact_secrets_scrubs_structured_credentials(
 
 
 @pytest.mark.parametrize(
+    ("text", "removed", "preserved"),
+    [
+        (
+            'Authorization: Digest username="alice", response="digest-response-secret"',
+            ("alice", "digest-response-secret"),
+            ("Authorization: [REDACTED]",),
+        ),
+        (
+            "Authorization: AWS4-HMAC-SHA256 Credential="
+            + "AKIA"
+            + "QWERTYUIOP123456"
+            + "/date/region/service/aws4_request, Signature=aws-signature-secret",
+            ("QWERTYUIOP123456", "aws-signature-secret"),
+            ("Authorization: [REDACTED]",),
+        ),
+        (
+            '{"Authorization": "Basic dXNlcjpodW50ZXIy", "status": 401}',
+            ("dXNlcjpodW50ZXIy",),
+            ('"Authorization": "[REDACTED]"', '"status": 401'),
+        ),
+        (
+            "Authorization: Basic\r\n dXNlcjpodW50ZXIy\r\nX-Request: failed",
+            ("dXNlcjpodW50ZXIy",),
+            ("Authorization: [REDACTED]", "X-Request: failed"),
+        ),
+    ],
+    ids=["digest", "aws4", "quoted-json", "folded-basic"],
+)
+def test_redact_secrets_scrubs_complete_authorization_values(
+    text: str, removed: tuple[str, ...], preserved: tuple[str, ...]
+) -> None:
+    """Complete structured Authorization values are redacted."""
+    scrubbed = cli_diagnostics.redact_secrets(text)
+    for value in removed:
+        assert value not in scrubbed
+    for value in preserved:
+        assert value in scrubbed
+
+
+def test_redact_secrets_preserves_authorization_prose() -> None:
+    """A credential scheme used as ordinary prose is not a header secret."""
+    text = "authorization: bearer of bad news"
+    assert cli_diagnostics.redact_secrets(text) == text
+
+
+@pytest.mark.parametrize(
+    ("url", "removed"),
+    [
+        ("https://:credential@host.example/path", ("credential",)),
+        ("https://credential:@host.example/path", ("credential",)),
+        ("https://user:pass word@host.example/path", ("user", "pass word")),
+        ("https://u:p@ss@host.example/path", ("u:p@ss",)),
+    ],
+    ids=["empty-user", "empty-password", "space-password", "at-in-password"],
+)
+def test_redact_secrets_scrubs_url_authority_userinfo(url: str, removed: tuple[str, ...]) -> None:
+    """Only userinfo inside the URL authority is redacted."""
+    scrubbed = cli_diagnostics.redact_secrets(url)
+    assert scrubbed == "https://[REDACTED]@host.example/path"
+    for value in removed:
+        assert value not in scrubbed
+
+
+@pytest.mark.parametrize(
     "secret",
     [
         "xoxb" + "-1234567890-abcdefslacktoken",
@@ -200,10 +264,25 @@ def test_redact_secrets_scrubs_opaque_shapes(secret: str) -> None:
     assert "[REDACTED]" in scrubbed
 
 
-def test_redact_secrets_preserves_url_with_at_sign_in_query() -> None:
-    """An ``@`` in a query string is not basic-auth userinfo."""
-    text = "GET https://app.example.com:8443?login_hint=alice@example.com failed 302"
+@pytest.mark.parametrize(
+    "text",
+    [
+        "GET https://app.example.com:8443?login_hint=alice@example.com failed 302",
+        "GET https://[2001:db8::1]:8443/path#owner@example.com failed 302",
+    ],
+    ids=["query-at-sign", "ipv6-fragment-at-sign"],
+)
+def test_redact_secrets_preserves_non_userinfo_urls(text: str) -> None:
+    """Query and fragment ``@`` signs are outside URL userinfo."""
     assert cli_diagnostics.redact_secrets(text) == text
+
+
+def test_redact_secrets_is_idempotent() -> None:
+    """Repeated formatter and stderr passes preserve the first redaction."""
+    text = "Authorization: Bearer abcdefghijk request failed"
+    once = cli_diagnostics.redact_secrets(text)
+    assert cli_diagnostics.redact_secrets(once) == once
+    assert "request failed" in once
 
 
 @pytest.mark.parametrize("prefix", ["AKIA", "ASIA"])
