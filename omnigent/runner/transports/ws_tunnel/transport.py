@@ -182,19 +182,15 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
         self._registry = registry
         self._runner_id = runner_id
 
-    def runner_registered(self, runner_id: str | None = None) -> bool:
+    def runner_registered(self) -> bool:
         """Return True when the runner has a live tunnel registered.
 
         Public liveness probe for disconnect attribution: a stream error
         while this is True is a live-tunnel stream loss, not a runner
         disconnect. Stale-generation stalls never reach it — the timeout
         paths classify those as tunnel transitions themselves.
-
-        :param runner_id: Runner to check, e.g. ``"runner_abc123"``.
-            Defaults to this transport's bound runner.
         """
-        rid = self._runner_id if runner_id is None else runner_id
-        return self._registry.get(rid) is not None
+        return self._registry.get(self._runner_id) is not None
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         session = self._registry.get(self._runner_id)

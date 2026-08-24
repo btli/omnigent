@@ -1075,6 +1075,7 @@ async def _reconnect_fires_connect_hook(
     """
     from omnigent.runner.routing import RoutedRunner
     from omnigent.server.routes import sessions as sessions_routes
+    from omnigent.server.routes._sessions.common import _RelayHandle
 
     router = ap_app.state.runner_router
     real_resolver = router.client_for_session_resources
@@ -1100,9 +1101,17 @@ async def _reconnect_fires_connect_hook(
 
     real_ensure = sessions_routes._ensure_runner_relay
     real_ensure_ready = sessions_routes._ensure_runner_relay_ready
+    stub_handles: list[tuple[str, _RelayHandle]] = []
 
     def _stub_ensure(sid, rid, client, store=None):  # type: ignore[no-untyped-def]
-        return None
+        del client, store
+        ready = asyncio.Event()
+        ready.set()
+        task = asyncio.create_task(asyncio.Event().wait())
+        handle = _RelayHandle(runner_id=rid, task=task, ready=ready)
+        sessions_routes._runner_relay_tasks[sid] = handle
+        stub_handles.append((sid, handle))
+        return handle
 
     async def _stub_ensure_ready(*args: Any, **kwargs: Any) -> None:
         return None
@@ -1167,6 +1176,12 @@ async def _reconnect_fires_connect_hook(
         sessions_routes._ensure_runner_relay = real_ensure  # type: ignore[assignment]
         sessions_routes._ensure_runner_relay_ready = real_ensure_ready  # type: ignore[assignment]
         sessions_routes._publish_runner_recovered_status = real_recover  # type: ignore[assignment]
+        for sid, handle in stub_handles:
+            if sessions_routes._runner_relay_tasks.get(sid) is handle:
+                sessions_routes._runner_relay_tasks.pop(sid, None)
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await handle.task
         if forwarder_task is not None:
             forwarder_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
