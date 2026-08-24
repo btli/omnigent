@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 
 import { useInputCapabilities } from "@/hooks/useInputCapabilities";
+import { useResizeDrag } from "@/hooks/useResizeDrag";
 
 const KEYBOARD_STEP_PX = 20;
 // Width of the painted separator strip (the consumer's `w-1` element).
@@ -24,12 +25,7 @@ export function useResizableColumn(
 ) {
   const { coarsePrimary } = useInputCapabilities();
   const [width, setWidth] = useState(defaultWidth);
-  // Pointer id of the active drag; null when idle. First pointer wins — a
-  // second concurrent pointer is ignored until the first drag ends.
-  const activePointerId = useRef<number | null>(null);
   const containerRef = useRef<HTMLElement | null>(null);
-  // Removes the document-level fallback listeners for the active drag.
-  const removeDocListeners = useRef<(() => void) | null>(null);
   const pad = coarsePrimary ? COARSE_PAD : FINE_PAD;
 
   const clamp = useCallback(
@@ -37,68 +33,17 @@ export function useResizableColumn(
     [minWidth, maxWidth],
   );
 
-  const endDrag = useCallback(() => {
-    if (activePointerId.current === null) return;
-    activePointerId.current = null;
-    removeDocListeners.current?.();
-    removeDocListeners.current = null;
-    document.body.style.cursor = "";
-    document.body.style.userSelect = "";
-  }, []);
-
-  const onPointerDown = useCallback(
-    (e: React.PointerEvent) => {
-      // Only the primary button starts a drag — right-click / pen barrel
-      // button must not capture the pointer or flip body styles.
-      if (!enabled || e.button !== 0) return;
-      if (activePointerId.current !== null) return;
-      // Capture so moves keep arriving when the pointer leaves the handle (or
-      // crosses an iframe), and so no other gesture consumer sees the stream.
-      // Capture first: if it throws (pointer already gone), stay idle rather
-      // than publishing a drag that can never receive its end events.
-      try {
-        e.currentTarget.setPointerCapture(e.pointerId);
-      } catch {
-        return;
-      }
-      e.preventDefault();
-      activePointerId.current = e.pointerId;
-      document.body.style.cursor = "col-resize";
-      document.body.style.userSelect = "none";
-      // Document-level fallback: if the handle element unmounts mid-drag
-      // (breakpoint flip, active terminal exits) its React handlers never
-      // fire, which would leave the drag armed and body styles stuck.
-      const onDocEnd = (ev: PointerEvent) => {
-        if (ev.pointerId === activePointerId.current) endDrag();
-      };
-      document.addEventListener("pointerup", onDocEnd);
-      document.addEventListener("pointercancel", onDocEnd);
-      removeDocListeners.current = () => {
-        document.removeEventListener("pointerup", onDocEnd);
-        document.removeEventListener("pointercancel", onDocEnd);
-      };
-    },
-    [enabled, endDrag],
-  );
-
-  const onPointerMove = useCallback(
-    (e: React.PointerEvent) => {
-      if (e.pointerId !== activePointerId.current || !containerRef.current) return;
-      const left = containerRef.current.getBoundingClientRect().left;
-      setWidth(clamp(e.clientX - left));
-    },
-    [clamp],
-  );
-
-  // pointerup ends the drag; pointercancel and capture loss abort it cleanly,
-  // keeping the last applied width (never a half-state).
-  const onPointerEnd = useCallback(
-    (e: React.PointerEvent) => {
-      if (e.pointerId !== activePointerId.current) return;
-      endDrag();
-    },
-    [endDrag],
-  );
+  const resizeDrag = useResizeDrag({
+    enabled,
+    onMove: useCallback(
+      (e: React.PointerEvent) => {
+        if (!containerRef.current) return;
+        const left = containerRef.current.getBoundingClientRect().left;
+        setWidth(clamp(e.clientX - left));
+      },
+      [clamp],
+    ),
+  });
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -115,16 +60,6 @@ export function useResizableColumn(
     [clamp],
   );
 
-  // Reset body cursor/selection if the hook itself unmounts mid-drag.
-  useEffect(() => endDrag, [endDrag]);
-
-  // The handle is conditionally rendered at desktop widths with an active
-  // terminal. If that gate closes mid-drag, no element remains to deliver an
-  // up/cancel event, so abort immediately.
-  useEffect(() => {
-    if (!enabled) endDrag();
-  }, [enabled, endDrag]);
-
   return {
     /** Pixel width for the left column (apply as inline style). */
     width,
@@ -139,11 +74,7 @@ export function useResizableColumn(
      * with the invisible pad straddling it.
      */
     handleProps: {
-      onPointerDown,
-      onPointerMove,
-      onPointerUp: onPointerEnd,
-      onPointerCancel: onPointerEnd,
-      onLostPointerCapture: onPointerEnd,
+      ...resizeDrag.handleProps,
       onKeyDown,
       role: "separator" as const,
       tabIndex: 0,
