@@ -9,7 +9,6 @@ from alembic import op
 
 from omnigent.db.db_models import Uuid16
 
-
 revision = "a5363b7c9d2e"
 down_revision = "e5d9bc8ac650"
 branch_labels = None
