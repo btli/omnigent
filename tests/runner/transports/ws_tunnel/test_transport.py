@@ -315,6 +315,36 @@ async def test_cancelled_response_head_wait_sends_request_cancel() -> None:
 
 
 @pytest.mark.asyncio
+async def test_repeated_cancellation_during_head_cleanup_closes_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second cancellation cannot strand response-head request state."""
+    reg = TunnelRegistry()
+    session = reg.register("r1", _NoopWS(), _hello())
+    transport = WSTunnelTransport(reg, "r1")
+    task = asyncio.create_task(transport.handle_async_request(_make_stream_request(None)))
+    request_wire = await asyncio.wait_for(session.outbound_queue.get(), timeout=1.0)
+    assert request_wire is not None
+    request_frame = decode_frame(request_wire)
+    assert isinstance(request_frame, RequestFrame)
+    cancel_send_started = asyncio.Event()
+
+    async def _stall_cancel_send(runner_session: RunnerSession, data: str) -> None:
+        del runner_session, data
+        cancel_send_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(reg, "send_text", _stall_cancel_send)
+    task.cancel()
+    await asyncio.wait_for(cancel_send_started.wait(), timeout=1.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert request_frame.id not in session.in_flight
+
+
+@pytest.mark.asyncio
 async def test_stalled_body_on_replaced_tunnel_raises_connection_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
