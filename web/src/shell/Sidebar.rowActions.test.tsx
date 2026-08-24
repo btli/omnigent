@@ -65,8 +65,8 @@ const mocks = vi.hoisted(() => {
     viewerId: "viewer@example.com" as string | null,
     conversations: [] as unknown[],
     pinnedStore,
-    // Archive + stop mutations, so the swipe tests can assert the swipe→archive
-    // path drives the same stop→archive handler the kebab uses.
+    // Archive + stop mutations let swipe tests verify the archive path does
+    // not race the server-owned stop with a client stop.
     archive: { mutate: vi.fn() },
     stopSession: { mutate: vi.fn() },
     // Stop-and-delete, so the swipe→delete test can assert the row deletes only
@@ -347,22 +347,12 @@ beforeEach(() => {
   mocks.rename.isError = false;
   mocks.moveToProject.mutate.mockReset();
   mocks.leave.mutate.mockReset();
-  // Resolve archive callbacks synchronously so the transient "Archiving…"
-  // status row settles back to the interactive row within the test.
+  // Resolve archive success synchronously so navigation/toast side effects run.
   mocks.archive.mutate.mockReset();
-  mocks.archive.mutate.mockImplementation(
-    (_args: unknown, opts?: { onSuccess?: () => void; onSettled?: () => void }) => {
-      opts?.onSuccess?.();
-      opts?.onSettled?.();
-    },
-  );
-  // The stop that precedes archiving (runArchive) fires its `onSettled` once
-  // the runner stop resolves; invoke it synchronously so the follow-on
-  // archive.mutate runs in tests.
-  mocks.stopSession.mutate.mockReset();
-  mocks.stopSession.mutate.mockImplementation((_id: string, opts?: { onSettled?: () => void }) => {
-    opts?.onSettled?.();
+  mocks.archive.mutate.mockImplementation((_args: unknown, opts?: { onSuccess?: () => void }) => {
+    opts?.onSuccess?.();
   });
+  mocks.stopSession.mutate.mockReset();
   mocks.del.mutate.mockReset();
   mocks.del.reset.mockReset();
   mocks.projects = [];
@@ -1312,9 +1302,13 @@ describe("touch swipe actions", () => {
     fireEvent(target, event);
   }
 
+  function conversationRow() {
+    return screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+  }
+
   function moveSwipeRow(dx: number, durationMs = 500) {
     const link = screen.getByRole("link", { name: /My Session/ });
-    const li = link.closest("li")!;
+    const li = conversationRow();
     pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
     // First move locks the axis; the second carries it past the commit point.
     pointerEventAt(
@@ -1486,7 +1480,7 @@ describe("touch swipe actions", () => {
     // With an action armed, the row must override touch-action so the browser
     // doesn't take the horizontal pan mid-gesture...
     const { unmount } = renderSidebar();
-    const li = () => screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    const li = conversationRow;
     expect(li()).toHaveClass("touch-pan-y");
     unmount();
 
@@ -1544,7 +1538,7 @@ describe("touch swipe actions", () => {
 
   it("uses pointer-down eligibility when settings disable swipe before a pending release", () => {
     renderSidebar();
-    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    const li = conversationRow();
 
     pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
     act(() => writeSwipeActions({ left: "none", right: "none" }));
@@ -1560,7 +1554,7 @@ describe("touch swipe actions", () => {
       .mockImplementation((callback) => (frames.push(callback), frames.length));
     const cancelFrame = vi.spyOn(window, "cancelAnimationFrame").mockImplementation(() => {});
     renderSidebar();
-    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    const li = conversationRow();
 
     pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
     pointerEventAt("pointerMove", li, { clientX: 80, clientY: 100 }, 1_010);
@@ -1585,7 +1579,7 @@ describe("touch swipe actions", () => {
       pointerType: "mouse",
     });
     fireEvent.click(screen.getByTestId("session-filter-shared"));
-    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    const li = conversationRow();
 
     pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
     act(() => vi.advanceTimersByTime(400));
@@ -1630,7 +1624,7 @@ describe("touch swipe actions", () => {
   ] as const)("commits a pause-then-fast flick toward $action", ({ dx, action }) => {
     writeSwipeActions({ left: "archive", right: "delete" });
     renderSidebar();
-    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    const li = conversationRow();
 
     pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
     // The pause must not dilute the velocity of the final 50ms movement window.
@@ -1650,7 +1644,7 @@ describe("touch swipe actions", () => {
 
   it("commits when the final release-only segment crosses the distance threshold", () => {
     renderSidebar();
-    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    const li = conversationRow();
 
     pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
     pointerEventAt("pointerMove", li, { clientX: 80, clientY: 100 }, 1_300);
@@ -1662,7 +1656,7 @@ describe("touch swipe actions", () => {
 
   it("promotes a pending release-only gesture and commits by distance", () => {
     renderSidebar();
-    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    const li = conversationRow();
 
     pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
     pointerEventAt("pointerUp", li, { clientX: 20, clientY: 100 }, 1_500);
@@ -1676,7 +1670,7 @@ describe("touch swipe actions", () => {
   ] as const)("promotes a pending release-only flick toward $action", ({ dx, action }) => {
     writeSwipeActions({ left: "archive", right: "delete" });
     renderSidebar();
-    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    const li = conversationRow();
 
     pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
     pointerEventAt("pointerUp", li, { clientX: 100 + dx, clientY: 100 }, 1_050);
@@ -1696,7 +1690,7 @@ describe("touch swipe actions", () => {
   ])("does not promote a pending $dx,$dy release without horizontal intent", ({ dx, dy }) => {
     writeSwipeActions({ left: "archive", right: "delete" });
     renderSidebar();
-    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    const li = conversationRow();
 
     pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
     pointerEventAt("pointerUp", li, { clientX: 100 + dx, clientY: 100 + dy }, 1_050);
@@ -1711,7 +1705,7 @@ describe("touch swipe actions", () => {
   ] as const)("commits a release-only short flick toward $action", ({ dx, action }) => {
     writeSwipeActions({ left: "archive", right: "delete" });
     renderSidebar();
-    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    const li = conversationRow();
 
     pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
     pointerEventAt("pointerMove", li, { clientX: 100 + Math.sign(dx) * 20, clientY: 100 }, 1_500);
@@ -1729,7 +1723,7 @@ describe("touch swipe actions", () => {
   it("uses the release-time direction and snapshot action after a reversal", () => {
     writeSwipeActions({ left: "archive", right: "delete" });
     renderSidebar();
-    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    const li = conversationRow();
 
     pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
     pointerEventAt("pointerMove", li, { clientX: 80, clientY: 100 }, 1_300);
@@ -1743,7 +1737,7 @@ describe("touch swipe actions", () => {
 
   it("does not commit a noisy slow release-only segment", () => {
     renderSidebar();
-    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    const li = conversationRow();
 
     pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
     pointerEventAt("pointerMove", li, { clientX: 80, clientY: 100 }, 1_300);
@@ -1756,7 +1750,7 @@ describe("touch swipe actions", () => {
 
   it("does not create a flick from an unusable pointer-up coordinate", () => {
     renderSidebar();
-    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    const li = conversationRow();
 
     pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
     pointerEventAt("pointerMove", li, { clientX: 80, clientY: 100 }, 1_300);
@@ -1768,7 +1762,7 @@ describe("touch swipe actions", () => {
 
   it("does not commit a stale distance when the pointer-up coordinate is unusable", () => {
     renderSidebar();
-    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    const li = conversationRow();
 
     pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
     pointerEventAt("pointerMove", li, { clientX: 80, clientY: 100 }, 1_300);
@@ -1781,7 +1775,7 @@ describe("touch swipe actions", () => {
   it.each([-50, 50] as const)("does not commit a single-event short swipe at %dpx", (dx) => {
     writeSwipeActions({ left: "archive", right: "delete" });
     renderSidebar();
-    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    const li = conversationRow();
 
     pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
     pointerEventAt("pointerMove", li, { clientX: 100 + dx, clientY: 100 }, 1_500);
@@ -1794,7 +1788,7 @@ describe("touch swipe actions", () => {
   it.each([-50, 50] as const)("does not commit a noisy slow short swipe at %dpx", (dx) => {
     writeSwipeActions({ left: "archive", right: "delete" });
     renderSidebar();
-    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    const li = conversationRow();
     const direction = Math.sign(dx);
 
     pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
@@ -1820,7 +1814,7 @@ describe("touch swipe actions", () => {
   it("does not treat fast vertical-dominant travel as a flick", () => {
     writeSwipeActions({ left: "archive", right: "delete" });
     renderSidebar();
-    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    const li = conversationRow();
 
     pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
     pointerEventAt("pointerMove", li, { clientX: 140, clientY: 160 }, 1_025);
@@ -1837,8 +1831,7 @@ describe("touch swipe actions", () => {
       .mockImplementation((callback) => (frames.push(callback), frames.length));
     renderSidebar();
 
-    const link = screen.getByRole("link", { name: /My Session/ });
-    const li = link.closest("li")!;
+    const li = conversationRow();
     fireEvent.pointerDown(li, { ...POINTER, clientX: 200, clientY: 100 });
     fireEvent.pointerMove(li, { ...POINTER, clientX: 180, clientY: 100 });
     fireEvent.pointerMove(li, { ...POINTER, clientX: 100, clientY: 100 });
@@ -1866,7 +1859,7 @@ describe("touch swipe actions", () => {
       renderSidebar();
 
       const link = screen.getByRole("link", { name: /My Session/ });
-      const li = link.closest("li")!;
+      const li = conversationRow();
       let captured = false;
       li.setPointerCapture = () => {
         captured = true;
@@ -1935,7 +1928,7 @@ describe("touch swipe actions", () => {
     // A touchscreen laptop's pen and mouse paths remain inert.
     renderSidebar();
 
-    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    const li = conversationRow();
     for (const [pointerId, pointerType] of ["pen", "mouse"].entries()) {
       const pointer = { pointerId, isPrimary: true, pointerType };
       fireEvent.pointerDown(li, { ...pointer, clientX: 100, clientY: 100 });
@@ -1953,7 +1946,7 @@ describe("touch swipe actions", () => {
     // fires, even though it travels well past the commit distance horizontally.
     renderSidebar();
 
-    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    const li = conversationRow();
     fireEvent.pointerDown(li, { ...POINTER, clientX: 100, clientY: 100 });
     // First move is dominated by the vertical axis → decided="other".
     fireEvent.pointerMove(li, { ...POINTER, clientX: 105, clientY: 140 });

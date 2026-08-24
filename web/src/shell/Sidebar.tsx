@@ -3652,10 +3652,19 @@ function ConversationRow({
     </Link>
   );
 
-  // The action revealed behind the row for the direction currently being
-  // swiped, and whether the drag has passed the commit point (drives the hint's
-  // icon and tint). `isSwiping` gates every bit of swipe-only markup/styling, so
-  // a row at rest renders exactly as it did before the gesture existed.
+  const renderContextMenu = (trigger: ReactNode) => (
+    <ContextMenu modal={false} open={contextMenuOpen} onOpenChange={handleContextMenuOpenChange}>
+      <ContextMenuTrigger asChild>{trigger}</ContextMenuTrigger>
+      <ContextMenuContent className="min-w-44">
+        <ConversationMenuItems
+          components={contextBundle}
+          setMenuOpen={() => {}}
+          {...menuItemProps}
+        />
+      </ContextMenuContent>
+    </ContextMenu>
+  );
+
   const swipingAction: SwipeAction =
     gesture.dx < 0
       ? (gesture.actions?.left ?? swipeActions.left)
@@ -3693,18 +3702,8 @@ function ConversationRow({
         ownsPointer && "touch-none",
       )}
     >
-      {/* The row is the shared inset containing block for the reveal and surface,
-          keeping their edges adjacent throughout a partial swipe. */}
-      {/* Swipe reveal hint: sits behind the moving surface, showing the
-          configured action's icon only inside the strip the surface vacates.
-          Clipping that strip keeps the hint disjoint from the moving overflow
-          target at every offset. It is inert and only rendered mid-swipe, so at
-          rest the row markup is exactly what it was before the gesture existed.
-          Archive uses the accent pair (blue in both modes) rather than
-          `--primary`, which is near-black in light mode and reads as a flat grey
-          button instead of a revealed surface. Passing the commit threshold
-          deepens the tint and scales the glyph, so "will fire on release" isn't
-          carried by color alone. */}
+      {/* Clip the hint to the vacated strip so it cannot overlap the moving
+          surface. The threshold also scales the glyph, avoiding a color-only cue. */}
       {isSwiping && (
         <div
           aria-hidden
@@ -3740,16 +3739,8 @@ function ConversationRow({
           </span>
         </div>
       )}
-      {/* Moving surface: the WHOLE row — link, session-state badge, and the
-          pin/kebab controls — moves together, so the trailing icons travel with
-          the text instead of the text sliding out from under them.
-          It INSETS from the swiped edge rather than translating: a translate
-          would push the title past the panel boundary and cut it mid-word (the
-          hint needs ~48px of gap, but the title only has ~18px of slack). An
-          inset re-truncates the title with its existing ellipsis instead, and
-          keeps every row control inside the panel.
-          `bg-sidebar` only while mid-swipe: an unconditional background would
-          plate every row and cover the sidebar canvas. */}
+      {/* Inset instead of translating so the title re-truncates and every row
+          control stays inside the panel. */}
       <div
         data-testid="conversation-swipe-surface"
         className={cn(
@@ -3796,22 +3787,7 @@ function ConversationRow({
           )
         ) : projectFlyoutName ? (
           <HoverCard openDelay={150} closeDelay={0}>
-            <ContextMenu
-              modal={false}
-              open={contextMenuOpen}
-              onOpenChange={handleContextMenuOpenChange}
-            >
-              <ContextMenuTrigger asChild>
-                <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
-              </ContextMenuTrigger>
-              <ContextMenuContent className="min-w-44">
-                <ConversationMenuItems
-                  components={contextBundle}
-                  setMenuOpen={() => {}}
-                  {...menuItemProps}
-                />
-              </ContextMenuContent>
-            </ContextMenu>
+            {renderContextMenu(<HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>)}
             <PinnedProjectFlyoutContent
               title={conversation.title ?? conversation.id}
               projectName={projectFlyoutName}
@@ -3819,40 +3795,14 @@ function ConversationRow({
             />
           </HoverCard>
         ) : isMobile ? (
-          <ContextMenu
-            modal={false}
-            open={contextMenuOpen}
-            onOpenChange={handleContextMenuOpenChange}
-          >
-            <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
-            <ContextMenuContent className="min-w-44">
-              <ConversationMenuItems
-                components={contextBundle}
-                setMenuOpen={() => {}}
-                {...menuItemProps}
-              />
-            </ContextMenuContent>
-          </ContextMenu>
+          renderContextMenu(rowLink)
         ) : (
           <Tooltip>
-            <ContextMenu
-              modal={false}
-              open={contextMenuOpen}
-              onOpenChange={handleContextMenuOpenChange}
-            >
-              <ContextMenuTrigger asChild>
-                <div className="w-full">
-                  <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
-                </div>
-              </ContextMenuTrigger>
-              <ContextMenuContent className="min-w-44">
-                <ConversationMenuItems
-                  components={contextBundle}
-                  setMenuOpen={() => {}}
-                  {...menuItemProps}
-                />
-              </ContextMenuContent>
-            </ContextMenu>
+            {renderContextMenu(
+              <div className="w-full">
+                <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
+              </div>,
+            )}
             <SessionTooltipContent conversation={conversation} hostsById={hostsById} />
           </Tooltip>
         )}

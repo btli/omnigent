@@ -39,7 +39,7 @@ export const DEFAULT_SWIPE_ACTIONS: SwipeActionPreferences = {
 
 /** Return whether a string is one of the selectable swipe actions. */
 export function isSwipeAction(value: unknown): value is SwipeAction {
-  return value === "archive" || value === "delete" || value === "none";
+  return typeof value === "string" && (swipeActions as readonly string[]).includes(value);
 }
 
 /**

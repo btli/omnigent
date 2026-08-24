@@ -47,7 +47,6 @@ interface ActiveRowGesture {
   phase: Exclude<RowGesturePhase, "idle">;
   target: Element;
   sensorTarget: Element;
-  offset: number;
   actions: SwipeActionPreferences;
   swipeEnabled: boolean;
   movementSamples: RowMovementSample[];
@@ -334,7 +333,6 @@ export function useRowGesture({
         phase: "pending",
         target: event.currentTarget,
         sensorTarget: target instanceof Element ? target : event.currentTarget,
-        offset: 0,
         // A live Settings change must affect the next gesture, not change the
         // meaning of a finger that is already down.
         actions,
@@ -414,13 +412,11 @@ export function useRowGesture({
         // rather than translating with nothing revealed behind it.
         const reversedInto = deltaX < 0 ? gesture.actions.left : gesture.actions.right;
         if (reversedInto === "none") {
-          gesture.offset = 0;
           scheduleDx(0);
           return;
         }
         event.preventDefault();
-        gesture.offset = swipeOffset(deltaX);
-        scheduleDx(gesture.offset);
+        scheduleDx(swipeOffset(deltaX));
         return;
       }
 
@@ -440,8 +436,7 @@ export function useRowGesture({
         setGesturePhase(gesture, "swipe");
         capturePointer(gesture);
         event.preventDefault();
-        gesture.offset = swipeOffset(deltaX);
-        setDx(gesture.offset);
+        setDx(swipeOffset(deltaX));
         return;
       }
       if (Math.hypot(deltaX, deltaY) >= ROW_SCROLL_ACTIVATE_PX) {
