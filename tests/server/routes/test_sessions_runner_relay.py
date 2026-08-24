@@ -116,6 +116,80 @@ class _HeartbeatRunnerClient:
         return _HeartbeatStreamResponse(self._release)
 
 
+class _NoBannerStreamResponse:
+    """Fake replacement stream that exits without becoming ready."""
+
+    def __init__(self, release: asyncio.Event) -> None:
+        self._release = release
+
+    async def __aenter__(self) -> _NoBannerStreamResponse:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, exc, traceback
+
+    async def aiter_text(self) -> AsyncIterator[str]:
+        await self._release.wait()
+        yield "data: [DONE]\n\n"
+
+
+class _DropAfterBannerStreamResponse:
+    """Fake initial stream that becomes ready and then disconnects."""
+
+    def __init__(self, drop: asyncio.Event) -> None:
+        self._drop = drop
+
+    async def __aenter__(self) -> _DropAfterBannerStreamResponse:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, exc, traceback
+
+    async def aiter_text(self) -> AsyncIterator[str]:
+        yield 'data: {"type": "session.heartbeat"}\n\n'
+        await self._drop.wait()
+        raise ConnectionError("replacement needed")
+
+
+class _DropThenNoBannerRunnerClient:
+    """Fake runner whose replacement stream never signals ready."""
+
+    def __init__(
+        self,
+        drop: asyncio.Event,
+        replacement_started: asyncio.Event,
+        replacement_release: asyncio.Event,
+    ) -> None:
+        self._drop = drop
+        self._replacement_started = replacement_started
+        self._replacement_release = replacement_release
+        self._calls = 0
+
+    def stream(
+        self,
+        method: str,
+        path: str,
+        *,
+        timeout: Any,
+    ) -> _DropAfterBannerStreamResponse | _NoBannerStreamResponse:
+        del method, path, timeout
+        self._calls += 1
+        if self._calls == 1:
+            return _DropAfterBannerStreamResponse(self._drop)
+        self._replacement_started.set()
+        return _NoBannerStreamResponse(self._replacement_release)
+
+
 @pytest.mark.asyncio
 async def test_runner_relay_ready_waits_for_runner_heartbeat() -> None:
     """
@@ -768,6 +842,180 @@ async def test_relay_tunnel_replacement_stays_runner_disconnected(
         )
 
 
+class _NeverReadyStreamResponse:
+    """Fake stream that never produces a response banner."""
+
+    async def __aenter__(self) -> _NeverReadyStreamResponse:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, exc, traceback
+
+    async def aiter_text(self) -> AsyncIterator[str]:
+        await asyncio.Event().wait()
+        yield ""
+
+
+class _DropThenNeverReadyRunnerClient:
+    """Fake runner that drops once, then stalls before its banner."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def stream(
+        self,
+        method: str,
+        path: str,
+        *,
+        timeout: Any,
+    ) -> _NeverReadyStreamResponse:
+        del method, path, timeout
+        self.calls += 1
+        if self.calls == 1:
+            raise ConnectionError("tunnel closed before request completed")
+        return _NeverReadyStreamResponse()
+
+
+@pytest.mark.asyncio
+async def test_relay_retry_attempt_cannot_overrun_reconnect_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retry stalled before its banner stops at the original deadline."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    grace = 0.2
+    monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", grace)
+    monkeypatch.setattr(orchestration, "_RELAY_RETRY_INTERVAL_S", 0.01)
+    monkeypatch.setattr(orchestration, "_RELAY_RETRY_MAX_INTERVAL_S", 0.01)
+    monkeypatch.setattr(orchestration._logger, "warning", lambda *args, **kwargs: None)
+    sessions_module._runner_relay_tasks.clear()
+    fake_runner = _DropThenNeverReadyRunnerClient()
+    store = _RecordingLabelStore(live_status="running")
+    session_id = "7a8b9c0d1e2f30415263748596a7b8c9"
+    sessions_module._session_status_cache[session_id] = "running"
+
+    await asyncio.to_thread(lambda: None)
+    started = time.monotonic()
+    try:
+        handle = sessions_module._ensure_runner_relay(
+            session_id,
+            "runner_retry_deadline",
+            cast(httpx.AsyncClient, fake_runner),
+            conversation_store=cast(ConversationStore, store),
+        )
+        assert handle is not None
+        await asyncio.wait_for(handle.task, timeout=1.0)
+
+        elapsed = time.monotonic() - started
+        assert fake_runner.calls == 2
+        assert grace * 0.75 <= elapsed < grace + 0.2
+        assert sessions_module._session_status_cache.get(session_id) == "failed"
+    finally:
+        await _cleanup_relay_test(session_id=session_id)
+
+
+class _FlappingStreamResponse:
+    """Fake stream that becomes ready, makes progress, then drops."""
+
+    async def __aenter__(self) -> _FlappingStreamResponse:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, exc, traceback
+
+    async def aiter_text(self) -> AsyncIterator[str]:
+        yield 'data: {"type": "session.heartbeat"}\n\n'
+        yield 'data: {"type": "session.status", "status": "running"}\n\n'
+        raise ConnectionError("flapping tunnel")
+
+
+class _FlappingRunnerClient:
+    """Fake runner whose every stream attempt flaps after one event."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def stream(
+        self,
+        method: str,
+        path: str,
+        *,
+        timeout: Any,
+    ) -> _FlappingStreamResponse:
+        del method, path, timeout
+        self.calls += 1
+        return _FlappingStreamResponse()
+
+
+@pytest.mark.asyncio
+async def test_relay_repeated_flaps_stop_at_absolute_degraded_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated progress cannot keep a degraded relay alive forever."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    grace = 0.08
+    monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", grace)
+    monkeypatch.setattr(orchestration, "_RELAY_RETRY_INTERVAL_S", 0.005)
+    monkeypatch.setattr(orchestration, "_RELAY_RETRY_MAX_INTERVAL_S", 0.02)
+    monkeypatch.setattr(orchestration._logger, "warning", lambda *args, **kwargs: None)
+    sessions_module._runner_relay_tasks.clear()
+    fake_runner = _FlappingRunnerClient()
+    store = _RecordingLabelStore(live_status="running")
+    session_id = "8b9c0d1e2f30415263748596a7b8c9d0"
+
+    await asyncio.to_thread(lambda: None)
+    started = time.monotonic()
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_repeated_flaps",
+            cast(httpx.AsyncClient, fake_runner),
+            conversation_store=cast(ConversationStore, store),
+        )
+        assert handle is not None
+        await asyncio.wait_for(handle.task, timeout=1.5)
+
+        elapsed = time.monotonic() - started
+        assert fake_runner.calls >= 4
+        assert elapsed < grace * 9
+        assert sessions_module._session_status_cache.get(session_id) == "failed"
+        assert sessions_module._last_task_error_from_labels(store.labels[session_id]) == {
+            "code": "runner_disconnected",
+            "message": "Runner disconnected unexpectedly.",
+        }
+    finally:
+        await _cleanup_relay_test(session_id=session_id)
+
+
+def test_relay_retry_delay_uses_jittered_exponential_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retry delay backs off, jitters, and caps at its maximum."""
+    from omnigent.server.routes._sessions import orchestration
+
+    monkeypatch.setattr(orchestration, "_RELAY_RETRY_INTERVAL_S", 0.5)
+    monkeypatch.setattr(orchestration, "_RELAY_RETRY_MAX_INTERVAL_S", 2.0)
+    draws = iter((0, 1_000_000, 500_000))
+    monkeypatch.setattr(orchestration.secrets, "randbelow", lambda upper: next(draws))
+
+    assert orchestration._relay_retry_delay(0) == pytest.approx(0.4)
+    assert orchestration._relay_retry_delay(1) == pytest.approx(1.2)
+    assert orchestration._relay_retry_delay(8) == pytest.approx(2.0)
+
+
 async def _feed_banner_then_stall(registry: TunnelRegistry, runner_id: str) -> None:
     """Serve each new stream request a banner heartbeat, then stall."""
     seen: set[str] = set()
@@ -840,7 +1088,7 @@ async def test_relay_idle_attempt_outliving_grace_refreshes_on_disconnect(
     from omnigent.server.routes._sessions import orchestration
 
     monkeypatch.setattr(orchestration, "_RELAY_STREAM_READ_TIMEOUT_S", 5.0)
-    monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 0.2)
+    monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 0.15)
     monkeypatch.setattr(orchestration, "_RELAY_RETRY_INTERVAL_S", 0.05)
     sessions_module._runner_relay_tasks.clear()
     runner_id = "runner_idle_disconnect_grace"
@@ -858,7 +1106,7 @@ async def test_relay_idle_attempt_outliving_grace_refreshes_on_disconnect(
         # Attempt 2: banner, idle past the whole grace, then disconnect.
         req2 = await _wait_for_new_tunnel_request(registry, runner_id, seen)
         _route_tunnel_sse_start(registry, runner_id, req2)
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.45)
         registry.deregister(runner_id)
         _register_test_runner(registry, runner_id)
         # Attempt 3 exists only if attempt 2 refreshed the window: end
@@ -930,7 +1178,7 @@ async def test_relay_slow_banner_then_disconnect_exhausts_nonzero_grace(
             await asyncio.sleep(0.3)
             _route_tunnel_sse_start(registry, runner_id, req_id)
             # Let the banner chunk reach the relay before dropping.
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.02)
             registry.deregister(runner_id)
             _register_test_runner(registry, runner_id)
 
@@ -953,7 +1201,7 @@ async def test_relay_slow_banner_then_disconnect_exhausts_nonzero_grace(
         event = await asyncio.wait_for(collector.queue.get(), timeout=2.0)
         assert event.get("type") == "session.status"
         assert event.get("status") == "failed"
-        assert event["error"]["code"] == "runner_disconnected"
+        assert event["error"]["code"] == "session_stream_lost"
     finally:
         await _cleanup_relay_test(
             session_id=session_id,
@@ -1118,6 +1366,73 @@ class _RecordingLabelStore:
             labels=dict(self.labels.get(conversation_id, {})),
             live_status=self.live_status,
         )
+
+
+@pytest.mark.asyncio
+async def test_stream_loss_recovery_waits_for_replacement_relay_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reconnect without a ready replacement relay keeps the failure."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    sessions_module._runner_relay_tasks.clear()
+    monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 0.2)
+    monkeypatch.setattr(orchestration, "_RELAY_RETRY_INTERVAL_S", 0.01)
+    monkeypatch.setattr(orchestration, "_RELAY_RETRY_MAX_INTERVAL_S", 0.01)
+    drop = asyncio.Event()
+    replacement_started = asyncio.Event()
+    replacement_release = asyncio.Event()
+    store = _RecordingLabelStore()
+    session_id = "8192a3b4c5d6e7f8091a2b3c4d5e6f70"
+    store.labels[session_id] = {
+        sessions_module._LAST_TASK_ERROR_CODE_LABEL_KEY: "session_stream_lost",
+        sessions_module._LAST_TASK_ERROR_MESSAGE_LABEL_KEY: ("Session stream lost unexpectedly."),
+    }
+    sessions_module._session_status_cache[session_id] = "failed"
+
+    try:
+        handle = sessions_module._ensure_runner_relay(
+            session_id,
+            "runner_replacement_not_ready",
+            cast(
+                httpx.AsyncClient,
+                _DropThenNoBannerRunnerClient(
+                    drop,
+                    replacement_started,
+                    replacement_release,
+                ),
+            ),
+            conversation_store=None,
+        )
+        assert handle is not None
+        await asyncio.wait_for(handle.ready.wait(), timeout=1.0)
+        drop.set()
+        await asyncio.wait_for(replacement_started.wait(), timeout=1.0)
+
+        async def _release_unready_relay() -> None:
+            await asyncio.sleep(0.01)
+            replacement_release.set()
+
+        await asyncio.gather(
+            sessions_module._publish_runner_recovered_status(
+                session_id,
+                cast(ConversationStore, store),
+                require_disconnect_code=True,
+            ),
+            _release_unready_relay(),
+        )
+
+        assert handle.ready.is_set() is False
+        assert sessions_module._session_status_cache.get(session_id) == "failed"
+        assert sessions_module._last_task_error_from_labels(store.labels[session_id]) == {
+            "code": "session_stream_lost",
+            "message": "Session stream lost unexpectedly.",
+        }
+    finally:
+        drop.set()
+        replacement_release.set()
+        await _cleanup_relay_test(session_id=session_id)
 
 
 @pytest.mark.asyncio
@@ -2002,9 +2317,12 @@ async def test_runner_tunnel_alive_resolves_on_real_routed_client() -> None:
     try:
         routed = router.client_for_existing_conversation("conv_liveness_pin")
         assert routed is not None
+        transport = cast(WSTunnelTransport, routed.client._transport)
+        assert transport.runner_registered() is True
         assert _runner_tunnel_alive(routed.client, runner_id) is True
 
         registry.deregister(runner_id)
+        assert transport.runner_registered() is False
         assert _runner_tunnel_alive(routed.client, runner_id) is False
     finally:
         await router.aclose()
