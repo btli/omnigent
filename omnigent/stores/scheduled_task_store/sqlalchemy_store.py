@@ -179,7 +179,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
     def list(
         self,
         *,
-        owner_user_id: str | None = _UNSET,
+        owner_user_id: str | None = None,
         project_id: str | None = _UNSET,
     ) -> list[ScheduledTask]:
         """List all scheduled tasks ordered by ``created_at ASC, id ASC``.
@@ -193,7 +193,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 .where(SqlScheduledTask.workspace_id == current_workspace_id())
                 .order_by(asc(SqlScheduledTask.created_at), asc(SqlScheduledTask.id))
             )
-            if owner_user_id is not _UNSET:
+            if owner_user_id is not None:
                 stmt = stmt.where(SqlScheduledTask.user_id == owner_user_id)
             if project_id is None:
                 stmt = stmt.outerjoin(

@@ -132,15 +132,6 @@ class FireDeps:
     artifact_store: Any | None = None
 
 
-@dataclass(frozen=True)
-class _FireProjectResolution:
-    """The ownership result for one task snapshot's Project pointer."""
-
-    project_id: str | None
-    outcome: str
-    error: Exception | None = None
-
-
 def _prompt_event(prompt: str) -> SessionEventInput:
     """Build the user-message event that carries a task's prompt to the runner."""
     return SessionEventInput(
@@ -424,8 +415,7 @@ async def _run_fire_for_task(
             )
             return
 
-        project_resolution = await _resolve_fire_project(deps, task)
-        effective = replace(effective, project_id=project_resolution.project_id)
+        effective = replace(effective, project_id=await _resolve_fire_project(deps, task))
         try:
             conv = await _create_session(deps, effective)
         except Exception:
@@ -441,7 +431,6 @@ async def _run_fire_for_task(
             )
             return
 
-        conv = await _confirm_fired_session_project(deps, task, conv, project_resolution)
         await _attach_cost_budget(deps, task, conv.id)
 
         try:
@@ -627,24 +616,64 @@ async def _resolve_owned_fire_project(
 async def _resolve_fire_project(
     deps: FireDeps,
     task: ScheduledTask,
-) -> _FireProjectResolution:
-    """Resolve the task snapshot's Project without changing stored intent."""
+) -> str | None:
+    """Resolve one fire's Project and repair only a proven-missing pointer."""
     if task.project_id is None:
-        return _FireProjectResolution(None, "unassigned")
+        return None
     project_store = deps.project_store
     if project_store is None:
-        return _FireProjectResolution(None, "unverifiable")
+        _logger.warning(
+            "scheduled fire: task %s project %s could not be verified; "
+            "run is unfiled; assignment preserved",
+            task.id,
+            task.project_id,
+        )
+        return None
     try:
         resolved = await _resolve_owned_fire_project(
             project_store,
             task.project_id,
             task.user_id,
         )
-    except Exception as exc:  # noqa: BLE001 -- lookup failures are unverifiable, not absent
-        return _FireProjectResolution(None, "unverifiable", exc)
-    if resolved is None:
-        return _FireProjectResolution(None, "absent")
-    return _FireProjectResolution(resolved, "owned")
+    except Exception:  # noqa: BLE001 -- lookup failures are unverifiable, not absent
+        _logger.warning(
+            "scheduled fire: task %s project %s could not be verified; "
+            "run is unfiled; assignment preserved",
+            task.id,
+            task.project_id,
+            exc_info=True,
+        )
+        return None
+    if resolved is not None:
+        return resolved
+
+    try:
+        exists = await asyncio.to_thread(project_store.exists, task.project_id)
+    except Exception:  # noqa: BLE001 -- existence failures are unverifiable
+        _logger.warning(
+            "scheduled fire: task %s project %s existence could not be verified; "
+            "run is unfiled; assignment preserved",
+            task.id,
+            task.project_id,
+            exc_info=True,
+        )
+        return None
+    if exists:
+        _logger.warning(
+            "scheduled fire: task %s project %s is not owned by the current identity; "
+            "run is unfiled; assignment preserved",
+            task.id,
+            task.project_id,
+        )
+        return None
+
+    _logger.warning(
+        "scheduled fire: task %s project %s no longer exists; run is unfiled",
+        task.id,
+        task.project_id,
+    )
+    await _self_heal_task_project(deps, task)
+    return None
 
 
 async def _self_heal_task_project(deps: FireDeps, task: ScheduledTask) -> None:
@@ -673,94 +702,6 @@ async def _self_heal_task_project(deps: FireDeps, task: ScheduledTask) -> None:
             task.id,
             task.project_id,
         )
-
-
-async def _unfile_fired_session(deps: FireDeps, conv: Conversation) -> Conversation:
-    """Persist required unfiling and keep the in-memory snapshot consistent."""
-    unfiled = await asyncio.to_thread(
-        deps.conversation_store.set_conversation_project,
-        conv.id,
-        None,
-    )
-    if not unfiled:
-        raise RuntimeError(f"scheduled session {conv.id!r} disappeared before unfiling")
-    return replace(conv, project_id=None)
-
-
-async def _confirm_fired_session_project(
-    deps: FireDeps,
-    task: ScheduledTask,
-    conv: Conversation,
-    initial: _FireProjectResolution,
-) -> Conversation:
-    """Confirm membership before dispatch and repair only proven absence."""
-    if initial.outcome == "unassigned":
-        return conv
-    if initial.outcome == "absent":
-        _logger.warning(
-            "scheduled fire: task %s project %s no longer exists; session %s is unfiled",
-            task.id,
-            task.project_id,
-            conv.id,
-        )
-        await _self_heal_task_project(deps, task)
-        return conv
-    if initial.outcome == "unverifiable":
-        exc_info = None
-        if initial.error is not None:
-            exc_info = (
-                type(initial.error),
-                initial.error,
-                initial.error.__traceback__,
-            )
-        _logger.warning(
-            "scheduled fire: task %s project %s could not be verified; "
-            "session %s is unfiled; assignment preserved",
-            task.id,
-            task.project_id,
-            conv.id,
-            exc_info=exc_info,
-        )
-        return conv
-
-    project_store = deps.project_store
-    if project_store is None or initial.project_id is None:
-        conv = await _unfile_fired_session(deps, conv)
-        _logger.warning(
-            "scheduled fire: task %s project %s could not be verified; "
-            "session %s is unfiled; assignment preserved",
-            task.id,
-            task.project_id,
-            conv.id,
-        )
-        return conv
-    try:
-        confirmed = await _resolve_owned_fire_project(
-            project_store,
-            initial.project_id,
-            task.user_id,
-        )
-    except Exception:  # noqa: BLE001 -- confirmation failures are unverifiable
-        conv = await _unfile_fired_session(deps, conv)
-        _logger.warning(
-            "scheduled fire: task %s project %s could not be verified; "
-            "session %s is unfiled; assignment preserved",
-            task.id,
-            task.project_id,
-            conv.id,
-            exc_info=True,
-        )
-        return conv
-    if confirmed is None:
-        conv = await _unfile_fired_session(deps, conv)
-        _logger.warning(
-            "scheduled fire: task %s project %s no longer exists; session %s is unfiled",
-            task.id,
-            task.project_id,
-            conv.id,
-        )
-        await _self_heal_task_project(deps, task)
-    return conv
 
 
 async def _permission_mode_launch_args(deps: FireDeps, task: ScheduledTask) -> list[str] | None:
