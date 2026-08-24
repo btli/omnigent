@@ -3374,7 +3374,9 @@ function ConversationRow({
     rowLinkRef.current?.dispatchEvent(event);
   }, []);
   const runArchiveRef = useRef(runArchive);
-  runArchiveRef.current = runArchive;
+  useEffect(() => {
+    runArchiveRef.current = runArchive;
+  });
   const handleGestureAction = useCallback((action: Exclude<SwipeAction, "none">) => {
     if (action === "archive") runArchiveRef.current();
     else setDeleteOpen(true);
@@ -3584,6 +3586,7 @@ function ConversationRow({
       onContextMenu={(e) => {
         if (isDragging) e.preventDefault();
       }}
+      onKeyDown={gesture.clearClickSuppression}
       className={cn(
         SIDEBAR_ROW,
         "relative flex flex-col justify-center text-left text-foreground transition-colors",
@@ -3655,7 +3658,7 @@ function ConversationRow({
   const renderContextMenu = (trigger: ReactNode) => (
     <ContextMenu modal={false} open={contextMenuOpen} onOpenChange={handleContextMenuOpenChange}>
       <ContextMenuTrigger asChild>{trigger}</ContextMenuTrigger>
-      <ContextMenuContent className="min-w-44">
+      <ContextMenuContent className="min-w-44 touch-pan-y select-none">
         <ConversationMenuItems
           components={contextBundle}
           setMenuOpen={() => {}}
@@ -3674,6 +3677,13 @@ function ConversationRow({
   const isSwiping = gesture.dx !== 0 && swipingAction !== "none";
   const swipeCommitted = Math.abs(gesture.dx) >= ROW_SWIPE_COMMIT_PX;
   const ownsPointer = gesture.phase === "armed" || gesture.phase === "drag";
+  const swipeTouchAction = !swipeEnabled
+    ? undefined
+    : swipeActions.left !== "none" && swipeActions.right !== "none"
+      ? "touch-pan-y"
+      : swipeActions.left !== "none"
+        ? "touch-pan-y touch-pan-left"
+        : "touch-pan-y touch-pan-right";
 
   return (
     // Drag props on the <li> so the whole row is grabbable; `isDragging` dims
@@ -3698,7 +3708,7 @@ function ConversationRow({
         // the swipe: without this the browser can take the horizontal pan (or
         // back-navigation gesture) and cancel the gesture mid-drag. Only where
         // a swipe can actually fire, so rows without one keep default behavior.
-        swipeEnabled && !ownsPointer && "touch-pan-y",
+        !ownsPointer && swipeTouchAction,
         ownsPointer && "touch-none",
       )}
     >

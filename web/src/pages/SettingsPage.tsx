@@ -934,7 +934,7 @@ function SwipeActionsControl() {
         {(["left", "right"] as const).map((direction) => (
           <div key={direction} className="flex items-center justify-between gap-4">
             <span className="text-sm">
-              Swipe {direction} <span aria-hidden>→</span>
+              Swipe {direction} <span aria-hidden>{direction === "left" ? "←" : "→"}</span>
             </span>
             <Select
               value={actions[direction]}
