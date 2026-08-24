@@ -15,6 +15,7 @@ from omnigent.runner.transports.ws_tunnel import transport as transport_module
 from omnigent.runner.transports.ws_tunnel.frames import (
     HelloFrame,
     RequestCancelFrame,
+    RequestFrame,
     ResponseBodyFrame,
     ResponseEndFrame,
     ResponseHeadFrame,
@@ -285,6 +286,32 @@ async def test_stalled_response_head_raises_read_timeout() -> None:
     assert session is not None
     assert not session.in_flight
     assert len(_drain_cancel_frames(session)) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_response_head_wait_sends_request_cancel() -> None:
+    """Cancelling before the response head stops the runner dispatch."""
+    reg = TunnelRegistry()
+    session = reg.register("r1", _NoopWS(), _hello())
+    transport = WSTunnelTransport(reg, "r1")
+
+    task = asyncio.create_task(transport.handle_async_request(_make_stream_request(None)))
+    request_wire = await asyncio.wait_for(session.outbound_queue.get(), timeout=1.0)
+    assert request_wire is not None
+    request_frame = decode_frame(request_wire)
+    assert isinstance(request_frame, RequestFrame)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    cancel_wire = await asyncio.wait_for(session.outbound_queue.get(), timeout=1.0)
+    assert cancel_wire is not None
+    cancel_frame = decode_frame(cancel_wire)
+    assert isinstance(cancel_frame, RequestCancelFrame)
+    assert cancel_frame.id == request_frame.id
+    assert cancel_frame.reason == "client_disconnected"
+    assert request_frame.id not in session.in_flight
 
 
 @pytest.mark.asyncio

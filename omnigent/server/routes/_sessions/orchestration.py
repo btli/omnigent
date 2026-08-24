@@ -2497,9 +2497,10 @@ async def _publish_runner_recovered_status_impl(
             "session_stream_lost",
         }:
             return
-        if last_error.get("code") == "session_stream_lost" and not await _relay_ready_for_recovery(
-            session_id
+        if last_error.get("code") == "session_stream_lost" and not (
+            _current_relay_ready_for_recovery(session_id)
         ):
+            _schedule_runner_recovery_when_ready(session_id, conversation_store)
             return
     _session_status_cache[session_id] = "idle"
     session_live_state.persist_live_status(session_id, "idle")
@@ -5791,13 +5792,24 @@ def _runner_tunnel_alive(runner_client: httpx.AsyncClient, runner_id: str | None
     return transport.runner_registered()
 
 
+def _current_relay_ready_for_recovery(session_id: str) -> bool:
+    """Return whether the current relay is live and ready."""
+    handle = _runner_relay_tasks.get(session_id)
+    return (
+        handle is not None
+        and not handle.task.done()
+        and not handle.task.cancelling()
+        and handle.ready.is_set()
+    )
+
+
 async def _relay_ready_for_recovery(session_id: str) -> bool:
-    """Wait for the current replacement relay to become ready or exit."""
+    """Wait off the connect-hook path for a current relay to become ready."""
     while True:
         handle = _runner_relay_tasks.get(session_id)
-        if handle is None:
+        if handle is None or handle.task.done() or handle.task.cancelling():
             return False
-        if handle.ready.is_set():
+        if _current_relay_ready_for_recovery(session_id):
             return True
         ready_wait = asyncio.create_task(handle.ready.wait())
         try:
@@ -5810,10 +5822,57 @@ async def _relay_ready_for_recovery(session_id: str) -> bool:
                 ready_wait.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await ready_wait
+        if _runner_relay_tasks.get(session_id) is not handle:
+            continue
+        if handle.task.done() or handle.task.cancelling():
+            return False
         if handle.ready.is_set():
             return True
-        if _runner_relay_tasks.get(session_id) is handle:
-            return False
+
+
+_relay_recovery_tasks: dict[str, asyncio.Task[None]] = {}
+
+
+async def _publish_runner_recovered_when_ready(
+    session_id: str,
+    conversation_store: ConversationStore,
+) -> None:
+    """Clear stream-loss state when the current relay eventually becomes ready."""
+    if await _relay_ready_for_recovery(session_id):
+        await _publish_runner_recovered_status(
+            session_id,
+            conversation_store,
+            require_disconnect_code=True,
+        )
+
+
+def _schedule_runner_recovery_when_ready(
+    session_id: str,
+    conversation_store: ConversationStore,
+) -> None:
+    """Schedule one off-hook readiness waiter for a session."""
+    existing = _relay_recovery_tasks.get(session_id)
+    if existing is not None and not existing.done():
+        return
+    task = asyncio.create_task(
+        _publish_runner_recovered_when_ready(session_id, conversation_store),
+        name=f"runner-recovery-{session_id}",
+    )
+    _relay_recovery_tasks[session_id] = task
+
+    def _clear_slot(done: asyncio.Task[None]) -> None:
+        if _relay_recovery_tasks.get(session_id) is done:
+            _relay_recovery_tasks.pop(session_id, None)
+        error = None if done.cancelled() else done.exception()
+        if error is not None:
+            _logger.warning(
+                "Deferred runner recovery failed for session=%s",
+                session_id,
+                exc_info=(type(error), error, error.__traceback__),
+                extra={"session_id": session_id},
+            )
+
+    task.add_done_callback(_clear_slot)
 
 
 def _relay_retry_delay(retry_number: int) -> float:
@@ -5852,6 +5911,7 @@ async def _run_relay_retry_attempt(
         )
     )
     banner_wait = asyncio.create_task(banner_seen.wait())
+    sustained_wait: asyncio.Task[None] | None = None
     progress_wait: asyncio.Task[bool] | None = None
     timed_out = False
     try:
@@ -5868,6 +5928,23 @@ async def _run_relay_retry_attempt(
             timed_out = True
             return
 
+        sustained_wait = asyncio.create_task(asyncio.sleep(RUNNER_DISCONNECT_GRACE_S))
+        remaining = max(0.0, degraded_deadline - time.monotonic())
+        done, _ = await asyncio.wait(
+            {attempt, sustained_wait},
+            timeout=remaining,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if attempt in done:
+            await attempt
+            return
+        if sustained_wait not in done:
+            timed_out = True
+            return
+
+        # Progress from before the sustained-health threshold is not
+        # enough to escape this incident's absolute deadline.
+        progress_seen.clear()
         progress_wait = asyncio.create_task(progress_seen.wait())
         remaining = max(0.0, degraded_deadline - time.monotonic())
         done, _ = await asyncio.wait(
@@ -5883,8 +5960,8 @@ async def _run_relay_retry_attempt(
             return
         timed_out = True
     finally:
-        cancelled_waiters: list[asyncio.Task[bool]] = []
-        for waiter in (banner_wait, progress_wait):
+        cancelled_waiters: list[asyncio.Task[Any]] = []
+        for waiter in (banner_wait, sustained_wait, progress_wait):
             if waiter is not None and not waiter.done():
                 waiter.cancel()
                 cancelled_waiters.append(waiter)
@@ -5971,29 +6048,22 @@ async def _relay_runner_stream(
             now = time.monotonic()
             if ready is not None:
                 ready.clear()
-            # An attempt that made progress (received a stream event)
-            # was a live stream dropping anew — give the new outage a
-            # fresh window. So was an idle attempt whose stream stayed
-            # provably healthy PAST the banner for longer than the
-            # whole grace and then genuinely disconnected: between the
-            # banner and the first keepalive heartbeat a healthy idle
-            # stream carries no frames, so the post-banner interval
-            # stands in for progress there. Timeouts never refresh on
-            # duration (regardless of how the transport attributes
-            # them) — a wedged runner must exhaust the grace, even one
-            # slow enough that serving the banner alone outlasts it.
-            idle_recovery = (
+            sustained_health = (
                 lost.banner_at is not None
-                and not lost.stream_lost
                 and not lost.timed_out
                 and now - lost.banner_at > RUNNER_DISCONNECT_GRACE_S
             )
-            if reconnect_deadline is None:
+            # A non-timeout stream that survived past one whole grace
+            # represents a new incident. Short-lived progress refreshes
+            # only the reconnect window, leaving the absolute flap cap.
+            if reconnect_deadline is None or sustained_health:
                 reconnect_deadline = now + RUNNER_DISCONNECT_GRACE_S
                 degraded_deadline = (
                     now + RUNNER_DISCONNECT_GRACE_S * _RELAY_MAX_DEGRADED_GRACE_WINDOWS
                 )
-            elif lost.progress or idle_recovery:
+                if sustained_health:
+                    retry_number = 0
+            elif lost.progress:
                 reconnect_deadline = now + RUNNER_DISCONNECT_GRACE_S
             assert degraded_deadline is not None
             retry_delay = _relay_retry_delay(retry_number)
@@ -6704,6 +6774,7 @@ def _ensure_runner_relay(
             existing.task.done(),
             extra={"session_id": session_id},
         )
+        existing.ready.clear()
         if not existing.task.done():
             existing.task.cancel()  # stale binding; replace
     else:

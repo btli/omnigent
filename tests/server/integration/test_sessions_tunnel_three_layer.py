@@ -1052,6 +1052,7 @@ async def _reconnect_fires_connect_hook(
     fake_pm: Any,
     *,
     wait_for_recover: str,
+    unready_sessions: set[str] | None = None,
 ) -> AsyncIterator[list[str]]:
     """Drive a real tunnel disconnect/reconnect so ``_on_runner_connect`` fires.
 
@@ -1096,7 +1097,8 @@ async def _reconnect_fires_connect_hook(
     def _stub_ensure(sid, rid, client, store=None):  # type: ignore[no-untyped-def]
         del client, store
         ready = asyncio.Event()
-        ready.set()
+        if unready_sessions is None or sid not in unready_sessions:
+            ready.set()
         task = asyncio.create_task(asyncio.Event().wait())
         handle = _RelayHandle(runner_id=rid, task=task, ready=ready)
         sessions_routes._runner_relay_tasks[sid] = handle
@@ -1310,6 +1312,62 @@ async def test_on_runner_connect_clears_disconnect_failure_on_idle_reconnect(
             assert sessions_module._last_task_error_from_labels(cleared.labels) is None
     finally:
         sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_on_runner_connect_unready_session_does_not_block_later_session(
+    tunnel_three_layer_stack: _TunnelStack,
+) -> None:
+    """One unready relay cannot starve later sessions in the connect hook."""
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+    fake_pm = tunnel_three_layer_stack.fake_pm
+    first_id = await _bind_failed_session(
+        ap_client,
+        error_code="session_stream_lost",
+        error_message="Session stream lost unexpectedly.",
+    )
+    second_id = await _bind_failed_session(
+        ap_client,
+        error_code="session_stream_lost",
+        error_message="Session stream lost unexpectedly.",
+    )
+    store = get_conversation_store()
+    test_ids = {first_id, second_id}
+    loop_order = [
+        conv.id
+        for conv in store.list_conversations_by_runner_id(_RUNNER_ID)
+        if conv.id in test_ids
+    ]
+    assert set(loop_order) == test_ids
+    blocked_id, later_id = loop_order
+
+    try:
+        async with _reconnect_fires_connect_hook(
+            ap_app,
+            fake_pm,
+            wait_for_recover=later_id,
+            unready_sessions={blocked_id},
+        ) as recovered:
+            assert recovered.index(blocked_id) < recovered.index(later_id)
+            assert sessions_module._session_status_cache.get(blocked_id) == "failed"
+            assert sessions_module._session_status_cache.get(later_id) == "idle"
+            blocked = store.get_conversation(blocked_id)
+            later = store.get_conversation(later_id)
+            assert blocked is not None
+            assert later is not None
+            assert sessions_module._last_task_error_from_labels(blocked.labels) == {
+                "code": "session_stream_lost",
+                "message": "Session stream lost unexpectedly.",
+            }
+            assert sessions_module._last_task_error_from_labels(later.labels) is None
+    finally:
+        sessions_module._session_status_cache.pop(first_id, None)
+        sessions_module._session_status_cache.pop(second_id, None)
 
 
 @pytest.mark.asyncio
