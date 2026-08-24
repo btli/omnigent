@@ -23,6 +23,7 @@ from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omnigent.db.account_authority import account_generation, current_account_user
+from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server import project_assignment
@@ -259,6 +260,10 @@ def create_scheduled_tasks_router(
 
     async def _resolve_requested_project(project_id: str, owner: str | None) -> str:
         """Resolve an assignment target while preserving the API's 404 privacy."""
+        try:
+            canonical_project_id = uuid_to_bytes(project_id).hex()
+        except InvalidUuidError as exc:
+            raise OmnigentError("Not found.", code=ErrorCode.NOT_FOUND) from exc
         if project_store is None:
             raise OmnigentError(
                 "Project assignment is not supported by this server",
@@ -267,7 +272,7 @@ def create_scheduled_tasks_router(
         resolved = await asyncio.to_thread(
             project_assignment.resolve_owned_project_id,
             project_store,
-            project_id,
+            canonical_project_id,
             user_id=owner,
         )
         if resolved is None:
@@ -464,10 +469,7 @@ def create_scheduled_tasks_router(
         if unfiled:
             tasks = store.list(owner_user_id=owner_id, project_id=None)
         elif project_id is not None:
-            if project_id == "" and project_store is None:
-                tasks = store.list(owner_user_id=owner_id, project_id=project_id)
-            else:
-                resolved = await _resolve_requested_project(project_id, _project_owner(owner))
+            resolved = await _resolve_requested_project(project_id, _project_owner(owner))
             tasks = store.list(owner_user_id=owner_id, project_id=resolved)
         else:
             tasks = store.list(owner_user_id=owner_id)
