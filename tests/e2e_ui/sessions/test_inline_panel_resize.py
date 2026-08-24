@@ -47,6 +47,65 @@ def _stored_width(page: Page, session_id: str) -> float | None:
     )
 
 
+def test_resize_gutter_owns_only_its_capped_hit_slivers(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The gutter owns its seam slivers without covering adjacent controls."""
+    base_url, session_id = seeded_session
+    page.set_viewport_size(_VIEWPORT)
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+
+    main_box = page.locator("main").bounding_box()
+    panel_box = page.get_by_role("complementary", name="Workspace").bounding_box()
+    transcript_box = page.get_by_role("log").bounding_box()
+    files_box = page.get_by_role("tab", name="Files").bounding_box()
+    assert main_box is not None
+    assert panel_box is not None
+    assert transcript_box is not None
+    assert files_box is not None
+
+    hits = page.evaluate(
+        """(points) => Object.fromEntries(
+          Object.entries(points).map(([name, point]) => {
+            const target = document.elementFromPoint(point.x, point.y);
+            return [name, {
+              gutter: target?.closest('[data-workspace-panel-resize-gutter]') !== null,
+              filesTab: target?.closest('[role="tab"]')?.getAttribute('aria-label') === 'Files',
+            }];
+          }),
+        )""",
+        {
+            "chatSliver": {
+                "x": main_box["x"] + main_box["width"] - 3,
+                "y": transcript_box["y"] + transcript_box["height"] / 2,
+            },
+            "chatOutside": {
+                "x": main_box["x"] + main_box["width"] - 8,
+                "y": transcript_box["y"] + transcript_box["height"] / 2,
+            },
+            "panelSliver": {
+                "x": panel_box["x"] + 4,
+                "y": files_box["y"] + files_box["height"] / 2,
+            },
+            "panelOutside": {
+                "x": panel_box["x"] + 9,
+                "y": files_box["y"] + files_box["height"] / 2,
+            },
+        },
+    )
+
+    assert hits["chatSliver"]["gutter"] is True, hits
+    assert hits["panelSliver"]["gutter"] is True, hits
+    assert hits["chatOutside"]["gutter"] is False, hits
+    assert hits["panelOutside"] == {"gutter": False, "filesTab": True}, hits
+    assert (
+        page.locator(_GUTTER).evaluate("element => getComputedStyle(element).position")
+        == "relative"
+    )
+
+
 def test_touch_resize_persists_without_stealing_transcript_scroll(
     page: Page,
     seeded_session: tuple[str, str],

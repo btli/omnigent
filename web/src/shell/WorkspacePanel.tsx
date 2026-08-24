@@ -712,7 +712,7 @@ export function WorkspacePanel({
         <div
           {...handleProps}
           data-workspace-panel-resize-gutter
-          className="z-50 hidden w-1 shrink-0 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
+          className="relative z-50 hidden w-1 shrink-0 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
         />
       )}
       <aside
