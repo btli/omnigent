@@ -1,4 +1,5 @@
 import {
+  type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
   type SyntheticEvent,
   type TouchEvent as ReactTouchEvent,
@@ -182,6 +183,7 @@ export function useRowGesture({
   const state = useRef<ActiveRowGesture | null>(null);
   const holdTimer = useRef<number | null>(null);
   const suppressClick = useRef(false);
+  const suppressionKeydown = useRef<((event: KeyboardEvent) => void) | null>(null);
   const touchMoveGuard = useRef<(() => void) | null>(null);
   const dxFrame = useRef<number | null>(null);
   const pendingDx = useRef(0);
@@ -280,18 +282,30 @@ export function useRowGesture({
     [cancelDxFrame, clearHoldTimer, disarmTouchMoveGuard, onCancel, releaseCapture],
   );
 
-  // Armed until the trailing click arrives or the next press clears it. A timer
-  // would race the click: the browser does not guarantee dispatch inside the
-  // same task, and losing that race navigates into the row just swiped away.
-  const suppressTrailingClick = useCallback(() => {
-    suppressClick.current = true;
+  const clearClickSuppression = useCallback(() => {
+    suppressClick.current = false;
+    const keydown = suppressionKeydown.current;
+    if (!keydown) return;
+    suppressionKeydown.current = null;
+    document.removeEventListener("keydown", keydown, true);
   }, []);
+
+  // Armed until the trailing click arrives or the next press/key clears it. A
+  // timer would race the click because browsers need not dispatch it in the
+  // same task, so keyboard intent clears through a one-shot capture listener.
+  const suppressTrailingClick = useCallback(() => {
+    clearClickSuppression();
+    suppressClick.current = true;
+    const keydown = () => clearClickSuppression();
+    suppressionKeydown.current = keydown;
+    document.addEventListener("keydown", keydown, { capture: true, once: true });
+  }, [clearClickSuppression]);
 
   const consumeClick = useCallback(() => {
     if (!suppressClick.current) return false;
-    suppressClick.current = false;
+    clearClickSuppression();
     return true;
-  }, []);
+  }, [clearClickSuppression]);
 
   const setGesturePhase = useCallback(
     (gesture: ActiveRowGesture, next: ActiveRowGesture["phase"]) => {
@@ -311,7 +325,7 @@ export function useRowGesture({
 
   const onPointerDown = useCallback(
     (event: ReactPointerEvent) => {
-      suppressClick.current = false;
+      clearClickSuppression();
       if (event.pointerType !== "touch") return;
       if (!event.isPrimary) {
         reset(true);
@@ -367,6 +381,7 @@ export function useRowGesture({
       actions,
       armTouchMoveGuard,
       capturePointer,
+      clearClickSuppression,
       enabled,
       onLongPress,
       onPickUp,
@@ -402,6 +417,7 @@ export function useRowGesture({
           setGesturePhase(gesture, "scroll");
           releaseCapture(gesture);
           disarmTouchMoveGuard();
+          onCancel?.();
         }
         return;
       }
@@ -450,6 +466,7 @@ export function useRowGesture({
       dragEnabled,
       disarmTouchMoveGuard,
       onDragStart,
+      onCancel,
       releaseCapture,
       scheduleDx,
       setGesturePhase,
@@ -539,12 +556,17 @@ export function useRowGesture({
       onPointerUp,
       onPointerCancel,
       onLostPointerCapture,
+      onKeyDown: (event: ReactKeyboardEvent) => {
+        clearClickSuppression();
+        callDndListener(dragListeners, "onKeyDown", event);
+      },
       onTouchStart: (event: ReactTouchEvent) => {
         onTouchStart(event);
         callDndListener(dragListeners, "onTouchStart", event);
       },
     }),
     [
+      clearClickSuppression,
       onLostPointerCapture,
       onPointerCancel,
       onPointerDown,
@@ -562,12 +584,10 @@ export function useRowGesture({
 
   useEffect(
     () => () => {
-      clearHoldTimer();
-      cancelDxFrame();
-      releaseCapture(state.current);
-      disarmTouchMoveGuard();
+      reset(true);
+      clearClickSuppression();
     },
-    [cancelDxFrame, clearHoldTimer, disarmTouchMoveGuard, releaseCapture],
+    [clearClickSuppression, reset],
   );
 
   return {
@@ -577,5 +597,6 @@ export function useRowGesture({
     listeners: bindListeners,
     dndData,
     consumeClick,
+    clearClickSuppression,
   };
 }

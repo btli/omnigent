@@ -12,6 +12,8 @@ import { useSyncExternalStore } from "react";
 export interface InputCapabilities {
   /** ANY attached pointer is coarse — `(any-pointer: coarse)`. */
   anyCoarse: boolean;
+  /** A touch digitizer is present. */
+  hasTouch: boolean;
 }
 
 const CAPABILITY_QUERIES = ["(any-pointer: coarse)"] as const;
@@ -20,6 +22,7 @@ const CAPABILITY_QUERIES = ["(any-pointer: coarse)"] as const;
 // desktop), matching the shell's historical desktop-first defaults.
 const SERVER_SNAPSHOT: InputCapabilities = {
   anyCoarse: false,
+  hasTouch: false,
 };
 
 let mediaLists: MediaQueryList[] | null = null;
@@ -33,6 +36,7 @@ function read(): InputCapabilities {
   if (typeof window === "undefined" || !window.matchMedia) return SERVER_SNAPSHOT;
   return {
     anyCoarse: lists()[0].matches,
+    hasTouch: navigator.maxTouchPoints > 0,
   };
 }
 
@@ -42,7 +46,7 @@ let cached: InputCapabilities = SERVER_SNAPSHOT;
 
 function getSnapshot(): InputCapabilities {
   const next = read();
-  if (next.anyCoarse !== cached.anyCoarse) {
+  if (next.anyCoarse !== cached.anyCoarse || next.hasTouch !== cached.hasTouch) {
     cached = next;
   }
   return cached;
