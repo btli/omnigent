@@ -17,11 +17,10 @@ depends_on = None
 
 def upgrade() -> None:
     """Add the nullable Project pointer and filtered-list index."""
-    sqlite = op.get_bind().dialect.name == "sqlite"
-    with op.batch_alter_table(
-        "scheduled_tasks", recreate="always" if sqlite else "auto"
-    ) as batch_op:
-        batch_op.add_column(sa.Column("project_id", Uuid16(), nullable=True))
+    op.add_column(
+        "scheduled_tasks",
+        sa.Column("project_id", Uuid16(), nullable=True),
+    )
     op.create_index(
         "ix_scheduled_tasks_project_id",
         "scheduled_tasks",
