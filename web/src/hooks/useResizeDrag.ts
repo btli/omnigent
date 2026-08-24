@@ -1,40 +1,56 @@
 import { useCallback, useEffect, useRef } from "react";
 
 interface ResizeDragOptions<T extends Element> {
-  captureRequired?: boolean;
   enabled?: boolean;
   onMove: (event: React.PointerEvent<T>) => void;
   onCommit?: () => void;
   overlay?: boolean;
   observeHandleRemoval?: boolean;
-  releaseCaptureOnFinish?: boolean;
 }
 
 const OVERLAY_STYLE =
   "position:fixed;inset:0;z-index:2147483647;cursor:col-resize;background:transparent;";
 
+const bodyStyleOwners = new Set<symbol>();
+let previousBodyCursor = "";
+let previousBodyUserSelect = "";
+
+function acquireBodyStyles(owner: symbol): void {
+  if (bodyStyleOwners.size === 0) {
+    previousBodyCursor = document.body.style.cursor;
+    previousBodyUserSelect = document.body.style.userSelect;
+  }
+  bodyStyleOwners.add(owner);
+  document.body.style.cursor = "col-resize";
+  document.body.style.userSelect = "none";
+}
+
+function releaseBodyStyles(owner: symbol): void {
+  bodyStyleOwners.delete(owner);
+  if (bodyStyleOwners.size !== 0) return;
+  document.body.style.cursor = previousBodyCursor;
+  document.body.style.userSelect = previousBodyUserSelect;
+}
+
 /** Shared pointer lifecycle for resize handles; callers provide only sizing policy. */
 export function useResizeDrag<T extends Element = Element>({
-  captureRequired = true,
   enabled = true,
   onMove,
   onCommit,
   overlay = false,
   observeHandleRemoval = false,
-  releaseCaptureOnFinish = false,
 }: ResizeDragOptions<T>) {
   const activePointerId = useRef<number | null>(null);
   const activeHandle = useRef<T | null>(null);
   const cleanup = useRef<(() => void) | null>(null);
   const overlayElement = useRef<HTMLDivElement | null>(null);
+  const bodyStyleOwner = useRef(Symbol("resize-drag"));
   const onMoveRef = useRef(onMove);
   const onCommitRef = useRef(onCommit);
-  const releaseCaptureOnFinishRef = useRef(releaseCaptureOnFinish);
   onMoveRef.current = onMove;
   onCommitRef.current = onCommit;
-  releaseCaptureOnFinishRef.current = releaseCaptureOnFinish;
 
-  const finishDrag = useCallback((commit: boolean, releaseCapture = false) => {
+  const finishDrag = useCallback((commit: boolean) => {
     const pointerId = activePointerId.current;
     if (pointerId === null) return;
 
@@ -45,37 +61,28 @@ export function useResizeDrag<T extends Element = Element>({
     cleanup.current = null;
     overlayElement.current?.remove();
     overlayElement.current = null;
-    if (commit) onCommitRef.current?.();
 
-    if (releaseCapture) {
-      try {
-        if (handle?.hasPointerCapture?.(pointerId)) handle.releasePointerCapture(pointerId);
-      } catch {
-        // The handle may have detached before the drag ended.
-      }
+    try {
+      handle?.releasePointerCapture(pointerId);
+    } catch {
+      // The handle may have detached or already lost capture.
     }
 
-    document.body.style.cursor = "";
-    document.body.style.userSelect = "";
+    releaseBodyStyles(bodyStyleOwner.current);
+    if (commit) onCommitRef.current?.();
   }, []);
 
-  const cancelDrag = useCallback(
-    () => finishDrag(false, releaseCaptureOnFinishRef.current),
-    [finishDrag],
-  );
+  const cancelDrag = useCallback(() => finishDrag(false), [finishDrag]);
 
   const onPointerDown = useCallback(
     (event: React.PointerEvent<T>) => {
       if (!enabled || event.button !== 0 || activePointerId.current !== null) return;
 
       const capture = event.currentTarget.setPointerCapture;
-      if (capture) {
-        try {
-          capture.call(event.currentTarget, event.pointerId);
-        } catch {
-          return;
-        }
-      } else if (captureRequired) {
+      if (!capture) return;
+      try {
+        capture.call(event.currentTarget, event.pointerId);
+      } catch {
         return;
       }
 
@@ -85,14 +92,20 @@ export function useResizeDrag<T extends Element = Element>({
 
       const onDocumentPointerUp = (documentEvent: PointerEvent) => {
         if (documentEvent.pointerId === activePointerId.current) {
-          finishDrag(true, releaseCaptureOnFinishRef.current);
+          finishDrag(true);
         }
       };
       const onDocumentPointerCancel = (documentEvent: PointerEvent) => {
         if (documentEvent.pointerId === activePointerId.current) {
-          finishDrag(false, releaseCaptureOnFinishRef.current);
+          cancelDrag();
         }
       };
+      const onDocumentKeyDown = (documentEvent: KeyboardEvent) => {
+        if (documentEvent.key === "Escape") cancelDrag();
+      };
+      const onContextMenu = () => cancelDrag();
+      const onWindowBlur = () => cancelDrag();
+      const onVisibilityChange = () => cancelDrag();
       const observer = observeHandleRemoval
         ? new MutationObserver(() => {
             if (activeHandle.current && !activeHandle.current.isConnected) cancelDrag();
@@ -101,10 +114,18 @@ export function useResizeDrag<T extends Element = Element>({
       observer?.observe(document.documentElement, { childList: true, subtree: true });
       document.addEventListener("pointerup", onDocumentPointerUp);
       document.addEventListener("pointercancel", onDocumentPointerCancel);
+      document.addEventListener("keydown", onDocumentKeyDown);
+      document.addEventListener("contextmenu", onContextMenu);
+      window.addEventListener("blur", onWindowBlur);
+      document.addEventListener("visibilitychange", onVisibilityChange);
       cleanup.current = () => {
         observer?.disconnect();
         document.removeEventListener("pointerup", onDocumentPointerUp);
         document.removeEventListener("pointercancel", onDocumentPointerCancel);
+        document.removeEventListener("keydown", onDocumentKeyDown);
+        document.removeEventListener("contextmenu", onContextMenu);
+        window.removeEventListener("blur", onWindowBlur);
+        document.removeEventListener("visibilitychange", onVisibilityChange);
       };
 
       if (overlay) {
@@ -113,10 +134,9 @@ export function useResizeDrag<T extends Element = Element>({
         document.body.appendChild(element);
         overlayElement.current = element;
       }
-      document.body.style.cursor = "col-resize";
-      document.body.style.userSelect = "none";
+      acquireBodyStyles(bodyStyleOwner.current);
     },
-    [cancelDrag, captureRequired, enabled, finishDrag, observeHandleRemoval, overlay],
+    [cancelDrag, enabled, finishDrag, observeHandleRemoval, overlay],
   );
 
   const onPointerMove = useCallback((event: React.PointerEvent<T>) => {
@@ -125,18 +145,16 @@ export function useResizeDrag<T extends Element = Element>({
 
   const onPointerUp = useCallback(
     (event: React.PointerEvent<T>) => {
-      if (event.pointerId === activePointerId.current) finishDrag(true, true);
+      if (event.pointerId === activePointerId.current) finishDrag(true);
     },
     [finishDrag],
   );
 
   const onPointerCancel = useCallback(
     (event: React.PointerEvent<T>) => {
-      if (event.pointerId === activePointerId.current) {
-        finishDrag(false, releaseCaptureOnFinishRef.current);
-      }
+      if (event.pointerId === activePointerId.current) cancelDrag();
     },
-    [finishDrag],
+    [cancelDrag],
   );
 
   useEffect(() => {

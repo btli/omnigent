@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useReducer, useRef, useSyncExternalStore } from "react";
 import { createResizableWidthStore } from "@/hooks/resizableWidthStore";
 import { useInputCapabilities } from "@/hooks/useInputCapabilities";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -70,7 +70,7 @@ export function resetSharedWidthStoreForTesting(): void {
  * props to spread onto the resize handle element.
  */
 export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx = MIN_WIDTH_PX) {
-  const { coarsePrimary } = useInputCapabilities();
+  const { anyCoarse } = useInputCapabilities();
   const mobileViewport = useIsMobileViewport();
   const isDesktop = typeof window !== "undefined" && !mobileViewport;
   const width = useSyncExternalStore(
@@ -80,6 +80,7 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
   );
   const minWidthRef = useRef(minWidthPx);
   minWidthRef.current = minWidthPx;
+  const [, bumpViewport] = useReducer((version: number) => version + 1, 0);
 
   // Re-clamp the stored width when the viewport resizes so a width
   // that was valid on a wider monitor doesn't push content off-screen
@@ -93,6 +94,7 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
         const base = widthStore.getPreferred() ?? prev;
         return base !== null ? clampWidth(base, minWidthRef.current) : prev;
       });
+      bumpViewport();
     }
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
@@ -154,7 +156,7 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
     handleProps: {
       ...resizeDrag.handleProps,
       onKeyDown,
-      style: handleGutterStyle(coarsePrimary),
+      style: handleGutterStyle(anyCoarse),
       role: "separator" as const,
       "aria-orientation": "vertical" as const,
       "aria-label": "Resize panel",

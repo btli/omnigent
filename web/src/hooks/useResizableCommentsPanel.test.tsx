@@ -86,13 +86,18 @@ const overlaySelector = () =>
 function attachContainer(
   ref: React.MutableRefObject<HTMLDivElement | null>,
   { parentWidth = 2000, panelRight = 1000 } = {},
-): void {
+) {
   const parent = document.createElement("div");
   const panel = document.createElement("div");
   parent.appendChild(panel);
-  vi.spyOn(parent, "getBoundingClientRect").mockReturnValue({ width: parentWidth } as DOMRect);
-  vi.spyOn(panel, "getBoundingClientRect").mockReturnValue({ right: panelRight } as DOMRect);
+  const parentRect = vi
+    .spyOn(parent, "getBoundingClientRect")
+    .mockReturnValue({ width: parentWidth } as DOMRect);
+  const panelRect = vi
+    .spyOn(panel, "getBoundingClientRect")
+    .mockReturnValue({ right: panelRight } as DOMRect);
   ref.current = panel;
+  return { panelRect, parentRect };
 }
 
 beforeEach(() => {
@@ -410,8 +415,8 @@ describe("useResizableCommentsPanel touch affordances", () => {
     unmount();
   });
 
-  it("widens the gutter and hit target on coarse-pointer devices", () => {
-    mockMatchMedia({ "(pointer: coarse)": true });
+  it("widens the gutter on a fine-primary device with a coarse pointer", () => {
+    mockMatchMedia({ "(pointer: coarse)": false, "(any-pointer: coarse)": true });
     const { result, unmount } = renderHook(() => useResizableCommentsPanel());
 
     // Coarse: 8px gutter, 26px hit total — TR-7's 24px floor with the same
@@ -425,7 +430,7 @@ describe("useResizableCommentsPanel touch affordances", () => {
   });
 
   it("exposes the width to assistive tech via aria value attributes", () => {
-    const { result, rerender, unmount } = renderHook(() => useResizableCommentsPanel());
+    const { result, unmount } = renderHook(() => useResizableCommentsPanel());
     expect(result.current.handleProps["aria-valuenow"]).toBe(240);
     expect(result.current.handleProps["aria-valuemin"]).toBe(200);
     expect(result.current.handleProps["aria-valuemax"]).toBe(640);
@@ -440,8 +445,29 @@ describe("useResizableCommentsPanel touch affordances", () => {
     expect(result.current.handleProps["aria-valuenow"]).toBe(260);
 
     attachContainer(result.current.containerRef, { parentWidth: 500, panelRight: 500 });
-    rerender();
+    act(() => window.dispatchEvent(new Event("resize")));
     expect(result.current.handleProps["aria-valuemax"]).toBe(252);
+    unmount();
+  });
+
+  it("does not repeat the aria maximum layout read during pointer moves", () => {
+    const { result, unmount } = renderHook(() => useResizableCommentsPanel());
+    const { panelRect, parentRect } = attachContainer(result.current.containerRef);
+    act(() => window.dispatchEvent(new Event("resize")));
+    expect(parentRect).toHaveBeenCalledTimes(1);
+
+    const target = makeHandleTarget();
+    act(() => {
+      result.current.handleProps.onPointerDown(pointerEvent(target, { pointerId: 9 }));
+      result.current.handleProps.onPointerMove(
+        pointerEvent(target, { pointerId: 9, clientX: 700 }),
+      );
+    });
+
+    // One panel-edge read and one max-clamp read are required for the move;
+    // aria-valuemax stays memoized until the constraint signal changes.
+    expect(panelRect).toHaveBeenCalledTimes(1);
+    expect(parentRect).toHaveBeenCalledTimes(2);
     unmount();
   });
 
