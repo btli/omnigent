@@ -158,6 +158,26 @@ def test_list_filters_project_unfiled_and_all_before_ordering(
     ] == [unfiled_id]
 
 
+def test_list_explicit_none_owner_preserves_unfiltered_local_mode(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    local = store.create(_uid("local-task"), "local", "p", "FREQ=DAILY", None, _uid("ag"), "UTC")
+    authenticated = store.create(
+        _uid("auth-task"),
+        "auth",
+        "p",
+        "FREQ=DAILY",
+        "alice@example.com",
+        _uid("ag"),
+        "UTC",
+    )
+
+    assert {task.id for task in store.list(owner_user_id=None)} == {
+        local.id,
+        authenticated.id,
+    }
+
+
 def test_unfiled_filter_includes_directly_inserted_dangling_pointer_for_paused_task(
     store: SqlAlchemyScheduledTaskStore,
 ) -> None:
