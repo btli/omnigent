@@ -114,6 +114,66 @@ def _section(page: Page, title: str) -> Locator:
     return page.locator("section").filter(has=page.get_by_role("button", name=title, exact=True))
 
 
+def test_released_swipe_archives_without_navigating_and_stationary_tap_navigates(
+    browser: Browser,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A real released swipe commits archive, while a stationary touch remains a tap."""
+    base_url, session_id = seeded_session
+    _set_title(base_url, session_id, f"e2e-touch-archive-{uuid.uuid4().hex[:8]}")
+
+    context = _new_touch_context(browser)
+    try:
+        page = context.new_page()
+        page.goto(f"{base_url}/?sidebar=open")
+        link = _row_link(page, session_id)
+        expect(link).to_be_visible()
+        x, y = _center(link)
+
+        cdp = page.context.new_cdp_session(page)
+        try:
+            _touch(cdp, "touchStart", x, y)
+            _touch(cdp, "touchEnd")
+            page.wait_for_url(f"**/c/{session_id}")
+
+            page.goto(f"{base_url}/?sidebar=open")
+            link = _row_link(page, session_id)
+            expect(link).to_be_visible()
+            row = link.locator("xpath=ancestor::li[1]")
+            x, y = _center(link)
+            _touch(cdp, "touchStart", x, y)
+            for offset in (16, 32, 50, 74, 90):
+                _touch(cdp, "touchMove", x - offset, y)
+                page.wait_for_timeout(25)
+            expect(row).to_have_class(re.compile(r"\bmx-1\b"))
+            assert _unexpected_events(page) == []
+            _touch(cdp, "touchEnd")
+        finally:
+            cdp.detach()
+
+        deadline = time.monotonic() + 15.0
+        archived = False
+        while time.monotonic() < deadline:
+            response = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+            if response.status_code == 200 and response.json().get("archived") is True:
+                archived = True
+                break
+            time.sleep(0.25)
+        assert archived, (
+            "released swipe should archive the session on the server; "
+            f"events={_unexpected_events(page)} path={page.evaluate('location.pathname')}"
+        )
+        assert page.evaluate("location.pathname") == "/"
+        assert _unexpected_events(page) == []
+    finally:
+        httpx.patch(
+            f"{base_url}/v1/sessions/{session_id}",
+            json={"archived": False},
+            timeout=10.0,
+        ).raise_for_status()
+        context.close()
+
+
 def test_still_touch_opens_session_context_menu_without_dragging(
     browser: Browser,
     seeded_session: tuple[str, str],
