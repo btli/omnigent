@@ -15,11 +15,13 @@
 // resizes are also persisted so a full page reload restores the width.
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { createResizableWidthStore } from "@/hooks/resizableWidthStore";
 import { useInputCapabilities } from "@/hooks/useInputCapabilities";
-import { MD_MIN_WIDTH_QUERY, isMobileViewport } from "@/lib/breakpoints";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useResizeDrag } from "@/hooks/useResizeDrag";
 import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
 
-const DEFAULT_WIDTH_PX = 240; // matches the previous fixed `md:w-60`
+const DEFAULT_WIDTH_PX = 240;
 const MIN_WIDTH_PX = 200;
 const MAX_WIDTH_PX = 640;
 /** Keep at least this much room for the code/diff viewer beside the panel. */
@@ -58,57 +60,14 @@ function gutterStyle(isCoarse: boolean): React.CSSProperties {
 // Module-level width store (shared across panel remounts within a session)
 // ---------------------------------------------------------------------------
 
-// `preferredWidth` mirrors the persisted user choice; `storedWidth` is the
-// effective width after clamping to the available row space. Keeping the
-// preference in memory lets the resize handler re-derive the effective width
-// from it — restoring the larger choice when the row widens again.
-let preferredWidth: number | null = readPanelSizePreference("commentsPanelWidthPx");
-let storedWidth: number | null = preferredWidth;
-const listeners = new Set<() => void>();
-
-function persistWidth(value: number | null) {
-  preferredWidth = value;
-  writePanelSizePreference("commentsPanelWidthPx", value);
-}
-
-function setStoredWidthRaw(value: number | null, persist = false) {
-  if (value === storedWidth) return;
-  storedWidth = value;
-  if (persist) persistWidth(value);
-  for (const l of listeners) l();
-}
-
-function setStoredWidth(
-  next: number | null | ((prev: number | null) => number | null),
-  persist = false,
-) {
-  setStoredWidthRaw(typeof next === "function" ? next(storedWidth) : next, persist);
-}
-
-/** Snapshot the current width to storage (called once at drag end). */
-function persistStoredWidth() {
-  persistWidth(storedWidth);
-}
-
-function subscribe(cb: () => void): () => void {
-  listeners.add(cb);
-  return () => {
-    listeners.delete(cb);
-  };
-}
-
-function getSnapshot(): number | null {
-  return storedWidth;
-}
-
-function getServerSnapshot(): number | null {
-  return null;
-}
+const widthStore = createResizableWidthStore(
+  readPanelSizePreference("commentsPanelWidthPx"),
+  (width) => writePanelSizePreference("commentsPanelWidthPx", width),
+);
 
 /** Reset module-level width state from localStorage. Only for tests. */
 export function resetCommentsWidthStoreForTesting(): void {
-  preferredWidth = readPanelSizePreference("commentsPanelWidthPx");
-  setStoredWidthRaw(preferredWidth);
+  widthStore.reset(readPanelSizePreference("commentsPanelWidthPx"));
 }
 
 /**
@@ -125,48 +84,15 @@ export function resetCommentsWidthStoreForTesting(): void {
  */
 export function useResizableCommentsPanel() {
   const { coarsePrimary } = useInputCapabilities();
-  const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
-  const width = Math.max(MIN_WIDTH_PX, Math.min(raw ?? DEFAULT_WIDTH_PX, MAX_WIDTH_PX));
-  // Pointer id of the active drag; null when idle. A second concurrent
-  // pointer (e.g. another finger) is ignored — first pointer wins.
-  const activePointerId = useRef<number | null>(null);
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const overlayRef = useRef<HTMLDivElement | null>(null);
-  // Removes the document-level pointerup/pointercancel fallbacks installed
-  // for the active drag; null when idle.
-  const removeDocFallbacks = useRef<(() => void) | null>(null);
-
-  // While dragging, a transparent full-window overlay sits above the panel so
-  // the pointer stream keeps reaching the parent document even if capture is
-  // lost. Without it, dragging over a cross-origin/sandboxed iframe (e.g. the
-  // HTML preview) routes moves into the frame and the drag sticks.
-  const addDragOverlay = useCallback(() => {
-    if (overlayRef.current || typeof document === "undefined") return;
-    const el = document.createElement("div");
-    el.style.cssText =
-      "position:fixed;inset:0;z-index:2147483647;cursor:col-resize;background:transparent;";
-    document.body.appendChild(el);
-    overlayRef.current = el;
-  }, []);
-
-  const removeDragOverlay = useCallback(() => {
-    overlayRef.current?.remove();
-    overlayRef.current = null;
-  }, []);
-
-  const [isDesktop, setIsDesktop] = useState(
-    () => typeof window !== "undefined" && !isMobileViewport(),
+  const mobileViewport = useIsMobileViewport();
+  const isDesktop = typeof window !== "undefined" && !mobileViewport;
+  const raw = useSyncExternalStore(
+    widthStore.subscribe,
+    widthStore.getSnapshot,
+    widthStore.getServerSnapshot,
   );
-
-  useEffect(() => {
-    const mql = window.matchMedia(MD_MIN_WIDTH_QUERY);
-    const handler = (e: MediaQueryListEvent) => setIsDesktop(e.matches);
-    mql.addEventListener("change", handler);
-    return () => mql.removeEventListener("change", handler);
-  }, []);
-
-  // Coarse pointers get the deliberate capped 26px target; fine pointers
-  // (mouse, trackpad, pen tip) get a 24px target.
+  const width = Math.max(MIN_WIDTH_PX, Math.min(raw ?? DEFAULT_WIDTH_PX, MAX_WIDTH_PX));
+  const containerRef = useRef<HTMLDivElement | null>(null);
 
   // Clamp a candidate width to [MIN, dynamic max], leaving MIN_VIEWER_PX for
   // the sibling code/diff viewer so the panel can't swallow the whole row.
@@ -196,8 +122,8 @@ export function useResizableCommentsPanel() {
     const parent = containerRef.current?.parentElement;
     if (!parent || typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(() => {
-      setStoredWidth((prev) => {
-        const base = preferredWidth ?? prev;
+      widthStore.set((prev) => {
+        const base = widthStore.getPreferred() ?? prev;
         return base !== null ? clampWidth(base) : prev;
       });
       setConstraintVersion((version) => version + 1);
@@ -206,96 +132,20 @@ export function useResizableCommentsPanel() {
     return () => observer.disconnect();
   }, [clampWidth]);
 
-  // Ends the drag at the last applied width (never a half-state): clears the
-  // active pointer, drops the overlay, and restores the body cursor/selection.
-  // Only a deliberate release persists; aborts (cancel, capture loss, unmount)
-  // keep the width on screen but don't write storage. Idempotent so pointerup
-  // + the lostpointercapture it triggers don't double-run.
-  const endDrag = useCallback(
-    (persist: boolean) => {
-      if (activePointerId.current === null) return;
-      activePointerId.current = null;
-      removeDocFallbacks.current?.();
-      removeDocFallbacks.current = null;
-      removeDragOverlay();
-      if (persist) persistStoredWidth();
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    },
-    [removeDragOverlay],
-  );
-
-  const onPointerDown = useCallback(
-    (e: React.PointerEvent) => {
-      // First pointer wins; only the primary button/tip starts a drag. (A pen
-      // barrel button reports pointerType "pen" with button 2, so the guard
-      // must not be mouse-only; touch and pen tip are always button 0.)
-      if (activePointerId.current !== null) return;
-      if (e.button !== 0) return;
-      // Capture BEFORE publishing any drag state: if capture throws (pointer
-      // already gone, detached node), staying fully idle avoids a stale
-      // activePointerId that a later reused pointerId could match — which
-      // would spuriously end (and persist) a drag that never started.
-      try {
-        e.currentTarget.setPointerCapture?.(e.pointerId); // jsdom lacks capture
-      } catch {
-        return;
-      }
-      e.preventDefault();
-      activePointerId.current = e.pointerId;
-      // Document-level fallbacks: if the browser drops capture without
-      // delivering the handle's up/cancel, the drag still ends here so the
-      // max-z overlay can never outlive it.
-      const onDocPointerUp = (ev: PointerEvent) => {
-        if (ev.pointerId === activePointerId.current) endDrag(true);
-      };
-      const onDocPointerCancel = (ev: PointerEvent) => {
-        if (ev.pointerId === activePointerId.current) endDrag(false);
-      };
-      document.addEventListener("pointerup", onDocPointerUp);
-      document.addEventListener("pointercancel", onDocPointerCancel);
-      removeDocFallbacks.current = () => {
-        document.removeEventListener("pointerup", onDocPointerUp);
-        document.removeEventListener("pointercancel", onDocPointerCancel);
-      };
-      addDragOverlay();
-      document.body.style.cursor = "col-resize";
-      document.body.style.userSelect = "none";
-    },
-    [addDragOverlay, endDrag],
-  );
-
-  const onPointerMove = useCallback(
-    (e: React.PointerEvent) => {
-      if (e.pointerId !== activePointerId.current || !containerRef.current) return;
-      const right = containerRef.current.getBoundingClientRect().right;
-      // Update the live width only; persist once on release to avoid a
-      // synchronous localStorage write per move.
-      setStoredWidth(clampWidth(right - e.clientX));
-    },
-    [clampWidth],
-  );
-
-  const onPointerUp = useCallback(
-    (e: React.PointerEvent) => {
-      if (e.pointerId !== activePointerId.current) return;
-      if (e.currentTarget.hasPointerCapture?.(e.pointerId)) {
-        e.currentTarget.releasePointerCapture(e.pointerId);
-      }
-      endDrag(true);
-    },
-    [endDrag],
-  );
-
-  // pointercancel (e.g. the browser reclaims the touch) and capture loss
-  // both abort cleanly to the last applied width, without persisting it.
-  const onPointerCancel = useCallback(
-    (e: React.PointerEvent) => {
-      if (e.pointerId !== activePointerId.current) return;
-      endDrag(false);
-    },
-    [endDrag],
-  );
+  const resizeDrag = useResizeDrag({
+    captureRequired: false,
+    enabled: isDesktop,
+    overlay: true,
+    onCommit: widthStore.persist,
+    onMove: useCallback(
+      (e: React.PointerEvent) => {
+        if (!containerRef.current) return;
+        const right = containerRef.current.getBoundingClientRect().right;
+        widthStore.set(clampWidth(right - e.clientX));
+      },
+      [clampWidth],
+    ),
+  });
 
   // Keyboard resize: left/right arrows widen/narrow by 20px.
   const onKeyDown = useCallback(
@@ -303,23 +153,14 @@ export function useResizableCommentsPanel() {
       const step = 20;
       if (e.key === "ArrowLeft") {
         e.preventDefault();
-        setStoredWidth((prev) => clampWidth((prev ?? DEFAULT_WIDTH_PX) + step), true);
+        widthStore.set((prev) => clampWidth((prev ?? DEFAULT_WIDTH_PX) + step), true);
       } else if (e.key === "ArrowRight") {
         e.preventDefault();
-        setStoredWidth((prev) => clampWidth((prev ?? DEFAULT_WIDTH_PX) - step), true);
+        widthStore.set((prev) => clampWidth((prev ?? DEFAULT_WIDTH_PX) - step), true);
       }
     },
     [clampWidth],
   );
-
-  // Unmount mid-drag: abort (no persist) and clean up body/overlay state.
-  useEffect(() => () => endDrag(false), [endDrag]);
-
-  // The layout flipping to mobile mid-drag unmounts the handle, so its
-  // up/cancel can never arrive — abort so the overlay doesn't outlive the drag.
-  useEffect(() => {
-    if (!isDesktop) endDrag(false);
-  }, [isDesktop, endDrag]);
 
   // Re-clamp the stored width when the viewport resizes so a width chosen on
   // a wider layout doesn't crowd out the viewer after the window shrinks.
@@ -327,8 +168,8 @@ export function useResizableCommentsPanel() {
     function onResize() {
       // Re-derive the effective width from the persisted preference so the
       // panel widens back to the user's choice when the row regains space.
-      setStoredWidth((prev) => {
-        const base = preferredWidth ?? prev;
+      widthStore.set((prev) => {
+        const base = widthStore.getPreferred() ?? prev;
         return base !== null ? clampWidth(base) : prev;
       });
     }
@@ -350,11 +191,7 @@ export function useResizableCommentsPanel() {
      * clipped and would steal the neighbors' pointer streams.
      */
     handleProps: {
-      onPointerDown,
-      onPointerMove,
-      onPointerUp,
-      onPointerCancel,
-      onLostPointerCapture: onPointerCancel,
+      ...resizeDrag.handleProps,
       onKeyDown,
       role: "separator" as const,
       "aria-orientation": "vertical" as const,

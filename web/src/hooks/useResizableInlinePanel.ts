@@ -6,7 +6,9 @@
 // while the inline panel starts at a compact sidebar width.
 
 import { useCallback, useEffect, useReducer, useRef, useSyncExternalStore } from "react";
+import { createResizableWidthStore } from "@/hooks/resizableWidthStore";
 import { useInputCapabilities } from "@/hooks/useInputCapabilities";
+import { useResizeDrag } from "@/hooks/useResizeDrag";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
 const MIN_WIDTH_PX = 240;
@@ -45,8 +47,7 @@ function gutterStyle(isCoarse: boolean): React.CSSProperties {
   };
 }
 
-// ~36 % of viewport, clamped [420, 600] — ~30 % wider than the prior default so
-// the first manual open lands at a comfortable working width.
+// Default to ~36% of the viewport, clamped to a comfortable working width.
 const DEFAULT_RATIO = 0.36;
 const DEFAULT_MIN_PX = 420;
 const DEFAULT_MAX_PX = 600;
@@ -100,37 +101,11 @@ function clamp(w: number, minPx = MIN_WIDTH_PX, reservedPx = 0): number {
 // Both start null: the active session's saved width is loaded once the hook
 // learns its conversationId (see loadSession), since the width is per-session.
 let currentSessionId: string | null = null;
-let preferredWidth: number | null = null;
-let storedWidth: number | null = null;
-const listeners = new Set<() => void>();
-
-function persistWidth(value: number | null) {
-  preferredWidth = value;
+const widthStore = createResizableWidthStore(null, (value) => {
   if (currentSessionId !== null && value !== null) {
     writeSessionWorkspaceState(currentSessionId, { widthPx: value });
   }
-}
-
-function setStoredWidthRaw(value: number | null, persist = false) {
-  if (value === storedWidth) return;
-  storedWidth = value;
-  if (persist) persistWidth(value);
-  for (const l of listeners) l();
-}
-
-function setStoredWidth(next: number | ((prev: number | null) => number), persist = false) {
-  setStoredWidthRaw(typeof next === "function" ? next(storedWidth) : next, persist);
-}
-
-/** Snapshot the current width to storage (called once at drag end). */
-function persistStoredWidth() {
-  persistWidth(storedWidth);
-}
-
-function subscribe(cb: () => void): () => void {
-  listeners.add(cb);
-  return () => listeners.delete(cb);
-}
+});
 
 // Re-seed the module store from a session's saved width. Called when the
 // active conversation changes so each session restores its own width (and a
@@ -138,24 +113,15 @@ function subscribe(cb: () => void): () => void {
 function loadSession(sessionId: string | null): void {
   if (sessionId === currentSessionId) return;
   currentSessionId = sessionId;
-  preferredWidth =
-    sessionId !== null ? (readSessionWorkspaceState(sessionId).widthPx ?? null) : null;
-  setStoredWidthRaw(preferredWidth);
+  widthStore.reset(
+    sessionId !== null ? (readSessionWorkspaceState(sessionId).widthPx ?? null) : null,
+  );
 }
 
 /** Reset all module-level state. Only for use in tests. */
 export function resetWidthStoreForTesting(): void {
   currentSessionId = null;
-  preferredWidth = null;
-  setStoredWidthRaw(null);
-}
-
-function getSnapshot(): number | null {
-  return storedWidth;
-}
-
-function getServerSnapshot(): number | null {
-  return null;
+  widthStore.reset(null);
 }
 
 // ---------------------------------------------------------------------------
@@ -187,7 +153,11 @@ export function useResizableInlinePanel(
   enabled = true,
 ) {
   const { coarsePrimary } = useInputCapabilities();
-  const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
+  const raw = useSyncExternalStore(
+    widthStore.subscribe,
+    widthStore.getSnapshot,
+    widthStore.getServerSnapshot,
+  );
   // On a session switch the module store still holds the previous session's
   // width until the effect below re-seeds it after commit. Derive this render's
   // width straight from the incoming session's saved value so the panel doesn't
@@ -208,30 +178,10 @@ export function useResizableInlinePanel(
   // could dip below its minimum on a shrink. This tick forces a recompute on
   // every resize regardless of whether the stored width moved.
   const [, bumpViewport] = useReducer((n: number) => n + 1, 0);
-  const activePointerIdRef = useRef<number | null>(null);
-  const overlayRef = useRef<HTMLDivElement | null>(null);
   const minWidthRef = useRef(minWidthPx);
   minWidthRef.current = minWidthPx;
   const reservedRef = useRef(reservedPx);
   reservedRef.current = reservedPx;
-
-  // While dragging, a transparent full-window overlay sits above the panel so
-  // the pointer stream keeps reaching the parent document. Capture continues
-  // moves off the handle, but without the overlay a drag over a cross-origin
-  // iframe (e.g. the HTML preview) can still lose the stream on some engines.
-  const addDragOverlay = useCallback(() => {
-    if (overlayRef.current || typeof document === "undefined") return;
-    const el = document.createElement("div");
-    el.style.cssText =
-      "position:fixed;inset:0;z-index:2147483647;cursor:col-resize;background:transparent;";
-    document.body.appendChild(el);
-    overlayRef.current = el;
-  }, []);
-
-  const removeDragOverlay = useCallback(() => {
-    overlayRef.current?.remove();
-    overlayRef.current = null;
-  }, []);
 
   // Re-clamp on viewport resize so the panel can't overflow a shrunken window.
   // Re-derive the effective width from the persisted preference so widening the
@@ -241,8 +191,8 @@ export function useResizableInlinePanel(
   // (collapsing it restores this width).
   useEffect(() => {
     function onResize() {
-      setStoredWidth((prev) => {
-        const base = preferredWidth ?? prev;
+      widthStore.set((prev) => {
+        const base = widthStore.getPreferred() ?? prev;
         return base !== null ? clamp(base, minWidthRef.current) : defaultWidthPx();
       });
       // Force a re-render even when the stored width is unchanged, so the
@@ -253,92 +203,25 @@ export function useResizableInlinePanel(
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
-  // The resolvedWidth formula already enforces the visual minimum. No effect
-  // needed — this lets the panel shrink back when minWidthPx drops.
-
-  const endDrag = useCallback(
-    (persist: boolean) => {
-      if (activePointerIdRef.current === null) return;
-      activePointerIdRef.current = null;
-      if (persist) persistStoredWidth();
-      removeDragOverlay();
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    },
-    [removeDragOverlay],
-  );
+  const resizeDrag = useResizeDrag({
+    enabled: enabled && resolvedWidth !== 0,
+    overlay: true,
+    onCommit: widthStore.persist,
+    onMove: useCallback((e: React.PointerEvent<HTMLElement>) => {
+      widthStore.set(
+        clamp(window.innerWidth - e.clientX, minWidthRef.current, reservedRef.current),
+      );
+    }, []),
+  });
+  const cancelResizeDrag = resizeDrag.cancelDrag;
 
   // A session switch removes the old panel identity even when the next
   // session also renders a rail. Abort before re-seeding so a late pointerup
   // cannot persist the old drag into the new conversation.
   useEffect(() => {
-    endDrag(false);
+    cancelResizeDrag();
     loadSession(sessionId);
-  }, [endDrag, sessionId]);
-
-  const onPointerDown = useCallback(
-    (e: React.PointerEvent<HTMLElement>) => {
-      // First pointer wins; secondary buttons do not start a resize.
-      if (!enabled || resolvedWidth === 0) return;
-      if (activePointerIdRef.current !== null) return;
-      if (e.button !== 0) return;
-      try {
-        e.currentTarget.setPointerCapture(e.pointerId);
-      } catch {
-        return;
-      }
-      e.preventDefault();
-      activePointerIdRef.current = e.pointerId;
-      addDragOverlay();
-      document.body.style.cursor = "col-resize";
-      document.body.style.userSelect = "none";
-    },
-    [addDragOverlay, enabled, resolvedWidth],
-  );
-
-  const onPointerMove = useCallback((e: React.PointerEvent<HTMLElement>) => {
-    if (e.pointerId !== activePointerIdRef.current) return;
-    // Live width only; persist once on release to avoid a storage write per move.
-    setStoredWidth(clamp(window.innerWidth - e.clientX, minWidthRef.current, reservedRef.current));
-  }, []);
-
-  const onPointerUp = useCallback(
-    (e: React.PointerEvent<HTMLElement>) => {
-      if (e.pointerId !== activePointerIdRef.current) return;
-      endDrag(true);
-      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
-        e.currentTarget.releasePointerCapture(e.pointerId);
-      }
-    },
-    [endDrag],
-  );
-
-  const onPointerCancel = useCallback(
-    (e: React.PointerEvent<HTMLElement>) => {
-      if (e.pointerId !== activePointerIdRef.current) return;
-      endDrag(false);
-    },
-    [endDrag],
-  );
-
-  useEffect(() => {
-    const onDocumentPointerUp = (e: PointerEvent) => {
-      if (e.pointerId === activePointerIdRef.current) endDrag(true);
-    };
-    const onDocumentPointerCancel = (e: PointerEvent) => {
-      if (e.pointerId === activePointerIdRef.current) endDrag(false);
-    };
-    document.addEventListener("pointerup", onDocumentPointerUp);
-    document.addEventListener("pointercancel", onDocumentPointerCancel);
-    return () => {
-      document.removeEventListener("pointerup", onDocumentPointerUp);
-      document.removeEventListener("pointercancel", onDocumentPointerCancel);
-    };
-  }, [endDrag]);
-
-  useEffect(() => {
-    if (!enabled || resolvedWidth === 0) endDrag(false);
-  }, [enabled, endDrag, resolvedWidth]);
+  }, [cancelResizeDrag, sessionId]);
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -346,13 +229,13 @@ export function useResizableInlinePanel(
       const step = 20;
       if (e.key === "ArrowLeft") {
         e.preventDefault();
-        setStoredWidth(
+        widthStore.set(
           (prev) => clamp((prev ?? resolvedWidth) + step, minWidthRef.current, reservedRef.current),
           true,
         );
       } else if (e.key === "ArrowRight") {
         e.preventDefault();
-        setStoredWidth(
+        widthStore.set(
           (prev) => clamp((prev ?? resolvedWidth) - step, minWidthRef.current, reservedRef.current),
           true,
         );
@@ -361,16 +244,10 @@ export function useResizableInlinePanel(
     [enabled, resolvedWidth],
   );
 
-  useEffect(() => () => endDrag(false), [endDrag]);
-
   return {
     panelWidth: resolvedWidth,
     handleProps: {
-      onPointerDown,
-      onPointerMove,
-      onPointerUp,
-      onPointerCancel,
-      onLostPointerCapture: onPointerCancel,
+      ...resizeDrag.handleProps,
       onKeyDown,
       style: gutterStyle(coarsePrimary),
       role: "separator" as const,

@@ -62,6 +62,7 @@ function mockMatchMedia(matches: Record<string, boolean> = {}) {
   })) as typeof window.matchMedia;
   return {
     fire(query: string, value: boolean) {
+      matches[query] = value;
       for (const cb of listeners.get(query) ?? new Set<MediaListener>()) {
         cb({ matches: value } as MediaQueryListEvent);
       }
