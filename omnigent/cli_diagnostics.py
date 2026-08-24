@@ -110,13 +110,9 @@ _redirected_logging_streams: list[_LoggingStreamSnapshot] = []
 #: Patterns that match values likely to be secrets.  Applied to every
 #: log record's formatted message before it hits the file.
 _SECRET_PATTERNS: list[re.Pattern[str]] = [
-    # Authorization header: consume the scheme AND the credential together so
-    # "Authorization: Bearer <token>" / "Authorization: Basic <blob>" leave no
-    # credential behind. Must precede the bare-bearer rule; the optional second
-    # token stays on the same line ([ \t], not \s) so it never eats across a
-    # newline into unrelated log text.
+    # Consume both the authorization scheme and credential on the same line.
     re.compile(r"(?i)(authorization\s*[:=]\s*)\S+(?:[ \t]+\S+)?"),
-    # Bare bearer token with no Authorization prefix.
+    # Bare bearer token
     re.compile(r"(?i)(bearer\s+)\S+"),
     # Env-var style keys: FOO_TOKEN=xxx, FOO_API_KEY=xxx, ...
     re.compile(r"(?i)(\b\w*(?:token|api_key|secret|password)\s*[:=]\s*)\S+"),
@@ -128,13 +124,9 @@ _SECRET_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),
     # GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_)
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
-    # AWS access key ids (long-term AKIA, temporary ASIA). Open-ended count: a
-    # fixed {16} followed by \b fails to match AT ALL on a longer run (no word
-    # boundary after the counted chars), leaking the whole token.
+    # AWS access key ids (long-term AKIA, temporary ASIA)
     re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16,}"),
-    # URL-embedded basic-auth userinfo: https://user:pass@host → redact userinfo.
-    # The password class excludes ? — RFC 3986 §3.2.1 bars an unencoded ? from
-    # userinfo, so an @ after a ? belongs to the query and is not a credential.
+    # URL-embedded basic-auth userinfo; ``?`` begins the query, not userinfo.
     re.compile(r"(?i)(https?://)[^/\s:@]+:[^/\s@?]+(?=@)"),
 ]
 _REDACTED = "[REDACTED]"

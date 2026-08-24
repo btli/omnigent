@@ -2785,21 +2785,14 @@ def _normalize_background_task(raw: object) -> _JsonObject | None:
     return out or None
 
 
-# Upper bound on the failure detail carried to a parent session. A few hundred
-# chars keeps the surfaced error readable while refusing an entire stack trace.
+# Bound provider failure text before forwarding it to a parent session.
 _HOOK_FAILURE_DETAIL_MAX_CHARS = 500
-# Explicit marker inserted/appended when the detail is truncated.
 _HOOK_FAILURE_DETAIL_TRUNCATION_MARKER = "… [truncated]"
-# Window kept when the detail exceeds the cap: head carries the error's own
-# framing, tail the actionable final line — Python/Java tracebacks put the
-# cause LAST, so a head-only window retains pure stack-frame boilerplate.
+# Preserve the traceback framing and its final, actionable line.
 _HOOK_FAILURE_DETAIL_HEAD_CHARS = 150
 _HOOK_FAILURE_DETAIL_TAIL_CHARS = _HOOK_FAILURE_DETAIL_MAX_CHARS - _HOOK_FAILURE_DETAIL_HEAD_CHARS
-# Hard cap on the RAW payload scanned, so a multi-megabyte provider blob is
-# never fully regex-scanned or walked char-by-char. A generous multiple of the
-# output cap leaves headroom for ANSI/control bytes that shrink after stripping.
+# Bound regex and character scanning before controls are stripped.
 _HOOK_FAILURE_DETAIL_RAW_LIMIT = _HOOK_FAILURE_DETAIL_MAX_CHARS * 8
-# ANSI CSI/OSC escape sequences a provider may embed in hook text.
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 
 
@@ -2807,28 +2800,10 @@ def _sanitize_hook_failure_detail(text: str) -> str | None:
     """
     Scrub and cap untrusted hook failure text for a parent session ``output``.
 
-    Hook text is provider-controlled, so it is bounded and scrubbed:
-
-    1. The raw input is bounded up front so a huge blob is never fully scanned.
-       That bound is itself a pre-redaction cut, so when it actually truncates,
-       the trailing (possibly bisected) token is dropped — otherwise the raw
-       cut could leave a length-gated secret as a sub-threshold, un-matchable
-       prefix.
-    2. ANSI escapes and control bytes are stripped to a single line, so the
-       detail cannot corrupt a terminal or log.
-    3. Secrets are redacted BEFORE the length cap, so a length-gated pattern
-       (e.g. ``sk-…{10,}``) matches whole tokens — a boundary token becomes
-       ``[REDACTED]`` before truncation can split it into a usable prefix.
-    4. An over-long detail is windowed head+tail with the marker between,
-       because tracebacks put the actionable line last. A detail cut by the
-       raw bound but left under the cap still gets the marker, so truncated
-       text never reads as the complete message.
-
-    The no-leak guarantee is provided by steps 1 and 3: no secret the redactor
-    recognizes can appear in the result, including one straddling the raw bound
-    or the length cap. (An unrecognized token cut mid-string is inherent to any
-    cap.) Every redaction pattern is ungated or open-ended, so the pre-cap pass
-    alone cannot miss a token the cap would newly expose — no post-cap re-scan.
+    ANSI escapes and controls are removed before whitespace is collapsed.
+    Secrets are redacted before the head/tail window is selected so the cap
+    cannot expose a token prefix. A raw cut drops its potentially partial final
+    token and always carries a truncation marker.
 
     :param text: Raw failure text from a ``StopFailure`` hook payload.
     :returns: Sanitized single-line detail, or ``None`` when nothing usable
@@ -2836,12 +2811,9 @@ def _sanitize_hook_failure_detail(text: str) -> str | None:
     """
     raw_truncated = len(text) > _HOOK_FAILURE_DETAIL_RAW_LIMIT
     without_ansi = _ANSI_ESCAPE_RE.sub("", text[:_HOOK_FAILURE_DETAIL_RAW_LIMIT])
-    # Non-printable control bytes (and newlines/tabs) become spaces so the detail
-    # cannot corrupt a terminal or log; whitespace runs then collapse to one.
     stripped = "".join(ch if ch.isprintable() else " " for ch in without_ansi)
     if raw_truncated:
-        # The raw bound may have bisected the final token; drop that trailing
-        # non-space run so a length-gated secret cannot survive as a prefix.
+        # The raw bound may bisect a secret-shaped token.
         stripped = re.sub(r"\S+$", "", stripped)
     collapsed = " ".join(stripped.split())
     if not collapsed:
@@ -2852,8 +2824,6 @@ def _sanitize_hook_failure_detail(text: str) -> str | None:
         tail = redacted[-_HOOK_FAILURE_DETAIL_TAIL_CHARS:].lstrip()
         return f"{head} {_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER} {tail}"
     if raw_truncated:
-        # The raw cut plus bisected-token drop can leave a short fragment
-        # under the cap; mark it so it never reads as the complete message.
         return f"{redacted} {_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER}"
     return redacted
 
@@ -2862,13 +2832,8 @@ def _hook_failure_detail(payload: _JsonObject) -> str | None:
     """
     Build a sanitized failure detail from a ``StopFailure`` hook payload.
 
-    Prefers the human-readable ``last_assistant_message`` and prefixes the
-    ``error`` code when both are present, so the parent session surfaces
-    actionable text instead of the generic failure string. Each field is
-    sanitized separately so a field carrying only ANSI/control noise drops
-    out entirely — checking emptiness on the raw combined string would let
-    the ``": "`` separator survive when both fields sanitize away, surfacing
-    a bare ``":"`` that shadows the generic fallback.
+    Each field is sanitized separately so control-only values do not leave a
+    dangling separator or shadow the generic failure fallback.
 
     :param payload: ``StopFailure`` hook payload.
     :returns: Sanitized detail, or ``None`` when the payload carried none.

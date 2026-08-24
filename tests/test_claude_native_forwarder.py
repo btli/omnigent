@@ -1995,16 +1995,33 @@ async def test_forwarder_uses_auth_to_refresh_token_per_request(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_fields", "expected_data"),
+    [
+        ({}, {"status": "failed"}),
+        (
+            {
+                "error": "model_not_found",
+                "last_assistant_message": (
+                    "There's an issue with the selected model (claude-fable-5)."
+                ),
+            },
+            {
+                "status": "failed",
+                "output": (
+                    "model_not_found: There's an issue with the selected model (claude-fable-5)."
+                ),
+            },
+        ),
+    ],
+    ids=["without-detail", "provider-detail"],
+)
 async def test_forwarder_posts_external_session_status_on_stop_failure_hook(
     tmp_path: Path,
+    failure_fields: dict[str, str],
+    expected_data: dict[str, str],
 ) -> None:
-    """
-    ``StopFailure`` maps to ``session.status`` failed, not idle.
-
-    A regression that collapses both Stop variants to ``idle`` would
-    silently hide turn errors from the web UI — the user would see
-    the session return to idle as if everything succeeded.
-    """
+    """``StopFailure`` posts a failed status with available provider detail."""
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text("", encoding="utf-8")
@@ -2018,7 +2035,11 @@ async def test_forwarder_posts_external_session_status_on_stop_failure_hook(
     )
     record_hook_event(
         bridge_dir,
-        {"hook_event_name": "StopFailure", "session_id": "claude-session"},
+        {
+            "hook_event_name": "StopFailure",
+            "session_id": "claude-session",
+            **failure_fields,
+        },
     )
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
@@ -2044,72 +2065,8 @@ async def test_forwarder_posts_external_session_status_on_stop_failure_hook(
 
     assert request["body"] == {
         "type": "external_session_status",
-        "data": {"status": "failed"},
+        "data": expected_data,
     }
-
-
-@pytest.mark.asyncio
-async def test_forwarder_posts_stop_failure_detail_as_output(
-    tmp_path: Path,
-) -> None:
-    """
-    A ``StopFailure`` carrying failure text posts it as the failed ``output``.
-
-    Reproduces the incident where a sub-agent failed on an unservable model:
-    the hook's ``error`` + ``last_assistant_message`` was the actionable text,
-    but the parent only ever saw the generic "turn failed" string because the
-    forwarder posted the failed status with no ``output``.
-    """
-    bridge_dir = tmp_path / "bridge"
-    transcript_path = tmp_path / "session.jsonl"
-    transcript_path.write_text("", encoding="utf-8")
-    record_hook_event(
-        bridge_dir,
-        {
-            "hook_event_name": "SessionStart",
-            "session_id": "claude-session",
-            "transcript_path": str(transcript_path),
-        },
-    )
-    record_hook_event(
-        bridge_dir,
-        {
-            "hook_event_name": "StopFailure",
-            "session_id": "claude-session",
-            "error": "model_not_found",
-            "last_assistant_message": (
-                "There's an issue with the selected model (claude-fable-5)."
-            ),
-        },
-    )
-    server, thread, base_url = _start_recording_server()
-    task = asyncio.create_task(
-        forward_claude_transcript_to_session(
-            base_url=base_url,
-            headers={},
-            session_id="conv_abc",
-            bridge_dir=bridge_dir,
-            agent_name="claude-native-ui",
-            start_at_end=False,
-            poll_interval_s=0.01,
-        )
-    )
-    try:
-        request = await _get_recorded_request(server)
-    finally:
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5.0)
-
-    assert request["body"]["type"] == "external_session_status"
-    data = request["body"]["data"]
-    assert data["status"] == "failed"
-    assert data["output"] == (
-        "model_not_found: There's an issue with the selected model (claude-fable-5)."
-    )
 
 
 @pytest.mark.asyncio
