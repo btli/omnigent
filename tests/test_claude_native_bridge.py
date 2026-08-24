@@ -7511,6 +7511,25 @@ def test_hook_failure_detail_redacts_cross_field_authorization() -> None:
     assert secret not in detail
 
 
+def test_hook_failure_detail_bounds_fields_before_stripping() -> None:
+    """Provider fields are bounded before whitespace normalization scans them."""
+
+    class GuardedDetail(str):
+        def strip(self, chars: str | None = None, /) -> str:
+            raise AssertionError("unbounded provider field strip")
+
+    raw = GuardedDetail(
+        "provider failure\n"
+        + "x" * (_HOOK_FAILURE_DETAIL_RAW_LIMIT + 100)
+        + " FinalCause: model_not_found"
+    )
+    detail = _hook_failure_detail({"error": raw})
+    assert detail is not None
+    assert detail.startswith("provider failure")
+    assert "FinalCause: model_not_found" in detail
+    assert _HOOK_FAILURE_DETAIL_TRUNCATION_MARKER in detail
+
+
 def test_hook_failure_detail_neutralizes_system_frame_delimiters() -> None:
     """Provider text cannot close and forge a model-visible system frame."""
     detail = _hook_failure_detail(
@@ -7613,14 +7632,30 @@ def test_sanitize_hook_failure_detail_redacts_secret_straddling_truncation() -> 
     assert "dapi" not in detail
 
 
-def test_sanitize_hook_failure_detail_redacts_secret_straddling_raw_bound() -> None:
+def test_sanitize_hook_failure_detail_drops_secret_straddling_raw_bound() -> None:
     """A secret bisected by the raw input bound cannot leak as a prefix."""
     prefix = "boot error: "
     token = "dapi" + "A" * 40
-    pad = "\x00" * (_HOOK_FAILURE_DETAIL_RAW_LIMIT - len(prefix) - 6)
-    detail = _sanitize_hook_failure_detail(f"{prefix}{pad} {token}")
+    midpoint = _HOOK_FAILURE_DETAIL_RAW_LIMIT // 2
+    head_pad = "x" * (midpoint - len(prefix) - len(token) // 2)
+    tail_pad = "y" * (midpoint - (len(token) - len(token) // 2) + 1)
+    detail = _sanitize_hook_failure_detail(f"{prefix}{head_pad}{token}{tail_pad}")
     assert detail == f"boot error: {_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER}"
     assert "dapi" not in detail
+
+
+def test_sanitize_hook_failure_detail_keeps_newline_free_raw_tail() -> None:
+    """A newline-free raw tail drops its partial token but keeps complete words."""
+    text = (
+        "Traceback starts here\n"
+        + "x" * _HOOK_FAILURE_DETAIL_RAW_LIMIT
+        + " FinalCause model_not_found"
+    )
+    detail = _sanitize_hook_failure_detail(text)
+    assert detail == (
+        f"Traceback starts here FinalCause model_not_found "
+        f"{_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER}"
+    )
 
 
 def test_sanitize_hook_failure_detail_drops_partial_authorization_tail() -> None:
@@ -7721,6 +7756,24 @@ def test_sanitize_hook_failure_detail_orders_redaction_before_framing(
 ) -> None:
     """URL redaction stays trusted while planted markers are neutralized."""
     assert _sanitize_hook_failure_detail(text) == expected
+
+
+def test_sanitize_hook_failure_detail_redacts_after_planted_marker() -> None:
+    """A planted marker cannot shield a following bearer credential."""
+    detail = _sanitize_hook_failure_detail("Bearer [REDACTED] abcdefghijk")
+    assert detail == "Bearer (REDACTED) [REDACTED]"
+
+
+def test_redact_hook_failure_shadow_clamps_empty_mapped_span(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty shadow span cannot duplicate a visible-only character."""
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "redact_secrets",
+        lambda _text: "a[REDACTED]b",
+    )
+    assert claude_native_bridge._redact_hook_failure_shadow("a\u200db") == "a[REDACTED]b"
 
 
 def test_sanitize_hook_failure_detail_marks_removed_single_token() -> None:

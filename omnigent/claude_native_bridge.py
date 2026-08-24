@@ -2829,14 +2829,19 @@ def _raw_hook_failure_window(text: str) -> tuple[str, bool]:
     head = re.sub(r"\S+$", "", text[:_HOOK_FAILURE_DETAIL_RAW_HEAD_CHARS])
     tail = text[-_HOOK_FAILURE_DETAIL_RAW_TAIL_CHARS:]
     while tail:
+        tail_before_partition = tail
         _, separator, tail = tail.partition("\n")
-        if not separator or not tail.startswith((" ", "\t")):
+        if not separator:
+            tail = re.sub(r"^\S+", "", tail_before_partition)
+            break
+        if not tail.startswith((" ", "\t")):
             break
     return "\n".join(part.strip() for part in (head, tail) if part.strip()), True
 
 
 def _redact_hook_failure_shadow(text: str) -> str:
     """Apply redaction matches from a deobfuscated shadow to readable text."""
+    # Match the deobfuscated shadow, emit readable NFKC, and map aligned redaction spans.
     prepared = "".join(
         "\x00" if unicodedata.category(ch).startswith("Z") and ch != " " else ch for ch in text
     )
@@ -2858,7 +2863,7 @@ def _redact_hook_failure_shadow(text: str) -> str:
     visible = "".join(visible_chars)
     shadow = "".join(shadow_chars)
     visible = _HOOK_FAILURE_PLANTED_REDACTION_RE.sub("(REDACTED)", visible)
-    shadow = _HOOK_FAILURE_PLANTED_REDACTION_RE.sub("(REDACTED)", shadow)
+    shadow = _HOOK_FAILURE_PLANTED_REDACTION_RE.sub(lambda match: " " * len(match.group()), shadow)
     redacted = redact_secrets(shadow)
     if redacted == shadow:
         return " ".join(visible.split())
@@ -2875,6 +2880,7 @@ def _redact_hook_failure_shadow(text: str) -> str:
         for index in range(1, len(parts))
     ]
     for start, end in reversed(spans):
+        start, end = sorted((start, end))
         visible = f"{visible[:start]}{_HOOK_FAILURE_REDACTION_MARKER}{visible[end:]}"
     return " ".join(visible.split())
 
@@ -2932,8 +2938,19 @@ def _hook_failure_detail(payload: _JsonObject) -> str | None:
     """
     raw_error = payload.get("error")
     raw_message = payload.get("last_assistant_message")
-    error = raw_error.strip() if isinstance(raw_error, str) else ""
-    message = raw_message.strip() if isinstance(raw_message, str) else ""
+
+    def bounded_field(value: object) -> str:
+        if not isinstance(value, str):
+            return ""
+        if len(value) > _HOOK_FAILURE_DETAIL_RAW_LIMIT:
+            value = (
+                f"{value[:_HOOK_FAILURE_DETAIL_RAW_HEAD_CHARS]}\n"
+                f"{value[-_HOOK_FAILURE_DETAIL_RAW_TAIL_CHARS:]}"
+            )
+        return value.strip()
+
+    error = bounded_field(raw_error)
+    message = bounded_field(raw_message)
     if error and message:
         combined = f"{error}: {message}"
     else:

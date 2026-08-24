@@ -220,8 +220,27 @@ def test_redact_secrets_scrubs_structured_credentials(
             ("0123456789abcdef0123",),
             ("Authorization: [REDACTED]",),
         ),
+        (
+            "Authorization: GNAP+Sig 0123456789abcdef0123",
+            ("0123456789abcdef0123",),
+            ("Authorization: [REDACTED]",),
+        ),
+        (
+            "Authorization='GNAP+Sig 0123456789abcdef0123'; status=401",
+            ("0123456789abcdef0123",),
+            ("Authorization='[REDACTED]'", "status=401"),
+        ),
     ],
-    ids=["digest", "aws4", "quoted-json", "folded-basic", "token", "scheme-less"],
+    ids=[
+        "digest",
+        "aws4",
+        "quoted-json",
+        "folded-basic",
+        "token",
+        "scheme-less",
+        "gnap-sig",
+        "matching-quote",
+    ],
 )
 def test_redact_secrets_scrubs_complete_authorization_values(
     text: str, removed: tuple[str, ...], preserved: tuple[str, ...]
@@ -243,14 +262,14 @@ def test_redact_secrets_preserves_authorization_prose() -> None:
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
-        ("Authorization: Bearer abcdefghijk, retrying", "Authorization: [REDACTED], retrying"),
+        ("Authorization: Bearer abcdefghijk, retrying", "Authorization: [REDACTED]"),
         ("(bearer abcdefghijk)", "(bearer [REDACTED])"),
         ('"bearer abcdefghijk"', '"bearer [REDACTED]"'),
     ],
     ids=["authorization-comma", "parenthesized", "quoted"],
 )
 def test_redact_secrets_scrubs_punctuation_terminated_bearer(text: str, expected: str) -> None:
-    """Punctuation after a bearer credential is not part of the token."""
+    """Punctuation around bearer credentials cannot prevent redaction."""
     assert cli_diagnostics.redact_secrets(text) == expected
 
 
@@ -260,8 +279,9 @@ def test_redact_secrets_scrubs_punctuation_terminated_bearer(text: str, expected
         ("https://:credential@host.example/path", ("credential",)),
         ("https://credential:@host.example/path", ("credential",)),
         ("https://tokenvalue@host.example/path", ("tokenvalue",)),
+        ("https://u:p@ss@host.example/path", ("u:p@ss",)),
     ],
-    ids=["empty-user", "empty-password", "no-password"],
+    ids=["empty-user", "empty-password", "no-password", "at-in-password"],
 )
 def test_redact_secrets_scrubs_url_authority_userinfo(url: str, removed: tuple[str, ...]) -> None:
     """Only userinfo inside the URL authority is redacted."""
@@ -269,6 +289,25 @@ def test_redact_secrets_scrubs_url_authority_userinfo(url: str, removed: tuple[s
     assert scrubbed == "https://[REDACTED]@host.example/path"
     for value in removed:
         assert value not in scrubbed
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        (
+            "https://user:pass@host_name%2Einternal/path",
+            "https://[REDACTED]@host_name%2Einternal/path",
+        ),
+        (
+            "https://user:pass@[fe80::1%25eth0]/path",
+            "https://[REDACTED]@[fe80::1%25eth0]/path",
+        ),
+    ],
+    ids=["reg-name", "ipv6-zone"],
+)
+def test_redact_secrets_accepts_url_host_characters(url: str, expected: str) -> None:
+    """Valid reg-name and IPv6 zone characters terminate URL userinfo."""
+    assert cli_diagnostics.redact_secrets(url) == expected
 
 
 @pytest.mark.parametrize(
@@ -304,9 +343,10 @@ def test_redact_secrets_preserves_non_userinfo_urls(text: str) -> None:
 
 def test_redact_secrets_is_idempotent() -> None:
     """Repeated formatter and stderr passes preserve the first redaction."""
-    text = "Authorization: Bearer abcdefghijk request failed"
+    text = '{"Authorization": "GNAP+Sig abcdefghijk", "status": "request failed"}'
     once = cli_diagnostics.redact_secrets(text)
     assert cli_diagnostics.redact_secrets(once) == once
+    assert once == '{"Authorization": "[REDACTED]", "status": "request failed"}'
     assert "request failed" in once
 
 

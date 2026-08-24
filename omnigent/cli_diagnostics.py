@@ -109,18 +109,18 @@ _redirected_logging_streams: list[_LoggingStreamSnapshot] = []
 
 #: Patterns that match values likely to be secrets.  Applied to every
 #: log record's formatted message before it hits the file.
+_AUTHORIZATION_RE = re.compile(
+    r'(?i)(?P<prefix>["\']?authorization["\']?\s*[:=]\s*)'
+    r'(?P<quote>["\'])?'
+    r"(?P<value>(?(quote)(?:\\[^\r\n]|(?!(?P=quote))[^\r\n])*"
+    r"|(?:[^\r\n]|\r?\n[ \t]+)*))"
+    r"(?(quote)(?P=quote))"
+)
+# Eight characters excludes short prose while covering the shortest accepted credentials.
+_AUTHORIZATION_VALUE_RE = re.compile(r"[A-Za-z0-9._~+/=-]{8,}")
+
 _SECRET_PATTERNS: list[re.Pattern[str]] = [
-    # Any Authorization scheme or opaque value; structured parameters consume the line.
-    re.compile(
-        r'(?i)(["\']?authorization["\']?\s*[:=]\s*["\']?)'
-        r"(?!\[REDACTED\])(?:"
-        r"(?=[A-Za-z][A-Za-z0-9_-]*(?:[ \t]+|\r?\n[ \t]+)"
-        r"[A-Za-z][A-Za-z0-9_-]*\s*=\s*\S)(?:[^\r\n]|\r?\n[ \t]+)+"
-        r"|(?:[A-Za-z][A-Za-z0-9_-]*(?:[ \t]+|\r?\n[ \t]+))?"
-        r"[A-Za-z0-9._~+/=-]{8,}(?![A-Za-z0-9._~+/=-])"
-        r")"
-    ),
-    # Bare bearer token; the length floor avoids prose such as "bearer of news".
+    # Bare bearer tokens outside an Authorization field.
     re.compile(
         r"(?i)(\bbearer[ \t]+)(?!\[REDACTED\])"
         r"[A-Za-z0-9._~+/=-]{8,}(?![A-Za-z0-9._~+/=-])"
@@ -139,8 +139,9 @@ _SECRET_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16,}"),
     # URL userinfo is confined to one whitespace-bounded authority.
     re.compile(
-        r"(?i)(https?://)[^/\s@?#:]*(?::[^/\s@?#]*)?"
-        r"(?=@(?:\[[0-9a-f:.%]+\]|[a-z0-9.-]+)(?::[0-9]+)?(?:[/?#\s]|$))"
+        r"(?i)(https?://)[^/\s@?#:]*(?::[^/\s?#]*)?"
+        r"(?=@(?:\[[a-z0-9._~!$&'()*+,;=:%-]+\]"
+        r"|[a-z0-9._~!$&'()*+,;=%-]+)(?::[0-9]+)?(?:[/?#\s]|$))"
     ),
 ]
 _REDACTED = "[REDACTED]"
@@ -153,6 +154,15 @@ def redact_secrets(text: str) -> str:
     :param text: Arbitrary log text (may include tracebacks).
     :returns: Scrubbed text.
     """
+
+    def redact_authorization(match: re.Match[str]) -> str:
+        value = match.group("value")
+        if value.lstrip().startswith(_REDACTED) or _AUTHORIZATION_VALUE_RE.search(value) is None:
+            return match.group(0)
+        quote = match.group("quote") or ""
+        return f"{match.group('prefix')}{quote}{_REDACTED}{quote}"
+
+    text = _AUTHORIZATION_RE.sub(redact_authorization, text)
     for pat in _SECRET_PATTERNS:
         text = pat.sub(
             lambda m: m.group(1) + _REDACTED if m.lastindex else _REDACTED,
