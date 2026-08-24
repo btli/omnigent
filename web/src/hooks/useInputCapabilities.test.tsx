@@ -1,5 +1,5 @@
 import { act, renderHook } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { useInputCapabilities } from "./useInputCapabilities";
 
@@ -33,78 +33,32 @@ function installMatchMedia(state: Record<string, boolean>) {
   };
 }
 
-function setMaxTouchPoints(value: number) {
-  Object.defineProperty(navigator, "maxTouchPoints", {
-    configurable: true,
-    value,
-  });
-}
-
-afterEach(() => {
-  setMaxTouchPoints(0);
-});
-
 describe("useInputCapabilities", () => {
-  it("reports a mouse desktop when no query matches", () => {
+  it("reports no coarse pointer when the query does not match", () => {
     installMatchMedia({});
     const { result } = renderHook(() => useInputCapabilities());
-    expect(result.current).toEqual({
-      coarsePrimary: false,
-      anyCoarse: false,
-      hoverPrimary: false,
-      hasTouch: false,
-    });
+    expect(result.current).toEqual({ anyCoarse: false });
   });
 
-  it("reads each capability from its media query and maxTouchPoints", () => {
-    installMatchMedia({
-      "(pointer: coarse)": true,
-      "(any-pointer: coarse)": true,
-      "(hover: hover)": false,
-    });
-    setMaxTouchPoints(5);
+  it("reports a coarse pointer when the query matches", () => {
+    installMatchMedia({ "(any-pointer: coarse)": true });
     const { result } = renderHook(() => useInputCapabilities());
-    expect(result.current).toEqual({
-      coarsePrimary: true,
-      anyCoarse: true,
-      hoverPrimary: false,
-      hasTouch: true,
-    });
+    expect(result.current).toEqual({ anyCoarse: true });
   });
 
-  it("keeps viewport-independent axes independent: a fine-primary touch laptop", () => {
-    // any-pointer coarse (touchscreen present) with a fine hovering primary
-    // (trackpad) — TR-2's touch-laptop shape must be representable.
-    installMatchMedia({
-      "(any-pointer: coarse)": true,
-      "(hover: hover)": true,
-    });
-    setMaxTouchPoints(10);
+  it("updates live when the coarse-pointer query flips", () => {
+    const media = installMatchMedia({});
     const { result } = renderHook(() => useInputCapabilities());
-    expect(result.current).toEqual({
-      coarsePrimary: false,
-      anyCoarse: true,
-      hoverPrimary: true,
-      hasTouch: true,
-    });
-  });
-
-  it("updates live when a media query flips (convertible mode change)", () => {
-    const media = installMatchMedia({ "(hover: hover)": true });
-    const { result } = renderHook(() => useInputCapabilities());
-    expect(result.current.coarsePrimary).toBe(false);
-    expect(result.current.hoverPrimary).toBe(true);
+    expect(result.current.anyCoarse).toBe(false);
 
     act(() => {
-      media.set("(pointer: coarse)", true);
-      media.set("(hover: hover)", false);
+      media.set("(any-pointer: coarse)", true);
     });
-    expect(result.current.coarsePrimary).toBe(true);
-    expect(result.current.hoverPrimary).toBe(false);
+    expect(result.current.anyCoarse).toBe(true);
   });
 
   it("returns a referentially stable snapshot while values are unchanged", () => {
-    installMatchMedia({ "(hover: hover)": true });
+    installMatchMedia({ "(any-pointer: coarse)": true });
     const { result, rerender } = renderHook(() => useInputCapabilities());
     const first = result.current;
     rerender();

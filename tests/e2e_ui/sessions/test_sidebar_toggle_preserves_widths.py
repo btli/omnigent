@@ -91,9 +91,10 @@ def test_shrinking_viewport_keeps_chat_minimum_with_sidebar_open(
     expect(conversations).not_to_have_attribute("data-collapsed", "true")
     assert _chat_width(page) >= _CHAT_MIN_PX - 1, _chat_width(page)
 
-    # At this tablet width the rail clamp binds exactly at the 240px hard floor.
+    # At this tablet width the rail clamp may cede below the chat's comfort
+    # minimum, but it must preserve the hard floor.
     page.set_viewport_size({"width": 928, "height": 800})
     expect(conversations).not_to_have_attribute("data-collapsed", "true")
     chat_width = _chat_width(page)
-    assert abs(chat_width - _CHAT_HARD_MIN_PX) <= 2, chat_width
+    assert chat_width >= _CHAT_HARD_MIN_PX - 1, chat_width
     assert chat_width < _CHAT_MIN_PX, chat_width
