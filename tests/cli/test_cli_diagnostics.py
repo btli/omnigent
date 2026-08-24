@@ -290,6 +290,14 @@ def test_redact_secrets_scrubs_folded_quoted_authorization(newline: str) -> None
     assert cli_diagnostics.redact_secrets(text) == 'Authorization: "[REDACTED]"'
 
 
+def test_redact_secrets_limits_unterminated_quoted_authorization_folds() -> None:
+    """A malformed quoted value cannot consume an indented stack trace."""
+    text = 'Authorization: "abc\n secretcredential\n frame one\n frame two'
+    assert cli_diagnostics.redact_secrets(text) == (
+        'Authorization: "[REDACTED]\n frame one\n frame two'
+    )
+
+
 def test_redact_secrets_scrubs_after_planted_authorization_marker() -> None:
     """A planted marker cannot shield a later Authorization credential."""
     text = "Authorization: [REDACTED] actualcredential"

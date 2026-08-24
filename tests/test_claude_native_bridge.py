@@ -7653,7 +7653,7 @@ def test_sanitize_hook_failure_detail_keeps_newline_free_raw_tail() -> None:
     )
     detail = _sanitize_hook_failure_detail(text)
     assert detail == (
-        f"Traceback starts here FinalCause model_not_found "
+        f"Traceback starts here\nFinalCause model_not_found "
         f"{_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER}"
     )
 
@@ -7671,7 +7671,7 @@ def test_sanitize_hook_failure_detail_drops_partial_authorization_tail() -> None
     )
     detail = _sanitize_hook_failure_detail(text)
     assert detail == (
-        f"Traceback starts here FinalCause: provider rejected credentials "
+        f"Traceback starts here\nFinalCause: provider rejected credentials "
         f"{_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER}"
     )
     assert secret not in detail
@@ -7689,11 +7689,11 @@ def test_sanitize_hook_failure_detail_redacts_overlong_aws_key_straddling_cap() 
 
 
 def test_sanitize_hook_failure_detail_strips_control_and_ansi() -> None:
-    """ANSI and control bytes are removed and whitespace becomes one line."""
+    """ANSI and control bytes are removed without flattening line boundaries."""
     detail = _sanitize_hook_failure_detail("\x1b[31mred\x1b[0m\x07 line one\nline two\tcol\x00nul")
-    assert detail == "red line one line two col nul"
+    assert detail == "red line one\nline two col nul"
     assert "\x1b" not in detail
-    assert "\n" not in detail and "\t" not in detail and "\x00" not in detail
+    assert "\t" not in detail and "\x00" not in detail
 
 
 @pytest.mark.parametrize(
@@ -7738,9 +7738,9 @@ def test_sanitize_hook_failure_detail_redacts_thin_space_github_token() -> None:
 
 
 def test_sanitize_hook_failure_detail_preserves_nfkc_diagnostics() -> None:
-    """The emitted detail preserves scripts, accents, joiners, and modifiers."""
+    """NFKC text stays readable while ignorable format characters become spaces."""
     detail = _sanitize_hook_failure_detail("München réessayer क्ष 👩\u200d💻 ｶﾞ")
-    assert detail == "München réessayer क्ष 👩\u200d💻 ガ"
+    assert detail == "München réessayer क्ष 👩 💻 ガ"
 
 
 @pytest.mark.parametrize(
@@ -7764,10 +7764,38 @@ def test_sanitize_hook_failure_detail_redacts_after_planted_marker() -> None:
     assert detail == "Bearer (REDACTED) [REDACTED]"
 
 
-def test_sanitize_hook_failure_detail_redacts_thin_space_bearer() -> None:
-    """A Unicode separator remains recognizable as a bearer-token gap."""
-    detail = _sanitize_hook_failure_detail("Bearer\u2009abcdefghijk")
-    assert detail == "Bearer [REDACTED]"
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("x\u2009Bearer\u2009abcdefghijk", "x Bearer [REDACTED]"),
+        ("ghp_abcdefghijbearer\u2009klmnopqrst", "[REDACTED]"),
+        ("Bearer\nabcdefghijk", "Bearer\n[REDACTED]"),
+        ("Authorization\n: Basic dXNlcjpodW50ZXIy", "Authorization\n: [REDACTED]"),
+        ("bearer\ufeffabcdefghijk", "bearer [REDACTED]"),
+        ("bearer\u2060abcdefghijk", "bearer [REDACTED]"),
+        ("bearer\u200dabcdefghijk", "bearer [REDACTED]"),
+        ("Bearer\u2009of bad news", "Bearer of bad news"),
+        ("bearer\ufeffof bad news", "bearer of bad news"),
+        ("Bearer\nof bad news", "Bearer\nof bad news"),
+    ],
+    ids=[
+        "prefixed-thin-space-bearer",
+        "github-token-with-thin-space",
+        "newline-bearer",
+        "split-authorization-key",
+        "bom-bearer",
+        "word-joiner-bearer",
+        "zwj-bearer",
+        "thin-space-prose",
+        "bom-prose",
+        "newline-prose",
+    ],
+)
+def test_sanitize_hook_failure_detail_canonicalizes_before_redaction(
+    text: str, expected: str
+) -> None:
+    """Secret matching uses the same canonical text emitted to the parent."""
+    assert _sanitize_hook_failure_detail(text) == expected
 
 
 @pytest.mark.parametrize(
@@ -7785,15 +7813,15 @@ def test_sanitize_hook_failure_detail_redacts_empty_authorization(
     assert _sanitize_hook_failure_detail(text) == expected
 
 
-def test_sanitize_hook_failure_detail_maps_empty_url_userinfo() -> None:
-    """Empty URL userinfo safely covers a visible-only joiner."""
+def test_sanitize_hook_failure_detail_redacts_canonical_empty_url_userinfo() -> None:
+    """Ignorable-only URL userinfo remains redacted after canonicalization."""
     assert _sanitize_hook_failure_detail("https://\u200d@host") == "https://[REDACTED]@host"
 
 
 def test_sanitize_hook_failure_detail_preserves_lines_after_authorization() -> None:
     """Authorization redaction stops before a following diagnostic line."""
     detail = _sanitize_hook_failure_detail("Authorization: abcdefghijk\nNext-Line: ok")
-    assert detail == "Authorization: [REDACTED] Next-Line: ok"
+    assert detail == "Authorization: [REDACTED]\nNext-Line: ok"
 
 
 def test_sanitize_hook_failure_detail_marks_removed_single_token() -> None:

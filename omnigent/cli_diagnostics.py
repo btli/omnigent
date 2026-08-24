@@ -111,22 +111,25 @@ _redirected_logging_streams: list[_LoggingStreamSnapshot] = []
 #: log record's formatted message before it hits the file.
 _AUTHORIZATION_KEY_RE = re.compile(
     r'(?i)(?<!\w)(?P<prefix>(?:"authorization"|\'authorization\'|authorization)'
-    r"[ \t]*[:=][ \t]*)"
+    r"[ \t\r\n]*[:=][ \t\r\n]*)"
 )
 
 _SECRET_PATTERNS: list[re.Pattern[str]] = [
     # The keyless branch keeps a length floor so ordinary bearer prose survives.
-    re.compile(r"(?i)(\bbearer[ \t]+)[A-Za-z0-9._~+/=-]{8,}(?![A-Za-z0-9._~+/=-])"),
+    re.compile(
+        r"(?i)(\bbearer[ \t\r\n]+(?:\(REDACTED\)[ \t\r\n]+)*)"
+        r"[A-Za-z0-9._~+/=-]{8,}(?![A-Za-z0-9._~+/=-])"
+    ),
     # Env-var style keys: FOO_TOKEN=xxx, FOO_API_KEY=xxx, ...
     re.compile(r"(?i)(\b\w*(?:token|api_key|secret|password)\s*[:=]\s*)\S+"),
     # Anthropic / OpenAI style keys
     re.compile(r"\bsk-[A-Za-z0-9_-]{10,}\b"),
     # Databricks PATs
-    re.compile(r"\bdapi[A-Za-z0-9]{10,}\b"),
+    re.compile(r"\bdapi[^\W_](?: ?[^\W_]){9,}\b"),
     # Slack tokens (xoxb-/xoxa-/xoxp-/xoxr-/xoxs-)
     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),
     # GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_)
-    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9](?: ?[A-Za-z0-9]){19,}\b"),
     # AWS access key ids (long-term AKIA, temporary ASIA)
     re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16,}"),
     # URL userinfo is confined to one whitespace-bounded authority.
@@ -134,8 +137,14 @@ _SECRET_PATTERNS: list[re.Pattern[str]] = [
         r"(?i)(https?://)[^/\s?#]*"
         r"(?=@(?:\[[^/\s@?#]+\]|[^/\s@?#:]+)(?::[0-9]+)?(?:[/?#\s]|$))"
     ),
+    # Canonicalized ignorable-only userinfo becomes one space before the delimiter.
+    re.compile(
+        r"(?i)(https?://) +"
+        r"(?=@(?:\[[^/\s@?#]+\]|[^/\s@?#:]+)(?::[0-9]+)?(?:[/?#\s]|$))"
+    ),
 ]
 _REDACTED = "[REDACTED]"
+_MAX_UNTERMINATED_AUTHORIZATION_FOLDS = 1
 
 
 def _authorization_value_end(text: str, start: int, quote: str | None) -> tuple[int, bool]:
@@ -144,9 +153,12 @@ def _authorization_value_end(text: str, start: int, quote: str | None) -> tuple[
 
     Quoted values end at an unescaped matching quote; unquoted values end at
     end-of-line. In either form, CR, LF, or CRLF followed by indentation
-    continues the value; an unclosed quote stops at the first non-folded line end.
+    continues the value. A closed quote may span any number of folds; an
+    unclosed quote retains at most one continuation line of redaction.
     """
     index = start
+    unterminated_end: int | None = None
+    folded_lines = 0
     while index < len(text):
         char = text[index]
         if quote is not None:
@@ -160,11 +172,18 @@ def _authorization_value_end(text: str, start: int, quote: str | None) -> tuple[
             if char == "\r" and newline_end < len(text) and text[newline_end] == "\n":
                 newline_end += 1
             if newline_end < len(text) and text[newline_end] in " \t":
+                folded_lines += 1
+                if (
+                    quote is not None
+                    and folded_lines > _MAX_UNTERMINATED_AUTHORIZATION_FOLDS
+                    and unterminated_end is None
+                ):
+                    unterminated_end = index
                 index = newline_end
                 continue
-            return index, False
+            return unterminated_end if unterminated_end is not None else index, False
         index += 1
-    return index, False
+    return unterminated_end if unterminated_end is not None else index, False
 
 
 def _redact_authorization_values(text: str) -> str:

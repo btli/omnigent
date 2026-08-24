@@ -2816,7 +2816,6 @@ _ANSI_ESCAPE_RE = re.compile(
     r")",
     re.DOTALL,
 )
-_HOOK_FAILURE_IGNORED_UNICODE_CATEGORIES = frozenset({"Cf", "Cs"})
 _HOOK_FAILURE_FRAME_TRANSLATION = str.maketrans({"[": "(", "]": ")"})
 _HOOK_FAILURE_REDACTION_MARKER = "[REDACTED]"
 _HOOK_FAILURE_PLANTED_REDACTION_RE = re.compile(r"(?i)\[REDACTED\]")
@@ -2839,61 +2838,27 @@ def _raw_hook_failure_window(text: str) -> tuple[str, bool]:
     return "\n".join(part.strip() for part in (head, tail) if part.strip()), True
 
 
-def _redact_hook_failure_shadow(text: str) -> str:
-    """Apply redaction matches from a deobfuscated shadow to readable text."""
-    # Match the deobfuscated shadow, emit readable NFKC, and map aligned redaction spans.
-    prepared = "".join(
-        "\x00" if unicodedata.category(ch).startswith("Z") and ch != " " else ch for ch in text
-    )
-    canonical = unicodedata.normalize("NFKC", prepared)
-    visible_chars: list[str] = []
-    shadow_chars: list[str] = []
-    shadow_to_visible: list[int] = []
-    for ch in canonical:
-        visible_chars.append(ch if ch.isprintable() or ch in "\r\n\u200c\u200d" else " ")
-        for match_char in unicodedata.normalize("NFKD", ch):
-            category = unicodedata.category(match_char)
-            if match_char == "\x00":
-                if "".join(shadow_chars[-6:]).casefold() == "bearer":
-                    shadow_chars.append(" ")
-                    shadow_to_visible.append(len(visible_chars) - 1)
-                continue
-            if (
-                category not in _HOOK_FAILURE_IGNORED_UNICODE_CATEGORIES
-                and not category.startswith("M")
-            ):
-                shadow_chars.append(
-                    match_char if match_char.isprintable() or match_char in "\r\n" else " "
-                )
-                shadow_to_visible.append(len(visible_chars) - 1)
-    visible = "".join(visible_chars)
-    shadow = "".join(shadow_chars)
-    visible = _HOOK_FAILURE_PLANTED_REDACTION_RE.sub("(REDACTED)", visible)
-    shadow = _HOOK_FAILURE_PLANTED_REDACTION_RE.sub(lambda match: " " * len(match.group()), shadow)
-    redacted = redact_secrets(shadow)
-    if redacted != shadow:
-        parts = redacted.split(_HOOK_FAILURE_REDACTION_MARKER)
-        pattern = r"\A" + r"(.*?)".join(re.escape(part) for part in parts) + r"\Z"
-        match = re.match(pattern, shadow, re.DOTALL)
-        if match is None:
-            return _HOOK_FAILURE_REDACTION_MARKER
-        spans: list[tuple[int, int]] = []
-        for index in range(1, len(parts)):
-            shadow_start = match.start(index)
-            shadow_end = match.end(index)
-            if shadow_start < len(shadow_to_visible):
-                visible_start = shadow_to_visible[shadow_start]
-            elif shadow_to_visible:
-                visible_start = shadow_to_visible[-1] + 1
-            else:
-                visible_start = 0
-            visible_end = shadow_to_visible[shadow_end - 1] + 1 if shadow_end else visible_start
-            spans.append((visible_start, visible_end))
-        for start, end in reversed(spans):
-            # Empty matches can bracket visible-only characters; order the mapped span.
-            start, end = sorted((start, end))
-            visible = f"{visible[:start]}{_HOOK_FAILURE_REDACTION_MARKER}{visible[end:]}"
-    return " ".join(visible.split())
+def _canonicalize_hook_failure_detail(text: str) -> str:
+    """Build the normalized text used for both secret matching and output."""
+    normalized = unicodedata.normalize("NFKC", text.replace("\r\n", "\n").replace("\r", "\n"))
+    canonical: list[str] = []
+    for char in normalized:
+        if char == "\n":
+            canonical.append(char)
+            continue
+        category = unicodedata.category(char)
+        variation_selector = "\ufe00" <= char <= "\ufe0f" or "\U000e0100" <= char <= "\U000e01ef"
+        if (
+            char.isspace()
+            or category in {"Cc", "Cf", "Cs"}
+            or variation_selector
+            or not char.isprintable()
+        ):
+            if not canonical or canonical[-1] not in {" ", "\n"}:
+                canonical.append(" ")
+            continue
+        canonical.append(char)
+    return "".join(canonical)
 
 
 def _cap_hook_failure_detail(text: str, *, raw_truncated: bool) -> str:
@@ -2915,20 +2880,21 @@ def _sanitize_hook_failure_detail(text: str) -> str | None:
     """
     Scrub and cap untrusted hook failure text for a parent session ``output``.
 
-    Long raw input retains complete lines from both ends. A deobfuscated
-    matching shadow drives redaction while the readable NFKC text is emitted.
+    Long raw input retains complete lines from both ends. Matching and output
+    share one NFKC-normalized representation with preserved line boundaries.
     Square brackets are neutralized to prevent model-visible frame injection,
     including the accepted trade-off that ordinary bracketed text is rewritten.
 
     :param text: Raw failure text from a ``StopFailure`` hook payload.
-    :returns: Sanitized single-line detail, or ``None`` when nothing usable
-        remains.
+    :returns: Sanitized detail, or ``None`` when nothing usable remains.
     """
     bounded, raw_truncated = _raw_hook_failure_window(text)
     if raw_truncated and not bounded:
         return _HOOK_FAILURE_DETAIL_REMOVED_SENTINEL
     without_ansi = _ANSI_ESCAPE_RE.sub("", bounded)
-    redacted = _redact_hook_failure_shadow(without_ansi)
+    canonical = _canonicalize_hook_failure_detail(without_ansi)
+    canonical = _HOOK_FAILURE_PLANTED_REDACTION_RE.sub("(REDACTED)", canonical)
+    redacted = redact_secrets(canonical)
     if not redacted:
         return _HOOK_FAILURE_DETAIL_REMOVED_SENTINEL if raw_truncated else None
     protected = redacted.replace(_HOOK_FAILURE_REDACTION_MARKER, "\x00")
