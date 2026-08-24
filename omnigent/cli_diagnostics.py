@@ -128,10 +128,14 @@ _SECRET_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),
     # GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_)
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
-    # AWS access key ids (long-term AKIA, temporary ASIA)
-    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
-    # URL-embedded basic-auth userinfo: https://user:pass@host → redact userinfo
-    re.compile(r"(?i)(https?://)[^/\s:@]+:[^/\s@]+(?=@)"),
+    # AWS access key ids (long-term AKIA, temporary ASIA). Open-ended count: a
+    # fixed {16} followed by \b fails to match AT ALL on a longer run (no word
+    # boundary after the counted chars), leaking the whole token.
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16,}"),
+    # URL-embedded basic-auth userinfo: https://user:pass@host → redact userinfo.
+    # The password class excludes ? — RFC 3986 §3.2.1 bars an unencoded ? from
+    # userinfo, so an @ after a ? belongs to the query and is not a credential.
+    re.compile(r"(?i)(https?://)[^/\s:@]+:[^/\s@?]+(?=@)"),
 ]
 _REDACTED = "[REDACTED]"
 

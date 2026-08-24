@@ -203,6 +203,36 @@ def test_redact_secrets_scrubs_url_basic_auth_userinfo() -> None:
     assert "registry.internal" in scrubbed
 
 
+def test_redact_secrets_preserves_url_with_at_sign_in_query() -> None:
+    """An ``@`` in the query string is not userinfo — the endpoint must survive.
+
+    Per RFC 3986 §3.2.1 ``?`` cannot appear unencoded in userinfo, so in a
+    no-path URL like ``https://host:port?login_hint=a@b`` the ``@`` belongs to
+    the query and nothing here is a credential. Over-redacting destroys the
+    one string that identifies which upstream failed.
+    """
+    text = "GET https://app.example.com:8443?login_hint=alice@example.com failed 302"
+    assert cli_diagnostics.redact_secrets(text) == text
+
+
+@pytest.mark.parametrize("prefix", ["AKIA", "ASIA"])
+def test_redact_secrets_scrubs_overlong_aws_key(prefix: str) -> None:
+    """An over-long key-shaped run is still redacted; short/lowercase noise is not.
+
+    A fixed-count quantifier followed by ``\\b`` fails to match AT ALL when the
+    run is longer than the count (no word boundary after the counted chars),
+    leaking the whole token. No cap is involved here, so this pins the pattern
+    itself matching an over-long key.
+    """
+    key = prefix + "A" * 17
+    scrubbed = cli_diagnostics.redact_secrets(f"boot failed with {key} end")
+    assert key not in scrubbed
+    assert "[REDACTED]" in scrubbed
+    # Not loosened: sub-length and lowercase runs stay untouched.
+    assert cli_diagnostics.redact_secrets(prefix + "A" * 15) == prefix + "A" * 15
+    assert cli_diagnostics.redact_secrets(prefix.lower() + "a" * 17) == prefix.lower() + "a" * 17
+
+
 def test_setup_cli_logging_uses_data_dir_cli_destination(
     isolated_cli_diagnostics: None,
     monkeypatch: pytest.MonkeyPatch,

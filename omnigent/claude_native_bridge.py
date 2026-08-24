@@ -2766,8 +2766,13 @@ _TERMINAL_BACKGROUND_TASK_STATUSES: frozenset[str] = frozenset(
 # Upper bound on the failure detail carried to a parent session. A few hundred
 # chars keeps the surfaced error readable while refusing an entire stack trace.
 _HOOK_FAILURE_DETAIL_MAX_CHARS = 500
-# Explicit marker appended when the detail is truncated.
+# Explicit marker inserted/appended when the detail is truncated.
 _HOOK_FAILURE_DETAIL_TRUNCATION_MARKER = "… [truncated]"
+# Window kept when the detail exceeds the cap: head carries the error's own
+# framing, tail the actionable final line — Python/Java tracebacks put the
+# cause LAST, so a head-only window retains pure stack-frame boilerplate.
+_HOOK_FAILURE_DETAIL_HEAD_CHARS = 150
+_HOOK_FAILURE_DETAIL_TAIL_CHARS = _HOOK_FAILURE_DETAIL_MAX_CHARS - _HOOK_FAILURE_DETAIL_HEAD_CHARS
 # Hard cap on the RAW payload scanned, so a multi-megabyte provider blob is
 # never fully regex-scanned or walked char-by-char. A generous multiple of the
 # output cap leaves headroom for ANSI/control bytes that shrink after stripping.
@@ -2792,11 +2797,16 @@ def _sanitize_hook_failure_detail(text: str) -> str | None:
     3. Secrets are redacted BEFORE the length cap, so a length-gated pattern
        (e.g. ``sk-…{10,}``) matches whole tokens — a boundary token becomes
        ``[REDACTED]`` before truncation can split it into a usable prefix.
+    4. An over-long detail is windowed head+tail with the marker between,
+       because tracebacks put the actionable line last. A detail cut by the
+       raw bound but left under the cap still gets the marker, so truncated
+       text never reads as the complete message.
 
     The no-leak guarantee is provided by steps 1 and 3: no secret the redactor
     recognizes can appear in the result, including one straddling the raw bound
     or the length cap. (An unrecognized token cut mid-string is inherent to any
-    cap.) The post-cap re-scan below is defensive only.
+    cap.) Every redaction pattern is ungated or open-ended, so the pre-cap pass
+    alone cannot miss a token the cap would newly expose — no post-cap re-scan.
 
     :param text: Raw failure text from a ``StopFailure`` hook payload.
     :returns: Sanitized single-line detail, or ``None`` when nothing usable
@@ -2816,13 +2826,14 @@ def _sanitize_hook_failure_detail(text: str) -> str | None:
         return None
     redacted = redact_secrets(collapsed)
     if len(redacted) > _HOOK_FAILURE_DETAIL_MAX_CHARS:
-        capped = redacted[:_HOOK_FAILURE_DETAIL_MAX_CHARS].rstrip()
-        # Defensive re-scan: truncation can introduce a new trailing word
-        # boundary that lets a fixed-count pattern (e.g. AWS ``AKIA…{16}\b``)
-        # match the capped form though the longer string did not. A no-op for
-        # open-ended shapes under idempotent global redaction.
-        redacted = redact_secrets(capped) + _HOOK_FAILURE_DETAIL_TRUNCATION_MARKER
-    return redacted or None
+        head = redacted[:_HOOK_FAILURE_DETAIL_HEAD_CHARS].rstrip()
+        tail = redacted[-_HOOK_FAILURE_DETAIL_TAIL_CHARS:].lstrip()
+        return f"{head} {_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER} {tail}"
+    if raw_truncated:
+        # The raw cut plus bisected-token drop can leave a short fragment
+        # under the cap; mark it so it never reads as the complete message.
+        return f"{redacted} {_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER}"
+    return redacted
 
 
 def _hook_failure_detail(payload: _JsonObject) -> str | None:
@@ -2831,22 +2842,22 @@ def _hook_failure_detail(payload: _JsonObject) -> str | None:
 
     Prefers the human-readable ``last_assistant_message`` and prefixes the
     ``error`` code when both are present, so the parent session surfaces
-    actionable text instead of the generic failure string.
+    actionable text instead of the generic failure string. Each field is
+    sanitized separately so a field carrying only ANSI/control noise drops
+    out entirely — checking emptiness on the raw combined string would let
+    the ``": "`` separator survive when both fields sanitize away, surfacing
+    a bare ``":"`` that shadows the generic fallback.
 
     :param payload: ``StopFailure`` hook payload.
     :returns: Sanitized detail, or ``None`` when the payload carried none.
     """
     raw_error = payload.get("error")
     raw_message = payload.get("last_assistant_message")
-    error = raw_error.strip() if isinstance(raw_error, str) else ""
-    message = raw_message.strip() if isinstance(raw_message, str) else ""
+    error = _sanitize_hook_failure_detail(raw_error) if isinstance(raw_error, str) else None
+    message = _sanitize_hook_failure_detail(raw_message) if isinstance(raw_message, str) else None
     if error and message:
-        combined = f"{error}: {message}"
-    else:
-        combined = error or message
-    if not combined:
-        return None
-    return _sanitize_hook_failure_detail(combined)
+        return f"{error}: {message}"
+    return error or message
 
 
 def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
