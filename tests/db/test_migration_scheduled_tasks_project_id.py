@@ -102,9 +102,7 @@ def test_project_assignment_migration_downgrade_round_trip(tmp_path: Path) -> No
     engine = get_or_create_engine(uri)
     _insert_task_and_run(engine)
     with engine.begin() as conn:
-        conn.execute(
-            sa.text(f"UPDATE scheduled_tasks SET project_id = X'{_PROJECT_ID}'")
-        )
+        conn.execute(sa.text(f"UPDATE scheduled_tasks SET project_id = X'{_PROJECT_ID}'"))
 
     config = _build_alembic_config(uri)
     with engine.begin() as conn:
@@ -119,9 +117,10 @@ def test_project_assignment_migration_downgrade_round_trip(tmp_path: Path) -> No
         index["name"] for index in inspector.get_indexes("scheduled_tasks")
     }
     with engine.connect() as conn:
-        assert conn.execute(
-            sa.text("SELECT permission_mode FROM scheduled_tasks")
-        ).scalar_one() == "acceptEdits"
+        assert (
+            conn.execute(sa.text("SELECT permission_mode FROM scheduled_tasks")).scalar_one()
+            == "acceptEdits"
+        )
     assert _row_counts(engine) == (1, 1)
 
     with engine.begin() as conn:
