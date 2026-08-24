@@ -97,13 +97,14 @@ class ScheduledTaskStore(ABC):
     def list(
         self,
         *,
-        owner_user_id: str | None = _UNSET,
+        owner_user_id: str | None = None,
         project_id: str | None = _UNSET,
     ) -> list[ScheduledTask]:
         """
         List all scheduled tasks ordered by ``created_at ASC, id ASC``.
 
-        :param owner_user_id: When given, return only tasks owned by this user.
+        :param owner_user_id: A non-null id filters by owner. ``None`` preserves
+            the legacy unfiltered local-mode listing.
         :param project_id: Omit for all tasks, pass ``None`` for tolerant
             unfiled membership, or pass an id for one Project.
         :returns: List of :class:`ScheduledTask` instances.
