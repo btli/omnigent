@@ -109,22 +109,14 @@ _redirected_logging_streams: list[_LoggingStreamSnapshot] = []
 
 #: Patterns that match values likely to be secrets.  Applied to every
 #: log record's formatted message before it hits the file.
-_AUTHORIZATION_RE = re.compile(
-    r'(?i)(?P<prefix>["\']?authorization["\']?\s*[:=]\s*)'
-    r'(?P<quote>["\'])?'
-    r"(?P<value>(?(quote)(?:\\[^\r\n]|(?!(?P=quote))[^\r\n])*"
-    r"|(?:[^\r\n]|\r?\n[ \t]+)*))"
-    r"(?(quote)(?P=quote))"
+_AUTHORIZATION_KEY_RE = re.compile(
+    r'(?i)(?<!\w)(?P<prefix>(?:"authorization"|\'authorization\'|authorization)'
+    r"[ \t]*[:=][ \t]*)"
 )
-# Eight characters excludes short prose while covering the shortest accepted credentials.
-_AUTHORIZATION_VALUE_RE = re.compile(r"[A-Za-z0-9._~+/=-]{8,}")
 
 _SECRET_PATTERNS: list[re.Pattern[str]] = [
-    # Bare bearer tokens outside an Authorization field.
-    re.compile(
-        r"(?i)(\bbearer[ \t]+)(?!\[REDACTED\])"
-        r"[A-Za-z0-9._~+/=-]{8,}(?![A-Za-z0-9._~+/=-])"
-    ),
+    # The keyless branch keeps a length floor so ordinary bearer prose survives.
+    re.compile(r"(?i)(\bbearer[ \t]+)[A-Za-z0-9._~+/=-]{8,}(?![A-Za-z0-9._~+/=-])"),
     # Env-var style keys: FOO_TOKEN=xxx, FOO_API_KEY=xxx, ...
     re.compile(r"(?i)(\b\w*(?:token|api_key|secret|password)\s*[:=]\s*)\S+"),
     # Anthropic / OpenAI style keys
@@ -139,12 +131,60 @@ _SECRET_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16,}"),
     # URL userinfo is confined to one whitespace-bounded authority.
     re.compile(
-        r"(?i)(https?://)[^/\s@?#:]*(?::[^/\s?#]*)?"
-        r"(?=@(?:\[[a-z0-9._~!$&'()*+,;=:%-]+\]"
-        r"|[a-z0-9._~!$&'()*+,;=%-]+)(?::[0-9]+)?(?:[/?#\s]|$))"
+        r"(?i)(https?://)[^/\s?#]*"
+        r"(?=@(?:\[[^/\s@?#]+\]|[^/\s@?#:]+)(?::[0-9]+)?(?:[/?#\s]|$))"
     ),
 ]
 _REDACTED = "[REDACTED]"
+
+
+def _authorization_value_end(text: str, start: int, quote: str | None) -> tuple[int, bool]:
+    """Find one Authorization value boundary with a forward-only scan."""
+    index = start
+    while index < len(text):
+        char = text[index]
+        if quote is not None:
+            if char == quote:
+                return index, True
+            if char == "\\" and index + 1 < len(text) and text[index + 1] not in "\r\n":
+                index += 2
+                continue
+        if char in "\r\n":
+            newline_end = index + 1
+            if char == "\r" and newline_end < len(text) and text[newline_end] == "\n":
+                newline_end += 1
+            if quote is None and newline_end < len(text) and text[newline_end] in " \t":
+                index = newline_end
+                continue
+            return index, False
+        index += 1
+    return index, False
+
+
+def _redact_authorization_values(text: str) -> str:
+    """Redact explicit Authorization values using linear boundary scans."""
+    parts: list[str] = []
+    cursor = 0
+    while match := _AUTHORIZATION_KEY_RE.search(text, cursor):
+        parts.append(text[cursor : match.end()])
+        value_start = match.end()
+        quote = (
+            text[value_start]
+            if value_start < len(text) and text[value_start] in {'"', "'"}
+            else None
+        )
+        content_start = value_start + 1 if quote is not None else value_start
+        value_end, closed = _authorization_value_end(text, content_start, quote)
+        if quote is not None:
+            parts.append(quote)
+        parts.append(_REDACTED)
+        if quote is not None and closed:
+            parts.append(quote)
+            cursor = value_end + 1
+        else:
+            cursor = value_end
+    parts.append(text[cursor:])
+    return "".join(parts)
 
 
 def redact_secrets(text: str) -> str:
@@ -155,14 +195,7 @@ def redact_secrets(text: str) -> str:
     :returns: Scrubbed text.
     """
 
-    def redact_authorization(match: re.Match[str]) -> str:
-        value = match.group("value")
-        if value.lstrip().startswith(_REDACTED) or _AUTHORIZATION_VALUE_RE.search(value) is None:
-            return match.group(0)
-        quote = match.group("quote") or ""
-        return f"{match.group('prefix')}{quote}{_REDACTED}{quote}"
-
-    text = _AUTHORIZATION_RE.sub(redact_authorization, text)
+    text = _redact_authorization_values(text)
     for pat in _SECRET_PATTERNS:
         text = pat.sub(
             lambda m: m.group(1) + _REDACTED if m.lastindex else _REDACTED,

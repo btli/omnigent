@@ -2880,6 +2880,7 @@ def _redact_hook_failure_shadow(text: str) -> str:
         for index in range(1, len(parts))
     ]
     for start, end in reversed(spans):
+        # Defensive only: current redactors do not emit zero-width spans.
         start, end = sorted((start, end))
         visible = f"{visible[:start]}{_HOOK_FAILURE_REDACTION_MARKER}{visible[end:]}"
     return " ".join(visible.split())

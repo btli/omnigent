@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import logging
 import sys
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -253,10 +254,51 @@ def test_redact_secrets_scrubs_complete_authorization_values(
         assert value in scrubbed
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Authorization: Basic YTo=",
+        "Authorization: Bearer abc",
+    ],
+    ids=["short-basic", "short-bearer"],
+)
+def test_redact_secrets_scrubs_short_authorization_values(text: str) -> None:
+    """Explicit Authorization keys redact even short valid credentials."""
+    assert cli_diagnostics.redact_secrets(text) == "Authorization: [REDACTED]"
+
+
 def test_redact_secrets_preserves_authorization_prose() -> None:
-    """A credential scheme used as ordinary prose is not a header secret."""
-    text = "authorization: bearer of bad news"
+    """A keyless bearer phrase remains readable when it is ordinary prose."""
+    text = "bearer of bad news"
     assert cli_diagnostics.redact_secrets(text) == text
+
+
+def test_redact_secrets_handles_unterminated_quoted_authorization_linearly() -> None:
+    """An unterminated quoted value with backslashes is scanned in linear time."""
+    text = 'Authorization: "' + "\\" * 34
+    started_at = time.perf_counter()
+    scrubbed = cli_diagnostics.redact_secrets(text)
+    elapsed = time.perf_counter() - started_at
+    assert scrubbed == 'Authorization: "[REDACTED]'
+    assert elapsed < 0.5
+
+
+def test_redact_secrets_scrubs_after_planted_authorization_marker() -> None:
+    """A planted marker cannot shield a later Authorization credential."""
+    text = "Authorization: [REDACTED] actualcredential"
+    assert cli_diagnostics.redact_secrets(text) == "Authorization: [REDACTED]"
+
+
+def test_redact_secrets_requires_authorization_key_boundary() -> None:
+    """A longer unrelated key ending in authorization remains unchanged."""
+    text = "preauthorization: successful"
+    assert cli_diagnostics.redact_secrets(text) == text
+
+
+def test_redact_secrets_stops_unquoted_authorization_at_eol() -> None:
+    """An unquoted Authorization value cannot consume the following line."""
+    text = "Authorization: abcdefghijk\nNext-Line: ok"
+    assert cli_diagnostics.redact_secrets(text) == "Authorization: [REDACTED]\nNext-Line: ok"
 
 
 @pytest.mark.parametrize(
@@ -280,8 +322,9 @@ def test_redact_secrets_scrubs_punctuation_terminated_bearer(text: str, expected
         ("https://credential:@host.example/path", ("credential",)),
         ("https://tokenvalue@host.example/path", ("tokenvalue",)),
         ("https://u:p@ss@host.example/path", ("u:p@ss",)),
+        ("https://u@ss@host.example/path", ("u@ss",)),
     ],
-    ids=["empty-user", "empty-password", "no-password", "at-in-password"],
+    ids=["empty-user", "empty-password", "no-password", "at-in-password", "at-in-username"],
 )
 def test_redact_secrets_scrubs_url_authority_userinfo(url: str, removed: tuple[str, ...]) -> None:
     """Only userinfo inside the URL authority is redacted."""
@@ -302,11 +345,15 @@ def test_redact_secrets_scrubs_url_authority_userinfo(url: str, removed: tuple[s
             "https://user:pass@[fe80::1%25eth0]/path",
             "https://[REDACTED]@[fe80::1%25eth0]/path",
         ),
+        (
+            "https://user:pass@münchen.example/path",
+            "https://[REDACTED]@münchen.example/path",
+        ),
     ],
-    ids=["reg-name", "ipv6-zone"],
+    ids=["reg-name", "ipv6-zone", "unicode-iri"],
 )
 def test_redact_secrets_accepts_url_host_characters(url: str, expected: str) -> None:
-    """Valid reg-name and IPv6 zone characters terminate URL userinfo."""
+    """Valid reg-name, IPv6 zone, and Unicode host characters terminate URL userinfo."""
     assert cli_diagnostics.redact_secrets(url) == expected
 
 

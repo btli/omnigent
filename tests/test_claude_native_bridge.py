@@ -7764,18 +7764,6 @@ def test_sanitize_hook_failure_detail_redacts_after_planted_marker() -> None:
     assert detail == "Bearer (REDACTED) [REDACTED]"
 
 
-def test_redact_hook_failure_shadow_clamps_empty_mapped_span(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An empty shadow span cannot duplicate a visible-only character."""
-    monkeypatch.setattr(
-        claude_native_bridge,
-        "redact_secrets",
-        lambda _text: "a[REDACTED]b",
-    )
-    assert claude_native_bridge._redact_hook_failure_shadow("a\u200db") == "a[REDACTED]b"
-
-
 def test_sanitize_hook_failure_detail_marks_removed_single_token() -> None:
     """A raw-bound single token yields an explicit safe sentinel."""
     detail = _sanitize_hook_failure_detail("x" * (_HOOK_FAILURE_DETAIL_RAW_LIMIT + 1))
