@@ -965,7 +965,7 @@ class _TwoIncidentStreamResponse:
             await self._client.sustained_progress.wait()
             yield 'data: {"type": "session.heartbeat"}\n\n'
             await self._client.second_drop.wait()
-            raise ConnectionError("second blip")
+            raise self._client.second_error
         self._client.third_started.set()
         await self._client.finish.wait()
         yield "data: [DONE]\n\n"
@@ -974,8 +974,9 @@ class _TwoIncidentStreamResponse:
 class _TwoIncidentRunnerClient:
     """Fake runner with two blips separated by sustained health."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, second_error: Exception | None = None) -> None:
         self.calls = 0
+        self.second_error = second_error or ConnectionError("second blip")
         self.first_drop = asyncio.Event()
         self.second_started = asyncio.Event()
         self.sustained_progress = asyncio.Event()
@@ -1088,9 +1089,9 @@ async def test_relay_sustained_health_resets_budget_for_later_blip(
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes._sessions import orchestration
 
-    grace = 0.05
+    grace = 0.1
     monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", grace)
-    monkeypatch.setattr(orchestration, "_RELAY_MAX_DEGRADED_GRACE_WINDOWS", 2.0)
+    monkeypatch.setattr(orchestration, "_RELAY_MAX_DEGRADED_GRACE_WINDOWS", 3.0)
     monkeypatch.setattr(orchestration, "_RELAY_RETRY_INTERVAL_S", 0.005)
     monkeypatch.setattr(orchestration, "_RELAY_RETRY_MAX_INTERVAL_S", 0.005)
     retry_numbers: list[int] = []
@@ -1116,16 +1117,65 @@ async def test_relay_sustained_health_resets_budget_for_later_blip(
         fake_runner.first_drop.set()
         await asyncio.wait_for(fake_runner.second_started.wait(), timeout=1.0)
 
-        await asyncio.sleep(grace * 1.25)
+        await asyncio.sleep(grace * 2)
         fake_runner.sustained_progress.set()
         await asyncio.sleep(grace * 2)
         fake_runner.second_drop.set()
 
-        await asyncio.wait_for(fake_runner.third_started.wait(), timeout=1.0)
+        await asyncio.wait_for(fake_runner.third_started.wait(), timeout=2.0)
         fake_runner.finish.set()
-        await asyncio.wait_for(handle.task, timeout=1.0)
+        await asyncio.wait_for(handle.task, timeout=2.0)
         assert len(retry_numbers) >= 2
         assert retry_numbers[0] == retry_numbers[-1] == 0
+        assert sessions_module._session_status_cache.get(session_id) != "failed"
+    finally:
+        fake_runner.first_drop.set()
+        fake_runner.sustained_progress.set()
+        fake_runner.second_drop.set()
+        fake_runner.finish.set()
+        await _cleanup_relay_test(session_id=session_id)
+
+
+@pytest.mark.asyncio
+async def test_relay_sustained_health_survives_delayed_read_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A read timeout cannot erase recovery earned before the stall."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    grace = 0.1
+    monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", grace)
+    monkeypatch.setattr(orchestration, "_RELAY_MAX_DEGRADED_GRACE_WINDOWS", 3.0)
+    monkeypatch.setattr(orchestration, "_RELAY_RETRY_INTERVAL_S", 0.005)
+    monkeypatch.setattr(orchestration, "_RELAY_RETRY_MAX_INTERVAL_S", 0.005)
+    sessions_module._runner_relay_tasks.clear()
+    fake_runner = _TwoIncidentRunnerClient(
+        second_error=httpx.ReadTimeout("healthy stream later stalled")
+    )
+    session_id = "ad1e2f30415263748596a7b8c9d0e1f2"
+
+    try:
+        handle = sessions_module._ensure_runner_relay(
+            session_id,
+            "runner_healthy_then_timeout",
+            cast(httpx.AsyncClient, fake_runner),
+            conversation_store=None,
+        )
+        assert handle is not None
+        await asyncio.wait_for(handle.ready.wait(), timeout=1.0)
+        fake_runner.first_drop.set()
+        await asyncio.wait_for(fake_runner.second_started.wait(), timeout=1.0)
+
+        await asyncio.sleep(grace * 2)
+        fake_runner.sustained_progress.set()
+        await asyncio.sleep(grace * 2)
+        fake_runner.second_drop.set()
+
+        await asyncio.wait_for(fake_runner.third_started.wait(), timeout=2.0)
+        fake_runner.finish.set()
+        await asyncio.wait_for(handle.task, timeout=2.0)
+        assert fake_runner.calls >= 3
         assert sessions_module._session_status_cache.get(session_id) != "failed"
     finally:
         fake_runner.first_drop.set()
@@ -1741,6 +1791,66 @@ async def test_stream_loss_recovery_clears_when_late_relay_becomes_ready(
         banner.set()
         finish.set()
         await _cleanup_relay_test(session_id=session_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("next_code", "next_message"),
+    [
+        ("runner_disconnected", "Runner disconnected unexpectedly."),
+        ("session_stream_lost", "Session stream lost again."),
+    ],
+)
+async def test_deferred_stream_recovery_does_not_clear_new_failure_generation(
+    next_code: str,
+    next_message: str,
+) -> None:
+    """A deferred clear owns only the stream-loss failure that scheduled it."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes._sessions.common import _RelayHandle
+
+    sessions_module._runner_relay_tasks.clear()
+    store = _RecordingLabelStore()
+    session_id = "a2b3c4d5e6f708192a3b4c5d6e7f8091"
+    store.labels[session_id] = {
+        sessions_module._LAST_TASK_ERROR_CODE_LABEL_KEY: "session_stream_lost",
+        sessions_module._LAST_TASK_ERROR_MESSAGE_LABEL_KEY: ("Session stream lost unexpectedly."),
+    }
+    sessions_module._session_status_cache[session_id] = "failed"
+    ready = asyncio.Event()
+    relay_task = asyncio.create_task(asyncio.Event().wait())
+    handle = _RelayHandle("runner_generation", relay_task, ready)
+    sessions_module._runner_relay_tasks[session_id] = handle
+
+    try:
+        await sessions_module._publish_runner_recovered_status(
+            session_id,
+            cast(ConversationStore, store),
+            require_disconnect_code=True,
+        )
+        recovery_task = orchestration._relay_recovery_tasks[session_id]
+        await asyncio.sleep(0)
+
+        orchestration._record_transport_failure_generation(session_id)
+        store.labels[session_id] = {
+            sessions_module._LAST_TASK_ERROR_CODE_LABEL_KEY: next_code,
+            sessions_module._LAST_TASK_ERROR_MESSAGE_LABEL_KEY: next_message,
+        }
+        ready.set()
+        await asyncio.wait_for(recovery_task, timeout=1.0)
+
+        assert sessions_module._session_status_cache.get(session_id) == "failed"
+        assert sessions_module._last_task_error_from_labels(store.labels[session_id]) == {
+            "code": next_code,
+            "message": next_message,
+        }
+    finally:
+        relay_task.cancel()
+        await asyncio.gather(relay_task, return_exceptions=True)
+        sessions_module._runner_relay_tasks.pop(session_id, None)
+        sessions_module._session_status_cache.pop(session_id, None)
+        orchestration._transport_failure_generations.pop(session_id, None)
 
 
 @pytest.mark.asyncio
