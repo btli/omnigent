@@ -16,6 +16,7 @@
 
 import { useMemo, useState } from "react";
 import {
+  FolderIcon,
   MoreHorizontalIcon,
   PauseIcon,
   PencilIcon,
@@ -37,6 +38,7 @@ import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 
 export function ScheduledTaskRow({
   task,
+  projectName,
   now,
   onEdit,
   onPauseToggle,
@@ -45,6 +47,8 @@ export function ScheduledTaskRow({
   busy,
 }: {
   task: ScheduledTask;
+  /** Resolved first-class Project name; absent for null or dangling ids. */
+  projectName?: string;
   // The current wall-clock time, supplied by the parent's shared `useNow` ticker
   // so the relative next-run label ("in 3 hours") re-renders and stays fresh as
   // time passes. Passed in (not read here) to keep the row a pure function of
@@ -93,6 +97,15 @@ export function ScheduledTaskRow({
               className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
             >
               Paused
+            </span>
+          )}
+          {projectName && (
+            <span
+              data-testid="task-project-chip"
+              className="flex min-w-0 shrink items-center gap-1 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+            >
+              <FolderIcon className="size-3" />
+              <span className="truncate">{projectName}</span>
             </span>
           )}
         </span>
