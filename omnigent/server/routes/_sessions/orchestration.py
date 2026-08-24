@@ -2580,7 +2580,6 @@ async def _publish_runner_recovered_status_impl(
     conversation_store: ConversationStore,
     *,
     require_disconnect_code: bool = False,
-    expected_recovery: tuple[_RelayHandle, int] | None = None,
 ) -> None:
     """
     Clear a stale failed session status after runner recovery.
@@ -2620,8 +2619,6 @@ async def _publish_runner_recovered_status_impl(
         ``session_stream_lost``); when ``False`` (default, explicit
         rebind/handshake), clear any stale ``failed`` state. Labels are
         cleared in both cases.
-    :param expected_recovery: Relay handle and transport-failure generation
-        owned by a deferred stream-loss recovery.
     :returns: None.
     """
     if _session_status_cache.get(session_id) != "failed":
@@ -2641,25 +2638,17 @@ async def _publish_runner_recovered_status_impl(
             "session_stream_lost",
         }:
             return
-        if expected_recovery is not None:
-            expected_handle, expected_generation = expected_recovery
+        if last_error.get("code") == "session_stream_lost":
+            # Leave an unready passive reconnect failed until the next
+            # explicit session-init proves the stream path is usable.
+            handle = _runner_relay_tasks.get(session_id)
             if (
-                last_error.get("code") != "session_stream_lost"
-                or _transport_failure_generations.get(session_id, 0) != expected_generation
-                or not _relay_handle_ready_for_recovery(session_id, expected_handle)
+                handle is None
+                or handle.task.done()
+                or handle.task.cancelling()
+                or not handle.ready.is_set()
             ):
                 return
-        elif last_error.get("code") == "session_stream_lost" and not (
-            _current_relay_ready_for_recovery(session_id)
-        ):
-            handle = _runner_relay_tasks.get(session_id)
-            if handle is not None:
-                _schedule_runner_recovery_when_ready(
-                    session_id,
-                    conversation_store,
-                    (handle, _transport_failure_generations.get(session_id, 0)),
-                )
-            return
     _session_status_cache[session_id] = "idle"
     session_live_state.persist_live_status(session_id, "idle")
     event = SessionStatusEvent(
@@ -2725,8 +2714,6 @@ async def _mark_runner_sessions_offline_impl(
         dead_on_arrival = fail_idle_top_level and conv.kind != "sub_agent"
         if not interrupted and not dead_on_arrival:
             continue
-        if error.code in {"runner_disconnected", "session_stream_lost"}:
-            _record_transport_failure_generation(conv.id)
         _publish_status(conv.id, "failed", error)
         await _persist_session_status_error_labels(conv.id, error, conversation_store)
 
@@ -5969,117 +5956,6 @@ def _runner_tunnel_alive(runner_client: httpx.AsyncClient, runner_id: str | None
     return transport.runner_registered()
 
 
-_transport_failure_generations: dict[str, int] = {}
-
-
-def _record_transport_failure_generation(session_id: str) -> int:
-    """Advance and return the session's local transport-failure generation."""
-    generation = _transport_failure_generations.get(session_id, 0) + 1
-    _transport_failure_generations[session_id] = generation
-    return generation
-
-
-def _relay_handle_ready_for_recovery(session_id: str, handle: _RelayHandle) -> bool:
-    """Return whether the expected relay is still current and ready."""
-    return (
-        _runner_relay_tasks.get(session_id) is handle
-        and not handle.task.done()
-        and not handle.task.cancelling()
-        and handle.ready.is_set()
-    )
-
-
-def _current_relay_ready_for_recovery(session_id: str) -> bool:
-    """Return whether the current relay is live and ready."""
-    handle = _runner_relay_tasks.get(session_id)
-    return handle is not None and _relay_handle_ready_for_recovery(session_id, handle)
-
-
-async def _relay_ready_for_recovery(
-    session_id: str,
-    expected_handle: _RelayHandle | None = None,
-) -> bool:
-    """Wait off the connect-hook path for a current relay to become ready."""
-    while True:
-        handle = expected_handle or _runner_relay_tasks.get(session_id)
-        if handle is None or handle.task.done() or handle.task.cancelling():
-            return False
-        if _relay_handle_ready_for_recovery(session_id, handle):
-            return True
-        ready_wait = asyncio.create_task(handle.ready.wait())
-        try:
-            await asyncio.wait(
-                {handle.task, ready_wait},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-        finally:
-            if not ready_wait.done():
-                ready_wait.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await ready_wait
-        if _runner_relay_tasks.get(session_id) is not handle:
-            if expected_handle is not None:
-                return False
-            continue
-        if handle.task.done() or handle.task.cancelling():
-            return False
-        if handle.ready.is_set():
-            return True
-
-
-_relay_recovery_tasks: dict[str, asyncio.Task[None]] = {}
-
-
-async def _publish_runner_recovered_when_ready(
-    session_id: str,
-    conversation_store: ConversationStore,
-    expected_recovery: tuple[_RelayHandle, int],
-) -> None:
-    """Clear stream-loss state when the current relay eventually becomes ready."""
-    expected_handle, _ = expected_recovery
-    if await _relay_ready_for_recovery(session_id, expected_handle):
-        await _publish_runner_recovered_status(
-            session_id,
-            conversation_store,
-            require_disconnect_code=True,
-            expected_recovery=expected_recovery,
-        )
-
-
-def _schedule_runner_recovery_when_ready(
-    session_id: str,
-    conversation_store: ConversationStore,
-    expected_recovery: tuple[_RelayHandle, int],
-) -> None:
-    """Schedule one off-hook readiness waiter for a session."""
-    existing = _relay_recovery_tasks.get(session_id)
-    if existing is not None and not existing.done():
-        return
-    task = asyncio.create_task(
-        _publish_runner_recovered_when_ready(
-            session_id,
-            conversation_store,
-            expected_recovery,
-        ),
-        name=f"runner-recovery-{session_id}",
-    )
-    _relay_recovery_tasks[session_id] = task
-
-    def _clear_slot(done: asyncio.Task[None]) -> None:
-        if _relay_recovery_tasks.get(session_id) is done:
-            _relay_recovery_tasks.pop(session_id, None)
-        error = None if done.cancelled() else done.exception()
-        if error is not None:
-            _logger.warning(
-                "Deferred runner recovery failed for session=%s",
-                session_id,
-                exc_info=(type(error), error, error.__traceback__),
-                extra={"session_id": session_id},
-            )
-
-    task.add_done_callback(_clear_slot)
-
-
 def _relay_retry_delay(retry_number: int) -> float:
     """Return a jittered exponential delay for a degraded relay."""
     base = min(
@@ -6357,7 +6233,6 @@ async def _relay_runner_stream(
                     extra={"session_id": session_id},
                 )
                 disconnect_error = ErrorDetail(code=code, message=message)
-                _record_transport_failure_generation(session_id)
                 _publish_status(session_id, "failed", disconnect_error)
                 # Persist the disconnect cause as durable labels so the
                 # distinction survives into snapshots and child-session

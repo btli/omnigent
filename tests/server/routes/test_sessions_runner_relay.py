@@ -190,62 +190,6 @@ class _DropThenNoBannerRunnerClient:
         return _NoBannerStreamResponse(self._replacement_release)
 
 
-class _DelayedBannerStreamResponse:
-    """Fake replacement stream whose banner arrives on demand."""
-
-    def __init__(self, banner: asyncio.Event, finish: asyncio.Event) -> None:
-        self._banner = banner
-        self._finish = finish
-
-    async def __aenter__(self) -> _DelayedBannerStreamResponse:
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> None:
-        del exc_type, exc, traceback
-
-    async def aiter_text(self) -> AsyncIterator[str]:
-        await self._banner.wait()
-        yield 'data: {"type": "session.heartbeat"}\n\n'
-        await self._finish.wait()
-        yield "data: [DONE]\n\n"
-
-
-class _DropThenDelayedBannerRunnerClient:
-    """Fake runner whose replacement banner arrives after recovery starts."""
-
-    def __init__(
-        self,
-        drop: asyncio.Event,
-        replacement_started: asyncio.Event,
-        banner: asyncio.Event,
-        finish: asyncio.Event,
-    ) -> None:
-        self._drop = drop
-        self._replacement_started = replacement_started
-        self._banner = banner
-        self._finish = finish
-        self._calls = 0
-
-    def stream(
-        self,
-        method: str,
-        path: str,
-        *,
-        timeout: Any,
-    ) -> _DropAfterBannerStreamResponse | _DelayedBannerStreamResponse:
-        del method, path, timeout
-        self._calls += 1
-        if self._calls == 1:
-            return _DropAfterBannerStreamResponse(self._drop)
-        self._replacement_started.set()
-        return _DelayedBannerStreamResponse(self._banner, self._finish)
-
-
 @pytest.mark.asyncio
 async def test_runner_relay_ready_waits_for_runner_heartbeat() -> None:
     """
@@ -1668,7 +1612,7 @@ class _RecordingLabelStore:
 async def test_stream_loss_recovery_waits_for_replacement_relay_ready(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A reconnect without a ready replacement relay keeps the failure."""
+    """An unready replacement keeps the failure for explicit session-init."""
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes._sessions import orchestration
 
@@ -1712,9 +1656,6 @@ async def test_stream_loss_recovery_waits_for_replacement_relay_ready(
             cast(ConversationStore, store),
             require_disconnect_code=True,
         )
-        recovery_task = orchestration._relay_recovery_tasks[session_id]
-        replacement_release.set()
-        await asyncio.wait_for(recovery_task, timeout=1.0)
 
         assert handle.ready.is_set() is False
         assert sessions_module._session_status_cache.get(session_id) == "failed"
@@ -1726,185 +1667,6 @@ async def test_stream_loss_recovery_waits_for_replacement_relay_ready(
         drop.set()
         replacement_release.set()
         await _cleanup_relay_test(session_id=session_id)
-
-
-@pytest.mark.asyncio
-async def test_stream_loss_recovery_clears_when_late_relay_becomes_ready(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Off-hook recovery clears once a slow replacement finally banners."""
-    from omnigent.server.routes import sessions as sessions_module
-    from omnigent.server.routes._sessions import orchestration
-
-    sessions_module._runner_relay_tasks.clear()
-    monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 0.2)
-    monkeypatch.setattr(orchestration, "_RELAY_RETRY_INTERVAL_S", 0.01)
-    monkeypatch.setattr(orchestration, "_RELAY_RETRY_MAX_INTERVAL_S", 0.01)
-    drop = asyncio.Event()
-    replacement_started = asyncio.Event()
-    banner = asyncio.Event()
-    finish = asyncio.Event()
-    store = _RecordingLabelStore()
-    session_id = "92a3b4c5d6e7f8091a2b3c4d5e6f7081"
-
-    try:
-        handle = sessions_module._ensure_runner_relay(
-            session_id,
-            "runner_replacement_late_ready",
-            cast(
-                httpx.AsyncClient,
-                _DropThenDelayedBannerRunnerClient(
-                    drop,
-                    replacement_started,
-                    banner,
-                    finish,
-                ),
-            ),
-            conversation_store=cast(ConversationStore, store),
-        )
-        assert handle is not None
-        await asyncio.wait_for(handle.ready.wait(), timeout=1.0)
-        drop.set()
-        await asyncio.wait_for(replacement_started.wait(), timeout=1.0)
-        store.labels[session_id] = {
-            sessions_module._LAST_TASK_ERROR_CODE_LABEL_KEY: "session_stream_lost",
-            sessions_module._LAST_TASK_ERROR_MESSAGE_LABEL_KEY: (
-                "Session stream lost unexpectedly."
-            ),
-        }
-        sessions_module._session_status_cache[session_id] = "failed"
-
-        await sessions_module._publish_runner_recovered_status(
-            session_id,
-            cast(ConversationStore, store),
-            require_disconnect_code=True,
-        )
-        recovery_task = orchestration._relay_recovery_tasks[session_id]
-        assert sessions_module._session_status_cache.get(session_id) == "failed"
-
-        banner.set()
-        await asyncio.wait_for(recovery_task, timeout=1.0)
-        assert sessions_module._session_status_cache.get(session_id) == "idle"
-        assert sessions_module._last_task_error_from_labels(store.labels[session_id]) is None
-    finally:
-        drop.set()
-        banner.set()
-        finish.set()
-        await _cleanup_relay_test(session_id=session_id)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("next_code", "next_message"),
-    [
-        ("runner_disconnected", "Runner disconnected unexpectedly."),
-        ("session_stream_lost", "Session stream lost again."),
-    ],
-)
-async def test_deferred_stream_recovery_does_not_clear_new_failure_generation(
-    next_code: str,
-    next_message: str,
-) -> None:
-    """A deferred clear owns only the stream-loss failure that scheduled it."""
-    from omnigent.server.routes import sessions as sessions_module
-    from omnigent.server.routes._sessions import orchestration
-    from omnigent.server.routes._sessions.common import _RelayHandle
-
-    sessions_module._runner_relay_tasks.clear()
-    store = _RecordingLabelStore()
-    session_id = "a2b3c4d5e6f708192a3b4c5d6e7f8091"
-    store.labels[session_id] = {
-        sessions_module._LAST_TASK_ERROR_CODE_LABEL_KEY: "session_stream_lost",
-        sessions_module._LAST_TASK_ERROR_MESSAGE_LABEL_KEY: ("Session stream lost unexpectedly."),
-    }
-    sessions_module._session_status_cache[session_id] = "failed"
-    ready = asyncio.Event()
-    relay_task = asyncio.create_task(asyncio.Event().wait())
-    handle = _RelayHandle("runner_generation", relay_task, ready)
-    sessions_module._runner_relay_tasks[session_id] = handle
-
-    try:
-        await sessions_module._publish_runner_recovered_status(
-            session_id,
-            cast(ConversationStore, store),
-            require_disconnect_code=True,
-        )
-        recovery_task = orchestration._relay_recovery_tasks[session_id]
-        await asyncio.sleep(0)
-
-        orchestration._record_transport_failure_generation(session_id)
-        store.labels[session_id] = {
-            sessions_module._LAST_TASK_ERROR_CODE_LABEL_KEY: next_code,
-            sessions_module._LAST_TASK_ERROR_MESSAGE_LABEL_KEY: next_message,
-        }
-        ready.set()
-        await asyncio.wait_for(recovery_task, timeout=1.0)
-
-        assert sessions_module._session_status_cache.get(session_id) == "failed"
-        assert sessions_module._last_task_error_from_labels(store.labels[session_id]) == {
-            "code": next_code,
-            "message": next_message,
-        }
-    finally:
-        relay_task.cancel()
-        await asyncio.gather(relay_task, return_exceptions=True)
-        sessions_module._runner_relay_tasks.pop(session_id, None)
-        sessions_module._session_status_cache.pop(session_id, None)
-        orchestration._transport_failure_generations.pop(session_id, None)
-
-
-@pytest.mark.asyncio
-async def test_stream_loss_recovery_rejects_replaced_relay_stale_ready() -> None:
-    """Readiness from a replaced relay cannot clear the current failure."""
-    from omnigent.server.routes import sessions as sessions_module
-    from omnigent.server.routes._sessions import orchestration
-    from omnigent.server.routes._sessions.common import _RelayHandle
-
-    sessions_module._runner_relay_tasks.clear()
-    store = _RecordingLabelStore()
-    session_id = "a3b4c5d6e7f8091a2b3c4d5e6f708192"
-    store.labels[session_id] = {
-        sessions_module._LAST_TASK_ERROR_CODE_LABEL_KEY: "session_stream_lost",
-        sessions_module._LAST_TASK_ERROR_MESSAGE_LABEL_KEY: ("Session stream lost unexpectedly."),
-    }
-    sessions_module._session_status_cache[session_id] = "failed"
-    old_ready = asyncio.Event()
-    old_task = asyncio.create_task(asyncio.Event().wait())
-    old_handle = _RelayHandle("runner_old", old_task, old_ready)
-    new_ready = asyncio.Event()
-    new_task = asyncio.create_task(asyncio.Event().wait())
-    new_handle = _RelayHandle("runner_new", new_task, new_ready)
-    sessions_module._runner_relay_tasks[session_id] = old_handle
-
-    try:
-        ready_check = asyncio.create_task(orchestration._relay_ready_for_recovery(session_id))
-        await sessions_module._publish_runner_recovered_status(
-            session_id,
-            cast(ConversationStore, store),
-            require_disconnect_code=True,
-        )
-        recovery_task = orchestration._relay_recovery_tasks[session_id]
-        await asyncio.sleep(0)
-        sessions_module._runner_relay_tasks[session_id] = new_handle
-        old_ready.set()
-        await asyncio.sleep(0)
-        new_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await new_task
-        assert await asyncio.wait_for(ready_check, timeout=1.0) is False
-        await asyncio.wait_for(recovery_task, timeout=1.0)
-
-        assert sessions_module._session_status_cache.get(session_id) == "failed"
-        assert sessions_module._last_task_error_from_labels(store.labels[session_id]) == {
-            "code": "session_stream_lost",
-            "message": "Session stream lost unexpectedly.",
-        }
-    finally:
-        old_task.cancel()
-        new_task.cancel()
-        await asyncio.gather(old_task, new_task, return_exceptions=True)
-        sessions_module._runner_relay_tasks.pop(session_id, None)
-        sessions_module._session_status_cache.pop(session_id, None)
 
 
 @pytest.mark.asyncio
