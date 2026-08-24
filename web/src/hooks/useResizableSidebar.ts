@@ -9,14 +9,14 @@
 // Unlike the inline panel this has no "boost" machinery — nothing auto-widens
 // the sidebar — so the store is just a persisted, viewport-clamped width.
 
-import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useSyncExternalStore } from "react";
+import { createResizableWidthStore } from "@/hooks/resizableWidthStore";
 import { useInputCapabilities } from "@/hooks/useInputCapabilities";
+import { useResizeDrag } from "@/hooks/useResizeDrag";
 import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
 
-// Default 320px (20rem) — wider than the old fixed ``md:w-64`` (256px) sidebar
-// so conversation titles have more room before truncating. The floor keeps the
-// search box + "New session" button usable; the viewport-relative ceiling keeps
-// the sidebar from consuming more than half of the desktop layout.
+// The default gives conversation titles room before truncating. The floor keeps
+// controls usable; the viewport-relative ceiling preserves the main content.
 const DEFAULT_WIDTH_PX = 320;
 const MIN_WIDTH_PX = 220;
 const MAX_WIDTH_RATIO = 0.5;
@@ -52,47 +52,13 @@ function clamp(w: number): number {
 // Module-level width store (independent of the inline panel / push-panel stores)
 // ---------------------------------------------------------------------------
 
-// ``preferredWidth`` mirrors the persisted user choice; ``storedWidth`` is the
-// effective (viewport-clamped) width. Keeping the preference in memory lets a
-// viewport-resize re-derive the effective width from it — springing back to the
-// larger choice when space returns — without ever touching disk.
-let preferredWidth: number | null = readPanelSizePreference("sidebarWidthPx");
-let storedWidth: number | null = preferredWidth;
-const listeners = new Set<() => void>();
-
-function persistWidth(value: number | null) {
-  preferredWidth = value;
-  writePanelSizePreference("sidebarWidthPx", value);
-}
-
-function setStoredWidthRaw(value: number | null, persist = false) {
-  if (value === storedWidth) return;
-  storedWidth = value;
-  if (persist) persistWidth(value);
-  for (const l of listeners) l();
-}
-
-function setStoredWidth(next: number | ((prev: number | null) => number), persist = false) {
-  setStoredWidthRaw(typeof next === "function" ? next(storedWidth) : next, persist);
-}
-
-function subscribe(cb: () => void): () => void {
-  listeners.add(cb);
-  return () => listeners.delete(cb);
-}
-
-function getSnapshot(): number | null {
-  return storedWidth;
-}
-
-function getServerSnapshot(): number | null {
-  return null;
-}
+const widthStore = createResizableWidthStore(readPanelSizePreference("sidebarWidthPx"), (width) =>
+  writePanelSizePreference("sidebarWidthPx", width),
+);
 
 /** Reset module-level state. Only for use in tests. */
 export function resetSidebarWidthStoreForTesting(): void {
-  preferredWidth = readPanelSizePreference("sidebarWidthPx");
-  setStoredWidthRaw(preferredWidth);
+  widthStore.reset(readPanelSizePreference("sidebarWidthPx"));
 }
 
 // ---------------------------------------------------------------------------
@@ -110,111 +76,32 @@ export function resetSidebarWidthStoreForTesting(): void {
  */
 export function useResizableSidebar() {
   const { coarsePrimary } = useInputCapabilities();
-  const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
+  const raw = useSyncExternalStore(
+    widthStore.subscribe,
+    widthStore.getSnapshot,
+    widthStore.getServerSnapshot,
+  );
   const width = clamp(raw ?? DEFAULT_WIDTH_PX);
-  const activePointerId = useRef<number | null>(null);
-  const activeHandle = useRef<HTMLElement | null>(null);
-  const dragCleanup = useRef<(() => void) | null>(null);
 
   // Re-clamp on viewport resize so a shrunken window pulls the sidebar back
   // under the ceiling; widening re-derives from the persisted preference so the
   // user's chosen width springs back when space returns.
   useEffect(() => {
     function onResize() {
-      setStoredWidth((prev) => clamp(preferredWidth ?? prev ?? DEFAULT_WIDTH_PX));
+      widthStore.set((prev) => clamp(widthStore.getPreferred() ?? prev ?? DEFAULT_WIDTH_PX));
     }
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
-  // No iframe shield: the sidebar never adjoins the preview iframe, so capture suffices.
-  const finishDrag = useCallback((commit: boolean) => {
-    const pointerId = activePointerId.current;
-    const handle = activeHandle.current;
-    if (pointerId === null) return;
-    activePointerId.current = null;
-    activeHandle.current = null;
-    dragCleanup.current?.();
-    dragCleanup.current = null;
-    if (commit) {
-      persistWidth(storedWidth);
-    }
-    try {
-      if (handle?.hasPointerCapture(pointerId)) {
-        handle.releasePointerCapture(pointerId);
-      }
-    } catch {
-      // The handle may already be detached when a responsive render gate flips.
-    }
-    document.body.style.cursor = "";
-    document.body.style.userSelect = "";
-  }, []);
-
-  const onPointerDown = useCallback(
-    (e: React.PointerEvent<HTMLElement>) => {
-      // First pointer wins; a right/middle mouse press doesn't start a drag.
-      if (activePointerId.current !== null) return;
-      if (e.button !== 0) return;
-
-      try {
-        e.currentTarget.setPointerCapture(e.pointerId);
-      } catch {
-        return;
-      }
-
-      e.preventDefault();
-      const handle = e.currentTarget;
-      const pointerId = e.pointerId;
-      activePointerId.current = pointerId;
-      activeHandle.current = handle;
-
-      function onDocumentPointerUp(event: PointerEvent) {
-        if (event.pointerId === activePointerId.current) finishDrag(true);
-      }
-
-      function onDocumentPointerCancel(event: PointerEvent) {
-        if (event.pointerId === activePointerId.current) finishDrag(false);
-      }
-
-      const observer = new MutationObserver(() => {
-        if (activeHandle.current && !activeHandle.current.isConnected) {
-          finishDrag(false);
-        }
-      });
-      observer.observe(document.documentElement, { childList: true, subtree: true });
-      document.addEventListener("pointerup", onDocumentPointerUp);
-      document.addEventListener("pointercancel", onDocumentPointerCancel);
-      dragCleanup.current = () => {
-        observer.disconnect();
-        document.removeEventListener("pointerup", onDocumentPointerUp);
-        document.removeEventListener("pointercancel", onDocumentPointerCancel);
-      };
-      document.body.style.cursor = "col-resize";
-      document.body.style.userSelect = "none";
-    },
-    [finishDrag],
-  );
-
-  const onPointerMove = useCallback((e: React.PointerEvent<HTMLElement>) => {
-    if (e.pointerId !== activePointerId.current) return;
-    setStoredWidth(clamp(e.clientX));
-  }, []);
-
-  const onPointerUp = useCallback(
-    (e: React.PointerEvent<HTMLElement>) => {
-      if (e.pointerId !== activePointerId.current) return;
-      finishDrag(true);
-    },
-    [finishDrag],
-  );
-
-  const onPointerCancel = useCallback(
-    (e: React.PointerEvent<HTMLElement>) => {
-      if (e.pointerId !== activePointerId.current) return;
-      finishDrag(false);
-    },
-    [finishDrag],
-  );
+  const resizeDrag = useResizeDrag({
+    onCommit: widthStore.persist,
+    onMove: useCallback((e: React.PointerEvent<HTMLElement>) => {
+      widthStore.set(clamp(e.clientX));
+    }, []),
+    observeHandleRemoval: true,
+    releaseCaptureOnFinish: true,
+  });
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -222,26 +109,20 @@ export function useResizableSidebar() {
       // Right edge of a left panel: ArrowRight widens, ArrowLeft narrows.
       if (e.key === "ArrowRight") {
         e.preventDefault();
-        setStoredWidth((prev) => clamp((prev ?? width) + step), true);
+        widthStore.set((prev) => clamp((prev ?? width) + step), true);
       } else if (e.key === "ArrowLeft") {
         e.preventDefault();
-        setStoredWidth((prev) => clamp((prev ?? width) - step), true);
+        widthStore.set((prev) => clamp((prev ?? width) - step), true);
       }
     },
     [width],
   );
 
-  useEffect(() => () => finishDrag(false), [finishDrag]);
-
   return {
     /** Current sidebar width in px (already viewport-clamped). */
     width,
     handleProps: {
-      onPointerDown,
-      onPointerMove,
-      onPointerUp,
-      onPointerCancel,
-      onLostPointerCapture: onPointerCancel,
+      ...resizeDrag.handleProps,
       onKeyDown,
       role: "separator" as const,
       "aria-orientation": "vertical" as const,

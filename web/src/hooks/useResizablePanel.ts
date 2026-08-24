@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
+import { createResizableWidthStore } from "@/hooks/resizableWidthStore";
 import { useInputCapabilities } from "@/hooks/useInputCapabilities";
-import { MD_MIN_WIDTH_QUERY, isMobileViewport } from "@/lib/breakpoints";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useResizeDrag } from "@/hooks/useResizeDrag";
 import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
 
 const MIN_WIDTH_PX = 320;
@@ -43,58 +45,13 @@ function clampWidth(w: number, minPx = MIN_WIDTH_PX): number {
 // independent default, which feels like the chat is jumping width
 // for no reason. ``null`` means "not yet set — fall back to the
 // caller's default (vw-based)". The first drag persists a px value.
-// `preferredWidth` mirrors the persisted user choice; `sharedWidth` is the
-// effective (viewport-clamped) width that drives layout. They diverge after a
-// viewport-shrink clamp — keeping the preference in memory lets the resize
-// handler re-derive the effective width from it (restoring the larger choice
-// when space returns) without reading localStorage on every resize event.
-let preferredWidth: number | null = readPanelSizePreference("pushPanelWidthPx");
-let sharedWidth: number | null = preferredWidth;
-const listeners = new Set<() => void>();
-
-function persistWidth(value: number | null) {
-  preferredWidth = value;
-  writePanelSizePreference("pushPanelWidthPx", value);
-}
-
-function setSharedWidthRaw(value: number | null, persist = false) {
-  if (value === sharedWidth) return;
-  sharedWidth = value;
-  if (persist) persistWidth(value);
-  for (const l of listeners) l();
-}
-
-function setSharedWidth(
-  next: number | null | ((prev: number | null) => number | null),
-  persist = false,
-) {
-  setSharedWidthRaw(typeof next === "function" ? next(sharedWidth) : next, persist);
-}
-
-/** Snapshot the current shared width to storage (called once at drag end). */
-function persistSharedWidth() {
-  persistWidth(sharedWidth);
-}
-
-function subscribeSharedWidth(cb: () => void): () => void {
-  listeners.add(cb);
-  return () => {
-    listeners.delete(cb);
-  };
-}
-
-function getSharedWidthSnapshot(): number | null {
-  return sharedWidth;
-}
-
-function getSharedWidthServerSnapshot(): number | null {
-  return null;
-}
+const widthStore = createResizableWidthStore(readPanelSizePreference("pushPanelWidthPx"), (width) =>
+  writePanelSizePreference("pushPanelWidthPx", width),
+);
 
 /** Reset module-level width state from localStorage. Only for tests. */
 export function resetSharedWidthStoreForTesting(): void {
-  preferredWidth = readPanelSizePreference("pushPanelWidthPx");
-  setSharedWidthRaw(preferredWidth);
+  widthStore.reset(readPanelSizePreference("pushPanelWidthPx"));
 }
 
 /**
@@ -114,28 +71,15 @@ export function resetSharedWidthStoreForTesting(): void {
  */
 export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx = MIN_WIDTH_PX) {
   const { coarsePrimary } = useInputCapabilities();
+  const mobileViewport = useIsMobileViewport();
+  const isDesktop = typeof window !== "undefined" && !mobileViewport;
   const width = useSyncExternalStore(
-    subscribeSharedWidth,
-    getSharedWidthSnapshot,
-    getSharedWidthServerSnapshot,
+    widthStore.subscribe,
+    widthStore.getSnapshot,
+    widthStore.getServerSnapshot,
   );
-  const activePointerId = useRef<number | null>(null);
-  const documentFallbackCleanupRef = useRef<(() => void) | null>(null);
-  const overlayRef = useRef<HTMLDivElement | null>(null);
   const minWidthRef = useRef(minWidthPx);
   minWidthRef.current = minWidthPx;
-
-  // Track whether we're on desktop — only apply inline width there.
-  const [isDesktop, setIsDesktop] = useState(
-    () => typeof window !== "undefined" && !isMobileViewport(),
-  );
-
-  useEffect(() => {
-    const mql = window.matchMedia(MD_MIN_WIDTH_QUERY);
-    const handler = (e: MediaQueryListEvent) => setIsDesktop(e.matches);
-    mql.addEventListener("change", handler);
-    return () => mql.removeEventListener("change", handler);
-  }, []);
 
   // Re-clamp the stored width when the viewport resizes so a width
   // that was valid on a wider monitor doesn't push content off-screen
@@ -145,8 +89,8 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
       // Re-derive the effective width from the persisted preference (not the
       // possibly-already-clamped live value) so widening the viewport restores
       // the user's larger choice instead of sticking at the prior clamp.
-      setSharedWidth((prev) => {
-        const base = preferredWidth ?? prev;
+      widthStore.set((prev) => {
+        const base = widthStore.getPreferred() ?? prev;
         return base !== null ? clampWidth(base, minWidthRef.current) : prev;
       });
     }
@@ -157,7 +101,7 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
   // When the minimum width increases (e.g. comments panel opens), ensure
   // the current shared width is at least the new minimum.
   useEffect(() => {
-    setSharedWidth((prev) => {
+    widthStore.set((prev) => {
       if (prev !== null && prev < minWidthPx) return clampWidth(prev, minWidthPx);
       return prev;
     });
@@ -169,90 +113,14 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
     minWidthPx,
   );
 
-  const addDragOverlay = useCallback(() => {
-    if (overlayRef.current || typeof document === "undefined") return;
-    const element = document.createElement("div");
-    element.style.cssText =
-      "position:fixed;inset:0;z-index:2147483647;cursor:col-resize;background:transparent;";
-    document.body.appendChild(element);
-    overlayRef.current = element;
-  }, []);
-
-  const removeDragOverlay = useCallback(() => {
-    overlayRef.current?.remove();
-    overlayRef.current = null;
-  }, []);
-
-  const endDrag = useCallback(
-    (persist: boolean) => {
-      if (activePointerId.current === null) return;
-      activePointerId.current = null;
-      documentFallbackCleanupRef.current?.();
-      documentFallbackCleanupRef.current = null;
-      if (persist) persistSharedWidth();
-      removeDragOverlay();
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    },
-    [removeDragOverlay],
-  );
-
-  const onPointerDown = useCallback(
-    (e: React.PointerEvent<HTMLElement>) => {
-      if (!open || !isDesktop) return;
-      if (activePointerId.current !== null) return;
-      if (e.button !== 0) return;
-      try {
-        e.currentTarget.setPointerCapture(e.pointerId);
-      } catch {
-        return;
-      }
-      e.preventDefault();
-      activePointerId.current = e.pointerId;
-      const onDocumentPointerUp = (event: PointerEvent) => {
-        if (event.pointerId === activePointerId.current) endDrag(true);
-      };
-      const onDocumentPointerCancel = (event: PointerEvent) => {
-        if (event.pointerId === activePointerId.current) endDrag(false);
-      };
-      document.addEventListener("pointerup", onDocumentPointerUp);
-      document.addEventListener("pointercancel", onDocumentPointerCancel);
-      documentFallbackCleanupRef.current = () => {
-        document.removeEventListener("pointerup", onDocumentPointerUp);
-        document.removeEventListener("pointercancel", onDocumentPointerCancel);
-      };
-      addDragOverlay();
-      document.body.style.cursor = "col-resize";
-      document.body.style.userSelect = "none";
-    },
-    [addDragOverlay, endDrag, open, isDesktop],
-  );
-
-  const onPointerMove = useCallback((e: React.PointerEvent<HTMLElement>) => {
-    if (e.pointerId !== activePointerId.current) return;
-    // Update the live width only; persist once on pointerup to avoid a
-    // synchronous localStorage write per pointermove.
-    setSharedWidth(clampWidth(window.innerWidth - e.clientX, minWidthRef.current));
-  }, []);
-
-  const onPointerUp = useCallback(
-    (e: React.PointerEvent<HTMLElement>) => {
-      if (e.pointerId !== activePointerId.current) return;
-      endDrag(true);
-      if (e.currentTarget.hasPointerCapture?.(e.pointerId)) {
-        e.currentTarget.releasePointerCapture(e.pointerId);
-      }
-    },
-    [endDrag],
-  );
-
-  const onPointerCancel = useCallback(
-    (e: React.PointerEvent<HTMLElement>) => {
-      if (e.pointerId !== activePointerId.current) return;
-      endDrag(false);
-    },
-    [endDrag],
-  );
+  const resizeDrag = useResizeDrag({
+    enabled: open && isDesktop,
+    overlay: true,
+    onCommit: widthStore.persist,
+    onMove: useCallback((e: React.PointerEvent<HTMLElement>) => {
+      widthStore.set(clampWidth(window.innerWidth - e.clientX, minWidthRef.current));
+    }, []),
+  });
 
   // Keyboard resize: left/right arrow keys adjust width by 20px.
   const onKeyDown = useCallback(
@@ -261,13 +129,13 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
       const step = 20;
       if (e.key === "ArrowLeft") {
         e.preventDefault();
-        setSharedWidth(
+        widthStore.set(
           (prev) => clampWidth((prev ?? resolvedWidth) + step, minWidthRef.current),
           true,
         );
       } else if (e.key === "ArrowRight") {
         e.preventDefault();
-        setSharedWidth(
+        widthStore.set(
           (prev) => clampWidth((prev ?? resolvedWidth) - step, minWidthRef.current),
           true,
         );
@@ -275,12 +143,6 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
     },
     [open, isDesktop, resolvedWidth],
   );
-
-  useEffect(() => () => endDrag(false), [endDrag]);
-
-  useEffect(() => {
-    if (!open || !isDesktop) endDrag(false);
-  }, [endDrag, isDesktop, open]);
 
   // On mobile the panel is a fixed full-screen overlay — no inline width.
   const panelWidth = isDesktop ? (open ? resolvedWidth : 0) : undefined;
@@ -290,11 +152,7 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
     panelWidth,
     /** Props to spread onto the resize handle element. */
     handleProps: {
-      onPointerDown,
-      onPointerMove,
-      onPointerUp,
-      onPointerCancel,
-      onLostPointerCapture: onPointerCancel,
+      ...resizeDrag.handleProps,
       onKeyDown,
       style: handleGutterStyle(coarsePrimary),
       role: "separator" as const,
