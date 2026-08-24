@@ -14,20 +14,136 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import click
 import pytest
 
 from omnigent.claude_native import (
     ClaudeNativeUcodeConfig,
     build_native_claude_terminal_env,
 )
+from omnigent.model_catalog_store import CatalogFreshness, CatalogResult
 from omnigent.runner.app import _build_claude_native_base_args, _claude_terminal_env_unset
 from omnigent.runner.native.orchestration import (
     _ROUTED_SPAWN_ALLOWED_TOOLS,
     _claude_launch_metadata_from_envelope,
     _load_legacy_claude_launch_metadata,
     _routed_spawn_launch_args,
+    _select_authoritative_claude_launch_model,
 )
 from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
+
+_GATEWAY_ROWS = [
+    {
+        "id": "sonnet",
+        "model": "system.ai.claude-sonnet-4-6[1m]",
+        "displayName": "Sonnet 4.6",
+    },
+    {
+        "id": "opus",
+        "model": "system.ai.claude-opus-4-8[1m]",
+        "displayName": "Opus 4.8",
+        "isDefault": True,
+    },
+    {
+        "id": "haiku",
+        "model": "system.ai.claude-haiku-4-5",
+        "displayName": "Haiku 4.5",
+    },
+]
+
+
+def _gateway_config() -> ClaudeNativeUcodeConfig:
+    return ClaudeNativeUcodeConfig(env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"})
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [
+        ("databricks-claude-sonnet-4-6", "system.ai.claude-sonnet-4-6[1m]"),
+        ("system.ai.claude-sonnet-4-6[1m]", "system.ai.claude-sonnet-4-6[1m]"),
+        ("sonnet", "sonnet"),
+        ("databricks-claude-opus-4-8", "system.ai.claude-opus-4-8[1m]"),
+        ("system.ai.claude-opus-4-8[1m]", "system.ai.claude-opus-4-8[1m]"),
+        ("opus", "opus"),
+        ("databricks-claude-haiku-4-5", "system.ai.claude-haiku-4-5"),
+        ("system.ai.claude-haiku-4-5", "system.ai.claude-haiku-4-5"),
+        ("haiku", "haiku"),
+    ],
+)
+def test_explicit_gateway_model_resolves_to_catalog_vocabulary(
+    requested: str,
+    expected: str,
+) -> None:
+    selected = _select_authoritative_claude_launch_model(
+        explicit_model=requested,
+        configured_model=None,
+        claude_config=_gateway_config(),
+        catalog=CatalogResult(_GATEWAY_ROWS, CatalogFreshness.FRESH),
+    )
+
+    assert selected == expected
+
+
+def test_fresh_catalog_miss_lists_launchable_ids_without_auth_advice() -> None:
+    with pytest.raises(click.ClickException) as exc_info:
+        _select_authoritative_claude_launch_model(
+            explicit_model="databricks-claude-fable-5",
+            configured_model=None,
+            claude_config=_gateway_config(),
+            catalog=CatalogResult(_GATEWAY_ROWS, CatalogFreshness.FRESH),
+        )
+
+    message = str(exc_info.value)
+    assert "not in this host's current model list" in message
+    assert "sonnet" in message
+    assert "system.ai.claude-opus-4-8[1m]" in message
+    assert "haiku" in message
+    assert "databricks auth login" not in message
+    assert "restoring provider credentials" not in message
+
+
+def test_fresh_catalog_does_not_substitute_a_different_generation() -> None:
+    with pytest.raises(click.ClickException, match="not in this host's current model list"):
+        _select_authoritative_claude_launch_model(
+            explicit_model="databricks-claude-opus-5",
+            configured_model=None,
+            claude_config=_gateway_config(),
+            catalog=CatalogResult(_GATEWAY_ROWS, CatalogFreshness.FRESH),
+        )
+
+
+def test_failed_catalog_refresh_keeps_credential_repair_advice() -> None:
+    with pytest.raises(click.ClickException) as exc_info:
+        _select_authoritative_claude_launch_model(
+            explicit_model="databricks-claude-opus-4-8",
+            configured_model=None,
+            claude_config=_gateway_config(),
+            catalog=CatalogResult(
+                _GATEWAY_ROWS,
+                CatalogFreshness.STALE,
+                "provider credentials or network unavailable",
+            ),
+        )
+
+    message = str(exc_info.value)
+    assert "provider credentials or network unavailable" in message
+    assert "restoring provider credentials" in message
+    assert "databricks auth login --profile <PROFILE>" in message
+
+
+def test_missing_catalog_without_refresh_error_does_not_blame_credentials() -> None:
+    with pytest.raises(click.ClickException) as exc_info:
+        _select_authoritative_claude_launch_model(
+            explicit_model="databricks-claude-opus-4-8",
+            configured_model=None,
+            claude_config=_gateway_config(),
+            catalog=CatalogResult(None, CatalogFreshness.MISSING),
+        )
+
+    message = str(exc_info.value)
+    assert "no fresh model list" in message
+    assert "databricks auth login" not in message
+    assert "provider credentials" not in message
 
 
 @pytest.mark.parametrize(

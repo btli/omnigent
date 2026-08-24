@@ -24,6 +24,8 @@ import os
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +50,23 @@ def fingerprint_of(*parts: object) -> str:
 #: Catalog entries older than this get a background refresh on read, and
 #: launch paths stop treating their ``isDefault`` row as launch authority.
 CATALOG_STALE_AFTER_S = 3600.0
+
+
+class CatalogFreshness(Enum):
+    """Authority state of catalog rows returned by a probe."""
+
+    FRESH = "fresh"
+    STALE = "stale"
+    MISSING = "missing"
+
+
+@dataclass(frozen=True)
+class CatalogResult:
+    """Catalog rows together with their authority state."""
+
+    rows: list[dict[str, Any]] | None
+    freshness: CatalogFreshness
+    refresh_error: str | None = None
 
 
 def _data_dir() -> Path:
@@ -190,39 +209,37 @@ async def ensure_catalog(
     return await asyncio.shield(task)
 
 
-def _refresh_in_background(
+def _refresh_failure(exc: Exception) -> str:
+    """Return a sanitized catalog-refresh failure for launch diagnostics."""
+    if isinstance(exc, TimeoutError):
+        return "model catalog refresh timed out"
+    if isinstance(exc, OSError):
+        return "provider credentials or network unavailable"
+    return f"model catalog refresh failed ({type(exc).__name__})"
+
+
+async def ensure_catalog_result(
     harness: str,
     fingerprint: str,
     resolve: Callable[[], Awaitable[list[dict[str, Any]] | None]],
-) -> None:
-    """
-    Re-probe a stale catalog off the caller's path, single-flight per key.
-
-    The stale rows keep serving; a successful probe rewrites the store so
-    the next read is fresh. Failures only log — staleness is not an outage.
-
-    :param harness: Canonical harness name.
-    :param fingerprint: The launch-config fingerprint.
-    :param resolve: Probe coroutine factory producing verbatim rows.
-    """
-    key = (harness, fingerprint)
-    task = _inflight.get(key)
-    if task is not None and not task.done():
-        return
-
-    async def _run() -> list[dict[str, Any]] | None:
-        try:
-            rows = await resolve()
-            if rows:
-                write_catalog(harness, fingerprint, rows)
-            return rows
-        except Exception:  # noqa: BLE001 — stale rows keep serving
-            _logger.warning("background %s catalog refresh failed", harness, exc_info=True)
-            return None
-        finally:
-            _inflight.pop(key, None)
-
-    _inflight[key] = asyncio.create_task(_run(), name=f"model-catalog-refresh-{harness}")
+) -> CatalogResult:
+    """Return catalog rows with whether the probe produced fresh authority."""
+    outcomes = await asyncio.gather(
+        ensure_catalog(harness, fingerprint, resolve),
+        return_exceptions=True,
+    )
+    rows = outcomes[0]
+    if isinstance(rows, Exception):
+        return CatalogResult(None, CatalogFreshness.MISSING, _refresh_failure(rows))
+    if isinstance(rows, BaseException):
+        raise rows
+    if rows is None:
+        return CatalogResult(
+            None,
+            CatalogFreshness.MISSING,
+            "model catalog refresh returned no models",
+        )
+    return CatalogResult(rows, CatalogFreshness.FRESH)
 
 
 def default_row(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -246,12 +263,15 @@ def catalog_contains(rows: list[dict[str, Any]], token: str) -> bool:
 
 __all__ = [
     "CATALOG_STALE_AFTER_S",
+    "CatalogFreshness",
+    "CatalogResult",
     "catalog_age_s",
     "catalog_contains",
     "catalog_is_stale",
     "catalog_path",
     "default_row",
     "ensure_catalog",
+    "ensure_catalog_result",
     "fingerprint_of",
     "read_catalog",
     "write_catalog",

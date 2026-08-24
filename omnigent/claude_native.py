@@ -63,7 +63,7 @@ from omnigent_client._http import is_loopback_url
 from websockets.exceptions import ConnectionClosed, ConnectionClosedError, WebSocketException
 from websockets.frames import Close
 
-from omnigent import model_catalog
+from omnigent import model_catalog, model_catalog_store
 from omnigent._native_resume_hint import echo_native_resume_hint
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._startup_profile import StartupProfiler
@@ -86,6 +86,7 @@ from omnigent.claude_model_vocabulary import (
     CUSTOM_MODEL_OPTION_NAME_ENV_VAR,
     LEGACY_CUSTOM_SLOT_ROW_ID,
     claude_model_alias,
+    normalized_model_id,
 )
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
@@ -415,6 +416,13 @@ def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> b
     return host == "anthropic.com" or host.endswith(".anthropic.com")
 
 
+def claude_config_serves_canonical_ids(
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> bool:
+    """Whether a launch config accepts canonical Anthropic model ids."""
+    return claude_config is None or _serves_canonical_anthropic_ids(claude_config)
+
+
 def _claude_family(token: str) -> str | None:
     """
     The family alias a model id or alias folds onto, bracket markers dropped.
@@ -427,6 +435,35 @@ def _claude_family(token: str) -> str | None:
 
     alias = claude_model_alias(token, {})
     return alias.partition("[")[0] if alias else None
+
+
+def resolve_claude_catalog_model(
+    rows: list[dict[str, object]],
+    model: str,
+) -> str | None:
+    """Resolve an equivalent provider spelling to a catalog launch token.
+
+    Exact picker ids and wire models remain unchanged. Provider-prefixed ids
+    are compared with the shared Claude vocabulary normalization, then folded
+    onto the matching row's wire model so the launch uses a spelling this
+    catalog actually enumerated.
+    """
+    from omnigent.model_catalog_store import catalog_contains
+
+    if catalog_contains(rows, model):
+        return model
+    normalized = normalized_model_id(model)
+    if not normalized:
+        return None
+    for row in rows:
+        row_id = str(row.get("id") or "")
+        wire_model = str(row.get("model") or "")
+        if any(
+            candidate and normalized_model_id(candidate) == normalized
+            for candidate in (row_id, wire_model)
+        ):
+            return wire_model or row_id
+    return None
 
 
 def claude_catalog_serves_model(
@@ -1185,9 +1222,9 @@ async def claude_model_catalog(
     return out
 
 
-async def claude_launch_catalog(
+async def claude_launch_catalog_result(
     claude_config: ClaudeNativeUcodeConfig | None,
-) -> list[dict[str, object]] | None:
+) -> model_catalog_store.CatalogResult:
     """
     The shared catalog for this launch config: read the store, probe on miss.
 
@@ -1196,28 +1233,19 @@ async def claude_launch_catalog(
     the answer for every later consumer.
 
     :param claude_config: The resolved launch config, or ``None``.
-    :returns: Catalog rows, or ``None`` when no catalog could be obtained.
+    :returns: Catalog rows with freshness and any sanitized refresh error.
     """
-    from omnigent import model_catalog_store
-
     fingerprint = claude_catalog_fingerprint(claude_config)
-    return await model_catalog_store.ensure_catalog(
+    return await model_catalog_store.ensure_catalog_result(
         "claude-native", fingerprint, lambda: claude_model_catalog(claude_config)
     )
 
 
-def claude_launch_catalog_is_stale(claude_config: ClaudeNativeUcodeConfig | None) -> bool:
-    """
-    Whether this config's stored catalog is past the freshness TTL.
-
-    :param claude_config: The resolved launch config, or ``None``.
-    :returns: ``True`` when the store holds only a stale entry.
-    """
-    from omnigent import model_catalog_store
-
-    return model_catalog_store.catalog_is_stale(
-        "claude-native", claude_catalog_fingerprint(claude_config)
-    )
+async def claude_launch_catalog(
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> list[dict[str, object]] | None:
+    """Return the shared catalog rows, preserving the existing list API."""
+    return (await claude_launch_catalog_result(claude_config)).rows
 
 
 def build_native_claude_terminal_env(

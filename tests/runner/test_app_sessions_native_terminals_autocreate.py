@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import click
 import httpx
 import pytest
 
@@ -47,6 +46,7 @@ from omnigent.codex_native_bridge import (
 )
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.inner.terminal import TerminalInstance
+from omnigent.model_catalog_store import CatalogFreshness, CatalogResult
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import (
     ResolvedSpec,
@@ -3193,13 +3193,12 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A persisted canonical id the catalog lists only by family still launches.
+    A persisted model id the catalog lists in equivalent vocabulary launches.
 
     A live ``/model`` persists the pane's exact id (``claude-opus-4-8``) while
-    the catalog spells that family as alias rows and the 1M default. On a
-    canonical endpoint the relaunch must pass the id through as ``--model``
-    rather than refuse the resume; a gateway, which routes only its own
-    spellings, keeps refusing it.
+    the catalog spells that family as alias rows and the 1M default. A canonical
+    endpoint passes the id through; a gateway folds the serving-endpoint id
+    onto the launch catalog's wire spelling.
     """
     from omnigent.claude_native import ClaudeNativeUcodeConfig
 
@@ -3225,11 +3224,11 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         },
     ]
 
-    async def _catalog(config: object) -> list[dict[str, object]]:
+    async def _catalog(config: object) -> CatalogResult:
         del config
-        return catalog
+        return CatalogResult(catalog, CatalogFreshness.FRESH)
 
-    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", _catalog)
+    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog_result", _catalog)
 
     captured: dict[str, Any] = {}
 
@@ -3259,8 +3258,12 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
                 metadata={"terminal_name": "claude", "session_key": "main", "running": True},
             )
 
+    model_override = (
+        "claude-opus-4-8" if endpoint == "subscription" else "databricks-claude-opus-4-8"
+    )
+
     def _handle_request(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"model_override": "claude-opus-4-8", "labels": {}})
+        return httpx.Response(200, json={"model_override": model_override, "labels": {}})
 
     fake_client = httpx.AsyncClient(
         base_url="http://test-server",
@@ -3280,26 +3283,16 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         return config
 
     session_id = "0f2d3d5c9a6b4e1f8c7d6e5f4a3b2c1d"
-    if endpoint == "subscription":
-        await _auto_create_claude_terminal(
-            session_id,
-            _FakeResourceRegistry(),
-            lambda _sid, _evt: None,
-            server_client=fake_client,
-            resolve_launch_config=_resolve,
-        )
-        args = captured["spec"].args
-        assert args[args.index("--model") + 1] == "claude-opus-4-8"
-    else:
-        with pytest.raises(click.ClickException, match="not in this host's current model list"):
-            await _auto_create_claude_terminal(
-                session_id,
-                _FakeResourceRegistry(),
-                lambda _sid, _evt: None,
-                server_client=fake_client,
-                resolve_launch_config=_resolve,
-            )
-        assert "spec" not in captured, "a refused launch must not start a terminal"
+    await _auto_create_claude_terminal(
+        session_id,
+        _FakeResourceRegistry(),
+        lambda _sid, _evt: None,
+        server_client=fake_client,
+        resolve_launch_config=_resolve,
+    )
+    args = captured["spec"].args
+    expected = "claude-opus-4-8" if endpoint == "subscription" else "system.ai.claude-opus-4-8[1m]"
+    assert args[args.index("--model") + 1] == expected
 
     await fake_client.aclose()
 

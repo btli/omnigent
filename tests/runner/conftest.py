@@ -53,6 +53,7 @@ def _isolated_model_catalog_store(
         return None
 
     monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", _no_catalog)
+    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog_result", _no_catalog)
     monkeypatch.setattr("omnigent.codex_native_app_server.codex_launch_catalog", _no_catalog)
 
 
