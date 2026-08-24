@@ -218,6 +218,7 @@ import {
   type SwipeDirection,
   writeSwipeActions,
 } from "@/lib/swipeActionPreferences";
+import { writeSessionFilter } from "@/lib/sessionFilterPreferences";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { Sidebar } from "./Sidebar";
 
@@ -1125,6 +1126,47 @@ describe("right-click context menu", () => {
     expect(mocks.del.mutate).not.toHaveBeenCalled();
   });
 
+  it("cancels an active touch drag when its row unmounts", () => {
+    vi.useFakeTimers();
+    try {
+      mocks.anyCoarse = true;
+      const view = renderSidebar();
+      const link = screen.getByRole("link", { name: /My Session/ });
+      const row = link.closest("li")!;
+      const touchCancel = vi.fn();
+      link.addEventListener("touchcancel", touchCancel);
+
+      fireEvent.pointerDown(link, {
+        pointerId: 1,
+        pointerType: "touch",
+        isPrimary: true,
+        button: 0,
+        clientX: 100,
+        clientY: 100,
+      });
+      act(() => vi.advanceTimersByTime(400));
+      fireEvent.pointerMove(link, {
+        pointerId: 1,
+        pointerType: "touch",
+        isPrimary: true,
+        clientX: 115,
+        clientY: 100,
+      });
+      expect(row).toHaveClass("opacity-40");
+
+      act(() => {
+        mockConversations([]);
+        view.rerenderSidebar();
+      });
+
+      expect(touchCancel).toHaveBeenCalledTimes(1);
+      expect(screen.getByRole("status")).toHaveTextContent("Dragging was cancelled");
+    } finally {
+      act(() => vi.runOnlyPendingTimers());
+      vi.useRealTimers();
+    }
+  });
+
   it("opens the same action items as the kebab and drives the same handlers", () => {
     renderSidebar();
 
@@ -1477,15 +1519,29 @@ describe("touch swipe actions", () => {
   });
 
   it("claims the horizontal touch axis only while a swipe action is configured", () => {
-    // With an action armed, the row must override touch-action so the browser
-    // doesn't take the horizontal pan mid-gesture...
-    const { unmount } = renderSidebar();
+    // A single configured direction leaves the opposite native pan available.
+    const first = renderSidebar();
     const li = conversationRow;
     expect(li()).toHaveClass("touch-pan-y");
-    unmount();
+    expect(li().classList.contains("touch-pan-left")).toBe(true);
+    expect(li()).not.toHaveClass("touch-pan-right");
+    first.unmount();
 
-    // ...but with BOTH directions inert there is no gesture to protect, so the
-    // override is dropped and the browser keeps its own horizontal gestures.
+    writeSwipeActions({ left: "none", right: "delete" });
+    const second = renderSidebar();
+    expect(li()).toHaveClass("touch-pan-y");
+    expect(li().classList.contains("touch-pan-right")).toBe(true);
+    expect(li()).not.toHaveClass("touch-pan-left");
+    second.unmount();
+
+    writeSwipeActions({ left: "archive", right: "delete" });
+    const third = renderSidebar();
+    expect(li()).toHaveClass("touch-pan-y");
+    expect(li()).not.toHaveClass("touch-pan-left");
+    expect(li()).not.toHaveClass("touch-pan-right");
+    third.unmount();
+
+    // With both directions inert, the browser keeps its horizontal gestures.
     writeSwipeActions({ left: "none", right: "none" });
     renderSidebar();
     expect(li()).not.toHaveClass("touch-pan-y");
@@ -1570,26 +1626,44 @@ describe("touch swipe actions", () => {
   });
 
   it("releases the armed touch guard when an ineligible row yields to scroll", () => {
-    vi.useFakeTimers();
     mockConversations([{ ...CONV, owner: "other@example.com" }]);
+    writeSessionFilter("shared");
     renderSidebar();
-    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
-      button: 0,
-      ctrlKey: false,
-      pointerType: "mouse",
-    });
-    fireEvent.click(screen.getByTestId("session-filter-shared"));
+    const li = conversationRow();
+    vi.useFakeTimers();
+    try {
+      pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+      act(() => vi.advanceTimersByTime(400));
+      expect(screen.getByTestId("leave-conversation")).toBeInTheDocument();
+      pointerEventAt("pointerMove", li, { clientX: 115, clientY: 100 }, 1_410);
+      expect(screen.queryByTestId("leave-conversation")).toBeNull();
+      const touchMove = new TouchEvent("touchmove", { bubbles: true, cancelable: true });
+      document.dispatchEvent(touchMove);
+
+      expect(touchMove.defaultPrevented).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not swallow keyboard activation when a swipe has no trailing click", async () => {
+    renderSidebar();
+    const link = screen.getByRole("link", { name: /My Session/ });
     const li = conversationRow();
 
     pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
-    act(() => vi.advanceTimersByTime(400));
-    pointerEventAt("pointerMove", li, { clientX: 115, clientY: 100 }, 1_410);
-    const touchMove = new TouchEvent("touchmove", { bubbles: true, cancelable: true });
-    document.dispatchEvent(touchMove);
-    const prevented = touchMove.defaultPrevented;
-    vi.useRealTimers();
+    pointerEventAt("pointerMove", li, { clientX: 80, clientY: 100 }, 1_250);
+    pointerEventAt("pointerUp", li, { clientX: 60, clientY: 100 }, 1_500);
+    await act(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 0);
+        }),
+    );
+    fireEvent.keyDown(link, { key: "Enter" });
+    fireEvent.click(link);
 
-    expect(prevented).toBe(false);
+    expect(screen.getByTestId("location-probe")).toHaveTextContent("/c/conv_1");
   });
 
   it("does not fire the action for a short swipe below the commit threshold", () => {

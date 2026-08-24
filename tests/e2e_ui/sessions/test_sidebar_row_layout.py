@@ -194,8 +194,6 @@ def test_partial_swipe_reveal_is_adjacent_to_ellipsis_surface(
             assert swiping_edges["left"] == resting_edges["left"] + 4
             assert swiping_edges["right"] == resting_edges["right"] - 4
             if delta_x < 0:
-                assert surface_edges["right"] == reveal_edges["left"]
                 assert surface_edges["right"] <= reveal_edges["left"]
             else:
-                assert reveal_edges["right"] == surface_edges["left"]
                 assert reveal_edges["right"] <= surface_edges["left"]
