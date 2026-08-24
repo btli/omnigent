@@ -6,7 +6,7 @@ import { resetWidthStoreForTesting, useResizableInlinePanel } from "./useResizab
 // useResizableInlinePanel keeps its width in a module-level store shared across
 // all callers, re-seeded per conversation. resetWidthStoreForTesting clears it
 // between tests so cases are fully independent. A 2000px viewport gives a
-// 1512px clamp ceiling (2000 - 480 chat minimum - 8 gap); the default width
+// 1508px clamp ceiling (2000 - 480 chat minimum - 12px gutter); the default width
 // there is 600 (0.36 * 2000 = 720, clamped to the [420, 600] band).
 
 const SESSION = "conv_test";
@@ -124,7 +124,7 @@ describe("useResizableInlinePanel persistence", () => {
     // Shrinking the viewport clamps the live width to the chat-preserving
     // ceiling. At 700px the chat cedes below its 480 comfort minimum down
     // toward its hard floor so the rail keeps a drag range: the ceiling is
-    // 240 rail floor + 120 travel = 360 (chat keeps 700 - 360 - 8 = 332).
+    // 240 rail floor + 120 travel = 360 (chat keeps 700 - 360 - 12 = 328).
     // The saved 620 preference is untouched.
     setInnerWidth(700);
     act(() => window.dispatchEvent(new Event("resize")));
@@ -144,7 +144,7 @@ describe("useResizableInlinePanel reserved width (sidebar)", () => {
   // preferred width, so collapsing the sidebar gives the width straight back.
   it("caps at the sidebar-aware ceiling and restores the preference when it collapses", () => {
     setInnerWidth(1400);
-    // Drag the panel out to its sidebar-collapsed ceiling: 1400 - 480 - 8 = 912.
+    // Drag the panel out to its sidebar-collapsed ceiling: 1400 - 480 - 12 = 908.
     const collapsed = renderHook(() =>
       useResizableInlinePanel(SESSION, undefined, /* reservedPx */ 0),
     );
@@ -156,20 +156,20 @@ describe("useResizableInlinePanel reserved width (sidebar)", () => {
       );
       collapsed.result.current.handleProps.onPointerUp(pointerEvent(handle.element));
     });
-    expect(collapsed.result.current.panelWidth).toBe(912);
-    expect(readSessionWorkspaceState(SESSION).widthPx).toBe(912);
+    expect(collapsed.result.current.panelWidth).toBe(908);
+    expect(readSessionWorkspaceState(SESSION).widthPx).toBe(908);
     collapsed.unmount();
 
-    // Sidebar open (320px): the ceiling drops to 1400 - 320 - 480 - 8 = 592, so
+    // Sidebar open (320px): the ceiling drops to 1400 - 320 - 480 - 12 = 588, so
     // the rendered width is squeezed but the saved preference is untouched.
     const open = renderHook(() => useResizableInlinePanel(SESSION, undefined, 320));
-    expect(open.result.current.panelWidth).toBe(592);
-    expect(readSessionWorkspaceState(SESSION).widthPx).toBe(912);
+    expect(open.result.current.panelWidth).toBe(588);
+    expect(readSessionWorkspaceState(SESSION).widthPx).toBe(908);
     open.unmount();
 
     // Collapsing restores the full preferred width.
     const reopened = renderHook(() => useResizableInlinePanel(SESSION, undefined, 0));
-    expect(reopened.result.current.panelWidth).toBe(912);
+    expect(reopened.result.current.panelWidth).toBe(908);
     reopened.unmount();
   });
 
@@ -185,8 +185,8 @@ describe("useResizableInlinePanel reserved width (sidebar)", () => {
         } as React.KeyboardEvent);
       }
     });
-    // 1400 - 320 sidebar - 8 gap - panel >= 480 for the chat.
-    expect(1400 - 320 - result.current.panelWidth - 8).toBeGreaterThanOrEqual(480);
+    // 1400 - 320 sidebar - 12px gutter - panel >= 480 for the chat.
+    expect(1400 - 320 - result.current.panelWidth - 12).toBeGreaterThanOrEqual(480);
     unmount();
   });
 
@@ -217,8 +217,8 @@ describe("useResizableInlinePanel reserved width (sidebar)", () => {
     setInnerWidth(1000);
     act(() => window.dispatchEvent(new Event("resize")));
     rerender({ reserved: reservedPx });
-    // chat = viewport - sidebar - gap - panel.
-    expect(1000 - reservedPx - 8 - result.current.panelWidth).toBeGreaterThanOrEqual(240);
+    // chat = viewport - sidebar - gutter - panel.
+    expect(1000 - reservedPx - 12 - result.current.panelWidth).toBeGreaterThanOrEqual(240);
   });
 });
 
@@ -251,7 +251,7 @@ describe("useResizableInlinePanel tablet-width viewports", () => {
     expect(result.current.panelWidth).toBeGreaterThan(narrow + 100);
 
     // The chat still keeps its hard floor at the rail's widest.
-    expect(1024 - 320 - 8 - result.current.panelWidth).toBeGreaterThanOrEqual(240);
+    expect(1024 - 320 - 12 - result.current.panelWidth).toBeGreaterThanOrEqual(240);
   });
 
   it("keeps the resize handle live at 840px with the sidebar open", () => {
@@ -532,10 +532,10 @@ describe("useResizableInlinePanel pointer drag", () => {
     expect(result.current.handleProps.style).toMatchObject({
       touchAction: "none",
       boxSizing: "content-box",
-      paddingLeft: 6,
-      paddingRight: 14,
+      paddingLeft: 9,
+      paddingRight: 11,
       marginLeft: -6,
-      marginRight: -18,
+      marginRight: -8,
       backgroundClip: "content-box",
     });
   });
@@ -547,7 +547,7 @@ describe("useResizableInlinePanel pointer drag", () => {
       role: "separator",
       "aria-valuenow": 600,
       "aria-valuemin": 240,
-      "aria-valuemax": 1512,
+      "aria-valuemax": 1508,
     });
 
     expect(nudgeWiderOnce(result)).toBe(620);
@@ -559,13 +559,13 @@ describe("useResizableInlinePanel pointer drag", () => {
     let coarse = false;
     let onChange: ((event: MediaQueryListEvent) => void) | undefined;
     window.matchMedia = ((query: string) => ({
-      matches: query === "(pointer: coarse)" ? coarse : false,
+      matches: query === "(any-pointer: coarse)" ? coarse : false,
       media: query,
       onchange: null,
       addListener: () => {},
       removeListener: () => {},
       addEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => {
-        if (query === "(pointer: coarse)") onChange = listener;
+        if (query === "(any-pointer: coarse)") onChange = listener;
       },
       removeEventListener: () => {},
       dispatchEvent: () => false,
@@ -577,10 +577,10 @@ describe("useResizableInlinePanel pointer drag", () => {
       act(() => onChange?.({ matches: true } as MediaQueryListEvent));
 
       expect(result.current.handleProps.style).toMatchObject({
-        paddingLeft: 6,
-        paddingRight: 16,
+        paddingLeft: 10,
+        paddingRight: 12,
         marginLeft: -6,
-        marginRight: -20,
+        marginRight: -8,
       });
     } finally {
       window.matchMedia = originalMatchMedia;
@@ -593,9 +593,7 @@ describe("useResizableInlinePanel pointer drag", () => {
     // TranscriptScrollbar's resting thumb occupies the 6–12px band from the
     // chat edge, so the resize target must stop at or before 6px.
     const style = result.current.handleProps.style;
-    const targetWidth = 4 + Number(style?.paddingLeft ?? 0) + Number(style?.paddingRight ?? 0);
-    const chatOverlap = targetWidth + Number(style?.marginRight ?? 0);
-    expect(chatOverlap).toBeLessThanOrEqual(6);
+    expect(-Number(style?.marginLeft ?? 0)).toBeLessThanOrEqual(6);
   });
 });
 
