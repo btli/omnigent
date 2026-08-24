@@ -30,6 +30,7 @@ from omnigent.claude_native_bridge import (
     _build_tools,
     _claude_prompt_rendered,
     _escape_unsupported_slash_command,
+    _hook_failure_detail,
     _hook_record_from_jsonl_record,
     _JsonlRecord,
     _occupying_surface,
@@ -7484,24 +7485,116 @@ def test_hook_record_non_stop_failure_event_has_no_failure_detail() -> None:
     assert record.failure_detail is None
 
 
+def test_hook_failure_detail_returns_none_for_content_free_fields() -> None:
+    """
+    Fields that sanitize to nothing yield ``None``, not a bare separator.
+
+    ``strip()`` removes whitespace but not ANSI/control bytes, so a payload of
+    pure noise used to pass the raw emptiness check and surface ``":"`` — a
+    truthy non-answer that shadowed the generic fallback it should yield to.
+    """
+    detail = _hook_failure_detail({"error": "\x1b[31m\x1b[0m", "last_assistant_message": "\x07"})
+    assert detail is None
+
+
+def test_hook_failure_detail_drops_dangling_separator() -> None:
+    """
+    A usable ``error`` beside a content-free message joins without ``": "``.
+    """
+    detail = _hook_failure_detail({"error": "rate_limit", "last_assistant_message": "\x07\x00"})
+    assert detail == "rate_limit"
+
+
+def test_hook_record_stop_failure_with_content_free_detail_is_none() -> None:
+    """
+    A noise-only ``StopFailure`` keeps ``failure_detail`` None end to end, so
+    the runner substitutes the generic failure string for the parent.
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "StopFailure",
+                "error": "\x1b[31m\x1b[0m",
+                "last_assistant_message": "\x07",
+            }
+        )
+    )
+    assert record.event_name == "StopFailure"
+    assert record.failure_detail is None
+
+
 # ── _sanitize_hook_failure_detail: untrusted text hardening ──────────────────
 
 
 def test_sanitize_hook_failure_detail_truncates_overlong() -> None:
     """
-    Over-long text is capped with an explicit truncation marker.
+    Over-long text is windowed head+tail with the marker between.
 
-    Secret-free input passes through the redactor unchanged, so the emitted
-    length is exactly the head cap plus the marker — a loose bound (``< 600``)
-    would still pass if the head cap silently widened. The input stays under the
-    raw bound so this exercises the output cap, not raw truncation.
+    The tail is where Python/Java tracebacks put the actionable final line, so
+    the cap keeps the first 150 and last 350 chars (pinned to
+    ``_HOOK_FAILURE_DETAIL_HEAD_CHARS`` / ``_TAIL_CHARS``) rather than a
+    head-only window that retained pure stack-frame boilerplate. Secret-free
+    input passes through the redactor unchanged, so the emitted text is
+    exactly head + marker + tail — a silent geometry change fails here. The
+    input stays under the raw bound so this exercises the output cap, not raw
+    truncation.
     """
     detail = _sanitize_hook_failure_detail("x" * 1000)
     assert detail is not None
-    assert detail.endswith(_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER)
-    assert len(detail) == _HOOK_FAILURE_DETAIL_MAX_CHARS + len(
-        _HOOK_FAILURE_DETAIL_TRUNCATION_MARKER
+    assert detail == "x" * 150 + f" {_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER} " + "x" * 350
+
+
+def test_sanitize_hook_failure_detail_keeps_traceback_tail() -> None:
+    """
+    A Python traceback keeps its actionable final line through the cap.
+
+    Tracebacks put the error type and cause LAST, so a head-only window
+    retains pure stack-frame boilerplate and cuts the one line naming the
+    failure. The head+tail window keeps both the framing and the cause.
+    """
+    frames = "".join(
+        f'  File "/app/harness.py", line {n}, in run\n    step()\n' for n in range(40)
     )
+    detail = _sanitize_hook_failure_detail(
+        "Traceback (most recent call last):\n"
+        + frames
+        + "openai.NotFoundError: Error code: 404 - {'error': {'message': "
+        "'The model `claude-fable-5` does not exist or you do not have access to it.', "
+        "'type': 'invalid_request_error', 'code': 'model_not_found'}}"
+    )
+    assert detail is not None
+    assert detail.startswith("Traceback (most recent call last):")
+    assert _HOOK_FAILURE_DETAIL_TRUNCATION_MARKER in detail
+    assert "model_not_found" in detail
+    assert "claude-fable-5" in detail
+
+
+def test_sanitize_hook_failure_detail_marks_raw_bound_truncation() -> None:
+    """
+    A detail cut by the RAW bound still carries the truncation marker.
+
+    A gateway 502 page with a spaceless ``<style>`` run forces the raw cut to
+    land mid-run; dropping the bisected token then leaves a short fragment
+    UNDER the cap, so the cap branch (and its marker) never fires. Without a
+    marker that fragment reads as the complete message.
+    """
+    page = "<!DOCTYPE html><html><head><title>502 Bad Gateway</title><style>" + "a" * 5000
+    detail = _sanitize_hook_failure_detail(page)
+    assert detail is not None
+    assert detail.startswith("<!DOCTYPE html><html>")
+    assert _HOOK_FAILURE_DETAIL_TRUNCATION_MARKER in detail
+
+
+def test_hook_failure_detail_marks_raw_bound_truncation() -> None:
+    """
+    The marker survives field-level sanitizing when a long field is raw-cut.
+    """
+    detail = _hook_failure_detail(
+        {"error": "x", "last_assistant_message": "real cause here " + "z" * 5000}
+    )
+    assert detail is not None
+    assert detail.startswith("x: real cause here")
+    assert _HOOK_FAILURE_DETAIL_TRUNCATION_MARKER in detail
 
 
 def test_sanitize_hook_failure_detail_redacts_secret_straddling_truncation() -> None:
@@ -7528,31 +7621,34 @@ def test_sanitize_hook_failure_detail_redacts_secret_straddling_raw_bound() -> N
     across the raw bound, so only a short, sub-threshold prefix is retained.
     Dropping the trailing bisected token on raw truncation prevents that prefix
     from surviving; without it, ``dapiA`` would reach the output. Legitimate
-    leading text is preserved.
+    leading text is preserved, and the marker keeps the cut visible.
     """
     prefix = "boot error: "
     token = "dapi" + "A" * 40
     pad = "\x00" * (_HOOK_FAILURE_DETAIL_RAW_LIMIT - len(prefix) - 6)
     detail = _sanitize_hook_failure_detail(f"{prefix}{pad} {token}")
-    assert detail == "boot error:"
+    assert detail == f"boot error: {_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER}"
     assert "dapi" not in detail
 
 
-def test_sanitize_hook_failure_detail_second_pass_catches_cap_created_boundary() -> None:
+def test_sanitize_hook_failure_detail_redacts_overlong_aws_key_straddling_cap() -> None:
     """
-    The post-cap re-scan catches a secret the length cap newly exposes.
+    An over-long key-shaped token straddling the cap is redacted pre-cap.
 
-    AWS key ids are a FIXED-count pattern (``AKIA`` + ``{16}`` + ``\\b``). A
-    token with 17 trailing chars has no valid boundary, so the pre-cap redact
-    misses it; the length cap can slice it to exactly ``AKIA`` + 16 chars,
-    creating a trailing boundary that only the defensive re-scan matches. This
-    is why the second ``redact_secrets`` call is kept, not dropped.
+    The AWS rule is open-ended (``AKIA`` + ``{16,}``), so the first pass
+    matches the whole 17-char run even though a fixed-count rule could not
+    (no word boundary after the counted chars). The defensive post-cap
+    re-scan that used to catch this shape was removed as redundant once every
+    pattern became ungated or open-ended; this pins the no-leak invariant
+    that pass guarded, on an input whose token fully survives the cap window.
     """
     token = "AKIA" + "A" * 17
-    padding = "x" * (_HOOK_FAILURE_DETAIL_MAX_CHARS - 21)
-    detail = _sanitize_hook_failure_detail(f"{padding} {token}")
+    padding = "x" * 139
+    detail = _sanitize_hook_failure_detail(f"{padding} {token} " + "y" * 400)
     assert detail is not None
     assert "AKIA" not in detail
+    assert "[REDACTED]" in detail
+    assert _HOOK_FAILURE_DETAIL_TRUNCATION_MARKER in detail
 
 
 def test_sanitize_hook_failure_detail_strips_control_and_ansi() -> None:
