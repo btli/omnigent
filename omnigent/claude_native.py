@@ -1244,7 +1244,7 @@ async def claude_launch_catalog_result(
 async def claude_launch_catalog(
     claude_config: ClaudeNativeUcodeConfig | None,
 ) -> list[dict[str, object]] | None:
-    """Return the shared catalog rows, preserving the existing list API."""
+    """Return the shared catalog rows for this launch config."""
     return (await claude_launch_catalog_result(claude_config)).rows
 
 

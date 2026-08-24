@@ -6138,7 +6138,6 @@ def _select_authoritative_claude_launch_model(
 ) -> str | None:
     """Select a launch model from an explicit pin or authoritative catalog."""
     from omnigent.claude_native import (
-        claude_catalog_serves_model,
         claude_config_serves_canonical_ids,
         resolve_claude_catalog_model,
         resolve_claude_native_model_selection,
@@ -6149,26 +6148,29 @@ def _select_authoritative_claude_launch_model(
         resolved = (
             resolve_claude_native_model_selection(explicit_model, claude_config) or explicit_model
         )
-        canonical_allowed = resolved.lower().startswith(
-            "claude-"
-        ) and claude_config_serves_canonical_ids(claude_config)
-        if canonical_allowed:
+        if resolved.lower().startswith("claude-") and claude_config_serves_canonical_ids(
+            claude_config
+        ):
             return resolved
-        fresh_rows = (
-            catalog.rows
-            if catalog is not None
-            and catalog.freshness is CatalogFreshness.FRESH
-            and catalog.rows is not None
-            else None
-        )
+    elif configured_model:
+        return resolve_claude_native_model_selection(configured_model, claude_config)
+    else:
+        resolved = None
+
+    fresh_rows = (
+        catalog.rows
+        if catalog is not None
+        and catalog.freshness is CatalogFreshness.FRESH
+        and catalog.rows is not None
+        else None
+    )
+    if resolved is not None:
         if fresh_rows is not None:
-            catalog_model = resolve_claude_catalog_model(fresh_rows, explicit_model)
+            catalog_model = resolve_claude_catalog_model(fresh_rows, explicit_model or resolved)
             if catalog_model is None and resolved != explicit_model:
                 catalog_model = resolve_claude_catalog_model(fresh_rows, resolved)
             if catalog_model is not None:
                 return catalog_model
-            if claude_catalog_serves_model(fresh_rows, resolved, claude_config):
-                return resolved
             launchable = sorted(
                 {
                     str(token)
@@ -6195,14 +6197,8 @@ def _select_authoritative_claude_launch_model(
             f"the requested model {explicit_model!r} could not be validated because this "
             "host has no fresh model list. Pick again from the model menu."
         )
-    if configured_model:
-        return resolve_claude_native_model_selection(configured_model, claude_config)
-    if (
-        catalog is not None
-        and catalog.freshness is CatalogFreshness.FRESH
-        and catalog.rows is not None
-    ):
-        row = default_row(catalog.rows)
+    if fresh_rows is not None:
+        row = default_row(fresh_rows)
         if row is not None:
             return str(row.get("model") or row.get("id") or "") or None
     refresh_error = catalog.refresh_error if catalog is not None else None
