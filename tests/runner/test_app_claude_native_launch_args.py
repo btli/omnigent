@@ -258,6 +258,54 @@ async def test_gateway_pin_uses_stale_rows_when_authoritative_refresh_fails() ->
     )
 
 
+async def test_gateway_pin_does_not_use_stale_rows_when_auth_refresh_fails() -> None:
+    catalog = model_catalog_store.CatalogResult(
+        _GATEWAY_ROWS,
+        model_catalog_store.CatalogFreshness.STALE,
+        model_catalog_store.CatalogRefreshError(
+            model_catalog_store.CatalogRefreshFailureKind.AUTH,
+            "Claude model catalog authentication failed",
+        ),
+    )
+
+    with pytest.raises(click.ClickException) as exc_info:
+        _select_authoritative_claude_launch_model(
+            explicit_model="databricks-claude-opus-4-8",
+            configured_model=None,
+            claude_config=_gateway_config(),
+            catalog=catalog,
+        )
+
+    message = str(exc_info.value)
+    assert "authentication failed" in message
+    assert "Restore provider credentials and retry" in message
+    assert "databricks auth login" in message
+
+
+async def test_gateway_pin_does_not_use_stale_rows_after_authoritative_empty() -> None:
+    catalog = model_catalog_store.CatalogResult(
+        _GATEWAY_ROWS,
+        model_catalog_store.CatalogFreshness.STALE,
+        model_catalog_store.CatalogRefreshError(
+            model_catalog_store.CatalogRefreshFailureKind.EMPTY,
+            "Claude model catalog refresh returned no launchable models",
+        ),
+    )
+
+    with pytest.raises(click.ClickException) as exc_info:
+        _select_authoritative_claude_launch_model(
+            explicit_model="databricks-claude-opus-4-8",
+            configured_model=None,
+            claude_config=_gateway_config(),
+            catalog=catalog,
+        )
+
+    message = str(exc_info.value)
+    assert "is not available" in message
+    assert "Pick again from the model menu" in message
+    assert "provider credentials" not in message
+
+
 def test_forbidden_catalog_failure_does_not_advise_reauthentication() -> None:
     refresh_error = claude_native._claude_probe_process_error(b"HTTP 403 Forbidden quota exceeded")
     catalog = model_catalog_store.CatalogResult(
@@ -354,10 +402,10 @@ async def test_missing_empty_catalog_does_not_blame_credentials() -> None:
         )
 
     message = str(exc_info.value)
-    assert "enumeration returned no models" in message
+    assert "is not available" in message
+    assert "Pick again from the model menu" in message
     assert "provider credentials" not in message
     assert "databricks auth login" not in message
-    assert "Claude CLI availability and provider connectivity" in message
 
 
 async def test_direct_login_alias_fails_open_when_refresh_fails() -> None:

@@ -9023,6 +9023,14 @@ def create_runner_app(
                     "detail": "the harness model probe is still resolving",
                 },
             )
+        except Exception:  # noqa: BLE001 — cold catalog failures are retryable and sanitized
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "claude_native_model_options_failed",
+                    "detail": "the harness model probe failed; retrying",
+                },
+            )
         if not rows:
             return JSONResponse(
                 status_code=503,

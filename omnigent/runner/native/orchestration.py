@@ -6180,6 +6180,11 @@ def _select_authoritative_claude_launch_model(
         if catalog is not None
         and catalog.freshness is model_catalog_store.CatalogFreshness.STALE
         and catalog.refresh_error is not None
+        and catalog.refresh_error.kind
+        in {
+            model_catalog_store.CatalogRefreshFailureKind.TIMEOUT,
+            model_catalog_store.CatalogRefreshFailureKind.OTHER,
+        }
         and catalog.rows is not None
         else None
     )
@@ -6217,9 +6222,27 @@ def _select_authoritative_claude_launch_model(
                 "list — it may have changed since the pick. Launchable model ids: "
                 f"{launchable_text}. Pick again from the model menu."
             )
+        refresh_error = catalog.refresh_error if catalog is not None else None
+        if (
+            refresh_error is not None
+            and refresh_error.kind is model_catalog_store.CatalogRefreshFailureKind.EMPTY
+        ):
+            raise click.ClickException(
+                f"the requested model {explicit_model!r} is not available from this host's "
+                "current model list — it may have been removed since the pick. Pick again "
+                "from the model menu."
+            )
+        if (
+            refresh_error is not None
+            and refresh_error.kind is model_catalog_store.CatalogRefreshFailureKind.AUTH
+        ):
+            raise click.ClickException(
+                f"the requested model {explicit_model!r} could not be validated against a "
+                f"fresh model list ({refresh_error}). "
+                f"{_claude_catalog_refresh_remediation(refresh_error, claude_config)}"
+            )
         if claude_config_serves_canonical_ids(claude_config):
             return resolved
-        refresh_error = catalog.refresh_error if catalog is not None else None
         if refresh_error is not None:
             raise click.ClickException(
                 f"the requested model {explicit_model!r} could not be validated against a "
