@@ -7713,6 +7713,48 @@ def test_sanitize_hook_failure_detail_strips_extended_ansi(sequence: str) -> Non
     assert _sanitize_hook_failure_detail(f"before {sequence} after") == "before after"
 
 
+def test_sanitize_hook_failure_detail_strips_unterminated_dcs_in_linear_time() -> None:
+    """Repeated unterminated DCS introducers cannot trigger quadratic rescanning."""
+    started = time.perf_counter()
+    detail = _sanitize_hook_failure_detail("\x1bP" * 8000)
+    elapsed = time.perf_counter() - started
+
+    assert detail is None
+    assert elapsed < 0.1
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["\u115f", "\u1160", "\u3164", "\uffa0"],
+    ids=["hangul-choseong-filler", "hangul-jungseong-filler", "hangul-filler", "halfwidth-filler"],
+)
+def test_sanitize_hook_failure_detail_removes_default_ignorable_fillers(
+    mutation: str,
+) -> None:
+    """Default-ignorable Lo fillers cannot split a GitHub-shaped credential."""
+    secret = "".join(("ghp_", "FAKE", "TEST", "TOKEN", "PLACEHOLDER"))
+    obfuscated = f"{secret[:14]}{mutation}{secret[14:]}"
+    assert _sanitize_hook_failure_detail(f"launch rejected {obfuscated}") == (
+        "launch rejected [REDACTED]"
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["\u0903", "\u20dd"],
+    ids=["spacing-combining-mark", "enclosing-combining-mark"],
+)
+def test_sanitize_hook_failure_detail_rejoins_all_combining_mark_categories(
+    mutation: str,
+) -> None:
+    """Mc and Me marks inside candidate tokens cannot evade redaction."""
+    secret = "".join(("ghp_", "FAKE", "TEST", "TOKEN", "PLACEHOLDER"))
+    obfuscated = f"{secret[:14]}{mutation}{secret[14:]}"
+    assert _sanitize_hook_failure_detail(f"launch rejected {obfuscated}") == (
+        "launch rejected [REDACTED]"
+    )
+
+
 @pytest.mark.parametrize(
     ("mutation", "mutation_name"),
     [("\u200b", "ignorable-separator"), ("\u0338", "combining-mark")],

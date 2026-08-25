@@ -2806,20 +2806,32 @@ _HOOK_FAILURE_DETAIL_RAW_HEAD_CHARS = _HOOK_FAILURE_DETAIL_RAW_LIMIT // 2
 _HOOK_FAILURE_DETAIL_RAW_TAIL_CHARS = (
     _HOOK_FAILURE_DETAIL_RAW_LIMIT - _HOOK_FAILURE_DETAIL_RAW_HEAD_CHARS
 )
-_ANSI_ESCAPE_RE = re.compile(
-    r"\x1b(?:"
-    r"\[[0-?]*[ -/]*[@-~]"
-    r"|\][^\x07\x1b]*(?:\x07|\x1b\\)"
-    r"|[PX^_].*?\x1b\\"
-    r"|[()][0-2A-Z]"
-    r"|[@-Z\\-_]"
-    r")",
-    re.DOTALL,
-)
 _HOOK_FAILURE_FRAME_TRANSLATION = str.maketrans({"[": "(", "]": ")"})
 _HOOK_FAILURE_REDACTION_MARKER = "[REDACTED]"
 _HOOK_FAILURE_PLANTED_REDACTION_RE = re.compile(r"(?i)\[REDACTED\]")
 _HOOK_FAILURE_SEPARATOR_MARKER = "\x00"
+# Unicode Default_Ignorable_Code_Point ranges from DerivedCoreProperties.txt.
+_DEFAULT_IGNORABLE_CODE_POINT_RANGES = frozenset(
+    {
+        (0x00AD, 0x00AD),
+        (0x034F, 0x034F),
+        (0x061C, 0x061C),
+        (0x115F, 0x1160),
+        (0x17B4, 0x17B5),
+        (0x180B, 0x180F),
+        (0x200B, 0x200F),
+        (0x202A, 0x202E),
+        (0x2060, 0x206F),
+        (0x3164, 0x3164),
+        (0xFE00, 0xFE0F),
+        (0xFEFF, 0xFEFF),
+        (0xFFA0, 0xFFA0),
+        (0xFFF0, 0xFFF8),
+        (0x1BCA0, 0x1BCA3),
+        (0x1D173, 0x1D17A),
+        (0xE0000, 0xE0FFF),
+    }
+)
 
 
 def _raw_hook_failure_window(text: str) -> tuple[str, bool]:
@@ -2839,9 +2851,68 @@ def _raw_hook_failure_window(text: str) -> tuple[str, bool]:
     return "\n".join(part.strip() for part in (head, tail) if part.strip()), True
 
 
-def _is_variation_selector(char: str) -> bool:
-    """Return whether *char* is a Unicode variation selector."""
-    return "\ufe00" <= char <= "\ufe0f" or "\U000e0100" <= char <= "\U000e01ef"
+def _is_default_ignorable_code_point(char: str) -> bool:
+    """Return whether *char* has Unicode's Default_Ignorable property."""
+    code_point = ord(char)
+    return any(start <= code_point <= end for start, end in _DEFAULT_IGNORABLE_CODE_POINT_RANGES)
+
+
+def _strip_ansi_escape_sequences(text: str) -> str:
+    """Strip ANSI control families in one forward pass."""
+    stripped: list[str] = []
+    index = 0
+    while index < len(text):
+        escape = text.find("\x1b", index)
+        if escape < 0:
+            stripped.append(text[index:])
+            break
+        stripped.append(text[index:escape])
+        if escape + 1 >= len(text):
+            break
+
+        introducer = text[escape + 1]
+        if introducer == "[":
+            cursor = escape + 2
+            while cursor < len(text) and "0" <= text[cursor] <= "?":
+                cursor += 1
+            while cursor < len(text) and " " <= text[cursor] <= "/":
+                cursor += 1
+            if cursor < len(text) and "@" <= text[cursor] <= "~":
+                cursor += 1
+            index = cursor
+            continue
+
+        if introducer == "]":
+            cursor = escape + 2
+            while cursor < len(text):
+                if text[cursor] == "\x07":
+                    cursor += 1
+                    break
+                if text.startswith("\x1b\\", cursor):
+                    cursor += 2
+                    break
+                cursor += 1
+            index = cursor
+            continue
+
+        if introducer in "PX^_":
+            terminator = text.find("\x1b\\", escape + 2)
+            index = len(text) if terminator < 0 else terminator + 2
+            continue
+
+        if (
+            introducer in "()"
+            and escape + 2 < len(text)
+            and (text[escape + 2] in "012" or "A" <= text[escape + 2] <= "Z")
+        ):
+            index = escape + 3
+            continue
+
+        if "@" <= introducer <= "Z" or "\\" <= introducer <= "_":
+            index = escape + 2
+            continue
+        index = escape + 1
+    return "".join(stripped)
 
 
 def _redactor_changes(text: str) -> bool:
@@ -2862,7 +2933,7 @@ def _canonicalize_hook_failure_chunk(chunk: str, previous_word: str) -> str:
     skeleton = "".join(
         char
         for char in unicodedata.normalize("NFKD", compact)
-        if unicodedata.category(char) != "Mn"
+        if unicodedata.category(char) not in {"Mn", "Mc", "Me"}
     )
     if skeleton != compact and (
         _redactor_changes(skeleton)
@@ -2884,7 +2955,7 @@ def _canonicalize_hook_failure_detail(text: str) -> str:
             prepared.append(char)
             continue
         category = unicodedata.category(char)
-        if category in {"Cf", "Cs"} or _is_variation_selector(char):
+        if _is_default_ignorable_code_point(char) or category == "Cs":
             continue
         if char.isspace() or category == "Cc":
             prepared.append(_HOOK_FAILURE_SEPARATOR_MARKER)
@@ -2944,7 +3015,7 @@ def _sanitize_hook_failure_detail(text: str) -> str | None:
     :param text: Raw failure text from a ``StopFailure`` hook payload.
     :returns: Sanitized detail, or ``None`` when nothing usable remains.
     """
-    without_ansi = _ANSI_ESCAPE_RE.sub("", text)
+    without_ansi = _strip_ansi_escape_sequences(text)
     canonical = _canonicalize_hook_failure_detail(without_ansi)
     canonical = _HOOK_FAILURE_PLANTED_REDACTION_RE.sub("(REDACTED)", canonical)
     redacted = redact_secrets(canonical)
