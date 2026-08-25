@@ -29,6 +29,7 @@ from omnigent.db.utils import (
     now_epoch,
 )
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
+from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 # Sentinel meaning "caller did not supply this argument; leave the column unchanged."
@@ -201,6 +202,16 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                     and_(
                         SqlProject.workspace_id == SqlScheduledTask.workspace_id,
                         SqlProject.id == SqlScheduledTask.project_id,
+                        or_(
+                            SqlProject.user_id == SqlScheduledTask.user_id,
+                            and_(
+                                SqlScheduledTask.user_id.is_(None),
+                                or_(
+                                    SqlProject.user_id.is_(None),
+                                    SqlProject.user_id == RESERVED_USER_LOCAL,
+                                ),
+                            ),
+                        ),
                     ),
                 ).where(
                     or_(
