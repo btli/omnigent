@@ -42,6 +42,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.parse
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass
@@ -56,6 +57,7 @@ from omnigent._platform import stable_user_id
 from omnigent.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.claude_native_status import CONTEXT_RAW_FILE
+from omnigent.cli_diagnostics import redact_secrets
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.kiro_native_bridge import bridge_root as kiro_bridge_root
 
@@ -545,6 +547,12 @@ class ClaudeHookRecord:
         each counted entry (see :func:`_normalize_background_task`), so the UI
         can name them. ``None`` for non-``Stop`` events, when the array is
         absent, or when no counted entry carried a usable field.
+    :param failure_detail: Sanitized, capped failure text from a
+        ``StopFailure`` hook event — the ``error`` code and
+        ``last_assistant_message`` the provider reported, e.g.
+        ``"model_not_found: There's an issue with the selected model."``.
+        ``None`` for all other events or when the payload carried no usable
+        detail.
     """
 
     event_cursor: int
@@ -565,6 +573,7 @@ class ClaudeHookRecord:
     task_status: str | None = None
     background_task_count: int = 0
     background_tasks: list[_JsonObject] | None = None
+    failure_detail: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2777,6 +2786,315 @@ def _normalize_background_task(raw: object) -> _JsonObject | None:
     return out or None
 
 
+# Bound provider failure text before forwarding it to a parent session.
+_HOOK_FAILURE_DETAIL_MAX_CHARS = 500
+_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER = "… [truncated]"
+_HOOK_FAILURE_DETAIL_REMOVED_SENTINEL = (
+    f"Provider detail removed at safety limit {_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER}"
+)
+# Preserve the traceback framing and its final, actionable line.
+_HOOK_FAILURE_DETAIL_HEAD_CHARS = 150
+_HOOK_FAILURE_DETAIL_WINDOW_SEPARATOR = f" {_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER} "
+_HOOK_FAILURE_DETAIL_TAIL_CHARS = (
+    _HOOK_FAILURE_DETAIL_MAX_CHARS
+    - _HOOK_FAILURE_DETAIL_HEAD_CHARS
+    - len(_HOOK_FAILURE_DETAIL_WINDOW_SEPARATOR)
+)
+# Bound regex and character scanning before controls are stripped.
+_HOOK_FAILURE_DETAIL_RAW_LIMIT = _HOOK_FAILURE_DETAIL_MAX_CHARS * 8
+_HOOK_FAILURE_DETAIL_RAW_HEAD_CHARS = _HOOK_FAILURE_DETAIL_RAW_LIMIT // 2
+_HOOK_FAILURE_DETAIL_RAW_TAIL_CHARS = (
+    _HOOK_FAILURE_DETAIL_RAW_LIMIT - _HOOK_FAILURE_DETAIL_RAW_HEAD_CHARS
+)
+_HOOK_FAILURE_FRAME_TRANSLATION = str.maketrans({"[": "(", "]": ")"})
+_HOOK_FAILURE_REDACTION_MARKER = "[REDACTED]"
+_HOOK_FAILURE_PLANTED_REDACTION_RE = re.compile(r"(?i)\[REDACTED\]")
+_HOOK_FAILURE_SEPARATOR_MARKER = "\x00"
+_ASCII_ALPHANUMERIC_RE = re.compile(r"[A-Za-z0-9]")
+# Unicode Default_Ignorable_Code_Point ranges from DerivedCoreProperties.txt.
+_DEFAULT_IGNORABLE_CODE_POINT_RANGES = frozenset(
+    {
+        (0x00AD, 0x00AD),
+        (0x034F, 0x034F),
+        (0x061C, 0x061C),
+        (0x115F, 0x1160),
+        (0x17B4, 0x17B5),
+        (0x180B, 0x180F),
+        (0x200B, 0x200F),
+        (0x202A, 0x202E),
+        (0x2060, 0x206F),
+        (0x3164, 0x3164),
+        (0xFE00, 0xFE0F),
+        (0xFEFF, 0xFEFF),
+        (0xFFA0, 0xFFA0),
+        (0xFFF0, 0xFFF8),
+        (0x1BCA0, 0x1BCA3),
+        (0x1D173, 0x1D17A),
+        (0xE0000, 0xE0FFF),
+    }
+)
+_DEFAULT_IGNORABLE_CODE_POINT_RE = re.compile(
+    "[\u00ad\u034f\u061c\u115f-\u1160\u17b4-\u17b5\u180b-\u180f"
+    "\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f"
+    "\ufeff\uffa0\ufff0-\ufff8\U0001bca0-\U0001bca3"
+    "\U0001d173-\U0001d17a\U000e0000-\U000e0fff]"
+)
+
+
+def _raw_hook_failure_window(text: str) -> tuple[str, bool]:
+    """Bound raw text while retaining both ends of a long provider error."""
+    if len(text) <= _HOOK_FAILURE_DETAIL_RAW_LIMIT:
+        return text, False
+    head = re.sub(r"\S+$", "", text[:_HOOK_FAILURE_DETAIL_RAW_HEAD_CHARS])
+    tail = text[-_HOOK_FAILURE_DETAIL_RAW_TAIL_CHARS:]
+    while tail:
+        tail_before_partition = tail
+        _, separator, tail = tail.partition("\n")
+        if not separator:
+            tail = re.sub(r"^\S+", "", tail_before_partition)
+            break
+        if not tail.startswith((" ", "\t")):
+            break
+    return "\n".join(part.strip() for part in (head, tail) if part.strip()), True
+
+
+def _is_default_ignorable_code_point(char: str) -> bool:
+    """Return whether *char* has Unicode's Default_Ignorable property."""
+    code_point = ord(char)
+    return any(start <= code_point <= end for start, end in _DEFAULT_IGNORABLE_CODE_POINT_RANGES)
+
+
+def _strip_ansi_escape_sequences(text: str) -> str:
+    """Strip ANSI control families in one forward pass."""
+    stripped: list[str] = []
+    index = 0
+    while index < len(text):
+        escape = text.find("\x1b", index)
+        if escape < 0:
+            stripped.append(text[index:])
+            break
+        stripped.append(text[index:escape])
+        if escape + 1 >= len(text):
+            break
+
+        introducer = text[escape + 1]
+        if introducer == "[":
+            cursor = escape + 2
+            while cursor < len(text) and "0" <= text[cursor] <= "?":
+                cursor += 1
+            while cursor < len(text) and " " <= text[cursor] <= "/":
+                cursor += 1
+            if cursor < len(text) and "@" <= text[cursor] <= "~":
+                cursor += 1
+            index = cursor
+            continue
+
+        if introducer == "]":
+            cursor = escape + 2
+            while cursor < len(text):
+                if text[cursor] == "\x07":
+                    cursor += 1
+                    break
+                if text.startswith("\x1b\\", cursor):
+                    cursor += 2
+                    break
+                cursor += 1
+            index = cursor
+            continue
+
+        if introducer in "PX^_":
+            terminator = text.find("\x1b\\", escape + 2)
+            index = len(text) if terminator < 0 else terminator + 2
+            continue
+
+        if (
+            introducer in "()"
+            and escape + 2 < len(text)
+            and (text[escape + 2] in "012" or "A" <= text[escape + 2] <= "Z")
+        ):
+            index = escape + 3
+            continue
+
+        if "@" <= introducer <= "Z" or "\\" <= introducer <= "_":
+            index = escape + 2
+            continue
+        index = escape + 1
+    return "".join(stripped)
+
+
+def _redactor_changes(text: str) -> bool:
+    """Return whether shared secret matching redacts *text*."""
+    return redact_secrets(text) != text
+
+
+def _canonicalize_hook_failure_chunk(chunk: str, previous_word: str) -> str:
+    """Normalize one hard-whitespace-bounded chunk without mangling prose."""
+    compact = chunk.replace(_HOOK_FAILURE_SEPARATOR_MARKER, "")
+    has_soft_separator = compact != chunk
+    if has_soft_separator and (
+        _redactor_changes(compact)
+        or (previous_word.casefold() == "bearer" and _redactor_changes(f"Bearer {compact}"))
+    ):
+        return compact
+    if len(compact) > _HOOK_FAILURE_DETAIL_RAW_LIMIT:
+        return compact
+
+    decomposed = unicodedata.normalize("NFKD", compact)
+    skeleton = "".join(
+        char for char in decomposed if unicodedata.category(char) not in {"Mn", "Mc", "Me"}
+    )
+    if skeleton != compact and (
+        _redactor_changes(skeleton)
+        or (previous_word.casefold() == "bearer" and _redactor_changes(f"Bearer {skeleton}"))
+    ):
+        return skeleton
+
+    if not has_soft_separator:
+        return chunk
+    return re.sub(f"{_HOOK_FAILURE_SEPARATOR_MARKER}+", " ", chunk)
+
+
+def _canonicalize_hook_failure_detail(text: str) -> str:
+    """Build the normalized text used for both secret matching and output."""
+    line_normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    if line_normalized.isprintable() and not _DEFAULT_IGNORABLE_CODE_POINT_RE.search(
+        line_normalized
+    ):
+        prepared_text = line_normalized
+    else:
+        prepared: list[str] = []
+        for char in line_normalized:
+            if char in {" ", "\n"}:
+                prepared.append(char)
+                continue
+            category = unicodedata.category(char)
+            if _is_default_ignorable_code_point(char) or category == "Cs":
+                continue
+            if char.isspace() or category == "Cc":
+                prepared.append(_HOOK_FAILURE_SEPARATOR_MARKER)
+                continue
+            if not char.isprintable():
+                continue
+            prepared.append(char)
+        prepared_text = "".join(prepared)
+
+    normalized = unicodedata.normalize("NFKC", prepared_text)
+    if (
+        len(normalized) > _HOOK_FAILURE_DETAIL_RAW_LIMIT
+        and _HOOK_FAILURE_SEPARATOR_MARKER not in normalized
+        and " " not in normalized
+        and "\n" not in normalized
+    ):
+        return normalized
+    canonical: list[str] = []
+    previous_word = ""
+    index = 0
+    while index < len(normalized):
+        char = normalized[index]
+        if char in {" ", "\n"}:
+            if char == "\n" or not canonical or canonical[-1] not in {" ", "\n"}:
+                canonical.append(char)
+            index += 1
+            continue
+        chunk_end = index + 1
+        while chunk_end < len(normalized) and normalized[chunk_end] not in {" ", "\n"}:
+            chunk_end += 1
+        chunk = _canonicalize_hook_failure_chunk(normalized[index:chunk_end], previous_word)
+        for chunk_char in chunk:
+            if chunk_char == " " and canonical and canonical[-1] in {" ", "\n"}:
+                continue
+            canonical.append(chunk_char)
+        previous_word = chunk.rsplit(" ", 1)[-1]
+        index = chunk_end
+    return "".join(canonical)
+
+
+def _cap_hook_failure_detail(text: str, *, raw_truncated: bool) -> str:
+    """Fit sanitized detail and its truncation marker inside the global cap."""
+    raw_suffix = f" {_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER}"
+    needs_window = len(text) > _HOOK_FAILURE_DETAIL_MAX_CHARS or (
+        raw_truncated and len(text) + len(raw_suffix) > _HOOK_FAILURE_DETAIL_MAX_CHARS
+    )
+    if needs_window:
+        head = text[:_HOOK_FAILURE_DETAIL_HEAD_CHARS].rstrip()
+        tail = text[-_HOOK_FAILURE_DETAIL_TAIL_CHARS:].lstrip()
+        return f"{head}{_HOOK_FAILURE_DETAIL_WINDOW_SEPARATOR}{tail}"
+    if raw_truncated:
+        return f"{text}{raw_suffix}"
+    return text
+
+
+def _sanitize_hook_failure_detail(text: str) -> str | None:
+    """
+    Scrub and cap untrusted hook failure text for a parent session ``output``.
+
+    Long raw input retains complete lines from both ends. Matching and output
+    share one NFKC-normalized representation with preserved line boundaries.
+    Square brackets are neutralized to prevent model-visible frame injection,
+    including the accepted trade-off that ordinary bracketed text is rewritten.
+
+    :param text: Raw failure text from a ``StopFailure`` hook payload.
+    :returns: Sanitized detail, or ``None`` when nothing usable remains.
+    """
+    without_ansi = _strip_ansi_escape_sequences(text)
+    canonical = _canonicalize_hook_failure_detail(without_ansi)
+    raw_preview, preview_truncated = _raw_hook_failure_window(canonical)
+    canonical = _HOOK_FAILURE_PLANTED_REDACTION_RE.sub("(REDACTED)", canonical)
+    if (
+        preview_truncated
+        and not raw_preview
+        and canonical.startswith(("ghp_", "gho_", "ghu_", "ghs_", "ghr_"))
+        and _ASCII_ALPHANUMERIC_RE.search(canonical[4:]) is None
+    ):
+        return _HOOK_FAILURE_DETAIL_REMOVED_SENTINEL
+    redacted = redact_secrets(canonical)
+    if preview_truncated and not raw_preview and redacted == canonical:
+        return _HOOK_FAILURE_DETAIL_REMOVED_SENTINEL
+    if not redacted:
+        return None
+    bounded, raw_truncated = _raw_hook_failure_window(redacted)
+    if raw_truncated and not bounded:
+        return _HOOK_FAILURE_DETAIL_REMOVED_SENTINEL
+    protected = bounded.replace(_HOOK_FAILURE_REDACTION_MARKER, "\x00")
+    neutralized = protected.translate(_HOOK_FAILURE_FRAME_TRANSLATION)
+    redacted = neutralized.replace("\x00", _HOOK_FAILURE_REDACTION_MARKER)
+    return _cap_hook_failure_detail(redacted, raw_truncated=raw_truncated)
+
+
+def _hook_failure_detail(payload: _JsonObject) -> str | None:
+    """
+    Build a sanitized failure detail from a ``StopFailure`` hook payload.
+
+    Fields are composed before one sanitize/redact/cap pass so credentials
+    split across the field boundary cannot bypass matching.
+
+    :param payload: ``StopFailure`` hook payload.
+    :returns: Sanitized detail, or ``None`` when the payload carried none.
+    """
+    raw_error = payload.get("error")
+    raw_message = payload.get("last_assistant_message")
+
+    def normalized_field(value: object) -> str:
+        if not isinstance(value, str):
+            return ""
+        return str(value).strip()
+
+    error = normalized_field(raw_error)
+    message = normalized_field(raw_message)
+    if error and message:
+        combined = f"{error}: {message}"
+    else:
+        combined = error or message
+    if not combined:
+        return None
+    detail = _sanitize_hook_failure_detail(combined)
+    if detail is None:
+        return None
+    if error and message:
+        detail = detail.strip(": ")
+    return detail or None
+
+
 def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
     """
     Convert one complete hook JSONL line into a hook record.
@@ -2878,6 +3196,9 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
                 if (detail := _normalize_background_task(task)) is not None
             ]
             background_tasks = details or None
+    failure_detail: str | None = None
+    if event_name == "StopFailure" and isinstance(payload, dict):
+        failure_detail = _hook_failure_detail(payload)
     return ClaudeHookRecord(
         event_cursor=record.line_number,
         byte_offset=record.next_byte_offset,
@@ -2921,6 +3242,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         task_status=task_status,
         background_task_count=background_task_count,
         background_tasks=background_tasks,
+        failure_detail=failure_detail,
     )
 
 
