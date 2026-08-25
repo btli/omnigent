@@ -149,6 +149,7 @@ import {
   sortAgentsForDisplay,
 } from "@/lib/agentGrouping";
 import { cn } from "@/lib/utils";
+import { useOmnigentAnalytics } from "@/lib/analytics";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import {
   isFullySupportedNativeCodingAgent,
@@ -158,12 +159,18 @@ import {
   nativeCodingAgentForAvailableAgent,
   nativeWrapperLabelsForAgent,
 } from "@/lib/nativeCodingAgents";
+import {
+  CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
+  CLAUDE_NATIVE_PERMISSION_MODES,
+} from "@/lib/claudePermissionMode";
 import { useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
 import {
   controlHost,
   getHostIdentity,
   isElectronShell,
+  isIOSShell,
   onHostStatusChanged,
+  setNativeViewMode,
   type HostIdentity,
 } from "@/lib/nativeBridge";
 import {
@@ -232,32 +239,6 @@ const AGENT_PICKER_DESCRIPTIONS: Record<string, string> = {
 // landing composer. Deliberately an allowlist while the pattern proves
 // out — other agents keep the "/" menu as the only skill surface.
 const SKILL_PILL_AGENTS = new Set(["polly", "debby"]);
-
-// Claude Code's `claude --permission-mode` choices (v2.1). Claude-native
-// sessions only. "default" is Claude's own default and sends no flag; any
-// other value is passed through as `--permission-mode <value>` via the
-// session's terminal_launch_args. Keep in sync with `claude --help`.
-const CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE = "default";
-const CLAUDE_NATIVE_PERMISSION_MODES: { value: string; label: string; description: string }[] = [
-  { value: "default", label: "Default", description: "Prompts before edits and commands" },
-  {
-    value: "auto",
-    label: "Auto",
-    description: "Auto-runs; a classifier blocks risky actions",
-  },
-  {
-    value: "acceptEdits",
-    label: "Accept edits",
-    description: "Auto-applies file edits; commands still prompt",
-  },
-  { value: "plan", label: "Plan", description: "Plans only; makes no edits" },
-  { value: "dontAsk", label: "Don't ask", description: "Auto-denies anything not pre-approved" },
-  {
-    value: "bypassPermissions",
-    label: "Bypass permissions",
-    description: "Runs everything; no prompts or safety checks",
-  },
-];
 
 // Antigravity (agy) permission control. agy exposes exactly ONE pre-emptive
 // knob — `--dangerously-skip-permissions`, an all-or-nothing bypass — with no
@@ -528,7 +509,7 @@ export function ConnectHostInstructions({
     <div className="flex flex-col gap-4 rounded-lg border border-dashed border-border p-4">
       {label && <p className="text-sm text-muted-foreground">{label}</p>}
       {databricksFeatures ? (
-        <Tabs defaultValue="local">
+        <Tabs defaultValue="local" componentId="new_chat.host_tabs">
           <TabsList className="w-full">
             <TabsTrigger value="local" className="text-sm">
               Local machine
@@ -788,6 +769,7 @@ function HarnessSetupNotice({
   featureEnabled: boolean;
   onSetup: () => void;
 }) {
+  const { trackClick } = useOmnigentAnalytics();
   return (
     <p
       // pl-2 lines the icon up with the chips tray directly above (which has
@@ -807,7 +789,10 @@ function HarnessSetupNotice({
             type="button"
             data-testid="new-chat-landing-harness-setup"
             className="inline-flex h-5 shrink-0 items-center rounded-md border border-amber-300 px-2 text-sm font-medium text-amber-700 hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400 dark:border-amber-500/40 dark:text-amber-400 dark:hover:bg-amber-500/20"
-            onClick={onSetup}
+            onClick={() => {
+              trackClick("new_chat.setup", "button");
+              onSetup();
+            }}
           >
             Set up {agentName}
           </button>
@@ -1786,6 +1771,7 @@ function HarnessConfigModal({
                   models={claudeModelSelectOptions}
                   defaultLabel={defaultModelLabel(claudeModelOptions)}
                   contentClassName="[&_[data-slot=select-item]]:pl-2.5"
+                  componentId="new_chat.config.model"
                 >
                   {claudeModelsLoading && (
                     <div className="px-2.5 py-1 text-sm text-muted-foreground">Loading models…</div>
@@ -1837,6 +1823,7 @@ function HarnessConfigModal({
                   options={CLAUDE_NATIVE_PERMISSION_MODES}
                   testId="new-chat-landing-config-permission"
                   ariaLabel="Permissions"
+                  componentId="new_chat.config.permission"
                 />
               </ConfigRow>
             </>
@@ -1857,6 +1844,7 @@ function HarnessConfigModal({
                   models={codexModelSelectOptions}
                   defaultLabel={defaultModelLabel(codexModelOptions)}
                   contentClassName="[&_[data-slot=select-item]]:pl-2.5"
+                  componentId="new_chat.config.model"
                 >
                   {codexModelsLoading && (
                     <div className="px-2.5 py-1 text-sm text-muted-foreground">Loading models…</div>
@@ -1890,6 +1878,7 @@ function HarnessConfigModal({
                   }
                   testId="new-chat-landing-config-approval"
                   ariaLabel="Approval"
+                  componentId="new_chat.config.approval"
                 />
               </ConfigRow>
             </>
@@ -1903,6 +1892,7 @@ function HarnessConfigModal({
                 options={CURSOR_NATIVE_EXEC_MODES}
                 testId="new-chat-landing-config-cursor-mode"
                 ariaLabel="Mode"
+                componentId="new_chat.config.cursor_mode"
               />
             </ConfigRow>
           )}
@@ -1916,6 +1906,7 @@ function HarnessConfigModal({
                   options={AGY_NATIVE_SKIP_MODES}
                   testId="new-chat-landing-config-agy-skip"
                   ariaLabel="Permissions"
+                  componentId="new_chat.config.permission"
                 />
               </ConfigRow>
               {/* Persistent danger banner while the bypass is selected. agy has
@@ -1942,7 +1933,12 @@ function HarnessConfigModal({
           read it back or switch away without cancelling. */}
           {!hasPermission && !hasApproval && !hasCursor && !hasAgySkip && brainDefault && (
             <ConfigRow label="Agent Harness" description="Underlying coding harness">
-              <Select value={draftHarness ?? brainDefault} onValueChange={setDraftHarness}>
+              <Select
+                value={draftHarness ?? brainDefault}
+                onValueChange={setDraftHarness}
+                componentId="new_chat.config.harness"
+                valueHasNoPii
+              >
                 <SelectTrigger
                   className="w-full cursor-pointer"
                   data-testid="new-chat-landing-config-harness"
@@ -2018,7 +2014,13 @@ function HarnessConfigModal({
           >
             Cancel
           </Button>
-          <Button type="button" onClick={save} data-testid="new-chat-landing-config-save" size="lg">
+          <Button
+            type="button"
+            onClick={save}
+            data-testid="new-chat-landing-config-save"
+            size="lg"
+            componentId="new_chat.save_config"
+          >
             Save
           </Button>
         </DialogFooter>
@@ -2067,6 +2069,22 @@ export function NewChatLandingScreen() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
+  const isMobileViewport = useIsMobileViewport();
+  // No session here, so there is nothing to switch between: assert the iOS
+  // shell's native Chat/Terminal bar is hidden. ChatPage's own bar is driven by
+  // the session surface and hides itself on unmount, but that is the only thing
+  // holding the native state down — and the bar was showing over this screen,
+  // so state the truth for this route instead of trusting a teardown that runs
+  // elsewhere. Idempotent, and re-asserted on every mount of this screen.
+  useEffect(() => {
+    if (!isIOSShell()) return;
+    setNativeViewMode({
+      mode: "chat",
+      terminalEnabled: false,
+      terminalStartingUp: false,
+      visible: false,
+    });
+  }, []);
   const heading = useHeading();
   const poweredBy = usePoweredBy();
   const serverUrl = getCliServerUrl();
@@ -4260,132 +4278,140 @@ export function NewChatLandingScreen() {
                 onAttach={attachMention}
               />
             )}
-            <textarea
-              ref={textareaRef}
-              value={message}
-              onChange={(e) => {
-                setMessage(e.target.value);
-                // A rejected attachment is never added, so there's no chip to
-                // remove and nothing else would ever clear this. Left sticky it
-                // reads as a blocker on a composer the user can actually submit.
-                if (attachmentError !== null) setAttachmentError(null);
-                // Recompute the active "@"-mention from the caret each keystroke
-                // (native terminal agents with a workspace — ``mentionEnabled``).
-                setMention(
-                  mentionEnabled
-                    ? detectMentionAt(
-                        e.target.value,
-                        e.target.selectionStart ?? e.target.value.length,
-                      )
-                    : null,
-                );
-              }}
-              onFocus={() => {
-                // From here the textarea's caret is one the user placed, so
-                // dictation inserts there instead of at the end of the draft.
-                dictation.noteFocus();
-              }}
-              onBlur={() => {
-                // Dismiss the mention menu when focus leaves the textarea; menu
-                // rows preventDefault on mousedown so selecting one doesn't blur.
-                dismissMention();
-              }}
-              onCompositionStart={() => {
-                isComposingRef.current = true;
-              }}
-              onCompositionEnd={() => {
-                isComposingRef.current = false;
-              }}
-              onKeyDown={(e) => {
-                if (isImeCompositionKeyEvent(e, isComposingRef.current)) {
-                  return;
-                }
+            <div className="relative overflow-hidden">
+              <textarea
+                ref={textareaRef}
+                value={message}
+                onChange={(e) => {
+                  setMessage(e.target.value);
+                  // A rejected attachment is never added, so there's no chip to
+                  // remove and nothing else would ever clear this. Left sticky it
+                  // reads as a blocker on a composer the user can actually submit.
+                  if (attachmentError !== null) setAttachmentError(null);
+                  // Recompute the active "@"-mention from the caret each keystroke
+                  // (native terminal agents with a workspace — ``mentionEnabled``).
+                  setMention(
+                    mentionEnabled
+                      ? detectMentionAt(
+                          e.target.value,
+                          e.target.selectionStart ?? e.target.value.length,
+                        )
+                      : null,
+                  );
+                }}
+                onFocus={() => {
+                  // From here the textarea's caret is one the user placed, so
+                  // dictation inserts there instead of at the end of the draft.
+                  dictation.noteFocus();
+                }}
+                onBlur={() => {
+                  // Dismiss the mention menu when focus leaves the textarea; menu
+                  // rows preventDefault on mousedown so selecting one doesn't blur.
+                  dismissMention();
+                }}
+                onCompositionStart={() => {
+                  isComposingRef.current = true;
+                }}
+                onCompositionEnd={() => {
+                  isComposingRef.current = false;
+                }}
+                onKeyDown={(e) => {
+                  if (isImeCompositionKeyEvent(e, isComposingRef.current)) {
+                    return;
+                  }
 
-                // "@"-mention menu navigation (shared useMentionBrowser) —
-                // mutually exclusive with the slash menu (a token can't be both)
-                // and takes priority over submission.
-                if (handleMentionKeyDown(e)) return;
+                  // "@"-mention menu navigation (shared useMentionBrowser) —
+                  // mutually exclusive with the slash menu (a token can't be both)
+                  // and takes priority over submission.
+                  if (handleMentionKeyDown(e)) return;
 
-                // While the skills menu is open, ArrowUp/Down navigate it and
-                // Enter/Tab complete the highlighted item — these take
-                // priority over submission (same UX as the in-session
-                // composer).
-                if (slashMenuOpen && slashMenuMatches.length > 0) {
-                  if (e.key === "ArrowDown") {
-                    e.preventDefault();
-                    setSlashMenuIndex((i) => (i + 1) % slashMenuMatches.length);
-                    return;
+                  // While the skills menu is open, ArrowUp/Down navigate it and
+                  // Enter/Tab complete the highlighted item — these take
+                  // priority over submission (same UX as the in-session
+                  // composer).
+                  if (slashMenuOpen && slashMenuMatches.length > 0) {
+                    if (e.key === "ArrowDown") {
+                      e.preventDefault();
+                      setSlashMenuIndex((i) => (i + 1) % slashMenuMatches.length);
+                      return;
+                    }
+                    if (e.key === "ArrowUp") {
+                      e.preventDefault();
+                      setSlashMenuIndex((i) => (i <= 0 ? slashMenuMatches.length - 1 : i - 1));
+                      return;
+                    }
+                    if (
+                      (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) &&
+                      slashMenuIndex >= 0
+                    ) {
+                      e.preventDefault();
+                      applySlashSelection(slashMenuMatches[slashMenuIndex]!);
+                      return;
+                    }
+                    if (e.key === "Escape") {
+                      e.preventDefault();
+                      // Dismiss the menu by clearing the draft so the user can
+                      // start fresh.
+                      setMessage("");
+                      setSlashMenuIndex(-1);
+                      return;
+                    }
                   }
-                  if (e.key === "ArrowUp") {
+                  // Enter sends; Shift+Enter inserts a newline.
+                  if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
-                    setSlashMenuIndex((i) => (i <= 0 ? slashMenuMatches.length - 1 : i - 1));
-                    return;
+                    // The mention menu is briefly closed while its listing loads;
+                    // swallow Enter so the in-progress "@dir/" token isn't sent.
+                    if (mentionListingPending) return;
+                    void handleCreate();
                   }
-                  if (
-                    (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) &&
-                    slashMenuIndex >= 0
-                  ) {
+                }}
+                onPaste={(e) => {
+                  // Pasted images/files attach instead of inserting as text,
+                  // mirroring the in-session composer.
+                  const pasted = Array.from(e.clipboardData.items)
+                    .filter((item) => item.kind === "file")
+                    .map((item) => item.getAsFile())
+                    .filter((f): f is File => f !== null);
+                  if (pasted.length > 0) {
                     e.preventDefault();
-                    applySlashSelection(slashMenuMatches[slashMenuIndex]!);
-                    return;
+                    addFiles(pasted);
                   }
-                  if (e.key === "Escape") {
-                    e.preventDefault();
-                    // Dismiss the menu by clearing the draft so the user can
-                    // start fresh.
-                    setMessage("");
-                    setSlashMenuIndex(-1);
-                    return;
-                  }
-                }
-                // Enter sends; Shift+Enter inserts a newline.
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  // The mention menu is briefly closed while its listing loads;
-                  // swallow Enter so the in-progress "@dir/" token isn't sent.
-                  if (mentionListingPending) return;
-                  void handleCreate();
-                }
-              }}
-              onPaste={(e) => {
-                // Pasted images/files attach instead of inserting as text,
-                // mirroring the in-session composer.
-                const pasted = Array.from(e.clipboardData.items)
-                  .filter((item) => item.kind === "file")
-                  .map((item) => item.getAsFile())
-                  .filter((f): f is File => f !== null);
-                if (pasted.length > 0) {
-                  e.preventDefault();
-                  addFiles(pasted);
-                }
-              }}
-              // Suppress the native placeholder when the overlay supplies its
-              // own prompt text; aria-label preserves the accessible name.
-              placeholder={pillSkills.length > 0 ? "" : placeholderText}
-              aria-label={placeholderText}
-              rows={1}
-              autoFocus
-              data-testid="new-chat-landing-input"
-              // Compose-pill text spec: SF Pro Text system stack at
-              // 14px/20px. (Note: sub-16px inputs make mobile Safari
-              // auto-zoom on focus — accepted tradeoff per the design.)
-              // Heights are border-box (12px top + 8px bottom padding lives
-              // inside them): max 200px = the spec's 180px of content.
-              // A 60px floor holds two 20px lines plus that padding;
-              // useAutoGrowTextarea expands from there to the unchanged cap.
-              className="min-h-[60px] max-h-[200px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-3 pb-2 font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-ui leading-5 text-foreground outline-none placeholder:text-muted-foreground md:select-text"
-            />
-            {/* Gated on an empty draft so it reads as the placeholder.
-                pointer-events-none lets clicks fall through to focus the
-                textarea; the pills themselves opt back in. */}
-            {pillSkills.length > 0 && message.length === 0 && (
-              <div className="pointer-events-none absolute inset-x-4 top-3 flex flex-wrap items-center gap-2">
-                <span className="font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-ui leading-5 text-muted-foreground">
-                  Describe a task, or try a skill
-                </span>
-                <SkillPills skills={pillSkills} onPick={applySkillPill} />
-              </div>
-            )}
+                }}
+                // Suppress the native placeholder when the overlay supplies its
+                // own prompt text; aria-label preserves the accessible name.
+                placeholder={pillSkills.length > 0 ? "" : placeholderText}
+                aria-label={placeholderText}
+                rows={1}
+                // Desktop only. This screen mounts on every arrival at "/" —
+                // including ones the user didn't make to type, like Back out of
+                // Settings — and on a phone focusing the field throws up the
+                // keyboard (and auto-zooms, per the note below) over whatever
+                // is on screen, sometimes with the sidebar drawer still open on
+                // top of it. Phones expect to be tapped before they type.
+                autoFocus={!isMobileViewport}
+                data-testid="new-chat-landing-input"
+                // Compose-pill text spec: inherited UI font at 14px/20px.
+                // (Note: sub-16px inputs make mobile Safari
+                // auto-zoom on focus — accepted tradeoff per the design.)
+                // Heights are border-box (12px top + 8px bottom padding lives
+                // inside them): max 200px = the spec's 180px of content.
+                // A 60px floor holds two 20px lines plus that padding;
+                // useAutoGrowTextarea expands from there to the unchanged cap.
+                className="block min-h-[60px] max-h-[200px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-3 pb-2 text-ui leading-5 text-foreground outline-none [scrollbar-width:none] placeholder:text-muted-foreground md:select-text [&::-webkit-scrollbar]:hidden"
+              />
+              {/* Gated on an empty draft so it reads as the placeholder.
+                  pointer-events-none lets clicks fall through to focus the
+                  textarea; the pills themselves opt back in. */}
+              {pillSkills.length > 0 && message.length === 0 && (
+                <div className="pointer-events-none absolute inset-x-4 top-3 flex flex-wrap items-center gap-2">
+                  <span className="text-ui leading-5 text-muted-foreground">
+                    Describe a task, or try a skill
+                  </span>
+                  <SkillPills skills={pillSkills} onPick={applySkillPill} />
+                </div>
+              )}
+            </div>
             {/* Hidden file input for the attach button. */}
             <input
               ref={fileInputRef}
@@ -4486,6 +4512,7 @@ export function NewChatLandingScreen() {
                   onClick={() => fileInputRef.current?.click()}
                   title="Attach files"
                   data-testid="new-chat-landing-attach"
+                  componentId="new_chat.attach_files"
                 >
                   <PaperclipIcon className="size-4" data-icon-size="16" />
                   <span className="sr-only">Attach files</span>
@@ -4553,6 +4580,7 @@ export function NewChatLandingScreen() {
                               disabled={creating}
                               onClick={() => setConfigOpen(true)}
                               data-testid="new-chat-landing-config-gear"
+                              componentId="new_chat.open_config"
                             >
                               <SettingsIcon className="size-4" data-icon-size="16" />
                               <span className="sr-only">
@@ -4641,6 +4669,7 @@ export function NewChatLandingScreen() {
                           aria-busy={creating}
                           data-testid="new-chat-landing-submit"
                           className="size-8 rounded-lg bg-foreground disabled:bg-muted disabled:text-muted-foreground transition-opacity hover:opacity-80 disabled:opacity-100 "
+                          componentId="new_chat.start_session"
                         >
                           {creating ? (
                             <Loader2Icon className="size-4 animate-spin" />

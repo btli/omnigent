@@ -10,8 +10,6 @@ import { Terminal } from "@xterm/xterm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   SHIFT_ENTER_CSI_U,
-  SYNC_ECHO_MAX_BYTES,
-  SYNC_ECHO_WINDOW_MS,
   TerminalSession,
   WHEEL_REPORTS_MAX_PER_EVENT,
   applyTerminalCopy,
@@ -24,7 +22,6 @@ import {
   parseTerminalClipboardMessage,
   parseTerminalOsc52Capability,
   sgrWheelReports,
-  shouldEchoSynchronously,
   terminalTheme,
   terminalKeyEventPayload,
   type ConnectionState,
@@ -177,30 +174,6 @@ describe("tmux clipboard parsing", () => {
   });
 });
 
-describe("shouldEchoSynchronously", () => {
-  it("takes the sync path for a small chunk right after a keystroke", () => {
-    // Echo/prompt-sized chunk arriving well within the window: paint it
-    // synchronously so the keystroke echo lands without a queued-write
-    // frame of latency.
-    expect(shouldEchoSynchronously(64, 10)).toBe(true);
-  });
-
-  it("stays async when the user hasn't typed recently", () => {
-    // Past the window, this is unsolicited output (an agent printing),
-    // not an echo — the async write queue is correct.
-    expect(shouldEchoSynchronously(64, SYNC_ECHO_WINDOW_MS)).toBe(false);
-    expect(shouldEchoSynchronously(64, SYNC_ECHO_WINDOW_MS + 1)).toBe(false);
-  });
-
-  it("stays async for large chunks even right after a keystroke", () => {
-    // A big chunk is a flood/redraw, not an echo; keeping it on the async
-    // path stops one giant synchronous write from blocking the main
-    // thread mid-type.
-    expect(shouldEchoSynchronously(SYNC_ECHO_MAX_BYTES + 1, 10)).toBe(false);
-    expect(shouldEchoSynchronously(SYNC_ECHO_MAX_BYTES, 10)).toBe(true);
-  });
-});
-
 describe("loadWebglRenderer", () => {
   it("returns null without throwing when WebGL is unavailable", () => {
     // jsdom has no WebGL context (getContext() is unimplemented), so this
@@ -286,6 +259,13 @@ describe("isUnexpectedTerminalClose", () => {
     expect(isUnexpectedTerminalClose(1006)).toBe(true);
     expect(isUnexpectedTerminalClose(1012)).toBe(true);
     expect(isUnexpectedTerminalClose(1013)).toBe(true);
+    // 1005 "no status" is the browser's other no-clean-close sentinel
+    // (mirror of 1006); a server redeploy behind an ingress surfaces as
+    // 1005. 1011/1014 are the proxy's server-error / bad-gateway codes
+    // while the backend restarts.
+    expect(isUnexpectedTerminalClose(1005)).toBe(true);
+    expect(isUnexpectedTerminalClose(1011)).toBe(true);
+    expect(isUnexpectedTerminalClose(1014)).toBe(true);
   });
 
   it("treats deliberate closes (normal, policy, app 4xxx) as terminal", () => {
@@ -601,15 +581,16 @@ describe("TerminalSession", () => {
     session.dispose();
   });
 
-  it("writes inbound binary frames to the terminal and fires onActivity", () => {
+  it("writes inbound binary frames through xterm's ordered queue and fires onActivity", () => {
     // WHY: ArrayBuffer message frames are raw PTY bytes — they must reach the
-    // terminal and trigger the best-effort activity signal. The throttle keys
-    // off performance.now(), so pin it past the 300ms window to make the first
-    // notification deterministic. Non-ArrayBuffer (text) frames are ignored so
-    // they aren't painted as output.
+    // terminal through xterm's ordered public write queue and trigger the
+    // best-effort activity signal. Bypassing that queue can replay already-
+    // parsed ANSI chunks and corrupt cursor state.
     vi.spyOn(performance, "now").mockReturnValue(10_000);
     const onActivity = vi.fn();
     const { socket, session } = makeSession(onActivity);
+    const term = (session as unknown as { term: Terminal }).term;
+    const writeSpy = vi.spyOn(term, "write");
 
     // Build the buffer from the global ArrayBuffer the source's
     // `instanceof ArrayBuffer` check sees — a TextEncoder's buffer comes from
@@ -617,6 +598,7 @@ describe("TerminalSession", () => {
     const data = new ArrayBuffer(5);
     new Uint8Array(data).set([104, 101, 108, 108, 111]); // "hello"
     socket.emit("message", { data });
+    expect(writeSpy).toHaveBeenCalledWith(expect.any(Uint8Array));
     expect(onActivity).toHaveBeenCalledTimes(1);
 
     socket.emit("message", { data: "text frame" });

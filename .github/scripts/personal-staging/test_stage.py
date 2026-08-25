@@ -1221,9 +1221,9 @@ def test_production_commit_identity(env):
     assert "committer omnigent-staging <staging@invalid>" in obj
 
 
-def test_notes_production_ring_no_apk_section(tmp_path, capsys):
-    """Production mints no dev tag and ships no APK: its notes are the
-    minimal variant — no APK-signing section either way — and the notes CLI
+def test_notes_production_ring_has_apk_section(tmp_path, capsys):
+    """Production ships a re-signed debug APK like staging, so its notes
+    carry the APK-signing section in both variants — and the notes CLI
     routes there via --ring (default stays staging, golden-locked)."""
     report = {
         "date": STAMP,
@@ -1232,10 +1232,11 @@ def test_notes_production_ring_no_apk_section(tmp_path, capsys):
         "applied": [],
         "skipped": [],
     }
-    for signed in (True, False):
-        out = stage_mod.notes(report, signed=signed, ring=stage_mod.PRODUCTION)
-        assert "production ring" in out
-        assert "APK" not in out and "keystore" not in out
+    out = stage_mod.notes(report, signed=True, ring=stage_mod.PRODUCTION)
+    assert "production ring" in out
+    assert "## APK signing" in out and "shared debug keystore" in out
+    out = stage_mod.notes(report, signed=False, ring=stage_mod.PRODUCTION)
+    assert "## APK signing" in out and "runner-ephemeral keystore" in out
 
     report_path = tmp_path / "r.json"
     report_path.write_text(json.dumps(report))
@@ -1244,7 +1245,7 @@ def test_notes_production_ring_no_apk_section(tmp_path, capsys):
     )
     assert rc == 0
     out = capsys.readouterr().out
-    assert "production ring" in out and "APK" not in out
+    assert "production ring" in out and "## APK signing" in out
 
     rc = stage_mod.main(["notes", "--report", str(report_path), "--signed", "false"])
     assert rc == 0
@@ -1419,3 +1420,151 @@ def test_branch_pin_missing_is_loud_advisory_skip(env, tmp_path):
             "source": "extra-branch",
         }
     ]
+
+
+def _record_seed(tmp_path: Path, env: Env, pr: dict, resolutions: dict[str, str]) -> Path:
+    """Merge *pr* onto current upstream main in a throwaway clone, resolve the
+    conflicts with *resolutions* ({path: content}), and return an rr-cache
+    seed directory holding the recorded entries."""
+    clone = tmp_path / f"seedgen-{pr['number']}"
+    # -b: the bare upstream's HEAD may name a branch that was never pushed
+    # (init.defaultBranch vs the harness's "main"), which some git versions
+    # clone as an unborn checkout — the merge below would silently no-op.
+    git(tmp_path, "clone", "-b", "main", str(env.upstream), str(clone))
+    git(clone, "config", "user.name", "t")
+    git(clone, "config", "user.email", "t@t")
+    git(clone, "config", "rerere.enabled", "true")
+    git(clone, "fetch", "origin", f"refs/pull/{pr['number']}/head")
+    git(clone, "merge", "--no-ff", "--no-commit", pr["headRefOid"], check=False)
+    for path, content in resolutions.items():
+        (clone / path).write_text(content)
+        git(clone, "add", path)
+    git(clone, "commit", "--no-verify", "-m", "record resolution")
+    seed = tmp_path / f"rr-seed-{pr['number']}"
+    shutil.copytree(clone / ".git" / "rr-cache", seed)
+    assert any(seed.iterdir()), "seed recording produced no rr-cache entries"
+    return seed
+
+
+def test_rr_cache_seed_resolves_conflicting_pr(env, tmp_path):
+    pr = env.add_pr(3, "a.txt", "pr side\n")
+    env.advance_main("a.txt", "main side\n")
+    seed = _record_seed(tmp_path, env, pr, {"a.txt": "reconciled\n"})
+
+    report = env.run([pr], rr_cache_dir=seed)
+
+    assert report["skipped"] == []
+    (applied,) = report["applied"]
+    assert applied["pr"] == 3
+    assert applied["rerere_paths"] == ["a.txt"]
+    assert git(env.fork, "show", "staging:a.txt").stdout == "reconciled\n"
+    # The resolution is a composition input: a rerun reproduces the same sha.
+    rerun = env.run([pr], rr_cache_dir=seed)
+    assert rerun["staging_sha"] == report["staging_sha"]
+    # Notes call out which paths the committed resolution covered.
+    assert "resolved from rr-cache: `a.txt`" in stage_mod.notes(report, signed=True)
+
+
+def test_rr_cache_partial_coverage_still_skips(env, tmp_path):
+    branch = "pr-3"
+    git(env.seed, "checkout", "-q", "main")
+    git(env.seed, "checkout", "-q", "-b", branch)
+    commit_file(env.seed, "a.txt", "pr alpha\n", "pr 3 a")
+    oid = commit_file(env.seed, "b.txt", "pr beta\n", "pr 3 b")
+    git(env.seed, "push", str(env.upstream), f"{branch}:refs/pull/3/head")
+    pr = {"number": 3, "headRefName": branch, "headRefOid": oid}
+    env.advance_main("a.txt", "main alpha\n")
+    env.advance_main("b.txt", "main beta\n")
+    seed = _record_seed(tmp_path, env, pr, {"a.txt": "res a\n", "b.txt": "res b\n"})
+    # Drop the b.txt entry so the seed covers only half the merge.
+    for entry in list(seed.iterdir()):
+        if "beta" in (entry / "preimage").read_text():
+            shutil.rmtree(entry)
+
+    report = env.run([pr], rr_cache_dir=seed)
+
+    assert report["applied"] == []
+    (skipped,) = report["skipped"]
+    assert skipped["conflict_paths"] == ["a.txt", "b.txt"]
+
+
+def test_delete_modify_conflict_never_auto_resolves(env, tmp_path):
+    pr = env.add_pr(3, "a.txt", "pr side\n")
+    git(env.seed, "checkout", "-q", "main")
+    git(env.seed, "rm", "-q", "a.txt")
+    git(env.seed, "commit", "--no-verify", "-m", "main: drop a.txt")
+    git(env.seed, "push", str(env.upstream), "main")
+    seed = tmp_path / "rr-seed"
+    seed.mkdir()
+
+    report = env.run([pr], rr_cache_dir=seed)
+
+    assert report["applied"] == []
+    (skipped,) = report["skipped"]
+    assert skipped["conflict_paths"] == ["a.txt"]
+
+
+def test_seed_rerere_rejects_malformed_entries(env, tmp_path):
+    missing = tmp_path / "no-such-dir"
+    assert stage_mod.seed_rerere(env.work, missing) == 0
+    assert stage_mod.seed_rerere(env.work, None) == 0
+
+    bad_name = tmp_path / "seed-bad-name"
+    (bad_name / "not-a-hash").mkdir(parents=True)
+    with pytest.raises(stage_mod.StageError, match="not a conflict-hash"):
+        stage_mod.seed_rerere(env.work, bad_name)
+
+    half = tmp_path / "seed-half"
+    entry = half / ("ab" * 20)
+    entry.mkdir(parents=True)
+    (entry / "preimage").write_text("x")
+    with pytest.raises(stage_mod.StageError, match="preimage/postimage"):
+        stage_mod.seed_rerere(env.work, half)
+
+
+def test_cli_rr_cache_flag_is_plumbed(env, tmp_path, capsys):
+    pr = env.add_pr(3, "a.txt", "pr side\n")
+    env.advance_main("a.txt", "main side\n")
+    seed = _record_seed(tmp_path, env, pr, {"a.txt": "reconciled\n"})
+    prs_json = tmp_path / "prs.json"
+    prs_json.write_text(json.dumps([pr]))
+    report_path = tmp_path / "merge-report.json"
+
+    rc = stage_mod.main(
+        [
+            "stage",
+            "--workdir",
+            str(env.work),
+            "--date",
+            STAMP,
+            "--prs-json",
+            str(prs_json),
+            "--report",
+            str(report_path),
+            "--rr-cache",
+            str(seed),
+        ]
+    )
+    assert rc == 0
+    capsys.readouterr()
+    report = json.loads(report_path.read_text())
+    assert report["applied"][0]["rerere_paths"] == ["a.txt"]
+
+
+def test_own_prs_filters_on_the_records_author():
+    """An ignored --author flag (observed: gh's search-backed filter coming
+    back as a plain unfiltered listing) must never compose someone else's PR."""
+    mine = {"number": 7, "headRefName": "b7", "author": {"login": "btli"}}
+    upper = {"number": 8, "headRefName": "b8", "author": {"login": "BTLI"}}
+    foreign = {"number": 9, "headRefName": "b9", "author": {"login": "mallory"}}
+
+    kept = stage_mod.own_prs([mine, upper, foreign])
+
+    assert [p["number"] for p in kept] == [7, 8]
+    assert all("author" not in p for p in kept)
+
+
+def test_own_prs_fails_loud_on_missing_author():
+    for record in ({"number": 7}, {"number": 7, "author": {}}, {"number": 7, "author": "btli"}):
+        with pytest.raises(stage_mod.StageError, match="no author login"):
+            stage_mod.own_prs([record])

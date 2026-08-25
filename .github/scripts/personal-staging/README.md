@@ -187,6 +187,30 @@ a deleted ref and an unreachable server are different problems:
   composition. **Do not delete the pin on this reason**; it means the
   fetch failed, not that the PR is gone.
 
+## Conflict resolutions (`rr-cache/`)
+
+A PR whose merge conflicts with an earlier train member is normally
+skipped. `.github/scripts/personal-staging/rr-cache/` holds committed
+resolutions in git's own rr-cache layout (one `<40-hex>/` directory with
+a `preimage`/`postimage` pair per recorded conflict). `stage.py` seeds
+them into the compose workspace before merging (`--rr-cache` overrides
+the directory; a missing directory means no resolutions), so a merge
+whose conflicts are **all** covered lands instead of skipping. Coverage
+is verified positively — `git rerere remaining` empty, every conflict
+two-sided (rerere never handles delete/rename conflicts and stays silent
+about them), no markers left in the worktree — anything less skips
+exactly as before. Applied entries record the covered paths as
+`rerere_paths` in `merge-report.json` and in the release notes.
+
+The seed is a composition input like `extras.txt`: identical seeds and
+heads reproduce identical staging bytes, and both the hourly/nightly
+staging and the production ring consume it. To record a new resolution:
+in a clone with `rerere.enabled=true`, merge the PR head onto the current
+composition point, resolve, commit, then copy the new
+`.git/rr-cache/<hash>/` directories here. **Remove entries once the
+conflicting pair no longer coexists** (one side landed or was retired);
+a stale entry whose conflict text no longer matches is inert.
+
 ## Stable download URL
 
 The floating prerelease keeps asset names fixed, so the newest nightly APK is

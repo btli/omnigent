@@ -37,6 +37,7 @@ from omnigent.harness_plugins import (
 from omnigent.runner.routing import RunnerRouter
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.schemas import (
+    BackgroundTaskInfo,
     McpServerStartup,
     SandboxStatus,
     ServerStreamEvent,
@@ -129,6 +130,9 @@ _EXTERNAL_SESSION_USAGE_TYPE: str = "external_session_usage"
 _EXTERNAL_MODEL_CHANGE_TYPE: str = "external_model_change"
 
 
+_EXTERNAL_PERMISSION_MODE_CHANGE_TYPE: str = "external_permission_mode_change"
+
+
 _EXTERNAL_SESSION_TITLE_TYPE: str = "external_session_title"
 
 
@@ -187,6 +191,21 @@ _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE: str = "external_codex_approval_mode_c
 
 
 _CODEX_NATIVE_COLLABORATION_MODES: frozenset[str] = frozenset({"default", "plan"})
+
+
+# Current permission mode of a live claude-native session.
+# ``terminal_launch_args`` records only the launch mode, so this label is what
+# the web UI reads back after a reload.
+_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY = "omnigent.claude_native.permission_mode"
+
+
+# Permission modes switchable on a running session — the ones Claude
+# Code's shift+tab cycle can reach. Mirrors
+# ``claude_native_bridge.CYCLEABLE_PERMISSION_MODES``; ``dontAsk`` and
+# ``bypassPermissions`` are launch-only and rejected on PATCH.
+_CLAUDE_NATIVE_PERMISSION_MODES: frozenset[str] = frozenset(
+    {"default", "acceptEdits", "plan", "auto"}
+)
 
 
 _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Codex"
@@ -419,6 +438,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_MCP_STARTUP_TYPE,
     _EXTERNAL_MODEL_CHANGE_TYPE,
     _EXTERNAL_MODEL_OPTIONS_TYPE,
+    _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE,
     _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
     _EXTERNAL_SESSION_TITLE_TYPE,
     _EXTERNAL_SESSION_TODOS_TYPE,
@@ -443,6 +463,12 @@ _session_active_response_cache: dict[str, str] = {}
 
 
 _session_background_task_count_cache: dict[str, int] = {}
+
+
+# Per-shell detail behind the tally above, kept sticky in lockstep with it (see
+# ``_publish_status``) so a reload/reconnect can restore it. Absent when the
+# count cache is absent, or when a runner reported only the count with no detail.
+_session_background_tasks_cache: dict[str, list[BackgroundTaskInfo]] = {}
 
 
 _read_last_seen: dict[str, dict[str, int]] = {}
@@ -797,6 +823,8 @@ __all__ = [
     "_CLAUDE_NATIVE_MESSAGE_TIMEOUT_S",
     "_CLAUDE_NATIVE_MODEL",
     "_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S",
+    "_CLAUDE_NATIVE_PERMISSION_MODES",
+    "_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY",
     "_CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS",
     "_CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY",
     "_CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE",
@@ -842,6 +870,7 @@ __all__ = [
     "_EXTERNAL_MODEL_OPTIONS_TYPE",
     "_EXTERNAL_OUTPUT_REASONING_DELTA_TYPE",
     "_EXTERNAL_OUTPUT_TEXT_DELTA_TYPE",
+    "_EXTERNAL_PERMISSION_MODE_CHANGE_TYPE",
     "_EXTERNAL_REASONING_EFFORT_CHANGE_TYPE",
     "_EXTERNAL_SESSION_INTERRUPTED_TYPE",
     "_EXTERNAL_SESSION_STATUS_TYPE",
@@ -938,6 +967,7 @@ __all__ = [
     "_server_runner_router",
     "_session_active_response_cache",
     "_session_background_task_count_cache",
+    "_session_background_tasks_cache",
     "_session_mcp_startup_cache",
     "_session_sandbox_status_cache",
     "_session_status_cache",
