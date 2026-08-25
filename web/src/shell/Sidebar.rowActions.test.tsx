@@ -1519,19 +1519,21 @@ describe("touch swipe actions", () => {
   });
 
   it("claims the horizontal touch axis only while a swipe action is configured", () => {
-    // A single configured direction leaves the opposite native pan available.
+    // A single configured direction cedes only the INERT direction to the
+    // browser: Chrome samples touch-action at pointerdown, so offering the
+    // actionable pan would let native panning cancel the swipe mid-stream.
     const first = renderSidebar();
     const li = conversationRow;
     expect(li()).toHaveClass("touch-pan-y");
-    expect(li().classList.contains("touch-pan-left")).toBe(true);
-    expect(li()).not.toHaveClass("touch-pan-right");
+    expect(li().classList.contains("touch-pan-right")).toBe(true);
+    expect(li()).not.toHaveClass("touch-pan-left");
     first.unmount();
 
     writeSwipeActions({ left: "none", right: "delete" });
     const second = renderSidebar();
     expect(li()).toHaveClass("touch-pan-y");
-    expect(li().classList.contains("touch-pan-right")).toBe(true);
-    expect(li()).not.toHaveClass("touch-pan-left");
+    expect(li().classList.contains("touch-pan-left")).toBe(true);
+    expect(li()).not.toHaveClass("touch-pan-right");
     second.unmount();
 
     writeSwipeActions({ left: "archive", right: "delete" });
@@ -1545,6 +1547,36 @@ describe("touch swipe actions", () => {
     writeSwipeActions({ left: "none", right: "none" });
     renderSidebar();
     expect(li()).not.toHaveClass("touch-pan-y");
+  });
+
+  it("does not start a swipe from a press on the row's kebab control", () => {
+    // Radix opens the dropdown on the trigger's own pointerdown; a swipe that
+    // then resolved would stack the archive/delete flow on the open menu.
+    renderSidebar();
+    const li = conversationRow();
+    const kebab = within(li).getByTestId("conversation-actions");
+    pointerEventAt("pointerDown", kebab, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerMove", li, { clientX: 80, clientY: 100 }, 1_250);
+    pointerEventAt("pointerMove", li, { clientX: 10, clientY: 100 }, 1_500);
+    pointerEventAt("pointerUp", li, { clientX: 10, clientY: 100 }, 1_500);
+
+    expect(within(li).queryByTestId("conversation-swipe-reveal")).toBeNull();
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
+  });
+
+  it("keeps a jittery tap toward an inert direction navigating", () => {
+    // Default mapping leaves swipe-right inert. A 15px rightward wobble is
+    // under the 25px scroll threshold, so it is still a tap — the trailing
+    // click must navigate rather than be suppressed.
+    renderSidebar();
+    const li = conversationRow();
+    pointerEventAt("pointerDown", li, { clientX: 100, clientY: 100 }, 1_000);
+    pointerEventAt("pointerMove", li, { clientX: 115, clientY: 100 }, 1_050);
+    pointerEventAt("pointerUp", li, { clientX: 115, clientY: 100 }, 1_100);
+    fireEvent.click(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.getByTestId("location-probe")).toHaveTextContent("/c/conv_1");
   });
 
   it("does nothing when swiping a direction mapped to none", () => {
