@@ -238,11 +238,8 @@ class MainActivity : AppCompatActivity() {
                         onPinnedDocumentStarted = ::onPinnedDocumentStarted,
                         onLoadFailure = ::showFullScreenRecovery,
                         onLoginRequired = ::startLogin,
-<<<<<<<
-                        bridgeScriptSource = ::nativeBridgeScriptSource,
-=======
                         loadUrl = { _, url -> loadUrlWithGeneration(url) },
->>>>>>>
+                        bridgeScriptSource = ::nativeBridgeScriptSource,
                     )
                 webViewClient = omnigentWebViewClient
                 webChromeClient =
@@ -254,48 +251,9 @@ class MainActivity : AppCompatActivity() {
                     downloadFile(downloadUrl, contentDisposition, mimeType)
                 }
             }
-<<<<<<<
-        // Wrap the WebView in a FrameLayout so the floating server-switcher
-        // pill can sit on top of it. The pill uses the app's brand palette
-        // (values/values-night colors.xml) so it adapts to light/dark mode.
-        val container = FrameLayout(this)
-        container.addView(webView)
-        val dp = resources.displayMetrics.density
-        switchButton =
-            TextView(this).apply {
-                text = serverUrl?.let(::hostLabelOf) ?: ""
-                background =
-                    ContextCompat.getDrawable(this@MainActivity, R.drawable.bg_floating_switch)
-                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.brand_foreground))
-                textSize = 12f
-                setPadding((12 * dp).toInt(), (6 * dp).toInt(), (12 * dp).toInt(), (6 * dp).toInt())
-                elevation = 6 * dp
-                isClickable = true
-                isFocusable = true
-                setOnClickListener { showServerSwitcherMenu(it) }
-            }
-        switchButton.layoutParams =
-            FrameLayout
-                .LayoutParams(
-                    FrameLayout.LayoutParams.WRAP_CONTENT,
-                    FrameLayout.LayoutParams.WRAP_CONTENT,
-                    Gravity.TOP or Gravity.CENTER_HORIZONTAL,
-                ).apply {
-                    // Initial position below the status bar; corrected by the
-                    // insets listener once system bar insets are measured.
-                    topMargin = (8 * dp).toInt()
-                }
-        container.addView(switchButton)
-        setContentView(container)
-=======
         setContentView(webView)
->>>>>>>
         applySystemBarContrast()
         installBridge()
-        if (!bridgeTransportInstalled) {
-            showFullScreenRecovery("This Android WebView cannot run the required secure bridge.")
-            return
-        }
 
         // Measure the OS safe area and push it into the page as CSS custom
         // properties — Android WebView can't rely on `env(safe-area-inset-*)`
@@ -379,13 +337,9 @@ class MainActivity : AppCompatActivity() {
         )
 
         ensureNotificationPermission()
-<<<<<<<
+        livenessWatchdog.beginDocument()
         if (serverUrl != null) loadUrlWithGeneration(serverUrl)
         enqueueDeepLink(coldDeepLink)
-=======
-        livenessWatchdog.beginInitialWindow()
-        webView.loadUrl(serverUrl)
->>>>>>>
     }
 
     override fun onPause() {
@@ -455,8 +409,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-<<<<<<<
-=======
     private fun nativeBridgeScriptSource(): String = NativeBridgeScript.source
 
     private fun onNativeWebReady(version: Int) {
@@ -509,14 +461,17 @@ class MainActivity : AppCompatActivity() {
         }
         val newOrigin = originOf(offered) ?: return
         store.connect(offered)
+        // Mirror the deep-link invariants of any server switch: supersede a
+        // pending navigation bound to the old origin, then resume the queue.
+        val resumeQueue = supersedePendingNavigation()
         reloadWithNewServer(offered, newOrigin)
+        if (resumeQueue) processNextDeepLink()
     }
 
     private fun openServerSetupFromBridge() {
         startActivity(Intent(this, ConnectActivity::class.java))
     }
 
->>>>>>>
     private fun applySystemBarContrast(configuration: Configuration = resources.configuration) {
         val isLightMode =
             configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK !=
@@ -651,9 +606,8 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-<<<<<<<
     /**
-     * Extract a short host[:port] label from a URL for the server switcher pill.
+     * Extract a short host[:port] label from a URL for user-facing dialogs.
      * Mirrors the iOS `URL.omnigentHostLabel` in `URL+Omnigent.swift`.
      */
     private fun hostLabelOf(url: String): String {
@@ -668,16 +622,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        livenessWatchdog.cancel()
         // Dismiss an open consent dialog first: it holds a window tied to this
         // Activity, and no listener fires on dismiss() (only setOnCancelListener
         // does), so the link is simply left unanswered — no accept path, no
         // second queue-resume call (moot anyway; this instance is dying).
         deepLinkDialog?.dismiss()
         deepLinkDialog = null
-=======
-    override fun onDestroy() {
-        livenessWatchdog.cancel()
->>>>>>>
         // Unblock a pending file input / mic request, then release WebView + worker.
         pendingFileCallback?.onReceiveValue(null)
         pendingFileCallback = null
@@ -735,16 +686,8 @@ class MainActivity : AppCompatActivity() {
         historyCleared = false
         loginAttempts = 0
         installBridge()
-<<<<<<<
-        if (!bridgeTransportInstalled) {
-            showFullScreenRecovery("This Android WebView cannot run the required secure bridge.")
-            return
-        }
-        livenessWatchdog.beginInitialWindow()
-        webView.loadUrl(serverUrl)
-=======
+        livenessWatchdog.beginDocument()
         loadUrlWithGeneration(serverUrl)
->>>>>>>
     }
 
     private fun removeBridge() {
@@ -761,65 +704,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-<<<<<<<
-=======
-    /**
-     * Show the server-switcher dropdown menu, mirroring the iOS `ServerSwitcher`
-     * `Menu`. Lists the current server (disabled header), the other servers on
-     * offer (organization presets, then recents), Reload, and Connect to New
-     * Server. Tapping a server switches directly without leaving the app;
-     * "Connect to New Server" opens [ConnectActivity] for manual URL entry.
-     */
-    private fun showServerSwitcherMenu(anchor: View) {
-        val store = ServerStore(this)
-        val currentUrl = store.currentServerUrl()
-        val otherServers = store.offeredServers().filter { originOf(it) != pinnedOrigin }
-
-        val popup = PopupMenu(this, anchor, Gravity.TOP)
-        MenuCompat.setGroupDividerEnabled(popup.menu, true)
-        popup.menu.apply {
-            // Group 0: current server — disabled header.
-            add(0, 0, 0, hostLabelOf(currentUrl)).isEnabled = false
-            // Group 1: the other servers on offer (divider before this group).
-            otherServers.forEachIndexed { i, url ->
-                add(1, 100 + i, 0, hostLabelOf(url))
-            }
-            // Group 2: actions (divider before this group).
-            add(2, 3, 0, getString(R.string.menu_reload))
-            add(2, 4, 0, getString(R.string.menu_connect_new))
-        }
-        popup.setOnMenuItemClickListener { item ->
-            when (item.itemId) {
-                3 -> {
-                    retryPinnedOrigin()
-                    true
-                }
-
-                4 -> {
-                    startActivity(Intent(this@MainActivity, ConnectActivity::class.java))
-                    true
-                }
-
-                in 100..Int.MAX_VALUE -> {
-                    val url = otherServers[item.itemId - 100]
-                    store.connect(url)
-                    originOf(url)?.let {
-                        val resumeQueue = supersedePendingNavigation()
-                        reloadWithNewServer(url, it)
-                        if (resumeQueue) processNextDeepLink()
-                    }
-                    true
-                }
-
-                else -> {
-                    false
-                }
-            }
-        }
-        popup.show()
-    }
-
->>>>>>>
     /** Run bridge-dependent work once a pinned-origin page has finished loading. */
     private fun onPageReady(
         url: String?,
@@ -847,7 +731,6 @@ class MainActivity : AppCompatActivity() {
             // become the stored current server / a trusted recent.
             pendingPersistUrl?.takeIf { originOf(it) == pinnedOrigin }?.let {
                 ServerStore(this).connect(it)
-                (switchButton as? TextView)?.text = hostLabelOf(it)
             }
             pendingPersistUrl = null
         }
@@ -866,7 +749,15 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-<<<<<<<
+    private fun onMainFrameOriginChanged(url: String?) {
+        livenessWatchdog.setOnPinnedOrigin(originOf(url) == pinnedOrigin)
+    }
+
+    private fun onPinnedDocumentStarted() {
+        compatibilityReady = false
+        livenessWatchdog.beginDocument()
+    }
+
     private fun flushPendingActivation(): Boolean {
         // Parked off-origin (e.g. mid re-login): keep the path pending; the
         // next pinned-origin onPageReady flushes it.
@@ -882,23 +773,6 @@ class MainActivity : AppCompatActivity() {
             return false
         }
         if (pendingNavigatePath == null) return false
-=======
-    private fun onMainFrameOriginChanged(url: String?) {
-        livenessWatchdog.setOnPinnedOrigin(originOf(url) == pinnedOrigin)
-    }
-
-    private fun onPinnedDocumentStarted() {
-        compatibilityReady = false
-        livenessWatchdog.beginInitialWindow()
-    }
-
-    private fun flushPendingActivation() {
-        // A tap can arrive (onNewIntent) while the WebView is parked off-origin —
-        // e.g. mid re-login — where the bridge facade doesn't exist, so emitting
-        // would silently drop the path. Keep it pending; the next pinned-origin
-        // onPageReady flushes it.
-        if (originOf(webView.url) != pinnedOrigin) return
->>>>>>>
         emitNotificationActivation(pendingNavigatePath)
         clearPendingNavigate()
         return true
