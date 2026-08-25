@@ -32,7 +32,8 @@ export const ROW_MENU_SYNTHETIC = Symbol("row-menu-synthetic");
 // Nested controls that own their own press (kebab menu trigger, pin button).
 // Radix opens the dropdown on the trigger's pointerdown, so a row gesture
 // resolving over it would stack an action dialog on the open menu.
-const ROW_INTERACTIVE_CONTROL_SELECTOR = "button, input, select, textarea, [contenteditable]";
+const ROW_INTERACTIVE_CONTROL_SELECTOR =
+  'button, input, select, textarea, [contenteditable]:not([contenteditable="false"])';
 
 const ROW_SCROLL_ACTIVATE_PX = 25;
 const ROW_HOLD_TOLERANCE_PX = 20;
