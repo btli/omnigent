@@ -194,15 +194,14 @@ const kotlinPanelTestIds = [...nativeInsetCss.matchAll(/data-testid="([^"]+)"/g)
 /* Panels that MUST carry the safe-area fold (sorted). The drift guards below
  * compare both stylesheets against this list, so deleting a testid from the
  * unified rule fails even if the Kotlin sheet is edited to match. Update it
- * when a panel deliberately joins or leaves the rule. */
+ * when a panel deliberately joins or leaves the rule. The rail-tab drawers
+ * (shells / subagents / todos) are covered through the shared
+ * `.mobile-panel-drawer` class rather than per-drawer testids. */
 const REQUIRED_PANEL_TEST_IDS = [
   "execution-logs-panel",
   "file-viewer",
   "files-panel-drawer",
-  "shells-panel-drawer",
-  "subagents-panel-drawer",
   "terminals-panel",
-  "todos-panel-drawer",
 ];
 
 function trimIndent(value: string): string {
@@ -267,6 +266,14 @@ function assertNativePanelPadding(
         shell.appendChild(panel);
         expectSafeAreaPadding(panel, variableFallback);
       }
+      if (css.includes(".mobile-panel-drawer")) {
+        // Rail-tab drawers carry no testid in the rule — the shared
+        // MobilePanelDrawer class folds the inset onto all of them.
+        const drawer = document.createElement("div");
+        drawer.className = "mobile-panel-drawer";
+        shell.appendChild(drawer);
+        expectSafeAreaPadding(drawer, variableFallback);
+      }
     } finally {
       shell.remove();
     }
@@ -296,6 +303,8 @@ describe("index.css native safe-area layout", () => {
     // stylesheets shrinks the derived lists together, so only this
     // checked-in expectation still fails on that edit.
     expect(cssPanelTestIds).toEqual(expect.arrayContaining(REQUIRED_PANEL_TEST_IDS));
+    // The rail-tab drawers ride on the class every MobilePanelDrawer sets.
+    expect(nativePanelRule).toContain(".mobile-panel-drawer");
   });
 
   it("keeps the unified rule at stylesheet top level, outside any at-rule", () => {
