@@ -3,9 +3,11 @@ package ai.omnigent.android
 import android.content.Context
 import android.content.RestrictionsManager
 import android.content.res.Configuration
+import android.net.Uri
 import android.os.Bundle
 import android.widget.Button
 import android.widget.EditText
+import androidx.browser.auth.AuthTabIntent
 import androidx.core.graphics.Insets
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -155,5 +157,189 @@ class MainActivityTest {
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
 
         assertEquals("https://example.com", shadowOf(activity.testWebView()).lastLoadedUrl)
+    }
+
+    @Test
+    fun `dismissed auth tab falls back to the inline login`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect(DATABRICKS_ORIGIN)
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        activity.authTabFlow.begin(DATABRICKS_ORIGIN, activity.packageName)
+
+        activity.onAuthTabOutcome(AuthTabIntent.RESULT_CANCELED, null)
+
+        assertFalse(activity.authTabFlow.inFlight)
+        assertTrue(activity.authTabFellBack)
+        assertEquals(DATABRICKS_ORIGIN, shadowOf(activity.testWebView()).lastLoadedUrl)
+    }
+
+    @Test
+    fun `failed app link verification falls back to inline login`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect(DATABRICKS_ORIGIN)
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        activity.authTabFlow.begin(DATABRICKS_ORIGIN, activity.packageName)
+
+        activity.onAuthTabOutcome(AuthTabIntent.RESULT_VERIFICATION_FAILED, null)
+
+        assertFalse(activity.authTabFlow.inFlight)
+        assertTrue(activity.authTabFellBack)
+        assertEquals(DATABRICKS_ORIGIN, shadowOf(activity.testWebView()).lastLoadedUrl)
+    }
+
+    @Test
+    fun `unmatched auth callback abandons the flow and falls back`() {
+        // Regression: a mismatched or malformed callback used to leave the
+        // pending flow armed, so the in-flight check short-circuited every
+        // later login attempt — a permanent wedge until process death.
+        ServerStore(ApplicationProvider.getApplicationContext()).connect(DATABRICKS_ORIGIN)
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        activity.authTabFlow.begin(DATABRICKS_ORIGIN, activity.packageName)
+
+        activity.onAuthTabOutcome(
+            AuthTabIntent.RESULT_OK,
+            Uri.parse(
+                "$DATABRICKS_ORIGIN${NativeAuth.CALLBACK_PATH}" +
+                    "?state=not-the-flow-state&code=c0de&exchange=tab",
+            ),
+        )
+
+        assertFalse(activity.authTabFlow.inFlight)
+        assertTrue(activity.authTabFellBack)
+    }
+
+    @Test
+    fun `initial auth tab launch falls back when provider resolution is null`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect(DATABRICKS_ORIGIN)
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        activity.authTabProviderPackageForTest = { null }
+
+        activity.startProxyLogin()
+
+        assertFalse(activity.authTabFlow.inFlight)
+        assertTrue(activity.authTabFellBack)
+        assertEquals(DATABRICKS_ORIGIN, shadowOf(activity.testWebView()).lastLoadedUrl)
+    }
+
+    @Test
+    fun `missing auth tab provider falls back without reloading a custom origin`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        ServerStore(context).connect(CUSTOM_ORIGIN)
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        val webView = shadowOf(activity.testWebView())
+        val loadedBeforeFallback = webView.lastLoadedUrl
+        activity.authTabProviderPackageForTest = { null }
+
+        activity.startProxyLogin()
+
+        assertFalse(activity.authTabFlow.inFlight)
+        assertTrue(activity.authTabFellBack)
+        assertEquals(loadedBeforeFallback, webView.lastLoadedUrl)
+    }
+
+    @Test
+    fun `exchange auth tab launch falls back when provider resolution is null`() {
+        val origin = DATABRICKS_ORIGIN
+        ServerStore(ApplicationProvider.getApplicationContext()).connect(origin)
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        activity.authTabProviderPackageForTest = { null }
+        val completion = activity.authTabFlow.begin(origin, activity.packageName)!!
+        val state = completion.getQueryParameter("state")!!
+
+        activity.onAuthTabOutcome(
+            AuthTabIntent.RESULT_OK,
+            Uri.parse(
+                "$origin${NativeAuth.CALLBACK_PATH}" +
+                    "?state=$state&code=one-time-code-1234&exchange=tab",
+            ),
+        )
+
+        assertFalse(activity.authTabFlow.inFlight)
+        assertTrue(activity.authTabFellBack)
+        assertEquals(origin, shadowOf(activity.testWebView()).lastLoadedUrl)
+    }
+
+    @Test
+    fun `stale exchange result for a switched-away origin leaves the current flow alone`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect(DATABRICKS_ORIGIN)
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        val webView = shadowOf(activity.webView())
+        // The current origin's own login is in flight when the exchange an old
+        // origin started (before the server switch) finally reports back.
+        activity.authTabFlow.begin(DATABRICKS_ORIGIN, activity.packageName)
+        val loadedBefore = webView.lastLoadedUrl
+        val stale =
+            AuthTabFlow.Outcome.ExchangePost(
+                origin = "https://previous.example.net",
+                code = "one-time-code-1234",
+                state = "stale-state",
+                verifier = "stale-verifier",
+            )
+
+        activity.onExchangeResult(stale, null)
+
+        assertTrue(activity.authTabFlow.inFlight)
+        assertFalse(activity.authTabFellBack)
+        assertEquals(loadedBefore, webView.lastLoadedUrl)
+    }
+
+    @Test
+    fun `failed exchange for the current origin abandons the flow and falls back`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect(DATABRICKS_ORIGIN)
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        activity.authTabFlow.begin(DATABRICKS_ORIGIN, activity.packageName)
+        val failed =
+            AuthTabFlow.Outcome.ExchangePost(
+                origin = DATABRICKS_ORIGIN,
+                code = "one-time-code-1234",
+                state = "flow-state",
+                verifier = "flow-verifier",
+            )
+
+        activity.onExchangeResult(failed, null)
+
+        assertFalse(activity.authTabFlow.inFlight)
+        assertTrue(activity.authTabFellBack)
+        assertEquals(DATABRICKS_ORIGIN, shadowOf(activity.webView()).lastLoadedUrl)
+    }
+
+    @Test
+    fun `cookie write landing after a server switch does not reload the old origin`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect(CUSTOM_ORIGIN)
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        val webView = shadowOf(activity.webView())
+        val loadedBefore = webView.lastLoadedUrl
+
+        // The async setCookie callback carries the origin captured when the
+        // write started; the pinned origin has since moved on.
+        activity.onSessionCookieWritten(
+            "https://previous.example.net",
+            "ap_session",
+            accepted = true,
+        )
+
+        assertEquals(loadedBefore, webView.lastLoadedUrl)
+    }
+
+    @Test
+    fun `cookie write for the pinned origin reloads it`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("$CUSTOM_ORIGIN/workspace")
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        val webView = shadowOf(activity.webView())
+        assertEquals("$CUSTOM_ORIGIN/workspace", webView.lastLoadedUrl)
+
+        activity.onSessionCookieWritten(CUSTOM_ORIGIN, "ap_session", accepted = true)
+
+        assertEquals(CUSTOM_ORIGIN, webView.lastLoadedUrl)
+    }
+
+    private fun MainActivity.webView(): WebView =
+        MainActivity::class
+            .java
+            .getDeclaredField("webView")
+            .apply { isAccessible = true }
+            .get(this) as WebView
+
+    private companion object {
+        const val CUSTOM_ORIGIN = "https://example.com"
+        const val DATABRICKS_ORIGIN = "https://example.databricksapps.com"
     }
 }
