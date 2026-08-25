@@ -191,6 +191,14 @@ def _validate_timezone_or_400(timezone: str) -> None:
         ) from exc
 
 
+def _canonical_project_id(project_id: str) -> str:
+    """Normalize a Project id without hiding malformed-id semantics."""
+    try:
+        return uuid_to_bytes(project_id).hex()
+    except InvalidUuidError:
+        raise InvalidUuidError("Not found.") from None
+
+
 def create_scheduled_tasks_router(
     store: ScheduledTaskStore,
     *,
@@ -228,10 +236,7 @@ def create_scheduled_tasks_router(
 
     async def _resolve_requested_project(project_id: str, owner: str | None) -> str:
         """Resolve an assignment target while preserving the API's 404 privacy."""
-        try:
-            canonical_project_id = uuid_to_bytes(project_id).hex()
-        except InvalidUuidError as exc:
-            raise OmnigentError("Not found.", code=ErrorCode.NOT_FOUND) from exc
+        canonical_project_id = _canonical_project_id(project_id)
         if project_store is None:
             raise OmnigentError(
                 "Project assignment is not supported by this server",
