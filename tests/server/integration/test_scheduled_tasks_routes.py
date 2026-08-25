@@ -15,6 +15,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.db.db_models import InvalidUuidError
 from omnigent.db.utils import builtin_agent_id
 from omnigent.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runtime.agent_cache import AgentCache
@@ -260,25 +261,51 @@ async def test_create_and_patch_reject_explicit_null_but_empty_string_unfiles(
     assert cleared.json()["project_id"] is None
 
 
+async def test_malformed_project_id_preserves_invalid_uuid_error() -> None:
+    with pytest.raises(InvalidUuidError, match=r"^Not found\.$"):
+        scheduled_tasks_routes._canonical_project_id("malformed")
+
+
 async def test_assignment_404s_for_missing_malformed_and_other_users_project(
     auth_client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
     _make_user(db_uri)
     _make_user(db_uri, "bob@example.com")
-    foreign = SqlAlchemyProjectStore(db_uri).create("b" * 32, "Bob", "bob@example.com")
-    for project_id, message in (
-        ("a" * 32, "Project not found"),
-        (foreign.id, "Project not found"),
-        ("malformed", "Not found."),
-    ):
+    projects = SqlAlchemyProjectStore(db_uri)
+    owned = projects.create("c" * 32, "Alice", "alice@example.com")
+    foreign = projects.create("b" * 32, "Bob", "bob@example.com")
+    cases = (
+        ("a" * 32, {"error": {"code": "not_found", "message": "Project not found"}}),
+        (foreign.id, {"error": {"code": "not_found", "message": "Project not found"}}),
+        ("malformed", {"error": {"code": "not_found", "message": "Not found."}}),
+    )
+    for project_id, body in cases:
         response = await auth_client.post(
             "/v1/scheduled-tasks",
             json=_create_body(project_id=project_id),
             headers=_headers(),
         )
         assert response.status_code == 404, response.text
-        assert response.json()["error"]["message"] == message
+        assert response.json() == body
+
+    created = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(project_id=owned.id),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    task_id = created.json()["id"]
+    task_store = SqlAlchemyScheduledTaskStore(db_uri)
+    for project_id, body in cases:
+        response = await auth_client.patch(
+            f"/v1/scheduled-tasks/{task_id}",
+            json={"project_id": project_id},
+            headers=_headers(),
+        )
+        assert response.status_code == 404, response.text
+        assert response.json() == body
+        assert task_store.get(task_id).project_id == owned.id
 
 
 async def test_uppercase_project_id_is_accepted_and_responses_are_lowercase_on_create_patch_and_filter(  # noqa: E501
