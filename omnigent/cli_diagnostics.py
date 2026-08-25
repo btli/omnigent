@@ -114,25 +114,6 @@ _AUTHORIZATION_KEY_RE = re.compile(
     r"[ \t\r\n]*[:=][ \t\r\n]*)"
 )
 _SECRET_PATTERNS: list[re.Pattern[str]] = [
-    # The keyless branch keeps a length floor so ordinary bearer prose survives.
-    re.compile(
-        r"(?i)(\bbearer[ \t\r\n]+(?:\(REDACTED\)[ \t\r\n]+)*)"
-        r"[A-Za-z0-9._~+/=-]{8,}(?![A-Za-z0-9._~+/=-])"
-    ),
-    # Canonicalization deletes an injected zero-width separator after the scheme.
-    re.compile(r"(?i)(\bbearer)[A-Za-z0-9._~+/=-]{8,}(?![A-Za-z0-9._~+/=-])"),
-    # Env-var style keys: FOO_TOKEN=xxx, FOO_API_KEY=xxx, ...
-    re.compile(r"(?i)(\b\w*(?:token|api_key|secret|password)\s*[:=]\s*)\S+"),
-    # Anthropic / OpenAI style keys
-    re.compile(r"\bsk-[A-Za-z0-9_-]{10,}\b"),
-    # Databricks PATs
-    re.compile(r"\bdapi[^\W_]{10,}\b"),
-    # Slack tokens (xoxb-/xoxa-/xoxp-/xoxr-/xoxs-)
-    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),
-    # GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_)
-    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
-    # AWS access key ids (long-term AKIA, temporary ASIA)
-    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16,}"),
     # URL userinfo is confined to one whitespace-bounded authority.
     re.compile(
         r"(?i)(https?://)[^/\s?#]*"
@@ -141,6 +122,174 @@ _SECRET_PATTERNS: list[re.Pattern[str]] = [
 ]
 _REDACTED = "[REDACTED]"
 _MAX_UNTERMINATED_AUTHORIZATION_FOLDS = 1
+_MAX_CREDENTIAL_WORD_GAPS = 1
+_ENV_VALUE_MIN_LENGTH = 8
+_WORD_GAP_TEXT = (
+    "\t \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007"
+    "\u2008\u2009\u200a\u202f\u205f\u3000"
+)
+_WORD_GAP_CHARACTERS = frozenset(_WORD_GAP_TEXT)
+_CREDENTIAL_ANCHOR_RE = re.compile(
+    r"(?P<github>(?<!\w)gh[pousr]_)"
+    r"|(?P<databricks>(?<!\w)dapi)"
+    r"|(?P<slack>(?<!\w)xox[baprs]-)"
+    r"|(?P<aws>(?<!\w)(?:AKIA|ASIA))"
+    r"|(?P<sk>(?<!\w)sk-)"
+    r"|(?P<bearer>(?<!\w)(?i:bearer))"
+)
+_ENV_CREDENTIAL_ANCHOR_RE = re.compile(r"(?<!\w)\w*(?i:token|api_key|secret|password)[ \t]*[:=]")
+_BEARER_ALPHABET_RE = r"[A-Za-z0-9._~+/=-]"
+# Removing every non-gap splitter makes this a conservative impossibility
+# check; the forward scanner below remains the only redaction matcher.
+_BEARER_SHADOW_STRIP_RE = re.compile(rf"[^{re.escape(_WORD_GAP_TEXT)}A-Za-z0-9._~+/=\-\r\n]+")
+_BEARER_SHADOW_POSSIBLE_RE = re.compile(
+    rf"(?i)(?<![A-Za-z0-9_])bearer[{re.escape(_WORD_GAP_TEXT)}]?"
+    rf"(?:{_BEARER_ALPHABET_RE}{{8}}|"
+    + "|".join(
+        rf"{_BEARER_ALPHABET_RE}{{{left}}}[{re.escape(_WORD_GAP_TEXT)}]"
+        rf"{_BEARER_ALPHABET_RE}{{{8 - left}}}"
+        for left in range(8)
+    )
+    + ")"
+)
+
+
+def _is_word_gap(char: str) -> bool:
+    """Return whether *char* is genuine horizontal word-separating whitespace."""
+    return char in _WORD_GAP_CHARACTERS
+
+
+def _credential_span_end(
+    text: str,
+    start: int,
+    *,
+    alphabet: str,
+    minimum: int,
+    allow_lowercase: bool = True,
+) -> int | None:
+    """
+    Scan one credential body in a single forward pass.
+
+    Before the length floor, every non-alphabet splitter is absorbed except a
+    newline; genuine word gaps have a small fixed budget. After the floor, the
+    first non-alphabet character ends the span, preserving following prose.
+    """
+    index = start
+    alphabet_count = 0
+    word_gaps = 0
+    while index < len(text):
+        char = text[index]
+        if char in "\r\n":
+            break
+        in_alphabet = (
+            "0" <= char <= "9"
+            or "A" <= char <= "Z"
+            or (allow_lowercase and "a" <= char <= "z")
+            or char in alphabet
+        )
+        if in_alphabet:
+            alphabet_count += 1
+            index += 1
+            continue
+        if alphabet_count >= minimum:
+            break
+        if char in _WORD_GAP_CHARACTERS:
+            word_gaps += 1
+            if word_gaps > _MAX_CREDENTIAL_WORD_GAPS:
+                break
+        index += 1
+    return index if alphabet_count >= minimum else None
+
+
+def _bearer_value_start(text: str, anchor_end: int) -> tuple[int, int]:
+    """Return the preserved prefix end and scan start for keyless Bearer auth."""
+    scan_start = anchor_end
+    if scan_start < len(text) and _is_word_gap(text[scan_start]):
+        scan_start += 1
+    preserved_end = scan_start
+    while text.startswith("(REDACTED)", scan_start):
+        marker_end = scan_start + len("(REDACTED)")
+        if marker_end >= len(text) or not _is_word_gap(text[marker_end]):
+            break
+        scan_start = marker_end + 1
+        preserved_end = scan_start
+    return preserved_end, scan_start
+
+
+def _redact_scanned_credentials(text: str) -> str:
+    """Redact prefixed credentials with bounded, forward-only span scans."""
+    parts: list[str] = []
+    cursor = 0
+    search_start = 0
+    bearer_shadow = _BEARER_SHADOW_STRIP_RE.sub("", text)
+    scan_bearer = _BEARER_SHADOW_POSSIBLE_RE.search(bearer_shadow) is not None
+    while match := _CREDENTIAL_ANCHOR_RE.search(text, search_start):
+        search_start = match.end()
+        family = match.lastgroup
+        if family in {"github", "databricks", "slack", "aws", "sk"}:
+            alphabet, minimum = {
+                "github": ("", 20),
+                "databricks": ("", 10),
+                "slack": ("-", 10),
+                "aws": ("", 16),
+                "sk": ("_-", 10),
+            }[family]
+            span_end = _credential_span_end(
+                text,
+                match.end(),
+                alphabet=alphabet,
+                minimum=minimum,
+                allow_lowercase=family != "aws",
+            )
+            if span_end is not None:
+                parts.extend((text[cursor : match.start()], _REDACTED))
+                cursor = span_end
+                search_start = span_end
+                continue
+
+        if family == "bearer":
+            if not scan_bearer:
+                continue
+            preserved_end, body_start = _bearer_value_start(text, match.end())
+            span_end = _credential_span_end(
+                text,
+                body_start,
+                alphabet="._~+/=-",
+                minimum=8,
+            )
+            if span_end is not None:
+                parts.extend((text[cursor:preserved_end], _REDACTED))
+                cursor = span_end
+                search_start = span_end
+                continue
+
+    parts.append(text[cursor:])
+    return _redact_scanned_env_credentials("".join(parts))
+
+
+def _redact_scanned_env_credentials(text: str) -> str:
+    """Redact env-style values in a separate fixed linear pass."""
+    parts: list[str] = []
+    cursor = 0
+    search_start = 0
+    while match := _ENV_CREDENTIAL_ANCHOR_RE.search(text, search_start):
+        search_start = match.end()
+        body_start = match.end()
+        if body_start < len(text) and _is_word_gap(text[body_start]):
+            body_start += 1
+        span_end = _credential_span_end(
+            text,
+            body_start,
+            alphabet="._~+/=-",
+            minimum=_ENV_VALUE_MIN_LENGTH,
+        )
+        if span_end is None:
+            continue
+        parts.extend((text[cursor:body_start], _REDACTED))
+        cursor = span_end
+        search_start = span_end
+    parts.append(text[cursor:])
+    return "".join(parts)
 
 
 def _authorization_value_end(text: str, start: int, quote: str | None) -> tuple[int, bool]:
@@ -217,6 +366,7 @@ def redact_secrets(text: str) -> str:
     """
 
     text = _redact_authorization_values(text)
+    text = _redact_scanned_credentials(text)
     for pat in _SECRET_PATTERNS:
         text = pat.sub(
             lambda m: m.group(1) + _REDACTED if m.lastindex else _REDACTED,

@@ -400,13 +400,29 @@ def test_redact_secrets_scrubs_opaque_shapes(secret: str) -> None:
     ],
     ids=["bearer", "dapi", "slack", "github", "aws-akia", "aws-asia"],
 )
-def test_redact_secrets_does_not_join_literal_interior_space(
+def test_redact_secrets_redacts_one_literal_interior_space(
     secret: str,
     split_index: int,
 ) -> None:
-    """The shared redactor only matches already-canonical contiguous tokens."""
+    """One genuine word gap cannot split an otherwise credential-shaped token."""
     spaced = f"{secret[:split_index]} {secret[split_index:]}"
-    assert cli_diagnostics.redact_secrets(spaced) == spaced
+    scrubbed = cli_diagnostics.redact_secrets(spaced)
+    assert spaced not in scrubbed
+    assert "[REDACTED]" in scrubbed
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "ghp_ is a prefix used in documentation",
+        "bearer of bad news",
+        "token= is not a credential value",
+    ],
+    ids=["github-prefix", "bearer", "env-key"],
+)
+def test_redact_secrets_preserves_prefixed_prose_with_word_gaps(text: str) -> None:
+    """Multiple real word gaps keep ordinary diagnostic prose readable."""
+    assert cli_diagnostics.redact_secrets(text) == text
 
 
 def test_redact_secrets_rejects_bearer_repetition_in_linear_time() -> None:

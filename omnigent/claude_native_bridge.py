@@ -2810,6 +2810,7 @@ _HOOK_FAILURE_FRAME_TRANSLATION = str.maketrans({"[": "(", "]": ")"})
 _HOOK_FAILURE_REDACTION_MARKER = "[REDACTED]"
 _HOOK_FAILURE_PLANTED_REDACTION_RE = re.compile(r"(?i)\[REDACTED\]")
 _HOOK_FAILURE_SEPARATOR_MARKER = "\x00"
+_ASCII_ALPHANUMERIC_RE = re.compile(r"[A-Za-z0-9]")
 # Unicode Default_Ignorable_Code_Point ranges from DerivedCoreProperties.txt.
 _DEFAULT_IGNORABLE_CODE_POINT_RANGES = frozenset(
     {
@@ -2831,6 +2832,12 @@ _DEFAULT_IGNORABLE_CODE_POINT_RANGES = frozenset(
         (0x1D173, 0x1D17A),
         (0xE0000, 0xE0FFF),
     }
+)
+_DEFAULT_IGNORABLE_CODE_POINT_RE = re.compile(
+    "[\u00ad\u034f\u061c\u115f-\u1160\u17b4-\u17b5\u180b-\u180f"
+    "\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f"
+    "\ufeff\uffa0\ufff0-\ufff8\U0001bca0-\U0001bca3"
+    "\U0001d173-\U0001d17a\U000e0000-\U000e0fff]"
 )
 
 
@@ -2916,7 +2923,7 @@ def _strip_ansi_escape_sequences(text: str) -> str:
 
 
 def _redactor_changes(text: str) -> bool:
-    """Return whether contiguous secret matching redacts *text*."""
+    """Return whether shared secret matching redacts *text*."""
     return redact_secrets(text) != text
 
 
@@ -2929,11 +2936,12 @@ def _canonicalize_hook_failure_chunk(chunk: str, previous_word: str) -> str:
         or (previous_word.casefold() == "bearer" and _redactor_changes(f"Bearer {compact}"))
     ):
         return compact
+    if len(compact) > _HOOK_FAILURE_DETAIL_RAW_LIMIT:
+        return compact
 
+    decomposed = unicodedata.normalize("NFKD", compact)
     skeleton = "".join(
-        char
-        for char in unicodedata.normalize("NFKD", compact)
-        if unicodedata.category(char) not in {"Mn", "Mc", "Me"}
+        char for char in decomposed if unicodedata.category(char) not in {"Mn", "Mc", "Me"}
     )
     if skeleton != compact and (
         _redactor_changes(skeleton)
@@ -2949,22 +2957,35 @@ def _canonicalize_hook_failure_chunk(chunk: str, previous_word: str) -> str:
 def _canonicalize_hook_failure_detail(text: str) -> str:
     """Build the normalized text used for both secret matching and output."""
     line_normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-    prepared: list[str] = []
-    for char in line_normalized:
-        if char in {" ", "\n"}:
+    if line_normalized.isprintable() and not _DEFAULT_IGNORABLE_CODE_POINT_RE.search(
+        line_normalized
+    ):
+        prepared_text = line_normalized
+    else:
+        prepared: list[str] = []
+        for char in line_normalized:
+            if char in {" ", "\n"}:
+                prepared.append(char)
+                continue
+            category = unicodedata.category(char)
+            if _is_default_ignorable_code_point(char) or category == "Cs":
+                continue
+            if char.isspace() or category == "Cc":
+                prepared.append(_HOOK_FAILURE_SEPARATOR_MARKER)
+                continue
+            if not char.isprintable():
+                continue
             prepared.append(char)
-            continue
-        category = unicodedata.category(char)
-        if _is_default_ignorable_code_point(char) or category == "Cs":
-            continue
-        if char.isspace() or category == "Cc":
-            prepared.append(_HOOK_FAILURE_SEPARATOR_MARKER)
-            continue
-        if not char.isprintable():
-            continue
-        prepared.append(char)
+        prepared_text = "".join(prepared)
 
-    normalized = unicodedata.normalize("NFKC", "".join(prepared))
+    normalized = unicodedata.normalize("NFKC", prepared_text)
+    if (
+        len(normalized) > _HOOK_FAILURE_DETAIL_RAW_LIMIT
+        and _HOOK_FAILURE_SEPARATOR_MARKER not in normalized
+        and " " not in normalized
+        and "\n" not in normalized
+    ):
+        return normalized
     canonical: list[str] = []
     previous_word = ""
     index = 0
@@ -3017,8 +3038,18 @@ def _sanitize_hook_failure_detail(text: str) -> str | None:
     """
     without_ansi = _strip_ansi_escape_sequences(text)
     canonical = _canonicalize_hook_failure_detail(without_ansi)
+    raw_preview, preview_truncated = _raw_hook_failure_window(canonical)
     canonical = _HOOK_FAILURE_PLANTED_REDACTION_RE.sub("(REDACTED)", canonical)
+    if (
+        preview_truncated
+        and not raw_preview
+        and canonical.startswith(("ghp_", "gho_", "ghu_", "ghs_", "ghr_"))
+        and _ASCII_ALPHANUMERIC_RE.search(canonical[4:]) is None
+    ):
+        return _HOOK_FAILURE_DETAIL_REMOVED_SENTINEL
     redacted = redact_secrets(canonical)
+    if preview_truncated and not raw_preview and redacted == canonical:
+        return _HOOK_FAILURE_DETAIL_REMOVED_SENTINEL
     if not redacted:
         return None
     bounded, raw_truncated = _raw_hook_failure_window(redacted)

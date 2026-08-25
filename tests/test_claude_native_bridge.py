@@ -7723,6 +7723,18 @@ def test_sanitize_hook_failure_detail_strips_unterminated_dcs_in_linear_time() -
     assert elapsed < 0.1
 
 
+def test_sanitize_hook_failure_detail_scans_splitter_flood_in_linear_time() -> None:
+    """A long non-alphabet splitter run is scanned once without redaction."""
+    text = "ghp_" + "\u2800" * 20_000
+    started = time.perf_counter()
+    detail = _sanitize_hook_failure_detail(text)
+    elapsed = time.perf_counter() - started
+
+    assert detail is not None
+    assert detail == _HOOK_FAILURE_DETAIL_REMOVED_SENTINEL
+    assert elapsed < 0.1
+
+
 @pytest.mark.parametrize(
     "mutation",
     ["\u115f", "\u1160", "\u3164", "\uffa0"],
@@ -7753,6 +7765,53 @@ def test_sanitize_hook_failure_detail_rejoins_all_combining_mark_categories(
     assert _sanitize_hook_failure_detail(f"launch rejected {obfuscated}") == (
         "launch rejected [REDACTED]"
     )
+
+
+@pytest.mark.parametrize(
+    ("secret", "split_index", "preserved"),
+    [
+        ("Bearer abcdefghijk", 11, "Bearer"),
+        ("".join(("dapi", "FAKE", "TEST", "0123456789")), 7, None),
+        ("".join(("xoxb", "-", "FAKE", "-", "TEST", "-", "TOKEN")), 9, None),
+        ("".join(("ghp_", "FAKE", "TEST", "TOKEN", "PLACEHOLDER")), 12, None),
+        ("".join(("AKIA", "FAKE", "TEST", "ONLY", "0000")), 10, None),
+        ("".join(("sk", "-", "FAKE", "_", "TEST", "_", "012345")), 8, None),
+        ("".join(("MODEL_TOKEN=", "FAKE", "VALUE", "012345")), 15, "MODEL_TOKEN="),
+    ],
+    ids=["bearer", "databricks", "slack", "github", "aws", "openai", "env-value"],
+)
+def test_sanitize_hook_failure_detail_redacts_braille_blank_split_credentials(
+    secret: str,
+    split_index: int,
+    preserved: str | None,
+) -> None:
+    """Printable non-space symbols cannot split any prefixed credential family."""
+    obfuscated = f"{secret[:split_index]}\u2800{secret[split_index:]}"
+    detail = _sanitize_hook_failure_detail(f"launch rejected {obfuscated}")
+
+    assert detail is not None
+    assert obfuscated not in detail
+    assert "[REDACTED]" in detail
+    if preserved is not None:
+        assert preserved in detail
+
+
+def test_hook_failure_detail_redacts_braille_split_message_credential() -> None:
+    """A credential split in the surfaced assistant message never reaches the parent."""
+    detail = _hook_failure_detail(
+        {
+            "error": "launch failed",
+            "last_assistant_message": "ghp_abcdefghij\u2800klmnopqrst rejected",
+        }
+    )
+
+    assert detail == "launch failed: [REDACTED] rejected"
+
+
+def test_sanitize_hook_failure_detail_redacts_single_space_split_credential() -> None:
+    """One ordinary space inside a GitHub-shaped token is absorbed into its span."""
+    detail = _sanitize_hook_failure_detail("launch rejected ghp_abcdefghij klmnopqrst")
+    assert detail == "launch rejected [REDACTED]"
 
 
 @pytest.mark.parametrize(
@@ -7904,7 +7963,7 @@ def test_sanitize_hook_failure_detail_redacts_after_planted_marker() -> None:
     [
         ("x\u2009Bearer\u2009abcdefghijk", "x Bearer [REDACTED]"),
         ("ghp_abcdefghijbearer\u2009klmnopqrst", "[REDACTED]"),
-        ("Bearer\nabcdefghijk", "Bearer\n[REDACTED]"),
+        ("Bearer\nabcdefghijk", "Bearer\nabcdefghijk"),
         ("Authorization\n: Basic dXNlcjpodW50ZXIy", "Authorization\n: [REDACTED]"),
         ("bearer\ufeffabcdefghijk", "bearer[REDACTED]"),
         ("bearer\u2060abcdefghijk", "bearer[REDACTED]"),
