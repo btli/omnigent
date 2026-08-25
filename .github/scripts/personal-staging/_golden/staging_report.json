@@ -9,6 +9,8 @@
       "push",
       "--atomic",
       "--force-with-lease=refs/heads/staging:",
+      "--force-with-lease=refs/heads/nightly-20260820:",
+      "--force-with-lease=refs/tags/nightly-20260820:",
       "--force-with-lease=refs/tags/v1.2.3.dev20260820:",
       "origin",
       "6a1c119077ab9279705945f51755b803c07411ee:refs/heads/staging",
@@ -34,10 +36,23 @@
         "source": "open"
       }
     ],
+    "audit": [
+      {
+        "expected": "6a1c119077ab9279705945f51755b803c07411ee",
+        "observed": "6a1c119077ab9279705945f51755b803c07411ee",
+        "ref": "refs/tags/nightly-20260820"
+      },
+      {
+        "expected": "6a1c119077ab9279705945f51755b803c07411ee",
+        "observed": "6a1c119077ab9279705945f51755b803c07411ee",
+        "ref": "refs/heads/nightly-20260820"
+      }
+    ],
     "branch": "nightly-20260820",
     "date": "20260820",
     "dev_tag": "v1.2.3.dev20260820",
     "pin_created": true,
+    "pin_ref": "refs/tags/nightly-20260820",
     "skipped": [],
     "staging_sha": "6a1c119077ab9279705945f51755b803c07411ee",
     "tag": "nightly-20260820",

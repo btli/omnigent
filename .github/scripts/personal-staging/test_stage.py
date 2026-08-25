@@ -286,6 +286,71 @@ def test_same_day_rerun_noop_then_rerun_suffix(env):
     assert env.fork_ref("refs/heads/staging") == third["staging_sha"]
 
 
+def test_pin_push_uses_expected_absent_leases(env, pushes):
+    report = env.run([])
+    push = pushes[-1]
+
+    assert f"--force-with-lease=refs/heads/{report['branch']}:" in push
+    assert f"--force-with-lease=refs/tags/{report['tag']}:" in push
+
+
+def test_pin_creation_race_is_atomic(env, monkeypatch):
+    real_git = stage_mod.git
+    raced = False
+    concurrent_sha = ""
+    pin_branch = f"refs/heads/nightly-{STAMP}"
+
+    def race(cwd, *args, **kwargs):
+        nonlocal concurrent_sha, raced
+        if args and args[0] == "push" and "--atomic" in args and not raced:
+            raced = True
+            concurrent_sha = git(cwd, "rev-parse", "HEAD^1").stdout.strip()
+            git(env.fork, "fetch", str(cwd), concurrent_sha)
+            git(env.fork, "update-ref", pin_branch, concurrent_sha)
+        return real_git(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(stage_mod, "git", race)
+    with pytest.raises(stage_mod.StageError, match="push --atomic"):
+        env.run([env.add_pr(31, "race.txt", "race\n")])
+
+    assert raced is True
+    assert env.fork_ref(pin_branch) == concurrent_sha
+    assert env.fork_ref(f"refs/tags/nightly-{STAMP}") == ""
+    assert env.fork_ref("refs/heads/staging") == ""
+
+
+def test_surviving_pin_branch_never_reuses_deleted_tag_name(env):
+    first = env.run([])
+    pin_branch = f"refs/heads/nightly-{STAMP}"
+    pin_tag = f"refs/tags/nightly-{STAMP}"
+    git(env.fork, "update-ref", "-d", pin_tag)
+    env.advance_main("descendant.txt", "descendant\n")
+
+    with pytest.raises(stage_mod.StageError, match="tag is absent"):
+        env.run([])
+
+    assert env.fork_ref(pin_branch) == first["staging_sha"]
+    assert env.fork_ref(pin_tag) == ""
+
+
+def test_post_push_audit_records_fully_qualified_pin_refs(env):
+    report = env.run([])
+
+    assert report["pin_ref"] == f"refs/tags/nightly-{STAMP}"
+    assert report["audit"] == [
+        {
+            "ref": f"refs/tags/nightly-{STAMP}",
+            "expected": report["staging_sha"],
+            "observed": report["staging_sha"],
+        },
+        {
+            "ref": f"refs/heads/nightly-{STAMP}",
+            "expected": report["staging_sha"],
+            "observed": report["staging_sha"],
+        },
+    ]
+
+
 def test_dev_tag_mirrors_nightly_scheme(env):
     report = env.run([])
     assert report["dev_tag"] == f"v1.2.3.dev{STAMP}"
@@ -1131,6 +1196,21 @@ def test_production_reads_no_extras(env, tmp_path, monkeypatch, capsys):
     capsys.readouterr()
 
 
+@pytest.mark.parametrize("source", ["extra", "extra-branch"])
+def test_direct_production_stage_rejects_extras_before_git(env, source):
+    pin = {
+        "number": None if source == "extra-branch" else 42,
+        "source": source,
+        "headRefName": "manual",
+    }
+
+    with pytest.raises(stage_mod.StageError, match=r"production.*extras"):
+        env.run([pin], ring=stage_mod.PRODUCTION)
+
+    assert git(env.work, "rev-parse", "-q", "--verify", "FETCH_HEAD", check=False).returncode != 0
+    assert git(env.work, "ls-remote", str(env.fork)).stdout.strip() == ""
+
+
 def test_production_pin_prefix(env):
     """The production nightly mints production-YYYYMMDD (branch + tag) at the
     composed sha — no nightly-* ref anywhere."""
@@ -1240,6 +1320,69 @@ def test_production_commit_identity(env):
     obj = git(env.work, "cat-file", "-p", staging["staging_sha"]).stdout
     assert "author omnigent-staging <staging@invalid>" in obj
     assert "committer omnigent-staging <staging@invalid>" in obj
+
+
+@pytest.mark.parametrize("tampering", ["subject", "identity", "first-parent"])
+def test_production_identity_tampering_fails_before_push(env, monkeypatch, tampering):
+    pr = env.add_pr(21, "identity.txt", "identity\n")
+    real_merge_prs = stage_mod.merge_prs
+
+    def tampered_merge_prs(
+        cwd, prs, upstream, fork="origin", ring=stage_mod.STAGING, upstream_sha=""
+    ):
+        applied, skipped = real_merge_prs(cwd, prs, upstream, fork, ring, upstream_sha)
+        subject = "production: merge PR #21 (pr-21 @ " + pr["headRefOid"][:12] + ")"
+        if tampering == "first-parent":
+            stage_mod.git(
+                cwd,
+                *stage_mod.commit_ident(ring),
+                "commit",
+                "--allow-empty",
+                "--no-verify",
+                "-m",
+                subject,
+            )
+        else:
+            if tampering == "subject":
+                subject = "staging: merge PR #21 (pr-21 @ " + pr["headRefOid"][:12] + ")"
+            ident = (
+                ["-c", "user.name=wrong", "-c", "user.email=wrong@invalid"]
+                if tampering == "identity"
+                else stage_mod.commit_ident(ring)
+            )
+            stage_mod.git(
+                cwd,
+                *ident,
+                "commit",
+                "--amend",
+                "--no-verify",
+                "-m",
+                subject,
+                env={
+                    "GIT_AUTHOR_NAME": "wrong"
+                    if tampering == "identity"
+                    else "omnigent-production",
+                    "GIT_AUTHOR_EMAIL": (
+                        "wrong@invalid" if tampering == "identity" else "production@invalid"
+                    ),
+                },
+            )
+        return applied, skipped
+
+    monkeypatch.setattr(stage_mod, "merge_prs", tampered_merge_prs)
+    with pytest.raises(stage_mod.StageError, match="production identity"):
+        env.run([pr], ring=stage_mod.PRODUCTION)
+
+    assert git(env.work, "ls-remote", str(env.fork)).stdout.strip() == ""
+
+
+def test_production_zero_merge_candidate_is_valid(env):
+    report = env.run([], ring=stage_mod.PRODUCTION)
+
+    assert report["staging_sha"] == report["upstream_sha"]
+    assert report["applied"] == []
+    assert env.fork_ref("refs/heads/production") == report["upstream_sha"]
+    assert env.fork_ref(f"refs/tags/production-{STAMP}") == report["upstream_sha"]
 
 
 def test_notes_production_ring_has_apk_section(tmp_path, capsys):

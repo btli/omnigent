@@ -132,7 +132,7 @@ manifest_digest() {
   printf '%s\n' "$digest"
 }
 
-TAG_SHA="$(gh api "repos/${REPO}/commits/${TAG}" --jq '.sha')"
+TAG_SHA="$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq '.object.sha')"
 SHORT_SHA="${TAG_SHA:0:12}"
 for image in ghcr.io/btli/omnigent-server ghcr.io/btli/omnigent-host; do
   date_digest="$(manifest_digest "${image}:${TAG}")"
