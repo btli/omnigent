@@ -200,8 +200,10 @@ const FULL_HEIGHT_PANEL_TARGETS = [
   { testId: "file-viewer" },
   { testId: "files-panel-drawer" },
   { testId: "terminals-panel" },
-  { testId: "subagents-panel-drawer" },
-  { testId: "todos-panel-drawer" },
+  // Drawer stubs carry both hooks: index.css insets them via the shared
+  // `.mobile-panel-drawer` class, the injected fallback sheet via `data-testid`.
+  { className: "mobile-panel-drawer", testId: "subagents-panel-drawer" },
+  { className: "mobile-panel-drawer", testId: "todos-panel-drawer" },
 ] as const;
 
 function trimIndent(value: string): string {
