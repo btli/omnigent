@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from pathlib import Path
@@ -64,71 +65,192 @@ def test_catalog_age_reports_and_misses() -> None:
     assert age is not None and age >= 0.0
 
 
-def _age_entry(harness: str, fingerprint: str, age_s: float) -> None:
-    """
-    Backdate a stored catalog file's mtime by *age_s* seconds.
-    """
-    path = store.catalog_path(harness, fingerprint)
-    old = time.time() - age_s
-    os.utime(path, (old, old))
+def _make_catalog_stale() -> None:
+    path = store.catalog_path("claude-native", "abc123")
+    stale_time = time.time() - store.CATALOG_STALE_AFTER_S - 1.0
+    os.utime(path, (stale_time, stale_time))
 
 
-def test_catalog_is_stale_truth_table() -> None:
-    assert store.catalog_is_stale("claude-native", "abc123") is False
+@pytest.mark.asyncio
+async def test_shared_stale_catalog_serves_immediately_and_refreshes_in_background() -> None:
+    old_rows = [{"id": "old", "model": "claude-old"}]
+    store.write_catalog("claude-native", "abc123", old_rows)
+    _make_catalog_stale()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _resolve() -> list[dict[str, object]]:
+        started.set()
+        await release.wait()
+        return _ROWS
+
+    rows = await asyncio.wait_for(
+        store.ensure_catalog("claude-native", "abc123", _resolve),
+        timeout=1.0,
+    )
+
+    assert rows == old_rows
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    refresh = store._inflight[("claude-native", "abc123")]
+    assert not refresh.done()
+    release.set()
+    await refresh
+    assert store.read_catalog("claude-native", "abc123") == _ROWS
+
+
+@pytest.mark.asyncio
+async def test_background_refresh_failure_log_does_not_include_exception_payload(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     store.write_catalog("claude-native", "abc123", _ROWS)
-    assert store.catalog_is_stale("claude-native", "abc123") is False
-    _age_entry("claude-native", "abc123", store.CATALOG_STALE_AFTER_S + 60)
-    assert store.catalog_is_stale("claude-native", "abc123") is True
+    _make_catalog_stale()
+    payload = "Authorization: Bearer super-secret response-body=private"
+
+    async def _resolve() -> list[dict[str, object]]:
+        raise RuntimeError(payload)
+
+    with caplog.at_level("WARNING", logger="omnigent.model_catalog_store"):
+        assert await store.ensure_catalog("claude-native", "abc123", _resolve) == _ROWS
+        refresh = store._inflight[("claude-native", "abc123")]
+        await asyncio.gather(refresh, return_exceptions=True)
+        await asyncio.sleep(0)
+
+    assert "background claude-native catalog refresh failed (other)" in caplog.text
+    assert payload not in caplog.text
+    assert "RuntimeError" not in caplog.text
 
 
-async def test_ensure_catalog_fresh_hit_never_probes() -> None:
+@pytest.mark.asyncio
+async def test_catalog_result_recent_cache_hit_is_fresh_without_a_probe() -> None:
     store.write_catalog("claude-native", "abc123", _ROWS)
-    probes: list[int] = []
+    calls: list[int] = []
 
-    async def _probe() -> list[dict[str, object]]:
-        probes.append(1)
+    async def _resolve() -> list[dict[str, object]]:
+        calls.append(1)
         return [{"id": "new"}]
 
-    assert await store.ensure_catalog("claude-native", "abc123", _probe) == _ROWS
-    assert probes == []
+    result = await store.ensure_authoritative_catalog_result("claude-native", "abc123", _resolve)
+
+    assert result == store.CatalogResult(_ROWS, store.CatalogFreshness.FRESH)
+    assert calls == []
 
 
-async def test_ensure_catalog_stale_hit_serves_now_and_refreshes_in_background() -> None:
-    """
-    A stale entry still answers instantly; the re-probe converges the store.
-    """
-    store.write_catalog("claude-native", "abc123", _ROWS)
-    _age_entry("claude-native", "abc123", store.CATALOG_STALE_AFTER_S + 60)
-    refreshed = [{"id": "sonnet", "model": "claude-sonnet-6", "isDefault": True}]
-    probes: list[int] = []
+@pytest.mark.asyncio
+async def test_catalog_result_cold_cache_miss_probes_and_persists_fresh_rows() -> None:
+    calls: list[int] = []
 
-    async def _probe() -> list[dict[str, object]]:
-        probes.append(1)
-        return refreshed
+    async def _resolve() -> list[dict[str, object]]:
+        calls.append(1)
+        return _ROWS
 
-    assert await store.ensure_catalog("claude-native", "abc123", _probe) == _ROWS
-    task = store._inflight.get(("claude-native", "abc123"))
-    assert task is not None, "a stale hit must kick a background refresh"
-    await task
-    assert probes == [1]
-    assert store.read_catalog("claude-native", "abc123") == refreshed
-    assert store.catalog_is_stale("claude-native", "abc123") is False
-    # The refreshed entry is fresh again: the next read is a plain hit.
-    assert await store.ensure_catalog("claude-native", "abc123", _probe) == refreshed
-    assert probes == [1]
+    result = await store.ensure_authoritative_catalog_result("claude-native", "abc123", _resolve)
 
-
-async def test_ensure_catalog_stale_refresh_failure_keeps_serving() -> None:
-    store.write_catalog("claude-native", "abc123", _ROWS)
-    _age_entry("claude-native", "abc123", store.CATALOG_STALE_AFTER_S + 60)
-
-    async def _probe() -> list[dict[str, object]]:
-        raise OSError("provider unreachable")
-
-    assert await store.ensure_catalog("claude-native", "abc123", _probe) == _ROWS
-    task = store._inflight.get(("claude-native", "abc123"))
-    assert task is not None
-    await task
-    # The stale rows keep serving; nothing crashed and nothing was clobbered.
+    assert result == store.CatalogResult(_ROWS, store.CatalogFreshness.FRESH)
+    assert calls == [1]
     assert store.read_catalog("claude-native", "abc123") == _ROWS
-    assert await store.ensure_catalog("claude-native", "abc123", _probe) == _ROWS
+
+
+@pytest.mark.asyncio
+async def test_catalog_result_stale_cached_hit_refreshes_to_fresh_rows() -> None:
+    old_rows = [{"id": "old", "model": "claude-old"}]
+    store.write_catalog("claude-native", "abc123", old_rows)
+    _make_catalog_stale()
+
+    async def _resolve() -> list[dict[str, object]]:
+        return _ROWS
+
+    result = await store.ensure_authoritative_catalog_result("claude-native", "abc123", _resolve)
+
+    assert result == store.CatalogResult(_ROWS, store.CatalogFreshness.FRESH)
+    assert store.read_catalog("claude-native", "abc123") == _ROWS
+
+
+@pytest.mark.asyncio
+async def test_catalog_result_stale_cached_miss_keeps_rows_with_empty_failure() -> None:
+    store.write_catalog("claude-native", "abc123", _ROWS)
+    _make_catalog_stale()
+
+    async def _empty() -> list[dict[str, object]] | None:
+        return None
+
+    result = await store.ensure_authoritative_catalog_result("claude-native", "abc123", _empty)
+
+    assert result.rows == _ROWS
+    assert result.freshness is store.CatalogFreshness.STALE
+    assert result.refresh_error is not None
+    assert result.refresh_error.kind is store.CatalogRefreshFailureKind.EMPTY
+    assert result.refresh_error.message == "model catalog refresh returned no models"
+
+
+@pytest.mark.asyncio
+async def test_catalog_result_refresh_failure_with_cache_preserves_rows_and_provenance() -> None:
+    store.write_catalog("claude-native", "abc123", _ROWS)
+    _make_catalog_stale()
+
+    async def _unauthorized() -> list[dict[str, object]]:
+        raise store.CatalogRefreshError(
+            store.CatalogRefreshFailureKind.AUTH,
+            "Claude model catalog authentication failed",
+        )
+
+    result = await store.ensure_authoritative_catalog_result(
+        "claude-native", "abc123", _unauthorized
+    )
+
+    assert result.rows == _ROWS
+    assert result.freshness is store.CatalogFreshness.STALE
+    assert result.refresh_error is not None
+    assert result.refresh_error.kind is store.CatalogRefreshFailureKind.AUTH
+    assert result.refresh_error.message == "Claude model catalog authentication failed"
+    assert store.read_catalog("claude-native", "abc123") == _ROWS
+
+
+@pytest.mark.asyncio
+async def test_catalog_result_refresh_failure_without_cache_is_sanitized_and_missing() -> None:
+    async def _offline() -> list[dict[str, object]]:
+        raise OSError("secret provider response")
+
+    result = await store.ensure_authoritative_catalog_result("claude-native", "abc123", _offline)
+
+    assert result.rows is None
+    assert result.freshness is store.CatalogFreshness.MISSING
+    assert result.refresh_error is not None
+    assert result.refresh_error.kind is store.CatalogRefreshFailureKind.OTHER
+    assert result.refresh_error.message == "model catalog refresh could not reach the provider"
+    assert "secret provider response" not in result.refresh_error.message
+
+
+@pytest.mark.asyncio
+async def test_catalog_result_coalesces_stale_refresh_failure_with_consistent_provenance() -> None:
+    store.write_catalog("claude-native", "abc123", _ROWS)
+    _make_catalog_stale()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[int] = []
+
+    async def _timeout() -> list[dict[str, object]]:
+        calls.append(1)
+        started.set()
+        await release.wait()
+        raise store.CatalogRefreshError(
+            store.CatalogRefreshFailureKind.TIMEOUT,
+            "Claude model catalog refresh timed out",
+        )
+
+    first = asyncio.create_task(
+        store.ensure_authoritative_catalog_result("claude-native", "abc123", _timeout)
+    )
+    await started.wait()
+    second = asyncio.create_task(
+        store.ensure_authoritative_catalog_result("claude-native", "abc123", _timeout)
+    )
+    release.set()
+    first_result, second_result = await asyncio.gather(first, second)
+
+    assert calls == [1]
+    for result in (first_result, second_result):
+        assert result.rows == _ROWS
+        assert result.freshness is store.CatalogFreshness.STALE
+        assert result.refresh_error is not None
+        assert result.refresh_error.kind is store.CatalogRefreshFailureKind.TIMEOUT
+        assert result.refresh_error.message == "Claude model catalog refresh timed out"
