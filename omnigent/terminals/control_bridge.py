@@ -116,8 +116,9 @@ _CONTROL_READ_CHUNK: Final[int] = 256 * 1024
 _CONTROL_STDOUT_BUFFER_LIMIT: Final[int] = 16 * 1024 * 1024
 
 # Bound on one buffered partial control line; a line that outgrows it is
-# discarded whole (%output records are lossy-safe and the queue's gap
-# handling repaints) instead of accumulating without limit across reads.
+# discarded whole instead of accumulating without limit across reads. Each
+# discard is reported via ``on_discard`` so the output queue's gap handling
+# (drop counters, resync bytes, snapshot repaint) recovers the lost screen.
 _CONTROL_MAX_LINE_BYTES: Final[int] = _CONTROL_STDOUT_BUFFER_LIMIT
 
 # When the control reader ends with a send backlog still queued (a
@@ -145,6 +146,7 @@ _CLIPBOARD_RECENT_INPUT_WINDOW_S: Final[float] = 5.0
 async def _parse_control_stream(
     stdout: asyncio.StreamReader,
     handle_line: Callable[[bytes], bool],
+    on_discard: Callable[[int], None] | None = None,
 ) -> None:
     """Parse raw control-stream reads into lines routed via *handle_line*.
 
@@ -154,10 +156,13 @@ async def _parse_control_stream(
     so the loop yields explicitly after each parsed batch to keep the event
     loop live under a flood; a partial line that outgrows
     :data:`_CONTROL_MAX_LINE_BYTES` is discarded whole rather than buffered
-    without bound.
+    without bound, and each discarded line is reported via *on_discard*.
 
     :param stdout: The control client's stdout stream.
     :param handle_line: Per-line router; returns ``False`` to stop reading.
+    :param on_discard: Called once per discarded oversized line with its
+        byte count so far, so the caller can run its drop/repaint recovery
+        (a discarded ``%output`` line is lost screen content).
     :returns: None on stream EOF or when *handle_line* stops the read.
     """
     buffer = b""
@@ -186,6 +191,8 @@ async def _parse_control_stream(
                     "control line exceeded %d bytes; discarding it whole",
                     _CONTROL_MAX_LINE_BYTES,
                 )
+                if on_discard is not None:
+                    on_discard(len(raw_line))
                 continue
             if not handle_line(raw_line.rstrip(b"\r")):
                 return
@@ -194,6 +201,8 @@ async def _parse_control_stream(
                 "control line exceeded %d bytes; discarding it whole",
                 _CONTROL_MAX_LINE_BYTES,
             )
+            if on_discard is not None:
+                on_discard(len(buffer))
             buffer = b""
             discarding = True
         # Give the event loop a turn after each parsed batch.
@@ -788,7 +797,18 @@ async def bridge_tmux_control_to_websocket(
     async def _read_control() -> None:
         """Parse the control stream, queueing %output; EOF sentinel on exit."""
         try:
-            await _parse_control_stream(stdout, _handle_control_line)
+            await _parse_control_stream(
+                stdout,
+                _handle_control_line,
+                # An oversized discarded line is lost screen content: open the
+                # drop gap so resync bytes + a snapshot repaint recover it.
+                on_discard=output_chunks.record_dropped_output,
+            )
+            # A drop just before EOF can leave the snapshot capture in flight;
+            # land it ahead of the sentinel or the forwarder never sends it.
+            # Skipped on cancellation so route teardown stays prompt.
+            with contextlib.suppress(Exception):
+                await repainter.flush(_FORWARD_DRAIN_TIMEOUT_S)
         finally:
             output_chunks.put_nowait(None)
             clipboard_buffers.put_nowait(None)

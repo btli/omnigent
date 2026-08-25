@@ -482,28 +482,38 @@ class _ByteBoundedOutputQueue(asyncio.Queue["bytes | None"]):
             self.queued_bytes -= len(item)
         return item
 
+    def record_dropped_output(self, num_bytes: int) -> None:
+        """Account one lost output chunk: open the gap and fire ``on_drop``.
+
+        Shared by the saturation drop below and by producers that must shed
+        output before it can ever be queued (an oversized control line), so
+        every loss opens the resync gap and requests a repaint instead of
+        leaving the client terminal silently inconsistent.
+        """
+        self.dropped_chunks += 1
+        self.dropped_bytes += num_bytes
+        self._in_gap = True
+        now = _monotonic()
+        if self._warned_at is None or now - self._warned_at >= _OUTPUT_DROP_WARN_INTERVAL_S:
+            self._warned_at = now
+            _logger.warning(
+                "terminal output queue saturated or producer shed output "
+                "(%d bytes / %d chunks queued); %d chunks (%d bytes) dropped so far",
+                self.queued_bytes,
+                self.qsize(),
+                self.dropped_chunks,
+                self.dropped_bytes,
+            )
+        if self.on_drop is not None:
+            self.on_drop()
+
     def put_nowait(self, item: bytes | None) -> None:
         if (
             item is not None
             and self.qsize() > 0
             and (self.queued_bytes + len(item) > self.max_bytes or self.qsize() >= self.max_items)
         ):
-            self.dropped_chunks += 1
-            self.dropped_bytes += len(item)
-            self._in_gap = True
-            now = _monotonic()
-            if self._warned_at is None or now - self._warned_at >= _OUTPUT_DROP_WARN_INTERVAL_S:
-                self._warned_at = now
-                _logger.warning(
-                    "terminal output queue saturated (%d bytes / %d chunks queued); "
-                    "%d chunks (%d bytes) dropped so far",
-                    self.queued_bytes,
-                    self.qsize(),
-                    self.dropped_chunks,
-                    self.dropped_bytes,
-                )
-            if self.on_drop is not None:
-                self.on_drop()
+            self.record_dropped_output(len(item))
             return
         if self._in_gap and item is not None:
             self._in_gap = False
@@ -561,6 +571,30 @@ class _GapRepainter:
         if self._trailing:
             self._trailing = False
             self._task = asyncio.create_task(self._run(self._cooldown()))
+
+    async def flush(self, timeout_s: float) -> None:
+        """Bounded wait for a pending repaint (and its trailing rerun) to land.
+
+        EOF-time helper: a drop right before stream EOF leaves the snapshot
+        task in flight, and output enqueued behind the EOF sentinel is never
+        read — so the reader flushes before queueing the sentinel. Returns
+        immediately when nothing is pending; gives up at *timeout_s* so a
+        wedged capture can't hang teardown.
+        """
+        deadline = _monotonic() + timeout_s
+        while True:
+            task = self._task
+            if task is None or task.done():
+                return
+            remaining = deadline - _monotonic()
+            if remaining <= 0:
+                return
+            # Shielded: a flush timeout must not cancel the repaint itself.
+            # A repaint error is already logged by _run; swallow it here.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+            if self._task is task:
+                return  # no trailing rerun was spawned
 
     def cancel(self) -> None:
         """Teardown: drop any pending or in-flight repaint."""
@@ -859,7 +893,10 @@ async def bridge_tmux_pty_to_websocket(
     pty_chunks = _ByteBoundedOutputQueue()
     last_client_input_at: float | None = None
     last_pane_check_at: float | None = None
-    # Every drop requests a (throttled) repaint of the content it lost.
+    # Every drop requests a (throttled) repaint of the content it lost. The
+    # repaint rides the PTY itself (refresh-client re-emits through the attach
+    # client), so a drop-then-EOF needs no flush here: PTY EOF means the attach
+    # client is gone and no repaint could reach the browser through it.
     repainter = _GapRepainter(lambda: _refresh_attach_client(socket_path, pid))
     pty_chunks.on_drop = repainter.request
 

@@ -878,6 +878,143 @@ async def test_parse_control_stream_discards_oversized_complete_line(
 
 
 @pytest.mark.asyncio
+async def test_parse_control_stream_oversized_discards_open_drop_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both oversized-discard branches run the queue's drop recovery.
+
+    A discarded ``%output`` line is lost screen content. If the discard
+    bypasses the queue's drop machinery, no repaint is requested and no
+    resync bytes precede the resuming output — the client terminal stays
+    permanently inconsistent. Wire the parser's discard hook to the bounded
+    queue exactly like the bridge does and assert a complete oversized line
+    AND an oversized partial each open the gap.
+    """
+    monkeypatch.setattr(control_bridge, "_CONTROL_MAX_LINE_BYTES", 64)
+    queue = ws_bridge._ByteBoundedOutputQueue()
+    drops: list[int] = []
+    queue.on_drop = lambda: drops.append(1)
+
+    def _handle(line: bytes) -> bool:
+        if line.startswith(b"%output "):
+            parts = line.split(b" ", 2)
+            queue.put_nowait(unescape_control_output(parts[2]))
+        return True
+
+    stdout = _ScriptedStdout(
+        [
+            b"%output %0 " + b"a" * 100 + b"\n",  # oversized COMPLETE line
+            b"%output %0 " + b"b" * 100,  # oversized PARTIAL, no newline yet
+            b"tail\n%output %0 after-gap\n",  # tail skipped; output resumes
+        ]
+    )
+    await control_bridge._parse_control_stream(
+        stdout,  # type: ignore[arg-type]
+        _handle,
+        on_discard=queue.record_dropped_output,
+    )
+
+    assert drops == [1, 1], "each oversized discard must fire the drop/repaint hook"
+    assert queue.dropped_chunks == 2
+    drained = [queue.get_nowait() for _ in range(queue.qsize())]
+    assert drained == [ws_bridge._OUTPUT_GAP_RESYNC, b"after-gap"], (
+        f"resync bytes must precede output resuming after a discard gap: {drained!r}"
+    )
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_control_bridge_oversized_line_discard_repaints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An oversized control line's discard delivers a repaint to the browser.
+
+    The reader sheds a line that outgrows the cap, losing its %output bytes
+    upstream of the bounded queue — so the queue's own saturation path never
+    sees the loss. The bridge must still route the discard into gap recovery
+    or the screen silently diverges with no repaint ever scheduled.
+    """
+    monkeypatch.setattr(control_bridge, "_CONTROL_MAX_LINE_BYTES", 256)
+    sock, target = await _new_private_tmux(
+        'python3 -c \'import sys,time; time.sleep(1.0); sys.stdout.write("Z"*8192); '
+        "sys.stdout.flush(); time.sleep(30)'"
+    )
+    await asyncio.sleep(0.2)
+
+    ws = _FakeWebSocket(inbound=[])
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+    )
+    # Attach completes while the pane is still quiet; the seed (sent before
+    # the burst) is the only clear+home on the wire at baseline time.
+    await asyncio.sleep(0.5)
+    baseline = b"".join(ws.sent).count(b"\x1b[H\x1b[2J")
+
+    # The 8 KiB burst arrives as %output lines far above the shrunken cap and
+    # is discarded whole — only a snapshot repaint can restore the screen.
+    deadline = asyncio.get_running_loop().time() + 8.0
+    while asyncio.get_running_loop().time() < deadline:
+        if b"".join(ws.sent).count(b"\x1b[H\x1b[2J") > baseline:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        pytest.fail("oversized-line discard never delivered a repaint snapshot")
+
+    await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_control_bridge_drop_right_before_eof_still_repaints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A repaint in flight when the control stream hits EOF still reaches the ws.
+
+    The reader enqueues the EOF sentinel from its exit path while the snapshot
+    capture runs as a separate task; without flushing the repaint first, the
+    snapshot lands behind the sentinel (never read) or is cancelled at
+    teardown — the drop's recovery silently vanishes.
+    """
+    created: list[ws_bridge._ByteBoundedOutputQueue] = []
+
+    class _Recording(ws_bridge._ByteBoundedOutputQueue):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+            created.append(self)
+
+    monkeypatch.setattr(control_bridge, "_ByteBoundedOutputQueue", _Recording)
+
+    marker = b"\x1b[H\x1b[2JEOF-REPAINT-MARKER"
+
+    async def _slow_snapshot(_socket_path: str, _tmux_target: str) -> bytes | None:
+        # Long enough that the EOF below reliably races the in-flight capture.
+        await asyncio.sleep(0.3)
+        return marker
+
+    monkeypatch.setattr(control_bridge, "_capture_pane_snapshot", _slow_snapshot)
+
+    sock, target = await _new_private_tmux("sleep 30")
+    ws = _FakeWebSocket(inbound=[])
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+    )
+    await asyncio.sleep(0.5)
+    assert created and created[0].on_drop is not None, "repaint hook not wired"
+
+    created[0].on_drop()  # a drop right before EOF: capture goes in flight
+    await asyncio.sleep(0.05)  # let the repaint task enter the slow capture
+    await _kill_and_join(sock, task)  # EOF races the capture; bridge drains
+
+    assert any(b"EOF-REPAINT-MARKER" in frame for frame in ws.sent), (
+        "repaint requested before EOF was lost behind the sentinel"
+    )
+
+
+@pytest.mark.asyncio
 async def test_parse_control_stream_yields_while_discarding_oversized_line(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
