@@ -313,9 +313,9 @@ def test_execution_logs_panel_folds_inset_below_and_above_md(
     page.add_init_script(_ANDROID_SHELL_INIT_SCRIPT)
     page.goto(f"{base_url}/c/{session_id}?debug=1")
 
-    # Below 48rem: open the full-screen overlay from the session-menu FAB
-    # (its Logs entry is debug-mode only).
-    page.get_by_role("button", name="Open session menu").click()
+    # Below 48rem: open the full-screen overlay from the mobile kebab, which
+    # carries the workspace-rail entries (its Logs entry is debug-mode only).
+    page.get_by_role("button", name="Conversation actions").click()
     page.get_by_role("menuitem", name="Logs").click()
     panel = page.locator('[data-testid="execution-logs-panel"]')
     expect(panel).to_be_visible()
