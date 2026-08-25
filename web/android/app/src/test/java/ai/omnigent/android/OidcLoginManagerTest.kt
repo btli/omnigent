@@ -75,6 +75,29 @@ class OidcLoginManagerTest {
     }
 
     @Test
+    fun `cancel before the queued browser launch suppresses it`() {
+        val activity = activity()
+        val manager = OidcLoginManager()
+        val launchQueued = CountDownLatch(1)
+        manager.requestTicket = { OidcLoginManager.Ticket("ticket-1", "/auth/login?t=1") }
+        manager.pollForToken = { _, _ ->
+            // Runs after the browser-launch runnable was posted to the (paused)
+            // main looper, so cancel() below lands before the looper drains.
+            launchQueued.countDown()
+            null
+        }
+
+        var delivered = false
+        assertTrue(manager.start(activity, origin) { _, _ -> delivered = true })
+        assertTrue(launchQueued.await(2, TimeUnit.SECONDS))
+        manager.cancel()
+        drainMain()
+
+        assertNull(shadowOf(activity).nextStartedActivity)
+        assertFalse(delivered)
+    }
+
+    @Test
     fun `a cancelled flow does not deliver a token that lands after the switch`() {
         val activity = activity()
         val manager = OidcLoginManager()

@@ -202,7 +202,9 @@ const FULL_HEIGHT_PANEL_TARGETS = [
   { testId: "terminals-panel" },
   // Drawer stubs carry both hooks: index.css insets them via the shared
   // `.mobile-panel-drawer` class, the injected fallback sheet via `data-testid`.
+  { className: "mobile-panel-drawer", testId: "shells-panel-drawer" },
   { className: "mobile-panel-drawer", testId: "subagents-panel-drawer" },
+  // No todos drawer ships yet — this stub pins the aspirational contract only.
   { className: "mobile-panel-drawer", testId: "todos-panel-drawer" },
 ] as const;
 

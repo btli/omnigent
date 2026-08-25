@@ -567,24 +567,33 @@ class MainActivity : AppCompatActivity() {
 
             is AuthTabFlow.Outcome.ExchangePost -> {
                 authLog("auth tab -> exchange post")
-                nativeExchange.exchange(outcome) { auth ->
-                    if (isDestroyed || isFinishing || !::webView.isInitialized) {
-                        return@exchange
-                    }
-                    // Re-check the origin: the exchange ran async and a server
-                    // switch may have landed meanwhile.
-                    authTabFlow.cancel()
-                    if (auth == null || outcome.origin != pinnedOrigin) {
-                        fallBackFromAuthTab("code exchange failed")
-                    } else {
-                        applyNativeAuthResult(auth)
-                    }
-                }
+                nativeExchange.exchange(outcome) { auth -> onExchangeResult(outcome, auth) }
             }
 
             is AuthTabFlow.Outcome.Complete -> {
                 applyNativeAuthResult(outcome.result)
             }
+        }
+    }
+
+    /** Advance (or abandon) the login with the async exchange result. */
+    internal fun onExchangeResult(
+        outcome: AuthTabFlow.Outcome.ExchangePost,
+        auth: NativeAuth.Result?,
+    ) {
+        if (isDestroyed || isFinishing || !::webView.isInitialized) return
+        // The exchange ran async, so a server switch may have landed meanwhile.
+        // Its result belongs to the OLD origin: it must not cancel — or fall
+        // back — the new origin's own in-flight flow.
+        if (outcome.origin != pinnedOrigin) {
+            authLog("exchange result for a switched-away origin — ignored")
+            return
+        }
+        authTabFlow.cancel()
+        if (auth == null) {
+            fallBackFromAuthTab("code exchange failed")
+        } else {
+            applyNativeAuthResult(auth)
         }
     }
 
@@ -706,22 +715,38 @@ class MainActivity : AppCompatActivity() {
         cookies.setAcceptCookie(true)
         authLog("onSessionToken: injecting $name (token len=${token.length})")
         cookies.setCookie(origin, cookie) { accepted ->
-            // setCookie's callback is async — re-check the WebView is still alive.
-            if (isDestroyed || !::webView.isInitialized) return@setCookie
-            authLog(
-                "setCookie accepted=$accepted present=${cookies
-                    .getCookie(
-                        origin,
-                    )?.contains(name) == true}",
-            )
-            // A rejected cookie means the reload would land unauthenticated,
-            // bounce to login, and re-launch the browser — burning the retry
-            // budget on a failure that retrying can't fix. Stay put instead.
-            if (!accepted) return@setCookie
-            cookies.flush()
-            webView.loadUrl(origin)
+            onSessionCookieWritten(origin, name, accepted)
         }
         return true
+    }
+
+    /** Continue the login once the async session-cookie write reports back. */
+    internal fun onSessionCookieWritten(
+        origin: String,
+        cookieName: String,
+        accepted: Boolean,
+    ) {
+        // setCookie's callback is async — re-check the WebView is still alive.
+        if (isDestroyed || !::webView.isInitialized) return
+        // A server switch can land while the write is in flight; reloading the
+        // origin the write was started for would silently leave the new server.
+        if (origin != pinnedOrigin) {
+            authLog("setCookie landed after a server switch — not reloading")
+            return
+        }
+        val cookies = CookieManager.getInstance()
+        authLog(
+            "setCookie accepted=$accepted present=${cookies
+                .getCookie(
+                    origin,
+                )?.contains(cookieName) == true}",
+        )
+        // A rejected cookie means the reload would land unauthenticated,
+        // bounce to login, and re-launch the browser — burning the retry
+        // budget on a failure that retrying can't fix. Stay put instead.
+        if (!accepted) return
+        cookies.flush()
+        webView.loadUrl(origin)
     }
 
     /**
