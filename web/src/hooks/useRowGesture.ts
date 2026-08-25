@@ -29,6 +29,11 @@ export const ROW_DRAG_ACTIVATE_PX = 10;
 // can suppress the OS long-press contextmenu without eating their own.
 export const ROW_MENU_SYNTHETIC = Symbol("row-menu-synthetic");
 
+// Nested controls that own their own press (kebab menu trigger, pin button).
+// Radix opens the dropdown on the trigger's pointerdown, so a row gesture
+// resolving over it would stack an action dialog on the open menu.
+const ROW_INTERACTIVE_CONTROL_SELECTOR = "button, input, select, textarea, [contenteditable]";
+
 const ROW_SCROLL_ACTIVATE_PX = 25;
 const ROW_HOLD_TOLERANCE_PX = 20;
 const ROW_SWIPE_MAX_PX = 96;
@@ -334,8 +339,11 @@ export function useRowGesture({
       if (!enabled) return;
       const target = event.target;
       if (target instanceof Node && !event.currentTarget.contains(target)) return;
-
       reset();
+      // A press on a nested control belongs to that control, not the row.
+      const control =
+        target instanceof Element ? target.closest(ROW_INTERACTIVE_CONTROL_SELECTOR) : null;
+      if (control && event.currentTarget.contains(control)) return;
       const gesture: ActiveRowGesture = {
         pointerId: event.pointerId,
         startX: event.clientX,
@@ -443,17 +451,16 @@ export function useRowGesture({
       // swipe precedence; everything it declines waits for the 25px circle.
       if (horizontal >= ROW_SWIPE_ACTIVATE_PX && horizontal > vertical) {
         const action = deltaX < 0 ? gesture.actions.left : gesture.actions.right;
-        if (!gesture.swipeEnabled || action === "none") {
+        if (gesture.swipeEnabled && action !== "none") {
           clearHoldTimer();
-          setGesturePhase(gesture, "scroll");
+          setGesturePhase(gesture, "swipe");
+          capturePointer(gesture);
+          event.preventDefault();
+          setDx(swipeOffset(deltaX));
           return;
         }
-        clearHoldTimer();
-        setGesturePhase(gesture, "swipe");
-        capturePointer(gesture);
-        event.preventDefault();
-        setDx(swipeOffset(deltaX));
-        return;
+        // A wobble toward an inert direction is not a gesture: stay pending so
+        // the trailing click still lands, until the 25px circle calls it a scroll.
       }
       if (Math.hypot(deltaX, deltaY) >= ROW_SCROLL_ACTIVATE_PX) {
         clearHoldTimer();
