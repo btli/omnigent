@@ -224,6 +224,27 @@ def test_rescue_lease_spares_a_branch_that_moved(env):
     assert env.fork_ref("refs/heads/pr-5") == moved
 
 
+def test_rescue_refuses_a_merge_containing_branch(env):
+    _rescuable_pr(env)
+    # Graft a merge commit onto the PR head: a linear replay would drop it
+    # (and any changes introduced only in its resolution), so the rescue
+    # must refuse and leave the branch's normal conflict skip in place.
+    git(env.seed, "checkout", "-q", "-b", "side-5", "pr-5~1")
+    commit_file(env.seed, "side5.txt", "s\n", "side work")
+    git(env.seed, "checkout", "-q", "pr-5")
+    git(env.seed, "merge", "--no-ff", "-m", "merge side work", "side-5")
+    oid = git(env.seed, "rev-parse", "HEAD").stdout.strip()
+    git(env.seed, "push", "-f", str(env.upstream), "pr-5:refs/pull/5/head")
+    git(env.seed, "push", "-f", str(env.fork), "pr-5:refs/heads/pr-5")
+    pr = {"number": 5, "headRefName": "pr-5", "headRefOid": oid}
+
+    report = env.run([pr])
+    assert report["applied"] == []
+    assert [p["pr"] for p in report["skipped"]] == [5]
+    # the PR branch is untouched — no destructive push-back happened
+    assert env.fork_ref("refs/heads/pr-5") == oid
+
+
 def test_production_ring_never_rescues(env):
     pr = _rescuable_pr(env)
 
