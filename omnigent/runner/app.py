@@ -9675,6 +9675,7 @@ def create_runner_app(
                     ),
                 },
             )
+        from omnigent import model_catalog_store
         from omnigent.claude_native import claude_launch_catalog
 
         rows: list[dict[str, object]] | None
@@ -9690,6 +9691,14 @@ def create_runner_app(
                 content={
                     "error": "claude_native_model_options_pending",
                     "detail": "the harness model probe is still resolving",
+                },
+            )
+        except model_catalog_store.CatalogRefreshError:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "claude_native_model_options_failed",
+                    "detail": "the harness model probe failed; retrying",
                 },
             )
         if not rows:
