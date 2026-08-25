@@ -3678,13 +3678,16 @@ function ConversationRow({
   const isSwiping = gesture.dx !== 0 && swipingAction !== "none";
   const swipeCommitted = Math.abs(gesture.dx) >= ROW_SWIPE_COMMIT_PX;
   const ownsPointer = gesture.phase === "armed" || gesture.phase === "drag";
+  // Chrome samples touch-action at pointerdown, so a direction granted to the
+  // browser is lost to the recognizer for the whole stream — cede only the
+  // inert horizontal direction, never one with a configured action.
   const swipeTouchAction = !swipeEnabled
     ? undefined
     : swipeActions.left !== "none" && swipeActions.right !== "none"
       ? "touch-pan-y"
       : swipeActions.left !== "none"
-        ? "touch-pan-y touch-pan-left"
-        : "touch-pan-y touch-pan-right";
+        ? "touch-pan-y touch-pan-right"
+        : "touch-pan-y touch-pan-left";
 
   return (
     // Drag props on the <li> so the whole row is grabbable; `isDragging` dims
