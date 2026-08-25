@@ -389,25 +389,34 @@ def test_redact_secrets_scrubs_opaque_shapes(secret: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("secret", "split_index", "expected"),
+    ("secret", "split_index"),
     [
-        ("Bearer abcdefghijk", 11, "Bearer [REDACTED]"),
-        ("".join(("dapi", "FAKE", "TEST", "0123456789")), 7, "[REDACTED]"),
-        ("".join(("xoxb", "-", "FAKE", "-", "TEST", "-", "TOKEN")), 9, "[REDACTED]"),
-        ("".join(("ghp_", "FAKE", "TEST", "TOKEN", "PLACEHOLDER")), 12, "[REDACTED]"),
-        ("".join(("AKIA", "FAKE", "TEST", "ONLY", "0000")), 10, "[REDACTED]"),
-        ("".join(("ASIA", "FAKE", "TEST", "ONLY", "0000")), 10, "[REDACTED]"),
+        ("Bearer abcdefghijk", 11),
+        ("".join(("dapi", "FAKE", "TEST", "0123456789")), 7),
+        ("".join(("xoxb", "-", "FAKE", "-", "TEST", "-", "TOKEN")), 9),
+        ("".join(("ghp_", "FAKE", "TEST", "TOKEN", "PLACEHOLDER")), 12),
+        ("".join(("AKIA", "FAKE", "TEST", "ONLY", "0000")), 10),
+        ("".join(("ASIA", "FAKE", "TEST", "ONLY", "0000")), 10),
     ],
     ids=["bearer", "dapi", "slack", "github", "aws-akia", "aws-asia"],
 )
-def test_redact_secrets_allows_one_bounded_interior_space(
+def test_redact_secrets_does_not_join_literal_interior_space(
     secret: str,
     split_index: int,
-    expected: str,
 ) -> None:
-    """One canonical separator inside a secret shape cannot evade redaction."""
+    """The shared redactor only matches already-canonical contiguous tokens."""
     spaced = f"{secret[:split_index]} {secret[split_index:]}"
-    assert cli_diagnostics.redact_secrets(spaced) == expected
+    assert cli_diagnostics.redact_secrets(spaced) == spaced
+
+
+def test_redact_secrets_rejects_bearer_repetition_in_linear_time() -> None:
+    """Bearer-like prose cannot trigger super-linear regex backtracking."""
+    text = ("bearer a " * 1600) + "!"
+    started_at = time.perf_counter()
+    scrubbed = cli_diagnostics.redact_secrets(text)
+    elapsed = time.perf_counter() - started_at
+    assert scrubbed == text
+    assert elapsed < 0.1
 
 
 @pytest.mark.parametrize(
@@ -431,12 +440,10 @@ def test_redact_secrets_rejects_multiple_interior_spaces(
     assert cli_diagnostics.redact_secrets(spaced) == spaced
 
 
-def test_redact_secrets_normalizes_one_space_inside_http_scheme() -> None:
-    """A canonical separator inside a URL scheme cannot evade userinfo redaction."""
-    assert (
-        cli_diagnostics.redact_secrets("ht tps://alice:secret@host.example/path")
-        == "https://[REDACTED]@host.example/path"
-    )
+def test_redact_secrets_does_not_join_literal_space_inside_http_scheme() -> None:
+    """The shared redactor does not rewrite non-canonical URL schemes."""
+    text = "ht tps://alice:secret@host.example/path"
+    assert cli_diagnostics.redact_secrets(text) == text
 
 
 @pytest.mark.parametrize(

@@ -113,39 +113,29 @@ _AUTHORIZATION_KEY_RE = re.compile(
     r'(?i)(?<!\w)(?P<prefix>(?:"authorization"|\'authorization\'|authorization)'
     r"[ \t\r\n]*[:=][ \t\r\n]*)"
 )
-_OBFUSCATED_HTTP_SCHEME_RE = re.compile(r"(?i)\bh ?t ?t ?p(?: ?s)? ?://")
-
 _SECRET_PATTERNS: list[re.Pattern[str]] = [
     # The keyless branch keeps a length floor so ordinary bearer prose survives.
     re.compile(
         r"(?i)(\bbearer[ \t\r\n]+(?:\(REDACTED\)[ \t\r\n]+)*)"
-        r"(?:"
         r"[A-Za-z0-9._~+/=-]{8,}(?![A-Za-z0-9._~+/=-])"
-        r"|(?=[-A-Za-z0-9._~+/= ]{9,}(?![-A-Za-z0-9._~+/= ]))"
-        r"[A-Za-z0-9._~+/=-]+ [A-Za-z0-9._~+/=-]+"
-        r"(?![-A-Za-z0-9._~+/= ])"
-        r")"
     ),
+    # Canonicalization deletes an injected zero-width separator after the scheme.
+    re.compile(r"(?i)(\bbearer)[A-Za-z0-9._~+/=-]{8,}(?![A-Za-z0-9._~+/=-])"),
     # Env-var style keys: FOO_TOKEN=xxx, FOO_API_KEY=xxx, ...
     re.compile(r"(?i)(\b\w*(?:token|api_key|secret|password)\s*[:=]\s*)\S+"),
     # Anthropic / OpenAI style keys
     re.compile(r"\bsk-[A-Za-z0-9_-]{10,}\b"),
     # Databricks PATs
-    re.compile(r"\bdapi[^\W_](?: ?[^\W_]){9,}\b"),
+    re.compile(r"\bdapi[^\W_]{10,}\b"),
     # Slack tokens (xoxb-/xoxa-/xoxp-/xoxr-/xoxs-)
-    re.compile(r"\bxox[baprs]-[A-Za-z0-9-](?: ?[A-Za-z0-9-]){9,}"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),
     # GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_)
-    re.compile(r"\bgh[pousr]_[A-Za-z0-9](?: ?[A-Za-z0-9]){19,}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
     # AWS access key ids (long-term AKIA, temporary ASIA)
-    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z](?: ?[0-9A-Z]){15,}"),
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16,}"),
     # URL userinfo is confined to one whitespace-bounded authority.
     re.compile(
         r"(?i)(https?://)[^/\s?#]*"
-        r"(?=@(?:\[[^/\s@?#]+\]|[^/\s@?#:]+)(?::[0-9]+)?(?:[/?#\s]|$))"
-    ),
-    # Canonicalized ignorable-only userinfo becomes one space before the delimiter.
-    re.compile(
-        r"(?i)(https?://) +"
         r"(?=@(?:\[[^/\s@?#]+\]|[^/\s@?#:]+)(?::[0-9]+)?(?:[/?#\s]|$))"
     ),
 ]
@@ -226,10 +216,6 @@ def redact_secrets(text: str) -> str:
     :returns: Scrubbed text.
     """
 
-    text = _OBFUSCATED_HTTP_SCHEME_RE.sub(
-        lambda match: match.group(0).replace(" ", ""),
-        text,
-    )
     text = _redact_authorization_values(text)
     for pat in _SECRET_PATTERNS:
         text = pat.sub(

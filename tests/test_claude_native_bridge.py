@@ -7511,8 +7511,8 @@ def test_hook_failure_detail_redacts_cross_field_authorization() -> None:
     assert secret not in detail
 
 
-def test_hook_failure_detail_bounds_fields_before_stripping() -> None:
-    """Provider fields are bounded before whitespace normalization scans them."""
+def test_hook_failure_detail_uses_builtin_strip_for_provider_fields() -> None:
+    """Provider string subclasses cannot intercept detail normalization."""
 
     class GuardedDetail(str):
         def strip(self, chars: str | None = None, /) -> str:
@@ -7659,7 +7659,7 @@ def test_sanitize_hook_failure_detail_keeps_newline_free_raw_tail() -> None:
 
 
 def test_sanitize_hook_failure_detail_drops_partial_authorization_tail() -> None:
-    """A raw cut inside a folded header cannot retain an unprefixed credential."""
+    """Redaction before windowing retains no partial Authorization credential."""
     secret = "0123456789abcdef0123"
     header = f'Authorization: Digest realm="{"a" * 2100}", response="{secret}"\n'
     text = (
@@ -7670,10 +7670,11 @@ def test_sanitize_hook_failure_detail_drops_partial_authorization_tail() -> None
         + "FinalCause: provider rejected credentials"
     )
     detail = _sanitize_hook_failure_detail(text)
-    assert detail == (
-        f"Traceback starts here\nFinalCause: provider rejected credentials "
-        f"{_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER}"
-    )
+    assert detail is not None
+    assert detail.startswith("Traceback starts here")
+    assert "Authorization: [REDACTED]" in detail
+    assert "FinalCause: provider rejected credentials" in detail
+    assert _HOOK_FAILURE_DETAIL_TRUNCATION_MARKER in detail
     assert secret not in detail
 
 
@@ -7784,10 +7785,55 @@ def test_sanitize_hook_failure_detail_redacts_thin_space_github_token() -> None:
     assert detail == "launch rejected [REDACTED]"
 
 
+@pytest.mark.parametrize(
+    ("obfuscated", "credential_fragment"),
+    [
+        (
+            "Authori\u200bzation: Basic " + "".join(("dXNl", "cjpo", "dW50", "ZXIy")),
+            "dXNlcjpodW50ZXIy",
+        ),
+        ("g\u200bhp_" + "".join(("FAKE", "TEST", "TOKEN", "PLACEHOLDER")), "ghp_"),
+        ("dapi\u200b" + "".join(("FAKE", "TEST", "0123456789")), "dapi"),
+        ("".join(("xoxb", "-")) + "\u200bFAKE-TEST-TOKEN", "xoxb-"),
+        ("AKIA\u200b" + "".join(("FAKE", "TEST", "ONLY", "0000")), "AKIA"),
+        ("https://alice:\u200bsecret@host", "alice"),
+        ("".join(("sk", "-")) + "\u200bFAKE_TEST_012345", "sk-"),
+    ],
+    ids=[
+        "authorization-key",
+        "github-prefix",
+        "databricks-prefix",
+        "slack-body-boundary",
+        "aws-body-boundary",
+        "url-userinfo",
+        "sk-body-boundary",
+    ],
+)
+def test_sanitize_hook_failure_detail_redacts_zero_width_obfuscation_at_every_position(
+    obfuscated: str,
+    credential_fragment: str,
+) -> None:
+    """Zero-width characters vanish before contiguous secret matching."""
+    detail = _sanitize_hook_failure_detail(f"launch rejected {obfuscated}")
+    assert detail is not None
+    assert credential_fragment not in detail
+    assert "[REDACTED]" in detail
+
+
+def test_sanitize_hook_failure_detail_redacts_before_raw_window() -> None:
+    """Canonicalization and redaction precede every head/tail truncation."""
+    token = "ghp_" + "abcdefghij\u2009klmnopqrst"
+    detail = _sanitize_hook_failure_detail(token + "X" * 5000)
+    assert detail is not None
+    assert "ghp_" not in detail
+    assert "abcdefghij" not in detail
+    assert "[REDACTED]" in detail
+
+
 def test_sanitize_hook_failure_detail_preserves_nfkc_diagnostics() -> None:
-    """NFKC text stays readable while ignorable format characters become spaces."""
-    detail = _sanitize_hook_failure_detail("München réessayer क्ष 👩\u200d💻 ｶﾞ")
-    assert detail == "München réessayer क्ष 👩 💻 ガ"
+    """NFKC text stays readable while ignorable format characters disappear."""
+    detail = _sanitize_hook_failure_detail("München re\u0301essayer क्ष 👩\u200d💻 ｶﾞ")
+    assert detail == "München réessayer क्ष 👩💻 ガ"
 
 
 @pytest.mark.parametrize(
@@ -7818,11 +7864,11 @@ def test_sanitize_hook_failure_detail_redacts_after_planted_marker() -> None:
         ("ghp_abcdefghijbearer\u2009klmnopqrst", "[REDACTED]"),
         ("Bearer\nabcdefghijk", "Bearer\n[REDACTED]"),
         ("Authorization\n: Basic dXNlcjpodW50ZXIy", "Authorization\n: [REDACTED]"),
-        ("bearer\ufeffabcdefghijk", "bearer [REDACTED]"),
-        ("bearer\u2060abcdefghijk", "bearer [REDACTED]"),
-        ("bearer\u200dabcdefghijk", "bearer [REDACTED]"),
+        ("bearer\ufeffabcdefghijk", "bearer[REDACTED]"),
+        ("bearer\u2060abcdefghijk", "bearer[REDACTED]"),
+        ("bearer\u200dabcdefghijk", "bearer[REDACTED]"),
         ("Bearer\u2009of bad news", "Bearer of bad news"),
-        ("bearer\ufeffof bad news", "bearer of bad news"),
+        ("bearer\ufeffof bad news", "bearerof bad news"),
         ("Bearer\nof bad news", "Bearer\nof bad news"),
     ],
     ids=[

@@ -2819,9 +2819,7 @@ _ANSI_ESCAPE_RE = re.compile(
 _HOOK_FAILURE_FRAME_TRANSLATION = str.maketrans({"[": "(", "]": ")"})
 _HOOK_FAILURE_REDACTION_MARKER = "[REDACTED]"
 _HOOK_FAILURE_PLANTED_REDACTION_RE = re.compile(r"(?i)\[REDACTED\]")
-_HOOK_FAILURE_ASCII_SECRET_ALPHABET = frozenset(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~+/=-:@%"
-)
+_HOOK_FAILURE_SEPARATOR_MARKER = "\x00"
 
 
 def _raw_hook_failure_window(text: str) -> tuple[str, bool]:
@@ -2841,69 +2839,81 @@ def _raw_hook_failure_window(text: str) -> tuple[str, bool]:
     return "\n".join(part.strip() for part in (head, tail) if part.strip()), True
 
 
-def _is_hook_failure_exotic_separator(char: str) -> bool:
-    """Return whether *char* may invisibly split an ASCII secret shape."""
-    if char in {" ", "\n"}:
-        return False
-    category = unicodedata.category(char)
-    variation_selector = "\ufe00" <= char <= "\ufe0f" or "\U000e0100" <= char <= "\U000e01ef"
-    return (
-        char.isspace()
-        or category in {"Cc", "Cf", "Cs", "Mn"}
-        or variation_selector
-        or not char.isprintable()
+def _is_variation_selector(char: str) -> bool:
+    """Return whether *char* is a Unicode variation selector."""
+    return "\ufe00" <= char <= "\ufe0f" or "\U000e0100" <= char <= "\U000e01ef"
+
+
+def _redactor_changes(text: str) -> bool:
+    """Return whether contiguous secret matching redacts *text*."""
+    return redact_secrets(text) != text
+
+
+def _canonicalize_hook_failure_chunk(chunk: str, previous_word: str) -> str:
+    """Normalize one hard-whitespace-bounded chunk without mangling prose."""
+    compact = chunk.replace(_HOOK_FAILURE_SEPARATOR_MARKER, "")
+    has_soft_separator = compact != chunk
+    if has_soft_separator and (
+        _redactor_changes(compact)
+        or (previous_word.casefold() == "bearer" and _redactor_changes(f"Bearer {compact}"))
+    ):
+        return compact
+
+    skeleton = "".join(
+        char
+        for char in unicodedata.normalize("NFKD", compact)
+        if unicodedata.category(char) != "Mn"
     )
+    if skeleton != compact and (
+        _redactor_changes(skeleton)
+        or (previous_word.casefold() == "bearer" and _redactor_changes(f"Bearer {skeleton}"))
+    ):
+        return skeleton
+
+    if not has_soft_separator:
+        return chunk
+    return re.sub(f"{_HOOK_FAILURE_SEPARATOR_MARKER}+", " ", chunk)
 
 
 def _canonicalize_hook_failure_detail(text: str) -> str:
     """Build the normalized text used for both secret matching and output."""
     line_normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-    rejoined: list[str] = []
-    index = 0
-    while index < len(line_normalized):
-        char = line_normalized[index]
-        if _is_hook_failure_exotic_separator(char):
-            run_end = index + 1
-            while run_end < len(line_normalized) and _is_hook_failure_exotic_separator(
-                line_normalized[run_end]
-            ):
-                run_end += 1
-            ascii_bounded = (
-                index > 0
-                and run_end < len(line_normalized)
-                and line_normalized[index - 1] in _HOOK_FAILURE_ASCII_SECRET_ALPHABET
-                and line_normalized[run_end] in _HOOK_FAILURE_ASCII_SECRET_ALPHABET
-            )
-            combining_run = all(
-                unicodedata.category(run_char) == "Mn"
-                for run_char in line_normalized[index:run_end]
-            )
-            if not combining_run or ascii_bounded:
-                if not rejoined or rejoined[-1] not in {" ", "\n"}:
-                    rejoined.append(" ")
-                index = run_end
-                continue
-        rejoined.append(char)
-        index += 1
-
-    normalized = unicodedata.normalize("NFKC", "".join(rejoined))
-    canonical: list[str] = []
-    for char in normalized:
-        if char == "\n":
-            canonical.append(char)
+    prepared: list[str] = []
+    for char in line_normalized:
+        if char in {" ", "\n"}:
+            prepared.append(char)
             continue
         category = unicodedata.category(char)
-        variation_selector = "\ufe00" <= char <= "\ufe0f" or "\U000e0100" <= char <= "\U000e01ef"
-        if (
-            char.isspace()
-            or category in {"Cc", "Cf", "Cs"}
-            or variation_selector
-            or not char.isprintable()
-        ):
-            if not canonical or canonical[-1] not in {" ", "\n"}:
-                canonical.append(" ")
+        if category in {"Cf", "Cs"} or _is_variation_selector(char):
             continue
-        canonical.append(char)
+        if char.isspace() or category == "Cc":
+            prepared.append(_HOOK_FAILURE_SEPARATOR_MARKER)
+            continue
+        if not char.isprintable():
+            continue
+        prepared.append(char)
+
+    normalized = unicodedata.normalize("NFKC", "".join(prepared))
+    canonical: list[str] = []
+    previous_word = ""
+    index = 0
+    while index < len(normalized):
+        char = normalized[index]
+        if char in {" ", "\n"}:
+            if char == "\n" or not canonical or canonical[-1] not in {" ", "\n"}:
+                canonical.append(char)
+            index += 1
+            continue
+        chunk_end = index + 1
+        while chunk_end < len(normalized) and normalized[chunk_end] not in {" ", "\n"}:
+            chunk_end += 1
+        chunk = _canonicalize_hook_failure_chunk(normalized[index:chunk_end], previous_word)
+        for chunk_char in chunk:
+            if chunk_char == " " and canonical and canonical[-1] in {" ", "\n"}:
+                continue
+            canonical.append(chunk_char)
+        previous_word = chunk.rsplit(" ", 1)[-1]
+        index = chunk_end
     return "".join(canonical)
 
 
@@ -2934,16 +2944,16 @@ def _sanitize_hook_failure_detail(text: str) -> str | None:
     :param text: Raw failure text from a ``StopFailure`` hook payload.
     :returns: Sanitized detail, or ``None`` when nothing usable remains.
     """
-    bounded, raw_truncated = _raw_hook_failure_window(text)
-    if raw_truncated and not bounded:
-        return _HOOK_FAILURE_DETAIL_REMOVED_SENTINEL
-    without_ansi = _ANSI_ESCAPE_RE.sub("", bounded)
+    without_ansi = _ANSI_ESCAPE_RE.sub("", text)
     canonical = _canonicalize_hook_failure_detail(without_ansi)
     canonical = _HOOK_FAILURE_PLANTED_REDACTION_RE.sub("(REDACTED)", canonical)
     redacted = redact_secrets(canonical)
     if not redacted:
-        return _HOOK_FAILURE_DETAIL_REMOVED_SENTINEL if raw_truncated else None
-    protected = redacted.replace(_HOOK_FAILURE_REDACTION_MARKER, "\x00")
+        return None
+    bounded, raw_truncated = _raw_hook_failure_window(redacted)
+    if raw_truncated and not bounded:
+        return _HOOK_FAILURE_DETAIL_REMOVED_SENTINEL
+    protected = bounded.replace(_HOOK_FAILURE_REDACTION_MARKER, "\x00")
     neutralized = protected.translate(_HOOK_FAILURE_FRAME_TRANSLATION)
     redacted = neutralized.replace("\x00", _HOOK_FAILURE_REDACTION_MARKER)
     return _cap_hook_failure_detail(redacted, raw_truncated=raw_truncated)
@@ -2962,18 +2972,13 @@ def _hook_failure_detail(payload: _JsonObject) -> str | None:
     raw_error = payload.get("error")
     raw_message = payload.get("last_assistant_message")
 
-    def bounded_field(value: object) -> str:
+    def normalized_field(value: object) -> str:
         if not isinstance(value, str):
             return ""
-        if len(value) > _HOOK_FAILURE_DETAIL_RAW_LIMIT:
-            value = (
-                f"{value[:_HOOK_FAILURE_DETAIL_RAW_HEAD_CHARS]}\n"
-                f"{value[-_HOOK_FAILURE_DETAIL_RAW_TAIL_CHARS:]}"
-            )
-        return value.strip()
+        return str(value).strip()
 
-    error = bounded_field(raw_error)
-    message = bounded_field(raw_message)
+    error = normalized_field(raw_error)
+    message = normalized_field(raw_message)
     if error and message:
         combined = f"{error}: {message}"
     else:
