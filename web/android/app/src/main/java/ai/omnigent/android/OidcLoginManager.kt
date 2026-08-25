@@ -82,6 +82,9 @@ class OidcLoginManager {
                 authLog("cli-login -> ${if (ticket != null) "ticket ok" else "FAILED"}")
                 if (ticket != null) {
                     main.post {
+                        // cancel() can land after this runnable is queued — a
+                        // cancelled flow must not open the browser for the
+                        // origin the host has switched away from.
                         if (
                             flow === current &&
                             !current.cancelled.get() &&
