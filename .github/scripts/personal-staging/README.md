@@ -16,9 +16,10 @@ It:
    Extras are never rebased (their refs are frozen pins), and the
    production ring never rescues. All PRs conflicting is a reported
    outcome, not a failure.
-2. Pins an immutable `nightly-YYYYMMDD` branch + tag at the staging commit
+2. Pins an immutable, canonical `nightly-YYYYMMDD` tag at the staging commit
    (same-day rerun: no-op when nothing changed, else `-rerunN`), plus a
-   PEP 440 `vX.Y.Z.devYYYYMMDD` tag mirroring `nightly-release.yml`'s
+   deprecated same-name compatibility branch slated for removal in v0.12.0
+   and a PEP 440 `vX.Y.Z.devYYYYMMDD` tag mirroring `nightly-release.yml`'s
    scheme, so `scripts/update_nightly.sh` resolves it:
 
    ```sh
@@ -89,8 +90,9 @@ runs the same composer with `--ring production`: fork branch `production` =
 upstream main + every open **non-draft** btli PR — **no extras** (nothing
 hand-pinned reaches prod) and no dev tag. Draft status is the promotion
 gate: mark a PR draft to keep it out of production while staging still
-carries it. Each run mints an immutable `production-YYYYMMDD` branch + tag
-pin (same rerun/no-op semantics as `nightly-*`), which homelab's
+carries it. Each run mints an immutable, canonical `production-YYYYMMDD` tag
+pin (same rerun/no-op semantics as `nightly-*`) plus a deprecated same-name
+compatibility branch slated for removal in v0.12.0, which homelab's
 `build-omnigent-production.yml` resolves at 11:10 UTC to build and
 digest-pin the prod server + host images. Compose + pin only: no
 APK/releases/images. Its concurrency group (`personal-production`,
@@ -146,8 +148,9 @@ shas are not stable, and a commit that was on the branch an hour ago may
 be gone. Nothing should track the branch tip.
 
 - **Pin instead:** for anything reproducible — homelab deploys, container
-  builds, bisecting — use a `nightly-YYYYMMDD` pin (branch + tag, both
-  immutable) or the `vX.Y.Z.devYYYYMMDD` tag from the nightly.
+  builds, bisecting — use the canonical `nightly-YYYYMMDD` tag or the
+  `vX.Y.Z.devYYYYMMDD` tag from the nightly. The same-name dated branch is a
+  deprecated compatibility shim slated for removal in v0.12.0.
 - **Existing clone:** `git pull` on `staging` will refuse or conflict
   after a rewrite. Recover with:
 

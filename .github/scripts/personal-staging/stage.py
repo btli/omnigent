@@ -6,12 +6,14 @@ Builds branch ``staging`` = upstream main + every open btli PR plus the
 PRs are skipped and reported — but an open PR whose merge conflicts gets
 one rebase rescue onto upstream main first, and a clean rescue is pushed
 back to the PR's fork branch so the PR stays current). The nightly mode
-then pins an immutable ``nightly-YYYYMMDD`` branch + tag and a PEP 440
-``vX.Y.Z.devYYYYMMDD`` tag at the same commit; ``--staging-only`` (the
-hourly mode) pushes only ``staging`` and skips the push entirely when the
-composition is unchanged. The refs ever pushed are ``staging``, the
-``nightly-*`` pin, the dev tag, and (rescues only) the rescued PR's own
-fork branch. ``--ring production`` composes the production ring instead: open
+then pins an immutable ``nightly-YYYYMMDD`` tag, a same-name compatibility
+branch through v0.11.x,
+and a PEP 440 ``vX.Y.Z.devYYYYMMDD`` tag at the same commit;
+``--staging-only`` (the hourly mode) pushes only
+``staging`` and skips the push entirely when the composition is unchanged.
+The refs ever pushed are ``staging``, the ``nightly-*`` pin, the dev tag,
+and (rescues only) the rescued PR's own fork branch. ``--ring production``
+composes the production ring instead: open
 non-draft PRs only, no extras, branch ``production`` + immutable
 ``production-YYYYMMDD`` pins, no dev tag, and no hourly mode
 (``--staging-only`` is rejected for it). A production composition
@@ -745,17 +747,94 @@ def push_causes(
 def pin_name(
     cwd: str | Path, fork: str, datestamp: str, sha: str, ring: Ring = STAGING
 ) -> tuple[str, bool]:
-    """Immutable name for tonight's pin: ``<prefix>YYYYMMDD``, -rerunN if the day
-    already has a pin at a different commit, no-op if it already points here."""
+    """Allocate a dual-namespace pin, failing closed on incomplete pairs."""
     n = 0
     while True:
         cand = f"{ring.pin_prefix}{datestamp}" + (f"-rerun{n}" if n else "")
-        existing = remote_ref(cwd, fork, f"refs/tags/{cand}")
-        if not existing:
+        branch_sha = remote_ref(cwd, fork, f"refs/heads/{cand}")
+        tag_sha = remote_ref(cwd, fork, f"refs/tags/{cand}")
+        if not branch_sha and not tag_sha:
             return cand, True
-        if existing == sha:
+        if branch_sha and not tag_sha:
+            raise StageError(
+                f"pin branch {cand} points at {branch_sha}, but its tag is absent; "
+                "refusing to reuse the dated name"
+            )
+        if tag_sha and not branch_sha:
+            if tag_sha != sha:
+                raise StageError(
+                    f"pin tag {cand} points at {tag_sha}, expected {sha}, "
+                    "and its compatibility branch is absent"
+                )
+            return cand, False
+        if branch_sha != tag_sha:
+            raise StageError(
+                f"pin branch {cand} points at {branch_sha}, but tag points at {tag_sha}"
+            )
+        if tag_sha == sha:
             return cand, False
         n += 1
+
+
+def assert_production_identity(
+    cwd: str | Path, candidate_sha: str, upstream_sha: str, applied: list[dict]
+) -> None:
+    """Fail closed unless a production candidate is the expected merge chain."""
+    if git(
+        cwd,
+        "merge-base",
+        "--is-ancestor",
+        upstream_sha,
+        candidate_sha,
+        check=False,
+    ).returncode:
+        raise StageError("production identity: upstream is not an ancestor of the candidate")
+
+    if any(p.get("source") in {"extra", "extra-branch"} for p in applied):
+        raise StageError("production identity: extras are not valid production inputs")
+    expected = [p for p in applied if p.get("source") == "open" and p.get("minted") is True]
+    commits = git(
+        cwd,
+        "rev-list",
+        "--first-parent",
+        "--reverse",
+        f"{upstream_sha}..{candidate_sha}",
+    ).stdout.splitlines()
+    if len(commits) != len(expected):
+        raise StageError(
+            "production identity: first-parent merges do not match minted open PR entries"
+        )
+
+    expected_ident = "omnigent-production <production@invalid>"
+    for commit, entry in zip(commits, expected, strict=True):
+        fields = (
+            git(
+                cwd,
+                "show",
+                "-s",
+                "--format=%P%x00%s%x00%an <%ae>%x00%cn <%ce>",
+                commit,
+            )
+            .stdout.rstrip("\n")
+            .split("\0")
+        )
+        parents, subject, author, committer = fields
+        parent_shas = parents.split()
+        if len(parent_shas) != 2:
+            raise StageError(f"production identity: {commit} is not a two-parent merge")
+        expected_subject = (
+            f"production: merge PR #{entry['pr']} ({entry['branch']} @ {str(entry['oid'])[:12]})"
+        )
+        if subject != expected_subject or merge_re(PRODUCTION).fullmatch(subject) is None:
+            raise StageError(f"production identity: nonconforming merge subject {subject!r}")
+        if parent_shas[1] != entry["oid"]:
+            raise StageError(
+                f"production identity: {commit} does not merge applied PR #{entry['pr']}"
+            )
+        if author != expected_ident or committer != expected_ident:
+            raise StageError(
+                f"production identity: {commit} has author {author!r} and committer {committer!r}"
+            )
 
 
 # Alembic migrations live here; a composition that touches (or drops) a file
@@ -816,6 +895,9 @@ def stage(
 ) -> dict:
     datestamp = date.strftime("%Y%m%d")
 
+    if ring == PRODUCTION and any(p.get("source") in {"extra", "extra-branch"} for p in prs):
+        raise StageError("production compositions do not accept extras")
+
     # Seed before the detach: the seed directory is part of the trusted fork
     # checkout and disappears from the worktree once HEAD moves to upstream.
     seed_rerere(cwd, rr_cache_dir)
@@ -833,6 +915,9 @@ def stage(
         for p in skipped
         if p.get("reason") == EXTRA_FETCH_FAILED
     ]
+
+    if ring == PRODUCTION:
+        assert_production_identity(cwd, staging_sha, upstream_sha, applied)
 
     if staging_only:
         # Hourly mode: only refs/heads/staging moves — no pins, no tags.
@@ -911,6 +996,8 @@ def stage(
 
     dev_tag = dev_version(cwd, upstream_sha, datestamp) if ring.mint_dev_tag else None
     name, created = pin_name(cwd, fork, datestamp, staging_sha, ring)
+    pin_branch_ref = f"refs/heads/{name}"
+    pin_tag_ref = f"refs/tags/{name}"
 
     # One atomic push for every ref: a partial failure can't leave the fork
     # with mixed staging/pin/dev-tag state. Leases pin the values we just
@@ -921,17 +1008,13 @@ def stage(
     if expected_staging != staging_sha:
         refspecs.append(f"{staging_sha}:refs/heads/{ring.branch}")
         leases.append(f"--force-with-lease=refs/heads/{ring.branch}:{expected_staging}")
+    # Dated compatibility branches are removed in v0.12.0.
     if created:
-        refspecs += [f"{staging_sha}:refs/heads/{name}", f"{staging_sha}:refs/tags/{name}"]
-    else:
-        # The tag already points here; the twin branch must agree. Repair a
-        # missing branch, but a divergent one means someone moved an
-        # immutable pin — fail rather than clobber.
-        branch_sha = remote_ref(cwd, fork, f"refs/heads/{name}")
-        if not branch_sha:
-            refspecs.append(f"{staging_sha}:refs/heads/{name}")
-        elif branch_sha != staging_sha:
-            raise StageError(f"pin branch {name} points at {branch_sha}, expected {staging_sha}")
+        refspecs += [f"{staging_sha}:{pin_branch_ref}", f"{staging_sha}:{pin_tag_ref}"]
+        leases += [
+            f"--force-with-lease={pin_branch_ref}:",
+            f"--force-with-lease={pin_tag_ref}:",
+        ]
     # The dev tag floats within the day: a rerun repoints it (fork-local tag,
     # nothing downstream pins to it mid-day). Rings without one push nothing.
     if dev_tag:
@@ -948,6 +1031,15 @@ def stage(
         "staging_sha": staging_sha,
         "branch": name,
         "tag": name,
+        "pin_ref": pin_tag_ref,
+        "audit": [
+            {
+                "ref": ref,
+                "expected": staging_sha,
+                "observed": remote_ref(cwd, fork, ref),
+            }
+            for ref in (pin_tag_ref, pin_branch_ref)
+        ],
         **({"dev_tag": dev_tag} if dev_tag else {}),
         "pin_created": created,
         **({"migration_gate": gate} if gate else {}),
