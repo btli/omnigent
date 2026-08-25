@@ -187,8 +187,11 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
         When *owner_user_id* is given, only tasks owned by that user are returned.
         """
-        operation_name = "list_tasks_by_project" if project_id is not _UNSET else "list_tasks"
-        with self._session(operation_name) as session:
+        if project_id is not _UNSET:
+            session_context = self._session("list_tasks_by_project")
+        else:
+            session_context = self._session("list_tasks")
+        with session_context as session:
             stmt = (
                 select(SqlScheduledTask)
                 .where(SqlScheduledTask.workspace_id == current_workspace_id())
