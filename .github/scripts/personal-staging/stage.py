@@ -780,15 +780,14 @@ def assert_production_identity(
     cwd: str | Path, candidate_sha: str, upstream_sha: str, applied: list[dict]
 ) -> None:
     """Fail closed unless a production candidate is the expected merge chain."""
-    ancestor = git(
+    if git(
         cwd,
         "merge-base",
         "--is-ancestor",
         upstream_sha,
         candidate_sha,
         check=False,
-    )
-    if ancestor.returncode != 0:
+    ).returncode:
         raise StageError("production identity: upstream is not an ancestor of the candidate")
 
     if any(p.get("source") in {"extra", "extra-branch"} for p in applied):
@@ -1009,8 +1008,8 @@ def stage(
     if expected_staging != staging_sha:
         refspecs.append(f"{staging_sha}:refs/heads/{ring.branch}")
         leases.append(f"--force-with-lease=refs/heads/{ring.branch}:{expected_staging}")
+    # Dated compatibility branches are removed in v0.12.0.
     if created:
-        # Dated compatibility branches are removed in v0.12.0.
         refspecs += [f"{staging_sha}:{pin_branch_ref}", f"{staging_sha}:{pin_tag_ref}"]
         leases += [
             f"--force-with-lease={pin_branch_ref}:",
@@ -1022,7 +1021,6 @@ def stage(
         # immutable pin — fail rather than clobber.
         branch_sha = remote_ref(cwd, fork, pin_branch_ref)
         if not branch_sha:
-            # Dated compatibility branches are removed in v0.12.0.
             refspecs.append(f"{staging_sha}:{pin_branch_ref}")
             leases.append(f"--force-with-lease={pin_branch_ref}:")
         elif branch_sha != staging_sha:
@@ -1037,15 +1035,6 @@ def stage(
     if refspecs:
         git(cwd, "push", "--atomic", *leases, fork, *refspecs)
 
-    audit = [
-        {
-            "ref": ref,
-            "expected": staging_sha,
-            "observed": remote_ref(cwd, fork, ref),
-        }
-        for ref in (pin_tag_ref, pin_branch_ref)
-    ]
-
     return {
         "date": datestamp,
         "upstream_sha": upstream_sha,
@@ -1053,7 +1042,14 @@ def stage(
         "branch": name,
         "tag": name,
         "pin_ref": pin_tag_ref,
-        "audit": audit,
+        "audit": [
+            {
+                "ref": ref,
+                "expected": staging_sha,
+                "observed": remote_ref(cwd, fork, ref),
+            }
+            for ref in (pin_tag_ref, pin_branch_ref)
+        ],
         **({"dev_tag": dev_tag} if dev_tag else {}),
         "pin_created": created,
         **({"migration_gate": gate} if gate else {}),

@@ -335,16 +335,17 @@ def test_surviving_pin_branch_never_reuses_deleted_tag_name(env):
 
 def test_post_push_audit_records_fully_qualified_pin_refs(env):
     report = env.run([])
+    pin = f"nightly-{STAMP}"
 
-    assert report["pin_ref"] == f"refs/tags/nightly-{STAMP}"
+    assert report["pin_ref"] == f"refs/tags/{pin}"
     assert report["audit"] == [
         {
-            "ref": f"refs/tags/nightly-{STAMP}",
+            "ref": f"refs/tags/{pin}",
             "expected": report["staging_sha"],
             "observed": report["staging_sha"],
         },
         {
-            "ref": f"refs/heads/nightly-{STAMP}",
+            "ref": f"refs/heads/{pin}",
             "expected": report["staging_sha"],
             "observed": report["staging_sha"],
         },
@@ -1198,14 +1199,8 @@ def test_production_reads_no_extras(env, tmp_path, monkeypatch, capsys):
 
 @pytest.mark.parametrize("source", ["extra", "extra-branch"])
 def test_direct_production_stage_rejects_extras_before_git(env, source):
-    pin = {
-        "number": None if source == "extra-branch" else 42,
-        "source": source,
-        "headRefName": "manual",
-    }
-
     with pytest.raises(stage_mod.StageError, match=r"production.*extras"):
-        env.run([pin], ring=stage_mod.PRODUCTION)
+        env.run([{"source": source}], ring=stage_mod.PRODUCTION)
 
     assert git(env.work, "rev-parse", "-q", "--verify", "FETCH_HEAD", check=False).returncode != 0
     assert git(env.work, "ls-remote", str(env.fork)).stdout.strip() == ""
