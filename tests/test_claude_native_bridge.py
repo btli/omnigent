@@ -13,7 +13,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -3661,8 +3661,9 @@ def test_inject_user_message_raises_when_draft_never_submits(
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
     monkeypatch.setattr("omnigent.claude_native_bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
-    monkeypatch.setattr("omnigent.claude_native_bridge._SUBMIT_VERIFY_TIMEOUT_S", 0.2)
+    monkeypatch.setattr("omnigent.claude_native_bridge._SUBMIT_VERIFY_TIMEOUT_S", 30.0)
     monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr("omnigent.claude_native_bridge.time", _VirtualClock())
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
         bridge_dir,
@@ -3692,7 +3693,12 @@ def test_inject_user_message_raises_when_draft_never_submits(
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    with pytest.raises(RuntimeError, match="message was not delivered"):
+    with pytest.raises(
+        RuntimeError,
+        match=r"Claude Code hasn't accepted the message yet — your text is still in the "
+        r"sub-agent's input box\. Open the Subagents panel and press Enter to send it\. "
+        r"Waited 30s\.",
+    ):
         inject_user_message(bridge_dir, content="fix the flaky test")
 
 
@@ -8721,9 +8727,15 @@ def test_a_slash_command_stuck_in_the_composer_fails_loud(
     the authoritative fallback — an honest failure, not a silent divergence.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 30.0)
     _fake_tmux(monkeypatch, [_composer_pane("/effort high")])
 
-    with pytest.raises(RuntimeError, match="was not delivered"):
+    with pytest.raises(
+        RuntimeError,
+        match=r"Claude Code hasn't accepted the slash command yet — it is still in the "
+        r"sub-agent's input box\. Open the Subagents panel and press Enter to send it\. "
+        r"Waited 30s\.",
+    ):
         claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
 
@@ -8750,6 +8762,80 @@ def test_a_slash_command_draft_that_never_renders_submits_blind(
     assert tails == ["C-u", "/effort high", "Enter"], (
         f"An unverifiable draft must submit blind exactly once; got {tails}."
     )
+
+
+@pytest.mark.parametrize(
+    ("inject", "argument", "draft"),
+    [
+        (claude_native_bridge.inject_user_message, "content", "fix the flaky test"),
+        (claude_native_bridge.inject_slash_command, "command", "/effort high"),
+    ],
+)
+def test_submit_verify_honors_the_budget_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inject: Callable[..., None],
+    argument: str,
+    draft: str,
+) -> None:
+    def _enters_for_budget(budget_s: float) -> list[list[str]]:
+        monkeypatch.setattr(claude_native_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", budget_s)
+        sends = _fake_tmux(monkeypatch, [_composer_pane(draft)])
+        with pytest.raises(RuntimeError, match=r"hasn't accepted"):
+            inject(_picker_bridge_dir(tmp_path / f"b{budget_s}"), **{argument: draft})
+        return [args for args in sends if args[-1] == "Enter"]
+
+    tight = _enters_for_budget(2.0)
+    generous = _enters_for_budget(6.0)
+    assert len(tight) < len(generous), (
+        f"a wider budget must retry the swallowed Enter more times; "
+        f"got {len(tight)} vs {len(generous)} Enter(s)"
+    )
+
+
+@pytest.mark.parametrize(("value", "expected"), [(None, "30.0"), ("45", "45.0")])
+def test_submit_verify_budget_reads_environment(value: str | None, expected: str) -> None:
+    env = os.environ.copy()
+    if value is None:
+        env.pop("OMNIGENT_CLAUDE_SUBMIT_VERIFY_TIMEOUT_S", None)
+    else:
+        env["OMNIGENT_CLAUDE_SUBMIT_VERIFY_TIMEOUT_S"] = value
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import omnigent.claude_native_bridge as bridge; "
+            "print(bridge._SUBMIT_VERIFY_TIMEOUT_S)",
+        ],
+        check=True,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+
+    assert result.stdout.strip() == expected
+
+
+@pytest.mark.parametrize("value", ["inf", "nan", "0", "-5", "invalid"])
+def test_invalid_submit_verify_budget_warns_and_uses_default(value: str) -> None:
+    variable = "OMNIGENT_CLAUDE_SUBMIT_VERIFY_TIMEOUT_S"
+    env = os.environ | {variable: value}
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import omnigent.claude_native_bridge as bridge; "
+            "print(bridge._SUBMIT_VERIFY_TIMEOUT_S)",
+        ],
+        check=True,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+
+    assert result.stdout.strip() == "30.0"
+    assert f"{variable}={value!r}" in result.stderr
+    assert "using 30s" in result.stderr
 
 
 def test_an_effort_switch_with_a_swallowed_confirm_leaves_the_pane_usable(
