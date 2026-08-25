@@ -760,7 +760,7 @@ describe("TerminalFirstContext", () => {
     expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_bash_s1");
   });
 
-  it("does not enable Terminal view when only a user shell is cached", () => {
+  it("allows Terminal view when only a user shell is cached", () => {
     mockConversations([
       {
         id: "conv_native",
@@ -776,8 +776,13 @@ describe("TerminalFirstContext", () => {
 
     renderShell("/c/conv_native");
 
-    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminals-available", "false");
-    expect(screen.getByTestId("view-mode-terminal")).toBeDisabled();
+    const probe = screen.getByTestId("view-probe");
+    expect(probe).toHaveAttribute("data-terminals-available", "false");
+    const terminalToggle = screen.getByTestId("view-mode-terminal");
+    expect(terminalToggle).toBeEnabled();
+    fireEvent.click(terminalToggle);
+    expect(probe).toHaveAttribute("data-view", "terminal");
+    expect(probe).toHaveAttribute("data-terminal-view-key", "");
   });
 
   it("flags a child (sub-agent) session terminal-first from the snapshot when the sidebar omits it", () => {
@@ -892,17 +897,18 @@ describe("TerminalFirstContext", () => {
     expect(probe).toHaveAttribute("data-terminals-available", "false");
     expect(probe).toHaveAttribute("data-view", "chat");
 
-    fireEvent.click(screen.getByRole("button", { name: "Terminal" }));
+    const terminalToggle = screen.getByTestId("view-mode-terminal");
+    expect(terminalToggle).toBeEnabled();
+    fireEvent.click(terminalToggle);
 
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
     expect(screen.queryByTestId("terminals-panel")).toBeNull();
   });
 
-  it("falls back to chat when an open terminal view loses its terminal", () => {
-    // A runner stop / disconnect empties the terminal list (useTerminals clears
-    // it on the runner-offline edge). Landing while the terminal view is open,
-    // that would strand the user on "No terminals available"; the view must
-    // fall back to chat, where the composer can resume the session.
+  it("stays in Terminal when an open agent terminal loses its runner", () => {
+    // A runner stop / disconnect empties the terminal list. Keep the user's
+    // selected view so its stopped-harness state can explain what happened and
+    // offer the resume action instead of unexpectedly switching back to Chat.
     mockConversations([
       { id: "conv_native", permission_level: null, labels: { "omnigent.ui": "terminal" } },
     ]);
@@ -946,8 +952,7 @@ describe("TerminalFirstContext", () => {
     useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
     rerender(makeTree());
 
-    // Fell back to chat rather than stranding on "No terminals available".
-    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
   });
 
   it("stays in terminal view while the terminal is relaunching", () => {
@@ -1047,9 +1052,8 @@ describe("TerminalFirstContext", () => {
   });
 
   it("does not restore terminal view in a fresh tab (sessionStorage scope)", () => {
-    // First-time visitors must still land in chat view — the persistence
-    // is sessionStorage, so a new tab starts with no stored preference.
-    // This is the deliberate default.
+    // First-time visitors still land in chat view when no Appearance override
+    // exists. Per-chat persistence remains scoped to sessionStorage.
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null },
       isLoading: false,
@@ -1070,6 +1074,60 @@ describe("TerminalFirstContext", () => {
     renderShell("/c/conv_native");
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
     expect(screen.getByRole("button", { name: "Chat" })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("opens terminal-first transcripts in Terminal when configured", () => {
+    localStorage.setItem("omnigent:default-transcript-view", "terminal");
+    mockConversations([
+      {
+        id: "conv_native",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal" },
+      },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_claude_main", name: "claude", session: "main", running: true }],
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_native");
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
+  });
+
+  it("remembers an explicit Chat choice over the Terminal default", () => {
+    localStorage.setItem("omnigent:default-transcript-view", "terminal");
+    mockConversations([
+      {
+        id: "conv_native",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal" },
+      },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_claude_main", name: "claude", session: "main", running: true }],
+      isLoading: false,
+      error: null,
+    });
+
+    const { unmount } = renderShell("/c/conv_native");
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
+    fireEvent.click(screen.getByRole("button", { name: "Chat" }));
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
+
+    unmount();
+    renderShell("/c/conv_native");
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
+  });
+
+  it("does not apply the Terminal default to regular chat sessions", () => {
+    localStorage.setItem("omnigent:default-transcript-view", "terminal");
+    mockConversations([{ id: "conv_regular", permission_level: null, labels: {} }]);
+
+    renderShell("/c/conv_regular");
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
   });
 });
 
@@ -2763,14 +2821,14 @@ describe("Right-rail tab switching — file viewer close", () => {
 });
 
 describe("Mobile session menu", () => {
-  // The right-rail tabs have no room on a phone, so they're reached via the
-  // top-right session-menu FAB, which opens each tab's content as a full-
-  // screen drawer. jsdom doesn't apply the `md:hidden` CSS, so the FAB and
-  // its menu items are present in the DOM regardless of viewport.
+  // The right-rail tabs have no room on a phone, so they're reached from the
+  // header's single kebab, which opens each tab's content as a full-screen
+  // drawer alongside the session actions. jsdom doesn't apply the `md:hidden`
+  // CSS, so the trigger and its items are present regardless of viewport.
 
-  /** Open the session-menu dropdown and return its trigger. */
+  /** Open the session-actions dropdown and return its trigger. */
   function openSessionMenu() {
-    const trigger = screen.getByRole("button", { name: /open session menu/i });
+    const trigger = screen.getByTestId("session-actions-menu");
     // Radix DropdownMenu opens on pointerdown, not click.
     fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
     return trigger;
@@ -2978,11 +3036,11 @@ describe("Mobile session menu", () => {
     expect(drawer).toHaveAttribute("data-flat-view", "true");
   });
 
-  it("keeps the FAB with only the Agents entry for a minimal agent", () => {
+  it("keeps the kebab with only the Agents entry for a minimal agent", () => {
     // available:false → no files; no shells, no debug. The
     // Agents entry is unconditional (badge = 1, the main agent), so the
-    // FAB still renders with exactly that entry. A missing FAB means
-    // the always-visible Agents rule regressed on mobile.
+    // kebab still lists exactly that entry. Its absence means the
+    // always-visible Agents rule regressed on mobile.
     useEnvironmentMock.mockReturnValue({
       data: { available: false, root: null },
       isLoading: false,
@@ -2992,7 +3050,7 @@ describe("Mobile session menu", () => {
     renderShell("/c/conv_abc");
 
     // Radix DropdownMenu opens on pointerdown, not click.
-    fireEvent.pointerDown(screen.getByRole("button", { name: /open session menu/i }), {
+    fireEvent.pointerDown(screen.getByTestId("session-actions-menu"), {
       button: 0,
       ctrlKey: false,
     });
