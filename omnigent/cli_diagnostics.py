@@ -109,27 +109,114 @@ _redirected_logging_streams: list[_LoggingStreamSnapshot] = []
 
 #: Patterns that match values likely to be secrets.  Applied to every
 #: log record's formatted message before it hits the file.
+_AUTHORIZATION_KEY_RE = re.compile(
+    r'(?i)(?<!\w)(?P<prefix>(?:"authorization"|\'authorization\'|authorization)'
+    r"[ \t\r\n]*[:=][ \t\r\n]*)"
+)
 _SECRET_PATTERNS: list[re.Pattern[str]] = [
-    # Header values: "Authorization: Bearer xxx" or "bearer xxx"
-    re.compile(r"(?i)(authorization\s*[:=]\s*)\S+"),
-    re.compile(r"(?i)(bearer\s+)\S+"),
+    # The keyless branch keeps a length floor so ordinary bearer prose survives.
+    re.compile(
+        r"(?i)(\bbearer[ \t\r\n]+(?:\(REDACTED\)[ \t\r\n]+)*)"
+        r"[A-Za-z0-9._~+/=-]{8,}(?![A-Za-z0-9._~+/=-])"
+    ),
+    # Canonicalization deletes an injected zero-width separator after the scheme.
+    re.compile(r"(?i)(\bbearer)[A-Za-z0-9._~+/=-]{8,}(?![A-Za-z0-9._~+/=-])"),
     # Env-var style keys: FOO_TOKEN=xxx, FOO_API_KEY=xxx, ...
     re.compile(r"(?i)(\b\w*(?:token|api_key|secret|password)\s*[:=]\s*)\S+"),
     # Anthropic / OpenAI style keys
     re.compile(r"\bsk-[A-Za-z0-9_-]{10,}\b"),
     # Databricks PATs
-    re.compile(r"\bdapi[A-Za-z0-9]{10,}\b"),
+    re.compile(r"\bdapi[^\W_]{10,}\b"),
+    # Slack tokens (xoxb-/xoxa-/xoxp-/xoxr-/xoxs-)
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),
+    # GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_)
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
+    # AWS access key ids (long-term AKIA, temporary ASIA)
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16,}"),
+    # URL userinfo is confined to one whitespace-bounded authority.
+    re.compile(
+        r"(?i)(https?://)[^/\s?#]*"
+        r"(?=@(?:\[[^/\s@?#]+\]|[^/\s@?#:]+)(?::[0-9]+)?(?:[/?#\s]|$))"
+    ),
 ]
 _REDACTED = "[REDACTED]"
+_MAX_UNTERMINATED_AUTHORIZATION_FOLDS = 1
 
 
-def _redact(text: str) -> str:
+def _authorization_value_end(text: str, start: int, quote: str | None) -> tuple[int, bool]:
+    """
+    Find one Authorization value boundary with a forward-only scan.
+
+    Quoted values end at an unescaped matching quote; unquoted values end at
+    end-of-line. In either form, CR, LF, or CRLF followed by indentation
+    continues the value. A closed quote may span any number of folds; an
+    unclosed quote retains at most one continuation line of redaction.
+    """
+    index = start
+    unterminated_end: int | None = None
+    folded_lines = 0
+    while index < len(text):
+        char = text[index]
+        if quote is not None:
+            if char == quote:
+                return index, True
+            if char == "\\" and index + 1 < len(text) and text[index + 1] not in "\r\n":
+                index += 2
+                continue
+        if char in "\r\n":
+            newline_end = index + 1
+            if char == "\r" and newline_end < len(text) and text[newline_end] == "\n":
+                newline_end += 1
+            if newline_end < len(text) and text[newline_end] in " \t":
+                folded_lines += 1
+                if (
+                    quote is not None
+                    and folded_lines > _MAX_UNTERMINATED_AUTHORIZATION_FOLDS
+                    and unterminated_end is None
+                ):
+                    unterminated_end = index
+                index = newline_end
+                continue
+            return unterminated_end if unterminated_end is not None else index, False
+        index += 1
+    return unterminated_end if unterminated_end is not None else index, False
+
+
+def _redact_authorization_values(text: str) -> str:
+    """Redact explicit Authorization values using linear boundary scans."""
+    parts: list[str] = []
+    cursor = 0
+    while match := _AUTHORIZATION_KEY_RE.search(text, cursor):
+        parts.append(text[cursor : match.end()])
+        value_start = match.end()
+        quote = (
+            text[value_start]
+            if value_start < len(text) and text[value_start] in {'"', "'"}
+            else None
+        )
+        content_start = value_start + 1 if quote is not None else value_start
+        value_end, closed = _authorization_value_end(text, content_start, quote)
+        if quote is not None:
+            parts.append(quote)
+        parts.append(_REDACTED)
+        if quote is not None and closed:
+            parts.append(quote)
+            cursor = value_end + 1
+        else:
+            cursor = value_end
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
+def redact_secrets(text: str) -> str:
     """
     Replace secret-shaped substrings in *text* with :data:`_REDACTED`.
 
     :param text: Arbitrary log text (may include tracebacks).
     :returns: Scrubbed text.
     """
+
+    text = _redact_authorization_values(text)
     for pat in _SECRET_PATTERNS:
         text = pat.sub(
             lambda m: m.group(1) + _REDACTED if m.lastindex else _REDACTED,
@@ -160,7 +247,7 @@ class _RedactingFormatter(TerminalLogFormatter):
         :param record: The log record to format.
         :returns: Formatted, redacted string ready for the handler.
         """
-        return _redact(super().format(record))
+        return redact_secrets(super().format(record))
 
 
 class _RedactingStderr(io.TextIOBase):
@@ -189,7 +276,7 @@ class _RedactingStderr(io.TextIOBase):
         :param text: Text sent to ``sys.stderr.write``.
         :returns: The length of the caller's original text.
         """
-        self._inner.write(_redact(text))
+        self._inner.write(redact_secrets(text))
         return len(text)
 
     def flush(self) -> None:
