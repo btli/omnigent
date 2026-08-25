@@ -1539,18 +1539,21 @@ describe("touch swipe actions", () => {
     // A single configured direction cedes only the INERT direction to the
     // browser: Chrome samples touch-action at pointerdown, so offering the
     // actionable pan would let native panning cancel the swipe mid-stream.
+    // CSS pan directions name the scroll direction (reverse of finger travel):
+    // a left action fires on a leftward finger = a rightward pan, so pan-left
+    // is the inert grant for it.
     const first = renderSidebar();
     const li = conversationRow;
     expect(li()).toHaveClass("touch-pan-y");
-    expect(li().classList.contains("touch-pan-right")).toBe(true);
-    expect(li()).not.toHaveClass("touch-pan-left");
+    expect(li().classList.contains("touch-pan-left")).toBe(true);
+    expect(li()).not.toHaveClass("touch-pan-right");
     first.unmount();
 
     writeSwipeActions({ left: "none", right: "delete" });
     const second = renderSidebar();
     expect(li()).toHaveClass("touch-pan-y");
-    expect(li().classList.contains("touch-pan-left")).toBe(true);
-    expect(li()).not.toHaveClass("touch-pan-right");
+    expect(li().classList.contains("touch-pan-right")).toBe(true);
+    expect(li()).not.toHaveClass("touch-pan-left");
     second.unmount();
 
     writeSwipeActions({ left: "archive", right: "delete" });
