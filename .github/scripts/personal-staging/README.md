@@ -7,9 +7,15 @@ It:
 1. Composes fork branch `staging` = upstream `omnigent-ai/omnigent` main +
    every open btli PR plus the [`extras.txt`](#extras-manifest-extrastxt)
    pins, merged sequentially ascending by PR number (`stage.py`). A
-   conflicting PR is skipped — its conflict paths land in
-   `merge-report.json` — and the run continues. All PRs conflicting is a
-   reported outcome, not a failure.
+   conflicting open PR gets one rebase rescue: its head is replayed onto
+   upstream main (reproducible identity/dates, already-landed patches
+   dropped), and a clean rescue is merged and pushed back to the PR's fork
+   branch with a lease on the pre-rescue head (a branch that moved keeps
+   its newer work). A PR whose rescue also conflicts is skipped — its
+   conflict paths land in `merge-report.json` — and the run continues.
+   Extras are never rebased (their refs are frozen pins), and the
+   production ring never rescues. All PRs conflicting is a reported
+   outcome, not a failure.
 2. Pins an immutable `nightly-YYYYMMDD` branch + tag at the staging commit
    (same-day rerun: no-op when nothing changed, else `-rerunN`), plus a
    PEP 440 `vX.Y.Z.devYYYYMMDD` tag mirroring `nightly-release.yml`'s

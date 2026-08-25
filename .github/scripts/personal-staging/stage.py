@@ -3,12 +3,15 @@
 
 Builds branch ``staging`` = upstream main + every open btli PR plus the
 ``extras.txt`` pins, merged sequentially (ascending PR number; conflicting
-PRs are skipped and reported). The nightly mode then pins an immutable
-``nightly-YYYYMMDD`` branch + tag and a PEP 440 ``vX.Y.Z.devYYYYMMDD`` tag
-at the same commit; ``--staging-only`` (the hourly mode) pushes only
-``staging`` and skips the push entirely when the composition is unchanged.
-The only refs ever pushed are ``staging``, the ``nightly-*`` pin, and the
-dev tag. ``--ring production`` composes the production ring instead: open
+PRs are skipped and reported — but an open PR whose merge conflicts gets
+one rebase rescue onto upstream main first, and a clean rescue is pushed
+back to the PR's fork branch so the PR stays current). The nightly mode
+then pins an immutable ``nightly-YYYYMMDD`` branch + tag and a PEP 440
+``vX.Y.Z.devYYYYMMDD`` tag at the same commit; ``--staging-only`` (the
+hourly mode) pushes only ``staging`` and skips the push entirely when the
+composition is unchanged. The refs ever pushed are ``staging``, the
+``nightly-*`` pin, the dev tag, and (rescues only) the rescued PR's own
+fork branch. ``--ring production`` composes the production ring instead: open
 non-draft PRs only, no extras, branch ``production`` + immutable
 ``production-YYYYMMDD`` pins, no dev tag, and no hourly mode
 (``--staging-only`` is rejected for it). A production composition
@@ -29,6 +32,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -76,6 +80,11 @@ class Ring:
     use_extras: bool
     exclude_drafts: bool
     mint_dev_tag: bool
+    # Whether a conflicting open PR gets a rebase rescue onto upstream main
+    # (and its fork branch force-with-lease pushed to the rescued head).
+    # Rewriting PR branches is a staging-ring convenience only; production
+    # composes what the PRs actually say.
+    rebase_rescue: bool = False
 
 
 # The staging ring — the composer's only ring today; every function defaults to
@@ -88,6 +97,7 @@ STAGING = Ring(
     use_extras=True,
     exclude_drafts=False,
     mint_dev_tag=True,
+    rebase_rescue=True,
 )
 
 
@@ -453,8 +463,56 @@ def _pin_label(p: dict) -> str:
     return f"#{p['pr']}"
 
 
+def rebase_rescue(cwd: str | Path, oid: str, upstream_sha: str, ring: Ring = STAGING) -> str:
+    """Replay a conflicting PR head onto upstream main, commit by commit.
+
+    A merge applies the branch's TOTAL diff against the merge base, so a PR
+    partially landed upstream (merged in evolved form, cherry-picked, …)
+    conflicts even though replaying its commits one by one succeeds — the
+    rebase drops already-upstreamed patches by patch-id and ``--empty=drop``
+    discards ones that replay to nothing. Runs in a throwaway worktree so the
+    composition's detached HEAD never moves. ``--committer-date-is-author-date``
+    plus the ring's fixed identity keeps the rewritten oids byte-reproducible:
+    a same-day rerun (or a run after a failed push-back) rebuilds the
+    identical head, so no-op detection still works.
+
+    :returns: The rescued head oid, or ``""`` when the rebase conflicts or
+        would not move the head (already based on upstream — the conflict is
+        with the stack, and re-basing cannot help).
+    """
+    scratch = Path(tempfile.mkdtemp(prefix="rebase-rescue-"))
+    worktree = scratch / "wt"
+    try:
+        git(cwd, "worktree", "add", "--detach", str(worktree), oid)
+        rebase = git(
+            worktree,
+            *commit_ident(ring),
+            "rebase",
+            "--empty=drop",
+            "--committer-date-is-author-date",
+            upstream_sha,
+            check=False,
+        )
+        if rebase.returncode != 0:
+            git(worktree, "rebase", "--abort", check=False)
+            return ""
+        new_oid = git(worktree, "rev-parse", "HEAD").stdout.strip()
+        # No head movement means the conflict was with the stack; landing ON
+        # upstream_sha means every commit already landed (blanking the PR
+        # branch with upstream's own sha helps nobody) — neither is a rescue.
+        return "" if new_oid in (oid, upstream_sha) else new_oid
+    finally:
+        git(cwd, "worktree", "remove", "--force", str(worktree), check=False)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def merge_prs(
-    cwd: str | Path, prs: list[dict], upstream: str, fork: str = "origin", ring: Ring = STAGING
+    cwd: str | Path,
+    prs: list[dict],
+    upstream: str,
+    fork: str = "origin",
+    ring: Ring = STAGING,
+    upstream_sha: str = "",
 ) -> tuple[list[dict], list[dict]]:
     applied: list[dict] = []
     skipped: list[dict] = []
@@ -505,6 +563,7 @@ def merge_prs(
                     }
                 )
                 continue
+        rebased_from = ""
         merge = git(
             cwd,
             "-c",
@@ -527,16 +586,36 @@ def merge_prs(
                 )
             paths = conflict_paths(cwd)
             # A seeded rr-cache resolution (seed_rerere) may cover the whole
-            # merge; anything short of full, verified coverage skips as before.
+            # merge; anything short of full, verified coverage falls through
+            # to the rebase rescue.
             resolved = _rerere_resolved_paths(cwd, paths)
-            if resolved is None:
+            if resolved is not None:
+                git(cwd, "add", "--", *resolved)
+                rerere_paths = resolved
+            else:
                 git(cwd, "merge", "--abort")
-                skipped.append(
-                    {"pr": num, "branch": branch, "conflict_paths": paths, "source": source}
+                # One rescue per conflicting open PR: rebase its head onto
+                # upstream main and retry the merge with the rescued head.
+                # Extras stay verbatim — their refs are frozen pins.
+                rescued = (
+                    rebase_rescue(cwd, oid, upstream_sha, ring)
+                    if source == "open" and upstream_sha and ring.rebase_rescue
+                    else ""
                 )
-                continue
-            git(cwd, "add", "--", *resolved)
-            rerere_paths = resolved
+                retried = rescued and (
+                    git(
+                        cwd, "merge", "--no-ff", "--no-commit", "--", rescued, check=False
+                    ).returncode
+                    == 0
+                )
+                if not retried:
+                    if rescued and git(cwd, "ls-files", "-u").stdout.strip():
+                        git(cwd, "merge", "--abort")
+                    skipped.append(
+                        {"pr": num, "branch": branch, "conflict_paths": paths, "source": source}
+                    )
+                    continue
+                rebased_from, oid = oid, rescued
         # --no-commit leaves MERGE_HEAD behind on a real merge; an
         # already-merged PR returns 0 with nothing to commit.
         minted = False
@@ -560,16 +639,25 @@ def merge_prs(
                 env={"GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when},
             )
             minted = True
-        applied.append(
-            {
-                "pr": num,
-                "branch": branch,
-                "oid": oid,
-                "source": source,
-                "minted": minted,
-                **({"rerere_paths": rerere_paths} if rerere_paths else {}),
-            }
-        )
+        entry = {"pr": num, "branch": branch, "oid": oid, "source": source, "minted": minted}
+        if rerere_paths:
+            entry["rerere_paths"] = rerere_paths
+        if rebased_from:
+            # Refresh the PR with its rescued head so the next run composes it
+            # on the normal path. The lease pins the pre-rescue head: a branch
+            # that moved meanwhile keeps its newer work (this run still ships
+            # the rescue, and the next run rescues from the newer head).
+            push = git(
+                cwd,
+                "push",
+                f"--force-with-lease=refs/heads/{branch}:{rebased_from}",
+                fork,
+                f"{oid}:refs/heads/{branch}",
+                check=False,
+            )
+            entry["rebased_from"] = rebased_from
+            entry["pushed_back"] = push.returncode == 0
+        applied.append(entry)
     return applied, skipped
 
 
@@ -727,7 +815,7 @@ def stage(
     upstream_sha = git(cwd, "rev-parse", "FETCH_HEAD").stdout.strip()
     git(cwd, "checkout", "--detach", upstream_sha)
 
-    applied, skipped = merge_prs(cwd, prs, upstream, fork, ring)
+    applied, skipped = merge_prs(cwd, prs, upstream, fork, ring, upstream_sha)
     staging_sha = git(cwd, "rev-parse", "HEAD").stdout.strip()
 
     # An extra we could not even reach is an infrastructure failure, not a
@@ -880,10 +968,15 @@ def notes(report: dict, signed: bool, ring: Ring = STAGING) -> str:
     lines += [
         f"- {_pin_label(p)} {md_code(p['branch'])} @ `{str(p['oid'])[:12]}`"
         + (
-            " — conflicts resolved from rr-cache: "
-            + ", ".join(md_code(x) for x in p["rerere_paths"])
-            if p.get("rerere_paths")
-            else ""
+            f" — rebased onto upstream from `{str(p['rebased_from'])[:12]}`"
+            + ("" if p.get("pushed_back") else " (branch push-back FAILED; will re-rescue)")
+            if p.get("rebased_from")
+            else (
+                " — conflicts resolved from rr-cache: "
+                + ", ".join(md_code(x) for x in p["rerere_paths"])
+                if p.get("rerere_paths")
+                else ""
+            )
         )
         for p in report["applied"]
     ] or ["- none"]
