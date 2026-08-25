@@ -220,6 +220,7 @@ dependencies {
     implementation(libs.androidx.appcompat)
     implementation(libs.androidx.webkit)
     implementation(libs.androidx.work.runtime.ktx)
+    implementation(libs.androidx.browser)
     testImplementation(libs.junit)
     testImplementation(libs.robolectric)
     testImplementation(libs.androidx.test.core)
