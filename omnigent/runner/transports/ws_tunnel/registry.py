@@ -61,6 +61,11 @@ _logger = logging.getLogger(__name__)
 # the stall deadline fails the send loudly with ConnectionError.
 _OUTBOUND_QUEUE_MAX_FRAMES = 1024
 _OUTBOUND_SEND_STALL_S = 10.0
+# Drain-poll interval while a send waits out a full queue. Polling (instead of
+# parking in ``Queue.put``) keeps the stale-check + enqueue atomic under the
+# registry lock and lets a session replacement release waiting senders within
+# one interval instead of the full stall deadline.
+_OUTBOUND_SEND_POLL_S = 0.05
 
 
 class WebSocketLike(Protocol):
@@ -727,39 +732,46 @@ class TunnelRegistry:
         async def _enqueue() -> None:
             """Run on ``session.loop``: bounded-wait enqueue of the frame."""
             try:
-                if _stale():
-                    _resolve(_replaced_error())
-                    return
-                try:
+                deadline = time.monotonic() + _OUTBOUND_SEND_STALL_S
+                while True:
+                    # Stale-check + enqueue in one locked step: ``register``
+                    # swaps sessions under the same lock, so a frame can never
+                    # land in a queue that was already retired (whose sender
+                    # may still transmit on the dying connection).
+                    with self._lock:
+                        if self._sessions.get(session.runner_id) is not session:
+                            _resolve(_replaced_error())
+                            return
+                        try:
+                            session.outbound_queue.put_nowait(data)
+                        except asyncio.QueueFull:
+                            pass
+                        else:
+                            _resolve(None)
+                            return
                     # A full queue is backpressure, not failure: a burst can
-                    # fill it faster than the sender wakes, so wait for drain
-                    # and only treat no room freed in the deadline as failure.
-                    await asyncio.wait_for(
-                        session.outbound_queue.put(data), timeout=_OUTBOUND_SEND_STALL_S
-                    )
-                except TimeoutError:
-                    if _stale():
-                        _resolve(_replaced_error())
-                        return
-                    _logger.warning(
-                        "runner %s outbound queue freed no room in %.0fs (%d frames); "
-                        "failing send (sender stalled, or outpaced by concurrent senders)",
-                        session.runner_id,
-                        _OUTBOUND_SEND_STALL_S,
-                        session.outbound_queue.qsize(),
-                    )
-                    _resolve(
-                        ConnectionError(
-                            f"runner {session.runner_id!r} outbound tunnel stalled "
-                            "(sender dead, or saturated by concurrent sends)"
+                    # fill it faster than the sender wakes, so poll for drain
+                    # (re-validating the generation each pass) and only treat
+                    # no room freed within the deadline as failure.
+                    if time.monotonic() >= deadline:
+                        if _stale():
+                            _resolve(_replaced_error())
+                            return
+                        _logger.warning(
+                            "runner %s outbound queue freed no room in %.0fs (%d frames); "
+                            "failing send (sender stalled, or outpaced by concurrent senders)",
+                            session.runner_id,
+                            _OUTBOUND_SEND_STALL_S,
+                            session.outbound_queue.qsize(),
                         )
-                    )
-                    return
-                if _stale():
-                    # The frame landed in a retired queue no sender drains.
-                    _resolve(_replaced_error())
-                    return
-                _resolve(None)
+                        _resolve(
+                            ConnectionError(
+                                f"runner {session.runner_id!r} outbound tunnel stalled "
+                                "(sender dead, or saturated by concurrent sends)"
+                            )
+                        )
+                        return
+                    await asyncio.sleep(_OUTBOUND_SEND_POLL_S)
             finally:
                 # Route teardown can cancel this task mid-wait; the caller
                 # must never be left awaiting an ack nothing will settle.

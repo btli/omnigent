@@ -461,6 +461,75 @@ async def test_send_text_reports_replaced_when_session_swapped_mid_wait(
 
 
 @pytest.mark.asyncio
+async def test_send_text_swap_mid_wait_never_lands_frame_in_retired_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A send waiting out a full queue must not enqueue after a session swap.
+
+    The retired session's sender can still be transmitting on the dying
+    connection; a frame that lands in its queue after the swap may be sent
+    there even while the caller is told 'replaced' — a duplicate-operation
+    risk when the caller retries. Stale-check + enqueue must be atomic with
+    respect to ``register``.
+    """
+    import omnigent.runner.transports.ws_tunnel.registry as registry_mod
+    from omnigent.runner.transports.ws_tunnel.registry import _OUTBOUND_QUEUE_MAX_FRAMES
+
+    monkeypatch.setattr(registry_mod, "_OUTBOUND_SEND_STALL_S", 30.0)
+    reg = TunnelRegistry()
+    old = reg.register("r1", _NoopWS(), _hello())
+    for _ in range(_OUTBOUND_QUEUE_MAX_FRAMES):
+        old.outbound_queue.put_nowait("frame")
+
+    send = asyncio.create_task(reg.send_text(old, "sneaky-frame"))
+    await asyncio.sleep(0.05)
+    assert not send.done(), "send resolved before the sender freed any room"
+
+    reg.register("r1", _NoopWS(), _hello())  # swap; old session is retired
+    await asyncio.sleep(0)
+    # The old (dying) sender drains one more dead frame, freeing a slot the
+    # parked frame could sneak into.
+    old.outbound_queue.get_nowait()
+
+    with pytest.raises(ConnectionError, match="replaced"):
+        await asyncio.wait_for(send, timeout=2.0)
+    drained = [old.outbound_queue.get_nowait() for _ in range(old.outbound_queue.qsize())]
+    assert "sneaky-frame" not in drained, (
+        "frame landed in the retired queue after the swap — it could still "
+        "transmit on the dying connection while the caller was told 'replaced'"
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_text_replacement_releases_parked_sender_promptly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retirement must release a full-queue waiter well before the stall deadline.
+
+    The retirement sentinel keeps the retired queue full, so a putter parked
+    inside ``Queue.put`` would only discover the replacement at the 10s stall
+    timeout. The waiter must instead observe the swap and fail 'replaced'
+    promptly.
+    """
+    import omnigent.runner.transports.ws_tunnel.registry as registry_mod
+    from omnigent.runner.transports.ws_tunnel.registry import _OUTBOUND_QUEUE_MAX_FRAMES
+
+    monkeypatch.setattr(registry_mod, "_OUTBOUND_SEND_STALL_S", 30.0)
+    reg = TunnelRegistry()
+    old = reg.register("r1", _NoopWS(), _hello())
+    for _ in range(_OUTBOUND_QUEUE_MAX_FRAMES):
+        old.outbound_queue.put_nowait("frame")
+
+    send = asyncio.create_task(reg.send_text(old, "parked-frame"))
+    await asyncio.sleep(0.05)
+    assert not send.done(), "send resolved before the sender freed any room"
+
+    reg.register("r1", _NoopWS(), _hello())  # swap; nothing drains the old queue
+    with pytest.raises(ConnectionError, match="replaced"):
+        await asyncio.wait_for(send, timeout=2.0)
+
+
+@pytest.mark.asyncio
 async def test_send_text_resolves_when_enqueue_task_cancelled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
