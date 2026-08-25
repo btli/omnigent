@@ -192,22 +192,79 @@ async def ensure_catalog(
     fingerprint: str,
     resolve: Callable[[], Awaitable[list[dict[str, Any]] | None]],
 ) -> list[dict[str, Any]] | None:
-    """Return rows from the freshness-aware shared catalog store.
+    """Store-first catalog access with stale-while-revalidate semantics.
 
-    Recent cache hits serve immediately. Missing or over-age entries run
-    *resolve* once (concurrent callers join it); stale rows remain available
-    when that refresh fails.
+    Any cache hit serves immediately. An over-age hit starts a single-flight
+    background refresh, while a miss waits for that same shared probe.
 
     :param harness: Canonical harness name.
     :param fingerprint: The launch-config fingerprint.
     :param resolve: Probe coroutine factory producing verbatim rows.
     :returns: Catalog rows, or ``None`` when no catalog could be obtained.
     """
-    return (await ensure_catalog_result(harness, fingerprint, resolve)).rows
+    cached = read_catalog(harness, fingerprint)
+    if cached is not None:
+        if catalog_is_stale(harness, fingerprint):
+            _refresh_in_background(harness, fingerprint, resolve)
+        return cached
+    return await asyncio.shield(_start_refresh(harness, fingerprint, resolve))
+
+
+def _start_refresh(
+    harness: str,
+    fingerprint: str,
+    resolve: Callable[[], Awaitable[list[dict[str, Any]] | None]],
+) -> asyncio.Task[list[dict[str, Any]] | None]:
+    """Return the single in-flight refresh task for one catalog key."""
+    key = (harness, fingerprint)
+    task = _inflight.get(key)
+    if task is not None and not task.done():
+        return task
+
+    async def _run() -> list[dict[str, Any]] | None:
+        try:
+            rows = await resolve()
+            if rows:
+                write_catalog(harness, fingerprint, rows)
+            return rows
+        finally:
+            _inflight.pop(key, None)
+
+    task = asyncio.create_task(_run(), name=f"model-catalog-{harness}")
+    _inflight[key] = task
+    return task
+
+
+def _refresh_in_background(
+    harness: str,
+    fingerprint: str,
+    resolve: Callable[[], Awaitable[list[dict[str, Any]] | None]],
+) -> None:
+    """Start a sanitized fire-and-forget refresh for stale shared reads."""
+    key = (harness, fingerprint)
+    task = _inflight.get(key)
+    if task is not None and not task.done():
+        return
+    task = _start_refresh(harness, fingerprint, resolve)
+
+    def _consume_result(done: asyncio.Task[list[dict[str, Any]] | None]) -> None:
+        try:
+            done.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # noqa: BLE001 — stale rows remain available
+            failure = _refresh_failure(exc)
+            _logger.warning(
+                "background %s catalog refresh failed (%s)",
+                harness,
+                failure.kind.value,
+            )
+
+    task.add_done_callback(_consume_result)
 
 
 def _refresh_failure(
-    exc: CatalogRefreshError | TimeoutError | OSError,
+    exc: Exception,
 ) -> CatalogRefreshError:
     """Return a structured failure without provider response contents."""
     if isinstance(exc, CatalogRefreshError):
@@ -235,37 +292,24 @@ def _empty_refresh_failure() -> CatalogRefreshError:
     )
 
 
-async def ensure_catalog_result(
+async def ensure_authoritative_catalog_result(
     harness: str,
     fingerprint: str,
     resolve: Callable[[], Awaitable[list[dict[str, Any]] | None]],
 ) -> CatalogResult:
-    """Return rows with authoritative cache and refresh provenance.
+    """Synchronously refresh stale rows and return authority provenance.
 
     A recent cache or successful live probe is fresh. An over-age cache is
     re-probed; if the probe fails, its existing rows are returned stale with
     the sanitized failure. A failed cold probe is missing with that failure.
+    Callers must opt into waiting; shared catalog reads use :func:`ensure_catalog`.
     """
     cached = read_catalog(harness, fingerprint)
     age = catalog_age_s(harness, fingerprint) if cached is not None else None
     if cached is not None and age is not None and age <= CATALOG_STALE_AFTER_S:
         return CatalogResult(cached, CatalogFreshness.FRESH)
 
-    key = (harness, fingerprint)
-    task = _inflight.get(key)
-    if task is None or task.done():
-
-        async def _run() -> list[dict[str, Any]] | None:
-            try:
-                rows = await resolve()
-            finally:
-                _inflight.pop(key, None)
-            if rows:
-                write_catalog(harness, fingerprint, rows)
-            return rows
-
-        task = asyncio.create_task(_run(), name=f"model-catalog-{harness}")
-        _inflight[key] = task
+    task = _start_refresh(harness, fingerprint, resolve)
     try:
         rows = await asyncio.shield(task)
     except (CatalogRefreshError, TimeoutError, OSError) as exc:
@@ -309,8 +353,8 @@ __all__ = [
     "catalog_is_stale",
     "catalog_path",
     "default_row",
+    "ensure_authoritative_catalog_result",
     "ensure_catalog",
-    "ensure_catalog_result",
     "fingerprint_of",
     "read_catalog",
     "write_catalog",

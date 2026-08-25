@@ -200,7 +200,7 @@ _CLAUDE_CODE_USE_GATEWAY_ENV = "CLAUDE_CODE_USE_GATEWAY"
 _CLAUDE_NONESSENTIAL_TRAFFIC_ENV = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
 _CLAUDE_MODEL_PROBE_TIMEOUT_S = 20.0
 _CLAUDE_AUTH_FAILURE_PATTERN = re.compile(
-    r"(?:\b(?:401|403)\b|unauthori[sz]ed|forbidden|authentication(?:\s+\w+){0,2}\s+"
+    r"(?:\b401\b|unauthori[sz]ed|authentication(?:\s+\w+){0,2}\s+"
     r"(?:failed|required)|invalid\s+(?:api[ _-]?key|token|credentials)|"
     r"(?:login|sign[ -]?in)\s+required|not\s+(?:logged|signed)\s+in)",
     re.IGNORECASE,
@@ -1062,7 +1062,8 @@ class ClaudeModelProbe:
 def _claude_probe_process_error(stderr: bytes) -> model_catalog_store.CatalogRefreshError:
     """Classify a failed Claude subprocess without retaining its output."""
     failure_text = stderr.decode(errors="replace")
-    if _CLAUDE_AUTH_FAILURE_PATTERN.search(failure_text):
+    forbidden = re.search(r"(?:\b403\b|forbidden)", failure_text, re.IGNORECASE)
+    if forbidden is None and _CLAUDE_AUTH_FAILURE_PATTERN.search(failure_text):
         return model_catalog_store.CatalogRefreshError(
             model_catalog_store.CatalogRefreshFailureKind.AUTH,
             "Claude model catalog authentication failed",
@@ -1296,17 +1297,16 @@ async def claude_launch_catalog_result(
     claude_config: ClaudeNativeUcodeConfig | None,
 ) -> model_catalog_store.CatalogResult:
     """
-    The shared catalog for this launch config: read the store, probe on miss.
+    Return an authoritative catalog result for Claude launch selection.
 
-    The store read is what keeps launches fast once the host's boot probe
-    (or a previous launch) has run; a cold miss pays one probe and persists
-    the answer for every later consumer.
+    Fresh hits return immediately. Stale hits and misses synchronously join a
+    single-flight probe so only the launch path waits for freshness provenance.
 
     :param claude_config: The resolved launch config, or ``None``.
     :returns: Catalog rows with freshness and any sanitized refresh error.
     """
     fingerprint = claude_catalog_fingerprint(claude_config)
-    return await model_catalog_store.ensure_catalog_result(
+    return await model_catalog_store.ensure_authoritative_catalog_result(
         "claude-native", fingerprint, lambda: claude_model_catalog(claude_config)
     )
 
@@ -1314,8 +1314,11 @@ async def claude_launch_catalog_result(
 async def claude_launch_catalog(
     claude_config: ClaudeNativeUcodeConfig | None,
 ) -> list[dict[str, object]] | None:
-    """Return the shared catalog rows for this launch config."""
-    return (await claude_launch_catalog_result(claude_config)).rows
+    """Return shared rows immediately, refreshing stale hits in the background."""
+    fingerprint = claude_catalog_fingerprint(claude_config)
+    return await model_catalog_store.ensure_catalog(
+        "claude-native", fingerprint, lambda: claude_model_catalog(claude_config)
+    )
 
 
 def build_native_claude_terminal_env(

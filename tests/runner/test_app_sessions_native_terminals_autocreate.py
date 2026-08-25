@@ -3233,7 +3233,7 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         async def _resolve() -> list[dict[str, object]]:
             return catalog
 
-        return await model_catalog_store.ensure_catalog_result(
+        return await model_catalog_store.ensure_authoritative_catalog_result(
             "claude-native", f"autocreate-{endpoint}-{pin_source}", _resolve
         )
 

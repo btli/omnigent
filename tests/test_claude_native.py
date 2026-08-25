@@ -9364,7 +9364,7 @@ async def test_probe_claude_model_options_propagates_alias_auth_failure(
         del command, kwargs
         if "--model" not in args:
             return _Run(b"Usage: /model <name>. Available: opus, or a full model ID.\n")
-        return _Run(b"", b"HTTP 403 bearer=super-secret", returncode=1)
+        return _Run(b"", b"HTTP 401 bearer=super-secret", returncode=1)
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
 
@@ -9586,6 +9586,11 @@ async def test_claude_launch_catalog_reads_the_store_then_probes_once(
             b"HTTP 401 Unauthorized bearer=super-secret",
             model_catalog_store.CatalogRefreshFailureKind.AUTH,
             id="auth",
+        ),
+        pytest.param(
+            b"HTTP 403 Forbidden quota exceeded bearer=super-secret",
+            model_catalog_store.CatalogRefreshFailureKind.OTHER,
+            id="forbidden-is-not-auth",
         ),
         pytest.param(
             b"gateway 500 body=super-secret",

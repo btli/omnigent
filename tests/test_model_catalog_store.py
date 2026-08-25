@@ -72,6 +72,55 @@ def _make_catalog_stale() -> None:
 
 
 @pytest.mark.asyncio
+async def test_shared_stale_catalog_serves_immediately_and_refreshes_in_background() -> None:
+    old_rows = [{"id": "old", "model": "claude-old"}]
+    store.write_catalog("claude-native", "abc123", old_rows)
+    _make_catalog_stale()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _resolve() -> list[dict[str, object]]:
+        started.set()
+        await release.wait()
+        return _ROWS
+
+    rows = await asyncio.wait_for(
+        store.ensure_catalog("claude-native", "abc123", _resolve),
+        timeout=1.0,
+    )
+
+    assert rows == old_rows
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    refresh = store._inflight[("claude-native", "abc123")]
+    assert not refresh.done()
+    release.set()
+    await refresh
+    assert store.read_catalog("claude-native", "abc123") == _ROWS
+
+
+@pytest.mark.asyncio
+async def test_background_refresh_failure_log_does_not_include_exception_payload(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store.write_catalog("claude-native", "abc123", _ROWS)
+    _make_catalog_stale()
+    payload = "Authorization: Bearer super-secret response-body=private"
+
+    async def _resolve() -> list[dict[str, object]]:
+        raise RuntimeError(payload)
+
+    with caplog.at_level("WARNING", logger="omnigent.model_catalog_store"):
+        assert await store.ensure_catalog("claude-native", "abc123", _resolve) == _ROWS
+        refresh = store._inflight[("claude-native", "abc123")]
+        await asyncio.gather(refresh, return_exceptions=True)
+        await asyncio.sleep(0)
+
+    assert "background claude-native catalog refresh failed (other)" in caplog.text
+    assert payload not in caplog.text
+    assert "RuntimeError" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_catalog_result_recent_cache_hit_is_fresh_without_a_probe() -> None:
     store.write_catalog("claude-native", "abc123", _ROWS)
     calls: list[int] = []
@@ -80,7 +129,7 @@ async def test_catalog_result_recent_cache_hit_is_fresh_without_a_probe() -> Non
         calls.append(1)
         return [{"id": "new"}]
 
-    result = await store.ensure_catalog_result("claude-native", "abc123", _resolve)
+    result = await store.ensure_authoritative_catalog_result("claude-native", "abc123", _resolve)
 
     assert result == store.CatalogResult(_ROWS, store.CatalogFreshness.FRESH)
     assert calls == []
@@ -94,7 +143,7 @@ async def test_catalog_result_cold_cache_miss_probes_and_persists_fresh_rows() -
         calls.append(1)
         return _ROWS
 
-    result = await store.ensure_catalog_result("claude-native", "abc123", _resolve)
+    result = await store.ensure_authoritative_catalog_result("claude-native", "abc123", _resolve)
 
     assert result == store.CatalogResult(_ROWS, store.CatalogFreshness.FRESH)
     assert calls == [1]
@@ -110,7 +159,7 @@ async def test_catalog_result_stale_cached_hit_refreshes_to_fresh_rows() -> None
     async def _resolve() -> list[dict[str, object]]:
         return _ROWS
 
-    result = await store.ensure_catalog_result("claude-native", "abc123", _resolve)
+    result = await store.ensure_authoritative_catalog_result("claude-native", "abc123", _resolve)
 
     assert result == store.CatalogResult(_ROWS, store.CatalogFreshness.FRESH)
     assert store.read_catalog("claude-native", "abc123") == _ROWS
@@ -124,7 +173,7 @@ async def test_catalog_result_stale_cached_miss_keeps_rows_with_empty_failure() 
     async def _empty() -> list[dict[str, object]] | None:
         return None
 
-    result = await store.ensure_catalog_result("claude-native", "abc123", _empty)
+    result = await store.ensure_authoritative_catalog_result("claude-native", "abc123", _empty)
 
     assert result.rows == _ROWS
     assert result.freshness is store.CatalogFreshness.STALE
@@ -144,7 +193,9 @@ async def test_catalog_result_refresh_failure_with_cache_preserves_rows_and_prov
             "Claude model catalog authentication failed",
         )
 
-    result = await store.ensure_catalog_result("claude-native", "abc123", _unauthorized)
+    result = await store.ensure_authoritative_catalog_result(
+        "claude-native", "abc123", _unauthorized
+    )
 
     assert result.rows == _ROWS
     assert result.freshness is store.CatalogFreshness.STALE
@@ -159,7 +210,7 @@ async def test_catalog_result_refresh_failure_without_cache_is_sanitized_and_mis
     async def _offline() -> list[dict[str, object]]:
         raise OSError("secret provider response")
 
-    result = await store.ensure_catalog_result("claude-native", "abc123", _offline)
+    result = await store.ensure_authoritative_catalog_result("claude-native", "abc123", _offline)
 
     assert result.rows is None
     assert result.freshness is store.CatalogFreshness.MISSING
@@ -186,9 +237,13 @@ async def test_catalog_result_coalesces_stale_refresh_failure_with_consistent_pr
             "Claude model catalog refresh timed out",
         )
 
-    first = asyncio.create_task(store.ensure_catalog_result("claude-native", "abc123", _timeout))
+    first = asyncio.create_task(
+        store.ensure_authoritative_catalog_result("claude-native", "abc123", _timeout)
+    )
     await started.wait()
-    second = asyncio.create_task(store.ensure_catalog_result("claude-native", "abc123", _timeout))
+    second = asyncio.create_task(
+        store.ensure_authoritative_catalog_result("claude-native", "abc123", _timeout)
+    )
     release.set()
     first_result, second_result = await asyncio.gather(first, second)
 

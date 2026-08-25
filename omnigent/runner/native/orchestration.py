@@ -6175,24 +6175,34 @@ def _select_authoritative_claude_launch_model(
         and catalog.rows is not None
         else None
     )
+    stale_fallback_rows = (
+        catalog.rows
+        if catalog is not None
+        and catalog.freshness is model_catalog_store.CatalogFreshness.STALE
+        and catalog.refresh_error is not None
+        and catalog.rows is not None
+        else None
+    )
 
     if explicit_model is not None:
         resolved = (
             resolve_claude_native_model_selection(explicit_model, claude_config) or explicit_model
         )
-        if fresh_rows is not None:
+        validation_rows = fresh_rows or stale_fallback_rows
+        if validation_rows is not None:
             if (
                 resolved.lower().startswith("claude-")
                 and claude_config_serves_canonical_ids(claude_config)
-                and claude_catalog_serves_model(fresh_rows, resolved, claude_config)
+                and claude_catalog_serves_model(validation_rows, resolved, claude_config)
             ):
                 return resolved
             for candidate in dict.fromkeys((explicit_model, resolved)):
-                catalog_model = resolve_claude_catalog_model(fresh_rows, candidate)
+                catalog_model = resolve_claude_catalog_model(validation_rows, candidate)
                 if catalog_model is not None:
                     return catalog_model
-            if claude_catalog_serves_model(fresh_rows, resolved, claude_config):
+            if claude_catalog_serves_model(validation_rows, resolved, claude_config):
                 return resolved
+        if fresh_rows is not None:
             launchable = sorted(
                 {
                     str(token)
@@ -6239,6 +6249,15 @@ def _select_authoritative_claude_launch_model(
     if configured is not None:
         return configured
     return None
+
+
+def _log_claude_launch_catalog_unavailable(session_id: str) -> None:
+    """Log a catalog failure without serializing exception payloads."""
+    _logger.warning(
+        "claude launch catalog unavailable for session=%s",
+        session_id,
+        extra={"session_id": session_id},
+    )
 
 
 async def _auto_create_claude_terminal(
@@ -6679,12 +6698,7 @@ async def _auto_create_claude_terminal(
     try:
         launch_catalog_result = await claude_launch_catalog_result(claude_config)
     except Exception:  # noqa: BLE001 — no catalog means no validation/default
-        _logger.warning(
-            "claude launch catalog unavailable for session=%s",
-            session_id,
-            exc_info=True,
-            extra={"session_id": session_id},
-        )
+        _log_claude_launch_catalog_unavailable(session_id)
     launch_model = _select_authoritative_claude_launch_model(
         explicit_model=explicit_model,
         configured_model=configured_model,

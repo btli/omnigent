@@ -29,6 +29,7 @@ from omnigent.runner.native.orchestration import (
     _ROUTED_SPAWN_ALLOWED_TOOLS,
     _claude_launch_metadata_from_envelope,
     _load_legacy_claude_launch_metadata,
+    _log_claude_launch_catalog_unavailable,
     _routed_spawn_launch_args,
     _select_authoritative_claude_launch_model,
 )
@@ -74,7 +75,9 @@ async def _fresh_catalog_result(
     async def _resolve() -> list[dict[str, object]]:
         return rows
 
-    return await model_catalog_store.ensure_catalog_result("claude-native", fingerprint, _resolve)
+    return await model_catalog_store.ensure_authoritative_catalog_result(
+        "claude-native", fingerprint, _resolve
+    )
 
 
 async def _failed_catalog_result(
@@ -92,7 +95,9 @@ async def _failed_catalog_result(
     async def _fail() -> list[dict[str, object]]:
         raise model_catalog_store.CatalogRefreshError(kind, message)
 
-    return await model_catalog_store.ensure_catalog_result("claude-native", "selector", _fail)
+    return await model_catalog_store.ensure_authoritative_catalog_result(
+        "claude-native", "selector", _fail
+    )
 
 
 @pytest.mark.parametrize(
@@ -172,21 +177,21 @@ async def test_ambiguous_normalized_catalog_match_fails_closed() -> None:
         )
 
 
-async def test_auth_failed_catalog_refresh_gives_databricks_repair_only_on_databricks() -> None:
+async def test_auth_failed_catalog_refresh_gives_databricks_repair_for_absent_pin() -> None:
     catalog = await _failed_catalog_result(
         model_catalog_store.CatalogRefreshFailureKind.AUTH,
         "Claude model catalog authentication failed",
     )
     with pytest.raises(click.ClickException) as exc_info:
         _select_authoritative_claude_launch_model(
-            explicit_model="databricks-claude-opus-4-8",
+            explicit_model="databricks-claude-fable-5",
             configured_model=None,
             claude_config=_gateway_config(),
             catalog=catalog,
         )
 
     assert str(exc_info.value) == (
-        "the requested model 'databricks-claude-opus-4-8' could not be validated against "
+        "the requested model 'databricks-claude-fable-5' could not be validated against "
         "a fresh model list (Claude model catalog authentication failed). Restore provider "
         "credentials and retry. For Databricks, run "
         "`databricks auth login --profile <PROFILE>`."
@@ -200,7 +205,7 @@ async def test_auth_failed_catalog_refresh_omits_databricks_command_for_other_ga
     )
     with pytest.raises(click.ClickException) as exc_info:
         _select_authoritative_claude_launch_model(
-            explicit_model="gateway-claude-opus-4-8",
+            explicit_model="gateway-claude-fable-5",
             configured_model=None,
             claude_config=_gateway_config(databricks=False),
             catalog=catalog,
@@ -219,17 +224,76 @@ async def test_non_auth_refresh_failure_uses_neutral_retry_guidance() -> None:
     )
     with pytest.raises(click.ClickException) as exc_info:
         _select_authoritative_claude_launch_model(
-            explicit_model="databricks-claude-opus-4-8",
+            explicit_model="databricks-claude-fable-5",
             configured_model=None,
             claude_config=_gateway_config(),
             catalog=catalog,
         )
 
     assert str(exc_info.value) == (
-        "the requested model 'databricks-claude-opus-4-8' could not be validated against "
+        "the requested model 'databricks-claude-fable-5' could not be validated against "
         "a fresh model list (Claude model catalog refresh timed out). Retry after checking "
         "Claude CLI availability and provider connectivity."
     )
+
+
+async def test_gateway_pin_uses_stale_rows_when_authoritative_refresh_fails() -> None:
+    catalog = model_catalog_store.CatalogResult(
+        _GATEWAY_ROWS,
+        model_catalog_store.CatalogFreshness.STALE,
+        model_catalog_store.CatalogRefreshError(
+            model_catalog_store.CatalogRefreshFailureKind.TIMEOUT,
+            "Claude model catalog refresh timed out",
+        ),
+    )
+
+    assert (
+        _select_authoritative_claude_launch_model(
+            explicit_model="databricks-claude-opus-4-8",
+            configured_model=None,
+            claude_config=_gateway_config(),
+            catalog=catalog,
+        )
+        == "system.ai.claude-opus-4-8[1m]"
+    )
+
+
+def test_forbidden_catalog_failure_does_not_advise_reauthentication() -> None:
+    refresh_error = claude_native._claude_probe_process_error(b"HTTP 403 Forbidden quota exceeded")
+    catalog = model_catalog_store.CatalogResult(
+        None,
+        model_catalog_store.CatalogFreshness.MISSING,
+        refresh_error,
+    )
+
+    with pytest.raises(click.ClickException) as exc_info:
+        _select_authoritative_claude_launch_model(
+            explicit_model="databricks-claude-fable-5",
+            configured_model=None,
+            claude_config=_gateway_config(),
+            catalog=catalog,
+        )
+
+    message = str(exc_info.value)
+    assert "databricks auth login" not in message
+    assert "Restore provider credentials" not in message
+    assert "provider connectivity" in message
+
+
+def test_catalog_catch_all_log_does_not_include_exception_payload(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    payload = "Authorization: Bearer super-secret response-body=private"
+
+    with caplog.at_level("WARNING", logger="omnigent.runner.app"):
+        try:
+            raise RuntimeError(payload)
+        except RuntimeError:
+            _log_claude_launch_catalog_unavailable("session-123")
+
+    assert "claude launch catalog unavailable for session=session-123" in caplog.text
+    assert payload not in caplog.text
+    assert "RuntimeError" not in caplog.text
 
 
 async def test_probe_failure_message_suppresses_provider_secrets_end_to_end(
@@ -251,7 +315,7 @@ async def test_probe_failure_message_suppresses_provider_secrets_end_to_end(
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
     config = _gateway_config()
-    catalog = await model_catalog_store.ensure_catalog_result(
+    catalog = await model_catalog_store.ensure_authoritative_catalog_result(
         "claude-native",
         "secret-suppression",
         lambda: claude_native.claude_model_catalog(config),
