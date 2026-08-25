@@ -19,7 +19,7 @@ from omnigent.entities import (
     NewConversationItem,
     ReasoningData,
 )
-from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.session_import import (
     IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
     IMPORT_SOURCE_LABEL_KEY,
@@ -29,6 +29,8 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 
 # ── CRUD ──────────────────────────────────────────────
 
@@ -5657,6 +5659,32 @@ def test_unfiled_filter_includes_directly_inserted_dangling_first_class_pointer(
     unfiled = store.list_conversations(project="", owned_by=None)
     assert conv.id in {item.id for item in unfiled.data}
     assert store.get_conversation(conv.id).project_id == dangling_id
+
+
+@pytest.mark.parametrize(
+    "store_fixture",
+    ["conversation_store", "split_db_conversation_store"],
+)
+def test_unfiled_filter_keeps_pointer_reused_by_foreign_owner(
+    request: pytest.FixtureRequest,
+    store_fixture: str,
+) -> None:
+    store: SqlAlchemyConversationStore = request.getfixturevalue(store_fixture)
+    project_id = "e" * 32
+    projects = SqlAlchemyProjectStore(store.storage_location)
+    projects.create(project_id, "Alice deleted", "alice@example.com")
+    conv = store.create_conversation(project_id=project_id)
+    permissions = SqlAlchemyPermissionStore(store.storage_location)
+    permissions.ensure_user("alice@example.com")
+    permissions.grant("alice@example.com", conv.id, LEVEL_OWNER)
+    assert projects.delete(project_id, user_id="alice@example.com") is True
+    projects.create(project_id, "Bob reused", "bob@example.com")
+
+    unfiled = store.list_conversations(
+        project="", accessible_by="alice@example.com", owned_by=None
+    )
+    assert conv.id in {item.id for item in unfiled.data}
+    assert store.get_conversation(conv.id).project_id == project_id
 
 
 @pytest.mark.parametrize(
