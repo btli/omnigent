@@ -206,6 +206,46 @@ def test_unfiled_filter_includes_directly_inserted_dangling_pointer_for_paused_t
     assert store.get(task_id).project_id == dangling_id
 
 
+def test_unfiled_filter_resolves_projects_within_the_task_owner(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    projects = SqlAlchemyProjectStore(store.storage_location)
+    foreign_project = projects.create(_uid("foreign-project"), "Foreign", "bob@example.com")
+    none_local_project = projects.create(_uid("none-local-project"), "None local", None)
+    reserved_local_project = projects.create(
+        _uid("reserved-local-project"), "Reserved local", "local"
+    )
+    foreign_pointer = store.create(
+        _uid("foreign-pointer-task"),
+        "foreign pointer",
+        "p",
+        "FREQ=DAILY",
+        "alice@example.com",
+        _uid("ag"),
+        "UTC",
+        project_id=foreign_project.id,
+    )
+    for seed, project_id in (
+        ("none-local-task", none_local_project.id),
+        ("reserved-local-task", reserved_local_project.id),
+    ):
+        store.create(
+            _uid(seed),
+            seed,
+            "p",
+            "FREQ=DAILY",
+            None,
+            _uid("ag"),
+            "UTC",
+            project_id=project_id,
+        )
+
+    assert [
+        task.id for task in store.list(owner_user_id="alice@example.com", project_id=None)
+    ] == [foreign_pointer.id]
+    assert store.list(owner_user_id=None, project_id=None) == [foreign_pointer]
+
+
 def test_project_filter_is_workspace_and_owner_scoped(
     store: SqlAlchemyScheduledTaskStore,
 ) -> None:
