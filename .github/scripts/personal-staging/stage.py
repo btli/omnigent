@@ -476,10 +476,18 @@ def rebase_rescue(cwd: str | Path, oid: str, upstream_sha: str, ring: Ring = STA
     a same-day rerun (or a run after a failed push-back) rebuilds the
     identical head, so no-op detection still works.
 
-    :returns: The rescued head oid, or ``""`` when the rebase conflicts or
-        would not move the head (already based on upstream — the conflict is
-        with the stack, and re-basing cannot help).
+    :returns: The rescued head oid, or ``""`` when the head contains merge
+        commits (a linear replay would silently drop them), the rebase
+        conflicts, or the head would not move (already based on upstream —
+        the conflict is with the stack, and re-basing cannot help).
     """
+    # A linear replay silently drops merge commits — their messages, DCO
+    # trailers, and any changes introduced only in the merge resolution —
+    # and the rescued head would replace the contributor's branch. Refuse
+    # instead: a merge-containing head keeps its normal conflict skip.
+    merges = git(cwd, "rev-list", "--merges", f"{upstream_sha}..{oid}", check=False)
+    if merges.returncode != 0 or merges.stdout.strip():
+        return ""
     scratch = Path(tempfile.mkdtemp(prefix="rebase-rescue-"))
     worktree = scratch / "wt"
     try:
