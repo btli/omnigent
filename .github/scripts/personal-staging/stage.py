@@ -1015,16 +1015,6 @@ def stage(
             f"--force-with-lease={pin_branch_ref}:",
             f"--force-with-lease={pin_tag_ref}:",
         ]
-    else:
-        # The tag already points here; the twin branch must agree. Repair a
-        # missing branch, but a divergent one means someone moved an
-        # immutable pin — fail rather than clobber.
-        branch_sha = remote_ref(cwd, fork, pin_branch_ref)
-        if not branch_sha:
-            refspecs.append(f"{staging_sha}:{pin_branch_ref}")
-            leases.append(f"--force-with-lease={pin_branch_ref}:")
-        elif branch_sha != staging_sha:
-            raise StageError(f"pin branch {name} points at {branch_sha}, expected {staging_sha}")
     # The dev tag floats within the day: a rerun repoints it (fork-local tag,
     # nothing downstream pins to it mid-day). Rings without one push nothing.
     if dev_tag:

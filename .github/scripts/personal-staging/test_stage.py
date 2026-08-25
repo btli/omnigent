@@ -429,23 +429,23 @@ def test_notes_escape_untrusted_names_and_signed_variant():
     assert "| Skipped #2 |" in summary and "web/'x'.ts" in summary
 
 
-def test_pin_branch_repaired_and_mismatch_fails(env):
+def test_existing_pin_tag_does_not_recreate_missing_compat_branch(env, pushes):
     pr = env.add_pr(14, "j.txt", "j\n")
     first = env.run([pr])
-    pin = f"refs/heads/nightly-{STAMP}"
+    pin_branch = f"refs/heads/nightly-{STAMP}"
+    pin_tag = f"refs/tags/nightly-{STAMP}"
 
-    # a missing twin branch is repaired on rerun (tag untouched, no new pin)
-    git(env.fork, "update-ref", "-d", pin)
+    git(env.fork, "update-ref", "-d", pin_branch)
+    git(env.fork, "update-ref", "-d", "refs/heads/staging")
+    pushes.clear()
     again = env.run([pr])
-    assert again["pin_created"] is False
-    assert env.fork_ref(pin) == first["staging_sha"]
 
-    # a divergent pin branch means someone moved an immutable pin — fail,
-    # never clobber
-    git(env.fork, "update-ref", pin, first["upstream_sha"])
-    with pytest.raises(stage_mod.StageError, match="pin branch"):
-        env.run([pr])
-    assert env.fork_ref(pin) == first["upstream_sha"]
+    assert again["pin_created"] is False
+    assert env.fork_ref(pin_tag) == first["staging_sha"]
+    assert env.fork_ref(pin_branch) == ""
+    assert len(pushes) == 1
+    assert not any(arg.endswith(f":{pin_branch}") for arg in pushes[0])
+    assert not any(arg.endswith(f":{pin_tag}") for arg in pushes[0])
 
 
 def test_truncation_guard(env, tmp_path):
