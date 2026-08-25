@@ -306,7 +306,57 @@ async def test_gateway_pin_does_not_use_stale_rows_after_authoritative_empty() -
     assert "provider credentials" not in message
 
 
-def test_forbidden_catalog_failure_does_not_advise_reauthentication() -> None:
+async def test_configured_gateway_model_does_not_use_stale_rows_when_auth_refresh_fails() -> None:
+    catalog = model_catalog_store.CatalogResult(
+        _GATEWAY_ROWS,
+        model_catalog_store.CatalogFreshness.STALE,
+        model_catalog_store.CatalogRefreshError(
+            model_catalog_store.CatalogRefreshFailureKind.AUTH,
+            "Claude model catalog authentication failed",
+        ),
+    )
+
+    with pytest.raises(click.ClickException) as exc_info:
+        _select_authoritative_claude_launch_model(
+            explicit_model=None,
+            configured_model="databricks-claude-opus-4-8",
+            claude_config=_gateway_config(),
+            catalog=catalog,
+        )
+
+    message = str(exc_info.value)
+    assert "authentication failed" in message
+    assert "Restore provider credentials and retry" in message
+    assert "databricks auth login" in message
+
+
+def test_canonical_gateway_model_does_not_bypass_cli_absent_failure() -> None:
+    claude_config = ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}
+    )
+    catalog = model_catalog_store.CatalogResult(
+        None,
+        model_catalog_store.CatalogFreshness.MISSING,
+        model_catalog_store.CatalogRefreshError(
+            model_catalog_store.CatalogRefreshFailureKind.CLI_ABSENT,
+            "Claude model catalog could not launch the CLI",
+        ),
+    )
+
+    with pytest.raises(click.ClickException) as exc_info:
+        _select_authoritative_claude_launch_model(
+            explicit_model="system.ai.claude-opus-4-8[1m]",
+            configured_model=None,
+            claude_config=claude_config,
+            catalog=catalog,
+        )
+
+    message = str(exc_info.value)
+    assert "could not launch the CLI" in message
+    assert "Claude CLI availability and provider connectivity" in message
+
+
+def test_forbidden_catalog_failure_advises_reauthentication() -> None:
     refresh_error = claude_native._claude_probe_process_error(b"HTTP 403 Forbidden quota exceeded")
     catalog = model_catalog_store.CatalogResult(
         None,
@@ -323,9 +373,9 @@ def test_forbidden_catalog_failure_does_not_advise_reauthentication() -> None:
         )
 
     message = str(exc_info.value)
-    assert "databricks auth login" not in message
-    assert "Restore provider credentials" not in message
-    assert "provider connectivity" in message
+    assert "authentication failed" in message
+    assert "Restore provider credentials" in message
+    assert "databricks auth login" in message
 
 
 def test_catalog_catch_all_log_does_not_include_exception_payload(

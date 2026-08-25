@@ -9589,8 +9589,8 @@ async def test_claude_launch_catalog_reads_the_store_then_probes_once(
         ),
         pytest.param(
             b"HTTP 403 Forbidden quota exceeded bearer=super-secret",
-            model_catalog_store.CatalogRefreshFailureKind.OTHER,
-            id="forbidden-is-not-auth",
+            model_catalog_store.CatalogRefreshFailureKind.AUTH,
+            id="forbidden-auth",
         ),
         pytest.param(
             b"gateway 500 body=super-secret",

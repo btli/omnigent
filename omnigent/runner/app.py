@@ -9006,6 +9006,7 @@ def create_runner_app(
                     ),
                 },
             )
+        from omnigent import model_catalog_store
         from omnigent.claude_native import claude_launch_catalog
 
         rows: list[dict[str, object]] | None
@@ -9023,7 +9024,7 @@ def create_runner_app(
                     "detail": "the harness model probe is still resolving",
                 },
             )
-        except Exception:  # noqa: BLE001 — cold catalog failures are retryable and sanitized
+        except model_catalog_store.CatalogRefreshError:
             return JSONResponse(
                 status_code=503,
                 content={

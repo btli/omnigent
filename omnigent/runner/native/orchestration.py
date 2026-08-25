@@ -6153,6 +6153,47 @@ def _claude_catalog_refresh_remediation(
     return remediation
 
 
+def _claude_launch_catalog_selection_rows(
+    *,
+    selected_model: str | None,
+    claude_config: ClaudeNativeUcodeConfig | None,
+    catalog: model_catalog_store.CatalogResult | None,
+) -> list[dict[str, object]] | None:
+    """Apply refresh-failure policy once for every launch selection path."""
+    if catalog is None:
+        return None
+    if (
+        catalog.freshness is model_catalog_store.CatalogFreshness.FRESH
+        and catalog.rows is not None
+    ):
+        return catalog.rows
+
+    refresh_error = catalog.refresh_error
+    if refresh_error is None:
+        return None
+    if refresh_error.kind in {
+        model_catalog_store.CatalogRefreshFailureKind.TIMEOUT,
+        model_catalog_store.CatalogRefreshFailureKind.OTHER,
+    }:
+        if (
+            catalog.freshness is model_catalog_store.CatalogFreshness.STALE
+            and catalog.rows is not None
+        ):
+            return catalog.rows
+        return None
+
+    subject = f"the requested model {selected_model!r}" if selected_model else "the default model"
+    if refresh_error.kind is model_catalog_store.CatalogRefreshFailureKind.EMPTY:
+        raise click.ClickException(
+            f"{subject} is not available from this host's current model list — it may have "
+            "been removed since the pick. Pick again from the model menu."
+        )
+    raise click.ClickException(
+        f"{subject} could not be validated against a fresh model list ({refresh_error}). "
+        f"{_claude_catalog_refresh_remediation(refresh_error, claude_config)}"
+    )
+
+
 def _select_authoritative_claude_launch_model(
     *,
     explicit_model: str | None,
@@ -6168,24 +6209,15 @@ def _select_authoritative_claude_launch_model(
         resolve_claude_native_model_selection,
     )
 
-    fresh_rows = (
-        catalog.rows
-        if catalog is not None
-        and catalog.freshness is model_catalog_store.CatalogFreshness.FRESH
-        and catalog.rows is not None
-        else None
+    selected_model = explicit_model if explicit_model is not None else configured_model
+    validation_rows = _claude_launch_catalog_selection_rows(
+        selected_model=selected_model,
+        claude_config=claude_config,
+        catalog=catalog,
     )
-    stale_fallback_rows = (
-        catalog.rows
-        if catalog is not None
-        and catalog.freshness is model_catalog_store.CatalogFreshness.STALE
-        and catalog.refresh_error is not None
-        and catalog.refresh_error.kind
-        in {
-            model_catalog_store.CatalogRefreshFailureKind.TIMEOUT,
-            model_catalog_store.CatalogRefreshFailureKind.OTHER,
-        }
-        and catalog.rows is not None
+    fresh_rows = (
+        validation_rows
+        if catalog is not None and catalog.freshness is model_catalog_store.CatalogFreshness.FRESH
         else None
     )
 
@@ -6193,7 +6225,6 @@ def _select_authoritative_claude_launch_model(
         resolved = (
             resolve_claude_native_model_selection(explicit_model, claude_config) or explicit_model
         )
-        validation_rows = fresh_rows or stale_fallback_rows
         if validation_rows is not None:
             if (
                 resolved.lower().startswith("claude-")
@@ -6223,24 +6254,6 @@ def _select_authoritative_claude_launch_model(
                 f"{launchable_text}. Pick again from the model menu."
             )
         refresh_error = catalog.refresh_error if catalog is not None else None
-        if (
-            refresh_error is not None
-            and refresh_error.kind is model_catalog_store.CatalogRefreshFailureKind.EMPTY
-        ):
-            raise click.ClickException(
-                f"the requested model {explicit_model!r} is not available from this host's "
-                "current model list — it may have been removed since the pick. Pick again "
-                "from the model menu."
-            )
-        if (
-            refresh_error is not None
-            and refresh_error.kind is model_catalog_store.CatalogRefreshFailureKind.AUTH
-        ):
-            raise click.ClickException(
-                f"the requested model {explicit_model!r} could not be validated against a "
-                f"fresh model list ({refresh_error}). "
-                f"{_claude_catalog_refresh_remediation(refresh_error, claude_config)}"
-            )
         if claude_config_serves_canonical_ids(claude_config):
             return resolved
         if refresh_error is not None:
@@ -6255,17 +6268,17 @@ def _select_authoritative_claude_launch_model(
         )
 
     configured = resolve_claude_native_model_selection(configured_model, claude_config)
-    if fresh_rows is not None:
+    if validation_rows is not None:
         if configured is not None:
             for candidate in dict.fromkeys((configured_model, configured)):
                 if candidate is None:
                     continue
-                catalog_model = resolve_claude_catalog_model(fresh_rows, candidate)
+                catalog_model = resolve_claude_catalog_model(validation_rows, candidate)
                 if catalog_model is not None:
                     return catalog_model
-            if claude_catalog_serves_model(fresh_rows, configured, claude_config):
+            if claude_catalog_serves_model(validation_rows, configured, claude_config):
                 return configured
-        row = model_catalog_store.default_row(fresh_rows)
+        row = model_catalog_store.default_row(validation_rows)
         if row is not None:
             return str(row.get("model") or row.get("id") or "") or None
         return None

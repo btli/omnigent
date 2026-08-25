@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from omnigent import (
@@ -1236,6 +1237,74 @@ async def test_claude_native_model_options_cold_auth_failure_is_retryable(
         "error": "claude_native_model_options_failed",
         "detail": "the harness model probe failed; retrying",
     }
+
+
+@pytest.mark.asyncio
+async def test_claude_native_model_options_non_catalog_fault_surfaces_as_500(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unexpected catalog implementation faults reach the server error boundary."""
+    from omnigent.claude_native import ClaudeNativeUcodeConfig
+
+    conv_id = "21f07d437ef04a79abf4de3d12909e35"
+    claude_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return claude_spec
+
+    config = ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://catalog-fault.example/anthropic"}
+    )
+    monkeypatch.setattr(
+        "omnigent.claude_native.resolve_native_claude_config",
+        lambda *, spec: config,
+    )
+
+    async def _fault(claude_config: object) -> None:
+        del claude_config
+        raise RuntimeError("catalog implementation fault")
+
+    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", _fault)
+
+    async def _fake_auto_create(
+        session_id: str,
+        resource_registry: Any,
+        publish_event: Any,
+        **kwargs: Any,
+    ) -> SessionResourceView:
+        del resource_registry, publish_event, kwargs
+        return SessionResourceView(
+            id="terminal_claude_main",
+            type="terminal",
+            session_id=session_id,
+            name="claude:main",
+            metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+        )
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _fake_auto_create
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+
+    assert resp.status_code == 500
 
 
 @pytest.mark.asyncio

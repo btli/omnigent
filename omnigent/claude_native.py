@@ -1063,7 +1063,7 @@ def _claude_probe_process_error(stderr: bytes) -> model_catalog_store.CatalogRef
     """Classify a failed Claude subprocess without retaining its output."""
     failure_text = stderr.decode(errors="replace")
     forbidden = re.search(r"(?:\b403\b|forbidden)", failure_text, re.IGNORECASE)
-    if forbidden is None and _CLAUDE_AUTH_FAILURE_PATTERN.search(failure_text):
+    if forbidden is not None or _CLAUDE_AUTH_FAILURE_PATTERN.search(failure_text):
         return model_catalog_store.CatalogRefreshError(
             model_catalog_store.CatalogRefreshFailureKind.AUTH,
             "Claude model catalog authentication failed",
