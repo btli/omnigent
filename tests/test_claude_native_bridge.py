@@ -7724,8 +7724,8 @@ def test_sanitize_hook_failure_detail_strips_unterminated_dcs_in_linear_time() -
 
 
 def test_sanitize_hook_failure_detail_scans_splitter_flood_in_linear_time() -> None:
-    """A long non-alphabet splitter run is scanned once without redaction."""
-    text = "ghp_" + "\u2800" * 20_000
+    """A large non-alphabet splitter run is bounded before secret scanning."""
+    text = "ghp_" + "\u2800" * 200_000
     started = time.perf_counter()
     detail = _sanitize_hook_failure_detail(text)
     elapsed = time.perf_counter() - started

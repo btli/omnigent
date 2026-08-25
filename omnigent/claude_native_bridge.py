@@ -57,7 +57,7 @@ from omnigent._platform import stable_user_id
 from omnigent.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.claude_native_status import CONTEXT_RAW_FILE
-from omnigent.cli_diagnostics import redact_secrets
+from omnigent.cli_diagnostics import _redact_authorization_values, redact_secrets
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.kiro_native_bridge import bridge_root as kiro_bridge_root
 
@@ -2806,11 +2806,13 @@ _HOOK_FAILURE_DETAIL_RAW_HEAD_CHARS = _HOOK_FAILURE_DETAIL_RAW_LIMIT // 2
 _HOOK_FAILURE_DETAIL_RAW_TAIL_CHARS = (
     _HOOK_FAILURE_DETAIL_RAW_LIMIT - _HOOK_FAILURE_DETAIL_RAW_HEAD_CHARS
 )
+# A long single token gets a small leading detection window before removal.
+_HOOK_FAILURE_DETAIL_DETECTION_CHARS = 128
 _HOOK_FAILURE_FRAME_TRANSLATION = str.maketrans({"[": "(", "]": ")"})
 _HOOK_FAILURE_REDACTION_MARKER = "[REDACTED]"
 _HOOK_FAILURE_PLANTED_REDACTION_RE = re.compile(r"(?i)\[REDACTED\]")
 _HOOK_FAILURE_SEPARATOR_MARKER = "\x00"
-_ASCII_ALPHANUMERIC_RE = re.compile(r"[A-Za-z0-9]")
+_HOOK_FAILURE_EARLY_REDACTION_MARKER = "\ue000"
 # Unicode Default_Ignorable_Code_Point ranges from DerivedCoreProperties.txt.
 _DEFAULT_IGNORABLE_CODE_POINT_RANGES = frozenset(
     {
@@ -3037,22 +3039,43 @@ def _sanitize_hook_failure_detail(text: str) -> str | None:
     :returns: Sanitized detail, or ``None`` when nothing usable remains.
     """
     without_ansi = _strip_ansi_escape_sequences(text)
-    canonical = _canonicalize_hook_failure_detail(without_ansi)
-    raw_preview, preview_truncated = _raw_hook_failure_window(canonical)
-    canonical = _HOOK_FAILURE_PLANTED_REDACTION_RE.sub("(REDACTED)", canonical)
-    if (
-        preview_truncated
-        and not raw_preview
-        and canonical.startswith(("ghp_", "gho_", "ghu_", "ghs_", "ghr_"))
-        and _ASCII_ALPHANUMERIC_RE.search(canonical[4:]) is None
+    # Collapse long Authorization lines before the head/tail window drops them.
+    if len(without_ansi) > _HOOK_FAILURE_DETAIL_RAW_LIMIT and (
+        "a" in without_ansi or "A" in without_ansi
     ):
-        return _HOOK_FAILURE_DETAIL_REMOVED_SENTINEL
+        without_ansi = without_ansi.replace(_HOOK_FAILURE_EARLY_REDACTION_MARKER, " ")
+        without_ansi = _HOOK_FAILURE_PLANTED_REDACTION_RE.sub("(REDACTED)", without_ansi)
+        without_ansi = _redact_authorization_values(without_ansi).replace(
+            _HOOK_FAILURE_REDACTION_MARKER,
+            _HOOK_FAILURE_EARLY_REDACTION_MARKER,
+        )
+    raw_preview, preview_truncated = _raw_hook_failure_window(without_ansi)
+    matched_detection: str | None = None
+    detection_window = ""
+    if preview_truncated:
+        detection_window = without_ansi[:_HOOK_FAILURE_DETAIL_DETECTION_CHARS]
+        detection_canonical = _canonicalize_hook_failure_detail(detection_window)
+        candidate = redact_secrets(detection_canonical)
+        if candidate != detection_canonical:
+            matched_detection = detection_canonical
+    if matched_detection is not None:
+        canonical = matched_detection
+    elif preview_truncated and not raw_preview:
+        canonical = _canonicalize_hook_failure_detail(detection_window)
+    else:
+        canonical = _canonicalize_hook_failure_detail(raw_preview)
+    canonical = _HOOK_FAILURE_PLANTED_REDACTION_RE.sub("(REDACTED)", canonical)
+    canonical = canonical.replace(
+        _HOOK_FAILURE_EARLY_REDACTION_MARKER,
+        _HOOK_FAILURE_REDACTION_MARKER,
+    )
     redacted = redact_secrets(canonical)
     if preview_truncated and not raw_preview and redacted == canonical:
         return _HOOK_FAILURE_DETAIL_REMOVED_SENTINEL
     if not redacted:
         return None
-    bounded, raw_truncated = _raw_hook_failure_window(redacted)
+    bounded, bounded_truncated = _raw_hook_failure_window(redacted)
+    raw_truncated = preview_truncated or bounded_truncated
     if raw_truncated and not bounded:
         return _HOOK_FAILURE_DETAIL_REMOVED_SENTINEL
     protected = bounded.replace(_HOOK_FAILURE_REDACTION_MARKER, "\x00")

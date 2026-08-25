@@ -316,12 +316,18 @@ def test_redact_secrets_stops_unquoted_authorization_at_eol() -> None:
     assert cli_diagnostics.redact_secrets(text) == "Authorization: [REDACTED]\nNext-Line: ok"
 
 
+def test_redact_secrets_does_not_fold_bare_newline_after_authorization_colon() -> None:
+    """A following diagnostic line is not an unindented header continuation."""
+    text = "Authorization:\nNext-Line: ok"
+    assert cli_diagnostics.redact_secrets(text) == "Authorization:[REDACTED]\nNext-Line: ok"
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
         ("Authorization: Bearer abcdefghijk, retrying", "Authorization: [REDACTED]"),
-        ("(bearer abcdefghijk)", "(bearer [REDACTED])"),
-        ('"bearer abcdefghijk"', '"bearer [REDACTED]"'),
+        ("(bearer abcdefghijk)", "(bearer [REDACTED]"),
+        ('"bearer abcdefghijk"', '"bearer [REDACTED]'),
     ],
     ids=["authorization-comma", "parenthesized", "quoted"],
 )
@@ -386,6 +392,38 @@ def test_redact_secrets_scrubs_opaque_shapes(secret: str) -> None:
     scrubbed = cli_diagnostics.redact_secrets(f"boot failed: {secret} rejected")
     assert secret not in scrubbed
     assert "[REDACTED]" in scrubbed
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "g\u2800hp_" + "A" * 20,
+        "dap\u2800i" + "A" * 20,
+        "AK\u2800IA" + "A" * 16,
+        "sk\u2800-" + "A" * 20,
+        "g\u200bhp_" + "A" * 20,
+        "g\u0338hp_" + "A" * 20,
+        "Authori\u2800zation: Basic dXNlcjpodW50ZXIy",
+    ],
+    ids=[
+        "braille-github-anchor",
+        "braille-databricks-anchor",
+        "braille-aws-anchor",
+        "braille-openai-anchor",
+        "zero-width-github-anchor",
+        "combining-github-anchor",
+        "braille-authorization-anchor",
+    ],
+)
+def test_redact_secrets_absorbs_nonspace_splitters_inside_anchors(secret: str) -> None:
+    """Any non-space, non-newline splitter is absorbed throughout an anchor."""
+    assert cli_diagnostics.redact_secrets(secret).endswith("[REDACTED]")
+
+
+def test_redact_secrets_absorbs_splitter_and_body_after_length_floor() -> None:
+    """A non-boundary splitter after the body floor cannot expose the tail."""
+    secret = "ghp_" + "A" * 20 + "\u2800abcdefghijklmnopqrstuvwxyz0123456789"
+    assert cli_diagnostics.redact_secrets(secret) == "[REDACTED]"
 
 
 @pytest.mark.parametrize(

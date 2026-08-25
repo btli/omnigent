@@ -109,10 +109,6 @@ _redirected_logging_streams: list[_LoggingStreamSnapshot] = []
 
 #: Patterns that match values likely to be secrets.  Applied to every
 #: log record's formatted message before it hits the file.
-_AUTHORIZATION_KEY_RE = re.compile(
-    r'(?i)(?<!\w)(?P<prefix>(?:"authorization"|\'authorization\'|authorization)'
-    r"[ \t\r\n]*[:=][ \t\r\n]*)"
-)
 _SECRET_PATTERNS: list[re.Pattern[str]] = [
     # URL userinfo is confined to one whitespace-bounded authority.
     re.compile(
@@ -129,14 +125,25 @@ _WORD_GAP_TEXT = (
     "\u2008\u2009\u200a\u202f\u205f\u3000"
 )
 _WORD_GAP_CHARACTERS = frozenset(_WORD_GAP_TEXT)
-_CREDENTIAL_ANCHOR_RE = re.compile(
-    r"(?P<github>(?<!\w)gh[pousr]_)"
-    r"|(?P<databricks>(?<!\w)dapi)"
-    r"|(?P<slack>(?<!\w)xox[baprs]-)"
-    r"|(?P<aws>(?<!\w)(?:AKIA|ASIA))"
-    r"|(?P<sk>(?<!\w)sk-)"
-    r"|(?P<bearer>(?<!\w)(?i:bearer))"
+_CREDENTIAL_ANCHORS: tuple[tuple[str, str, bool], ...] = tuple(
+    [("github", f"gh{kind}_", False) for kind in "pousr"]
+    + [("databricks", "dapi", False)]
+    + [("slack", f"xox{kind}-", False) for kind in "baprs"]
+    + [("aws", prefix, False) for prefix in ("AKIA", "ASIA")]
+    + [("sk", "sk-", False), ("bearer", "bearer", True)]
 )
+_CREDENTIAL_ANCHORS_BY_INITIAL: dict[str, tuple[tuple[str, str, bool], ...]] = {
+    initial: tuple(
+        anchor
+        for anchor in _CREDENTIAL_ANCHORS
+        if anchor[1][0] == initial or (anchor[2] and anchor[1][0].upper() == initial)
+    )
+    for initial in "gdxAsbB"
+}
+_CREDENTIAL_ANCHOR_INITIAL_RE = re.compile(r"[gdxAsbB]")
+_CREDENTIAL_ANCHOR_INITIAL_WITHOUT_BEARER_RE = re.compile(r"[gdxAs]")
+_AUTHORIZATION_INITIAL_RE = re.compile(r"[aA]")
+_MAX_CREDENTIAL_SPLITTER_RUN = 64
 _ENV_CREDENTIAL_ANCHOR_RE = re.compile(r"(?<!\w)\w*(?i:token|api_key|secret|password)[ \t]*[:=]")
 _BEARER_ALPHABET_RE = r"[A-Za-z0-9._~+/=-]"
 # Removing every non-gap splitter makes this a conservative impossibility
@@ -152,11 +159,84 @@ _BEARER_SHADOW_POSSIBLE_RE = re.compile(
     )
     + ")"
 )
+_AUTHORIZATION_SHADOW_STRIP_RE = re.compile(rf"[^{re.escape(_WORD_GAP_TEXT)}A-Za-z0-9:=\r\n]+")
+_AUTHORIZATION_SHADOW_POSSIBLE_RE = re.compile(
+    rf"(?i)(?<![A-Za-z0-9_])authorization[{re.escape(_WORD_GAP_TEXT)}\r\n]*[:=]"
+)
 
 
 def _is_word_gap(char: str) -> bool:
     """Return whether *char* is genuine horizontal word-separating whitespace."""
     return char in _WORD_GAP_CHARACTERS
+
+
+def _is_ascii_credential_character(char: str) -> bool:
+    """Return whether *char* belongs to the shared ASCII credential alphabet."""
+    return "0" <= char <= "9" or "A" <= char <= "Z" or "a" <= char <= "z"
+
+
+def _anchor_character_matches(char: str, expected: str, *, casefold: bool) -> bool:
+    """Match one required ASCII anchor character."""
+    return char.casefold() == expected if casefold else char == expected
+
+
+def _interleaved_anchor_end(
+    text: str,
+    start: int,
+    literal: str,
+    *,
+    casefold: bool,
+) -> int | None:
+    """Match *literal* while absorbing every non-boundary splitter between characters."""
+    if start > 0 and (text[start - 1].isalnum() or text[start - 1] == "_"):
+        return None
+    index = start
+    for expected in literal:
+        splitter_run = 0
+        while index < len(text):
+            char = text[index]
+            if _anchor_character_matches(char, expected, casefold=casefold):
+                index += 1
+                break
+            if char in "\r\n" or _is_word_gap(char) or _is_ascii_credential_character(char):
+                return None
+            splitter_run += 1
+            if splitter_run > _MAX_CREDENTIAL_SPLITTER_RUN:
+                return None
+            index += 1
+        else:
+            return None
+    return index
+
+
+def _find_credential_anchor(
+    text: str,
+    start: int,
+    *,
+    include_bearer: bool,
+) -> tuple[int, int, str] | None:
+    """Find the next fixed credential anchor with property-agnostic splitters."""
+    initial_re = (
+        _CREDENTIAL_ANCHOR_INITIAL_RE
+        if include_bearer
+        else _CREDENTIAL_ANCHOR_INITIAL_WITHOUT_BEARER_RE
+    )
+    search_start = start
+    while initial_match := initial_re.search(text, search_start):
+        anchor_start = initial_match.start()
+        for family, literal, casefold in _CREDENTIAL_ANCHORS_BY_INITIAL.get(
+            text[anchor_start], ()
+        ):
+            anchor_end = _interleaved_anchor_end(
+                text,
+                anchor_start,
+                literal,
+                casefold=casefold,
+            )
+            if anchor_end is not None:
+                return anchor_start, anchor_end, family
+        search_start = anchor_start + 1
+    return None
 
 
 def _credential_span_end(
@@ -170,13 +250,13 @@ def _credential_span_end(
     """
     Scan one credential body in a single forward pass.
 
-    Before the length floor, every non-alphabet splitter is absorbed except a
-    newline; genuine word gaps have a small fixed budget. After the floor, the
-    first non-alphabet character ends the span, preserving following prose.
+    Every non-alphabet splitter is absorbed except a newline. Genuine word gaps
+    have a small pre-floor budget and end an already-confirmed credential span.
     """
     index = start
     alphabet_count = 0
     word_gaps = 0
+    splitter_run = 0
     while index < len(text):
         char = text[index]
         if char in "\r\n":
@@ -189,13 +269,19 @@ def _credential_span_end(
         )
         if in_alphabet:
             alphabet_count += 1
+            splitter_run = 0
             index += 1
             continue
-        if alphabet_count >= minimum:
-            break
         if char in _WORD_GAP_CHARACTERS:
+            if alphabet_count >= minimum:
+                break
             word_gaps += 1
+            splitter_run = 0
             if word_gaps > _MAX_CREDENTIAL_WORD_GAPS:
+                break
+        else:
+            splitter_run += 1
+            if splitter_run > _MAX_CREDENTIAL_SPLITTER_RUN:
                 break
         index += 1
     return index if alphabet_count >= minimum else None
@@ -223,9 +309,13 @@ def _redact_scanned_credentials(text: str) -> str:
     search_start = 0
     bearer_shadow = _BEARER_SHADOW_STRIP_RE.sub("", text)
     scan_bearer = _BEARER_SHADOW_POSSIBLE_RE.search(bearer_shadow) is not None
-    while match := _CREDENTIAL_ANCHOR_RE.search(text, search_start):
-        search_start = match.end()
-        family = match.lastgroup
+    while anchor := _find_credential_anchor(
+        text,
+        search_start,
+        include_bearer=scan_bearer,
+    ):
+        anchor_start, anchor_end, family = anchor
+        search_start = anchor_end
         if family in {"github", "databricks", "slack", "aws", "sk"}:
             alphabet, minimum = {
                 "github": ("", 20),
@@ -236,13 +326,13 @@ def _redact_scanned_credentials(text: str) -> str:
             }[family]
             span_end = _credential_span_end(
                 text,
-                match.end(),
+                anchor_end,
                 alphabet=alphabet,
                 minimum=minimum,
                 allow_lowercase=family != "aws",
             )
             if span_end is not None:
-                parts.extend((text[cursor : match.start()], _REDACTED))
+                parts.extend((text[cursor:anchor_start], _REDACTED))
                 cursor = span_end
                 search_start = span_end
                 continue
@@ -250,7 +340,7 @@ def _redact_scanned_credentials(text: str) -> str:
         if family == "bearer":
             if not scan_bearer:
                 continue
-            preserved_end, body_start = _bearer_value_start(text, match.end())
+            preserved_end, body_start = _bearer_value_start(text, anchor_end)
             span_end = _credential_span_end(
                 text,
                 body_start,
@@ -331,13 +421,60 @@ def _authorization_value_end(text: str, start: int, quote: str | None) -> tuple[
     return unterminated_end if unterminated_end is not None else index, False
 
 
+def _find_authorization_prefix(text: str, start: int) -> tuple[int, int] | None:
+    """Find an Authorization key and the start of its value."""
+    search_start = start
+    while initial_match := _AUTHORIZATION_INITIAL_RE.search(text, search_start):
+        anchor_start = initial_match.start()
+        anchor_end = _interleaved_anchor_end(
+            text,
+            anchor_start,
+            "authorization",
+            casefold=True,
+        )
+        if anchor_end is None:
+            search_start = anchor_start + 1
+            continue
+
+        delimiter = anchor_end
+        while delimiter < len(text):
+            char = text[delimiter]
+            if char in ":=":
+                break
+            if _is_ascii_credential_character(char):
+                break
+            delimiter += 1
+        if delimiter >= len(text) or text[delimiter] not in ":=":
+            search_start = anchor_start + 1
+            continue
+
+        value_start = delimiter + 1
+        while value_start < len(text) and _is_word_gap(text[value_start]):
+            value_start += 1
+        while value_start < len(text) and text[value_start] in "\r\n":
+            newline_end = value_start + 1
+            if text[value_start] == "\r" and text.startswith("\n", newline_end):
+                newline_end += 1
+            if newline_end >= len(text) or not _is_word_gap(text[newline_end]):
+                break
+            value_start = newline_end + 1
+            while value_start < len(text) and _is_word_gap(text[value_start]):
+                value_start += 1
+        return anchor_start, value_start
+    return None
+
+
 def _redact_authorization_values(text: str) -> str:
     """Redact explicit Authorization values using linear boundary scans."""
+    shadow = _AUTHORIZATION_SHADOW_STRIP_RE.sub("", text)
+    if _AUTHORIZATION_SHADOW_POSSIBLE_RE.search(shadow) is None:
+        return text
     parts: list[str] = []
     cursor = 0
-    while match := _AUTHORIZATION_KEY_RE.search(text, cursor):
-        parts.append(text[cursor : match.end()])
-        value_start = match.end()
+    search_start = 0
+    while anchor := _find_authorization_prefix(text, search_start):
+        _, value_start = anchor
+        parts.append(text[cursor:value_start])
         quote = (
             text[value_start]
             if value_start < len(text) and text[value_start] in {'"', "'"}
@@ -353,6 +490,7 @@ def _redact_authorization_values(text: str) -> str:
             cursor = value_end + 1
         else:
             cursor = value_end
+        search_start = cursor
     parts.append(text[cursor:])
     return "".join(parts)
 
