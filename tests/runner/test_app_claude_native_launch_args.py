@@ -12,10 +12,14 @@ passed. See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
 
 from __future__ import annotations
 
+import os
+import time
 from pathlib import Path
 
+import click
 import pytest
 
+from omnigent import claude_native, model_catalog_store
 from omnigent.claude_native import (
     ClaudeNativeUcodeConfig,
     build_native_claude_terminal_env,
@@ -25,9 +29,515 @@ from omnigent.runner.native.orchestration import (
     _ROUTED_SPAWN_ALLOWED_TOOLS,
     _claude_launch_metadata_from_envelope,
     _load_legacy_claude_launch_metadata,
+    _log_claude_launch_catalog_unavailable,
     _routed_spawn_launch_args,
+    _select_authoritative_claude_launch_model,
 )
 from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
+
+_GATEWAY_ROWS = [
+    {
+        "id": "sonnet",
+        "model": "system.ai.claude-sonnet-4-6[1m]",
+        "displayName": "Sonnet 4.6",
+    },
+    {
+        "id": "opus",
+        "model": "system.ai.claude-opus-4-8[1m]",
+        "displayName": "Opus 4.8",
+        "isDefault": True,
+    },
+    {
+        "id": "haiku",
+        "model": "system.ai.claude-haiku-4-5",
+        "displayName": "Haiku 4.5",
+    },
+]
+
+
+def _gateway_config(*, databricks: bool = True) -> ClaudeNativeUcodeConfig:
+    env = {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}
+    if databricks:
+        env.update(
+            {
+                "CLAUDE_CODE_USE_GATEWAY": "1",
+                "ANTHROPIC_CUSTOM_HEADERS": "x-databricks-use-coding-agent-mode: true",
+            }
+        )
+    return ClaudeNativeUcodeConfig(env=env)
+
+
+async def _fresh_catalog_result(
+    rows: list[dict[str, object]] = _GATEWAY_ROWS,
+    *,
+    fingerprint: str = "selector",
+) -> model_catalog_store.CatalogResult:
+    async def _resolve() -> list[dict[str, object]]:
+        return rows
+
+    return await model_catalog_store.ensure_authoritative_catalog_result(
+        "claude-native", fingerprint, _resolve
+    )
+
+
+async def _failed_catalog_result(
+    kind: model_catalog_store.CatalogRefreshFailureKind,
+    message: str,
+    *,
+    with_cache: bool = True,
+) -> model_catalog_store.CatalogResult:
+    if with_cache:
+        model_catalog_store.write_catalog("claude-native", "selector", _GATEWAY_ROWS)
+        path = model_catalog_store.catalog_path("claude-native", "selector")
+        stale_time = time.time() - model_catalog_store.CATALOG_STALE_AFTER_S - 1.0
+        os.utime(path, (stale_time, stale_time))
+
+    async def _fail() -> list[dict[str, object]]:
+        raise model_catalog_store.CatalogRefreshError(kind, message)
+
+    return await model_catalog_store.ensure_authoritative_catalog_result(
+        "claude-native", "selector", _fail
+    )
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [
+        ("databricks-claude-sonnet-4-6", "system.ai.claude-sonnet-4-6[1m]"),
+        ("system.ai.claude-sonnet-4-6[1m]", "system.ai.claude-sonnet-4-6[1m]"),
+        ("sonnet", "sonnet"),
+        ("databricks-claude-opus-4-8", "system.ai.claude-opus-4-8[1m]"),
+        ("system.ai.claude-opus-4-8[1m]", "system.ai.claude-opus-4-8[1m]"),
+        ("opus", "opus"),
+        ("databricks-claude-haiku-4-5", "system.ai.claude-haiku-4-5"),
+        ("system.ai.claude-haiku-4-5", "system.ai.claude-haiku-4-5"),
+        ("haiku", "haiku"),
+    ],
+)
+async def test_explicit_gateway_model_resolves_to_catalog_vocabulary(
+    requested: str,
+    expected: str,
+) -> None:
+    catalog = await _fresh_catalog_result()
+    selected = _select_authoritative_claude_launch_model(
+        explicit_model=requested,
+        configured_model=None,
+        claude_config=_gateway_config(),
+        catalog=catalog,
+    )
+
+    assert selected == expected
+
+
+async def test_fresh_catalog_miss_lists_launchable_ids_without_auth_advice() -> None:
+    catalog = await _fresh_catalog_result()
+    with pytest.raises(click.ClickException) as exc_info:
+        _select_authoritative_claude_launch_model(
+            explicit_model="databricks-claude-fable-5",
+            configured_model=None,
+            claude_config=_gateway_config(),
+            catalog=catalog,
+        )
+
+    assert str(exc_info.value) == (
+        "the requested model 'databricks-claude-fable-5' is not in this host's current "
+        "model list — it may have changed since the pick. Launchable model ids: 'haiku', "
+        "'opus', 'sonnet', 'system.ai.claude-haiku-4-5', "
+        "'system.ai.claude-opus-4-8[1m]', 'system.ai.claude-sonnet-4-6[1m]'. Pick again "
+        "from the model menu."
+    )
+
+
+async def test_fresh_catalog_does_not_substitute_a_different_generation() -> None:
+    catalog = await _fresh_catalog_result()
+    with pytest.raises(click.ClickException, match="not in this host's current model list"):
+        _select_authoritative_claude_launch_model(
+            explicit_model="databricks-claude-opus-5",
+            configured_model=None,
+            claude_config=_gateway_config(),
+            catalog=catalog,
+        )
+
+
+async def test_ambiguous_normalized_catalog_match_fails_closed() -> None:
+    catalog = await _fresh_catalog_result(
+        [
+            {"id": "opus", "model": "system.ai.claude-opus-4-8"},
+            {"id": "opus[1m]", "model": "system.ai.claude-opus-4-8[1m]"},
+        ],
+        fingerprint="ambiguous-selector",
+    )
+
+    with pytest.raises(click.ClickException, match="not in this host's current model list"):
+        _select_authoritative_claude_launch_model(
+            explicit_model="databricks-claude-opus-4-8",
+            configured_model=None,
+            claude_config=_gateway_config(),
+            catalog=catalog,
+        )
+
+
+async def test_auth_failed_catalog_refresh_gives_databricks_repair_for_absent_pin() -> None:
+    catalog = await _failed_catalog_result(
+        model_catalog_store.CatalogRefreshFailureKind.AUTH,
+        "Claude model catalog authentication failed",
+    )
+    with pytest.raises(click.ClickException) as exc_info:
+        _select_authoritative_claude_launch_model(
+            explicit_model="databricks-claude-fable-5",
+            configured_model=None,
+            claude_config=_gateway_config(),
+            catalog=catalog,
+        )
+
+    assert str(exc_info.value) == (
+        "the requested model 'databricks-claude-fable-5' could not be validated against "
+        "a fresh model list (Claude model catalog authentication failed). Restore provider "
+        "credentials and retry. For Databricks, run "
+        "`databricks auth login --profile <PROFILE>`."
+    )
+
+
+async def test_auth_failed_catalog_refresh_omits_databricks_command_for_other_gateway() -> None:
+    catalog = await _failed_catalog_result(
+        model_catalog_store.CatalogRefreshFailureKind.AUTH,
+        "Claude model catalog authentication failed",
+    )
+    with pytest.raises(click.ClickException) as exc_info:
+        _select_authoritative_claude_launch_model(
+            explicit_model="gateway-claude-fable-5",
+            configured_model=None,
+            claude_config=_gateway_config(databricks=False),
+            catalog=catalog,
+        )
+
+    message = str(exc_info.value)
+    assert "authentication failed" in message
+    assert "Restore provider credentials and retry" in message
+    assert "databricks auth login" not in message
+
+
+async def test_non_auth_refresh_failure_uses_neutral_retry_guidance() -> None:
+    catalog = await _failed_catalog_result(
+        model_catalog_store.CatalogRefreshFailureKind.TIMEOUT,
+        "Claude model catalog refresh timed out",
+    )
+    with pytest.raises(click.ClickException) as exc_info:
+        _select_authoritative_claude_launch_model(
+            explicit_model="databricks-claude-fable-5",
+            configured_model=None,
+            claude_config=_gateway_config(),
+            catalog=catalog,
+        )
+
+    assert str(exc_info.value) == (
+        "the requested model 'databricks-claude-fable-5' could not be validated against "
+        "a fresh model list (Claude model catalog refresh timed out). Retry after checking "
+        "Claude CLI availability and provider connectivity."
+    )
+
+
+async def test_gateway_pin_uses_stale_rows_when_authoritative_refresh_fails() -> None:
+    catalog = model_catalog_store.CatalogResult(
+        _GATEWAY_ROWS,
+        model_catalog_store.CatalogFreshness.STALE,
+        model_catalog_store.CatalogRefreshError(
+            model_catalog_store.CatalogRefreshFailureKind.TIMEOUT,
+            "Claude model catalog refresh timed out",
+        ),
+    )
+
+    assert (
+        _select_authoritative_claude_launch_model(
+            explicit_model="databricks-claude-opus-4-8",
+            configured_model=None,
+            claude_config=_gateway_config(),
+            catalog=catalog,
+        )
+        == "system.ai.claude-opus-4-8[1m]"
+    )
+
+
+async def test_gateway_pin_does_not_use_stale_rows_when_auth_refresh_fails() -> None:
+    catalog = model_catalog_store.CatalogResult(
+        _GATEWAY_ROWS,
+        model_catalog_store.CatalogFreshness.STALE,
+        model_catalog_store.CatalogRefreshError(
+            model_catalog_store.CatalogRefreshFailureKind.AUTH,
+            "Claude model catalog authentication failed",
+        ),
+    )
+
+    with pytest.raises(click.ClickException) as exc_info:
+        _select_authoritative_claude_launch_model(
+            explicit_model="databricks-claude-opus-4-8",
+            configured_model=None,
+            claude_config=_gateway_config(),
+            catalog=catalog,
+        )
+
+    message = str(exc_info.value)
+    assert "authentication failed" in message
+    assert "Restore provider credentials and retry" in message
+    assert "databricks auth login" in message
+
+
+async def test_gateway_pin_does_not_use_stale_rows_after_authoritative_empty() -> None:
+    catalog = model_catalog_store.CatalogResult(
+        _GATEWAY_ROWS,
+        model_catalog_store.CatalogFreshness.STALE,
+        model_catalog_store.CatalogRefreshError(
+            model_catalog_store.CatalogRefreshFailureKind.EMPTY,
+            "Claude model catalog refresh returned no launchable models",
+        ),
+    )
+
+    with pytest.raises(click.ClickException) as exc_info:
+        _select_authoritative_claude_launch_model(
+            explicit_model="databricks-claude-opus-4-8",
+            configured_model=None,
+            claude_config=_gateway_config(),
+            catalog=catalog,
+        )
+
+    message = str(exc_info.value)
+    assert "is not available" in message
+    assert "Pick again from the model menu" in message
+    assert "provider credentials" not in message
+
+
+async def test_configured_gateway_model_does_not_use_stale_rows_when_auth_refresh_fails() -> None:
+    catalog = model_catalog_store.CatalogResult(
+        _GATEWAY_ROWS,
+        model_catalog_store.CatalogFreshness.STALE,
+        model_catalog_store.CatalogRefreshError(
+            model_catalog_store.CatalogRefreshFailureKind.AUTH,
+            "Claude model catalog authentication failed",
+        ),
+    )
+
+    with pytest.raises(click.ClickException) as exc_info:
+        _select_authoritative_claude_launch_model(
+            explicit_model=None,
+            configured_model="databricks-claude-opus-4-8",
+            claude_config=_gateway_config(),
+            catalog=catalog,
+        )
+
+    message = str(exc_info.value)
+    assert "authentication failed" in message
+    assert "Restore provider credentials and retry" in message
+    assert "databricks auth login" in message
+
+
+def test_canonical_gateway_model_does_not_bypass_cli_absent_failure() -> None:
+    claude_config = ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}
+    )
+    catalog = model_catalog_store.CatalogResult(
+        None,
+        model_catalog_store.CatalogFreshness.MISSING,
+        model_catalog_store.CatalogRefreshError(
+            model_catalog_store.CatalogRefreshFailureKind.CLI_ABSENT,
+            "Claude model catalog could not launch the CLI",
+        ),
+    )
+
+    with pytest.raises(click.ClickException) as exc_info:
+        _select_authoritative_claude_launch_model(
+            explicit_model="system.ai.claude-opus-4-8[1m]",
+            configured_model=None,
+            claude_config=claude_config,
+            catalog=catalog,
+        )
+
+    message = str(exc_info.value)
+    assert "could not launch the CLI" in message
+    assert "Claude CLI availability and provider connectivity" in message
+
+
+def test_forbidden_catalog_failure_advises_reauthentication() -> None:
+    refresh_error = claude_native._claude_probe_process_error(b"HTTP 403 Forbidden quota exceeded")
+    catalog = model_catalog_store.CatalogResult(
+        None,
+        model_catalog_store.CatalogFreshness.MISSING,
+        refresh_error,
+    )
+
+    with pytest.raises(click.ClickException) as exc_info:
+        _select_authoritative_claude_launch_model(
+            explicit_model="databricks-claude-fable-5",
+            configured_model=None,
+            claude_config=_gateway_config(),
+            catalog=catalog,
+        )
+
+    message = str(exc_info.value)
+    assert "authentication failed" in message
+    assert "Restore provider credentials" in message
+    assert "databricks auth login" in message
+
+
+def test_catalog_catch_all_log_does_not_include_exception_payload(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    payload = "Authorization: Bearer super-secret response-body=private"
+
+    with caplog.at_level("WARNING", logger="omnigent.runner.app"):
+        try:
+            raise RuntimeError(payload)
+        except RuntimeError:
+            _log_claude_launch_catalog_unavailable("session-123")
+
+    assert "claude launch catalog unavailable for session=session-123" in caplog.text
+    assert payload not in caplog.text
+    assert "RuntimeError" not in caplog.text
+
+
+async def test_probe_failure_message_suppresses_provider_secrets_end_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class _UnauthorizedProcess:
+        returncode = 1
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return (
+                b"",
+                b"HTTP 401 Authorization: Bearer super-secret https://user:pass@gw.example",
+            )
+
+    async def _fake_exec(*args: object, **kwargs: object) -> _UnauthorizedProcess:
+        del args, kwargs
+        return _UnauthorizedProcess()
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+    config = _gateway_config()
+    catalog = await model_catalog_store.ensure_authoritative_catalog_result(
+        "claude-native",
+        "secret-suppression",
+        lambda: claude_native.claude_model_catalog(config),
+    )
+
+    with pytest.raises(click.ClickException) as exc_info:
+        _select_authoritative_claude_launch_model(
+            explicit_model="databricks-claude-opus-4-8",
+            configured_model=None,
+            claude_config=config,
+            catalog=catalog,
+        )
+
+    message = str(exc_info.value)
+    assert "authentication failed" in message
+    assert "super-secret" not in message
+    assert "Authorization" not in message
+    assert "user:pass" not in message
+    assert "super-secret" not in caplog.text
+    assert "Authorization" not in caplog.text
+    assert "user:pass" not in caplog.text
+
+
+async def test_missing_empty_catalog_does_not_blame_credentials() -> None:
+    catalog = await _failed_catalog_result(
+        model_catalog_store.CatalogRefreshFailureKind.EMPTY,
+        "Claude model catalog enumeration returned no models",
+        with_cache=False,
+    )
+    with pytest.raises(click.ClickException) as exc_info:
+        _select_authoritative_claude_launch_model(
+            explicit_model="databricks-claude-opus-4-8",
+            configured_model=None,
+            claude_config=_gateway_config(),
+            catalog=catalog,
+        )
+
+    message = str(exc_info.value)
+    assert "is not available" in message
+    assert "Pick again from the model menu" in message
+    assert "provider credentials" not in message
+    assert "databricks auth login" not in message
+
+
+async def test_direct_login_alias_fails_open_when_refresh_fails() -> None:
+    catalog = await _failed_catalog_result(
+        model_catalog_store.CatalogRefreshFailureKind.TIMEOUT,
+        "Claude model catalog refresh timed out",
+        with_cache=False,
+    )
+
+    assert (
+        _select_authoritative_claude_launch_model(
+            explicit_model="sonnet",
+            configured_model=None,
+            claude_config=None,
+            catalog=catalog,
+        )
+        == "sonnet"
+    )
+
+
+async def test_fresh_direct_login_catalog_still_rejects_an_unlisted_family() -> None:
+    catalog = await _fresh_catalog_result()
+
+    with pytest.raises(click.ClickException, match="not in this host's current model list"):
+        _select_authoritative_claude_launch_model(
+            explicit_model="claude-fable-5",
+            configured_model=None,
+            claude_config=None,
+            catalog=catalog,
+        )
+
+
+async def test_configured_gateway_model_folds_to_fresh_catalog_vocabulary() -> None:
+    catalog = await _fresh_catalog_result()
+
+    assert (
+        _select_authoritative_claude_launch_model(
+            explicit_model=None,
+            configured_model="databricks-claude-opus-4-8",
+            claude_config=_gateway_config(),
+            catalog=catalog,
+        )
+        == "system.ai.claude-opus-4-8[1m]"
+    )
+
+
+async def test_default_gateway_launch_fails_open_when_refresh_fails() -> None:
+    catalog = await _failed_catalog_result(
+        model_catalog_store.CatalogRefreshFailureKind.OTHER,
+        "Claude model catalog probe exited unsuccessfully",
+        with_cache=False,
+    )
+
+    assert (
+        _select_authoritative_claude_launch_model(
+            explicit_model=None,
+            configured_model=None,
+            claude_config=_gateway_config(),
+            catalog=catalog,
+        )
+        is None
+    )
+
+
+async def test_absent_configured_resolution_continues_to_fresh_catalog_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = await _fresh_catalog_result()
+    monkeypatch.setattr(
+        "omnigent.claude_native.resolve_claude_native_model_selection",
+        lambda model, config: None,
+    )
+
+    assert (
+        _select_authoritative_claude_launch_model(
+            explicit_model=None,
+            configured_model="unresolved-provider-default",
+            claude_config=_gateway_config(),
+            catalog=catalog,
+        )
+        == "system.ai.claude-opus-4-8[1m]"
+    )
 
 
 @pytest.mark.parametrize(
