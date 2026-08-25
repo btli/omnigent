@@ -261,7 +261,7 @@ class MainActivityTest {
     fun `stale exchange result for a switched-away origin leaves the current flow alone`() {
         ServerStore(ApplicationProvider.getApplicationContext()).connect(DATABRICKS_ORIGIN)
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
-        val webView = shadowOf(activity.webView())
+        val webView = shadowOf(activity.testWebView())
         // The current origin's own login is in flight when the exchange an old
         // origin started (before the server switch) finally reports back.
         activity.authTabFlow.begin(DATABRICKS_ORIGIN, activity.packageName)
@@ -298,14 +298,14 @@ class MainActivityTest {
 
         assertFalse(activity.authTabFlow.inFlight)
         assertTrue(activity.authTabFellBack)
-        assertEquals(DATABRICKS_ORIGIN, shadowOf(activity.webView()).lastLoadedUrl)
+        assertEquals(DATABRICKS_ORIGIN, shadowOf(activity.testWebView()).lastLoadedUrl)
     }
 
     @Test
     fun `cookie write landing after a server switch does not reload the old origin`() {
         ServerStore(ApplicationProvider.getApplicationContext()).connect(CUSTOM_ORIGIN)
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
-        val webView = shadowOf(activity.webView())
+        val webView = shadowOf(activity.testWebView())
         val loadedBefore = webView.lastLoadedUrl
 
         // The async setCookie callback carries the origin captured when the
@@ -323,20 +323,13 @@ class MainActivityTest {
     fun `cookie write for the pinned origin reloads it`() {
         ServerStore(ApplicationProvider.getApplicationContext()).connect("$CUSTOM_ORIGIN/workspace")
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
-        val webView = shadowOf(activity.webView())
+        val webView = shadowOf(activity.testWebView())
         assertEquals("$CUSTOM_ORIGIN/workspace", webView.lastLoadedUrl)
 
         activity.onSessionCookieWritten(CUSTOM_ORIGIN, "ap_session", accepted = true)
 
         assertEquals(CUSTOM_ORIGIN, webView.lastLoadedUrl)
     }
-
-    private fun MainActivity.webView(): WebView =
-        MainActivity::class
-            .java
-            .getDeclaredField("webView")
-            .apply { isAccessible = true }
-            .get(this) as WebView
 
     private companion object {
         const val CUSTOM_ORIGIN = "https://example.com"
