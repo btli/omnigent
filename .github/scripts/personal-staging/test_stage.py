@@ -1344,9 +1344,7 @@ def test_production_migration_gate_approval_publishes(env):
     blocked = env.run([pr], ring=stage_mod.PRODUCTION)
     assert blocked["migration_gate"]["blocked"] is True
 
-    report = env.run(
-        [pr], ring=stage_mod.PRODUCTION, migration_approval=blocked["staging_sha"]
-    )
+    report = env.run([pr], ring=stage_mod.PRODUCTION, migration_approval=blocked["staging_sha"])
     assert report["staging_sha"] == blocked["staging_sha"]
     assert report["migration_gate"]["blocked"] is False
     assert report["tag"] == f"production-{STAMP}"

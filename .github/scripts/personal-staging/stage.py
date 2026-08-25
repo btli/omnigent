@@ -57,6 +57,8 @@ EXTRA_MISSING = "extra unfetchable (likely deleted; remove from extras.txt)"
 EXTRA_FETCH_FAILED = "extra fetch failed (cannot reach remote; pin kept, staging not advanced)"
 EXTRA_FETCH_ATTEMPTS = 3
 EXTRA_FETCH_BACKOFF_S = 2
+
+
 @dataclass(frozen=True)
 class Ring:
     """A promotion ring the composer can build. Every branch-name, pin-tag
@@ -370,9 +372,7 @@ def _pin_label(p: dict) -> str:
     return f"#{p['pr']}"
 
 
-def rebase_rescue(
-    cwd: str | Path, oid: str, upstream_sha: str, ring: Ring = STAGING
-) -> str:
+def rebase_rescue(cwd: str | Path, oid: str, upstream_sha: str, ring: Ring = STAGING) -> str:
     """Replay a conflicting PR head onto upstream main, commit by commit.
 
     A merge applies the branch's TOTAL diff against the merge base, so a PR
