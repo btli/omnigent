@@ -27,7 +27,7 @@ import yaml
 from websockets.exceptions import ConnectionClosedError
 from websockets.frames import Close
 
-from omnigent import claude_native
+from omnigent import claude_native, model_catalog_store
 from omnigent._runner_startup import RunnerStartupProgress
 from omnigent._startup_profile import StartupProfiler
 from omnigent._terminal_picker_theme import PICKER_ACCENT, PICKER_MUTED
@@ -9291,13 +9291,13 @@ async def test_probe_claude_model_options_resolves_each_alias_via_the_harness(
     label from the printed line); rows show only the resolved label with
     1M-context resolutions marked, aliases resolving to a model an
     earlier row already covers are dropped (``best``, ``fable[1m]``, and
-    ``opusplan`` here), ``default`` never becomes a row (the picker has
-    its own Default choice), and a failing resolution leaves that alias's
-    bare row, never the whole probe.
+    ``opusplan`` here), and ``default`` never becomes a row (the picker has
+    its own Default choice).
     """
     resolutions = {
         "sonnet": ("claude-sonnet-5", "Sonnet 5"),
         "opus": ("claude-opus-5", "Opus 5"),
+        "haiku": ("claude-haiku-4-5", "Haiku 4.5"),
         "fable": ("claude-fable-5", "Fable 5"),
         "best": ("claude-fable-5", "Fable 5"),
         "sonnet[1m]": ("claude-sonnet-5[1m]", "Sonnet 5"),
@@ -9323,8 +9323,6 @@ async def test_probe_claude_model_options_resolves_each_alias_via_the_harness(
         assert "--output-format" in args and "stream-json" in args and "--verbose" in args
         alias = args[args.index("--model") + 1]
         assert alias != "default", "the skipped alias must not spawn a resolution run"
-        if alias == "haiku":
-            return _Run(b"", returncode=1)
         model, label = resolutions[alias]
         events = [
             {"type": "system", "subtype": "init", "model": model},
@@ -9341,7 +9339,7 @@ async def test_probe_claude_model_options_resolves_each_alias_via_the_harness(
     assert alias_rows == [
         {"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet 5"},
         {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5"},
-        {"id": "haiku", "model": "haiku", "displayName": "haiku"},
+        {"id": "haiku", "model": "claude-haiku-4-5", "displayName": "Haiku 4.5"},
         {"id": "fable", "model": "claude-fable-5", "displayName": "Fable 5"},
         {
             "id": "sonnet[1m]",
@@ -9350,6 +9348,35 @@ async def test_probe_claude_model_options_resolves_each_alias_via_the_harness(
         },
         {"id": "opus[1m]", "model": "claude-opus-5[1m]", "displayName": "Opus 5 (1M context)"},
     ]
+
+
+async def test_probe_claude_model_options_propagates_alias_auth_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed alias resolution makes the refresh stale with auth provenance."""
+
+    class _Run:
+        def __init__(self, stdout: bytes, stderr: bytes = b"", returncode: int = 0) -> None:
+            self.returncode = returncode
+            self._stdout = stdout
+            self._stderr = stderr
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return self._stdout, self._stderr
+
+    async def _fake_exec(command: str, *args: str, **kwargs: Any) -> _Run:
+        del command, kwargs
+        if "--model" not in args:
+            return _Run(b"Usage: /model <name>. Available: opus, or a full model ID.\n")
+        return _Run(b"", b"HTTP 401 bearer=super-secret", returncode=1)
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+
+    with pytest.raises(model_catalog_store.CatalogRefreshError) as exc_info:
+        await claude_native.probe_claude_model_options(None)
+
+    assert exc_info.value.kind is model_catalog_store.CatalogRefreshFailureKind.AUTH
+    assert "super-secret" not in exc_info.value.message
 
 
 async def test_probe_claude_model_options_runs_the_harness_under_the_launch_env(
@@ -9556,24 +9583,143 @@ async def test_claude_launch_catalog_reads_the_store_then_probes_once(
     assert len(calls) == 1, "the second read must come from the store, not a re-probe"
 
 
-async def test_probe_claude_model_options_returns_none_on_probe_failure(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize(
+    ("stderr", "expected_kind"),
+    [
+        pytest.param(
+            b"HTTP 401 Unauthorized bearer=super-secret",
+            model_catalog_store.CatalogRefreshFailureKind.AUTH,
+            id="auth",
+        ),
+        pytest.param(
+            b"HTTP 403 Forbidden quota exceeded bearer=super-secret",
+            model_catalog_store.CatalogRefreshFailureKind.AUTH,
+            id="forbidden-auth",
+        ),
+        pytest.param(
+            b"gateway 500 body=super-secret",
+            model_catalog_store.CatalogRefreshFailureKind.OTHER,
+            id="other",
+        ),
+    ],
+)
+async def test_probe_claude_model_options_classifies_nonzero_exit_without_leaking_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stderr: bytes,
+    expected_kind: model_catalog_store.CatalogRefreshFailureKind,
 ) -> None:
-    """A failing harness run yields None so callers keep configured rows."""
+    """Non-zero probe exits retain only a structured, sanitized reason."""
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
 
     class _FailedProcess:
         returncode = 1
 
         async def communicate(self) -> tuple[bytes, bytes]:
-            return b"", b"boom"
+            return b"", stderr
 
     async def _fake_exec(command: str, *args: str, **kwargs: Any) -> _FailedProcess:
         return _FailedProcess()
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
 
-    assert await claude_native.probe_claude_model_options(_gateway_probe_config()) is None
+    with pytest.raises(model_catalog_store.CatalogRefreshError) as exc_info:
+        await claude_native.probe_claude_model_options(_gateway_probe_config())
+
+    assert exc_info.value.kind is expected_kind
+    assert "super-secret" not in exc_info.value.message
+
+
+async def test_probe_claude_model_options_classifies_missing_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A missing Claude executable is distinct from auth and connectivity failures."""
+
+    async def _missing(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise FileNotFoundError("secret executable path")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _missing)
+
+    with pytest.raises(model_catalog_store.CatalogRefreshError) as exc_info:
+        await claude_native.probe_claude_model_options(None)
+
+    assert exc_info.value.kind is model_catalog_store.CatalogRefreshFailureKind.CLI_ABSENT
+    assert "secret executable path" not in exc_info.value.message
+    assert "secret executable path" not in caplog.text
+
+
+async def test_probe_claude_model_options_classifies_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timed-out Claude process retains timeout provenance and is reaped."""
+
+    class _TimedOutProcess:
+        returncode: int | None = None
+        killed = False
+        waited = False
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            raise TimeoutError("secret timeout detail")
+
+        def kill(self) -> None:
+            self.killed = True
+
+        async def wait(self) -> None:
+            self.waited = True
+
+    process = _TimedOutProcess()
+
+    async def _fake_exec(*args: object, **kwargs: object) -> _TimedOutProcess:
+        del args, kwargs
+        return process
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+
+    with pytest.raises(model_catalog_store.CatalogRefreshError) as exc_info:
+        await claude_native.probe_claude_model_options(None)
+
+    assert exc_info.value.kind is model_catalog_store.CatalogRefreshFailureKind.TIMEOUT
+    assert "secret timeout detail" not in exc_info.value.message
+    assert process.killed and process.waited
+
+
+async def test_probe_claude_model_options_classifies_empty_enumeration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful process with no model rows is an empty refresh, not auth."""
+
+    class _EmptyProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"no model rows", b""
+
+    async def _fake_exec(*args: object, **kwargs: object) -> _EmptyProcess:
+        del args, kwargs
+        return _EmptyProcess()
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+
+    with pytest.raises(model_catalog_store.CatalogRefreshError) as exc_info:
+        await claude_native.probe_claude_model_options(None)
+
+    assert exc_info.value.kind is model_catalog_store.CatalogRefreshFailureKind.EMPTY
+
+
+def test_resolve_claude_catalog_model_fails_closed_on_ambiguous_normalized_rows() -> None:
+    """Equivalent normalization cannot choose between distinct wire models."""
+    rows = [
+        {"id": "opus", "model": "system.ai.claude-opus-4-8"},
+        {"id": "opus[1m]", "model": "system.ai.claude-opus-4-8[1m]"},
+    ]
+
+    assert claude_native.resolve_claude_catalog_model(rows, "databricks-claude-opus-4-8") is None
+    assert (
+        claude_native.resolve_claude_catalog_model(rows, "system.ai.claude-opus-4-8[1m]")
+        == "system.ai.claude-opus-4-8[1m]"
+    )
 
 
 def _subscription_catalog() -> list[dict[str, object]]:
