@@ -113,12 +113,18 @@ _AUTHORIZATION_KEY_RE = re.compile(
     r'(?i)(?<!\w)(?P<prefix>(?:"authorization"|\'authorization\'|authorization)'
     r"[ \t\r\n]*[:=][ \t\r\n]*)"
 )
+_OBFUSCATED_HTTP_SCHEME_RE = re.compile(r"(?i)\bh ?t ?t ?p(?: ?s)? ?://")
 
 _SECRET_PATTERNS: list[re.Pattern[str]] = [
     # The keyless branch keeps a length floor so ordinary bearer prose survives.
     re.compile(
         r"(?i)(\bbearer[ \t\r\n]+(?:\(REDACTED\)[ \t\r\n]+)*)"
+        r"(?:"
         r"[A-Za-z0-9._~+/=-]{8,}(?![A-Za-z0-9._~+/=-])"
+        r"|(?=[-A-Za-z0-9._~+/= ]{9,}(?![-A-Za-z0-9._~+/= ]))"
+        r"[A-Za-z0-9._~+/=-]+ [A-Za-z0-9._~+/=-]+"
+        r"(?![-A-Za-z0-9._~+/= ])"
+        r")"
     ),
     # Env-var style keys: FOO_TOKEN=xxx, FOO_API_KEY=xxx, ...
     re.compile(r"(?i)(\b\w*(?:token|api_key|secret|password)\s*[:=]\s*)\S+"),
@@ -127,11 +133,11 @@ _SECRET_PATTERNS: list[re.Pattern[str]] = [
     # Databricks PATs
     re.compile(r"\bdapi[^\W_](?: ?[^\W_]){9,}\b"),
     # Slack tokens (xoxb-/xoxa-/xoxp-/xoxr-/xoxs-)
-    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-](?: ?[A-Za-z0-9-]){9,}"),
     # GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_)
     re.compile(r"\bgh[pousr]_[A-Za-z0-9](?: ?[A-Za-z0-9]){19,}\b"),
     # AWS access key ids (long-term AKIA, temporary ASIA)
-    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16,}"),
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z](?: ?[0-9A-Z]){15,}"),
     # URL userinfo is confined to one whitespace-bounded authority.
     re.compile(
         r"(?i)(https?://)[^/\s?#]*"
@@ -220,6 +226,10 @@ def redact_secrets(text: str) -> str:
     :returns: Scrubbed text.
     """
 
+    text = _OBFUSCATED_HTTP_SCHEME_RE.sub(
+        lambda match: match.group(0).replace(" ", ""),
+        text,
+    )
     text = _redact_authorization_values(text)
     for pat in _SECRET_PATTERNS:
         text = pat.sub(

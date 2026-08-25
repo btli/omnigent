@@ -7713,6 +7713,53 @@ def test_sanitize_hook_failure_detail_strips_extended_ansi(sequence: str) -> Non
 
 
 @pytest.mark.parametrize(
+    ("mutation", "mutation_name"),
+    [("\u200b", "ignorable-separator"), ("\u0338", "combining-mark")],
+    ids=["ignorable-separator", "combining-mark"],
+)
+@pytest.mark.parametrize(
+    ("secret", "separator_index", "combining_index", "expected"),
+    [
+        ("Bearer abcdefghijk", 11, 11, "launch rejected Bearer [REDACTED]"),
+        ("".join(("dapi", "FAKE", "TEST", "0123456789")), 7, 7, "launch rejected [REDACTED]"),
+        (
+            "".join(("xoxb", "-", "FAKE", "-", "TEST", "-", "TOKEN")),
+            9,
+            9,
+            "launch rejected [REDACTED]",
+        ),
+        (
+            "".join(("ghp_", "FAKE", "TEST", "TOKEN", "PLACEHOLDER")),
+            12,
+            12,
+            "launch rejected [REDACTED]",
+        ),
+        ("".join(("AKIA", "FAKE", "TEST", "ONLY", "0000")), 10, 10, "launch rejected [REDACTED]"),
+        ("".join(("ASIA", "FAKE", "TEST", "ONLY", "0000")), 10, 10, "launch rejected [REDACTED]"),
+        (
+            "https://alice:secret@host.example/path",
+            2,
+            2,
+            "launch rejected https://[REDACTED]@host.example/path",
+        ),
+    ],
+    ids=["bearer", "dapi", "slack", "github", "aws-akia", "aws-asia", "url-userinfo"],
+)
+def test_sanitize_hook_failure_detail_rejoins_unicode_obfuscated_secrets(
+    mutation: str,
+    mutation_name: str,
+    secret: str,
+    separator_index: int,
+    combining_index: int,
+    expected: str,
+) -> None:
+    """Exotic runs inside the shared ASCII secret alphabet cannot evade redaction."""
+    split_index = separator_index if mutation_name == "ignorable-separator" else combining_index
+    obfuscated = f"{secret[:split_index]}{mutation}{secret[split_index:]}"
+    assert _sanitize_hook_failure_detail(f"launch rejected {obfuscated}") == expected
+
+
+@pytest.mark.parametrize(
     "secret",
     [
         "ｄａｐｉａｂｃｄｅｆ０１２３４５６７８９",

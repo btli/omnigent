@@ -2819,6 +2819,9 @@ _ANSI_ESCAPE_RE = re.compile(
 _HOOK_FAILURE_FRAME_TRANSLATION = str.maketrans({"[": "(", "]": ")"})
 _HOOK_FAILURE_REDACTION_MARKER = "[REDACTED]"
 _HOOK_FAILURE_PLANTED_REDACTION_RE = re.compile(r"(?i)\[REDACTED\]")
+_HOOK_FAILURE_ASCII_SECRET_ALPHABET = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~+/=-:@%"
+)
 
 
 def _raw_hook_failure_window(text: str) -> tuple[str, bool]:
@@ -2838,9 +2841,52 @@ def _raw_hook_failure_window(text: str) -> tuple[str, bool]:
     return "\n".join(part.strip() for part in (head, tail) if part.strip()), True
 
 
+def _is_hook_failure_exotic_separator(char: str) -> bool:
+    """Return whether *char* may invisibly split an ASCII secret shape."""
+    if char in {" ", "\n"}:
+        return False
+    category = unicodedata.category(char)
+    variation_selector = "\ufe00" <= char <= "\ufe0f" or "\U000e0100" <= char <= "\U000e01ef"
+    return (
+        char.isspace()
+        or category in {"Cc", "Cf", "Cs", "Mn"}
+        or variation_selector
+        or not char.isprintable()
+    )
+
+
 def _canonicalize_hook_failure_detail(text: str) -> str:
     """Build the normalized text used for both secret matching and output."""
-    normalized = unicodedata.normalize("NFKC", text.replace("\r\n", "\n").replace("\r", "\n"))
+    line_normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    rejoined: list[str] = []
+    index = 0
+    while index < len(line_normalized):
+        char = line_normalized[index]
+        if _is_hook_failure_exotic_separator(char):
+            run_end = index + 1
+            while run_end < len(line_normalized) and _is_hook_failure_exotic_separator(
+                line_normalized[run_end]
+            ):
+                run_end += 1
+            ascii_bounded = (
+                index > 0
+                and run_end < len(line_normalized)
+                and line_normalized[index - 1] in _HOOK_FAILURE_ASCII_SECRET_ALPHABET
+                and line_normalized[run_end] in _HOOK_FAILURE_ASCII_SECRET_ALPHABET
+            )
+            combining_run = all(
+                unicodedata.category(run_char) == "Mn"
+                for run_char in line_normalized[index:run_end]
+            )
+            if not combining_run or ascii_bounded:
+                if not rejoined or rejoined[-1] not in {" ", "\n"}:
+                    rejoined.append(" ")
+                index = run_end
+                continue
+        rejoined.append(char)
+        index += 1
+
+    normalized = unicodedata.normalize("NFKC", "".join(rejoined))
     canonical: list[str] = []
     for char in normalized:
         if char == "\n":

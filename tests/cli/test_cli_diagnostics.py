@@ -389,6 +389,57 @@ def test_redact_secrets_scrubs_opaque_shapes(secret: str) -> None:
 
 
 @pytest.mark.parametrize(
+    ("secret", "split_index", "expected"),
+    [
+        ("Bearer abcdefghijk", 11, "Bearer [REDACTED]"),
+        ("".join(("dapi", "FAKE", "TEST", "0123456789")), 7, "[REDACTED]"),
+        ("".join(("xoxb", "-", "FAKE", "-", "TEST", "-", "TOKEN")), 9, "[REDACTED]"),
+        ("".join(("ghp_", "FAKE", "TEST", "TOKEN", "PLACEHOLDER")), 12, "[REDACTED]"),
+        ("".join(("AKIA", "FAKE", "TEST", "ONLY", "0000")), 10, "[REDACTED]"),
+        ("".join(("ASIA", "FAKE", "TEST", "ONLY", "0000")), 10, "[REDACTED]"),
+    ],
+    ids=["bearer", "dapi", "slack", "github", "aws-akia", "aws-asia"],
+)
+def test_redact_secrets_allows_one_bounded_interior_space(
+    secret: str,
+    split_index: int,
+    expected: str,
+) -> None:
+    """One canonical separator inside a secret shape cannot evade redaction."""
+    spaced = f"{secret[:split_index]} {secret[split_index:]}"
+    assert cli_diagnostics.redact_secrets(spaced) == expected
+
+
+@pytest.mark.parametrize(
+    ("secret", "split_index"),
+    [
+        ("Bearer abcdefghijk", 11),
+        ("".join(("dapi", "FAKE", "TEST", "0123456789")), 7),
+        ("".join(("xoxb", "-", "FAKE", "-", "TEST", "-", "TOKEN")), 9),
+        ("".join(("ghp_", "FAKE", "TEST", "TOKEN", "PLACEHOLDER")), 12),
+        ("".join(("AKIA", "FAKE", "TEST", "ONLY", "0000")), 10),
+        ("".join(("ASIA", "FAKE", "TEST", "ONLY", "0000")), 10),
+    ],
+    ids=["bearer", "dapi", "slack", "github", "aws-akia", "aws-asia"],
+)
+def test_redact_secrets_rejects_multiple_interior_spaces(
+    secret: str,
+    split_index: int,
+) -> None:
+    """Tolerance is bounded to one literal interior space."""
+    spaced = f"{secret[:split_index]}  {secret[split_index:]}"
+    assert cli_diagnostics.redact_secrets(spaced) == spaced
+
+
+def test_redact_secrets_normalizes_one_space_inside_http_scheme() -> None:
+    """A canonical separator inside a URL scheme cannot evade userinfo redaction."""
+    assert (
+        cli_diagnostics.redact_secrets("ht tps://alice:secret@host.example/path")
+        == "https://[REDACTED]@host.example/path"
+    )
+
+
+@pytest.mark.parametrize(
     "text",
     [
         "GET https://app.example.com:8443?login_hint=alice@example.com failed 302",
