@@ -3684,14 +3684,18 @@ function ConversationRow({
   const ownsPointer = gesture.phase === "armed" || gesture.phase === "drag";
   // Chrome samples touch-action at pointerdown, so a direction granted to the
   // browser is lost to the recognizer for the whole stream — cede only the
-  // inert horizontal direction, never one with a configured action.
+  // inert horizontal direction, never one with a configured action. CSS pan
+  // directions name the SCROLL direction, the reverse of finger travel
+  // (Chromium requires kPanLeft for deltaX>0, i.e. a rightward finger), so a
+  // left action — fired by a leftward finger = a rightward pan — must
+  // withhold pan-right and may cede pan-left, and vice versa.
   const swipeTouchAction = !swipeEnabled
     ? undefined
     : swipeActions.left !== "none" && swipeActions.right !== "none"
       ? "touch-pan-y"
       : swipeActions.left !== "none"
-        ? "touch-pan-y touch-pan-right"
-        : "touch-pan-y touch-pan-left";
+        ? "touch-pan-y touch-pan-left"
+        : "touch-pan-y touch-pan-right";
 
   return (
     // Drag props on the <li> so the whole row is grabbable; `isDragging` dims
@@ -3914,12 +3918,11 @@ function ConversationRow({
                   size="icon-xs"
                   aria-label="Conversation actions"
                   data-testid="conversation-actions"
-                  // On mobile (no hover state) it's always visible. On desktop it
-                  // stays hidden until hover / keyboard focus, with `aria-expanded`
-                  // keeping it surfaced while the menu is open so the trigger
-                  // doesn't vanish under the cursor.
+                  // The chat header owns these actions on mobile. On desktop the
+                  // row trigger appears on hover, focus, or while its menu is open.
                   className={cn(
                     "text-muted-foreground transition-opacity",
+                    "hidden md:inline-flex",
                     "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
                     "md:aria-expanded:opacity-100",
                   )}
