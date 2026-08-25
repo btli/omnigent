@@ -222,6 +222,80 @@ class MainActivityTest {
         assertEquals(origin, shadowOf(activity.webView()).lastLoadedUrl)
     }
 
+    @Test
+    fun `stale exchange result for a switched-away origin leaves the current flow alone`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect(DATABRICKS_ORIGIN)
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        val webView = shadowOf(activity.webView())
+        // The current origin's own login is in flight when the exchange an old
+        // origin started (before the server switch) finally reports back.
+        activity.authTabFlow.begin(DATABRICKS_ORIGIN, activity.packageName)
+        val loadedBefore = webView.lastLoadedUrl
+        val stale =
+            AuthTabFlow.Outcome.ExchangePost(
+                origin = "https://previous.example.net",
+                code = "one-time-code-1234",
+                state = "stale-state",
+                verifier = "stale-verifier",
+            )
+
+        activity.onExchangeResult(stale, null)
+
+        assertTrue(activity.authTabFlow.inFlight)
+        assertFalse(activity.authTabFellBack)
+        assertEquals(loadedBefore, webView.lastLoadedUrl)
+    }
+
+    @Test
+    fun `failed exchange for the current origin abandons the flow and falls back`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect(DATABRICKS_ORIGIN)
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        activity.authTabFlow.begin(DATABRICKS_ORIGIN, activity.packageName)
+        val failed =
+            AuthTabFlow.Outcome.ExchangePost(
+                origin = DATABRICKS_ORIGIN,
+                code = "one-time-code-1234",
+                state = "flow-state",
+                verifier = "flow-verifier",
+            )
+
+        activity.onExchangeResult(failed, null)
+
+        assertFalse(activity.authTabFlow.inFlight)
+        assertTrue(activity.authTabFellBack)
+        assertEquals(DATABRICKS_ORIGIN, shadowOf(activity.webView()).lastLoadedUrl)
+    }
+
+    @Test
+    fun `cookie write landing after a server switch does not reload the old origin`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect(CUSTOM_ORIGIN)
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        val webView = shadowOf(activity.webView())
+        val loadedBefore = webView.lastLoadedUrl
+
+        // The async setCookie callback carries the origin captured when the
+        // write started; the pinned origin has since moved on.
+        activity.onSessionCookieWritten(
+            "https://previous.example.net",
+            "ap_session",
+            accepted = true,
+        )
+
+        assertEquals(loadedBefore, webView.lastLoadedUrl)
+    }
+
+    @Test
+    fun `cookie write for the pinned origin reloads it`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("$CUSTOM_ORIGIN/workspace")
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        val webView = shadowOf(activity.webView())
+        assertEquals("$CUSTOM_ORIGIN/workspace", webView.lastLoadedUrl)
+
+        activity.onSessionCookieWritten(CUSTOM_ORIGIN, "ap_session", accepted = true)
+
+        assertEquals(CUSTOM_ORIGIN, webView.lastLoadedUrl)
+    }
+
     private fun MainActivity.webView(): WebView =
         MainActivity::class
             .java
