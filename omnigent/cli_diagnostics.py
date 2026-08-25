@@ -143,7 +143,6 @@ _CREDENTIAL_ANCHORS_BY_INITIAL: dict[str, tuple[tuple[str, str, bool], ...]] = {
 _CREDENTIAL_ANCHOR_INITIAL_RE = re.compile(r"[gdxAsbB]")
 _CREDENTIAL_ANCHOR_INITIAL_WITHOUT_BEARER_RE = re.compile(r"[gdxAs]")
 _AUTHORIZATION_INITIAL_RE = re.compile(r"[aA]")
-_MAX_CREDENTIAL_SPLITTER_RUN = 64
 _ENV_CREDENTIAL_ANCHOR_RE = re.compile(r"(?<!\w)\w*(?i:token|api_key|secret|password)[ \t]*[:=]")
 _BEARER_ALPHABET_RE = r"[A-Za-z0-9._~+/=-]"
 # Removing every non-gap splitter makes this a conservative impossibility
@@ -188,20 +187,16 @@ def _interleaved_anchor_end(
     casefold: bool,
 ) -> int | None:
     """Match *literal* while absorbing every non-boundary splitter between characters."""
-    if start > 0 and (text[start - 1].isalnum() or text[start - 1] == "_"):
+    if start > 0 and (_is_ascii_credential_character(text[start - 1]) or text[start - 1] == "_"):
         return None
     index = start
     for expected in literal:
-        splitter_run = 0
         while index < len(text):
             char = text[index]
             if _anchor_character_matches(char, expected, casefold=casefold):
                 index += 1
                 break
             if char in "\r\n" or _is_word_gap(char) or _is_ascii_credential_character(char):
-                return None
-            splitter_run += 1
-            if splitter_run > _MAX_CREDENTIAL_SPLITTER_RUN:
                 return None
             index += 1
         else:
@@ -256,7 +251,6 @@ def _credential_span_end(
     index = start
     alphabet_count = 0
     word_gaps = 0
-    splitter_run = 0
     while index < len(text):
         char = text[index]
         if char in "\r\n":
@@ -269,19 +263,13 @@ def _credential_span_end(
         )
         if in_alphabet:
             alphabet_count += 1
-            splitter_run = 0
             index += 1
             continue
+        if alphabet_count >= minimum:
+            break
         if char in _WORD_GAP_CHARACTERS:
-            if alphabet_count >= minimum:
-                break
             word_gaps += 1
-            splitter_run = 0
             if word_gaps > _MAX_CREDENTIAL_WORD_GAPS:
-                break
-        else:
-            splitter_run += 1
-            if splitter_run > _MAX_CREDENTIAL_SPLITTER_RUN:
                 break
         index += 1
     return index if alphabet_count >= minimum else None

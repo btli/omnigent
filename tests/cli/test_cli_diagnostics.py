@@ -326,8 +326,8 @@ def test_redact_secrets_does_not_fold_bare_newline_after_authorization_colon() -
     ("text", "expected"),
     [
         ("Authorization: Bearer abcdefghijk, retrying", "Authorization: [REDACTED]"),
-        ("(bearer abcdefghijk)", "(bearer [REDACTED]"),
-        ('"bearer abcdefghijk"', '"bearer [REDACTED]'),
+        ("(bearer abcdefghijk)", "(bearer [REDACTED])"),
+        ('"bearer abcdefghijk"', '"bearer [REDACTED]"'),
     ],
     ids=["authorization-comma", "parenthesized", "quoted"],
 )
@@ -420,10 +420,44 @@ def test_redact_secrets_absorbs_nonspace_splitters_inside_anchors(secret: str) -
     assert cli_diagnostics.redact_secrets(secret).endswith("[REDACTED]")
 
 
-def test_redact_secrets_absorbs_splitter_and_body_after_length_floor() -> None:
-    """A non-boundary splitter after the body floor cannot expose the tail."""
-    secret = "ghp_" + "A" * 20 + "\u2800abcdefghijklmnopqrstuvwxyz0123456789"
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "g" + "\u2800" * 65 + "hp_" + "A" * 20,
+        "g" + "hp_" + "A" * 10 + "\u2800" * 65 + "A" * 10,
+    ],
+    ids=["anchor", "body"],
+)
+def test_redact_secrets_absorbs_long_nonspace_splitter_runs(secret: str) -> None:
+    """A splitter run longer than the former cap remains inside the credential."""
     assert cli_diagnostics.redact_secrets(secret) == "[REDACTED]"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "\u03bb" + "g" + "hp_" + "A" * 20,
+        "\u00e9Bearer " + "a" * 11,
+    ],
+    ids=["github", "bearer"],
+)
+def test_redact_secrets_ignores_non_ascii_letter_before_anchor(text: str) -> None:
+    """A non-ASCII letter cannot shield an ASCII credential anchor."""
+    assert cli_diagnostics.redact_secrets(text).endswith("[REDACTED]")
+
+
+def test_redact_secrets_stops_at_splitter_after_length_floor() -> None:
+    """A non-boundary splitter after the body floor preserves the diagnostic tail."""
+    suffix = "\u2800abcdefghijklmnopqrstuvwxyz0123456789"
+    secret = "g" + "hp_" + "A" * 20 + suffix
+    assert cli_diagnostics.redact_secrets(secret) == "[REDACTED]" + suffix
+
+
+def test_redact_secrets_preserves_punctuation_delimited_suffix() -> None:
+    """Diagnostic punctuation and fields after a complete credential remain visible."""
+    suffix = ";status=401;reason=expired"
+    text = "g" + "hp_" + "A" * 20 + suffix
+    assert cli_diagnostics.redact_secrets(text) == "[REDACTED]" + suffix
 
 
 @pytest.mark.parametrize(
