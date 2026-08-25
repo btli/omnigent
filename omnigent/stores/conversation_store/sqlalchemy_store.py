@@ -22,7 +22,7 @@ from sqlalchemy import (
     text,
     update,
 )
-from sqlalchemy.orm import QueryableAttribute, Session, load_only
+from sqlalchemy.orm import QueryableAttribute, Session, aliased, load_only
 from sqlalchemy.sql.selectable import Subquery
 
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
@@ -2523,7 +2523,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """
-        from omnigent.server.auth import LEVEL_OWNER
+        from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 
         sort_col = self._resolve_sort_column(sort_by)
         is_desc = order == "desc"
@@ -2699,6 +2699,42 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationLabel.key == PROJECT_LABEL_KEY,
                 )
                 if project == "":
+                    owner_permission = aliased(SqlSessionPermission)
+                    has_owner = (
+                        select(owner_permission.conversation_id)
+                        .where(
+                            owner_permission.workspace_id == SqlConversationMetadata.workspace_id,
+                            owner_permission.conversation_id == SqlConversationMetadata.id,
+                            owner_permission.level >= LEVEL_OWNER,
+                        )
+                        .exists()
+                    )
+                    has_matching_owner = (
+                        select(owner_permission.conversation_id)
+                        .where(
+                            owner_permission.workspace_id == SqlConversationMetadata.workspace_id,
+                            owner_permission.conversation_id == SqlConversationMetadata.id,
+                            owner_permission.level >= LEVEL_OWNER,
+                            or_(
+                                owner_permission.user_id == SqlProject.user_id,
+                                and_(
+                                    owner_permission.user_id == RESERVED_USER_LOCAL,
+                                    SqlProject.user_id.is_(None),
+                                ),
+                            ),
+                        )
+                        .exists()
+                    )
+                    project_owner_matches = or_(
+                        has_matching_owner,
+                        and_(
+                            ~has_owner,
+                            or_(
+                                SqlProject.user_id.is_(None),
+                                SqlProject.user_id == RESERVED_USER_LOCAL,
+                            ),
+                        ),
+                    )
                     if self._conv_engine is self._engine:
                         stmt = stmt.outerjoin(
                             SqlConversationMetadata,
@@ -2712,6 +2748,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                             and_(
                                 SqlProject.workspace_id == SqlConversationMetadata.workspace_id,
                                 SqlProject.id == SqlConversationMetadata.project_id,
+                                project_owner_matches,
                             ),
                         )
                         stmt = stmt.where(
@@ -2732,6 +2769,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                                     SqlProject.workspace_id
                                     == SqlConversationMetadata.workspace_id,
                                     SqlProject.id == SqlConversationMetadata.project_id,
+                                    project_owner_matches,
                                 ),
                             )
                             .where(
