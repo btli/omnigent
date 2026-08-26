@@ -100,10 +100,19 @@ describe("modal WebAuthn timeout", () => {
 
   it("leaves an allow-listed roaming-key ceremony completely untouched", async () => {
     const originalRequest = new Promise(() => {});
-    const { credentials } = installGuard(() => originalRequest, 10);
+    const { report, credentials } = installGuard(() => originalRequest, 1);
     const request = credentials.get({ publicKey: { allowCredentials: [{ id: "usb" }] } });
 
     assert.equal(request, originalRequest);
+    assert.equal(
+      await Promise.race([
+        report.then(() => "armed"),
+        new Promise((resolve) => {
+          setTimeout(() => resolve("untouched"), 10);
+        }),
+      ]),
+      "untouched",
+    );
   });
 
   it("leaves conditional mediation untouched", async () => {
@@ -153,6 +162,31 @@ describe("modal WebAuthn timeout", () => {
     });
 
     assert.equal(notifications, 1);
+  });
+
+  it("surfaces a rejected timeout handler without an unhandled rejection", async () => {
+    const listeners = new Map();
+    const webContents = {
+      on: (eventName, listener) => listeners.set(eventName, listener),
+      executeJavaScript: async () => ({ timedOut: true }),
+    };
+    const failure = new Error("dialog failed");
+    const errors = [];
+    const originalConsoleError = console.error;
+    console.error = (...args) => errors.push(args);
+    try {
+      registerWebAuthnTimeout(webContents, {
+        onTimeout: async () => {
+          throw failure;
+        },
+      });
+
+      await listeners.get("did-finish-load")();
+    } finally {
+      console.error = originalConsoleError;
+    }
+
+    assert.deepEqual(errors, [["[omnigent] WebAuthn timeout handling failed", failure]]);
   });
 
   it("does not inject into ordinary server pages", async () => {

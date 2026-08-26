@@ -1627,7 +1627,13 @@ function createWindow(targetUrl, opts = {}) {
         : null;
     },
     async ({ serverUrl: expiredServerUrl, returnUrl }) => {
-      await loadServerUrl(win, expiredServerUrl, undefined, returnUrl);
+      const loaded = await loadServerUrl(win, expiredServerUrl, undefined, returnUrl);
+      if (!loaded) {
+        await loadSetupPage(win, {
+          error: "Your session expired and sign-in did not complete.",
+          url: expiredServerUrl,
+        });
+      }
     },
   );
 
@@ -1647,7 +1653,7 @@ function createWindow(targetUrl, opts = {}) {
         state?.authenticationNavigation === true,
       );
     },
-    onTimeout: () => void showWebAuthnTimeout(win),
+    onTimeout: () => showWebAuthnTimeout(win),
   });
 
   registerNavigationFallbacks(win);
