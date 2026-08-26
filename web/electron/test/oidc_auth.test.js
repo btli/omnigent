@@ -1,5 +1,6 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
+const { workspaceIdentityKey } = require("../src/url");
 
 const {
   oidcServerUrlError,
@@ -9,6 +10,7 @@ const {
   runOidcBrowserLogin,
   sessionCookieDetails,
   isSessionCookieOwnershipError,
+  navigateWithSessionCookieWorkspace,
   installAndVerifySessionCookie,
 } = require("../src/oidc_auth");
 
@@ -165,6 +167,75 @@ describe("OIDC provider detection", () => {
       kind: "oidc",
       status: 401,
     });
+    assert.deepEqual(removals, [{ url: workspaceA, name: "__Host-ap_session" }]);
+  });
+
+  it("does not credit a repinned window's cookie to its former workspace", async () => {
+    const workspaceA = "https://dbc-a.cloud.databricks.com/omnigent?o=workspace-a";
+    const workspaceB = "https://dbc-a.cloud.databricks.com/omnigent?o=workspace-b";
+    let pinnedIdentity = workspaceIdentityKey(workspaceA);
+    let stored = null;
+    let cookieChanged;
+    const removals = [];
+    const electronSession = {
+      cookies: {
+        get: async () => (stored ? [{ ...stored }] : []),
+        remove: async (url, name) => {
+          removals.push({ url, name });
+          stored = null;
+        },
+        on: (eventName, listener) => {
+          if (eventName === "changed") cookieChanged = listener;
+        },
+      },
+      fetch: async () => (stored ? response(200) : response(401, { login_url: "/auth/login" })),
+    };
+    const currentWorkspaceIdentity = () => pinnedIdentity;
+
+    await navigateWithSessionCookieWorkspace(electronSession, workspaceA, async () => {}, {
+      recordCookieAfterNavigation: true,
+      currentWorkspaceIdentity,
+    });
+    pinnedIdentity = workspaceIdentityKey(workspaceB);
+    stored = {
+      name: "__Host-ap_session",
+      value: "workspace-b-token",
+      domain: "dbc-a.cloud.databricks.com",
+      path: "/",
+      httpOnly: true,
+      secure: true,
+      sameSite: "lax",
+    };
+    cookieChanged?.({}, { ...stored }, "explicit", false);
+
+    assert.deepEqual(
+      await probeServerAuth(electronSession, workspaceA),
+      { kind: "oidc", status: 401 },
+      "workspace A must not own the cookie minted after the window moved to B",
+    );
+
+    await navigateWithSessionCookieWorkspace(
+      electronSession,
+      workspaceB,
+      async () => {
+        stored = {
+          name: "__Host-ap_session",
+          value: "workspace-b-token",
+          domain: "dbc-a.cloud.databricks.com",
+          path: "/",
+          httpOnly: true,
+          secure: true,
+          sameSite: "lax",
+        };
+      },
+      { recordCookieAfterNavigation: true, currentWorkspaceIdentity },
+    );
+
+    assert.deepEqual(
+      await probeServerAuth(electronSession, workspaceB),
+      { kind: "authenticated", status: 200 },
+      "workspace B must retain the cookie it established",
+    );
     assert.deepEqual(removals, [{ url: workspaceA, name: "__Host-ap_session" }]);
   });
 

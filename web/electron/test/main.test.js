@@ -670,6 +670,7 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
           serverAuthEntry: () => assert.fail("read cached OIDC auth"),
         },
         pinWindow: () => {},
+        pinnedWorkspaceIdentity: () => workspaceIdentityKey(serverUrl),
         probeServerAuth,
         runOidcBrowserLogin: async () => assert.fail("started OIDC browser login"),
         runOidcLoginDialog: async () => assert.fail("opened OIDC login dialog"),

@@ -1310,7 +1310,10 @@ async function loadAuthenticatedServerUrl(win, serverUrl, routePath, exactLoadUr
     session.defaultSession,
     serverUrl,
     () => win.loadURL(destination),
-    { recordCookieAfterNavigation: state?.cookieEstablishmentNavigation === true },
+    {
+      recordCookieAfterNavigation: state?.cookieEstablishmentNavigation === true,
+      currentWorkspaceIdentity: () => pinnedWorkspaceIdentity(win),
+    },
   );
   if (state) state.cookieEstablishmentNavigation = false;
 }
