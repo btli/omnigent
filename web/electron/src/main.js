@@ -2712,7 +2712,7 @@ function registerIpc() {
             "You remain connected to the current server. Try switching again.",
           buttons: ["OK"],
         });
-        throw error;
+        return;
       }
       if (!loaded || ephemeral) return;
       const settings = loadSettings();

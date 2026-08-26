@@ -1524,7 +1524,7 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
       windows,
     });
 
-    await assert.rejects(handler({ sender: {} }, target), isSessionCookieOwnershipError);
+    await handler({ sender: {} }, target);
 
     assert.equal(settings.server_url, current);
     assert.equal(settingsWrites, 0);
