@@ -269,7 +269,9 @@ async function localServerHealthy(timeoutMs = 1500) {
   if (!rec || !isPidAlive(rec.pid)) return null;
   const localUrl = `http://127.0.0.1:${rec.port}`;
   try {
-    const resp = await fetch(`${localUrl}/health`, { signal: AbortSignal.timeout(timeoutMs) });
+    const resp = await fetch(url.joinServerUrl(localUrl, "/health"), {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
     if (resp.ok) return { url: localUrl, pid: rec.pid, port: rec.port };
   } catch {
     // Refused / unreachable / timed out → not a healthy server we can reuse.
@@ -785,8 +787,7 @@ async function probeHostTunnel(serverUrl, hostId, { timeoutMs = 2000 } = {}) {
   if (token) headers.Authorization = `Bearer ${token}`;
   else if (!isLoopbackServer(serverUrl))
     return { status: null, reachable: false, authMissing: true };
-  const base = serverUrl.replace(/\/+$/, "");
-  const target = `${base}/v1/hosts/${encodeURIComponent(hostId)}`;
+  const target = url.joinServerUrl(serverUrl, `/v1/hosts/${encodeURIComponent(hostId)}`);
   try {
     const resp = await fetch(target, { headers, signal: AbortSignal.timeout(timeoutMs) });
     if (!resp.ok) return { status: null, reachable: true, authMissing: false };
@@ -830,9 +831,8 @@ async function probeServerAuth(serverUrl, { timeoutMs = 10000 } = {}) {
   const headers = {};
   const token = bearerTokenFor(serverUrl);
   if (token) headers.Authorization = `Bearer ${token}`;
-  const base = serverUrl.replace(/\/+$/, "");
   try {
-    const resp = await fetch(`${base}/v1/me`, {
+    const resp = await fetch(url.joinServerUrl(serverUrl, "/v1/me"), {
       headers,
       redirect: "manual",
       signal: AbortSignal.timeout(timeoutMs),
