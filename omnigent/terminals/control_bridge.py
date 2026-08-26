@@ -654,7 +654,7 @@ async def bridge_tmux_control_to_websocket(
         """Re-emit the visible pane after output was dropped."""
         snapshot = await _capture_pane_snapshot(socket_path, tmux_target)
         if snapshot is not None:
-            output_chunks.put_nowait(snapshot)
+            output_chunks.put_snapshot_nowait(snapshot)
 
     repainter = _GapRepainter(_emit_pane_snapshot)
     output_chunks.on_drop = repainter.request

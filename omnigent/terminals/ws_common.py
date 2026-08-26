@@ -101,17 +101,45 @@ class _ByteBoundedOutputQueue(asyncio.Queue[bytes | None]):
             self.on_drop()
 
     def put_nowait(self, item: bytes | None) -> None:
+        if item is None:
+            super().put_nowait(item)
+            return
+        gap_bytes = len(_OUTPUT_GAP_RESYNC) if self._in_gap else 0
+        added_items = 2 if self._in_gap else 1
         if (
-            item is not None
-            and self.qsize() > 0
-            and (self.queued_bytes + len(item) > self.max_bytes or self.qsize() >= self.max_items)
+            gap_bytes + len(item) > self.max_bytes
+            or self.queued_bytes + gap_bytes + len(item) > self.max_bytes
+            or self.qsize() + added_items > self.max_items
         ):
             self.record_dropped_output(len(item))
             return
-        if self._in_gap and item is not None:
-            self._in_gap = False
+        if self._in_gap:
             super().put_nowait(_OUTPUT_GAP_RESYNC)
+        self._in_gap = False
         super().put_nowait(item)
+
+    def put_snapshot_nowait(self, snapshot: bytes) -> None:
+        """Prioritize a full repaint by evicting stale queued output."""
+        while True:
+            gap_bytes = len(_OUTPUT_GAP_RESYNC) if self._in_gap else 0
+            added_items = 2 if self._in_gap else 1
+            if gap_bytes + len(snapshot) > self.max_bytes or added_items > self.max_items:
+                self.record_dropped_output(len(snapshot))
+                return
+            if (
+                self.queued_bytes + gap_bytes + len(snapshot) <= self.max_bytes
+                and self.qsize() + added_items <= self.max_items
+            ):
+                if self._in_gap:
+                    super().put_nowait(_OUTPUT_GAP_RESYNC)
+                self._in_gap = False
+                super().put_nowait(snapshot)
+                return
+            discarded = self.get_nowait()
+            if discarded is None:
+                super().put_nowait(None)
+                return
+            self.record_dropped_output(len(discarded))
 
 
 class _GapRepainter:
