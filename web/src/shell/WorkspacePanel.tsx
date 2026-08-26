@@ -12,7 +12,14 @@ import {
   TerminalIcon,
   XIcon,
 } from "lucide-react";
-import { type ReactElement, useCallback, useEffect, useRef, useState } from "react";
+import {
+  type CSSProperties,
+  type ReactElement,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { cn } from "@/lib/utils";
 import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
@@ -723,8 +730,13 @@ export function WorkspacePanel({
         maximized ? "md:absolute md:inset-0" : "md:shrink-0",
       )}
       // Width is fixed by the resize handle normally; maximized ignores it and
-      // stretches to the absolute inset instead.
-      style={maximized ? undefined : { width }}
+      // stretches to the absolute inset instead. The width doubles as the
+      // reservation index.css caps the rail's lateral safe-area insets to.
+      style={
+        maximized
+          ? undefined
+          : ({ width, "--omnigent-reserved-width": `${width}px` } as CSSProperties)
+      }
     >
       {/* Left-edge horizontal resize handle — suppressed while maximized. */}
       {!maximized && (

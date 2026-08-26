@@ -222,13 +222,19 @@ function withStyle(css: string, assertions: () => void): void {
   }
 }
 
-/** The four safe-area vars must land on the element's padding, edge for edge. */
+/** The four safe-area vars must land on the element's padding, edge for edge.
+ * Lateral edges are min()-capped to the surface's published reservation (see
+ * the sliver-rail suite); without the var the cap falls back to the full inset. */
 function expectSafeAreaPadding(element: HTMLElement): void {
   const computed = getComputedStyle(element);
   expect(computed.paddingTop).toBe("var(--omnigent-safe-top)");
   expect(computed.paddingBottom).toBe("var(--omnigent-safe-bottom)");
-  expect(computed.paddingLeft).toBe("var(--omnigent-safe-left)");
-  expect(computed.paddingRight).toBe("var(--omnigent-safe-right)");
+  expect(computed.paddingLeft).toBe(
+    "min(var(--omnigent-safe-left), var(--omnigent-lateral-inset-cap))",
+  );
+  expect(computed.paddingRight).toBe(
+    "min(var(--omnigent-safe-right), var(--omnigent-lateral-inset-cap))",
+  );
 }
 
 /** The rule must leave the element alone — all four padding edges stay 0. */
@@ -489,6 +495,23 @@ describe("index.css native safe-area layout on the rendered WorkspacePanel", () 
     // ghost bg-card strip along the screen edge on native shells.
     expect(renderRail(0).hasAttribute("data-collapsed")).toBe(true);
     expect(renderRail(320).hasAttribute("data-collapsed")).toBe(false);
+  });
+
+  it("caps a sliver rail's lateral insets at what its reservation can absorb", () => {
+    withStyle(nativePanelRule, () => {
+      // 40px reserves less than a typical landscape cutout's inset sum; with
+      // uncapped lateral padding the border-box floor would render the rail
+      // wider than the width the layout reserved for it.
+      const rail = renderRail(40);
+      expect(rail.style.width).toBe("40px");
+      expect(rail.style.getPropertyValue("--omnigent-reserved-width")).toBe("40px");
+      const computed = getComputedStyle(rail);
+      // jsdom strips whitespace inside custom-property values; compare bare.
+      expect(computed.getPropertyValue("--omnigent-lateral-inset-cap").replace(/\s/g, "")).toBe(
+        "calc(var(--omnigent-reserved-width,100000px)/2)",
+      );
+      expectSafeAreaPadding(rail);
+    });
   });
 });
 
