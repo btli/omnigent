@@ -60,6 +60,51 @@ describe("OIDC provider detection", () => {
     assert.equal(calls[0].init.redirect, "manual");
     assert.equal(calls[0].init.credentials, "include");
   });
+
+  it("clears a same-host workspace cookie before probing another organization", async () => {
+    let stored = { name: "__Host-ap_session", value: "workspace-a-token" };
+    const removals = [];
+    const fetches = [];
+    const electronSession = {
+      cookies: {
+        remove: async (url, name) => {
+          removals.push({ url, name });
+          stored = null;
+        },
+      },
+      fetch: async (url) => {
+        fetches.push({ url, cookie: stored?.value ?? null });
+        return stored ? response(200) : response(401, { login_url: "/auth/login" });
+      },
+    };
+    const workspaceA = "https://dbc-a.cloud.databricks.com/omnigent?o=workspace-a";
+    const workspaceB = "https://dbc-a.cloud.databricks.com/omnigent?o=workspace-b";
+
+    assert.deepEqual(await probeServerAuth(electronSession, workspaceA), {
+      kind: "authenticated",
+      status: 200,
+    });
+    assert.deepEqual(await probeServerAuth(electronSession, workspaceB), {
+      kind: "oidc",
+      status: 401,
+    });
+    assert.deepEqual(fetches, [
+      {
+        url: "https://dbc-a.cloud.databricks.com/omnigent/v1/me?o=workspace-a",
+        cookie: "workspace-a-token",
+      },
+      {
+        url: "https://dbc-a.cloud.databricks.com/omnigent/v1/me?o=workspace-b",
+        cookie: null,
+      },
+    ]);
+    assert.deepEqual(removals, [
+      {
+        url: workspaceB,
+        name: "__Host-ap_session",
+      },
+    ]);
+  });
 });
 
 describe("OIDC browser ticket flow", () => {
@@ -318,7 +363,7 @@ describe("OIDC browser ticket flow", () => {
       response(200, { token: "session-jwt" }),
     ];
     const opened = [];
-    const serverUrl = "https://dbc-a.cloud.databricks.com/omnigent?o=123456789";
+    const serverUrl = "https://dbc-a.cloud.databricks.com/omnigent?o=team%2Fblue";
 
     const result = await runOidcBrowserLogin(
       {
@@ -335,14 +380,14 @@ describe("OIDC browser ticket flow", () => {
     assert.deepEqual(result, { ok: true, token: "session-jwt" });
     assert.equal(
       calls[0],
-      "https://dbc-a.cloud.databricks.com/omnigent/auth/cli-login?o=123456789",
+      "https://dbc-a.cloud.databricks.com/omnigent/auth/cli-login?o=team%2Fblue",
     );
     assert.deepEqual(opened, [
-      "https://dbc-a.cloud.databricks.com/omnigent/auth/login?o=123456789&ticket=one-time",
+      "https://dbc-a.cloud.databricks.com/omnigent/auth/login?o=team%2Fblue&ticket=one-time",
     ]);
     assert.equal(
       calls[1],
-      "https://dbc-a.cloud.databricks.com/omnigent/auth/cli-poll?o=123456789&ticket=one-time",
+      "https://dbc-a.cloud.databricks.com/omnigent/auth/cli-poll?o=team%2Fblue&ticket=one-time",
     );
   });
 
@@ -645,13 +690,13 @@ describe("OIDC session cookie installation", () => {
 
   it("preserves the organization selector during cookie verification", async () => {
     const state = cookieSession(null, [response(200)]);
-    const serverUrl = "https://dbc-a.cloud.databricks.com/omnigent?o=123456789";
+    const serverUrl = "https://dbc-a.cloud.databricks.com/omnigent?o=team%2Fblue";
 
     await installAndVerifySessionCookie(state.electronSession, serverUrl, "session-jwt");
 
     assert.equal(state.getStored().url, serverUrl);
     assert.deepEqual(state.fetches, [
-      "https://dbc-a.cloud.databricks.com/omnigent/v1/me?o=123456789",
+      "https://dbc-a.cloud.databricks.com/omnigent/v1/me?o=team%2Fblue",
     ]);
   });
 

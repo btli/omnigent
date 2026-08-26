@@ -73,6 +73,20 @@ describe("modal WebAuthn timeout", () => {
       isWebAuthnEscapePage("https://server.example:444/base/login", "https://server.example/base"),
       false,
     );
+    assert.equal(
+      isWebAuthnEscapePage(
+        "https://dbc-a.cloud.databricks.com/omnigent/login?o=team%2Fblue",
+        "https://dbc-a.cloud.databricks.com/omnigent?o=team%2Fblue",
+      ),
+      true,
+    );
+    assert.equal(
+      isWebAuthnEscapePage(
+        "https://dbc-a.cloud.databricks.com/omnigent/login?o=other",
+        "https://dbc-a.cloud.databricks.com/omnigent?o=team%2Fblue",
+      ),
+      false,
+    );
   });
 
   it("reports a slow discoverable request without changing its Promise", async () => {
