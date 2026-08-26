@@ -1,7 +1,7 @@
 "use strict";
 
 const { setTimeout: delay } = require("node:timers/promises");
-const { isLoopbackServer } = require("./url");
+const { isDatabricksWorkspaceHost, isLoopbackServer } = require("./url");
 
 const AUTH_PROBE_TIMEOUT_MS = 10000;
 const OIDC_LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
@@ -14,7 +14,20 @@ const cookieMutationQueues = new WeakMap();
 // Keep API routes under workspace mounts, matching the CLI.
 function serverRoute(serverUrl, routePath) {
   if (oidcServerUrlError(serverUrl)) throw new Error("Invalid server URL.");
-  return serverUrl.replace(/\/+$/, "") + (routePath.startsWith("/") ? routePath : `/${routePath}`);
+  const destination = new URL(serverUrl);
+  const route = new URL(
+    routePath.startsWith("/") ? routePath : `/${routePath}`,
+    destination.origin,
+  );
+  destination.pathname = `${destination.pathname.replace(/\/+$/, "")}${route.pathname}`;
+  if (route.search) {
+    const routeQuery = route.search.slice(1);
+    destination.search = destination.search
+      ? `${destination.search.slice(1)}&${routeQuery}`
+      : routeQuery;
+  }
+  destination.hash = route.hash;
+  return destination.toString();
 }
 
 /** @returns {"authenticated" | "oidc" | "accounts" | "other"} */
@@ -61,12 +74,7 @@ function isUserAbort(signal) {
 }
 
 function oidcServerUrlError(serverUrl) {
-  if (
-    typeof serverUrl !== "string" ||
-    serverUrl.includes("\\") ||
-    serverUrl.includes("?") ||
-    serverUrl.includes("#")
-  ) {
+  if (typeof serverUrl !== "string" || serverUrl.includes("\\") || serverUrl.includes("#")) {
     return "invalid_server_url";
   }
   let parsed;
@@ -75,11 +83,15 @@ function oidcServerUrlError(serverUrl) {
   } catch {
     return "invalid_server_url";
   }
+  const organizationOnly =
+    isDatabricksWorkspaceHost(parsed.hostname) &&
+    [...parsed.searchParams.keys()].every((key) => key === "o");
+  if (serverUrl.includes("?") && !parsed.search) return "invalid_server_url";
+  if (parsed.search && !organizationOnly) return "invalid_server_url";
   if (
     (parsed.protocol !== "https:" && parsed.protocol !== "http:") ||
     parsed.username ||
     parsed.password ||
-    parsed.search ||
     parsed.hash
   ) {
     return "invalid_server_url";

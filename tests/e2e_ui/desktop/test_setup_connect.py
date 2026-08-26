@@ -14,12 +14,14 @@ the ``live_server`` omnigent backend.
 from __future__ import annotations
 
 import json
+import subprocess
 from collections.abc import Sequence
 from pathlib import Path
 
 from playwright.sync_api import Page, expect
 
-_SETUP_PAGE = Path(__file__).resolve().parents[3] / "web" / "electron" / "setup" / "index.html"
+_ELECTRON_DIR = Path(__file__).resolve().parents[3] / "web" / "electron"
+_SETUP_PAGE = _ELECTRON_DIR / "setup" / "index.html"
 
 # The setup page expects the Electron preload bridge (window.omnigentSetup),
 # which is absent in a plain browser. Stub it: reads feed page load, while
@@ -29,6 +31,18 @@ _PRELOAD_STUB = """
   window.__connectCalls = [];
   window.__copiedTexts = [];
   window.omnigentSetup = {
+    serverDisplayLabel: (value) => {
+      const url = new URL(value);
+      const host = url.hostname.toLowerCase();
+      const workspace = ["databricks.com", "azuredatabricks.net"].some(
+        (domain) => host === domain || host.endsWith(`.${domain}`),
+      );
+      const query = new URLSearchParams();
+      if (workspace) {
+        for (const organization of url.searchParams.getAll("o")) query.append("o", organization);
+      }
+      return `${url.host}${query.size ? `/?${query}` : ""}`;
+    },
     getServerUrl: () => Promise.resolve(""),
     getManagedServers: () => Promise.resolve(__MANAGED_SERVERS__),
     getRecentServers: () => Promise.resolve(__RECENT_SERVERS__),
@@ -164,28 +178,25 @@ def test_recent_server_connect_and_copy_actions_are_independent(page: Page) -> N
     assert page.evaluate("() => window.__connectCalls") == [recent_url]
 
 
-def test_shared_url_module_defaults_scheme_in_browser(page: Page) -> None:
-    """The shared url.js (also used by the main process) defaults the scheme.
-
-    The setup page loads ``web/electron/src/url.js`` as
-    ``window.omnigentUrl`` — the exact module the Electron main process uses to
-    normalize the URL it navigates to. Exercising it here covers the
-    main-process scheme logic the web-only e2e harness cannot otherwise reach.
+def test_shared_url_module_defaults_scheme_in_node() -> None:
+    """The main-process CommonJS URL module preserves current normalization."""
+    script = """
+      const { normalizeUrl } = require("./src/url");
+      console.log(JSON.stringify([
+        normalizeUrl("dbc-x.cloud.databricks.com/omnigent?ignored=yes&o=1965859176160743#page"),
+        normalizeUrl("localhost:6767"),
+      ]));
     """
-    _open_setup_page(page)
 
-    # Remote host → https root while retaining the Databricks organization;
-    # the main process then probes and appends the canonical /omnigent mount.
-    assert (
-        page.evaluate(
-            """() => window.omnigentUrl.normalizeUrl(
-              'dbc-x.cloud.databricks.com/omnigent?ignored=yes&o=1965859176160743#page'
-            )"""
-        )
-        == "https://dbc-x.cloud.databricks.com/?o=1965859176160743"
+    result = subprocess.run(
+        ["node", "--eval", script],
+        cwd=_ELECTRON_DIR,
+        check=True,
+        capture_output=True,
+        text=True,
     )
-    # Loopback stays http for local dev.
-    assert (
-        page.evaluate("() => window.omnigentUrl.normalizeUrl('localhost:6767')")
-        == "http://localhost:6767/"
-    )
+
+    assert json.loads(result.stdout) == [
+        "https://dbc-x.cloud.databricks.com/?o=1965859176160743",
+        "http://localhost:6767/",
+    ]

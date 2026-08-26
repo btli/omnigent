@@ -26,7 +26,7 @@ const vm = require("node:vm");
 
 const { runInNewContext } = vm;
 
-const { isSetupIdle, withServerLoad } = require("../src/server_load");
+const { isSetupIdle, loadInitialDestination, withServerLoad } = require("../src/server_load");
 const { normalizeUrl } = require("../src/url");
 const {
   oidcServerUrlError,
@@ -52,6 +52,9 @@ const oidcSessionCode = liveCode.match(
 )?.[0];
 const webAuthnTimeoutCode = liveCode.match(
   /async function showWebAuthnTimeout[\s\S]*?(?=function resolveServerPath)/,
+)?.[0];
+const resolveServerPathSource = liveCode.match(
+  /function resolveServerPath[\s\S]*?(?=async function runWindowOidcBrowserHandoff)/,
 )?.[0];
 const switchServerCode = liveCode.match(
   /ipcMain\.handle\("omnigent:switch-server"[\s\S]*?(?=ipcMain\.on\("omnigent:open-server-setup")/,
@@ -376,13 +379,48 @@ describe("managed server preference wiring", () => {
       liveCode,
       /ipcMain\.handle\("omnigent:get-managed-servers"[\s\S]{0,180}!isSetupPageSender\(event\)[\s\S]{0,180}return managedServerUrls\(\)/,
     );
+    assert.match(preloadSource, /serverDisplayLabel[,\s]/);
   });
 
-  it("preserves a managed path while still expanding bare workspace roots", () => {
-    assert.match(
-      liveCode,
-      /managedTarget\s*\?\?\s*normalizeUrl\(url\)[\s\S]{0,120}await expandDatabricksWorkspaceUrl\(normalized\)/,
+  it("returns an exact managed mount without normalizing it", async () => {
+    const managedUrl = "https://mdm.example.com/ml/omnigents";
+    const state = { ephemeral: true, serverUrl: null };
+    const win = { isDestroyed: () => false };
+    const calls = [];
+    const handlerSource = setupServerCode.slice(
+      setupServerCode.indexOf("async"),
+      setupServerCode.lastIndexOf(");"),
     );
+    const handler = runInNewContext(`(${handlerSource})`, {
+      BrowserWindow: { fromWebContents: () => win },
+      configuredServerUrlError: (_raw, normalized) => oidcServerUrlError(normalized),
+      configuredServerUrlErrorMessage: () => "Invalid server.",
+      expandDatabricksWorkspaceUrl: async (url) => {
+        calls.push(["expand", url]);
+        return url;
+      },
+      expandedServerUrlError: (url, expectedOrigin) =>
+        oidcServerUrlError(url) ??
+        (new URL(url).origin === expectedOrigin ? null : "invalid_server_url"),
+      isSetupPageSender: () => true,
+      loadServerUrl: async (_win, url) => {
+        calls.push(["load", url]);
+        return true;
+      },
+      managedServerUrls: () => [managedUrl],
+      normalizeUrl: () => assert.fail("normalized a managed mount"),
+      originOf: (url) => new URL(url).origin,
+      windows: new Map([[win, state]]),
+      withServerLoad,
+    });
+
+    const result = await handler({ sender: {} }, managedUrl);
+
+    assert.equal(result.loaded, true);
+    assert.deepEqual(calls, [
+      ["expand", managedUrl],
+      ["load", managedUrl],
+    ]);
   });
 
   it("returns managed choices in the connected-server picker", () => {
@@ -1027,6 +1065,7 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
       },
       expandDatabricksWorkspaceUrl: async () => assert.fail("expanded an invalid URL"),
       isSetupPageSender: () => true,
+      managedServerUrls: () => [],
       normalizeUrl,
       oidcServerUrlError,
       windows: new Map([[win, state]]),
@@ -1078,6 +1117,7 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
             (new URL(serverUrl).origin === expectedOrigin ? null : "invalid_server_url"),
           isSetupPageSender: () => true,
           loadServerUrl: async () => assert.fail("loaded an unsafe expanded URL"),
+          managedServerUrls: () => [],
           normalizeUrl: () => "https://workspace.example",
           originOf: (url) => new URL(url).origin,
           windows: new Map([[win, state]]),
@@ -1118,6 +1158,7 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
         return true;
       },
       loadSettings: () => ({}),
+      managedServerUrls: () => [],
       normalizeUrl: (url) => url,
       oidcServerUrlError,
       originOf: (url) => new URL(url).origin,
@@ -1148,6 +1189,7 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
       configuredServerUrlError: (_raw, normalized) => oidcServerUrlError(normalized),
       expandDatabricksWorkspaceUrl: () => expansion.promise,
       isSetupPageSender: () => true,
+      managedServerUrls: () => [],
       normalizeUrl: (url) => url,
       oidcServerUrlError,
       originOf: (url) => new URL(url).origin,
@@ -1178,6 +1220,7 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
         throw new Error("unexpected expansion");
       },
       isSetupPageSender: () => true,
+      managedServerUrls: () => [],
       normalizeUrl: (url) => url,
       oidcServerUrlError,
       originOf: (url) => new URL(url).origin,
@@ -1218,6 +1261,7 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
         return true;
       },
       loadSettings: () => ({ recent_servers: [target] }),
+      managedServerUrls: () => [],
       rememberRecentServer: () => {},
       saveSettings: () => {},
       windows: new Map([[win, state]]),
@@ -1380,6 +1424,31 @@ describe("OAuth popup COOP-strip wiring (src/main.js)", () => {
 });
 
 describe("recent-server startup wiring (src/main.js)", () => {
+  it("routes an organization-selected cold launch through the authenticated loader", async () => {
+    const serverUrl = "https://dbc-a.cloud.databricks.com/?o=123456789";
+    const destinations = [];
+    let setupLoads = 0;
+
+    assert.equal(oidcServerUrlError(serverUrl), null);
+    const loaded = await loadInitialDestination({
+      loadServer: async () => {
+        destinations.push(serverUrl);
+        return true;
+      },
+      loadSetup: async () => {
+        setupLoads += 1;
+      },
+    });
+
+    assert.equal(loaded, true);
+    assert.deepEqual(destinations, [serverUrl]);
+    assert.equal(setupLoads, 0);
+    assert.match(
+      createWindowCode,
+      /loadInitialDestination\([\s\S]{0,300}loadServerUrl\(win, serverUrl, undefined, destination/,
+    );
+  });
+
   it("backfills a saved server only after its cold load succeeds", () => {
     assert.match(
       liveCode,
@@ -1393,6 +1462,10 @@ describe("recent-server startup wiring (src/main.js)", () => {
         "(which may include a conversation path).",
       ].join(" "),
     );
+    assert.match(
+      liveCode,
+      /if\s*\(loaded\s*&&\s*!ephemeral\s*&&\s*!explicit\s*&&\s*serverUrl\)\s*\{\s*try\s*\{[\s\S]{0,200}rememberRecentServer[\s\S]{0,120}catch/,
+    );
   });
 
   it("normalizes persisted targets and excludes managed origins from setup recents", () => {
@@ -1404,11 +1477,8 @@ describe("recent-server startup wiring (src/main.js)", () => {
 });
 
 // Guard for the deep-link path join in createWindow. A basename-less SPA path
-// (/c/<id>) lives UNDER the server's workspace mount (/omnigent), so it
-// must be string-concatenated (resolveServerPath) — NOT resolved with
-// `new URL(path, serverUrl)`, which would anchor against the ORIGIN and drop
-// the mount, opening the wrong URL for every workspace deep link. This catches
-// a "simplification" the behavior tests can't (createWindow isn't unit-tested).
+// lives under the server mount, while an organization selector stays in the
+// query. resolveServerPath updates URL fields without dropping either.
 describe("deep-link path join wiring (src/main.js)", () => {
   it("joins opts.path onto opts.serverUrl via resolveServerPath as live code", () => {
     assert.match(
@@ -1416,10 +1486,22 @@ describe("deep-link path join wiring (src/main.js)", () => {
       /resolveServerPath\(serverUrl, opts\.path\)/,
       [
         "createWindow no longer joins opts.path onto opts.serverUrl via",
-        "resolveServerPath. A deep link to a workspace server (origin + /omnigent",
-        "mount) would lose the mount and 404. Restore the mount-aware join (see",
-        "resolveServerPath); do not replace it with `new URL(path, serverUrl)`.",
+        "resolveServerPath. A deep link to a workspace server would lose its",
+        "mount or organization selector. Restore the URL-aware mount join.",
       ].join(" "),
+    );
+  });
+
+  it("keeps the organization selector after a mounted deep-link path", () => {
+    assert.ok(resolveServerPathSource);
+    const resolveServerPath = runInNewContext(
+      `(() => { ${resolveServerPathSource}; return resolveServerPath; })()`,
+      { URL },
+    );
+
+    assert.equal(
+      resolveServerPath("https://dbc-a.cloud.databricks.com/omnigent?o=123456789", "/c/conv_abc"),
+      "https://dbc-a.cloud.databricks.com/omnigent/c/conv_abc?o=123456789",
     );
   });
 
