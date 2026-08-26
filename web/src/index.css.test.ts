@@ -5,9 +5,29 @@ import { readFileSync } from "node:fs";
 // lightningcss is the minifier @tailwindcss/vite runs during `vite build`
 // (resolved from its dependency tree, so we test the version the build uses).
 import { transform } from "lightningcss";
-import { describe, expect, it } from "vitest";
+import { type ComponentProps, createElement } from "react";
+import { cleanup, render } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { TooltipProvider } from "./components/ui/tooltip";
+import type * as UseTerminalsModule from "./hooks/useTerminals";
 import { UI_FONT_SIZE_DEFAULT, UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN } from "./lib/uiFontPreferences";
+import { WorkspacePanel } from "./shell/WorkspacePanel";
+
+// Rendering the real WorkspacePanel below is a layout test: stub its content
+// children and data hooks (each exercised by its own suite) so the rail
+// mounts without Monaco / xterm / query stacks.
+vi.mock("./shell/FileViewer", () => ({ FileViewer: () => null }));
+vi.mock("./shell/FilesPanel", () => ({ FilesPanel: () => null }));
+vi.mock("./shell/SubagentsPanel", () => ({ SubagentsPanel: () => null }));
+vi.mock("./components/BrowserPane/BrowserPane", () => ({ BrowserPane: () => null }));
+vi.mock("./components/blocks/TerminalView", () => ({ TerminalView: () => null }));
+vi.mock("./hooks/useTerminals", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseTerminalsModule>()),
+  useTerminals: () => ({ terminals: [], isLoading: false, error: null }),
+  useCreateTerminal: () => ({ mutate: () => {}, isPending: false, isError: false }),
+}));
+vi.mock("./hooks/useAgents", () => ({ useSessionAgent: () => ({ data: undefined }) }));
 
 // Relative to the vitest root (web/) — import.meta.url is not a file://
 // URL inside vitest's module graph, so it can't locate the file.
@@ -308,16 +328,6 @@ describe("index.css native safe-area layout", () => {
     expect(source).toMatch(/<aside[\s\S]{0,600}?aria-label="Workspace"/);
   });
 
-  it("marks the rail collapsed exactly while its inline width is starved to 0", () => {
-    // useResizableInlinePanel can clamp the rail to width 0 while AppShell
-    // keeps it mounted, and the rail is the only surface in the unified rule
-    // with no other collapsed state — without this marker the rule's
-    // :not([data-collapsed]) keeps padding a zero-width rail, painting a
-    // ghost bg-card strip along the screen edge on native shells.
-    const source = readFileSync("src/shell/WorkspacePanel.tsx", "utf8");
-    expect(source).toMatch(/<aside[\s\S]{0,400}?data-collapsed=\{width === 0 \|\| undefined\}/);
-  });
-
   it("leaves a collapsed rail unpadded, so its starved width stays zero", () => {
     withStyle(nativePanelRule, () => {
       const shell = document.createElement("div");
@@ -407,6 +417,78 @@ describe("index.css native safe-area layout", () => {
 
   it("does not double-count app-owned bar footprints", () => {
     expect(nativePanelRule).not.toMatch(/--omnigent-(?:inset|native)-/);
+  });
+});
+
+/* The stub <aside> suite above proves the CSS side; this suite renders the
+ * real WorkspacePanel (content children stubbed at the top of the file) so
+ * the attributes the unified rule keys on are asserted on the real DOM. */
+describe("index.css native safe-area layout on the rendered WorkspacePanel", () => {
+  const shells: HTMLElement[] = [];
+
+  afterEach(() => {
+    cleanup();
+    for (const shell of shells.splice(0)) shell.remove();
+  });
+
+  /** Renders the rail into a native-shell root, returning its <aside>. */
+  function renderRail(width: number): HTMLElement {
+    const shell = document.createElement("div");
+    shell.setAttribute("data-android-native", "");
+    document.body.appendChild(shell);
+    shells.push(shell);
+    render(
+      createElement(
+        TooltipProvider,
+        // children arrive as the third argument; the cast satisfies
+        // createElement's props typing, which insists they sit in props.
+        { delayDuration: 0 } as ComponentProps<typeof TooltipProvider>,
+        createElement(WorkspacePanel, {
+          conversationId: "conv",
+          width,
+          handleProps: { tabIndex: 0 },
+          rightRailTab: "files",
+          onRightRailTabChange: () => {},
+          showFilesPanel: true,
+          showBrowserTab: false,
+          changedCount: 0,
+          subagentsWorking: 0,
+          agentCount: 1,
+          rootSessionId: null,
+          selectedFilePath: null,
+          openFiles: [],
+          openFileViewer: () => {},
+          onCloseFile: () => {},
+          onShowScopeView: () => {},
+          onCommentsOpenChange: () => {},
+          openTerminalTab: () => {},
+          openTerminals: [],
+          selectedTerminalKey: null,
+          onCloseTerminal: () => {},
+          maximized: false,
+          onToggleMaximized: () => {},
+          permissionLevel: null,
+          filesPanelSort: "recent",
+          onSortChange: () => {},
+          filesPanelShowHidden: false,
+          onShowHiddenChange: () => {},
+        }),
+      ),
+      { container: shell },
+    );
+    const rail = shell.querySelector<HTMLElement>('aside[aria-label="Workspace"]');
+    expect(rail, "the rail <aside> the CSS selector keys on is gone").not.toBeNull();
+    return rail!;
+  }
+
+  it("marks the rail collapsed exactly while its inline width is starved to 0", () => {
+    // useResizableInlinePanel can clamp the rail to width 0 while AppShell
+    // keeps it mounted, and the rail is the only surface in the unified rule
+    // with no other collapsed state — without this marker the rule's
+    // :not([data-collapsed]) keeps padding a zero-width rail, painting a
+    // ghost bg-card strip along the screen edge on native shells.
+    expect(renderRail(0).hasAttribute("data-collapsed")).toBe(true);
+    expect(renderRail(320).hasAttribute("data-collapsed")).toBe(false);
   });
 });
 
