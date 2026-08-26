@@ -20,6 +20,10 @@
 // Kept Electron-free at its core so the matching logic and event wiring are
 // unit-testable (test/session-expiry.test.js) without booting the app.
 
+"use strict";
+
+const { joinServerUrl, workspaceIdentityKey } = require("./url");
+
 /**
  * Whether a webRequest redirect is the auth gate bouncing an expired session
  * to its login page. Keyed on the redirect *target* pathname ending in
@@ -63,14 +67,9 @@ function isLoginRedirect(details) {
 function registerSessionExpiryReload(ses, isConnectedServerOrigin, reloadWindowsForOrigin) {
   ses.webRequest.onBeforeRedirect((details) => {
     if (!isLoginRedirect(details)) return;
-    let origin;
-    try {
-      origin = new URL(details.url).origin;
-    } catch {
-      return;
-    }
-    if (!isConnectedServerOrigin(origin)) return;
-    reloadWindowsForOrigin(origin);
+    const identity = workspaceIdentityKey(details.url);
+    if (!identity || !isConnectedServerOrigin(identity)) return;
+    reloadWindowsForOrigin(identity);
   });
 }
 
@@ -87,10 +86,10 @@ function isOidcLoginNavigation(destinationUrl, serverUrl) {
   if (!serverUrl) return false;
   try {
     const destination = new URL(destinationUrl);
-    const server = new URL(serverUrl);
-    const basePath = server.pathname.replace(/\/+$/, "");
+    const expected = new URL(joinServerUrl(serverUrl, "/auth/login"));
     return (
-      destination.origin === server.origin && destination.pathname === `${basePath}/auth/login`
+      workspaceIdentityKey(destinationUrl) === workspaceIdentityKey(serverUrl) &&
+      destination.pathname === expected.pathname
     );
   } catch {
     return false;
@@ -118,7 +117,9 @@ function registerOidcSessionExpiryHandoff(webContents, serverUrlForWindow, onExp
     let returnUrl = serverUrl;
     try {
       const current = new URL(webContents.getURL());
-      if (current.origin === new URL(serverUrl).origin) returnUrl = current.toString();
+      if (workspaceIdentityKey(current.toString()) === workspaceIdentityKey(serverUrl)) {
+        returnUrl = current.toString();
+      }
     } catch {
       // Fall back to the clean server URL when the current page is unavailable.
     }

@@ -1,5 +1,7 @@
 "use strict";
 
+const { joinServerUrl, workspaceIdentityKey } = require("./url");
+
 const MODAL_WEBAUTHN_TIMEOUT_MS = 5 * 60 * 1000;
 
 // Arm only during fallback auth, plus the accounts-mode `/login` page.
@@ -7,12 +9,14 @@ function isWebAuthnEscapePage(pageUrl, serverUrl, authenticationNavigation = fal
   if (!serverUrl) return false;
   try {
     const page = new URL(pageUrl);
-    const server = new URL(serverUrl);
-    const basePath = server.pathname.replace(/\/+$/, "");
+    const accountsLoginUrl = new URL(joinServerUrl(serverUrl, "/login"));
+    const pageIdentity = workspaceIdentityKey(pageUrl);
+    const serverIdentity = workspaceIdentityKey(serverUrl);
     const isWebPage = page.protocol === "http:" || page.protocol === "https:";
-    const accountsLogin = page.origin === server.origin && page.pathname === `${basePath}/login`;
+    const accountsLogin =
+      pageIdentity === serverIdentity && page.pathname === accountsLoginUrl.pathname;
     return (
-      isWebPage && (accountsLogin || (authenticationNavigation && page.origin !== server.origin))
+      isWebPage && (accountsLogin || (authenticationNavigation && pageIdentity !== serverIdentity))
     );
   } catch {
     return false;
