@@ -67,10 +67,15 @@ function registerWebAuthnTimeout(
 ) {
   webContents.on("did-finish-load", () => {
     if (!shouldInject()) return;
-    void webContents
+    return webContents
       .executeJavaScript(webAuthnTimeoutScript(timeoutMs), true)
       .then((result) => {
-        if (result?.timedOut === true) onTimeout();
+        if (result?.timedOut !== true) return;
+        return Promise.resolve()
+          .then(onTimeout)
+          .catch((error) => {
+            console.error("[omnigent] WebAuthn timeout handling failed", error);
+          });
       })
       .catch(() => {
         // Navigation/destroyed context, or a page where injection is unavailable.
