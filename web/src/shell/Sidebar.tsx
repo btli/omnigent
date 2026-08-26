@@ -2763,6 +2763,7 @@ interface MenuItemProps {
   children?: ReactNode;
   className?: string;
   disabled?: boolean;
+  textValue?: string;
   variant?: "default" | "destructive";
   // Radix's menu `onSelect` receives a native Event in both families.
   onSelect?: (event: Event) => void;
@@ -4519,6 +4520,7 @@ function ProjectPickerMenu({
   const filtered = search
     ? projects.filter((p) => p.name.toLowerCase().includes(search.toLowerCase()))
     : projects;
+  const currentProjectIcon = projects.find((p) => p.name === currentProject)?.icon;
 
   // Keep keystrokes inside the inputs from reaching the menu's typeahead /
   // navigation handlers (which would otherwise steal letters and arrows).
@@ -4540,7 +4542,23 @@ function ProjectPickerMenu({
       </div>
       <div className="max-h-48 overflow-y-auto">
         {filtered.map((p) => (
-          <C.Item key={p.name} className="px-2 py-1" onSelect={() => onSelect(p.name)}>
+          <C.Item
+            key={p.name}
+            className="px-2 py-1"
+            textValue={p.name}
+            onSelect={() => onSelect(p.name)}
+          >
+            {p.icon ? (
+              <span
+                aria-hidden="true"
+                className="shrink-0 text-[14px] leading-none"
+                data-testid="project-icon"
+              >
+                {p.icon}
+              </span>
+            ) : (
+              <FolderIcon aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
+            )}
             <span className="flex-1 truncate text-left">{p.name}</span>
             {currentProject === p.name && (
               <CheckMarkIcon className="size-3.5 shrink-0 text-primary" />
@@ -4553,7 +4571,22 @@ function ProjectPickerMenu({
       </div>
       {currentProject && (
         <div className="border-t pt-1">
-          <C.Item className="px-2 py-1" onSelect={() => onSelect("")}>
+          <C.Item
+            className="px-2 py-1"
+            textValue={`Remove from ${currentProject}`}
+            onSelect={() => onSelect("")}
+          >
+            {currentProjectIcon ? (
+              <span
+                aria-hidden="true"
+                className="shrink-0 text-[14px] leading-none"
+                data-testid="project-icon"
+              >
+                {currentProjectIcon}
+              </span>
+            ) : (
+              <FolderIcon aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
+            )}
             Remove from{" "}
             <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
               {currentProject}
