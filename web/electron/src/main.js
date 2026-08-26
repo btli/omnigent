@@ -1296,25 +1296,24 @@ async function ensureWindowOidcSession(win, serverUrl) {
   return runWindowOidcBrowserHandoff(win, serverUrl);
 }
 
-async function loadAuthenticatedServerUrl(win, serverUrl, routePath, exactLoadUrl) {
+async function loadAuthenticatedServerUrl(win, serverUrl, routePath, exactLoadUrl, beforeLoad) {
   if (win.isDestroyed()) return;
-  pinWindow(win, serverUrl);
-  setWindowServerUrl(win, serverUrl);
   const destination = exactLoadUrl ?? (routePath ? joinServerUrl(serverUrl, routePath) : serverUrl);
+  const navigate = async () => {
+    await beforeLoad?.();
+    pinWindow(win, serverUrl);
+    setWindowServerUrl(win, serverUrl);
+    return win.loadURL(destination);
+  };
   if (omnigentCli.isLoopbackServer(serverUrl)) {
-    await win.loadURL(destination);
+    await navigate();
     return;
   }
   const state = windows.get(win);
-  await navigateWithSessionCookieWorkspace(
-    session.defaultSession,
-    serverUrl,
-    () => win.loadURL(destination),
-    {
-      recordCookieAfterNavigation: state?.cookieEstablishmentNavigation === true,
-      currentWorkspaceIdentity: () => pinnedWorkspaceIdentity(win),
-    },
-  );
+  await navigateWithSessionCookieWorkspace(session.defaultSession, serverUrl, navigate, {
+    recordCookieAfterNavigation: state?.cookieEstablishmentNavigation === true,
+    currentWorkspaceIdentity: () => pinnedWorkspaceIdentity(win),
+  });
   if (state) state.cookieEstablishmentNavigation = false;
 }
 
@@ -1329,8 +1328,7 @@ async function loadServerUrl(
     loadServerAfterAuth({
       authenticate: async () =>
         (await ensureWindowOidcSession(win, serverUrl)) && !win.isDestroyed(),
-      beforeLoad,
-      load: () => loadAuthenticatedServerUrl(win, serverUrl, routePath, exactLoadUrl),
+      load: () => loadAuthenticatedServerUrl(win, serverUrl, routePath, exactLoadUrl, beforeLoad),
     });
   return alreadyGated ? load() : withServerLoad(windows.get(win), load);
 }
@@ -2566,19 +2564,29 @@ function registerIpc() {
       // manifest is advisory, and a slow/absent one must not delay (or block)
       // connecting. fetchServerManifest never rejects — it resolves to the
       // pre-manifest baseline — so no catch is needed here.
-      const loaded = await loadServerUrl(win, target, undefined, undefined, {
-        alreadyGated: true,
-        beforeLoad: () => {
-          if (!ephemeral) {
-            const settings = loadSettings();
-            settings.server_url = target;
-            saveSettings(settings);
-          }
-          void fetchServerManifest(target).then((manifest) => {
-            if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
-          });
-        },
-      });
+      let loaded;
+      try {
+        loaded = await loadServerUrl(win, target, undefined, undefined, {
+          alreadyGated: true,
+          beforeLoad: () => {
+            if (!ephemeral) {
+              const settings = loadSettings();
+              settings.server_url = target;
+              saveSettings(settings);
+            }
+            void fetchServerManifest(target).then((manifest) => {
+              if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
+            });
+          },
+        });
+      } catch (error) {
+        if (!isSessionCookieOwnershipError(error)) throw error;
+        return {
+          loaded: false,
+          error:
+            "Omnigent couldn't safely verify the target server's session. Try connecting again.",
+        };
+      }
       if (!loaded) return { loaded: false };
       // Only a server that actually responded earns a recents slot —
       // a typo'd or unreachable URL must not show up in the
@@ -2676,21 +2684,36 @@ function registerIpc() {
     if (!state || state.pendingServerLoads) return;
     const ephemeral = state.ephemeral === true;
     if (win) {
-      const loaded = await loadServerUrl(win, url, undefined, undefined, {
-        beforeLoad: () => {
-          if (!ephemeral) {
-            const settings = loadSettings();
-            settings.server_url = url;
-            saveSettings(settings);
-          }
-          // Commit the new manifest only after authentication succeeds, so a
-          // cancelled switch leaves the old page and its metadata paired.
-          setWindowServerManifest(win, PRE_MANIFEST_BASELINE);
-          void fetchServerManifest(url).then((manifest) => {
-            if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
-          });
-        },
-      });
+      let loaded;
+      try {
+        loaded = await loadServerUrl(win, url, undefined, undefined, {
+          beforeLoad: () => {
+            if (!ephemeral) {
+              const settings = loadSettings();
+              settings.server_url = url;
+              saveSettings(settings);
+            }
+            // Commit the new manifest only after authentication succeeds, so a
+            // cancelled switch leaves the old page and its metadata paired.
+            setWindowServerManifest(win, PRE_MANIFEST_BASELINE);
+            void fetchServerManifest(url).then((manifest) => {
+              if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
+            });
+          },
+        });
+      } catch (error) {
+        if (!isSessionCookieOwnershipError(error)) throw error;
+        await dialog.showMessageBox(win, {
+          type: "warning",
+          title: "Omnigent",
+          message: "Couldn't switch servers",
+          detail:
+            "Omnigent couldn't safely verify the target server's session. " +
+            "You remain connected to the current server. Try switching again.",
+          buttons: ["OK"],
+        });
+        throw error;
+      }
       if (!loaded || ephemeral) return;
       const settings = loadSettings();
       rememberRecentServer(settings, url); // bump to head of the recents

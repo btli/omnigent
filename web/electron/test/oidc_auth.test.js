@@ -374,6 +374,52 @@ describe("OIDC provider detection", () => {
       assert.equal(fetches, 1);
     },
   );
+
+  it(
+    "bounds stuck read cleanup, denies navigation, and releases the queue",
+    { timeout: 500 },
+    async () => {
+      let reads = 0;
+      let removals = 0;
+      let navigations = 0;
+      let fetches = 0;
+      const electronSession = {
+        cookies: {
+          get: async () => {
+            reads += 1;
+            return reads === 1 ? new Promise(() => {}) : [];
+          },
+          remove: async () => {
+            removals += 1;
+            return new Promise(() => {});
+          },
+        },
+        fetch: async () => {
+          fetches += 1;
+          return response(401, { login_url: "/auth/login" });
+        },
+      };
+      const serverUrl = "https://server.example";
+
+      const deniedNavigation = navigateWithSessionCookieWorkspace(
+        electronSession,
+        serverUrl,
+        async () => {
+          navigations += 1;
+        },
+        { cookieReadTimeoutMs: 10 },
+      );
+      const queuedProbe = probeServerAuth(electronSession, serverUrl, {
+        cookieReadTimeoutMs: 10,
+      });
+
+      await assert.rejects(deniedNavigation, isSessionCookieOwnershipError);
+      assert.deepEqual(await queuedProbe, { kind: "oidc", status: 401 });
+      assert.equal(removals, 1);
+      assert.equal(navigations, 0);
+      assert.equal(fetches, 1);
+    },
+  );
 });
 
 describe("OIDC browser ticket flow", () => {

@@ -32,7 +32,12 @@ const {
   loadInitialDestination,
   withServerLoad,
 } = require("../src/server_load");
-const { joinServerUrl, normalizeUrl, workspaceIdentityKey } = require("../src/url");
+const {
+  joinServerUrl,
+  normalizeUrl,
+  PRE_MANIFEST_BASELINE,
+  workspaceIdentityKey,
+} = require("../src/url");
 const {
   oidcServerUrlError,
   probeServerAuth,
@@ -61,6 +66,9 @@ const oidcSessionCode = liveCode.match(
 const oidcLoadCode = liveCode.match(
   /async function runWindowOidcBrowserHandoff[\s\S]*?(?=async function loadServerUrl)/,
 )?.[0];
+const guardedServerLoadCode = liveCode.match(
+  /async function loadAuthenticatedServerUrl[\s\S]*?(?=async function loadSetupPage)/,
+)?.[0];
 const authenticationNavigationSetterCode = liveCode.match(
   /function setWindowAuthenticationNavigation[\s\S]*?(?=function setWindowServerManifest)/,
 )?.[0];
@@ -85,6 +93,40 @@ const oauthPopupCode = liveCode.match(
 const deepLinkHandlerCode = liveCode.match(
   /async function handleDeepLink\(raw\)[\s\S]*?(?=app\.setName)/,
 )?.[0];
+
+function ownershipFailure(message) {
+  const error = new Error(message);
+  error.code = "SESSION_COOKIE_OWNERSHIP_UNKNOWN";
+  return error;
+}
+
+function ownershipFailingServerLoader(win, state, error) {
+  assert.ok(guardedServerLoadCode);
+  const windows = new Map([[win, state]]);
+  const pins = [];
+  const loadServerUrl = runInNewContext(`${guardedServerLoadCode}; loadServerUrl`, {
+    ensureWindowOidcSession: async () => true,
+    joinServerUrl,
+    loadServerAfterAuth,
+    navigateWithSessionCookieWorkspace: async () => {
+      throw error;
+    },
+    omnigentCli: { isLoopbackServer: () => false },
+    pinWindow: (_win, serverUrl) => {
+      pins.push(serverUrl);
+      state.origin = new URL(serverUrl).origin;
+      state.identity = workspaceIdentityKey(serverUrl);
+    },
+    pinnedWorkspaceIdentity: () => state.identity,
+    session: { defaultSession: {} },
+    setWindowServerUrl: (_win, serverUrl) => {
+      state.serverUrl = serverUrl;
+    },
+    windows,
+    withServerLoad,
+  });
+  return { loadServerUrl, pins, windows };
+}
 
 async function runConsentUnknownDeepLink(
   initialPendingLoads,
@@ -1166,6 +1208,71 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     assert.doesNotMatch(beforeTransaction, /settings\.server_url = target/);
   });
 
+  it("keeps Setup unpinned and surfaces a final ownership failure", async () => {
+    const target = "https://target.example";
+    const state = { origin: null, identity: null, serverUrl: null, pendingServerLoads: 0 };
+    let navigations = 0;
+    const win = {
+      isDestroyed: () => false,
+      loadURL: async () => {
+        navigations += 1;
+      },
+    };
+    const error = ownershipFailure("cookie ownership is unknown");
+    const { loadServerUrl, pins, windows } = ownershipFailingServerLoader(win, state, error);
+    const settings = { server_url: "https://saved.example", recent_servers: [] };
+    let settingsWrites = 0;
+    const handlerSource = setupServerCode.slice(
+      setupServerCode.indexOf("async"),
+      setupServerCode.lastIndexOf(");"),
+    );
+    const handler = runInNewContext(`(${handlerSource})`, {
+      BrowserWindow: { fromWebContents: () => win },
+      configuredServerUrlError: () => null,
+      configuredServerUrlErrorMessage: () => "Invalid server.",
+      expandDatabricksWorkspaceUrl: async (url) => url,
+      expandedServerUrlError: () => null,
+      fetchServerManifest: async () => PRE_MANIFEST_BASELINE,
+      isSessionCookieOwnershipError,
+      isSetupPageSender: () => true,
+      loadServerUrl,
+      loadSettings: () => settings,
+      managedServerUrls: () => [],
+      normalizeUrl: (url) => url,
+      rememberRecentServer: () => {},
+      saveSettings: () => {
+        settingsWrites += 1;
+      },
+      setWindowServerManifest: (_win, manifest) => {
+        state.serverManifest = manifest;
+      },
+      windows,
+      withServerLoad,
+      workspaceIdentityKey,
+    });
+    const button = { disabled: false };
+    const err = { textContent: "" };
+    const input = { value: target };
+    const connect = runInNewContext(`${setupConnectSource}; connect`, {
+      button,
+      err,
+      input,
+      setup: { setServerUrl: (url) => handler({ sender: {} }, url) },
+    });
+
+    await connect();
+
+    assert.equal(settings.server_url, "https://saved.example");
+    assert.equal(settingsWrites, 0);
+    assert.deepEqual(pins, []);
+    assert.equal(state.identity, null);
+    assert.equal(state.serverUrl, null);
+    assert.equal(navigations, 0);
+    assert.equal(state.pendingServerLoads, 0);
+    assert.match(err.textContent, /safely verify.*try connecting again/i);
+    assert.equal(button.disabled, false);
+  });
+
   it("rejects invalid Setup URLs before workspace expansion or authentication", async () => {
     const state = { serverUrl: null };
     const win = {};
@@ -1362,6 +1469,74 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     );
     const beforeTransaction = switchServerCode.slice(0, switchServerCode.indexOf("loadServerUrl"));
     assert.doesNotMatch(beforeTransaction, /settings\.server_url = url|setWindowServerManifest/);
+  });
+
+  it("keeps the old server pinned and surfaces a final switch ownership failure", async () => {
+    const current = "https://current.example";
+    const target = "https://target.example";
+    const oldManifest = { version: "old" };
+    const state = {
+      origin: new URL(current).origin,
+      identity: workspaceIdentityKey(current),
+      serverUrl: current,
+      serverManifest: oldManifest,
+      ephemeral: false,
+      pendingServerLoads: 0,
+    };
+    let navigations = 0;
+    const win = {
+      isDestroyed: () => false,
+      loadURL: async () => {
+        navigations += 1;
+      },
+    };
+    const error = ownershipFailure("cookie ownership is unknown");
+    const { loadServerUrl, pins, windows } = ownershipFailingServerLoader(win, state, error);
+    const settings = { server_url: current, recent_servers: [target] };
+    const dialogs = [];
+    let settingsWrites = 0;
+    const handlerSource = switchServerCode.slice(
+      switchServerCode.indexOf("async"),
+      switchServerCode.lastIndexOf(");"),
+    );
+    const handler = runInNewContext(`(${handlerSource})`, {
+      BrowserWindow: { fromWebContents: () => win },
+      PRE_MANIFEST_BASELINE,
+      dialog: {
+        showMessageBox: async (_win, options) => {
+          dialogs.push(options);
+          return { response: 0 };
+        },
+      },
+      fetchServerManifest: async () => ({ version: "new" }),
+      isPinnedWorkspaceSender: () => true,
+      isSessionCookieOwnershipError,
+      loadServerUrl,
+      loadSettings: () => settings,
+      managedServerUrls: () => [],
+      rememberRecentServer: () => {},
+      saveSettings: () => {
+        settingsWrites += 1;
+      },
+      setWindowServerManifest: (_win, manifest) => {
+        state.serverManifest = manifest;
+      },
+      windows,
+    });
+
+    await assert.rejects(handler({ sender: {} }, target), isSessionCookieOwnershipError);
+
+    assert.equal(settings.server_url, current);
+    assert.equal(settingsWrites, 0);
+    assert.deepEqual(pins, []);
+    assert.equal(state.identity, workspaceIdentityKey(current));
+    assert.equal(state.serverUrl, current);
+    assert.equal(state.serverManifest, oldManifest);
+    assert.equal(navigations, 0);
+    assert.equal(state.pendingServerLoads, 0);
+    assert.equal(dialogs.length, 1);
+    assert.equal(dialogs[0].message, "Couldn't switch servers");
+    assert.match(dialogs[0].detail, /remain connected.*try switching again/i);
   });
 
   it("ignores switch-server while another window load is pending", async () => {

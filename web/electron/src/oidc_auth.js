@@ -357,7 +357,7 @@ function isSessionCookieOwnershipError(error) {
   return error?.code === SESSION_COOKIE_OWNERSHIP_ERROR;
 }
 
-function readSessionCookies(electronSession, serverUrl, details, timeoutMs) {
+function boundedCookieOperation(operation, timeoutMs, timeoutError) {
   return new Promise((resolve, reject) => {
     let settled = false;
     const finish = (callback, value) => {
@@ -366,29 +366,39 @@ function readSessionCookies(electronSession, serverUrl, details, timeoutMs) {
       clearTimeout(timer);
       callback(value);
     };
-    const timer = setTimeout(
-      () =>
-        finish(
-          reject,
-          new SessionCookieOwnershipError("Timed out while reading the session cookie."),
-        ),
-      timeoutMs,
-    );
+    const timer = setTimeout(() => finish(reject, timeoutError()), timeoutMs);
     Promise.resolve()
-      .then(() => electronSession.cookies.get({ url: serverUrl, name: details.name }))
+      .then(operation)
       .then(
-        (cookies) => finish(resolve, cookies),
+        (result) => finish(resolve, result),
         (error) => finish(reject, error),
       );
   });
 }
 
-async function clearSessionCookieWorkspace(electronSession, serverUrl, details) {
+function readSessionCookies(electronSession, serverUrl, details, timeoutMs) {
+  return boundedCookieOperation(
+    () => electronSession.cookies.get({ url: serverUrl, name: details.name }),
+    timeoutMs,
+    () => new SessionCookieOwnershipError("Timed out while reading the session cookie."),
+  );
+}
+
+async function clearSessionCookieWorkspace(
+  electronSession,
+  serverUrl,
+  details,
+  timeoutMs = SESSION_COOKIE_READ_TIMEOUT_MS,
+) {
   const scope = sessionCookieScope(serverUrl, details);
   activeCookieWorkspaceOwners.get(electronSession)?.delete(scope);
   deletePendingCookieWorkspaceOwner(electronSession, scope);
   try {
-    await electronSession.cookies.remove(serverUrl, details.name);
+    await boundedCookieOperation(
+      () => electronSession.cookies.remove(serverUrl, details.name),
+      timeoutMs,
+      () => new SessionCookieOwnershipError("Timed out while clearing the session cookie."),
+    );
   } catch (cause) {
     throw new SessionCookieOwnershipError("Could not clear an unowned session cookie.", {
       cause,
@@ -414,7 +424,7 @@ async function readSessionCookiesFailClosed(
   } catch (cause) {
     let cleanupError;
     try {
-      await clearSessionCookieWorkspace(electronSession, serverUrl, details);
+      await clearSessionCookieWorkspace(electronSession, serverUrl, details, cookieReadTimeoutMs);
     } catch (error) {
       cleanupError = error;
     }
@@ -465,7 +475,7 @@ async function prepareSessionCookieWorkspace(
   }
 
   // A persisted or unfamiliar cookie without matching live ownership is unsafe.
-  await clearSessionCookieWorkspace(electronSession, serverUrl, details);
+  await clearSessionCookieWorkspace(electronSession, serverUrl, details, cookieReadTimeoutMs);
   return null;
 }
 
@@ -597,7 +607,7 @@ async function reverifySessionCookieWorkspace(
     return;
   }
   if (inspected.present) {
-    await clearSessionCookieWorkspace(electronSession, serverUrl, details);
+    await clearSessionCookieWorkspace(electronSession, serverUrl, details, cookieReadTimeoutMs);
   } else {
     activeCookieWorkspaceOwners
       .get(electronSession)
@@ -625,7 +635,7 @@ async function recordCurrentSessionCookieWorkspace(
     return false;
   }
   if (!inspected.cookie) {
-    await clearSessionCookieWorkspace(electronSession, serverUrl, details);
+    await clearSessionCookieWorkspace(electronSession, serverUrl, details, cookieReadTimeoutMs);
     throw new SessionCookieOwnershipError("Chromium established an unfamiliar session cookie.");
   }
   rememberSessionCookieWorkspace(electronSession, serverUrl, details, inspected.cookie.value);
