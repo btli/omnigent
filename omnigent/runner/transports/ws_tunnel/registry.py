@@ -699,15 +699,20 @@ class TunnelRegistry:
             registry's current generation for its runner id.
         """
         ack: concurrent.futures.Future[None] = concurrent.futures.Future()
+        cancelled = False
+        enqueued = False
 
         def _resolve(error: BaseException | None) -> None:
             """Settle the cross-loop acknowledgement once."""
             if ack.done():
                 return
-            if error is None:
-                ack.set_result(None)
-            else:
-                ack.set_exception(error)
+            try:
+                if error is None:
+                    ack.set_result(None)
+                else:
+                    ack.set_exception(error)
+            except concurrent.futures.InvalidStateError:
+                return
 
         def _stale() -> bool:
             with self._lock:
@@ -718,6 +723,7 @@ class TunnelRegistry:
 
         async def _enqueue() -> None:
             """Wait for bounded queue room on the session owner loop."""
+            nonlocal enqueued
             try:
                 deadline = time.monotonic() + _OUTBOUND_SEND_STALL_S
                 while True:
@@ -726,13 +732,14 @@ class TunnelRegistry:
                         if self._sessions.get(session.runner_id) is not session:
                             _resolve(_replaced_error())
                             return
-                        if ack.done():
+                        if cancelled:
                             return
                         try:
                             session.outbound_queue.put_nowait(data)
                         except asyncio.QueueFull:
                             pass
                         else:
+                            enqueued = True
                             _resolve(None)
                             return
                     if time.monotonic() >= deadline:
@@ -772,7 +779,20 @@ class TunnelRegistry:
             _call_session_soon_threadsafe(session, _start_enqueue)
         except RuntimeError as exc:
             raise ConnectionError(f"runner {session.runner_id!r} tunnel loop is closed") from exc
-        await asyncio.wrap_future(ack)
+        wrapped_ack = asyncio.wrap_future(ack)
+        try:
+            await asyncio.shield(wrapped_ack)
+        except asyncio.CancelledError:
+            # Cancellation and enqueue use the same registry lock. Whichever
+            # wins is externally consistent: a cancelled send never lands, and
+            # a send already enqueued completes successfully instead of being
+            # reported to its caller as cancelled.
+            with self._lock:
+                if enqueued:
+                    return
+                cancelled = True
+            ack.cancel()
+            raise
 
     # ── Routing incoming frames ──────────────────────────
 
