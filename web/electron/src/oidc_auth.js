@@ -1,12 +1,7 @@
 "use strict";
 
 const { setTimeout: delay } = require("node:timers/promises");
-const {
-  isDatabricksWorkspaceHost,
-  isLoopbackServer,
-  joinServerUrl,
-  workspaceIdentityKey,
-} = require("./url");
+const { isDatabricksWorkspaceHost, isLoopbackServer, joinServerUrl } = require("./url");
 
 const AUTH_PROBE_TIMEOUT_MS = 10000;
 const OIDC_LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
@@ -15,7 +10,6 @@ const OIDC_REQUEST_TIMEOUT_MS = 10000;
 const MAX_PATH_DECODE_PASSES = 32;
 const TRANSIENT_AUTH_STATUSES = new Set([429, 502, 503, 504]);
 const cookieMutationQueues = new WeakMap();
-const activeCookieWorkspaceIdentities = new WeakMap();
 
 // Keep API routes under workspace mounts, matching the CLI.
 function serverRoute(serverUrl, routePath) {
@@ -36,34 +30,25 @@ function classifyAuthProbe(status, loginUrl) {
 async function probeServerAuth(
   electronSession,
   serverUrl,
-  { timeoutMs = AUTH_PROBE_TIMEOUT_MS, signal, cookieWorkspacePrepared = false } = {},
+  { timeoutMs = AUTH_PROBE_TIMEOUT_MS, signal } = {},
 ) {
-  const runProbe = async () => {
-    const response = await electronSession.fetch(serverRoute(serverUrl, "/v1/me"), {
-      method: "GET",
-      redirect: "manual",
-      cache: "no-store",
-      credentials: "include",
-      signal: requestSignal(signal, timeoutMs),
-    });
-    let loginUrl = null;
-    if (response.status === 401) {
-      try {
-        const body = await response.json();
-        loginUrl = body && typeof body === "object" ? body.login_url : null;
-      } catch {
-        // Non-JSON 401: unknown posture, so preserve the existing navigation.
-      }
-    }
-    return { kind: classifyAuthProbe(response.status, loginUrl), status: response.status };
-  };
-  if (cookieWorkspacePrepared) return runProbe();
-
-  const details = sessionCookieDetails(serverUrl, "");
-  return serializeCookieMutation(electronSession, serverUrl, details, async () => {
-    await prepareSessionCookieWorkspace(electronSession, serverUrl, details);
-    return runProbe();
+  const response = await electronSession.fetch(serverRoute(serverUrl, "/v1/me"), {
+    method: "GET",
+    redirect: "manual",
+    cache: "no-store",
+    credentials: "include",
+    signal: requestSignal(signal, timeoutMs),
   });
+  let loginUrl = null;
+  if (response.status === 401) {
+    try {
+      const body = await response.json();
+      loginUrl = body && typeof body === "object" ? body.login_url : null;
+    } catch {
+      // Non-JSON 401: unknown posture, so preserve the existing navigation.
+    }
+  }
+  return { kind: classifyAuthProbe(response.status, loginUrl), status: response.status };
 }
 
 function requestSignal(signal, timeoutMs = OIDC_REQUEST_TIMEOUT_MS) {
@@ -324,27 +309,6 @@ function serializeCookieMutation(electronSession, serverUrl, details, mutation) 
   });
 }
 
-/**
- * A __Host- session cookie is host-wide, while ``o`` selects a workspace on
- * that host. Before any authenticated probe, clear a cookie last associated
- * with another workspace so it can never be presented as the target's token.
- */
-async function prepareSessionCookieWorkspace(electronSession, serverUrl, details) {
-  const identity = workspaceIdentityKey(serverUrl);
-  if (!identity) throw new Error("The server URL is invalid.");
-  let identities = activeCookieWorkspaceIdentities.get(electronSession);
-  if (!identities) {
-    identities = new Map();
-    activeCookieWorkspaceIdentities.set(electronSession, identities);
-  }
-  const scope = `${new URL(serverUrl).hostname}\0${details.name}\0${details.path}`;
-  const activeIdentity = identities.get(scope);
-  if (activeIdentity !== undefined && activeIdentity !== identity) {
-    await electronSession.cookies.remove(serverUrl, details.name);
-  }
-  identities.set(scope, identity);
-}
-
 async function rollbackSessionCookie(electronSession, serverUrl, details, priorCookie) {
   const current = await electronSession.cookies.get({ url: serverUrl, name: details.name });
   const installedCookie = priorSessionCookie(current, serverUrl, details);
@@ -391,7 +355,6 @@ async function installAndVerifySessionCookie(
   }
   const details = sessionCookieDetails(serverUrl, token);
   return serializeCookieMutation(electronSession, serverUrl, details, async () => {
-    await prepareSessionCookieWorkspace(electronSession, serverUrl, details);
     const existing = await electronSession.cookies.get({ url: serverUrl, name: details.name });
     const priorCookie = priorSessionCookie(existing, serverUrl, details);
     await electronSession.cookies.set(details);
@@ -410,10 +373,7 @@ async function installAndVerifySessionCookie(
       }
 
       const verify = async (attempt) => {
-        const probe = await probeServerAuth(electronSession, serverUrl, {
-          signal,
-          cookieWorkspacePrepared: true,
-        });
+        const probe = await probeServerAuth(electronSession, serverUrl, { signal });
         if (probe.kind === "authenticated") return;
         if (!TRANSIENT_AUTH_STATUSES.has(probe.status) || attempt >= verificationAttempts) {
           throw new Error("The server did not accept the installed session cookie.");
