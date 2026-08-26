@@ -15,7 +15,7 @@ const OIDC_REQUEST_TIMEOUT_MS = 10000;
 const MAX_PATH_DECODE_PASSES = 32;
 const TRANSIENT_AUTH_STATUSES = new Set([429, 502, 503, 504]);
 const cookieMutationQueues = new WeakMap();
-const activeCookieWorkspaceIdentities = new WeakMap();
+const activeCookieWorkspaceOwners = new WeakMap();
 
 // Keep API routes under workspace mounts, matching the CLI.
 function serverRoute(serverUrl, routePath) {
@@ -324,25 +324,39 @@ function serializeCookieMutation(electronSession, serverUrl, details, mutation) 
   });
 }
 
-/**
- * A __Host- session cookie is host-wide, while ``o`` selects a workspace on
- * that host. Before any authenticated probe, clear a cookie last associated
- * with another workspace so it can never be presented as the target's token.
- */
+function sessionCookieScope(serverUrl, details) {
+  return `${new URL(serverUrl).hostname}\0${details.name}\0${details.path}`;
+}
+
 async function prepareSessionCookieWorkspace(electronSession, serverUrl, details) {
   const identity = workspaceIdentityKey(serverUrl);
   if (!identity) throw new Error("The server URL is invalid.");
-  let identities = activeCookieWorkspaceIdentities.get(electronSession);
-  if (!identities) {
-    identities = new Map();
-    activeCookieWorkspaceIdentities.set(electronSession, identities);
+  const cookies = await electronSession.cookies.get({ url: serverUrl, name: details.name });
+  const currentCookie = priorSessionCookie(cookies, serverUrl, details);
+  const owners = activeCookieWorkspaceOwners.get(electronSession);
+  const scope = sessionCookieScope(serverUrl, details);
+  const owner = owners?.get(scope);
+  if (!currentCookie) {
+    owners?.delete(scope);
+    return;
   }
-  const scope = `${new URL(serverUrl).hostname}\0${details.name}\0${details.path}`;
-  const activeIdentity = identities.get(scope);
-  if (activeIdentity !== undefined && activeIdentity !== identity) {
-    await electronSession.cookies.remove(serverUrl, details.name);
+  if (owner?.identity === identity && owner.cookieValue === currentCookie.value) return;
+
+  // A persisted cookie without matching live ownership is never safe to send.
+  owners?.delete(scope);
+  await electronSession.cookies.remove(serverUrl, details.name);
+}
+
+function rememberSessionCookieWorkspace(electronSession, serverUrl, details, cookieValue) {
+  let owners = activeCookieWorkspaceOwners.get(electronSession);
+  if (!owners) {
+    owners = new Map();
+    activeCookieWorkspaceOwners.set(electronSession, owners);
   }
-  identities.set(scope, identity);
+  owners.set(sessionCookieScope(serverUrl, details), {
+    identity: workspaceIdentityKey(serverUrl),
+    cookieValue,
+  });
 }
 
 async function rollbackSessionCookie(electronSession, serverUrl, details, priorCookie) {
@@ -424,6 +438,7 @@ async function installAndVerifySessionCookie(
       await verify(1);
       signal?.throwIfAborted();
       assertCanCommit();
+      rememberSessionCookieWorkspace(electronSession, serverUrl, details, cookie.value);
     } catch (verificationError) {
       try {
         await rollbackSessionCookie(electronSession, serverUrl, details, priorCookie);

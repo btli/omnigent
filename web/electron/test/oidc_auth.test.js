@@ -47,6 +47,9 @@ describe("OIDC provider detection", () => {
   it("uses the Electron session and leaves redirects manual", async () => {
     const calls = [];
     const electronSession = {
+      cookies: {
+        get: async () => [],
+      },
       fetch: async (url, init) => {
         calls.push({ url, init });
         return response(401, { login_url: "/auth/login" });
@@ -61,12 +64,45 @@ describe("OIDC provider detection", () => {
     assert.equal(calls[0].init.credentials, "include");
   });
 
+  it("clears an unknown persisted cookie before the first workspace probe", async () => {
+    let stored = {
+      name: "__Host-ap_session",
+      value: "workspace-a-token",
+      path: "/",
+      httpOnly: true,
+      secure: true,
+      sameSite: "lax",
+    };
+    const removals = [];
+    const workspaceB = "https://dbc-a.cloud.databricks.com/omnigent?o=workspace-b";
+    const electronSession = {
+      cookies: {
+        get: async () => (stored ? [{ ...stored }] : []),
+        remove: async (url, name) => {
+          removals.push({ url, name });
+          stored = null;
+        },
+      },
+      fetch: async () => (stored ? response(200) : response(401, { login_url: "/auth/login" })),
+    };
+
+    assert.deepEqual(await probeServerAuth(electronSession, workspaceB), {
+      kind: "oidc",
+      status: 401,
+    });
+    assert.deepEqual(removals, [{ url: workspaceB, name: "__Host-ap_session" }]);
+  });
+
   it("clears a same-host workspace cookie before probing another organization", async () => {
-    let stored = { name: "__Host-ap_session", value: "workspace-a-token" };
+    let stored = null;
     const removals = [];
     const fetches = [];
     const electronSession = {
       cookies: {
+        get: async () => (stored ? [{ ...stored }] : []),
+        set: async (details) => {
+          stored = { ...details };
+        },
         remove: async (url, name) => {
           removals.push({ url, name });
           stored = null;
@@ -80,10 +116,7 @@ describe("OIDC provider detection", () => {
     const workspaceA = "https://dbc-a.cloud.databricks.com/omnigent?o=workspace-a";
     const workspaceB = "https://dbc-a.cloud.databricks.com/omnigent?o=workspace-b";
 
-    assert.deepEqual(await probeServerAuth(electronSession, workspaceA), {
-      kind: "authenticated",
-      status: 200,
-    });
+    await installAndVerifySessionCookie(electronSession, workspaceA, "workspace-a-token");
     assert.deepEqual(await probeServerAuth(electronSession, workspaceB), {
       kind: "oidc",
       status: 401,
@@ -104,6 +137,34 @@ describe("OIDC provider detection", () => {
         name: "__Host-ap_session",
       },
     ]);
+  });
+
+  it("clears a persisted cookie that no longer matches its remembered owner", async () => {
+    let stored = null;
+    const removals = [];
+    const workspaceA = "https://dbc-a.cloud.databricks.com/omnigent?o=workspace-a";
+    const electronSession = {
+      cookies: {
+        get: async () => (stored ? [{ ...stored }] : []),
+        set: async (details) => {
+          stored = { ...details };
+        },
+        remove: async (url, name) => {
+          removals.push({ url, name });
+          stored = null;
+        },
+      },
+      fetch: async () => (stored ? response(200) : response(401, { login_url: "/auth/login" })),
+    };
+
+    await installAndVerifySessionCookie(electronSession, workspaceA, "workspace-a-token");
+    stored = { ...stored, value: "workspace-b-token" };
+
+    assert.deepEqual(await probeServerAuth(electronSession, workspaceA), {
+      kind: "oidc",
+      status: 401,
+    });
+    assert.deepEqual(removals, [{ url: workspaceA, name: "__Host-ap_session" }]);
   });
 });
 
@@ -754,7 +815,14 @@ describe("OIDC session cookie installation", () => {
       sameSite: "lax",
       expirationDate: 2000000000,
     };
-    const state = cookieSession(priorCookie, [response(401, { login_url: "/auth/login" })]);
+    const state = cookieSession(null, [response(200), response(401, { login_url: "/auth/login" })]);
+
+    await installAndVerifySessionCookie(
+      state.electronSession,
+      "https://server.example",
+      "prior-session",
+    );
+    state.setStored(priorCookie);
 
     await assert.rejects(
       installAndVerifySessionCookie(state.electronSession, "https://server.example", "new-session"),
@@ -766,7 +834,7 @@ describe("OIDC session cookie installation", () => {
     assert.equal(Object.hasOwn(state.getStored(), "domain"), false);
     assert.deepEqual(
       state.sets.map(({ value }) => value),
-      ["new-session", "prior-session"],
+      ["prior-session", "new-session", "prior-session"],
     );
   });
 
