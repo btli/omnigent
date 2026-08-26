@@ -103,6 +103,21 @@ describe("registerSessionExpiryReload", () => {
     assert.deepEqual(reloaded, ["https://ws.databricks.com"]);
   });
 
+  it("reloads only the organization named by the redirected request", () => {
+    const ses = fakeSession();
+    const reloaded = [];
+    registerSessionExpiryReload(
+      ses,
+      (identity) => identity === "https://ws.databricks.com?o=team%2Fblue",
+      (identity) => reloaded.push(identity),
+    );
+
+    ses.emit({ ...LOGIN_REDIRECT, url: `${LOGIN_REDIRECT.url}?o=other` });
+    ses.emit({ ...LOGIN_REDIRECT, url: `${LOGIN_REDIRECT.url}?o=team%2Fblue` });
+
+    assert.deepEqual(reloaded, ["https://ws.databricks.com?o=team%2Fblue"]);
+  });
+
   it("ignores a login redirect for an origin no window is connected to", () => {
     const ses = fakeSession();
     const reloaded = [];
@@ -187,6 +202,27 @@ describe("self-hosted OIDC session expiry", () => {
       isOidcLoginNavigation(
         "https://server.example:444/base/auth/login",
         "https://server.example/base",
+      ),
+      false,
+    );
+    assert.equal(
+      isOidcLoginNavigation(
+        "https://dbc-a.cloud.databricks.com/omnigent/auth/login?o=team%2Fblue&return_to=x",
+        "https://dbc-a.cloud.databricks.com/omnigent?o=team%2Fblue",
+      ),
+      true,
+    );
+    assert.equal(
+      isOidcLoginNavigation(
+        "https://dbc-a.cloud.databricks.com/omnigent/auth/login?o=other",
+        "https://dbc-a.cloud.databricks.com/omnigent?o=team%2Fblue",
+      ),
+      false,
+    );
+    assert.equal(
+      isOidcLoginNavigation(
+        "https://dbc-a.cloud.databricks.com/omnigent/auth/login",
+        "https://dbc-a.cloud.databricks.com/omnigent?o=team%2Fblue",
       ),
       false,
     );

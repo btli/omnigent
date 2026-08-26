@@ -50,6 +50,7 @@ const {
   parseDaemonRecord,
   daemonServerUrl,
   getHostConnectionFast,
+  probeHostTunnel,
   probeServerAuth,
   localHostId,
 } = require("../src/omnigent_cli");
@@ -483,6 +484,19 @@ describe("probeServerAuth — /v1/me auth gate", () => {
     assert.equal(calls[0].init.redirect, "manual");
   });
 
+  it("keeps a normalized organization selector on the auth probe", async () => {
+    const serverUrl = "https://dbc-a.cloud.databricks.com/omnigent?o=team%2Fblue";
+    mock.method(fs, "readFileSync", () => "{}");
+    let target;
+    mock.method(globalThis, "fetch", async (value) => {
+      target = value;
+      return { status: 200 };
+    });
+
+    assert.deepEqual(await probeServerAuth(serverUrl), { authed: true, reachable: true });
+    assert.equal(target, "https://dbc-a.cloud.databricks.com/omnigent/v1/me?o=team%2Fblue");
+  });
+
   it("returns not-authed for non-200 statuses (Databricks 302, opaque-redirect 0, 401)", async () => {
     mock.method(fs, "readFileSync", () => "{}");
     const url = "https://app.example.com";
@@ -554,6 +568,36 @@ describe("probeServerAuth — /v1/me auth gate", () => {
 
     assert.deepEqual(res, { authed: false, reachable: false });
     assert.equal(calls.length, 0);
+  });
+});
+
+describe("probeHostTunnel — workspace route", () => {
+  afterEach(() => {
+    mock.restoreAll();
+  });
+
+  it("places the host path before the organization selector", async () => {
+    const serverUrl = "https://dbc-a.cloud.databricks.com/omnigent?o=team%2Fblue";
+    mock.method(fs, "readFileSync", () =>
+      JSON.stringify({
+        [serverUrl]: { token: "session-token", expires_at: Date.now() / 1000 + 3600 },
+      }),
+    );
+    let target;
+    mock.method(globalThis, "fetch", async (value) => {
+      target = value;
+      return { ok: true, json: async () => ({ status: "online" }) };
+    });
+
+    assert.deepEqual(await probeHostTunnel(serverUrl, "host/a"), {
+      status: "online",
+      reachable: true,
+      authMissing: false,
+    });
+    assert.equal(
+      target,
+      "https://dbc-a.cloud.databricks.com/omnigent/v1/hosts/host%2Fa?o=team%2Fblue",
+    );
   });
 });
 

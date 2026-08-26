@@ -27,7 +27,7 @@ const vm = require("node:vm");
 const { runInNewContext } = vm;
 
 const { isSetupIdle, loadInitialDestination, withServerLoad } = require("../src/server_load");
-const { normalizeUrl } = require("../src/url");
+const { joinServerUrl, normalizeUrl, workspaceIdentityKey } = require("../src/url");
 const {
   oidcServerUrlError,
   runOidcBrowserLogin,
@@ -51,10 +51,7 @@ const oidcSessionCode = liveCode.match(
   /async function runWindowOidcBrowserHandoff[\s\S]*?(?=async function loadAuthenticatedServerUrl)/,
 )?.[0];
 const webAuthnTimeoutCode = liveCode.match(
-  /async function showWebAuthnTimeout[\s\S]*?(?=function resolveServerPath)/,
-)?.[0];
-const resolveServerPathSource = liveCode.match(
-  /function resolveServerPath[\s\S]*?(?=async function runWindowOidcBrowserHandoff)/,
+  /async function showWebAuthnTimeout[\s\S]*?(?=async function runWindowOidcBrowserHandoff)/,
 )?.[0];
 const switchServerCode = liveCode.match(
   /ipcMain\.handle\("omnigent:switch-server"[\s\S]*?(?=ipcMain\.on\("omnigent:open-server-setup")/,
@@ -79,7 +76,12 @@ async function runConsentUnknownDeepLink(
   initialPendingLoads,
   { closeDuringExpansion = false, expandedServerUrl = "https://unknown.example" } = {},
 ) {
-  const state = { origin: null, pendingServerLoads: initialPendingLoads, serverUrl: null };
+  const state = {
+    origin: null,
+    identity: null,
+    pendingServerLoads: initialPendingLoads,
+    serverUrl: null,
+  };
   let destroyed = false;
   const parent = {
     isDestroyed: () => destroyed,
@@ -108,24 +110,18 @@ async function runConsentUnknownDeepLink(
       }
       return expandedServerUrl;
     },
-    expandedServerUrlError: (serverUrl, expectedOrigin) =>
+    expandedServerUrlError: (serverUrl, expectedIdentity) =>
       oidcServerUrlError(serverUrl) ??
-      (new URL(serverUrl).origin === expectedOrigin ? null : "invalid_server_url"),
+      (workspaceIdentityKey(serverUrl) === expectedIdentity ? null : "invalid_server_url"),
     findKnownServerUrl: () => null,
     focusAndRestore: () => {},
     isSetupIdle,
-    knownOrigins: () => new Set(),
+    knownWorkspaceIdentities: () => [],
     loadServerUrl: async (win) => {
       parentLoads.push(win);
       return true;
     },
-    originOf: (url) => {
-      try {
-        return new URL(url).origin;
-      } catch {
-        return null;
-      }
-    },
+    workspaceIdentityKey,
     oidcServerUrlError,
     parseOmnigentDeepLink: () => ({ origin: "https://unknown.example", path: "/c/1" }),
     rememberServerUrl: (url) => remembered.push(url),
@@ -144,7 +140,7 @@ function loadNavigationHarness({
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   const listeners = new Map();
-  const calls = { loadFile: [] };
+  const calls = { closeAll: [], loadFile: [] };
   const bannerCalls = { show: [], hide: 0 };
   let currentUrl = serverUrl;
   const appEvents = new Map();
@@ -214,7 +210,7 @@ function loadNavigationHarness({
         return win;
       },
       {
-        fromWebContents: () => null,
+        fromWebContents: (contents) => (contents === webContents ? win : null),
         getFocusedWindow: () => null,
         getAllWindows: () => [],
       },
@@ -241,6 +237,9 @@ function loadNavigationHarness({
     "./localhost_cors": { registerLocalhostCors: () => {} },
     "./url": {
       normalizeUrl: (url) => url,
+      normalizeRecentServers: (urls) => urls,
+      workspaceIdentityKey,
+      joinServerUrl,
       expandDatabricksWorkspaceUrl: async (url) => url,
       fetchServerManifest: async () => ({}),
       PRE_MANIFEST_BASELINE: {},
@@ -322,7 +321,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { createWindow, registerNavigationFallbacks, windows, SETUP_PAGE, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; } };";
+    "\nmodule.exports.testApi = { createWindow, isPinnedWorkspaceSender, pinWindow, registerNavigationFallbacks, windows, SETUP_PAGE, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; } };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -351,10 +350,11 @@ function loadNavigationHarness({
   const api = module.exports.testApi;
   api.windows.set(win, {
     origin: new URL(serverUrl).origin,
+    identity: workspaceIdentityKey(serverUrl),
     serverUrl,
     ephemeral: false,
     badgeCount: 0,
-    browserRegistry: { closeAll: () => {} },
+    browserRegistry: { closeAll: (reason) => calls.closeAll.push(reason) },
   });
   if (registerFallbacks) api.registerNavigationFallbacks(win);
 
@@ -421,9 +421,9 @@ describe("managed server preference wiring", () => {
         calls.push(["expand", url]);
         return url;
       },
-      expandedServerUrlError: (url, expectedOrigin) =>
+      expandedServerUrlError: (url, expectedIdentity) =>
         oidcServerUrlError(url) ??
-        (new URL(url).origin === expectedOrigin ? null : "invalid_server_url"),
+        (workspaceIdentityKey(url) === expectedIdentity ? null : "invalid_server_url"),
       isSetupPageSender: () => true,
       loadServerUrl: async (_win, url) => {
         calls.push(["load", url]);
@@ -431,7 +431,7 @@ describe("managed server preference wiring", () => {
       },
       managedServerUrls: () => [managedUrl],
       normalizeUrl: () => assert.fail("normalized a managed mount"),
-      originOf: (url) => new URL(url).origin,
+      workspaceIdentityKey,
       windows: new Map([[win, state]]),
       withServerLoad,
     });
@@ -1233,14 +1233,14 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
           configuredServerUrlError: () => null,
           configuredServerUrlErrorMessage: () => "The server address is invalid.",
           expandDatabricksWorkspaceUrl: async () => expandedTarget,
-          expandedServerUrlError: (serverUrl, expectedOrigin) =>
+          expandedServerUrlError: (serverUrl, expectedIdentity) =>
             oidcServerUrlError(serverUrl) ??
-            (new URL(serverUrl).origin === expectedOrigin ? null : "invalid_server_url"),
+            (workspaceIdentityKey(serverUrl) === expectedIdentity ? null : "invalid_server_url"),
           isSetupPageSender: () => true,
           loadServerUrl: async () => assert.fail("loaded an unsafe expanded URL"),
           managedServerUrls: () => [],
           normalizeUrl: () => "https://workspace.example",
-          originOf: (url) => new URL(url).origin,
+          workspaceIdentityKey,
           windows: new Map([[win, state]]),
           withServerLoad,
         });
@@ -1268,9 +1268,9 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
         calls.push(["expand", url]);
         return `${url}/ml/omnigents`;
       },
-      expandedServerUrlError: (serverUrl, expectedOrigin) =>
+      expandedServerUrlError: (serverUrl, expectedIdentity) =>
         oidcServerUrlError(serverUrl) ??
-        (new URL(serverUrl).origin === expectedOrigin ? null : "invalid_server_url"),
+        (workspaceIdentityKey(serverUrl) === expectedIdentity ? null : "invalid_server_url"),
       fetchServerManifest: async () => ({}),
       configuredServerUrlError: (_raw, normalized) => oidcServerUrlError(normalized),
       isSetupPageSender: () => true,
@@ -1282,7 +1282,7 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
       managedServerUrls: () => [],
       normalizeUrl: (url) => url,
       oidcServerUrlError,
-      originOf: (url) => new URL(url).origin,
+      workspaceIdentityKey,
       rememberRecentServer() {},
       saveSettings() {},
       windows: new Map([[win, { ...state, ephemeral: true }]]),
@@ -1313,7 +1313,7 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
       managedServerUrls: () => [],
       normalizeUrl: (url) => url,
       oidcServerUrlError,
-      originOf: (url) => new URL(url).origin,
+      workspaceIdentityKey,
       windows: new Map([[win, state]]),
       withServerLoad,
     });
@@ -1344,7 +1344,7 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
       managedServerUrls: () => [],
       normalizeUrl: (url) => url,
       oidcServerUrlError,
-      originOf: (url) => new URL(url).origin,
+      workspaceIdentityKey,
       windows: new Map([[win, state]]),
       withServerLoad,
     });
@@ -1376,7 +1376,7 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     );
     const handler = runInNewContext(`(${handlerSource})`, {
       BrowserWindow: { fromWebContents: () => win },
-      isPinnedOriginSender: () => true,
+      isPinnedWorkspaceSender: () => true,
       loadServerUrl: async () => {
         loadCalls += 1;
         return true;
@@ -1407,7 +1407,7 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     const handler = runInNewContext(`(${handlerSource})`, {
       BrowserWindow: { fromWebContents: () => win },
       SETUP_PAGE: "/setup/index.html",
-      isPinnedOriginSender: () => true,
+      isPinnedWorkspaceSender: () => true,
       pinWindow: () => (pinCalls += 1),
       setWindowServerUrl: () => {},
       windows: new Map([[win, state]]),
@@ -1599,29 +1599,23 @@ describe("recent-server startup wiring (src/main.js)", () => {
 
 // Guard for the deep-link path join in createWindow. A basename-less SPA path
 // lives under the server mount, while an organization selector stays in the
-// query. resolveServerPath updates URL fields without dropping either.
+// query. The shared joinServerUrl helper updates URL fields without dropping either.
 describe("deep-link path join wiring (src/main.js)", () => {
-  it("joins opts.path onto opts.serverUrl via resolveServerPath as live code", () => {
+  it("joins opts.path onto opts.serverUrl via joinServerUrl as live code", () => {
     assert.match(
       liveCode,
-      /resolveServerPath\(serverUrl, opts\.path\)/,
+      /joinServerUrl\(serverUrl, opts\.path\)/,
       [
         "createWindow no longer joins opts.path onto opts.serverUrl via",
-        "resolveServerPath. A deep link to a workspace server would lose its",
+        "joinServerUrl. A deep link to a workspace server would lose its",
         "mount or organization selector. Restore the URL-aware mount join.",
       ].join(" "),
     );
   });
 
   it("keeps the organization selector after a mounted deep-link path", () => {
-    assert.ok(resolveServerPathSource);
-    const resolveServerPath = runInNewContext(
-      `(() => { ${resolveServerPathSource}; return resolveServerPath; })()`,
-      { URL },
-    );
-
     assert.equal(
-      resolveServerPath("https://dbc-a.cloud.databricks.com/omnigent?o=123456789", "/c/conv_abc"),
+      joinServerUrl("https://dbc-a.cloud.databricks.com/omnigent?o=123456789", "/c/conv_abc"),
       "https://dbc-a.cloud.databricks.com/omnigent/c/conv_abc?o=123456789",
     );
   });
@@ -1755,7 +1749,7 @@ describe("deep-link ingestion wiring (src/main.js)", () => {
     // consent-unknown branch, and does NOT appear before chooseDeepLinkStrategy.
     assert.match(
       liveCode,
-      /confirmOpenDeepLink\(parent, targetOrigin\)[\s\S]{0,300}expandDatabricksWorkspaceUrl\(targetOrigin\)/,
+      /confirmOpenDeepLink\(parent, parsed\.origin\)[\s\S]{0,300}expandDatabricksWorkspaceUrl\(parsed\.origin\)/,
       [
         "handleDeepLink no longer defers expandDatabricksWorkspaceUrl until AFTER",
         "confirmOpenDeepLink. A deep link to an unknown (attacker-chosen) server would",
@@ -1910,35 +1904,66 @@ describe("HTTP error status fallback (src/main.js)", () => {
   });
 });
 
+describe("privileged IPC workspace sender gate (src/main.js)", () => {
+  it("rejects a same-origin frame that changes or drops o", (t) => {
+    const workspaceA = "https://dbc-a.cloud.databricks.com/omnigent?o=workspace-a";
+    const harness = loadNavigationHarness({ serverUrl: workspaceA });
+    t.after(harness.cleanup);
+    const eventFor = (url) => ({
+      sender: harness.win.webContents,
+      senderFrame: { url },
+    });
+
+    assert.equal(
+      harness.api.isPinnedWorkspaceSender(
+        eventFor("https://dbc-a.cloud.databricks.com/omnigent/c/1?o=workspace-a"),
+      ),
+      true,
+    );
+    assert.equal(
+      harness.api.isPinnedWorkspaceSender(
+        eventFor("https://dbc-a.cloud.databricks.com/omnigent/c/1?o=workspace-b"),
+      ),
+      false,
+    );
+    assert.equal(
+      harness.api.isPinnedWorkspaceSender(
+        eventFor("https://dbc-a.cloud.databricks.com/omnigent/c/1"),
+      ),
+      false,
+    );
+  });
+});
+
 // pinWindow is the one chokepoint every "leave this server" path routes through
 // (Connect to new server, Change Server…, switch-server, did-fail-load fallback).
 // Those navigations tear down the renderer WITHOUT running BrowserPane's unmount
-// detach, so pinWindow must close the window's browser registry when the origin
-// changes — else the native WebContentsView dangles over the setup/welcome page.
+// detach, so pinWindow must close the window's browser registry when the
+// workspace identity changes — else the native WebContentsView dangles over
+// the next workspace or setup page.
 describe("browser-view teardown on server change (src/main.js)", () => {
-  it("closes the window's browserRegistry when pinWindow changes origin", () => {
-    assert.match(
-      liveCode,
-      /function pinWindow\(win,\s*origin\)\s*\{[\s\S]{0,600}browserRegistry\?\.closeAll\(/,
-      [
-        "pinWindow no longer closes the window's embedded-browser views when the",
-        "origin changes. Leaving a server (Connect to new server / Change Server / switch)",
-        "navigates the window away and tears down the renderer WITHOUT running",
-        "BrowserPane's unmount detach, so the native WebContentsView keeps painting over",
-        "the setup/welcome page. Restore the closeAll call in pinWindow.",
-      ].join(" "),
-    );
+  it("closes embedded views when o changes on the same origin", (t) => {
+    const workspaceA = "https://dbc-a.cloud.databricks.com/omnigent?o=workspace-a";
+    const workspaceB = "https://dbc-a.cloud.databricks.com/omnigent?o=workspace-b";
+    const harness = loadNavigationHarness({ serverUrl: workspaceA });
+    t.after(harness.cleanup);
+
+    harness.api.pinWindow(harness.win, workspaceB);
+
+    assert.deepEqual(harness.calls.closeAll, ["server-changed"]);
+    assert.equal(harness.api.windows.get(harness.win).identity, workspaceIdentityKey(workspaceB));
   });
 
-  it("guards the teardown so the initial cold-connect pin doesn't fire it", () => {
-    assert.match(
-      liveCode,
-      /function pinWindow\(win,\s*origin\)\s*\{[\s\S]{0,600}state\.origin\s*!=\s*null[\s\S]{0,120}browserRegistry\?\.closeAll\(/,
-      [
-        "The closeAll in pinWindow is no longer guarded on a prior origin. Without the",
-        "state.origin != null guard the initial pin (setup→first connect) would try to",
-        "close a registry with nothing open. Keep the guard.",
-      ].join(" "),
-    );
+  it("guards the teardown so the initial cold-connect pin doesn't fire it", (t) => {
+    const serverUrl = "https://dbc-a.cloud.databricks.com/omnigent?o=workspace-a";
+    const harness = loadNavigationHarness({ serverUrl });
+    t.after(harness.cleanup);
+    const state = harness.api.windows.get(harness.win);
+    state.origin = null;
+    state.identity = null;
+
+    harness.api.pinWindow(harness.win, serverUrl);
+
+    assert.deepEqual(harness.calls.closeAll, []);
   });
 });
