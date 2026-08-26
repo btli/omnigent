@@ -308,6 +308,35 @@ describe("index.css native safe-area layout", () => {
     expect(source).toMatch(/<aside[\s\S]{0,600}?aria-label="Workspace"/);
   });
 
+  it("marks the rail collapsed exactly while its inline width is starved to 0", () => {
+    // useResizableInlinePanel can clamp the rail to width 0 while AppShell
+    // keeps it mounted, and the rail is the only surface in the unified rule
+    // with no other collapsed state — without this marker the rule's
+    // :not([data-collapsed]) keeps padding a zero-width rail, painting a
+    // ghost bg-card strip along the screen edge on native shells.
+    const source = readFileSync("src/shell/WorkspacePanel.tsx", "utf8");
+    expect(source).toMatch(/<aside[\s\S]{0,400}?data-collapsed=\{width === 0 \|\| undefined\}/);
+  });
+
+  it("leaves a collapsed rail unpadded, so its starved width stays zero", () => {
+    withStyle(nativePanelRule, () => {
+      const shell = document.createElement("div");
+      shell.setAttribute("data-android-native", "");
+      const rail = document.createElement("aside");
+      rail.setAttribute("aria-label", "Workspace");
+      rail.setAttribute("data-collapsed", "true");
+      shell.appendChild(rail);
+      document.body.appendChild(shell);
+      try {
+        // The width-0 rail carries data-collapsed (pinned above); the rule
+        // must skip it edge for edge or the padding gives it real width.
+        expectZeroPadding(rail);
+      } finally {
+        shell.remove();
+      }
+    });
+  });
+
   it("leaves collapsed panels unpadded, so their w-0 width stays zero", () => {
     withStyle(nativePanelRule, () => {
       const shell = document.createElement("div");
