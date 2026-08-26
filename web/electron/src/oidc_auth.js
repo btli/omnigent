@@ -314,13 +314,15 @@ function serializeCookieMutation(electronSession, serverUrl, details, mutation) 
 async function rollbackSessionCookie(electronSession, serverUrl, details, priorCookie) {
   const current = await electronSession.cookies.get({ url: serverUrl, name: details.name });
   const installedCookie = priorSessionCookie(current, serverUrl, details);
-  if (!installedCookie || installedCookie.value !== details.value) return;
+  if (installedCookie && installedCookie.value !== details.value) return;
 
   let removalError = null;
-  try {
-    await electronSession.cookies.remove(serverUrl, details.name);
-  } catch (error) {
-    removalError = error;
+  if (installedCookie) {
+    try {
+      await electronSession.cookies.remove(serverUrl, details.name);
+    } catch (error) {
+      removalError = error;
+    }
   }
 
   if (priorCookie) {
