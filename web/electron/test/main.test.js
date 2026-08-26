@@ -1354,9 +1354,16 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
   it("falls back to setup when an expiry sign-in does not complete", async () => {
     assert.ok(expiryHandoffCallbackCode);
     const win = {};
+    const state = { pendingServerLoads: 1 };
+    let loadCalls = 0;
     const setupLoads = [];
+    const pinCalls = [];
+    const serverUrlCalls = [];
+    const pinWindow = (...args) => pinCalls.push(args);
+    const setWindowServerUrl = (...args) => serverUrlCalls.push(args);
     const callback = runInNewContext(`(${expiryHandoffCallbackCode})`, {
       loadServerUrl: async (...args) => {
+        loadCalls += 1;
         assert.deepEqual(args, [
           win,
           "https://server.example",
@@ -1365,8 +1372,13 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
         ]);
         return false;
       },
-      loadSetupPage: async (...args) => setupLoads.push(args),
+      loadSetupPage: async (...args) => {
+        setupLoads.push(args);
+        pinWindow(args[0], null);
+        setWindowServerUrl(args[0], null);
+      },
       win,
+      windows: new Map([[win, state]]),
     });
 
     await callback({
@@ -1374,6 +1386,18 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
       returnUrl: "https://server.example/c/current",
     });
 
+    assert.equal(loadCalls, 0);
+    assert.deepEqual(setupLoads, []);
+    assert.deepEqual(pinCalls, []);
+    assert.deepEqual(serverUrlCalls, []);
+
+    state.pendingServerLoads = 0;
+    await callback({
+      serverUrl: "https://server.example",
+      returnUrl: "https://server.example/c/current",
+    });
+
+    assert.equal(loadCalls, 1);
     assert.equal(setupLoads.length, 1);
     assert.equal(setupLoads[0][0], win);
     assert.equal(setupLoads[0][1].error, "Your session expired and sign-in did not complete.");

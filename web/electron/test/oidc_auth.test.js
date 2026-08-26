@@ -711,6 +711,52 @@ describe("OIDC session cookie installation", () => {
     );
   });
 
+  it("restores the prior cookie when a rejected write leaves the cookie jar empty", async () => {
+    const priorCookie = {
+      name: "__Host-ap_session",
+      value: "prior-session",
+      domain: "server.example",
+      path: "/",
+      httpOnly: true,
+      secure: true,
+      sameSite: "lax",
+    };
+    let stored = { ...priorCookie };
+    const sets = [];
+    let removals = 0;
+    const writeError = new Error("insert failed");
+    const electronSession = {
+      cookies: {
+        get: async () => (stored ? [{ ...stored }] : []),
+        set: async (details) => {
+          sets.push({ ...details });
+          if (details.value === "new-session") {
+            stored = null;
+            throw writeError;
+          }
+          stored = { ...details };
+        },
+        remove: async () => {
+          removals += 1;
+          stored = null;
+        },
+      },
+      fetch: async () => assert.fail("verified a rejected cookie write"),
+    };
+
+    await assert.rejects(
+      installAndVerifySessionCookie(electronSession, "https://server.example", "new-session"),
+      writeError,
+    );
+
+    assert.equal(stored?.value ?? null, "prior-session");
+    assert.deepEqual(
+      sets.map(({ value }) => value),
+      ["new-session", "prior-session"],
+    );
+    assert.equal(removals, 0);
+  });
+
   it("fails when the server still reports an unauthenticated OIDC session", async () => {
     const state = cookieSession(null, [response(401, { login_url: "/auth/login" })]);
 
