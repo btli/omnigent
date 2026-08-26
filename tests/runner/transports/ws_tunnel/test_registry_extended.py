@@ -479,6 +479,29 @@ async def test_cancelled_enqueue_task_resolves_waiting_sender(
 
 
 @pytest.mark.asyncio
+async def test_cancelled_send_text_never_enqueues_after_room_frees(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Caller cancellation prevents a parked owner-loop enqueue from landing."""
+    monkeypatch.setattr(registry_mod, "_OUTBOUND_SEND_STALL_S", 30.0)
+    monkeypatch.setattr(registry_mod, "_OUTBOUND_SEND_POLL_S", 0.01)
+    reg = TunnelRegistry()
+    session = reg.register("r1", _NoopWS(), _hello())
+    _fill_outbound(session)
+
+    send = asyncio.create_task(reg.send_text(session, "cancelled-frame"))
+    await asyncio.sleep(0)
+    send.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await send
+
+    session.outbound_queue.get_nowait()
+    await asyncio.sleep(0.05)
+    drained = [session.outbound_queue.get_nowait() for _ in range(session.outbound_queue.qsize())]
+    assert "cancelled-frame" not in drained
+
+
+@pytest.mark.asyncio
 async def test_send_text_fails_when_owner_loop_is_stopped() -> None:
     """A stopped owner loop fails the send instead of awaiting forever."""
     loop = asyncio.new_event_loop()
