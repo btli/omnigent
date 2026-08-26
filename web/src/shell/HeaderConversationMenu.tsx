@@ -11,6 +11,7 @@ import {
   CheckIcon,
   ChevronLeftIcon,
   EllipsisIcon,
+  FolderIcon,
   FolderInputIcon,
   GitBranchIcon,
   InfoIcon,
@@ -101,6 +102,7 @@ function ProjectPicker({
   const filtered = search
     ? projects.filter((project) => project.name.toLowerCase().includes(search.toLowerCase()))
     : projects;
+  const currentProjectIcon = projects.find((project) => project.name === currentProject)?.icon;
 
   return (
     <>
@@ -122,6 +124,13 @@ function ProjectPicker({
             className="px-2 py-1"
             onSelect={() => onSelect(project.name)}
           >
+            {project.icon ? (
+              <span aria-hidden="true" className="shrink-0 text-[14px] leading-none">
+                {project.icon}
+              </span>
+            ) : (
+              <FolderIcon aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
+            )}
             <span className="flex-1 truncate text-left">{project.name}</span>
             {currentProject === project.name && (
               <CheckIcon className="size-3.5 shrink-0 text-primary" />
@@ -135,6 +144,13 @@ function ProjectPicker({
       {currentProject && (
         <div className="border-t pt-1">
           <DropdownMenuItem className="px-2 py-1" onSelect={() => onSelect("")}>
+            {currentProjectIcon ? (
+              <span aria-hidden="true" className="shrink-0 text-[14px] leading-none">
+                {currentProjectIcon}
+              </span>
+            ) : (
+              <FolderIcon aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
+            )}
             Remove from{" "}
             <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
               {currentProject}

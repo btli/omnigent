@@ -52,6 +52,7 @@ const mocks = vi.hoisted(() => {
     // Projects surfaced by the picker + the move-to-project mutation, so the
     // mobile in-place project view test can assert both the list and the pick.
     projects: [] as string[],
+    projectIcons: {} as Record<string, string | null | undefined>,
     moveToProject: { mutate: vi.fn() },
     leave: { mutate: vi.fn(), isPending: false },
     // The signed-in viewer. Rows with no `owner` read as owned by them; a row
@@ -106,7 +107,13 @@ vi.mock("@/hooks/useConversations", () => ({
   useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useStopSession: () => ({ mutate: vi.fn() }),
-  useProjects: () => ({ data: mocks.projects.map((name: string) => ({ id: `p_${name}`, name })) }),
+  useProjects: () => ({
+    data: mocks.projects.map((name: string) => ({
+      id: `p_${name}`,
+      name,
+      icon: mocks.projectIcons[name],
+    })),
+  }),
   // A non-empty `useProjects` renders a project folder, which queries its
   // sessions — return the collapsed (disabled) shape so the folder is inert
   // (this suite keeps its test row unfiled; the picker only needs the name).
@@ -257,6 +264,7 @@ beforeEach(() => {
   mocks.moveToProject.mutate.mockReset();
   mocks.leave.mutate.mockReset();
   mocks.projects = [];
+  mocks.projectIcons = {};
   // Default every test to the desktop viewport; the mobile flyout test opts in.
   mocks.isMobile = false;
   useConvMock.mockReset();
@@ -874,6 +882,30 @@ describe("mobile in-place project picker", () => {
       id: "conv_1",
       project: "Sprint 42",
     });
+  });
+
+  it("shows decorative project icons and a folder fallback in the picker", () => {
+    mocks.isMobile = true;
+    mocks.projects = ["Sprint 42", "Legacy project"];
+    mocks.projectIcons = { "Sprint 42": "🚀" };
+    mockConversations([{ ...CONV, labels: { omni_project: "Sprint 42" } }]);
+    mocks.pinnedStore.set([CONV.id]);
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("move-to-project"));
+
+    const iconRow = screen.getByRole("menuitem", { name: "Sprint 42" });
+    const emoji = iconRow.querySelector('span[aria-hidden="true"]');
+    expect(emoji).toHaveTextContent("🚀");
+    expect(emoji).toHaveClass("shrink-0", "text-[14px]", "leading-none");
+
+    const fallback = screen.getByRole("menuitem", { name: "Legacy project" }).querySelector("svg");
+    expect(fallback).toHaveClass("lucide-folder", "size-3.5", "shrink-0");
+    expect(fallback).toHaveAttribute("aria-hidden", "true");
+
+    const removeItem = screen.getByRole("menuitem", { name: "Remove from Sprint 42" });
+    expect(removeItem.querySelector('span[aria-hidden="true"]')).toHaveTextContent("🚀");
   });
 
   it("keeps the desktop side-flyout submenu (no in-place swap)", () => {

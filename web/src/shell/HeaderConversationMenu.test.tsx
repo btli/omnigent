@@ -10,7 +10,11 @@ import { HeaderConversationMenu } from "./HeaderConversationMenu";
 
 const mocks = vi.hoisted(() => ({
   isMobile: false,
-  projects: [{ id: "project-1", name: "Sprint 42" }],
+  projects: [{ id: "project-1", name: "Sprint 42" }] as {
+    id: string | null;
+    name: string;
+    icon?: string | null;
+  }[],
   togglePinned: vi.fn(),
   rename: vi.fn(),
   moveToProject: vi.fn(),
@@ -194,6 +198,29 @@ describe("HeaderConversationMenu", () => {
     expect(screen.getByRole("textbox", { name: "Search projects" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("menuitem", { name: "Sprint 42" }));
     expect(mocks.moveToProject).toHaveBeenCalledWith({ id: "conv-1", project: "Sprint 42" });
+  });
+
+  it("shows decorative project icons and a folder fallback in the picker", () => {
+    mocks.isMobile = true;
+    mocks.projects = [
+      { id: "project-1", name: "Sprint 42", icon: "🚀" },
+      { id: null, name: "Legacy project" },
+    ];
+    renderMenu({ currentProject: "Sprint 42" });
+    openMenu();
+    fireEvent.click(screen.getByTestId("header-move-to-project"));
+
+    const iconRow = screen.getByRole("menuitem", { name: "Sprint 42" });
+    const emoji = iconRow.querySelector('span[aria-hidden="true"]');
+    expect(emoji).toHaveTextContent("🚀");
+    expect(emoji).toHaveClass("shrink-0", "text-[14px]", "leading-none");
+
+    const fallback = screen.getByRole("menuitem", { name: "Legacy project" }).querySelector("svg");
+    expect(fallback).toHaveClass("lucide-folder", "size-3.5", "shrink-0");
+    expect(fallback).toHaveAttribute("aria-hidden", "true");
+
+    const removeItem = screen.getByRole("menuitem", { name: "Remove from Sprint 42" });
+    expect(removeItem.querySelector('span[aria-hidden="true"]')).toHaveTextContent("🚀");
   });
 
   it("closes and resets Rename when the conversation id changes", async () => {
