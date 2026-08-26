@@ -1472,19 +1472,20 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     assert.equal(loadFileCalls, 1);
   });
 
-  it("falls back to setup when an expiry sign-in does not complete", async () => {
+  it("defers expiry recovery until the pending load settles", async () => {
     assert.ok(expiryHandoffCallbackCode);
-    const win = {};
-    const state = { pendingServerLoads: 1 };
-    let loadCalls = 0;
+    const win = { isDestroyed: () => false };
+    const pendingLoad = Promise.withResolvers();
+    const events = [];
+    const state = {
+      pendingServerLoads: 1,
+      pendingLoad: pendingLoad.promise.then(() => events.push("pending settled")),
+      serverUrl: "https://server.example",
+    };
     const setupLoads = [];
-    const pinCalls = [];
-    const serverUrlCalls = [];
-    const pinWindow = (...args) => pinCalls.push(args);
-    const setWindowServerUrl = (...args) => serverUrlCalls.push(args);
     const callback = runInNewContext(`(${expiryHandoffCallbackCode})`, {
       loadServerUrl: async (...args) => {
-        loadCalls += 1;
+        events.push("recovery");
         assert.deepEqual(args, [
           win,
           "https://server.example",
@@ -1493,36 +1494,79 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
         ]);
         return false;
       },
-      loadSetupPage: async (...args) => {
-        setupLoads.push(args);
-        pinWindow(args[0], null);
-        setWindowServerUrl(args[0], null);
-      },
+      loadSetupPage: async (...args) => setupLoads.push(args),
       win,
       windows: new Map([[win, state]]),
     });
 
-    await callback({
+    const recovery = callback({
       serverUrl: "https://server.example",
       returnUrl: "https://server.example/c/current",
     });
+    pendingLoad.resolve();
+    await recovery;
 
-    assert.equal(loadCalls, 0);
-    assert.deepEqual(setupLoads, []);
-    assert.deepEqual(pinCalls, []);
-    assert.deepEqual(serverUrlCalls, []);
-
-    state.pendingServerLoads = 0;
-    await callback({
-      serverUrl: "https://server.example",
-      returnUrl: "https://server.example/c/current",
-    });
-
-    assert.equal(loadCalls, 1);
+    assert.deepEqual(events, ["pending settled", "recovery"]);
     assert.equal(setupLoads.length, 1);
     assert.equal(setupLoads[0][0], win);
     assert.equal(setupLoads[0][1].error, "Your session expired and sign-in did not complete.");
     assert.equal(setupLoads[0][1].url, "https://server.example");
+  });
+
+  it("re-checks the pinned server after a pending load settles", async () => {
+    assert.ok(expiryHandoffCallbackCode);
+    const expiredServerUrl = "https://server-a.example";
+    const returnUrl = `${expiredServerUrl}/c/current`;
+
+    const runInterleaving = async ({ pinAfterPending, rejectPending = false }) => {
+      const win = { isDestroyed: () => false };
+      const pendingLoad = Promise.withResolvers();
+      const state = {
+        pendingServerLoads: 1,
+        pendingLoad: pendingLoad.promise,
+        serverUrl: expiredServerUrl,
+      };
+      const recoveryLoads = [];
+      const setupLoads = [];
+      const pinCalls = [];
+      const serverUrlCalls = [];
+      const callback = runInNewContext(`(${expiryHandoffCallbackCode})`, {
+        loadServerUrl: async (...args) => {
+          recoveryLoads.push(args);
+          return true;
+        },
+        loadSetupPage: async (...args) => {
+          setupLoads.push(args);
+          pinCalls.push([args[0], null]);
+          serverUrlCalls.push([args[0], null]);
+        },
+        win,
+        windows: new Map([[win, state]]),
+      });
+
+      const recovery = callback({ serverUrl: expiredServerUrl, returnUrl });
+      if (pinAfterPending) state.serverUrl = pinAfterPending;
+      if (rejectPending) pendingLoad.reject(new Error("pending load failed"));
+      else pendingLoad.resolve();
+      await recovery;
+      return { recoveryLoads, setupLoads, pinCalls, serverUrlCalls, win };
+    };
+
+    const switched = await runInterleaving({
+      pinAfterPending: "https://server-b.example",
+    });
+    assert.deepEqual(switched.recoveryLoads, []);
+    assert.deepEqual(switched.setupLoads, []);
+    assert.deepEqual(switched.pinCalls, []);
+    assert.deepEqual(switched.serverUrlCalls, []);
+
+    const unchanged = await runInterleaving({ rejectPending: true });
+    assert.deepEqual(unchanged.recoveryLoads, [
+      [unchanged.win, expiredServerUrl, undefined, returnUrl],
+    ]);
+    assert.deepEqual(unchanged.setupLoads, []);
+    assert.deepEqual(unchanged.pinCalls, []);
+    assert.deepEqual(unchanged.serverUrlCalls, []);
   });
 
   it("wiring-only: limits the fail-loud WebAuthn guard to main-window fallback authentication", () => {

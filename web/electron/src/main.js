@@ -1628,7 +1628,11 @@ function createWindow(targetUrl, opts = {}) {
     },
     async ({ serverUrl: expiredServerUrl, returnUrl }) => {
       const state = windows.get(win);
-      if (state?.pendingServerLoads) return;
+      if (state?.pendingServerLoads) {
+        await state.pendingLoad?.catch(() => {});
+        if (win.isDestroyed?.()) return;
+        if (windows.get(win)?.serverUrl !== expiredServerUrl) return;
+      }
       const loaded = await loadServerUrl(win, expiredServerUrl, undefined, returnUrl);
       if (!loaded) {
         await loadSetupPage(win, {
