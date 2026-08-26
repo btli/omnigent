@@ -1,13 +1,11 @@
 // Shared URL-normalization helpers for the desktop shell.
 //
-// Loaded by both the Electron main process (`require("./url")` in
-// `src/main.js`) and the bundled setup page (`<script src="../src/url.js">` in
-// `setup/index.html`, where it publishes `window.omnigentUrl`). One copy keeps
-// the two from drifting — the setup page's plain-http warning and the main
-// process's navigation must agree on what a bare URL means.
+// Loaded by the Electron main process for URL decisions. The preload imports
+// only serverDisplayLabel for the bundled setup page, keeping normalization out
+// of the renderer while sharing the harmless display formatting.
 //
-// Only web/Node globals (URL, fetch, AbortSignal) are used, so the same source
-// runs unchanged under CommonJS (main) and in the renderer (setup page).
+// Only web/Node globals (URL, fetch, AbortSignal) are used, so the helpers stay
+// portable across the shell's main and preload contexts.
 (function (root, factory) {
   const api = factory();
   if (typeof module === "object" && module.exports) {
@@ -372,6 +370,7 @@
     normalizeRecentServers,
     serverDisplayLabel,
     isPlainHttpRemote,
+    isDatabricksWorkspaceHost,
     WORKSPACE_UI_PATH,
     WORKSPACE_PROBE_TIMEOUT_MS,
     databricksWorkspaceUiUrl,
