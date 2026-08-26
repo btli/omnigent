@@ -699,6 +699,10 @@ export function WorkspacePanel({
     <aside
       aria-label="Workspace"
       inert={inert}
+      // The resize hook can starve the rail to width 0 while it stays mounted;
+      // marking it collapsed keeps index.css's safe-area padding off it so a
+      // zero-width rail can't paint a ghost bg-card strip on native shells.
+      data-collapsed={width === 0 || undefined}
       // Full-height desktop surface flush to the window edge, separated from
       // the main content by a left divider — no outer margin, rounding, or
       // shadow (mirrors the left sidebar). AppShell reserves the panel width
