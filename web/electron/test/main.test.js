@@ -26,7 +26,12 @@ const vm = require("node:vm");
 
 const { runInNewContext } = vm;
 
-const { isSetupIdle, loadInitialDestination, withServerLoad } = require("../src/server_load");
+const {
+  isSetupIdle,
+  loadInitialDestination,
+  loadServerAfterAuth,
+  withServerLoad,
+} = require("../src/server_load");
 const { joinServerUrl, normalizeUrl, workspaceIdentityKey } = require("../src/url");
 const {
   oidcServerUrlError,
@@ -64,6 +69,12 @@ const setupServerCode = liveCode.match(
 )?.[0];
 const createWindowCode = liveCode.match(
   /function createWindow\(targetUrl, opts = \{\}\)[\s\S]*?(?=const MAX_SPELL_SUGGESTIONS)/,
+)?.[0];
+const serverLoadCode = liveCode.match(
+  /async function loadAuthenticatedServerUrl[\s\S]*?(?=async function loadSetupPage)/,
+)?.[0];
+const expiryHandoffCallbackCode = createWindowCode?.match(
+  /async \(\{ serverUrl: expiredServerUrl, returnUrl \}\) => \{[\s\S]*?\n    \}/,
 )?.[0];
 const oauthPopupCode = liveCode.match(
   /function hardenOauthPopup\(child\)[\s\S]*?(?=async function showWebAuthnTimeout)/,
@@ -1244,6 +1255,45 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     assert.doesNotMatch(beforeTransaction, /settings\.server_url = url|setWindowServerManifest/);
   });
 
+  it("leaves the existing server state untouched when authentication fails", async () => {
+    assert.ok(serverLoadCode);
+    const previousServerUrl = "https://previous.example";
+    const previousManifest = { manifestVersion: 1 };
+    const state = {
+      origin: new URL(previousServerUrl).origin,
+      identity: workspaceIdentityKey(previousServerUrl),
+      serverUrl: previousServerUrl,
+      serverManifest: previousManifest,
+      pendingServerLoads: 0,
+    };
+    const settings = { server_url: previousServerUrl };
+    const win = { isDestroyed: () => false };
+    const loadServerUrl = runInNewContext(`${serverLoadCode}; loadServerUrl`, {
+      ensureWindowOidcSession: async () => false,
+      joinServerUrl,
+      loadServerAfterAuth,
+      pinWindow: () => assert.fail("changed the existing pin"),
+      setWindowServerUrl: () => assert.fail("changed the existing server URL"),
+      windows: new Map([[win, state]]),
+      withServerLoad,
+    });
+
+    const loaded = await loadServerUrl(win, "https://next.example", undefined, undefined, {
+      beforeLoad: () => {
+        settings.server_url = "https://next.example";
+        state.serverManifest = { manifestVersion: 2 };
+      },
+    });
+
+    assert.equal(loaded, false);
+    assert.equal(state.origin, new URL(previousServerUrl).origin);
+    assert.equal(state.identity, workspaceIdentityKey(previousServerUrl));
+    assert.equal(state.serverUrl, previousServerUrl);
+    assert.equal(settings.server_url, previousServerUrl);
+    assert.equal(state.serverManifest, previousManifest);
+    assert.equal(state.pendingServerLoads, 0);
+  });
+
   it("ignores switch-server while another window load is pending", async () => {
     const target = "https://other.example";
     const state = { ephemeral: false, pendingServerLoads: 1 };
@@ -1301,11 +1351,33 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     assert.equal(loadFileCalls, 1);
   });
 
-  it("wiring-only: routes intercepted OIDC expiry through the single-load path", () => {
-    assert.match(
-      liveCode,
-      /registerOidcSessionExpiryHandoff\([\s\S]{0,700}loadServerUrl\(win, expiredServerUrl, undefined, returnUrl\)/,
-    );
+  it("falls back to setup when an expiry sign-in does not complete", async () => {
+    assert.ok(expiryHandoffCallbackCode);
+    const win = {};
+    const setupLoads = [];
+    const callback = runInNewContext(`(${expiryHandoffCallbackCode})`, {
+      loadServerUrl: async (...args) => {
+        assert.deepEqual(args, [
+          win,
+          "https://server.example",
+          undefined,
+          "https://server.example/c/current",
+        ]);
+        return false;
+      },
+      loadSetupPage: async (...args) => setupLoads.push(args),
+      win,
+    });
+
+    await callback({
+      serverUrl: "https://server.example",
+      returnUrl: "https://server.example/c/current",
+    });
+
+    assert.equal(setupLoads.length, 1);
+    assert.equal(setupLoads[0][0], win);
+    assert.equal(setupLoads[0][1].error, "Your session expired and sign-in did not complete.");
+    assert.equal(setupLoads[0][1].url, "https://server.example");
   });
 
   it("wiring-only: limits the fail-loud WebAuthn guard to main-window fallback authentication", () => {

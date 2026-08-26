@@ -671,6 +671,46 @@ describe("OIDC session cookie installation", () => {
     );
   });
 
+  it("restores the prior cookie when Electron stores a cookie before rejecting the write", async () => {
+    const priorCookie = {
+      name: "__Host-ap_session",
+      value: "prior-session",
+      domain: "server.example",
+      path: "/",
+      httpOnly: true,
+      secure: true,
+      sameSite: "lax",
+    };
+    let stored = { ...priorCookie };
+    const sets = [];
+    const writeError = new Error("cookie write failed");
+    const electronSession = {
+      cookies: {
+        get: async () => (stored ? [{ ...stored }] : []),
+        set: async (details) => {
+          sets.push({ ...details });
+          stored = { ...details };
+          if (details.value === "new-session") throw writeError;
+        },
+        remove: async () => {
+          stored = null;
+        },
+      },
+      fetch: async () => assert.fail("verified a rejected cookie write"),
+    };
+
+    await assert.rejects(
+      installAndVerifySessionCookie(electronSession, "https://server.example", "new-session"),
+      writeError,
+    );
+
+    assert.equal(stored.value, "prior-session");
+    assert.deepEqual(
+      sets.map(({ value }) => value),
+      ["new-session", "prior-session"],
+    );
+  });
+
   it("fails when the server still reports an unauthenticated OIDC session", async () => {
     const state = cookieSession(null, [response(401, { login_url: "/auth/login" })]);
 
@@ -722,6 +762,50 @@ describe("OIDC session cookie installation", () => {
     assert.deepEqual(
       state.sets.map(({ value }) => value),
       ["new-session", "prior-session"],
+    );
+  });
+
+  it("does not restore non-HttpOnly or non-string prior session cookies", async () => {
+    const invalidPriorCookies = [
+      {
+        name: "__Host-ap_session",
+        value: "script-session",
+        domain: "server.example",
+        path: "/",
+        httpOnly: false,
+        secure: true,
+        sameSite: "lax",
+      },
+      {
+        name: "__Host-ap_session",
+        value: 42,
+        domain: "server.example",
+        path: "/",
+        httpOnly: true,
+        secure: true,
+        sameSite: "lax",
+      },
+    ];
+
+    await Promise.all(
+      invalidPriorCookies.map(async (priorCookie) => {
+        const state = cookieSession(priorCookie, [response(401, { login_url: "/auth/login" })]);
+
+        await assert.rejects(
+          installAndVerifySessionCookie(
+            state.electronSession,
+            "https://server.example",
+            "new-session",
+          ),
+          /did not accept/,
+        );
+
+        assert.equal(state.getStored(), null);
+        assert.deepEqual(
+          state.sets.map(({ value }) => value),
+          ["new-session"],
+        );
+      }),
     );
   });
 
