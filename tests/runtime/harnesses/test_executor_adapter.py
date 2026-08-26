@@ -1154,10 +1154,8 @@ def test_translate_event_non_mcp_request_queues_tool_use_id() -> None:
     result panel for the orphan call (the 2026-04-29
     user-reported regression on ``sys_timer_set``).
 
-    For codex / pi which emit ToolCallRequest but run the
-    tool natively (without invoking _stable_tool_executor for
-    that call), the push is harmless — the queue entry just
-    sits there until a real bridged-tool call drains it.
+    Executors that observe a tool already run by the native harness mark
+    it ``internally_executed`` and bypass this queue entirely.
     """
     from omnigent.inner.executor import ToolCallRequest
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
@@ -1184,6 +1182,40 @@ def test_translate_event_non_mcp_request_queues_tool_use_id() -> None:
         f"with different call_ids and the REPL double-renders "
         f"the ⏵ line."
     )
+
+
+def test_internally_executed_tool_bypasses_dispatch_correlation_queue() -> None:
+    """Keep an observed native tool from corrupting a later dispatch identity."""
+
+    from omnigent.inner.executor import ToolCallComplete, ToolCallRequest, ToolCallStatus
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext()
+    adapter._translate_event(
+        ToolCallRequest(
+            name="shell",
+            args={"command": "pwd"},
+            metadata={"call_id": "native-command-1", "internally_executed": True},
+        ),
+        ctx,  # type: ignore[arg-type]
+    )
+
+    adapter._translate_event(
+        ToolCallComplete(
+            name="shell",
+            status=ToolCallStatus.SUCCESS,
+            result="/workspace\n",
+            metadata={"call_id": "native-command-1"},
+        ),
+        ctx,  # type: ignore[arg-type]
+    )
+
+    assert list(adapter._pending_mcp_call_ids) == []
+    assert [event.item["type"] for event in ctx.emitted] == [
+        "function_call",
+        "function_call_output",
+    ]
 
 
 def test_translate_event_request_without_tool_use_id_does_not_queue() -> None:
@@ -1860,6 +1892,38 @@ def test_internal_errored_tool_complete_emits_output_with_real_call_id() -> None
     )
 
 
+def test_completed_observed_tool_request_is_durable() -> None:
+    """Mark the completed observation durable while retaining the live start."""
+
+    from omnigent.inner.executor import ToolCallRequest
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext()
+
+    request = ToolCallRequest(
+        name="shell",
+        args={"command": "pwd"},
+        metadata={"call_id": "command-1", "internally_executed": True},
+    )
+    adapter._translate_event(request, ctx)  # type: ignore[arg-type]
+    adapter._translate_event(
+        ToolCallRequest(
+            name="shell",
+            args={"command": "pwd"},
+            metadata={
+                "call_id": "command-1",
+                "internally_executed": True,
+                "observed_call_completed": True,
+            },
+        ),
+        ctx,  # type: ignore[arg-type]
+    )
+
+    assert [event.item["status"] for event in ctx.emitted] == ["in_progress", "completed"]
+    assert list(adapter._pending_mcp_call_ids) == []
+
+
 # ── ToolCallComplete suppression scoped to dispatched call ids ──────────────
 #
 # A tool routed through ``_stable_tool_executor`` → ``ctx.dispatch_tool`` already
@@ -2160,3 +2224,87 @@ async def test_run_turn_installs_the_choice_bridge_only_where_supported() -> Non
         assert installed is expected, type(executor).__name__
         # The yes/no bridge is installed on both — the choice bridge is additive.
         assert getattr(executor, "_elicitation_handler", None) is not None
+
+
+def test_translate_event_emits_subagent_started() -> None:
+    """A ``SubAgentStarted`` becomes the runner-internal ``subagent.started`` SSE event.
+
+    This is the harness half of the surfacing seam: the runner turns this event
+    into a child session. If it stops emitting, the Subagents panel goes empty
+    for the agent.
+    """
+    from omnigent.inner.executor import SubAgentStarted
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import SubagentStartedEvent
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext(response_id="resp_sa")
+    adapter._translate_event(
+        SubAgentStarted(child_key="a0ac9364", title="mathutils", task="create files"),
+        ctx,  # type: ignore[arg-type]
+    )
+    assert len(ctx.emitted) == 1
+    ev = ctx.emitted[0]
+    assert isinstance(ev, SubagentStartedEvent)
+    assert (ev.type, ev.child_key, ev.title, ev.task) == (
+        "subagent.started",
+        "a0ac9364",
+        "mathutils",
+        "create files",
+    )
+
+
+def test_translate_event_emits_subagent_completed() -> None:
+    """A ``SubAgentCompleted`` becomes the runner-internal ``subagent.completed`` SSE event."""
+    from omnigent.inner.executor import SubAgentCompleted
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import SubagentCompletedEvent
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext(response_id="resp_sa")
+    adapter._translate_event(
+        SubAgentCompleted(child_key="a0ac9364", ok=True, summary="3 tests pass"),
+        ctx,  # type: ignore[arg-type]
+    )
+    assert len(ctx.emitted) == 1
+    ev = ctx.emitted[0]
+    assert isinstance(ev, SubagentCompletedEvent)
+    assert (ev.type, ev.child_key, ev.ok, ev.summary) == (
+        "subagent.completed",
+        "a0ac9364",
+        True,
+        "3 tests pass",
+    )
+
+
+def test_translate_event_emits_subagent_tool_call() -> None:
+    """A ``SubAgentToolCall`` becomes ``subagent.tool_call`` with JSON arguments.
+
+    The runner appends this to the child transcript as a ``function_call`` card,
+    so ``arguments`` must be the JSON-encoded string the item expects.
+    """
+    from omnigent.inner.executor import SubAgentToolCall
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import SubagentToolCallEvent
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext(response_id="resp_sa")
+    adapter._translate_event(
+        SubAgentToolCall(
+            child_key="a0ac9364",
+            call_id="toolu_01",
+            name="Wrote mathutils.py",
+            args={"file_path": "mathutils.py"},
+        ),
+        ctx,  # type: ignore[arg-type]
+    )
+    assert len(ctx.emitted) == 1
+    ev = ctx.emitted[0]
+    assert isinstance(ev, SubagentToolCallEvent)
+    assert (ev.type, ev.child_key, ev.call_id, ev.name) == (
+        "subagent.tool_call",
+        "a0ac9364",
+        "toolu_01",
+        "Wrote mathutils.py",
+    )
+    assert json.loads(ev.arguments) == {"file_path": "mathutils.py"}
