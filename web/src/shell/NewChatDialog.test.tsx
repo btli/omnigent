@@ -870,7 +870,9 @@ function selectAgent(agentId: string): void {
 function selectUnconfiguredAgent(agentId: string): void {
   fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
   if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
-    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+    const moreTrigger = screen.getByTestId("new-chat-landing-harness-more");
+    expect(moreTrigger).toHaveAttribute("aria-haspopup", "menu");
+    fireEvent.click(moreTrigger);
   }
   fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
 }
@@ -1218,7 +1220,9 @@ describe("NewChatLandingScreen", () => {
     for (const id of ["a_cursor", "a_pi", "a_kiro"]) {
       expect(screen.queryByTestId(`new-chat-landing-agent-${id}`)).toBeNull();
     }
-    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+    const moreTrigger = screen.getByTestId("new-chat-landing-harness-more");
+    expect(moreTrigger).toHaveAttribute("aria-haspopup", "menu");
+    fireEvent.click(moreTrigger);
     const morePi = screen.getByTestId("new-chat-landing-agent-a_pi");
     const moreCursor = screen.getByTestId("new-chat-landing-agent-a_cursor");
     const moreKiro = screen.getByTestId("new-chat-landing-agent-a_kiro");
@@ -1298,7 +1302,9 @@ describe("NewChatLandingScreen", () => {
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
     expect(screen.queryByTestId("new-chat-landing-agent-a_cursor")).toBeNull();
-    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+    const moreTrigger = screen.getByTestId("new-chat-landing-harness-more");
+    expect(moreTrigger).toHaveAttribute("aria-haspopup", "menu");
+    fireEvent.click(moreTrigger);
     expect(screen.getByTestId("new-chat-landing-agent-a_cursor")).toBeTruthy();
   });
 
@@ -1429,7 +1435,9 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     expect(screen.queryByTestId("new-chat-landing-agent-a_pi")).toBeNull();
-    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+    const moreTrigger = screen.getByTestId("new-chat-landing-harness-more");
+    expect(moreTrigger).toHaveAttribute("aria-haspopup", "menu");
+    fireEvent.click(moreTrigger);
     expect(screen.getByTestId("new-chat-landing-agent-a_pi")).toBeTruthy();
   });
 
