@@ -29,6 +29,13 @@ describe("OIDC provider detection", () => {
     );
   });
 
+  it("keeps the organization selector on /v1/me", () => {
+    assert.equal(
+      serverRoute("https://dbc-a.cloud.databricks.com/omnigent?o=123456789", "/v1/me"),
+      "https://dbc-a.cloud.databricks.com/omnigent/v1/me?o=123456789",
+    );
+  });
+
   it("gates only the OIDC login_url", () => {
     assert.equal(classifyAuthProbe(200, null), "authenticated");
     assert.equal(classifyAuthProbe(401, "/auth/login"), "oidc");
@@ -68,6 +75,25 @@ describe("OIDC browser ticket flow", () => {
       assert.equal(oidcServerUrlError(serverUrl), null);
       assert.equal(serverRoute(serverUrl, "/v1/me"), `${serverUrl}/v1/me`);
     }
+  });
+
+  it("allows only organization selectors on Databricks workspace hosts", () => {
+    assert.equal(
+      oidcServerUrlError("https://dbc-a.cloud.databricks.com/omnigent?o=123456789"),
+      null,
+    );
+    assert.equal(
+      oidcServerUrlError("https://dbc-a.cloud.databricks.com/omnigent?o=123&o=456"),
+      null,
+    );
+    assert.equal(
+      oidcServerUrlError("https://server.example/base?o=123456789"),
+      "invalid_server_url",
+    );
+    assert.equal(
+      oidcServerUrlError("https://dbc-a.cloud.databricks.com/omnigent?o=123&view=chat"),
+      "invalid_server_url",
+    );
   });
 
   it("rejects non-loopback HTTP before any authentication side effect", async () => {
@@ -283,6 +309,41 @@ describe("OIDC browser ticket flow", () => {
     assert.equal(calls[0].init.redirect, "manual");
     assert.equal(calls[1].url, "https://server.example/base/auth/cli-poll?ticket=one-time");
     assert.equal(calls[2].url, calls[1].url);
+  });
+
+  it("keeps the organization selector on CLI and ticket login routes", async () => {
+    const calls = [];
+    const responses = [
+      response(200, { ticket: "one-time", login_url: "/auth/login?ticket=one-time" }),
+      response(200, { token: "session-jwt" }),
+    ];
+    const opened = [];
+    const serverUrl = "https://dbc-a.cloud.databricks.com/omnigent?o=123456789";
+
+    const result = await runOidcBrowserLogin(
+      {
+        fetch: async (url) => {
+          calls.push(url);
+          return responses.shift();
+        },
+      },
+      serverUrl,
+      async (url) => opened.push(url),
+      { pollIntervalMs: 1, timeoutMs: 100 },
+    );
+
+    assert.deepEqual(result, { ok: true, token: "session-jwt" });
+    assert.equal(
+      calls[0],
+      "https://dbc-a.cloud.databricks.com/omnigent/auth/cli-login?o=123456789",
+    );
+    assert.deepEqual(opened, [
+      "https://dbc-a.cloud.databricks.com/omnigent/auth/login?o=123456789&ticket=one-time",
+    ]);
+    assert.equal(
+      calls[1],
+      "https://dbc-a.cloud.databricks.com/omnigent/auth/cli-poll?o=123456789&ticket=one-time",
+    );
   });
 
   it("rejects a server-supplied external verification URL", async () => {
@@ -503,6 +564,7 @@ describe("OIDC session cookie installation", () => {
     let stored = initialCookie ? { ...initialCookie } : null;
     const sets = [];
     const removals = [];
+    const fetches = [];
     return {
       electronSession: {
         cookies: {
@@ -516,7 +578,8 @@ describe("OIDC session cookie installation", () => {
             stored = null;
           },
         },
-        fetch: async () => {
+        fetch: async (url) => {
+          fetches.push(url);
           const next = probes.shift();
           if (next instanceof Error) throw next;
           return typeof next === "function" ? next() : next;
@@ -528,6 +591,7 @@ describe("OIDC session cookie installation", () => {
       },
       removals,
       sets,
+      fetches,
     };
   }
 
@@ -577,6 +641,18 @@ describe("OIDC session cookie installation", () => {
     assert.equal(result, undefined);
     assert.equal(state.getStored().value, "session-jwt");
     assert.deepEqual(state.removals, []);
+  });
+
+  it("preserves the organization selector during cookie verification", async () => {
+    const state = cookieSession(null, [response(200)]);
+    const serverUrl = "https://dbc-a.cloud.databricks.com/omnigent?o=123456789";
+
+    await installAndVerifySessionCookie(state.electronSession, serverUrl, "session-jwt");
+
+    assert.equal(state.getStored().url, serverUrl);
+    assert.deepEqual(state.fetches, [
+      "https://dbc-a.cloud.databricks.com/omnigent/v1/me?o=123456789",
+    ]);
   });
 
   it("fails loudly when Electron silently rejects the __Host- cookie", async () => {

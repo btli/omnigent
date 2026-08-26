@@ -1139,17 +1139,29 @@ async function showWebAuthnTimeout(win) {
  * may carry a workspace mount (e.g. ``https://host/omnigent/``). The path is
  * an ABSOLUTE in-app route, but it lives UNDER the server's mount —
  * ``new URL("/c/x", serverUrl)`` would resolve against the ORIGIN and drop
- * ``/omnigent`` — so we string-concatenate: strip the server URL's trailing
- * slash, append the path. The SPA's react-router basename then matches
- * ``${mount}/c/:id``. Shared by createWindow (cold open) and loadServerUrl
- * (re-pointing an existing window) so the mount-aware join is in one place.
+ * ``/omnigent``. Join the path through URL fields so a workspace organization
+ * selector remains a query parameter. Shared by createWindow (cold open) and
+ * loadServerUrl (re-pointing an existing window).
  *
  * @param {string} serverUrl A normalized server URL (origin or origin+mount).
  * @param {string} routePath An absolute in-app path beginning with ``/``.
  * @returns {string}
  */
 function resolveServerPath(serverUrl, routePath) {
-  return serverUrl.replace(/\/+$/, "") + (routePath.startsWith("/") ? routePath : "/" + routePath);
+  const destination = new URL(serverUrl);
+  const route = new URL(
+    routePath.startsWith("/") ? routePath : `/${routePath}`,
+    destination.origin,
+  );
+  destination.pathname = `${destination.pathname.replace(/\/+$/, "")}${route.pathname}`;
+  if (route.search) {
+    const routeQuery = route.search.slice(1);
+    destination.search = destination.search
+      ? `${destination.search.slice(1)}&${routeQuery}`
+      : routeQuery;
+  }
+  destination.hash = route.hash;
+  return destination.toString();
 }
 
 /**
@@ -1505,9 +1517,13 @@ function createWindow(targetUrl, opts = {}) {
         // A saved server can predate the recents list. Backfill it only after
         // a successful cold load; explicit targets may be conversation URLs.
         if (loaded && !ephemeral && !explicit && serverUrl) {
-          const settings = loadSettings();
-          rememberRecentServer(settings, serverUrl);
-          saveSettings(settings);
+          try {
+            const settings = loadSettings();
+            rememberRecentServer(settings, serverUrl);
+            saveSettings(settings);
+          } catch (error) {
+            console.warn("[omnigent] could not backfill recent server", error);
+          }
         }
       })
       .catch(() => loadSetupPage(win));
