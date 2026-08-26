@@ -1,4 +1,4 @@
-// Recovering the desktop window when its outer auth session expires.
+// Recovering the desktop window when its auth session expires.
 //
 // A workspace-hosted Omnigent sits behind the Databricks SSO gate. When that
 // session's cookie lapses, the gate answers the SPA's API calls with a 303
@@ -12,8 +12,17 @@
 // server, reload the window. That re-issues the top-level navigation the SSO
 // gate inspects, so it can re-challenge and re-mint the session.
 //
-// Kept Electron-free at its core (isLoginRedirect) so the matching logic is
+// Self-hosted OIDC has a second expiry signal: the SPA assigns the main frame
+// to the same-server `/auth/login` route after an API 401. The shell must stop
+// that navigation before it can redirect to a third-party IdP, reauthenticate
+// in the system browser, and restore the exact route the user was viewing.
+//
+// Kept Electron-free at its core so the matching logic and event wiring are
 // unit-testable (test/session-expiry.test.js) without booting the app.
+
+"use strict";
+
+const { joinServerUrl, workspaceIdentityKey } = require("./url");
 
 /**
  * Whether a webRequest redirect is the auth gate bouncing an expired session
@@ -58,18 +67,78 @@ function isLoginRedirect(details) {
 function registerSessionExpiryReload(ses, isConnectedServerOrigin, reloadWindowsForOrigin) {
   ses.webRequest.onBeforeRedirect((details) => {
     if (!isLoginRedirect(details)) return;
-    let origin;
-    try {
-      origin = new URL(details.url).origin;
-    } catch {
-      return;
-    }
-    if (!isConnectedServerOrigin(origin)) return;
-    reloadWindowsForOrigin(origin);
+    const identity = workspaceIdentityKey(details.url);
+    if (!identity || !isConnectedServerOrigin(identity)) return;
+    reloadWindowsForOrigin(identity);
   });
+}
+
+/**
+ * Whether a main-frame destination is the pinned server's OIDC login route.
+ * The origin and exact pathname must both match; query parameters such as the
+ * SPA's `return_to` are allowed.
+ *
+ * @param {string} destinationUrl
+ * @param {string | null | undefined} serverUrl
+ * @returns {boolean}
+ */
+function isOidcLoginNavigation(destinationUrl, serverUrl) {
+  if (!serverUrl) return false;
+  try {
+    const destination = new URL(destinationUrl);
+    const expected = new URL(joinServerUrl(serverUrl, "/auth/login"));
+    return (
+      workspaceIdentityKey(destinationUrl) === workspaceIdentityKey(serverUrl) &&
+      destination.pathname === expected.pathname
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Stop live-renderer OIDC expiry navigation before the server can redirect the
+ * main frame to an IdP. The callback owns browser authentication and route
+ * restoration. Repeated navigation events share one in-flight callback.
+ *
+ * @param {Electron.WebContents} webContents
+ * @param {() => string | null} serverUrlForWindow
+ * @param {(params: { serverUrl: string, returnUrl: string }) => Promise<void>} onExpired
+ */
+function registerOidcSessionExpiryHandoff(webContents, serverUrlForWindow, onExpired) {
+  let inFlight = null;
+  const intercept = (event, destinationUrl, isMainFrame = true) => {
+    if (isMainFrame === false) return;
+    const serverUrl = serverUrlForWindow();
+    if (!isOidcLoginNavigation(destinationUrl, serverUrl)) return;
+    event.preventDefault();
+    if (inFlight) return;
+
+    let returnUrl = serverUrl;
+    try {
+      const current = new URL(webContents.getURL());
+      if (workspaceIdentityKey(current.toString()) === workspaceIdentityKey(serverUrl)) {
+        returnUrl = current.toString();
+      }
+    } catch {
+      // Fall back to the clean server URL when the current page is unavailable.
+    }
+    inFlight = Promise.resolve(onExpired({ serverUrl, returnUrl }))
+      .catch(() => {})
+      .finally(() => {
+        inFlight = null;
+      });
+  };
+
+  webContents.on("will-navigate", (event, url) => intercept(event, url));
+  webContents.on("will-redirect", (event, url, _isInPlace, isMainFrame) =>
+    intercept(event, url, isMainFrame),
+  );
 }
 
 module.exports = {
   isLoginRedirect,
+  isOidcLoginNavigation,
   registerSessionExpiryReload,
+  registerOidcSessionExpiryHandoff,
 };
