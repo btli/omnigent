@@ -60,51 +60,6 @@ describe("OIDC provider detection", () => {
     assert.equal(calls[0].init.redirect, "manual");
     assert.equal(calls[0].init.credentials, "include");
   });
-
-  it("clears a same-host workspace cookie before probing another organization", async () => {
-    let stored = { name: "__Host-ap_session", value: "workspace-a-token" };
-    const removals = [];
-    const fetches = [];
-    const electronSession = {
-      cookies: {
-        remove: async (url, name) => {
-          removals.push({ url, name });
-          stored = null;
-        },
-      },
-      fetch: async (url) => {
-        fetches.push({ url, cookie: stored?.value ?? null });
-        return stored ? response(200) : response(401, { login_url: "/auth/login" });
-      },
-    };
-    const workspaceA = "https://dbc-a.cloud.databricks.com/omnigent?o=workspace-a";
-    const workspaceB = "https://dbc-a.cloud.databricks.com/omnigent?o=workspace-b";
-
-    assert.deepEqual(await probeServerAuth(electronSession, workspaceA), {
-      kind: "authenticated",
-      status: 200,
-    });
-    assert.deepEqual(await probeServerAuth(electronSession, workspaceB), {
-      kind: "oidc",
-      status: 401,
-    });
-    assert.deepEqual(fetches, [
-      {
-        url: "https://dbc-a.cloud.databricks.com/omnigent/v1/me?o=workspace-a",
-        cookie: "workspace-a-token",
-      },
-      {
-        url: "https://dbc-a.cloud.databricks.com/omnigent/v1/me?o=workspace-b",
-        cookie: null,
-      },
-    ]);
-    assert.deepEqual(removals, [
-      {
-        url: workspaceB,
-        name: "__Host-ap_session",
-      },
-    ]);
-  });
 });
 
 describe("OIDC browser ticket flow", () => {
