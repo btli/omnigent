@@ -64,6 +64,8 @@ const {
   oidcServerUrlError,
   probeServerAuth,
   runOidcBrowserLogin,
+  isSessionCookieOwnershipError,
+  navigateWithSessionCookieWorkspace,
   installAndVerifySessionCookie,
 } = require("./oidc_auth");
 const { runOidcLoginDialog } = require("./oidc_login_dialog");
@@ -689,9 +691,12 @@ function setWindowServerUrl(win, serverUrl) {
   if (state) state.serverUrl = serverUrl;
 }
 
-function setWindowAuthenticationNavigation(win, enabled) {
+function setWindowAuthenticationNavigation(win, enabled, cookieEstablishment = enabled) {
   const state = windows.get(win);
-  if (state) state.authenticationNavigation = enabled;
+  if (state) {
+    state.authenticationNavigation = enabled;
+    state.cookieEstablishmentNavigation = cookieEstablishment;
+  }
 }
 
 /**
@@ -1262,13 +1267,17 @@ async function ensureWindowOidcSession(win, serverUrl) {
   let probe;
   try {
     probe = await probeServerAuth(session.defaultSession, serverUrl);
-  } catch {
+  } catch (error) {
+    if (isSessionCookieOwnershipError(error)) {
+      setWindowAuthenticationNavigation(win, false);
+      return false;
+    }
     // Preserve the existing load/failure behavior for unreachable or unknown
     // servers. did-fail-load will surface the actionable connection error.
     setWindowAuthenticationNavigation(win, true);
     return true;
   }
-  setWindowAuthenticationNavigation(win, probe.kind === "other");
+  setWindowAuthenticationNavigation(win, probe.kind === "other", probe.kind !== "authenticated");
   if (probe.kind !== "oidc") return true;
 
   const cachedAuth = omnigentCli.serverAuthEntry(serverUrl);
@@ -1292,7 +1301,18 @@ async function loadAuthenticatedServerUrl(win, serverUrl, routePath, exactLoadUr
   pinWindow(win, serverUrl);
   setWindowServerUrl(win, serverUrl);
   const destination = exactLoadUrl ?? (routePath ? joinServerUrl(serverUrl, routePath) : serverUrl);
-  await win.loadURL(destination);
+  if (omnigentCli.isLoopbackServer(serverUrl)) {
+    await win.loadURL(destination);
+    return;
+  }
+  const state = windows.get(win);
+  await navigateWithSessionCookieWorkspace(
+    session.defaultSession,
+    serverUrl,
+    () => win.loadURL(destination),
+    { recordCookieAfterNavigation: state?.cookieEstablishmentNavigation === true },
+  );
+  if (state) state.cookieEstablishmentNavigation = false;
 }
 
 async function loadServerUrl(

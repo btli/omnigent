@@ -12,10 +12,14 @@ const AUTH_PROBE_TIMEOUT_MS = 10000;
 const OIDC_LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 const OIDC_POLL_INTERVAL_MS = 2000;
 const OIDC_REQUEST_TIMEOUT_MS = 10000;
+const SESSION_COOKIE_READ_TIMEOUT_MS = 2000;
+const SESSION_COOKIE_OWNERSHIP_ERROR = "SESSION_COOKIE_OWNERSHIP_UNKNOWN";
 const MAX_PATH_DECODE_PASSES = 32;
 const TRANSIENT_AUTH_STATUSES = new Set([429, 502, 503, 504]);
 const cookieMutationQueues = new WeakMap();
 const activeCookieWorkspaceOwners = new WeakMap();
+const pendingCookieWorkspaceOwners = new WeakMap();
+const observedCookieSessions = new WeakSet();
 
 // Keep API routes under workspace mounts, matching the CLI.
 function serverRoute(serverUrl, routePath) {
@@ -36,7 +40,12 @@ function classifyAuthProbe(status, loginUrl) {
 async function probeServerAuth(
   electronSession,
   serverUrl,
-  { timeoutMs = AUTH_PROBE_TIMEOUT_MS, signal, cookieWorkspacePrepared = false } = {},
+  {
+    timeoutMs = AUTH_PROBE_TIMEOUT_MS,
+    signal,
+    cookieWorkspacePrepared = false,
+    cookieReadTimeoutMs = SESSION_COOKIE_READ_TIMEOUT_MS,
+  } = {},
 ) {
   const runProbe = async () => {
     const response = await electronSession.fetch(serverRoute(serverUrl, "/v1/me"), {
@@ -59,10 +68,8 @@ async function probeServerAuth(
   };
   if (cookieWorkspacePrepared) return runProbe();
 
-  const details = sessionCookieDetails(serverUrl, "");
-  return serializeCookieMutation(electronSession, serverUrl, details, async () => {
-    await prepareSessionCookieWorkspace(electronSession, serverUrl, details);
-    return runProbe();
+  return runWithSessionCookieWorkspace(electronSession, serverUrl, runProbe, {
+    cookieReadTimeoutMs,
   });
 }
 
@@ -287,8 +294,10 @@ function priorSessionCookie(cookies, serverUrl, details) {
     (cookie) =>
       cookie &&
       cookie.name === details.name &&
+      typeof cookie.value === "string" &&
       cookie.path === details.path &&
       cookie.secure === details.secure &&
+      cookie.httpOnly === true &&
       (!cookie.domain || cookie.domain === hostname),
   );
 }
@@ -328,23 +337,128 @@ function sessionCookieScope(serverUrl, details) {
   return `${new URL(serverUrl).hostname}\0${details.name}\0${details.path}`;
 }
 
-async function prepareSessionCookieWorkspace(electronSession, serverUrl, details) {
+class SessionCookieOwnershipError extends Error {
+  constructor(message, options) {
+    super(message, options);
+    this.name = "SessionCookieOwnershipError";
+    this.code = SESSION_COOKIE_OWNERSHIP_ERROR;
+  }
+}
+
+function isSessionCookieOwnershipError(error) {
+  return error?.code === SESSION_COOKIE_OWNERSHIP_ERROR;
+}
+
+function readSessionCookies(electronSession, serverUrl, details, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      callback(value);
+    };
+    const timer = setTimeout(
+      () =>
+        finish(
+          reject,
+          new SessionCookieOwnershipError("Timed out while reading the session cookie."),
+        ),
+      timeoutMs,
+    );
+    Promise.resolve()
+      .then(() => electronSession.cookies.get({ url: serverUrl, name: details.name }))
+      .then(
+        (cookies) => finish(resolve, cookies),
+        (error) => finish(reject, error),
+      );
+  });
+}
+
+async function clearSessionCookieWorkspace(electronSession, serverUrl, details) {
+  const scope = sessionCookieScope(serverUrl, details);
+  activeCookieWorkspaceOwners.get(electronSession)?.delete(scope);
+  pendingCookieWorkspaceOwners.get(electronSession)?.delete(scope);
+  try {
+    await electronSession.cookies.remove(serverUrl, details.name);
+  } catch (cause) {
+    throw new SessionCookieOwnershipError("Could not clear an unowned session cookie.", {
+      cause,
+    });
+  }
+}
+
+async function readSessionCookiesFailClosed(
+  electronSession,
+  serverUrl,
+  details,
+  cookieReadTimeoutMs,
+) {
+  try {
+    const cookies = await readSessionCookies(
+      electronSession,
+      serverUrl,
+      details,
+      cookieReadTimeoutMs,
+    );
+    if (!Array.isArray(cookies)) throw new Error("The cookie store returned an invalid result.");
+    return cookies;
+  } catch (cause) {
+    let cleanupError;
+    try {
+      await clearSessionCookieWorkspace(electronSession, serverUrl, details);
+    } catch (error) {
+      cleanupError = error;
+    }
+    const ownershipError = new SessionCookieOwnershipError(
+      "Could not determine session cookie ownership.",
+      { cause },
+    );
+    if (cleanupError) ownershipError.cleanupError = cleanupError;
+    throw ownershipError;
+  }
+}
+
+function inspectSessionCookies(cookies, serverUrl, details) {
+  const namedCookies = cookies.filter((cookie) => cookie?.name === details.name);
+  if (namedCookies.length === 0) return { present: false, cookie: null };
+  const cookie = priorSessionCookie(namedCookies, serverUrl, details);
+  return {
+    present: true,
+    cookie: namedCookies.length === 1 ? (cookie ?? null) : null,
+  };
+}
+
+async function prepareSessionCookieWorkspace(
+  electronSession,
+  serverUrl,
+  details,
+  cookieReadTimeoutMs = SESSION_COOKIE_READ_TIMEOUT_MS,
+) {
   const identity = workspaceIdentityKey(serverUrl);
   if (!identity) throw new Error("The server URL is invalid.");
-  const cookies = await electronSession.cookies.get({ url: serverUrl, name: details.name });
-  const currentCookie = priorSessionCookie(cookies, serverUrl, details);
+  const cookies = await readSessionCookiesFailClosed(
+    electronSession,
+    serverUrl,
+    details,
+    cookieReadTimeoutMs,
+  );
+  const inspected = inspectSessionCookies(cookies, serverUrl, details);
+  const currentCookie = inspected.cookie;
   const owners = activeCookieWorkspaceOwners.get(electronSession);
   const scope = sessionCookieScope(serverUrl, details);
   const owner = owners?.get(scope);
-  if (!currentCookie) {
+  if (!inspected.present) {
     owners?.delete(scope);
-    return;
+    return null;
   }
-  if (owner?.identity === identity && owner.cookieValue === currentCookie.value) return;
+  if (currentCookie && owner?.identity === identity && owner.cookieValue === currentCookie.value) {
+    return currentCookie.value;
+  }
 
-  // A persisted cookie without matching live ownership is never safe to send.
-  owners?.delete(scope);
-  await electronSession.cookies.remove(serverUrl, details.name);
+  // A persisted or unfamiliar cookie without matching live ownership is unsafe.
+  await clearSessionCookieWorkspace(electronSession, serverUrl, details);
+  return null;
 }
 
 function rememberSessionCookieWorkspace(electronSession, serverUrl, details, cookieValue) {
@@ -353,9 +467,182 @@ function rememberSessionCookieWorkspace(electronSession, serverUrl, details, coo
     owners = new Map();
     activeCookieWorkspaceOwners.set(electronSession, owners);
   }
-  owners.set(sessionCookieScope(serverUrl, details), {
+  const scope = sessionCookieScope(serverUrl, details);
+  owners.set(scope, {
     identity: workspaceIdentityKey(serverUrl),
     cookieValue,
+  });
+  pendingCookieWorkspaceOwners.get(electronSession)?.delete(scope);
+}
+
+function changedCookieScope(cookie) {
+  if (
+    !cookie ||
+    typeof cookie.domain !== "string" ||
+    typeof cookie.name !== "string" ||
+    typeof cookie.path !== "string"
+  ) {
+    return null;
+  }
+  const hostname = cookie.domain.replace(/^\./, "").toLowerCase();
+  return `${hostname}\0${cookie.name}\0${cookie.path}`;
+}
+
+function observePendingCookieWorkspaceOwners(electronSession) {
+  if (observedCookieSessions.has(electronSession)) return;
+  if (typeof electronSession.cookies.on !== "function") return;
+  observedCookieSessions.add(electronSession);
+  electronSession.cookies.on("changed", (_event, cookie, _cause, removed) => {
+    if (removed) return;
+    const scope = changedCookieScope(cookie);
+    if (!scope) return;
+    const pendingOwners = pendingCookieWorkspaceOwners.get(electronSession);
+    const pending = pendingOwners?.get(scope);
+    if (!pending) return;
+    if (Date.now() > pending.expiresAt) {
+      pendingOwners.delete(scope);
+      return;
+    }
+    const inspected = inspectSessionCookies([cookie], pending.serverUrl, pending.details);
+    if (!inspected.cookie) {
+      void clearSessionCookieWorkspace(electronSession, pending.serverUrl, pending.details).catch(
+        () => {},
+      );
+      return;
+    }
+    rememberSessionCookieWorkspace(
+      electronSession,
+      pending.serverUrl,
+      pending.details,
+      inspected.cookie.value,
+    );
+  });
+}
+
+function allowPendingCookieWorkspaceOwner(electronSession, serverUrl, details) {
+  let pendingOwners = pendingCookieWorkspaceOwners.get(electronSession);
+  if (!pendingOwners) {
+    pendingOwners = new Map();
+    pendingCookieWorkspaceOwners.set(electronSession, pendingOwners);
+  }
+  pendingOwners.set(sessionCookieScope(serverUrl, details), {
+    serverUrl,
+    details,
+    expiresAt: Date.now() + OIDC_LOGIN_TIMEOUT_MS,
+  });
+  observePendingCookieWorkspaceOwners(electronSession);
+}
+
+async function reverifySessionCookieWorkspace(
+  electronSession,
+  serverUrl,
+  details,
+  expectedCookieValue,
+  cookieReadTimeoutMs,
+) {
+  const cookies = await readSessionCookiesFailClosed(
+    electronSession,
+    serverUrl,
+    details,
+    cookieReadTimeoutMs,
+  );
+  const inspected = inspectSessionCookies(cookies, serverUrl, details);
+  if (!inspected.present && expectedCookieValue === null) return;
+
+  const identity = workspaceIdentityKey(serverUrl);
+  const owner = activeCookieWorkspaceOwners
+    .get(electronSession)
+    ?.get(sessionCookieScope(serverUrl, details));
+  if (
+    inspected.cookie &&
+    inspected.cookie.value === expectedCookieValue &&
+    owner?.identity === identity &&
+    owner.cookieValue === expectedCookieValue
+  ) {
+    return;
+  }
+  if (inspected.present) {
+    await clearSessionCookieWorkspace(electronSession, serverUrl, details);
+  } else {
+    activeCookieWorkspaceOwners
+      .get(electronSession)
+      ?.delete(sessionCookieScope(serverUrl, details));
+  }
+}
+
+async function recordCurrentSessionCookieWorkspace(
+  electronSession,
+  serverUrl,
+  details,
+  cookieReadTimeoutMs,
+) {
+  const cookies = await readSessionCookiesFailClosed(
+    electronSession,
+    serverUrl,
+    details,
+    cookieReadTimeoutMs,
+  );
+  const inspected = inspectSessionCookies(cookies, serverUrl, details);
+  if (!inspected.present) {
+    activeCookieWorkspaceOwners
+      .get(electronSession)
+      ?.delete(sessionCookieScope(serverUrl, details));
+    return false;
+  }
+  if (!inspected.cookie) {
+    await clearSessionCookieWorkspace(electronSession, serverUrl, details);
+    throw new SessionCookieOwnershipError("Chromium established an unfamiliar session cookie.");
+  }
+  rememberSessionCookieWorkspace(electronSession, serverUrl, details, inspected.cookie.value);
+  return true;
+}
+
+async function runWithSessionCookieWorkspace(
+  electronSession,
+  serverUrl,
+  operation,
+  { cookieReadTimeoutMs = SESSION_COOKIE_READ_TIMEOUT_MS, recordCookieAfterOperation = false } = {},
+) {
+  const details = sessionCookieDetails(serverUrl, "");
+  return serializeCookieMutation(electronSession, serverUrl, details, async () => {
+    const expectedCookieValue = await prepareSessionCookieWorkspace(
+      electronSession,
+      serverUrl,
+      details,
+      cookieReadTimeoutMs,
+    );
+    await reverifySessionCookieWorkspace(
+      electronSession,
+      serverUrl,
+      details,
+      expectedCookieValue,
+      cookieReadTimeoutMs,
+    );
+    const result = await operation();
+    if (recordCookieAfterOperation) {
+      const recorded = await recordCurrentSessionCookieWorkspace(
+        electronSession,
+        serverUrl,
+        details,
+        cookieReadTimeoutMs,
+      );
+      if (!recorded) allowPendingCookieWorkspaceOwner(electronSession, serverUrl, details);
+    }
+    return result;
+  });
+}
+
+function navigateWithSessionCookieWorkspace(
+  electronSession,
+  serverUrl,
+  navigate,
+  { cookieReadTimeoutMs, recordCookieAfterNavigation = false } = {},
+) {
+  const details = sessionCookieDetails(serverUrl, "");
+  pendingCookieWorkspaceOwners.get(electronSession)?.delete(sessionCookieScope(serverUrl, details));
+  return runWithSessionCookieWorkspace(electronSession, serverUrl, navigate, {
+    cookieReadTimeoutMs,
+    recordCookieAfterOperation: recordCookieAfterNavigation,
   });
 }
 
@@ -405,6 +692,9 @@ async function installAndVerifySessionCookie(
   }
   const details = sessionCookieDetails(serverUrl, token);
   return serializeCookieMutation(electronSession, serverUrl, details, async () => {
+    pendingCookieWorkspaceOwners
+      .get(electronSession)
+      ?.delete(sessionCookieScope(serverUrl, details));
     await prepareSessionCookieWorkspace(electronSession, serverUrl, details);
     const existing = await electronSession.cookies.get({ url: serverUrl, name: details.name });
     const priorCookie = priorSessionCookie(existing, serverUrl, details);
@@ -462,11 +752,14 @@ module.exports = {
   OIDC_LOGIN_TIMEOUT_MS,
   OIDC_POLL_INTERVAL_MS,
   OIDC_REQUEST_TIMEOUT_MS,
+  SESSION_COOKIE_READ_TIMEOUT_MS,
   oidcServerUrlError,
   serverRoute,
   classifyAuthProbe,
   probeServerAuth,
   runOidcBrowserLogin,
   sessionCookieDetails,
+  isSessionCookieOwnershipError,
+  navigateWithSessionCookieWorkspace,
   installAndVerifySessionCookie,
 };

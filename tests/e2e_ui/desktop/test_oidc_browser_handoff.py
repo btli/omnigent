@@ -12,6 +12,7 @@ import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
+from typing import Any
 from urllib.parse import urlparse
 
 from playwright.sync_api import Page, expect
@@ -52,7 +53,7 @@ _TICKET_CLIENT = """
 """
 
 
-def _run_ticket_flow(statuses: list[int]) -> dict[str, object]:
+def _run_ticket_flow(statuses: list[int]) -> dict[str, Any]:
     pending = list(statuses)
 
     class Handler(BaseHTTPRequestHandler):
@@ -81,7 +82,7 @@ def _run_ticket_flow(statuses: list[int]) -> dict[str, object]:
             self.end_headers()
             self.wfile.write(payload)
 
-        def log_message(self, _format: str, *args: object) -> None:
+        def log_message(self, format: str, *args: object) -> None:
             return
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)

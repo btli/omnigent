@@ -26,11 +26,19 @@ const vm = require("node:vm");
 
 const { runInNewContext } = vm;
 
-const { isSetupIdle, loadInitialDestination, withServerLoad } = require("../src/server_load");
+const {
+  loadServerAfterAuth,
+  isSetupIdle,
+  loadInitialDestination,
+  withServerLoad,
+} = require("../src/server_load");
 const { joinServerUrl, normalizeUrl, workspaceIdentityKey } = require("../src/url");
 const {
   oidcServerUrlError,
+  probeServerAuth,
   runOidcBrowserLogin,
+  isSessionCookieOwnershipError,
+  navigateWithSessionCookieWorkspace,
   installAndVerifySessionCookie,
 } = require("../src/oidc_auth");
 
@@ -49,6 +57,12 @@ const setupConnectSource = setupSource.match(
 const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
 const oidcSessionCode = liveCode.match(
   /async function runWindowOidcBrowserHandoff[\s\S]*?(?=async function loadAuthenticatedServerUrl)/,
+)?.[0];
+const oidcLoadCode = liveCode.match(
+  /async function runWindowOidcBrowserHandoff[\s\S]*?(?=async function loadServerUrl)/,
+)?.[0];
+const authenticationNavigationSetterCode = liveCode.match(
+  /function setWindowAuthenticationNavigation[\s\S]*?(?=function setWindowServerManifest)/,
 )?.[0];
 const webAuthnTimeoutCode = liveCode.match(
   /async function showWebAuthnTimeout[\s\S]*?(?=async function runWindowOidcBrowserHandoff)/,
@@ -268,6 +282,9 @@ function loadNavigationHarness({
         return { kind: "other" };
       },
       runOidcBrowserLogin: async () => ({ ok: false, reason: "cancelled" }),
+      isSessionCookieOwnershipError,
+      navigateWithSessionCookieWorkspace: async (_electronSession, _serverUrl, navigate) =>
+        navigate(),
       installAndVerifySessionCookie: async () => {
         if (rejectAuthSideEffects) assert.fail("invalid server URL reached cookie installation");
       },
@@ -580,6 +597,108 @@ describe("navigation fallback wiring (src/main.js)", () => {
 });
 
 describe("remote OIDC browser handoff wiring (src/main.js)", () => {
+  it("denies navigation when cookie ownership inspection fails", async () => {
+    const ensureWindowOidcSession = runInNewContext(`${oidcSessionCode}; ensureWindowOidcSession`, {
+      installAndVerifySessionCookie: async () => assert.fail("installed a cookie"),
+      isSessionCookieOwnershipError,
+      oidcServerUrlError,
+      omnigentCli: {
+        isLoopbackServer: () => false,
+        serverAuthEntry: () => assert.fail("read cached auth"),
+      },
+      probeServerAuth: async () => {
+        const error = new Error("cookie ownership is unknown");
+        error.code = "SESSION_COOKIE_OWNERSHIP_UNKNOWN";
+        throw error;
+      },
+      runOidcBrowserLogin: async () => assert.fail("started browser login"),
+      runOidcLoginDialog: async () => assert.fail("opened login dialog"),
+      session: { defaultSession: {} },
+      setWindowAuthenticationNavigation: () => {},
+    });
+    const win = { isDestroyed: () => false };
+    let navigations = 0;
+
+    const loaded = await loadServerAfterAuth({
+      authenticate: () => ensureWindowOidcSession(win, "https://server.example"),
+      load: async () => {
+        navigations += 1;
+      },
+    });
+
+    assert.equal(loaded, false);
+    assert.equal(navigations, 0);
+  });
+
+  it("keeps a Chromium-established accounts session on same-workspace reconnect", async () => {
+    let stored = null;
+    let cookieChanged;
+    const removals = [];
+    const serverUrl = "https://server.example";
+    const electronSession = {
+      cookies: {
+        get: async () => (stored ? [{ ...stored }] : []),
+        remove: async (url, name) => {
+          removals.push({ url, name });
+          stored = null;
+        },
+        on: (eventName, listener) => {
+          if (eventName === "changed") cookieChanged = listener;
+        },
+      },
+      fetch: async () => ({
+        status: stored ? 200 : 401,
+        json: async () => ({ login_url: "/login" }),
+      }),
+    };
+    const state = { cookieEstablishmentNavigation: false };
+    const win = {
+      isDestroyed: () => false,
+      loadURL: async () => {},
+    };
+    const windows = new Map([[win, state]]);
+    const { ensureWindowOidcSession, loadAuthenticatedServerUrl } = runInNewContext(
+      `${authenticationNavigationSetterCode}; ${oidcLoadCode}; ({ ensureWindowOidcSession, loadAuthenticatedServerUrl })`,
+      {
+        installAndVerifySessionCookie: async () => assert.fail("installed an OIDC cookie"),
+        isSessionCookieOwnershipError,
+        joinServerUrl,
+        navigateWithSessionCookieWorkspace,
+        oidcServerUrlError,
+        omnigentCli: {
+          isLoopbackServer: () => false,
+          serverAuthEntry: () => assert.fail("read cached OIDC auth"),
+        },
+        pinWindow: () => {},
+        probeServerAuth,
+        runOidcBrowserLogin: async () => assert.fail("started OIDC browser login"),
+        runOidcLoginDialog: async () => assert.fail("opened OIDC login dialog"),
+        session: { defaultSession: electronSession },
+        setWindowServerUrl: () => {},
+        windows,
+      },
+    );
+
+    assert.equal(await ensureWindowOidcSession(win, serverUrl), true);
+    await loadAuthenticatedServerUrl(win, serverUrl);
+    stored = {
+      name: "__Host-ap_session",
+      value: "chromium-login-token",
+      domain: "server.example",
+      path: "/",
+      httpOnly: true,
+      secure: true,
+      sameSite: "lax",
+    };
+    cookieChanged?.({}, { ...stored }, "explicit", false);
+
+    assert.deepEqual(await probeServerAuth(electronSession, serverUrl), {
+      kind: "authenticated",
+      status: 200,
+    });
+    assert.deepEqual(removals, []);
+  });
+
   it("keeps js-yaml outside the main process startup import path", () => {
     assert.match(mainSource, /const omnigentCli = require\("\.\/omnigent_cli"\)/);
     const loaderIndex = omnigentCliSource.indexOf("function loadYamlParser");
@@ -1313,7 +1432,7 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     assert.doesNotMatch(oauthPopupCode, /registerWebAuthnTimeout|showWebAuthnTimeout/);
     assert.match(
       oidcSessionCode,
-      /setWindowAuthenticationNavigation\(win, true\)[\s\S]{0,220}setWindowAuthenticationNavigation\(win, probe\.kind === "other"\)/,
+      /setWindowAuthenticationNavigation\(win, true\)[\s\S]{0,300}setWindowAuthenticationNavigation\(\s*win,\s*probe\.kind === "other",\s*probe\.kind !== "authenticated"\s*\)/,
     );
     assert.match(
       liveCode,

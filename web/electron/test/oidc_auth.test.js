@@ -8,6 +8,7 @@ const {
   probeServerAuth,
   runOidcBrowserLogin,
   sessionCookieDetails,
+  isSessionCookieOwnershipError,
   installAndVerifySessionCookie,
 } = require("../src/oidc_auth");
 
@@ -166,6 +167,142 @@ describe("OIDC provider detection", () => {
     });
     assert.deepEqual(removals, [{ url: workspaceA, name: "__Host-ap_session" }]);
   });
+
+  it("never sends a cookie installed or replaced after the ownership snapshot", async () => {
+    const serverUrl = "https://dbc-a.cloud.databricks.com/omnigent?o=workspace-a";
+    const foreignCookie = {
+      name: "__Host-ap_session",
+      value: "workspace-b-token",
+      path: "/",
+      httpOnly: true,
+      secure: true,
+      sameSite: "lax",
+    };
+
+    await Promise.all(
+      [false, true].map(async (replaceOwnedCookie) => {
+        let stored = null;
+        let mutateOnRead = false;
+        const fetchCookies = [];
+        const electronSession = {
+          cookies: {
+            get: async () => {
+              const snapshot = stored ? [{ ...stored }] : [];
+              if (mutateOnRead) {
+                mutateOnRead = false;
+                queueMicrotask(() => {
+                  stored = { ...foreignCookie };
+                });
+              }
+              return snapshot;
+            },
+            set: async (details) => {
+              stored = { ...details };
+            },
+            remove: async () => {
+              stored = null;
+            },
+          },
+          fetch: async () => {
+            fetchCookies.push(stored?.value ?? null);
+            return stored ? response(200) : response(401, { login_url: "/auth/login" });
+          },
+        };
+
+        if (replaceOwnedCookie) {
+          await installAndVerifySessionCookie(electronSession, serverUrl, "workspace-a-token");
+          fetchCookies.length = 0;
+        }
+        mutateOnRead = true;
+
+        assert.deepEqual(await probeServerAuth(electronSession, serverUrl), {
+          kind: "oidc",
+          status: 401,
+        });
+        assert.deepEqual(fetchCookies, [null]);
+      }),
+    );
+  });
+
+  it("fails closed when the cookie store read throws", async () => {
+    let removals = 0;
+    let fetches = 0;
+    const electronSession = {
+      cookies: {
+        get: async () => {
+          throw new Error("cookie database unavailable");
+        },
+        remove: async () => {
+          removals += 1;
+        },
+      },
+      fetch: async () => {
+        fetches += 1;
+        return response(200);
+      },
+    };
+
+    await assert.rejects(
+      probeServerAuth(electronSession, "https://server.example"),
+      isSessionCookieOwnershipError,
+    );
+    assert.equal(removals, 1);
+    assert.equal(fetches, 0);
+  });
+
+  it("clears an unrecognized same-name cookie before probing", async () => {
+    let stored = { name: "__Host-ap_session", value: "unknown-shape-token" };
+    const electronSession = {
+      cookies: {
+        get: async () => (stored ? [{ ...stored }] : []),
+        remove: async () => {
+          stored = null;
+        },
+      },
+      fetch: async () => (stored ? response(200) : response(401, { login_url: "/auth/login" })),
+    };
+
+    assert.deepEqual(await probeServerAuth(electronSession, "https://server.example"), {
+      kind: "oidc",
+      status: 401,
+    });
+    assert.equal(stored, null);
+  });
+
+  it(
+    "times out a stuck cookie read, fails closed, and releases the queue",
+    { timeout: 500 },
+    async () => {
+      let stuck = true;
+      let removals = 0;
+      let fetches = 0;
+      const electronSession = {
+        cookies: {
+          get: async () => (stuck ? new Promise(() => {}) : []),
+          remove: async () => {
+            removals += 1;
+          },
+        },
+        fetch: async () => {
+          fetches += 1;
+          return response(401, { login_url: "/auth/login" });
+        },
+      };
+      const serverUrl = "https://server.example";
+
+      await assert.rejects(
+        probeServerAuth(electronSession, serverUrl, { cookieReadTimeoutMs: 10 }),
+        isSessionCookieOwnershipError,
+      );
+      stuck = false;
+      assert.deepEqual(
+        await probeServerAuth(electronSession, serverUrl, { cookieReadTimeoutMs: 10 }),
+        { kind: "oidc", status: 401 },
+      );
+      assert.equal(removals, 1);
+      assert.equal(fetches, 1);
+    },
+  );
 });
 
 describe("OIDC browser ticket flow", () => {
