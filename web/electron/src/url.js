@@ -108,8 +108,9 @@
       } catch {
         continue;
       }
-      if (seen.has(url)) continue;
-      seen.add(url);
+      const identity = workspaceIdentityKey(url);
+      if (!identity || seen.has(identity)) continue;
+      seen.add(identity);
       normalized.push(url);
     }
     return normalized;
@@ -184,6 +185,67 @@
     );
   }
 
+  /** Copy only Databricks' workspace selector into a fresh query. */
+  function workspaceOrganizationSearch(url) {
+    const query = new URLSearchParams();
+    if (isDatabricksWorkspaceHost(url.hostname)) {
+      for (const organization of url.searchParams.getAll("o")) {
+        query.append("o", organization);
+      }
+    }
+    return query;
+  }
+
+  /**
+   * Stable server identity for workspace-scoped state. Browser origins discard
+   * queries, but Databricks uses ``o`` to select a workspace on shared hosts.
+   * Every other query remains deliberately outside the identity boundary.
+   *
+   * @param {string | null | undefined} rawUrl
+   * @returns {string | null}
+   */
+  function workspaceIdentityKey(rawUrl) {
+    let url;
+    try {
+      url = new URL(rawUrl);
+    } catch {
+      return null;
+    }
+    const query = workspaceOrganizationSearch(url).toString();
+    return `${url.origin}${query ? `?${query}` : ""}`;
+  }
+
+  /**
+   * Join an internal path onto a server URL without string-concatenating after
+   * its query. The server's mount is retained by default; origin-scoped routes
+   * such as ``/.well-known`` opt out. Only a Databricks ``o`` selector is
+   * inherited, and it is emitted once even if a route also carries ``o``.
+   *
+   * @param {string} serverUrl
+   * @param {string} routePath
+   * @param {{ fromOrigin?: boolean }} [options]
+   * @returns {string}
+   */
+  function joinServerUrl(serverUrl, routePath, { fromOrigin = false } = {}) {
+    const server = new URL(serverUrl);
+    const route = new URL(routePath.startsWith("/") ? routePath : `/${routePath}`, server.origin);
+    const destination = new URL(server.origin);
+    const basePath = fromOrigin ? "" : server.pathname.replace(/\/+$/, "");
+    destination.pathname = `${basePath}${route.pathname}` || "/";
+
+    const inheritedOrganizations = workspaceOrganizationSearch(server).toString();
+    let routeQuery = route.search.slice(1);
+    if (inheritedOrganizations) {
+      routeQuery = routeQuery
+        .split("&")
+        .filter((part) => part && new URLSearchParams(part).keys().next().value !== "o")
+        .join("&");
+    }
+    destination.search = [inheritedOrganizations, routeQuery].filter(Boolean).join("&");
+    destination.hash = route.hash;
+    return destination.toString();
+  }
+
   /**
    * Return the workspace UI URL for a bare Databricks workspace root.
    * Deliberate deep links are left untouched, while query and fragment survive
@@ -252,7 +314,7 @@
     }
     let probe;
     try {
-      probe = await fetch(`${url.origin}/`, {
+      probe = await fetch(joinServerUrl(normalized, "/", { fromOrigin: true }), {
         method: "HEAD",
         redirect: "manual",
         signal: AbortSignal.timeout(WORKSPACE_PROBE_TIMEOUT_MS),
@@ -315,15 +377,15 @@
    *   minDesktopVersion: string | null, ui: Record<string, unknown>}>}
    */
   async function fetchServerManifest(serverUrl) {
-    let origin;
+    let manifestUrl;
     try {
-      origin = new URL(serverUrl).origin;
+      manifestUrl = joinServerUrl(serverUrl, WELL_KNOWN_MANIFEST_PATH, { fromOrigin: true });
     } catch {
       return PRE_MANIFEST_BASELINE;
     }
     let response;
     try {
-      response = await fetch(`${origin}${WELL_KNOWN_MANIFEST_PATH}`, {
+      response = await fetch(manifestUrl, {
         // A redirect to a login page is not a manifest; don't follow it.
         redirect: "manual",
         signal: AbortSignal.timeout(MANIFEST_FETCH_TIMEOUT_MS),
@@ -371,6 +433,8 @@
     serverDisplayLabel,
     isPlainHttpRemote,
     isDatabricksWorkspaceHost,
+    workspaceIdentityKey,
+    joinServerUrl,
     WORKSPACE_UI_PATH,
     WORKSPACE_PROBE_TIMEOUT_MS,
     databricksWorkspaceUiUrl,
