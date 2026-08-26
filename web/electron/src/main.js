@@ -40,6 +40,8 @@ const { registerLocalhostCors } = require("./localhost_cors");
 const {
   normalizeUrl,
   normalizeRecentServers,
+  workspaceIdentityKey,
+  joinServerUrl,
   expandDatabricksWorkspaceUrl,
   fetchServerManifest,
   PRE_MANIFEST_BASELINE,
@@ -52,10 +54,49 @@ const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
 const { isDeveloperModeEnabled } = require("./developer_mode");
 const { excludingManagedServers, getManagedServerUrls } = require("./managed_preferences");
-const { registerSessionExpiryReload } = require("./session-expiry");
+const {
+  registerSessionExpiryReload,
+  registerOidcSessionExpiryHandoff,
+} = require("./session-expiry");
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
+const {
+  OIDC_LOGIN_TIMEOUT_MS,
+  oidcServerUrlError,
+  probeServerAuth,
+  runOidcBrowserLogin,
+  installAndVerifySessionCookie,
+} = require("./oidc_auth");
+const { runOidcLoginDialog } = require("./oidc_login_dialog");
+const {
+  loadServerAfterAuth,
+  loadInitialDestination,
+  isSetupIdle,
+  withServerLoad,
+} = require("./server_load");
+const { isWebAuthnEscapePage, registerWebAuthnTimeout } = require("./webauthn_timeout");
 const omnigentCli = require("./omnigent_cli");
 const serverManager = require("./server_manager");
+
+function configuredServerUrlErrorMessage(reason) {
+  return reason === "insecure_transport"
+    ? "Remote servers require HTTPS. Update the server address and try again."
+    : "The server address is invalid. Correct it and try again.";
+}
+
+function configuredServerUrlError(raw, normalized) {
+  const trimmed = String(raw ?? "").trim();
+  const validationUrl = trimmed.includes("://")
+    ? trimmed
+    : `${new URL(normalized).protocol}//${trimmed}`;
+  return oidcServerUrlError(validationUrl);
+}
+
+function expandedServerUrlError(serverUrl, expectedIdentity) {
+  return (
+    oidcServerUrlError(serverUrl) ??
+    (workspaceIdentityKey(serverUrl) === expectedIdentity ? null : "invalid_server_url")
+  );
+}
 
 /** Absolute path to the bundled setup page (the "connect to server" form). */
 const SETUP_PAGE = path.join(__dirname, "..", "setup", "index.html");
@@ -65,6 +106,9 @@ const SETUP_PAGE_URL = pathToFileURL(SETUP_PAGE);
 
 /** Absolute path to the bundled find-in-page bar page. */
 const FIND_PAGE = path.join(__dirname, "..", "find", "index.html");
+/** Shell-owned system-browser sign-in status page and its isolated preload. */
+const OIDC_LOGIN_PAGE = path.join(__dirname, "oidc_login.html");
+const OIDC_LOGIN_PRELOAD = path.join(__dirname, "oidc_login_preload.js");
 // Built by web's `build:overlay` into electron/overlay/ (shipped by
 // electron-builder). Shell-owned so the update UI is independent of the
 // connected server's web-bundle version.
@@ -417,10 +461,10 @@ const EXPIRY_RELOAD_MIN_INTERVAL_MS = 15_000;
  * the resulting "Failed to load" state manually, so the shell does it.
  */
 function registerSessionExpiryAccess() {
-  registerSessionExpiryReload(session.defaultSession, isPinnedServerUrl, (origin) => {
+  registerSessionExpiryReload(session.defaultSession, isPinnedWorkspaceUrl, (identity) => {
     const now = Date.now();
     for (const [win, state] of windows) {
-      if (state.origin !== origin || win.isDestroyed()) continue;
+      if (state.identity !== identity || win.isDestroyed()) continue;
       const last = lastExpiryReloadAt.get(win) ?? 0;
       if (now - last < EXPIRY_RELOAD_MIN_INTERVAL_MS) continue;
       lastExpiryReloadAt.set(win, now);
@@ -477,6 +521,9 @@ function applyDockIcon() {
  */
 const windows = new Map();
 
+/** One in-flight browser-login flow per shell window, mirroring Android. */
+const oidcLoginFlows = new WeakMap();
+
 /**
  * Live OAuth popup child windows (see hardenOauthPopup). Tracked apart
  * from `windows` on purpose: a popup gains NO shell-window privileges —
@@ -503,14 +550,17 @@ const oauthPopups = new Set();
  * it (e.g. Windows app-level, or macOS without a Dock tile).
  */
 function updateBadge() {
-  /** @type {Map<string, number>} max reported count per pinned origin */
-  const perOrigin = new Map();
+  /** @type {Map<string, number>} max reported count per workspace */
+  const perWorkspace = new Map();
   for (const state of windows.values()) {
-    if (!state.origin) continue;
-    perOrigin.set(state.origin, Math.max(perOrigin.get(state.origin) ?? 0, state.badgeCount));
+    if (!state.identity) continue;
+    perWorkspace.set(
+      state.identity,
+      Math.max(perWorkspace.get(state.identity) ?? 0, state.badgeCount),
+    );
   }
   let total = 0;
-  for (const count of perOrigin.values()) total += count;
+  for (const count of perWorkspace.values()) total += count;
   const ok = app.setBadgeCount(total);
   console.log(`[omnigent] setBadgeCount(${total}) -> ${ok}`);
 }
@@ -523,11 +573,11 @@ function updateBadge() {
  * @returns {boolean}
  */
 function multipleServersActive() {
-  const origins = new Set();
+  const identities = new Set();
   for (const state of windows.values()) {
-    if (state.origin) origins.add(state.origin);
+    if (state.identity) identities.add(state.identity);
   }
-  return origins.size > 1;
+  return identities.size > 1;
 }
 
 /**
@@ -557,6 +607,11 @@ function pinnedOrigin(win) {
   return (win && windows.get(win)?.origin) ?? null;
 }
 
+/** Workspace identity a window is pinned to, including Databricks ``o``. */
+function pinnedWorkspaceIdentity(win) {
+  return (win && windows.get(win)?.identity) ?? null;
+}
+
 /**
  * True when a URL (or origin string) belongs to an origin some open window
  * is currently pinned to — i.e. a server the user explicitly connected to.
@@ -576,19 +631,30 @@ function isPinnedServerUrl(url) {
   return false;
 }
 
+/** True when a URL belongs to a workspace some open window is pinned to. */
+function isPinnedWorkspaceUrl(url) {
+  const identity = workspaceIdentityKey(url ?? "");
+  if (!identity) return false;
+  for (const state of windows.values()) {
+    if (state.identity === identity) return true;
+  }
+  return false;
+}
+
 /**
- * Pin (or unpin) a window to a server origin. Called when a window is
+ * Pin (or unpin) a window to a server workspace. Called when a window is
  * created onto a server URL, when the setup page connects it, and (with
  * null) when it returns to the setup page.
  *
  * @param {BrowserWindow} win
- * @param {string | null} origin Origin string from ``new URL(url).origin``,
- *   or null to unpin.
+ * @param {string | null} serverUrl Full server URL, or null to unpin.
  */
-function pinWindow(win, origin) {
+function pinWindow(win, serverUrl) {
   const state = windows.get(win);
   if (!state) return;
-  if (state.origin !== origin) {
+  const origin = serverUrl ? originOf(serverUrl) : null;
+  const identity = serverUrl ? workspaceIdentityKey(serverUrl) : null;
+  if (state.identity !== identity) {
     // Leaving a server: this window's unread contribution goes with it.
     state.badgeCount = 0;
     updateBadge();
@@ -597,7 +663,7 @@ function pinWindow(win, origin) {
     // (setup page / new server) WITHOUT running BrowserPane's unmount detach —
     // so without this the native WebContentsView keeps painting over the new
     // page. Skip the initial pin (no prior origin: cold connect, nothing open).
-    if (state.origin != null) {
+    if (state.identity != null) {
       try {
         state.browserRegistry?.closeAll("server-changed");
       } catch {
@@ -606,6 +672,7 @@ function pinWindow(win, origin) {
     }
   }
   state.origin = origin;
+  state.identity = identity;
 }
 
 /**
@@ -620,6 +687,11 @@ function pinWindow(win, origin) {
 function setWindowServerUrl(win, serverUrl) {
   const state = windows.get(win);
   if (state) state.serverUrl = serverUrl;
+}
+
+function setWindowAuthenticationNavigation(win, enabled) {
+  const state = windows.get(win);
+  if (state) state.authenticationNavigation = enabled;
 }
 
 /**
@@ -736,7 +808,7 @@ const updater = createDesktopUpdater({
   autoUpdater,
   loadSettings,
   saveSettings,
-  isPinnedOriginSender,
+  isPinnedOriginSender: isPinnedWorkspaceSender,
   pinnedOrigin,
   iconPath: ICON_PNG,
   getCurrentVersion: () => currentDesktopVersion,
@@ -870,9 +942,14 @@ function rememberRecentServer(settings, url) {
   // Tolerate a hand-edited/corrupt settings.json (non-array, junk entries)
   // by rebuilding the list from whatever string entries survive.
   const existing = Array.isArray(settings.recent_servers) ? settings.recent_servers : [];
+  const identity = workspaceIdentityKey(url);
   settings.recent_servers = [
     url,
-    ...existing.filter((u) => typeof u === "string" && u !== url),
+    ...existing.filter(
+      (candidate) =>
+        typeof candidate === "string" &&
+        (identity === null ? candidate !== url : workspaceIdentityKey(candidate) !== identity),
+    ),
   ].slice(0, MAX_RECENT_SERVERS);
 }
 
@@ -1032,21 +1109,56 @@ function hardenOauthPopup(child) {
 }
 
 /**
- * Join a basename-less SPA path (e.g. ``/c/conv_abc``) onto a server URL that
- * may carry a workspace mount (e.g. ``https://host/omnigent/``). The path is
- * an ABSOLUTE in-app route, but it lives UNDER the server's mount —
- * ``new URL("/c/x", serverUrl)`` would resolve against the ORIGIN and drop
- * ``/omnigent`` — so we string-concatenate: strip the server URL's trailing
- * slash, append the path. The SPA's react-router basename then matches
- * ``${mount}/c/:id``. Shared by createWindow (cold open) and loadServerUrl
- * (re-pointing an existing window) so the mount-aware join is in one place.
+ * Surface a WebAuthn request that Electron could not service.
  *
- * @param {string} serverUrl A normalized server URL (origin or origin+mount).
- * @param {string} routePath An absolute in-app path beginning with ``/``.
- * @returns {string}
+ * @param {Electron.BrowserWindow} win
  */
-function resolveServerPath(serverUrl, routePath) {
-  return serverUrl.replace(/\/+$/, "") + (routePath.startsWith("/") ? routePath : "/" + routePath);
+async function showWebAuthnTimeout(win) {
+  if (!win || win.isDestroyed()) return;
+  const state = windows.get(win);
+  const serverUrl = state?.serverUrl;
+  if (!serverUrl) return;
+  const serverUrlError = oidcServerUrlError(serverUrl);
+  if (serverUrlError) {
+    await loadSetupPage(win, {
+      error: configuredServerUrlErrorMessage(serverUrlError),
+      url: serverUrl,
+    });
+    return;
+  }
+  const signInUrl = win.webContents.getURL();
+  let protocol;
+  try {
+    protocol = new URL(signInUrl).protocol;
+  } catch {
+    return;
+  }
+  if (!WEB_SCHEMES.has(protocol)) return;
+  const { response } = await dialog.showMessageBox(win, {
+    type: "warning",
+    title: "Sign-in is still waiting",
+    message: "This security-key request is taking longer than expected.",
+    detail:
+      "The request is still active, so a roaming USB security key can finish here. " +
+      "Or open this sign-in in your system browser for platform passkeys.",
+    buttons: ["Open in Browser", "Keep Waiting"],
+    defaultId: 0,
+    cancelId: 1,
+    noLink: true,
+  });
+  if (response !== 0 || win.isDestroyed()) return;
+  let probe;
+  try {
+    probe = await probeServerAuth(session.defaultSession, serverUrl);
+  } catch {
+    return;
+  }
+  if (probe.kind !== "oidc") return;
+  await withServerLoad(state, async () => {
+    const authenticated = await runWindowOidcBrowserHandoff(win, serverUrl);
+    if (!authenticated || win.isDestroyed()) return;
+    await loadAuthenticatedServerUrl(win, serverUrl);
+  });
 }
 
 /**
@@ -1054,17 +1166,162 @@ function resolveServerPath(serverUrl, routePath) {
  * path-suffixed) URL. Shared by the deep-link reuse/reload paths so the
  * pin + identity + load sequence isn't duplicated. ``serverUrl`` is stored as
  * the window's CLEAN server identity (no conversation path); ``path`` is joined
- * onto it only for the load URL (see resolveServerPath).
+ * onto it only for the load URL (see joinServerUrl).
  *
  * @param {BrowserWindow} win
  * @param {string} serverUrl Clean server URL (origin or origin+mount).
  * @param {string} [routePath] Optional basename-less in-app path (e.g. ``/c/<id>``).
  * @returns {Promise<void>}
  */
-function loadServerUrl(win, serverUrl, routePath) {
-  pinWindow(win, originOf(serverUrl));
+async function runWindowOidcBrowserHandoff(win, serverUrl) {
+  const existingFlow = oidcLoginFlows.get(win);
+  if (existingFlow?.serverUrl === serverUrl) return existingFlow.promise;
+
+  const promise = runOidcLoginDialog({
+    BrowserWindow,
+    ipcMain,
+    parent: win,
+    serverUrl,
+    pagePath: OIDC_LOGIN_PAGE,
+    preloadPath: OIDC_LOGIN_PRELOAD,
+    runAttempt: async ({ signal, updateMessage }) => {
+      const result = await runOidcBrowserLogin(
+        session.defaultSession,
+        serverUrl,
+        (url) => shell.openExternal(url),
+        {
+          timeoutMs: OIDC_LOGIN_TIMEOUT_MS,
+          signal,
+          onPollError: () => {
+            const host = new URL(serverUrl).host;
+            updateMessage(`Still waiting — the last attempt failed to reach ${host}. Retrying…`);
+          },
+        },
+      );
+      if (signal.aborted || (!result.ok && result.reason === "cancelled")) {
+        return { ok: false, error: "Sign-in was cancelled." };
+      }
+      if (!result.ok && result.reason === "insecure_transport") {
+        return {
+          ok: false,
+          error:
+            "Browser sign-in requires HTTPS for remote servers. Update the server URL and retry.",
+        };
+      }
+      if (!result.ok && result.reason === "invalid_server_url") {
+        return {
+          ok: false,
+          error: "The server address is invalid. Return to setup, correct it, and retry.",
+        };
+      }
+      if (!result.ok && result.reason === "timed_out") {
+        return {
+          ok: false,
+          error: "Sign-in timed out after 5 minutes. Complete the browser flow, then retry.",
+        };
+      }
+      if (!result.ok && result.reason === "expired") {
+        return {
+          ok: false,
+          error: "The sign-in ticket expired. Retry to open a fresh browser sign-in.",
+        };
+      }
+      if (!result.ok) {
+        return {
+          ok: false,
+          error: "The browser sign-in did not complete. Check the server and try again.",
+        };
+      }
+      try {
+        await installAndVerifySessionCookie(session.defaultSession, serverUrl, result.token, {
+          signal,
+          assertCanCommit: () => signal.throwIfAborted(),
+        });
+      } catch {
+        return {
+          ok: false,
+          error: "Sign-in completed, but Electron could not install and verify the session cookie.",
+        };
+      }
+      return { ok: true };
+    },
+  }).finally(() => {
+    if (oidcLoginFlows.get(win)?.promise === promise) oidcLoginFlows.delete(win);
+  });
+  oidcLoginFlows.set(win, { serverUrl, promise });
+  return promise;
+}
+
+async function ensureWindowOidcSession(win, serverUrl) {
+  if (oidcServerUrlError(serverUrl)) return false;
+  if (omnigentCli.isLoopbackServer(serverUrl)) {
+    setWindowAuthenticationNavigation(win, false);
+    return true;
+  }
+
+  let probe;
+  try {
+    probe = await probeServerAuth(session.defaultSession, serverUrl);
+  } catch {
+    // Preserve the existing load/failure behavior for unreachable or unknown
+    // servers. did-fail-load will surface the actionable connection error.
+    setWindowAuthenticationNavigation(win, true);
+    return true;
+  }
+  setWindowAuthenticationNavigation(win, probe.kind === "other");
+  if (probe.kind !== "oidc") return true;
+
+  const cachedAuth = omnigentCli.serverAuthEntry(serverUrl);
+  if (typeof cachedAuth?.token === "string") {
+    try {
+      await installAndVerifySessionCookie(session.defaultSession, serverUrl, cachedAuth.token);
+      console.log(
+        `[omnigent] OIDC session cookie accepted and verified for ${new URL(serverUrl).host}`,
+      );
+      return true;
+    } catch {
+      // A rejected cookie falls through to a fresh browser flow.
+    }
+  }
+
+  return runWindowOidcBrowserHandoff(win, serverUrl);
+}
+
+async function loadAuthenticatedServerUrl(win, serverUrl, routePath, exactLoadUrl) {
+  if (win.isDestroyed()) return;
+  pinWindow(win, serverUrl);
   setWindowServerUrl(win, serverUrl);
-  return win.loadURL(routePath ? resolveServerPath(serverUrl, routePath) : serverUrl);
+  const destination = exactLoadUrl ?? (routePath ? joinServerUrl(serverUrl, routePath) : serverUrl);
+  await win.loadURL(destination);
+}
+
+async function loadServerUrl(
+  win,
+  serverUrl,
+  routePath,
+  exactLoadUrl,
+  { beforeLoad, alreadyGated = false } = {},
+) {
+  const load = () =>
+    loadServerAfterAuth({
+      authenticate: async () =>
+        (await ensureWindowOidcSession(win, serverUrl)) && !win.isDestroyed(),
+      beforeLoad,
+      load: () => loadAuthenticatedServerUrl(win, serverUrl, routePath, exactLoadUrl),
+    });
+  return alreadyGated ? load() : withServerLoad(windows.get(win), load);
+}
+
+async function loadSetupPage(win, { error, url } = {}) {
+  if (win.isDestroyed()) return;
+  const search = new URLSearchParams();
+  if (windows.get(win)?.ephemeral) search.set("ephemeral", "1");
+  if (error) search.set("error", error);
+  if (url) search.set("url", url);
+  pinWindow(win, null);
+  setWindowServerUrl(win, null);
+  setWindowServerManifest(win, PRE_MANIFEST_BASELINE);
+  await win.loadFile(SETUP_PAGE, search.size > 0 ? { search: search.toString() } : undefined);
 }
 
 /**
@@ -1085,14 +1342,14 @@ function registerNavigationFallbacks(win) {
       // A failure report for a URL the window is no longer pinned to (the
       // window was re-pointed while the failing load was in flight) must
       // not yank the window off its new destination.
-      const failedOrigin = originOf(validatedURL ?? "");
-      if (failedOrigin !== windows.get(win)?.origin) return;
+      const failedIdentity = workspaceIdentityKey(validatedURL ?? "");
+      const state = windows.get(win);
+      if (failedIdentity !== state?.identity) return;
       const params = new URLSearchParams({
         error: `${errorDescription || "load failed"} (${errorCode})`,
-        // The failure often happens on a deep SPA route (e.g. /chat/…);
-        // prefill the setup form with just the server origin — that's what
-        // the user connects to — not the full path that happened to fail.
-        url: failedOrigin ? failedOrigin + "/" : (validatedURL ?? ""),
+        // Keep the clean server URL, including a workspace selector, rather
+        // than the deep SPA route that happened to fail.
+        url: state?.serverUrl ?? validatedURL ?? "",
       });
       if (windows.get(win)?.ephemeral) params.set("ephemeral", "1");
       pinWindow(win, null); // back on the setup page → no trusted origin
@@ -1107,8 +1364,8 @@ function registerNavigationFallbacks(win) {
   win.webContents.on("did-navigate", (_event, url, httpResponseCode, httpStatusText) => {
     if (httpResponseCode < 400) return;
     const state = windows.get(win);
-    const failedOrigin = originOf(url ?? "");
-    if (failedOrigin !== state?.origin) return;
+    const failedIdentity = workspaceIdentityKey(url ?? "");
+    if (failedIdentity !== state?.identity) return;
     const status = httpStatusText
       ? `${httpResponseCode} ${httpStatusText}`
       : `HTTP ${httpResponseCode}`;
@@ -1134,7 +1391,7 @@ function registerNavigationFallbacks(win) {
  * `opts.serverUrl` and `opts.path` decouple the window's server IDENTITY
  * (clean, no conversation path — used by host/server CLI commands) from the
  * loaded URL: a deep link loads ``${serverUrl}${path}`` but stores
- * ``serverUrl`` without the ``/c/<id>`` (see resolveServerPath). Without an
+ * ``serverUrl`` without the ``/c/<id>`` (see joinServerUrl). Without an
  * explicit ``opts.serverUrl``, the identity is the loaded URL, preserving the
  * behavior of the existing New Window / launch callers.
  *
@@ -1208,27 +1465,31 @@ function createWindow(targetUrl, opts = {}) {
     (typeof opts.serverUrl === "string" && opts.serverUrl.length > 0 ? opts.serverUrl : null) ??
     explicit ??
     (ephemeral ? null : typeof saved === "string" && saved.length > 0 ? saved : null);
+  const serverUrlError = serverUrl ? oidcServerUrlError(serverUrl) : null;
   // loadUrl: what the webContents actually loads. A deep-link path resolves
-  // under the server URL (mount-aware — see resolveServerPath); an explicit
+  // under the server URL (mount-aware — see joinServerUrl); an explicit
   // target (New Window) loads that exact URL; otherwise load the server URL.
-  const loadUrl =
-    (typeof opts.path === "string" && opts.path.length > 0 && serverUrl
-      ? resolveServerPath(serverUrl, opts.path)
-      : null) ??
-    explicit ??
-    serverUrl;
+  const loadUrl = serverUrlError
+    ? null
+    : ((typeof opts.path === "string" && opts.path.length > 0 && serverUrl
+        ? joinServerUrl(serverUrl, opts.path)
+        : null) ??
+      explicit ??
+      serverUrl);
   // A serverUrl that doesn't parse (hand-edited/corrupt settings.json) is
   // treated as "no server configured" rather than crashing window creation.
   const destinationOrigin = serverUrl ? originOf(serverUrl) : null;
   const destination = destinationOrigin ? loadUrl : null;
   updateOverlay.ensureOverlay(win);
   windows.set(win, {
-    // Pin to the destination's origin up front; setup-page windows stay
-    // unpinned (null) until the user connects them.
-    origin: destinationOrigin,
-    // Clean server identity (no conversation path) for host/server CLI
-    // commands; ``loadUrl`` (possibly /c/<id>) is what gets loaded below.
+    // A destination is pinned only after its auth gate succeeds. Until then the
+    // shell-owned sign-in modal has no privileged server origin underneath it.
+    origin: null,
+    identity: null,
+    // Keep the clean identity separate from the exact load URL even while the
+    // auth gate is pending; privileges still require the null origin to be set.
     serverUrl: destination ? serverUrl : null,
+    authenticationNavigation: false,
     ephemeral,
     badgeCount: 0,
     // Per-conversation embedded-browser view registry for this window.
@@ -1236,42 +1497,49 @@ function createWindow(targetUrl, opts = {}) {
   });
   registerWorkspaceRootBounce(win.webContents, () => pinnedOrigin(win));
   if (destination) {
-    // Learn the server's version alongside the load. Every window that opens
-    // straight onto a server (normal app launch with a saved URL, a deep link,
-    // a new window) comes through here — without this the manifest would only
-    // exist after a fresh setup-page connect. Never awaited and never throws
-    // (see fetchServerManifest), so it cannot delay or fail the load.
-    if (serverUrl) {
-      void fetchServerManifest(serverUrl).then((manifest) => {
-        if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
-      });
-    }
-    void win
-      .loadURL(destination)
-      .then(() => {
+    void loadInitialDestination({
+      loadServer: () =>
+        loadServerUrl(win, serverUrl, undefined, destination, {
+          beforeLoad: () => {
+            // Learn the server's version alongside the load; never awaited and
+            // never throws (see fetchServerManifest).
+            void fetchServerManifest(serverUrl).then((manifest) => {
+              if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
+            });
+          },
+        }),
+      loadSetup: () => loadSetupPage(win),
+    })
+      .then((loaded) => {
         // A saved server can predate the recents list. Backfill it only after
         // a successful cold load; explicit targets may be conversation URLs.
-        if (!ephemeral && !explicit && serverUrl) {
-          const settings = loadSettings();
-          rememberRecentServer(settings, serverUrl);
-          saveSettings(settings);
+        if (loaded && !ephemeral && !explicit && serverUrl) {
+          try {
+            const settings = loadSettings();
+            rememberRecentServer(settings, serverUrl);
+            saveSettings(settings);
+          } catch (error) {
+            console.warn("[omnigent] could not backfill recent server", error);
+          }
         }
       })
-      .catch(() => {
-        // Load failure falls back via did-fail-load → setup page w/ error.
-      });
+      .catch(() => loadSetupPage(win));
   } else {
-    // ?ephemeral=1 only changes the setup page's copy (the window's
-    // WindowState is the source of truth for persistence behavior).
-    const search = new URLSearchParams();
-    if (ephemeral) search.set("ephemeral", "1");
-    if (serverUrl && !destinationOrigin) {
+    if (serverUrlError) {
+      void loadSetupPage(win, {
+        error: configuredServerUrlErrorMessage(serverUrlError),
+        url: serverUrl,
+      });
+    } else if (serverUrl && !destinationOrigin) {
       // Fail loud on a corrupt hand-edited settings.json: show WHY the
       // window landed on setup instead of silently presenting a blank form.
-      search.set("error", "saved server URL in settings.json is not a valid URL");
-      search.set("url", serverUrl);
+      void loadSetupPage(win, {
+        error: "saved server URL in settings.json is not a valid URL",
+        url: serverUrl,
+      });
+    } else {
+      void loadSetupPage(win);
     }
-    void win.loadFile(SETUP_PAGE, search.size > 0 ? { search: search.toString() } : undefined);
   }
 
   // Page-initiated window.open / target=_blank: web links open in the
@@ -1315,6 +1583,50 @@ function createWindow(targetUrl, opts = {}) {
 
   // Fires only for window.open the handler above allowed (OAuth popups).
   win.webContents.on("did-create-window", (child) => hardenOauthPopup(child));
+
+  registerOidcSessionExpiryHandoff(
+    win.webContents,
+    () => {
+      const pinnedServerUrl = windows.get(win)?.serverUrl ?? null;
+      return pinnedServerUrl && !omnigentCli.isLoopbackServer(pinnedServerUrl)
+        ? pinnedServerUrl
+        : null;
+    },
+    async ({ serverUrl: expiredServerUrl, returnUrl }) => {
+      const state = windows.get(win);
+      if (state?.pendingServerLoads) {
+        await state.pendingLoad?.catch(() => {});
+        if (win.isDestroyed?.()) return;
+        if (windows.get(win)?.serverUrl !== expiredServerUrl) return;
+      }
+      const loaded = await loadServerUrl(win, expiredServerUrl, undefined, returnUrl);
+      if (!loaded) {
+        await loadSetupPage(win, {
+          error: "Your session expired and sign-in did not complete.",
+          url: expiredServerUrl,
+        });
+      }
+    },
+  );
+
+  registerWebAuthnTimeout(win.webContents, {
+    shouldInject: () => {
+      const state = windows.get(win);
+      const pageUrl = win.webContents.getURL();
+      if (
+        state?.authenticationNavigation &&
+        workspaceIdentityKey(pageUrl) === workspaceIdentityKey(state.serverUrl ?? "")
+      ) {
+        state.authenticationNavigation = false;
+      }
+      return isWebAuthnEscapePage(
+        pageUrl,
+        state?.serverUrl ?? null,
+        state?.authenticationNavigation === true,
+      );
+    },
+    onTimeout: () => showWebAuthnTimeout(win),
+  });
 
   registerNavigationFallbacks(win);
 
@@ -1566,9 +1878,13 @@ function isFindBarSender(event) {
 function newWindow() {
   const win = activeWindow();
   const current = win?.webContents.getURL();
+  const state = win ? windows.get(win) : null;
   // Cloning an ephemeral (multi-server) window keeps the clone
   // ephemeral, so Change Server… from it still won't touch saved settings.
-  createWindow(current, { ephemeral: win ? windows.get(win)?.ephemeral === true : false });
+  createWindow(current, {
+    ephemeral: state?.ephemeral === true,
+    serverUrl: state?.serverUrl ?? undefined,
+  });
 }
 
 /**
@@ -1591,11 +1907,13 @@ function newWindow() {
  *   e.g. ``"vscode:"``.
  */
 async function confirmExternalProtocol(win, url, scheme) {
-  const pinned = pinnedOrigin(win);
+  const pinned = pinnedWorkspaceIdentity(win);
+  const pinnedServerOrigin = pinnedOrigin(win);
   // The persisted grant applies only when the user is actually ON the
   // pinned server — a foreign page reached via redirect gets a fresh
   // prompt even for an always-allowed scheme.
-  const onPinnedServer = pinned !== null && originOf(win.webContents.getURL()) === pinned;
+  const onPinnedServer =
+    pinned !== null && workspaceIdentityKey(win.webContents.getURL()) === pinned;
   const allowedSchemes = loadSettings().allowed_protocols?.[pinned] ?? [];
   if (onPinnedServer && allowedSchemes.includes(scheme)) {
     void shell.openExternal(url);
@@ -1610,7 +1928,7 @@ async function confirmExternalProtocol(win, url, scheme) {
     message: `Open this ${scheme.slice(0, -1)} link?`,
     detail: `${requester ?? "This page"} wants to open:\n\n${url}`,
     checkboxLabel: onPinnedServer
-      ? `Always allow ${scheme.slice(0, -1)} links from ${new URL(pinned).host}`
+      ? `Always allow ${scheme.slice(0, -1)} links from ${new URL(pinnedServerOrigin).host}`
       : undefined,
     checkboxChecked: false,
   });
@@ -1651,18 +1969,18 @@ async function confirmExternalProtocol(win, url, scheme) {
  */
 async function confirmHostEnrollment(win) {
   if (!win) return false;
-  const pinned = pinnedOrigin(win);
+  const pinned = pinnedWorkspaceIdentity(win);
   if (!pinned) return false;
   // Only honor (and offer to persist) the grant while the visible top-level
   // page is the pinned server itself — never a foreign page that reached a
   // pinned window via redirect.
-  const onPinnedServer = originOf(win.webContents.getURL()) === pinned;
+  const onPinnedServer = workspaceIdentityKey(win.webContents.getURL()) === pinned;
   const approved = loadSettings().allowed_hosting_origins ?? [];
   if (onPinnedServer && Array.isArray(approved) && approved.includes(pinned)) return true;
 
-  let host = pinned;
+  let host = pinnedOrigin(win) ?? pinned;
   try {
-    host = new URL(pinned).host;
+    host = new URL(host).host;
   } catch {
     // Keep the full origin string if it somehow doesn't parse.
   }
@@ -2131,12 +2449,12 @@ function isSetupPageSender(event) {
  * @param {Electron.IpcMainInvokeEvent | Electron.IpcMainEvent} event
  * @returns {boolean}
  */
-function isPinnedOriginSender(event) {
-  const pinned = pinnedOrigin(BrowserWindow.fromWebContents(event.sender));
+function isPinnedWorkspaceSender(event) {
+  const pinned = pinnedWorkspaceIdentity(BrowserWindow.fromWebContents(event.sender));
   if (!pinned) return false;
-  if (originOf(event.senderFrame?.url ?? "") !== pinned) return false;
+  if (workspaceIdentityKey(event.senderFrame?.url ?? "") !== pinned) return false;
   // event.sender.getURL() is the webContents' main-frame URL.
-  return originOf(event.sender.getURL()) === pinned;
+  return workspaceIdentityKey(event.sender.getURL()) === pinned;
 }
 
 // ---------------------------------------------------------------------------
@@ -2206,55 +2524,63 @@ function registerIpc() {
       // A server page must never be able to re-point which server is saved.
       throw new Error("set-server-url is only available to the setup page");
     }
-    // A managed choice is already validated and may name a workspace mount;
-    // preserve it exactly. The shared expansion is a no-op for paths, while a
-    // managed workspace root still gets the normal mount discovery.
-    const managedTarget = managedServerUrls().find((candidate) => candidate === url);
-    const normalized = managedTarget ?? normalizeUrl(url); // throws → setup page shows error
-    const target = await expandDatabricksWorkspaceUrl(normalized);
-    const win = BrowserWindow.fromWebContents(event.sender) ?? activeWindow();
-    // Multi-server windows connect without touching the saved server —
-    // the connection lives and dies with the window.
-    const ephemeral = Boolean(win && windows.get(win)?.ephemeral);
-    if (!ephemeral) {
-      const settings = loadSettings();
-      // The saved default persists immediately even if this load fails:
-      // the failure fallback keeps it pre-filled so Connect retries it.
-      settings.server_url = target;
-      saveSettings(settings);
+    let normalized;
+    try {
+      const managedTarget = managedServerUrls().find((candidate) => candidate === url);
+      normalized = managedTarget ?? normalizeUrl(url);
+    } catch {
+      return { loaded: false, error: configuredServerUrlErrorMessage("invalid_server_url") };
     }
-    if (win) {
-      // The user explicitly chose this server — it becomes the window's
-      // trusted origin for privileged IPC and permission grants.
-      pinWindow(win, new URL(target).origin);
-      setWindowServerUrl(win, target);
+    const serverUrlError = configuredServerUrlError(url, normalized);
+    if (serverUrlError) {
+      return { loaded: false, error: configuredServerUrlErrorMessage(serverUrlError) };
+    }
+    const validatedIdentity = workspaceIdentityKey(normalized);
+    const win = BrowserWindow.fromWebContents(event.sender) ?? activeWindow();
+    const state = win && windows.get(win);
+    if (!state || state.pendingServerLoads) return { loaded: false };
+    return withServerLoad(state, async () => {
+      // Bare Databricks workspace URLs serve a 404 at the root; expand them to
+      // the Omnigent UI mount so the user can paste just the workspace host.
+      const target = await expandDatabricksWorkspaceUrl(normalized);
+      const targetError = expandedServerUrlError(target, validatedIdentity);
+      if (targetError) {
+        return { loaded: false, error: configuredServerUrlErrorMessage(targetError) };
+      }
+      // Multi-server windows connect without touching the saved server —
+      // the connection lives and dies with the window.
+      const ephemeral = Boolean(windows.get(win)?.ephemeral);
       // Learn what this server is before deciding anything version-dependent
       // about the window. Deliberately NOT awaited ahead of loadURL: the
       // manifest is advisory, and a slow/absent one must not delay (or block)
       // connecting. fetchServerManifest never rejects — it resolves to the
       // pre-manifest baseline — so no catch is needed here.
-      void fetchServerManifest(target).then((manifest) => {
-        if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
-      });
-      win
-        .loadURL(target)
-        .then(() => {
-          // Only a server that actually responded earns a recents slot —
-          // a typo'd or unreachable URL must not show up in the
-          // quick-pick list on the setup page.
+      const loaded = await loadServerUrl(win, target, undefined, undefined, {
+        alreadyGated: true,
+        beforeLoad: () => {
           if (!ephemeral) {
             const settings = loadSettings();
-            rememberRecentServer(settings, target);
+            settings.server_url = target;
             saveSettings(settings);
           }
-          // The desktop does NOT auto-connect this machine as a runner on
-          // connect — that's an explicit action from the host menu.
-        })
-        .catch(() => {
-          // Load failure is handled by the did-fail-load fallback (setup
-          // page with the error); the URL is deliberately not recorded.
-        });
-    }
+          void fetchServerManifest(target).then((manifest) => {
+            if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
+          });
+        },
+      });
+      if (!loaded) return { loaded: false };
+      // Only a server that actually responded earns a recents slot —
+      // a typo'd or unreachable URL must not show up in the
+      // quick-pick list on the setup page.
+      if (!ephemeral) {
+        const settings = loadSettings();
+        rememberRecentServer(settings, target);
+        saveSettings(settings);
+      }
+      // The desktop does NOT auto-connect this machine as a runner on
+      // connect — that's an explicit action from the host menu.
+      return { loaded: true };
+    });
   });
 
   // Setup page → pre-fill the input with any saved URL.
@@ -2299,7 +2625,7 @@ function registerIpc() {
   // recent-servers list, so the picker can render "current server" and the
   // switch targets. Foreign pages get null (nothing to fingerprint).
   ipcMain.handle("omnigent:get-server-picker", (event) => {
-    if (!isPinnedOriginSender(event)) {
+    if (!isPinnedWorkspaceSender(event)) {
       console.warn("[omnigent] get-server-picker from untrusted sender dropped");
       return null;
     }
@@ -2307,8 +2633,9 @@ function registerIpc() {
     const managedServers = managedServerUrls();
     const recents = excludingManagedServers(loadSettings().recent_servers, managedServers);
     return {
-      // isPinnedOriginSender guarantees the sender window is tracked.
+      // isPinnedWorkspaceSender guarantees the sender window is tracked.
       currentOrigin: windows.get(win).origin,
+      currentServerUrl: windows.get(win).serverUrl,
       managedServers,
       recentServers: recents,
       // The connected server's manifest, forwarded so the SPA branches on the
@@ -2323,8 +2650,8 @@ function registerIpc() {
   // server. Only URLs in the persisted recent list or the current managed list
   // are accepted: pinning is a privilege grant (notifications, badge, protocol
   // grants), so a server page must never choose an arbitrary origin.
-  ipcMain.handle("omnigent:switch-server", (event, url) => {
-    if (!isPinnedOriginSender(event)) {
+  ipcMain.handle("omnigent:switch-server", async (event, url) => {
+    if (!isPinnedWorkspaceSender(event)) {
       throw new Error("switch-server is only available to a connected server page");
     }
     const recents = loadSettings().recent_servers;
@@ -2334,34 +2661,29 @@ function registerIpc() {
       throw new Error("switch-server target must be a recent or managed server");
     }
     const win = BrowserWindow.fromWebContents(event.sender);
-    const ephemeral = Boolean(win && windows.get(win)?.ephemeral);
-    if (!ephemeral) {
-      const settings = loadSettings();
-      settings.server_url = url;
-      saveSettings(settings);
-    }
+    const state = win && windows.get(win);
+    if (!state || state.pendingServerLoads) return;
+    const ephemeral = state.ephemeral === true;
     if (win) {
-      pinWindow(win, new URL(url).origin);
-      setWindowServerUrl(win, url);
-      // Switching servers means a possibly DIFFERENT version: re-read the
-      // manifest so the window never keeps the previous server's answer. Reset
-      // to the baseline first — until the new fetch lands, "unknown" is the
-      // honest state, and stale-but-plausible would be worse than absent.
-      setWindowServerManifest(win, PRE_MANIFEST_BASELINE);
-      void fetchServerManifest(url).then((manifest) => {
-        if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
+      const loaded = await loadServerUrl(win, url, undefined, undefined, {
+        beforeLoad: () => {
+          if (!ephemeral) {
+            const settings = loadSettings();
+            settings.server_url = url;
+            saveSettings(settings);
+          }
+          // Commit the new manifest only after authentication succeeds, so a
+          // cancelled switch leaves the old page and its metadata paired.
+          setWindowServerManifest(win, PRE_MANIFEST_BASELINE);
+          void fetchServerManifest(url).then((manifest) => {
+            if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
+          });
+        },
       });
-      win
-        .loadURL(url)
-        .then(() => {
-          if (ephemeral) return;
-          const settings = loadSettings();
-          rememberRecentServer(settings, url); // bump to head of the recents
-          saveSettings(settings);
-        })
-        .catch(() => {
-          // Load failure falls back via did-fail-load → setup page w/ error.
-        });
+      if (!loaded || ephemeral) return;
+      const settings = loadSettings();
+      rememberRecentServer(settings, url); // bump to head of the recents
+      saveSettings(settings);
     }
   });
 
@@ -2370,13 +2692,14 @@ function registerIpc() {
   // keeps the saved default server (connecting from setup overwrites it
   // only when the user actually submits a URL).
   ipcMain.on("omnigent:open-server-setup", (event) => {
-    if (!isPinnedOriginSender(event)) {
+    if (!isPinnedWorkspaceSender(event)) {
       console.warn("[omnigent] open-server-setup from untrusted sender dropped");
       return;
     }
     const win = BrowserWindow.fromWebContents(event.sender);
-    if (!win) return;
-    const ephemeral = windows.get(win)?.ephemeral === true;
+    const state = win && windows.get(win);
+    if (!state || state.pendingServerLoads) return;
+    const ephemeral = state.ephemeral === true;
     pinWindow(win, null); // back on the setup page → no trusted origin
     setWindowServerUrl(win, null);
     void win.loadFile(SETUP_PAGE, ephemeral ? { search: "ephemeral=1" } : undefined);
@@ -2419,11 +2742,11 @@ function registerIpc() {
   // app-wide badge shown is the sum across windows (see updateBadge), so two
   // windows on different servers don't clobber each other's counts.
   ipcMain.on("omnigent:set-badge-count", (event, count) => {
-    if (!isPinnedOriginSender(event)) {
+    if (!isPinnedWorkspaceSender(event)) {
       console.warn("[omnigent] set-badge-count from untrusted sender dropped");
       return;
     }
-    // isPinnedOriginSender guarantees the sender window is tracked.
+    // isPinnedWorkspaceSender guarantees the sender window is tracked.
     const state = windows.get(BrowserWindow.fromWebContents(event.sender));
     state.badgeCount = typeof count === "number" && count > 0 ? Math.floor(count) : 0;
     updateBadge();
@@ -2441,7 +2764,7 @@ function registerIpc() {
   // show: bounce the macOS dock icon / flash the taskbar frame. That makes a
   // non-open session's turn-end noticeable even with the app in front.
   ipcMain.handle("omnigent:notify", (event, params) => {
-    if (!isPinnedOriginSender(event)) {
+    if (!isPinnedWorkspaceSender(event)) {
       // The contract is "resolves false when not shown" — a foreign page
       // gets a quiet false, not an exception it could fingerprint.
       console.warn("[omnigent] notify from untrusted sender dropped");
@@ -2453,7 +2776,7 @@ function registerIpc() {
     let title = String(params?.title ?? "");
     if (multipleServersActive()) {
       const origin = pinnedOrigin(BrowserWindow.fromWebContents(event.sender));
-      // isPinnedOriginSender above guarantees a pinned, parseable origin.
+      // isPinnedWorkspaceSender above guarantees a pinned workspace.
       title = `[${new URL(origin).host}] ${title}`;
     }
     // On macOS we play the notification sound ourselves (afplay, after show())
@@ -2509,7 +2832,7 @@ function registerIpc() {
   //
   // Setup-page handlers (CLI detection, path config, start-locally) gate on
   // isSetupPageSender. The SPA can READ host status and REQUEST host control
-  // (gated on isPinnedOriginSender), but enrolling this machine as a runner is
+  // (gated on isPinnedWorkspaceSender), but enrolling this machine as a runner is
   // privileged — start/restart additionally require native, main-process user
   // consent (confirmHostEnrollment), since the pinned-origin gate proves the
   // caller is the server's page, not that the user asked.
@@ -2568,7 +2891,7 @@ function registerIpc() {
   // instant — it lets the new-session picker tag/connect "this machine" without
   // waiting on the slow runner-status check.
   ipcMain.handle("omnigent:host-get-identity", (event) => {
-    if (!isPinnedOriginSender(event)) {
+    if (!isPinnedWorkspaceSender(event)) {
       console.warn("[omnigent] host-get-identity from untrusted sender dropped");
       return null;
     }
@@ -2578,7 +2901,7 @@ function registerIpc() {
   // SPA (in-app Settings → Local CLI) → is the CLI installed and runnable,
   // plus the resolved path / version / source. Read-only; pinned-origin gated.
   ipcMain.handle("omnigent:cli-get-status", async (event) => {
-    if (!isPinnedOriginSender(event)) {
+    if (!isPinnedWorkspaceSender(event)) {
       console.warn("[omnigent] cli-get-status from untrusted sender dropped");
       return null;
     }
@@ -2592,7 +2915,7 @@ function registerIpc() {
   // (and validation runs `<path> --version`). Choosing a path stays on the
   // bundled file:// setup page.
   ipcMain.handle("omnigent:cli-reset-path", async (event) => {
-    if (!isPinnedOriginSender(event)) {
+    if (!isPinnedWorkspaceSender(event)) {
       throw new Error("cli-reset-path is only available to a connected server page");
     }
     return clearCliPath();
@@ -2609,7 +2932,7 @@ function registerIpc() {
   // gated to a pinned server page like every other privileged channel, so a
   // foreign page can't drive the shell's native appearance.
   ipcMain.on("omnigent:set-color-scheme", (event, scheme) => {
-    if (!isPinnedOriginSender(event)) return;
+    if (!isPinnedWorkspaceSender(event)) return;
     if (scheme === "light" || scheme === "dark" || scheme === "system") {
       nativeTheme.themeSource = scheme;
     }
@@ -2618,7 +2941,7 @@ function registerIpc() {
   // SPA → start / stop / restart this machine's host daemon for the window's
   // own server (the host selection menu's "connect this machine" action).
   ipcMain.handle("omnigent:host-control", async (event, action) => {
-    if (!isPinnedOriginSender(event)) {
+    if (!isPinnedWorkspaceSender(event)) {
       throw new Error("host-control is only available to a connected server page");
     }
     const serverUrl = senderServerUrl(event);
@@ -2631,7 +2954,7 @@ function registerIpc() {
     if (action === "start" || action === "restart") {
       // Enrolling this machine as a runner executes agent code locally, so it
       // needs explicit user consent that the server's own page can't fake. The
-      // isPinnedOriginSender gate above only proves the call came FROM the
+      // isPinnedWorkspaceSender gate above only proves the call came FROM the
       // pinned server's page — not that the USER asked for it — so gate
       // start/restart on a native, main-process confirmation (persisted per
       // origin, so a trusted server is asked just once). stop is fail-safe and
@@ -2665,7 +2988,7 @@ function registerIpc() {
   // browserIpc.js; the trust gate + per-window registry lookup are injected.
   registerBrowserIpc({
     ipcMain,
-    isPinnedOriginSender,
+    isPinnedOriginSender: isPinnedWorkspaceSender,
     getRegistryForEvent: browserRegistryForSender,
   });
 }
@@ -2687,15 +3010,15 @@ function registerIpc() {
 
 /**
  * Full server URL (origin, or origin+mount) of a server the user previously
- * connected to, whose origin matches `origin`; null when none. Reusing the
+ * connected to, whose workspace identity matches `identity`; null when none. Reusing the
  * recorded URL means a deep link to a KNOWN workspace server opens WITHOUT the
  * network probe — the mount is already in the saved URL. Used both to detect
  * "known" (for the consent gate) and to skip probe-based expansion.
  *
- * @param {string} origin e.g. ``"https://my-workspace.cloud.databricks.com"``.
+ * @param {string} identity A value from workspaceIdentityKey.
  * @returns {string | null}
  */
-function findKnownServerUrl(origin) {
+function findKnownServerUrl(identity) {
   const settings = loadSettings();
   /** @type {string[]} */
   const candidates = [];
@@ -2704,35 +3027,35 @@ function findKnownServerUrl(origin) {
     for (const u of settings.recent_servers) if (typeof u === "string") candidates.push(u);
   }
   for (const u of candidates) {
-    if (originOf(u) === origin) return u;
+    if (workspaceIdentityKey(u) === identity) return u;
   }
   return null;
 }
 
 /**
- * Origins of every server the user previously connected to (saved default +
+ * Workspace identities of every server the user previously connected to (saved default +
  * recent servers). The set used to tell a known server (open without consent)
  * from a never-connected one (ask consent — pinning is a privilege grant).
  *
  * @returns {string[]}
  */
-function knownOrigins() {
+function knownWorkspaceIdentities() {
   const settings = loadSettings();
   /** @type {Set<string>} */
-  const origins = new Set();
+  const identities = new Set();
   if (typeof settings.server_url === "string") {
-    const o = originOf(settings.server_url);
-    if (o) origins.add(o);
+    const identity = workspaceIdentityKey(settings.server_url);
+    if (identity) identities.add(identity);
   }
   if (Array.isArray(settings.recent_servers)) {
     for (const u of settings.recent_servers) {
       if (typeof u === "string") {
-        const o = originOf(u);
-        if (o) origins.add(o);
+        const identity = workspaceIdentityKey(u);
+        if (identity) identities.add(identity);
       }
     }
   }
-  return [...origins];
+  return [...identities];
 }
 
 /**
@@ -2895,28 +3218,29 @@ async function handleDeepLink(raw) {
   // The origin is fixed by the link itself — no network request needed for the
   // decision. expandDatabricksWorkspaceUrl only appends a mount path under this
   // same origin, so approving the origin is approving the server.
-  const targetOrigin = parsed.origin;
+  const targetIdentity = workspaceIdentityKey(parsed.origin);
+  if (!targetIdentity) return;
   // A KNOWN server: reuse its recorded URL (already mount-bearing, e.g.
   // `https://host/omnigent`) so we SKIP the probe entirely. null for an
   // unknown server — the mount is discovered AFTER consent (see consent-unknown).
-  const known = findKnownServerUrl(targetOrigin);
+  const known = findKnownServerUrl(targetIdentity);
 
   // Snapshot the live windows (creation order) for the pure decision.
   const winList = [...windows.keys()];
   const focused = BrowserWindow.getFocusedWindow();
   const focusedIndex = focused && windows.has(focused) ? winList.indexOf(focused) : -1;
   const decision = chooseDeepLinkStrategy({
-    targetOrigin,
+    targetOrigin: targetIdentity,
     windows: winList.map((win) => ({
-      origin: windows.get(win).origin,
-      currentOrigin: win.isDestroyed() ? null : originOf(win.webContents.getURL()),
+      origin: windows.get(win).identity,
+      currentOrigin: win.isDestroyed() ? null : workspaceIdentityKey(win.webContents.getURL()),
     })),
-    knownOrigins: knownOrigins(),
+    knownOrigins: knownWorkspaceIdentities(),
     focusedIndex: focusedIndex < 0 ? null : focusedIndex,
   });
   console.log(
     `[omnigent] deep-link: strategy=${decision.strategy} ` +
-      `target=${targetOrigin} known=${known ? "yes" : "no"} ` +
+      `target=${targetIdentity} known=${known ? "yes" : "no"} ` +
       `windows=${winList.length}`,
   );
 
@@ -2949,24 +3273,30 @@ async function handleDeepLink(raw) {
       // consent, or stays as the normal launch window on cancel).
       let parent = activeWindow();
       if (!parent) parent = createWindow();
-      if (!(await confirmOpenDeepLink(parent, targetOrigin))) return; // cancelled
-      // Consent given — NOW probe to discover the workspace mount. The origin
-      // is unchanged (the probe only appends a path under it), so the consent
-      // decision stands; the user approved connecting to this host.
-      const serverUrl = await expandDatabricksWorkspaceUrl(targetOrigin);
-      if (!originOf(serverUrl)) return; // expansion yielded an unparseable URL
-      // Reuse the just-created setup-page window instead of opening a second;
-      // if a window was already open (warm start), open a new one.
-      if (!pinnedOrigin(parent)) {
-        await loadServerUrl(parent, serverUrl, parsed.path).catch(() => {});
-        focusAndRestore(parent);
-      } else {
-        const win = createWindow(undefined, { serverUrl, path: parsed.path });
-        focusAndRestore(win);
-      }
-      // Record the newly-trusted server so the next link is frictionless.
-      rememberServerUrl(serverUrl);
-      return;
+      if (!(await confirmOpenDeepLink(parent, parsed.origin))) return; // cancelled
+      const state = windows.get(parent);
+      if (!state) return;
+      const reuseParent = isSetupIdle(state);
+      const openAfterExpansion = async () => {
+        // Consent given — NOW probe to discover the workspace mount. The origin
+        // is unchanged (the probe only appends a path under it), so the consent
+        // decision stands; the user approved connecting to this host.
+        const serverUrl = await expandDatabricksWorkspaceUrl(parsed.origin);
+        if (expandedServerUrlError(serverUrl, targetIdentity)) return;
+        if (reuseParent && !parent.isDestroyed() && windows.get(parent) === state) {
+          await loadServerUrl(parent, serverUrl, parsed.path, undefined, {
+            alreadyGated: true,
+          }).catch(() => {});
+          focusAndRestore(parent);
+        } else {
+          const win = createWindow(undefined, { serverUrl, path: parsed.path });
+          focusAndRestore(win);
+        }
+        // Record explicit origin consent independently of login completion.
+        // Unlike Setup Connect, this never changes the launch default.
+        rememberServerUrl(serverUrl);
+      };
+      return reuseParent ? withServerLoad(state, openAfterExpansion) : openAfterExpansion();
     }
   }
 }
