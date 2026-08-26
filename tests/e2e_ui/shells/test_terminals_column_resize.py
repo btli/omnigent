@@ -27,7 +27,7 @@ import time
 import httpx
 from playwright.sync_api import Page, ViewportSize, expect
 
-# Below Tailwind's ``md`` (768px) so the FAB/mobile drawer renders.
+# Below Tailwind's ``md`` (768px) so the mobile header menu and drawer render.
 _MOBILE_VIEWPORT: ViewportSize = {"width": 390, "height": 844}
 # Comfortably above ``md`` so the panel splits into list + xterm columns.
 _DESKTOP_VIEWPORT: ViewportSize = {"width": 1400, "height": 900}
@@ -90,16 +90,16 @@ def _force_chat_first(base_url: str, session_id: str, timeout_s: float = 15.0) -
 def _open_terminals_panel_on_desktop(page: Page, base_url: str, session_id: str) -> None:
     """Open the full-screen Shells panel, then widen to a desktop viewport.
 
-    Mobile flow (FAB → Shells drawer → tap the ``main`` shell row) is the
-    panel's entry point; the subsequent viewport widening flips the panel
+    Mobile flow (Conversation actions → Shells drawer → tap the ``main`` shell
+    row) is the panel's entry point; widening the viewport then flips the panel
     into its desktop list/xterm split where the column handle renders.
     """
     page.set_viewport_size(_MOBILE_VIEWPORT)
     page.goto(f"{base_url}/c/{session_id}")
 
-    fab = page.get_by_role("button", name="Open session menu")
-    expect(fab).to_be_visible(timeout=15_000)
-    fab.click()
+    actions_menu = page.get_by_role("button", name="Conversation actions")
+    expect(actions_menu).to_be_visible(timeout=15_000)
+    actions_menu.click()
     # Accessible name includes the shell-count badge (e.g. "Shells 2").
     shells_entry = page.get_by_role("menuitem", name=re.compile(r"^Shells\b"))
     expect(shells_entry).to_be_visible(timeout=10_000)

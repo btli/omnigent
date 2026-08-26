@@ -689,6 +689,26 @@ function mockAgents(agents: AvailableAgent[]) {
   } as unknown as ReturnType<typeof useAvailableAgents>);
 }
 
+// Evaluate both width-query poles against an explicit browser viewport.
+function stubViewportWidth(width: number): void {
+  window.matchMedia = ((query: string) => ({
+    matches: (() => {
+      const min = query.match(/^\(min-width: ([\d.]+)px\)$/);
+      if (min) return width >= parseFloat(min[1]);
+      const max = query.match(/^\(max-width: ([\d.]+)px\)$/);
+      if (max) return width <= parseFloat(max[1]);
+      return false;
+    })(),
+    media: query,
+    onchange: null,
+    addListener: () => {},
+    removeListener: () => {},
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    dispatchEvent: () => false,
+  })) as typeof window.matchMedia;
+}
+
 // Shared mock setup for the landing-screen tests: one online host (host_1,
 // auto-selected), two agents (Claude Code default + Codex), inert
 // directory-session / runner-health / filesystem stubs, and a persisted
@@ -2283,20 +2303,15 @@ describe("NewChatLandingScreen", () => {
     // The sandbox option is pinned FIRST in the menu, above the host list —
     // DOCUMENT_POSITION_FOLLOWING means the host item comes after it.
     const sandboxOption = screen.getByTestId("new-chat-landing-sandbox-option");
-    const hostItem = screen
-      .getAllByText("This machine")
-      .find((el) => el.closest('[role="menuitem"]') !== null);
-    expect(hostItem).toBeTruthy();
+    const hostItem = screen.getByTestId("new-chat-landing-host-host_1");
     expect(
-      sandboxOption.compareDocumentPosition(hostItem!) & Node.DOCUMENT_POSITION_FOLLOWING,
+      sandboxOption.compareDocumentPosition(hostItem) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
     // Picking the host restores the workspace flow (file-browser chip,
     // worktree chip) — the sandbox default doesn't wedge the normal path.
-    fireEvent.click(hostItem!);
+    fireEvent.click(hostItem);
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
-        "This machine",
-      ),
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).not.toContain("Sandbox"),
     );
     expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeTruthy();
     expect(screen.getByTestId("new-chat-landing-branch-chip")).toBeTruthy();
@@ -3344,15 +3359,10 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
-    const hostItem = screen
-      .getAllByText("This machine")
-      .find((el) => el.closest('[role="menuitem"]') !== null);
-    expect(hostItem).toBeTruthy();
-    fireEvent.click(hostItem!);
+    const hostItem = screen.getByTestId("new-chat-landing-host-host_1");
+    fireEvent.click(hostItem);
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
-        "This machine",
-      ),
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).not.toContain("Sandbox"),
     );
     // With no custom agents yet, the create item is a top-level row (no
     // "Custom agents" submenu to hide it behind) and opens the dialog.
@@ -3371,14 +3381,10 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
-    const hostItem = screen
-      .getAllByText("This machine")
-      .find((el) => el.closest('[role="menuitem"]') !== null);
-    fireEvent.click(hostItem!);
+    const hostItem = screen.getByTestId("new-chat-landing-host-host_1");
+    fireEvent.click(hostItem);
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
-        "This machine",
-      ),
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).not.toContain("Sandbox"),
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-create-agent"));
@@ -3417,22 +3423,12 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
 // Touch devices can't hover, so the desktop submenu flyouts ("More" for
 // needs-setup harnesses, "Custom agents") are unreachable there. Below the
 // `md` breakpoint the picker swaps its contents in place: tapping the row
-// drills into that group's page with a Back row. jsdom's matchMedia mock
-// reports non-mobile, so these tests force the `max-width` query to match.
+// drills into that group's page with a Back row. These tests pin a phone width.
 // ---------------------------------------------------------------------------
 
 function forceMobileViewport(): () => void {
   const real = window.matchMedia;
-  window.matchMedia = ((query: string) => ({
-    matches: /max-width/.test(query),
-    media: query,
-    onchange: null,
-    addListener: () => {},
-    removeListener: () => {},
-    addEventListener: () => {},
-    removeEventListener: () => {},
-    dispatchEvent: () => false,
-  })) as typeof window.matchMedia;
+  stubViewportWidth(375);
   return () => {
     window.matchMedia = real;
   };

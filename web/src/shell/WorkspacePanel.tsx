@@ -634,7 +634,7 @@ interface WorkspacePanelProps {
  * rail height.
  *
  * Desktop-only (``hidden md:flex``): on mobile the rail's contents are
- * reached via the header's session-menu FAB → full-screen drawers. The
+ * reached via the header's Conversation actions menu → full-screen drawers. The
  * card is drag-resizable via a handle on its left edge.
  *
  * Render gating (default-open, hidden while a push panel owns the
