@@ -15,6 +15,7 @@
 "use strict";
 
 const { contextBridge, ipcRenderer } = require("electron");
+const { serverDisplayLabel } = require("./url");
 
 // Collapse the update states the in-page UpdateBanner renders on
 // (available / downloaded / error-security) to `idle` so the server page can
@@ -414,6 +415,7 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
 // Setup-page bridge: persist + navigate to a server URL, and read the saved
 // one to pre-fill the form. Separate object so the SPA never sees it.
 contextBridge.exposeInMainWorld("omnigentSetup", {
+  serverDisplayLabel,
   getServerUrl: () => ipcRenderer.invoke("omnigent:get-server-url"),
   /**
    * Persist + navigate to a server URL. Connecting this machine as a runner is

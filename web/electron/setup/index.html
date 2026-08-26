@@ -444,11 +444,7 @@
         <button type="button" id="cli-modal-close" class="modal-close">Done</button>
       </div>
     </div>
-    <script src="../src/url.js"></script>
     <script>
-      // Shared URL helpers (electron/src/url.js), exposed as window.omnigentUrl
-      // — the same module the main process uses, so the two never drift.
-      const { serverDisplayLabel } = window.omnigentUrl;
       // Uses the Electron preload bridge (electron/src/preload.js).
       const setup = window.omnigentSetup;
       const input = document.getElementById("url");
@@ -499,7 +495,7 @@
         const section = document.getElementById(sectionId);
         const list = document.getElementById(listId);
         for (const url of urls) {
-          const label = serverDisplayLabel(url);
+          const label = setup.serverDisplayLabel(url);
           const row = document.createElement("div");
           row.className = "recent-row";
 
