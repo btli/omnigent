@@ -13,6 +13,7 @@ const OIDC_LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 const OIDC_POLL_INTERVAL_MS = 2000;
 const OIDC_REQUEST_TIMEOUT_MS = 10000;
 const SESSION_COOKIE_READ_TIMEOUT_MS = 2000;
+const SESSION_COOKIE_OPERATION_TIMEOUT_MS = 2000;
 const SESSION_COOKIE_OWNERSHIP_ERROR = "SESSION_COOKIE_OWNERSHIP_UNKNOWN";
 const MAX_PATH_DECODE_PASSES = 32;
 const TRANSIENT_AUTH_STATUSES = new Set([429, 502, 503, 504]);
@@ -376,11 +377,27 @@ function boundedCookieOperation(operation, timeoutMs, timeoutError) {
   });
 }
 
-function readSessionCookies(electronSession, serverUrl, details, timeoutMs) {
+// Cookie-store stalls must not hold the shared workspace mutation queue indefinitely.
+function boundedCookieStoreCall(
+  electronSession,
+  method,
+  args,
+  timeoutMs = SESSION_COOKIE_OPERATION_TIMEOUT_MS,
+) {
+  const action = method === "get" ? "reading" : method === "set" ? "writing" : "clearing";
   return boundedCookieOperation(
-    () => electronSession.cookies.get({ url: serverUrl, name: details.name }),
+    () => electronSession.cookies[method](...args),
     timeoutMs,
-    () => new SessionCookieOwnershipError("Timed out while reading the session cookie."),
+    () => new SessionCookieOwnershipError(`Timed out while ${action} the session cookie.`),
+  );
+}
+
+function readSessionCookies(electronSession, serverUrl, details, timeoutMs) {
+  return boundedCookieStoreCall(
+    electronSession,
+    "get",
+    [{ url: serverUrl, name: details.name }],
+    timeoutMs,
   );
 }
 
@@ -394,11 +411,7 @@ async function clearSessionCookieWorkspace(
   activeCookieWorkspaceOwners.get(electronSession)?.delete(scope);
   deletePendingCookieWorkspaceOwner(electronSession, scope);
   try {
-    await boundedCookieOperation(
-      () => electronSession.cookies.remove(serverUrl, details.name),
-      timeoutMs,
-      () => new SessionCookieOwnershipError("Timed out while clearing the session cookie."),
-    );
+    await boundedCookieStoreCall(electronSession, "remove", [serverUrl, details.name], timeoutMs);
   } catch (cause) {
     throw new SessionCookieOwnershipError("Could not clear an unowned session cookie.", {
       cause,
@@ -638,6 +651,15 @@ async function recordCurrentSessionCookieWorkspace(
     await clearSessionCookieWorkspace(electronSession, serverUrl, details, cookieReadTimeoutMs);
     throw new SessionCookieOwnershipError("Chromium established an unfamiliar session cookie.");
   }
+  const identity = workspaceIdentityKey(serverUrl);
+  const owner = activeCookieWorkspaceOwners
+    .get(electronSession)
+    ?.get(sessionCookieScope(serverUrl, details));
+  if (owner && owner.identity !== identity) {
+    throw new SessionCookieOwnershipError(
+      "Chromium established a session cookie owned by another workspace.",
+    );
+  }
   rememberSessionCookieWorkspace(electronSession, serverUrl, details, inspected.cookie.value);
   return true;
 }
@@ -694,8 +716,6 @@ function navigateWithSessionCookieWorkspace(
   navigate,
   { cookieReadTimeoutMs, recordCookieAfterNavigation = false, currentWorkspaceIdentity } = {},
 ) {
-  const details = sessionCookieDetails(serverUrl, "");
-  deletePendingCookieWorkspaceOwner(electronSession, sessionCookieScope(serverUrl, details));
   return runWithSessionCookieWorkspace(electronSession, serverUrl, navigate, {
     cookieReadTimeoutMs,
     recordCookieAfterOperation: recordCookieAfterNavigation,
@@ -703,22 +723,42 @@ function navigateWithSessionCookieWorkspace(
   });
 }
 
-async function rollbackSessionCookie(electronSession, serverUrl, details, priorCookie) {
-  const current = await electronSession.cookies.get({ url: serverUrl, name: details.name });
+async function rollbackSessionCookie(
+  electronSession,
+  serverUrl,
+  details,
+  priorCookie,
+  cookieOperationTimeoutMs,
+) {
+  const current = await boundedCookieStoreCall(
+    electronSession,
+    "get",
+    [{ url: serverUrl, name: details.name }],
+    cookieOperationTimeoutMs,
+  );
   const installedCookie = priorSessionCookie(current, serverUrl, details);
   if (!installedCookie || installedCookie.value !== details.value) return;
 
   let removalError = null;
   try {
-    await electronSession.cookies.remove(serverUrl, details.name);
+    await boundedCookieStoreCall(
+      electronSession,
+      "remove",
+      [serverUrl, details.name],
+      cookieOperationTimeoutMs,
+    );
   } catch (error) {
     removalError = error;
   }
 
   if (priorCookie) {
     try {
-      await electronSession.cookies.set(sessionCookieRestoreDetails(serverUrl, priorCookie));
-      return;
+      await boundedCookieStoreCall(
+        electronSession,
+        "set",
+        [sessionCookieRestoreDetails(serverUrl, priorCookie)],
+        cookieOperationTimeoutMs,
+      );
     } catch (restoreError) {
       const error = new Error("Could not restore the prior session cookie.", {
         cause: restoreError,
@@ -726,6 +766,12 @@ async function rollbackSessionCookie(electronSession, serverUrl, details, priorC
       if (removalError) error.removalError = removalError;
       throw error;
     }
+    if (removalError) {
+      throw new Error("Could not confirm removal of the unverified session cookie.", {
+        cause: removalError,
+      });
+    }
+    return;
   }
   if (removalError) {
     throw new Error("Could not remove the unverified session cookie.", { cause: removalError });
@@ -737,7 +783,13 @@ async function installAndVerifySessionCookie(
   electronSession,
   serverUrl,
   token,
-  { verificationAttempts = 3, retryDelayMs = 250, signal, assertCanCommit = () => {} } = {},
+  {
+    verificationAttempts = 3,
+    retryDelayMs = 250,
+    signal,
+    assertCanCommit = () => {},
+    cookieOperationTimeoutMs = SESSION_COOKIE_OPERATION_TIMEOUT_MS,
+  } = {},
 ) {
   const serverUrlError = oidcServerUrlError(serverUrl);
   if (serverUrlError) {
@@ -750,12 +802,27 @@ async function installAndVerifySessionCookie(
   const details = sessionCookieDetails(serverUrl, token);
   return serializeCookieMutation(electronSession, serverUrl, details, async () => {
     deletePendingCookieWorkspaceOwner(electronSession, sessionCookieScope(serverUrl, details));
-    await prepareSessionCookieWorkspace(electronSession, serverUrl, details);
-    const existing = await electronSession.cookies.get({ url: serverUrl, name: details.name });
+    await prepareSessionCookieWorkspace(
+      electronSession,
+      serverUrl,
+      details,
+      cookieOperationTimeoutMs,
+    );
+    const existing = await boundedCookieStoreCall(
+      electronSession,
+      "get",
+      [{ url: serverUrl, name: details.name }],
+      cookieOperationTimeoutMs,
+    );
     const priorCookie = priorSessionCookie(existing, serverUrl, details);
-    await electronSession.cookies.set(details);
+    await boundedCookieStoreCall(electronSession, "set", [details], cookieOperationTimeoutMs);
     try {
-      const accepted = await electronSession.cookies.get({ url: serverUrl, name: details.name });
+      const accepted = await boundedCookieStoreCall(
+        electronSession,
+        "get",
+        [{ url: serverUrl, name: details.name }],
+        cookieOperationTimeoutMs,
+      );
       const cookie = accepted.find(
         (candidate) =>
           candidate.name === details.name &&
@@ -786,7 +853,13 @@ async function installAndVerifySessionCookie(
       rememberSessionCookieWorkspace(electronSession, serverUrl, details, cookie.value);
     } catch (verificationError) {
       try {
-        await rollbackSessionCookie(electronSession, serverUrl, details, priorCookie);
+        await rollbackSessionCookie(
+          electronSession,
+          serverUrl,
+          details,
+          priorCookie,
+          cookieOperationTimeoutMs,
+        );
       } catch (cleanupError) {
         const error = new Error(
           "Session cookie verification failed and cleanup did not complete.",

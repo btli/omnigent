@@ -239,6 +239,66 @@ describe("OIDC provider detection", () => {
     assert.deepEqual(removals, [{ url: workspaceA, name: "__Host-ap_session" }]);
   });
 
+  it("does not credit a delayed cookie from an overlapping workspace navigation", async () => {
+    const workspaceA = "https://dbc-a.cloud.databricks.com/omnigent?o=workspace-a";
+    const workspaceB = "https://dbc-a.cloud.databricks.com/omnigent?o=workspace-b";
+    let stored = null;
+    let cookieChanged;
+    const navigationStarted = Promise.withResolvers();
+    const finishNavigation = Promise.withResolvers();
+    const removals = [];
+    const electronSession = {
+      cookies: {
+        get: async () => (stored ? [{ ...stored }] : []),
+        remove: async (url, name) => {
+          removals.push({ url, name });
+          stored = null;
+        },
+        on: (eventName, listener) => {
+          if (eventName === "changed") cookieChanged = listener;
+        },
+      },
+      fetch: async () => (stored ? response(200) : response(401, { login_url: "/auth/login" })),
+    };
+
+    await navigateWithSessionCookieWorkspace(electronSession, workspaceB, async () => {}, {
+      recordCookieAfterNavigation: true,
+      currentWorkspaceIdentity: () => workspaceIdentityKey(workspaceB),
+    });
+    const navigationA = navigateWithSessionCookieWorkspace(
+      electronSession,
+      workspaceA,
+      async () => {
+        navigationStarted.resolve();
+        await finishNavigation.promise;
+      },
+      {
+        recordCookieAfterNavigation: true,
+        currentWorkspaceIdentity: () => workspaceIdentityKey(workspaceA),
+      },
+    );
+    await navigationStarted.promise;
+    stored = {
+      name: "__Host-ap_session",
+      value: "workspace-b-token",
+      domain: "dbc-a.cloud.databricks.com",
+      path: "/",
+      httpOnly: true,
+      secure: true,
+      sameSite: "lax",
+    };
+    cookieChanged?.({}, { ...stored }, "explicit", false);
+    finishNavigation.resolve();
+
+    await assert.rejects(navigationA, isSessionCookieOwnershipError);
+    assert.deepEqual(await probeServerAuth(electronSession, workspaceB), {
+      kind: "authenticated",
+      status: 200,
+    });
+    assert.equal(stored.value, "workspace-b-token");
+    assert.deepEqual(removals, []);
+  });
+
   it("never sends a cookie installed or replaced after the ownership snapshot", async () => {
     const serverUrl = "https://dbc-a.cloud.databricks.com/omnigent?o=workspace-a";
     const foreignCookie = {
@@ -1166,6 +1226,47 @@ describe("OIDC session cookie installation", () => {
     await acceptedLogin;
     assert.equal(stored.value, "accepted-session");
   });
+
+  it(
+    "bounds stuck rollback cleanup and releases the cookie mutation queue",
+    { timeout: 500 },
+    async () => {
+      let stored = null;
+      let removals = 0;
+      const probes = [
+        response(401, { login_url: "/auth/login" }),
+        response(401, { login_url: "/auth/login" }),
+      ];
+      const electronSession = {
+        cookies: {
+          get: async () => (stored ? [{ ...stored }] : []),
+          set: async (details) => {
+            stored = { ...details };
+          },
+          remove: async () => {
+            removals += 1;
+            if (removals === 1) return new Promise(() => {});
+            stored = null;
+          },
+        },
+        fetch: async () => probes.shift(),
+      };
+
+      const rejectedLogin = installAndVerifySessionCookie(
+        electronSession,
+        "https://server.example",
+        "rejected-session",
+        { verificationAttempts: 1, cookieOperationTimeoutMs: 10 },
+      );
+      const queuedProbe = probeServerAuth(electronSession, "https://server.example", {
+        cookieReadTimeoutMs: 10,
+      });
+
+      await assert.rejects(rejectedLogin, /cleanup did not complete/);
+      assert.deepEqual(await queuedProbe, { kind: "oidc", status: 401 });
+      assert.equal(removals, 2);
+    },
+  );
 
   it("rolls back when cancellation wins after verification", async () => {
     const controller = new AbortController();

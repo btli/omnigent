@@ -1159,11 +1159,23 @@ async function showWebAuthnTimeout(win) {
     return;
   }
   if (probe.kind !== "oidc") return;
-  await withServerLoad(state, async () => {
-    const authenticated = await runWindowOidcBrowserHandoff(win, serverUrl);
-    if (!authenticated || win.isDestroyed()) return;
-    await loadAuthenticatedServerUrl(win, serverUrl);
-  });
+  try {
+    await withServerLoad(state, async () => {
+      const authenticated = await runWindowOidcBrowserHandoff(win, serverUrl);
+      if (!authenticated || win.isDestroyed()) return;
+      await loadAuthenticatedServerUrl(win, serverUrl);
+    });
+  } catch (error) {
+    if (!isSessionCookieOwnershipError(error)) throw error;
+    if (win.isDestroyed()) return;
+    await dialog.showMessageBox(win, {
+      type: "warning",
+      title: "Omnigent",
+      message: "Couldn't finish signing in",
+      detail: "Omnigent couldn't safely verify this server's session. Try signing in again.",
+      buttons: ["OK"],
+    });
+  }
 }
 
 /**
@@ -1270,7 +1282,7 @@ async function ensureWindowOidcSession(win, serverUrl) {
   } catch (error) {
     if (isSessionCookieOwnershipError(error)) {
       setWindowAuthenticationNavigation(win, false);
-      return false;
+      throw error;
     }
     // Preserve the existing load/failure behavior for unreachable or unknown
     // servers. did-fail-load will surface the actionable connection error.
@@ -1299,21 +1311,31 @@ async function ensureWindowOidcSession(win, serverUrl) {
 async function loadAuthenticatedServerUrl(win, serverUrl, routePath, exactLoadUrl, beforeLoad) {
   if (win.isDestroyed()) return;
   const destination = exactLoadUrl ?? (routePath ? joinServerUrl(serverUrl, routePath) : serverUrl);
+  let navigationCommitted = false;
   const navigate = async () => {
     await beforeLoad?.();
     pinWindow(win, serverUrl);
     setWindowServerUrl(win, serverUrl);
-    return win.loadURL(destination);
+    const result = await win.loadURL(destination);
+    navigationCommitted = true;
+    return result;
   };
   if (omnigentCli.isLoopbackServer(serverUrl)) {
     await navigate();
     return;
   }
   const state = windows.get(win);
-  await navigateWithSessionCookieWorkspace(session.defaultSession, serverUrl, navigate, {
-    recordCookieAfterNavigation: state?.cookieEstablishmentNavigation === true,
-    currentWorkspaceIdentity: () => pinnedWorkspaceIdentity(win),
-  });
+  try {
+    await navigateWithSessionCookieWorkspace(session.defaultSession, serverUrl, navigate, {
+      recordCookieAfterNavigation: state?.cookieEstablishmentNavigation === true,
+      currentWorkspaceIdentity: () => pinnedWorkspaceIdentity(win),
+    });
+  } catch (error) {
+    if (navigationCommitted && isSessionCookieOwnershipError(error)) {
+      error.sessionCookieNavigationCommitted = true;
+    }
+    throw error;
+  }
   if (state) state.cookieEstablishmentNavigation = false;
 }
 
@@ -2581,6 +2603,14 @@ function registerIpc() {
         });
       } catch (error) {
         if (!isSessionCookieOwnershipError(error)) throw error;
+        if (error.sessionCookieNavigationCommitted === true) {
+          if (!ephemeral) {
+            const settings = loadSettings();
+            rememberRecentServer(settings, target);
+            saveSettings(settings);
+          }
+          return { loaded: true };
+        }
         return {
           loaded: false,
           error:
@@ -2703,6 +2733,23 @@ function registerIpc() {
         });
       } catch (error) {
         if (!isSessionCookieOwnershipError(error)) throw error;
+        if (error.sessionCookieNavigationCommitted === true) {
+          if (!ephemeral) {
+            const settings = loadSettings();
+            rememberRecentServer(settings, url);
+            saveSettings(settings);
+          }
+          await dialog.showMessageBox(win, {
+            type: "warning",
+            title: "Omnigent",
+            message: "Switched servers with a session warning",
+            detail:
+              "The target server opened, but Omnigent couldn't safely verify its session. " +
+              "Try signing in again if the page doesn't load correctly.",
+            buttons: ["OK"],
+          });
+          return;
+        }
         await dialog.showMessageBox(win, {
           type: "warning",
           title: "Omnigent",

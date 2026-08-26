@@ -100,15 +100,17 @@ function ownershipFailure(message) {
   return error;
 }
 
-function ownershipFailingServerLoader(win, state, error) {
+function ownershipFailingServerLoader(win, state, error, { afterNavigation = false } = {}) {
   assert.ok(guardedServerLoadCode);
   const windows = new Map([[win, state]]);
   const pins = [];
   const loadServerUrl = runInNewContext(`${guardedServerLoadCode}; loadServerUrl`, {
     ensureWindowOidcSession: async () => true,
+    isSessionCookieOwnershipError,
     joinServerUrl,
     loadServerAfterAuth,
-    navigateWithSessionCookieWorkspace: async () => {
+    navigateWithSessionCookieWorkspace: async (_electronSession, _serverUrl, navigate) => {
+      if (afterNavigation) await navigate();
       throw error;
     },
     omnigentCli: { isLoopbackServer: () => false },
@@ -639,7 +641,7 @@ describe("navigation fallback wiring (src/main.js)", () => {
 });
 
 describe("remote OIDC browser handoff wiring (src/main.js)", () => {
-  it("denies navigation when cookie ownership inspection fails", async () => {
+  it("reports cookie ownership inspection failures before navigation", async () => {
     const ensureWindowOidcSession = runInNewContext(`${oidcSessionCode}; ensureWindowOidcSession`, {
       installAndVerifySessionCookie: async () => assert.fail("installed a cookie"),
       isSessionCookieOwnershipError,
@@ -661,14 +663,15 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     const win = { isDestroyed: () => false };
     let navigations = 0;
 
-    const loaded = await loadServerAfterAuth({
-      authenticate: () => ensureWindowOidcSession(win, "https://server.example"),
-      load: async () => {
-        navigations += 1;
-      },
-    });
-
-    assert.equal(loaded, false);
+    await assert.rejects(
+      loadServerAfterAuth({
+        authenticate: () => ensureWindowOidcSession(win, "https://server.example"),
+        load: async () => {
+          navigations += 1;
+        },
+      }),
+      isSessionCookieOwnershipError,
+    );
     assert.equal(navigations, 0);
   });
 
@@ -908,6 +911,42 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     assert.equal(stored.value, "session-token");
     assert.equal(fetches.at(-1), "https://server.example/v1/me");
     assert.deepEqual(reloads, [[win, "https://server.example"]]);
+    assert.equal(state.pendingServerLoads, 0);
+  });
+
+  it("surfaces an ownership failure from the WebAuthn escape reload", async () => {
+    const win = {
+      isDestroyed: () => false,
+      webContents: { getURL: () => "https://idp.example/passkey" },
+    };
+    const state = { serverUrl: "https://server.example", pendingServerLoads: 0 };
+    const dialogs = [];
+    const showWebAuthnTimeout = runInNewContext(`${webAuthnTimeoutCode}; showWebAuthnTimeout`, {
+      WEB_SCHEMES: new Set(["https:"]),
+      URL,
+      dialog: {
+        showMessageBox: async (_win, options) => {
+          dialogs.push(options);
+          return { response: 0 };
+        },
+      },
+      isSessionCookieOwnershipError,
+      loadAuthenticatedServerUrl: async () => {
+        throw ownershipFailure("cookie ownership is unknown");
+      },
+      oidcServerUrlError,
+      probeServerAuth: async () => ({ kind: "oidc", status: 401 }),
+      runWindowOidcBrowserHandoff: async () => true,
+      session: { defaultSession: {} },
+      windows: new Map([[win, state]]),
+      withServerLoad,
+    });
+
+    await showWebAuthnTimeout(win);
+
+    assert.equal(dialogs.length, 2);
+    assert.equal(dialogs[1].message, "Couldn't finish signing in");
+    assert.match(dialogs[1].detail, /safely verify.*try signing in again/i);
     assert.equal(state.pendingServerLoads, 0);
   });
 
@@ -1537,6 +1576,82 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     assert.equal(dialogs.length, 1);
     assert.equal(dialogs[0].message, "Couldn't switch servers");
     assert.match(dialogs[0].detail, /remain connected.*try switching again/i);
+  });
+
+  it("reports a post-navigation ownership failure without claiming the old server remained", async () => {
+    const current = "https://current.example";
+    const target = "https://target.example";
+    const state = {
+      origin: new URL(current).origin,
+      identity: workspaceIdentityKey(current),
+      serverUrl: current,
+      serverManifest: { version: "old" },
+      ephemeral: false,
+      pendingServerLoads: 0,
+      cookieEstablishmentNavigation: true,
+    };
+    let navigations = 0;
+    const win = {
+      isDestroyed: () => false,
+      loadURL: async () => {
+        navigations += 1;
+      },
+    };
+    const error = ownershipFailure("cookie ownership is unknown");
+    const { loadServerUrl, pins, windows } = ownershipFailingServerLoader(win, state, error, {
+      afterNavigation: true,
+    });
+    const settings = { server_url: current, recent_servers: [current, target] };
+    const dialogs = [];
+    let settingsWrites = 0;
+    const handlerSource = switchServerCode.slice(
+      switchServerCode.indexOf("async"),
+      switchServerCode.lastIndexOf(");"),
+    );
+    const handler = runInNewContext(`(${handlerSource})`, {
+      BrowserWindow: { fromWebContents: () => win },
+      PRE_MANIFEST_BASELINE,
+      dialog: {
+        showMessageBox: async (_win, options) => {
+          dialogs.push(options);
+          return { response: 0 };
+        },
+      },
+      fetchServerManifest: async () => ({ version: "new" }),
+      isPinnedWorkspaceSender: () => true,
+      isSessionCookieOwnershipError,
+      loadServerUrl,
+      loadSettings: () => settings,
+      managedServerUrls: () => [],
+      rememberRecentServer: (savedSettings, url) => {
+        savedSettings.recent_servers = [
+          url,
+          ...savedSettings.recent_servers.filter((candidate) => candidate !== url),
+        ];
+      },
+      saveSettings: () => {
+        settingsWrites += 1;
+      },
+      setWindowServerManifest: (_win, manifest) => {
+        state.serverManifest = manifest;
+      },
+      windows,
+    });
+
+    await handler({ sender: {} }, target);
+
+    assert.equal(settings.server_url, target);
+    assert.deepEqual(settings.recent_servers, [target, current]);
+    assert.equal(settingsWrites, 2);
+    assert.deepEqual(pins, [target]);
+    assert.equal(state.identity, workspaceIdentityKey(target));
+    assert.equal(state.serverUrl, target);
+    assert.equal(navigations, 1);
+    assert.equal(state.pendingServerLoads, 0);
+    assert.equal(dialogs.length, 1);
+    assert.equal(dialogs[0].message, "Switched servers with a session warning");
+    assert.doesNotMatch(dialogs[0].detail, /remain connected/i);
+    assert.match(dialogs[0].detail, /target server opened.*try signing in again/i);
   });
 
   it("ignores switch-server while another window load is pending", async () => {
