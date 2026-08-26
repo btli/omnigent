@@ -273,7 +273,9 @@ function priorSessionCookie(cookies, serverUrl, details) {
       cookie &&
       cookie.name === details.name &&
       cookie.path === details.path &&
+      cookie.httpOnly === true &&
       cookie.secure === details.secure &&
+      typeof cookie.value === "string" &&
       (!cookie.domain || cookie.domain === hostname),
   );
 }
@@ -357,8 +359,8 @@ async function installAndVerifySessionCookie(
   return serializeCookieMutation(electronSession, serverUrl, details, async () => {
     const existing = await electronSession.cookies.get({ url: serverUrl, name: details.name });
     const priorCookie = priorSessionCookie(existing, serverUrl, details);
-    await electronSession.cookies.set(details);
     try {
+      await electronSession.cookies.set(details);
       const accepted = await electronSession.cookies.get({ url: serverUrl, name: details.name });
       const cookie = accepted.find(
         (candidate) =>
