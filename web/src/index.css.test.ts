@@ -58,25 +58,45 @@ function selectorOf(rule: string): string {
     .trim();
 }
 
-/** Innermost `selector { ... }` blocks that declare backdrop-filter. */
-function extractBackdropFilterRules(): string[] {
-  // Require a `:` so blocks that merely mention backdrop-filter in a
-  // comment (e.g. the dark-token block) are not treated as glass rules.
-  return cssBlocks.map(([block]) => block).filter((block) => UNPREFIXED_DECL.test(block));
-}
+const REQUIRED_BACKDROP_FILTER_RULES = [
+  {
+    name: "dark top-level cards",
+    selector:
+      '.dark :is(.bg-card, [class*="md:bg-card"]):not( :is(.bg-card, [class*="md:bg-card"]) :is(.bg-card, [class*="md:bg-card"]) ):not([data-collapsed]):not([aria-label="Workspace"]):not([aria-label="Conversations"])',
+  },
+  {
+    name: "dark popovers and menus",
+    selector:
+      '.dark [data-slot="popover-content"], .dark [data-slot="select-content"], .dark [role="menu"], .dark [data-radix-popper-content-wrapper] > *',
+  },
+  {
+    name: "mobile sidebar glass chip",
+    selector: ".sidebar-glass-chip",
+  },
+  {
+    name: "light custom translucent sidebar",
+    selector:
+      ':root:not(.dark)[data-theme="custom"][data-custom-translucent-sidebar] :is(.conversations-sidebar, aside[aria-label="Workspace"]:not([data-maximized]))',
+  },
+  {
+    name: "dark custom translucent sidebar",
+    selector:
+      '.dark[data-theme="custom"][data-custom-translucent-sidebar] :is(.conversations-sidebar, aside[aria-label="Workspace"]:not([data-maximized]))',
+  },
+] as const;
+
+const backdropFilterRulesBySelector = new Map(
+  cssBlocks.map(([block]) => [selectorOf(block).replace(/\s+/g, " "), block]),
+);
 
 describe("index.css backdrop-filter glass rules", () => {
-  const rules = extractBackdropFilterRules();
+  it.each(REQUIRED_BACKDROP_FILTER_RULES)(
+    "keeps both backdrop-filter forms after build minification: $name",
+    ({ name, selector }) => {
+      const rule = backdropFilterRulesBySelector.get(selector);
+      expect(rule, `${name} rule is gone from the concatenated CSS source`).toBeDefined();
+      if (rule === undefined) return;
 
-  it("has the glass rules this test exists to protect", () => {
-    // 2 today: the bg-card frosted surfaces and the popover/menu rule.
-    // 0 or 1 means a rule was removed/renamed — update or delete this test.
-    expect(rules.length).toBeGreaterThanOrEqual(2);
-  });
-
-  it.each(rules.map((rule) => [rule.trim().slice(0, 60), rule] as const))(
-    "keeps both backdrop-filter forms after build minification: %s",
-    (_label, rule) => {
       const minified = new TextDecoder().decode(
         transform({
           filename: "index.css",
@@ -110,7 +130,8 @@ describe("index.css backdrop-filter glass rules", () => {
  */
 describe("index.css bg-card glass rule selector", () => {
   // The selector of the rule declaring the bg-card glass border/blur.
-  const cardRule = extractBackdropFilterRules().find((rule) => rule.includes(".bg-card"))!;
+  const cardRule =
+    backdropFilterRulesBySelector.get(REQUIRED_BACKDROP_FILTER_RULES[0].selector) ?? "";
   const selector = selectorOf(cardRule);
 
   function makeAside(): HTMLElement {
