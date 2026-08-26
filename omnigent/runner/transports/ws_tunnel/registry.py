@@ -731,6 +731,8 @@ class TunnelRegistry:
                         if self._sessions.get(session.runner_id) is not session:
                             _resolve(_replaced_error())
                             return
+                        if ack.done():
+                            return
                         try:
                             session.outbound_queue.put_nowait(data)
                         except asyncio.QueueFull:
