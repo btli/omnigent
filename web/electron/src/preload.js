@@ -15,6 +15,7 @@
 "use strict";
 
 const { contextBridge, ipcRenderer } = require("electron");
+const { serverDisplayLabel, workspaceIdentityKey } = require("./url");
 
 // Collapse the update states the in-page UpdateBanner renders on
 // (available / downloaded / error-security) to `idle` so the server page can
@@ -93,6 +94,10 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * recently-connected server URLs. Resolves null off a connected server.
    */
   getServerPicker: () => ipcRenderer.invoke("omnigent:get-server-picker"),
+  // Shared main/preload identity + label rules keep Databricks `o` handling
+  // identical in the server-served picker without exposing Node or Electron.
+  serverDisplayLabel,
+  workspaceIdentityKey,
   /**
    * Re-point this window to a URL returned by getServerPicker (anything else
    * rejects in the main process).
@@ -414,6 +419,7 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
 // Setup-page bridge: persist + navigate to a server URL, and read the saved
 // one to pre-fill the form. Separate object so the SPA never sees it.
 contextBridge.exposeInMainWorld("omnigentSetup", {
+  serverDisplayLabel,
   getServerUrl: () => ipcRenderer.invoke("omnigent:get-server-url"),
   /**
    * Persist + navigate to a server URL. Connecting this machine as a runner is
