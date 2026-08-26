@@ -200,7 +200,7 @@ describe("HeaderConversationMenu", () => {
     expect(mocks.moveToProject).toHaveBeenCalledWith({ id: "conv-1", project: "Sprint 42" });
   });
 
-  it("shows decorative project icons and a folder fallback in the picker", () => {
+  it("orders decorative project icons and a folder fallback before their names", () => {
     mocks.isMobile = true;
     mocks.projects = [
       { id: "project-1", name: "Sprint 42", icon: "🚀" },
@@ -211,16 +211,56 @@ describe("HeaderConversationMenu", () => {
     fireEvent.click(screen.getByTestId("header-move-to-project"));
 
     const iconRow = screen.getByRole("menuitem", { name: "Sprint 42" });
-    const emoji = iconRow.querySelector('span[aria-hidden="true"]');
+    const emoji = iconRow.firstElementChild;
+    expect(emoji).toHaveAttribute("data-testid", "project-icon");
+    expect(emoji).toHaveAttribute("aria-hidden", "true");
     expect(emoji).toHaveTextContent("🚀");
-    expect(emoji).toHaveClass("shrink-0", "text-[14px]", "leading-none");
+    expect(emoji?.nextElementSibling).toHaveTextContent("Sprint 42");
 
-    const fallback = screen.getByRole("menuitem", { name: "Legacy project" }).querySelector("svg");
-    expect(fallback).toHaveClass("lucide-folder", "size-3.5", "shrink-0");
+    const fallback = screen.getByRole("menuitem", { name: "Legacy project" }).firstElementChild;
+    expect(fallback?.tagName.toLowerCase()).toBe("svg");
     expect(fallback).toHaveAttribute("aria-hidden", "true");
+    expect(fallback?.nextElementSibling).toHaveTextContent("Legacy project");
 
     const removeItem = screen.getByRole("menuitem", { name: "Remove from Sprint 42" });
-    expect(removeItem.querySelector('span[aria-hidden="true"]')).toHaveTextContent("🚀");
+    expect(removeItem.firstElementChild).toHaveAttribute("data-testid", "project-icon");
+    expect(removeItem.firstElementChild).toHaveTextContent("🚀");
+  });
+
+  it("uses project names and the Remove label for desktop picker typeahead", async () => {
+    mocks.projects = [
+      { id: null, name: "Alpha" },
+      { id: "project-1", name: "Sprint 42", icon: "🚀" },
+    ];
+    const view = renderMenu({ currentProject: "Sprint 42" });
+    openMenu();
+    const moveTrigger = screen.getByTestId("header-move-to-project");
+    moveTrigger.focus();
+    fireEvent.keyDown(moveTrigger, { key: "ArrowRight" });
+
+    const alphaRow = await screen.findByRole("menuitem", { name: "Alpha" });
+    const sprintRow = screen.getByRole("menuitem", { name: "Sprint 42" });
+    expect(alphaRow.firstElementChild?.tagName.toLowerCase()).toBe("svg");
+    expect(alphaRow.firstElementChild).toHaveAttribute("aria-hidden", "true");
+    expect(alphaRow.firstElementChild?.nextElementSibling).toHaveTextContent("Alpha");
+    expect(sprintRow.firstElementChild).toHaveAttribute("data-testid", "project-icon");
+    expect(sprintRow.firstElementChild?.nextElementSibling).toHaveTextContent("Sprint 42");
+    await waitFor(() => expect(alphaRow).toHaveFocus());
+    fireEvent.keyDown(alphaRow, { key: "s" });
+    await waitFor(() => expect(sprintRow).toHaveFocus());
+
+    view.unmount();
+    renderMenu({ currentProject: "Sprint 42" });
+    openMenu();
+    const freshMoveTrigger = screen.getByTestId("header-move-to-project");
+    freshMoveTrigger.focus();
+    fireEvent.keyDown(freshMoveTrigger, { key: "ArrowRight" });
+
+    const freshAlphaRow = await screen.findByRole("menuitem", { name: "Alpha" });
+    const removeItem = screen.getByRole("menuitem", { name: "Remove from Sprint 42" });
+    await waitFor(() => expect(freshAlphaRow).toHaveFocus());
+    fireEvent.keyDown(freshAlphaRow, { key: "r" });
+    await waitFor(() => expect(removeItem).toHaveFocus());
   });
 
   it("closes and resets Rename when the conversation id changes", async () => {

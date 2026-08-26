@@ -122,10 +122,15 @@ function ProjectPicker({
           <DropdownMenuItem
             key={project.name}
             className="px-2 py-1"
+            textValue={project.name}
             onSelect={() => onSelect(project.name)}
           >
             {project.icon ? (
-              <span aria-hidden="true" className="shrink-0 text-[14px] leading-none">
+              <span
+                aria-hidden="true"
+                className="shrink-0 text-[14px] leading-none"
+                data-testid="project-icon"
+              >
                 {project.icon}
               </span>
             ) : (
@@ -143,9 +148,17 @@ function ProjectPicker({
       </div>
       {currentProject && (
         <div className="border-t pt-1">
-          <DropdownMenuItem className="px-2 py-1" onSelect={() => onSelect("")}>
+          <DropdownMenuItem
+            className="px-2 py-1"
+            textValue={`Remove from ${currentProject}`}
+            onSelect={() => onSelect("")}
+          >
             {currentProjectIcon ? (
-              <span aria-hidden="true" className="shrink-0 text-[14px] leading-none">
+              <span
+                aria-hidden="true"
+                className="shrink-0 text-[14px] leading-none"
+                data-testid="project-icon"
+              >
                 {currentProjectIcon}
               </span>
             ) : (

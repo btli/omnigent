@@ -8,7 +8,7 @@
 
 import { useSyncExternalStore } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -884,7 +884,7 @@ describe("mobile in-place project picker", () => {
     });
   });
 
-  it("shows decorative project icons and a folder fallback in the picker", () => {
+  it("orders decorative project icons and a folder fallback before their names", () => {
     mocks.isMobile = true;
     mocks.projects = ["Sprint 42", "Legacy project"];
     mocks.projectIcons = { "Sprint 42": "🚀" };
@@ -896,16 +896,57 @@ describe("mobile in-place project picker", () => {
     fireEvent.click(screen.getByTestId("move-to-project"));
 
     const iconRow = screen.getByRole("menuitem", { name: "Sprint 42" });
-    const emoji = iconRow.querySelector('span[aria-hidden="true"]');
+    const emoji = iconRow.firstElementChild;
+    expect(emoji).toHaveAttribute("data-testid", "project-icon");
+    expect(emoji).toHaveAttribute("aria-hidden", "true");
     expect(emoji).toHaveTextContent("🚀");
-    expect(emoji).toHaveClass("shrink-0", "text-[14px]", "leading-none");
+    expect(emoji?.nextElementSibling).toHaveTextContent("Sprint 42");
 
-    const fallback = screen.getByRole("menuitem", { name: "Legacy project" }).querySelector("svg");
-    expect(fallback).toHaveClass("lucide-folder", "size-3.5", "shrink-0");
+    const fallback = screen.getByRole("menuitem", { name: "Legacy project" }).firstElementChild;
+    expect(fallback?.tagName.toLowerCase()).toBe("svg");
     expect(fallback).toHaveAttribute("aria-hidden", "true");
+    expect(fallback?.nextElementSibling).toHaveTextContent("Legacy project");
 
     const removeItem = screen.getByRole("menuitem", { name: "Remove from Sprint 42" });
-    expect(removeItem.querySelector('span[aria-hidden="true"]')).toHaveTextContent("🚀");
+    expect(removeItem.firstElementChild).toHaveAttribute("data-testid", "project-icon");
+    expect(removeItem.firstElementChild).toHaveTextContent("🚀");
+  });
+
+  it("uses project names and the Remove label for desktop picker typeahead", async () => {
+    mocks.projects = ["Alpha", "Sprint 42"];
+    mocks.projectIcons = { "Sprint 42": "🚀" };
+    mockConversations([{ ...CONV, labels: { omni_project: "Sprint 42" } }]);
+    mocks.pinnedStore.set([CONV.id]);
+    const view = renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    const moveTrigger = screen.getByTestId("move-to-project");
+    moveTrigger.focus();
+    fireEvent.keyDown(moveTrigger, { key: "ArrowRight" });
+
+    const alphaRow = await screen.findByRole("menuitem", { name: "Alpha" });
+    const sprintRow = screen.getByRole("menuitem", { name: "Sprint 42" });
+    expect(alphaRow.firstElementChild?.tagName.toLowerCase()).toBe("svg");
+    expect(alphaRow.firstElementChild).toHaveAttribute("aria-hidden", "true");
+    expect(alphaRow.firstElementChild?.nextElementSibling).toHaveTextContent("Alpha");
+    expect(sprintRow.firstElementChild).toHaveAttribute("data-testid", "project-icon");
+    expect(sprintRow.firstElementChild?.nextElementSibling).toHaveTextContent("Sprint 42");
+    await waitFor(() => expect(alphaRow).toHaveFocus());
+    fireEvent.keyDown(alphaRow, { key: "s" });
+    await waitFor(() => expect(sprintRow).toHaveFocus());
+
+    view.unmount();
+    renderSidebar();
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    const freshMoveTrigger = screen.getByTestId("move-to-project");
+    freshMoveTrigger.focus();
+    fireEvent.keyDown(freshMoveTrigger, { key: "ArrowRight" });
+
+    const freshAlphaRow = await screen.findByRole("menuitem", { name: "Alpha" });
+    const removeItem = screen.getByRole("menuitem", { name: "Remove from Sprint 42" });
+    await waitFor(() => expect(freshAlphaRow).toHaveFocus());
+    fireEvent.keyDown(freshAlphaRow, { key: "r" });
+    await waitFor(() => expect(removeItem).toHaveFocus());
   });
 
   it("keeps the desktop side-flyout submenu (no in-place swap)", () => {

@@ -2709,6 +2709,7 @@ interface MenuItemProps {
   children?: ReactNode;
   className?: string;
   disabled?: boolean;
+  textValue?: string;
   variant?: "default" | "destructive";
   // Radix's menu `onSelect` receives a native Event in both families.
   onSelect?: (event: Event) => void;
@@ -4487,9 +4488,18 @@ function ProjectPickerMenu({
       </div>
       <div className="max-h-48 overflow-y-auto">
         {filtered.map((p) => (
-          <C.Item key={p.name} className="px-2 py-1" onSelect={() => onSelect(p.name)}>
+          <C.Item
+            key={p.name}
+            className="px-2 py-1"
+            textValue={p.name}
+            onSelect={() => onSelect(p.name)}
+          >
             {p.icon ? (
-              <span aria-hidden="true" className="shrink-0 text-[14px] leading-none">
+              <span
+                aria-hidden="true"
+                className="shrink-0 text-[14px] leading-none"
+                data-testid="project-icon"
+              >
                 {p.icon}
               </span>
             ) : (
@@ -4507,9 +4517,17 @@ function ProjectPickerMenu({
       </div>
       {currentProject && (
         <div className="border-t pt-1">
-          <C.Item className="px-2 py-1" onSelect={() => onSelect("")}>
+          <C.Item
+            className="px-2 py-1"
+            textValue={`Remove from ${currentProject}`}
+            onSelect={() => onSelect("")}
+          >
             {currentProjectIcon ? (
-              <span aria-hidden="true" className="shrink-0 text-[14px] leading-none">
+              <span
+                aria-hidden="true"
+                className="shrink-0 text-[14px] leading-none"
+                data-testid="project-icon"
+              >
                 {currentProjectIcon}
               </span>
             ) : (
