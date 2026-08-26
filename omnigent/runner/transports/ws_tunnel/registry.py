@@ -700,22 +700,78 @@ class TunnelRegistry:
         """
         ack: concurrent.futures.Future[None] = concurrent.futures.Future()
 
-        def _enqueue() -> None:
-            """Run on ``session.loop`` and enqueue the outbound frame."""
-            error: ConnectionError | None = None
-            with self._lock:
-                if self._sessions.get(session.runner_id) is not session:
-                    error = ConnectionError(f"runner {session.runner_id!r} tunnel was replaced")
-                else:
-                    session.outbound_queue.put_nowait(data)
-            if error is not None:
-                if not ack.done():
-                    ack.set_exception(error)
+        def _resolve(error: BaseException | None) -> None:
+            """Settle the cross-loop acknowledgement once."""
+            if ack.done():
+                return
+            if error is None:
+                ack.set_result(None)
             else:
-                if not ack.done():
-                    ack.set_result(None)
+                ack.set_exception(error)
 
-        _call_session_soon_threadsafe(session, _enqueue)
+        def _stale() -> bool:
+            with self._lock:
+                return self._sessions.get(session.runner_id) is not session
+
+        def _replaced_error() -> ConnectionError:
+            return ConnectionError(f"runner {session.runner_id!r} tunnel was replaced")
+
+        async def _enqueue() -> None:
+            """Wait for bounded queue room on the session owner loop."""
+            try:
+                deadline = time.monotonic() + _OUTBOUND_SEND_STALL_S
+                while True:
+                    # Keep generation validation and enqueue atomic with register().
+                    with self._lock:
+                        if self._sessions.get(session.runner_id) is not session:
+                            _resolve(_replaced_error())
+                            return
+                        if ack.done():
+                            return
+                        try:
+                            session.outbound_queue.put_nowait(data)
+                        except asyncio.QueueFull:
+                            pass
+                        else:
+                            _resolve(None)
+                            return
+                    if time.monotonic() >= deadline:
+                        if _stale():
+                            _resolve(_replaced_error())
+                            return
+                        _logger.warning(
+                            "runner %s outbound queue freed no room in %.0fs (%d frames); "
+                            "failing send",
+                            session.runner_id,
+                            _OUTBOUND_SEND_STALL_S,
+                            session.outbound_queue.qsize(),
+                        )
+                        _resolve(
+                            ConnectionError(
+                                f"runner {session.runner_id!r} outbound tunnel stalled"
+                            )
+                        )
+                        return
+                    await asyncio.sleep(_OUTBOUND_SEND_POLL_S)
+            finally:
+                _resolve(_replaced_error())
+
+        def _finalize_enqueue(task: asyncio.Task[None]) -> None:
+            """Settle sends whose enqueue task was cancelled before starting."""
+            if not task.cancelled():
+                _ = task.exception()
+            _resolve(_replaced_error())
+
+        def _start_enqueue() -> None:
+            task = asyncio.get_running_loop().create_task(_enqueue())
+            task.add_done_callback(_finalize_enqueue)
+
+        if not session.loop.is_running():
+            raise ConnectionError(f"runner {session.runner_id!r} tunnel loop is not running")
+        try:
+            _call_session_soon_threadsafe(session, _start_enqueue)
+        except RuntimeError as exc:
+            raise ConnectionError(f"runner {session.runner_id!r} tunnel loop is closed") from exc
         await asyncio.wrap_future(ack)
 
     # ── Routing incoming frames ──────────────────────────
