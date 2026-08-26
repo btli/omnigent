@@ -174,8 +174,8 @@ describe("index.css app-shell viewport lock", () => {
 
 /* The unified native-panel rule: one ungated :is() list covering the
  * Workspace rail, the conversations sidebar, and every push panel / rail-tab
- * drawer. The assertions below apply it verbatim — no media stripping, which
- * is what made the earlier phone-width-gated assertions vacuous. */
+ * drawer. The assertions below apply it verbatim — media-stripping a gated
+ * rule would assert padding the md+ layout never applies. */
 // Every block carrying panel testids + the safe-area fold (a single rule
 // today). Matching ALL blocks, not the first, so if the rule is ever split
 // no trailing block's panels silently escape the assertions below.
@@ -246,37 +246,48 @@ function expectZeroPadding(element: HTMLElement): void {
   expect(computed.paddingRight).toBe("0");
 }
 
-/* Mounts the rail, the sidebar, and every derived panel testid under a
- * native-shell root and asserts the four-edge fold on each. */
-function assertNativePanelPadding(platform: "android" | "ios"): void {
+/** Mounts a native-shell root with the unified rule applied, hands it to
+ * `assertions`, then removes both. */
+function withNativeShell(
+  platform: "android" | "ios",
+  assertions: (shell: HTMLElement) => void,
+): void {
   withStyle(nativePanelRule, () => {
     const shell = document.createElement("div");
     shell.setAttribute(`data-${platform}-native`, "");
     document.body.appendChild(shell);
     try {
-      const rail = document.createElement("aside");
-      rail.setAttribute("aria-label", "Workspace");
-      shell.appendChild(rail);
-      expectSafeAreaPadding(rail);
-      const sidebar = document.createElement("div");
-      sidebar.className = "conversations-sidebar";
-      shell.appendChild(sidebar);
-      expectSafeAreaPadding(sidebar);
-      for (const testId of cssPanelTestIds) {
-        const panel = document.createElement("div");
-        panel.dataset.testid = testId;
-        shell.appendChild(panel);
-        expectSafeAreaPadding(panel);
-      }
-      // Rail-tab drawers carry no testid in the rule — the shared
-      // MobilePanelDrawer class folds the inset onto all of them.
-      const drawer = document.createElement("div");
-      drawer.className = "mobile-panel-drawer";
-      shell.appendChild(drawer);
-      expectSafeAreaPadding(drawer);
+      assertions(shell);
     } finally {
       shell.remove();
     }
+  });
+}
+
+/* Mounts the rail, the sidebar, and every derived panel testid under a
+ * native-shell root and asserts the four-edge fold on each. */
+function assertNativePanelPadding(platform: "android" | "ios"): void {
+  withNativeShell(platform, (shell) => {
+    const rail = document.createElement("aside");
+    rail.setAttribute("aria-label", "Workspace");
+    shell.appendChild(rail);
+    expectSafeAreaPadding(rail);
+    const sidebar = document.createElement("div");
+    sidebar.className = "conversations-sidebar";
+    shell.appendChild(sidebar);
+    expectSafeAreaPadding(sidebar);
+    for (const testId of cssPanelTestIds) {
+      const panel = document.createElement("div");
+      panel.dataset.testid = testId;
+      shell.appendChild(panel);
+      expectSafeAreaPadding(panel);
+    }
+    // Rail-tab drawers carry no testid in the rule — the shared
+    // MobilePanelDrawer class folds the inset onto all of them.
+    const drawer = document.createElement("div");
+    drawer.className = "mobile-panel-drawer";
+    shell.appendChild(drawer);
+    expectSafeAreaPadding(drawer);
   });
 }
 
@@ -335,82 +346,54 @@ describe("index.css native safe-area layout", () => {
   });
 
   it("leaves a collapsed rail unpadded, so its starved width stays zero", () => {
-    withStyle(nativePanelRule, () => {
-      const shell = document.createElement("div");
-      shell.setAttribute("data-android-native", "");
+    withNativeShell("android", (shell) => {
       const rail = document.createElement("aside");
       rail.setAttribute("aria-label", "Workspace");
       rail.setAttribute("data-collapsed", "true");
       shell.appendChild(rail);
-      document.body.appendChild(shell);
-      try {
-        // The width-0 rail carries data-collapsed (pinned above); the rule
-        // must skip it edge for edge or the padding gives it real width.
-        expectZeroPadding(rail);
-      } finally {
-        shell.remove();
-      }
+      // The width-0 rail carries data-collapsed (pinned above); the rule
+      // must skip it edge for edge or the padding gives it real width.
+      expectZeroPadding(rail);
     });
   });
 
   it("leaves collapsed panels unpadded, so their w-0 width stays zero", () => {
-    withStyle(nativePanelRule, () => {
-      const shell = document.createElement("div");
-      shell.setAttribute("data-android-native", "");
+    withNativeShell("android", (shell) => {
       const panel = document.createElement("div");
       panel.dataset.testid = "execution-logs-panel";
       panel.setAttribute("data-collapsed", "");
       shell.appendChild(panel);
-      document.body.appendChild(shell);
-      try {
-        // Closed push panels stay mounted at w-0; with border-box sizing any
-        // padding would give them real width — a cutout-sized gap in the
-        // layout (the e2e layer asserts the layout width itself stays 0).
-        expectZeroPadding(panel);
-      } finally {
-        shell.remove();
-      }
+      // Closed push panels stay mounted at w-0; with border-box sizing any
+      // padding would give them real width — a cutout-sized gap in the
+      // layout (the e2e layer asserts the layout width itself stays 0).
+      expectZeroPadding(panel);
     });
   });
 
   it("exempts panels nested inside the already-padded rail", () => {
-    withStyle(nativePanelRule, () => {
-      const shell = document.createElement("div");
-      shell.setAttribute("data-android-native", "");
+    withNativeShell("android", (shell) => {
       const rail = document.createElement("aside");
       rail.setAttribute("aria-label", "Workspace");
       const panel = document.createElement("div");
       panel.dataset.testid = "file-viewer";
       rail.appendChild(panel);
       shell.appendChild(rail);
-      document.body.appendChild(shell);
-      try {
-        // The rail already pads all four edges; padding the nested viewer
-        // again would double the inset.
-        expectZeroPadding(panel);
-      } finally {
-        shell.remove();
-      }
+      // The rail already pads all four edges; padding the nested viewer
+      // again would double the inset.
+      expectZeroPadding(panel);
     });
   });
 
   it("leaves the peeking sidebar unpadded — the card floats clear of every bar", () => {
-    withStyle(nativePanelRule, () => {
-      const shell = document.createElement("div");
-      shell.setAttribute("data-android-native", "");
+    withNativeShell("android", (shell) => {
       const sidebar = document.createElement("div");
       sidebar.className = "conversations-sidebar is-peek";
       shell.appendChild(sidebar);
-      document.body.appendChild(shell);
-      try {
-        // Peek is a floating card inset 8px off every screen edge (md:absolute
-        // md:inset-2 p-0); it touches neither bar, and effectiveOpen is true
-        // so no data-collapsed saves it — an unguarded rule would override
-        // the card's p-0 with cutout-sized padding.
-        expectZeroPadding(sidebar);
-      } finally {
-        shell.remove();
-      }
+      // Peek is a floating card inset 8px off every screen edge (md:absolute
+      // md:inset-2 p-0); it touches neither bar, and effectiveOpen is true
+      // so no data-collapsed saves it — an unguarded rule would override
+      // the card's p-0 with cutout-sized padding.
+      expectZeroPadding(sidebar);
     });
   });
 
