@@ -84,4 +84,25 @@ describe("transactional server loading", () => {
     await first;
     assert.equal(state.pendingServerLoads, 0);
   });
+
+  it("tracks and clears a rejected pending load with the server-load gate", async () => {
+    const state = { pendingServerLoads: 0 };
+    const loadStarted = Promise.withResolvers();
+    const finishLoad = Promise.withResolvers();
+    const loadError = new Error("load failed");
+    const loading = withServerLoad(state, async () => {
+      loadStarted.resolve();
+      await finishLoad.promise;
+      throw loadError;
+    });
+
+    await loadStarted.promise;
+    assert.equal(state.pendingServerLoads, 1);
+    assert.equal(state.pendingLoad, loading);
+
+    finishLoad.resolve();
+    await assert.rejects(loading, loadError);
+    assert.equal(state.pendingServerLoads, 0);
+    assert.equal(state.pendingLoad, null);
+  });
 });
