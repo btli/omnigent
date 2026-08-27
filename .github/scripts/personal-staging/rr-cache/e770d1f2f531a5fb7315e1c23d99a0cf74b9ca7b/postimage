@@ -20,6 +20,18 @@ import {
 import { cn } from "@/lib/utils";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 
+/** Compact display label that keeps path-based deployments distinguishable. */
+function serverLabel(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname.endsWith(".databricks.com")) return serverDisplayLabel(url);
+    const path = parsed.pathname === "/" ? "" : parsed.pathname.replace(/\/$/, "");
+    return `${parsed.host}${path}`;
+  } catch {
+    return url;
+  }
+}
+
 /** Browser-canonical server identity, retaining path and query. */
 function serverKey(url: string): string {
   try {
@@ -98,7 +110,7 @@ export function SidebarServerPicker() {
     const key = serverKey(url);
     return !matchesCurrent(url) && !managedKeys.has(key);
   });
-  const currentLabel = serverDisplayLabel(currentUrl);
+  const currentLabel = serverLabel(currentUrl);
 
   return (
     // shrink-0 keeps the row at its natural height so the scrolling session
@@ -153,7 +165,7 @@ export function SidebarServerPicker() {
                       <span className="size-4 shrink-0" aria-hidden="true" />
                     )}
                     <span className={cn("truncate", isCurrent && "font-medium")}>
-                      {serverDisplayLabel(url)}
+                      {serverLabel(url)}
                     </span>
                   </DropdownMenuItem>
                 );
@@ -177,7 +189,7 @@ export function SidebarServerPicker() {
                   onSelect={() => void switchServer(url)}
                 >
                   <span className="size-4 shrink-0" aria-hidden="true" />
-                  <span className="truncate">{serverDisplayLabel(url)}</span>
+                  <span className="truncate">{serverLabel(url)}</span>
                 </DropdownMenuItem>
               ))}
             </>
