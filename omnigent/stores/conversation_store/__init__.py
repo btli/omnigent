@@ -373,6 +373,7 @@ class ConversationStore(ABC):
         workspace: str | None = None,
         git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
+        project_id: str | None = None,
         conversation_id: str | None = None,
     ) -> Conversation:
         """
@@ -426,6 +427,8 @@ class ConversationStore(ABC):
             the column NULL; a list (including ``[]``) is persisted
             so the runner applies it when it auto-launches the
             terminal.
+        :param project_id: First-class Project membership. ``None`` means
+            unfiled.
         :param conversation_id: Optional caller-supplied identifier.
             ``None`` generates a new random id. Reserved for flows that
             require database-enforced idempotency.
