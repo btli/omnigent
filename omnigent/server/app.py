@@ -1288,6 +1288,7 @@ def create_app(
                 conversation_store=conversation_store,
                 permission_store=permission_store,
                 policy_store=policy_store,
+                project_store=project_store,
                 host_store=host_store,
                 host_registry=host_registry,
                 agent_cache=agent_cache,
@@ -1574,6 +1575,18 @@ def create_app(
         return JSONResponse(
             status_code=exc.http_status,
             content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
+    @app.exception_handler(InvalidUuidError)
+    async def _handle_invalid_uuid(
+        request: Request,  # noqa: ARG001
+        exc: InvalidUuidError,
+    ) -> JSONResponse:
+        """Map an explicitly validated malformed id to the standard 404 body."""
+        _logger.debug("Malformed id mapped to 404: %s", exc)
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"code": ErrorCode.NOT_FOUND, "message": "Not found."}},
         )
 
     @app.exception_handler(StatementError)
@@ -2361,6 +2374,7 @@ def create_app(
                 scheduled_task_store,
                 agent_store=agent_store,
                 conversation_store=conversation_store,
+                project_store=project_store,
                 permission_store=permission_store,
                 agent_cache=agent_cache,
                 auth_provider=auth_provider,
