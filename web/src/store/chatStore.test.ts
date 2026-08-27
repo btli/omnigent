@@ -8434,6 +8434,46 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  it("acks an optimistic user bubble when reconnect backfills its committed item", async () => {
+    const before = userMessage("ack_pre", "before the gap");
+    seedSession("conv_reconnect_ack", [before]);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_reconnect_ack",
+      abortController: controller,
+      blocks: itemsToBlocks([before]),
+      pendingUserMessages: [
+        {
+          tempId: "pend_gap",
+          content: [{ type: "input_text", text: "only once" }],
+          posted: true,
+        },
+      ],
+    });
+
+    const loop = startStreamPump("conv_reconnect_ack", controller, setState, getState);
+    await drainAsync();
+    expect(sinks).toHaveLength(1);
+
+    const committed = userMessage("ack_gap", "only once");
+    const reply = assistantMessage("ack_gap", "the reply");
+    seedSessionItems("conv_reconnect_ack", [before, committed, reply]);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    const state = useChatStore.getState();
+    expect(state.pendingUserMessages).toEqual([]);
+    expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([before.id, committed.id, reply.id]);
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
   it("keeps a heartbeat-alive stream connected across many stall windows", async () => {
     seedSession("conv_hb", []);
     const sinks = routeStreamOpens();
@@ -8778,7 +8818,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
-  it("re-hydrate keeps pending elicitation and synthetic error blocks in the tail", async () => {
+  it("re-hydrate restores itemless blocks at their transcript time", async () => {
     const preGap = Array.from({ length: 30 }, (_, i) => gapUser("kpre", i));
     const windowItems = preGap.slice(-SESSION_HISTORY_PAGE_SIZE);
     seedSession("conv_keep", preGap);
@@ -8806,7 +8846,15 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     // both itemId-less with responseId "" (no streaming rid owns them).
     const approvalCard: ElicitationBlock = {
       type: "elicitation",
-      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: null },
+      ctx: {
+        agent: null,
+        depth: 0,
+        turn: 0,
+        timestamp: 0,
+        responseId: "",
+        itemId: null,
+        clientCreatedAtS: 9_260,
+      },
       elicitationId: "elic_keep",
       message: "Allow the tool call?",
       phase: "tool_call",
@@ -8819,7 +8867,15 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     };
     const syntheticError: ErrorBlock = {
       type: "error",
-      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: null },
+      ctx: {
+        agent: null,
+        depth: 0,
+        turn: 0,
+        timestamp: 0,
+        responseId: "",
+        itemId: null,
+        clientCreatedAtS: 9_580,
+      },
       message: "boom",
       source: "",
       code: "task_failed",
@@ -8838,6 +8894,9 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
     // 100 gap items: the backfill cap is outrun, forcing the re-hydrate.
     const gap = Array.from({ length: 100 }, (_, i) => gapUser("kgap", i));
+    gap.forEach((item, i) => {
+      item.created_at = 9_000 + i * 10;
+    });
     seedSessionItems("conv_keep", [...preGap, ...gap]);
     sinks[0]!.error();
     await drainAsync();
@@ -8846,11 +8905,11 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     const state = useChatStore.getState();
     // The fresh fetch returns ITEMS only — dropping these blocks would lose
     // the pending ApprovalCard (and the failure reason) with no way back.
-    expect(state.blocks.map((b) => b.ctx.itemId ?? b.type)).toEqual([
-      ...gap.slice(-INITIAL_WINDOW_ITEMS).map((item) => item.id),
-      "elicitation",
-      "error",
-    ]);
+    // Appending them after the fresh window was the ordering bug: a 9:26 card
+    // rendered below messages from 10+ minutes later after reconnect.
+    const ordered = state.blocks.map((b) => b.ctx.itemId ?? b.type);
+    expect(ordered.indexOf("elicitation")).toBeLessThan(ordered.indexOf("msg_kgap_0080_user"));
+    expect(ordered.indexOf("error")).toBeLessThan(ordered.indexOf("msg_kgap_0080_user"));
     const card = state.blocks.find((b): b is ElicitationBlock => b.type === "elicitation");
     expect(card?.elicitationId).toBe("elic_keep");
     expect(card?.status).toBe("pending");
