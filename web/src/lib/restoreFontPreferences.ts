@@ -9,8 +9,8 @@
 // SSR/no-DOM safe: every apply/load helper guards for a missing document.
 
 import {
+  applyDesktopUiFontSize,
   applyUiFontFamily,
-  applyUiFontScale,
   readUiFontFamily,
   readUiFontSizePx,
 } from "./uiFontPreferences";
@@ -20,9 +20,9 @@ import { loadCodeFontFamily, readCodeFontFamily } from "./codeFontPreferences";
 /**
  * Restore the saved UI + fixed-width + code font preferences on boot.
  *
- * - UI font: applies the size (`--ui-font-scale`) and family (`--ui-font-family`)
- *   to the document root; `applyUiFontFamily` also kicks the catalog webfont
- *   load for the saved family.
+ * - UI font: applies the size (`--desktop-ui-font-size`) and family
+ *   (`--ui-font-family`) to the document root; `applyUiFontFamily` also kicks
+ *   the catalog webfont load for the saved family.
  * - Fixed-width font: rides `--ui-mono-font-family` like the UI font;
  *   `applyFixedWidthFontFamily` sets the var and kicks the catalog webfont load
  *   for the saved family.
@@ -31,7 +31,7 @@ import { loadCodeFontFamily, readCodeFontFamily } from "./codeFontPreferences";
  *   re-measure when it lands.
  */
 export function restoreFontPreferences(): void {
-  applyUiFontScale(readUiFontSizePx());
+  applyDesktopUiFontSize(readUiFontSizePx());
   applyUiFontFamily(readUiFontFamily());
   applyFixedWidthFontFamily(readFixedWidthFontFamily());
   loadCodeFontFamily(readCodeFontFamily());

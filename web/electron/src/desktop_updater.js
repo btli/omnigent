@@ -11,8 +11,10 @@
 //
 // Design notes preserved from the original inline implementation:
 //   - Updates are gated on a usable feed: a packaged build, or a dev build with
-//     `OMNIGENT_FORCE_DEV_UPDATE_CONFIG=1` (surfaced here as `forceDevUpdateConfig`).
-//     Manual actions in an unusable feed reject with a friendly dev message.
+//     `forceDevUpdateConfig` set (main.js derives it from !app.isPackaged, so
+//     dev always uses dev-app-update.yml and a packaged build can never be
+//     redirected to it). Manual actions in an unusable feed reject with a
+//     friendly dev message.
 //   - `autoDownload` is always off; downloads and installs are explicit and
 //     each privileged IPC action re-confirms with a native dialog (a cached
 //     hosting grant must not silently authorize an update action).
@@ -78,8 +80,12 @@ function isUpdateSecurityError(message) {
  * @param {(win: Electron.BrowserWindow | null | undefined) => string | null} deps.pinnedOrigin
  *   The origin a window is pinned to (used for the consent dialog copy).
  * @param {string} deps.iconPath Absolute path to the app icon PNG.
- * @param {boolean} [deps.forceDevUpdateConfig] Force the dev feed on in an
- *   unpackaged build (from `OMNIGENT_FORCE_DEV_UPDATE_CONFIG=1`).
+ * @param {boolean} [deps.forceDevUpdateConfig] Enable the development update
+ *   config in an unpackaged build (main.js sets this from !app.isPackaged).
+ * @param {() => string} [deps.getCurrentVersion] Version shown in update UI.
+ *   Defaults to Electron's real app version.
+ * @param {(installReady: boolean) => void} [deps.onInstallReadyChange]
+ *   Called when a downloaded update becomes ready or stops being ready.
  * @returns {{
  *   getConfig: () => { mode: string, autoInstall: boolean, skippedVersion: string | null },
  *   setConfig: (patch?: object) => { mode: string, autoInstall: boolean, skippedVersion: string | null },
@@ -105,6 +111,8 @@ function createDesktopUpdater({
   pinnedOrigin,
   iconPath,
   forceDevUpdateConfig = false,
+  getCurrentVersion = () => app.getVersion(),
+  onInstallReadyChange = () => {},
 }) {
   let updateCheckTimer = null;
   let currentUpdateStatus = { state: "idle" };
@@ -120,16 +128,13 @@ function createDesktopUpdater({
   function setConfig(patch = {}) {
     const settings = loadSettings();
     const next = { ...settings };
-    if (Object.prototype.hasOwnProperty.call(patch, "mode") && UPDATE_MODES.has(patch.mode)) {
+    if (Object.hasOwn(patch, "mode") && UPDATE_MODES.has(patch.mode)) {
       next.update_mode = patch.mode;
     }
-    if (
-      Object.prototype.hasOwnProperty.call(patch, "autoInstall") &&
-      typeof patch.autoInstall === "boolean"
-    ) {
+    if (Object.hasOwn(patch, "autoInstall") && typeof patch.autoInstall === "boolean") {
       next.update_auto_install = patch.autoInstall;
     }
-    if (Object.prototype.hasOwnProperty.call(patch, "skippedVersion")) {
+    if (Object.hasOwn(patch, "skippedVersion")) {
       next.update_skipped_version =
         typeof patch.skippedVersion === "string" ? patch.skippedVersion : null;
     }
@@ -142,7 +147,10 @@ function createDesktopUpdater({
   }
 
   function broadcast(status) {
+    const wasInstallReady = currentUpdateStatus.state === "downloaded";
     currentUpdateStatus = status;
+    const installReady = status.state === "downloaded";
+    if (installReady !== wasInstallReady) onInstallReadyChange(installReady);
     for (const win of BrowserWindow.getAllWindows()) {
       if (win.isDestroyed()) continue;
       try {
@@ -181,6 +189,10 @@ function createDesktopUpdater({
         () => autoUpdater.checkForUpdates().catch(() => {}),
         PERIODIC_CHECK_INTERVAL_MS,
       );
+      // Don't let the 6-hourly re-check keep the Node event loop alive at quit
+      // (a ref'd interval can leave the main process lingering after the
+      // windows close on some platforms).
+      if (typeof updateCheckTimer.unref === "function") updateCheckTimer.unref();
     }
   }
 
@@ -192,7 +204,7 @@ function createDesktopUpdater({
     autoUpdater.on("checking-for-update", () => broadcast({ state: "checking" }));
     autoUpdater.on("update-available", (info) => {
       manualCheckInFlight = false;
-      broadcast({ state: "available", info });
+      broadcast({ state: "available", currentVersion: getCurrentVersion(), info });
     });
     autoUpdater.on("update-not-available", () => {
       manualCheckInFlight = false;
@@ -201,7 +213,9 @@ function createDesktopUpdater({
     autoUpdater.on("download-progress", (progress) =>
       broadcast({ state: "downloading", progress }),
     );
-    autoUpdater.on("update-downloaded", (info) => broadcast({ state: "downloaded", info }));
+    autoUpdater.on("update-downloaded", (info) =>
+      broadcast({ state: "downloaded", currentVersion: getCurrentVersion(), info }),
+    );
     autoUpdater.on("error", (err) => {
       const msg = String(err?.message ?? err);
       const isSecurity = isUpdateSecurityError(msg);
@@ -249,6 +263,21 @@ function createDesktopUpdater({
     installPending = true;
     app.quit();
     return true;
+  }
+
+  /**
+   * Start downloading the available update. Feed-gated like the other actions.
+   * Used by the trusted shell update overlay (the server-page IPC calls
+   * `autoUpdater.downloadUpdate()` inline behind its own consent dialog).
+   *
+   * @returns {Promise<void>}
+   */
+  function downloadUpdate() {
+    if (!canUseFeed()) {
+      reportUnavailableInDev();
+      return Promise.reject(unavailableInDevError());
+    }
+    return autoUpdater.downloadUpdate().then(() => undefined);
   }
 
   /**
@@ -396,6 +425,7 @@ function createDesktopUpdater({
     getStatus,
     init,
     checkForUpdates,
+    downloadUpdate,
     installUpdateNow,
     registerIpc,
     quitAndInstallIfPending,

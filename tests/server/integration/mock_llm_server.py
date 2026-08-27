@@ -45,9 +45,16 @@ Configuration via ``POST /mock/configure``::
                     {"call_id": "c1", "name": "grep", "arguments": "{}"}
                 ]
             },
-            {"error": "rate limit exceeded", "status_code": 429}
+            {"error": "rate limit exceeded", "status_code": 429},
+            {"text": "later", "delay": 1.5},
+            {"text": "one two three", "stream": true, "truncate_after": 2}
         ]
     }
+
+``truncate_after`` opens a normal ``200`` SSE stream but emits only that many
+events before ending — dropping the terminal completion event — to simulate a
+stream that dies mid-flight (the mid-stream fault the ``error`` field, an
+open-time HTTP status, cannot express).
 """
 
 from __future__ import annotations
@@ -272,6 +279,20 @@ def sse_tool_call_response(
         )
     _add("response.completed", response=response_obj)
     return "".join(events)
+
+
+def truncate_sse(body: str, keep_events: int) -> str:
+    """Return the first *keep_events* SSE events of *body*, dropping the rest.
+
+    Events are ``\\n\\n``-delimited. Keeping a prefix drops the terminal
+    completion event (``response.completed`` / ``message_stop``), so a client
+    reading the stream sees deltas start and then the connection end without a
+    completion — the "dropped events mid-stream" fault used to drive the SPA's
+    error/recovery UI. ``keep_events=0`` yields an empty body (immediate EOF).
+    """
+    events = [seg for seg in body.split("\n\n") if seg]
+    kept = events[: max(0, keep_events)]
+    return "".join(f"{seg}\n\n" for seg in kept)
 
 
 def sse_streaming_text(text: str, model: str = "mock-model") -> str:
@@ -520,6 +541,21 @@ class QueuedResponse:
     :param stream: If True, stream text deltas before completed.
     :param error: If set, return an error response with this message.
     :param status_code: HTTP status code for error responses.
+    :param delay: Seconds to sleep before returning this response.
+        Unlike ``block`` (which waits for an external gate release),
+        this is a fixed wall-clock pause the mock owns — use it to
+        give a server-side side effect (e.g. a cold interactive
+        subprocess booting/evaluating) real time to land before the
+        next scripted tool call fires, without depending on the CI
+        runner being fast enough for a back-to-back agent loop.
+    :param truncate_after: If set, open the SSE stream normally but emit only
+        this many events and then end the connection — dropping the terminal
+        completion event so the client sees a stream that starts and dies
+        mid-flight. Unlike ``error`` (an HTTP status at open time, before any
+        stream), this is a *mid-stream* fault: the response is a ``200`` SSE
+        body that stops early, which is what exercises the SPA's stream
+        error/recovery UI. ``0`` emits an empty body (immediate EOF after the
+        headers).
     """
 
     text: str = "Mock LLM response"
@@ -529,6 +565,8 @@ class QueuedResponse:
     stream: bool = False
     error: str | None = None
     status_code: int = 500
+    delay: float = 0.0
+    truncate_after: int | None = None
     _gate: asyncio.Event = field(default_factory=asyncio.Event)
     _pending: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -629,9 +667,9 @@ class MockState:
         Scoped to user-role content deliberately — NOT the system prompt
         (``instructions`` / ``system``) or tool outputs — so a
         content-routing token only ever matches what the test itself
-        typed, never incidental words in a shared system prompt. Content
-        may be a plain string or a list of ``{"type","text"}`` blocks
-        (both the Responses and Messages shapes), so both are walked.
+        typed, never incidental words in a shared system prompt. Responses
+        input may itself be a string, while message content can be a string,
+        mapping, or nested list of text blocks.
 
         :param parsed: The parsed request body.
         :returns: Space-joined user message text (``""`` if none).
@@ -639,20 +677,37 @@ class MockState:
         if not isinstance(parsed, dict):
             return ""
         parts: list[str] = []
-        # ``input`` (Responses API) and ``messages`` (Anthropic / Chat)
-        # are mutually exclusive in practice, but walk both so the helper
-        # is correct for every endpoint that routes through it.
-        for key in ("input", "messages"):
-            for item in parsed.get(key) or []:
-                if not isinstance(item, dict) or item.get("role") != "user":
-                    continue
-                content = item.get("content")
-                if isinstance(content, str):
-                    parts.append(content)
-                elif isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict):
-                            parts.append(str(block.get("text", "")))
+
+        def append_text(content: object) -> None:
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, dict):
+                text = content.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+                nested = content.get("content")
+                if nested is not None:
+                    append_text(nested)
+            elif isinstance(content, list):
+                for block in content:
+                    append_text(block)
+
+        response_input = parsed.get("input")
+        if isinstance(response_input, str):
+            append_text(response_input)
+        elif isinstance(response_input, (dict, list)):
+            items = response_input if isinstance(response_input, list) else [response_input]
+            for item in items:
+                if isinstance(item, dict) and item.get("role") == "user":
+                    append_text(item.get("content"))
+
+        messages = parsed.get("messages")
+        if isinstance(messages, dict):
+            messages = [messages]
+        if isinstance(messages, list):
+            for item in messages:
+                if isinstance(item, dict) and item.get("role") == "user":
+                    append_text(item.get("content"))
         return " ".join(parts)
 
     def resolve_queue_for_request(self, parsed: object) -> _ResponseQueue:
@@ -665,11 +720,9 @@ class MockState:
         unaffected.
 
         When several match-queues are live at once (e.g. a sub-agent test
-        with distinct parent/worker queues), the LONGEST matching token
-        wins — deterministic regardless of dict order, and robust if one
-        token is a substring of another. Tests should still pick mutually
-        non-substring tokens; longest-match is a safety net, not a
-        license to overlap.
+        with distinct parent/worker queues), the longest matching token
+        wins. Equal-length matches use the rightmost token, which selects
+        the newest turn when a native client resends its full conversation.
 
         :param parsed: The parsed request body.
         :returns: The selected response queue.
@@ -677,13 +730,15 @@ class MockState:
         user_text = self._user_input_text(parsed)
         if user_text:
             best: _ResponseQueue | None = None
+            best_score = (-1, -1)
             for queue in self.queues.values():
-                if (
-                    queue.match
-                    and queue.match in user_text
-                    and (best is None or len(queue.match) > len(best.match or ""))
-                ):
+                if not queue.match:
+                    continue
+                position = user_text.rfind(queue.match)
+                score = (len(queue.match), position)
+                if position >= 0 and score > best_score:
                     best = queue
+                    best_score = score
             if best is not None:
                 return best
         model = parsed.get("model") if isinstance(parsed, dict) else None
@@ -744,6 +799,10 @@ async def create_response(
         queue = _state.resolve_queue_for_request(parsed)
         qr = queue.next()
 
+    # Fixed wall-clock pause the mock owns (see QueuedResponse.delay).
+    if qr.delay:
+        await asyncio.sleep(qr.delay)
+
     # Error response
     if qr.error is not None:
         return JSONResponse(
@@ -780,6 +839,10 @@ async def create_response(
     else:
         sse_body = sse_text_response(qr.text)
 
+    # Mid-stream fault: emit only a prefix and end, dropping the completion.
+    if qr.truncate_after is not None:
+        sse_body = truncate_sse(sse_body, qr.truncate_after)
+
     async def _generate() -> AsyncIterator[str]:
         yield sse_body
 
@@ -811,6 +874,10 @@ async def create_message(
         queue = _state.resolve_queue_for_request(parsed)
         qr = queue.next()
 
+    # Fixed wall-clock pause the mock owns (see QueuedResponse.delay).
+    if qr.delay:
+        await asyncio.sleep(qr.delay)
+
     if qr.error is not None:
         return JSONResponse(
             status_code=qr.status_code,
@@ -829,6 +896,10 @@ async def create_message(
         sse_body = anthropic_sse_tool_call_response(qr.tool_calls)
     else:
         sse_body = anthropic_sse_text_response(qr.text)
+
+    # Mid-stream fault: emit only a prefix and end, dropping message_stop.
+    if qr.truncate_after is not None:
+        sse_body = truncate_sse(sse_body, qr.truncate_after)
 
     async def _generate() -> AsyncIterator[str]:
         yield sse_body
@@ -860,6 +931,10 @@ async def create_chat_completion(
         model = parsed.get("model") if isinstance(parsed, dict) else None
         queue = _state.resolve_queue_for_request(parsed)
         qr = queue.next()
+
+    # Fixed wall-clock pause the mock owns (see QueuedResponse.delay).
+    if qr.delay:
+        await asyncio.sleep(qr.delay)
 
     if qr.error is not None:
         return JSONResponse(
@@ -931,8 +1006,14 @@ async def create_chat_completion(
             ],
         }
 
+        stream_body = f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n"
+        # Mid-stream fault: drop the trailing ``[DONE]`` (and, at 0, the chunk
+        # too) so the client sees the stream end without a terminator.
+        if qr.truncate_after is not None:
+            stream_body = truncate_sse(stream_body, qr.truncate_after)
+
         async def _stream() -> AsyncIterator[str]:
-            yield f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n"
+            yield stream_body
 
         return StreamingResponse(_stream(), media_type="text/event-stream")
     return JSONResponse(content=body_json)
@@ -984,6 +1065,8 @@ async def configure(request: Request) -> dict[str, object]:
                     stream=entry.get("stream", False),
                     error=entry.get("error"),
                     status_code=entry.get("status_code", 500),
+                    delay=entry.get("delay", 0.0),
+                    truncate_after=entry.get("truncate_after"),
                 )
             )
         count = len(queue.responses)

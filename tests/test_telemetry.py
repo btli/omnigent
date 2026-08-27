@@ -298,6 +298,23 @@ def test_fetch_remote_config_respects_rollout_percentage_boundaries(
     assert (result is not None) is included
 
 
+def test_fetch_remote_config_accepts_default_version() -> None:
+    """A config with omnigent_version='default' is accepted for any client version."""
+    import omnigent.telemetry.client as _mod
+
+    config = {
+        "omnigent_version": "default",
+        "ingestion_url": "https://telemetry.example.test",
+        "rollout_percentage": 100,
+    }
+    with patch("urllib.request.urlopen") as urlopen:
+        response = urlopen.return_value.__enter__.return_value
+        response.read.return_value = json.dumps(config).encode("utf-8")
+        result = _mod._fetch_remote_config()
+
+    assert result is not None
+
+
 # ── get_installation_id ──────────────────────────────────────────────────────
 
 
@@ -474,6 +491,77 @@ def test_host_registry_get_host_installation_id_registered() -> None:
     assert registry.get_host_installation_id("host_abc") == "inst-xyz"
 
 
+# ── PolicyRegisteredEvent ────────────────────────────────────────────────────
+
+
+def test_build_record_policy_registered_event_admin_scope() -> None:
+    """``_build_record`` serialises admin-scope ``PolicyRegisteredEvent`` correctly.
+
+    ``installation_id``, ``session_id``, and ``anon_user_id`` are promoted to
+    top-level ``data`` fields; ``handler``, ``policy_type``, and ``scope`` go
+    into ``params``.  Admin policies have ``session_id=None`` which becomes
+    an empty string in the wire format.
+    """
+    import omnigent.telemetry.client as _mod
+    from omnigent.telemetry.events import PolicyRegisteredEvent
+
+    event = PolicyRegisteredEvent(
+        installation_id="inst-abc",
+        handler="omnigent.policies.builtins.safety.ask_on_os_tools",
+        policy_type="python",
+        scope="admin",
+        session_id=None,
+        anon_user_id="deadbeef01234567",
+    )
+    record = _mod._build_record(event)
+    data = record["data"]
+
+    assert data["event_name"] == "PolicyRegisteredEvent"
+    assert data["installation_id"] == "inst-abc"
+    assert data["anon_user_id"] == "deadbeef01234567"
+    # session_id=None → empty string sentinel in wire format
+    assert data["session_id"] == ""
+    # Event-specific fields live in params, not at top level.
+    params = json.loads(data["params"]) if data["params"] else {}
+    assert params["handler"] == "omnigent.policies.builtins.safety.ask_on_os_tools"
+    assert params["policy_type"] == "python"
+    assert params["scope"] == "admin"
+    # Promoted fields must not leak into params.
+    assert "installation_id" not in params
+    assert "session_id" not in params
+    assert "anon_user_id" not in params
+
+
+def test_build_record_policy_registered_event_session_scope() -> None:
+    """``_build_record`` serialises session-scope ``PolicyRegisteredEvent`` correctly.
+
+    ``session_id`` is a real string for session-scoped policies and must appear
+    as the top-level ``session_id`` field, not inside ``params``.
+    """
+    import omnigent.telemetry.client as _mod
+    from omnigent.telemetry.events import PolicyRegisteredEvent
+
+    event = PolicyRegisteredEvent(
+        installation_id="inst-xyz",
+        handler="https://example.com/policies/eval",
+        policy_type="url",
+        scope="session",
+        session_id="sess_abc123",
+        anon_user_id=None,
+    )
+    record = _mod._build_record(event)
+    data = record["data"]
+
+    assert data["event_name"] == "PolicyRegisteredEvent"
+    assert data["session_id"] == "sess_abc123"
+    assert data["anon_user_id"] is None
+    params = json.loads(data["params"]) if data["params"] else {}
+    assert params["scope"] == "session"
+    assert params["handler"] == "https://example.com/policies/eval"
+    assert params["policy_type"] == "url"
+    assert "session_id" not in params
+
+
 def test_build_record_promotes_host_installation_id() -> None:
     """``_build_record`` lifts ``host_installation_id`` to top-level data."""
     import omnigent.telemetry.client as _mod
@@ -495,3 +583,183 @@ def test_build_record_promotes_host_installation_id() -> None:
     assert data["host_installation_id"] == "host-inst-abc"
     params = json.loads(data["params"]) if data["params"] else {}
     assert "host_installation_id" not in params
+
+
+def test_session_created_event_agent_name_polly() -> None:
+    """``agent_name`` is set for polly sessions."""
+    from omnigent.telemetry.events import SessionCreatedEvent
+
+    event = SessionCreatedEvent(
+        installation_id=None,
+        session_id="sess_polly",
+        agent_id="ag_001",
+        harness="claude-sdk",
+        surface="web",
+        anon_user_id=None,
+        host_installation_id=None,
+        is_fork=False,
+        is_sub_agent=False,
+        agent_name="polly",
+    )
+    assert event.agent_name == "polly"
+
+
+def test_session_created_event_agent_name_none_for_custom() -> None:
+    """``agent_name`` defaults to ``None`` for custom (non-built-in) agents."""
+    from omnigent.telemetry.events import SessionCreatedEvent
+
+    event = SessionCreatedEvent(
+        installation_id=None,
+        session_id="sess_custom",
+        agent_id="ag_002",
+        harness="claude-sdk",
+        surface="web",
+        anon_user_id=None,
+        host_installation_id=None,
+        is_fork=False,
+        is_sub_agent=False,
+    )
+    assert event.agent_name is None
+
+
+# ── _resolve_harness ─────────────────────────────────────────────────────────
+
+
+def test_resolve_harness_none_when_conv_is_none() -> None:
+    """``None`` conversation → ``None``."""
+    from omnigent.server.routes.sessions import _resolve_harness
+
+    assert _resolve_harness(None) is None
+
+
+def test_resolve_harness_uses_harness_override() -> None:
+    """``conv.harness_override`` is returned immediately, no store lookup."""
+    from unittest.mock import MagicMock
+
+    from omnigent.server.routes.sessions import _resolve_harness
+
+    conv = MagicMock()
+    conv.harness_override = "claude-sdk"
+    assert _resolve_harness(conv) == "claude-sdk"
+
+
+def test_resolve_harness_none_when_agent_store_uninitialized() -> None:
+    """``_agent_store is None`` (runtime not started) → ``None``."""
+    from unittest.mock import MagicMock, patch
+
+    from omnigent.server.routes.sessions import _resolve_harness
+
+    conv = MagicMock()
+    conv.harness_override = None
+    conv.agent_id = "ag_abc"
+
+    with patch("omnigent.runtime._globals._agent_store", None):
+        assert _resolve_harness(conv) is None
+
+
+def test_resolve_harness_none_when_agent_not_in_store() -> None:
+    """Agent id present but not found in the store → ``None``."""
+    from unittest.mock import MagicMock, patch
+
+    from omnigent.server.routes.sessions import _resolve_harness
+
+    conv = MagicMock()
+    conv.harness_override = None
+    conv.agent_id = "ag_missing"
+
+    mock_store = MagicMock()
+    mock_store.get.return_value = None
+
+    with patch("omnigent.runtime._globals._agent_store", mock_store):
+        assert _resolve_harness(conv) is None
+
+
+def test_resolve_harness_sdk_via_config_key() -> None:
+    """Executor with ``config["harness"] = "claude-sdk"`` → ``"claude-sdk"``."""
+    from unittest.mock import MagicMock, patch
+
+    from omnigent.server.routes.sessions import _resolve_harness
+
+    conv = MagicMock()
+    conv.harness_override = None
+    conv.agent_id = "ag_sdk"
+    conv.sub_agent_name = None
+
+    executor = MagicMock()
+    executor.config = {"harness": "claude-sdk"}
+    executor.type = "omnigent"
+
+    spec = MagicMock()
+    spec.executor = executor
+    spec.sub_agents = []
+
+    loaded = MagicMock()
+    loaded.spec = spec
+
+    mock_store = MagicMock()
+    mock_store.get.return_value = MagicMock(
+        id="ag_sdk", bundle_location="ag_sdk/bundle", session_id=None
+    )
+
+    mock_cache = MagicMock()
+    mock_cache.load.return_value = loaded
+
+    with (
+        patch("omnigent.runtime._globals._agent_store", mock_store),
+        patch("omnigent.runtime.get_agent_cache", return_value=mock_cache),
+    ):
+        assert _resolve_harness(conv) == "claude-sdk"
+
+
+def test_resolve_harness_sdk_via_executor_type() -> None:
+    """Executor with no ``config["harness"]`` falls back to ``executor.type``."""
+    from unittest.mock import MagicMock, patch
+
+    from omnigent.server.routes.sessions import _resolve_harness
+
+    conv = MagicMock()
+    conv.harness_override = None
+    conv.agent_id = "ag_sdk2"
+    conv.sub_agent_name = None
+
+    executor = MagicMock()
+    executor.config = {}  # no harness key
+    executor.type = "claude-sdk"
+
+    spec = MagicMock()
+    spec.executor = executor
+    spec.sub_agents = []
+
+    loaded = MagicMock()
+    loaded.spec = spec
+
+    mock_store = MagicMock()
+    mock_store.get.return_value = MagicMock(
+        id="ag_sdk2", bundle_location="ag_sdk2/bundle", session_id=None
+    )
+
+    mock_cache = MagicMock()
+    mock_cache.load.return_value = loaded
+
+    with (
+        patch("omnigent.runtime._globals._agent_store", mock_store),
+        patch("omnigent.runtime.get_agent_cache", return_value=mock_cache),
+    ):
+        assert _resolve_harness(conv) == "claude-sdk"
+
+
+def test_resolve_harness_returns_none_on_exception() -> None:
+    """Any exception inside the resolver degrades to ``None`` (never raises)."""
+    from unittest.mock import MagicMock, patch
+
+    from omnigent.server.routes.sessions import _resolve_harness
+
+    conv = MagicMock()
+    conv.harness_override = None
+    conv.agent_id = "ag_boom"
+
+    mock_store = MagicMock()
+    mock_store.get.side_effect = OSError("disk read error")
+
+    with patch("omnigent.runtime._globals._agent_store", mock_store):
+        assert _resolve_harness(conv) is None

@@ -12,7 +12,7 @@ const mockLoadFontByFamily = vi.mocked(loadFontByFamily);
 
 afterEach(() => {
   localStorage.clear();
-  document.documentElement.style.removeProperty("--ui-font-scale");
+  document.documentElement.style.removeProperty("--desktop-ui-font-size");
   document.documentElement.style.removeProperty("--ui-font-family");
   document.documentElement.style.removeProperty("--ui-mono-font-family");
   vi.clearAllMocks();
@@ -20,13 +20,12 @@ afterEach(() => {
 
 describe("restoreFontPreferences", () => {
   it("applies the saved UI size + family to the document root on boot", () => {
-    localStorage.setItem("omnigent:ui-font-size", JSON.stringify(20));
+    localStorage.setItem("omnigent:ui-font-size", JSON.stringify(15));
     localStorage.setItem("omnigent:ui-font-family", JSON.stringify("Inter"));
 
     restoreFontPreferences();
 
-    // 20 / 16 base = 1.25.
-    expect(document.documentElement.style.getPropertyValue("--ui-font-scale")).toBe("1.25");
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("15px");
     expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe(
       "Inter, var(--font-sans)",
     );
@@ -49,8 +48,8 @@ describe("restoreFontPreferences", () => {
 
   it("applies defaults when nothing is stored (no throw)", () => {
     expect(() => restoreFontPreferences()).not.toThrow();
-    // Default size 16 → scale 1; families unset → no overrides.
-    expect(document.documentElement.style.getPropertyValue("--ui-font-scale")).toBe("1");
+    // Default size 13px; families unset → no overrides.
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("13px");
     expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");
     expect(document.documentElement.style.getPropertyValue("--ui-mono-font-family")).toBe("");
   });

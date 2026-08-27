@@ -12,8 +12,7 @@ import { useTheme } from "next-themes";
 import { normalizeResolvedTheme } from "@/components/theme/themeMode";
 import {
   codeFontFamilyForEditor,
-  readCodeFontFamily,
-  readCodeFontSizePx,
+  readCodeFont,
   subscribeCodeFont,
 } from "@/lib/codeFontPreferences";
 import type { Comment } from "@/hooks/useComments";
@@ -26,6 +25,7 @@ import {
   resolvedThemeToMonaco,
 } from "./monacoSetup";
 import { useMonacoCommentLayer, type CodeEditorInstance } from "./useMonacoCommentLayer";
+import { attachEditorScrollRestore } from "./useScrollRestore";
 import "./monacoCodeEditor.css";
 
 interface MonacoDiffViewerProps {
@@ -107,6 +107,12 @@ export function MonacoDiffViewer({
   const diffEditorRef = useRef<Parameters<DiffOnMount>[0] | null>(null);
   const [mounted, setMounted] = useState(false);
 
+  // The diff scrolls inside Monaco, so its offset is cached per conversation +
+  // file rather than via the DOM scroll-restore hook. Kept in its own namespace
+  // so a file's diff and its editor view don't share one offset.
+  const scrollKeyRef = useRef("");
+  scrollKeyRef.current = `viewer-diff:${conversationId}:${path}`;
+
   const handleMount: DiffOnMount = useCallback(
     (diffEditor, monaco) => {
       diffEditorRef.current = diffEditor;
@@ -121,6 +127,13 @@ export function MonacoDiffViewer({
             ? monaco.editor.EndOfLineSequence.CRLF
             : monaco.editor.EndOfLineSequence.LF,
         );
+      // Restore the reader's place in the diff and cache further scrolling under
+      // the diff's own key.
+      attachEditorScrollRestore(
+        modified,
+        () => scrollKeyRef.current,
+        () => modifiedEditorRef.current === modified,
+      );
       setMounted(true);
     },
     [after],
@@ -136,13 +149,14 @@ export function MonacoDiffViewer({
 
   // Apply live code-font changes to both diff panes. Monaco is a fixed-pixel
   // widget with no CSS-variable path like the chrome font, so the new
-  // size/family must be pushed imperatively; the options memo seeds the initial
+  // options must be pushed imperatively; the options memo seeds the initial
   // value at creation.
   useEffect(() => {
     return subscribeCodeFont((font) => {
       diffEditorRef.current?.updateOptions({
         fontSize: font.sizePx,
         fontFamily: codeFontFamilyForEditor(font.family),
+        fontWeight: String(font.weight),
       });
     });
   }, []);
@@ -160,8 +174,9 @@ export function MonacoDiffViewer({
     path,
   });
 
-  const options = useMemo<DiffEditorProps["options"]>(
-    () => ({
+  const options = useMemo<DiffEditorProps["options"]>(() => {
+    const font = readCodeFont();
+    return {
       readOnly: true, // modified side: view + select + comment, no editing
       originalEditable: false,
       renderSideBySide: layout === "split",
@@ -176,8 +191,9 @@ export function MonacoDiffViewer({
       // changes arrive via updateOptions in the effect above. An unset family
       // resolves to the shared mono stack, so the diff matches the terminal
       // rather than falling back to Monaco's own platform default.
-      fontSize: readCodeFontSizePx(),
-      fontFamily: codeFontFamilyForEditor(readCodeFontFamily()),
+      fontSize: font.sizePx,
+      fontFamily: codeFontFamilyForEditor(font.family),
+      fontWeight: String(font.weight),
       automaticLayout: true,
       renderOverviewRuler: false,
       ignoreTrimWhitespace: hideWhitespace,
@@ -187,20 +203,19 @@ export function MonacoDiffViewer({
       // Collapse long unchanged runs into expandable bands (like the old pierre
       // diff / GitHub) so only changed hunks + a few context lines are shown.
       hideUnchangedRegions: { enabled: true, contextLineCount: 3 },
-    }),
-    [layout, hideWhitespace, wrapLines],
-  );
+    };
+  }, [layout, hideWhitespace, wrapLines]);
 
   return (
     <div className="flex h-full flex-col">
       <div className="relative min-h-0 flex-1">
         {loadError && (
-          <div className="flex items-center justify-center p-8 text-destructive text-sm">
+          <div className="flex items-center justify-center p-8 text-destructive text-ui">
             Failed to load the diff.
           </div>
         )}
         {!loadError && !ready && (
-          <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
             Loading diff…
           </div>
         )}

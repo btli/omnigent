@@ -28,6 +28,8 @@ cli_group = cli_mod.cli
 
 _APPS_URL = "https://myapp-1234.aws.databricksapps.com"
 _WORKSPACE = "https://example.databricks.com"
+# The login pins ``--profile`` to the workspace's first DNS label.
+_PROFILE = "example"
 _APPS_REDIRECT = f"{_WORKSPACE}/oidc/oauth2/v2.0/authorize?client_id=abc&response_type=code"
 _WORKSPACE_API_URL = f"{_WORKSPACE}/api/2.0/omnigent"
 
@@ -142,7 +144,14 @@ def _patch_login_env(
     class _Completed:
         returncode: int = 0
 
+    real_run = cli_mod.subprocess.run
+
     def _fake_run(argv: list[str], **kwargs: object) -> _Completed:
+        # Patching ``cli_mod.subprocess`` swaps ``run`` on the module
+        # itself, so background threads land here too. Anything that is
+        # not the databricks CLI goes to the real runner.
+        if Path(argv[0]).name != "databricks":
+            return real_run(argv, **kwargs)
         login_calls.append(" ".join(argv[1:]))  # drop the binary path
         return _Completed()
 
@@ -238,8 +247,11 @@ def test_login_runs_databricks_auth_login_when_no_cached_grant(
 ) -> None:
     """No cached host-keyed grant → ``databricks auth login --host <ws>`` runs.
 
-    The login is host-keyed (no ``--profile`` / profile name anywhere);
-    after it succeeds the token resolves and the record is stored.
+    The login pins ``--profile`` to the workspace's first DNS label so a
+    second workspace doesn't clobber the shared ``DEFAULT`` profile;
+    resolution stays host-matched (name-agnostic), so the profile name
+    isn't consulted anywhere. After login the token resolves and the
+    record is stored.
     """
     from omnigent.cli_auth import load_databricks_workspace_host
 
@@ -259,10 +271,9 @@ def test_login_runs_databricks_auth_login_when_no_cached_grant(
     result = CliRunner().invoke(cli_group, ["login", _APPS_URL])
 
     assert result.exit_code == 0, result.output
-    # Exactly one browser login, host-keyed, with no profile flag — a
-    # `--profile` here would recreate the named-profile coupling this
-    # flow exists to remove.
-    assert login_calls == [f"auth login --host {_WORKSPACE}"]
+    # Exactly one browser login, pinned to the per-workspace profile so
+    # ``DEFAULT`` is left alone; ``?o=`` stays only on ``--host``.
+    assert login_calls == [f"auth login --host {_WORKSPACE} --profile {_PROFILE}"]
     assert load_databricks_workspace_host(_APPS_URL) == _WORKSPACE
 
 
@@ -347,10 +358,45 @@ def test_login_stale_cached_grant_triggers_fresh_login_and_retry(
     assert result.exit_code == 0, result.output
     # Exactly one forced re-login — a second rejection must fail loud,
     # not loop the browser flow.
-    assert login_calls == [f"auth login --host {_WORKSPACE}"]
+    assert login_calls == [f"auth login --host {_WORKSPACE} --profile {_PROFILE}"]
     # The retry verify presented the freshly minted token, not the stale one.
     assert fake.requests[-1]["authorization"] == "Bearer tok-fresh"
     assert load_databricks_workspace_host(_APPS_URL) == _WORKSPACE
+
+
+def test_foreign_subprocess_calls_stay_out_of_the_login_recorder(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path
+) -> None:
+    """Only the databricks CLI reaches ``login_calls``; the rest pass through.
+
+    ``_patch_login_env`` swaps ``run`` on the ``subprocess`` module itself,
+    so every thread in the process sees the stub. A background caller
+    landing mid-test would otherwise append its argv to the recorder and
+    break the login assertions.
+    """
+    fake = _FakeHttpx(
+        responses=[
+            _response(302, headers={"location": _APPS_REDIRECT}),
+            _response(200, body={"user_id": "alice@example.com"}),
+        ]
+    )
+    login_calls = _patch_login_env(
+        monkeypatch,
+        fake_httpx=fake,
+        # No cached grant, so the flow shells out to `databricks auth login`.
+        cached_tokens=[None, "tok-fresh"],
+    )
+
+    # Stands in for a background thread shelling out mid-login.
+    probe = cli_mod.subprocess.run(["git", "--version"], capture_output=True)
+
+    result = CliRunner().invoke(cli_group, ["login", _APPS_URL])
+
+    assert result.exit_code == 0, result.output
+    assert login_calls == [f"auth login --host {_WORKSPACE} --profile {_PROFILE}"]
+    # Delegated to the real runner rather than stubbed out from under it.
+    assert probe.returncode == 0
+    assert b"git version" in probe.stdout
 
 
 # ── ?o= workspace selector ──────────────────────────────────────────
@@ -435,8 +481,9 @@ def test_login_threads_org_id_through_workspace_login_and_verify(
     result = CliRunner().invoke(cli_group, ["login", _SELECTOR_URL])
 
     assert result.exit_code == 0, result.output
-    # The browser login carries the selector so the profile is workspace-scoped.
-    assert login_calls == [f"auth login --host {_WORKSPACE}/?o={_ORG_ID}"]
+    # The browser login carries the selector on --host so the grant is
+    # workspace-scoped; the profile name stays the bare first DNS label.
+    assert login_calls == [f"auth login --host {_WORKSPACE}/?o={_ORG_ID} --profile {_PROFILE}"]
     # The verify request routes to the workspace via ?o= (and used the token).
     assert fake.requests[-1]["params"] == {"o": _ORG_ID}
     assert fake.requests[-1]["authorization"] == "Bearer tok-fresh"
@@ -585,12 +632,13 @@ def test_login_failure_leaves_default_server_unchanged(
 
 def _scripted_normalizer_httpx(
     monkeypatch: pytest.MonkeyPatch,
-    responses_by_url: dict[str, httpx.Response],
+    responses_by_url: dict[str, httpx.Response | Exception],
 ) -> list[str]:
     """Route ``httpx.get`` by exact URL for normalizer tests.
 
     :param monkeypatch: Pytest monkeypatch fixture.
-    :param responses_by_url: Exact-URL → response map; an unmapped URL
+    :param responses_by_url: Exact-URL → response map; a mapped exception is
+        raised instead (for a host that does not resolve), and an unmapped URL
         fails the test loudly (it means an unexpected probe ran).
     :returns: The list of URLs probed, in order.
     """
@@ -599,10 +647,86 @@ def _scripted_normalizer_httpx(
     def _get(url: str, **kwargs: object) -> httpx.Response:
         probed.append(url)
         assert url in responses_by_url, f"unexpected probe: {url}"
-        return responses_by_url[url]
+        mapped = responses_by_url[url]
+        if isinstance(mapped, Exception):
+            raise mapped
+        return mapped
 
     monkeypatch.setattr(httpx, "get", _get)
     return probed
+
+
+def test_azure_vanity_url_falls_back_to_probed_canonical_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An Azure vanity URL that 303s to /login resolves via the canonical host.
+
+    Drives the real ``_workspace_api_server_url`` with only httpx scripted, so it
+    catches what a stubbed expander cannot: that function drops the ``?o=``
+    selector before probing, so the fallback has to compare against the root it
+    actually probed rather than the URL it was handed.
+    """
+    vanity_root = "https://mydomain.azuredatabricks.net"
+    canonical_root = "https://adb-4173618801742158.18.azuredatabricks.net"
+    probed = _scripted_normalizer_httpx(
+        monkeypatch,
+        {
+            # The vanity edge redirects to a relative /login, which the
+            # login-target detector does not recognize.
+            f"{vanity_root}/v1/me": _response(303, headers={"location": "/login"}),
+            f"{canonical_root}/v1/me": _response(404, headers={"server": "databricks"}),
+            f"{canonical_root}/api/2.0/omnigent/v1/me": _response(
+                401, headers={"www-authenticate": 'DatabricksRealm realm="omnigent"'}
+            ),
+        },
+    )
+
+    result = cli_mod._resolve_server_url(f"{vanity_root}/?o=4173618801742158")
+
+    assert result == f"{canonical_root}/api/2.0/omnigent"
+    # The vanity root is probed first and the canonical host only after it fails.
+    assert probed[0] == f"{vanity_root}/v1/me"
+    assert f"{canonical_root}/v1/me" in probed
+
+
+def test_azure_vanity_url_that_answers_is_never_rewritten(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A vanity URL that resolves on its own keeps the host the user typed."""
+    vanity_root = "https://mydomain.azuredatabricks.net"
+    probed = _scripted_normalizer_httpx(
+        monkeypatch,
+        {f"{vanity_root}/v1/me": _response(200)},
+    )
+
+    result = cli_mod._resolve_server_url(f"{vanity_root}/?o=4173618801742158")
+
+    assert result == vanity_root
+    # No canonical host was ever synthesized or probed. The vanity root is asked
+    # twice: once by the expansion, once by the usable check, which is the cost of
+    # the expansion not reporting whether the URL it returned actually answered.
+    assert probed == [f"{vanity_root}/v1/me"] * 2
+
+
+def test_azure_vanity_url_kept_when_canonical_host_is_dead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wrong synthesis must not strand the user on a host they never typed."""
+    vanity_root = "https://mydomain.azuredatabricks.net"
+    canonical_root = "https://adb-4173618801742158.18.azuredatabricks.net"
+    probed = _scripted_normalizer_httpx(
+        monkeypatch,
+        {
+            f"{vanity_root}/v1/me": _response(303, headers={"location": "/login"}),
+            # The synthesized host does not resolve at all.
+            f"{canonical_root}/v1/me": httpx.ConnectError("dns failure"),
+        },
+    )
+
+    result = cli_mod._resolve_server_url(f"{vanity_root}/?o=4173618801742158")
+
+    assert result == vanity_root
+    assert f"{canonical_root}/v1/me" in probed
 
 
 def test_workspace_url_expands_bare_workspace_host(

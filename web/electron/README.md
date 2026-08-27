@@ -67,15 +67,18 @@ adds native niceties:
   OS-level mic gate is open too (packaged builds ship
   `NSMicrophoneUsageDescription`).
 
-  > **Caveat — Web Speech may still not transcribe in Electron.** Granting the
+  > **Caveat — Web Speech does not transcribe in Electron.** Granting the
   > mic clears the _permission_ gate, but `SpeechRecognition` also depends on
   > Google's cloud speech backend keyed to official Google Chrome builds, which
-  > Electron's bundled Chromium does **not** ship. So recognition can still
-  > fail (typically a `network` error) even with the mic allowed. The web app
-  > degrades gracefully (the button shows "Dictation unavailable" rather than
-  > crashing). Fully reliable in-app dictation would require a MediaRecorder
-  > capture + a server-side transcription endpoint (e.g. Whisper) wired to the
-  > composer's existing `onAudioRecorded` fallback — not yet implemented.
+  > Electron's bundled Chromium does **not** ship. Electron therefore uses the
+  > **server-side dictation fallback** instead: when the connected server has
+  > the `dictation` extra and models installed (`GET /v1/info` reports
+  > `dictation_available`), a take that fails with Web Speech's `network`
+  > error falls back to streaming audio to `WS /v1/dictation/stream` and
+  > transcribing on the server — no cloud, no Chrome dependency. See
+  > `designs/server-dictation.md`. Without the server extra, the button still
+  > renders (the constructor exists) but shows "Dictation unavailable" when
+  > clicked, as before.
 
 ## How it works (zero UI duplication)
 
@@ -106,6 +109,26 @@ clears the saved URL and returns the focused window to the setup page.
 Open another view with **Server → New Window** (`Cmd/Ctrl+N`). It clones the
 focused window's current URL onto a new window against the same server, so two
 conversations can be watched at once.
+
+## Debugging a packaged macOS build
+
+Developer Tools are disabled by default in the production app. To opt in, quit
+Omnigent, set its macOS user default, and reopen it:
+
+```bash
+defaults write ai.omnigent.desktop DeveloperMode -bool true
+```
+
+The **Debug → Developer Tools** menu is then available in the packaged app. To
+turn production debugging off again, quit Omnigent and remove the override:
+
+```bash
+defaults delete ai.omnigent.desktop DeveloperMode
+```
+
+Development (`pnpm --dir web/electron dev`) builds keep Developer Tools enabled
+without this preference. The override is intentionally macOS-only and does not
+relax production update security checks.
 
 The native enhancements live on the web side in
 [`../src/lib/nativeBridge.ts`](../src/lib/nativeBridge.ts). It detects the
@@ -343,7 +366,7 @@ app open?" error rather than hanging.
 
 ## Prerequisites
 
-- **Node** 22.x + npm (already used by `web`).
+- **Node** 22.x + pnpm (already used by `web`).
 - Electron ships its own Chromium/Node, so no system webview libs are needed
   on Linux for _running_ the built app, though packaging tools may pull a few
   build deps.
@@ -353,8 +376,8 @@ app open?" error rather than hanging.
 From the `web/electron/` directory:
 
 ```bash
-npm install     # installs electron + electron-builder
-npm start        # launches the Electron shell
+pnpm install     # installs electron + electron-builder
+pnpm start        # launches the Electron shell
 ```
 
 The shell opens on the bundled setup page. Point it at a running Omnigent
@@ -362,18 +385,34 @@ server (see below), Connect, and you're in.
 
 > Note: this loads the UI from whatever server URL you give it — it does
 > **not** run the Vite dev server. To develop the web UI itself with hot
-> reload, run `npm run dev` (plain Vite in a browser) from `web/` as usual.
+> reload, run `pnpm run dev` (plain Vite in a browser) from `web/` as usual.
+
+### Test desktop updates
+
+To override the current version used by development update checks, launch the
+unpackaged app with a valid semantic version:
+
+```bash
+OMNIGENT_DESKTOP_VERSION_OVERRIDE=0.9.0 pnpm start
+```
+
+The override controls both the **Current version** shown in update prompts and
+the baseline `electron-updater` uses to decide whether a production release is
+newer. It does not change Electron's real app/package version. Packaged builds
+ignore it. `pnpm start` rebuilds the shell-owned update overlay before launching
+it. Unpackaged runs read `dev-app-update.yml`, which intentionally checks the
+same production HTTPS update server as packaged builds.
 
 ## Build a distributable
 
 From `web/electron/`:
 
 ```bash
-npm run build             # current platform
-npm run build:mac         # .dmg + .zip (signed if an identity is available, not notarized)
-npm run build:mac:release # .dmg + .zip, signed + notarized (requires credentials, see below)
-npm run build:linux       # AppImage + .deb
-npm run build:win         # NSIS installer
+pnpm run build             # current platform
+pnpm run build:mac         # .dmg + .zip (signed if an identity is available, not notarized)
+pnpm run build:mac:release # .dmg + .zip; app and DMG signed + notarized (see below)
+pnpm run build:linux       # AppImage + .deb
+pnpm run build:win         # NSIS installer
 ```
 
 Output lands in `electron/dist/` (the DMG is named
@@ -391,7 +430,7 @@ build:
 | ------------------------------------------------------------------ | -------------------------------------------------------------------- |
 | none                                                               | ad-hoc–signed app; runs locally, other Macs see a Gatekeeper warning |
 | Developer ID cert                                                  | signed app; downloads still warn until notarized                     |
-| Developer ID cert + Apple notarization creds (`build:mac:release`) | signed + notarized; installs cleanly everywhere                      |
+| Developer ID cert + Apple notarization creds (`build:mac:release`) | app and DMG signed + notarized; installs cleanly everywhere          |
 
 ### 1. Get a signing certificate
 
@@ -401,7 +440,7 @@ Create it at <https://developer.apple.com/account/resources/certificates>
 (or via Xcode → Settings → Accounts → Manage Certificates), then either:
 
 - **Keychain (local builds):** install the cert + private key into your
-  login keychain. electron-builder auto-discovers it — `npm run build:mac`
+  login keychain. electron-builder auto-discovers it — `pnpm run build:mac`
   just works. Verify with
   `security find-identity -v -p codesigning` (you should see
   `Developer ID Application: <Your Name> (<TEAMID>)`).
@@ -414,7 +453,7 @@ Create it at <https://developer.apple.com/account/resources/certificates>
   ```
 
 To force an **unsigned** build even when a cert is present (faster dev
-iteration): `CSC_IDENTITY_AUTO_DISCOVERY=false npm run build:mac`.
+iteration): `CSC_IDENTITY_AUTO_DISCOVERY=false pnpm run build:mac`.
 
 ### 2. Notarize (release builds)
 
@@ -440,20 +479,24 @@ export APPLE_TEAM_ID=<TEAMID>
 then:
 
 ```bash
-npm run build:mac:release
+pnpm run build:mac:release
 ```
 
-This is the same build with `mac.notarize=true` switched on; expect the
-notarization step to add a few minutes (Apple-side processing). Verify the
+This release build signs and notarizes the app first so both the DMG and ZIP
+contain a trusted app. It then signs each finished DMG, submits it to Apple,
+and staples and validates the resulting ticket. Expect the notarization steps
+to add a few minutes per architecture (Apple-side processing). Verify the
 result with:
 
 ```bash
 spctl -a -vv dist/mac-arm64/Omnigent.app   # → "accepted, source=Notarized Developer ID"
+codesign --verify --verbose=2 dist/Omnigent-*-arm64.dmg
+xcrun stapler validate -v dist/Omnigent-*-arm64.dmg
 ```
 
-`build:mac:release` **fails loudly** if signing or notarization
-credentials are missing — that's intentional, so a release artifact can't
-silently ship unsigned.
+`build:mac:release` **fails loudly** if signing or notarization credentials
+are missing, if Apple rejects a DMG, or if stapling fails. That's intentional,
+so a release artifact can't silently ship unsigned or unnotarized.
 
 ## Getting a server to point at
 
@@ -517,7 +560,7 @@ to a **remote** server never needs the CLI — only "Start locally" and hosting 
 
 ### Start locally
 
-**"Start a server on this machine"** runs `omnigent server start` (idempotent —
+**"Start a server on this machine"** runs `omnigent server --background` (idempotent —
 reuses a healthy one) and then connects this window to its
 `http://127.0.0.1:<port>` URL through the normal connect flow. It does not
 connect this machine as a runner — that stays an explicit step in the app.
@@ -635,13 +678,13 @@ server in the desktop app — the way a browser deep link opens a page:
 
 ```
 omnigent://localhost:8000/c/conv_abc              → http://localhost:8000/c/conv_abc
-omnigent://my-workspace.cloud.databricks.com/c/x → https://…/ml/omnigents/c/x
+omnigent://my-workspace.cloud.databricks.com/c/x → https://…/omnigent/c/x
 ```
 
 The link names a server by **host** (with port if non-default) and carries no
 `http`/`https` — the shell infers the scheme with the same rule the setup page
 uses (`http` for loopback, `https` for a remote host), so a deep link and a
-pasted URL can never disagree. The Databricks workspace mount (`/ml/omnigents`)
+pasted URL can never disagree. The Databricks workspace mount (`/omnigent`)
 is **not** in the link; it is server-determined and discovered the same way a
 pasted workspace URL is. v1 accepts only `/c/<session_id>`; other paths are
 ignored.

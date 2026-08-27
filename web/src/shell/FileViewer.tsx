@@ -24,6 +24,7 @@ import {
   AlertTriangleIcon,
   ArrowLeftIcon,
   CheckIcon,
+  ChevronDownIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
   CloudOffIcon,
@@ -89,11 +90,13 @@ import {
   type SaveStatus,
   detectLang,
   isImageFile,
+  isModelFile,
   isNotebookPath,
   isPdfFile,
   openHtmlArtifactInNewTab,
 } from "./codeViewerHelpers";
 import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
+import { useScrollRestore } from "./useScrollRestore";
 import { isPdfAnchor } from "./pdfCommentHelpers";
 
 // Monaco diff is heavy (~MBs + worker); load it only when the diff view is
@@ -539,7 +542,7 @@ function FileViewerBody({
   const fileContent = useMemo(() => fileQuery.data?.content ?? "", [fileQuery.data]);
   const { open: openComments, addressed: addressedComments } = useMemo(
     () => classifyAndRemapComments(allComments, fileContent),
-    [allComments, fileContent], // eslint-disable-line react-hooks/exhaustive-deps
+    [allComments, fileContent],
   );
 
   // Apply the linked comment (from ?comment= URL param) once per lifecycle.
@@ -627,9 +630,16 @@ function FileViewerBody({
   // them (Monaco would otherwise render the base64 payload as garbage text).
   const isImage = isImageFile(path, fileQuery.data?.content_type);
   const isPdf = isPdfFile(path, fileQuery.data?.content_type);
+  // 3D models render through CodeViewer's <ModelViewer> — like images and PDFs,
+  // they have no meaningful source/diff/preview text representation, so diff is
+  // suppressed and they always resolve to the (viewer-owning) source surface.
+  const isModel = isModelFile(path, fileQuery.data?.content_type);
   // Show Δ button only when the file appears in the session's changed-files list.
   const isDiffAvailable =
-    !isImage && !isPdf && (changedFiles.data?.data.some((f) => f.path === path) ?? false);
+    !isImage &&
+    !isPdf &&
+    !isModel &&
+    (changedFiles.data?.data.some((f) => f.path === path) ?? false);
   const isDeletedFile =
     changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
 
@@ -707,6 +717,18 @@ function FileViewerBody({
   const viewMode: "editor" | "preview" | "source" | "diff" =
     diffActive && isDiffAvailable ? "diff" : fileViewMode;
   const diffViewActive = viewMode === "diff";
+  // Persist where the reader was in the content area (markdown source, plain
+  // text). The view mode is part of the key because each mode renders a
+  // different height, so sharing one offset across modes would drop the reader
+  // at an unrelated place after a toggle; the namespace is separate from the
+  // `viewer:` keys Monaco writes for its own internal scroller.
+  const contentScrollKey =
+    conversationId && path ? `viewer-content:${conversationId}:${viewMode}:${path}` : null;
+  const handleContentScroll = useScrollRestore(
+    contentAreaRef,
+    contentScrollKey,
+    fileQuery.data !== undefined,
+  );
   // Measure the content area so the split toggle can hide when there isn't
   // enough room for side-by-side. Only observe while the diff is shown — the
   // ref element only exists then, and it's the only mode that cares.
@@ -766,7 +788,7 @@ function FileViewerBody({
   // rendered as a single dropdown (a "picker" button inline, a submenu when
   // collapsed) rather than one button per choice. Markdown's view-mode picker
   // (Preview / Edit / Source) uses this so it occupies one toolbar slot.
-  type ToolbarOption = {
+  interface ToolbarOption {
     key: string;
     label: string;
     tooltip?: string;
@@ -780,11 +802,13 @@ function FileViewerBody({
     /** Suppress the active check mark — for toggles whose icon already reflects
      * state (e.g. the whitespace eye flips open/closed). */
     noActiveCheck?: boolean;
-  };
-  type ToolbarAction = {
+  }
+  interface ToolbarAction {
     key: string;
     /** Accessible name for the inline icon button. */
     label: string;
+    /** Text label for the inline icon button. */
+    textLabel?: string;
     /** Tooltip + dropdown row text; falls back to `label` when omitted. */
     tooltip?: string;
     icon: ReactNode;
@@ -797,7 +821,7 @@ function FileViewerBody({
      * single trigger. Unlike `options`, these are not mutually exclusive and
      * carry no "selected choice" semantics. `onSelect` is ignored. */
     menu?: ToolbarOption[];
-  };
+  }
   const toolbarActions: ToolbarAction[] = [];
   if (lang === "markdown" && viewMode !== "diff") {
     // Markdown is a segmented control over three reachable modes: the rich-text
@@ -855,6 +879,7 @@ function FileViewerBody({
     toolbarActions.push({
       key: "md-view-mode",
       label: `View mode: ${activeMode.label}`,
+      textLabel: activeMode.label,
       tooltip: "View mode",
       icon: activeMode.icon,
       options: modeOptions,
@@ -1070,11 +1095,13 @@ function FileViewerBody({
                   <Button
                     type="button"
                     variant="ghost"
-                    size="icon-sm"
+                    size={action.textLabel ? "sm" : "icon-sm"}
                     aria-label={action.label}
                     tabIndex={interactive ? undefined : -1}
                   >
                     {action.icon}
+                    {action.textLabel}
+                    <ChevronDownIcon />
                   </Button>
                 </DropdownMenuTrigger>
               </TooltipTrigger>
@@ -1086,7 +1113,7 @@ function FileViewerBody({
             {action.options.map((option) => (
               <DropdownMenuItem
                 key={option.key}
-                className={cn("whitespace-nowrap", option.active && "bg-accent")}
+                className={cn("whitespace-nowrap")}
                 onSelect={interactive ? option.onSelect : undefined}
               >
                 {option.icon}
@@ -1176,7 +1203,7 @@ function FileViewerBody({
             </div>
           )}
           {/* Always show the file path/name in the toolbar, in every view. */}
-          <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">{path}</span>
+          <span className="min-w-0 truncate font-mono text-sm text-muted-foreground">{path}</span>
         </div>
         <div
           className="relative flex min-w-0 items-center justify-end gap-1"
@@ -1195,7 +1222,7 @@ function FileViewerBody({
                   : undefined
               }
               className={cn(
-                "mr-1 flex shrink-0 items-center gap-1 whitespace-nowrap text-[11px]",
+                "mr-1 flex shrink-0 items-center gap-1 whitespace-nowrap text-sm",
                 saveStatus === "error" ? "text-destructive" : "text-muted-foreground",
               )}
             >
@@ -1245,25 +1272,22 @@ function FileViewerBody({
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end" className="w-auto min-w-40">
                   {toolbarActions.map((action) =>
-                    action.options || action.menu ? (
-                      // Pickers and settings menus collapse to a nested submenu
-                      // of their items. Toggle items (keepOpen) prevent the
-                      // submenu from closing so several can be flipped in a row.
+                    action.options ? (
+                      // A mutually-exclusive picker (e.g. view mode) collapses to
+                      // a nested submenu so its "selected choice" semantics — one
+                      // highlighted option — stay intact.
                       <DropdownMenuSub key={action.key}>
                         <DropdownMenuSubTrigger className="whitespace-nowrap">
                           {action.icon}
                           {action.tooltip ?? action.label}
                         </DropdownMenuSubTrigger>
                         <DropdownMenuSubContent>
-                          {(action.options ?? action.menu ?? []).map((option) => (
+                          {action.options.map((option) => (
                             <DropdownMenuItem
                               key={option.key}
-                              // Settings-menu items lean on the check mark alone;
-                              // the mutually-exclusive picker also highlights the
-                              // active choice.
                               className={cn(
                                 "whitespace-nowrap",
-                                action.options && option.active && "bg-accent",
+                                option.active && "bg-muted dark:bg-muted/50",
                               )}
                               onSelect={(e) => {
                                 if (option.keepOpen) e.preventDefault();
@@ -1279,6 +1303,26 @@ function FileViewerBody({
                           ))}
                         </DropdownMenuSubContent>
                       </DropdownMenuSub>
+                    ) : action.menu ? (
+                      // The settings menu's items are already independent
+                      // toggles/actions, so flatten them straight into this "⋯"
+                      // overflow rather than nesting a "⋯"-in-"⋯" submenu.
+                      action.menu.map((option) => (
+                        <DropdownMenuItem
+                          key={option.key}
+                          className="whitespace-nowrap"
+                          onSelect={(e) => {
+                            if (option.keepOpen) e.preventDefault();
+                            option.onSelect();
+                          }}
+                        >
+                          {option.icon}
+                          {option.label}
+                          {option.active && !option.noActiveCheck && (
+                            <CheckIcon className="ml-auto size-4" />
+                          )}
+                        </DropdownMenuItem>
+                      ))
                     ) : (
                       <DropdownMenuItem
                         key={action.key}
@@ -1312,7 +1356,7 @@ function FileViewerBody({
           <span
             ref={toolbarPathMeasureRef}
             aria-hidden
-            className="pointer-events-none absolute left-[-9999px] top-0 font-mono text-xs whitespace-nowrap"
+            className="pointer-events-none absolute left-[-9999px] top-0 font-mono text-sm whitespace-nowrap"
           >
             {path}
           </span>
@@ -1320,13 +1364,17 @@ function FileViewerBody({
       </div>
 
       <div className="min-h-0 flex-1 flex flex-col md:flex-row overflow-hidden">
-        <div ref={contentAreaRef} className="flex-1 overflow-y-auto min-w-0">
+        <div
+          ref={contentAreaRef}
+          onScroll={handleContentScroll}
+          className="flex-1 overflow-y-auto min-w-0"
+        >
           {isDeletedFile && viewMode !== "diff" ? (
-            <div className="flex flex-col items-center justify-center gap-2 p-8 text-sm text-muted-foreground">
+            <div className="flex flex-col items-center justify-center gap-2 p-8 text-ui text-muted-foreground">
               <Trash2Icon className="size-5 opacity-40" />
               <span>This file has been deleted.</span>
               {isDiffAvailable && (
-                <span className="text-xs">
+                <span className="text-sm">
                   Click <FileDiffIcon className="inline size-3.5 align-text-bottom" /> to view its
                   previous content.
                 </span>
@@ -1338,7 +1386,7 @@ function FileViewerBody({
             // hanging on "Loading diff…" forever — diffQuery.data stays
             // undefined on error, which would otherwise read as still-loading.
             diffQuery.isError ? (
-              <div className="flex items-center justify-center p-8 text-destructive text-sm">
+              <div className="flex items-center justify-center p-8 text-destructive text-ui">
                 Failed to load:{" "}
                 {diffQuery.error instanceof Error
                   ? diffQuery.error.message
@@ -1350,13 +1398,13 @@ function FileViewerBody({
             // wrong content and mis-set EOL (onMount runs once). Once data is
             // present, pass the real before/after through (legitimate nulls and all).
             !diffQuery.data ? (
-              <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+              <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
                 Loading diff…
               </div>
             ) : (
               <Suspense
                 fallback={
-                  <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+                  <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
                     Loading diff…
                   </div>
                 }
@@ -1460,8 +1508,8 @@ function FileViewerBody({
       </div>
       <Dialog
         open={pendingAction !== null}
-        onOpenChange={(open) => {
-          if (!open) setPendingAction(null);
+        onOpenChange={(isOpen) => {
+          if (!isOpen) setPendingAction(null);
         }}
       >
         <DialogContent showCloseButton={false}>

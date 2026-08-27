@@ -6,6 +6,14 @@ session on a recurring schedule (``rrule``). A
 :class:`ScheduledTaskRun` records one firing of a task (its run history). This
 module holds the plain dataclasses the store converts ORM rows into; the store
 owns the JSON (de)serialization of the Text-backed columns.
+
+Naming: the user-facing product name for this feature is "Automations"
+(web UI display copy only). The domain model, DB tables
+(``scheduled_tasks`` / ``scheduled_task_runs``), stores, REST paths
+(``/v1/scheduled-tasks``), agent tools (``sys_scheduled_task_*``), and
+these types deliberately keep the name "scheduled task". Keep code,
+comments, and schema on "scheduled task"; only presentation strings say
+"Automations".
 """
 
 from __future__ import annotations
@@ -21,12 +29,13 @@ class ScheduledTask:
     A task's trigger is a required recurring ``rrule``.
 
     :param id: UUID primary key (bare 32-char hex string, no dashes).
+    :param workspace_id: Tenant partition key that owns this row.
     :param name: Human-readable task name, e.g. ``"nightly triage"``.
     :param prompt: The instruction dispatched to the agent on each firing.
     :param rrule: The required RFC 5545 recurrence rule for the recurring
         trigger, e.g. ``"FREQ=DAILY;BYHOUR=9;BYMINUTE=0"``. Evaluated in
         ``timezone``.
-    :param owner_user_id: User the spawned session's ``LEVEL_OWNER`` grant is
+    :param user_id: User the spawned session's ``LEVEL_OWNER`` grant is
         written for, e.g. ``"alice@example.com"``. ``None`` in single-user mode.
     :param agent_id: The agent bound to this task, e.g. ``"ag_..."``.
     :param timezone: IANA timezone the trigger is evaluated in,
@@ -36,15 +45,24 @@ class ScheduledTask:
         ``"claude-opus-4-7"``. ``None`` means use the agent default.
     :param reasoning_effort: Per-task reasoning-effort hint, e.g. ``"high"``.
         ``None`` means use the agent default.
-    :param workspace: Absolute path where a fired session's runner should
-        start (the source repo / working dir). ``None`` when unset.
-    :param base_branch: Git base ref a firing branches from when it creates a
-        worktree at fire time. Pairs with ``workspace``. ``None`` when unset.
-    :param execution_target: Where a firing runs — one of ``"connected_host"``,
-        ``"managed_sandbox"``. Defaults to ``"connected_host"``.
-    :param host_id: For ``connected_host``, the specific host to run on;
-        ``None`` means the owner's freshest online host. Always ``None`` for
-        ``managed_sandbox``.
+    :param permission_mode: Per-task permission mode for native coding harnesses
+        that support one (currently Claude Code), e.g. ``"acceptEdits"`` or
+        ``"bypassPermissions"``. The fire path turns it into the runner's
+        ``["--permission-mode", <value>]`` terminal launch args. ``None`` means
+        use the agent's configured default.
+    :param max_cost_usd: Optional per-firing cost budget in USD. When set, the
+        fire path attaches a ``cost_budget`` policy to each spawned session that
+        blocks all models once cumulative spend reaches this limit. ``None``
+        means no per-firing cost cap (the session runs unconstrained unless the
+        agent spec or server-wide defaults impose one).
+    :param workspace: Absolute existing path where a fired session's connected
+        host runner should start. ``None`` only for legacy or invalid rows.
+    :param base_branch: Reserved legacy column; scheduled tasks currently do
+        not create git worktrees at fire time.
+    :param execution_target: Reserved legacy column; scheduled tasks currently
+        run only on ``"connected_host"``.
+    :param host_id: Specific connected host to run on. ``None`` only for legacy
+        or invalid rows.
     :param state: Lifecycle state — one of ``"active"``, ``"paused"``,
         ``"deleted"``. Defaults to ``"active"``.
     :param last_run_at: Unix epoch seconds of the most recent firing, or
@@ -59,12 +77,15 @@ class ScheduledTask:
     name: str
     prompt: str
     rrule: str
-    owner_user_id: str | None
+    user_id: str | None
     agent_id: str
     timezone: str
     created_at: int
+    workspace_id: int = 0
     model_override: str | None = None
     reasoning_effort: str | None = None
+    permission_mode: str | None = None
+    max_cost_usd: float | None = None
     workspace: str | None = None
     base_branch: str | None = None
     execution_target: str = "connected_host"

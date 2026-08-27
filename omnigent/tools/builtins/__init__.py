@@ -44,8 +44,16 @@ from omnigent.tools.builtins.load_skill import (
     format_skill_meta_text,
     list_skill_resources,
 )
+from omnigent.tools.builtins.nimble_extract import NimbleExtractTool
+from omnigent.tools.builtins.nimble_research import NimbleResearchTool
 from omnigent.tools.builtins.read_skill_file import (
     ReadSkillFileTool,
+)
+from omnigent.tools.builtins.scheduled_tasks import (
+    SysScheduledTaskCreateTool,
+    SysScheduledTaskDeleteTool,
+    SysScheduledTaskListTool,
+    SysScheduledTaskUpdateTool,
 )
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
@@ -69,6 +77,8 @@ __all__ = [
     "INSTANTIABLE_BUILTINS",
     "ListCommentsTool",
     "LoadSkillTool",
+    "NimbleExtractTool",
+    "NimbleResearchTool",
     "ReadSkillFileTool",
     "SysAdviseModelsTool",
     "SysAgentDownloadTool",
@@ -78,6 +88,10 @@ __all__ = [
     "SysCancelAsyncTool",
     "SysListModelsTool",
     "SysReadInboxTool",
+    "SysScheduledTaskCreateTool",
+    "SysScheduledTaskDeleteTool",
+    "SysScheduledTaskListTool",
+    "SysScheduledTaskUpdateTool",
     "SysSessionCloseTool",
     "SysSessionCreateTool",
     "SysSessionGetHistoryTool",
@@ -103,8 +117,8 @@ __all__ = [
 
 # Factory type: each constructor accepts a config dict and returns
 # a Tool. Callable is used instead of type[Tool] because the base
-# Tool.__init__ does not declare a config parameter — only the
-# web search subclasses do.
+# Tool.__init__ does not declare a config parameter — only some
+# subclasses (web search, nimble research, nimble extract) do.
 _BuiltinFactory = Callable[[dict[str, str]], Tool]
 
 
@@ -236,6 +250,8 @@ def _create_hindsight_reflect(config: dict[str, str]) -> Tool:
 _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     # User-enablable tools (factory present).
     "web_search": lambda config: WebSearchTool(config=config),
+    "nimble_research": lambda config: NimbleResearchTool(config=config),
+    "nimble_extract": lambda config: NimbleExtractTool(config=config),
     "upload_file": _create_upload_file,
     "list_files": _create_list_files,
     "download_file": _create_download_file,
@@ -294,11 +310,13 @@ if _hindsight_available():
 # between the reserved-name check and the factory dispatch.
 BUILTIN_NAMES: frozenset[str] = frozenset(_BUILTIN_REGISTRY.keys())
 
-# Subset of names that have a user-facing factory. Used by the
-# onboarding ``list_builtin_tools`` helper, which only lists
-# tools an agent spec can actually enable via
-# ``tools.builtins`` — framework-owned names would just confuse
-# the agent author.
+# Subset of names that have a user-facing factory: the tools an
+# agent spec can actually enable via ``tools.builtins``.
+# The onboarding ``list_builtin_tools`` helper covers the same
+# ground but keeps its own hand-maintained table, because it must
+# not import this package (see that module's docstring), so a new
+# builtin, or a new optional-extra gate, has to be added in both
+# places.
 INSTANTIABLE_BUILTINS: frozenset[str] = frozenset(
     name for name, factory in _BUILTIN_REGISTRY.items() if factory is not None
 )

@@ -57,6 +57,7 @@ from pathlib import Path
 
 import httpx
 
+from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 from omnigent.qwen_native_bridge import events_file_path
 
 _logger = logging.getLogger(__name__)
@@ -87,10 +88,10 @@ def _new_seen(uuids: Iterable[str] | None = None) -> dict[str, None]:
     return dict.fromkeys(uuids or [])
 
 
-# The executor injects ``[Attached: <path>]`` markers for web-UI attachments
-# before submitting; strip them from the mirrored bubble (the path is an internal
-# bridge detail).
-_ATTACHMENT_MARKER_RE = re.compile(r"\[Attached:[^\]]*\]")
+# The executor injects ``[Attached: <path>]`` (or the could-not-load marker
+# from native_attachments) for web-UI attachments before submitting; strip them
+# from the mirrored bubble (internal bridge details).
+_ATTACHMENT_MARKER_RE = re.compile(ATTACHMENT_MARKER_STRIP_PATTERN)
 
 
 @dataclass
@@ -317,9 +318,9 @@ async def forward_qwen_events_to_session(
     offset = persisted.offset
     seen = _new_seen(persisted.seen_uuids)
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
-    async with httpx.AsyncClient(
-        base_url=base_url, headers=headers, auth=auth, timeout=timeout
-    ) as client:
+    from omnigent.cli_auth import open_server_client
+
+    async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:
             try:
                 items, new_offset = await asyncio.to_thread(
@@ -515,9 +516,9 @@ async def supervise_qwen_compaction_mirror(
     except OSError:
         offset = 0  # not created yet; first poll reads from the start
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
-    async with httpx.AsyncClient(
-        base_url=base_url, headers=headers, auth=auth, timeout=timeout
-    ) as client:
+    from omnigent.cli_auth import open_server_client
+
+    async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:
             try:
                 statuses, offset = await asyncio.to_thread(
