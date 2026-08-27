@@ -8157,6 +8157,8 @@ async def _remove_session_worktree_best_effort(
     delete_branch: bool,
     request: Request,
     reason: str,
+    conversation_store: ConversationStore | None = None,
+    exclude_conversation_id: str | None = None,
 ) -> None:
     """
     Best-effort removal of a session's git worktree.
@@ -8176,12 +8178,21 @@ async def _remove_session_worktree_best_effort(
     :param request: FastAPI request carrying the host registry.
     :param reason: Short label for log lines, e.g.
         ``"create-rollback"`` or ``"session-delete"``.
+    :param conversation_store: Store used to check whether another live
+        session shares this directory. ``None`` skips the check — correct
+        for create-rollback, whose worktree was made moments ago in the
+        same request and cannot be referenced by anything else.
+    :param exclude_conversation_id: The conversation whose delete triggered
+        this removal, excluded from that check. Required with
+        *conversation_store*.
     """
     from omnigent.server.routes._host_worktree import (
         WorktreeProxyError,
         remove_worktree_on_host,
     )
 
+    # Host reachability first: both checks below end in "skip", and this one
+    # is an in-memory lookup, so an unreachable host costs no DB work.
     host_registry = getattr(request.app.state, "host_registry", None)
     if host_registry is None:
         return
@@ -8194,6 +8205,26 @@ async def _remove_session_worktree_best_effort(
             host_id,
         )
         return
+
+    # A fork reusing the source's directory, or several sessions attached to
+    # one existing worktree, all run in the same cwd. Removing it under them
+    # leaves their runners on a deleted directory, so leave a shared worktree
+    # alone and let the last session out clean it up. Only a skip is logged;
+    # the caller still deletes its own row.
+    if conversation_store is not None and exclude_conversation_id is not None:
+        shared = await asyncio.to_thread(
+            conversation_store.has_other_live_session_in_workspace,
+            host_id=host_id,
+            workspace=worktree_path,
+            exclude_conversation_id=exclude_conversation_id,
+        )
+        if shared:
+            _logger.info(
+                "Keeping worktree %s (%s): another live session still runs there",
+                worktree_path,
+                reason,
+            )
+            return
     try:
         await remove_worktree_on_host(
             host_registry=host_registry,
@@ -8267,20 +8298,21 @@ def _require_declared_subagent(
     """
     Reject a ``sub_agent_name`` the parent's spec does not declare.
 
-    ``POST /v1/sessions`` persists ``sub_agent_name`` verbatim, and every
-    downstream site that swaps in the resolved child spec is guarded by
-    ``if ... is not None`` with no ``else`` — so a name that resolves to
-    nothing leaves the parent's spec, workdir, harness and instructions in
-    place and the child silently boots as a full clone of the parent
-    (runaway recursion for an orchestrator). This gate fails the create
-    loud instead, mirroring normal dispatch (``tool_dispatch`` rejects an
-    undeclared ``agent``) and the ``AGENTSPEC.md`` contract that unlisted
-    names are rejected.
+    ``POST /v1/sessions`` persists ``sub_agent_name`` verbatim, and no
+    downstream spec-swap site rejects an unresolvable one: each warns and
+    runs the session against the PARENT spec instead. An undeclared name
+    would therefore be stored once and answered by the parent for the
+    session's whole life, with a warning as the only sign. This gate rejects
+    it up front, before any row is persisted, mirroring normal dispatch
+    (``tool_dispatch`` rejects an undeclared ``agent``) and the
+    ``AGENTSPEC.md`` contract that unlisted names are rejected.
 
-    Only rejects when the bundle loads AND the name is positively absent:
-    a load failure or absent cache cannot prove the negative, so it is
-    left to fail-loud downstream rather than blocking a create we cannot
-    adjudicate here.
+    It narrows, but does not bound, what can reach the downstream fallback.
+    The check runs only when the bundle LOADS and the name is positively
+    absent: with no agent cache, or on any load failure, it returns without
+    adjudicating, so a never-declared name still reaches a swap site by
+    either route. What the gate guarantees is one direction only — a name
+    this check REJECTED never gets persisted.
 
     :param agent: The parent agent row whose bundle declares the
         sub-agents.
@@ -8300,8 +8332,8 @@ def _require_declared_subagent(
         ).spec
     except Exception:  # noqa: BLE001
         # Can't load the bundle -> can't prove the name is undeclared.
-        # Leave it to the runner's fail-loud resolution rather than
-        # rejecting a create we cannot adjudicate.
+        # Leave it to the runner, which warns and runs the session on the
+        # parent spec, rather than rejecting a create we cannot adjudicate.
         return
     if _find_spec_by_name(parent_spec, sub_agent_name) is None:
         raise OmnigentError(

@@ -2222,7 +2222,7 @@ def register_events_routes(
         if runner_client is not None:
             try:
                 await runner_client.delete(
-                    f"/v1/sessions/{session_id}/resources",
+                    f"/v1/sessions/{session_id}",
                     timeout=10.0,
                 )
             except (httpx.HTTPError, ConnectionError):
@@ -2260,6 +2260,8 @@ def register_events_routes(
                 delete_branch=True,
                 request=request,
                 reason="session-delete",
+                conversation_store=conversation_store,
+                exclude_conversation_id=conv.id,
             )
         _interrupt_fenced_sessions.discard(session_id)
         _intentional_stop_sessions.discard(session_id)
