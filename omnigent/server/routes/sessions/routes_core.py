@@ -54,6 +54,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
+from omnigent.server import project_assignment
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -2082,15 +2083,18 @@ def register_core_routes(
                         "Filing a session into a project is not supported by this server",
                         code=ErrorCode.INVALID_INPUT,
                     )
-                owned = await asyncio.to_thread(
-                    project_store.get, target_project_id, user_id=user_id
+                canonical_project_id = await asyncio.to_thread(
+                    project_assignment.resolve_owned_project_id,
+                    project_store,
+                    target_project_id,
+                    user_id=user_id,
                 )
-                if owned is None:
+                if canonical_project_id is None:
                     raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
                 filed = await asyncio.to_thread(
                     conversation_store.set_conversation_project,
                     session_id,
-                    target_project_id,
+                    canonical_project_id,
                 )
                 if not filed:
                     raise _session_not_found()
@@ -2278,9 +2282,12 @@ def register_core_routes(
         # unfiled (a foreign project id would show in no folder view).
         fork_project_id = None
         if source.project_id is not None and project_store is not None:
-            owned = await asyncio.to_thread(project_store.get, source.project_id, user_id=user_id)
-            if owned is not None:
-                fork_project_id = source.project_id
+            fork_project_id = await asyncio.to_thread(
+                project_assignment.resolve_owned_project_id,
+                project_store,
+                source.project_id,
+                user_id=user_id,
+            )
 
         try:
             new_conv = await asyncio.to_thread(
