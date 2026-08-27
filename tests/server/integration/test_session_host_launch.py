@@ -2389,7 +2389,8 @@ async def test_rider_of_a_refused_relaunch_surfaces_the_refusal(
     Single-flight makes the second caller ride the first flight's rotated
     binding; without the last-attempt memo it would lose the structured
     ``harness_not_configured`` refusal and dead-end in a connect wait.
-    Both messages must return promptly with the actionable error turn.
+    Both messages must return promptly, and every error turn they leave
+    behind must carry the actionable refusal.
     """
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
@@ -2470,9 +2471,17 @@ async def test_rider_of_a_refused_relaunch_surfaces_the_refusal(
 
     assert first.status_code in (200, 202), first.text
     assert second.status_code in (200, 202), second.text
+    # Reaching here at all is the guard: a rider that loses the refusal falls
+    # into the 30s connect wait and the wait_for above fires. What the
+    # transcript must show is that every banner carries the actionable
+    # refusal. A count would instead pin how many messages opened a turn,
+    # which turn scheduling decides, not the rider path.
     items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
     error_items = [i for i in items if i.get("type") == "error"]
-    assert len(error_items) >= 2, (
-        "both racing messages must persist the actionable refusal banner; "
-        f"got {len(error_items)} error item(s) — the rider lost the refusal"
-    )
+    assert error_items, "the refused relaunch must persist an actionable banner"
+    for item in error_items:
+        assert item["code"] == "harness_not_configured", (
+            f"a racing caller surfaced a non-actionable error instead of the "
+            f"host refusal: {item!r}"
+        )
+        assert "omnigent setup" in item["message"], item

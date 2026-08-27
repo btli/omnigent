@@ -4857,11 +4857,14 @@ async def _launch_runner_on_host(*args: Any, **kwargs: Any) -> _HostLaunchAttemp
 # collected once no flight holds or awaits it), the most recent attempt per
 # conversation (so a rider that short-circuits onto another flight's binding
 # surfaces THAT flight's structured refusal instead of a generic connect
-# timeout; entries are a few strings each and only conversations that ever
-# relaunched appear), and strong refs to the detached superseded-runner
-# stops.
+# timeout), and strong refs to the detached superseded-runner stops.
 _relaunch_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 _relaunch_last_attempt: dict[str, _HostLaunchAttempt] = {}
+# Riders read the memo within a flight's own window (milliseconds), so it only
+# has to outlive the racing callers, not the conversation. Cap it: a
+# weak-valued map would drop entries the racers still need, and an uncapped one
+# would keep a row for every conversation this process ever relaunched.
+_RELAUNCH_MEMO_MAX = 512
 _detached_supersede_stops: set[asyncio.Task[None]] = set()
 
 
@@ -4892,7 +4895,13 @@ def _spawn_superseded_runner_stop(
 
     async def _stop_and_log() -> None:
         try:
-            await _stop_session_host_runner(session_id, host_id, runner_id, host_registry)
+            await _stop_session_host_runner(
+                session_id,
+                host_id,
+                runner_id,
+                host_registry,
+                expect_already_stopped=True,
+            )
         except Exception:  # noqa: BLE001 — must never die unobserved
             _logger.warning(
                 "Superseded-runner stop failed for session %s runner %s; "
@@ -4965,7 +4974,12 @@ async def _launch_runner_on_host_impl(
         attempt = await _launch_runner_on_host_locked(
             fresh, conversation_store, host_registry, host_conn
         )
+        # Re-insert so the plain dict's insertion order is newest-last, then
+        # evict from the front once past the cap.
+        _relaunch_last_attempt.pop(conv.id, None)
         _relaunch_last_attempt[conv.id] = attempt
+        while len(_relaunch_last_attempt) > _RELAUNCH_MEMO_MAX:
+            del _relaunch_last_attempt[next(iter(_relaunch_last_attempt))]
         return attempt
 
 
@@ -5953,6 +5967,8 @@ async def _stop_session_host_runner(
     host_id: str,
     runner_id: str,
     host_registry: Any,
+    *,
+    expect_already_stopped: bool = False,
 ) -> bool:
     """
     Terminate the host-launched runner backing a host-spawned session.
@@ -5990,6 +6006,10 @@ async def _stop_session_host_runner(
     :param host_registry: The :class:`HostRegistry` tracking live host
         tunnels on this replica, or ``None`` when host support is not wired
         (in-process / test setups without a host tunnel).
+    :param expect_already_stopped: Log a host-reported ``failed`` at debug
+        instead of warning, for callers that race another reaper for the same
+        runner (the relaunch belt: see
+        :func:`_spawn_superseded_runner_stop`). Delivery failures still warn.
     :returns: ``True`` when the stop was delivered and acknowledged (the
         runner is exiting, so a tunnel drop is expected); ``False`` on any
         best-effort early-out (no host registry, host offline/replaced,
@@ -6043,7 +6063,10 @@ async def _stop_session_host_runner(
         )
         return False
     if result.get("status") == "failed":
-        _logger.warning(
+        # An unknown runner means someone already reaped it. Expected for the
+        # relaunch belt, which the host's own supersession normally beats, so
+        # a warning there would report a successful reap as a failure.
+        (_logger.debug if expect_already_stopped else _logger.warning)(
             "Host %s failed to stop runner %s for session %s: %s",
             host_id,
             runner_id,
