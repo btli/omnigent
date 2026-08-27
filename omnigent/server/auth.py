@@ -23,6 +23,13 @@ Cookie validation is identical across OIDC and accounts modes —
 both share :class:`AccountsConfig`/:class:`OIDCConfig`-shaped cookie
 parameters. The provider is instantiated once at server startup
 and closed over by route factories — no per-request import cost.
+
+In ``"oidc"``/``"accounts"`` mode, a Bearer token that fails the
+self-minted-session check falls back to one more identity source: an
+in-cluster Kubernetes ServiceAccount JWT, gated behind
+``OMNIGENT_K8S_SA_AUTH_ENABLED`` and default-off — see
+:func:`resolve_k8s_sa_auth_config` and
+:meth:`UnifiedAuthProvider._check_k8s_service_account`.
 """
 
 from __future__ import annotations
@@ -30,9 +37,11 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
+import ssl
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -368,6 +377,137 @@ def resolve_auth_source() -> str:
     return "header"
 
 
+# ── In-cluster Kubernetes ServiceAccount bearer auth ──────────────
+#
+# Lets a workload running as a Kubernetes ServiceAccount (e.g. an
+# in-cluster webhook receiver) authenticate to this server with its
+# projected SA token instead of a human-minted, manually-refreshed
+# session JWT (``omnigent login``). Consulted only from
+# :meth:`UnifiedAuthProvider._check_cookie`'s Bearer-token fallback,
+# and only AFTER the primary self-minted HS256 decode has already
+# failed — see :func:`resolve_k8s_sa_auth_config` for the default-off
+# contract.
+
+_K8S_SA_AUTH_ENABLED_ENV = "OMNIGENT_K8S_SA_AUTH_ENABLED"
+_K8S_SA_ISSUER_ENV = "OMNIGENT_K8S_SA_ISSUER"
+_K8S_SA_AUDIENCE_ENV = "OMNIGENT_K8S_SA_AUDIENCE"
+_K8S_SA_SUBJECTS_ENV = "OMNIGENT_K8S_SA_SUBJECTS"
+_K8S_SA_JWKS_URI_ENV = "OMNIGENT_K8S_SA_JWKS_URI"
+_K8S_SA_CA_BUNDLE_ENV = "OMNIGENT_K8S_SA_CA_BUNDLE"
+# Where the kubelet projects a pod's trusted CA bundle inside every
+# container — the standard in-cluster API-server trust anchor. Used to
+# auto-detect in-cluster CA trust when no explicit override is given;
+# harmless off-cluster, where the file is simply absent and this whole
+# feature is inert anyway (see :func:`resolve_k8s_sa_auth_config`).
+_DEFAULT_K8S_CA_BUNDLE_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+# K8s API server's service-account-issuer-discovery convention.
+_K8S_SA_JWKS_PATH = "/openid/v1/jwks"
+
+
+@dataclass(frozen=True)
+class K8sServiceAccountAuthConfig:
+    """Validated config for verifying an in-cluster Kubernetes
+    ServiceAccount projected JWT presented as a Bearer token.
+
+    Built once at server startup by :func:`resolve_k8s_sa_auth_config`
+    and threaded into :class:`UnifiedAuthProvider`. Consulted only by
+    :meth:`UnifiedAuthProvider._check_k8s_service_account`.
+
+    :param issuer: Expected ``iss`` claim, e.g.
+        ``"https://kubernetes.default.svc.cluster.local"``.
+    :param audience: Expected ``aud`` claim, e.g.
+        ``"omnigent-webhook-receiver"`` (a custom audience configured
+        on the projected-volume token, not the default API-server
+        audience).
+    :param subjects: Exact-match allowlist of accepted ``sub`` claims,
+        e.g. ``frozenset({"system:serviceaccount:webhooks:webhook"})``.
+        A signature- and claim-valid token whose subject is not in
+        this set is still rejected — the allowlist, not signature
+        validity alone, is what scopes access to one specific
+        workload identity out of every ServiceAccount in the cluster.
+    :param jwks_uri: The issuer's JWKS discovery endpoint.
+    :param ssl_context: TLS trust context for the JWKS fetch (trusting
+        the in-cluster CA), or ``None`` to use the interpreter's
+        default trust store.
+    """
+
+    issuer: str
+    audience: str
+    subjects: frozenset[str]
+    jwks_uri: str
+    ssl_context: ssl.SSLContext | None
+
+
+def resolve_k8s_sa_auth_config() -> K8sServiceAccountAuthConfig | None:
+    """
+    Build the K8s ServiceAccount auth config from the environment.
+
+    Default-off: returns ``None`` unless ``OMNIGENT_K8S_SA_AUTH_ENABLED``
+    is truthy. While ``None``,
+    :meth:`UnifiedAuthProvider._check_k8s_service_account` is a no-op
+    and a Bearer token that fails the primary session-cookie decode is
+    rejected exactly as it was before this feature existed — merging
+    this code changes nothing for a deployment that never sets the
+    env vars.
+
+    Once enabled, ``OMNIGENT_K8S_SA_ISSUER``, ``OMNIGENT_K8S_SA_AUDIENCE``,
+    and ``OMNIGENT_K8S_SA_SUBJECTS`` (a comma-separated exact-subject
+    allowlist) are all required — the explicit opt-in gets the same
+    fail-loud validation :meth:`OIDCConfig.from_env` and
+    :meth:`AccountsConfig.from_env` give their own required vars, so a
+    half-configured deployment fails at startup rather than running
+    with an ambiguous verification scope.
+
+    ``OMNIGENT_K8S_SA_JWKS_URI`` overrides the JWKS endpoint; it
+    otherwise defaults to the issuer's
+    ``/openid/v1/jwks`` (K8s's service-account-issuer-discovery
+    convention). ``OMNIGENT_K8S_SA_CA_BUNDLE`` overrides the CA bundle
+    trusted for that fetch; it otherwise defaults to the kubelet-
+    projected in-cluster bundle at
+    ``/var/run/secrets/kubernetes.io/serviceaccount/ca.crt`` when that
+    file is present (auto-detected in-cluster trust), else the
+    interpreter's default trust store.
+
+    :returns: The validated config, or ``None`` when the feature is
+        off.
+    :raises RuntimeError: When enabled but any required variable is
+        missing or empty.
+    """
+    if not env_var_is_truthy(_K8S_SA_AUTH_ENABLED_ENV):
+        return None
+
+    def _require(name: str) -> str:
+        val = os.environ.get(name, "").strip()
+        if not val:
+            raise RuntimeError(
+                f"Missing required environment variable {name} "
+                f"({_K8S_SA_AUTH_ENABLED_ENV}=1 requires it)"
+            )
+        return val
+
+    issuer = _require(_K8S_SA_ISSUER_ENV).rstrip("/")
+    audience = _require(_K8S_SA_AUDIENCE_ENV)
+    raw_subjects = _require(_K8S_SA_SUBJECTS_ENV)
+    subjects = frozenset(s.strip() for s in raw_subjects.split(",") if s.strip())
+    if not subjects:
+        raise RuntimeError(f"{_K8S_SA_SUBJECTS_ENV} must list at least one exact subject")
+
+    jwks_uri = os.environ.get(_K8S_SA_JWKS_URI_ENV, "").strip() or (issuer + _K8S_SA_JWKS_PATH)
+
+    ca_bundle_path = os.environ.get(_K8S_SA_CA_BUNDLE_ENV, "").strip()
+    if not ca_bundle_path and os.path.exists(_DEFAULT_K8S_CA_BUNDLE_PATH):
+        ca_bundle_path = _DEFAULT_K8S_CA_BUNDLE_PATH
+    ssl_context = ssl.create_default_context(cafile=ca_bundle_path) if ca_bundle_path else None
+
+    return K8sServiceAccountAuthConfig(
+        issuer=issuer,
+        audience=audience,
+        subjects=subjects,
+        jwks_uri=jwks_uri,
+        ssl_context=ssl_context,
+    )
+
+
 class AuthProvider(ABC):
     """Extract a user ID from an incoming request.
 
@@ -439,6 +579,17 @@ class UnifiedAuthProvider(AuthProvider):
         back to ``""`` (strip nothing; see
         :func:`resolve_auth_header_strip_prefix`). Only consulted in
         header mode. Tests pass an explicit prefix.
+    :param k8s_sa_config: Config for verifying an in-cluster Kubernetes
+        ServiceAccount Bearer token as a fallback identity source (see
+        :meth:`_check_k8s_service_account`). ``None`` (the default)
+        disables the fallback entirely — unlike the other optional
+        params, this is NOT auto-resolved from the environment here;
+        :func:`create_auth_provider` resolves it once via
+        :func:`resolve_k8s_sa_auth_config` and passes it in, so ``None``
+        unambiguously means "off" rather than "resolve from env". Only
+        consulted in ``"oidc"``/``"accounts"`` mode, and only after the
+        primary HS256 cookie/token decode has already failed. Tests
+        pass an explicit :class:`K8sServiceAccountAuthConfig`.
     """
 
     def __init__(
@@ -449,10 +600,12 @@ class UnifiedAuthProvider(AuthProvider):
         local_single_user: bool | None = None,
         header_name: str | None = None,
         header_strip_prefix: str | None = None,
+        k8s_sa_config: K8sServiceAccountAuthConfig | None = None,
     ) -> None:
         self._source = source
         self._oidc_config = oidc_config
         self._accounts_config = accounts_config
+        self._k8s_sa_config = k8s_sa_config
         self._local_single_user = (
             local_single_user if local_single_user is not None else local_single_user_enabled()
         )
@@ -554,8 +707,13 @@ class UnifiedAuthProvider(AuthProvider):
 
         Checks the session cookie first (browser clients), then
         falls back to ``Authorization: Bearer <jwt>`` (CLI clients
-        authenticated via ``omnigent login``). Both carry the same
-        HS256-signed JWT.
+        authenticated via ``omnigent login``, or an in-cluster
+        workload's projected Kubernetes ServiceAccount token — see
+        :meth:`_check_k8s_service_account`). Both the CLI and browser
+        paths carry the same HS256-signed JWT, checked FIRST; only a
+        Bearer token that fails that check is ever handed to the SA
+        verifier, so a human/CLI session token is always accepted on
+        this first decode and never reaches the SA path.
 
         Uses a TTL credential cache keyed by HMAC-SHA256 digest of
         the raw token to avoid repeated JWT decoding on every
@@ -598,7 +756,11 @@ class UnifiedAuthProvider(AuthProvider):
                 algorithms=["HS256"],
             )
         except jwt.InvalidTokenError:
-            return None
+            # Not a self-minted session/CLI token. The only other bearer
+            # this server recognizes is an in-cluster ServiceAccount
+            # token — inert (returns None immediately) unless that
+            # fallback is explicitly configured.
+            return self._check_k8s_service_account(token)
 
         user_id = payload.get("sub")
         if not isinstance(user_id, str) or not user_id or user_id in _RESERVED_USERS:
@@ -633,6 +795,63 @@ class UnifiedAuthProvider(AuthProvider):
             )
 
         return user_id
+
+    def _check_k8s_service_account(self, token: str) -> str | None:
+        """Verify *token* as an in-cluster Kubernetes ServiceAccount JWT.
+
+        Only reached from :meth:`_check_cookie` after the primary
+        HS256 session-cookie/CLI-token decode has already failed, so a
+        valid human/CLI session token never reaches this method.
+
+        Reuses the same :class:`jwt.PyJWKClient` verification pattern
+        as the generic-OIDC ``id_token`` check in
+        ``omnigent.server.routes.auth._resolve_oidc_email``: fetch the
+        signing key for the token's ``kid`` from the issuer's JWKS,
+        then verify signature, issuer, and audience together via
+        ``jwt.decode``. The decoded ``sub`` must additionally match
+        the exact-match allowlist in :attr:`_k8s_sa_config` — a valid
+        signature only proves the token came from *some* ServiceAccount
+        in the cluster, not that it is the specific one this
+        deployment intends to trust.
+
+        Fails closed on every error path (feature disabled, invalid
+        token, wrong issuer/audience, unlisted or reserved subject, or
+        a JWKS-fetch failure) by returning ``None`` — the caller then
+        falls through to the ordinary 401, exactly as an unrecognized
+        Bearer token always has. Deliberately catches ``jwt.PyJWTError``
+        (broader than the ``InvalidTokenError`` the OIDC path catches)
+        so a transient JWKS-fetch failure also fails closed here rather
+        than raising a 500; no claim contents are logged either way.
+
+        :param token: The raw bearer token that failed HS256 decoding.
+        :returns: The verified ``sub`` claim (used as the user ID), or
+            ``None`` if the feature is disabled or verification fails.
+        """
+        config = self._k8s_sa_config
+        if config is None:
+            return None
+
+        import jwt
+
+        try:
+            jwks_client = jwt.PyJWKClient(config.jwks_uri, ssl_context=config.ssl_context)
+            signing_key = jwks_client.get_signing_key_from_jwt(token)
+            claims = jwt.decode(
+                token,
+                signing_key.key,
+                algorithms=["RS256"],
+                audience=config.audience,
+                issuer=config.issuer,
+            )
+        except jwt.PyJWTError:
+            return None
+
+        subject = claims.get("sub")
+        if not isinstance(subject, str) or not subject:
+            return None
+        if subject in _RESERVED_USERS or subject not in config.subjects:
+            return None
+        return subject
 
     def _check_header(self, request: HTTPConnection) -> str | None:
         """Read the trusted identity header and return the user ID.
@@ -722,7 +941,11 @@ def create_auth_provider() -> AuthProvider:
 
     Validates the source's required env vars at startup (fail
     loud) — OIDC fetches the discovery document, accounts decodes
-    the cookie secret.
+    the cookie secret. The optional in-cluster ServiceAccount Bearer
+    fallback (see :func:`resolve_k8s_sa_auth_config`) is resolved and
+    attached here too, independent of *source* — it only ever activates
+    from within the ``"oidc"``/``"accounts"`` cookie-check path, so
+    attaching it under ``"header"`` mode is inert.
 
     :returns: Configured auth provider.
     :raises RuntimeError: On unknown source or invalid config.
@@ -754,6 +977,7 @@ def create_auth_provider() -> AuthProvider:
         source=source,
         oidc_config=oidc_config,
         accounts_config=accounts_config,
+        k8s_sa_config=resolve_k8s_sa_auth_config(),
     )
 
 
