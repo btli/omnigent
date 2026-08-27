@@ -4,7 +4,7 @@ import { readSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { resetWidthStoreForTesting, useResizableInlinePanel } from "./useResizableInlinePanel";
 
 // useResizableInlinePanel keeps its width in a module-level store shared across
-// all callers, re-seeded per conversation. resetWidthStoreForTesting clears it
+// all callers, re-seeded per storage key. resetWidthStoreForTesting clears it
 // between tests so cases are fully independent. A 2000px viewport gives a
 // 1508px clamp ceiling (2000 - 480 chat minimum - 12px gutter); the default width
 // there is 600 (0.36 * 2000 = 720, clamped to the [420, 600] band).
@@ -100,17 +100,18 @@ describe("useResizableInlinePanel persistence", () => {
     restored.unmount();
   });
 
-  it("scopes the saved width to its session: a different session uses the default", () => {
-    const first = renderHook(() => useResizableInlinePanel(SESSION));
+  it("scopes the saved width to its root-tree key: a different tree uses the default", () => {
+    const rootTreeKey = "conv_root";
+    const first = renderHook(() => useResizableInlinePanel(rootTreeKey));
     expect(nudgeWiderOnce(first.result)).toBe(620);
-    expect(readSessionWorkspaceState(SESSION).widthPx).toBe(620);
+    expect(readSessionWorkspaceState(rootTreeKey).widthPx).toBe(620);
     first.unmount();
 
-    // A second conversation has no saved width, so it falls back to the
+    // A second root tree has no saved width, so it falls back to the
     // viewport-derived default (600) rather than inheriting the first's 620.
-    const second = renderHook(() => useResizableInlinePanel("conv_other"));
+    const second = renderHook(() => useResizableInlinePanel("conv_other_root"));
     expect(second.result.current.panelWidth).toBe(600);
-    expect(readSessionWorkspaceState("conv_other").widthPx).toBeUndefined();
+    expect(readSessionWorkspaceState("conv_other_root").widthPx).toBeUndefined();
     second.unmount();
   });
 
@@ -433,6 +434,28 @@ describe("useResizableInlinePanel pointer drag", () => {
     expect(document.body.style.userSelect).toBe("");
   });
 
+  it("aborts without persisting when its root-tree key becomes tentative", () => {
+    const { result, rerender } = renderHook(
+      ({ persistEnabled }) => useResizableInlinePanel(SESSION, undefined, 0, true, persistEnabled),
+      { initialProps: { persistEnabled: true } },
+    );
+    const handle = createPointerHandle();
+
+    act(() => {
+      result.current.handleProps.onPointerDown(pointerEvent(handle.element));
+      result.current.handleProps.onPointerMove(pointerEvent(handle.element, { clientX: 1200 }));
+    });
+    expect(result.current.panelWidth).toBe(800);
+
+    rerender({ persistEnabled: false });
+
+    expect(result.current.panelWidth).toBe(800);
+    expect(readSessionWorkspaceState(SESSION).widthPx).toBeUndefined();
+    expect(overlaySelector()).toBeNull();
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
+  });
+
   it("does not start pointer or keyboard resize while disabled", () => {
     const { result } = renderHook(() => useResizableInlinePanel(SESSION, undefined, 0, false));
     const handle = createPointerHandle();
@@ -449,6 +472,33 @@ describe("useResizableInlinePanel pointer drag", () => {
 
     expect(handle.setPointerCapture).not.toHaveBeenCalled();
     expect(result.current.handleProps["aria-disabled"]).toBe(true);
+    expect(result.current.handleProps.hidden).toBe(true);
+    expect(result.current.handleProps.tabIndex).toBe(-1);
+    expect(result.current.panelWidth).toBe(600);
+    expect(readSessionWorkspaceState(SESSION).widthPx).toBeUndefined();
+    expect(overlaySelector()).toBeNull();
+  });
+
+  it("keeps a tentative root-tree gutter visible but blocks resize input", () => {
+    const { result } = renderHook(() =>
+      useResizableInlinePanel(SESSION, undefined, 0, true, false),
+    );
+    const handle = createPointerHandle();
+
+    act(() => {
+      result.current.handleProps.onPointerDown(pointerEvent(handle.element));
+      result.current.handleProps.onPointerMove(pointerEvent(handle.element, { clientX: 1200 }));
+      result.current.handleProps.onPointerUp(pointerEvent(handle.element));
+      result.current.handleProps.onKeyDown({
+        key: "ArrowLeft",
+        preventDefault: () => {},
+      } as React.KeyboardEvent);
+    });
+
+    expect(handle.setPointerCapture).not.toHaveBeenCalled();
+    expect(result.current.handleProps["aria-disabled"]).toBe(true);
+    expect(result.current.handleProps.hidden).toBe(false);
+    expect(result.current.handleProps.tabIndex).toBe(-1);
     expect(result.current.panelWidth).toBe(600);
     expect(readSessionWorkspaceState(SESSION).widthPx).toBeUndefined();
     expect(overlaySelector()).toBeNull();

@@ -2274,6 +2274,26 @@ describe("Right workspace card visibility", () => {
       isLoading: false,
     } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
     mockConversations([{ id: "conv_drag_close", permission_level: null }]);
+    useSessionMock.mockReturnValue({
+      session: {
+        id: "conv_drag_close",
+        agentId: "ag_owner",
+        agentName: "developer",
+        runnerId: null,
+        status: "idle",
+        createdAt: 0,
+        title: null,
+        labels: {},
+        items: [],
+        pendingElicitations: [],
+        permissionLevel: 4,
+        parentSessionId: null,
+        subAgentName: null,
+        kind: "default",
+      },
+      isLoading: false,
+      error: null,
+    });
 
     renderShell("/c/conv_drag_close");
 

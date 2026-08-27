@@ -747,13 +747,14 @@ describe("WorkspacePanel resize handle geometry", () => {
     expect(separator.style.backgroundClip).toBe("content-box");
   });
 
-  it("does not render the gutter when the hook marks it disabled", () => {
+  it("does not render the gutter when the hook marks it hidden", () => {
     renderWorkspace({
       handleProps: {
         tabIndex: 0,
         role: "separator",
         "aria-label": "Resize panel",
         "aria-disabled": true,
+        hidden: true,
       },
     });
 
