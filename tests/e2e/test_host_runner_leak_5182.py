@@ -22,6 +22,7 @@ bound to the stopped runner, exactly as in the incident.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import signal
@@ -255,7 +256,7 @@ def test_relaunch_reaps_the_superseded_runner(
         # host's shutdown cascade (or the assertion above) isn't racing
         # a process frozen in the middle of teardown.
         if stopped_pid is not None and _pid_alive(stopped_pid):
-            with __import__("contextlib").suppress(ProcessLookupError):
+            with contextlib.suppress(ProcessLookupError):
                 os.kill(stopped_pid, signal.SIGCONT)
         daemon.proc.send_signal(signal.SIGTERM)
         try:
