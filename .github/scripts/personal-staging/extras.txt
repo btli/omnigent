@@ -1,0 +1,19 @@
+# Personal-staging extras manifest: one pin per line.
+#
+# Accepted forms:
+#   1234              upstream PR (merged even when closed; GitHub keeps
+#                     refs/pull/N/head fetchable after close)
+#   branch:<name>     fork branch (resolved on --fork-remote, e.g. origin)
+#
+# Blank lines and `#` comments are ignored. Remove an entry once the
+# change lands upstream (or the fork branch is retired). A ref confirmed
+# deleted (`ls-remote` reports it absent) is skipped loudly in the run
+# report; a transport failure reaching the remote blocks the hourly push
+# (run stays green with a warning); fails the nightly run — that is not
+# a cue to edit the manifest. `branch:` names must be legal git branch
+# names, must not start with `-`, and must not be `main` or `staging`.
+#
+# Examples:
+# 1234              # keep the composer hotfix until upstream merges it
+# branch:homelab    # fork-only justfile recipes, not an upstream PR
+branch:homelab    # fork-only dev-env justfile recipes + agy regression test

@@ -1,0 +1,482 @@
+# Nightly personal staging ring for the btli fork.
+#
+# Composes upstream main + every open btli PR (sequential merges, conflicts
+# skipped and reported) onto fork branch `staging`, pins an immutable
+# nightly-YYYYMMDD branch + tag and a PEP 440 vX.Y.Z.devYYYYMMDD tag, builds
+# Android debug APK + unsigned release AAB from that commit, and publishes a
+# prerelease (plus a floating `nightly-latest` for a stable download URL).
+#
+# Trust boundary: jobs that execute third-party code (the test suite's dev
+# deps in test-composer, merged PR code in android-build) run secretless with
+# credentials unpersisted and may not write shared caches. The privileged
+# integrate job runs only the stdlib composer; the keystore only ever appears
+# in android-sign, which re-signs the APK unconditionally so the untrusted
+# build's own signature never ships. PAT-bearing jobs use the main-only
+# staging-push environment so staging-tree workflows cannot receive the PAT;
+# dev-tag pushes may enqueue release/image workflows, whose repo guards skip.
+name: Personal Staging Nightly
+
+on:
+  schedule:
+    # Intent: 3:00 AM Pacific. GitHub cron is UTC-only: 10:00 UTC is 3:00 AM PDT,
+    # then 2:00 AM PST after November's DST change; winter is 0 11 * * *.
+    - cron: "0 10 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: personal-staging
+  cancel-in-progress: false
+
+jobs:
+  # Keep fork main tracking upstream with a plain merge commit (no force). A
+  # conflict fails THIS job with the paths in the summary — resolution is
+  # manual — but the staging ring below still runs: it stacks from upstream
+  # HEAD directly and never reads fork main.
+  sync-main:
+    # Fork-only, mirroring upstream's `if: github.repository == 'omnigent-ai/omnigent'` guards.
+    if: github.repository == 'btli/omnigent' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: staging-push
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout fork main with full history
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # App tokens cannot push workflow-file changes; prefer the
+          # workflows-scoped PAT, with GitHub token as fallback.
+          token: ${{ secrets.STAGING_PUSH_TOKEN || github.token }}
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge upstream main and push
+        env:
+          HAS_PAT: ${{ secrets.STAGING_PUSH_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/omnigent-ai/omnigent.git
+          git fetch upstream main
+          if [ "$HAS_PAT" = "true" ]; then
+            merge_command=(git merge --no-ff -m "Merge upstream main [skip ci]" FETCH_HEAD)
+          else
+            merge_command=(git merge --no-edit FETCH_HEAD)
+          fi
+          if ! "${merge_command[@]}"; then
+            {
+              echo "## sync-main: merge conflict with upstream main"
+              echo ""
+              git diff --name-only --diff-filter=U | while read -r f; do printf -- '- %s\n' "\`$f\`"; done
+              echo ""
+              echo "Resolve manually; tonight's staging ring still ran from upstream HEAD."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          git push origin main
+
+      - name: Report failure
+        if: failure()
+        run: echo "## Personal staging nightly — sync-main job FAILED (see logs)" >> "$GITHUB_STEP_SUMMARY"
+
+  # Secretless test gate: `uv run` installs third-party dev deps, so this job
+  # never holds a write token (the repo's default pytest testpaths never
+  # collect .github/scripts/**, hence the explicit run here).
+  test-composer:
+    if: github.repository == 'btli/omnigent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: false
+
+      - name: Test the staging composer
+        run: uv run --frozen --group dev python -m pytest .github/scripts/personal-staging/
+
+      - name: Report failure
+        if: failure()
+        run: echo "## Personal staging nightly — test-composer job FAILED (see logs)" >> "$GITHUB_STEP_SUMMARY"
+
+  integrate:
+    # Privileged (pushes refs) but runs ONLY the stdlib composer — no
+    # third-party code. Requires the secretless test gate to pass; still runs
+    # when sync-main failed on a conflict (the ring stacks from upstream
+    # HEAD, not fork main).
+    needs: [sync-main, test-composer]
+    # The ref guard blocks accidental non-main dispatches of privileged jobs
+    # (schedule always runs main). It is accident prevention only: a
+    # dispatched ref executes its own workflow copy, so file-level guards
+    # can't stop a malicious ref — the keystore's real protection is the
+    # server-enforced staging-signing Environment on android-sign.
+    if: always() && needs.test-composer.result == 'success' && needs.sync-main.result != 'cancelled' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: staging-push
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    outputs:
+      staging_sha: ${{ steps.report.outputs.staging_sha }}
+      tag: ${{ steps.report.outputs.tag }}
+      date: ${{ steps.report.outputs.date }}
+    steps:
+      - name: Checkout fork with full history
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # App tokens cannot push workflow-file changes; prefer the
+          # workflows-scoped PAT, with GitHub token as fallback.
+          token: ${{ secrets.STAGING_PUSH_TOKEN || github.token }}
+          fetch-depth: 0
+
+      - name: Compose staging from upstream main + open btli PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # git merge --no-ff --no-commit checks identity before the composer reaches
+          # its commit phase (run 31338098075 failed here). This identity is preflight-only;
+          # stage.py's COMMIT_IDENT -c overrides set reproducible staging commit identities.
+          # Do not use GIT_AUTHOR_* / GIT_COMMITTER_* env instead: env beats -c,
+          # changing those identities and breaking same-day SHA reproducibility.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/omnigent-ai/omnigent.git
+          python3 .github/scripts/personal-staging/stage.py stage \
+            --upstream-remote upstream --fork-remote origin \
+            --report merge-report.json
+
+      - name: Export report fields
+        id: report
+        run: |
+          set -euo pipefail
+          {
+            echo "staging_sha=$(jq -r .staging_sha merge-report.json)"
+            echo "tag=$(jq -r .tag merge-report.json)"
+            echo "date=$(jq -r .date merge-report.json)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload merge report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: merge-report
+          path: merge-report.json
+
+      - name: Report failure
+        if: failure()
+        run: echo "## Personal staging nightly — integrate job FAILED (see logs)" >> "$GITHUB_STEP_SUMMARY"
+
+  # Secretless: this job executes third-party gradle/build code from the
+  # merged PRs, so it gets no secrets, no persisted git credentials, and
+  # read-only access to the shared gradle cache (a poisoned cache write
+  # would be restored by future runs).
+  android-build:
+    needs: integrate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: web/android
+    steps:
+      - name: Checkout the staging commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.integrate.outputs.staging_sha }}
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle (cache read-only)
+        uses: gradle/actions/setup-gradle@48b5f213c81028ace310571dc5ec0fbbca0b2947 # v4
+        with:
+          cache-read-only: true
+
+      # Datestamp as versionCode keeps nightly installs monotonically
+      # upgradeable on-device (fits comfortably under Android's 2.1e9 cap).
+      - name: Build debug APK and unsigned release AAB
+        env:
+          VERSION_CODE: ${{ needs.integrate.outputs.date }}
+        run: |
+          ./gradlew assembleDebug bundleRelease --no-daemon --console=plain \
+            -PversionCode="$VERSION_CODE"
+
+      # Hand off exactly two named files from a freshly created dir — the
+      # build must not be able to smuggle extra files across the boundary.
+      - name: Stage build outputs
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/unsigned"
+          mkdir -p "$RUNNER_TEMP/unsigned"
+          cp app/build/outputs/apk/debug/app-debug.apk \
+            "$RUNNER_TEMP/unsigned/omnigent-staging-debug.apk"
+          cp app/build/outputs/bundle/release/app-release.aab \
+            "$RUNNER_TEMP/unsigned/omnigent-staging-release-unsigned.aab"
+
+      - name: Upload unsigned build outputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: android-unsigned
+          path: |
+            ${{ runner.temp }}/unsigned/omnigent-staging-debug.apk
+            ${{ runner.temp }}/unsigned/omnigent-staging-release-unsigned.aab
+
+      - name: Report failure
+        if: failure()
+        run: echo "## Personal staging nightly — android-build job FAILED (see logs)" >> "$GITHUB_STEP_SUMMARY"
+
+  # Clean job for the keystore: only downloads the built artifact, never
+  # checks out or executes merged code. The APK is ALWAYS re-signed here —
+  # with the shared keystore when configured, else with a keystore minted in
+  # this job — so the untrusted build's own signature never survives.
+  android-sign:
+    needs: android-build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Server-enforced gate for the keystore secrets: the staging-signing
+    # Environment carries the OMNIGENT_DEBUG_* secrets and a main-only
+    # deployment-branch rule, so a dispatched non-main workflow copy can
+    # never read them regardless of what its file says.
+    environment: staging-signing
+    outputs:
+      signed: ${{ steps.keystore.outputs.signed }}
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Download unsigned build outputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: android-unsigned
+          path: unsigned
+
+      - name: Verify artifact contents
+        run: |
+          set -euo pipefail
+          got="$(find unsigned -mindepth 1 | LC_ALL=C sort | paste -sd' ' -)"
+          want="unsigned/omnigent-staging-debug.apk unsigned/omnigent-staging-release-unsigned.aab"
+          if [ "$got" != "$want" ]; then
+            echo "unexpected artifact contents: $got"
+            exit 1
+          fi
+
+      # Verified HERE, on the downloaded artifact and before any keystore
+      # material exists in the job: the untrusted build job could shadow
+      # zipfile / swap the file under a check running in its own runner.
+      # The release AAB must ship unsigned (no release keystore on this
+      # ring): its ZIP must carry no META-INF signature blocks at all.
+      - name: Verify release AAB is unsigned
+        run: |
+          python3 - <<'EOF'
+          import sys
+          import zipfile
+
+          names = zipfile.ZipFile("unsigned/omnigent-staging-release-unsigned.aab").namelist()
+          sigs = [
+              n
+              for n in names
+              if n.upper().startswith("META-INF/")
+              and n.upper().endswith((".RSA", ".DSA", ".EC", ".SF"))
+          ]
+          sys.exit(f"release AAB carries signature blocks: {sigs}" if sigs else 0)
+          EOF
+
+      - name: Prepare signing keystore
+        id: keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.OMNIGENT_DEBUG_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.OMNIGENT_DEBUG_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.OMNIGENT_DEBUG_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.OMNIGENT_DEBUG_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -n "$KEYSTORE_B64" ]; then
+            printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/debug.keystore"
+            printf '%s' "$KS_PASS" > "$RUNNER_TEMP/ks-pass"
+            printf '%s' "$KEY_PASS" > "$RUNNER_TEMP/key-pass"
+            printf '%s' "$KEY_ALIAS" > "$RUNNER_TEMP/key-alias"
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            # No shared keystore: mint a run-ephemeral one (in-place upgrades
+            # across nightlies won't work, flagged in the release notes).
+            pass="$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9')"
+            printf '%s' "$pass" > "$RUNNER_TEMP/ks-pass"
+            printf '%s' "$pass" > "$RUNNER_TEMP/key-pass"
+            printf '%s' "omnigent-ephemeral" > "$RUNNER_TEMP/key-alias"
+            keytool -genkeypair -keystore "$RUNNER_TEMP/debug.keystore" \
+              -alias omnigent-ephemeral -keyalg RSA -keysize 2048 -validity 30 \
+              -storepass:file "$RUNNER_TEMP/ks-pass" \
+              -keypass:file "$RUNNER_TEMP/key-pass" \
+              -dname "CN=omnigent staging ephemeral"
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Re-sign debug APK
+        run: |
+          set -euo pipefail
+          bt="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          apksigner="$bt/apksigner"
+          "$apksigner" sign \
+            --ks "$RUNNER_TEMP/debug.keystore" \
+            --ks-pass "file:$RUNNER_TEMP/ks-pass" \
+            --ks-key-alias "$(cat "$RUNNER_TEMP/key-alias")" \
+            --key-pass "file:$RUNNER_TEMP/key-pass" \
+            unsigned/omnigent-staging-debug.apk
+          "$apksigner" verify unsigned/omnigent-staging-debug.apk
+          {
+            echo "## APK signing certificate"
+            echo '```'
+            "$apksigner" verify --print-certs unsigned/omnigent-staging-debug.apk | grep -i "SHA-256"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Android assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: android-assets
+          path: |
+            unsigned/omnigent-staging-debug.apk
+            unsigned/omnigent-staging-release-unsigned.aab
+
+      - name: Report failure
+        if: failure()
+        run: echo "## Personal staging nightly — android-sign job FAILED (see logs)" >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    needs: [integrate, android-sign]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: staging-push
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      # for chaining the image-build workflow_dispatch
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.integrate.outputs.tag }}
+      STAGING_SHA: ${{ needs.integrate.outputs.staging_sha }}
+    steps:
+      - name: Checkout (for the release script)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Download merge report
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: merge-report
+          path: report
+
+      - name: Download Android assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: android-assets
+          path: assets
+
+      # dist is rebuilt from scratch out of explicitly named files; anything
+      # unexpected in either artifact fails the publish.
+      - name: Assemble release assets, notes, checksums
+        env:
+          SIGNED: ${{ needs.android-sign.outputs.signed }}
+        run: |
+          set -euo pipefail
+          got="$(find report assets -mindepth 1 | LC_ALL=C sort | paste -sd' ' -)"
+          want="assets/omnigent-staging-debug.apk assets/omnigent-staging-release-unsigned.aab report/merge-report.json"
+          if [ "$got" != "$want" ]; then
+            echo "unexpected artifact contents: $got"
+            exit 1
+          fi
+          rm -rf dist && mkdir dist
+          cp report/merge-report.json \
+            assets/omnigent-staging-debug.apk \
+            assets/omnigent-staging-release-unsigned.aab dist/
+          python3 .github/scripts/personal-staging/stage.py notes \
+            --report dist/merge-report.json --signed "$SIGNED" > notes.md
+          (cd dist && sha256sum ./* > ../SHA256SUMS && mv ../SHA256SUMS .)
+          cat notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      # Idempotent for same-day reruns: refresh the notes when the release
+      # already exists, then clobber-upload assets either way.
+      - name: Publish dated prerelease
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" --prerelease \
+              --title "Personal staging $TAG" --notes-file notes.md
+          fi
+          gh release upload "$TAG" dist/* --clobber
+
+      # Floating prerelease: the tag is (re)pointed FIRST so a partial state
+      # (tag exists, release missing) can never pin the release to a stale
+      # commit; the release is then edited in place (no delete/recreate, so
+      # the stable releases/download/nightly-latest/<asset> URL never 404s).
+      - name: Update nightly-latest
+        env:
+          # App tokens cannot update refs containing workflow-file changes;
+          # prefer the workflows-scoped PAT, with GitHub token as fallback.
+          GH_TOKEN: ${{ secrets.STAGING_PUSH_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/nightly-latest" \
+            -f sha="$STAGING_SHA" -F force=true \
+            || gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/nightly-latest" -f sha="$STAGING_SHA"
+          if gh release view nightly-latest >/dev/null 2>&1; then
+            gh release edit nightly-latest --prerelease \
+              --title "Personal staging (latest — $TAG)" --notes-file notes.md
+          else
+            gh release create nightly-latest --prerelease \
+              --title "Personal staging (latest — $TAG)" --notes-file notes.md
+          fi
+          gh release upload nightly-latest dist/* --clobber
+
+      # Chain the image build. It is dispatch-only and always runs main's
+      # trusted definition — nightly tags point at PR-merged code, so the
+      # tag's own workflow copy must never run privileged. Probe for the
+      # workflow file on main first: absent (not merged yet) is a warning,
+      # while a failed dispatch of a present workflow fails the nightly.
+      - name: Dispatch image build for this nightly
+        run: |
+          set -euo pipefail
+          probe_rc=0
+          probe_err="$(gh api \
+            "repos/$GITHUB_REPOSITORY/contents/.github/workflows/personal-staging-images.yml?ref=main" \
+            2>&1 >/dev/null)" || probe_rc=$?
+          if [ "$probe_rc" -eq 0 ]; then
+            gh workflow run personal-staging-images.yml --ref main -f ref="$TAG"
+            echo "Dispatched personal-staging-images.yml (main) with ref=$TAG" >> "$GITHUB_STEP_SUMMARY"
+          elif printf '%s' "$probe_err" | grep -q "(HTTP 404)"; then
+            # Only a definite not-found means "not merged yet"; auth,
+            # rate-limit, or network failures must fail the nightly loud.
+            echo "> [!WARNING]" >> "$GITHUB_STEP_SUMMARY"
+            echo "> Image build NOT dispatched: personal-staging-images.yml is not on main yet." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "workflow probe failed (exit $probe_rc): $probe_err"
+            exit 1
+          fi
+
+      - name: Report failure
+        if: failure()
+        run: echo "## Personal staging nightly — publish job FAILED (see logs)" >> "$GITHUB_STEP_SUMMARY"

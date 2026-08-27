@@ -35,6 +35,7 @@ from omnigent.server.schemas import ServerStreamEvent
 
 from ._child_status import child_summary_busy
 from ._errors import raise_for_status, require_json_object, response_body
+from ._timeouts import _SSE_TIMEOUT
 
 # Default recursion cap for the sub-agent tree helpers. Mirrors web's
 # ``MAX_TREE_DEPTH`` and the REPL's ``_MAX_SUBAGENT_TREE_DEPTH`` so the SDK
@@ -369,6 +370,8 @@ class SessionsNamespace:
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
+        host_type: str = "external",
+        sandbox_provider: str | None = None,
     ) -> Session:
         """
         Create a new session from an uploaded agent bundle.
@@ -388,11 +391,18 @@ class SessionsNamespace:
             starts with no labels.
         :param reasoning_effort: Optional per-session reasoning
             effort, e.g. ``"high"``. ``None`` uses the agent default.
-        :param workspace: Optional absolute starting cwd to record on
-            the session, e.g. ``"/Users/corey/projects/myapp"``.
-            CLI-launched sessions populate this with ``os.getcwd()``
-            so the Web UI can show "running locally in <workspace>";
-            sessions with no recorded workspace pass ``None``.
+        :param workspace: Optional starting workspace. For an external
+            host (the default), an absolute cwd to record on the session,
+            e.g. ``"/Users/corey/projects/myapp"`` — CLI-launched sessions
+            populate this with ``os.getcwd()``. For ``host_type="managed"``,
+            a git repository URL (optionally ``#<branch>``) the server
+            clones into the sandbox. ``None`` records no workspace.
+        :param host_type: ``"external"`` (default) uploads the bundle and
+            runs it on a caller-managed runner; ``"managed"`` uploads the
+            bundle and has the server provision a sandbox host to run it.
+        :param sandbox_provider: With ``host_type="managed"``, which
+            configured sandbox provider to provision (e.g. ``"lakebox"``);
+            ``None`` takes the server's first. Ignored for external hosts.
         :returns: The newly created :class:`Session` snapshot.
         :raises OmnigentError: If the server returns a non-2xx
             status.
@@ -406,6 +416,10 @@ class SessionsNamespace:
             metadata["reasoning_effort"] = reasoning_effort
         if workspace is not None:
             metadata["workspace"] = workspace
+        if host_type != "external":
+            metadata["host_type"] = host_type
+        if sandbox_provider is not None:
+            metadata["sandbox_provider"] = sandbox_provider
         resp = await self._http.post(
             f"{self._base}/v1/sessions",
             data={"metadata": json.dumps(metadata)},
@@ -1216,6 +1230,7 @@ async def _stream_session_events(
     async with http.stream(
         "GET",
         f"{base_url}/v1/sessions/{session_id}/stream",
+        timeout=_SSE_TIMEOUT,
     ) as resp:
         if resp.status_code >= 400:
             await resp.aread()

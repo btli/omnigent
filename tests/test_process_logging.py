@@ -18,9 +18,12 @@ from omnigent.process_logging import (
     LOG_TTY_FD_ENV_VAR,
     PROCESS_LOG_FILE_ENV_VAR,
     TerminalLogFormatter,
+    _debug_sink_target_loggers,
+    _unlink_if_empty,
     child_logging_popen_kwargs,
     configure_process_logging,
     current_process_log_path,
+    process_log_dir_reference,
     process_log_reference,
     terminal_stream_handler,
     terminal_supports_color,
@@ -214,6 +217,29 @@ def test_process_log_reference_falls_back_to_the_destination_dir(
     assert process_log_reference("runner") == f"{tmp_path / 'data' / 'logs' / 'runner'}/"
 
 
+def test_process_log_dir_reference_follows_the_data_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The directory pointer tracks ``OMNIGENT_DATA_DIR``.
+
+    Unlike :func:`process_log_reference` this never substitutes the caller's
+    own log file, so a message about another process names that process's
+    tree even when this one has a captured log.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Pytest temp dir, used as the runtime data dir.
+    """
+    monkeypatch.setattr(
+        "omnigent.process_logging._current_process_log_path",
+        tmp_path / "mine" / "cli.log",
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "elsewhere")
+    monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path / "data"))
+
+    assert process_log_dir_reference("host") == f"{tmp_path / 'data' / 'logs' / 'host'}/"
+
+
 def test_configure_process_logging_publishes_its_log_path(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -244,3 +270,81 @@ def test_configure_process_logging_publishes_its_log_path(
         for handler in list(logger.handlers):
             logger.removeHandler(handler)
             handler.close()
+
+
+def test_unlink_if_empty_sweeps_only_empty_files(tmp_path: Path) -> None:
+    """The exit sweep removes an empty log, keeps a written one, tolerates absence."""
+    empty = tmp_path / "empty.log"
+    empty.touch()
+    written = tmp_path / "written.log"
+    written.write_text("one line\n")
+
+    _unlink_if_empty(empty)
+    _unlink_if_empty(written)
+    _unlink_if_empty(tmp_path / "missing.log")
+
+    assert not empty.exists()
+    assert written.exists()
+
+
+def test_configure_registers_the_empty_log_sweep_for_self_allocated_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Only a self-allocated log path gets the exit sweep.
+
+    A crash before the first record used to leave a fresh empty log
+    behind on every start (dozens a day for crash-at-birth hosts). A
+    parent-published (env) or explicit ``log_path`` is the caller's to
+    manage, so no hook is registered for those.
+    """
+    registered: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        "omnigent.process_logging.atexit.register",
+        lambda fn, *args: registered.append((fn, *args)),
+    )
+    monkeypatch.setattr("omnigent.process_logging._current_process_log_path", None)
+    monkeypatch.delenv(PROCESS_LOG_FILE_ENV_VAR, raising=False)
+    monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path))
+    logger_name = "omnigent.test_empty_log_sweep"
+
+    path = configure_process_logging("host", logger_names=(logger_name,), root=False)
+    try:
+        assert registered == [(_unlink_if_empty, path)]
+
+        registered.clear()
+        explicit = configure_process_logging(
+            "host",
+            log_path=tmp_path / "explicit.log",
+            logger_names=(logger_name,),
+            root=False,
+        )
+        assert registered == []
+        assert explicit == tmp_path / "explicit.log"
+    finally:
+        logger = logging.getLogger(logger_name)
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
+
+
+def test_debug_sink_targets_follow_non_propagating_package_logger() -> None:
+    # cli_diagnostics sets our package loggers to propagate=False with their own
+    # handlers, so records logged under them never reach root. The debug-log
+    # sink (attached to root) must therefore also attach to such loggers, or it
+    # sees nothing — the bug that left server/host rows undelivered.
+    name = "omnigent.test.sink_target_propagation"
+    logger = logging.getLogger(name)
+    original = logger.propagate
+    try:
+        logger.propagate = False
+        targets = _debug_sink_target_loggers((name,), root=True)
+        assert logging.getLogger() in targets  # root, for propagating loggers
+        assert logger in targets  # and the non-propagating package logger itself
+
+        logger.propagate = True
+        targets = _debug_sink_target_loggers((name,), root=True)
+        # A propagating logger reaches root already; root-only avoids double-ship.
+        assert targets == [logging.getLogger()]
+    finally:
+        logger.propagate = original

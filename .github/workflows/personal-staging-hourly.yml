@@ -1,0 +1,197 @@
+# Hourly personal staging refresh for the btli fork.
+#
+# Keeps fork branch `staging` = upstream main + open btli PRs + extras.txt
+# pins between nightlies, via `stage.py stage --staging-only`: no nightly
+# pins, no dev tags, no APK/releases/images — those stay on the nightly
+# (personal-staging.yml). Composition is byte-reproducible, so an unchanged
+# hour is a skipped push ("unchanged" in the summary).
+name: Personal Staging Hourly
+
+on:
+  schedule:
+    # Off the top of the hour on purpose: :00 would collide with the nightly's
+    # 10:00 UTC slot (both push fork main), and GitHub delays or drops runs
+    # scheduled on the congested :00 minute.
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Deliberately NOT the nightly's `personal-staging` group: hourly runs
+# coalesce via cancel-in-progress, and sharing the group would let an hourly
+# run cancel a running nightly. A rare push race with the nightly resolves
+# loudly via --force-with-lease; a lost lease here is acceptable — the next
+# hourly run retries.
+concurrency:
+  group: personal-staging-hourly
+  cancel-in-progress: true
+
+jobs:
+  # Soft-fail twin of the nightly's sync-main: keep fork main tracking
+  # upstream, but a content conflict only warns (abort + summary + exit 0) —
+  # the compose job stacks from upstream HEAD and never reads fork main,
+  # and hourly noise for a conflict the nightly already reports helps nobody.
+  # Soft-fail is classified, not blanket: only a genuine content conflict
+  # (unmerged paths) or a confirmed stale-ref push rejection soft-fails;
+  # auth, permissions, transport, or any other merge/push failure stays loud.
+  sync-main:
+    # Fork-only, and main-only for the same accident-prevention reason as the
+    # compose job below: a dispatched ref runs its own workflow copy, so this
+    # guard is not a server-enforced boundary — it just keeps a stray dispatch
+    # from pushing fork main with this job's write token.
+    if: github.repository == 'btli/omnigent' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: staging-push
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout fork main with full history
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # App tokens cannot push workflow-file changes; prefer the
+          # workflows-scoped PAT, with GitHub token as fallback.
+          # PAT pushes trigger workflows, so PAT merges force a [skip ci] commit.
+          token: ${{ secrets.STAGING_PUSH_TOKEN || github.token }}
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge upstream main and push (soft-fail on conflict)
+        env:
+          HAS_PAT: ${{ secrets.STAGING_PUSH_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/omnigent-ai/omnigent.git
+          git fetch upstream main
+
+          soft_fail() {
+            { echo "## sync-main: $1"; echo ""; printf '%s\n' "$2"; } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::sync-main: $1 (see step summary) — this hour's staging compose still runs from upstream HEAD"
+            exit 0
+          }
+
+          # Same rule the composer applies: only genuine content conflicts
+          # (unmerged index entries) are skippable. A bad object or a transport
+          # error must stay loud instead of hiding behind an hourly warning.
+          merge_or_soft_fail() {
+            if [ "$HAS_PAT" = "true" ]; then
+              git merge --no-ff -m "Merge upstream main [skip ci]" "$1" && return 0
+            else
+              git merge --no-edit "$1" && return 0
+            fi
+            if [ -z "$(git ls-files -u)" ]; then
+              echo "::error::sync-main: git merge failed with no conflicting paths — not a content conflict"
+              exit 1
+            fi
+            paths="$(git diff --name-only --diff-filter=U | while read -r f; do printf -- '- %s\n' "\`$f\`"; done)"
+            git merge --abort
+            soft_fail "merge conflict with upstream main — resolve manually" "$paths"
+          }
+
+          # Soft-fail ONLY a confirmed non-fast-forward / stale-ref rejection
+          # on refs/heads/main, classified from `git push --porcelain` status
+          # lines (stage.py is-stale-ref-rejection) — never from free-form
+          # stderr. Auth, permissions, transport, or [remote rejected] hooks
+          # must fail the step — same discipline as merge_or_soft_fail above.
+          is_stale_ref_rejection() {
+            printf '%s\n' "$1" | python3 .github/scripts/personal-staging/stage.py \
+              is-stale-ref-rejection
+          }
+
+          merge_or_soft_fail FETCH_HEAD
+          # Porcelain status → stdout; prose errors → stderr. Classify stdout only.
+          if ! push_out=$(git push --porcelain origin main 2>push_err.txt); then
+            cat push_err.txt >&2
+            printf '%s\n' "$push_out" >&2
+            if ! is_stale_ref_rejection "$push_out"; then
+              echo "::error::sync-main: git push failed (not a stale-ref race)"
+              exit 1
+            fi
+            # Lost a race (the nightly, or a human push). Integrate and retry
+            # once; never force-push main.
+            git fetch origin main
+            merge_or_soft_fail FETCH_HEAD
+            if ! push_out=$(git push --porcelain origin main 2>push_err.txt); then
+              cat push_err.txt >&2
+              printf '%s\n' "$push_out" >&2
+              if is_stale_ref_rejection "$push_out"; then
+                soft_fail "could not push fork main" \
+                  "Lost the push race twice; the next hourly run retries."
+              fi
+              echo "::error::sync-main: git push failed after retry (not a stale-ref race)"
+              exit 1
+            fi
+          fi
+
+  # Secretless test gate: `uv run` installs third-party dev deps, so this job
+  # never holds a write token (the repo's default pytest testpaths never
+  # collect .github/scripts/**, hence the explicit run here).
+  test-composer:
+    if: github.repository == 'btli/omnigent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: false
+
+      - name: Test the staging composer
+        run: uv run --frozen --group dev python -m pytest .github/scripts/personal-staging/
+
+  # Privileged (pushes refs/heads/staging) but runs ONLY the stdlib composer.
+  # Independent of sync-main by design: staging stacks from upstream HEAD,
+  # never fork main.
+  compose:
+    needs: test-composer
+    # Accident prevention for non-main dispatches (schedule always runs main);
+    # a dispatched ref executes its own workflow copy, so this is not a
+    # security boundary — see the nightly workflow's integrate job.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: staging-push
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout fork with full history
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # App tokens cannot push workflow-file changes; prefer the
+          # workflows-scoped PAT, with GitHub token as fallback.
+          token: ${{ secrets.STAGING_PUSH_TOKEN || github.token }}
+          fetch-depth: 0
+
+      - name: Compose staging from upstream main + open btli PRs + extras
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # git merge --no-ff --no-commit checks identity before the composer reaches
+          # its commit phase (run 31338098075 failed here). This identity is preflight-only;
+          # stage.py's COMMIT_IDENT -c overrides set reproducible staging commit identities.
+          # Do not use GIT_AUTHOR_* / GIT_COMMITTER_* env instead: env beats -c,
+          # changing those identities and breaking same-day SHA reproducibility.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/omnigent-ai/omnigent.git
+          python3 .github/scripts/personal-staging/stage.py stage --staging-only \
+            --upstream-remote upstream --fork-remote origin \
+            --report merge-report.json
+
+      - name: Report failure
+        if: failure()
+        run: echo "## Personal staging hourly — compose job FAILED (see logs)" >> "$GITHUB_STEP_SUMMARY"

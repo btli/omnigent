@@ -1,0 +1,62 @@
+{
+  "merge_commits": [
+    "tree cb819bf55c4832e796cb89f06de277782a39c094\nparent d50e4666d789a86c2500f06370afb0f7f8bcc520\nparent a3cd760d1b37c73f15c3a3557cf26108ba463c01\nauthor omnigent-staging <staging@invalid> 1785662100 +0000\ncommitter omnigent-staging <staging@invalid> 1785662100 +0000\n\nstaging: merge PR #4 (pr-4 @ a3cd760d1b37)\n",
+    "tree b8bdf2cfb550046b8629f706efa219ced2ca01d9\nparent 46d2d1f30d542867c1d6b54f0907fac00a46e0fa\nparent 30297b0a8b5c44a5b6f9555f527e5975173149a7\nauthor omnigent-staging <staging@invalid> 1785781800 +0000\ncommitter omnigent-staging <staging@invalid> 1785781800 +0000\n\nstaging: merge PR #9 (pr-9 @ 30297b0a8b5c)\n"
+  ],
+  "notes": "Nightly personal staging ring for 20260820 (UTC).\n\n- Upstream main: `d50e4666d789a86c2500f06370afb0f7f8bcc520`\n- Staging commit: `6a1c119077ab9279705945f51755b803c07411ee`\n- Dev tag: `v1.2.3.dev20260820`\n\n## Applied PRs (2)\n- #4 `pr-4` @ `a3cd760d1b37`\n- #9 `pr-9` @ `30297b0a8b5c`\n\n## Skipped PRs (0)\n- none\n\n## APK signing\nDebug APK signed with the shared debug keystore \u2014 installs upgrade in place.\n",
+  "pushed": [
+    [
+      "push",
+      "--atomic",
+      "--force-with-lease=refs/heads/staging:",
+      "--force-with-lease=refs/heads/nightly-20260820:",
+      "--force-with-lease=refs/tags/nightly-20260820:",
+      "--force-with-lease=refs/tags/v1.2.3.dev20260820:",
+      "origin",
+      "6a1c119077ab9279705945f51755b803c07411ee:refs/heads/staging",
+      "6a1c119077ab9279705945f51755b803c07411ee:refs/heads/nightly-20260820",
+      "6a1c119077ab9279705945f51755b803c07411ee:refs/tags/nightly-20260820",
+      "6a1c119077ab9279705945f51755b803c07411ee:refs/tags/v1.2.3.dev20260820"
+    ]
+  ],
+  "report": {
+    "applied": [
+      {
+        "branch": "pr-4",
+        "minted": true,
+        "oid": "a3cd760d1b37c73f15c3a3557cf26108ba463c01",
+        "pr": 4,
+        "source": "open"
+      },
+      {
+        "branch": "pr-9",
+        "minted": true,
+        "oid": "30297b0a8b5c44a5b6f9555f527e5975173149a7",
+        "pr": 9,
+        "source": "open"
+      }
+    ],
+    "audit": [
+      {
+        "expected": "6a1c119077ab9279705945f51755b803c07411ee",
+        "observed": "6a1c119077ab9279705945f51755b803c07411ee",
+        "ref": "refs/tags/nightly-20260820"
+      },
+      {
+        "expected": "6a1c119077ab9279705945f51755b803c07411ee",
+        "observed": "6a1c119077ab9279705945f51755b803c07411ee",
+        "ref": "refs/heads/nightly-20260820"
+      }
+    ],
+    "branch": "nightly-20260820",
+    "date": "20260820",
+    "dev_tag": "v1.2.3.dev20260820",
+    "pin_created": true,
+    "pin_ref": "refs/tags/nightly-20260820",
+    "skipped": [],
+    "staging_sha": "6a1c119077ab9279705945f51755b803c07411ee",
+    "tag": "nightly-20260820",
+    "upstream_sha": "d50e4666d789a86c2500f06370afb0f7f8bcc520"
+  },
+  "summary": "## Personal staging nightly\n\n| | |\n| --- | --- |\n| Upstream main | `d50e4666d789a86c2500f06370afb0f7f8bcc520` |\n| Staging | `6a1c119077ab9279705945f51755b803c07411ee` |\n| Pin | `nightly-20260820` |\n| Dev tag | `v1.2.3.dev20260820` |\n| Applied / skipped | 2 / 0 |\n"
+}

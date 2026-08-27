@@ -43,6 +43,7 @@ Omnigent lets you:
 
 - **☁️ Run agents in cloud sandboxes.** No laptop required: run sessions in
   disposable [Modal](https://modal.com), [Daytona](https://www.daytona.io),
+  [Blaxel](https://blaxel.ai),
   [Islo](https://islo.dev), [E2B](https://e2b.dev),
   [CoreWeave](https://docs.coreweave.com/products/sandboxes),
   [Kubernetes](https://kubernetes.io), [OpenShell](https://github.com/NVIDIA/OpenShell),
@@ -80,7 +81,7 @@ curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/i
 Available user-facing extras include:
 
 - **Model providers:** `databricks`, `bedrock`, `vertex`
-- **Sandbox providers:** `modal`, `daytona`, `boxlite`, `cwsandbox`, `e2b`,
+- **Sandbox providers:** `modal`, `daytona`, `blaxel`, `boxlite`, `cwsandbox`, `e2b`,
   `openshell`, `kubernetes`
 - **SDK harnesses:** `antigravity`, `copilot`, `cursor`, `agents-sdk`
 - **Storage and memory:** `s3`, `hindsight`
@@ -262,6 +263,7 @@ Or launch a specific agent runtime:
 omnigent claude                      # Claude Code, in a session your team can join
 omnigent codex                       # Codex
 omnigent cursor                      # Cursor
+omnigent agy                         # Antigravity
 omnigent opencode                    # OpenCode
 omnigent hermes                      # Hermes Agent (Nous Research)
 omnigent pi                          # Pi
@@ -269,6 +271,40 @@ omnigent pi                          # Pi
 
 Using OpenClaw? See the [OpenClaw integration guide](docs/openclaw.md) to import
 its coding agents or drive a live OpenClaw Gateway session over ACP.
+
+<details>
+<summary>Grok Build and Devin</summary>
+
+Two more coding agents are built in but have no `omnigent <name>` launcher of
+their own, because each ships a CLI that holds its own login. Install the vendor
+CLI, log in with it, then name the harness:
+
+```bash
+# Grok Build (xAI)
+curl -fsSL https://x.ai/cli/install.sh | bash
+grok login --device-auth              # xAI OAuth
+omnigent run --harness grok           # 'grok-build' also works
+
+# Devin (Cognition)
+curl -fsSL https://cli.devin.ai/install.sh | bash
+devin auth login
+omnigent run --harness devin
+```
+
+Both speak the [Agent Client Protocol](https://agentclientprotocol.com) over
+stdio, and Omnigent stores no credential for either — each CLI reads back the
+login it wrote to disk. That also means `--model` is refused rather than
+silently dropped: both run their account-default model. To pin one, configure an
+`acp:` agent whose command passes the vendor's own model flag.
+
+Use the vendor login rather than an API key. A builtin ACP row has no
+`env_passthrough` of its own, and `XAI_API_KEY` is not in the host-to-runner
+credential allowlist, so exporting it in your shell does not reach the agent.
+If you need the key route, pass it explicitly with
+`OMNIGENT_RUNNER_ENV_PASSTHROUGH=XAI_API_KEY`, or configure an `acp:` agent that
+declares the passthrough.
+
+</details>
 
 #### 🐙 Polly and 🟠🔵 Debby
 
@@ -305,7 +341,7 @@ plus one `tools/mcp/*.yaml` server, no sub-agents.
 machine as a host:
 
 ```bash
-omnigent host --background   # starts the local server too, then returns
+omnigent start   # starts the local server and registers this machine as a host
 ```
 
 Open the server URL it prints, hit **New Chat**, pick your machine, and go.
@@ -364,8 +400,10 @@ Face Spaces**, **Modal**, **Cloudflare** (serverless, scale-to-zero), and
 covered too — and a **Cloudflare quick tunnel** (public) or **Tailscale**
 (private) reaches a server running on your own laptop without a deploy. The
 server can also provision a cloud sandbox per session (*managed hosts*), so no
-laptop has to stay online. The full menu of targets, the database options, and
-the sandbox setup live in
+laptop has to stay online. The full menu of targets, the database options, the
+sandbox setup, and
+[branding/white-labeling](https://github.com/omnigent-ai/omnigent/blob/main/deploy/README.md#branding-white-labeling)
+live in
 [`deploy/README.md`](https://github.com/omnigent-ai/omnigent/blob/main/deploy/README.md).
 
 Once the server is up, sign in and register your laptop as a host:
@@ -410,6 +448,9 @@ and they're in. Signup is invite-only.
 
 - **Share a live session.** Hit **Share** in the web UI and send the link;
   teammates watch your agent work and chat with it in real time.
+- **Leave a shared session.** Done with a session someone shared with you?
+  Pick **Leave session** from its sidebar row menu to drop it from your
+  sidebar. Nothing is deleted — the owner keeps it and can share it again.
 - **Co-drive.** A teammate co-attaches to your running session; their
   messages execute on **your** machine. Great for pairing or handing the
   keyboard to a domain expert mid-investigation.
@@ -424,11 +465,6 @@ and they're in. Signup is invite-only.
   ```bash
   omnigent run --fork <session_id>
   ```
-
-Shared sessions identify model-visible messages with `[account]:` labels by
-default. Set `OMNIGENT_SHARED_MESSAGE_ATTRIBUTION_ENABLED=0` to hide those
-labels. This does not change stored authors, UI avatars, or who may approve or
-run privileged actions.
 
 > [!TIP]
 > Want your team to sign in with the logins they already have (**Google,

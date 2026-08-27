@@ -12,11 +12,13 @@ import pytest
 from fastapi import HTTPException
 
 from omnigent.entities import Conversation
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.routes._host_launch import (
     resolve_host_launch,
     resolve_host_launch_allowlist,
     resolve_host_owner,
 )
+from omnigent.stores.host_store import now_epoch
 
 _MAINTAINER = "alice"
 _SA_IDENTITY = "system:serviceaccount:webhooks:webhook"
@@ -27,6 +29,8 @@ class _FakeHost:
     host_id: str = "host_1"
     name: str = "test-host"
     user_id: str = "alice"
+    status: str = "online"
+    updated_at: int = field(default_factory=now_epoch)
 
 
 @dataclass
@@ -248,11 +252,11 @@ class TestResolveHostLaunchAllowlist:
 
 class TestResolveHostLaunch:
     def test_host_offline_409(self) -> None:
-        host = _FakeHost(host_id="host_1", user_id="alice")
+        host = _FakeHost(host_id="host_1", user_id="alice", status="offline")
         store = _FakeHostStore(hosts={"host_1": host})
         registry = _FakeHostRegistry()  # empty = no connections
         conv_store = _FakeConversationStore()
-        with pytest.raises(HTTPException) as exc_info:
+        with pytest.raises(OmnigentError) as exc_info:
             resolve_host_launch(
                 user_id="alice",
                 host_id="host_1",
@@ -262,7 +266,7 @@ class TestResolveHostLaunch:
                 conversation_store=conv_store,
                 permission_store=None,
             )
-        assert exc_info.value.status_code == 409
+        assert exc_info.value.code == ErrorCode.CONFLICT
 
     def test_missing_session_404(self) -> None:
         host = _FakeHost(host_id="host_1", user_id="alice")

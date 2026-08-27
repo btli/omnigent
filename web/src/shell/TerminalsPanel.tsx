@@ -243,7 +243,7 @@ export function TerminalsPanel({
                 sessionId={conversationId}
                 terminalId={activeTerminal.id}
                 readOnly={readOnly}
-                transport={activeTerminal.transport}
+                directAttachUrl={activeTerminal.directAttachUrl}
                 onStateChange={(state) => {
                   setTerminalConnectionState(activeTerminal.id, state);
                 }}

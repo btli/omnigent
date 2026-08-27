@@ -1,0 +1,137 @@
+name: Publish personal staging images
+run-name: Publish personal staging images (${{ inputs.ref }}) by @${{ github.actor }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Existing nightly-* tag name (bare, e.g. nightly-20260809)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: personal-staging-images
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    if: github.repository == 'btli/omnigent'
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ format('refs/tags/{0}', inputs.ref) }}
+
+      - name: Resolve source tag
+        id: source
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+
+          case "${INPUT_REF}" in
+            nightly-*) tag_name="${INPUT_REF}" ;;
+            *)
+              echo "Dispatch ref must be a nightly-* tag name, got '${INPUT_REF}'." >&2
+              exit 1
+              ;;
+          esac
+
+          if [[ ! "${tag_name}" =~ ^nightly-[A-Za-z0-9_.-]{1,120}$ ]]; then
+            echo "Tag '${tag_name}' is not a valid Docker tag name." >&2
+            exit 1
+          fi
+          if ! git check-ref-format "refs/tags/${tag_name}" >/dev/null; then
+            echo "Invalid tag ref '${tag_name}'." >&2
+            exit 1
+          fi
+
+          short_sha="$(git rev-parse HEAD | cut -c1-12)"
+          server_image='ghcr.io/btli/omnigent-server'
+          host_image='ghcr.io/btli/omnigent-host'
+          echo "server_tags=${server_image}:sha-${short_sha},${server_image}:${tag_name}" >> "${GITHUB_OUTPUT}"
+          echo "host_tags=${host_image}:sha-${short_sha},${host_image}:${tag_name}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3  # v4.1.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+
+      - name: Install crane
+        env:
+          CRANE_VERSION: v0.21.6
+          CRANE_ARCHIVE: go-containerregistry_Linux_x86_64.tar.gz
+          CRANE_SHA256: 7ebbdcd05b652345c1f5105f8475e518534b90d66f3bdb50017be63f426ea435
+        run: |
+          set -euo pipefail
+          base_url="https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}"
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "${tmp_dir}"' EXIT
+          curl --fail --silent --show-error --location --retry 5 \
+            "${base_url}/checksums.txt" -o "${tmp_dir}/checksums.txt"
+          curl --fail --silent --show-error --location --retry 5 \
+            "${base_url}/${CRANE_ARCHIVE}" -o "${tmp_dir}/${CRANE_ARCHIVE}"
+          expected_sha256="$(awk -v archive="${CRANE_ARCHIVE}" '$2 == archive { print $1; exit }' "${tmp_dir}/checksums.txt")"
+          test "${expected_sha256}" = "${CRANE_SHA256}"
+          printf '%s  %s\n' "${CRANE_SHA256}" "${tmp_dir}/${CRANE_ARCHIVE}" | sha256sum --check --status
+          tar --extract --gzip --file "${tmp_dir}/${CRANE_ARCHIVE}" --directory "${tmp_dir}" crane
+          install -m 0755 "${tmp_dir}/crane" "${RUNNER_TEMP}/crane"
+          echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push server image
+        id: build-server
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: runtime
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.source.outputs.server_tags }}
+          cache-from: type=registry,ref=ghcr.io/btli/omnigent-server:buildcache
+          cache-to: type=registry,ref=ghcr.io/btli/omnigent-server:buildcache,mode=max
+          provenance: false
+          sbom: true
+
+      - name: Build and push host image
+        id: build-host
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: host
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.source.outputs.host_tags }}
+          cache-from: type=registry,ref=ghcr.io/btli/omnigent-host:buildcache
+          cache-to: type=registry,ref=ghcr.io/btli/omnigent-host:buildcache,mode=max
+          provenance: false
+          sbom: true
+
+      - name: Publish staging-nightly tags
+        env:
+          SERVER_DIGEST: ${{ steps.build-server.outputs.digest }}
+          HOST_DIGEST: ${{ steps.build-host.outputs.digest }}
+        run: |
+          set -euo pipefail
+          test -n "${SERVER_DIGEST}"
+          test -n "${HOST_DIGEST}"
+          crane tag "ghcr.io/btli/omnigent-server@${SERVER_DIGEST}" staging-nightly
+          crane tag "ghcr.io/btli/omnigent-host@${HOST_DIGEST}" staging-nightly

@@ -156,9 +156,9 @@ interface ElectronDesktopApi extends NativeShellApi {
    * idle, so the web never shows a (duplicate) banner. Absent on older shells.
    */
   updates?: ElectronUpdateBridge;
-  /** Current server origin + recent servers, or null on a foreign page. */
+  /** Current server origin + managed/recent choices, or null on a foreign page. */
   getServerPicker?: () => Promise<ServerPickerInfo | null>;
-  /** Re-point this window to a previously-connected server URL. */
+  /** Re-point this window to a server URL returned by the picker. */
   switchServer?: (url: string) => Promise<void>;
   /** Return this window to the shell's "connect to server" setup page. */
   openServerSetup?: () => void;
@@ -183,6 +183,13 @@ interface ElectronDesktopApi extends NativeShellApi {
     bounds?: unknown,
     opts?: { force?: boolean; agent?: boolean },
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
+  /**
+   * Hide/show the active embedded browser view while a DOM overlay is open.
+   * The native view paints above the renderer, so this is how overlays
+   * (dialogs, menus, tooltips, toasts) avoid being covered. Absent on shells
+   * predating the feature — callers must optional-chain.
+   */
+  browserSetSuppressed?: (suppressed: boolean) => Promise<{ ok: boolean; error?: string }>;
 }
 
 /** A lifecycle action for the host daemon. */
@@ -216,6 +223,13 @@ export interface HostIdentity {
 export interface HostActionResult {
   ok: boolean;
   error?: string;
+  /**
+   * True when the failure was an authentication/sign-in problem — e.g. the
+   * server needs a Databricks/OIDC login the desktop couldn't complete
+   * headlessly — so the UI can offer a sign-in/retry affordance rather than a
+   * generic error. Set by the desktop's `omnigent:host-control` handler.
+   */
+  authError?: boolean;
 }
 
 export type UpdateMode = "none" | "manual" | "start" | "default";
@@ -226,7 +240,10 @@ export interface UpdateConfig {
   skippedVersion: string | null;
 }
 
-export type UpdateStatus =
+export type UpdateStatus = {
+  /** Installed Electron app version; absent on older desktop shells. */
+  currentVersion?: string;
+} & (
   | {
       state: "idle" | "checking" | "none";
       info?: undefined;
@@ -250,7 +267,8 @@ export type UpdateStatus =
       info?: { version: string; releaseNotes?: string };
       progress?: undefined;
       lastError?: string;
-    };
+    }
+);
 
 export interface ElectronUpdateBridge {
   getConfig: () => Promise<UpdateConfig>;
@@ -260,14 +278,89 @@ export interface ElectronUpdateBridge {
   installNow: () => Promise<void>;
   setConfig: (patch: Partial<UpdateConfig>) => Promise<UpdateConfig>;
   onStatus: (callback: (status: UpdateStatus) => void) => () => void;
+  /** Shell-owned update card height; optional on older desktop builds. */
+  getOverlayHeight?: () => Promise<number>;
+  /** Subscribe to shell-owned update card height changes. */
+  onOverlayHeight?: (callback: (height: number) => void) => () => void;
 }
 
 /** Data backing the title-bar server picker, from the Electron shell. */
 export interface ServerPickerInfo {
   /** Origin this window is connected to, e.g. `"http://localhost:8000"`. */
   currentOrigin: string;
+  /**
+   * Server URLs supplied through macOS Managed Preferences. Optional because a
+   * newer server-served SPA can run inside a desktop shell that predates MDM.
+   */
+  managedServers?: string[];
   /** Recently-connected server URLs, most recent first. */
   recentServers: string[];
+  /**
+   * The connected server's version manifest (`/.well-known/omnigent.json`),
+   * forwarded by the shell. Optional: shells older than the manifest simply
+   * don't send it — see {@link serverManifestOf}, which supplies the
+   * pre-manifest baseline so callers never handle `undefined`.
+   */
+  serverManifest?: ServerManifest;
+}
+
+/**
+ * The server's version manifest, as forwarded by the desktop shell from
+ * `GET /.well-known/omnigent.json`.
+ *
+ * Read it through {@link serverManifestOf} and gate on `manifestVersion >= N`,
+ * never `=== N`: a newer server must keep working with an older client, which
+ * is the entire point of the document.
+ */
+export interface ServerManifest {
+  /**
+   * Envelope version. `0` is the pre-manifest baseline — a server older than
+   * the manifest route, or one the shell could not read — so the ordinary
+   * `>= 1` gate excludes it without callers testing for null.
+   */
+  manifestVersion: number;
+  /** Installed omnigent package version. Display only, never gate on it. */
+  serverVersion: string | null;
+  /** Oldest supported desktop build, or null for no floor (the normal case). */
+  minDesktopVersion: string | null;
+  /**
+   * Where server-driven chrome lives. `server_picker` is `"sidebar"` on builds
+   * that dock the picker at the sidebar's bottom, `"titlebar"` on older ones.
+   * Loosely typed on purpose: unknown keys are the extension point, so a newer
+   * server can add shapes this build has never heard of.
+   */
+  ui: Record<string, unknown>;
+}
+
+/**
+ * The pre-manifest baseline: what a server implies when it has no manifest —
+ * every server older than the route — or when the shell is too old to forward
+ * one. `manifestVersion: 0` fails every `>= 1` gate, so callers fall back to
+ * existing behavior without distinguishing "absent" from "unreadable".
+ */
+export const PRE_MANIFEST_BASELINE: ServerManifest = {
+  manifestVersion: 0,
+  serverVersion: null,
+  minDesktopVersion: null,
+  ui: {},
+};
+
+/**
+ * The manifest carried by a picker payload, or the pre-manifest baseline.
+ *
+ * Use this rather than reading `info.serverManifest` directly: the field is
+ * absent on older shells, and this collapses that case into a real manifest so
+ * every caller can gate on `manifestVersion` unconditionally.
+ *
+ * @param info A payload from {@link getServerPicker}, or null off-shell.
+ */
+export function serverManifestOf(info: ServerPickerInfo | null): ServerManifest {
+  const manifest = info?.serverManifest;
+  // Validate rather than trust: this crosses the IPC boundary from a shell
+  // whose version is unknown, so a malformed/partial object degrades to the
+  // baseline instead of yielding NaN comparisons downstream.
+  if (!manifest || typeof manifest.manifestVersion !== "number") return PRE_MANIFEST_BASELINE;
+  return manifest;
 }
 
 /** The Electron preload bridge, or undefined outside the Electron shell. */
@@ -586,8 +679,8 @@ export function onNativeInsets(callback: (insets: NativeInsets) => void): () => 
 }
 
 /**
- * Fetch the title-bar server picker data from the Electron shell: the
- * window's current server origin plus the recently-connected server list.
+ * Fetch server picker data from the Electron shell: the current origin plus
+ * organization-provided and recently-connected server lists.
  *
  * Resolves `null` outside the Electron shell, under a shell too old to
  * support the picker, or on a page the shell doesn't recognize as a
@@ -605,9 +698,9 @@ export async function getServerPicker(): Promise<ServerPickerInfo | null> {
 }
 
 /**
- * Ask the Electron shell to re-point this window to another
- * previously-connected server URL (one of `ServerPickerInfo.recentServers`).
- * The shell navigates the whole window, so on success this page unloads.
+ * Ask the Electron shell to re-point this window to another URL returned in
+ * `ServerPickerInfo.managedServers` or `recentServers`. The shell navigates the
+ * whole window, so on success this page unloads.
  */
 export async function switchServer(url: string): Promise<void> {
   const electron = electronApi();

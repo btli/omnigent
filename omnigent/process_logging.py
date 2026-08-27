@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import logging
 import os
@@ -267,6 +268,22 @@ def current_process_log_path() -> Path | None:
     return _current_process_log_path or _process_log_file_from_env()
 
 
+def process_log_dir_reference(destination: str) -> str:
+    """Return a user-facing pointer to a process-log *directory*.
+
+    Resolved through :func:`process_log_dir`, so the path tracks
+    ``OMNIGENT_DATA_DIR`` instead of assuming the default tree. Use this
+    rather than :func:`process_log_reference` when the message is about a
+    different process than the caller. The CLI naming where the host daemon
+    logs must point at the host directory, not the CLI's own log file.
+
+    :param destination: Process-log destination, e.g. ``"host"``.
+    :returns: A display path with a trailing separator, e.g.
+        ``"~/.omnigent/logs/host/"``.
+    """
+    return f"{display_log_path(process_log_dir(destination))}/"
+
+
 def process_log_reference(destination: str) -> str:
     """Return a user-facing pointer to this process's log for error messages.
 
@@ -283,7 +300,7 @@ def process_log_reference(destination: str) -> str:
     path = current_process_log_path()
     if path is not None:
         return display_log_path(path)
-    return f"{display_log_path(process_log_dir(destination))}/"
+    return process_log_dir_reference(destination)
 
 
 def _terminal_stream() -> TextIO | None:
@@ -333,6 +350,16 @@ def terminal_log_formatter() -> logging.Formatter:
     return TerminalLogFormatter(use_colors=terminal_supports_color())
 
 
+def _unlink_if_empty(path: Path) -> None:
+    """Remove *path* if it is still an empty file.
+
+    :param path: Log file to sweep, e.g. a self-allocated host log.
+    """
+    with contextlib.suppress(OSError):
+        if path.stat().st_size == 0:
+            path.unlink()
+
+
 def configure_process_logging(
     destination: str,
     *,
@@ -354,6 +381,11 @@ def configure_process_logging(
     path = Path(log_path).expanduser() if log_path is not None else _process_log_file_from_env()
     if path is None:
         path = create_process_log_path(destination)
+        # A process that dies before its first record would leave this
+        # freshly created file empty forever (crash-at-birth hosts littered
+        # dozens a day); sweep it on exit. Self-allocated paths only — a
+        # parent-published or explicit path is the caller's to manage.
+        atexit.register(_unlink_if_empty, path)
     path.parent.mkdir(parents=True, exist_ok=True)
     _current_process_log_path = path
 
@@ -397,8 +429,35 @@ def configure_process_logging(
             for handler in handlers:
                 _add_handler_once(logger, handler)
 
+    # Mirror the file handler's reach with the optional debug-log upload sink,
+    # so it captures the same records this process writes to disk.
+    from omnigent.debug_logging import attach_debug_log_sink
+
+    sink_targets = _debug_sink_target_loggers(logger_names, root=root)
+    attach_debug_log_sink(sink_targets, source=destination, level=resolved_level)
+
     logging.captureWarnings(True)
     return path
+
+
+def _debug_sink_target_loggers(logger_names: Sequence[str], *, root: bool) -> list[logging.Logger]:
+    """Loggers the debug-log sink must attach to, mirroring the file handler.
+
+    The sink has to sit wherever a record is actually handled. A package logger
+    with ``propagate=False`` (e.g. ``omnigent`` under the CLI diagnostics setup)
+    never reaches root, so a root-only sink would miss every record logged under
+    it. This matches the file-handler placement in
+    :func:`configure_process_logging` exactly, so the sink captures the same
+    records the process writes to disk.
+    """
+    targets: list[logging.Logger] = []
+    if root:
+        targets.append(logging.getLogger())
+    for name in logger_names:
+        logger = logging.getLogger(name)
+        if not logger.propagate or not root:
+            targets.append(logger)
+    return targets
 
 
 def _add_handler_once(logger: logging.Logger, handler: logging.Handler) -> None:

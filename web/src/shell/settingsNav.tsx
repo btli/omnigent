@@ -33,6 +33,7 @@ export type SettingsSectionId =
   | "appearance"
   | "git"
   | "shortcuts"
+  | "import"
   | "account"
   | "members"
   | "policies"
@@ -45,6 +46,7 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
   "git",
   "shortcuts",
+  "import",
   "account",
   "members",
   "policies",
@@ -86,6 +88,7 @@ export function settingsNavGroups(
     { id: "appearance", label: "Appearance", icon: PaletteIcon },
     { id: "git", label: "Git", icon: GitBranchIcon },
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon, hideOnMobile: true },
+    { id: "import", label: "Import sessions", icon: DownloadIcon },
   ];
   if (hasAuthSession) {
     // Account leads the group when present — it's the most-visited section
@@ -211,7 +214,11 @@ export function SettingsSidebarBody({
 
   return (
     <>
-      <div className="px-3 pt-3">
+      {/* settings-sidebar-header carries the same traffic-light clearance the
+      home sidebar's header row gets: with the sidebar now starting at the
+      window's top edge on the macOS shell, this Back row would otherwise sit
+      underneath the window controls (see index.css). Inert elsewhere. */}
+      <div className="settings-sidebar-header px-3 pt-3">
         <Button
           asChild
           variant="ghost"
@@ -257,6 +264,7 @@ export function SettingsSidebarBody({
                     to={`/settings/${item.id}`}
                     onClick={onNavClick}
                     data-testid={`settings-nav-${item.id}`}
+                    componentId={`settings.nav.${item.id}`}
                     aria-current={selected ? "page" : undefined}
                   >
                     <Icon

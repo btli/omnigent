@@ -56,6 +56,7 @@ from omnigent.inner.executor import (
     ToolCallStatus,
     ToolSpec,
     TurnComplete,
+    describe_exception,
 )
 from omnigent.inner.os_env import OSEnvironment, create_os_environment
 
@@ -456,7 +457,7 @@ class GooseExecutor(Executor):
             for fut in self._pending.values():
                 if not fut.done():
                     fut.set_exception(exc)
-            await self._queue.put({"type": "error", "message": str(exc)})
+            await self._queue.put({"type": "error", "message": describe_exception(exc)})
 
     async def _send(self, msg: _AcpJsonObject) -> None:
         """Write one newline-terminated JSON message to goose stdin."""
@@ -1102,7 +1103,7 @@ class GooseExecutor(Executor):
             await self._ensure_initialized()
             session_id = await self._ensure_session()
         except Exception as exc:  # noqa: BLE001
-            yield ExecutorError(message=str(exc), retryable=False)
+            yield ExecutorError(message=describe_exception(exc), retryable=False)
             return
 
         # A fresh ACP session (first turn of a new/respawned process, or after
@@ -1195,7 +1196,8 @@ class GooseExecutor(Executor):
             if fut.done() and self._queue.empty():
                 try:
                     response = fut.result()
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
+                    logger.exception("goose process response retrieval failed")
                     self._session_id = None
                     self._system_prompt_sent = False
                     yield ExecutorError(message=f"goose process error: {exc}", retryable=True)

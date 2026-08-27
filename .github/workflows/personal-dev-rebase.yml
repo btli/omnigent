@@ -1,0 +1,197 @@
+# Nightly auto-rebase of fork branch `development` onto upstream main.
+#
+# dev.omni runs `development` live (no build): this keeps its base fresh
+# while PRESERVING experiment commits — never-clobber semantics. Every
+# non-success outcome leaves the branch exactly as it was and exits green:
+#   - conflict        → rebase --abort + ::warning:: + ha-notify, no push
+#   - upstream moved  → skip the push, retry next run
+#   - lease rejected  → a concurrent `just dev-sync` won the race, no push
+#   - branch missing  → pre-cutover no-op (development not created yet)
+# The manual `just dev-branch` / `just dev-sync` recipes stay authoritative;
+# only genuine infrastructure failures (auth, transport) go red.
+name: Personal Dev Rebase
+
+on:
+  schedule:
+    # After the production compose's 10:30 slot; off the congested :00 minute
+    # like the other fork schedules.
+    - cron: "45 10 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Reruns coalesce — a queued rebase is worthless once a newer one runs. Own
+# group so it can never cancel (or be cancelled by) the staging or
+# production composes.
+concurrency:
+  group: personal-dev-rebase
+  cancel-in-progress: true
+
+jobs:
+  rebase:
+    if: github.repository == 'btli/omnigent' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Same PAT protection as the composes; the push touches no workflow
+    # files, so the github.token fallback works too when no PAT is set.
+    environment: staging-push
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      # This workflow lands BEFORE the branch-creation cutover: a missing
+      # `development` must be a green no-op, not a red checkout failure.
+      # Only ls-remote exit 2 (ref confirmed absent) is the no-op; transport
+      # or auth failures stay loud so the failure alert fires.
+      - name: Probe for the development branch
+        id: probe
+        run: |
+          set -euo pipefail
+          rc=0
+          git ls-remote --exit-code --heads \
+            "https://github.com/${GITHUB_REPOSITORY}.git" development >/dev/null || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          elif [ "$rc" -eq 2 ]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "## Personal dev rebase"
+              echo ""
+              echo "\`development\` branch not created yet — no-op (pre-cutover)."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::probe for the development branch failed (exit $rc)"
+            exit "$rc"
+          fi
+
+      - name: Checkout development with full history
+        if: steps.probe.outputs.exists == 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # App tokens cannot push workflow-file changes; prefer the
+          # workflows-scoped PAT, with GitHub token as fallback.
+          token: ${{ secrets.STAGING_PUSH_TOKEN || github.token }}
+          ref: development
+          fetch-depth: 0
+
+      - name: Rebase onto upstream main (never clobber)
+        if: steps.probe.outputs.exists == 'true'
+        env:
+          HA_NOTIFY_HMAC: ${{ secrets.HA_NOTIFY_HMAC }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Neutral committer identity for the rewritten (rebased) commits;
+          # author identity/dates on the experiment commits are preserved.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/omnigent-ai/omnigent.git
+          git fetch upstream main
+
+          # The push classifier lives on the fork's main; this checkout is
+          # `development` (upstream-based, may not carry it). fetch-depth: 0
+          # brought every branch, so extract the trusted copy up front — a
+          # missing script is a loud infrastructure failure, not a soft skip.
+          CLASSIFIER="$RUNNER_TEMP/stage-classify.py"
+          git show origin/main:.github/scripts/personal-staging/stage.py > "$CLASSIFIER"
+
+          summary() { printf '%s\n' "$@" >> "$GITHUB_STEP_SUMMARY"; }
+
+          # Best-effort by contract (spec decision 13): the receiver may not
+          # be live yet; an unreachable hook or an absent secret only warns.
+          ha_notify() {
+            if [ -z "$HA_NOTIFY_HMAC" ]; then
+              echo "::warning::ha-notify skipped: HA_NOTIFY_HMAC secret is not set"
+              return 0
+            fi
+            local body sig
+            body=$(python3 -c 'import json,sys; print(json.dumps({"message": sys.argv[1]}))' "$1")
+            sig=$(printf '%s' "$body" | python3 -c 'import hashlib,hmac,os,sys; print(hmac.new(os.environ["HA_NOTIFY_HMAC"].encode(), sys.stdin.buffer.read(), hashlib.sha256).hexdigest())')
+            curl -fsS -m 15 -X POST https://hooks.bryanli.net/hooks/ha-notify \
+              -H "Content-Type: application/json" \
+              -H "X-Hub-Signature-256: sha256=$sig" \
+              --data-binary "$body" \
+              || echo "::warning::ha-notify unreachable"
+          }
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            summary "## Personal dev rebase" "" "Already based on upstream main — no-op."
+            exit 0
+          fi
+
+          OLD=$(git rev-parse HEAD)
+          BASE=$(git rev-parse upstream/main)
+
+          if ! git rebase upstream/main; then
+            conflicts=$(git diff --name-only --diff-filter=U)
+            git rebase --abort
+            summary "## Personal dev rebase — CONFLICT (branch left untouched)" ""
+            printf '%s\n' "$conflicts" | while read -r f; do
+              if [ -n "$f" ]; then summary "- \`$f\`"; fi
+            done
+            summary "" "Resolve manually (local rebase or \`just dev-sync\`); this run changed nothing."
+            echo "::warning::development rebase conflict — branch left untouched: $(printf '%s' "$conflicts" | tr '\n' ' ')"
+            ha_notify "omnigent development rebase conflict — branch left untouched. Conflicts: $(printf '%s' "$conflicts" | tr '\n' ' '). $RUN_URL"
+            exit 0
+          fi
+
+          # Re-resolve the upstream tip immediately before pushing: rebasing
+          # onto a base that is already stale must not publish — the next
+          # run rebases onto the fresh tip instead.
+          git fetch upstream main
+          if [ "$(git rev-parse upstream/main)" != "$BASE" ]; then
+            summary "## Personal dev rebase" "" \
+              "Upstream advanced mid-rebase; retrying next run (nothing pushed)."
+            exit 0
+          fi
+
+          # The lease pins the pre-rebase sha: a concurrent dev-sync (or any
+          # human push) wins and this run backs off — never clobber. Soft-fail
+          # ONLY a confirmed stale-ref/lease rejection on refs/heads/development,
+          # classified from `git push --porcelain` status lines (stdout — never
+          # free-form stderr prose). Auth, transport, or [remote rejected] hooks
+          # must fail the step so alert-failure fires.
+          if ! push_out=$(git push --porcelain \
+              --force-with-lease=refs/heads/development:"$OLD" \
+              origin HEAD:refs/heads/development 2>"$RUNNER_TEMP/push_err.txt"); then
+            cat "$RUNNER_TEMP/push_err.txt" >&2
+            printf '%s\n' "$push_out" >&2
+            if ! printf '%s\n' "$push_out" | python3 "$CLASSIFIER" \
+                is-stale-ref-rejection --ref refs/heads/development; then
+              echo "::error::development push failed (not a lease race)"
+              exit 1
+            fi
+            summary "## Personal dev rebase" "" \
+              "Lease push rejected (concurrent push to \`development\`) — nothing overwritten; next run retries."
+            echo "::warning::development lease push rejected — a concurrent update won; this run changed nothing"
+            exit 0
+          fi
+          summary "## Personal dev rebase" "" \
+            "Rebased \`development\` onto upstream main: \`$OLD\` → \`$(git rev-parse HEAD)\`."
+
+  # Genuine infrastructure failure (auth, transport, broken probe) — the
+  # soft outcomes above all exit 0 and never reach this job.
+  alert-failure:
+    needs: rebase
+    if: failure() && github.repository == 'btli/omnigent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Notify Home Assistant
+        env:
+          HA_NOTIFY_HMAC: ${{ secrets.HA_NOTIFY_HMAC }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "$HA_NOTIFY_HMAC" ]; then
+            echo "::warning::ha-notify skipped: HA_NOTIFY_HMAC secret is not set"
+            exit 0
+          fi
+          body=$(python3 -c 'import json,sys; print(json.dumps({"message": sys.argv[1]}))' \
+            "omnigent dev-rebase workflow FAILED — $RUN_URL")
+          sig=$(printf '%s' "$body" | python3 -c 'import hashlib,hmac,os,sys; print(hmac.new(os.environ["HA_NOTIFY_HMAC"].encode(), sys.stdin.buffer.read(), hashlib.sha256).hexdigest())')
+          curl -fsS -m 15 -X POST https://hooks.bryanli.net/hooks/ha-notify \
+            -H "Content-Type: application/json" \
+            -H "X-Hub-Signature-256: sha256=$sig" \
+            --data-binary "$body" \
+            || echo "::warning::ha-notify unreachable"
