@@ -262,6 +262,7 @@ def _make_conversation(
     agent_id: str | None = "087b7cb7ac30abf4debfaa578d052ec6",
     title: str = "Source Chat",
     kind: str = "default",
+    project_id: str | None = None,
 ) -> Conversation:
     """
     Build a minimal Conversation entity for testing.
@@ -281,6 +282,7 @@ def _make_conversation(
         agent_id=agent_id,
         title=title,
         kind=kind,
+        project_id=project_id,
     )
 
 
@@ -309,6 +311,7 @@ def _make_item(item_id: str, text: str, response_id: str = "resp_001") -> Conver
 def _build_app(
     store: _ConversationStore,
     agent_store: _AgentStore | None = None,
+    project_store: Any | None = None,
 ) -> FastAPI:
     """
     Build a FastAPI app with the sessions router and error handler.
@@ -337,6 +340,7 @@ def _build_app(
     router = create_sessions_router(
         conversation_store=store,  # type: ignore[arg-type]
         agent_store=agent_store,  # type: ignore[arg-type]
+        project_store=project_store,
     )
     app = FastAPI()
 
@@ -357,6 +361,34 @@ def _build_app(
 
 
 # ── Tests ────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_fork_uses_shared_project_resolver(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fork inheritance delegates ownership checks to the shared resolver."""
+    requested_id = "A" * 32
+    canonical_id = "a" * 32
+    source = _make_conversation(project_id=requested_id)
+    store = _ConversationStore({source.id: source})
+    calls: list[tuple[str, str | None]] = []
+
+    def _resolve(project_store: object, project_id: str, *, user_id: str | None) -> str:
+        calls.append((project_id, user_id))
+        assert project_store is marker_store
+        return canonical_id
+
+    marker_store = object()
+    monkeypatch.setattr(
+        "omnigent.server.project_assignment.resolve_owned_project_id",
+        _resolve,
+    )
+    client = TestClient(_build_app(store, project_store=marker_store))
+
+    response = client.post(f"/v1/sessions/{source.id}/fork", json={})
+
+    assert response.status_code == 201
+    assert store.fork_calls[0]["project_id"] == canonical_id
+    assert calls == [(requested_id, None)]
 
 
 @pytest.mark.asyncio
