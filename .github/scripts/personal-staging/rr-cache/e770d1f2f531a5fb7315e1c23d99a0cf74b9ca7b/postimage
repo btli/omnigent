@@ -20,6 +20,22 @@ import {
 import { cn } from "@/lib/utils";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 
+/** Browser-canonical server identity, retaining path and query. */
+function serverKey(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname.endsWith(".databricks.com")) {
+      const workspaceIdentity = workspaceIdentityKey(url);
+      if (workspaceIdentity) return workspaceIdentity;
+    }
+    parsed.hash = "";
+    if (parsed.pathname.length > 1) parsed.pathname = parsed.pathname.replace(/\/$/, "");
+    return parsed.href;
+  } catch {
+    return `raw:${url}`;
+  }
+}
+
 /**
  * The server picker for every native shell (Electron, iOS, Android), pinned to
  * the sidebar's bottom.
@@ -62,27 +78,25 @@ export function SidebarServerPicker() {
   if (!info) return null;
 
   const currentUrl = info.currentServerUrl ?? info.currentOrigin;
-  const comparableIdentity = (url: string) => workspaceIdentityKey(url) ?? url;
-  const currentIdentity = comparableIdentity(currentUrl);
+  const currentKey = serverKey(currentUrl);
   const matchesCurrent =
     info.currentServerUrl === undefined
       ? (url: string) => {
-          if (comparableIdentity(url) === currentIdentity) return true;
           try {
             return new URL(url).origin === info.currentOrigin;
           } catch {
             return false;
           }
         }
-      : (url: string) => comparableIdentity(url) === currentIdentity;
+      : (url: string) => serverKey(url) === currentKey;
   const managed = Array.isArray(info.managedServers) ? info.managedServers : [];
-  const managedIdentities = new Set(managed.map(comparableIdentity));
+  const managedKeys = new Set(managed.map(serverKey));
   const currentIsManaged = managed.some(matchesCurrent);
   // The current server leads its section even when settings were edited out
-  // from under us. Managed workspaces are not repeated under Recents.
+  // from under us. Managed servers are not repeated under Recents.
   const recentOthers = info.recentServers.filter((url) => {
-    const identity = comparableIdentity(url);
-    return !matchesCurrent(url) && !managedIdentities.has(identity);
+    const key = serverKey(url);
+    return !matchesCurrent(url) && !managedKeys.has(key);
   });
   const currentLabel = serverDisplayLabel(currentUrl);
 
