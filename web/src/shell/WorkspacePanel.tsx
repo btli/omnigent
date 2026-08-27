@@ -708,7 +708,7 @@ export function WorkspacePanel({
     <>
       {/* The resize target is a real flex gutter. Its bounded slivers stay
           outside both scroll containers. */}
-      {!maximized && handleProps["aria-disabled"] !== true && (
+      {!maximized && handleProps.hidden !== true && (
         <div
           {...handleProps}
           data-workspace-panel-resize-gutter

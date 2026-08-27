@@ -96,7 +96,7 @@ function clamp(w: number, minPx = MIN_WIDTH_PX, reservedPx = 0): number {
 // memory lets the resize handler re-derive the effective width from it —
 // restoring the larger choice when space returns — without touching disk.
 // Both start null: the active session's saved width is loaded once the hook
-// learns its conversationId (see loadSession), since the width is per-session.
+// learns its storage key (see loadSession), since width is scoped by the caller.
 let currentSessionId: string | null = null;
 const widthStore = createResizableWidthStore(null, (value) => {
   if (currentSessionId !== null && value !== null) {
@@ -104,9 +104,8 @@ const widthStore = createResizableWidthStore(null, (value) => {
   }
 });
 
-// Re-seed the module store from a session's saved width. Called when the
-// active conversation changes so each session restores its own width (and a
-// session with no saved width falls back to the viewport-derived default).
+// Re-seed the module store from a storage key's saved width. A key with no
+// saved width falls back to the viewport-derived default.
 function loadSession(sessionId: string | null): void {
   if (sessionId === currentSessionId) return;
   currentSessionId = sessionId;
@@ -134,20 +133,25 @@ export function resetWidthStoreForTesting(): void {
  * handle element. Drag uses pointer events with capture so touch/stylus work
  * the same as mouse. Callers should not render the handle on mobile.
  *
- * `sessionId` scopes the persisted width: each conversation remembers its own
- * rail width. Pass `null` when there is no active conversation (the panel then
- * uses the default width and resizes are not persisted).
+ * `sessionId` scopes the persisted width. AppShell passes the root session so
+ * one agent tree shares a rail width. Pass `null` when there is no active
+ * conversation (the panel then uses the default width and resizes are not
+ * persisted).
  *
  * `reservedPx` is layout width the panel may not claim — the open sidebar. It
  * tightens the ceiling without touching the persisted preference, so opening
  * the sidebar temporarily shrinks the panel and collapsing it restores the
  * user's width.
+ *
+ * `enabled` disables manual resizing while the panel is hidden. `persistEnabled`
+ * separately disables interaction while the storage key is tentative.
  */
 export function useResizableInlinePanel(
   sessionId: string | null,
   minWidthPx = MIN_WIDTH_PX,
   reservedPx = 0,
   enabled = true,
+  persistEnabled = true,
 ) {
   const { anyCoarse } = useInputCapabilities();
   const raw = useSyncExternalStore(
@@ -200,8 +204,9 @@ export function useResizableInlinePanel(
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
+  const resizeEnabled = enabled && persistEnabled && resolvedWidth !== 0;
   const resizeDrag = useResizeDrag({
-    enabled: enabled && resolvedWidth !== 0,
+    enabled: resizeEnabled,
     overlay: true,
     onCommit: widthStore.persist,
     onMove: useCallback((e: React.PointerEvent<HTMLElement>) => {
@@ -222,7 +227,7 @@ export function useResizableInlinePanel(
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
-      if (!enabled || resolvedWidth === 0) return;
+      if (!resizeEnabled) return;
       const step = 20;
       if (e.key === "ArrowLeft") {
         e.preventDefault();
@@ -238,9 +243,8 @@ export function useResizableInlinePanel(
         );
       }
     },
-    [enabled, resolvedWidth],
+    [resizeEnabled, resolvedWidth],
   );
-
   return {
     panelWidth: resolvedWidth,
     handleProps: {
@@ -253,8 +257,9 @@ export function useResizableInlinePanel(
       "aria-valuenow": resolvedWidth,
       "aria-valuemin": Math.min(minWidthPx, resolvedWidth),
       "aria-valuemax": clamp(Number.POSITIVE_INFINITY, minWidthPx, reservedPx),
-      "aria-disabled": !enabled || resolvedWidth === 0,
-      tabIndex: 0,
+      "aria-disabled": !resizeEnabled,
+      hidden: !enabled || resolvedWidth === 0,
+      tabIndex: resizeEnabled ? 0 : -1,
     },
   };
 }
