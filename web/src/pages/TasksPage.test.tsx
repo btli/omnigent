@@ -7,12 +7,13 @@
 // stubbed to a marker so we assert the page opens it without exercising its
 // internals (covered by its own tests).
 
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TasksPage } from "./TasksPage";
 import * as hooks from "@/hooks/useScheduledTasks";
-import type { ScheduledTask } from "@/lib/scheduledTasksApi";
+import * as conversationHooks from "@/hooks/useConversations";
+import { ScheduledTaskApiError, type ScheduledTask } from "@/lib/scheduledTasksApi";
 
 vi.mock("@/hooks/useScheduledTasks", () => ({
   useScheduledTasks: vi.fn(),
@@ -20,6 +21,7 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
   useDeleteScheduledTask: vi.fn(),
   useRunScheduledTaskNow: vi.fn(),
 }));
+vi.mock("@/hooks/useConversations", () => ({ useProjects: vi.fn() }));
 
 // Stub the create dialog — its internals are covered separately; here we only
 // need to know it opened and WHICH prefill (initialName/initialPrompt) TasksPage
@@ -29,11 +31,13 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
     open,
     initialName,
     initialPrompt,
+    initialProjectId,
     editingTask,
   }: {
     open: boolean;
     initialName?: string;
     initialPrompt?: string;
+    initialProjectId?: string;
     editingTask?: ScheduledTask | null;
   }) =>
     open ? (
@@ -41,6 +45,7 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
         data-testid="manual-dialog-open"
         data-initial-name={initialName ?? ""}
         data-initial-prompt={initialPrompt ?? ""}
+        data-initial-project-id={initialProjectId ?? ""}
         data-editing-task-id={editingTask?.id ?? ""}
         data-editing-task-name={editingTask?.name ?? ""}
       />
@@ -63,6 +68,7 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
     permissionMode: null,
     workspace: null,
     hostId: null,
+    projectId: null,
     state: "active",
     lastRunAt: null,
     lastRunStatus: null,
@@ -82,10 +88,46 @@ function setTasks(tasks: ScheduledTask[], state: { isLoading?: boolean; isError?
     isLoading: state.isLoading ?? false,
     isError: state.isError ?? false,
     refetch: vi.fn(),
+    error: state.isError ? new Error("load failed") : null,
   } as unknown as ReturnType<typeof hooks.useScheduledTasks>);
 }
 
+interface QueryState {
+  data?: ScheduledTask[];
+  isLoading?: boolean;
+  isError?: boolean;
+  error?: Error | null;
+  refetch?: ReturnType<typeof vi.fn>;
+}
+
+function setTaskQueries({
+  all,
+  project = all,
+  unfiled = all,
+}: {
+  all: QueryState;
+  project?: QueryState;
+  unfiled?: QueryState;
+}) {
+  vi.mocked(hooks.useScheduledTasks).mockImplementation((filter = { kind: "all" }) => {
+    const selected = filter.kind === "all" ? all : filter.kind === "unfiled" ? unfiled : project;
+    return {
+      data: selected.data,
+      isLoading: selected.isLoading ?? false,
+      isError: selected.isError ?? false,
+      error: selected.error ?? null,
+      refetch: selected.refetch ?? vi.fn(),
+    } as unknown as ReturnType<typeof hooks.useScheduledTasks>;
+  });
+}
+
+async function chooseProjectFilter(name: string) {
+  fireEvent.keyDown(screen.getByTestId("tasks-project-filter"), { key: "Enter" });
+  fireEvent.click(await screen.findByRole("option", { name }));
+}
+
 beforeEach(() => {
+  vi.clearAllMocks();
   mutate.mockReset();
   deleteMutate.mockReset();
   runNowMutate.mockReset();
@@ -104,6 +146,16 @@ beforeEach(() => {
     isPending: false,
     variables: undefined,
   } as unknown as ReturnType<typeof hooks.useRunScheduledTaskNow>);
+  vi.mocked(conversationHooks.useProjects).mockReturnValue({
+    data: [
+      { id: "p_a", name: "Project A" },
+      { id: "p_b", name: "Project B" },
+      { id: null, name: "Legacy only" },
+    ],
+    isLoading: false,
+    isError: false,
+    refetch: vi.fn(),
+  } as unknown as ReturnType<typeof conversationHooks.useProjects>);
 });
 
 afterEach(() => cleanup());
@@ -283,6 +335,176 @@ describe("filtering + search", () => {
     const rows = screen.getAllByTestId("scheduled-task-row");
     expect(rows).toHaveLength(1);
     expect(within(rows[0]).getByText("PR sweep")).toBeInTheDocument();
+  });
+});
+
+describe("Project filtering", () => {
+  it("keeps the All query mounted and renders the selected server slice", async () => {
+    const inA = task({ id: "a", name: "In A", projectId: "p_a" });
+    const inB = task({ id: "b", name: "In B", projectId: "p_b" });
+    setTaskQueries({ all: { data: [inA, inB] }, project: { data: [inA] } });
+    renderPage();
+
+    await chooseProjectFilter("Project A");
+
+    expect(hooks.useScheduledTasks).toHaveBeenCalledWith({ kind: "all" });
+    expect(hooks.useScheduledTasks).toHaveBeenCalledWith({ kind: "project", projectId: "p_a" });
+    expect(screen.getByText("In A")).toBeInTheDocument();
+    expect(screen.queryByText("In B")).toBeNull();
+    expect(screen.queryByTestId("task-project-chip")).toBeNull();
+  });
+
+  it("prefills create from a selected first-class Project", async () => {
+    setTaskQueries({ all: { data: [task()] }, project: { data: [] } });
+    renderPage();
+    await chooseProjectFilter("Project A");
+    fireEvent.click(screen.getByTestId("new-task-button"));
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
+      "data-initial-project-id",
+      "p_a",
+    );
+  });
+
+  it("shows resolved chips in All and hides null or dangling assignments", () => {
+    setTasks([
+      task({ id: "a", projectId: "p_a" }),
+      task({ id: "null", name: "Null", projectId: null }),
+      task({ id: "dangling", name: "Dangling", projectId: "deleted" }),
+    ]);
+    renderPage();
+    expect(screen.getAllByTestId("task-project-chip")).toHaveLength(1);
+    expect(screen.getByTestId("task-project-chip")).toHaveTextContent("Project A");
+    expect(
+      screen.getByTestId("tasks-list").querySelectorAll('[data-testid="tasks-list"]'),
+    ).toHaveLength(0);
+  });
+
+  it("uses the exact global, Project, Unfiled, and client-no-match precedence", async () => {
+    setTaskQueries({ all: { data: [] }, project: { data: [] } });
+    const { unmount } = renderPage();
+    await chooseProjectFilter("Project A");
+    expect(screen.getByText("No automations yet")).toBeInTheDocument();
+    unmount();
+
+    cleanup();
+    setTaskQueries({ all: { data: [task()] }, project: { data: [] }, unfiled: { data: [] } });
+    renderPage();
+    await chooseProjectFilter("Project A");
+    expect(screen.getByText("No automations in Project A")).toBeInTheDocument();
+    await chooseProjectFilter("Unfiled");
+    expect(screen.getByText("No unfiled automations")).toBeInTheDocument();
+
+    cleanup();
+    setTasks([task({ state: "active" })]);
+    renderPage();
+    fireEvent.click(screen.getByTestId("tasks-filter-paused"));
+    expect(screen.getByText("No automations found")).toBeInTheDocument();
+  });
+
+  it("gives task error and loading states precedence only without cached data", () => {
+    setTaskQueries({ all: { data: undefined, isError: true, error: new Error("boom") } });
+    const { unmount } = renderPage();
+    expect(screen.getByText("Couldn’t load automations.")).toBeInTheDocument();
+    unmount();
+
+    cleanup();
+    setTaskQueries({ all: { data: undefined, isLoading: true } });
+    renderPage();
+    expect(screen.getByText("Loading automations…")).toBeInTheDocument();
+  });
+
+  it("keeps Project-list loading and errors inline without replacing task content", () => {
+    setTasks([task()]);
+    vi.mocked(conversationHooks.useProjects).mockReturnValue({
+      data: undefined,
+      isLoading: true,
+      isError: false,
+      refetch: vi.fn(),
+    } as unknown as ReturnType<typeof conversationHooks.useProjects>);
+    const { rerender } = renderPage();
+    expect(screen.getByTestId("tasks-project-filter")).toBeDisabled();
+    expect(screen.getByText("Nightly triage")).toBeInTheDocument();
+
+    vi.mocked(conversationHooks.useProjects).mockReturnValue({
+      data: undefined,
+      isLoading: false,
+      isError: true,
+      refetch: vi.fn(),
+    } as unknown as ReturnType<typeof conversationHooks.useProjects>);
+    rerender(
+      <MemoryRouter>
+        <TasksPage />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText(/Couldn't load projects/)).toBeInTheDocument();
+    expect(screen.getByText("Nightly triage")).toBeInTheDocument();
+  });
+
+  it("hides Suggestions for Project, Unfiled, search, and status filters", async () => {
+    setTaskQueries({
+      all: { data: [task()] },
+      project: { data: [task()] },
+      unfiled: { data: [task()] },
+    });
+    renderPage();
+    expect(screen.getByTestId("tasks-suggestions")).toBeInTheDocument();
+    await chooseProjectFilter("Project A");
+    expect(screen.queryByTestId("tasks-suggestions")).toBeNull();
+    await chooseProjectFilter("All projects");
+    fireEvent.change(screen.getByTestId("tasks-search"), { target: { value: "night" } });
+    expect(screen.queryByTestId("tasks-suggestions")).toBeNull();
+    fireEvent.change(screen.getByTestId("tasks-search"), { target: { value: "" } });
+    fireEvent.click(screen.getByTestId("tasks-filter-active"));
+    expect(screen.queryByTestId("tasks-suggestions")).toBeNull();
+    fireEvent.click(screen.getByTestId("tasks-filter-all"));
+    await chooseProjectFilter("Unfiled");
+    expect(screen.queryByTestId("tasks-suggestions")).toBeNull();
+  });
+
+  it("resets a deleted selection and a transient 404 to All", async () => {
+    const allRefetch = vi.fn();
+    setTaskQueries({ all: { data: [task()], refetch: allRefetch }, project: { data: [] } });
+    const { rerender } = renderPage();
+    await chooseProjectFilter("Project A");
+    vi.mocked(conversationHooks.useProjects).mockReturnValue({
+      data: [{ id: "p_b", name: "Project B" }],
+      isLoading: false,
+      isError: false,
+      refetch: vi.fn(),
+    } as unknown as ReturnType<typeof conversationHooks.useProjects>);
+    rerender(
+      <MemoryRouter>
+        <TasksPage />
+      </MemoryRouter>,
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("tasks-project-filter")).toHaveTextContent("All projects"),
+    );
+
+    vi.mocked(conversationHooks.useProjects).mockReturnValue({
+      data: [{ id: "p_a", name: "Project A" }],
+      isLoading: false,
+      isError: false,
+      refetch: vi.fn(),
+    } as unknown as ReturnType<typeof conversationHooks.useProjects>);
+    setTaskQueries({
+      all: { data: [task()], refetch: allRefetch },
+      project: {
+        data: undefined,
+        isError: true,
+        error: new ScheduledTaskApiError("Project not found", 404, "not_found"),
+      },
+    });
+    rerender(
+      <MemoryRouter>
+        <TasksPage />
+      </MemoryRouter>,
+    );
+    await chooseProjectFilter("Project A");
+    await waitFor(() =>
+      expect(screen.getByTestId("tasks-project-filter")).toHaveTextContent("All projects"),
+    );
+    expect(allRefetch).toHaveBeenCalled();
   });
 });
 
