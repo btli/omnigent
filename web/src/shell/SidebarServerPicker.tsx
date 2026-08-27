@@ -21,33 +21,33 @@ import { cn } from "@/lib/utils";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 
 /**
- * Server picker for the Electron desktop shell, pinned to the sidebar's bottom.
+ * The server picker for every native shell (Electron, iOS, Android), pinned to
+ * the sidebar's bottom.
  *
  * A sidebar row (server glyph + current host + an upward chevron) that opens a
  * menu of organization-provided and recently-connected servers — selecting one
- * re-points the whole window via the shell — plus "Connect to new server…",
- * which returns the window to the shell's setup page.
+ * re-points the whole surface via the shell; setup opens from the final item.
  *
- * This deliberately lives at the bottom of the sidebar rather than in the
- * window's title bar. The macOS shell hides the native title bar (titleBarStyle
- * "hiddenInset"), and the previous picker filled that freed strip with a
- * centered "<thread> — <host>" label. But the chat header occupies the same
- * strip (`absolute top-0`, and taller at h-14), so on a narrow window the
- * centered label ran into the header's action cluster. Docking the picker here
- * takes it out of that contested space; the drag strip and the sidebar's
- * traffic-light top margin stay exactly as they were, since those are what keep
- * the OS window controls off the sidebar card.
+ * This deliberately lives at the bottom of the sidebar rather than in any
+ * shell's own chrome. On desktop the chat header already contests the freed
+ * title-bar strip; on iOS/Android a floating top pill fought the header band
+ * and needed inset/visibility choreography. Docking the picker here gives all
+ * three shells one picker with none of that.
  *
  * Renders nothing until the shell confirms this page is a connected server
  * (getServerPicker resolves non-null) — so it's absent in plain browsers, under
- * shells too old for the picker IPC, and on foreign pages. That single check is
- * the whole gate: no platform sniffing, matching how the rest of nativeBridge
- * degrades (one bundle, many runtimes, decided at runtime). Note this reaches
- * every Electron platform, where the old title-bar picker was macOS-only —
- * Windows and Linux desktop users previously had no in-app picker at all.
+ * shells too old for the picker bridge, and on foreign pages. That single check
+ * is the whole gate: no platform sniffing, matching how the rest of
+ * nativeBridge degrades (one bundle, many runtimes, decided at runtime).
  */
 export function SidebarServerPicker() {
   const [info, setInfo] = useState<ServerPickerInfo | null>(null);
+
+  const refresh = () => {
+    void getServerPicker().then((result) => {
+      if (result) setInfo(result);
+    });
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -62,16 +62,26 @@ export function SidebarServerPicker() {
   if (!info) return null;
 
   const currentUrl = info.currentServerUrl ?? info.currentOrigin;
-  const comparableIdentity = (url: string) => workspaceIdentityKey(url) ?? url;
+  const comparableIdentity = (url: string) => workspaceIdentityKey(url) ?? `raw:${url}`;
   const currentIdentity = comparableIdentity(currentUrl);
+  const matchesCurrent =
+    info.currentServerUrl === undefined
+      ? (url: string) => {
+          try {
+            return new URL(url).origin === info.currentOrigin;
+          } catch {
+            return false;
+          }
+        }
+      : (url: string) => comparableIdentity(url) === currentIdentity;
   const managed = Array.isArray(info.managedServers) ? info.managedServers : [];
   const managedIdentities = new Set(managed.map(comparableIdentity));
-  const currentIsManaged = managedIdentities.has(currentIdentity);
+  const currentIsManaged = managed.some(matchesCurrent);
   // The current server leads its section even when settings were edited out
   // from under us. Managed workspaces are not repeated under Recents.
   const recentOthers = info.recentServers.filter((url) => {
     const identity = comparableIdentity(url);
-    return identity !== currentIdentity && !managedIdentities.has(identity);
+    return !matchesCurrent(url) && !managedIdentities.has(identity);
   });
   const currentLabel = serverDisplayLabel(currentUrl);
 
@@ -79,13 +89,7 @@ export function SidebarServerPicker() {
     // shrink-0 keeps the row at its natural height so the scrolling session
     // list above (flex-1) gives up space instead of squashing it.
     <div className="shrink-0 px-2 pt-1 pb-2" data-testid="sidebar-server-picker-row">
-      <DropdownMenu
-        onOpenChange={(open) => {
-          // Re-read when opened so a newly applied/removed MDM profile appears
-          // without restarting the server-served SPA.
-          if (open) void getServerPicker().then(setInfo);
-        }}
-      >
+      <DropdownMenu onOpenChange={(open) => open && refresh()}>
         <DropdownMenuTrigger asChild>
           <Button
             type="button"
@@ -96,6 +100,8 @@ export function SidebarServerPicker() {
             className={cn(
               SIDEBAR_ROW,
               "w-full justify-start border-0 font-normal",
+              // Touch drawers need a 44px target while desktop stays compact.
+              "min-h-11 md:min-h-0",
               "text-muted-foreground",
               "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50",
               "data-[state=open]:bg-muted data-[state=open]:text-foreground",
@@ -111,19 +117,19 @@ export function SidebarServerPicker() {
         </DropdownMenuTrigger>
         {/* side="top" — the trigger sits at the bottom of the window, so the
             menu must grow upward rather than off-screen. */}
-        <DropdownMenuContent side="top" align="start" className="min-w-56">
+        <DropdownMenuContent side="top" align="start" collisionPadding={8} className="min-w-56">
           {managed.length > 0 ? (
             <>
               <DropdownMenuLabel className="text-muted-foreground">
                 Provided by your organization
               </DropdownMenuLabel>
               {managed.map((url) => {
-                const isCurrent = comparableIdentity(url) === currentIdentity;
+                const isCurrent = matchesCurrent(url);
                 return (
                   <DropdownMenuItem
                     key={url}
                     disabled={isCurrent}
-                    className={cn("gap-2", isCurrent && "opacity-100")}
+                    className={cn("gap-2 min-h-11 md:min-h-0", isCurrent && "opacity-100")}
                     onSelect={isCurrent ? undefined : () => void switchServer(url)}
                   >
                     {isCurrent ? (
@@ -144,7 +150,7 @@ export function SidebarServerPicker() {
               {managed.length > 0 ? <DropdownMenuSeparator /> : null}
               <DropdownMenuLabel className="text-muted-foreground">Recents</DropdownMenuLabel>
               {!currentIsManaged ? (
-                <DropdownMenuItem disabled className="gap-2 opacity-100">
+                <DropdownMenuItem disabled className="gap-2 min-h-11 opacity-100 md:min-h-0">
                   <CheckIcon className="size-4 shrink-0" />
                   <span className="truncate font-medium">{currentLabel}</span>
                 </DropdownMenuItem>
@@ -152,7 +158,7 @@ export function SidebarServerPicker() {
               {recentOthers.map((url) => (
                 <DropdownMenuItem
                   key={url}
-                  className="gap-2"
+                  className="gap-2 min-h-11 md:min-h-0"
                   onSelect={() => void switchServer(url)}
                 >
                   <span className="size-4 shrink-0" aria-hidden="true" />
@@ -162,7 +168,10 @@ export function SidebarServerPicker() {
             </>
           ) : null}
           <DropdownMenuSeparator />
-          <DropdownMenuItem className="gap-2" onSelect={() => openServerSetup()}>
+          <DropdownMenuItem
+            className="gap-2 min-h-11 md:min-h-0"
+            onSelect={() => openServerSetup()}
+          >
             <PlusIcon className="size-4 shrink-0" />
             Connect to new server…
           </DropdownMenuItem>
