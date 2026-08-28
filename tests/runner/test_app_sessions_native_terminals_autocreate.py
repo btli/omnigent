@@ -3530,20 +3530,30 @@ async def test_auto_create_claude_terminal_substitutes_an_unavailable_tier_with_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("endpoint", "requested", "expected", "catalog_status"),
+    ("endpoint", "requested", "expected", "catalog_status", "notice_reason"),
     [
         pytest.param(
             "subscription",
             "claude-opus-4-8",
-            "claude-opus-4-8[1m]",
+            "claude-opus-4-8",
             "fresh",
-            id="subscription-equivalent",
+            None,
+            id="subscription-canonical",
+        ),
+        pytest.param(
+            "subscription",
+            "Claude-Opus-4-8",
+            "claude-opus-4-8",
+            "fresh",
+            "host's verified spelling",
+            id="subscription-wrong-case",
         ),
         pytest.param(
             "gateway",
             "claude-opus-4-8",
             "system.ai.claude-opus-4-8[1m]",
             "fresh",
+            "different [1m] context marker",
             id="gateway-equivalent",
         ),
         pytest.param(
@@ -3551,6 +3561,7 @@ async def test_auto_create_claude_terminal_substitutes_an_unavailable_tier_with_
             "claude-opus-bogus",
             None,
             "fresh",
+            None,
             id="gateway-unrecognized",
         ),
         pytest.param(
@@ -3558,6 +3569,7 @@ async def test_auto_create_claude_terminal_substitutes_an_unavailable_tier_with_
             "claude-opus-bogus",
             None,
             "refresh-failed",
+            None,
             id="gateway-refresh-failed",
         ),
     ],
@@ -3567,15 +3579,16 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
     requested: str,
     expected: str | None,
     catalog_status: str,
+    notice_reason: str | None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     A persisted canonical id the catalog lists only by family still launches.
 
-    A live ``/model`` can persist ``claude-opus-4-8`` while the current catalog
-    lists only the equivalent 1M spelling. Both endpoint types use the verified
-    catalog spelling visibly; unrecognized ids remain loud before launch.
+    A canonical endpoint honors a recognized canonical pin by construction.
+    Gateways require a catalog spelling, while wrong-case and unrecognized ids
+    remain visible or loud before launch.
     """
     from omnigent.claude_native import (
         ClaudeLaunchCatalogResult,
@@ -3584,12 +3597,17 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
     )
 
     prefix = "" if endpoint == "subscription" else "system.ai."
+    equivalent = (
+        "claude-opus-4-8"
+        if endpoint == "subscription" and requested == "Claude-Opus-4-8"
+        else f"{prefix}claude-opus-4-8[1m]"
+    )
     catalog: list[dict[str, object]] = [
         {"id": "opus", "model": f"{prefix}claude-opus-5", "displayName": "Opus 5"},
         {
-            "id": f"{prefix}claude-opus-4-8[1m]",
-            "model": f"{prefix}claude-opus-4-8[1m]",
-            "displayName": "Opus 4.8 (1M context)",
+            "id": equivalent,
+            "model": equivalent,
+            "displayName": "Opus 4.8",
             "isDefault": True,
         },
     ]
@@ -3650,11 +3668,11 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         )
         args = captured["spec"].args
         assert args[args.index("--model") + 1] == expected
-    if requested == "claude-opus-4-8":
+    if notice_reason is not None:
         assert len(event_posts) == 1
         item = event_posts[0]["data"]["item_data"]
         assert item["code"] == "claude_model_substituted"
-        assert "different [1m] context marker" in item["message"]
+        assert notice_reason in item["message"]
     else:
         assert event_posts == []
 
@@ -3662,11 +3680,23 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
 
 
 @pytest.mark.asyncio
-async def test_auto_create_claude_terminal_spec_pin_survives_catalog_refresh_failure(
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [
+        pytest.param("claude-opus-4-8", "claude-opus-4-8", id="canonical-id"),
+        pytest.param("opus[1m]", "opus[1m]", id="canonical-alias"),
+        pytest.param("claude-opus-bogus", None, id="bogus-id"),
+        pytest.param("Claude-Opus-4-8", None, id="wrong-case"),
+        pytest.param("databricks-claude-opus-4-8", None, id="provider-prefixed"),
+    ],
+)
+async def test_auto_create_claude_terminal_own_login_outage_only_passes_canonical_pins(
+    requested: str,
+    expected: str | None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Own-login launches pass a spec pin through when discovery is transiently down."""
+    """Own-login outages pass only recognized, canonically-spelled pins through."""
     from omnigent.claude_native import ClaudeLaunchCatalogResult, ClaudeLaunchCatalogStatus
 
     async def _catalog(_config: object) -> ClaudeLaunchCatalogResult:
@@ -3682,29 +3712,50 @@ async def test_auto_create_claude_terminal_spec_pin_survives_catalog_refresh_fai
     async def _resolve() -> None:
         return None
 
-    requested = "claude-opus-4-8"
     try:
-        await _auto_create_claude_terminal(
-            "1a2b3c4d5e6f70819283746556473829",
-            resource_registry,
-            lambda _sid, _evt: None,
-            server_client=fake_client,
-            resolve_launch_config=_resolve,
-            agent_spec=AgentSpec(
-                spec_version=1,
-                name="claude",
-                executor=ExecutorSpec(
-                    type="omnigent",
-                    model=requested,
-                    config={"harness": "claude-native"},
+        if expected is None:
+            with pytest.raises(click.ClickException) as exc_info:
+                await _auto_create_claude_terminal(
+                    "1a2b3c4d5e6f70819283746556473829",
+                    resource_registry,
+                    lambda _sid, _evt: None,
+                    server_client=fake_client,
+                    resolve_launch_config=_resolve,
+                    agent_spec=AgentSpec(
+                        spec_version=1,
+                        name="claude",
+                        executor=ExecutorSpec(
+                            type="omnigent",
+                            model=requested,
+                            config={"harness": "claude-native"},
+                        ),
+                    ),
+                )
+            assert "Launchable model ids: none" in str(exc_info.value)
+            assert "spec" not in captured
+        else:
+            await _auto_create_claude_terminal(
+                "1a2b3c4d5e6f70819283746556473829",
+                resource_registry,
+                lambda _sid, _evt: None,
+                server_client=fake_client,
+                resolve_launch_config=_resolve,
+                agent_spec=AgentSpec(
+                    spec_version=1,
+                    name="claude",
+                    executor=ExecutorSpec(
+                        type="omnigent",
+                        model=requested,
+                        config={"harness": "claude-native"},
+                    ),
                 ),
-            ),
-        )
+            )
     finally:
         await fake_client.aclose()
 
-    args = captured["spec"].args
-    assert args[args.index("--model") + 1] == requested
+    if expected is not None:
+        args = captured["spec"].args
+        assert args[args.index("--model") + 1] == expected
     assert event_posts == []
 
 

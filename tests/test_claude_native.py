@@ -9944,7 +9944,9 @@ def test_claude_catalog_selection_surfaces_alias_context_marker_change(
         selected, notice = claude_native.resolve_claude_native_catalog_selection(
             requested,
             [{"id": catalog_model, "model": catalog_model}],
-            None,
+            claude_native.ClaudeNativeUcodeConfig(
+                env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}
+            ),
         )
 
     assert selected == catalog_model
