@@ -3731,6 +3731,12 @@ def _resolve_codex_launch_model_override(requested: str, catalog: list[_JsonObje
     """
     from omnigent.codex_model_vocabulary import codex_reachable_model_slug
 
+    # An exact id/model match wins over any folding alias, so a persisted pin's
+    # own spelling survives regardless of catalog row order.
+    for row in catalog:
+        row_id = row.get("id")
+        if isinstance(row_id, str) and requested in (row_id, row.get("model")):
+            return row_id
     resolved = codex_reachable_model_slug(requested, catalog)
     if resolved is not None:
         return resolved
