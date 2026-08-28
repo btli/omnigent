@@ -91,6 +91,26 @@ def test_right_click_opens_project_folder_menu(project_page: tuple[Page, str]) -
     expect(page.get_by_test_id("rename-project-confirm")).to_be_visible()
 
 
+def test_click_dismissing_menu_does_not_toggle_then_next_click_toggles(
+    project_page: tuple[Page, str],
+) -> None:
+    """A dismissing click is inert; the next click toggles the folder."""
+    page, project = project_page
+    header = _folder_header(page, project)
+
+    header.click(button="right")
+    expect(page.get_by_test_id("rename-project")).to_be_visible()
+    before = _expanded(header)
+    flipped = "false" if before == "true" else "true"
+
+    header.click()
+    expect(page.get_by_test_id("rename-project")).not_to_be_visible()
+    expect(header).to_have_attribute("aria-expanded", before)
+
+    header.click()
+    expect(header).to_have_attribute("aria-expanded", flipped)
+
+
 def test_left_click_still_toggles_the_folder(project_page: tuple[Page, str]) -> None:
     """Plain left-click still expands and collapses the folder."""
     page, project = project_page

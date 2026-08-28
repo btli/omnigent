@@ -398,4 +398,21 @@ describe("project folder header context menu", () => {
     fireEvent.contextMenu(folderHeader());
     expect(screen.queryByTestId("rename-project")).toBeNull();
   });
+
+  it("keeps the collapse toggle active when selection mode unmounts an open menu", () => {
+    renderSidebar();
+    const header = folderHeader();
+    const before = header.getAttribute("aria-expanded");
+    if (before === null) throw new Error("Folder header is missing aria-expanded");
+
+    fireEvent.pointerDown(screen.getByTestId("project-list-actions"), { button: 0 });
+    fireEvent.contextMenu(header);
+    expect(screen.getByTestId("rename-project")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("projects-select-sessions"));
+    const selectionHeader = folderHeader();
+    expect(selectionHeader.closest('[data-slot="context-menu-trigger"]')).toBeNull();
+    fireEvent.click(selectionHeader);
+
+    expect(selectionHeader).toHaveAttribute("aria-expanded", before === "true" ? "false" : "true");
+  });
 });
