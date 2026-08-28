@@ -3366,6 +3366,55 @@ def test_routed_spawn_launch_args_need_a_router() -> None:
     assert _routed_spawn_launch_args(False) == (None, ())
 
 
+def _prepare_claude_model_launch_test(
+    *,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    snapshot: dict[str, Any],
+) -> tuple[Any, httpx.AsyncClient, dict[str, Any], list[dict[str, Any]]]:
+    """Set up a captured Claude launch with an in-memory session snapshot."""
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+
+    async def _no_op_forwarder(**kwargs: Any) -> None:
+        del kwargs
+
+    monkeypatch.setattr(
+        "omnigent.claude_native_forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(self, **kwargs: Any) -> SessionResourceView:
+            captured["spec"] = kwargs["spec"]
+            return SessionResourceView(
+                id="terminal_claude_main",
+                type="terminal",
+                session_id=kwargs["session_id"],
+                name="claude:main",
+                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+            )
+
+    event_posts: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=snapshot)
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            event_posts.append(json.loads(request.content))
+        return httpx.Response(200, json={})
+
+    client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(_handle_request),
+    )
+    return _FakeResourceRegistry(), client, captured, event_posts
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "pin_source",
@@ -3384,17 +3433,6 @@ async def test_auto_create_claude_terminal_substitutes_an_unavailable_tier_with_
         ClaudeNativeUcodeConfig,
     )
 
-    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
-
-    async def _no_op_forwarder(**kwargs: Any) -> None:
-        del kwargs
-
-    monkeypatch.setattr(
-        "omnigent.claude_native_forwarder.supervise_forwarder",
-        _no_op_forwarder,
-    )
     catalog: list[dict[str, object]] = [
         {"id": "haiku", "model": "system.ai.claude-haiku-4-5"},
         {"id": "sonnet", "model": "system.ai.claude-sonnet-4-6[1m]"},
@@ -3419,50 +3457,24 @@ async def test_auto_create_claude_terminal_substitutes_an_unavailable_tier_with_
     async def _resolve() -> ClaudeNativeUcodeConfig:
         return config
 
-    captured: dict[str, Any] = {}
-
-    class _FakeResourceRegistry:
-        terminal_registry = None
-
-        async def launch_required_terminal(self, **kwargs: Any) -> SessionResourceView:
-            captured["spec"] = kwargs["spec"]
-            return SessionResourceView(
-                id="terminal_claude_main",
-                type="terminal",
-                session_id=kwargs["session_id"],
-                name="claude:main",
-                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
-            )
-
-    event_posts: list[dict[str, Any]] = []
-
-    def _handle_request(request: httpx.Request) -> httpx.Response:
-        if request.method == "GET":
-            model_override = None
-            terminal_launch_args = None
-            if pin_source in {"session", "session-over-spec"}:
-                model_override = "fable"
-            elif pin_source == "argv-unavailable":
-                model_override = "haiku"
-                terminal_launch_args = ["--model", "fable"]
-            elif pin_source == "argv-available":
-                model_override = "fable"
-                terminal_launch_args = ["--model", "system.ai.claude-sonnet-4-6[1m]"]
-            return httpx.Response(
-                200,
-                json={
-                    "model_override": model_override,
-                    "terminal_launch_args": terminal_launch_args,
-                    "labels": {},
-                },
-            )
-        if request.method == "POST" and request.url.path.endswith("/events"):
-            event_posts.append(json.loads(request.content))
-        return httpx.Response(200, json={})
-
-    fake_client = httpx.AsyncClient(
-        base_url="http://test-server",
-        transport=httpx.MockTransport(_handle_request),
+    model_override = None
+    terminal_launch_args = None
+    if pin_source in {"session", "session-over-spec"}:
+        model_override = "fable"
+    elif pin_source == "argv-unavailable":
+        model_override = "haiku"
+        terminal_launch_args = ["--model", "fable"]
+    elif pin_source == "argv-available":
+        model_override = "fable"
+        terminal_launch_args = ["--model", "system.ai.claude-sonnet-4-6[1m]"]
+    resource_registry, fake_client, captured, event_posts = _prepare_claude_model_launch_test(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        snapshot={
+            "model_override": model_override,
+            "terminal_launch_args": terminal_launch_args,
+            "labels": {},
+        },
     )
     session_id = "7d1e4a3c2b5f69807162534453627180"
     agent_spec = (
@@ -3482,7 +3494,7 @@ async def test_auto_create_claude_terminal_substitutes_an_unavailable_tier_with_
         with caplog.at_level(logging.WARNING, logger="omnigent.claude_native"):
             await _auto_create_claude_terminal(
                 session_id,
-                _FakeResourceRegistry(),  # type: ignore[arg-type]
+                resource_registry,
                 lambda _sid, _evt: None,
                 server_client=fake_client,
                 resolve_launch_config=_resolve,
@@ -3572,17 +3584,6 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         ClaudeNativeUcodeConfig,
     )
 
-    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
-
-    async def _no_op_forwarder(**kwargs: Any) -> None:
-        del kwargs
-
-    monkeypatch.setattr(
-        "omnigent.claude_native_forwarder.supervise_forwarder",
-        _no_op_forwarder,
-    )
     prefix = "" if endpoint == "subscription" else "system.ai."
     catalog: list[dict[str, object]] = [
         {"id": "opus", "model": f"{prefix}claude-opus-5", "displayName": "Opus 5"},
@@ -3601,45 +3602,10 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         return ClaudeLaunchCatalogResult(catalog, ClaudeLaunchCatalogStatus.FRESH)
 
     monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog_result", _catalog)
-
-    captured: dict[str, Any] = {}
-
-    class _FakeResourceRegistry:
-        """Captures the launched terminal spec."""
-
-        terminal_registry = None
-
-        async def launch_required_terminal(
-            self,
-            *,
-            session_id: str,
-            terminal_name: str,
-            session_key: str,
-            spec: Any,
-            resource_role: str | None = None,
-            parent_os_env: Any = None,
-        ) -> SessionResourceView:
-            """Record the spec and return a terminal resource view."""
-            del terminal_name, session_key
-            captured["spec"] = spec
-            return SessionResourceView(
-                id="terminal_claude_main",
-                type="terminal",
-                session_id=session_id,
-                name="claude:main",
-                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
-            )
-
-    event_posts: list[dict[str, Any]] = []
-
-    def _handle_request(request: httpx.Request) -> httpx.Response:
-        if request.method == "POST" and request.url.path.endswith("/events"):
-            event_posts.append(json.loads(request.content))
-        return httpx.Response(200, json={"model_override": requested, "labels": {}})
-
-    fake_client = httpx.AsyncClient(
-        base_url="http://test-server",
-        transport=httpx.MockTransport(_handle_request),
+    resource_registry, fake_client, captured, event_posts = _prepare_claude_model_launch_test(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        snapshot={"model_override": requested, "labels": {}},
     )
     config = (
         None
@@ -3659,7 +3625,7 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         with pytest.raises(click.ClickException) as exc_info:
             await _auto_create_claude_terminal(
                 session_id,
-                _FakeResourceRegistry(),
+                resource_registry,
                 lambda _sid, _evt: None,
                 server_client=fake_client,
                 resolve_launch_config=_resolve,
@@ -3678,7 +3644,7 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
     else:
         await _auto_create_claude_terminal(
             session_id,
-            _FakeResourceRegistry(),
+            resource_registry,
             lambda _sid, _evt: None,
             server_client=fake_client,
             resolve_launch_config=_resolve,
@@ -3712,17 +3678,6 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
     from omnigent import model_catalog_store
     from omnigent.claude_native import claude_catalog_fingerprint
 
-    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
-
-    async def _no_op_forwarder(**kwargs: Any) -> None:
-        del kwargs
-
-    monkeypatch.setattr(
-        "omnigent.claude_native_forwarder.supervise_forwarder",
-        _no_op_forwarder,
-    )
     monkeypatch.setattr(
         "omnigent.claude_native.claude_launch_catalog_result",
         REAL_CLAUDE_LAUNCH_CATALOG_RESULT,
@@ -3755,40 +3710,10 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
         old = time.time() - (model_catalog_store.CATALOG_STALE_AFTER_S + 60)
         os.utime(path, (old, old))
 
-    captured: dict[str, Any] = {}
-
-    class _FakeResourceRegistry:
-        """Captures the launched terminal spec."""
-
-        terminal_registry = None
-
-        async def launch_required_terminal(
-            self,
-            *,
-            session_id: str,
-            terminal_name: str,
-            session_key: str,
-            spec: Any,
-            resource_role: str | None = None,
-            parent_os_env: Any = None,
-        ) -> SessionResourceView:
-            """Record the spec and return a terminal resource view."""
-            del terminal_name, session_key
-            captured["spec"] = spec
-            return SessionResourceView(
-                id="terminal_claude_main",
-                type="terminal",
-                session_id=session_id,
-                name="claude:main",
-                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
-            )
-
-    def _handle_request(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"labels": {}})
-
-    fake_client = httpx.AsyncClient(
-        base_url="http://test-server",
-        transport=httpx.MockTransport(_handle_request),
+    resource_registry, fake_client, captured, _event_posts = _prepare_claude_model_launch_test(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        snapshot={"labels": {}},
     )
 
     async def _resolve() -> None:
@@ -3796,7 +3721,7 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
 
     await _auto_create_claude_terminal(
         "9b1d2c3e4f5a6b7c8d9e0f1a2b3c4d5e",
-        _FakeResourceRegistry(),
+        resource_registry,
         lambda _sid, _evt: None,
         server_client=fake_client,
         resolve_launch_config=_resolve,

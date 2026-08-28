@@ -230,16 +230,7 @@ _CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV = "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"
 # model ID.  When set, the /model picker shows these IDs as options rather
 # than normalising to canonical Anthropic names (which the Databricks gateway
 # rejects).  See https://code.claude.com/docs/en/model-config#override-model-ids-per-version
-_ANTHROPIC_DEFAULT_FABLE_MODEL_ENV = "ANTHROPIC_DEFAULT_FABLE_MODEL"
-_ANTHROPIC_DEFAULT_OPUS_MODEL_ENV = "ANTHROPIC_DEFAULT_OPUS_MODEL"
-_ANTHROPIC_DEFAULT_SONNET_MODEL_ENV = "ANTHROPIC_DEFAULT_SONNET_MODEL"
-_ANTHROPIC_DEFAULT_HAIKU_MODEL_ENV = "ANTHROPIC_DEFAULT_HAIKU_MODEL"
-_UCODE_CLAUDE_TIER_TO_ENV: dict[str, str] = {
-    "fable": _ANTHROPIC_DEFAULT_FABLE_MODEL_ENV,
-    "opus": _ANTHROPIC_DEFAULT_OPUS_MODEL_ENV,
-    "sonnet": _ANTHROPIC_DEFAULT_SONNET_MODEL_ENV,
-    "haiku": _ANTHROPIC_DEFAULT_HAIKU_MODEL_ENV,
-}
+_UCODE_CLAUDE_TIER_TO_ENV = dict(ALIAS_MODEL_ENV_VARS)
 # Capability-descending launch fallback policy. Vocabulary ordering is not policy.
 _CLAUDE_TIER_FALLBACK_ORDER: tuple[str, ...] = ("fable", "opus", "sonnet", "haiku")
 # The 4 family aliases above pin one model ID each. Claude Code has exactly
@@ -552,23 +543,6 @@ def _claude_catalog_tier_model(rows: list[dict[str, object]], tier: str) -> str 
     return str(selected.get("model") or selected.get("id") or "").strip() or None
 
 
-def _documented_claude_tier_alias(model: str) -> str | None:
-    """Return a documented bare or 1M tier alias, otherwise ``None``."""
-    candidate = model.strip().lower()
-    base = candidate.removesuffix("[1m]")
-    if base in CLAUDE_MODEL_ALIASES and candidate in {base, f"{base}[1m]"}:
-        return base
-    return None
-
-
-def _claude_launchable_model_text(rows: list[dict[str, object]]) -> str:
-    """Render deterministic launchable picker and wire ids for an error."""
-    launchable = sorted(
-        {str(token) for row in rows for token in (row.get("id"), row.get("model")) if token}
-    )
-    return ", ".join(repr(token) for token in launchable) or "none"
-
-
 def resolve_claude_native_catalog_selection(
     requested_model: str,
     rows: list[dict[str, object]],
@@ -590,7 +564,14 @@ def resolve_claude_native_catalog_selection(
     resolved_request = (
         resolve_claude_native_model_selection(requested_model, claude_config) or requested_model
     )
-    requested_tier = _documented_claude_tier_alias(requested_model)
+    requested_alias = requested_model.strip().lower()
+    alias_base = requested_alias.removesuffix("[1m]")
+    requested_tier = (
+        alias_base
+        if alias_base in CLAUDE_MODEL_ALIASES
+        and requested_alias in {alias_base, f"{alias_base}[1m]"}
+        else None
+    )
     for candidate in dict.fromkeys((requested_model, resolved_request)):
         catalog_model = resolve_claude_catalog_model(rows, candidate)
         if catalog_model is not None:
@@ -636,10 +617,14 @@ def resolve_claude_native_catalog_selection(
             )
             return substitute, notice
 
+    launchable = sorted(
+        {str(token) for row in rows for token in (row.get("id"), row.get("model")) if token}
+    )
+    launchable_text = ", ".join(repr(token) for token in launchable) or "none"
     raise click.ClickException(
         f"the requested model {requested_model!r} is not in this host's current "
         "model list — it may have changed since the pick. Launchable model ids: "
-        f"{_claude_launchable_model_text(rows)}. Pick again from the model menu."
+        f"{launchable_text}. Pick again from the model menu."
     )
 
 
@@ -1354,10 +1339,6 @@ class ClaudeLaunchCatalogStatus(Enum):
     REFRESH_FAILED = "refresh_failed"
 
 
-class _UnavailableCatalogRefreshError(Exception):
-    """Sentinel used when structured catalog refresh errors are unavailable."""
-
-
 @dataclass(frozen=True)
 class ClaudeLaunchCatalogResult:
     """Catalog rows plus authoritative refresh provenance."""
@@ -1378,23 +1359,16 @@ async def claude_launch_catalog_result(
         "claude-native", fingerprint
     ):
         return ClaudeLaunchCatalogResult(cached, ClaudeLaunchCatalogStatus.FRESH)
-    catalog_refresh_error = cast(
-        type[Exception],
-        getattr(
-            model_catalog_store,
-            "CatalogRefreshError",
-            _UnavailableCatalogRefreshError,
-        ),
-    )
+    catalog_refresh_error = getattr(model_catalog_store, "CatalogRefreshError", None)
     try:
         rows = await claude_model_catalog(claude_config)
-    except catalog_refresh_error as exc:
-        failure_kind = getattr(getattr(exc, "kind", None), "value", None)
-        if failure_kind == "empty":
+    except Exception as exc:  # noqa: BLE001 — return sanitized refresh provenance
+        if (
+            catalog_refresh_error is not None
+            and isinstance(exc, catalog_refresh_error)
+            and (getattr(getattr(exc, "kind", None), "value", None) == "empty")
+        ):
             return ClaudeLaunchCatalogResult([], ClaudeLaunchCatalogStatus.EMPTY)
-        _logger.warning("Claude launch catalog refresh failed", exc_info=True)
-        return ClaudeLaunchCatalogResult([], ClaudeLaunchCatalogStatus.REFRESH_FAILED)
-    except Exception:  # noqa: BLE001 — return sanitized refresh provenance
         _logger.warning("Claude launch catalog refresh failed", exc_info=True)
         return ClaudeLaunchCatalogResult([], ClaudeLaunchCatalogStatus.REFRESH_FAILED)
     if rows is None:
