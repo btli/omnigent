@@ -2322,7 +2322,7 @@ function SectionHeader({
       type="button"
       aria-expanded={!collapsed}
       aria-current={active ? "page" : undefined}
-      onClick={contextMenuOpen ? undefined : onToggleCollapsed}
+      onClick={contextMenuOpen && !contextMenuDisabled ? undefined : onToggleCollapsed}
       className={
         icon
           ? cn(
