@@ -57,6 +57,11 @@ class MainActivity : AppCompatActivity() {
     private var pendingNavigatePath: String? = null
     private var lastInsets: Insets? = null
     private var pageLoaded = false
+
+    // True between onStop and onStart. A deep link arriving while stopped is
+    // held for onStart, which emits it after resumeTimers() so the JS side is
+    // guaranteed to be running.
+    private var stopped = false
     private var bridgeTransportInstalled = false
     private var bridgeScriptHandler: ScriptHandler? = null
     private var loginAttempts = 0 // capped browser-login retries; reset in onPageReady
@@ -278,6 +283,29 @@ class MainActivity : AppCompatActivity() {
 
         ensureNotificationPermission()
         webView.loadUrl(serverUrl)
+    }
+
+    override fun onStop() {
+        super.onStop()
+        stopped = true
+        if (::webView.isInitialized) {
+            // Suspend JS timers while off-screen: the SPA's heartbeat and reconnect
+            // loops otherwise burn CPU/radio until the OS freezes the process. Timers
+            // only (webView.onPause() would kill audio on screen-off), from onStop so a
+            // visible multi-window pane never freezes; process-global, sole WebView host.
+            webView.pauseTimers()
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        stopped = false
+        if (::webView.isInitialized) {
+            webView.resumeTimers()
+            // A notification tap that arrived while stopped deferred its deep
+            // link (see onNewIntent); emit it now that JS timers run again.
+            if (pageLoaded) flushPendingActivation()
+        }
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -505,8 +533,11 @@ class MainActivity : AppCompatActivity() {
 
         val path = navigatePathOf(intent) ?: return
         pendingNavigatePath = path
-        // Replay now if the page is up; otherwise onPageReady will flush it.
-        if (pageLoaded) flushPendingActivation()
+        // Replay now if the page is up — unless we're stopped with JS timers
+        // paused, where an evaluateJavascript could be dropped on older
+        // WebViews; onStart re-flushes after resumeTimers(). A cold page
+        // flushes from onPageReady instead.
+        if (pageLoaded && !stopped) flushPendingActivation()
     }
 
     /**
