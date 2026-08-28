@@ -3640,20 +3640,8 @@ def test_resolve_codex_launch_model_override_folds_to_catalog_spelling(
 
 
 def test_resolve_codex_launch_model_override_rejects_unlisted_model() -> None:
-    """A model with no launchable counterpart is rejected, not substituted."""
-    from omnigent.runner.native.orchestration import (
-        _resolve_codex_launch_model_override,
-    )
-
-    with pytest.raises(click.ClickException) as excinfo:
-        _resolve_codex_launch_model_override(
-            "databricks-gpt-5-3-codex", _codex_launch_catalog_rows()
-        )
-    assert "databricks-gpt-5-3-codex" in str(excinfo.value)
-
-
-def test_resolve_codex_launch_model_override_enumerates_launchable_ids() -> None:
-    """The rejection names every launchable id so the failure is diagnosable."""
+    """An unlisted model is rejected, not substituted, and the error names it
+    alongside every launchable id so the failure is diagnosable."""
     from omnigent.runner.native.orchestration import (
         _resolve_codex_launch_model_override,
     )
@@ -3663,6 +3651,7 @@ def test_resolve_codex_launch_model_override_enumerates_launchable_ids() -> None
             "databricks-gpt-5-3-codex", _codex_launch_catalog_rows()
         )
     message = str(excinfo.value)
+    assert "databricks-gpt-5-3-codex" in message
     assert "Launchable model ids:" in message
     for launchable in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.2"):
         assert repr(launchable) in message
