@@ -9904,6 +9904,58 @@ def test_claude_catalog_selection_surfaces_an_equivalent_context_marker_change(
     assert repr(equivalent) in warnings[0].getMessage()
 
 
+def test_claude_catalog_selection_uses_verified_case_with_notice(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A wrong-case legacy pin launches the catalog's verified spelling visibly."""
+    requested = "Claude-Opus-4-8"
+    verified = "claude-opus-4-8"
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.claude_native"):
+        selected, notice = claude_native.resolve_claude_native_catalog_selection(
+            requested,
+            [{"id": verified, "model": verified}],
+            None,
+        )
+
+    assert selected == verified
+    assert notice is not None
+    assert "host's verified spelling" in notice
+    warnings = [record for record in caplog.records if "substituting" in record.getMessage()]
+    assert len(warnings) == 1
+    assert repr(requested) in warnings[0].getMessage()
+    assert repr(verified) in warnings[0].getMessage()
+
+
+@pytest.mark.parametrize(
+    ("requested", "catalog_model"),
+    [
+        pytest.param("opus[1m]", "opus", id="long-to-standard"),
+        pytest.param("opus", "opus[1m]", id="standard-to-long"),
+    ],
+)
+def test_claude_catalog_selection_surfaces_alias_context_marker_change(
+    requested: str,
+    catalog_model: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An alias's explicit context marker cannot change silently."""
+    with caplog.at_level(logging.WARNING, logger="omnigent.claude_native"):
+        selected, notice = claude_native.resolve_claude_native_catalog_selection(
+            requested,
+            [{"id": catalog_model, "model": catalog_model}],
+            None,
+        )
+
+    assert selected == catalog_model
+    assert notice is not None
+    assert "different [1m] context marker" in notice
+    warnings = [record for record in caplog.records if "substituting" in record.getMessage()]
+    assert len(warnings) == 1
+    assert repr(requested) in warnings[0].getMessage()
+    assert repr(catalog_model) in warnings[0].getMessage()
+
+
 def test_claude_tier_fallback_order_is_capability_descending() -> None:
     """Launch policy has explicit order and exactly the documented tier membership."""
     from omnigent.claude_model_vocabulary import CLAUDE_MODEL_ALIASES

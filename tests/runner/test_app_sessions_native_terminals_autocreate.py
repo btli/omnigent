@@ -3535,9 +3535,9 @@ async def test_auto_create_claude_terminal_substitutes_an_unavailable_tier_with_
         pytest.param(
             "subscription",
             "claude-opus-4-8",
-            "claude-opus-4-8",
+            "claude-opus-4-8[1m]",
             "fresh",
-            id="subscription-canonical",
+            id="subscription-equivalent",
         ),
         pytest.param(
             "gateway",
@@ -3573,10 +3573,9 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
     """
     A persisted canonical id the catalog lists only by family still launches.
 
-    A live ``/model`` persists the pane's exact id (``claude-opus-4-8``) while
-    the catalog spells that family as alias rows and the 1M default. A canonical
-    endpoint honors that id; a gateway uses only an equivalent catalog spelling.
-    Unrecognized ids remain loud and never start a terminal.
+    A live ``/model`` can persist ``claude-opus-4-8`` while the current catalog
+    lists only the equivalent 1M spelling. Both endpoint types use the verified
+    catalog spelling visibly; unrecognized ids remain loud before launch.
     """
     from omnigent.claude_native import (
         ClaudeLaunchCatalogResult,
@@ -3651,7 +3650,7 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         )
         args = captured["spec"].args
         assert args[args.index("--model") + 1] == expected
-    if endpoint == "gateway" and requested == "claude-opus-4-8":
+    if requested == "claude-opus-4-8":
         assert len(event_posts) == 1
         item = event_posts[0]["data"]["item_data"]
         assert item["code"] == "claude_model_substituted"
@@ -3660,6 +3659,53 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         assert event_posts == []
 
     await fake_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_auto_create_claude_terminal_spec_pin_survives_catalog_refresh_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Own-login launches pass a spec pin through when discovery is transiently down."""
+    from omnigent.claude_native import ClaudeLaunchCatalogResult, ClaudeLaunchCatalogStatus
+
+    async def _catalog(_config: object) -> ClaudeLaunchCatalogResult:
+        return ClaudeLaunchCatalogResult([], ClaudeLaunchCatalogStatus.REFRESH_FAILED)
+
+    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog_result", _catalog)
+    resource_registry, fake_client, captured, event_posts = _prepare_claude_model_launch_test(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        snapshot={"labels": {}},
+    )
+
+    async def _resolve() -> None:
+        return None
+
+    requested = "claude-opus-4-8"
+    try:
+        await _auto_create_claude_terminal(
+            "1a2b3c4d5e6f70819283746556473829",
+            resource_registry,
+            lambda _sid, _evt: None,
+            server_client=fake_client,
+            resolve_launch_config=_resolve,
+            agent_spec=AgentSpec(
+                spec_version=1,
+                name="claude",
+                executor=ExecutorSpec(
+                    type="omnigent",
+                    model=requested,
+                    config={"harness": "claude-native"},
+                ),
+            ),
+        )
+    finally:
+        await fake_client.aclose()
+
+    args = captured["spec"].args
+    assert args[args.index("--model") + 1] == requested
+    assert event_posts == []
 
 
 @pytest.mark.asyncio

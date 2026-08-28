@@ -424,6 +424,13 @@ def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> b
     return host == "anthropic.com" or host.endswith(".anthropic.com")
 
 
+def claude_config_serves_canonical_ids(
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> bool:
+    """Whether a launch config accepts canonical Anthropic model ids."""
+    return claude_config is None or _serves_canonical_anthropic_ids(claude_config)
+
+
 def _claude_family(token: str) -> str | None:
     """
     The family alias a model id or alias folds onto, bracket markers dropped.
@@ -561,6 +568,8 @@ def resolve_claude_native_catalog_selection(
     :returns: ``(launch_model, notice)``; ``notice`` is set only on substitution.
     :raises click.ClickException: If the request cannot stay in the Claude family.
     """
+    from omnigent.model_catalog_store import catalog_contains
+
     resolved_request = (
         resolve_claude_native_model_selection(requested_model, claude_config) or requested_model
     )
@@ -573,30 +582,33 @@ def resolve_claude_native_catalog_selection(
         else None
     )
     for candidate in dict.fromkeys((requested_model, resolved_request)):
+        exact_match = catalog_contains(rows, candidate)
         catalog_model = resolve_claude_catalog_model(rows, candidate)
         if catalog_model is not None:
-            if candidate.lower().startswith("claude-") and (
-                claude_config is None or _serves_canonical_anthropic_ids(claude_config)
-            ):
-                launch_model = candidate
-            else:
-                launch_model = catalog_model
-            if requested_tier is None and requested_model.lower().endswith(
-                "[1m]"
-            ) != launch_model.lower().endswith("[1m]"):
+            launch_model = candidate if exact_match else catalog_model
+            if requested_model.lower().endswith("[1m]") != launch_model.lower().endswith("[1m]"):
                 reason = "the equivalent catalog model uses a different [1m] context marker"
-                _logger.warning(
-                    "native-claude: substituting requested model %r with %r: %s",
-                    requested_model,
-                    launch_model,
-                    reason,
-                )
-                notice = (
-                    f"Requested Claude model {requested_model!r} was substituted with "
-                    f"{launch_model!r} because {reason}."
-                )
-                return launch_model, notice
-            return launch_model, None
+            elif (
+                candidate == requested_model
+                and not exact_match
+                and launch_model != requested_model
+                and requested_model.lower().endswith("[1m]")
+                == launch_model.lower().endswith("[1m]")
+            ):
+                reason = "the equivalent catalog model uses the host's verified spelling"
+            else:
+                return launch_model, None
+            _logger.warning(
+                "native-claude: substituting requested model %r with %r: %s",
+                requested_model,
+                launch_model,
+                reason,
+            )
+            notice = (
+                f"Requested Claude model {requested_model!r} was substituted with "
+                f"{launch_model!r} because {reason}."
+            )
+            return launch_model, notice
 
     if requested_tier in _CLAUDE_TIER_FALLBACK_ORDER:
         start = _CLAUDE_TIER_FALLBACK_ORDER.index(requested_tier)
