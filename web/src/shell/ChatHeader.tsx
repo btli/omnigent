@@ -443,7 +443,10 @@ export function ChatHeader({
 
       <div
         className={cn(
-          "flex items-center gap-2 max-md:gap-0 max-md:empty:hidden",
+          // shrink-0 + w-fit keep the pill sized to its rigid controls on a
+          // phone, so a long breadcrumb truncates instead of squeezing the
+          // cluster and spilling a control past the pill's edge.
+          "flex items-center gap-2 max-md:w-fit max-md:shrink-0 max-md:gap-0 max-md:empty:hidden",
           MOBILE_GLASS_PILL,
         )}
       >

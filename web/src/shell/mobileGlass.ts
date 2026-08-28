@@ -16,11 +16,13 @@ export const MOBILE_GLASS_SURFACE =
  * session kebab must read as the same size.
  *
  * The exception is the Chat/Terminal track (ViewModeToggle): it paints its
- * own background out to its edge, so with no padding it collides with the
- * pill's border while an icon-only neighbour still clears it by the slack
- * inside its 40px box. Inset the leading edge by that slack — only when the
- * track is present — so ink sits 12px from either end. Assumes the track is
- * the cluster's leading child on mobile; a control added ahead of it would
- * take the inset instead.
+ * own background out to its edge, so with no padding its ink runs into the
+ * pill's rounded cap while an icon-only neighbour clears it by the slack
+ * inside its 40px box. When the track is present, inset BOTH ends by that
+ * slack and pin the pill to 40px, so the 28px track sits centered with
+ * vertical clearance and its ink stays inside the rounded caps whether it is
+ * flanked by a kebab or is the cluster's only control (a terminal-first
+ * sub-agent). The symmetric inset means the leading child no longer has to be
+ * the track.
  */
-export const MOBILE_GLASS_PILL = `${MOBILE_GLASS_SURFACE} max-md:rounded-full max-md:has-data-[slot=view-mode-toggle]:pl-1.5`;
+export const MOBILE_GLASS_PILL = `${MOBILE_GLASS_SURFACE} max-md:rounded-full max-md:has-data-[slot=view-mode-toggle]:h-10 max-md:has-data-[slot=view-mode-toggle]:px-1.5`;
