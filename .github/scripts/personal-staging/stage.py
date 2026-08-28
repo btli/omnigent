@@ -52,6 +52,7 @@ UPSTREAM_REPO = "omnigent-ai/omnigent"
 PR_AUTHOR = "btli"
 PR_LIST_LIMIT = 300
 EXTRAS_FILE = Path(__file__).resolve().parent / "extras.txt"
+EXCLUDE_FILE = Path(__file__).resolve().parent / "exclude.txt"
 # Two different answers about a pinned extra: only a ref confirmed absent
 # invites editing the manifest, and only a failure to reach the remote blocks
 # the push (dropping a required pin would silently regress staging).
@@ -344,6 +345,24 @@ def parse_extras(path: Path, ring: Ring = STAGING) -> tuple[list[int], list[str]
     return numbers, branches
 
 
+def parse_exclusions(path: Path) -> list[int]:
+    """PR numbers from the exclusion manifest, one per line."""
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return []
+    numbers: list[int] = []
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        entry = raw.split("#", 1)[0].strip()
+        if not entry:
+            continue
+        if entry.isdigit():
+            numbers.append(int(entry))
+            continue
+        raise StageError(f"{path}:{lineno}: invalid exclude entry {entry!r}")
+    return numbers
+
+
 def fetch_extra(cwd: str | Path, remote: str, ref: str) -> tuple[str, str]:
     """Resolve a pinned extra ref to a commit oid, returning ``(oid, "")``
     on success and ``("", reason)`` otherwise. A deleted ref and an
@@ -371,6 +390,14 @@ def merge_stream(open_prs: list[dict], extras: list[int]) -> list[dict]:
     stream = [{**p, "source": "open"} for p in open_prs]
     stream += [{"number": n, "source": "extra"} for n in sorted(set(extras) - open_nums)]
     return sorted(stream, key=lambda p: p["number"])
+
+
+def apply_exclusions(prs: list[dict], exclusions: list[int]) -> tuple[list[dict], list[dict]]:
+    numbers = list(dict.fromkeys(exclusions))
+    excluded_numbers = set(numbers)
+    stream = [p for p in prs if p["number"] not in excluded_numbers]
+    excluded = [{"pr": number, "reason": "held out via exclude.txt"} for number in numbers]
+    return stream, excluded
 
 
 def remote_ref(cwd: str | Path, remote: str, ref: str) -> str:
@@ -1211,6 +1238,11 @@ def main(argv: list[str] | None = None) -> int:
         help="extras manifest path (missing file == no extras)",
     )
     p_stage.add_argument(
+        "--exclude",
+        default=str(EXCLUDE_FILE),
+        help="exclusion manifest path (missing file == no exclusions)",
+    )
+    p_stage.add_argument(
         "--rr-cache",
         default=str(RR_CACHE_DIR),
         help="committed rr-cache seed directory (missing dir == no resolutions)",
@@ -1275,6 +1307,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if ring.exclude_drafts:
             prs = filter_drafts(prs)
+        exclusions = parse_exclusions(Path(args.exclude))
         # Extras are read here, before any merge touches the worktree, so the
         # manifest always comes from the trusted checkout. A ring without
         # extras never opens the manifest at all.
@@ -1284,6 +1317,7 @@ def main(argv: list[str] | None = None) -> int:
         prs = merge_stream(prs, pr_extras)
         for name in dict.fromkeys(branch_extras):
             prs.append({"source": "extra-branch", "headRefName": name, "number": None})
+        prs, excluded = apply_exclusions(prs, exclusions)
         report = stage(
             args.workdir,
             prs,
@@ -1295,6 +1329,7 @@ def main(argv: list[str] | None = None) -> int:
             migration_approval=args.migration_approval,
             rr_cache_dir=Path(args.rr_cache),
         )
+        report["excluded"] = excluded
     except Exception as e:
         # The step summary is the failure surface — never exit without one.
         append_summary(f"## {title}\n\n**FAILED:** {e}\n")
