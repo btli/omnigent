@@ -431,6 +431,25 @@ def claude_config_serves_canonical_ids(
     return claude_config is None or _serves_canonical_anthropic_ids(claude_config)
 
 
+def is_canonical_claude_pin(model: str) -> bool:
+    """Whether *model* is recognized and already uses Claude's canonical spelling."""
+    if model != model.strip() or model != model.lower():
+        return False
+    bare = model.removesuffix("[1m]")
+    if bare in CLAUDE_MODEL_ALIASES:
+        return True
+    parts = bare.split("-")
+    if not parts or parts[0] != "claude":
+        return False
+    model_parts = parts[1:]
+    tiers = [part for part in model_parts if part in CLAUDE_MODEL_ALIASES]
+    return (
+        len(tiers) == 1
+        and any(part.isdigit() for part in model_parts)
+        and all(part.isdigit() or part in CLAUDE_MODEL_ALIASES for part in model_parts)
+    )
+
+
 def _claude_family(token: str) -> str | None:
     """
     The family alias a model id or alias folds onto, bracket markers dropped.
@@ -585,16 +604,16 @@ def resolve_claude_native_catalog_selection(
         exact_match = catalog_contains(rows, candidate)
         catalog_model = resolve_claude_catalog_model(rows, candidate)
         if catalog_model is not None:
-            launch_model = candidate if exact_match else catalog_model
+            if exact_match or (
+                is_canonical_claude_pin(candidate)
+                and claude_config_serves_canonical_ids(claude_config)
+            ):
+                launch_model = candidate
+            else:
+                launch_model = catalog_model
             if requested_model.lower().endswith("[1m]") != launch_model.lower().endswith("[1m]"):
                 reason = "the equivalent catalog model uses a different [1m] context marker"
-            elif (
-                candidate == requested_model
-                and not exact_match
-                and launch_model != requested_model
-                and requested_model.lower().endswith("[1m]")
-                == launch_model.lower().endswith("[1m]")
-            ):
+            elif candidate == requested_model and launch_model != requested_model:
                 reason = "the equivalent catalog model uses the host's verified spelling"
             else:
                 return launch_model, None
