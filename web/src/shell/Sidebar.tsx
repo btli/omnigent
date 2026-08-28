@@ -4490,7 +4490,6 @@ function useProjectFolderMenu(
   return { actions, dialogs };
 }
 
-/** The kebab entry point for the shared project-folder action menu. */
 function ProjectFolderMenu({
   projectName,
   icon,
