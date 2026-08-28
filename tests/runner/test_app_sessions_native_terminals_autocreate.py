@@ -3657,27 +3657,54 @@ def test_resolve_codex_launch_model_override_rejects_unlisted_model() -> None:
         assert repr(launchable) in message
 
 
-def test_resolve_codex_launch_model_override_exact_match_beats_earlier_fold() -> None:
-    """An exact pin wins over an earlier row that merely folds to it, so its own
-    spelling survives regardless of catalog row order.
-
-    Distinct tiers (``-sol``/``-terra``/``-luna``) never fold together, so a
-    fold collision only ever pairs two spellings of one model; the hazard is
-    purely that row order could shadow an exact pin — which this pins shut.
-    """
+@pytest.mark.parametrize("reverse_rows", [False, True], ids=["model-row-first", "id-row-first"])
+def test_resolve_codex_launch_model_override_exact_match_beats_earlier_fold(
+    reverse_rows: bool,
+) -> None:
+    """An exact selectable id wins over another row's exact model alias."""
     from omnigent.runner.native.orchestration import (
         _resolve_codex_launch_model_override,
     )
 
     catalog = [
-        {"id": "system.ai.gpt-5-6-sol", "model": "system.ai.gpt-5-6-sol"},
-        {"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "isDefault": True},
+        {"id": "other-selector", "model": "gpt-5.6-sol"},
+        {"id": "gpt-5.6-sol", "model": "system.ai.gpt-5-6-sol", "isDefault": True},
     ]
+    if reverse_rows:
+        catalog.reverse()
     assert _resolve_codex_launch_model_override("gpt-5.6-sol", catalog) == "gpt-5.6-sol"
-    assert (
-        _resolve_codex_launch_model_override("gpt-5.6-sol", list(reversed(catalog)))
-        == "gpt-5.6-sol"
+
+
+def test_resolve_codex_launch_model_override_rejects_ambiguous_exact_models() -> None:
+    """Two selectable ids for one exact model spelling fail loudly."""
+    from omnigent.runner.native.orchestration import (
+        _resolve_codex_launch_model_override,
     )
+
+    catalog = [
+        {"id": "first-selector", "model": "shared-provider-model"},
+        {"id": "second-selector", "model": "shared-provider-model"},
+    ]
+    with pytest.raises(click.ClickException) as excinfo:
+        _resolve_codex_launch_model_override("shared-provider-model", catalog)
+    message = str(excinfo.value)
+    assert "do not resolve to exactly one valid catalog id" in message
+    assert "'first-selector'" in message
+    assert "'second-selector'" in message
+
+
+@pytest.mark.parametrize("invalid_id", ["", "   "], ids=["empty", "whitespace"])
+def test_resolve_codex_launch_model_override_never_returns_a_blank_id(invalid_id: str) -> None:
+    """An exact model match without a valid selectable id fails loudly."""
+    from omnigent.runner.native.orchestration import (
+        _resolve_codex_launch_model_override,
+    )
+
+    with pytest.raises(click.ClickException, match="exactly one valid catalog id"):
+        _resolve_codex_launch_model_override(
+            "shared-provider-model",
+            [{"id": invalid_id, "model": "shared-provider-model"}],
+        )
 
 
 @pytest.mark.asyncio

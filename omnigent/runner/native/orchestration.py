@@ -3731,23 +3731,50 @@ def _resolve_codex_launch_model_override(requested: str, catalog: list[_JsonObje
     """
     from omnigent.codex_model_vocabulary import codex_reachable_model_slug
 
-    # An exact id/model match wins over any folding alias, so a persisted pin's
-    # own spelling survives regardless of catalog row order.
-    for row in catalog:
+    def _valid_row_id(row: _JsonObject) -> str | None:
         row_id = row.get("id")
-        if isinstance(row_id, str) and requested in (row_id, row.get("model")):
+        if not isinstance(row_id, str):
+            return None
+        row_id = row_id.strip()
+        return row_id or None
+
+    def _launchable_text() -> str:
+        launchable = sorted(
+            {str(token) for row in catalog for token in (row.get("id"), row.get("model")) if token}
+        )
+        return ", ".join(repr(token) for token in launchable) or "none"
+
+    # A selectable id is stronger than another row's model alias.
+    for row in catalog:
+        row_id = _valid_row_id(row)
+        if row_id is not None and requested == row_id:
             return row_id
+
+    exact_model_match = False
+    exact_model_ids: set[str] = set()
+    for row in catalog:
+        if requested != row.get("model"):
+            continue
+        exact_model_match = True
+        row_id = _valid_row_id(row)
+        if row_id is not None:
+            exact_model_ids.add(row_id)
+    if exact_model_match:
+        if len(exact_model_ids) == 1:
+            return next(iter(exact_model_ids))
+        raise click.ClickException(
+            f"the requested model {requested!r} exactly matches catalog rows that "
+            "do not resolve to exactly one valid catalog id. Launchable model ids: "
+            f"{_launchable_text()}. Pick again from the model menu."
+        )
+
     resolved = codex_reachable_model_slug(requested, catalog)
     if resolved is not None:
         return resolved
-    launchable = sorted(
-        {str(token) for row in catalog for token in (row.get("id"), row.get("model")) if token}
-    )
-    launchable_text = ", ".join(repr(token) for token in launchable) or "none"
     raise click.ClickException(
         f"the requested model {requested!r} is not in this host's current model "
         f"list — it may have changed since the pick. Launchable model ids: "
-        f"{launchable_text}. Pick again from the model menu."
+        f"{_launchable_text()}. Pick again from the model menu."
     )
 
 
