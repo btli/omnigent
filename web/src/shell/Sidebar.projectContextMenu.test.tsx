@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -151,6 +151,18 @@ function dismissMenu() {
   fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
 }
 
+function dispatchTouchPointer(target: HTMLElement, type: "pointerdown" | "pointermove") {
+  const event = new PointerEvent(type, {
+    bubbles: true,
+    cancelable: true,
+    clientX: type === "pointerdown" ? 10 : 11,
+    clientY: 10,
+    pointerType: "touch",
+  });
+  expect(event.pointerType).toBe("touch");
+  fireEvent(target, event);
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   useConversationsMock.mockReset();
@@ -275,6 +287,47 @@ describe("project folder header context menu", () => {
     fireEvent.click(folderHeader());
 
     expect(folderHeader()).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("opens after a stationary touch long-press", () => {
+    vi.useFakeTimers();
+    try {
+      renderSidebar();
+      const header = folderHeader();
+
+      dispatchTouchPointer(header, "pointerdown");
+      act(() => vi.advanceTimersByTime(699));
+      expect(screen.queryByTestId("rename-project")).toBeNull();
+      act(() => vi.advanceTimersByTime(1));
+
+      expect(screen.getByTestId("rename-project")).toBeInTheDocument();
+    } finally {
+      cleanup();
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels a touch long-press when the pointer moves", () => {
+    vi.useFakeTimers();
+    try {
+      renderSidebar();
+      const header = folderHeader();
+
+      // Prove the same touch path can open before exercising cancellation.
+      dispatchTouchPointer(header, "pointerdown");
+      act(() => vi.advanceTimersByTime(700));
+      expect(screen.getByTestId("rename-project")).toBeInTheDocument();
+      dismissMenu();
+
+      dispatchTouchPointer(header, "pointerdown");
+      dispatchTouchPointer(header, "pointermove");
+      act(() => vi.advanceTimersByTime(700));
+
+      expect(screen.queryByTestId("rename-project")).toBeNull();
+    } finally {
+      cleanup();
+      vi.useRealTimers();
+    }
   });
 
   it("opens for a keyboard-originated contextmenu event", () => {
