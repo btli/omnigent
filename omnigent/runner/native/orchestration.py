@@ -5713,6 +5713,7 @@ def _select_authoritative_claude_launch_model(
     """Select one launch model from the effective pin and fresh catalog."""
     from omnigent.claude_native import (
         ClaudeLaunchCatalogStatus,
+        claude_config_serves_canonical_ids,
         resolve_claude_native_catalog_selection,
         resolve_claude_native_model_selection,
     )
@@ -5725,6 +5726,8 @@ def _select_authoritative_claude_launch_model(
     notice: str | None = None
     if explicit_model:
         if catalog is None or catalog.status is ClaudeLaunchCatalogStatus.REFRESH_FAILED:
+            if claude_config_serves_canonical_ids(claude_config):
+                return launch_model, None
             raise click.ClickException(
                 f"could not verify requested Claude model {explicit_model!r} because "
                 "this host's current model list could not be refreshed. Try again "
