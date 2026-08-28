@@ -293,6 +293,14 @@ describe("project folder header context menu", () => {
     expect(folderHeader()).toHaveAttribute("aria-expanded", "true");
   });
 
+  it("guards touch selection without a viewport breakpoint", () => {
+    renderSidebar();
+    const header = folderHeader();
+
+    expect(header).toHaveClass("select-none", "[-webkit-touch-callout:none]");
+    expect(header).not.toHaveClass("md:select-none", "md:[-webkit-touch-callout:none]");
+  });
+
   it("opens after a stationary touch long-press", () => {
     vi.useFakeTimers();
     try {

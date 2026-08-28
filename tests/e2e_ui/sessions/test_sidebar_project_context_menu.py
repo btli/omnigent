@@ -146,7 +146,7 @@ def test_keyboard_opens_project_folder_menu(project_page: tuple[Page, str]) -> N
 def test_touch_long_press_opens_project_folder_menu(
     touch_project_page: tuple[Page, str],
 ) -> None:
-    """A stationary touch hold opens actions without toggling the folder."""
+    """A stationary touch hold opens actions without toggling or selecting."""
     page, project = touch_project_page
     header = _folder_header(page, project)
     before = _expanded(header)
@@ -160,6 +160,8 @@ def test_touch_long_press_opens_project_folder_menu(
     finally:
         cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
 
+    selection = page.evaluate("window.getSelection()?.toString() ?? ''")
+    assert selection == "", f"project title is selected: {selection!r}"
     expect(header).to_have_attribute("aria-expanded", before)
 
 
