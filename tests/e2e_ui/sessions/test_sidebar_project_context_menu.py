@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterator
 
 import pytest
 from playwright.sync_api import Browser, Locator, Page, expect
@@ -38,6 +39,39 @@ def project_page(page: Page, seeded_session: tuple[str, str]) -> tuple[Page, str
     expect(_folder_header(page, project)).to_be_visible()
 
     return page, project
+
+
+@pytest.fixture
+def touch_project_page(
+    browser: Browser,
+    seeded_session: tuple[str, str],
+) -> Iterator[tuple[Page, str]]:
+    """Open a touch-enabled desktop sidebar with a fresh project folder."""
+    base_url, session_id = seeded_session
+    project = f"Project {uuid.uuid4().hex[:6]}"
+    context = browser.new_context(
+        has_touch=True,
+        viewport={"width": 1280, "height": 720},
+    )
+    try:
+        page = context.new_page()
+        page.goto(f"{base_url}/c/{session_id}")
+        _create_project(page, project)
+        expect(_folder_header(page, project)).to_be_visible()
+        yield page, project
+    finally:
+        context.close()
+
+
+def _touch_point(header: Locator, *, x_offset: float = 0) -> dict[str, float | int]:
+    """Return a CDP touch point within the folder header."""
+    bounds = header.bounding_box()
+    assert bounds is not None, "folder header has no touch target bounds"
+    return {
+        "id": 0,
+        "x": bounds["x"] + bounds["width"] / 2 + x_offset,
+        "y": bounds["y"] + bounds["height"] / 2,
+    }
 
 
 def test_right_click_opens_project_folder_menu(project_page: tuple[Page, str]) -> None:
@@ -85,35 +119,47 @@ def test_keyboard_opens_project_folder_menu(project_page: tuple[Page, str]) -> N
 
 
 def test_touch_long_press_opens_project_folder_menu(
-    browser: Browser,
-    seeded_session: tuple[str, str],
+    touch_project_page: tuple[Page, str],
 ) -> None:
-    """A stationary touch hold opens the folder actions."""
-    base_url, session_id = seeded_session
-    project = f"Project {uuid.uuid4().hex[:6]}"
-    context = browser.new_context(
-        has_touch=True,
-        viewport={"width": 1280, "height": 720},
+    """A stationary touch hold opens actions without toggling the folder."""
+    page, project = touch_project_page
+    header = _folder_header(page, project)
+    before = _expanded(header)
+    cdp = page.context.new_cdp_session(page)
+    point = _touch_point(header)
+
+    cdp.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [point]})
+    try:
+        page.wait_for_timeout(750)
+        expect(page.get_by_test_id("rename-project")).to_be_visible()
+    finally:
+        cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+
+    expect(header).to_have_attribute("aria-expanded", before)
+
+
+def test_moving_touch_hold_does_not_open_project_folder_menu(
+    touch_project_page: tuple[Page, str],
+) -> None:
+    """Touch movement cancels the pending folder context menu."""
+    page, project = touch_project_page
+    header = _folder_header(page, project)
+    before = _expanded(header)
+    cdp = page.context.new_cdp_session(page)
+
+    cdp.send(
+        "Input.dispatchTouchEvent",
+        {"type": "touchStart", "touchPoints": [_touch_point(header)]},
     )
     try:
-        page = context.new_page()
-        page.goto(f"{base_url}/c/{session_id}")
-        _create_project(page, project)
-        header = _folder_header(page, project)
-        expect(header).to_be_visible()
-
-        bounds = header.bounding_box()
-        assert bounds is not None, "folder header has no touch target bounds"
-        point = {
-            "x": bounds["x"] + bounds["width"] / 2,
-            "y": bounds["y"] + bounds["height"] / 2,
-        }
-        cdp = context.new_cdp_session(page)
-        cdp.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [point]})
-        try:
-            page.wait_for_timeout(750)
-            expect(page.get_by_test_id("rename-project")).to_be_visible()
-        finally:
-            cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+        page.wait_for_timeout(100)
+        cdp.send(
+            "Input.dispatchTouchEvent",
+            {"type": "touchMove", "touchPoints": [_touch_point(header, x_offset=20)]},
+        )
+        page.wait_for_timeout(700)
+        expect(page.get_by_test_id("rename-project")).not_to_be_visible()
     finally:
-        context.close()
+        cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+
+    expect(header).to_have_attribute("aria-expanded", before)

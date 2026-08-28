@@ -151,7 +151,10 @@ function dismissMenu() {
   fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
 }
 
-function dispatchTouchPointer(target: HTMLElement, type: "pointerdown" | "pointermove") {
+function dispatchTouchPointer(
+  target: HTMLElement,
+  type: "pointerdown" | "pointermove" | "pointerup",
+) {
   const event = new PointerEvent(type, {
     bubbles: true,
     cancelable: true,
@@ -294,6 +297,9 @@ describe("project folder header context menu", () => {
     try {
       renderSidebar();
       const header = folderHeader();
+      fireEvent.click(header);
+      const before = header.getAttribute("aria-expanded");
+      if (before === null) throw new Error("Folder header is missing aria-expanded");
 
       dispatchTouchPointer(header, "pointerdown");
       act(() => vi.advanceTimersByTime(699));
@@ -301,6 +307,9 @@ describe("project folder header context menu", () => {
       act(() => vi.advanceTimersByTime(1));
 
       expect(screen.getByTestId("rename-project")).toBeInTheDocument();
+      dispatchTouchPointer(header, "pointerup");
+      fireEvent.click(header);
+      expect(header).toHaveAttribute("aria-expanded", before);
     } finally {
       cleanup();
       vi.useRealTimers();
