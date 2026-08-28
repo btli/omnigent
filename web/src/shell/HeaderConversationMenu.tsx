@@ -51,6 +51,7 @@ import { markConversationUnread } from "@/hooks/useUnseenConversations";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { Link, useNavigate } from "@/lib/routing";
+import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showToast } from "@/components/ui/toast";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
@@ -222,14 +223,19 @@ export function HeaderConversationMenu({
           Agent info
         </DropdownMenuItem>
       )}
-      <DropdownMenuItem
-        data-testid="header-rename-conversation"
-        className={itemClass}
-        onSelect={() => setRenameOpen(true)}
-      >
-        <PencilIcon className="size-3.5" />
-        Rename
-      </DropdownMenuItem>
+      {/* Rename lives here only on mobile — the native shells hide the
+          breadcrumb, so this menu is the sole entry point. On desktop the
+          shortcut is clicking the breadcrumb title (HeaderTitle). */}
+      {isMobile && (
+        <DropdownMenuItem
+          data-testid="header-rename-conversation"
+          className={itemClass}
+          onSelect={() => setRenameOpen(true)}
+        >
+          <PencilIcon className="size-3.5" />
+          Rename
+        </DropdownMenuItem>
+      )}
       <DropdownMenuItem
         data-testid="header-mark-unread-conversation"
         className={itemClass}
@@ -351,6 +357,7 @@ export function HeaderConversationMenu({
               autoFocus
               aria-label="Session name"
               data-testid="header-rename-conversation-input"
+              maxLength={USER_SESSION_TITLE_MAX_CHARS}
               value={renameTitle}
               onChange={(event) => setRenameTitle(event.target.value)}
               onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => {

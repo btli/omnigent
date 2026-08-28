@@ -170,7 +170,7 @@
         "description": "Request body for the current-agent automatic rename endpoint.",
         "properties": {
           "title": {
-            "maxLength": 60,
+            "maxLength": 100,
             "minLength": 2,
             "title": "Title",
             "type": "string"
@@ -4573,6 +4573,7 @@
           "title": {
             "anyOf": [
               {
+                "maxLength": 200,
                 "type": "string"
               },
               {
@@ -7599,6 +7600,7 @@
           "title": {
             "anyOf": [
               {
+                "maxLength": 200,
                 "type": "string"
               },
               {
