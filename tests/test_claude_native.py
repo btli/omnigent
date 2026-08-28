@@ -9876,21 +9876,32 @@ def test_claude_catalog_selection_honors_an_available_concrete_pin(
     assert not [record for record in caplog.records if "substitut" in record.getMessage()]
 
 
-def test_claude_catalog_selection_matches_an_equivalent_generation_before_fallback() -> None:
-    """A provider spelling and context marker do not change the pinned generation."""
+def test_claude_catalog_selection_surfaces_an_equivalent_context_marker_change(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An equivalent generation with a different context marker is visible."""
     requested = "databricks-claude-opus-4-8"
     equivalent = "system.ai.claude-opus-4-8[1m]"
 
-    assert claude_native.resolve_claude_native_catalog_selection(
-        requested,
-        [
-            {"id": "opus", "model": "system.ai.claude-opus-5"},
-            {"id": equivalent, "model": equivalent},
-        ],
-        claude_native.ClaudeNativeUcodeConfig(
-            env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}
-        ),
-    ) == (equivalent, None)
+    with caplog.at_level(logging.WARNING, logger="omnigent.claude_native"):
+        selected, notice = claude_native.resolve_claude_native_catalog_selection(
+            requested,
+            [
+                {"id": "opus", "model": "system.ai.claude-opus-5"},
+                {"id": equivalent, "model": equivalent},
+            ],
+            claude_native.ClaudeNativeUcodeConfig(
+                env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}
+            ),
+        )
+
+    assert selected == equivalent
+    assert notice is not None
+    assert "different [1m] context marker" in notice
+    warnings = [record for record in caplog.records if "substituting" in record.getMessage()]
+    assert len(warnings) == 1
+    assert repr(requested) in warnings[0].getMessage()
+    assert repr(equivalent) in warnings[0].getMessage()
 
 
 def test_claude_tier_fallback_order_is_capability_descending() -> None:
@@ -9923,6 +9934,23 @@ def test_claude_tier_fallback_is_stable_across_catalog_order() -> None:
             None,
         )
         assert selection == "system.ai.claude-opus-5"
+        assert notice is not None
+
+
+def test_claude_tier_fallback_is_stable_for_case_distinct_rows() -> None:
+    """Original-case tie-breakers make case-distinct rows deterministic."""
+    catalog: list[dict[str, object]] = [
+        {"id": "OPUS-5", "model": "SYSTEM.AI.CLAUDE-OPUS-5"},
+        {"id": "opus-5", "model": "system.ai.claude-opus-5"},
+    ]
+
+    for permuted in itertools.permutations(catalog):
+        selection, notice = claude_native.resolve_claude_native_catalog_selection(
+            "fable",
+            list(permuted),
+            None,
+        )
+        assert selection == "SYSTEM.AI.CLAUDE-OPUS-5"
         assert notice is not None
 
 
@@ -9980,7 +10008,7 @@ def test_claude_catalog_selection_rejects_an_unrecognized_claude_looking_id() ->
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("probe_rows", "expected_status", "expected_rows"),
+    ("probe_outcome", "expected_status", "expected_rows"),
     [
         pytest.param(
             [{"id": "opus", "model": "claude-opus-5"}],
@@ -9988,9 +10016,14 @@ def test_claude_catalog_selection_rejects_an_unrecognized_claude_looking_id() ->
             [{"id": "opus", "model": "claude-opus-5"}],
             id="fresh",
         ),
-        pytest.param([], claude_native.ClaudeLaunchCatalogStatus.EMPTY, [], id="empty"),
         pytest.param(
-            None,
+            "empty-error",
+            claude_native.ClaudeLaunchCatalogStatus.EMPTY,
+            [],
+            id="empty",
+        ),
+        pytest.param(
+            "refresh-error",
             claude_native.ClaudeLaunchCatalogStatus.REFRESH_FAILED,
             [],
             id="refresh-failed",
@@ -10000,7 +10033,7 @@ def test_claude_catalog_selection_rejects_an_unrecognized_claude_looking_id() ->
 async def test_claude_launch_catalog_result_ignores_stale_rows_and_reports_refresh_outcome(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    probe_rows: list[dict[str, object]] | None,
+    probe_outcome: list[dict[str, object]] | str,
     expected_status: claude_native.ClaudeLaunchCatalogStatus,
     expected_rows: list[dict[str, object]],
 ) -> None:
@@ -10017,8 +10050,26 @@ async def test_claude_launch_catalog_result_ignores_stale_rows_and_reports_refre
     stale_time = time.time() - model_catalog_store.CATALOG_STALE_AFTER_S - 1
     os.utime(path, (stale_time, stale_time))
 
-    async def _probe(_config: object) -> list[dict[str, object]] | None:
-        return probe_rows
+    class _EmptyKind:
+        value = "empty"
+
+    class CatalogRefreshError(Exception):
+        kind = _EmptyKind()
+
+    monkeypatch.setattr(
+        model_catalog_store,
+        "CatalogRefreshError",
+        CatalogRefreshError,
+        raising=False,
+    )
+
+    async def _probe(_config: object) -> list[dict[str, object]]:
+        if probe_outcome == "empty-error":
+            raise CatalogRefreshError("model catalog refresh returned no models")
+        if probe_outcome == "refresh-error":
+            raise RuntimeError("catalog refresh unavailable")
+        assert isinstance(probe_outcome, list)
+        return probe_outcome
 
     monkeypatch.setattr(claude_native, "claude_model_catalog", _probe)
 

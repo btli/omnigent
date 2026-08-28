@@ -512,7 +512,7 @@ def resolve_claude_catalog_model(
 def _claude_catalog_tier_rank(
     row: dict[str, object],
     tier: str,
-) -> tuple[bool, tuple[int, ...], bool, str, str]:
+) -> tuple[bool, tuple[int, ...], bool, str, str, str, str]:
     """Rank a tier's alias first, then newest standard-context model."""
     from omnigent.claude_model_vocabulary import normalized_model_id
 
@@ -528,6 +528,8 @@ def _claude_catalog_tier_rank(
         launch_model.lower().endswith("[1m]"),
         launch_model.lower(),
         row_id.lower(),
+        launch_model,
+        row_id,
     )
 
 
@@ -588,16 +590,33 @@ def resolve_claude_native_catalog_selection(
     resolved_request = (
         resolve_claude_native_model_selection(requested_model, claude_config) or requested_model
     )
+    requested_tier = _documented_claude_tier_alias(requested_model)
     for candidate in dict.fromkeys((requested_model, resolved_request)):
         catalog_model = resolve_claude_catalog_model(rows, candidate)
         if catalog_model is not None:
             if candidate.lower().startswith("claude-") and (
                 claude_config is None or _serves_canonical_anthropic_ids(claude_config)
             ):
-                return candidate, None
-            return catalog_model, None
+                launch_model = candidate
+            else:
+                launch_model = catalog_model
+            if requested_tier is None and requested_model.lower().endswith(
+                "[1m]"
+            ) != launch_model.lower().endswith("[1m]"):
+                reason = "the equivalent catalog model uses a different [1m] context marker"
+                _logger.warning(
+                    "native-claude: substituting requested model %r with %r: %s",
+                    requested_model,
+                    launch_model,
+                    reason,
+                )
+                notice = (
+                    f"Requested Claude model {requested_model!r} was substituted with "
+                    f"{launch_model!r} because {reason}."
+                )
+                return launch_model, notice
+            return launch_model, None
 
-    requested_tier = _documented_claude_tier_alias(requested_model)
     if requested_tier in _CLAUDE_TIER_FALLBACK_ORDER:
         start = _CLAUDE_TIER_FALLBACK_ORDER.index(requested_tier)
         for tier in _CLAUDE_TIER_FALLBACK_ORDER[start:]:
@@ -1335,6 +1354,10 @@ class ClaudeLaunchCatalogStatus(Enum):
     REFRESH_FAILED = "refresh_failed"
 
 
+class _UnavailableCatalogRefreshError(Exception):
+    """Sentinel used when structured catalog refresh errors are unavailable."""
+
+
 @dataclass(frozen=True)
 class ClaudeLaunchCatalogResult:
     """Catalog rows plus authoritative refresh provenance."""
@@ -1355,9 +1378,23 @@ async def claude_launch_catalog_result(
         "claude-native", fingerprint
     ):
         return ClaudeLaunchCatalogResult(cached, ClaudeLaunchCatalogStatus.FRESH)
+    catalog_refresh_error = cast(
+        type[Exception],
+        getattr(
+            model_catalog_store,
+            "CatalogRefreshError",
+            _UnavailableCatalogRefreshError,
+        ),
+    )
     try:
         rows = await claude_model_catalog(claude_config)
-    except Exception:  # noqa: BLE001 — provenance is returned to the launch selector
+    except catalog_refresh_error as exc:
+        failure_kind = getattr(getattr(exc, "kind", None), "value", None)
+        if failure_kind == "empty":
+            return ClaudeLaunchCatalogResult([], ClaudeLaunchCatalogStatus.EMPTY)
+        _logger.warning("Claude launch catalog refresh failed", exc_info=True)
+        return ClaudeLaunchCatalogResult([], ClaudeLaunchCatalogStatus.REFRESH_FAILED)
+    except Exception:  # noqa: BLE001 — return sanitized refresh provenance
         _logger.warning("Claude launch catalog refresh failed", exc_info=True)
         return ClaudeLaunchCatalogResult([], ClaudeLaunchCatalogStatus.REFRESH_FAILED)
     if rows is None:

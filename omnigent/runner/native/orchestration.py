@@ -5723,11 +5723,13 @@ def _select_authoritative_claude_launch_model(
         claude_config,
     )
     notice: str | None = None
-    if (
-        explicit_model
-        and catalog is not None
-        and catalog.status in {ClaudeLaunchCatalogStatus.FRESH, ClaudeLaunchCatalogStatus.EMPTY}
-    ):
+    if explicit_model:
+        if catalog is None or catalog.status is ClaudeLaunchCatalogStatus.REFRESH_FAILED:
+            raise click.ClickException(
+                f"could not verify requested Claude model {explicit_model!r} because "
+                "this host's current model list could not be refreshed. Try again "
+                "after model discovery recovers."
+            )
         launch_model, notice = resolve_claude_native_catalog_selection(
             explicit_model,
             catalog.rows,
@@ -6709,7 +6711,7 @@ async def _auto_create_claude_terminal(
     # or to resolve a Default launch that would otherwise pass no ``--model``
     # and leave the model to invisible CLI-private state.
     if explicit_model or configured_model is None:
-        from omnigent.claude_native import ClaudeLaunchCatalogStatus, claude_launch_catalog_result
+        from omnigent.claude_native import claude_launch_catalog_result
 
         try:
             launch_catalog_result = await claude_launch_catalog_result(claude_config)
@@ -6718,16 +6720,6 @@ async def _auto_create_claude_terminal(
                 "claude launch catalog unavailable for session=%s",
                 session_id,
                 exc_info=True,
-                extra={"session_id": session_id},
-            )
-        if (
-            launch_catalog_result is not None
-            and launch_catalog_result.status is ClaudeLaunchCatalogStatus.REFRESH_FAILED
-        ):
-            _logger.warning(
-                "claude launch catalog refresh failed for session=%s; "
-                "preserving the requested launch model without substitution",
-                session_id,
                 extra={"session_id": session_id},
             )
     launch_model, model_substitution_notice = _select_authoritative_claude_launch_model(
