@@ -1,11 +1,11 @@
-"""Browser coverage for project-folder right-click actions."""
+"""Browser coverage for project-folder context-menu actions."""
 
 from __future__ import annotations
 
 import uuid
 
 import pytest
-from playwright.sync_api import Locator, Page, expect
+from playwright.sync_api import Browser, Locator, Page, expect
 
 
 def _create_project(page: Page, name: str) -> None:
@@ -82,3 +82,38 @@ def test_keyboard_opens_project_folder_menu(project_page: tuple[Page, str]) -> N
 
     expect(page.get_by_test_id("rename-project")).to_be_visible()
     expect(header).to_have_attribute("aria-expanded", before)
+
+
+def test_touch_long_press_opens_project_folder_menu(
+    browser: Browser,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A stationary touch hold opens the folder actions."""
+    base_url, session_id = seeded_session
+    project = f"Project {uuid.uuid4().hex[:6]}"
+    context = browser.new_context(
+        has_touch=True,
+        viewport={"width": 1280, "height": 720},
+    )
+    try:
+        page = context.new_page()
+        page.goto(f"{base_url}/c/{session_id}")
+        _create_project(page, project)
+        header = _folder_header(page, project)
+        expect(header).to_be_visible()
+
+        bounds = header.bounding_box()
+        assert bounds is not None, "folder header has no touch target bounds"
+        point = {
+            "x": bounds["x"] + bounds["width"] / 2,
+            "y": bounds["y"] + bounds["height"] / 2,
+        }
+        cdp = context.new_cdp_session(page)
+        cdp.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [point]})
+        try:
+            page.wait_for_timeout(750)
+            expect(page.get_by_test_id("rename-project")).to_be_visible()
+        finally:
+            cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+    finally:
+        context.close()
