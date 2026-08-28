@@ -3693,18 +3693,37 @@ def test_resolve_codex_launch_model_override_rejects_ambiguous_exact_models() ->
     assert "'second-selector'" in message
 
 
-@pytest.mark.parametrize("invalid_id", ["", "   "], ids=["empty", "whitespace"])
-def test_resolve_codex_launch_model_override_never_returns_a_blank_id(invalid_id: str) -> None:
-    """An exact model match without a valid selectable id fails loudly."""
+@pytest.mark.parametrize("reverse_rows", [False, True], ids=["blank-row-first", "fold-row-first"])
+def test_resolve_codex_launch_model_override_folds_past_a_blank_exact_model_id(
+    reverse_rows: bool,
+) -> None:
+    """A malformed exact-model row cannot hide a valid fold-only row."""
     from omnigent.runner.native.orchestration import (
         _resolve_codex_launch_model_override,
     )
 
-    with pytest.raises(click.ClickException, match="exactly one valid catalog id"):
+    catalog = [
+        {"id": "   ", "model": "system.ai.gpt-5.6-sol"},
+        {"id": "gpt-5.6-sol", "model": "gpt-5.6-sol"},
+    ]
+    if reverse_rows:
+        catalog.reverse()
+    assert _resolve_codex_launch_model_override("system.ai.gpt-5.6-sol", catalog) == "gpt-5.6-sol"
+
+
+@pytest.mark.parametrize("invalid_id", ["", "   "], ids=["empty", "whitespace"])
+def test_resolve_codex_launch_model_override_never_returns_a_blank_id(invalid_id: str) -> None:
+    """A blank-only exact model falls through, then fails without returning it."""
+    from omnigent.runner.native.orchestration import (
+        _resolve_codex_launch_model_override,
+    )
+
+    with pytest.raises(click.ClickException) as excinfo:
         _resolve_codex_launch_model_override(
             "shared-provider-model",
             [{"id": invalid_id, "model": "shared-provider-model"}],
         )
+    assert "is not in this host's current model list" in str(excinfo.value)
 
 
 @pytest.mark.asyncio

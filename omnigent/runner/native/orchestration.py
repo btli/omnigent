@@ -3762,11 +3762,12 @@ def _resolve_codex_launch_model_override(requested: str, catalog: list[_JsonObje
     if exact_model_match:
         if len(exact_model_ids) == 1:
             return next(iter(exact_model_ids))
-        raise click.ClickException(
-            f"the requested model {requested!r} exactly matches catalog rows that "
-            "do not resolve to exactly one valid catalog id. Launchable model ids: "
-            f"{_launchable_text()}. Pick again from the model menu."
-        )
+        if len(exact_model_ids) > 1:
+            raise click.ClickException(
+                f"the requested model {requested!r} exactly matches catalog rows that "
+                "do not resolve to exactly one valid catalog id. Launchable model ids: "
+                f"{_launchable_text()}. Pick again from the model menu."
+            )
 
     resolved = codex_reachable_model_slug(requested, catalog)
     if resolved is not None:
