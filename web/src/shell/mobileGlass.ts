@@ -16,11 +16,19 @@ export const MOBILE_GLASS_SURFACE =
  * session kebab must read as the same size.
  *
  * The exception is the Chat/Terminal track (ViewModeToggle): it paints its
- * own background out to its edge, so with no padding it collides with the
- * pill's border while an icon-only neighbour still clears it by the slack
- * inside its 40px box. Inset the leading edge by that slack — only when the
- * track is present — so ink sits 12px from either end. Assumes the track is
- * the cluster's leading child on mobile; a control added ahead of it would
- * take the inset instead.
+ * own background out to its edge, so with no padding its ink runs into the
+ * pill's rounded cap while an icon-only neighbour clears it by the slack
+ * inside its 40px box. When the track is present, inset BOTH ends by that
+ * slack and pin the pill to 40px, so the 28px track sits centered with
+ * vertical clearance and its ink stays inside the rounded caps in every
+ * cluster shape — flanked by a kebab (the shape every reachable state
+ * produces) or, as a defense-in-depth guard, alone. The symmetric inset also
+ * makes it RTL-safe: the old physical `pl-1.5` inset the wrong edge under RTL.
+ *
+ * `has-data-[…]` compiles to `:has()`, which shipped in Safari/iOS 15.4; on
+ * 15.0–15.3 (still inside this build's `safari15`/`ios15` target) the selector
+ * never matches, so the pill keeps its unpinned/lone-edge geometry there. This
+ * is the same floor the prior `pl-1.5` depended on, and the guarded case is
+ * latent anyway, so it does not warrant a JS-applied class.
  */
-export const MOBILE_GLASS_PILL = `${MOBILE_GLASS_SURFACE} max-md:rounded-full max-md:has-data-[slot=view-mode-toggle]:pl-1.5`;
+export const MOBILE_GLASS_PILL = `${MOBILE_GLASS_SURFACE} max-md:rounded-full max-md:has-data-[slot=view-mode-toggle]:h-10 max-md:has-data-[slot=view-mode-toggle]:px-1.5`;

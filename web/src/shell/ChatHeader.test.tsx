@@ -351,56 +351,41 @@ function makeTerminalFirstCtx(
  * mounts. QueryClientProvider covers AgentInfoButton's react-query hooks; it
  * self-hides here (no agent info), leaving the toggle as the asserted control.
  */
-function renderHeaderWithSession(ctx: TerminalFirstContextValue | null) {
+function renderHeaderWithSession(
+  ctx: TerminalFirstContextValue | null,
+  overrides: { hasHeaderMenu?: boolean; hasRailContent?: boolean; showFilesPanel?: boolean } = {},
+) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const header = (
+    <ChatHeader
+      sidebarOpen
+      onOpenSidebar={() => {}}
+      isChildSession={false}
+      conversationId="sess-1"
+      conversationTitle={null}
+      projectName={null}
+      boundAgent={undefined}
+      wrapperLabel={null}
+      canShare={false}
+      onShare={() => {}}
+      hasAgentInfo={false}
+      onAgentInfo={() => {}}
+      hasHeaderMenu={overrides.hasHeaderMenu ?? false}
+      showFilesPanel={overrides.showFilesPanel ?? false}
+      hasRailContent={overrides.hasRailContent ?? false}
+      rightPanelOpen={false}
+      onToggleRightPanel={() => {}}
+      mobileMenu={mobileMenu}
+    />
+  );
   return render(
     <MemoryRouter initialEntries={["/c/sess-1"]}>
       <QueryClientProvider client={qc}>
         <TooltipProvider>
           {ctx ? (
-            <TerminalFirstContextProvider value={ctx}>
-              <ChatHeader
-                sidebarOpen
-                onOpenSidebar={() => {}}
-                isChildSession={false}
-                conversationId="sess-1"
-                conversationTitle={null}
-                projectName={null}
-                boundAgent={undefined}
-                wrapperLabel={null}
-                canShare={false}
-                onShare={() => {}}
-                hasAgentInfo={false}
-                onAgentInfo={() => {}}
-                hasHeaderMenu={false}
-                showFilesPanel={false}
-                hasRailContent={false}
-                rightPanelOpen={false}
-                onToggleRightPanel={() => {}}
-                mobileMenu={mobileMenu}
-              />
-            </TerminalFirstContextProvider>
+            <TerminalFirstContextProvider value={ctx}>{header}</TerminalFirstContextProvider>
           ) : (
-            <ChatHeader
-              sidebarOpen
-              onOpenSidebar={() => {}}
-              isChildSession={false}
-              conversationId="sess-1"
-              conversationTitle={null}
-              projectName={null}
-              boundAgent={undefined}
-              wrapperLabel={null}
-              canShare={false}
-              onShare={() => {}}
-              hasAgentInfo={false}
-              onAgentInfo={() => {}}
-              hasHeaderMenu={false}
-              showFilesPanel={false}
-              hasRailContent={false}
-              rightPanelOpen={false}
-              onToggleRightPanel={() => {}}
-              mobileMenu={mobileMenu}
-            />
+            header
           )}
         </TooltipProvider>
       </QueryClientProvider>
@@ -474,18 +459,50 @@ describe("ChatHeader — floating mobile controls", () => {
     expect(toggle).toHaveClass("size-10");
   });
 
-  it("insets the pill's leading edge for the Chat/Terminal track", () => {
+  it("insets both ends and pins the pill height for the Chat/Terminal track", () => {
     // The track paints its own background to its edge, so with the pill's
-    // zero padding it sat flush against the border while an icon-only
-    // neighbour cleared it by the slack in its 40px box. The inset is
-    // conditional: a lone kebab must stay the 40px circle asserted above.
+    // zero padding its ink runs into the rounded cap. When the track is
+    // present the pill insets BOTH ends and pins itself to 40px, so the 28px
+    // track sits centered and clears the caps whether a kebab flanks it (the
+    // reachable shape) or it is the only control (an unreachable
+    // defense-in-depth guard). The inset is conditional: a lone kebab must
+    // stay the 40px circle asserted above.
     isMobileMock.mockReturnValue(true);
     renderHeaderWithSession(makeTerminalFirstCtx());
 
     const cluster = screen.getByTestId("view-mode-toggle").parentElement;
-    expect(cluster).toHaveClass("max-md:has-data-[slot=view-mode-toggle]:pl-1.5");
+    expect(cluster).toHaveClass(
+      "max-md:has-data-[slot=view-mode-toggle]:px-1.5",
+      "max-md:has-data-[slot=view-mode-toggle]:h-10",
+    );
     // The guard keys off the track's own data-slot, so it has to be present.
     expect(screen.getByTestId("view-mode-toggle")).toHaveAttribute("data-slot", "view-mode-toggle");
+  });
+
+  it("renders the Chat/Terminal track and the session kebab in one pill", () => {
+    // PRODUCTION-STRUCTURE coverage: the reachable mobile shape is track +
+    // kebab (the class-string tests above mounted only a lone control, since
+    // hasHeaderMenu / hasRailContent were false). Mount the real 3-icon
+    // cluster so a regression that drops or detaches a control from the pill
+    // is caught. This guards STRUCTURE only — it is green with or without the
+    // CSS change (the 40px kebab already forces a 40px pill); the CSS
+    // regression is the synthetic lone-track case in
+    // tests/e2e_ui/mobile/test_header_pill_overflow, where the geometry lives.
+    isMobileMock.mockReturnValue(true);
+    renderHeaderWithSession(makeTerminalFirstCtx(), {
+      hasHeaderMenu: true,
+      hasRailContent: true,
+      showFilesPanel: true,
+    });
+
+    const toggle = screen.getByTestId("view-mode-toggle");
+    const kebab = screen.getByTestId("session-actions-menu");
+    // Both controls share the one glass pill.
+    expect(toggle.parentElement).toBe(kebab.parentElement);
+    expect(toggle.parentElement).toHaveClass(
+      "max-md:has-data-[slot=view-mode-toggle]:px-1.5",
+      "max-md:has-data-[slot=view-mode-toggle]:h-10",
+    );
   });
 
   it("rounds the kebab's own background so no square shows inside the pill", () => {
