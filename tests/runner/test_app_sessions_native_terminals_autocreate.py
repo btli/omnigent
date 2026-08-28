@@ -15,7 +15,6 @@ import httpx
 import pytest
 
 from omnigent import (
-    claude_native,
     claude_native_bridge,
     cursor_native_bridge,
     kiro_native_bridge,
@@ -74,25 +73,12 @@ from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
 from tests.runner.conftest import (
+    REAL_CLAUDE_LAUNCH_CATALOG_RESULT,
     _FakeProcessManager,
     _runner_client,
     _ScriptedHarnessClient,
 )
 from tests.runner.helpers import NullServerClient
-
-_REAL_CLAUDE_LAUNCH_CATALOG_RESULT = claude_native.claude_launch_catalog_result
-
-
-@pytest.fixture(autouse=True)
-def _disable_authoritative_claude_catalog_probe(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep auto-create unit tests from launching the real Claude CLI."""
-
-    async def _no_catalog(*_args: Any, **_kwargs: Any) -> claude_native.ClaudeLaunchCatalogResult:
-        return claude_native.ClaudeLaunchCatalogResult(
-            [], claude_native.ClaudeLaunchCatalogStatus.REFRESH_FAILED
-        )
-
-    monkeypatch.setattr(claude_native, "claude_launch_catalog_result", _no_catalog)
 
 
 def _load_claude_invocation_settings(args: list[str]) -> dict[str, Any]:
@@ -3383,7 +3369,7 @@ def test_routed_spawn_launch_args_need_a_router() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "pin_source",
-    ["session", "spec", "argv-unavailable", "argv-available"],
+    ["session", "spec", "session-over-spec", "argv-unavailable", "argv-available"],
 )
 async def test_auto_create_claude_terminal_substitutes_an_unavailable_tier_with_notice(
     pin_source: str,
@@ -3454,7 +3440,7 @@ async def test_auto_create_claude_terminal_substitutes_an_unavailable_tier_with_
         if request.method == "GET":
             model_override = None
             terminal_launch_args = None
-            if pin_source == "session":
+            if pin_source in {"session", "session-over-spec"}:
                 model_override = "fable"
             elif pin_source == "argv-unavailable":
                 model_override = "haiku"
@@ -3485,11 +3471,11 @@ async def test_auto_create_claude_terminal_substitutes_an_unavailable_tier_with_
             name="claude",
             executor=ExecutorSpec(
                 type="omnigent",
-                model="fable",
+                model="haiku" if pin_source == "session-over-spec" else "fable",
                 config={"harness": "claude-native"},
             ),
         )
-        if pin_source == "spec"
+        if pin_source in {"spec", "session-over-spec"}
         else None
     )
     try:
@@ -3532,27 +3518,43 @@ async def test_auto_create_claude_terminal_substitutes_an_unavailable_tier_with_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("endpoint", "requested", "expected"),
+    ("endpoint", "requested", "expected", "catalog_status"),
     [
         pytest.param(
             "subscription",
             "claude-opus-4-8",
             "claude-opus-4-8",
+            "fresh",
             id="subscription-canonical",
         ),
         pytest.param(
             "gateway",
             "claude-opus-4-8",
             "system.ai.claude-opus-4-8[1m]",
+            "fresh",
             id="gateway-equivalent",
         ),
-        pytest.param("gateway", "claude-opus-bogus", None, id="gateway-unrecognized"),
+        pytest.param(
+            "gateway",
+            "claude-opus-bogus",
+            None,
+            "fresh",
+            id="gateway-unrecognized",
+        ),
+        pytest.param(
+            "gateway",
+            "claude-opus-bogus",
+            None,
+            "refresh-failed",
+            id="gateway-refresh-failed",
+        ),
     ],
 )
 async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_override(
     endpoint: str,
     requested: str,
     expected: str | None,
+    catalog_status: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3594,6 +3596,8 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
 
     async def _catalog(config: object) -> ClaudeLaunchCatalogResult:
         del config
+        if catalog_status == "refresh-failed":
+            return ClaudeLaunchCatalogResult([], ClaudeLaunchCatalogStatus.REFRESH_FAILED)
         return ClaudeLaunchCatalogResult(catalog, ClaudeLaunchCatalogStatus.FRESH)
 
     monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog_result", _catalog)
@@ -3660,10 +3664,16 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
                 server_client=fake_client,
                 resolve_launch_config=_resolve,
             )
-        assert "Launchable model ids: 'opus', 'system.ai.claude-opus-4-8[1m]', " in str(
-            exc_info.value
-        )
-        assert "'system.ai.claude-opus-5'" in str(exc_info.value)
+        if catalog_status == "refresh-failed":
+            assert "could not verify requested Claude model 'claude-opus-bogus'" in str(
+                exc_info.value
+            )
+            assert "current model list could not be refreshed" in str(exc_info.value)
+        else:
+            assert "Launchable model ids: 'opus', 'system.ai.claude-opus-4-8[1m]', " in str(
+                exc_info.value
+            )
+            assert "'system.ai.claude-opus-5'" in str(exc_info.value)
         assert "spec" not in captured, "a refused launch must not start a terminal"
     else:
         await _auto_create_claude_terminal(
@@ -3675,7 +3685,13 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         )
         args = captured["spec"].args
         assert args[args.index("--model") + 1] == expected
-    assert event_posts == []
+    if endpoint == "gateway" and requested == "claude-opus-4-8":
+        assert len(event_posts) == 1
+        item = event_posts[0]["data"]["item_data"]
+        assert item["code"] == "claude_model_substituted"
+        assert "different [1m] context marker" in item["message"]
+    else:
+        assert event_posts == []
 
     await fake_client.aclose()
 
@@ -3709,7 +3725,7 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
     )
     monkeypatch.setattr(
         "omnigent.claude_native.claude_launch_catalog_result",
-        _REAL_CLAUDE_LAUNCH_CATALOG_RESULT,
+        REAL_CLAUDE_LAUNCH_CATALOG_RESULT,
     )
     refreshed: list[dict[str, object]] = [
         {"id": "sonnet", "model": "claude-sonnet-5", "isDefault": True}

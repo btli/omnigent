@@ -201,6 +201,8 @@ class TestModelFamilyMismatch:
             ("claude-native", "databricks-glm-5-2", "only runs Claude models"),
             ("claude-sdk", "system.ai.glm-5-2", "only runs Claude models"),
             ("claude-sdk", "databricks-kimi-k2-6", "only runs Claude models"),
+            ("claude-sdk", "opus", "only runs Claude models"),
+            ("claude_sdk", "sonnet[1m]", "only runs Claude models"),
             (
                 "codex-native",
                 "databricks-claude-sonnet-4-6",

@@ -26,6 +26,7 @@ from tests.runner.helpers import NullServerClient
 # attribute back to this. (An assignment, not an alias import, so lint
 # autofixes can't strip it as unused.)
 REAL_CLAUDE_LAUNCH_CATALOG = claude_native.claude_launch_catalog
+REAL_CLAUDE_LAUNCH_CATALOG_RESULT = claude_native.claude_launch_catalog_result
 REAL_CODEX_LAUNCH_CATALOG = codex_native_app_server.codex_launch_catalog
 
 # Project root: two parents up from this conftest (tests/runner/ → repo root).
@@ -52,7 +53,18 @@ def _isolated_model_catalog_store(
     async def _no_catalog(*_args: Any, **_kwargs: Any) -> None:
         return None
 
+    async def _no_claude_catalog_result(
+        *_args: Any, **_kwargs: Any
+    ) -> claude_native.ClaudeLaunchCatalogResult:
+        return claude_native.ClaudeLaunchCatalogResult(
+            [], claude_native.ClaudeLaunchCatalogStatus.REFRESH_FAILED
+        )
+
     monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", _no_catalog)
+    monkeypatch.setattr(
+        "omnigent.claude_native.claude_launch_catalog_result",
+        _no_claude_catalog_result,
+    )
     monkeypatch.setattr("omnigent.codex_native_app_server.codex_launch_catalog", _no_catalog)
 
 
