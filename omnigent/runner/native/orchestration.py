@@ -3731,13 +3731,6 @@ def _resolve_codex_launch_model_override(requested: str, catalog: list[_JsonObje
     """
     from omnigent.codex_model_vocabulary import codex_reachable_model_slug
 
-    def _valid_row_id(row: _JsonObject) -> str | None:
-        row_id = row.get("id")
-        if not isinstance(row_id, str):
-            return None
-        row_id = row_id.strip()
-        return row_id or None
-
     def _launchable_text() -> str:
         launchable = sorted(
             {str(token) for row in catalog for token in (row.get("id"), row.get("model")) if token}
@@ -3745,17 +3738,14 @@ def _resolve_codex_launch_model_override(requested: str, catalog: list[_JsonObje
         return ", ".join(repr(token) for token in launchable) or "none"
 
     # A selectable id is stronger than another row's model alias.
-    for row in catalog:
-        row_id = _valid_row_id(row)
-        if row_id is not None and requested == row_id:
-            return row_id
-
     exact_model_ids: set[str] = set()
     for row in catalog:
-        if requested != row.get("model"):
+        row_id = row.get("id")
+        if not isinstance(row_id, str) or not (row_id := row_id.strip()):
             continue
-        row_id = _valid_row_id(row)
-        if row_id is not None:
+        if requested == row_id:
+            return row_id
+        if requested == row.get("model"):
             exact_model_ids.add(row_id)
     if len(exact_model_ids) == 1:
         return next(iter(exact_model_ids))
