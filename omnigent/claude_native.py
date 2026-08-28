@@ -240,7 +240,8 @@ _UCODE_CLAUDE_TIER_TO_ENV: dict[str, str] = {
     "sonnet": _ANTHROPIC_DEFAULT_SONNET_MODEL_ENV,
     "haiku": _ANTHROPIC_DEFAULT_HAIKU_MODEL_ENV,
 }
-_CLAUDE_TIER_FALLBACK_ORDER = CLAUDE_MODEL_ALIASES
+# Capability-descending launch fallback policy. Vocabulary ordering is not policy.
+_CLAUDE_TIER_FALLBACK_ORDER: tuple[str, ...] = ("fable", "opus", "sonnet", "haiku")
 # The 4 family aliases above pin one model ID each. Claude Code has exactly
 # one more independently-selectable /model picker slot beyond those
 # families — ANTHROPIC_CUSTOM_MODEL_OPTION — used here to surface Sonnet 5
@@ -483,8 +484,56 @@ def claude_catalog_serves_model(
     )
 
 
+def resolve_claude_catalog_model(
+    rows: list[dict[str, object]],
+    model: str,
+) -> str | None:
+    """Resolve an exact or unambiguous equivalent catalog spelling."""
+    from omnigent.claude_model_vocabulary import normalized_model_id
+    from omnigent.model_catalog_store import catalog_contains
+
+    if catalog_contains(rows, model):
+        return model
+    normalized = normalized_model_id(model)
+    if not normalized:
+        return None
+    matches: set[str] = set()
+    for row in rows:
+        row_id = str(row.get("id") or "").strip()
+        row_model = str(row.get("model") or "").strip()
+        if any(
+            candidate and normalized_model_id(candidate) == normalized
+            for candidate in (row_id, row_model)
+        ):
+            matches.add(row_model or row_id)
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
+def _claude_catalog_tier_rank(
+    row: dict[str, object],
+    tier: str,
+) -> tuple[bool, tuple[int, ...], bool, str, str]:
+    """Rank a tier's alias first, then newest standard-context model."""
+    from omnigent.claude_model_vocabulary import normalized_model_id
+
+    row_id = str(row.get("id") or "").strip()
+    row_model = str(row.get("model") or "").strip()
+    launch_model = row_model or row_id
+    normalized = normalized_model_id(launch_model)
+    family_tail = normalized.partition(f"{tier}-")[2]
+    generation = tuple(-int(part) for part in re.findall(r"\d+", family_tail)) or (0,)
+    return (
+        row_id.lower() != tier,
+        generation,
+        launch_model.lower().endswith("[1m]"),
+        launch_model.lower(),
+        row_id.lower(),
+    )
+
+
 def _claude_catalog_tier_model(rows: list[dict[str, object]], tier: str) -> str | None:
-    """Return the catalog's launch spelling for one Claude tier."""
+    """Return the catalog's deterministic launch spelling for one Claude tier."""
+    candidates: list[dict[str, object]] = []
     for row in rows:
         row_id = str(row.get("id") or "").strip()
         row_model = str(row.get("model") or "").strip()
@@ -494,8 +543,28 @@ def _claude_catalog_tier_model(rows: list[dict[str, object]], tier: str) -> str 
         lower_token = family_token.lower()
         if lower_token not in CLAUDE_MODEL_ALIASES and "claude" not in lower_token:
             continue
-        return row_model or row_id
+        candidates.append(row)
+    if not candidates:
+        return None
+    selected = min(candidates, key=lambda row: _claude_catalog_tier_rank(row, tier))
+    return str(selected.get("model") or selected.get("id") or "").strip() or None
+
+
+def _documented_claude_tier_alias(model: str) -> str | None:
+    """Return a documented bare or 1M tier alias, otherwise ``None``."""
+    candidate = model.strip().lower()
+    base = candidate.removesuffix("[1m]")
+    if base in CLAUDE_MODEL_ALIASES and candidate in {base, f"{base}[1m]"}:
+        return base
     return None
+
+
+def _claude_launchable_model_text(rows: list[dict[str, object]]) -> str:
+    """Render deterministic launchable picker and wire ids for an error."""
+    launchable = sorted(
+        {str(token) for row in rows for token in (row.get("id"), row.get("model")) if token}
+    )
+    return ", ".join(repr(token) for token in launchable) or "none"
 
 
 def resolve_claude_native_catalog_selection(
@@ -519,18 +588,16 @@ def resolve_claude_native_catalog_selection(
     resolved_request = (
         resolve_claude_native_model_selection(requested_model, claude_config) or requested_model
     )
-    if claude_catalog_serves_model(
-        rows, requested_model, claude_config
-    ) or claude_catalog_serves_model(rows, resolved_request, claude_config):
-        return resolved_request, None
+    for candidate in dict.fromkeys((requested_model, resolved_request)):
+        catalog_model = resolve_claude_catalog_model(rows, candidate)
+        if catalog_model is not None:
+            if candidate.lower().startswith("claude-") and (
+                claude_config is None or _serves_canonical_anthropic_ids(claude_config)
+            ):
+                return candidate, None
+            return catalog_model, None
 
-    lower_request = requested_model.strip().lower()
-    is_claude_request = (
-        lower_request in CLAUDE_MODEL_ALIASES
-        or lower_request == _UCODE_CLAUDE_CUSTOM_TIER
-        or "claude" in lower_request
-    )
-    requested_tier = _claude_family(resolved_request) if is_claude_request else None
+    requested_tier = _documented_claude_tier_alias(requested_model)
     if requested_tier in _CLAUDE_TIER_FALLBACK_ORDER:
         start = _CLAUDE_TIER_FALLBACK_ORDER.index(requested_tier)
         for tier in _CLAUDE_TIER_FALLBACK_ORDER[start:]:
@@ -552,7 +619,8 @@ def resolve_claude_native_catalog_selection(
 
     raise click.ClickException(
         f"the requested model {requested_model!r} is not in this host's current "
-        "model list — it may have changed since the pick. Pick again from the model menu."
+        "model list — it may have changed since the pick. Launchable model ids: "
+        f"{_claude_launchable_model_text(rows)}. Pick again from the model menu."
     )
 
 
@@ -1257,6 +1325,47 @@ async def claude_model_catalog(
                 }
             )
     return out
+
+
+class ClaudeLaunchCatalogStatus(Enum):
+    """Freshness provenance for launch-authoritative Claude catalogs."""
+
+    FRESH = "fresh"
+    EMPTY = "empty"
+    REFRESH_FAILED = "refresh_failed"
+
+
+@dataclass(frozen=True)
+class ClaudeLaunchCatalogResult:
+    """Catalog rows plus authoritative refresh provenance."""
+
+    rows: list[dict[str, object]]
+    status: ClaudeLaunchCatalogStatus
+
+
+async def claude_launch_catalog_result(
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> ClaudeLaunchCatalogResult:
+    """Return only fresh rows for launch selection, refreshing stale hits."""
+    from omnigent import model_catalog_store
+
+    fingerprint = claude_catalog_fingerprint(claude_config)
+    cached = model_catalog_store.read_catalog("claude-native", fingerprint)
+    if cached is not None and not model_catalog_store.catalog_is_stale(
+        "claude-native", fingerprint
+    ):
+        return ClaudeLaunchCatalogResult(cached, ClaudeLaunchCatalogStatus.FRESH)
+    try:
+        rows = await claude_model_catalog(claude_config)
+    except Exception:  # noqa: BLE001 — provenance is returned to the launch selector
+        _logger.warning("Claude launch catalog refresh failed", exc_info=True)
+        return ClaudeLaunchCatalogResult([], ClaudeLaunchCatalogStatus.REFRESH_FAILED)
+    if rows is None:
+        return ClaudeLaunchCatalogResult([], ClaudeLaunchCatalogStatus.REFRESH_FAILED)
+    if not rows:
+        return ClaudeLaunchCatalogResult([], ClaudeLaunchCatalogStatus.EMPTY)
+    model_catalog_store.write_catalog("claude-native", fingerprint, rows)
+    return ClaudeLaunchCatalogResult(rows, ClaudeLaunchCatalogStatus.FRESH)
 
 
 async def claude_launch_catalog(

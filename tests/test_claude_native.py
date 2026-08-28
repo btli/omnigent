@@ -8,6 +8,7 @@ import binascii
 import contextlib
 import importlib.metadata
 import io
+import itertools
 import json
 import logging
 import os
@@ -9856,7 +9857,7 @@ def test_claude_catalog_selection_honors_an_available_concrete_pin(
 ) -> None:
     """An exact live pin is launched unchanged and emits no downgrade warning."""
     requested = "system.ai.claude-opus-4-8[1m]"
-    catalog = [
+    catalog: list[dict[str, object]] = [
         {"id": "opus", "model": "system.ai.claude-opus-5"},
         {"id": requested, "model": requested},
     ]
@@ -9875,16 +9876,154 @@ def test_claude_catalog_selection_honors_an_available_concrete_pin(
     assert not [record for record in caplog.records if "substitut" in record.getMessage()]
 
 
-def test_claude_catalog_selection_keeps_loud_failure_without_a_claude_tier() -> None:
+def test_claude_catalog_selection_matches_an_equivalent_generation_before_fallback() -> None:
+    """A provider spelling and context marker do not change the pinned generation."""
+    requested = "databricks-claude-opus-4-8"
+    equivalent = "system.ai.claude-opus-4-8[1m]"
+
+    assert claude_native.resolve_claude_native_catalog_selection(
+        requested,
+        [
+            {"id": "opus", "model": "system.ai.claude-opus-5"},
+            {"id": equivalent, "model": equivalent},
+        ],
+        claude_native.ClaudeNativeUcodeConfig(
+            env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}
+        ),
+    ) == (equivalent, None)
+
+
+def test_claude_tier_fallback_order_is_capability_descending() -> None:
+    """Launch policy has explicit order and exactly the documented tier membership."""
+    from omnigent.claude_model_vocabulary import CLAUDE_MODEL_ALIASES
+
+    assert claude_native._CLAUDE_TIER_FALLBACK_ORDER == (
+        "fable",
+        "opus",
+        "sonnet",
+        "haiku",
+    )
+    assert set(claude_native._CLAUDE_TIER_FALLBACK_ORDER) == set(CLAUDE_MODEL_ALIASES)
+    assert claude_native._CLAUDE_TIER_FALLBACK_ORDER is not CLAUDE_MODEL_ALIASES
+
+
+def test_claude_tier_fallback_is_stable_across_catalog_order() -> None:
+    """Newest standard-context model wins within a tier regardless of row order."""
+    catalog: list[dict[str, object]] = [
+        {"id": "opus-4-8", "model": "system.ai.claude-opus-4-8"},
+        {"id": "opus-4-8-1m", "model": "system.ai.claude-opus-4-8[1m]"},
+        {"id": "opus-5-1m", "model": "system.ai.claude-opus-5[1m]"},
+        {"id": "opus-5", "model": "system.ai.claude-opus-5"},
+    ]
+
+    for permuted in itertools.permutations(catalog):
+        selection, notice = claude_native.resolve_claude_native_catalog_selection(
+            "fable",
+            list(permuted),
+            None,
+        )
+        assert selection == "system.ai.claude-opus-5"
+        assert notice is not None
+
+
+@pytest.mark.parametrize(
+    ("catalog", "launchable"),
+    [
+        pytest.param([], "none", id="empty"),
+        pytest.param(
+            [{"id": "gpt-row", "model": "gpt-5.4"}],
+            "'gpt-5.4', 'gpt-row'",
+            id="non-claude",
+        ),
+    ],
+)
+def test_claude_catalog_selection_keeps_loud_failure_without_a_claude_tier(
+    catalog: list[dict[str, object]],
+    launchable: str,
+) -> None:
     """A catalog with no Claude tier preserves the actionable launch failure."""
     with pytest.raises(click.ClickException) as exc_info:
         claude_native.resolve_claude_native_catalog_selection(
             "fable",
-            [{"id": "gpt-5.4", "model": "gpt-5.4"}],
+            catalog,
             None,
         )
 
     assert exc_info.value.message == (
         "the requested model 'fable' is not in this host's current model list — "
-        "it may have changed since the pick. Pick again from the model menu."
+        "it may have changed since the pick. Launchable model ids: "
+        f"{launchable}. Pick again from the model menu."
     )
+
+
+def test_claude_catalog_selection_rejects_an_unrecognized_claude_looking_id() -> None:
+    """Only documented tier aliases can degrade after catalog matching fails."""
+    catalog: list[dict[str, object]] = [
+        {"id": "opus", "model": "system.ai.claude-opus-5"},
+        {"id": "sonnet", "model": "system.ai.claude-sonnet-4-6[1m]"},
+    ]
+
+    with pytest.raises(click.ClickException) as exc_info:
+        claude_native.resolve_claude_native_catalog_selection(
+            "claude-opus-bogus",
+            catalog,
+            None,
+        )
+
+    assert exc_info.value.message == (
+        "the requested model 'claude-opus-bogus' is not in this host's current "
+        "model list — it may have changed since the pick. Launchable model ids: "
+        "'opus', 'sonnet', 'system.ai.claude-opus-5', "
+        "'system.ai.claude-sonnet-4-6[1m]'. Pick again from the model menu."
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("probe_rows", "expected_status", "expected_rows"),
+    [
+        pytest.param(
+            [{"id": "opus", "model": "claude-opus-5"}],
+            claude_native.ClaudeLaunchCatalogStatus.FRESH,
+            [{"id": "opus", "model": "claude-opus-5"}],
+            id="fresh",
+        ),
+        pytest.param([], claude_native.ClaudeLaunchCatalogStatus.EMPTY, [], id="empty"),
+        pytest.param(
+            None,
+            claude_native.ClaudeLaunchCatalogStatus.REFRESH_FAILED,
+            [],
+            id="refresh-failed",
+        ),
+    ],
+)
+async def test_claude_launch_catalog_result_ignores_stale_rows_and_reports_refresh_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    probe_rows: list[dict[str, object]] | None,
+    expected_status: claude_native.ClaudeLaunchCatalogStatus,
+    expected_rows: list[dict[str, object]],
+) -> None:
+    """Launch selection sees fresh rows and distinguishes empty from failed refreshes."""
+    import time
+
+    from omnigent import model_catalog_store
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    fingerprint = claude_native.claude_catalog_fingerprint(None)
+    stale_rows = [{"id": "fable", "model": "claude-fable-retired"}]
+    model_catalog_store.write_catalog("claude-native", fingerprint, stale_rows)
+    path = model_catalog_store.catalog_path("claude-native", fingerprint)
+    stale_time = time.time() - model_catalog_store.CATALOG_STALE_AFTER_S - 1
+    os.utime(path, (stale_time, stale_time))
+
+    async def _probe(_config: object) -> list[dict[str, object]] | None:
+        return probe_rows
+
+    monkeypatch.setattr(claude_native, "claude_model_catalog", _probe)
+
+    result = await claude_native.claude_launch_catalog_result(None)
+
+    assert result.status is expected_status
+    assert result.rows == expected_rows
+    assert result.rows != stale_rows

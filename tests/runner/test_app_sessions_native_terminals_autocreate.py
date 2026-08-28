@@ -10,10 +10,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import click
 import httpx
 import pytest
 
 from omnigent import (
+    claude_native,
     claude_native_bridge,
     cursor_native_bridge,
     kiro_native_bridge,
@@ -77,6 +79,20 @@ from tests.runner.conftest import (
     _ScriptedHarnessClient,
 )
 from tests.runner.helpers import NullServerClient
+
+_REAL_CLAUDE_LAUNCH_CATALOG_RESULT = claude_native.claude_launch_catalog_result
+
+
+@pytest.fixture(autouse=True)
+def _disable_authoritative_claude_catalog_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep auto-create unit tests from launching the real Claude CLI."""
+
+    async def _no_catalog(*_args: Any, **_kwargs: Any) -> claude_native.ClaudeLaunchCatalogResult:
+        return claude_native.ClaudeLaunchCatalogResult(
+            [], claude_native.ClaudeLaunchCatalogStatus.REFRESH_FAILED
+        )
+
+    monkeypatch.setattr(claude_native, "claude_launch_catalog_result", _no_catalog)
 
 
 def _load_claude_invocation_settings(args: list[str]) -> dict[str, Any]:
@@ -3365,13 +3381,22 @@ def test_routed_spawn_launch_args_need_a_router() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pin_source",
+    ["session", "spec", "argv-unavailable", "argv-available"],
+)
 async def test_auto_create_claude_terminal_substitutes_an_unavailable_tier_with_notice(
+    pin_source: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A stale Fable pin launches on Opus and makes the downgrade visible."""
-    from omnigent.claude_native import ClaudeNativeUcodeConfig
+    """The effective explicit pin is validated and any downgrade is visible."""
+    from omnigent.claude_native import (
+        ClaudeLaunchCatalogResult,
+        ClaudeLaunchCatalogStatus,
+        ClaudeNativeUcodeConfig,
+    )
 
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
@@ -3384,16 +3409,16 @@ async def test_auto_create_claude_terminal_substitutes_an_unavailable_tier_with_
         "omnigent.claude_native_forwarder.supervise_forwarder",
         _no_op_forwarder,
     )
-    catalog = [
+    catalog: list[dict[str, object]] = [
         {"id": "haiku", "model": "system.ai.claude-haiku-4-5"},
         {"id": "sonnet", "model": "system.ai.claude-sonnet-4-6[1m]"},
         {"id": "opus", "model": "system.ai.claude-opus-4-8[1m]"},
     ]
 
-    async def _catalog(_config: object) -> list[dict[str, object]]:
-        return catalog
+    async def _catalog(_config: object) -> ClaudeLaunchCatalogResult:
+        return ClaudeLaunchCatalogResult(catalog, ClaudeLaunchCatalogStatus.FRESH)
 
-    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", _catalog)
+    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog_result", _catalog)
     config = ClaudeNativeUcodeConfig(
         env={
             "ANTHROPIC_BASE_URL": "https://gateway.example/anthropic",
@@ -3427,7 +3452,24 @@ async def test_auto_create_claude_terminal_substitutes_an_unavailable_tier_with_
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":
-            return httpx.Response(200, json={"model_override": "fable", "labels": {}})
+            model_override = None
+            terminal_launch_args = None
+            if pin_source == "session":
+                model_override = "fable"
+            elif pin_source == "argv-unavailable":
+                model_override = "haiku"
+                terminal_launch_args = ["--model", "fable"]
+            elif pin_source == "argv-available":
+                model_override = "fable"
+                terminal_launch_args = ["--model", "system.ai.claude-sonnet-4-6[1m]"]
+            return httpx.Response(
+                200,
+                json={
+                    "model_override": model_override,
+                    "terminal_launch_args": terminal_launch_args,
+                    "labels": {},
+                },
+            )
         if request.method == "POST" and request.url.path.endswith("/events"):
             event_posts.append(json.loads(request.content))
         return httpx.Response(200, json={})
@@ -3437,6 +3479,19 @@ async def test_auto_create_claude_terminal_substitutes_an_unavailable_tier_with_
         transport=httpx.MockTransport(_handle_request),
     )
     session_id = "7d1e4a3c2b5f69807162534453627180"
+    agent_spec = (
+        AgentSpec(
+            spec_version=1,
+            name="claude",
+            executor=ExecutorSpec(
+                type="omnigent",
+                model="fable",
+                config={"harness": "claude-native"},
+            ),
+        )
+        if pin_source == "spec"
+        else None
+    )
     try:
         with caplog.at_level(logging.WARNING, logger="omnigent.claude_native"):
             await _auto_create_claude_terminal(
@@ -3445,6 +3500,7 @@ async def test_auto_create_claude_terminal_substitutes_an_unavailable_tier_with_
                 lambda _sid, _evt: None,
                 server_client=fake_client,
                 resolve_launch_config=_resolve,
+                agent_spec=agent_spec,
             )
         await asyncio.sleep(0)
     finally:
@@ -3452,24 +3508,51 @@ async def test_auto_create_claude_terminal_substitutes_an_unavailable_tier_with_
 
     args = captured["spec"].args
     substitute = "system.ai.claude-opus-4-8[1m]"
-    assert args[args.index("--model") + 1] == substitute
-    warning = next(record for record in caplog.records if "substituting" in record.getMessage())
-    assert warning.levelno == logging.WARNING
-    assert "'fable'" in warning.getMessage()
-    assert repr(substitute) in warning.getMessage()
-    assert "absent from this host's current model list" in warning.getMessage()
-    assert len(event_posts) == 1
-    item = event_posts[0]["data"]
-    assert item["item_type"] == "error"
-    assert item["item_data"]["code"] == "claude_model_substituted"
-    assert "'fable' is unavailable" in item["item_data"]["message"]
-    assert f"with {substitute!r} instead" in item["item_data"]["message"]
+    selected = args[args.index("--model") + 1]
+    warnings = [record for record in caplog.records if "substituting" in record.getMessage()]
+    if pin_source == "argv-available":
+        assert selected == "system.ai.claude-sonnet-4-6[1m]"
+        assert warnings == []
+        assert event_posts == []
+    else:
+        assert selected == substitute
+        assert len(warnings) == 1
+        warning = warnings[0]
+        assert warning.levelno == logging.WARNING
+        assert "'fable'" in warning.getMessage()
+        assert repr(substitute) in warning.getMessage()
+        assert "absent from this host's current model list" in warning.getMessage()
+        assert len(event_posts) == 1
+        item = event_posts[0]["data"]
+        assert item["item_type"] == "error"
+        assert item["item_data"]["code"] == "claude_model_substituted"
+        assert "'fable' is unavailable" in item["item_data"]["message"]
+        assert f"with {substitute!r} instead" in item["item_data"]["message"]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("endpoint", ["subscription", "gateway"])
+@pytest.mark.parametrize(
+    ("endpoint", "requested", "expected"),
+    [
+        pytest.param(
+            "subscription",
+            "claude-opus-4-8",
+            "claude-opus-4-8",
+            id="subscription-canonical",
+        ),
+        pytest.param(
+            "gateway",
+            "claude-opus-4-8",
+            "system.ai.claude-opus-4-8[1m]",
+            id="gateway-equivalent",
+        ),
+        pytest.param("gateway", "claude-opus-bogus", None, id="gateway-unrecognized"),
+    ],
+)
 async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_override(
     endpoint: str,
+    requested: str,
+    expected: str | None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3478,9 +3561,14 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
 
     A live ``/model`` persists the pane's exact id (``claude-opus-4-8``) while
     the catalog spells that family as alias rows and the 1M default. A canonical
-    endpoint honors that id; a gateway substitutes its concrete current Opus.
+    endpoint honors that id; a gateway uses only an equivalent catalog spelling.
+    Unrecognized ids remain loud and never start a terminal.
     """
-    from omnigent.claude_native import ClaudeNativeUcodeConfig
+    from omnigent.claude_native import (
+        ClaudeLaunchCatalogResult,
+        ClaudeLaunchCatalogStatus,
+        ClaudeNativeUcodeConfig,
+    )
 
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
@@ -3494,7 +3582,7 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         _no_op_forwarder,
     )
     prefix = "" if endpoint == "subscription" else "system.ai."
-    catalog = [
+    catalog: list[dict[str, object]] = [
         {"id": "opus", "model": f"{prefix}claude-opus-5", "displayName": "Opus 5"},
         {
             "id": f"{prefix}claude-opus-4-8[1m]",
@@ -3504,11 +3592,11 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         },
     ]
 
-    async def _catalog(config: object) -> list[dict[str, object]]:
+    async def _catalog(config: object) -> ClaudeLaunchCatalogResult:
         del config
-        return catalog
+        return ClaudeLaunchCatalogResult(catalog, ClaudeLaunchCatalogStatus.FRESH)
 
-    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", _catalog)
+    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog_result", _catalog)
 
     captured: dict[str, Any] = {}
 
@@ -3538,8 +3626,12 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
                 metadata={"terminal_name": "claude", "session_key": "main", "running": True},
             )
 
-    def _handle_request(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"model_override": "claude-opus-4-8", "labels": {}})
+    event_posts: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            event_posts.append(json.loads(request.content))
+        return httpx.Response(200, json={"model_override": requested, "labels": {}})
 
     fake_client = httpx.AsyncClient(
         base_url="http://test-server",
@@ -3559,16 +3651,31 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         return config
 
     session_id = "0f2d3d5c9a6b4e1f8c7d6e5f4a3b2c1d"
-    await _auto_create_claude_terminal(
-        session_id,
-        _FakeResourceRegistry(),
-        lambda _sid, _evt: None,
-        server_client=fake_client,
-        resolve_launch_config=_resolve,
-    )
-    args = captured["spec"].args
-    expected = "claude-opus-4-8" if endpoint == "subscription" else "system.ai.claude-opus-5"
-    assert args[args.index("--model") + 1] == expected
+    if expected is None:
+        with pytest.raises(click.ClickException) as exc_info:
+            await _auto_create_claude_terminal(
+                session_id,
+                _FakeResourceRegistry(),
+                lambda _sid, _evt: None,
+                server_client=fake_client,
+                resolve_launch_config=_resolve,
+            )
+        assert "Launchable model ids: 'opus', 'system.ai.claude-opus-4-8[1m]', " in str(
+            exc_info.value
+        )
+        assert "'system.ai.claude-opus-5'" in str(exc_info.value)
+        assert "spec" not in captured, "a refused launch must not start a terminal"
+    else:
+        await _auto_create_claude_terminal(
+            session_id,
+            _FakeResourceRegistry(),
+            lambda _sid, _evt: None,
+            server_client=fake_client,
+            resolve_launch_config=_resolve,
+        )
+        args = captured["spec"].args
+        assert args[args.index("--model") + 1] == expected
+    assert event_posts == []
 
     await fake_client.aclose()
 
@@ -3581,20 +3688,13 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A Default launch pins the stored default only while the entry is fresh.
-
-    The store never forgets an entry, so its ``isDefault`` row can outlive
-    the model it names (a retirement or an entitlement change); pinning it
-    as ``--model`` then hard-fails every Default launch on the host. A
-    stale entry defers to the CLI's own default — no ``--model`` at all —
-    while the store re-probes in the background.
+    A Default launch uses a fresh cached default or an authoritative refresh.
     """
     import os
     import time
 
     from omnigent import model_catalog_store
     from omnigent.claude_native import claude_catalog_fingerprint
-    from tests.runner.conftest import REAL_CLAUDE_LAUNCH_CATALOG
 
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
@@ -3607,10 +3707,13 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
         "omnigent.claude_native_forwarder.supervise_forwarder",
         _no_op_forwarder,
     )
-    # The real store-backed resolver, against the conftest-isolated store
-    # dir; the background re-probe is stubbed so no real CLI ever runs.
-    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG)
-    refreshed = [{"id": "sonnet", "model": "claude-sonnet-5", "isDefault": True}]
+    monkeypatch.setattr(
+        "omnigent.claude_native.claude_launch_catalog_result",
+        _REAL_CLAUDE_LAUNCH_CATALOG_RESULT,
+    )
+    refreshed: list[dict[str, object]] = [
+        {"id": "sonnet", "model": "claude-sonnet-5", "isDefault": True}
+    ]
 
     async def _fake_probe_catalog(config: object) -> list[dict[str, object]]:
         del config
@@ -3686,11 +3789,7 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
     if freshness == "fresh":
         assert args[args.index("--model") + 1] == "claude-3-5-sonnet-20241022"
     else:
-        assert "--model" not in args, f"a stale default was still pinned: {args}"
-        task = model_catalog_store._inflight.get(("claude-native", fingerprint))
-        if task is not None:
-            await task
-        # The background re-probe healed the store for the next launch.
+        assert args[args.index("--model") + 1] == "claude-sonnet-5"
         assert model_catalog_store.read_catalog("claude-native", fingerprint) == refreshed
 
     await fake_client.aclose()
