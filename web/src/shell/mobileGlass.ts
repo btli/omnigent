@@ -22,5 +22,8 @@ export const MOBILE_GLASS_SURFACE =
  * track is present — so ink sits 12px from either end. Assumes the track is
  * the cluster's leading child on mobile; a control added ahead of it would
  * take the inset instead.
+ *
+ * Focus rings paint inward so the full 3px indicator stays within the pill
+ * without changing its control geometry.
  */
-export const MOBILE_GLASS_PILL = `${MOBILE_GLASS_SURFACE} max-md:rounded-full max-md:has-data-[slot=view-mode-toggle]:pl-1.5`;
+export const MOBILE_GLASS_PILL = `${MOBILE_GLASS_SURFACE} max-md:rounded-full max-md:focus-visible:ring-inset max-md:*:focus-visible:ring-inset max-md:has-data-[slot=view-mode-toggle]:pl-1.5`;
