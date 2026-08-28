@@ -620,6 +620,22 @@ def test_parse_extras_garbage_line_fails_loud(tmp_path):
         stage_mod.parse_extras(manifest)
 
 
+def test_parse_exclusions_comments_blanks_and_missing(tmp_path):
+    manifest = tmp_path / "exclude.txt"
+    manifest.write_text("# held out\n\n12  # trailing comment\n7\n12\n")
+    assert stage_mod.parse_exclusions(manifest) == [12, 7, 12]
+    assert stage_mod.parse_exclusions(tmp_path / "missing.txt") == []
+
+
+@pytest.mark.parametrize("entry", ["branch:foo", "abc"])
+def test_parse_exclusions_invalid_entry_fails_loud(tmp_path, entry):
+    manifest = tmp_path / "exclude.txt"
+    manifest.write_text(f"12\n{entry}\n")
+    message = f"{manifest}:2: invalid exclude entry {entry!r}"
+    with pytest.raises(stage_mod.StageError, match=re.escape(message)):
+        stage_mod.parse_exclusions(manifest)
+
+
 def test_parse_extras_branch_homelab(tmp_path):
     manifest = tmp_path / "extras.txt"
     manifest.write_text("branch:homelab\n")
@@ -985,6 +1001,51 @@ def test_cli_staging_only_with_extras_manifest(env, tmp_path, monkeypatch, capsy
     text = summary.read_text()
     assert "## Personal staging hourly" in text
     assert "extra unfetchable" in text
+    capsys.readouterr()
+
+
+def test_cli_exclusion_wins_over_open_and_extra_sources(env, tmp_path, capsys):
+    excluded_pr = env.add_pr(11, "excluded.txt", "excluded\n")
+    surviving_pr = env.add_pr(12, "surviving.txt", "surviving\n")
+    env.add_fork_branch("homelab", "homelab.txt", "lab\n")
+    prs_json = tmp_path / "prs.json"
+    prs_json.write_text(json.dumps([excluded_pr, surviving_pr]))
+    extras = tmp_path / "extras.txt"
+    extras.write_text("11\nbranch:homelab\n")
+    exclusions = tmp_path / "exclude.txt"
+    exclusions.write_text("11\n999\n")
+    report_path = tmp_path / "r.json"
+
+    rc = stage_mod.main(
+        [
+            "stage",
+            "--workdir",
+            str(env.work),
+            "--date",
+            STAMP,
+            "--prs-json",
+            str(prs_json),
+            "--extras",
+            str(extras),
+            "--exclude",
+            str(exclusions),
+            "--staging-only",
+            "--report",
+            str(report_path),
+        ]
+    )
+
+    assert rc == 0
+    report = json.loads(report_path.read_text())
+    assert [(p["pr"], p["source"]) for p in report["applied"]] == [
+        (12, "open"),
+        (None, "extra-branch"),
+    ]
+    assert report["excluded"] == [
+        {"pr": 11, "reason": "held out via exclude.txt"},
+        {"pr": 999, "reason": "held out via exclude.txt"},
+    ]
+    assert git(env.work, "show", f"{report['staging_sha']}:homelab.txt").stdout == "lab\n"
     capsys.readouterr()
 
 
