@@ -46,18 +46,23 @@ def touch_project_page(
     browser: Browser,
     seeded_session: tuple[str, str],
 ) -> Iterator[tuple[Page, str]]:
-    """Open a touch-enabled desktop sidebar with a fresh project folder."""
+    """Open a touch-enabled mobile sidebar with a fresh project folder."""
     base_url, session_id = seeded_session
     project = f"Project {uuid.uuid4().hex[:6]}"
     context = browser.new_context(
         has_touch=True,
-        viewport={"width": 1280, "height": 720},
+        viewport={"width": 767, "height": 720},
     )
     try:
         page = context.new_page()
-        page.goto(f"{base_url}/c/{session_id}")
+        page.goto(f"{base_url}/c/{session_id}?sidebar=open")
         _create_project(page, project)
-        expect(_folder_header(page, project)).to_be_visible()
+        header = _folder_header(page, project)
+        expect(header).to_be_visible()
+        header.evaluate(
+            "element => element.scrollIntoView({ block: 'center', behavior: 'instant' })"
+        )
+        page.wait_for_timeout(100)
         yield page, project
     finally:
         context.close()
@@ -152,6 +157,14 @@ def test_touch_long_press_opens_project_folder_menu(
     before = _expanded(header)
     cdp = page.context.new_cdp_session(page)
     point = _touch_point(header)
+    hit_target = header.evaluate(
+        """(element, point) => {
+            const target = document.elementFromPoint(point.x, point.y);
+            return { contains: element.contains(target), target: target?.outerHTML };
+        }""",
+        point,
+    )
+    assert hit_target["contains"], hit_target
 
     cdp.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [point]})
     try:
@@ -160,6 +173,10 @@ def test_touch_long_press_opens_project_folder_menu(
     finally:
         cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
 
+    user_select = header.evaluate("element => getComputedStyle(element).userSelect")
+    assert user_select == "none"
+    # Desktop Chrome does not synthesize the iOS selection; computed style and
+    # the unit class check provide the discriminating coverage.
     selection = page.evaluate("window.getSelection()?.toString() ?? ''")
     assert selection == "", f"project title is selected: {selection!r}"
     expect(header).to_have_attribute("aria-expanded", before)
