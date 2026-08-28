@@ -19,7 +19,6 @@
 4439 11e3784071f5ffc95bc235ce732869a468663cb2 pollux/kimi-tui-inject-hardening
 4441 5d00e0b69f46d2ecf2d1400aa67543d24e5c77c1 pollux/kimi-forwarder-lifecycle
 4481 f3b5358b7a9c4541874165c810dfd03a9ae408d0 kimi-usage-cost
-4623 08f34935f818ee8a4fa787d8374a35a30bafb995 fix/android-notification-icon
 5181 a8495d74cb3681a9f2c31baacae1d73e7aaa3374 fix/forwarder-item-idempotency
 5198 ba5fd3f1cb45a6745e1656be8b41b24567871760 android-app-id-suffix
 5214 13f41b1b26f62dba853afac4fc568bdf763a4c7f sidebar-collapsed-count-pill

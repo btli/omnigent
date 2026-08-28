@@ -88,6 +88,14 @@ git -C "$WT" reset --hard "$BASE" >/dev/null
 merge_one() {
   local ref="$1" msg="$2"
   git -C "$WT" merge --no-ff --rerere-autoupdate -m "$msg" "$ref" >/dev/null && return 0
+  # A fatal before the merge started (flaky fs, not a conflict) leaves no
+  # MERGE_HEAD; retry once rather than misreading it as resolved.
+  if ! git -C "$WT" rev-parse -q --verify MERGE_HEAD >/dev/null; then
+    echo "   (merge aborted before starting; retrying once)"
+    git -C "$WT" merge --no-ff --rerere-autoupdate -m "$msg" "$ref" >/dev/null && return 0
+    git -C "$WT" rev-parse -q --verify MERGE_HEAD >/dev/null || {
+      echo "merge of $ref failed without starting; see $WT" >&2; exit 1; }
+  fi
   # rerere may have staged every resolution; if nothing is left unmerged,
   # the merge only needs committing.
   if [ -z "$(git -C "$WT" diff --name-only --diff-filter=U)" ]; then
