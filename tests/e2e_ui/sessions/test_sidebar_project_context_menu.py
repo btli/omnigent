@@ -3,21 +3,9 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Iterator
 
-import httpx
 import pytest
 from playwright.sync_api import Locator, Page, expect
-
-
-def _set_title(base_url: str, session_id: str, title: str) -> None:
-    """Give the seeded session a unique title."""
-    response = httpx.patch(
-        f"{base_url}/v1/sessions/{session_id}",
-        json={"title": title},
-        timeout=10.0,
-    )
-    response.raise_for_status()
 
 
 def _create_project(page: Page, name: str) -> None:
@@ -32,32 +20,31 @@ def _folder_header(page: Page, project: str) -> Locator:
     return page.get_by_role("button", name=project, exact=True)
 
 
-def _expanded(page: Page, project: str) -> str:
+def _expanded(header: Locator) -> str:
     """Read the raw expanded state for comparison across an action."""
-    value = _folder_header(page, project).get_attribute("aria-expanded")
+    value = header.get_attribute("aria-expanded")
     assert value is not None, "folder header is missing aria-expanded"
     return value
 
 
 @pytest.fixture
-def project_page(page: Page, seeded_session: tuple[str, str]) -> Iterator[tuple[Page, str]]:
+def project_page(page: Page, seeded_session: tuple[str, str]) -> tuple[Page, str]:
     """Open a desktop sidebar containing a fresh project folder."""
     base_url, session_id = seeded_session
-    _set_title(base_url, session_id, f"e2e-projctx-{uuid.uuid4().hex[:8]}")
     project = f"Project {uuid.uuid4().hex[:6]}"
 
     page.goto(f"{base_url}/c/{session_id}")
     _create_project(page, project)
     expect(_folder_header(page, project)).to_be_visible()
 
-    yield page, project
+    return page, project
 
 
 def test_right_click_opens_project_folder_menu(project_page: tuple[Page, str]) -> None:
     """Right-click opens the shared actions without toggling the folder."""
     page, project = project_page
     header = _folder_header(page, project)
-    before = _expanded(page, project)
+    before = _expanded(header)
 
     header.click(button="right")
 
@@ -74,7 +61,7 @@ def test_left_click_still_toggles_the_folder(project_page: tuple[Page, str]) -> 
     """Plain left-click still expands and collapses the folder."""
     page, project = project_page
     header = _folder_header(page, project)
-    before = _expanded(page, project)
+    before = _expanded(header)
     flipped = "false" if before == "true" else "true"
 
     expect(header).to_have_attribute("data-slot", "context-menu-trigger")
