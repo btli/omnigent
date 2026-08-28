@@ -2316,12 +2316,13 @@ function SectionHeader({
   /** Suppresses the header context menu while another interaction owns it. */
   contextMenuDisabled?: boolean;
 }) {
+  const [contextMenuOpen, setContextMenuOpen] = useState(false);
   const button = (
     <button
       type="button"
       aria-expanded={!collapsed}
       aria-current={active ? "page" : undefined}
-      onClick={onToggleCollapsed}
+      onClick={contextMenuOpen ? undefined : onToggleCollapsed}
       className={
         icon
           ? cn(
@@ -2402,7 +2403,7 @@ function SectionHeader({
   return (
     <h2>
       {contextMenu && !contextMenuDisabled ? (
-        <ContextMenu modal={false}>
+        <ContextMenu modal={false} onOpenChange={setContextMenuOpen}>
           <ContextMenuTrigger asChild>{button}</ContextMenuTrigger>
           {contextMenu}
         </ContextMenu>
