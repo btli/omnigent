@@ -1243,6 +1243,8 @@ function ProjectFolder({
     data: { type: "project", name },
   });
 
+  const { actions: menuActions, dialogs: menuDialogs } = useProjectFolderMenu(name, projectId);
+
   return (
     <div
       ref={setNodeRef}
@@ -1308,10 +1310,21 @@ function ProjectFolder({
         headerAction={
           <ProjectFolderActions
             projectName={name}
-            projectId={projectId}
             icon={icon}
             onNavigate={onRowClick}
+            actions={menuActions}
           />
+        }
+        headerContextMenu={
+          <ContextMenuContent className="min-w-40">
+            <ProjectFolderMenuItems
+              components={contextBundle}
+              projectName={name}
+              icon={icon}
+              onNavigate={onRowClick}
+              actions={menuActions}
+            />
+          </ContextMenuContent>
         }
         footer={
           loadingFirstPage ? (
@@ -1327,6 +1340,7 @@ function ProjectFolder({
           )
         }
       />
+      {menuDialogs}
     </div>
   );
 }
@@ -2285,6 +2299,8 @@ function SectionHeader({
   hasAction,
   collapsed,
   onToggleCollapsed,
+  contextMenu,
+  contextMenuDisabled,
 }: {
   title: string;
   icon?: ReactNode;
@@ -2297,89 +2313,104 @@ function SectionHeader({
   hasAction?: boolean;
   collapsed: boolean;
   onToggleCollapsed: () => void;
+  /** Optional context-menu content for the header button. */
+  contextMenu?: ReactNode;
+  /** Suppresses the header context menu while another interaction owns it. */
+  contextMenuDisabled?: boolean;
 }) {
-  return (
-    <h2>
-      <button
-        type="button"
-        aria-expanded={!collapsed}
-        aria-current={active ? "page" : undefined}
-        onClick={onToggleCollapsed}
-        className={
-          icon
-            ? cn(
-                SIDEBAR_ROW,
-                "group flex w-full items-center border-0 text-left text-foreground transition-colors",
-                SIDEBAR_HOVER_HIGHLIGHT,
-                active && SIDEBAR_ACTIVE_HIGHLIGHT,
-              )
-            : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-1 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
-        }
-      >
-        {icon ? (
-          // Headers with a leading icon (project folders) swap the folder for a
-          // chevron on desktop hover/focus, so the caret takes the icon's place
-          // rather than trailing the name. Mobile (no hover) keeps the folder
-          // icon and shows the trailing chevron below.
-          <span className="relative flex size-4 shrink-0 items-center justify-center">
-            <span className="flex md:transition-opacity md:group-hover:opacity-0 md:group-focus-visible:opacity-0">
-              {icon}
-            </span>
-            <ChevronRightIcon
-              className={cn(
-                "absolute size-3.5 opacity-0 transition-[transform,opacity]",
-                !collapsed && "rotate-90",
-                "hidden md:flex md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
-              )}
-            />
+  const button = (
+    <button
+      type="button"
+      aria-expanded={!collapsed}
+      aria-current={active ? "page" : undefined}
+      onClick={onToggleCollapsed}
+      className={
+        icon
+          ? cn(
+              SIDEBAR_ROW,
+              "group flex w-full items-center border-0 text-left text-foreground transition-colors",
+              SIDEBAR_HOVER_HIGHLIGHT,
+              active && SIDEBAR_ACTIVE_HIGHLIGHT,
+            )
+          : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-1 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
+      }
+    >
+      {icon ? (
+        // Headers with a leading icon (project folders) swap the folder for a
+        // chevron on desktop hover/focus, so the caret takes the icon's place
+        // rather than trailing the name. Mobile (no hover) keeps the folder
+        // icon and shows the trailing chevron below.
+        <span className="relative flex size-4 shrink-0 items-center justify-center">
+          <span className="flex md:transition-opacity md:group-hover:opacity-0 md:group-focus-visible:opacity-0">
+            {icon}
           </span>
-        ) : null}
-        <span className="min-w-0 truncate">{title}</span>
-        {/* Trailing chevron, rotating on expand. Headers without a leading icon
+          <ChevronRightIcon
+            className={cn(
+              "absolute size-3.5 opacity-0 transition-[transform,opacity]",
+              !collapsed && "rotate-90",
+              "hidden md:flex md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
+            )}
+          />
+        </span>
+      ) : null}
+      <span className="min-w-0 truncate">{title}</span>
+      {/* Trailing chevron, rotating on expand. Headers without a leading icon
             reveal it on desktop hover/focus; icon headers show it only on mobile
             (no hover) since desktop swaps the folder for the chevron above. */}
-        <ChevronRightIcon
-          className={cn(
-            "size-3.5 shrink-0 transition-[transform,opacity]",
-            !collapsed && "rotate-90",
-            icon
-              ? "md:hidden"
-              : "md:opacity-0 md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
-          )}
-        />
-        {/* A hidden row inside this collapsed section carries a marker — surface
-            the exact same badge a row would show, pinned to the right edge. */}
-        {collapsed && marker && (
-          <span
-            className={cn(
-              // Match the session rows' badge slot so the marker lines up
-              // vertically with the dots on the rows above. The header button's
-              // right padding differs by kind (icon folders use px-2, plain
-              // headers use pr-0), so offset each to the same right-1 edge:
-              // -mr-1 trims the folder's 8px padding to 4px; mr-1 pushes the
-              // padless header out to 4px.
-              "ml-auto flex shrink-0 items-center justify-center transition-opacity",
-              icon ? "-mr-1" : "mr-1",
-              // Dot/spinner markers get the fixed size-6 centered box (center
-              // lands 16px from the edge, matching the rows). The "awaiting"
-              // pill keeps its natural width so its label isn't clipped.
-              isDotMarker(marker) && "w-6",
-              // When the header also carries a hover-revealed kebab, keep the
-              // marker clear of it the same way a row's time/marker slot does:
-              // reserve space on mobile (kebab always shown) and fade out on
-              // desktop hover so the kebab takes its place.
-              hasAction &&
-                cn(
-                  "mr-14",
-                  icon ? "md:-mr-1" : "md:mr-1",
-                  "md:group-hover/section:opacity-0 md:group-focus-within/section:opacity-0",
-                ),
-            )}
-          >
-            <SessionStateBadge state={marker} />
-          </span>
+      <ChevronRightIcon
+        className={cn(
+          "size-3.5 shrink-0 transition-[transform,opacity]",
+          !collapsed && "rotate-90",
+          icon
+            ? "md:hidden"
+            : "md:opacity-0 md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
         )}
-      </button>
+      />
+      {/* A hidden row inside this collapsed section carries a marker — surface
+            the exact same badge a row would show, pinned to the right edge. */}
+      {collapsed && marker && (
+        <span
+          className={cn(
+            // Match the session rows' badge slot so the marker lines up
+            // vertically with the dots on the rows above. The header button's
+            // right padding differs by kind (icon folders use px-2, plain
+            // headers use pr-0), so offset each to the same right-1 edge:
+            // -mr-1 trims the folder's 8px padding to 4px; mr-1 pushes the
+            // padless header out to 4px.
+            "ml-auto flex shrink-0 items-center justify-center transition-opacity",
+            icon ? "-mr-1" : "mr-1",
+            // Dot/spinner markers get the fixed size-6 centered box (center
+            // lands 16px from the edge, matching the rows). The "awaiting"
+            // pill keeps its natural width so its label isn't clipped.
+            isDotMarker(marker) && "w-6",
+            // When the header also carries a hover-revealed kebab, keep the
+            // marker clear of it the same way a row's time/marker slot does:
+            // reserve space on mobile (kebab always shown) and fade out on
+            // desktop hover so the kebab takes its place.
+            hasAction &&
+              cn(
+                "mr-14",
+                icon ? "md:-mr-1" : "md:mr-1",
+                "md:group-hover/section:opacity-0 md:group-focus-within/section:opacity-0",
+              ),
+          )}
+        >
+          <SessionStateBadge state={marker} />
+        </span>
+      )}
+    </button>
+  );
+
+  return (
+    <h2>
+      {contextMenu && !contextMenuDisabled ? (
+        <ContextMenu modal={false}>
+          <ContextMenuTrigger asChild>{button}</ContextMenuTrigger>
+          {contextMenu}
+        </ContextMenu>
+      ) : (
+        button
+      )}
     </h2>
   );
 }
@@ -2588,6 +2619,7 @@ function ConversationSection({
   emptyMessage,
   indentRows,
   headerAction,
+  headerContextMenu,
   persistentHeaderAction,
   afterHeader,
   footer,
@@ -2617,6 +2649,8 @@ function ConversationSection({
   /** Optional control overlaid at the header's right edge (e.g. a project's
       kebab). Hover/focus-revealed on desktop, always shown on mobile. */
   headerAction?: ReactNode;
+  /** Optional context-menu content opened from the header button. */
+  headerContextMenu?: ReactNode;
   /** Optional control that remains visible at the header's right edge. */
   persistentHeaderAction?: ReactNode;
   /** Optional content rendered directly under the header, above the rows (and
@@ -2646,11 +2680,13 @@ function ConversationSection({
             hasAction={headerAction != null || persistentHeaderAction != null}
             collapsed={isCollapsed}
             onToggleCollapsed={onToggleCollapsed}
+            contextMenu={headerContextMenu}
+            contextMenuDisabled={selectionMode}
           />
           {(headerAction || persistentHeaderAction) && (
             <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5">
               {headerAction && (
-                <div className="flex items-center transition-opacity md:opacity-0 md:group-focus-within/header:opacity-100 md:group-hover/header:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100 md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 md:has-[[aria-expanded=true]]:opacity-100">
+                <div className="flex items-center transition-opacity [@media(hover:hover)]:md:opacity-0 [@media(hover:hover)]:md:group-focus-within/header:opacity-100 [@media(hover:hover)]:md:group-hover/header:opacity-100 [@media(hover:hover)]:md:group-has-[[data-state=open]]/header:opacity-100 [@media(hover:hover)]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 [@media(hover:hover)]:md:has-[[aria-expanded=true]]:opacity-100">
                   {headerAction}
                 </div>
               )}
@@ -2708,6 +2744,7 @@ function ConversationSection({
 // either family satisfy `MenuComponents` so `ConversationMenuItems` can author
 // the menu body once and render it under either menu kind.
 interface MenuItemProps {
+  asChild?: boolean;
   children?: ReactNode;
   className?: string;
   disabled?: boolean;
@@ -4035,25 +4072,24 @@ function ArchivingRow({ label }: { label: string }) {
  */
 function ProjectFolderActions({
   projectName,
-  projectId,
   icon,
   onNavigate,
+  actions,
 }: {
   projectName: string;
-  /** First-class project id, or null for a label-only folder. */
-  projectId: string | null;
   /** Current emoji icon, or null/absent when unset. */
   icon?: string | null;
   /** Plain-left-click nav handler — closes the mobile overlay so the
       pre-filed new-session page isn't left hidden behind the sidebar. */
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
+  actions: ProjectFolderMenuActions;
 }) {
   return (
     // gap-0.5 (2px) between the pencil and kebab mirrors the session row's
     // pin↔kebab spacing, so the two icon columns line up across row types.
     <div className="flex items-center gap-0.5">
-      {/* Desktop-only quick affordance; on mobile it folds into the kebab's
-          "New session" item below. */}
+      {/* Hover-capable desktop shortcut. Without hover, this action lives in
+          the always-reachable menu at every viewport width. */}
       <Tooltip>
         <TooltipTrigger asChild>
           <Button
@@ -4063,7 +4099,7 @@ function ProjectFolderActions({
             size="icon-xs"
             aria-label={`New session in ${projectName}`}
             data-testid="project-new-session"
-            className="text-muted-foreground max-md:hidden"
+            className="hidden text-muted-foreground [@media(hover:hover)]:md:flex"
           >
             <Link
               to={`/?project=${encodeURIComponent(projectName)}`}
@@ -4082,9 +4118,9 @@ function ProjectFolderActions({
       </Tooltip>
       <ProjectFolderMenu
         projectName={projectName}
-        projectId={projectId}
         icon={icon}
         onNavigate={onNavigate}
+        actions={actions}
       />
     </div>
   );
@@ -4092,32 +4128,79 @@ function ProjectFolderActions({
 
 // ── ProjectFolderMenu ─────────────────────────────────────────────────────────
 
-/**
- * The kebab on a project-folder header: "Rename project" (O(1) via
- * `PATCH /v1/projects/{id}` for a first-class project; promotes a label-only
- * folder on demand) and "Delete project" (archives + unfiles all members, then
- * removes the container). Delete is confirmed since it archives sessions.
- */
-function ProjectFolderMenu({
+/** The menu body shared by the project-folder kebab and context menu. */
+function ProjectFolderMenuItems({
+  components: C,
   projectName,
-  projectId,
   icon,
   onNavigate,
+  actions,
 }: {
+  components: MenuComponents;
   projectName: string;
-  projectId: string | null;
-  /** Current emoji icon, or null/absent when unset (gates "Remove icon"). */
   icon?: string | null;
-  /** Nav handler for the mobile-only "New session" item (desktop uses the
-      hover-revealed pencil). Closes the sidebar overlay on mobile. */
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
+  actions: ProjectFolderMenuActions;
 }) {
+  useEffect(() => {
+    actions.onMenuOpen(icon);
+    return actions.onMenuClose;
+  }, [actions, icon]);
+
+  return (
+    <>
+      <C.Item
+        asChild
+        className="[@media(hover:hover)]:md:hidden"
+        data-testid="project-new-session-menu"
+      >
+        <Link
+          to={`/?project=${encodeURIComponent(projectName)}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            onNavigate(e);
+          }}
+        >
+          <SquarePenIcon className="size-3.5" />
+          New session
+        </Link>
+      </C.Item>
+      <C.Item data-testid="rename-project" onSelect={actions.openRename}>
+        <PencilIcon className="size-3.5" />
+        Rename project
+      </C.Item>
+      <C.Item data-testid="project-settings" onSelect={actions.openSettings}>
+        <Settings2Icon className="size-3.5" />
+        Project settings
+      </C.Item>
+      <C.Item data-testid="delete-project" variant="destructive" onSelect={actions.openDelete}>
+        <Trash2Icon className="size-3.5" />
+        Delete project
+      </C.Item>
+    </>
+  );
+}
+
+interface ProjectFolderMenuActions {
+  openRename: () => void;
+  openSettings: () => void;
+  openDelete: () => void;
+  onMenuOpen: (icon?: string | null) => void;
+  onMenuClose: () => void;
+}
+
+/** Owns the dialogs and mutations shared by both project-folder menus. */
+function useProjectFolderMenu(
+  projectName: string,
+  projectId: string | null,
+): { actions: ProjectFolderMenuActions; dialogs: ReactNode } {
   const [menuOpen, setMenuOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [renameValue, setRenameValue] = useState(projectName);
+  const [fallbackIcon, setFallbackIcon] = useState<string | null>();
   // The icon staged in the rename modal, committed only on Confirm:
   //   undefined = untouched (show the saved icon), string = a picked emoji,
   //   null = staged removal. Reset to `undefined` each time the modal opens.
@@ -4139,68 +4222,31 @@ function ProjectFolderMenu({
   // label-only folder (`projectId === null`), whose base is legitimately `{}`.
   // This gates only the icon path; renaming the name never needs the config.
   const configReady = projectId === null || iconConfig !== undefined;
-  const savedIcon = iconConfig !== undefined ? iconConfig?.icon : icon;
+  const savedIcon = iconConfig !== undefined ? iconConfig?.icon : fallbackIcon;
   // What the modal's tile shows: the staged pick when touched, else the saved
   // icon. `null` (staged removal) renders as the empty folder.
   const displayIcon = pendingIcon !== undefined ? pendingIcon : savedIcon;
 
-  return (
+  const actions = useMemo<ProjectFolderMenuActions>(
+    () => ({
+      openRename: () => {
+        setRenameValue(projectName);
+        setPendingIcon(undefined);
+        setRenameOpen(true);
+      },
+      openSettings: () => setSettingsOpen(true),
+      openDelete: () => setDeleteOpen(true),
+      onMenuOpen: (currentIcon) => {
+        setFallbackIcon(currentIcon);
+        setMenuOpen(true);
+      },
+      onMenuClose: () => setMenuOpen(false),
+    }),
+    [projectName],
+  );
+
+  const dialogs = (
     <>
-      <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
-        <DropdownMenuTrigger asChild>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-xs"
-            aria-label={`Project actions for ${projectName}`}
-            data-testid="project-actions"
-            className="text-muted-foreground"
-            // Sits on the folder header; keep its click off the collapse toggle.
-            onClick={(e) => e.stopPropagation()}
-          >
-            <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="min-w-40">
-          {/* New session — mobile-only (md:hidden); desktop uses the
-              hover-revealed pencil on the folder header. */}
-          <DropdownMenuItem asChild className="md:hidden" data-testid="project-new-session-menu">
-            <Link
-              to={`/?project=${encodeURIComponent(projectName)}`}
-              onClick={(e) => {
-                e.stopPropagation();
-                onNavigate(e);
-              }}
-            >
-              <SquarePenIcon className="size-3.5" />
-              New session
-            </Link>
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            data-testid="rename-project"
-            onSelect={() => {
-              setRenameValue(projectName);
-              setPendingIcon(undefined);
-              setRenameOpen(true);
-            }}
-          >
-            <PencilIcon className="size-3.5" />
-            Rename project
-          </DropdownMenuItem>
-          <DropdownMenuItem data-testid="project-settings" onSelect={() => setSettingsOpen(true)}>
-            <Settings2Icon className="size-3.5" />
-            Project settings
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            data-testid="delete-project"
-            variant="destructive"
-            onSelect={() => setDeleteOpen(true)}
-          >
-            <Trash2Icon className="size-3.5" />
-            Delete project
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
       <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
         <DialogContent
           onClick={(e) => e.stopPropagation()}
@@ -4439,6 +4485,48 @@ function ProjectFolderMenu({
         </DialogContent>
       </Dialog>
     </>
+  );
+
+  return { actions, dialogs };
+}
+
+/** The kebab entry point for the shared project-folder action menu. */
+function ProjectFolderMenu({
+  projectName,
+  icon,
+  onNavigate,
+  actions,
+}: {
+  projectName: string;
+  icon?: string | null;
+  onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
+  actions: ProjectFolderMenuActions;
+}) {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-xs"
+          aria-label={`Project actions for ${projectName}`}
+          data-testid="project-actions"
+          className="text-muted-foreground"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="min-w-40">
+        <ProjectFolderMenuItems
+          components={dropdownBundle}
+          projectName={projectName}
+          icon={icon}
+          onNavigate={onNavigate}
+          actions={actions}
+        />
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 

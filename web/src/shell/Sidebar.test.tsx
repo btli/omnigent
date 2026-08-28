@@ -727,10 +727,10 @@ describe("Sidebar session list", () => {
     expect(selectSessions).toHaveClass("text-muted-foreground", "hover:text-foreground");
     expect(selectSessions).not.toHaveTextContent("Select sessions");
     expect(selectSessions.parentElement).toHaveClass(
-      "md:opacity-0",
-      "md:group-hover/header:opacity-100",
-      "md:group-focus-within/header:opacity-100",
-      "md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100",
+      "[@media(hover:hover)]:md:opacity-0",
+      "[@media(hover:hover)]:md:group-hover/header:opacity-100",
+      "[@media(hover:hover)]:md:group-focus-within/header:opacity-100",
+      "[@media(hover:hover)]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100",
     );
 
     const filterSessions = within(sessionsSection!).getByRole("button", {
@@ -1726,17 +1726,16 @@ describe("Sidebar project sections", () => {
   });
 
   it("folds the new-session pencil into the kebab on mobile", async () => {
-    // The pencil is desktop-only (max-md:hidden); on mobile the same action is
-    // offered as a md:hidden "New session" kebab item pre-filed under the
-    // project (same ?project= link as the pencil).
+    // The pencil is limited to hover-capable desktop inputs. Without hover the
+    // same action stays in the kebab at every viewport width.
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
     ]);
     renderSidebar();
 
-    // Pencil stays in the tree but is hidden below the md breakpoint.
-    expect(screen.getByTestId("project-new-session")).toHaveClass("max-md:hidden");
+    const pencil = screen.getByTestId("project-new-session");
+    expect(pencil).toHaveClass("hidden", "[@media(hover:hover)]:md:flex");
 
     // Open the kebab → a mobile-only "New session" item linking to the same
     // pre-filed composer.
@@ -1745,7 +1744,8 @@ describe("Sidebar project sections", () => {
       ctrlKey: false,
     });
     const menuItem = await screen.findByTestId("project-new-session-menu");
-    expect(menuItem).toHaveClass("md:hidden");
+    expect(menuItem).toHaveClass("[@media(hover:hover)]:md:hidden");
+    expect(menuItem).not.toHaveClass("md:hidden");
     expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
   });
 });
