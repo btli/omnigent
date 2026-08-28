@@ -159,4 +159,10 @@ dev-sync:
 [group('dev-env')]
 dev-down:
     {{ DEV_KUBECTL }} scale deploy/omnigent-test --replicas=0
+
+# Rebuild `staging` = upstream/main + manifest PR tips + homelab overlay.
+# Never touches PR branches, so upstream approvals survive. See dev/fork/.
+[group('dev-env')]
+sync-staging *args:
+    dev/fork/sync-staging.sh {{ args }}
 # ─── end homelab dev env ─────────────────────────────────────────────────────

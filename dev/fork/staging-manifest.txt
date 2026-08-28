@@ -1,0 +1,30 @@
+# Branches composed into the `staging` build, merged in order (oldest first).
+# Format: <upstream-pr-number> <pinned-sha> <label>
+#
+# The pinned sha is the reviewed head of the upstream PR — the exact commits
+# maintainers approved. staging is rebuilt by merging these tips as-is, so a
+# rebuild never rewrites a PR branch and never invalidates approvals.
+#
+# - Update a line only when you deliberately push a new revision to that PR.
+# - Remove a line once its PR merges upstream (the content then arrives via
+#   upstream/main on the next rebuild).
+# - The homelab overlay branch is not listed here; sync-staging.sh always
+#   merges it last.
+2923 f8b150d8947a742f046d14bc0337d5045884c1e2 polly/font-loader-catalog
+3182 04dbf5541b8120aabad7587c1a909c9e242095cf polly/android-workmanager-poller
+3587 8dec8364f531e283d7914ec241839935e4325612 fix/android-right-rail
+4058 3dd198261a2efd43eca129abdcecb2f71637531a feat/graph-view-agent-icons-v2
+4158 2e18abfd2882b0a6fa1ebfa11b234b9227ca5e38 android-oidc-origin-binding
+4438 5d41e3742dfaeafb5a25878177e5ff45df555485 pollux/server-disconnect-attribution
+4439 11e3784071f5ffc95bc235ce732869a468663cb2 pollux/kimi-tui-inject-hardening
+4441 5d00e0b69f46d2ecf2d1400aa67543d24e5c77c1 pollux/kimi-forwarder-lifecycle
+4481 f3b5358b7a9c4541874165c810dfd03a9ae408d0 kimi-usage-cost
+4623 08f34935f818ee8a4fa787d8374a35a30bafb995 fix/android-notification-icon
+5181 a8495d74cb3681a9f2c31baacae1d73e7aaa3374 fix/forwarder-item-idempotency
+5198 ba5fd3f1cb45a6745e1656be8b41b24567871760 android-app-id-suffix
+5214 13f41b1b26f62dba853afac4fc568bdf763a4c7f sidebar-collapsed-count-pill
+5264 90571c905a5dfc0edea92ba5e42e7a370eaad1ec fix/terminal-scrollbar-bleed-5225
+5278 56b144250874b78216c3f5e20b01d6c50447f1ea fix-claude-native-stopfailure-diagnostics
+5280 1a35d4a906f9402f6cadc590aa1ad816c02588ea fix-claude-submit-verify-budget
+5366 25afc382ae3897ddb2a5b5bafb99b2485d32b95b pollux/claude-launch-model-vocab
+5381 56040cf754ad776648971faca5a9e5937f172897 automation-project-assignment
