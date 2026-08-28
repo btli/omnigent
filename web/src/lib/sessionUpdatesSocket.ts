@@ -31,10 +31,19 @@ export type SessionUpdatesFrame =
 type FrameListener = (frame: SessionUpdatesFrame) => void;
 
 // Reconnect backoff — mirrors the chat stream pump (chatStore.ts): 250 ms
-// base, doubling, capped at 5 s, with ±50% jitter so many tabs reconnecting
-// after a server blip don't synchronize into a thundering herd.
+// base, doubling, capped at 5 s visible / 60 s hidden, with ±50% jitter so
+// many tabs reconnecting after a server blip don't synchronize into a
+// thundering herd.
 const RECONNECT_BASE_MS = 250;
-const RECONNECT_MAX_MS = 5_000;
+// Exported so the backoff tests can assert the exact saturated delay rather
+// than hard-coding the literal (same pattern as HEARTBEAT_WATCHDOG_MS).
+export const RECONNECT_MAX_MS = 5_000;
+
+// A hidden page doesn't need sub-second freshness: while `document.hidden`
+// the retry cap stretches, so a backgrounded tab or mobile WebView facing an
+// unreachable server doesn't wake the CPU/radio every few seconds. Returning
+// to the foreground reconnects immediately (see `onVisibilityChange`).
+export const HIDDEN_RECONNECT_MAX_MS = 60_000;
 
 // The server pushes a heartbeat every 30 s when a watch-set is idle (see
 // `_SESSION_UPDATES_HEARTBEAT_INTERVAL_S`). If we go appreciably longer than
@@ -50,7 +59,9 @@ const RECONNECT_MAX_MS = 5_000;
 export const HEARTBEAT_WATCHDOG_MS = 70_000;
 
 function nextReconnectDelay(failedAttempts: number): number {
-  const base = Math.min(RECONNECT_BASE_MS * 2 ** (failedAttempts - 1), RECONNECT_MAX_MS);
+  const max =
+    typeof document !== "undefined" && document.hidden ? HIDDEN_RECONNECT_MAX_MS : RECONNECT_MAX_MS;
+  const base = Math.min(RECONNECT_BASE_MS * 2 ** (failedAttempts - 1), max);
   return base / 2 + Math.random() * (base / 2);
 }
 
@@ -110,12 +121,22 @@ class SessionUpdatesSocket {
   start(): void {
     if (this.started) return;
     this.started = true;
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", this.onVisibilityChange);
+    }
     this.connect();
   }
 
   /** Close the connection and stop reconnecting. */
   stop(): void {
     this.started = false;
+    // A deliberate stop ends the current reconnect campaign: a later start()
+    // begins fresh at the 250 ms base instead of inheriting a saturated
+    // (up to 60 s hidden) delay from an outage that may be long over.
+    this.failedAttempts = 0;
+    if (typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", this.onVisibilityChange);
+    }
     this.clearWatchdog();
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
@@ -253,6 +274,19 @@ class SessionUpdatesSocket {
     // close() drives onclose → setConnected(false) → scheduleReconnect.
     this.ws.close();
   }
+
+  /**
+   * Coming back to the foreground: a pending retry may have been scheduled
+   * under the stretched hidden-page cap, so skip the wait and reconnect now.
+   */
+  private readonly onVisibilityChange = (): void => {
+    if (document.hidden || !this.started) return;
+    if (this.reconnectTimer !== null && this.ws === null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+      this.connect();
+    }
+  };
 
   private scheduleReconnect(): void {
     if (!this.started || this.reconnectTimer !== null) return;
