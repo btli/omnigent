@@ -28,7 +28,7 @@ from omnigent.json_types import JsonObject as _JsonObject
 if TYPE_CHECKING:
     # Type-only import: the runner keeps codex deps out of its runtime import
     # graph (they are imported lazily inside the codex-native helpers).
-    from omnigent.claude_native import ClaudeNativeUcodeConfig
+    from omnigent.claude_native import ClaudeLaunchCatalogResult, ClaudeNativeUcodeConfig
     from omnigent.codex_native_app_server import CodexAppServerClient, CodexNativeAppServer
     from omnigent.inner.datamodel import OSEnvSpec
     from omnigent.opencode_native_app_server import OpenCodeNativeServer
@@ -2272,21 +2272,25 @@ async def _auto_create_pi_terminal(
     # message silently fails to reach the model — the user sees no reply and no
     # reason. Best-effort: a delivery failure must not fail the launch.
     if credential_warning is not None:
-        await _post_pi_native_credential_warning(
+        await _post_native_session_error_notice(
             session_id=session_id,
             server_client=server_client,
-            warning=credential_warning,
+            code="pi_credentials_unresolved",
+            message=credential_warning,
+            log_prefix="pi-native: failed to surface credential warning",
         )
     return terminal_view
 
 
-async def _post_pi_native_credential_warning(
+async def _post_native_session_error_notice(
     *,
     session_id: str,
     server_client: httpx.AsyncClient | None,
-    warning: str,
+    code: str,
+    message: str,
+    log_prefix: str,
 ) -> None:
-    """Surface a credential warning into the session as an error banner.
+    """Surface a native-launch warning into the session as an error banner.
 
     Posts an ``error`` item via ``external_conversation_item`` so the notice
     renders as the web UI's distinct destructive banner (not a misleading
@@ -2297,7 +2301,9 @@ async def _post_pi_native_credential_warning(
 
     :param session_id: Session/conversation identifier.
     :param server_client: Runner Omnigent server client (``None`` in tests).
-    :param warning: The user-facing warning text to surface.
+    :param code: Stable error item code.
+    :param message: User-facing warning text.
+    :param log_prefix: Harness-specific delivery failure description.
     """
     if server_client is None:
         return
@@ -2310,8 +2316,8 @@ async def _post_pi_native_credential_warning(
                     "item_type": "error",
                     "item_data": {
                         "source": "execution",
-                        "code": "pi_credentials_unresolved",
-                        "message": warning,
+                        "code": code,
+                        "message": message,
                     },
                 },
             },
@@ -2320,7 +2326,8 @@ async def _post_pi_native_credential_warning(
         resp.raise_for_status()
     except httpx.HTTPError:
         _logger.warning(
-            "pi-native: failed to surface credential warning for session %s",
+            "%s for session %s",
+            log_prefix,
             session_id,
             exc_info=True,
         )
@@ -5666,6 +5673,79 @@ def _is_runner_owned_antigravity_terminal(
     )
 
 
+def _claude_model_from_launch_args(terminal_launch_args: list[str] | None) -> str | None:
+    """Return the last valid explicit ``--model`` value in launch argv."""
+    model: str | None = None
+    args = terminal_launch_args or []
+    for index, arg in enumerate(args):
+        if arg == "--model" and index + 1 < len(args) and args[index + 1]:
+            model = args[index + 1]
+        elif arg.startswith("--model=") and arg.partition("=")[2]:
+            model = arg.partition("=")[2]
+    return model
+
+
+def _claude_launch_args_with_model(
+    terminal_launch_args: list[str] | None,
+    model: str,
+) -> list[str] | None:
+    """Replace the effective explicit ``--model`` value with *model*."""
+    if terminal_launch_args is None:
+        return None
+    args = list(terminal_launch_args)
+    for index in range(len(args) - 1, -1, -1):
+        if args[index].startswith("--model="):
+            args[index] = f"--model={model}"
+            return args
+        if args[index] == "--model" and index + 1 < len(args):
+            args[index + 1] = model
+            return args
+    return args
+
+
+def _select_authoritative_claude_launch_model(
+    *,
+    explicit_model: str | None,
+    configured_model: str | None,
+    claude_config: ClaudeNativeUcodeConfig | None,
+    catalog: ClaudeLaunchCatalogResult | None,
+) -> tuple[str | None, str | None]:
+    """Select one launch model from the effective pin and fresh catalog."""
+    from omnigent.claude_native import (
+        ClaudeLaunchCatalogStatus,
+        resolve_claude_native_catalog_selection,
+        resolve_claude_native_model_selection,
+    )
+    from omnigent.model_catalog_store import default_row
+
+    launch_model = resolve_claude_native_model_selection(
+        explicit_model or configured_model,
+        claude_config,
+    )
+    notice: str | None = None
+    if (
+        explicit_model
+        and catalog is not None
+        and catalog.status in {ClaudeLaunchCatalogStatus.FRESH, ClaudeLaunchCatalogStatus.EMPTY}
+    ):
+        launch_model, notice = resolve_claude_native_catalog_selection(
+            explicit_model,
+            catalog.rows,
+            claude_config,
+        )
+    if (
+        launch_model is None
+        and catalog is not None
+        and catalog.status is ClaudeLaunchCatalogStatus.FRESH
+    ):
+        catalog_default = default_row(catalog.rows)
+        if catalog_default is not None:
+            launch_model = (
+                str(catalog_default.get("model") or catalog_default.get("id") or "") or None
+            )
+    return launch_model, notice
+
+
 def _build_claude_native_base_args(
     *,
     reasoning_effort: str | None,
@@ -6186,38 +6266,6 @@ async def _load_claude_launch_metadata(
     return metadata
 
 
-async def _post_claude_native_model_substitution_notice(
-    *,
-    session_id: str,
-    server_client: httpx.AsyncClient,
-    notice: str,
-) -> None:
-    """Surface a Claude launch-model substitution in the session."""
-    try:
-        response = await server_client.post(
-            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/events",
-            json={
-                "type": "external_conversation_item",
-                "data": {
-                    "item_type": "error",
-                    "item_data": {
-                        "source": "execution",
-                        "code": "claude_model_substituted",
-                        "message": notice,
-                    },
-                },
-            },
-            timeout=30.0,
-        )
-        response.raise_for_status()
-    except httpx.HTTPError:
-        _logger.warning(
-            "claude-native: failed to surface model substitution for session %s",
-            session_id,
-            exc_info=True,
-        )
-
-
 async def _auto_create_claude_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -6412,8 +6460,6 @@ async def _auto_create_claude_terminal(
         build_native_claude_terminal_env,
         claude_config_with_launch_model_pinned,
         claude_config_with_routed_arms_pinned,
-        resolve_claude_native_catalog_selection,
-        resolve_claude_native_model_selection,
         resolve_native_claude_config,
     )
 
@@ -6652,32 +6698,21 @@ async def _auto_create_claude_terminal(
         from omnigent.server.smart_routing import task_v1_claude_arms
 
         claude_config = claude_config_with_routed_arms_pinned(claude_config, task_v1_claude_arms())
-    launch_model = resolve_claude_native_model_selection(
-        session_model_override
-        or _claude_native_model_from_spec(agent_spec)
-        or (claude_config.model if claude_config is not None else None),
-        claude_config,
+    argv_model = _claude_model_from_launch_args(session_launch_args)
+    explicit_model = (
+        argv_model or session_model_override or _claude_native_model_from_spec(agent_spec)
     )
-    model_substitution_notice: str | None = None
+    configured_model = claude_config.model if claude_config is not None else None
+    launch_catalog_result: ClaudeLaunchCatalogResult | None = None
     # Explicit launches (model-flows design §4): consult the shared catalog
     # only when it can change the outcome — to validate an explicit request,
     # or to resolve a Default launch that would otherwise pass no ``--model``
     # and leave the model to invisible CLI-private state.
-    if session_model_override or launch_model is None:
-        from omnigent.claude_native import (
-            claude_launch_catalog,
-            claude_launch_catalog_is_stale,
-        )
-        from omnigent.model_catalog_store import default_row
+    if explicit_model or configured_model is None:
+        from omnigent.claude_native import ClaudeLaunchCatalogStatus, claude_launch_catalog_result
 
-        launch_catalog: list[dict[str, object]] | None = None
-        launch_catalog_was_stale = False
         try:
-            # Read staleness BEFORE the fetch: the fetch itself kicks the
-            # background re-probe, which could land between the two reads and
-            # make a same-launch check call yesterday's rows fresh.
-            launch_catalog_was_stale = claude_launch_catalog_is_stale(claude_config)
-            launch_catalog = await claude_launch_catalog(claude_config)
+            launch_catalog_result = await claude_launch_catalog_result(claude_config)
         except Exception:  # noqa: BLE001 — no catalog means no validation/default
             _logger.warning(
                 "claude launch catalog unavailable for session=%s",
@@ -6685,32 +6720,24 @@ async def _auto_create_claude_terminal(
                 exc_info=True,
                 extra={"session_id": session_id},
             )
-        if session_model_override and launch_catalog is not None:
-            launch_model, model_substitution_notice = resolve_claude_native_catalog_selection(
-                session_model_override,
-                launch_catalog,
-                claude_config,
+        if (
+            launch_catalog_result is not None
+            and launch_catalog_result.status is ClaudeLaunchCatalogStatus.REFRESH_FAILED
+        ):
+            _logger.warning(
+                "claude launch catalog refresh failed for session=%s; "
+                "preserving the requested launch model without substitution",
+                session_id,
+                extra={"session_id": session_id},
             )
-        if launch_model is None and launch_catalog:
-            # A stale entry's default is yesterday's answer: pinning it as
-            # ``--model`` turns a provider-side retirement or entitlement
-            # change into a hard launch failure. Launch bare instead — the
-            # CLI's own default is servable by construction, and the
-            # harness's ``reported_model`` records what it actually ran —
-            # while the store's background re-probe converges the catalog.
-            if launch_catalog_was_stale:
-                _logger.info(
-                    "claude catalog for session=%s is stale; deferring the Default "
-                    "launch to the CLI's own default model",
-                    session_id,
-                )
-            else:
-                catalog_default = default_row(launch_catalog)
-                if catalog_default is not None:
-                    launch_model = (
-                        str(catalog_default.get("model") or catalog_default.get("id") or "")
-                        or None
-                    )
+    launch_model, model_substitution_notice = _select_authoritative_claude_launch_model(
+        explicit_model=explicit_model,
+        configured_model=configured_model,
+        claude_config=claude_config,
+        catalog=launch_catalog_result,
+    )
+    if argv_model is not None and launch_model is not None and launch_model != argv_model:
+        session_launch_args = _claude_launch_args_with_model(session_launch_args, launch_model)
     # Give an exact launch model (a Smart Routing pick is resolved before the
     # terminal exists) a spelling of its own in the picker, so a later
     # ``/model`` can return to it instead of stepping onto whatever the family
@@ -6929,10 +6956,12 @@ async def _auto_create_claude_terminal(
         },
     )
     if model_substitution_notice is not None:
-        await _post_claude_native_model_substitution_notice(
+        await _post_native_session_error_notice(
             session_id=session_id,
             server_client=server_client,
-            notice=model_substitution_notice,
+            code="claude_model_substituted",
+            message=model_substitution_notice,
+            log_prefix="claude-native: failed to surface model substitution",
         )
     _publish_tmux_target_for_bridge(
         resource_registry=resource_registry,

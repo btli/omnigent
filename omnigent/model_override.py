@@ -173,7 +173,8 @@ def model_family_mismatch(harness: str, model: str) -> str | None:
     """
     canon = canonicalize_harness(harness)
     lower = model.lower()
-    is_claude = lower in CLAUDE_MODEL_ALIASES or "claude" in lower
+    alias_base = lower.removesuffix("[1m]")
+    is_claude = alias_base in CLAUDE_MODEL_ALIASES or "claude" in lower
     # Antigravity's reject-list stays the narrow GPT/codex rule: GLM and Kimi
     # ids carry no Gemini-native verdict, so they are not newly excluded here.
     is_gpt = "gpt" in lower or "codex" in lower
