@@ -3750,24 +3750,21 @@ def _resolve_codex_launch_model_override(requested: str, catalog: list[_JsonObje
         if row_id is not None and requested == row_id:
             return row_id
 
-    exact_model_match = False
     exact_model_ids: set[str] = set()
     for row in catalog:
         if requested != row.get("model"):
             continue
-        exact_model_match = True
         row_id = _valid_row_id(row)
         if row_id is not None:
             exact_model_ids.add(row_id)
-    if exact_model_match:
-        if len(exact_model_ids) == 1:
-            return next(iter(exact_model_ids))
-        if len(exact_model_ids) > 1:
-            raise click.ClickException(
-                f"the requested model {requested!r} exactly matches catalog rows that "
-                "do not resolve to exactly one valid catalog id. Launchable model ids: "
-                f"{_launchable_text()}. Pick again from the model menu."
-            )
+    if len(exact_model_ids) == 1:
+        return next(iter(exact_model_ids))
+    if len(exact_model_ids) > 1:
+        raise click.ClickException(
+            f"the requested model {requested!r} exactly matches catalog rows that "
+            "do not resolve to exactly one valid catalog id. Launchable model ids: "
+            f"{_launchable_text()}. Pick again from the model menu."
+        )
 
     resolved = codex_reachable_model_slug(requested, catalog)
     if resolved is not None:
