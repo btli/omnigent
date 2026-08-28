@@ -14,6 +14,7 @@ def _create_project(page: Page, name: str) -> None:
     page.get_by_test_id("new-project").click()
     page.get_by_placeholder("Project name…").fill(name)
     page.get_by_test_id("new-project-confirm").click()
+    expect(page.get_by_test_id("new-project-confirm")).to_have_count(0)
 
 
 def _folder_header(page: Page, project: str) -> Locator:
@@ -62,7 +63,7 @@ def touch_project_page(
         header.evaluate(
             "element => element.scrollIntoView({ block: 'center', behavior: 'instant' })"
         )
-        page.wait_for_timeout(100)
+        expect(header).to_be_in_viewport()
         yield page, project
     finally:
         context.close()
@@ -77,6 +78,18 @@ def _touch_point(header: Locator, *, x_offset: float = 0) -> dict[str, float | i
         "x": bounds["x"] + bounds["width"] / 2 + x_offset,
         "y": bounds["y"] + bounds["height"] / 2,
     }
+
+
+def _assert_touch_point_hits(header: Locator, point: dict[str, float | int]) -> None:
+    """Confirm that a CDP touch point targets the folder header."""
+    hit_target = header.evaluate(
+        """(element, point) => {
+            const target = document.elementFromPoint(point.x, point.y);
+            return { contains: element.contains(target), target: target?.outerHTML };
+        }""",
+        point,
+    )
+    assert hit_target["contains"], hit_target
 
 
 def test_right_click_opens_project_folder_menu(project_page: tuple[Page, str]) -> None:
@@ -157,14 +170,7 @@ def test_touch_long_press_opens_project_folder_menu(
     before = _expanded(header)
     cdp = page.context.new_cdp_session(page)
     point = _touch_point(header)
-    hit_target = header.evaluate(
-        """(element, point) => {
-            const target = document.elementFromPoint(point.x, point.y);
-            return { contains: element.contains(target), target: target?.outerHTML };
-        }""",
-        point,
-    )
-    assert hit_target["contains"], hit_target
+    _assert_touch_point_hits(header, point)
 
     cdp.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [point]})
     try:
@@ -190,10 +196,12 @@ def test_moving_touch_hold_does_not_open_project_folder_menu(
     header = _folder_header(page, project)
     before = _expanded(header)
     cdp = page.context.new_cdp_session(page)
+    point = _touch_point(header)
+    _assert_touch_point_hits(header, point)
 
     cdp.send(
         "Input.dispatchTouchEvent",
-        {"type": "touchStart", "touchPoints": [_touch_point(header)]},
+        {"type": "touchStart", "touchPoints": [point]},
     )
     try:
         page.wait_for_timeout(100)
