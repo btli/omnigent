@@ -2403,7 +2403,9 @@ function SectionHeader({
     <h2>
       {contextMenu && !contextMenuDisabled ? (
         <ContextMenu>
-          <ContextMenuTrigger asChild>{button}</ContextMenuTrigger>
+          <ContextMenuTrigger asChild className="select-none [-webkit-touch-callout:none]">
+            {button}
+          </ContextMenuTrigger>
           {contextMenu}
         </ContextMenu>
       ) : (
