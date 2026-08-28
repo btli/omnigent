@@ -3733,6 +3733,53 @@ async def _auto_create_kimi_terminal(
     return terminal_view
 
 
+def _resolve_codex_launch_model_override(requested: str, catalog: list[_JsonObject]) -> str:
+    """Resolve an explicit codex model pin to the id its catalog advertises.
+
+    An orchestrator-selected id can arrive in gateway vocabulary
+    (``system.ai.gpt-5.6-sol``) or with dashed version digits
+    (``system.ai.gpt-5-6-sol``) while codex's own ``model/list`` spells the
+    same model ``gpt-5.6-sol``. Fold both sides to codex's comparison form and
+    return the catalog's own spelling so the launch pins what codex serves. A
+    model no row names is rejected with the launchable ids enumerated.
+    """
+    from omnigent.codex_model_vocabulary import codex_reachable_model_slug
+
+    def _launchable_text() -> str:
+        launchable = sorted(
+            {str(token) for row in catalog for token in (row.get("id"), row.get("model")) if token}
+        )
+        return ", ".join(repr(token) for token in launchable) or "none"
+
+    # A selectable id is stronger than another row's model alias.
+    exact_model_ids: set[str] = set()
+    for row in catalog:
+        row_id = row.get("id")
+        if not isinstance(row_id, str) or not (row_id := row_id.strip()):
+            continue
+        if requested == row_id:
+            return row_id
+        if requested == row.get("model"):
+            exact_model_ids.add(row_id)
+    if len(exact_model_ids) == 1:
+        return next(iter(exact_model_ids))
+    if len(exact_model_ids) > 1:
+        raise click.ClickException(
+            f"the requested model {requested!r} exactly matches catalog rows that "
+            "do not resolve to exactly one valid catalog id. Launchable model ids: "
+            f"{_launchable_text()}. Pick again from the model menu."
+        )
+
+    resolved = codex_reachable_model_slug(requested, catalog)
+    if resolved is not None:
+        return resolved
+    raise click.ClickException(
+        f"the requested model {requested!r} is not in this host's current model "
+        f"list — it may have changed since the pick. Launchable model ids: "
+        f"{_launchable_text()}. Pick again from the model menu."
+    )
+
+
 async def _auto_create_codex_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -3844,19 +3891,26 @@ async def _auto_create_codex_terminal(
             codex_launch_catalog,
             codex_launch_catalog_is_stale,
         )
-        from omnigent.model_catalog_store import catalog_contains, default_row
+        from omnigent.model_catalog_store import default_row
 
         # Read staleness BEFORE the fetch — the fetch kicks the background
         # re-probe, which could land between the two reads.
         _codex_catalog_was_stale = await codex_launch_catalog_is_stale()
         _codex_catalog = await codex_launch_catalog(codex_path=_codex_cli_path)
         if launch_config.model_override and _codex_catalog:
-            if not catalog_contains(_codex_catalog, launch_config.model_override):
-                raise click.ClickException(
-                    f"the requested model {launch_config.model_override!r} is not in "
-                    "this host's current model list — it may have changed since the "
-                    "pick. Pick again from the model menu."
+            # Fold gateway/dashed vocabulary onto codex's own spelling before
+            # accepting or rejecting, and pin the id codex actually advertises.
+            _resolved_model = _resolve_codex_launch_model_override(
+                launch_config.model_override, _codex_catalog
+            )
+            if _resolved_model != _codex_launch.model:
+                _logger.info(
+                    "codex launch for session=%s: resolved requested model %r to catalog id %r",
+                    session_id,
+                    launch_config.model_override,
+                    _resolved_model,
                 )
+                _codex_launch = _dataclass_replace(_codex_launch, model=_resolved_model)
         if _codex_launch.model is None and _codex_launch.profile is None and _codex_catalog:
             # Same staleness rule as the claude branch: never convert a stale
             # entry's default into an explicit model pin.

@@ -3620,3 +3620,205 @@ async def test_auto_create_claude_terminal_default_pin_uses_authoritative_catalo
         assert model_catalog_store.read_catalog("claude-native", fingerprint) == refreshed
 
     await fake_client.aclose()
+
+
+def _codex_launch_catalog_rows() -> list[dict[str, Any]]:
+    """This host's codex launchable ids in codex's own dotted spelling."""
+    return [
+        {"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "isDefault": True},
+        {"id": "gpt-5.6-terra", "model": "gpt-5.6-terra"},
+        {"id": "gpt-5.6-luna", "model": "gpt-5.6-luna"},
+        {"id": "gpt-5.5", "model": "gpt-5.5"},
+        {"id": "gpt-5.2", "model": "gpt-5.2"},
+    ]
+
+
+@pytest.mark.parametrize(
+    "requested",
+    ["system.ai.gpt-5.6-sol", "system.ai.gpt-5-6-sol", "gpt-5.6-sol"],
+)
+def test_resolve_codex_launch_model_override_folds_to_catalog_spelling(
+    requested: str,
+) -> None:
+    """Gateway/dashed vocabulary resolves to codex's own advertised id.
+
+    An orchestrator can hand this branch ``system.ai.gpt-5.6-sol`` or the
+    dashed ``system.ai.gpt-5-6-sol``; both name codex's ``gpt-5.6-sol``, and
+    the exact spelling passes through unchanged.
+    """
+    from omnigent.runner.native.orchestration import (
+        _resolve_codex_launch_model_override,
+    )
+
+    resolved = _resolve_codex_launch_model_override(requested, _codex_launch_catalog_rows())
+    assert resolved == "gpt-5.6-sol"
+
+
+def test_resolve_codex_launch_model_override_rejects_unlisted_model() -> None:
+    """An unlisted model is rejected, not substituted, and the error names it
+    alongside every launchable id so the failure is diagnosable."""
+    from omnigent.runner.native.orchestration import (
+        _resolve_codex_launch_model_override,
+    )
+
+    with pytest.raises(click.ClickException) as excinfo:
+        _resolve_codex_launch_model_override(
+            "databricks-gpt-5-3-codex", _codex_launch_catalog_rows()
+        )
+    message = str(excinfo.value)
+    assert "databricks-gpt-5-3-codex" in message
+    assert "Launchable model ids:" in message
+    for launchable in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.2"):
+        assert repr(launchable) in message
+
+
+@pytest.mark.parametrize("reverse_rows", [False, True], ids=["model-row-first", "id-row-first"])
+def test_resolve_codex_launch_model_override_exact_match_beats_earlier_fold(
+    reverse_rows: bool,
+) -> None:
+    """An exact selectable id wins over another row's exact model alias."""
+    from omnigent.runner.native.orchestration import (
+        _resolve_codex_launch_model_override,
+    )
+
+    catalog = [
+        {"id": "other-selector", "model": "gpt-5.6-sol"},
+        {"id": "gpt-5.6-sol", "model": "system.ai.gpt-5-6-sol", "isDefault": True},
+    ]
+    if reverse_rows:
+        catalog.reverse()
+    assert _resolve_codex_launch_model_override("gpt-5.6-sol", catalog) == "gpt-5.6-sol"
+
+
+def test_resolve_codex_launch_model_override_rejects_ambiguous_exact_models() -> None:
+    """Two selectable ids for one exact model spelling fail loudly."""
+    from omnigent.runner.native.orchestration import (
+        _resolve_codex_launch_model_override,
+    )
+
+    catalog = [
+        {"id": "first-selector", "model": "shared-provider-model"},
+        {"id": "second-selector", "model": "shared-provider-model"},
+    ]
+    with pytest.raises(click.ClickException) as excinfo:
+        _resolve_codex_launch_model_override("shared-provider-model", catalog)
+    message = str(excinfo.value)
+    assert "do not resolve to exactly one valid catalog id" in message
+    assert "'first-selector'" in message
+    assert "'second-selector'" in message
+
+
+@pytest.mark.parametrize("reverse_rows", [False, True], ids=["blank-row-first", "fold-row-first"])
+def test_resolve_codex_launch_model_override_folds_past_a_blank_exact_model_id(
+    reverse_rows: bool,
+) -> None:
+    """A malformed exact-model row cannot hide a valid fold-only row."""
+    from omnigent.runner.native.orchestration import (
+        _resolve_codex_launch_model_override,
+    )
+
+    catalog = [
+        {"id": "   ", "model": "system.ai.gpt-5.6-sol"},
+        {"id": "gpt-5.6-sol", "model": "gpt-5.6-sol"},
+    ]
+    if reverse_rows:
+        catalog.reverse()
+    assert _resolve_codex_launch_model_override("system.ai.gpt-5.6-sol", catalog) == "gpt-5.6-sol"
+
+
+@pytest.mark.parametrize("invalid_id", ["", "   "], ids=["empty", "whitespace"])
+def test_resolve_codex_launch_model_override_never_returns_a_blank_id(invalid_id: str) -> None:
+    """A blank-only exact model falls through, then fails without returning it."""
+    from omnigent.runner.native.orchestration import (
+        _resolve_codex_launch_model_override,
+    )
+
+    with pytest.raises(click.ClickException) as excinfo:
+        _resolve_codex_launch_model_override(
+            "shared-provider-model",
+            [{"id": invalid_id, "model": "shared-provider-model"}],
+        )
+    assert "is not in this host's current model list" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_auto_create_codex_terminal_launch_gate_folds_a_gateway_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The launch path pins codex's advertised spelling for a gateway override.
+
+    Drives ``_auto_create_codex_terminal`` with a persisted
+    ``system.ai.gpt-5.6-sol`` pin and asserts the app-server builder receives
+    codex's own ``gpt-5.6-sol`` — exercising the resolve → replace on
+    ``_codex_launch.model`` that is the actual fix and the site of the bug.
+    """
+    import omnigent.codex_native_app_server as codex_app_server
+    from omnigent.codex_native_app_server import NativeCodexLaunch
+    from omnigent.runner.native.orchestration import _auto_create_codex_terminal
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "codex-bridge")
+
+    catalog = _codex_launch_catalog_rows()
+
+    async def _catalog(*, codex_path: object = None) -> list[dict[str, Any]]:
+        del codex_path
+        return catalog
+
+    async def _not_stale() -> bool:
+        return False
+
+    def _resolve_launch(*, model: str | None, spec: object = None) -> NativeCodexLaunch:
+        del spec
+        return NativeCodexLaunch(config_overrides=[], model=model, profile=None)
+
+    monkeypatch.setattr(codex_app_server, "codex_launch_catalog", _catalog)
+    monkeypatch.setattr(codex_app_server, "codex_launch_catalog_is_stale", _not_stale)
+    monkeypatch.setattr(codex_app_server, "resolve_native_codex_launch", _resolve_launch)
+
+    captured: dict[str, Any] = {}
+
+    class _StopBeforeLaunch(Exception):
+        """Halts the launch once the resolved model reaches the server builder."""
+
+    def _capture_build(**kwargs: Any) -> None:
+        captured["model"] = kwargs.get("model")
+        raise _StopBeforeLaunch
+
+    monkeypatch.setattr(codex_app_server, "build_codex_native_server", _capture_build)
+
+    def _handle_request(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model_override": "system.ai.gpt-5.6-sol",
+                "workspace": str(tmp_path),
+                "labels": {},
+            },
+        )
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(_handle_request),
+    )
+
+    class _FakeResourceRegistry:
+        """Never reached — the launch is halted at the server builder."""
+
+        terminal_registry = None
+
+    session_id = "c0dec0dec0dec0dec0dec0dec0dec0de"
+    with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+        with pytest.raises(_StopBeforeLaunch):
+            await _auto_create_codex_terminal(
+                session_id,
+                _FakeResourceRegistry(),
+                lambda _sid, _evt: None,
+                server_client=fake_client,
+            )
+    assert captured["model"] == "gpt-5.6-sol"
+    assert "resolved requested model" in caplog.text
+
+    await fake_client.aclose()
