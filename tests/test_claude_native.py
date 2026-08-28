@@ -9,6 +9,7 @@ import contextlib
 import importlib.metadata
 import io
 import json
+import logging
 import os
 import re
 import shlex
@@ -9847,4 +9848,43 @@ def test_claude_catalog_serves_model(
     Exact rows serve; a canonical id serves on a canonical endpoint when its family is listed."""
     assert (
         claude_native.claude_catalog_serves_model(_subscription_catalog(), model, config) is served
+    )
+
+
+def test_claude_catalog_selection_honors_an_available_concrete_pin(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An exact live pin is launched unchanged and emits no downgrade warning."""
+    requested = "system.ai.claude-opus-4-8[1m]"
+    catalog = [
+        {"id": "opus", "model": "system.ai.claude-opus-5"},
+        {"id": requested, "model": requested},
+    ]
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.claude_native"):
+        selection = claude_native.resolve_claude_native_catalog_selection(
+            requested,
+            catalog,
+            config,
+        )
+
+    assert selection == (requested, None)
+    assert not [record for record in caplog.records if "substitut" in record.getMessage()]
+
+
+def test_claude_catalog_selection_keeps_loud_failure_without_a_claude_tier() -> None:
+    """A catalog with no Claude tier preserves the actionable launch failure."""
+    with pytest.raises(click.ClickException) as exc_info:
+        claude_native.resolve_claude_native_catalog_selection(
+            "fable",
+            [{"id": "gpt-5.4", "model": "gpt-5.4"}],
+            None,
+        )
+
+    assert exc_info.value.message == (
+        "the requested model 'fable' is not in this host's current model list — "
+        "it may have changed since the pick. Pick again from the model menu."
     )

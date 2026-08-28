@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import click
 import httpx
 import pytest
 
@@ -3366,6 +3365,108 @@ def test_routed_spawn_launch_args_need_a_router() -> None:
 
 
 @pytest.mark.asyncio
+async def test_auto_create_claude_terminal_substitutes_an_unavailable_tier_with_notice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A stale Fable pin launches on Opus and makes the downgrade visible."""
+    from omnigent.claude_native import ClaudeNativeUcodeConfig
+
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+
+    async def _no_op_forwarder(**kwargs: Any) -> None:
+        del kwargs
+
+    monkeypatch.setattr(
+        "omnigent.claude_native_forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+    catalog = [
+        {"id": "haiku", "model": "system.ai.claude-haiku-4-5"},
+        {"id": "sonnet", "model": "system.ai.claude-sonnet-4-6[1m]"},
+        {"id": "opus", "model": "system.ai.claude-opus-4-8[1m]"},
+    ]
+
+    async def _catalog(_config: object) -> list[dict[str, object]]:
+        return catalog
+
+    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", _catalog)
+    config = ClaudeNativeUcodeConfig(
+        env={
+            "ANTHROPIC_BASE_URL": "https://gateway.example/anthropic",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-8[1m]",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": "system.ai.claude-sonnet-4-6[1m]",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": "system.ai.claude-haiku-4-5",
+        },
+        model="system.ai.claude-opus-4-8[1m]",
+        routable_models=tuple(str(row["model"]) for row in catalog),
+    )
+
+    async def _resolve() -> ClaudeNativeUcodeConfig:
+        return config
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(self, **kwargs: Any) -> SessionResourceView:
+            captured["spec"] = kwargs["spec"]
+            return SessionResourceView(
+                id="terminal_claude_main",
+                type="terminal",
+                session_id=kwargs["session_id"],
+                name="claude:main",
+                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+            )
+
+    event_posts: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={"model_override": "fable", "labels": {}})
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            event_posts.append(json.loads(request.content))
+        return httpx.Response(200, json={})
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(_handle_request),
+    )
+    session_id = "7d1e4a3c2b5f69807162534453627180"
+    try:
+        with caplog.at_level(logging.WARNING, logger="omnigent.claude_native"):
+            await _auto_create_claude_terminal(
+                session_id,
+                _FakeResourceRegistry(),  # type: ignore[arg-type]
+                lambda _sid, _evt: None,
+                server_client=fake_client,
+                resolve_launch_config=_resolve,
+            )
+        await asyncio.sleep(0)
+    finally:
+        await fake_client.aclose()
+
+    args = captured["spec"].args
+    substitute = "system.ai.claude-opus-4-8[1m]"
+    assert args[args.index("--model") + 1] == substitute
+    warning = next(record for record in caplog.records if "substituting" in record.getMessage())
+    assert warning.levelno == logging.WARNING
+    assert "'fable'" in warning.getMessage()
+    assert repr(substitute) in warning.getMessage()
+    assert "absent from this host's current model list" in warning.getMessage()
+    assert len(event_posts) == 1
+    item = event_posts[0]["data"]
+    assert item["item_type"] == "error"
+    assert item["item_data"]["code"] == "claude_model_substituted"
+    assert "'fable' is unavailable" in item["item_data"]["message"]
+    assert f"with {substitute!r} instead" in item["item_data"]["message"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("endpoint", ["subscription", "gateway"])
 async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_override(
     endpoint: str,
@@ -3376,10 +3477,8 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
     A persisted canonical id the catalog lists only by family still launches.
 
     A live ``/model`` persists the pane's exact id (``claude-opus-4-8``) while
-    the catalog spells that family as alias rows and the 1M default. On a
-    canonical endpoint the relaunch must pass the id through as ``--model``
-    rather than refuse the resume; a gateway, which routes only its own
-    spellings, keeps refusing it.
+    the catalog spells that family as alias rows and the 1M default. A canonical
+    endpoint honors that id; a gateway substitutes its concrete current Opus.
     """
     from omnigent.claude_native import ClaudeNativeUcodeConfig
 
@@ -3460,26 +3559,16 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         return config
 
     session_id = "0f2d3d5c9a6b4e1f8c7d6e5f4a3b2c1d"
-    if endpoint == "subscription":
-        await _auto_create_claude_terminal(
-            session_id,
-            _FakeResourceRegistry(),
-            lambda _sid, _evt: None,
-            server_client=fake_client,
-            resolve_launch_config=_resolve,
-        )
-        args = captured["spec"].args
-        assert args[args.index("--model") + 1] == "claude-opus-4-8"
-    else:
-        with pytest.raises(click.ClickException, match="not in this host's current model list"):
-            await _auto_create_claude_terminal(
-                session_id,
-                _FakeResourceRegistry(),
-                lambda _sid, _evt: None,
-                server_client=fake_client,
-                resolve_launch_config=_resolve,
-            )
-        assert "spec" not in captured, "a refused launch must not start a terminal"
+    await _auto_create_claude_terminal(
+        session_id,
+        _FakeResourceRegistry(),
+        lambda _sid, _evt: None,
+        server_client=fake_client,
+        resolve_launch_config=_resolve,
+    )
+    args = captured["spec"].args
+    expected = "claude-opus-4-8" if endpoint == "subscription" else "system.ai.claude-opus-5"
+    assert args[args.index("--model") + 1] == expected
 
     await fake_client.aclose()
 

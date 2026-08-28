@@ -82,6 +82,7 @@ from omnigent._wrapper_labels import (
 from omnigent.claude_launcher import resolve_claude_launch
 from omnigent.claude_model_vocabulary import (
     ALIAS_MODEL_ENV_VARS,
+    CLAUDE_MODEL_ALIASES,
     CUSTOM_MODEL_OPTION_ENV_VAR,
     CUSTOM_MODEL_OPTION_NAME_ENV_VAR,
     LEGACY_CUSTOM_SLOT_ROW_ID,
@@ -239,6 +240,7 @@ _UCODE_CLAUDE_TIER_TO_ENV: dict[str, str] = {
     "sonnet": _ANTHROPIC_DEFAULT_SONNET_MODEL_ENV,
     "haiku": _ANTHROPIC_DEFAULT_HAIKU_MODEL_ENV,
 }
+_CLAUDE_TIER_FALLBACK_ORDER = CLAUDE_MODEL_ALIASES
 # The 4 family aliases above pin one model ID each. Claude Code has exactly
 # one more independently-selectable /model picker slot beyond those
 # families — ANTHROPIC_CUSTOM_MODEL_OPTION — used here to surface Sonnet 5
@@ -478,6 +480,79 @@ def claude_catalog_serves_model(
     family = _claude_family(model)
     return family is not None and any(
         _claude_family(str(row.get("id") or row.get("model") or "")) == family for row in rows
+    )
+
+
+def _claude_catalog_tier_model(rows: list[dict[str, object]], tier: str) -> str | None:
+    """Return the catalog's launch spelling for one Claude tier."""
+    for row in rows:
+        row_id = str(row.get("id") or "").strip()
+        row_model = str(row.get("model") or "").strip()
+        family_token = row_model or row_id
+        if _claude_family(family_token) != tier:
+            continue
+        lower_token = family_token.lower()
+        if lower_token not in CLAUDE_MODEL_ALIASES and "claude" not in lower_token:
+            continue
+        return row_model or row_id
+    return None
+
+
+def resolve_claude_native_catalog_selection(
+    requested_model: str,
+    rows: list[dict[str, object]],
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> tuple[str, str | None]:
+    """Resolve an explicit Claude launch request against the host catalog.
+
+    Available requests retain their exact resolved spelling. An unavailable
+    Claude tier steps down through Fable, Opus, Sonnet, and Haiku, never across
+    vendors. When no lower Claude tier is available, the existing actionable
+    launch error is preserved.
+
+    :param requested_model: Persisted picker id or concrete Claude model id.
+    :param rows: The host's current launch catalog.
+    :param claude_config: Resolved provider config for the terminal.
+    :returns: ``(launch_model, notice)``; ``notice`` is set only on substitution.
+    :raises click.ClickException: If the request cannot stay in the Claude family.
+    """
+    resolved_request = (
+        resolve_claude_native_model_selection(requested_model, claude_config) or requested_model
+    )
+    if claude_catalog_serves_model(
+        rows, requested_model, claude_config
+    ) or claude_catalog_serves_model(rows, resolved_request, claude_config):
+        return resolved_request, None
+
+    lower_request = requested_model.strip().lower()
+    is_claude_request = (
+        lower_request in CLAUDE_MODEL_ALIASES
+        or lower_request == _UCODE_CLAUDE_CUSTOM_TIER
+        or "claude" in lower_request
+    )
+    requested_tier = _claude_family(resolved_request) if is_claude_request else None
+    if requested_tier in _CLAUDE_TIER_FALLBACK_ORDER:
+        start = _CLAUDE_TIER_FALLBACK_ORDER.index(requested_tier)
+        for tier in _CLAUDE_TIER_FALLBACK_ORDER[start:]:
+            substitute = _claude_catalog_tier_model(rows, tier)
+            if substitute is None:
+                continue
+            reason = "the requested Claude model is absent from this host's current model list"
+            _logger.warning(
+                "native-claude: substituting unavailable requested model %r with %r: %s",
+                requested_model,
+                substitute,
+                reason,
+            )
+            notice = (
+                f"Requested Claude model {requested_model!r} is unavailable on this host. "
+                f"Launched with {substitute!r} instead because {reason}."
+            )
+            return substitute, notice
+
+    raise click.ClickException(
+        f"the requested model {requested_model!r} is not in this host's current "
+        "model list — it may have changed since the pick. Pick again from the model menu."
     )
 
 

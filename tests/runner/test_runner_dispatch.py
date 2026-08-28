@@ -4075,6 +4075,26 @@ async def test_sys_session_send_passes_model_through_when_provider_undeterminabl
 
 
 @pytest.mark.asyncio
+async def test_sys_session_send_accepts_a_documented_claude_model_alias(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The claude-native family guard accepts the launchable ``opus`` alias."""
+    _isolate_model_providers(monkeypatch, tmp_path, "")
+    result = await _dispatch_model_send(
+        monkeypatch,
+        agent_spec=_spec_with_subagent_harness("claude-native"),
+        model="opus",
+        conv_id="conv_parent_claude_alias",
+    )
+
+    payload = json.loads(result.output)
+    assert payload["status"] == "launching"
+    assert len(result.create_bodies) == 1
+    assert result.create_bodies[0]["model_override"] == "opus"
+
+
+@pytest.mark.asyncio
 async def test_sys_session_send_family_guard_runs_before_normalization(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

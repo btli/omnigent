@@ -6186,6 +6186,38 @@ async def _load_claude_launch_metadata(
     return metadata
 
 
+async def _post_claude_native_model_substitution_notice(
+    *,
+    session_id: str,
+    server_client: httpx.AsyncClient,
+    notice: str,
+) -> None:
+    """Surface a Claude launch-model substitution in the session."""
+    try:
+        response = await server_client.post(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "error",
+                    "item_data": {
+                        "source": "execution",
+                        "code": "claude_model_substituted",
+                        "message": notice,
+                    },
+                },
+            },
+            timeout=30.0,
+        )
+        response.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "claude-native: failed to surface model substitution for session %s",
+            session_id,
+            exc_info=True,
+        )
+
+
 async def _auto_create_claude_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -6380,6 +6412,7 @@ async def _auto_create_claude_terminal(
         build_native_claude_terminal_env,
         claude_config_with_launch_model_pinned,
         claude_config_with_routed_arms_pinned,
+        resolve_claude_native_catalog_selection,
         resolve_claude_native_model_selection,
         resolve_native_claude_config,
     )
@@ -6625,13 +6658,13 @@ async def _auto_create_claude_terminal(
         or (claude_config.model if claude_config is not None else None),
         claude_config,
     )
+    model_substitution_notice: str | None = None
     # Explicit launches (model-flows design §4): consult the shared catalog
     # only when it can change the outcome — to validate an explicit request,
     # or to resolve a Default launch that would otherwise pass no ``--model``
     # and leave the model to invisible CLI-private state.
     if session_model_override or launch_model is None:
         from omnigent.claude_native import (
-            claude_catalog_serves_model,
             claude_launch_catalog,
             claude_launch_catalog_is_stale,
         )
@@ -6652,22 +6685,12 @@ async def _auto_create_claude_terminal(
                 exc_info=True,
                 extra={"session_id": session_id},
             )
-        if session_model_override and launch_catalog:
-            resolved_request = (
-                resolve_claude_native_model_selection(session_model_override, claude_config)
-                or session_model_override
+        if session_model_override and launch_catalog is not None:
+            launch_model, model_substitution_notice = resolve_claude_native_catalog_selection(
+                session_model_override,
+                launch_catalog,
+                claude_config,
             )
-            # A pane's ``/model`` persists the exact id it runs; the catalog
-            # may spell that model only by its family alias.
-            if not (
-                claude_catalog_serves_model(launch_catalog, session_model_override, claude_config)
-                or claude_catalog_serves_model(launch_catalog, resolved_request, claude_config)
-            ):
-                raise click.ClickException(
-                    f"the requested model {session_model_override!r} is not in this "
-                    "host's current model list — it may have changed since the pick. "
-                    "Pick again from the model menu."
-                )
         if launch_model is None and launch_catalog:
             # A stale entry's default is yesterday's answer: pinning it as
             # ``--model`` turns a provider-side retirement or entitlement
@@ -6905,6 +6928,12 @@ async def _auto_create_claude_terminal(
             "resource": terminal_payload,
         },
     )
+    if model_substitution_notice is not None:
+        await _post_claude_native_model_substitution_notice(
+            session_id=session_id,
+            server_client=server_client,
+            notice=model_substitution_notice,
+        )
     _publish_tmux_target_for_bridge(
         resource_registry=resource_registry,
         session_id=session_id,

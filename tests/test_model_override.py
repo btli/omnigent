@@ -134,6 +134,10 @@ class TestModelFamilyMismatch:
         [
             ("claude-native", "databricks-claude-sonnet-4-6"),
             ("claude-sdk", "claude-opus-4-8"),
+            ("claude-native", "fable"),
+            ("claude-native", "opus"),
+            ("claude-native", "sonnet"),
+            ("claude-native", "haiku"),
             ("codex-native", "databricks-gpt-5-4"),
             ("codex", "gpt-5.1-codex"),
             # The OpenAI family is matched as a substring, which is the only
