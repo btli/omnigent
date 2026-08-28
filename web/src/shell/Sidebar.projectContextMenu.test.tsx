@@ -277,21 +277,13 @@ describe("project folder header context menu", () => {
     expect(folderHeader()).toHaveAttribute("aria-expanded", "true");
   });
 
-  it("opens for keyboard context-menu commands", () => {
-    for (const key of [
-      { key: "F10", shiftKey: true },
-      { key: "ContextMenu", shiftKey: false },
-    ]) {
-      renderSidebar();
-      const header = folderHeader();
-      header.focus();
+  it("opens for a keyboard-originated contextmenu event", () => {
+    renderSidebar();
+    const header = folderHeader();
+    header.focus();
 
-      fireEvent.keyDown(header, key);
-      fireEvent.contextMenu(header, { detail: 0 });
-      expect(screen.getByTestId("rename-project")).toBeInTheDocument();
-
-      cleanup();
-    }
+    fireEvent.contextMenu(header, { detail: 0 });
+    expect(screen.getByTestId("rename-project")).toBeInTheDocument();
   });
 
   it("toggles on the first keyboard activation after dismissal", async () => {
@@ -299,7 +291,6 @@ describe("project folder header context menu", () => {
     const header = folderHeader();
     header.focus();
 
-    fireEvent.keyDown(header, { key: "F10", shiftKey: true });
     fireEvent.contextMenu(header, { detail: 0 });
     expect(screen.getByTestId("rename-project")).toBeInTheDocument();
     dismissMenu();

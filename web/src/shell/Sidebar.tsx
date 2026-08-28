@@ -1243,7 +1243,11 @@ function ProjectFolder({
     data: { type: "project", name },
   });
 
-  const { actions: menuActions, dialogs: menuDialogs } = useProjectFolderMenu(name, projectId);
+  const { actions: menuActions, dialogs: menuDialogs } = useProjectFolderMenu(
+    name,
+    projectId,
+    icon,
+  );
 
   return (
     <div
@@ -1308,19 +1312,13 @@ function ProjectFolder({
         }
         indentRows
         headerAction={
-          <ProjectFolderActions
-            projectName={name}
-            icon={icon}
-            onNavigate={onRowClick}
-            actions={menuActions}
-          />
+          <ProjectFolderActions projectName={name} onNavigate={onRowClick} actions={menuActions} />
         }
         headerContextMenu={
           <ContextMenuContent className="min-w-40">
             <ProjectFolderMenuItems
               components={contextBundle}
               projectName={name}
-              icon={icon}
               onNavigate={onRowClick}
               actions={menuActions}
             />
@@ -4072,13 +4070,10 @@ function ArchivingRow({ label }: { label: string }) {
  */
 function ProjectFolderActions({
   projectName,
-  icon,
   onNavigate,
   actions,
 }: {
   projectName: string;
-  /** Current emoji icon, or null/absent when unset. */
-  icon?: string | null;
   /** Plain-left-click nav handler — closes the mobile overlay so the
       pre-filed new-session page isn't left hidden behind the sidebar. */
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
@@ -4116,12 +4111,7 @@ function ProjectFolderActions({
         </TooltipTrigger>
         <TooltipContent side="bottom">New session in project</TooltipContent>
       </Tooltip>
-      <ProjectFolderMenu
-        projectName={projectName}
-        icon={icon}
-        onNavigate={onNavigate}
-        actions={actions}
-      />
+      <ProjectFolderMenu projectName={projectName} onNavigate={onNavigate} actions={actions} />
     </div>
   );
 }
@@ -4132,20 +4122,19 @@ function ProjectFolderActions({
 function ProjectFolderMenuItems({
   components: C,
   projectName,
-  icon,
   onNavigate,
   actions,
 }: {
   components: MenuComponents;
   projectName: string;
-  icon?: string | null;
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   actions: ProjectFolderMenuActions;
 }) {
   useEffect(() => {
-    actions.onMenuOpen(icon);
+    // Config loading follows the Radix content lifecycle; do not force-mount it.
+    actions.onMenuOpen();
     return actions.onMenuClose;
-  }, [actions, icon]);
+  }, [actions]);
 
   return (
     <>
@@ -4185,7 +4174,7 @@ interface ProjectFolderMenuActions {
   openRename: () => void;
   openSettings: () => void;
   openDelete: () => void;
-  onMenuOpen: (icon?: string | null) => void;
+  onMenuOpen: () => void;
   onMenuClose: () => void;
 }
 
@@ -4193,6 +4182,7 @@ interface ProjectFolderMenuActions {
 function useProjectFolderMenu(
   projectName: string,
   projectId: string | null,
+  icon?: string | null,
 ): { actions: ProjectFolderMenuActions; dialogs: ReactNode } {
   const [menuOpen, setMenuOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -4200,7 +4190,6 @@ function useProjectFolderMenu(
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [renameValue, setRenameValue] = useState(projectName);
-  const [fallbackIcon, setFallbackIcon] = useState<string | null>();
   // The icon staged in the rename modal, committed only on Confirm:
   //   undefined = untouched (show the saved icon), string = a picked emoji,
   //   null = staged removal. Reset to `undefined` each time the modal opens.
@@ -4222,7 +4211,7 @@ function useProjectFolderMenu(
   // label-only folder (`projectId === null`), whose base is legitimately `{}`.
   // This gates only the icon path; renaming the name never needs the config.
   const configReady = projectId === null || iconConfig !== undefined;
-  const savedIcon = iconConfig !== undefined ? iconConfig?.icon : fallbackIcon;
+  const savedIcon = iconConfig !== undefined ? iconConfig?.icon : icon;
   // What the modal's tile shows: the staged pick when touched, else the saved
   // icon. `null` (staged removal) renders as the empty folder.
   const displayIcon = pendingIcon !== undefined ? pendingIcon : savedIcon;
@@ -4236,10 +4225,7 @@ function useProjectFolderMenu(
       },
       openSettings: () => setSettingsOpen(true),
       openDelete: () => setDeleteOpen(true),
-      onMenuOpen: (currentIcon) => {
-        setFallbackIcon(currentIcon);
-        setMenuOpen(true);
-      },
+      onMenuOpen: () => setMenuOpen(true),
       onMenuClose: () => setMenuOpen(false),
     }),
     [projectName],
@@ -4492,12 +4478,10 @@ function useProjectFolderMenu(
 
 function ProjectFolderMenu({
   projectName,
-  icon,
   onNavigate,
   actions,
 }: {
   projectName: string;
-  icon?: string | null;
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   actions: ProjectFolderMenuActions;
 }) {
@@ -4520,7 +4504,6 @@ function ProjectFolderMenu({
         <ProjectFolderMenuItems
           components={dropdownBundle}
           projectName={projectName}
-          icon={icon}
           onNavigate={onNavigate}
           actions={actions}
         />

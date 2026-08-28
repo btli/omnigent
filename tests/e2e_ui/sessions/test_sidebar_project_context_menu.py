@@ -69,3 +69,16 @@ def test_left_click_still_toggles_the_folder(project_page: tuple[Page, str]) -> 
     expect(header).to_have_attribute("aria-expanded", flipped)
     header.click()
     expect(header).to_have_attribute("aria-expanded", before)
+
+
+def test_keyboard_opens_project_folder_menu(project_page: tuple[Page, str]) -> None:
+    """The Menu key opens the folder actions from the focused header."""
+    page, project = project_page
+    header = _folder_header(page, project)
+    before = _expanded(header)
+
+    header.focus()
+    header.press("ContextMenu")
+
+    expect(page.get_by_test_id("rename-project")).to_be_visible()
+    expect(header).to_have_attribute("aria-expanded", before)
