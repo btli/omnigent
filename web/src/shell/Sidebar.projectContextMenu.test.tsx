@@ -178,15 +178,16 @@ afterEach(cleanup);
 describe("project folder header context menu", () => {
   it("opens the kebab's exact action set on right-click", () => {
     renderSidebar();
+    const header = folderHeader();
 
     expect(screen.queryByTestId("rename-project")).toBeNull();
-    fireEvent.contextMenu(folderHeader());
+    fireEvent.contextMenu(header);
 
     expect(screen.getByTestId("project-new-session-menu")).toBeInTheDocument();
     expect(screen.getByTestId("rename-project")).toBeInTheDocument();
     expect(screen.getByTestId("project-settings")).toBeInTheDocument();
     expect(screen.getByTestId("delete-project")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: PROJECT_NAME })).toBe(folderHeader());
+    expect(header).toHaveAttribute("data-slot", "context-menu-trigger");
   });
 
   it("carries exactly the same items as the kebab", () => {
@@ -307,8 +308,8 @@ describe("project folder header context menu", () => {
       act(() => vi.advanceTimersByTime(1));
 
       expect(screen.getByTestId("rename-project")).toBeInTheDocument();
+      expect(document.body).toHaveStyle({ pointerEvents: "none" });
       dispatchTouchPointer(header, "pointerup");
-      fireEvent.click(header);
       expect(header).toHaveAttribute("aria-expanded", before);
     } finally {
       cleanup();

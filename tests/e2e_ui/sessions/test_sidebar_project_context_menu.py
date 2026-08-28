@@ -18,7 +18,7 @@ def _create_project(page: Page, name: str) -> None:
 
 def _folder_header(page: Page, project: str) -> Locator:
     """Locate a project folder's collapse-toggle button."""
-    return page.get_by_role("button", name=project, exact=True)
+    return page.locator('button[data-slot="context-menu-trigger"]').filter(has_text=project)
 
 
 def _expanded(header: Locator) -> str:
@@ -102,8 +102,13 @@ def test_click_dismissing_menu_does_not_toggle_then_next_click_toggles(
     expect(page.get_by_test_id("rename-project")).to_be_visible()
     before = _expanded(header)
     flipped = "false" if before == "true" else "true"
+    bounds = header.bounding_box()
+    assert bounds is not None, "folder header has no click target bounds"
 
-    header.click()
+    page.mouse.click(
+        bounds["x"] + bounds["width"] / 2,
+        bounds["y"] + bounds["height"] / 2,
+    )
     expect(page.get_by_test_id("rename-project")).not_to_be_visible()
     expect(header).to_have_attribute("aria-expanded", before)
 
