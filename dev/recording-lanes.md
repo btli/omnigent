@@ -64,6 +64,8 @@ and block on control FDs it doesn't have, so it hangs with an empty `runner.log`
 and stays `online: false`. Strip them with `env -u`:
 
 ```bash
+# Point npm/pnpm at the Databricks registry proxy first (see
+# dev/agent-environment.md) or this install fails with an auth error.
 pnpm --filter web install && pnpm --filter web run build   # once, up front
 env -u OMNIGENT_RUNNER_ID -u OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN \
     -u OMNIGENT_RUNNER_TUNNEL_TOKEN -u OMNIGENT_RUNNER_PARENT_PID \

@@ -1471,7 +1471,7 @@ describe("Composer placeholder", () => {
 
   it("shows the normal placeholder when the runner is live", () => {
     render(<Composer {...composerProps({})} />);
-    expect(textarea().placeholder).toMatch(/ask the agent anything/i);
+    expect(textarea().placeholder).toMatch(/send a message/i);
   });
 
   it("a structural read-only reason wins over the normal placeholder", () => {
@@ -1481,17 +1481,8 @@ describe("Composer placeholder", () => {
     expect(textarea().placeholder).toBe("Mirrored transcript");
   });
 
-  it("runner_asleep (reconnectHint): enabled composer nudges the user to send", () => {
-    // Host online but runner offline — sending relaunches the runner, so the
-    // composer stays writable and the placeholder is the affordance.
-    render(<Composer {...composerProps({ reconnectHint: true })} />);
-    expect(textarea().placeholder).toBe("Send a message to reconnect this session");
-    expect(textarea().disabled).toBe(false);
-  });
-
-  it("streaming wins over the reconnect hint", () => {
-    // A queued follow-up message takes precedence over the asleep nudge.
-    render(<Composer {...composerProps({ reconnectHint: true, status: "streaming" })} />);
+  it("streaming shows the queued follow-up placeholder", () => {
+    render(<Composer {...composerProps({ status: "streaming" })} />);
     expect(textarea().placeholder).toMatch(/send a follow-up/i);
   });
 
@@ -1499,12 +1490,6 @@ describe("Composer placeholder", () => {
     // A message can't wake it, so the textarea is disabled and the banner
     // below is the only affordance.
     render(<Composer {...composerProps({ unreachable: true })} />);
-    expect(textarea().disabled).toBe(true);
-    expect(textarea().placeholder).toMatch(/reconnect below/i);
-  });
-
-  it("unreachable wins over the reconnect hint (both set defensively)", () => {
-    render(<Composer {...composerProps({ unreachable: true, reconnectHint: true })} />);
     expect(textarea().disabled).toBe(true);
     expect(textarea().placeholder).toMatch(/reconnect below/i);
   });
