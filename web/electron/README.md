@@ -34,6 +34,11 @@ adds native niceties:
   window can also be opened against a **different server** (see "Multiple
   servers" below). Notifications and the dock badge are app-wide (one badge
   for all windows); a notification click focuses the window that fired it.
+- **macOS Managed Preferences for MDM-provided servers.** Administrators can
+  publish an HTTPS `serverUrls` list in the `ai.omnigent.desktop` preference
+  domain. The connect screen and in-app switcher show those choices under
+  **Provided by your organization** without auto-connecting or preventing a
+  manually entered server. See [Managed Preferences](docs/managed-preferences.md).
 - **A dock / taskbar badge showing the number of unread sessions** at all
   times (macOS dock badge, Linux Unity launcher count, via
   `app.setBadgeCount`). A session becomes "unread" when it finishes a turn
@@ -144,6 +149,7 @@ electron/
   package.json             # Electron + electron-builder deps and build config
   src/main.js              # main process: window, settings, menu, IPC, badge, notify
   src/preload.js           # contextBridge: window.omnigentDesktop + omnigentSetup
+  src/managed_preferences.js # read/validate macOS MDM server choices
   src/find_preload.js      # contextBridge for the find bar: window.omnigentFind
   src/browserViewRegistry.js  # per-conversation WebContentsView registry (browser pane)
   src/browserViewBounds.js    # CSS-px → window-DIP bounds conversion (browser pane)
@@ -151,6 +157,7 @@ electron/
   setup/index.html         # the bundled "connect to server" setup page
   find/index.html          # the bundled find-in-page bar (Cmd/Ctrl+F)
   icons/                   # app icons
+  docs/managed-preferences.md # public MDM configuration contract
 ```
 
 Native niceties beyond notifications/badge: a right-click context menu
@@ -386,6 +393,22 @@ server (see below), Connect, and you're in.
 > Note: this loads the UI from whatever server URL you give it — it does
 > **not** run the Vite dev server. To develop the web UI itself with hot
 > reload, run `pnpm run dev` (plain Vite in a browser) from `web/` as usual.
+
+### Test desktop updates
+
+To override the current version used by development update checks, launch the
+unpackaged app with a valid semantic version:
+
+```bash
+OMNIGENT_DESKTOP_VERSION_OVERRIDE=0.9.0 pnpm start
+```
+
+The override controls both the **Current version** shown in update prompts and
+the baseline `electron-updater` uses to decide whether a production release is
+newer. It does not change Electron's real app/package version. Packaged builds
+ignore it. `pnpm start` rebuilds the shell-owned update overlay before launching
+it. Unpackaged runs read `dev-app-update.yml`, which intentionally checks the
+same production HTTPS update server as packaged builds.
 
 ## Build a distributable
 
