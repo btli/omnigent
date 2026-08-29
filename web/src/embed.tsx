@@ -31,10 +31,24 @@ import { TooltipProvider } from "./components/ui/tooltip";
 import { ImageLightboxProvider } from "./components/ImageLightbox";
 import { RunnerHealthProvider } from "./hooks/RunnerHealthProvider";
 import { CapabilitiesContext } from "./lib/CapabilitiesContext";
+import { createBootServerInfo } from "./lib/bootCapabilities";
 import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { EmbeddedProvider } from "./lib/embedded";
-import { type OmnigentHostConfig, setEmbedRoot, setOmnigentHostConfig } from "./lib/host";
+import {
+  type OmnigentHostConfig,
+  setEmbedRoot,
+  setEmbedScopeRoot,
+  setOmnigentHostConfig,
+} from "./lib/host";
 import { resolveIdentity } from "./lib/identity";
+import {
+  applyDesktopUiFontSize,
+  applyUiFontFamily,
+  readUiFontFamily,
+  readUiFontSizePx,
+} from "./lib/uiFontPreferences";
+import { applyThemePalette, readThemePalette } from "./lib/themePalette";
+import { applyCustomTheme, readCustomTheme } from "./lib/customTheme";
 import {
   type RoutingApi,
   RoutingProvider,
@@ -100,26 +114,6 @@ export interface OmnigentAppProps extends OmnigentHostConfig {
  * as the Radix portal root, so the host only renders this — no class/portal
  * wiring needed.
  */
-// Sentinel used when the `/v1/info` probe is slow or missing — matches
-// `main.tsx`'s fallback (accounts off, no login).
-const SERVER_INFO_OFFLINE_FALLBACK: ServerInfo = {
-  accounts_enabled: false,
-  single_user: false,
-  login_url: null,
-  needs_setup: false,
-  databricks_features: false,
-  managed_sandboxes_enabled: false,
-  sandbox_provider: null,
-  sharing_mode: "on",
-  public_sharing_enabled: true,
-  server_version: null,
-  smart_routing_enabled: false,
-  smart_routing_sources: { external: false, oss: false },
-  harness_install_enabled: false,
-  installable_harnesses: [],
-  dictation_available: false,
-};
-
 /**
  * Runs `main.tsx`'s boot-time `/v1/info` probe inside the embed tree.
  *
@@ -136,26 +130,15 @@ function EmbedCapabilitiesProvider({ children }: { children: ReactNode }) {
   const [info, setInfo] = useState<ServerInfo | "loading">("loading");
   useEffect(() => {
     let alive = true;
-    let resolved = false;
-    // First paint must not hang on "loading": if the probe is still in flight
-    // after 1.5s, paint the offline fallback so the chat UI appears. Unlike a
-    // Promise.race, we do NOT stop there — when the real /v1/info value lands
-    // (even later, on a slow-but-successful probe) we adopt it. Otherwise a
-    // probe that loses the 1.5s race pins the fallback for the whole mount,
-    // hiding capability-gated UI (e.g. the managed-sandbox host option) until a
-    // full re-navigation. resolveServerInfo never rejects (its failure path
-    // resolves to the OFF sentinel), so the real value always arrives.
-    const fallbackTimer = setTimeout(() => {
-      if (alive && !resolved) setInfo(SERVER_INFO_OFFLINE_FALLBACK);
-    }, 1500);
-    void resolveServerInfo().then((real) => {
-      resolved = true;
-      clearTimeout(fallbackTimer);
-      if (alive) setInfo(real);
+    const boot = createBootServerInfo(resolveServerInfo());
+    void boot.initial.then((resolved) => {
+      if (alive) setInfo(resolved);
+    });
+    void boot.settled.then((resolved) => {
+      if (alive) setInfo(resolved);
     });
     return () => {
       alive = false;
-      clearTimeout(fallbackTimer);
     };
   }, []);
   return <CapabilitiesContext.Provider value={info}>{children}</CapabilitiesContext.Provider>;
@@ -189,6 +172,22 @@ function OmnigentProviders({
     setEmbedRoot(el);
   }, []);
 
+  // The outer `.omnigent-app` scope root is where the scoped `:root` tokens
+  // live, so per-device preferences (UI font, color palette, custom theme) must
+  // be applied here — standalone main.tsx applies them to <html> at boot; the
+  // embed applies them once the scope root mounts. The inner `scopeRef` runs
+  // first (child refs fire before parent refs), so `getEmbedRoot()` is already
+  // set for the palette's dark-mode attribute stamping.
+  const scopeRootRef = useCallback((el: HTMLDivElement | null) => {
+    setEmbedScopeRoot(el);
+    if (el) {
+      applyDesktopUiFontSize(readUiFontSizePx());
+      applyUiFontFamily(readUiFontFamily());
+      applyThemePalette(readThemePalette());
+      applyCustomTheme(readCustomTheme());
+    }
+  }, []);
+
   return (
     // Two nested wrappers on purpose:
     //   - `.omnigent-app` (outer) is the scope anchor. The scoped stylesheet
@@ -199,7 +198,7 @@ function OmnigentProviders({
     //     the Radix portal root, so both the app and its overlays read the dark
     //     token overrides. Light mode = no class → inherits the scope root's
     //     light tokens.
-    <div className="omnigent-app" style={{ height: "100%", width: "100%" }}>
+    <div ref={scopeRootRef} className="omnigent-app" style={{ height: "100%", width: "100%" }}>
       <div
         ref={scopeRef}
         className={isDarkMode ? "dark" : undefined}

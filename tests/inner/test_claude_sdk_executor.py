@@ -651,6 +651,10 @@ class TestConstructor(unittest.TestCase):
         model falls back to the Databricks default. The neutral
         generic-provider gateway path never does this (see
         ``test_neutral_gateway_no_model_does_not_inject_databricks_default``).
+
+        Live model discovery is stubbed unavailable here so the resolver drops
+        to the bundled catalog — its documented last resort; the discovery-first
+        path is covered by ``test_databricks_profile_uses_discovered_model``.
         """
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
         from omnigent.inner.databricks_executor import DatabricksCredentials
@@ -679,6 +683,10 @@ class TestConstructor(unittest.TestCase):
 
             with (
                 patch(
+                    "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+                    side_effect=RuntimeError("live listing unavailable"),
+                ),
+                patch(
                     "omnigent.model_catalog.resolve_catalog_model",
                     side_effect=_resolve_model,
                 ),
@@ -693,6 +701,64 @@ class TestConstructor(unittest.TestCase):
                         pass
 
             self.assertEqual(captured["model"], "catalog-databricks-claude-default")
+
+        _run(_t())
+
+    def test_databricks_profile_uses_discovered_model(self):
+        """gateway=True (profile-derived) + no model → the workspace's live model.
+
+        The resolver prefers the live Unity Catalog listing over the bundled
+        catalog, walking the ``opus > sonnet > haiku > fable`` precedence
+        claude-native falls back to; the bundled ``databricks-*`` catalog is
+        only the last resort (see ``..._default_model_used_when_unset``).
+        """
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+        from omnigent.inner.databricks_executor import DatabricksCredentials
+
+        async def _t():
+            with patch(
+                "omnigent.inner.databricks_executor._read_databrickscfg",
+                return_value=DatabricksCredentials(
+                    host="https://example.cloud.databricks.com",
+                    token="dapi_test_token",
+                ),
+            ):
+                executor = ClaudeSDKExecutor(gateway=True)
+
+            captured: dict[str, str | None] = {}
+
+            async def fake_get_or_create_client(sdk, *, session_key, options, model):
+                captured["model"] = model
+                raise RuntimeError("stop after model resolution")
+
+            with (
+                patch(
+                    "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+                    return_value=SimpleNamespace(
+                        host="https://example.cloud.databricks.com", token="dapi_test_token"
+                    ),
+                ),
+                patch(
+                    "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+                    return_value=SimpleNamespace(
+                        families={
+                            "sonnet": "system.ai.claude-sonnet-5",
+                            "opus": "system.ai.claude-opus-5",
+                        }
+                    ),
+                ),
+                patch.object(
+                    executor,
+                    "_get_or_create_client",
+                    side_effect=fake_get_or_create_client,
+                ),
+            ):
+                with self.assertRaises(RuntimeError):
+                    async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                        pass
+
+            # opus outranks sonnet in the family precedence.
+            self.assertEqual(captured["model"], "system.ai.claude-opus-5")
 
         _run(_t())
 
@@ -1183,6 +1249,54 @@ class TestResolveGatewayEnv(unittest.TestCase):
             )
             self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
 
+    def test_databricks_gateway_negotiates_betas(self):
+        """A real Databricks AI Gateway base URL negotiates betas, not disables them.
+
+        Blanket-disabling betas makes Claude Code strip ``interleaved-thinking``,
+        which the Databricks gateway then rejects with a thinking-block 400. On a
+        genuine gateway we set ``CLAUDE_CODE_USE_GATEWAY`` and leave the disable
+        flag off (matching claude-native).
+        """
+        from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
+        from omnigent.inner.databricks_executor import DatabricksCredentials
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch(
+                "omnigent.inner.databricks_executor._read_databrickscfg",
+                return_value=DatabricksCredentials(
+                    host="https://wkspc.cloud.databricks.com",
+                    token="dapi_abc123",
+                ),
+            ),
+        ):
+            env = _resolve_gateway_env()
+        self.assertEqual(env["CLAUDE_CODE_USE_GATEWAY"], "1")
+        self.assertNotIn("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", env)
+
+    def test_non_databricks_gateway_keeps_beta_disable(self):
+        """A gateway host outside the trusted Databricks domains keeps the workaround.
+
+        A generic gateway (or a mock server) can't negotiate betas, so the
+        original ``CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`` behavior is preserved.
+        """
+        from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
+        from omnigent.inner.databricks_executor import DatabricksCredentials
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch(
+                "omnigent.inner.databricks_executor._read_databrickscfg",
+                # Not under a trusted Databricks parent domain.
+                return_value=DatabricksCredentials(
+                    host="https://example.databricks.com", token="t"
+                ),
+            ),
+        ):
+            env = _resolve_gateway_env()
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"], "1")
+        self.assertNotIn("CLAUDE_CODE_USE_GATEWAY", env)
+
     def test_strips_trailing_slash(self):
         from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
         from omnigent.inner.databricks_executor import DatabricksCredentials
@@ -1551,6 +1665,106 @@ class TestSystemMessages(unittest.TestCase):
             self.assertIn("databrickscfg", events[0].message)
 
         _run(_t())
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "claude-sdk is COMPOSED_SESSION_SNAPSHOT: the cached persistent "
+        "client does not rebuild when late-bound framework instructions "
+        "change after client creation, so a live session stays pinned to "
+        "the prompt it was created with. Deferred, with its follow-up "
+        "recorded in docs/AGENT_YAML_SPEC.md. If this test starts passing, "
+        "the client refresh landed — flip claude-sdk's registry row to "
+        "COMPOSED_PER_TURN in the same commit that removes this xfail, do "
+        "not let the two drift apart."
+    ),
+)
+def test_client_does_not_refresh_late_framework_instructions() -> None:
+    """Desired conformance, not the current bug: a framework instruction
+    that activates mid-conversation (e.g. ``shared_message_attribution_
+    enabled()`` flips on between turns) must reach the SDK client on the
+    very next turn. Today the client is constructed once and cached; only
+    ``model`` is refreshed on reuse (see ``_get_or_create_client``), so the
+    composed text a later turn actually sees is turn 1's stale value. This
+    asserts the fix's intended behavior, so it correctly XFAILs now and
+    would XPASS (failing the suite, per ``strict=True``) the moment someone
+    rebuilds the client on a changed composed prompt.
+    """
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.runtime.prompt import SHARED_SESSION_AUTHORSHIP_INSTRUCTION
+
+    class _ResultMessage:
+        def __init__(self, subtype, result):
+            self.subtype = subtype
+            self.result = result
+
+    captured_options = []
+
+    class _FakeSDK:
+        AssistantMessage = type("AssistantMessage", (), {})
+        UserMessage = type("UserMessage", (), {})
+        SystemMessage = type("SystemMessage", (), {})
+        ResultMessage = _ResultMessage
+        StreamEvent = type("StreamEvent", (), {})
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                captured_options.append(options)
+
+            async def connect(self):
+                return None
+
+            async def query(self, prompt, session_id="default"):
+                return None
+
+            async def receive_response(self):
+                yield _ResultMessage("default", "ok")
+
+            async def disconnect(self):
+                return None
+
+            async def set_model(self, model):
+                return None
+
+    turn1_instructions = "Base authored instructions."
+    turn2_instructions = f"{turn1_instructions}\n\n{SHARED_SESSION_AUTHORSHIP_INSTRUCTION}"
+
+    async def _t():
+        executor = ClaudeSDKExecutor()
+        with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+            [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hello"}],
+                    [],
+                    turn1_instructions,
+                )
+            ]
+            # A framework instruction activates between turns; the runner
+            # recomposes and passes the new value on the next call.
+            [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "follow-up"}],
+                    [],
+                    turn2_instructions,
+                )
+            ]
+
+    _run(_t())
+
+    # The contract is over the second-turn options the SDK sees. Client count
+    # is unconstrained: reusing one client and rebuilding it on a changed
+    # composed prompt both satisfy it, so an exact count is an implementation
+    # choice rather than part of the contract.
+    assert len(captured_options) >= 1
+    assert captured_options[-1].system_prompt == turn2_instructions
 
 
 # ---------------------------------------------------------------------------
