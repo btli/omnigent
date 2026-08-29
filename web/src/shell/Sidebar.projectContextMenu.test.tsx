@@ -266,7 +266,7 @@ describe("project folder header context menu", () => {
     const item = screen.getByTestId("project-new-session-menu");
 
     expect(item).toHaveAttribute("href", `/?project=${encodeURIComponent(PROJECT_NAME)}`);
-    expect(item).toHaveClass("[@media(hover:hover)]:md:hidden");
+    expect(item).toHaveClass("[@media((hover:hover)_and_(pointer:fine))]:md:hidden");
     expect(item).not.toHaveClass("md:hidden");
   });
 

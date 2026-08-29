@@ -1959,7 +1959,9 @@ describe("Sidebar project sections", () => {
   });
 
   it("folds the new-session pencil into the kebab on mobile", async () => {
-    // The pencil is limited to hover-capable desktop inputs. Without hover the
+    // The pencil is limited to fine-pointer hover desktops — the condition
+    // that lets hovering reveal it. Everywhere else (including fine-pointer
+    // touchscreen laptops, where a tap can't reveal the gated overlay) the
     // same action stays in the kebab at every viewport width.
     projectsMock.push("Customer X");
     mockConversations([
@@ -1968,7 +1970,7 @@ describe("Sidebar project sections", () => {
     renderSidebar();
 
     const pencil = screen.getByTestId("project-new-session");
-    expect(pencil).toHaveClass("hidden", "[@media(hover:hover)]:md:flex");
+    expect(pencil).toHaveClass("hidden", "[@media((hover:hover)_and_(pointer:fine))]:md:flex");
 
     // Open the kebab → a mobile-only "New session" item linking to the same
     // pre-filed composer.
@@ -1977,7 +1979,7 @@ describe("Sidebar project sections", () => {
       ctrlKey: false,
     });
     const menuItem = await screen.findByTestId("project-new-session-menu");
-    expect(menuItem).toHaveClass("[@media(hover:hover)]:md:hidden");
+    expect(menuItem).toHaveClass("[@media((hover:hover)_and_(pointer:fine))]:md:hidden");
     expect(menuItem).not.toHaveClass("md:hidden");
     expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
   });
