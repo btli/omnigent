@@ -134,6 +134,12 @@ class TestModelFamilyMismatch:
         [
             ("claude-native", "databricks-claude-sonnet-4-6"),
             ("claude-sdk", "claude-opus-4-8"),
+            ("claude-native", "fable"),
+            ("claude-native", "opus"),
+            ("claude-native", "sonnet"),
+            ("claude-native", "haiku"),
+            ("claude-native", "opus[1m]"),
+            ("claude-native", "sonnet[1m]"),
             ("codex-native", "databricks-gpt-5-4"),
             ("codex", "gpt-5.1-codex"),
             # The OpenAI family is matched as a substring, which is the only
@@ -195,6 +201,8 @@ class TestModelFamilyMismatch:
             ("claude-native", "databricks-glm-5-2", "only runs Claude models"),
             ("claude-sdk", "system.ai.glm-5-2", "only runs Claude models"),
             ("claude-sdk", "databricks-kimi-k2-6", "only runs Claude models"),
+            ("claude-sdk", "opus", "only runs Claude models"),
+            ("claude_sdk", "sonnet[1m]", "only runs Claude models"),
             (
                 "codex-native",
                 "databricks-claude-sonnet-4-6",
