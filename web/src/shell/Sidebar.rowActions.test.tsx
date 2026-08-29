@@ -1180,6 +1180,32 @@ describe("right-click context menu", () => {
     expect(mocks.del.mutate).not.toHaveBeenCalled();
   });
 
+  it("ends an active drag on a pointer-only release (no touch events)", () => {
+    // In a Pointer-Events-only environment the release emits only pointerup —
+    // no touchend. A TouchSensor-based drag sensor never saw it, so dnd-kit
+    // stayed active forever: row dimmed, later drags blocked. The sensor now
+    // ends on the document's pointerup.
+    vi.useFakeTimers();
+    try {
+      mocks.anyCoarse = true;
+      renderSidebar();
+      const link = screen.getByRole("link", { name: /My Session/ });
+      const row = link.closest("li")!;
+      const touch = { pointerId: 1, pointerType: "touch", isPrimary: true, button: 0 };
+
+      fireEvent.pointerDown(link, { ...touch, clientX: 100, clientY: 100 });
+      act(() => vi.advanceTimersByTime(400));
+      fireEvent.pointerMove(link, { ...touch, clientX: 115, clientY: 100 });
+      expect(row).toHaveClass("opacity-40");
+
+      fireEvent.pointerUp(link, { ...touch, clientX: 115, clientY: 100 });
+      expect(row).not.toHaveClass("opacity-40");
+    } finally {
+      act(() => vi.runOnlyPendingTimers());
+      vi.useRealTimers();
+    }
+  });
+
   it("cancels an active touch drag when its row unmounts", () => {
     vi.useFakeTimers();
     try {
@@ -1187,8 +1213,10 @@ describe("right-click context menu", () => {
       const view = renderSidebar();
       const link = screen.getByRole("link", { name: /My Session/ });
       const row = link.closest("li")!;
-      const touchCancel = vi.fn();
-      link.addEventListener("touchcancel", touchCancel);
+      // The synthetic cancel is dispatched on the document (the unmounted
+      // row can no longer bubble to it), where the drag sensor listens.
+      const pointerCancel = vi.fn();
+      document.addEventListener("pointercancel", pointerCancel);
 
       fireEvent.pointerDown(link, {
         pointerId: 1,
@@ -1213,8 +1241,9 @@ describe("right-click context menu", () => {
         view.rerenderSidebar();
       });
 
-      expect(touchCancel).toHaveBeenCalledTimes(1);
+      expect(pointerCancel).toHaveBeenCalledTimes(1);
       expect(screen.getByRole("status")).toHaveTextContent("Dragging was cancelled");
+      document.removeEventListener("pointercancel", pointerCancel);
     } finally {
       act(() => vi.runOnlyPendingTimers());
       vi.useRealTimers();

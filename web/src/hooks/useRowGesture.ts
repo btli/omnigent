@@ -11,8 +11,8 @@ import {
 } from "react";
 import {
   type DraggableSyntheticListeners,
-  TouchSensor,
-  type TouchSensorOptions,
+  PointerSensor,
+  type PointerSensorOptions,
 } from "@dnd-kit/core";
 import type { SwipeAction, SwipeActionPreferences } from "@/lib/swipeActionPreferences";
 
@@ -113,7 +113,7 @@ const rowGestureActivators = [
     eventName: "onPointerMove",
     handler: (
       { nativeEvent: event }: ReactPointerEvent,
-      { onActivation }: TouchSensorOptions,
+      { onActivation }: PointerSensorOptions,
       { active }: RowGestureActivationContext,
     ) => {
       if (event.pointerType !== "touch" || !event.isPrimary) return false;
@@ -125,9 +125,17 @@ const rowGestureActivators = [
   },
 ];
 
-/** A touch sensor that is instantiated only after the row recognizer chooses drag. */
-export class RowGestureTouchSensor extends TouchSensor {
-  static override activators = rowGestureActivators as unknown as typeof TouchSensor.activators;
+/**
+ * A drag sensor that is instantiated only after the row recognizer chooses
+ * drag. Based on PointerSensor, NOT TouchSensor: the gesture is tracked as a
+ * pointer stream, and a TouchSensor base listens for touchmove/touchend —
+ * in a Pointer-Events-only environment the release emits only pointerup, so
+ * dnd-kit stayed active forever (row dimmed, later drags blocked).
+ * PointerSensor ends and cancels on the document's pointerup / pointercancel,
+ * which fire on real touch hardware too.
+ */
+export class RowGesturePointerSensor extends PointerSensor {
+  static override activators = rowGestureActivators as unknown as typeof PointerSensor.activators;
 }
 
 function swipeOffset(deltaX: number): number {
@@ -326,8 +334,13 @@ export function useRowGesture({
       setActiveActions(null);
       if (cancelDrag) onCancel?.();
       if (cancelDrag && gesture.phase === "drag") {
-        gesture.sensorTarget.dispatchEvent(
-          new Event("touchcancel", { bubbles: true, cancelable: true }),
+        // The sensor listens on the owner document, so dispatch the synthetic
+        // cancel there directly: when the row just unmounted (the main reason
+        // no native pointercancel will follow), an event dispatched on the
+        // detached element would never bubble to the document and dnd-kit
+        // would keep the drag alive.
+        (gesture.sensorTarget.ownerDocument ?? document).dispatchEvent(
+          new Event("pointercancel", { bubbles: true, cancelable: true }),
         );
       }
     },

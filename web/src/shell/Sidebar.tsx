@@ -165,7 +165,7 @@ import {
   finishActiveRowGesture,
   ROW_MENU_SYNTHETIC,
   ROW_SWIPE_COMMIT_PX,
-  RowGestureTouchSensor,
+  RowGesturePointerSensor,
   useRowGesture,
 } from "@/hooks/useRowGesture";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -1711,7 +1711,7 @@ function ConversationList({
   // into a drag. Keyboard users use the kebab menu instead (no KeyboardSensor).
   const sensors = useSensors(
     useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
-    useSensor(RowGestureTouchSensor),
+    useSensor(RowGesturePointerSensor),
   );
   const handleDragStart = useCallback((event: DragStartEvent) => {
     const data = event.active.data.current as
