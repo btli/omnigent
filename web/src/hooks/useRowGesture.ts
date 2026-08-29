@@ -363,6 +363,13 @@ export function useRowGesture({
         movementSamples: [{ x: event.clientX, at: event.timeStamp }],
       };
       state.current = gesture;
+      // The recognizer has claimed this touch: prevent the pointer-down
+      // default here — not unconditionally on the row link — so native
+      // claimants (anchor drag, focus flash) stand down only for pointers the
+      // recognizer actually tracks. When the recognizer is disabled or the
+      // press belongs to a nested control, the default (and the plain tap's
+      // compatibility click) is left alone.
+      event.preventDefault();
       setActiveActions(actions);
       setPhase("pending");
       holdTimer.current = window.setTimeout(() => {

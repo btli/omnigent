@@ -161,7 +161,6 @@ import { isMobileViewport } from "@/lib/breakpoints";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { type SwipeAction, useSwipeActions } from "@/lib/swipeActionPreferences";
-import { useInputCapabilities } from "@/hooks/useInputCapabilities";
 import {
   finishActiveRowGesture,
   ROW_MENU_SYNTHETIC,
@@ -3199,7 +3198,6 @@ function ConversationRow({
   // project flyout's HoverCard and leave it lingering over the chat. Gate the
   // flyout off below the `md` breakpoint (see `projectFlyoutName`).
   const isMobile = useIsMobileViewport();
-  const { hasTouch } = useInputCapabilities();
   // When this row becomes the active conversation (e.g. a freshly created
   // session navigated to via `/c/:id`), scroll it toward the center of the
   // sidebar so it's comfortably in view rather than pinned to an edge.
@@ -3355,13 +3353,17 @@ function ConversationRow({
 
   const dragEnabled = isOwner && !selectionMode && !isArchived && !isEditing;
   const swipeActions = useSwipeActions();
+  // No capability gate here: the recognizer branches per-event on the active
+  // sequence's `pointerType` (it only ever claims touch pointers), so it stays
+  // attached even when `hasTouch` reads false — `maxTouchPoints` is a
+  // point-in-time affordance signal that never re-notifies when a digitizer
+  // attaches, and gating event handling on it left first touches dead.
   const swipeEnabled =
-    hasTouch &&
     !selectionMode &&
     isOwner &&
     !isEditing &&
     (swipeActions.left !== "none" || swipeActions.right !== "none");
-  const gestureEnabled = hasTouch && !selectionMode && !isEditing;
+  const gestureEnabled = !selectionMode && !isEditing;
   const [contextMenuOpen, setContextMenuOpen] = useState(false);
   const rowLinkRef = useRef<HTMLAnchorElement>(null);
   const touchContextMenuRef = useRef(false);
@@ -3396,7 +3398,7 @@ function ConversationRow({
   const gesture = useRowGesture({
     enabled: gestureEnabled,
     swipeEnabled,
-    dragEnabled: hasTouch && dragEnabled,
+    dragEnabled,
     actions: swipeActions,
     onAction: handleGestureAction,
     onLongPress: openContextMenuAt,
@@ -3591,9 +3593,6 @@ function ConversationRow({
       to={selectionMode ? "#" : `/c/${conversation.id}`}
       componentId="sidebar.conversation_switcher"
       draggable={false}
-      onPointerDown={(e) => {
-        if (e.pointerType === "touch") e.preventDefault();
-      }}
       onContextMenu={(e) => {
         if (isDragging) e.preventDefault();
       }}

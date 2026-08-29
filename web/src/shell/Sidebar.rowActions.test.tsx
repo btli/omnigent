@@ -2079,12 +2079,16 @@ describe("touch swipe actions", () => {
     expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
   });
 
-  it("ignores touch swipes when only fine pointers are available", () => {
+  it("honors a real touch sequence even when capabilities report no touch", () => {
+    // A touch pointer event IS proof of touch. Capability queries
+    // (`maxTouchPoints`, `any-pointer: coarse`) gate affordances only and can
+    // read false on a fine-primary laptop whose digitizer never re-notifies —
+    // gesture recognition branches on the sequence's own `pointerType`.
     mocks.anyCoarse = false;
     renderSidebar();
 
     swipeRow(-90);
-    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
   });
 
   it("ignores non-touch pointers when a coarse pointer also exists", () => {
