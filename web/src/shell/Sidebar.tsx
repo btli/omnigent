@@ -1315,9 +1315,7 @@ function ProjectFolder({
         headerAction={
           <ProjectFolderActions projectName={name} onNavigate={onRowClick} actions={menuActions} />
         }
-        // The kebab/pencil reveal only on fine-hover desktops; touch reaches
-        // the same four actions via the header's long-press context menu, so
-        // collapsed badges never reserve the control column for them.
+        // Touch exposes these actions through the header's long-press menu.
         actionHoverOnly
         headerContextMenu={
           <ContextMenuContent className="min-w-40">
@@ -2306,7 +2304,7 @@ export function SectionHeader({
   count,
   active = false,
   hasAction,
-  actionHoverOnly = false,
+  actionHoverOnly,
   hasPersistentAction,
   actionFocusVisible,
   collapsed,
@@ -2328,11 +2326,7 @@ export function SectionHeader({
       full control column there; only at rest on hover-capable desktops do the
       badges return to the rows' badge column. */
   hasAction?: boolean;
-  /** Set when the header action reveals only under the fine-hover media
-      condition below and is never painted at rest (e.g. the project kebab —
-      touch reaches the same items via the header's long-press context menu).
-      The badges then keep their rest slot at every capability instead of
-      reserving the control column. */
+  /** Whether the header action is absent without a fine hover pointer. */
   actionHoverOnly?: boolean;
   /** Whether an always-visible control sits at the header's right edge (the
       Sessions filter), which the collapsed badges must clear even at rest on
@@ -2362,10 +2356,9 @@ export function SectionHeader({
   // state exists. Everywhere else the controls stay painted and clickable, so
   // with `hasAction` the cluster reserves the full mr-14 control column,
   // returning to this rest offset (or clearing the always-visible Sessions
-  // filter with mr-7) only under that same condition. A hover-only action
-  // (`actionHoverOnly`) is never painted at rest, so its badges keep this rest
-  // offset at every capability. On fine-pointer
-  // touchscreen laptops a screen tap still hit-tests before hover applies, so
+  // filter with mr-7) only under that same condition. Hover-only actions keep
+  // this rest offset at every capability. On fine-pointer touchscreen laptops
+  // a screen tap still hit-tests before hover applies, so
   // the folder's menu keeps its "New session" fallback at every breakpoint.
   const clusterRestMargin = showsMarker ? (icon ? "-mr-1" : "mr-1") : "mr-2";
   const clusterHoverDesktopMargin = hasPersistentAction
@@ -2736,7 +2729,7 @@ function ConversationSection({
   emptyMessage,
   indentRows,
   headerAction,
-  actionHoverOnly = false,
+  actionHoverOnly,
   headerContextMenu,
   persistentHeaderAction,
   afterHeader,
@@ -2768,13 +2761,9 @@ function ConversationSection({
   emptyMessage?: ReactNode;
   /** Indent the rows one extra step (used to nest a project's chats). */
   indentRows?: boolean;
-  /** Optional control overlaid at the header's right edge (e.g. a project's
-      kebab). Hover/focus-revealed on hover-capable desktops; painted at rest
-      wherever hover isn't available unless `actionHoverOnly` is set. */
+  /** Optional control overlaid at the header's right edge. */
   headerAction?: ReactNode;
-  /** Set when `headerAction` reveals only under the fine-hover media condition
-      and is never painted at rest, so collapsed badges keep their rest slot
-      instead of reserving the control column. */
+  /** Whether `headerAction` is absent without a fine hover pointer. */
   actionHoverOnly?: boolean;
   /** Optional context-menu content opened from the header button. */
   headerContextMenu?: ReactNode;
@@ -4218,13 +4207,7 @@ function ArchivingRow({ label }: { label: string }) {
 
 // ── ProjectFolderActions ──────────────────────────────────────────────────────
 
-/**
- * The hover-revealed controls on a project-folder header: a kebab menu and a
- * pencil that starts a new session pre-filed under this project. Both appear
- * only under the fine-hover media condition — on touch the header's long-press
- * context menu carries the same actions. The pencil links to the landing
- * composer with `?project=<name>` so its project chip lands already selected.
- */
+/** Fine-hover shortcuts for project actions and starting a pre-filed session. */
 function ProjectFolderActions({
   projectName,
   onNavigate,
@@ -4641,9 +4624,6 @@ function ProjectFolderMenu({
   actions: ProjectFolderMenuActions;
 }) {
   return (
-    // Painted only where the pencil's fine-hover condition reveals it;
-    // everywhere else the header's context menu (long-press on touch) carries
-    // these same items, so a visible kebab would be redundant.
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
         <Button
