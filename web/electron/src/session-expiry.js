@@ -103,7 +103,11 @@ function expiredRequestMatchesIdentity(windowIdentity, requestIdentity) {
 
 /**
  * Whether a main-frame destination is the pinned server's OIDC login route.
- * The origin and exact pathname must both match; query parameters such as the
+ * The exact pathname must match; the identity is matched with the same rule
+ * as the redirect stream (expiredRequestMatchesIdentity): a selector-less
+ * destination — the SPA's `/auth/login` assignment usually drops the `?o=`
+ * query — still intercepts on a `?o=`-pinned window, while a destination
+ * carrying a DIFFERENT selector never does. Query parameters such as the
  * SPA's `return_to` are allowed.
  *
  * @param {string} destinationUrl
@@ -116,8 +120,10 @@ function isOidcLoginNavigation(destinationUrl, serverUrl) {
     const destination = new URL(destinationUrl);
     const expected = new URL(joinServerUrl(serverUrl, "/auth/login"));
     return (
-      workspaceIdentityKey(destinationUrl) === workspaceIdentityKey(serverUrl) &&
-      destination.pathname === expected.pathname
+      expiredRequestMatchesIdentity(
+        workspaceIdentityKey(serverUrl),
+        workspaceIdentityKey(destinationUrl),
+      ) && destination.pathname === expected.pathname
     );
   } catch {
     return false;

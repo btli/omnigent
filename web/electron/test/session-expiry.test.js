@@ -296,12 +296,16 @@ describe("self-hosted OIDC session expiry", () => {
       ),
       false,
     );
+    // A selector-less /auth/login destination still intercepts on a
+    // ?o=-pinned window: the SPA's login assignment usually drops the query
+    // (same tolerance as expiredRequestMatchesIdentity on the redirect
+    // stream) — only a DIFFERENT selector refuses.
     assert.equal(
       isOidcLoginNavigation(
         "https://dbc-a.cloud.databricks.com/omnigent/auth/login",
         "https://dbc-a.cloud.databricks.com/omnigent?o=team%2Fblue",
       ),
-      false,
+      true,
     );
   });
 

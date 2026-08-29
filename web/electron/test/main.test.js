@@ -1512,9 +1512,14 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     const events = [];
     const state = {
       pendingServerLoads: 1,
-      pendingLoad: pendingLoad.promise.then(() => events.push("pending settled")),
       serverUrl: "https://server.example",
     };
+    // Mirror withServerLoad's finally: a settled load releases the claim.
+    state.pendingLoad = pendingLoad.promise.then(() => {
+      events.push("pending settled");
+      state.pendingServerLoads = 0;
+      state.pendingLoad = null;
+    });
     const setupLoads = [];
     const callback = runInNewContext(`(${expiryHandoffCallbackCode})`, {
       loadServerUrl: async (...args) => {
@@ -1556,9 +1561,13 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
       const pendingLoad = Promise.withResolvers();
       const state = {
         pendingServerLoads: 1,
-        pendingLoad: pendingLoad.promise,
         serverUrl: expiredServerUrl,
       };
+      // Mirror withServerLoad's finally: a settled load releases the claim.
+      state.pendingLoad = pendingLoad.promise.finally(() => {
+        state.pendingServerLoads = 0;
+        state.pendingLoad = null;
+      });
       const recoveryLoads = [];
       const setupLoads = [];
       const pinCalls = [];
@@ -1600,6 +1609,48 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     assert.deepEqual(unchanged.setupLoads, []);
     assert.deepEqual(unchanged.pinCalls, []);
     assert.deepEqual(unchanged.serverUrlCalls, []);
+  });
+
+  it("leaves the window to a load that starts in the settle gap", async () => {
+    // The awaited pending load settles and a user-initiated load (switch
+    // server / deep link, possibly to the SAME server URL) claims the window
+    // in the gap before recovery runs. Recovery must do nothing — running
+    // loadServerUrl would return false (withServerLoad already claimed) and
+    // the old behavior then flashed the expired-session setup page over a
+    // healthy in-flight load.
+    assert.ok(expiryHandoffCallbackCode);
+    const win = { isDestroyed: () => false };
+    const pendingLoad = Promise.withResolvers();
+    const state = {
+      pendingServerLoads: 1,
+      serverUrl: "https://server.example",
+    };
+    state.pendingLoad = pendingLoad.promise.then(() => {
+      // Settle releases the claim — and a new load immediately takes it.
+      state.pendingServerLoads = 1;
+      state.pendingLoad = null;
+    });
+    const recoveryLoads = [];
+    const setupLoads = [];
+    const callback = runInNewContext(`(${expiryHandoffCallbackCode})`, {
+      loadServerUrl: async (...args) => {
+        recoveryLoads.push(args);
+        return false; // withServerLoad refuses: another load owns the window
+      },
+      loadSetupPage: async (...args) => setupLoads.push(args),
+      win,
+      windows: new Map([[win, state]]),
+    });
+
+    const recovery = callback({
+      serverUrl: "https://server.example",
+      returnUrl: "https://server.example/c/current",
+    });
+    pendingLoad.resolve();
+    await recovery;
+
+    assert.deepEqual(recoveryLoads, []);
+    assert.deepEqual(setupLoads, []);
   });
 
   it("wiring-only: limits the fail-loud WebAuthn guard to main-window fallback authentication", () => {
@@ -2186,10 +2237,19 @@ describe("expired-session reload identity matching (src/main.js)", () => {
 describe("deep-link workspace identity (src/main.js)", () => {
   const { parseOmnigentDeepLink } = require("../src/deepLink");
 
-  function runDeepLink(raw, { knownIdentities = [], knownServerUrl = null } = {}) {
+  function runDeepLink(
+    raw,
+    { knownIdentities = [], knownServerUrl = null, liveIdentities = [] } = {},
+  ) {
     const decisions = [];
     const created = [];
     const lookups = [];
+    const windows = new Map(
+      liveIdentities.map((identity) => [
+        { isDestroyed: () => false, webContents: { getURL: () => `${identity.split("?")[0]}/` } },
+        { identity, serverUrl: identity },
+      ]),
+    );
     const handler = runInNewContext(`${deepLinkHandlerCode}; handleDeepLink`, {
       BrowserWindow: { getFocusedWindow: () => null },
       chooseDeepLinkStrategy: (state) => {
@@ -2208,7 +2268,7 @@ describe("deep-link workspace identity (src/main.js)", () => {
       },
       knownWorkspaceIdentities: () => knownIdentities,
       parseOmnigentDeepLink,
-      windows: new Map(),
+      windows,
       workspaceIdentityKey,
     });
     return handler(raw).then(() => ({ decisions, created, lookups }));
@@ -2258,6 +2318,70 @@ describe("deep-link workspace identity (src/main.js)", () => {
     assert.equal(decisions[0].targetOrigin, "https://server.example");
   });
 
+  it("counts a live ephemeral workspace against silent adoption", async () => {
+    // Only ?o=111 is PERSISTED, but an ephemeral window is live on ?o=222 —
+    // adopting the persisted identity would silently route the link away
+    // from a workspace the user is actively using (and skip its consent
+    // ambiguity listing). The identity must stay bare (ambiguous).
+    const { decisions } = await runDeepLink("omnigent://ws.cloud.databricks.com/c/conv_abc", {
+      knownIdentities: ["https://ws.cloud.databricks.com?o=111"],
+      liveIdentities: ["https://ws.cloud.databricks.com?o=222"],
+      knownServerUrl: null,
+    });
+
+    assert.equal(decisions[0].targetOrigin, "https://ws.cloud.databricks.com");
+  });
+
+  it("adopts a live-only workspace identity when it is the only one on the origin", async () => {
+    // Nothing persisted, one ephemeral window live on the origin: the link
+    // can only mean that workspace.
+    const { decisions } = await runDeepLink("omnigent://ws.cloud.databricks.com/c/conv_abc", {
+      knownIdentities: [],
+      liveIdentities: ["https://ws.cloud.databricks.com?o=222"],
+      knownServerUrl: null,
+    });
+
+    assert.equal(decisions[0].targetOrigin, "https://ws.cloud.databricks.com?o=222");
+  });
+
+  it("lists live workspaces among the consent candidates", async () => {
+    const confirmCalls = [];
+    const parentState = { serverUrl: null, pendingServerLoads: 0 };
+    const parent = { isDestroyed: () => false, webContents: { getURL: () => "file:///setup" } };
+    const live = {
+      isDestroyed: () => false,
+      webContents: { getURL: () => "https://ws.cloud.databricks.com/" },
+    };
+    const handler = runInNewContext(`${deepLinkHandlerCode}; handleDeepLink`, {
+      BrowserWindow: { getFocusedWindow: () => null },
+      activeWindow: () => parent,
+      chooseDeepLinkStrategy: () => ({ strategy: "consent-unknown" }),
+      confirmOpenDeepLink: async (...args) => {
+        confirmCalls.push(args);
+        return false; // cancel — the candidates listing is what's under test
+      },
+      console: { log: () => {} },
+      findKnownServerUrl: () => null,
+      knownWorkspaceIdentities: () => ["https://ws.cloud.databricks.com?o=111"],
+      parseOmnigentDeepLink,
+      windows: new Map([
+        [parent, parentState],
+        [live, { identity: "https://ws.cloud.databricks.com?o=222", serverUrl: null }],
+      ]),
+      workspaceIdentityKey,
+    });
+
+    await handler("omnigent://ws.cloud.databricks.com/c/conv_abc");
+
+    assert.equal(confirmCalls.length, 1);
+    // Array.from: the candidates array is built inside the vm realm, so the
+    // strict deepEqual prototype check needs a host-realm copy.
+    assert.deepEqual(Array.from(confirmCalls[0][2]), [
+      "https://ws.cloud.databricks.com?o=111",
+      "https://ws.cloud.databricks.com?o=222",
+    ]);
+  });
+
   it("does not guess between several known ?o= workspaces on one origin", async () => {
     // A selector-less link is ambiguous when the origin has several saved
     // workspaces — silently adopting one (e.g. the saved default) could
@@ -2300,7 +2424,9 @@ describe("deep-link workspace identity (src/main.js)", () => {
     await handler("omnigent://ws.cloud.databricks.com/c/conv_abc");
 
     assert.equal(confirmCalls.length, 1);
-    assert.deepEqual(confirmCalls[0][2], [
+    // Array.from: the candidates array is built inside the vm realm, so the
+    // strict deepEqual prototype check needs a host-realm copy.
+    assert.deepEqual(Array.from(confirmCalls[0][2]), [
       "https://ws.cloud.databricks.com?o=111",
       "https://ws.cloud.databricks.com?o=222",
     ]);
@@ -2474,7 +2600,7 @@ describe("expired-session reload attribution (src/main.js)", () => {
     return { win, state: { identity }, reloadCount: () => reloads };
   }
 
-  function wire(windowsList) {
+  function wire(windowsList, { monotonicNow = () => 1_000_000, wallDate = Date } = {}) {
     assert.ok(accessCode);
     assert.ok(pinnedCode);
     let listener = null;
@@ -2487,10 +2613,11 @@ describe("expired-session reload attribution (src/main.js)", () => {
     };
     const windows = new Map(windowsList.map(({ win, state }) => [win, state]));
     const register = runInNewContext(`${pinnedCode}; ${accessCode}; registerSessionExpiryAccess`, {
-      Date,
+      Date: wallDate,
       EXPIRY_RELOAD_MIN_INTERVAL_MS: 15_000,
       expiredRequestMatchesIdentity,
       lastExpiryReloadAt: new WeakMap(),
+      performance: { now: monotonicNow },
       registerSessionExpiryReload,
       session: { defaultSession: ses },
       windows,
@@ -2539,5 +2666,27 @@ describe("expired-session reload attribution (src/main.js)", () => {
     emit({ ...LOGIN_REDIRECT, webContentsId: 1 });
 
     assert.equal(a.reloadCount(), 0);
+  });
+
+  it("throttles on a monotonic clock — a backward wall-clock step cannot suppress reloads", () => {
+    const a = makeWindow(1, "https://ws.databricks.com?o=111");
+    const monotonic = [1_000, 2_000, 18_000];
+    let tick = 0;
+    // Wall clock steps BACKWARD across the whole scenario (NTP correction):
+    // Date.now()-based throttling would see `now - last` negative forever
+    // and suppress every reload until wall time recovers.
+    let wall = 5_000_000_000;
+    const { emit } = wire([a], {
+      monotonicNow: () => monotonic[tick],
+      wallDate: { now: () => (wall -= 60_000) },
+    });
+
+    emit({ ...LOGIN_REDIRECT, webContentsId: 1 }); // t=1s → reload
+    tick = 1;
+    emit({ ...LOGIN_REDIRECT, webContentsId: 1 }); // t=2s → throttled
+    tick = 2;
+    emit({ ...LOGIN_REDIRECT, webContentsId: 1 }); // t=18s → reload again
+
+    assert.equal(a.reloadCount(), 2);
   });
 });

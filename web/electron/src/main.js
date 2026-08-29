@@ -471,7 +471,9 @@ function registerSessionExpiryAccess() {
     session.defaultSession,
     isPinnedWorkspaceUrl,
     (identity, webContentsId) => {
-      const now = Date.now();
+      // Monotonic: a backward wall-clock step must not make `now - last`
+      // negative and silently suppress every reload for up to the step size.
+      const now = performance.now();
       for (const [win, state] of windows) {
         if (win.isDestroyed()) continue;
         // Attribute the redirect to the window whose webContents issued the
@@ -482,7 +484,10 @@ function registerSessionExpiryAccess() {
         // views, workers, or no id at all) reload nothing.
         if (webContentsId == null || win.webContents.id !== webContentsId) continue;
         if (!expiredRequestMatchesIdentity(state.identity, identity)) continue;
-        const last = lastExpiryReloadAt.get(win) ?? 0;
+        // Default far enough in the past that a window's FIRST reload is
+        // never throttled — performance.now() starts near 0 at launch, so a
+        // `?? 0` default would swallow expiries in the app's first 15s.
+        const last = lastExpiryReloadAt.get(win) ?? -EXPIRY_RELOAD_MIN_INTERVAL_MS;
         if (now - last < EXPIRY_RELOAD_MIN_INTERVAL_MS) continue;
         lastExpiryReloadAt.set(win, now);
         win.webContents.reload();
@@ -1660,6 +1665,11 @@ function createWindow(targetUrl, opts = {}) {
         if (win.isDestroyed?.()) return;
         if (windows.get(win)?.serverUrl !== expiredServerUrl) return;
       }
+      // A user-initiated load (switch server, deep link) can begin in the
+      // gap after the awaited pending load settles — that load owns the
+      // window now; recovering (or showing the expired setup page when
+      // withServerLoad refuses) would clobber it.
+      if (windows.get(win)?.pendingServerLoads) return;
       const loaded = await loadServerUrl(win, expiredServerUrl, undefined, returnUrl);
       if (!loaded) {
         await loadSetupPage(win, {
@@ -3316,14 +3326,21 @@ async function handleDeepLink(raw) {
   if (!targetIdentity) return;
   const knownIdentities = knownWorkspaceIdentities();
   // A link WITHOUT a selector still belongs to a known workspace when only
-  // the selector differs — but adopt it ONLY when exactly one known identity
+  // the selector differs — but adopt it ONLY when exactly one identity
   // exists on that origin: with several, guessing (e.g. the saved default)
   // could route the conversation into the wrong tenant, so the link stays a
-  // bare identity and goes through the consent prompt, which lists the known
-  // workspaces so the user can see the ambiguity.
+  // bare identity and goes through the consent prompt, which lists the
+  // candidate workspaces so the user can see the ambiguity. Live windows
+  // count alongside persisted servers: an ephemeral window is pinned to an
+  // identity settings never saw, and it must both block silent adoption and
+  // appear in the ambiguity listing.
+  const reachableIdentities = new Set(knownIdentities);
+  for (const state of windows.values()) {
+    if (state.identity) reachableIdentities.add(state.identity);
+  }
   let workspaceCandidates = [];
-  if (!targetIdentity.includes("?") && !knownIdentities.includes(targetIdentity)) {
-    const sameOrigin = knownIdentities.filter((identity) =>
+  if (!targetIdentity.includes("?") && !reachableIdentities.has(targetIdentity)) {
+    const sameOrigin = [...reachableIdentities].filter((identity) =>
       identity.startsWith(`${targetIdentity}?`),
     );
     if (sameOrigin.length === 1) targetIdentity = sameOrigin[0];
