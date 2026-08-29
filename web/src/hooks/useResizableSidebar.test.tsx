@@ -8,6 +8,35 @@ import { resetSidebarWidthStoreForTesting, useResizableSidebar } from "./useResi
 // are independent. A 2000px viewport gives a 1000px ceiling (50vw).
 
 const originalInnerWidth = window.innerWidth;
+const originalMatchMedia = window.matchMedia;
+
+type MediaListener = (e: MediaQueryListEvent) => void;
+
+/** Controllable matchMedia mock: per-query matches plus a change-event firer. */
+function mockMatchMedia(matches: Record<string, boolean> = {}) {
+  const listeners = new Map<string, Set<MediaListener>>();
+  window.matchMedia = ((query: string) => ({
+    matches: matches[query] ?? false,
+    media: query,
+    onchange: null,
+    addEventListener: (_: string, cb: MediaListener) => {
+      if (!listeners.has(query)) listeners.set(query, new Set());
+      listeners.get(query)?.add(cb);
+    },
+    removeEventListener: (_: string, cb: MediaListener) => listeners.get(query)?.delete(cb),
+    addListener: () => {},
+    removeListener: () => {},
+    dispatchEvent: () => false,
+  })) as typeof window.matchMedia;
+  return {
+    fire(query: string, value: boolean) {
+      matches[query] = value;
+      for (const cb of listeners.get(query) ?? new Set<MediaListener>()) {
+        cb({ matches: value } as MediaQueryListEvent);
+      }
+    },
+  };
+}
 
 function setInnerWidth(px: number): void {
   Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: px });
@@ -98,6 +127,7 @@ afterEach(() => {
   localStorage.clear();
   resetSidebarWidthStoreForTesting();
   setInnerWidth(originalInnerWidth);
+  window.matchMedia = originalMatchMedia;
 });
 
 describe("useResizableSidebar", () => {
@@ -346,6 +376,35 @@ describe("useResizableSidebar", () => {
       expect(document.body.style.userSelect).toBe("");
     },
   );
+
+  it("cancels a drag with restore when the viewport crosses below the md breakpoint", () => {
+    // A touch/pen drag started at desktop width must not survive the layout
+    // flip to mobile: the handle hides but capture would persist, and release
+    // would write an unintended width.
+    const mm = mockMatchMedia({ "(min-width: 768px)": true });
+    const { result, unmount } = renderHook(() => useResizableSidebar());
+    const handle = createHandle();
+
+    startDrag(result, handle, { pointerId: 5 });
+    act(() =>
+      result.current.handleProps.onPointerMove(
+        pointerEvent(handle, { pointerId: 5, clientX: 600 }),
+      ),
+    );
+    expect(result.current.width).toBe(600);
+    expect(document.body.style.cursor).toBe("col-resize");
+
+    act(() => mm.fire("(min-width: 768px)", false));
+
+    expect(result.current.width).toBe(320);
+    expect(readPanelSizePreference("sidebarWidthPx")).toBeNull();
+    expect(document.body.style.cursor).toBe("");
+
+    // A stray release from the dead drag must not commit anything.
+    act(() => result.current.handleProps.onPointerUp(pointerEvent(handle, { pointerId: 5 })));
+    expect(readPanelSizePreference("sidebarWidthPx")).toBeNull();
+    unmount();
+  });
 
   it("restores the persisted width when Escape cancels a drag", () => {
     const { result } = renderHook(() => useResizableSidebar());

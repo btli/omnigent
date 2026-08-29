@@ -13,6 +13,7 @@ import { useCallback, useEffect, useReducer, useRef, useSyncExternalStore } from
 import { createResizableWidthStore } from "@/hooks/resizableWidthStore";
 import { useInputCapabilities } from "@/hooks/useInputCapabilities";
 import { useResizeDrag } from "@/hooks/useResizeDrag";
+import { MD_MIN_WIDTH_QUERY, isMobileViewport, subscribeMatchMedia } from "@/lib/breakpoints";
 import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
 
 // The default gives conversation titles room before truncating. The floor keeps
@@ -114,6 +115,20 @@ export function useResizableSidebar() {
     }, []),
     observeHandleRemoval: true,
   });
+
+  // A touch/pen drag started at desktop width can outlive the viewport
+  // crossing below the md breakpoint: the handle hides (the sidebar becomes a
+  // full-screen overlay) but pointer capture persists, so release would write
+  // an unintended width. Cancel — restoring the pre-drag width — the moment
+  // the desktop query stops matching.
+  const cancelResizeDrag = resizeDrag.cancelDrag;
+  useEffect(
+    () =>
+      subscribeMatchMedia([MD_MIN_WIDTH_QUERY], () => {
+        if (isMobileViewport()) cancelResizeDrag();
+      }),
+    [cancelResizeDrag],
+  );
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
