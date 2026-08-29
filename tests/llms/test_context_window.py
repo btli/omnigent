@@ -210,6 +210,59 @@ def test_fetch_model_pricing_parses_cache_rates(monkeypatch: pytest.MonkeyPatch)
     assert pricing.cache_write_per_token == pytest.approx(3.125e-6)
 
 
+def test_fetch_model_pricing_kimi_posted_rates_fall_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Kimi models missing from the catalog price at the posted API rates.
+
+    The kimi-native forwarder posts token usage under ids like
+    ``system.ai.kimi-k3`` / ``kimi-k3-databricks`` that the shared catalog
+    typically does not carry; without this fallback those sessions would
+    report zero cost. Rates pinned to https://platform.kimi.ai/
+    (retrieved 2026-08-28).
+    """
+    monkeypatch.setattr(context_window, "find_catalog_models", lambda _model: [])
+    for model in ("system.ai.kimi-k3", "kimi-k3-databricks", "KIMI-K3"):
+        pricing = fetch_model_pricing(model)
+        assert pricing is not None, model
+        assert pricing.input_per_token == pytest.approx(3.00e-6)
+        assert pricing.output_per_token == pytest.approx(15.00e-6)
+        assert pricing.cache_read_per_token == pytest.approx(0.30e-6)
+        assert pricing.cache_write_per_token is None
+    k27 = fetch_model_pricing("kimi-k2.7-code")
+    assert k27 is not None
+    assert k27.input_per_token == pytest.approx(0.95e-6)
+    assert k27.output_per_token == pytest.approx(4.00e-6)
+    assert k27.cache_read_per_token == pytest.approx(0.19e-6)
+    k26 = fetch_model_pricing("kimi-k2.6")
+    assert k26 is not None
+    assert k26.cache_read_per_token == pytest.approx(0.16e-6)
+    assert fetch_model_pricing("gpt-5-unknown") is None
+
+
+def test_fetch_model_pricing_catalog_beats_kimi_posted_rates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A catalog entry for a kimi model stays authoritative over the fallback."""
+    monkeypatch.setattr(
+        context_window,
+        "find_catalog_models",
+        lambda _model: [
+            ModelInfo(
+                name="system.ai.kimi-k3",
+                provider="system.ai",
+                input_price=2.0,
+                output_price=9.0,
+            )
+        ],
+    )
+    pricing = fetch_model_pricing("system.ai.kimi-k3")
+    assert pricing is not None
+    assert pricing.input_per_token == pytest.approx(2.0e-6)
+    assert pricing.output_per_token == pytest.approx(9.0e-6)
+
+
 def test_fetch_model_pricing_omits_cache_rates_when_absent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

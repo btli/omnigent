@@ -371,6 +371,11 @@ class TestApprovalKeystroke:
             after_key_panes=("", _fixture("approval_menu.txt"), _fixture("first_boot_empty.txt")),
             capture_log=captures,
         )
+        # Generous deadline: the real 0.5s window minus two poll sleeps leaves
+        # too little margin under CI load, and this test is about retry order,
+        # not the deadline.
+        monkeypatch.setattr(kimi_native_bridge, "_APPROVAL_SETTLE_TIMEOUT_S", 5.0)
+        monkeypatch.setattr(kimi_native_bridge, "_POLL_INTERVAL_S", 0.01)
         assert inject_approval_keystroke(tmp_path, key=APPROVE_KEY) is True
         assert sent == [("send-keys", "-t", "main", APPROVE_KEY)]
         assert captures[-1] == _fixture("first_boot_empty.txt")
