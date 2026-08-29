@@ -1590,6 +1590,44 @@ describe("SectionHeader collapsed badge cluster", () => {
     );
   });
 
+  it("ungates the focus fade and drops md from the count fade for a hover-only header", () => {
+    // A hover-only action's focus reveal (focus-visible:not-sr-only) is ungated
+    // by pointer type — a coarse-pointer tablet with a keyboard can land focus
+    // on the control. So the focus-within fade must fire at every pointer type
+    // too, or the focus-revealed kebab paints over a still-visible badge. The
+    // hover-driven count fade instead tracks the all-width hover reveal (no md).
+    render(
+      <TooltipProvider>
+        <SectionHeader
+          title="Hover-only"
+          count={3}
+          marker={{ kind: "running" }}
+          hasAction
+          actionHoverOnly
+          collapsed
+          onToggleCollapsed={() => {}}
+        />
+      </TooltipProvider>,
+    );
+    const pill = screen.getByTestId("section-collapsed-count");
+    const markerSlot = screen.getByTestId("session-state-badge").parentElement!;
+    // (G3a) focus-within fade is UNgated by pointer type on both badges.
+    for (const el of [pill, markerSlot]) {
+      expect(el).toHaveClass("group-has-[[data-header-controls]:focus-within]/header:opacity-0");
+      expect(el).not.toHaveClass(
+        "[@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-header-controls]:focus-within]/header:opacity-0",
+      );
+    }
+    // (G3b) hover-driven count fade is capability-only (no md) — pins the form
+    // so a revert to the md-gated string is caught even if markerFade is right.
+    expect(pill).toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/header:opacity-0",
+    );
+    expect(pill).not.toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-0",
+    );
+  });
+
   it("keeps the lone-pill offset when no marker renders", () => {
     render(
       <TooltipProvider>
@@ -2102,7 +2140,7 @@ describe("Sidebar project sections", () => {
     }
   });
 
-  it("keeps the touch kebab in the a11y tree and focus-revealable, never display:none", () => {
+  it("gives the touch kebab the sr-only (not display:none) class contract", () => {
     // The touch/coarse case (390px and 810px). No CSS is loaded in jsdom, so a
     // display:none button is equally findable/focusable here — the meaningful
     // guard is the class contract: sr-only (kept in the a11y tree, unlike
@@ -2232,13 +2270,18 @@ describe("Sidebar collapsed project marker", () => {
     expect(cluster).toHaveClass("-mr-1");
     expect(cluster).not.toHaveClass("mr-14");
     expect(cluster).not.toHaveClass("[@media((hover:hover)_and_(pointer:fine))]:md:-mr-1");
-    // The kebab reveals on hover at every width for a fine hover pointer, so
-    // the marker must fade under the same capability-only condition (no md) —
-    // otherwise the revealed kebab paints over a still-visible spinner on a
-    // narrow hover desktop. The fade condition tracks the reveal condition.
+    // The hover-driven fades track the fine-hover reveal (hover only exists on
+    // fine), so they stay pointer-gated with no md.
     expect(slot).toHaveClass(
       "[@media((hover:hover)_and_(pointer:fine))]:group-hover/section:opacity-0",
       "[@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:opacity-0",
+    );
+    // The focus-within fade tracks the pointer-UNgated focus-visible reveal, so
+    // it is ungated too: a coarse-pointer tablet + keyboard can focus the kebab,
+    // and the spinner must clear there as well or the revealed kebab overlaps
+    // it. Asserted separately below (it must NOT carry the pointer/hover gate).
+    expect(slot).toHaveClass("group-has-[[data-header-controls]:focus-within]/header:opacity-0");
+    expect(slot).not.toHaveClass(
       "[@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-header-controls]:focus-within]/header:opacity-0",
     );
     // No width-gated fade survives for a hover-only action — that mismatch is
