@@ -530,10 +530,10 @@ class KimiExecutor(Executor):
         if not session_id or session_id in self._wire_offsets:
             return
         if session_id in self._first_read_floor_ms:
-            # An earlier turn's collection already failed for this session, so
-            # rows written since that turn are still unbilled: snapshotting
-            # EOF now would skip them forever. The first read starts at 0,
-            # gated on the recorded floor instead.
+            # An earlier turn's collection yielded no usage (missing, empty,
+            # or unreadable wire), so rows written since that turn are still
+            # unbilled: snapshotting EOF now would skip them forever. The
+            # first read starts at 0, gated on the recorded floor instead.
             return
         try:
             wire = _find_wire_log(resolve_user_kimi_home(), session_id)
@@ -577,13 +577,18 @@ class KimiExecutor(Executor):
                 wire_path, offset=offset, turn_start_ms=floor_ms
             )
             self._wire_offsets[session_id] = new_offset
-            if totals is not None or new_offset != offset:
-                # A read actually consumed the log; the pending-first-read
-                # floor has served its purpose (kept while the file is
-                # missing, unreadable, or still empty).
-                self._first_read_floor_ms.pop(session_id, None)
             if totals is None:
+                # ANY first collection that yields no usage — wire missing
+                # (handled above), empty, unreadable, or holding zero billable
+                # rows — records the FIRST such turn's start, so rows flushed
+                # late still bill on the eventual productive read instead of
+                # failing a later turn's time gate.
+                if offset == 0:
+                    self._first_read_floor_ms.setdefault(session_id, turn_start_ms)
                 return None
+            # A read actually consumed billable rows; the pending-first-read
+            # floor has served its purpose.
+            self._first_read_floor_ms.pop(session_id, None)
             usage: dict[str, object] = dict(totals)
             if model:
                 usage["model"] = model

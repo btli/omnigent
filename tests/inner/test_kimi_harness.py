@@ -1046,6 +1046,47 @@ def test_run_turn_malformed_wire_rows_are_skipped_whole(
     assert any("unparseable wire row" in r.message for r in caplog.records)
 
 
+@pytest.mark.parametrize("failure", ["empty", "unreadable"])
+def test_run_turn_yieldless_existing_wire_still_bills_late_rows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str
+) -> None:
+    """An EXISTING wire that yields nothing on turn 1 behaves like a missing
+    one: the pending-first-read floor is recorded, so turn-1 rows flushed
+    after the turn still bill on turn 2 instead of failing its time gate."""
+    wire = _write_wire(tmp_path, "session_yieldless-1", [])
+    wire.write_text("", encoding="utf-8")
+    if failure == "unreadable":
+        wire.chmod(0)
+
+    events, ex = _run_stubbed_turn(monkeypatch, tmp_path, session_id="session_yieldless-1")
+    turn = next(e for e in events if isinstance(e, TurnComplete))
+    assert turn.usage is None
+
+    if failure == "unreadable":
+        wire.chmod(0o600)
+    # Turn-1's row flushes late, between the turns.
+    late_turn1_ms = int(time.time() * 1000)
+    wire.write_text(
+        json.dumps(_usage_row(input_other=6, output=2, time_ms=late_turn1_ms)) + "\n",
+        encoding="utf-8",
+    )
+
+    def _append_turn2_row() -> None:
+        with wire.open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(_usage_row(input_other=4, output=1, time_ms=int(time.time() * 1000)))
+                + "\n"
+            )
+
+    events2 = _collect_stubbed_turn(
+        monkeypatch, ex, session_id="session_yieldless-1", on_spawn=_append_turn2_row
+    )
+    turn2 = next(e for e in events2 if isinstance(e, TurnComplete))
+    assert turn2.usage is not None
+    assert turn2.usage["input_tokens"] == 6 + 4
+    assert turn2.usage["output_tokens"] == 2 + 1
+
+
 def test_run_turn_first_read_attributes_model_from_real_fixture(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
