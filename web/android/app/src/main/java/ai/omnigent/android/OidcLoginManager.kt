@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import androidx.annotation.VisibleForTesting
 import org.json.JSONObject
 import java.net.HttpURLConnection
@@ -47,8 +48,22 @@ class OidcLoginManager {
         val cancelled = AtomicBoolean(false)
     }
 
+    // The in-flight HTTP request, so cancel() can force blocking I/O to abort:
+    // shutdownNow() only interrupts the polling sleeps, not a thread blocked
+    // in HttpURLConnection connect/read (or a slow-trickle response body).
+    @Volatile private var activeConnection: HttpURLConnection? = null
+
+    // Monotonic clock for login deadlines — unlike wall-clock
+    // System.currentTimeMillis(), it can't jump with NTP/user adjustments and
+    // silently expire (or extend) a login window. Substitutable because
+    // Robolectric's SystemClock is simulated and does not advance with real
+    // background-thread sleeps.
+    @VisibleForTesting
+    internal var monotonicNowMs: () -> Long = { SystemClock.elapsedRealtime() }
+
     // The flow's two network steps, substitutable so tests can drive a token
-    // through the completion path without a server.
+    // through the completion path without a server. Deadlines are
+    // [monotonicNowMs] values.
     @VisibleForTesting
     internal var requestTicket: (origin: String, deadlineMs: Long) -> Ticket? =
         { origin, deadlineMs -> httpRequestTicket(origin, deadlineMs) }
@@ -75,9 +90,9 @@ class OidcLoginManager {
         if (flow != null) return false
         val current = Flow(Executors.newSingleThreadExecutor())
         flow = current
-        // One deadline bounds ticket creation AND polling, mirroring the
-        // desktop shell's single 5-minute login window.
-        val deadlineMs = System.currentTimeMillis() + LOGIN_TIMEOUT_MS
+        // One monotonic deadline bounds ticket creation AND polling, mirroring
+        // the desktop shell's single 5-minute login window.
+        val deadlineMs = monotonicNowMs() + LOGIN_TIMEOUT_MS
         current.executor.execute {
             var token: String? = null
             try {
@@ -125,6 +140,10 @@ class OidcLoginManager {
             it.cancelled.set(true)
             it.executor.shutdownNow() // interrupts the polling sleep so the task exits promptly
         }
+        // shutdownNow() cannot interrupt blocking HttpURLConnection I/O —
+        // tear the in-flight connection down so the flow thread exits promptly
+        // instead of waiting out a read timeout (or a slow-trickle body).
+        runCatching { activeConnection?.disconnect() }
         flow = null
     }
 
@@ -148,6 +167,7 @@ class OidcLoginManager {
             conn.setRequestProperty("Content-Length", "0")
             conn.connectTimeout = HTTP_TIMEOUT_MS
             conn.readTimeout = HTTP_TIMEOUT_MS
+            activeConnection = conn
             try {
                 val status = conn.responseCode
                 if (status !in TRANSIENT_STATUSES) {
@@ -163,13 +183,14 @@ class OidcLoginManager {
                     return Ticket(id, loginUrl)
                 }
             } finally {
+                activeConnection = null
                 conn.disconnect()
             }
             // A transient gate/proxy hiccup (same status set as the desktop
             // shell) — wait out one interval and retry until the login deadline.
-            if (System.currentTimeMillis() >= deadlineMs) return null
+            if (monotonicNowMs() >= deadlineMs) return null
             Thread.sleep(POLL_INTERVAL_MS) // throws InterruptedException on shutdownNow()
-            if (System.currentTimeMillis() >= deadlineMs) return null
+            if (monotonicNowMs() >= deadlineMs) return null
         }
     }
 
@@ -195,8 +216,11 @@ class OidcLoginManager {
         deadlineMs: Long,
     ): String? {
         val encoded = Uri.encode(ticket)
-        while (System.currentTimeMillis() < deadlineMs) {
+        while (monotonicNowMs() < deadlineMs) {
             Thread.sleep(POLL_INTERVAL_MS) // throws InterruptedException on shutdownNow()
+            // The sleep itself can cross the deadline — never issue a request
+            // past it.
+            if (monotonicNowMs() >= deadlineMs) return null
             val conn = (
                 URL(
                     "$origin/auth/cli-poll?ticket=$encoded",
@@ -205,6 +229,7 @@ class OidcLoginManager {
             conn.requestMethod = "GET"
             conn.connectTimeout = HTTP_TIMEOUT_MS
             conn.readTimeout = HTTP_TIMEOUT_MS
+            activeConnection = conn
             try {
                 when (conn.responseCode) {
                     202 -> {
@@ -214,6 +239,9 @@ class OidcLoginManager {
                     // still pending
                     200 -> {
                         val body = conn.inputStream.bufferedReader().use { it.readText() }
+                        // A token trickling in past the deadline belongs to an
+                        // expired login window — reject it.
+                        if (monotonicNowMs() >= deadlineMs) return null
                         return JSONObject(body).optString("token").ifEmpty { null }
                     }
 
@@ -231,6 +259,7 @@ class OidcLoginManager {
                 if (Thread.currentThread().isInterrupted) return null // shutdown mid-request
                 continue // transient network error — keep polling until the deadline
             } finally {
+                activeConnection = null
                 conn.disconnect()
             }
         }

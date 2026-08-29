@@ -126,6 +126,15 @@ class OidcLoginManagerTest {
         assertNull(shadowOf(activity).nextStartedActivity)
     }
 
+    // Real monotonic clock for the HTTP-seam tests: Robolectric's SystemClock
+    // is simulated and does not advance with the real sleeps inside the
+    // ticket/poll loops, so drive deadlines from the JVM's own monotonic time.
+    private fun realClock(manager: OidcLoginManager): () -> Long {
+        val clock = { System.nanoTime() / 1_000_000 }
+        manager.monotonicNowMs = clock
+        return clock
+    }
+
     // A one-shot local server: transient failures for the first [failures]
     // requests to a path, then the real answer — drives the default (HTTP)
     // requestTicket/pollForToken seams end to end on the JVM.
@@ -156,8 +165,9 @@ class OidcLoginManagerTest {
             transientThenOk(1, 503, """{"ticket":"t-1","login_url":"/auth/login?ticket=t-1"}""")
         try {
             val manager = OidcLoginManager()
+            val clock = realClock(manager)
             val origin = "http://127.0.0.1:${server.address.port}"
-            val ticket = manager.requestTicket(origin, System.currentTimeMillis() + 30_000)
+            val ticket = manager.requestTicket(origin, clock() + 30_000)
             assertEquals(OidcLoginManager.Ticket("t-1", "/auth/login?ticket=t-1"), ticket)
             assertEquals(2, hits.get())
         } finally {
@@ -170,8 +180,9 @@ class OidcLoginManagerTest {
         val (server, hits) = transientThenOk(1, 401, """{"ticket":"t","login_url":"/l"}""")
         try {
             val manager = OidcLoginManager()
+            val clock = realClock(manager)
             val origin = "http://127.0.0.1:${server.address.port}"
-            assertNull(manager.requestTicket(origin, System.currentTimeMillis() + 30_000))
+            assertNull(manager.requestTicket(origin, clock() + 30_000))
             assertEquals(1, hits.get())
         } finally {
             server.stop(0)
@@ -183,11 +194,90 @@ class OidcLoginManagerTest {
         val (server, hits) = transientThenOk(1, 503, """{"token":"session-jwt"}""")
         try {
             val manager = OidcLoginManager()
+            val clock = realClock(manager)
             val origin = "http://127.0.0.1:${server.address.port}"
-            val token = manager.pollForToken(origin, "t-1", System.currentTimeMillis() + 30_000)
+            val token = manager.pollForToken(origin, "t-1", clock() + 30_000)
             assertEquals("session-jwt", token)
             assertEquals(2, hits.get())
         } finally {
+            server.stop(0)
+        }
+    }
+
+    @Test
+    fun `polling never issues a request once the sleep crosses the deadline`() {
+        val (server, hits) = transientThenOk(0, 200, """{"token":"session-jwt"}""")
+        try {
+            val manager = OidcLoginManager()
+            val clock = realClock(manager)
+            val origin = "http://127.0.0.1:${server.address.port}"
+            // The 2s inter-poll sleep crosses this deadline before the first
+            // request — the loop must exit without touching the server.
+            assertNull(manager.pollForToken(origin, "t-1", clock() + 1_000))
+            assertEquals(0, hits.get())
+        } finally {
+            server.stop(0)
+        }
+    }
+
+    @Test
+    fun `a token arriving past the deadline is rejected`() {
+        // The request is issued in time, but the server's delayed 200 lands
+        // the token past the deadline — expired-window output must be dropped.
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val hits = AtomicInteger(0)
+        server.createContext("/") { exchange ->
+            hits.incrementAndGet()
+            Thread.sleep(500)
+            val bytes = """{"token":"session-jwt"}""".toByteArray()
+            exchange.sendResponseHeaders(200, bytes.size.toLong())
+            exchange.responseBody.use { it.write(bytes) }
+        }
+        server.start()
+        try {
+            val manager = OidcLoginManager()
+            val clock = realClock(manager)
+            val origin = "http://127.0.0.1:${server.address.port}"
+            // 2s sleep + request dispatch fit; the 500ms response delay does not.
+            assertNull(manager.pollForToken(origin, "t-1", clock() + 2_300))
+            assertEquals(1, hits.get())
+        } finally {
+            server.stop(0)
+        }
+    }
+
+    @Test
+    fun `cancel disconnects an in-flight request so a blocked thread exits promptly`() {
+        val requestArrived = CountDownLatch(1)
+        val hold = CountDownLatch(1)
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/") { exchange ->
+            requestArrived.countDown()
+            // Hold the response longer than the join below — only cancel()'s
+            // disconnect (not shutdownNow's interrupt) can unblock the read.
+            runCatching { hold.await(8, TimeUnit.SECONDS) }
+            exchange.sendResponseHeaders(200, -1)
+            exchange.close()
+        }
+        server.start()
+        try {
+            val manager = OidcLoginManager()
+            val clock = realClock(manager)
+            val origin = "http://127.0.0.1:${server.address.port}"
+            var result: OidcLoginManager.Ticket? = OidcLoginManager.Ticket("sentinel", "/x")
+            val worker =
+                Thread {
+                    result =
+                        runCatching { manager.requestTicket(origin, clock() + 30_000) }.getOrNull()
+                }
+            worker.start()
+            assertTrue(requestArrived.await(2, TimeUnit.SECONDS))
+            manager.cancel()
+            worker.join(3_000)
+            assertFalse(worker.isAlive)
+            assertNull(result)
+        } finally {
+            hold.countDown()
             server.stop(0)
         }
     }
@@ -197,8 +287,9 @@ class OidcLoginManagerTest {
         val (server, hits) = transientThenOk(1, 410, """{"token":"session-jwt"}""")
         try {
             val manager = OidcLoginManager()
+            val clock = realClock(manager)
             val origin = "http://127.0.0.1:${server.address.port}"
-            assertNull(manager.pollForToken(origin, "t-1", System.currentTimeMillis() + 30_000))
+            assertNull(manager.pollForToken(origin, "t-1", clock() + 30_000))
             assertEquals(1, hits.get())
         } finally {
             server.stop(0)
