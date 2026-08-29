@@ -32,6 +32,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -170,9 +171,27 @@ _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit E
 # the handoff deterministic where the old fixed sleep raced it.
 _PASTE_COMMIT_TIMEOUT_S = 5.0
 # After the submit Enter, how long to keep checking that the draft
-# actually left the input box (re-sending Enter while it hasn't)
-# before failing loud.
-_SUBMIT_VERIFY_TIMEOUT_S = 10.0
+# actually left the input box (re-sending Enter while it hasn't) before
+# failing loud. OMNIGENT_CLAUDE_SUBMIT_VERIFY_TIMEOUT_S overrides it.
+_SUBMIT_VERIFY_TIMEOUT_ENV = "OMNIGENT_CLAUDE_SUBMIT_VERIFY_TIMEOUT_S"
+_SUBMIT_VERIFY_TIMEOUT_DEFAULT_S = 30.0
+_submit_verify_timeout_raw = os.environ.get(_SUBMIT_VERIFY_TIMEOUT_ENV)
+try:
+    _SUBMIT_VERIFY_TIMEOUT_S = (
+        float(_submit_verify_timeout_raw)
+        if _submit_verify_timeout_raw is not None
+        else _SUBMIT_VERIFY_TIMEOUT_DEFAULT_S
+    )
+except ValueError:
+    _SUBMIT_VERIFY_TIMEOUT_S = math.nan
+if not math.isfinite(_SUBMIT_VERIFY_TIMEOUT_S) or _SUBMIT_VERIFY_TIMEOUT_S <= 0:
+    _logger.warning(
+        "Ignoring invalid %s=%r; using %gs",
+        _SUBMIT_VERIFY_TIMEOUT_ENV,
+        _submit_verify_timeout_raw,
+        _SUBMIT_VERIFY_TIMEOUT_DEFAULT_S,
+    )
+    _SUBMIT_VERIFY_TIMEOUT_S = _SUBMIT_VERIFY_TIMEOUT_DEFAULT_S
 # Minimum spacing between repeated submit Enters during verification.
 # Long enough for the TUI to clear the box after a successful submit
 # (so a slow-but-successful first Enter isn't double-tapped), short
@@ -1817,8 +1836,9 @@ def augment_claude_args(
         / ``"none"`` / list of skill names), mapped to
         ``--setting-sources`` exactly as the SDK executor maps it onto
         ``setting_sources``. Defaults to ``"all"``.
-    :param append_system_prompt: Optional framework-owned instructions to
-        append through Claude Code's native ``--append-system-prompt`` flag.
+    :param append_system_prompt: Optional raw ``AgentSpec.instructions``
+        (author-supplied, not framework-composed) to append through Claude
+        Code's native ``--append-system-prompt`` flag.
     :param allowed_tools: Optional narrowly scoped Claude tool names to merge
         into ``--allowedTools`` without replacing the user's allowlist.
     :param subagent_router_dir: Directory advertising the runner's
@@ -2479,32 +2499,48 @@ def read_transcript_items_from_offset(
     )
 
 
-# Per-model pricing memo for transcript cost computation. Deliberately
-# NOT ``functools.lru_cache``: a transient ``fetch_model_pricing`` failure
-# returns ``None``, and lru_cache would pin that ``None`` for the model's
-# lifetime; this dict stores only successful lookups, so a later poll
-# retries a model whose first lookup failed.
-_TRANSCRIPT_PRICING_CACHE: dict[str, ModelPricing] = {}
+# Per-model pricing memo for transcript cost computation. Each successful
+# lookup is paired with the provider-config digest that produced it, so a
+# config change replaces stale pricing. ``None`` is never cached, allowing a
+# later poll to retry after a transient catalog failure.
+_TRANSCRIPT_PRICING_CACHE: dict[str, tuple[bytes, ModelPricing]] = {}
 
 
-def _transcript_model_pricing(model: str) -> ModelPricing | None:
+def _transcript_model_pricing(
+    model: str,
+    *,
+    provider_config: dict[str, object],
+    provider_config_fingerprint: bytes,
+) -> ModelPricing | None:
     """
-    Look up per-token pricing for *model*, memoizing successful results.
+    Look up per-token pricing for *model*, memoizing successful results for
+    the current provider configuration.
+
+    Checks provider config for custom pricing first (self-hosted models),
+    then falls back to catalog. This enables cost tracking for native
+    claude-native sessions using self-hosted endpoints.
 
     :param model: API model id from a transcript ``message.model``,
         e.g. ``"claude-opus-4-8"`` or ``"databricks-claude-sonnet-4-6"``.
+    :param provider_config: Parsed provider configuration for this transcript
+        scan.
+    :param provider_config_fingerprint: Digest used to invalidate pricing when
+        the provider configuration changes.
     :returns: The model's :class:`ModelPricing`, or ``None`` when pricing
         is unavailable (network error / model absent from the catalog),
         so the caller skips that message's cost.
     """
     cached = _TRANSCRIPT_PRICING_CACHE.get(model)
-    if cached is not None:
-        return cached
-    from omnigent.llms.context_window import fetch_model_pricing
+    if cached is not None and cached[0] == provider_config_fingerprint:
+        return cached[1]
+    from omnigent.llms.context_window import fetch_model_pricing_with_provider
 
-    pricing = fetch_model_pricing(model)
+    # For claude-native transcript pricing, assume claude-native harness
+    pricing = fetch_model_pricing_with_provider(
+        model, provider_config=provider_config, harness="claude-native"
+    )
     if pricing is not None:
-        _TRANSCRIPT_PRICING_CACHE[model] = pricing
+        _TRANSCRIPT_PRICING_CACHE[model] = (provider_config_fingerprint, pricing)
     return pricing
 
 
@@ -2562,6 +2598,10 @@ def compute_transcript_cumulative_cost(
         start_line=0,
     )
     from omnigent.llms.context_window import compute_llm_cost
+    from omnigent.onboarding.provider_config import load_config
+
+    provider_config = load_config()
+    provider_config_fingerprint = hashlib.sha256(repr(provider_config).encode("utf-8")).digest()
 
     # Per-``requestId`` cost (USD); last priceable record per id wins so a
     # response written across multiple transcript records is counted once.
@@ -2586,7 +2626,11 @@ def compute_transcript_cumulative_cost(
         model = _model_from_transcript_entry(entry)
         if model is None:
             continue
-        pricing = _transcript_model_pricing(model)
+        pricing = _transcript_model_pricing(
+            model,
+            provider_config=provider_config,
+            provider_config_fingerprint=provider_config_fingerprint,
+        )
         if pricing is None:
             continue
         request_id = entry.get("requestId")
@@ -3509,24 +3553,17 @@ def inject_user_message(
         # verification would trivially "pass". Submit blind as before.
         return
     # Verify the submit took: a successful Enter clears the input box.
-    # If the draft is still sitting there the Enter was swallowed into
-    # the paste burst as a newline — re-send it (the retry lands well
-    # after the burst, so it submits). Each Enter only fires while the
-    # draft is verifiably still present, so a retry can never hit an
-    # empty prompt or a permission dialog of the started turn.
-    deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
-    last_enter = time.monotonic()
-    while time.monotonic() < deadline:
-        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-        pane = _capture_pane(info["socket_path"], info["tmux_target"])
-        if not _draft_in_input_box(pane, needle):
-            return
-        if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
-            _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
-            last_enter = time.monotonic()
-    raise RuntimeError(
-        f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
-        "(the draft is still in the input box). The message was not delivered."
+    # A draft still sitting there means the Enter was swallowed into the
+    # paste burst as a newline, so it is re-sent until the box clears.
+    _verify_draft_submitted(
+        info["socket_path"],
+        info["tmux_target"],
+        needle,
+        failure_message=(
+            "Claude Code hasn't accepted the message yet — your text is still in the "
+            "sub-agent's input box. Open the Subagents panel and press Enter to send it. "
+            f"Waited {_SUBMIT_VERIFY_TIMEOUT_S:g}s."
+        ),
     )
 
 
@@ -3726,28 +3763,18 @@ def inject_slash_command(
     time.sleep(_PASTE_SETTLE_S)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     if draft_seen:
-        # Re-send only while the command verifiably still sits in the box —
-        # a one-poll-stale retry can at worst hit the empty composer (no-op)
-        # or our own confirm dialog (the intended answer), never a foreign
-        # surface. The command leaving the box is the submit signal; the
-        # dialog replacing the composer counts, since submission pops it.
-        deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
-        last_enter = time.monotonic()
-        submitted = False
-        while time.monotonic() < deadline:
-            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-            if not _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
-                submitted = True
-                break
-            if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
-                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-                last_enter = time.monotonic()
-        if not submitted:
-            raise RuntimeError(
-                f"Claude Code did not accept the slash command within "
-                f"{_SUBMIT_VERIFY_TIMEOUT_S}s (the command is still in the "
-                "input box). The command was not delivered."
-            )
+        # The command leaving the box is the submit signal; the dialog
+        # replacing the composer counts, since submission pops it.
+        _verify_draft_submitted(
+            socket_path,
+            tmux_target,
+            needle,
+            failure_message=(
+                "Claude Code hasn't accepted the slash command yet — it is still in the "
+                "sub-agent's input box. Open the Subagents panel and press Enter to send it."
+                f" Waited {_SUBMIT_VERIFY_TIMEOUT_S:g}s."
+            ),
+        )
     if dialog_hint is not None:
         _confirm_tui_dialog(socket_path, tmux_target, hint=dialog_hint)
 
@@ -4453,6 +4480,27 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
     if _PASTED_PLACEHOLDER_PREFIX in tail:
         return True
     return bool(needle) and needle in tail
+
+
+def _verify_draft_submitted(
+    socket_path: str,
+    tmux_target: str,
+    needle: str,
+    *,
+    failure_message: str,
+) -> None:
+    """Re-send Enter while the draft verifiably remains in the input box."""
+    deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
+    last_enter = time.monotonic()
+    while time.monotonic() < deadline:
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+        # Best-effort: re-check the draft before each Enter to narrow the capture-to-send race.
+        if not _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
+            return
+        if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+            last_enter = time.monotonic()
+    raise RuntimeError(failure_message)
 
 
 def _format_terminal_failure_tail(pane: str) -> str:
