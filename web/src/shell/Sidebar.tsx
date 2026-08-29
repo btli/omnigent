@@ -3693,13 +3693,18 @@ function ConversationRow({
   // (Chromium requires kPanLeft for deltaX>0, i.e. a rightward finger), so a
   // left action — fired by a leftward finger = a rightward pan — must
   // withhold pan-right and may cede pan-left, and vice versa.
+  //
+  // This must be a single composed `touch-action` VALUE, applied inline:
+  // Tailwind's `touch-pan-y` + `touch-pan-left` are same-property utilities
+  // that don't compose — stylesheet order picks one, so the one-sided grant
+  // never reached the browser as `pan-y pan-left`.
   const swipeTouchAction = !swipeEnabled
     ? undefined
     : swipeActions.left !== "none" && swipeActions.right !== "none"
-      ? "touch-pan-y"
+      ? "pan-y"
       : swipeActions.left !== "none"
-        ? "touch-pan-y touch-pan-left"
-        : "touch-pan-y touch-pan-right";
+        ? "pan-y pan-left"
+        : "pan-y pan-right";
 
   return (
     // Drag props on the <li> so the whole row is grabbable; `isDragging` dims
@@ -3720,13 +3725,14 @@ function ConversationRow({
         isSwiping && "mx-1",
         isDragging && "opacity-40",
         gesture.phase === "armed" && "z-10 scale-[1.01] shadow-sm",
-        // Keep vertical scrolling native while claiming the horizontal axis for
-        // the swipe: without this the browser can take the horizontal pan (or
-        // back-navigation gesture) and cancel the gesture mid-drag. Only where
-        // a swipe can actually fire, so rows without one keep default behavior.
-        !ownsPointer && swipeTouchAction,
         ownsPointer && "touch-none",
       )}
+      // Keep vertical scrolling native while claiming the horizontal axis for
+      // the swipe: without this the browser can take the horizontal pan (or
+      // back-navigation gesture) and cancel the gesture mid-drag. Only where
+      // a swipe can actually fire, so rows without one keep default behavior.
+      // Inline style, not utility classes — see the swipeTouchAction comment.
+      style={!ownsPointer && swipeTouchAction ? { touchAction: swipeTouchAction } : undefined}
     >
       {/* Clip the hint to the vacated strip so it cannot overlap the moving
           surface. The threshold also scales the glyph, avoiding a color-only cue. */}

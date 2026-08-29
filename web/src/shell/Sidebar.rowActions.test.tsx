@@ -1579,31 +1579,32 @@ describe("touch swipe actions", () => {
     // CSS pan directions name the scroll direction (reverse of finger travel):
     // a left action fires on a leftward finger = a rightward pan, so pan-left
     // is the inert grant for it.
+    //
+    // Assert the effective touch-action VALUE, not class names: Tailwind's
+    // touch-pan-* utilities all set the same property and don't compose, so a
+    // "touch-pan-y touch-pan-left" class pair never reached the browser as
+    // `pan-y pan-left` — the composed value must be a single inline style.
+    const touchAction = () => getComputedStyle(li()).touchAction;
     const first = renderSidebar();
     const li = conversationRow;
-    expect(li()).toHaveClass("touch-pan-y");
-    expect(li().classList.contains("touch-pan-left")).toBe(true);
-    expect(li()).not.toHaveClass("touch-pan-right");
+    expect(touchAction()).toBe("pan-y pan-left");
     first.unmount();
 
     writeSwipeActions({ left: "none", right: "delete" });
     const second = renderSidebar();
-    expect(li()).toHaveClass("touch-pan-y");
-    expect(li().classList.contains("touch-pan-right")).toBe(true);
-    expect(li()).not.toHaveClass("touch-pan-left");
+    expect(touchAction()).toBe("pan-y pan-right");
     second.unmount();
 
     writeSwipeActions({ left: "archive", right: "delete" });
     const third = renderSidebar();
-    expect(li()).toHaveClass("touch-pan-y");
-    expect(li()).not.toHaveClass("touch-pan-left");
-    expect(li()).not.toHaveClass("touch-pan-right");
+    expect(touchAction()).toBe("pan-y");
     third.unmount();
 
     // With both directions inert, the browser keeps its horizontal gestures.
     writeSwipeActions({ left: "none", right: "none" });
     renderSidebar();
-    expect(li()).not.toHaveClass("touch-pan-y");
+    expect(touchAction()).toBe("auto");
+    expect(li().style.touchAction).toBe("");
   });
 
   it("does not start a swipe from a press on the row's kebab control", () => {
