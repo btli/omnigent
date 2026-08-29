@@ -3240,7 +3240,7 @@ async def test_cold_start_agy_conversation_accepts_a_locally_owned_cascade(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("freshness", ["fresh", "stale"])
+@pytest.mark.parametrize("freshness", ["fresh", "stale", "missing"])
 async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
     freshness: str,
     tmp_path: Path,
@@ -3297,11 +3297,12 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
     fingerprint = codex_app_mod.codex_catalog_fingerprint(
         codex_app_mod.resolve_native_codex_launch(model=None)
     )
-    model_catalog_store.write_catalog(
-        "codex-native",
-        fingerprint,
-        [{"id": "gpt-5.4-yesterday", "model": "gpt-5.4-yesterday", "isDefault": True}],
-    )
+    if freshness != "missing":
+        model_catalog_store.write_catalog(
+            "codex-native",
+            fingerprint,
+            [{"id": "gpt-5.4-yesterday", "model": "gpt-5.4-yesterday", "isDefault": True}],
+        )
     if freshness == "stale":
         path = model_catalog_store.catalog_path("codex-native", fingerprint)
         old = time.time() - (model_catalog_store.CATALOG_STALE_AFTER_S + 60)
@@ -3477,6 +3478,8 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
     assert build_calls, "the app-server was never built"
     if freshness == "fresh":
         assert build_calls[0]["model"] == "gpt-5.4-yesterday"
+    elif freshness == "missing":
+        assert build_calls[0]["model"] == "gpt-5.6-terra"
     else:
         assert build_calls[0]["model"] is None, (
             f"a stale default was still pinned: {build_calls[0]['model']!r}"
