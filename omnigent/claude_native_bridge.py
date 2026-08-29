@@ -3070,6 +3070,90 @@ def _cap_hook_failure_detail(text: str, *, raw_truncated: bool) -> str:
     return text
 
 
+# A shorter surviving remnant of a matched credential is treated as noise.
+_HOOK_FAILURE_REMNANT_TOKEN_MIN_CHARS = 4
+
+
+def _redaction_removed_fragments(original: str, redacted: str) -> list[str] | None:
+    """
+    Recover the fragments of *original* that redaction replaced with markers.
+
+    :param original: Text before :func:`redact_secrets`.
+    :param redacted: The same text after :func:`redact_secrets`.
+    :returns: The removed fragments in order, or ``None`` when the two texts
+        cannot be aligned unambiguously.
+    """
+    fragments: list[str] = []
+    original_index = 0
+    redacted_index = 0
+    while redacted_index < len(redacted):
+        if redacted.startswith(_HOOK_FAILURE_REDACTION_MARKER, redacted_index):
+            redacted_index += len(_HOOK_FAILURE_REDACTION_MARKER)
+            next_marker = redacted.find(_HOOK_FAILURE_REDACTION_MARKER, redacted_index)
+            preserved = (
+                redacted[redacted_index:]
+                if next_marker < 0
+                else redacted[redacted_index:next_marker]
+            )
+            if not preserved:
+                if next_marker >= 0:
+                    return None
+                fragments.append(original[original_index:])
+                original_index = len(original)
+                break
+            resume = original.find(preserved, original_index)
+            if resume < 0:
+                return None
+            fragments.append(original[original_index:resume])
+            original_index = resume
+        elif (
+            original_index < len(original) and original[original_index] == redacted[redacted_index]
+        ):
+            original_index += 1
+            redacted_index += 1
+        else:
+            return None
+    return fragments
+
+
+def _window_with_detection_remnants_redacted(
+    window_canonical: str, detection_canonical: str
+) -> str | None:
+    """
+    Accept the head/tail window unless the detection match survives inside it.
+
+    The head/tail window may bisect the very credential the detection pass
+    matched, leaving an un-redacted remnant (e.g. a prefix that no longer
+    meets its family's length floor). Each removed detection fragment is
+    checked against the window's redacted form; a surviving remnant token is
+    replaced with the early redaction marker instead of discarding the tail.
+
+    :param window_canonical: Canonicalized head/tail window text.
+    :param detection_canonical: Canonicalized detection-window text whose
+        redaction is known to change it.
+    :returns: The window with remnants redacted, or ``None`` when the
+        detection redaction cannot be aligned and the caller must fall back
+        to the detection window.
+    """
+    neutral_detection = _HOOK_FAILURE_PLANTED_REDACTION_RE.sub("(REDACTED)", detection_canonical)
+    fragments = _redaction_removed_fragments(neutral_detection, redact_secrets(neutral_detection))
+    if fragments is None:
+        return None
+    neutral_window = _HOOK_FAILURE_PLANTED_REDACTION_RE.sub("(REDACTED)", window_canonical)
+    window_redacted = redact_secrets(neutral_window)
+    result = window_canonical
+    # A remnant is a surviving window token that is part of a removed
+    # fragment — windowing can keep either a whole boundary token of a
+    # multi-token match or a truncated prefix of a single bisected token,
+    # so the containment test runs window-token-in-fragment.
+    for token in window_redacted.split():
+        if len(token) < _HOOK_FAILURE_REMNANT_TOKEN_MIN_CHARS or "REDACTED" in token:
+            continue
+        if any(token in fragment for fragment in fragments):
+            result = result.replace(token, _HOOK_FAILURE_EARLY_REDACTION_MARKER)
+    return result
+
+
 def _sanitize_hook_failure_detail(text: str) -> str | None:
     """
     Scrub and cap untrusted hook failure text for a parent session ``output``.
@@ -3104,13 +3188,19 @@ def _sanitize_hook_failure_detail(text: str) -> str | None:
             matched_detection = detection_canonical
     if matched_detection is not None:
         # The detection window redacts, proving matching works on this input.
-        # Keep the full head/tail window so the actionable tail survives —
-        # unless windowing itself bisected the match, in which case fall back
-        # to the detection window, whose redaction is proven.
+        # Keep the full head/tail window so the actionable tail survives:
+        # the window is accepted iff the matched credential is absent from it
+        # or redacted inside it, with surviving remnants of the match
+        # (windowing can bisect a credential below its length floor) redacted
+        # in place rather than discarding the tail. Only when the detection
+        # redaction cannot be aligned does the proven detection slice win.
         canonical = matched_detection
         if raw_preview:
-            window_canonical = _canonicalize_hook_failure_detail(raw_preview)
-            if redact_secrets(window_canonical) != window_canonical:
+            window_canonical = _window_with_detection_remnants_redacted(
+                _canonicalize_hook_failure_detail(raw_preview),
+                matched_detection,
+            )
+            if window_canonical is not None:
                 canonical = window_canonical
     elif preview_truncated and not raw_preview:
         canonical = _canonicalize_hook_failure_detail(detection_window)

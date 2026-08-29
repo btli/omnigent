@@ -7712,6 +7712,27 @@ def test_sanitize_hook_failure_detail_keeps_tail_after_head_secret() -> None:
     assert _HOOK_FAILURE_DETAIL_TRUNCATION_MARKER in detail
 
 
+def test_sanitize_hook_failure_detail_keeps_tail_after_long_leading_token() -> None:
+    """A long leading credential stripped by windowing cannot drop the tail."""
+    text = "Bearer " + "A" * 5000 + "\nFinalCause: model_not_found"
+    detail = _sanitize_hook_failure_detail(text)
+    assert detail is not None
+    assert "AAAA" not in detail
+    assert "FinalCause: model_not_found" in detail
+    assert _HOOK_FAILURE_DETAIL_TRUNCATION_MARKER in detail
+
+
+def test_sanitize_hook_failure_detail_redacts_bisected_credential_prefix() -> None:
+    """A window-bisected credential prefix is redacted, keeping the tail."""
+    text = "ghp_" + "X" * 10 + " " + "x" * 4500 + "\npassword=xyz\nFinalCause: model_not_found"
+    detail = _sanitize_hook_failure_detail(text)
+    assert detail is not None
+    assert "ghp_" not in detail
+    assert "xyz" not in detail
+    assert "FinalCause: model_not_found" in detail
+    assert _HOOK_FAILURE_DETAIL_TRUNCATION_MARKER in detail
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
