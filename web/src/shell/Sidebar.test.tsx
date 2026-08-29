@@ -729,7 +729,7 @@ describe("Sidebar session list", () => {
     expect(selectSessions.parentElement).toHaveClass(
       "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
       "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-focus-within/header:opacity-100",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100",
       "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100",
     );
 
@@ -1422,7 +1422,7 @@ describe("Sidebar collapsed section count pill", () => {
     expect(sessionsOuter).toHaveClass(
       "[@media((hover:hover)_and_(pointer:fine))]:md:pointer-events-none",
       "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pointer-events-auto",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-focus-within/header:pointer-events-auto",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:pointer-events-auto",
       "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:pointer-events-auto",
     );
     // …while the inner hover-revealed wrapper carries opacity only — a
@@ -1434,6 +1434,15 @@ describe("Sidebar collapsed section count pill", () => {
     expect(Array.from(sessionsInner.classList).some((c) => c.includes("pointer-events-none"))).toBe(
       false,
     );
+    // Focus reveals are scoped to focus WITHIN the control cluster — a bare
+    // header-wide focus-within on either node would paint hit-testable
+    // controls over the still-visible badges when the header button itself
+    // holds keyboard focus (the badges' fades are cluster-scoped too).
+    for (const node of [sessionsOuter, sessionsInner]) {
+      expect(Array.from(node.classList).some((c) => c.includes("group-focus-within/header"))).toBe(
+        false,
+      );
+    }
     // The always-visible filter re-enables hit-testing for itself inside the
     // gated box, so it stays clickable at rest.
     const filterWrapper = screen.getByTestId("session-filter").closest(".pointer-events-auto")!;
