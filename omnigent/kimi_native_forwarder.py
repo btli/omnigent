@@ -1167,12 +1167,14 @@ class _KimiUsageSync:
     def note_new_wire(self) -> None:
         """Adopt a freshly discovered wire log.
 
-        Only the per-log view resets (context occupancy, delivery dedup); the
-        cumulative totals and model carry forward — they are session-scoped,
-        and a zero-reset would make every later post a server-ignored
-        decrease. The billed mark needs no reset: it is scoped to its wire
-        identity, so a different log's rows never compare against it.
+        Only the per-log view resets (context occupancy, request attribution,
+        delivery dedup); the cumulative totals and model carry forward — they
+        are session-scoped, and a zero-reset would make every later post a
+        server-ignored decrease. The billed mark needs no reset: it is scoped
+        to its wire identity, so a different log's rows never compare against
+        it.
         """
+        self._pending_models.clear()
         self._context_tokens = None
         self._last_posted = None
 
@@ -1692,11 +1694,18 @@ async def forward_kimi_wire_to_session(
                     # A new wire restarts line numbering, so a stale edge id
                     # could silently dedupe the new wire's edge at the same line.
                     last_edge_id = None
+                    last_assistant_text = ""
+                    tools_in_flight = 0
+                    dropped_edge_status = None
+                    dropped_edge_output = ""
+                    poison_id = None
+                    poison_attempts = 0
                     # Cursor resets; cumulative usage totals carry forward.
                     usage_sync.note_new_wire()
                     _persist()
             all_posted = True
             pane_is_alive = pane_alive() if pane_alive is not None else None
+            dead_tail_pending = False
             if wire_path is not None and wire_path.exists():
                 try:
                     wire_stat = wire_path.stat()
@@ -1716,6 +1725,12 @@ async def forward_kimi_wire_to_session(
                         last_observed_size = None
                         last_edge_id = None
                         last_prompt_id = None
+                        last_assistant_text = ""
+                        tools_in_flight = 0
+                        dropped_edge_status = None
+                        dropped_edge_output = ""
+                        poison_id = None
+                        poison_attempts = 0
                         wire_dev, wire_ino = generation
                         usage_sync.note_wire_restarted(str(wire_path))
                         last_wire_activity = time.monotonic()
@@ -1735,6 +1750,12 @@ async def forward_kimi_wire_to_session(
                     offset,
                     last_line,
                     include_unterminated=stable_dead_tail,
+                )
+                dead_tail_pending = (
+                    pane_is_alive is False
+                    and not stable_dead_tail
+                    and observed_size is not None
+                    and new_offset < observed_size
                 )
                 observed_size_changed = (
                     observed_size is not None and observed_size != last_observed_size
@@ -1756,6 +1777,12 @@ async def forward_kimi_wire_to_session(
                         # would reject its usage rows up to the old watermark.
                         last_edge_id = None
                         last_prompt_id = None
+                        last_assistant_text = ""
+                        tools_in_flight = 0
+                        dropped_edge_status = None
+                        dropped_edge_output = ""
+                        poison_id = None
+                        poison_attempts = 0
                         usage_sync.note_wire_restarted(str(wire_path))
                     last_seen_offset = new_offset
                     last_wire_activity = time.monotonic()
@@ -1776,6 +1803,12 @@ async def forward_kimi_wire_to_session(
                     # and reader-restart paths do.
                     last_edge_id = None
                     last_prompt_id = None
+                    last_assistant_text = ""
+                    tools_in_flight = 0
+                    dropped_edge_status = None
+                    dropped_edge_output = ""
+                    poison_id = None
+                    poison_attempts = 0
                     usage_sync.note_wire_restarted(str(wire_path))
                     last_wire_activity = time.monotonic()
                     last_wire_activity_wall = time.time()
@@ -1976,9 +2009,10 @@ async def forward_kimi_wire_to_session(
             # that has since vanished (the totals are already persisted, so a
             # missing log must not orphan an undelivered post forever).
             await usage_sync.sync(client)
-            if turn_open and pane_is_alive is False:
+            if turn_open and pane_is_alive is False and not dead_tail_pending:
                 # The pane died mid-turn: no further wire rows are coming, so
-                # post the failed edge instead of stranding the session.
+                # post the failed edge instead of stranding the session. Give
+                # a final unterminated row its stable-size acceptance poll first.
                 await _close_turn("failed", "pane-death")
             elif (
                 turn_open

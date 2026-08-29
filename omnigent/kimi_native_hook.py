@@ -318,7 +318,11 @@ def _request_web_approval(
             _PERMISSION_REQUEST_TIMEOUT_S,
             remaining - _PERMISSION_DEADLINE_MARGIN_S,
         )
-        timeout = httpx.Timeout(timeout_s, connect=min(_SURFACE_TIMEOUT_S, timeout_s))
+        connect_timeout_s = min(_SURFACE_TIMEOUT_S, timeout_s / 2)
+        timeout = httpx.Timeout(
+            timeout_s - connect_timeout_s,
+            connect=connect_timeout_s,
+        )
         try:
             with httpx.Client(headers=headers, timeout=timeout) as client:
                 resp = client.post(url, json=body)

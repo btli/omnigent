@@ -458,10 +458,13 @@ def test_permission_read_timeout_leaves_global_deadline_margin(
 
     body = {"_omnigent_elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
     assert kimi_native_hook._request_web_approval("http://server", {}, body) == "allow"
-    assert timeouts[0].read == (
+    request_budget = (
         kimi_native_hook._PERMISSION_RETRY_WINDOW_S
         - kimi_native_hook._PERMISSION_DEADLINE_MARGIN_S
     )
+    assert timeouts[0].connect is not None
+    assert timeouts[0].read is not None
+    assert timeouts[0].connect + timeouts[0].read <= request_budget
 
 
 def test_permission_poll_budget_is_below_kimi_hook_ceiling() -> None:

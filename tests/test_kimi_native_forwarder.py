@@ -1489,6 +1489,18 @@ class TestUsageSync:
         assert state.by_model["system.ai.kimi-k3"]["input_other"] == 30
         assert state.by_model["system.ai.kimi-k2.7"]["input_other"] == 9
 
+    def test_wire_restart_discards_pending_model_attribution(self, tmp_path: Path) -> None:
+        sync = _sync(tmp_path)
+        sync.note_model("system.ai.kimi-k3")
+
+        sync.note_wire_restarted("/w/a")
+        sync.note_model("system.ai.kimi-k2.7")
+        sync.record(_usage_item(1, input_other=9), wire="/w/a")
+
+        state, trusted = _read_usage_state(tmp_path)
+        assert trusted is True and state is not None
+        assert state.by_model == {"system.ai.kimi-k2.7": _segment(input_other=9)}
+
     @pytest.mark.asyncio
     async def test_cost_omitted_when_any_segment_unpriceable(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -2062,6 +2074,37 @@ class TestForwardLoopEdges:
 
         assert self.statuses == [("idle", "")]
 
+    async def test_inode_replacement_discards_prior_assistant_text(self, tmp_path: Path) -> None:
+        rows = [_prompt_row("new prompt"), _turn_ended_row("completed")]
+
+        def _seed(bridge: Path, wire: Path) -> None:
+            old_rows = [_prompt_row("old prompt"), _assistant_row("old", "OLD ANSWER")]
+            old_text = "".join(json.dumps(row) + "\n" for row in old_rows)
+            wire.write_text(old_text, encoding="utf-8")
+            old_stat = wire.stat()
+            _write_state(
+                bridge,
+                _ForwardState(
+                    wire_path=str(wire),
+                    last_line=2,
+                    offset=len(old_text.encode()),
+                    turn_open=True,
+                    last_assistant_text="OLD ANSWER",
+                    last_seen_offset=len(old_text.encode()),
+                    wire_dev=old_stat.st_dev,
+                    wire_ino=old_stat.st_ino,
+                ),
+            )
+            replacement = wire.with_suffix(".replacement")
+            replacement.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+            )
+            replacement.replace(wire)
+
+        await _drive_loop_until(tmp_path, rows, lambda: bool(self.statuses), prepare=_seed)
+
+        assert self.statuses == [("idle", "")]
+
     async def test_turn_ended_completed_posts_idle_edge_with_output(self, tmp_path: Path) -> None:
         rows = [_prompt_row(), _assistant_row("u1", "done!"), _turn_ended_row("completed")]
         await _drive_loop_until(tmp_path, rows, lambda: bool(self.statuses))
@@ -2079,6 +2122,22 @@ class TestForwardLoopEdges:
             tmp_path, rows, lambda: bool(self.statuses), pane_alive=lambda: False
         )
         assert self.statuses == [("failed", "so far")]
+
+    async def test_dead_pane_waits_for_unterminated_terminal_row(self, tmp_path: Path) -> None:
+        rows = [_prompt_row(), _turn_ended_row("completed")]
+
+        def _remove_final_newline(_bridge: Path, wire: Path) -> None:
+            wire.write_bytes(wire.read_bytes()[:-1])
+
+        await _drive_loop_until(
+            tmp_path,
+            rows,
+            lambda: bool(self.statuses),
+            pane_alive=lambda: False,
+            prepare=_remove_final_newline,
+        )
+
+        assert self.statuses == [("idle", "")]
 
     async def test_quiescence_closes_turn_without_edge_as_idle(self, tmp_path: Path) -> None:
         # A wedged turn writes no wire edge; the quiet-wire fallback closes it.
