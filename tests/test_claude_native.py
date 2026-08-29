@@ -10214,6 +10214,15 @@ def test_claude_catalog_selection_keeps_loud_failure_without_a_claude_tier(
             "claude-3-opus-20240307",
             id="date-tiebreak-within-generation",
         ),
+        pytest.param(
+            [
+                {"id": "v2-system.ai.claude-opus-4-8", "model": "v2-system.ai.claude-opus-4-8"},
+                {"id": "v1-system.ai.claude-opus-5", "model": "v1-system.ai.claude-opus-5"},
+            ],
+            "fable",
+            "v1-system.ai.claude-opus-5",
+            id="unstripped-provider-qualifier-digits-do-not-count",
+        ),
     ],
 )
 def test_claude_tier_ladder_prefers_current_generation_over_dated_legacy_ids(
@@ -10251,6 +10260,57 @@ def test_probe_error_classifies_established_auth_messages_as_auth(stderr: bytes)
     error = claude_native._claude_probe_process_error(stderr)
 
     assert error.kind is model_catalog_store.CatalogRefreshFailureKind.AUTH
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        pytest.param(b"retry after 401 seconds", id="401-retry-delay"),
+        pytest.param(b"connect 10.0.4.1:401 refused", id="401-ip-port"),
+        pytest.param(b"token bucket lease expired", id="rate-limit-token-bucket"),
+    ],
+)
+def test_probe_error_keeps_non_auth_outages_out_of_the_auth_class(stderr: bytes) -> None:
+    """A 401 without auth context and a rate-limit token bucket stay OTHER."""
+    error = claude_native._claude_probe_process_error(stderr)
+
+    assert error.kind is model_catalog_store.CatalogRefreshFailureKind.OTHER
+
+
+def test_fold_notice_is_silent_for_an_exact_picker_id_resolution() -> None:
+    """Resolving a picker id to its own [1m] custom option substitutes nothing."""
+    assert (
+        claude_native.claude_model_fold_notice(
+            "sonnet_5",
+            "system.ai.claude-sonnet-5[1m]",
+            "system.ai.claude-sonnet-5[1m]",
+        )
+        is None
+    )
+
+
+def test_picker_id_resolution_to_its_1m_custom_option_launches_without_a_banner() -> None:
+    """The persisted custom-slot pick must not fire a destructive substitution notice."""
+    from omnigent.claude_native import ClaudeNativeUcodeConfig
+
+    config = ClaudeNativeUcodeConfig(
+        env={
+            "ANTHROPIC_BASE_URL": "https://gateway.example/anthropic",
+            "ANTHROPIC_CUSTOM_MODEL_OPTION": "system.ai.claude-sonnet-5[1m]",
+        }
+    )
+    rows: list[dict[str, object]] = [
+        {"id": "system.ai.claude-sonnet-5[1m]", "model": "system.ai.claude-sonnet-5[1m]"}
+    ]
+
+    launch_model, notice = claude_native.resolve_claude_native_catalog_selection(
+        "sonnet_5",
+        rows,
+        config,
+    )
+
+    assert launch_model == "system.ai.claude-sonnet-5[1m]"
+    assert notice is None
 
 
 def test_claude_catalog_selection_rejects_an_unrecognized_claude_looking_id() -> None:
