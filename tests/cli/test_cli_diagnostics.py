@@ -572,6 +572,52 @@ def test_redact_secrets_is_idempotent_for_keyed_values(text: str, expected: str)
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
+        ("Bearer [REDACTED]actualsecret", "Bearer [REDACTED]"),
+        ("password=[REDACTED]actualsecret", "password=[REDACTED]"),
+    ],
+    ids=["bearer", "env"],
+)
+def test_redact_secrets_scrubs_marker_glued_values(text: str, expected: str) -> None:
+    """A planted marker glued to a value cannot shield the glued suffix."""
+    once = cli_diagnostics.redact_secrets(text)
+    assert once == expected
+    assert cli_diagnostics.redact_secrets(once) == once
+
+
+@pytest.mark.parametrize("quote", ['"', "'"])
+def test_redact_secrets_scrubs_quoted_multiline_env_value(quote: str) -> None:
+    """A quoted env value runs to its closing quote across a folded newline."""
+    text = f"DATABASE_PASSWORD={quote}line-one\n line-two{quote} status=401"
+    scrubbed = cli_diagnostics.redact_secrets(text)
+    assert scrubbed == f"DATABASE_PASSWORD={quote}[REDACTED]{quote} status=401"
+    assert "line-one" not in scrubbed
+    assert "line-two" not in scrubbed
+    assert cli_diagnostics.redact_secrets(scrubbed) == scrubbed
+
+
+def test_redact_secrets_caps_unquoted_authorization_folds() -> None:
+    """An unquoted Authorization value folds once; the traceback survives."""
+    text = (
+        "Authorization: Bearer abc\n"
+        "  trace-line-one\n"
+        "  trace-line-two\n"
+        "  trace-line-three\n"
+        "X-Next: ok"
+    )
+    assert cli_diagnostics.redact_secrets(text) == (
+        "Authorization: [REDACTED]\n  trace-line-two\n  trace-line-three\nX-Next: ok"
+    )
+
+
+def test_redact_secrets_preserves_gapless_bearer_prose() -> None:
+    """Prose continuing the anchor word ("bearers") is not widened into a value."""
+    text = "the bearers of these tokens"
+    assert cli_diagnostics.redact_secrets(text) == text
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
         ("DATABASE_PASSWORD=hunter2", "DATABASE_PASSWORD=[REDACTED]"),
         ("API_KEY=a1b2c3", "API_KEY=[REDACTED]"),
         ("Bearer abc123", "Bearer [REDACTED]"),

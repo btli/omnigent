@@ -7712,6 +7712,21 @@ def test_sanitize_hook_failure_detail_keeps_tail_after_head_secret() -> None:
     assert _HOOK_FAILURE_DETAIL_TRUNCATION_MARKER in detail
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Bearer [REDACTED]actualsecret", "Bearer [REDACTED]"),
+        ("password=[REDACTED]actualsecret", "password=[REDACTED]"),
+    ],
+    ids=["bearer", "env"],
+)
+def test_sanitize_hook_failure_detail_redacts_marker_glued_values(
+    text: str, expected: str
+) -> None:
+    """A planted marker glued to a value leaves no un-redacted remnant."""
+    assert _sanitize_hook_failure_detail(text) == expected
+
+
 def test_sanitize_hook_failure_detail_keeps_newline_free_raw_tail() -> None:
     """A newline-free raw tail drops its partial token but keeps complete words."""
     text = (
@@ -8055,8 +8070,8 @@ def test_sanitize_hook_failure_detail_redacts_keyed_env_values(text: str, expect
         ("bearer\ufeffabcdefghijk", "bearer[REDACTED]"),
         ("bearer\u2060abcdefghijk", "bearer[REDACTED]"),
         ("bearer\u200dabcdefghijk", "bearer[REDACTED]"),
-        ("Bearer\u2009of bad news", "Bearer[REDACTED] bad news"),
-        ("bearer\ufeffof bad news", "bearer[REDACTED] bad news"),
+        ("Bearer\u2009of bad news", "Bearer [REDACTED] bad news"),
+        ("bearer\ufeffof bad news", "bearerof bad news"),
         ("Bearer\nof bad news", "Bearer\nof bad news"),
     ],
     ids=[

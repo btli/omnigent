@@ -121,11 +121,16 @@ _REDACTED = "[REDACTED]"
 _MAX_UNTERMINATED_AUTHORIZATION_FOLDS = 1
 _MAX_CREDENTIAL_WORD_GAPS = 1
 _MAX_ENV_VALUE_NEWLINE_FOLDS = 1
-# Keyed anchors (env-style ``key=``/``key:`` and ``Bearer``) redact any
-# non-empty value: the key names the value sensitive, so no length floor
-# applies (parity with the regexes this scanner replaced). Length floors
-# remain only on the unkeyed fixed-prefix families.
+# Keyed anchors (env-style ``key=``/``key:`` and gap-separated ``Bearer``)
+# redact any non-empty value: the key names the value sensitive, so no
+# length floor applies (parity with the regexes this scanner replaced).
+# Length floors remain only on the unkeyed fixed-prefix families.
 _KEYED_VALUE_MIN_LENGTH = 1
+# A Bearer value glued directly to the anchor (no word gap) is either an
+# obfuscated credential whose splitters were stripped upstream or ordinary
+# prose like "bearers" — the old floor separates the two shapes.
+_GAPLESS_BEARER_MIN_LENGTH = 8
+_KEYED_VALUE_ALPHABET = "._~+/=-"
 _WORD_GAP_TEXT = (
     "\t \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007"
     "\u2008\u2009\u200a\u202f\u205f\u3000"
@@ -293,6 +298,37 @@ def _bearer_value_start(text: str, anchor_end: int) -> tuple[int, int]:
     return preserved_end, scan_start
 
 
+def _is_keyed_value_character(char: str) -> bool:
+    """Return whether *char* belongs to the keyed-value span alphabet."""
+    return _is_ascii_credential_character(char) or char in _KEYED_VALUE_ALPHABET
+
+
+def _marker_glue_span_start(text: str, start: int) -> int | None:
+    """
+    Resolve a redaction marker sitting at a keyed value's start.
+
+    :param text: Text being scanned.
+    :param start: Position of the keyed value.
+    :returns: The position span scanning must start from, or ``None`` when
+        the value is exactly this module's own completed ``[REDACTED]``
+        marker (already redacted on a previous pass; re-scanning would break
+        idempotence for double-redacting log paths). A marker glued directly
+        to span-alphabet text is attacker input: scanning resumes after the
+        marker so the whole glued token is consumed into one redacted span
+        instead of leaving an un-redacted suffix behind.
+    """
+    for marker in (_REDACTED, "(REDACTED)"):
+        if not text.startswith(marker, start):
+            continue
+        boundary = start + len(marker)
+        if boundary < len(text) and _is_keyed_value_character(text[boundary]):
+            return boundary
+        if marker == _REDACTED:
+            return None
+        break
+    return start
+
+
 def _redact_scanned_credentials(text: str) -> str:
     """Redact prefixed credentials with bounded, forward-only span scans."""
     parts: list[str] = []
@@ -331,17 +367,16 @@ def _redact_scanned_credentials(text: str) -> str:
         if family == "bearer":
             if not scan_bearer:
                 continue
+            gapped = anchor_end < len(text) and _is_word_gap(text[anchor_end])
             preserved_end, body_start = _bearer_value_start(text, anchor_end)
-            if text.startswith(_REDACTED, body_start):
-                # Our own emitted marker: the first pass already consumed
-                # exactly this value, so a repeated pass must not re-scan it
-                # (idempotence for double-redacting log paths).
+            span_start = _marker_glue_span_start(text, body_start)
+            if span_start is None:
                 continue
             span_end = _credential_span_end(
                 text,
-                body_start,
-                alphabet="._~+/=-",
-                minimum=_KEYED_VALUE_MIN_LENGTH,
+                span_start,
+                alphabet=_KEYED_VALUE_ALPHABET,
+                minimum=_KEYED_VALUE_MIN_LENGTH if gapped else _GAPLESS_BEARER_MIN_LENGTH,
             )
             if span_end is not None:
                 parts.extend((text[cursor:preserved_end], _REDACTED))
@@ -379,13 +414,29 @@ def _redact_scanned_env_credentials(text: str) -> str:
             newline_folds += 1
             while body_start < len(text) and _is_word_gap(text[body_start]):
                 body_start += 1
-        if text.startswith(_REDACTED, body_start):
-            # Our own emitted marker: already redacted on a previous pass.
+        span_start = _marker_glue_span_start(text, body_start)
+        if span_start is None:
+            continue
+        quote = (
+            text[span_start] if span_start < len(text) and text[span_start] in {'"', "'"} else None
+        )
+        if quote is not None:
+            # A quoted value runs to its closing quote across bounded folds,
+            # mirroring quoted-Authorization handling — otherwise the
+            # continuation lines of a multiline secret survive redaction.
+            value_end, closed = _authorization_value_end(text, span_start + 1, quote)
+            parts.extend((text[cursor:span_start], quote, _REDACTED))
+            if closed:
+                parts.append(quote)
+                cursor = value_end + 1
+            else:
+                cursor = value_end
+            search_start = cursor
             continue
         span_end = _credential_span_end(
             text,
-            body_start,
-            alphabet="._~+/=-",
+            span_start,
+            alphabet=_KEYED_VALUE_ALPHABET,
             minimum=_KEYED_VALUE_MIN_LENGTH,
         )
         if span_end is None:
@@ -404,7 +455,8 @@ def _authorization_value_end(text: str, start: int, quote: str | None) -> tuple[
     Quoted values end at an unescaped matching quote; unquoted values end at
     end-of-line. In either form, CR, LF, or CRLF followed by indentation
     continues the value. A closed quote may span any number of folds; an
-    unclosed quote retains at most one continuation line of redaction.
+    unclosed quote or an unquoted value retains at most one continuation
+    line of redaction, so an indented traceback after the value survives.
     """
     index = start
     unterminated_end: int | None = None
@@ -424,8 +476,7 @@ def _authorization_value_end(text: str, start: int, quote: str | None) -> tuple[
             if newline_end < len(text) and text[newline_end] in " \t":
                 folded_lines += 1
                 if (
-                    quote is not None
-                    and folded_lines > _MAX_UNTERMINATED_AUTHORIZATION_FOLDS
+                    folded_lines > _MAX_UNTERMINATED_AUTHORIZATION_FOLDS
                     and unterminated_end is None
                 ):
                     unterminated_end = index
