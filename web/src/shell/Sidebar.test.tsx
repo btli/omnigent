@@ -161,7 +161,7 @@ vi.mock("@/lib/serverOrigin", () => ({
 
 import { useConversations } from "@/hooks/useConversations";
 import { useChatStore } from "@/store/chatStore";
-import { Sidebar } from "./Sidebar";
+import { SectionHeader, Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
 
@@ -1340,6 +1340,129 @@ describe("Sidebar collapsed section count pill", () => {
     fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
     expect(screen.queryByTestId("section-collapsed-count")).toBeNull();
   });
+
+  // The Sessions header paints BOTH right-edge controls (Select sessions +
+  // the filter) whenever hover isn't available — `[@media(hover:hover)]:md:`
+  // only hides the Select control at rest on hover-capable md+ displays. The
+  // pill's cluster must therefore reserve the full two-control column by
+  // default and narrow to clear just the always-visible filter only where
+  // hover support exists. jsdom cannot evaluate the media-query variants, so
+  // effective geometry is e2e territory; the reservation classes per state are
+  // asserted here.
+  it("reserves the Sessions header's full control column except at rest on hover desktops", () => {
+    mockConversations([conv("conv_mine", "Claude Code")]);
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
+    const cluster = screen.getByTestId("section-collapsed-count").parentElement!;
+    expect(cluster).toHaveClass("ml-auto", "mr-14", "[@media(hover:hover)]:md:mr-7");
+  });
+
+  // The Projects group's overlay (New project + kebab) is likewise painted at
+  // every width without hover support — it must not sit on top of the count
+  // pill there. The old desktop-only `mobileAction` flag reserved nothing at
+  // all (a bare mr-2), leaving the pill under the always-visible controls on
+  // touch viewports.
+  it("reserves the Projects group's control column for the count pill", () => {
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
+    ]);
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: "Projects" }));
+    const projectsSection = screen.getByText("Projects").closest("section")!;
+    const cluster = within(projectsSection).getByTestId("section-collapsed-count").parentElement!;
+    expect(cluster).toHaveClass("ml-auto", "mr-14", "[@media(hover:hover)]:md:mr-2");
+  });
+
+  // On hover-capable desktops the header overlays are opacity-0 at rest but
+  // were still hit-testable — a click aimed at the pill could fire the
+  // invisible "New project" (or "Select sessions") button. The overlays must
+  // drop pointer-events while hidden and restore them under the same
+  // conditions that reveal them. jsdom cannot hit-test through media-query
+  // variants, so the class contract is asserted here and the effective
+  // click-through behaviour stays e2e-only.
+  it("keeps hidden header overlays from intercepting clicks aimed at the pill", () => {
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_mine", "Claude Code"),
+      conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
+    ]);
+    renderSidebar();
+
+    const groupOverlay = screen
+      .getByRole("button", { name: "New project" })
+      .closest("div[class*=absolute]")!;
+    expect(groupOverlay).toHaveClass(
+      "[@media(hover:hover)]:md:pointer-events-none",
+      "[@media(hover:hover)]:md:group-hover/header:pointer-events-auto",
+      "[@media(hover:hover)]:md:has-[:focus-visible]:pointer-events-auto",
+      "[@media(hover:hover)]:md:group-has-[[data-state=open]]/header:pointer-events-auto",
+    );
+
+    const sessionsOverlay = screen
+      .getByTestId("toggle-selection-mode")
+      .closest("div[class*=transition-opacity]")!;
+    expect(sessionsOverlay).toHaveClass(
+      "[@media(hover:hover)]:md:pointer-events-none",
+      "[@media(hover:hover)]:md:group-hover/header:pointer-events-auto",
+      "[@media(hover:hover)]:md:group-focus-within/header:pointer-events-auto",
+    );
+    // The always-visible filter lives OUTSIDE the guarded wrapper — it must
+    // stay clickable at rest.
+    expect(sessionsOverlay.contains(screen.getByTestId("session-filter"))).toBe(false);
+  });
+});
+
+// The count pill and the collapsed-state marker are independent conditions;
+// if both ever render, they must share one right-pinned cluster (pill before
+// marker, reservation margin on the cluster's outer edge) instead of two
+// separately-margined spans with a floating gap between them. No current
+// sidebar section co-renders them (folders: marker only; groups/lists: count
+// only), so this is exercised directly on the exported SectionHeader.
+describe("SectionHeader collapsed badge cluster", () => {
+  it("right-pins a co-rendered pill and marker in one cluster, pill first", () => {
+    render(
+      <TooltipProvider>
+        <SectionHeader
+          title="Both"
+          count={3}
+          marker={{ kind: "running" }}
+          hasAction
+          collapsed
+          onToggleCollapsed={() => {}}
+        />
+      </TooltipProvider>,
+    );
+
+    const cluster = screen.getByTestId("section-collapsed-badges");
+    const pill = screen.getByTestId("section-collapsed-count");
+    const markerSlot = screen.getByTestId("session-state-badge").parentElement!;
+
+    // One flex cluster pinned to the right edge holds both badges, in order.
+    expect(cluster).toHaveClass("ml-auto");
+    expect(pill.parentElement).toBe(cluster);
+    expect(markerSlot.parentElement).toBe(cluster);
+    expect(Array.from(cluster.children)).toEqual([pill, markerSlot]);
+
+    // The reservation/alignment margins sit on the cluster alone — a margin on
+    // the pill would open a floating gap between it and the marker.
+    expect(cluster).toHaveClass("mr-14", "[@media(hover:hover)]:md:mr-1");
+    for (const child of [pill, markerSlot]) {
+      expect(Array.from(child.classList).some((c) => /(^|:)-?mr-/.test(c))).toBe(false);
+    }
+  });
+
+  it("keeps the lone-pill offset when no marker renders", () => {
+    render(
+      <TooltipProvider>
+        <SectionHeader title="Pill" count={2} collapsed onToggleCollapsed={() => {}} />
+      </TooltipProvider>,
+    );
+    // No header controls at all: the pill rests in the Inbox badge column.
+    expect(screen.getByTestId("section-collapsed-badges")).toHaveClass("mr-2");
+  });
 });
 
 // Pagination belongs to the Sessions list: collapsing it must take the
@@ -1860,10 +1983,15 @@ describe("Sidebar collapsed project marker", () => {
     // Fixed centered box so the dot centers on the same vertical line as the
     // rows' dots.
     expect(slot).toHaveClass("w-6", "justify-center");
-    // Folder headers use px-2, so on desktop the slot trims the trailing
-    // padding to the rows' right-1 (4px) edge. (The header also carries a
-    // kebab, so the mobile reserve is mr-14 and the -mr-1 is md-gated.)
-    expect(slot).toHaveClass("md:-mr-1");
+    // Margins live on the right-pinned badge cluster, not the slot. Folder
+    // headers use px-2, so at rest on hover-capable desktops the cluster trims
+    // the trailing padding to the rows' right-1 (4px) edge. The header's kebab
+    // is painted whenever hover isn't available — including desktop-width
+    // touch viewports — so the mr-14 reserve is the default and the -mr-1
+    // reset is gated on hover support, not just width.
+    const cluster = screen.getByTestId("section-collapsed-badges");
+    expect(cluster).toBe(slot.parentElement);
+    expect(cluster).toHaveClass("mr-14", "[@media(hover:hover)]:md:-mr-1");
   });
 
   // The "awaiting" pill is wider than the dot markers; constraining it to the
