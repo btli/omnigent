@@ -332,6 +332,18 @@ def default_row(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     return next((row for row in rows if row.get("isDefault") is True), None)
 
 
+def launchable_ids_text(rows: list[dict[str, Any]]) -> str:
+    """Enumerate every launchable token (row ``id`` or wire ``model``) for errors.
+
+    :param rows: Catalog rows.
+    :returns: A sorted, ``repr``-quoted, comma-joined enumeration, or ``"none"``.
+    """
+    launchable = sorted(
+        {str(token) for row in rows for token in (row.get("id"), row.get("model")) if token}
+    )
+    return ", ".join(repr(token) for token in launchable) or "none"
+
+
 def catalog_contains(rows: list[dict[str, Any]], token: str) -> bool:
     """Whether *token* names a catalog row (by ``id`` or wire ``model``).
 
@@ -356,6 +368,7 @@ __all__ = [
     "ensure_authoritative_catalog_result",
     "ensure_catalog",
     "fingerprint_of",
+    "launchable_ids_text",
     "read_catalog",
     "write_catalog",
 ]

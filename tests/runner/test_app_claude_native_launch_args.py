@@ -119,7 +119,7 @@ async def test_explicit_gateway_model_resolves_to_catalog_vocabulary(
     expected: str,
 ) -> None:
     catalog = await _fresh_catalog_result()
-    selected = _select_authoritative_claude_launch_model(
+    selected, _notice = _select_authoritative_claude_launch_model(
         explicit_model=requested,
         configured_model=None,
         claude_config=_gateway_config(),
@@ -247,15 +247,114 @@ async def test_gateway_pin_uses_stale_rows_when_authoritative_refresh_fails() ->
         ),
     )
 
-    assert (
-        _select_authoritative_claude_launch_model(
-            explicit_model="databricks-claude-opus-4-8",
-            configured_model=None,
+    launch_model, notice = _select_authoritative_claude_launch_model(
+        explicit_model="databricks-claude-opus-4-8",
+        configured_model=None,
+        claude_config=_gateway_config(),
+        catalog=catalog,
+    )
+    assert launch_model == "system.ai.claude-opus-4-8[1m]"
+    # The stale fold is as visible as the fresh one: the launch spelling
+    # carries a different [1m] context marker than the request.
+    assert notice is not None
+    assert "context marker" in notice
+
+
+async def test_configured_pin_survives_a_stale_row_outage_with_a_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Stale rows that neither fold nor serve the configured pin never drop it."""
+    catalog = model_catalog_store.CatalogResult(
+        [{"id": "opus", "model": "system.ai.claude-opus-4-8[1m]", "isDefault": True}],
+        model_catalog_store.CatalogFreshness.STALE,
+        model_catalog_store.CatalogRefreshError(
+            model_catalog_store.CatalogRefreshFailureKind.TIMEOUT,
+            "Claude model catalog refresh timed out",
+        ),
+    )
+
+    with caplog.at_level("WARNING", logger="omnigent.runner.app"):
+        selection = _select_authoritative_claude_launch_model(
+            explicit_model=None,
+            configured_model="databricks-claude-fable-5",
             claude_config=_gateway_config(),
             catalog=catalog,
         )
-        == "system.ai.claude-opus-4-8[1m]"
+
+    assert selection[0] == "databricks-claude-fable-5"
+    assert selection[1] is not None
+    assert "could not be verified" in selection[1]
+    assert "without fresh-catalog verification" in caplog.text
+
+
+async def test_canonical_configured_pin_survives_a_stale_row_outage_silently(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A canonical configured pin passes the outage without the unverified WARN."""
+    catalog = model_catalog_store.CatalogResult(
+        [{"id": "haiku", "model": "claude-haiku-4-5", "isDefault": True}],
+        model_catalog_store.CatalogFreshness.STALE,
+        model_catalog_store.CatalogRefreshError(
+            model_catalog_store.CatalogRefreshFailureKind.TIMEOUT,
+            "Claude model catalog refresh timed out",
+        ),
     )
+    claude_config = ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+        model="claude-fable-5",
+    )
+
+    with caplog.at_level("WARNING", logger="omnigent.runner.app"):
+        selection = _select_authoritative_claude_launch_model(
+            explicit_model=None,
+            configured_model="claude-fable-5",
+            claude_config=claude_config,
+            catalog=catalog,
+        )
+
+    assert selection == ("claude-fable-5", None)
+    assert "without fresh-catalog verification" not in caplog.text
+
+
+async def test_default_launch_goes_bare_when_only_stale_rows_survive() -> None:
+    """A stale default is yesterday's answer: a no-pin launch passes no --model."""
+    catalog = model_catalog_store.CatalogResult(
+        _GATEWAY_ROWS,
+        model_catalog_store.CatalogFreshness.STALE,
+        model_catalog_store.CatalogRefreshError(
+            model_catalog_store.CatalogRefreshFailureKind.TIMEOUT,
+            "Claude model catalog refresh timed out",
+        ),
+    )
+
+    assert _select_authoritative_claude_launch_model(
+        explicit_model=None,
+        configured_model=None,
+        claude_config=_gateway_config(),
+        catalog=catalog,
+    ) == (None, None)
+
+
+def test_canonical_pin_fail_closes_on_established_auth_probe_failure() -> None:
+    """`Please run /login` in probe stderr is an AUTH failure, not fail-open."""
+    refresh_error = claude_native._claude_probe_process_error(b"Please run /login")
+    catalog = model_catalog_store.CatalogResult(
+        None,
+        model_catalog_store.CatalogFreshness.MISSING,
+        refresh_error,
+    )
+
+    with pytest.raises(click.ClickException) as exc_info:
+        _select_authoritative_claude_launch_model(
+            explicit_model="claude-opus-4-8",
+            configured_model=None,
+            claude_config=None,
+            catalog=catalog,
+        )
+
+    message = str(exc_info.value)
+    assert "authentication failed" in message
+    assert "Restore provider credentials" in message
 
 
 async def test_gateway_pin_does_not_use_stale_rows_when_auth_refresh_fails() -> None:
@@ -330,7 +429,19 @@ async def test_configured_gateway_model_does_not_use_stale_rows_when_auth_refres
     assert "databricks auth login" in message
 
 
-def test_canonical_gateway_model_does_not_bypass_cli_absent_failure() -> None:
+@pytest.mark.parametrize(
+    "pin",
+    [
+        # A genuinely canonical pin: the outage pass-through would accept it,
+        # so this locks CLI_ABSENT failing closed BEFORE the pass-through.
+        "claude-opus-4-8",
+        "system.ai.claude-opus-4-8[1m]",
+    ],
+)
+def test_canonical_gateway_model_does_not_bypass_cli_absent_failure(pin: str) -> None:
+    from omnigent.claude_native import is_canonical_claude_pin
+
+    assert is_canonical_claude_pin("claude-opus-4-8")
     claude_config = ClaudeNativeUcodeConfig(
         env={"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}
     )
@@ -345,7 +456,7 @@ def test_canonical_gateway_model_does_not_bypass_cli_absent_failure() -> None:
 
     with pytest.raises(click.ClickException) as exc_info:
         _select_authoritative_claude_launch_model(
-            explicit_model="system.ai.claude-opus-4-8[1m]",
+            explicit_model=pin,
             configured_model=None,
             claude_config=claude_config,
             catalog=catalog,
@@ -465,15 +576,12 @@ async def test_direct_login_alias_fails_open_when_refresh_fails() -> None:
         with_cache=False,
     )
 
-    assert (
-        _select_authoritative_claude_launch_model(
-            explicit_model="sonnet",
-            configured_model=None,
-            claude_config=None,
-            catalog=catalog,
-        )
-        == "sonnet"
-    )
+    assert _select_authoritative_claude_launch_model(
+        explicit_model="sonnet",
+        configured_model=None,
+        claude_config=None,
+        catalog=catalog,
+    ) == ("sonnet", None)
 
 
 async def test_fresh_direct_login_catalog_still_rejects_an_unlisted_family() -> None:
@@ -488,18 +596,60 @@ async def test_fresh_direct_login_catalog_still_rejects_an_unlisted_family() -> 
         )
 
 
-async def test_configured_gateway_model_folds_to_fresh_catalog_vocabulary() -> None:
+async def test_configured_gateway_model_folds_to_fresh_catalog_vocabulary(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     catalog = await _fresh_catalog_result()
 
-    assert (
-        _select_authoritative_claude_launch_model(
+    with caplog.at_level("WARNING", logger="omnigent.claude_native"):
+        selection = _select_authoritative_claude_launch_model(
             explicit_model=None,
             configured_model="databricks-claude-opus-4-8",
             claude_config=_gateway_config(),
             catalog=catalog,
         )
-        == "system.ai.claude-opus-4-8[1m]"
+
+    assert selection[0] == "system.ai.claude-opus-4-8[1m]"
+    assert selection[1] is not None
+    assert "different [1m] context marker" in selection[1]
+    assert "substituting requested model" in caplog.text
+
+
+async def test_unserved_configured_gateway_model_uses_fresh_default_visibly(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    catalog = await _fresh_catalog_result()
+
+    with caplog.at_level("WARNING", logger="omnigent.runner.app"):
+        selection = _select_authoritative_claude_launch_model(
+            explicit_model=None,
+            configured_model="system.ai.claude-opus-4-7",
+            claude_config=_gateway_config(),
+            catalog=catalog,
+        )
+
+    assert selection[0] == "system.ai.claude-opus-4-8[1m]"
+    assert selection[1] is not None
+    assert "is unavailable on this host" in selection[1]
+    assert "using fresh catalog default" in caplog.text
+
+
+async def test_unserved_configured_gateway_model_uses_bare_fresh_launch_visibly() -> None:
+    catalog = await _fresh_catalog_result(
+        [{"id": "sonnet", "model": "system.ai.claude-sonnet-4-6"}],
+        fingerprint="configured-without-default",
     )
+
+    selection = _select_authoritative_claude_launch_model(
+        explicit_model=None,
+        configured_model="system.ai.claude-opus-4-7",
+        claude_config=_gateway_config(),
+        catalog=catalog,
+    )
+
+    assert selection[0] is None
+    assert selection[1] is not None
+    assert "fresh catalog has no default" in selection[1]
 
 
 async def test_default_gateway_launch_fails_open_when_refresh_fails() -> None:
@@ -509,15 +659,31 @@ async def test_default_gateway_launch_fails_open_when_refresh_fails() -> None:
         with_cache=False,
     )
 
-    assert (
-        _select_authoritative_claude_launch_model(
-            explicit_model=None,
-            configured_model=None,
-            claude_config=_gateway_config(),
-            catalog=catalog,
-        )
-        is None
+    assert _select_authoritative_claude_launch_model(
+        explicit_model=None,
+        configured_model=None,
+        claude_config=_gateway_config(),
+        catalog=catalog,
+    ) == (None, None)
+
+
+async def test_configured_gateway_pin_surfaces_a_cold_catalog_outage() -> None:
+    catalog = await _failed_catalog_result(
+        model_catalog_store.CatalogRefreshFailureKind.TIMEOUT,
+        "Claude model catalog refresh timed out",
+        with_cache=False,
     )
+
+    selection = _select_authoritative_claude_launch_model(
+        explicit_model=None,
+        configured_model="databricks-claude-opus-4-8",
+        claude_config=_gateway_config(),
+        catalog=catalog,
+    )
+
+    assert selection[0] == "databricks-claude-opus-4-8"
+    assert selection[1] is not None
+    assert "could not be verified" in selection[1]
 
 
 async def test_absent_configured_resolution_continues_to_fresh_catalog_default(
@@ -529,15 +695,16 @@ async def test_absent_configured_resolution_continues_to_fresh_catalog_default(
         lambda model, config: None,
     )
 
-    assert (
-        _select_authoritative_claude_launch_model(
-            explicit_model=None,
-            configured_model="unresolved-provider-default",
-            claude_config=_gateway_config(),
-            catalog=catalog,
-        )
-        == "system.ai.claude-opus-4-8[1m]"
+    selection = _select_authoritative_claude_launch_model(
+        explicit_model=None,
+        configured_model="unresolved-provider-default",
+        claude_config=_gateway_config(),
+        catalog=catalog,
     )
+
+    assert selection[0] == "system.ai.claude-opus-4-8[1m]"
+    assert selection[1] is not None
+    assert "is unavailable on this host" in selection[1]
 
 
 @pytest.mark.parametrize(
