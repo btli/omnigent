@@ -339,6 +339,27 @@ class TestBuildAgyLaunch:
         )
         assert argv.count(_SKIP_FLAG) == 1
 
+    def test_skip_flag_not_duplicated_from_bypass_mode_plus_extra_args(
+        self, fake_agy: str
+    ) -> None:
+        """
+        ``permission_mode=bypassPermissions`` + the flag in extra_args → one flag.
+
+        The CLI launch path passes a real ``permission_mode`` AND user
+        pass-through args; the server-derived sub-agent args carry the flag in
+        ``terminal_launch_args``. Both bypass sources meeting here must still
+        emit the flag exactly once.
+        """
+        argv, _ = build_agy_launch(
+            conversation_id=None,
+            model=None,
+            resume=False,
+            permission_mode="bypassPermissions",
+            headless=False,
+            extra_args=(_SKIP_FLAG,),
+        )
+        assert argv.count(_SKIP_FLAG) == 1
+
 
 # ---------------------------------------------------------------------------
 # should_skip_permissions
