@@ -12,6 +12,7 @@ const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 
 const {
+  expiredRequestMatchesIdentity,
   isLoginRedirect,
   isOidcLoginNavigation,
   registerSessionExpiryReload,
@@ -164,6 +165,68 @@ describe("registerSessionExpiryReload", () => {
     ses.emit({ ...LOGIN_REDIRECT, url: "not a url" });
 
     assert.deepEqual(reloaded, []);
+  });
+
+  it("reloads a window pinned with ?o= when the failing request carries no o", () => {
+    // The API request the gate 303s (e.g. .../ajax-api/...) has no `?o=`
+    // selector even when the window's pinned identity does — matching must
+    // key on what the request can carry, not the full workspace identity.
+    const pinnedIdentity = "https://ws.databricks.com?o=123456789";
+    const ses = fakeSession();
+    const reloaded = [];
+    registerSessionExpiryReload(
+      ses,
+      (identity) => expiredRequestMatchesIdentity(pinnedIdentity, identity),
+      (identity) => {
+        if (expiredRequestMatchesIdentity(pinnedIdentity, identity)) reloaded.push(pinnedIdentity);
+      },
+    );
+
+    ses.emit(LOGIN_REDIRECT); // request URL has NO ?o=
+
+    assert.deepEqual(reloaded, [pinnedIdentity]);
+  });
+});
+
+describe("expiredRequestMatchesIdentity", () => {
+  it("matches identical identities", () => {
+    assert.equal(
+      expiredRequestMatchesIdentity("https://ws.databricks.com", "https://ws.databricks.com"),
+      true,
+    );
+    assert.equal(
+      expiredRequestMatchesIdentity(
+        "https://ws.databricks.com?o=123",
+        "https://ws.databricks.com?o=123",
+      ),
+      true,
+    );
+  });
+
+  it("matches a bare-origin request against an o-pinned identity", () => {
+    assert.equal(
+      expiredRequestMatchesIdentity("https://ws.databricks.com?o=123", "https://ws.databricks.com"),
+      true,
+    );
+  });
+
+  it("keeps a selector-bearing request exact (multi-workspace hosts)", () => {
+    assert.equal(
+      expiredRequestMatchesIdentity(
+        "https://ws.databricks.com?o=123",
+        "https://ws.databricks.com?o=456",
+      ),
+      false,
+    );
+  });
+
+  it("never matches across origins or against null", () => {
+    assert.equal(
+      expiredRequestMatchesIdentity("https://a.example?o=1", "https://b.example"),
+      false,
+    );
+    assert.equal(expiredRequestMatchesIdentity(null, "https://a.example"), false);
+    assert.equal(expiredRequestMatchesIdentity("https://a.example", null), false);
   });
 });
 

@@ -57,6 +57,7 @@ const { registerBrowserIpc } = require("./browserIpc");
 const { isDeveloperModeEnabled } = require("./developer_mode");
 const { excludingManagedServers, getManagedServerUrls } = require("./managed_preferences");
 const {
+  expiredRequestMatchesIdentity,
   registerSessionExpiryReload,
   registerOidcSessionExpiryHandoff,
 } = require("./session-expiry");
@@ -469,7 +470,7 @@ function registerSessionExpiryAccess() {
   registerSessionExpiryReload(session.defaultSession, isPinnedWorkspaceUrl, (identity) => {
     const now = Date.now();
     for (const [win, state] of windows) {
-      if (state.identity !== identity || win.isDestroyed()) continue;
+      if (!expiredRequestMatchesIdentity(state.identity, identity) || win.isDestroyed()) continue;
       const last = lastExpiryReloadAt.get(win) ?? 0;
       if (now - last < EXPIRY_RELOAD_MIN_INTERVAL_MS) continue;
       lastExpiryReloadAt.set(win, now);
@@ -636,12 +637,16 @@ function isPinnedServerUrl(url) {
   return false;
 }
 
-/** True when a URL belongs to a workspace some open window is pinned to. */
+/**
+ * True when a URL belongs to a workspace some open window is pinned to. The
+ * URL is a raw API request URL, which usually lacks the `?o=` selector a
+ * pinned identity may carry — see expiredRequestMatchesIdentity.
+ */
 function isPinnedWorkspaceUrl(url) {
   const identity = workspaceIdentityKey(url ?? "");
   if (!identity) return false;
   for (const state of windows.values()) {
-    if (state.identity === identity) return true;
+    if (expiredRequestMatchesIdentity(state.identity, identity)) return true;
   }
   return false;
 }
@@ -1174,7 +1179,13 @@ async function showWebAuthnTimeout(win) {
   } catch {
     return;
   }
-  if (probe.kind !== "oidc") return;
+  if (probe.kind !== "oidc") {
+    // Accounts-mode `/login` has no ticket handoff, but the user still asked
+    // to leave the stuck ceremony — hand the sign-in page itself to the
+    // system browser, where a platform passkey can complete it.
+    if (probe.kind === "accounts") void shell.openExternal(signInUrl);
+    return;
+  }
   await withServerLoad(state, async () => {
     const authenticated = await runWindowOidcBrowserHandoff(win, serverUrl);
     if (!authenticated || win.isDestroyed()) return;
@@ -1557,7 +1568,11 @@ function createWindow(targetUrl, opts = {}) {
           }
         }
       })
-      .catch(() => loadSetupPage(win));
+      .catch(() => {
+        // Load failure falls back via did-fail-load → setup page with the
+        // error and server URL shown; loading setup here too would supersede
+        // that parameterized page with a blank form.
+      });
   } else {
     if (serverUrlError) {
       void loadSetupPage(win, {
@@ -1915,9 +1930,16 @@ function newWindow() {
   const win = activeWindow();
   const current = win?.webContents.getURL();
   const state = win ? windows.get(win) : null;
+  // A bundled file: page (setup, sign-in status) is not a clonable server
+  // destination — only pass a real http(s) page as the explicit target, so
+  // the clone falls back to the saved server instead of a file:// "server".
+  const isWebPage =
+    typeof current === "string" &&
+    (current.startsWith("http://") || current.startsWith("https://"));
+  const target = isWebPage ? current : undefined;
   // Cloning an ephemeral (multi-server) window keeps the clone
   // ephemeral, so Change Server… from it still won't touch saved settings.
-  createWindow(current, {
+  createWindow(target, {
     ephemeral: state?.ephemeral === true,
     serverUrl: state?.serverUrl ?? undefined,
   });
@@ -3252,11 +3274,23 @@ async function handleDeepLink(raw) {
   const parsed = parseOmnigentDeepLink(raw);
   if (!parsed) return;
 
-  // The origin is fixed by the link itself — no network request needed for the
-  // decision. expandDatabricksWorkspaceUrl only appends a mount path under this
-  // same origin, so approving the origin is approving the server.
-  const targetIdentity = workspaceIdentityKey(parsed.origin);
+  // The identity is fixed by the link itself — no network request needed for
+  // the decision. It keeps the link's Databricks `?o=` workspace selector
+  // (URL.origin would drop it, misfiling a known workspace as unknown);
+  // workspaceIdentityKey discards every other query parameter.
+  // expandDatabricksWorkspaceUrl only appends a mount path under this same
+  // origin, so approving the identity is approving the server.
+  let targetIdentity = workspaceIdentityKey(parsed.origin + (parsed.search ?? ""));
   if (!targetIdentity) return;
+  const knownIdentities = knownWorkspaceIdentities();
+  // A link WITHOUT a selector still belongs to a known workspace when only
+  // the selector differs — adopt the first known identity on that origin
+  // (saved default first, then recents) rather than treating the server as
+  // unknown (consent prompt, bare-origin probe, second window).
+  if (!targetIdentity.includes("?") && !knownIdentities.includes(targetIdentity)) {
+    const byOrigin = knownIdentities.find((identity) => identity.startsWith(`${targetIdentity}?`));
+    if (byOrigin) targetIdentity = byOrigin;
+  }
   // A KNOWN server: reuse its recorded URL (already mount-bearing, e.g.
   // `https://host/omnigent`) so we SKIP the probe entirely. null for an
   // unknown server — the mount is discovered AFTER consent (see consent-unknown).
@@ -3272,7 +3306,7 @@ async function handleDeepLink(raw) {
       origin: windows.get(win).identity,
       currentOrigin: win.isDestroyed() ? null : workspaceIdentityKey(win.webContents.getURL()),
     })),
-    knownOrigins: knownWorkspaceIdentities(),
+    knownOrigins: knownIdentities,
     focusedIndex: focusedIndex < 0 ? null : focusedIndex,
   });
   console.log(
@@ -3317,8 +3351,13 @@ async function handleDeepLink(raw) {
       const openAfterExpansion = async () => {
         // Consent given — NOW probe to discover the workspace mount. The origin
         // is unchanged (the probe only appends a path under it), so the consent
-        // decision stands; the user approved connecting to this host.
-        const serverUrl = await expandDatabricksWorkspaceUrl(parsed.origin);
+        // decision stands; the user approved connecting to this host. The
+        // identity (origin plus any `?o=` selector, other query params already
+        // filtered out) rides through expansion so the expanded URL keeps the
+        // workspace identity the decision ran on. In this branch adoption never
+        // fired (an adopted identity is known), so targetIdentity is still the
+        // link's own identity.
+        const serverUrl = await expandDatabricksWorkspaceUrl(targetIdentity);
         if (expandedServerUrlError(serverUrl, targetIdentity)) return;
         if (reuseParent && !parent.isDestroyed() && windows.get(parent) === state) {
           await loadServerUrl(parent, serverUrl, parsed.path, undefined, {

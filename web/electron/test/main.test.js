@@ -313,6 +313,7 @@ function loadNavigationHarness({
     },
     "./omnigent_cli": {
       isExecutableFile: () => false,
+      isLoopbackServer: () => false,
       resolveCliPath: () => null,
       localHostId: () => "host_test",
       getCliStatus: () => ({ installed: false }),
@@ -888,6 +889,7 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     };
     const state = { serverUrl: "https://server.example", pendingServerLoads: 0 };
     let handoffs = 0;
+    const opened = [];
     const showWebAuthnTimeout = runInNewContext(`${webAuthnTimeoutCode}; showWebAuthnTimeout`, {
       WEB_SCHEMES: new Set(["https:"]),
       URL,
@@ -898,6 +900,7 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
         handoffs += 1;
       },
       session: { defaultSession: {} },
+      shell: { openExternal: async (url) => opened.push(url) },
       windows: new Map([[win, state]]),
       withServerLoad,
     });
@@ -905,6 +908,36 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     await showWebAuthnTimeout(win);
 
     assert.equal(handoffs, 0);
+    // "Open in Browser" must still do what it says on an accounts-mode
+    // /login page: no ticket handoff exists, so the stuck sign-in page
+    // itself goes to the system browser (where a platform passkey works).
+    assert.deepEqual(opened, ["https://server.example/login"]);
+    assert.equal(state.pendingServerLoads, 0);
+  });
+
+  it("keeps 'other' auth postures inert (no handoff, no browser open)", async () => {
+    const win = {
+      isDestroyed: () => false,
+      webContents: { getURL: () => "https://server.example/somewhere" },
+    };
+    const state = { serverUrl: "https://server.example", pendingServerLoads: 0 };
+    const opened = [];
+    const showWebAuthnTimeout = runInNewContext(`${webAuthnTimeoutCode}; showWebAuthnTimeout`, {
+      WEB_SCHEMES: new Set(["https:"]),
+      URL,
+      dialog: { showMessageBox: async () => ({ response: 0 }) },
+      oidcServerUrlError,
+      probeServerAuth: async () => ({ kind: "other", status: 500 }),
+      runWindowOidcBrowserHandoff: async () => assert.fail("constructed the OIDC modal"),
+      session: { defaultSession: {} },
+      shell: { openExternal: async (url) => opened.push(url) },
+      windows: new Map([[win, state]]),
+      withServerLoad,
+    });
+
+    await showWebAuthnTimeout(win);
+
+    assert.deepEqual(opened, []);
     assert.equal(state.pendingServerLoads, 0);
   });
 
@@ -1889,7 +1922,7 @@ describe("deep-link ingestion wiring (src/main.js)", () => {
     // consent-unknown branch, and does NOT appear before chooseDeepLinkStrategy.
     assert.match(
       liveCode,
-      /confirmOpenDeepLink\(parent, parsed\.origin\)[\s\S]{0,300}expandDatabricksWorkspaceUrl\(parsed\.origin\)/,
+      /confirmOpenDeepLink\(parent, parsed\.origin\)[\s\S]{0,700}expandDatabricksWorkspaceUrl\(targetIdentity\)/,
       [
         "handleDeepLink no longer defers expandDatabricksWorkspaceUrl until AFTER",
         "confirmOpenDeepLink. A deep link to an unknown (attacker-chosen) server would",
@@ -2105,5 +2138,184 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     harness.api.pinWindow(harness.win, serverUrl);
 
     assert.deepEqual(harness.calls.closeAll, []);
+  });
+});
+
+// Round-1 review fixes: expiry reload matching, deep-link workspace identity,
+// cold-start failure fallback, and New Window's explicit target.
+describe("expired-session reload identity matching (src/main.js)", () => {
+  const { expiredRequestMatchesIdentity } = require("../src/session-expiry");
+
+  it("wires expiredRequestMatchesIdentity into the pinned-workspace predicate", () => {
+    assert.match(
+      liveCode,
+      /function isPinnedWorkspaceUrl\(url\)\s*\{[\s\S]{0,300}expiredRequestMatchesIdentity\(state\.identity,\s*identity\)/,
+      [
+        "isPinnedWorkspaceUrl no longer matches via expiredRequestMatchesIdentity.",
+        "The API request that hits the expired SSO gate usually lacks the ?o=",
+        "selector a pinned identity carries, so exact matching means the expiry",
+        "reload never fires for ?o=-pinned Databricks windows.",
+      ].join(" "),
+    );
+  });
+
+  it("wires expiredRequestMatchesIdentity into the reload loop", () => {
+    assert.match(
+      liveCode,
+      /registerSessionExpiryReload\([\s\S]{0,300}expiredRequestMatchesIdentity\(state\.identity,\s*identity\)/,
+      [
+        "The expiry-reload window loop no longer matches via",
+        "expiredRequestMatchesIdentity, so ?o=-pinned windows are never reloaded",
+        "when their bare-origin API request hits the expired gate.",
+      ].join(" "),
+    );
+  });
+
+  it("reloads a ?o=-pinned window for a bare-origin expired request end to end", () => {
+    const pinned = "https://ws.databricks.com?o=123456789";
+    assert.equal(
+      expiredRequestMatchesIdentity(
+        pinned,
+        workspaceIdentityKey("https://ws.databricks.com/ajax-api/2.0/omnigents/v1/sessions"),
+      ),
+      true,
+    );
+  });
+});
+
+describe("deep-link workspace identity (src/main.js)", () => {
+  const { parseOmnigentDeepLink } = require("../src/deepLink");
+
+  function runDeepLink(raw, { knownIdentities = [], knownServerUrl = null } = {}) {
+    const decisions = [];
+    const created = [];
+    const lookups = [];
+    const handler = runInNewContext(`${deepLinkHandlerCode}; handleDeepLink`, {
+      BrowserWindow: { getFocusedWindow: () => null },
+      chooseDeepLinkStrategy: (state) => {
+        decisions.push(state);
+        return { strategy: "open-known" };
+      },
+      console: { log: () => {} },
+      createWindow: (_target, options) => {
+        created.push(options);
+        return {};
+      },
+      focusAndRestore: () => {},
+      findKnownServerUrl: (identity) => {
+        lookups.push(identity);
+        return knownServerUrl;
+      },
+      knownWorkspaceIdentities: () => knownIdentities,
+      parseOmnigentDeepLink,
+      windows: new Map(),
+      workspaceIdentityKey,
+    });
+    return handler(raw).then(() => ({ decisions, created, lookups }));
+  }
+
+  it("keeps the link's ?o= selector in the target identity", async () => {
+    const { decisions, lookups } = await runDeepLink(
+      "omnigent://ws.cloud.databricks.com/c/conv_abc?o=123456789",
+      {
+        knownIdentities: ["https://ws.cloud.databricks.com?o=123456789"],
+        knownServerUrl: "https://ws.cloud.databricks.com/omnigent?o=123456789",
+      },
+    );
+
+    assert.equal(decisions[0].targetOrigin, "https://ws.cloud.databricks.com?o=123456789");
+    assert.deepEqual(lookups, ["https://ws.cloud.databricks.com?o=123456789"]);
+  });
+
+  it("adopts a known ?o= identity for a selector-less link to the same origin", async () => {
+    const { decisions, created } = await runDeepLink(
+      "omnigent://ws.cloud.databricks.com/c/conv_abc",
+      {
+        knownIdentities: ["https://ws.cloud.databricks.com?o=123456789"],
+        knownServerUrl: "https://ws.cloud.databricks.com/omnigent?o=123456789",
+      },
+    );
+
+    assert.equal(decisions[0].targetOrigin, "https://ws.cloud.databricks.com?o=123456789");
+    assert.equal(created[0].serverUrl, "https://ws.cloud.databricks.com/omnigent?o=123456789");
+  });
+
+  it("keeps a bare identity when it is itself known", async () => {
+    const { decisions } = await runDeepLink("omnigent://ws.cloud.databricks.com/c/conv_abc", {
+      knownIdentities: [
+        "https://ws.cloud.databricks.com",
+        "https://ws.cloud.databricks.com?o=123456789",
+      ],
+      knownServerUrl: "https://ws.cloud.databricks.com",
+    });
+
+    assert.equal(decisions[0].targetOrigin, "https://ws.cloud.databricks.com");
+  });
+
+  it("ignores non-Databricks query parameters for identity", async () => {
+    const { decisions } = await runDeepLink("omnigent://server.example/c/conv_abc?token=evil");
+
+    assert.equal(decisions[0].targetOrigin, "https://server.example");
+  });
+});
+
+describe("cold-start load failure fallback (src/main.js)", () => {
+  it("defers load failures to did-fail-load instead of blanking the setup params", () => {
+    assert.ok(createWindowCode);
+    assert.doesNotMatch(
+      createWindowCode,
+      /loadInitialDestination\([\s\S]{0,900}\.catch\(\(\) => loadSetupPage\(win\)\)/,
+      [
+        "createWindow's cold-start catch loads a BLANK setup page again. did-fail-load",
+        "already routes a failed saved-server load to setup WITH ?error=&url= — the",
+        "catch must stay a no-op so it cannot supersede that parameterized page.",
+      ].join(" "),
+    );
+    assert.match(
+      createWindowCode,
+      /loadInitialDestination\([\s\S]{0,1200}\.catch\(\(\) => \{\s*\}\)/,
+      "createWindow's cold-start load chain lost its no-op rejection catch.",
+    );
+  });
+});
+
+describe("New Window explicit target (src/main.js)", () => {
+  const newWindowCode = liveCode.match(/function newWindow\(\)[\s\S]*?\n\}/)?.[0];
+
+  it("passes only http(s) pages as the clone target", () => {
+    assert.ok(newWindowCode);
+    const created = [];
+    const win = {
+      webContents: { getURL: () => "file:///electron/setup/index.html" },
+    };
+    const newWindow = runInNewContext(`${newWindowCode}; newWindow`, {
+      activeWindow: () => win,
+      createWindow: (target, opts) => created.push({ target, opts }),
+      windows: new Map([[win, { ephemeral: false, serverUrl: null }]]),
+    });
+
+    newWindow();
+
+    // The setup page's file:// URL must not be treated as a server to clone
+    // (it would prefill a "server address is invalid" banner downstream).
+    assert.equal(created[0].target, undefined);
+  });
+
+  it("still clones a real server page URL", () => {
+    const newWindowCode2 = liveCode.match(/function newWindow\(\)[\s\S]*?\n\}/)?.[0];
+    const created = [];
+    const win = {
+      webContents: { getURL: () => "https://server.example/c/conv_abc" },
+    };
+    const newWindow = runInNewContext(`${newWindowCode2}; newWindow`, {
+      activeWindow: () => win,
+      createWindow: (target, opts) => created.push({ target, opts }),
+      windows: new Map([[win, { ephemeral: false, serverUrl: "https://server.example" }]]),
+    });
+
+    newWindow();
+
+    assert.equal(created[0].target, "https://server.example/c/conv_abc");
+    assert.equal(created[0].opts.serverUrl, "https://server.example");
   });
 });

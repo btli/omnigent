@@ -74,6 +74,27 @@ function registerSessionExpiryReload(ses, isConnectedServerOrigin, reloadWindows
 }
 
 /**
+ * Whether a window's pinned workspace identity is hit by an expired-session
+ * redirect on the given request identity. The redirected API request rarely
+ * carries Databricks' ``?o=`` workspace selector even when the window's
+ * pinned identity does — the selector lives in the SPA's URL, not in every
+ * API call — so a bare-origin request matches every pinned identity on that
+ * origin. A request that DOES carry a selector still requires the exact
+ * identity, so multi-workspace hosts reload only the named workspace.
+ *
+ * @param {string | null | undefined} windowIdentity A window's pinned
+ *   workspaceIdentityKey value.
+ * @param {string | null | undefined} requestIdentity workspaceIdentityKey of
+ *   the redirected request's URL.
+ * @returns {boolean}
+ */
+function expiredRequestMatchesIdentity(windowIdentity, requestIdentity) {
+  if (!windowIdentity || !requestIdentity) return false;
+  if (windowIdentity === requestIdentity) return true;
+  return !requestIdentity.includes("?") && windowIdentity.startsWith(`${requestIdentity}?`);
+}
+
+/**
  * Whether a main-frame destination is the pinned server's OIDC login route.
  * The origin and exact pathname must both match; query parameters such as the
  * SPA's `return_to` are allowed.
@@ -137,6 +158,7 @@ function registerOidcSessionExpiryHandoff(webContents, serverUrlForWindow, onExp
 }
 
 module.exports = {
+  expiredRequestMatchesIdentity,
   isLoginRedirect,
   isOidcLoginNavigation,
   registerSessionExpiryReload,
