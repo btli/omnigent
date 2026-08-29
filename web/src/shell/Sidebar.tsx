@@ -2338,33 +2338,30 @@ function SectionHeader({
       >
         {icon ? (
           // Headers with a leading icon (project folders) swap the folder for a
-          // chevron on desktop hover/focus, so the caret takes the icon's place
-          // rather than trailing the name. Mobile (no hover) keeps the folder
-          // icon and shows the trailing chevron below.
+          // chevron on hover-capable desktop, so the caret takes the icon's
+          // place. Without hover, the folder and trailing caret stay visible.
           <span className="relative flex size-4 shrink-0 items-center justify-center">
-            <span className="flex md:transition-opacity md:group-hover:opacity-0 md:group-focus-visible:opacity-0">
+            <span className="flex md:transition-opacity [@media(hover:hover)]:md:group-hover:opacity-0 [@media(hover:hover)]:md:group-focus-visible:opacity-0">
               {icon}
             </span>
             <ChevronRightIcon
               className={cn(
                 "absolute size-3.5 opacity-0 transition-[transform,opacity]",
                 !collapsed && "rotate-90",
-                "hidden md:flex md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
+                "hidden md:flex [@media(hover:hover)]:md:group-hover:opacity-100 [@media(hover:hover)]:md:group-focus-visible:opacity-100",
               )}
             />
           </span>
         ) : null}
         <span className="min-w-0 truncate">{title}</span>
-        {/* Trailing chevron, rotating on expand. Headers without a leading icon
-            reveal it on desktop hover/focus; icon headers show it only on mobile
-            (no hover) since desktop swaps the folder for the chevron above. */}
+        {/* Without hover, the trailing caret stays visible at every width. */}
         <ChevronRightIcon
           className={cn(
             "size-3.5 shrink-0 transition-[transform,opacity]",
             !collapsed && "rotate-90",
             icon
-              ? "md:hidden"
-              : "md:opacity-0 md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
+              ? "[@media(hover:hover)]:md:hidden"
+              : "[@media(hover:hover)]:md:opacity-0 [@media(hover:hover)]:md:group-hover:opacity-100 [@media(hover:hover)]:md:group-focus-visible:opacity-100",
           )}
         />
         {/* A hidden row inside this collapsed section carries a marker — surface
@@ -2390,9 +2387,9 @@ function SectionHeader({
               // desktop hover so the kebab takes its place.
               hasAction &&
                 cn(
-                  "mr-14",
+                  "mr-8",
                   icon ? "md:-mr-1" : "md:mr-1",
-                  "md:group-hover/section:opacity-0 md:group-focus-within/section:opacity-0",
+                  "md:group-hover/section:opacity-0 md:group-focus-within/section:opacity-0 md:group-has-[[data-state=open]]/header:opacity-0",
                 ),
             )}
           >

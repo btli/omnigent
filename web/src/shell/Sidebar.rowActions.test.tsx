@@ -482,6 +482,28 @@ describe("quick pin/unpin hover button", () => {
     );
   });
 
+  it("keeps Pinned and Sessions carets visible on a wide coarse-pointer device", () => {
+    mocks.anyCoarse = true;
+    mocks.pinnedStore.set([CONV.id]);
+    mockConversations([
+      CONV,
+      { ...CONV, id: "conv_2", title: "Another session", updated_at: CONV.updated_at - 1 },
+    ]);
+    renderSidebar();
+
+    expect(mocks.anyCoarse).toBe(true);
+    for (const name of ["Pinned", "Sessions"]) {
+      const header = screen.getByRole("button", { name });
+      const chevron = header.querySelector(".lucide-chevron-right");
+      expect(chevron).toHaveClass(
+        "[@media(hover:hover)]:md:opacity-0",
+        "[@media(hover:hover)]:md:group-hover:opacity-100",
+        "[@media(hover:hover)]:md:group-focus-visible:opacity-100",
+      );
+      expect(chevron).not.toHaveClass("md:opacity-0");
+    }
+  });
+
   it("hides the Projects list-actions kebab when there are no projects", () => {
     // With no projects, the kebab has nothing to offer (no expand/collapse, no
     // sessions to select) and would open empty — so it's hidden entirely,

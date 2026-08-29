@@ -269,12 +269,14 @@ function closeProjectsMenu() {
 // Evaluate min-/max-width media queries against a simulated viewport width,
 // so each test runs at an explicit real-browser width instead of inheriting
 // the global test-setup mock (which answers false to every query).
-function stubViewportWidth(width: number) {
+function stubViewportWidth(width: number, anyCoarse = false) {
   Object.defineProperty(window, "matchMedia", {
     writable: true,
     configurable: true,
     value: (query: string) => ({
       matches: (() => {
+        if (query.includes("any-pointer: coarse")) return anyCoarse;
+        if (query.includes("pointer: coarse")) return anyCoarse;
         const min = query.match(/^\(min-width: ([\d.]+)px\)$/);
         if (min) return width >= parseFloat(min[1]);
         const max = query.match(/^\(max-width: ([\d.]+)px\)$/);
@@ -1931,6 +1933,45 @@ describe("Sidebar collapsed project marker", () => {
     // padding to the rows' right-1 (4px) edge. (The header also carries a
     // kebab, so the mobile reserve is mr-14 and the -mr-1 is md-gated.)
     expect(slot).toHaveClass("md:-mr-1");
+  });
+
+  it("reserves one action slot for the marker on a narrow coarse-pointer device", () => {
+    stubViewportWidth(390, true);
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_running", "Claude Code", {
+        labels: { omni_project: "Customer X" },
+        status: "running",
+      }),
+    ]);
+    renderSidebar();
+
+    expect(window.matchMedia("(any-pointer: coarse)").matches).toBe(true);
+    const slot = screen.getByTestId("session-state-badge").parentElement!;
+    expect(slot).toHaveClass("w-6", "mr-8", "md:-mr-1");
+    expect(slot).not.toHaveClass("mr-14");
+  });
+
+  it("keeps the marker hidden while an open project menu is outside the header", async () => {
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_running", "Claude Code", {
+        labels: { omni_project: "Customer X" },
+        status: "running",
+      }),
+    ]);
+    renderSidebar();
+
+    const header = screen.getByRole("button", { name: /^Customer X/ });
+    const trigger = screen.getByRole("button", { name: "Project actions for Customer X" });
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+    await screen.findByTestId("rename-project");
+
+    fireEvent.pointerLeave(header.closest("section")!);
+    fireEvent.blur(trigger);
+    expect(trigger).toHaveAttribute("data-state", "open");
+    const slot = screen.getByTestId("session-state-badge").parentElement!;
+    expect(slot).toHaveClass("md:group-has-[[data-state=open]]/header:opacity-0");
   });
 
   // The "awaiting" pill is wider than the dot markers; constraining it to the
