@@ -59,7 +59,9 @@ _CLEAR_SETTLE_TIMEOUT_S = 2.0
 _DRAFT_NEEDLE_MAX_CHARS = 24
 _PASTE_PLACEHOLDER_RE = re.compile(r"\[paste #(\d+) (?:(?:\+(\d+) lines?)|(?:(\d+) chars))\]")
 _TRUST_HEADER = "Trust this folder?"
-_TRUST_DESCRIPTION = "Kimi Code loads project-level MCP servers"
+# Anchor on the accept-option label, not the modal's body prose: the body copy
+# has been reworded between kimi releases while the option row has stayed put.
+_TRUST_DESCRIPTION = "Enable project MCP servers"
 _PERMISSION_MENU_FOOTER_MARKER = "1/2/3/4 choose"
 _INJECTION_CANCEL_FILE = "injection.cancelled"
 
@@ -520,8 +522,10 @@ def _parse_pane(pane: str, *, turn_streaming: bool = False) -> _KimiPaneState:
         for index, line in enumerate(lines)
         if row_kinds[index] != _PaneRowKind.INSIDE_EDITOR and _TRUST_DESCRIPTION in line
     ]
+    # The option row sits ~9-10 lines below the header; allow slack for a
+    # wrapped body sentence or a long workspace path.
     trust_visible = any(
-        description - header <= 8
+        description - header <= 14
         and description > header
         and header > 0
         and _menu_rule(lines[header - 1])

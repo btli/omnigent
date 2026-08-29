@@ -4,8 +4,8 @@
 
   <scratch>/kimi-fixture-trust
 
-  Kimi Code loads project-level MCP servers (.mcp.json, .kimi-code/mcp.json) only in trusted folders. They run as
-  local processes on your machine.
+  Project-level MCP servers are disabled until you explicitly choose Trust. Trust starts the listed project MCP targets
+  and remembers this folder.
 
    ❯ Trust this folder
      Enable project MCP servers. Remembered for this folder.
