@@ -10184,6 +10184,75 @@ def test_claude_catalog_selection_keeps_loud_failure_without_a_claude_tier(
     )
 
 
+@pytest.mark.parametrize(
+    ("catalog", "requested", "expected"),
+    [
+        pytest.param(
+            [
+                {"id": "claude-3-opus-20240229", "model": "claude-3-opus-20240229"},
+                {"id": "claude-opus-4-8", "model": "claude-opus-4-8"},
+            ],
+            "fable",
+            "claude-opus-4-8",
+            id="opus",
+        ),
+        pytest.param(
+            [
+                {"id": "claude-3-5-sonnet-20241022", "model": "claude-3-5-sonnet-20241022"},
+                {"id": "claude-sonnet-4-6", "model": "claude-sonnet-4-6"},
+            ],
+            "fable",
+            "claude-sonnet-4-6",
+            id="sonnet",
+        ),
+        pytest.param(
+            [
+                {"id": "claude-3-opus-20240229", "model": "claude-3-opus-20240229"},
+                {"id": "claude-3-opus-20240307", "model": "claude-3-opus-20240307"},
+            ],
+            "fable",
+            "claude-3-opus-20240307",
+            id="date-tiebreak-within-generation",
+        ),
+    ],
+)
+def test_claude_tier_ladder_prefers_current_generation_over_dated_legacy_ids(
+    catalog: list[dict[str, object]],
+    requested: str,
+    expected: str,
+) -> None:
+    """A dated legacy id must never outrank a newer generation on alias-less rows.
+
+    The legacy ``claude-G[-x]-<tier>-<date>`` shape carries its release date
+    as a huge digit group; ranking raw digit groups let Opus 3's date beat
+    Opus 4.8's generation. The date may only break ties within a generation.
+    """
+    launch_model, notice = claude_native.resolve_claude_native_catalog_selection(
+        requested,
+        catalog,
+        None,
+    )
+
+    assert launch_model == expected
+    assert notice is not None
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        pytest.param(b"Please run /login", id="run-login"),
+        pytest.param(b"Error: not authenticated", id="not-authenticated"),
+        pytest.param(b"OAuth token expired. Run /login again.", id="oauth-token-expired"),
+        pytest.param(b"your credentials have expired", id="credentials-expired"),
+    ],
+)
+def test_probe_error_classifies_established_auth_messages_as_auth(stderr: bytes) -> None:
+    """Claude's own login prompts classify as AUTH, never as a transient OTHER."""
+    error = claude_native._claude_probe_process_error(stderr)
+
+    assert error.kind is model_catalog_store.CatalogRefreshFailureKind.AUTH
+
+
 def test_claude_catalog_selection_rejects_an_unrecognized_claude_looking_id() -> None:
     """Only documented tier aliases can degrade after catalog matching fails."""
     catalog: list[dict[str, object]] = [
