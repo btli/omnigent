@@ -738,6 +738,21 @@ function setWindowServerManifest(win, manifest) {
 }
 
 /**
+ * Learn a server's version manifest alongside a load and record it on the
+ * window once it resolves. Deliberately not awaited and never throws (see
+ * `fetchServerManifest`): the manifest is advisory, so a slow or absent one
+ * must not delay or block connecting.
+ *
+ * @param {Electron.BrowserWindow} win
+ * @param {string} serverUrl
+ */
+function refreshWindowServerManifest(win, serverUrl) {
+  void fetchServerManifest(serverUrl).then((manifest) => {
+    if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
+  });
+}
+
+/**
  * The server manifest for a window, or the pre-manifest baseline when the
  * window has none yet (no connect has completed, or the server predates the
  * manifest route). Never null, so callers can read `.manifestVersion`
@@ -1574,13 +1589,7 @@ function createWindow(targetUrl, opts = {}) {
     void loadInitialDestination({
       loadServer: () =>
         loadServerUrl(win, serverUrl, undefined, destination, {
-          beforeLoad: () => {
-            // Learn the server's version alongside the load; never awaited and
-            // never throws (see fetchServerManifest).
-            void fetchServerManifest(serverUrl).then((manifest) => {
-              if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
-            });
-          },
+          beforeLoad: () => refreshWindowServerManifest(win, serverUrl),
         }),
       loadSetup: () => loadSetupPage(win),
     })
@@ -2660,10 +2669,7 @@ function registerIpc() {
       // the connection lives and dies with the window.
       const ephemeral = Boolean(windows.get(win)?.ephemeral);
       // Learn what this server is before deciding anything version-dependent
-      // about the window. Deliberately NOT awaited ahead of loadURL: the
-      // manifest is advisory, and a slow/absent one must not delay (or block)
-      // connecting. fetchServerManifest never rejects — it resolves to the
-      // pre-manifest baseline — so no catch is needed here.
+      // about the window (see refreshWindowServerManifest).
       const loaded = await loadServerUrl(win, target, undefined, undefined, {
         alreadyGated: true,
         beforeLoad: () => {
@@ -2672,9 +2678,7 @@ function registerIpc() {
             settings.server_url = target;
             saveSettings(settings);
           }
-          void fetchServerManifest(target).then((manifest) => {
-            if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
-          });
+          refreshWindowServerManifest(win, target);
         },
       });
       if (!loaded) return { loaded: false };
@@ -2784,9 +2788,7 @@ function registerIpc() {
           // Commit the new manifest only after authentication succeeds, so a
           // cancelled switch leaves the old page and its metadata paired.
           setWindowServerManifest(win, PRE_MANIFEST_BASELINE);
-          void fetchServerManifest(url).then((manifest) => {
-            if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
-          });
+          refreshWindowServerManifest(win, url);
         },
       });
       if (!loaded || ephemeral) return;

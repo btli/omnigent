@@ -65,6 +65,20 @@ function isUserAbort(signal) {
   return signal?.aborted === true;
 }
 
+// Past the login deadline: distinguish a user cancel from a plain timeout.
+function timedOutOrCancelled(signal) {
+  return { ok: false, reason: isUserAbort(signal) ? "cancelled" : "timed_out" };
+}
+
+// Progress reporting must never terminate an otherwise recoverable auth flow.
+function reportPollError(onPollError, ...args) {
+  try {
+    onPollError?.(...args);
+  } catch {
+    // Reporter errors are advisory only.
+  }
+}
+
 function oidcServerUrlError(serverUrl) {
   if (typeof serverUrl !== "string" || serverUrl.includes("\\") || serverUrl.includes("#")) {
     return "invalid_server_url";
@@ -176,11 +190,7 @@ async function runOidcBrowserLogin(
         signal: requestSignal(signal),
       });
       if (!TRANSIENT_AUTH_STATUSES.has(response.status)) return response;
-      try {
-        onPollError?.(response.status);
-      } catch {
-        // Progress reporting cannot terminate authentication.
-      }
+      reportPollError(onPollError, response.status);
       if (monotonicNowMs() >= deadline) return null;
       await delay(pollIntervalMs, undefined, { signal });
       return monotonicNowMs() < deadline ? createTicket() : null;
@@ -194,7 +204,7 @@ async function runOidcBrowserLogin(
     // flow, and opening the system browser for it would start a login the
     // shell has already abandoned. Same recheck as the token poll below.
     if (monotonicNowMs() >= deadline) {
-      return { ok: false, reason: isUserAbort(signal) ? "cancelled" : "timed_out" };
+      return timedOutOrCancelled(signal);
     }
     ticket = body && typeof body.ticket === "string" ? body.ticket : "";
     const loginPath = body && typeof body.login_url === "string" ? body.login_url : "";
@@ -211,7 +221,7 @@ async function runOidcBrowserLogin(
   pollUrl.searchParams.set("ticket", ticket);
   const pollForCompletion = async () => {
     if (monotonicNowMs() >= deadline) {
-      return { ok: false, reason: isUserAbort(signal) ? "cancelled" : "timed_out" };
+      return timedOutOrCancelled(signal);
     }
     try {
       await delay(pollIntervalMs, undefined, { signal });
@@ -219,7 +229,7 @@ async function runOidcBrowserLogin(
       return { ok: false, reason: "cancelled" };
     }
     if (monotonicNowMs() >= deadline) {
-      return { ok: false, reason: isUserAbort(signal) ? "cancelled" : "timed_out" };
+      return timedOutOrCancelled(signal);
     }
 
     let response;
@@ -232,20 +242,12 @@ async function runOidcBrowserLogin(
       });
     } catch {
       if (isUserAbort(signal)) return { ok: false, reason: "cancelled" };
-      try {
-        onPollError?.();
-      } catch {
-        // Progress reporting must never terminate an otherwise recoverable poll.
-      }
+      reportPollError(onPollError);
       return pollForCompletion();
     }
     if (response.status === 202) return pollForCompletion();
     if (TRANSIENT_AUTH_STATUSES.has(response.status)) {
-      try {
-        onPollError?.(response.status);
-      } catch {
-        // Progress reporting must never terminate an otherwise recoverable poll.
-      }
+      reportPollError(onPollError, response.status);
       return pollForCompletion();
     }
     if (response.status === 410) return { ok: false, reason: "expired" };
@@ -257,7 +259,7 @@ async function runOidcBrowserLogin(
       // — a token landing past the deadline is expired-flow output and must
       // not install a session, matching the Android shell's late-token check.
       if (monotonicNowMs() >= deadline) {
-        return { ok: false, reason: isUserAbort(signal) ? "cancelled" : "timed_out" };
+        return timedOutOrCancelled(signal);
       }
       if (!body || typeof body.token !== "string" || body.token === "") {
         return { ok: false, reason: "failed" };
