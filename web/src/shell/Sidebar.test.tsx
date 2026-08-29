@@ -727,17 +727,20 @@ describe("Sidebar session list", () => {
     expect(selectSessions).toHaveClass("text-muted-foreground", "hover:text-foreground");
     expect(selectSessions).not.toHaveTextContent("Select sessions");
     expect(selectSessions.parentElement).toHaveClass(
-      "[@media(hover:hover)]:md:opacity-0",
-      "[@media(hover:hover)]:md:group-hover/header:opacity-100",
-      "[@media(hover:hover)]:md:group-focus-within/header:opacity-100",
-      "[@media(hover:hover)]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-focus-within/header:opacity-100",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100",
     );
 
     const filterSessions = within(sessionsSection!).getByRole("button", {
       name: "Filter sessions",
     });
+    // The filter never fades; its wrapper re-enables hit-testing inside the
+    // pointer-events-gated outer box (see the overlay hit-test spec below).
     expect(filterSessions.parentElement).not.toHaveClass("md:opacity-0");
-    expect(filterSessions.parentElement).toHaveClass("absolute", "right-1", "flex");
+    expect(filterSessions.parentElement).toHaveClass("pointer-events-auto", "flex");
+    expect(filterSessions.parentElement!.parentElement).toHaveClass("absolute", "right-1", "flex");
 
     fireEvent.click(selectSessions);
     expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
@@ -1355,7 +1358,11 @@ describe("Sidebar collapsed section count pill", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
     const cluster = screen.getByTestId("section-collapsed-count").parentElement!;
-    expect(cluster).toHaveClass("ml-auto", "mr-14", "[@media(hover:hover)]:md:mr-7");
+    expect(cluster).toHaveClass(
+      "ml-auto",
+      "mr-14",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:mr-7",
+    );
   });
 
   // The Projects group's overlay (New project + kebab) is likewise painted at
@@ -1373,16 +1380,23 @@ describe("Sidebar collapsed section count pill", () => {
     fireEvent.click(screen.getByRole("button", { name: "Projects" }));
     const projectsSection = screen.getByText("Projects").closest("section")!;
     const cluster = within(projectsSection).getByTestId("section-collapsed-count").parentElement!;
-    expect(cluster).toHaveClass("ml-auto", "mr-14", "[@media(hover:hover)]:md:mr-2");
+    expect(cluster).toHaveClass(
+      "ml-auto",
+      "mr-14",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:mr-2",
+    );
   });
 
-  // On hover-capable desktops the header overlays are opacity-0 at rest but
-  // were still hit-testable — a click aimed at the pill could fire the
-  // invisible "New project" (or "Select sessions") button. The overlays must
-  // drop pointer-events while hidden and restore them under the same
-  // conditions that reveal them. jsdom cannot hit-test through media-query
-  // variants, so the class contract is asserted here and the effective
-  // click-through behaviour stays e2e-only.
+  // On fine-pointer hover desktops the header overlays are opacity-0 at rest
+  // but sit over the pill/marker; they must not be hit-testable while hidden,
+  // or a click aimed at the visible pill dies on (or fires) an invisible
+  // control. The gate must live on the OUTER positioned box: hit-testing a
+  // pointer-events-none child falls through to its nearest `auto` ancestor,
+  // so a gate on only the inner wrapper leaves the outer box swallowing the
+  // click anyway. The gate is also scoped to (hover:hover) and (pointer:fine)
+  // so coarse-pointer hybrids keep always-visible, always-clickable controls.
+  // jsdom cannot hit-test through media-query variants, so the class contract
+  // is asserted here and the effective click-through behaviour stays e2e-only.
   it("keeps hidden header overlays from intercepting clicks aimed at the pill", () => {
     projectsMock.push("Customer X");
     mockConversations([
@@ -1395,23 +1409,66 @@ describe("Sidebar collapsed section count pill", () => {
       .getByRole("button", { name: "New project" })
       .closest("div[class*=absolute]")!;
     expect(groupOverlay).toHaveClass(
-      "[@media(hover:hover)]:md:pointer-events-none",
-      "[@media(hover:hover)]:md:group-hover/header:pointer-events-auto",
-      "[@media(hover:hover)]:md:has-[:focus-visible]:pointer-events-auto",
-      "[@media(hover:hover)]:md:group-has-[[data-state=open]]/header:pointer-events-auto",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:pointer-events-none",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pointer-events-auto",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:pointer-events-auto",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:pointer-events-auto",
     );
 
-    const sessionsOverlay = screen
+    // Sessions: the gate sits on the outer positioned box…
+    const sessionsOuter = screen
+      .getByTestId("toggle-selection-mode")
+      .closest("div[class*=absolute]")!;
+    expect(sessionsOuter).toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:md:pointer-events-none",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pointer-events-auto",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-focus-within/header:pointer-events-auto",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:pointer-events-auto",
+    );
+    // …while the inner hover-revealed wrapper carries opacity only — a
+    // pointer-events gate there would be defeated by this outer box.
+    const sessionsInner = screen
       .getByTestId("toggle-selection-mode")
       .closest("div[class*=transition-opacity]")!;
-    expect(sessionsOverlay).toHaveClass(
-      "[@media(hover:hover)]:md:pointer-events-none",
-      "[@media(hover:hover)]:md:group-hover/header:pointer-events-auto",
-      "[@media(hover:hover)]:md:group-focus-within/header:pointer-events-auto",
+    expect(sessionsInner).not.toBe(sessionsOuter);
+    expect(Array.from(sessionsInner.classList).some((c) => c.includes("pointer-events-none"))).toBe(
+      false,
     );
-    // The always-visible filter lives OUTSIDE the guarded wrapper — it must
-    // stay clickable at rest.
-    expect(sessionsOverlay.contains(screen.getByTestId("session-filter"))).toBe(false);
+    // The always-visible filter re-enables hit-testing for itself inside the
+    // gated box, so it stays clickable at rest.
+    const filterWrapper = screen.getByTestId("session-filter").closest(".pointer-events-auto")!;
+    expect(sessionsOuter.contains(filterWrapper)).toBe(true);
+  });
+
+  // The pill's fade list must mirror the overlay's reveal list — an overlay
+  // state that reveals controls over a still-visible pill (open kebab menu,
+  // expanded filter) must also fade the pill — and its focus condition is
+  // scoped to focus INSIDE the control cluster, so keyboard focus on the
+  // header button itself doesn't hide the count while the controls stay
+  // hidden. Everything is gated on the same (hover:hover) and (pointer:fine)
+  // md+ condition that hides the controls at rest: where they never hide
+  // (touch, coarse-pointer hybrids), the pill never fades.
+  it("fades the pill under exactly the control-reveal conditions", () => {
+    mockConversations([conv("conv_mine", "Claude Code")]);
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
+    const pill = screen.getByTestId("section-collapsed-count");
+    expect(pill).toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-0",
+    );
+    // No bare header-wide focus fade, and no width-only (md:) fade that would
+    // hide the pill under sticky touch-hover on hover:none viewports.
+    for (const cls of pill.classList) {
+      expect(cls).not.toMatch(/^md:/);
+      expect(cls.includes("group-focus-within/header")).toBe(false);
+    }
+    // The overlays the list mirrors are tagged as the focus scope.
+    const overlay = screen.getByTestId("toggle-selection-mode").closest("div[class*=absolute]")!;
+    expect(overlay).toHaveAttribute("data-header-controls");
   });
 });
 
@@ -1448,7 +1505,7 @@ describe("SectionHeader collapsed badge cluster", () => {
 
     // The reservation/alignment margins sit on the cluster alone — a margin on
     // the pill would open a floating gap between it and the marker.
-    expect(cluster).toHaveClass("mr-14", "[@media(hover:hover)]:md:mr-1");
+    expect(cluster).toHaveClass("mr-14", "[@media((hover:hover)_and_(pointer:fine))]:md:mr-1");
     for (const child of [pill, markerSlot]) {
       expect(Array.from(child.classList).some((c) => /(^|:)-?mr-/.test(c))).toBe(false);
     }
@@ -1984,14 +2041,15 @@ describe("Sidebar collapsed project marker", () => {
     // rows' dots.
     expect(slot).toHaveClass("w-6", "justify-center");
     // Margins live on the right-pinned badge cluster, not the slot. Folder
-    // headers use px-2, so at rest on hover-capable desktops the cluster trims
-    // the trailing padding to the rows' right-1 (4px) edge. The header's kebab
-    // is painted whenever hover isn't available — including desktop-width
-    // touch viewports — so the mr-14 reserve is the default and the -mr-1
-    // reset is gated on hover support, not just width.
+    // headers use px-2, so at rest on fine-pointer hover desktops the cluster
+    // trims the trailing padding to the rows' right-1 (4px) edge. The header's
+    // kebab is painted whenever a fine hover pointer isn't primary — touch
+    // viewports at any width, coarse-pointer convertibles — so the mr-14
+    // reserve is the default and the -mr-1 reset is gated on the pointer
+    // capability, not just width.
     const cluster = screen.getByTestId("section-collapsed-badges");
     expect(cluster).toBe(slot.parentElement);
-    expect(cluster).toHaveClass("mr-14", "[@media(hover:hover)]:md:-mr-1");
+    expect(cluster).toHaveClass("mr-14", "[@media((hover:hover)_and_(pointer:fine))]:md:-mr-1");
   });
 
   // The "awaiting" pill is wider than the dot markers; constraining it to the
