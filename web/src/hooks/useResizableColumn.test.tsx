@@ -278,9 +278,7 @@ describe("useResizableColumn keyboard resizing", () => {
     // The handle can render inside a closed (aria-hidden) panel; it must not
     // be reachable by Tab there, and arrow keys must not resize the
     // off-screen column.
-    const { result } = renderHook(() =>
-      useResizableColumn(undefined, undefined, undefined, false),
-    );
+    const { result } = renderHook(() => useResizableColumn(undefined, undefined, undefined, false));
 
     expect(result.current.handleProps.tabIndex).toBe(-1);
 

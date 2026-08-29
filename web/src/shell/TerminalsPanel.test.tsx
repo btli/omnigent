@@ -328,7 +328,9 @@ describe("TerminalsPanel column resize handle", () => {
     // The closed aside is aria-hidden; a tabbable separator inside it would
     // be an ARIA violation and would let keyboard users resize the
     // off-screen column.
-    expect(screen.queryByRole("separator", { name: /resize terminal list/i, hidden: true })).toBeNull();
+    expect(
+      screen.queryByRole("separator", { name: /resize terminal list/i, hidden: true }),
+    ).toBeNull();
     const panel = screen.getByTestId("terminals-panel");
     expect(panel).toHaveAttribute("aria-hidden", "true");
     expect(panel.querySelector('[tabindex="0"][role="separator"]')).toBeNull();
