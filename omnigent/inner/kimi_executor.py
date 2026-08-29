@@ -391,6 +391,11 @@ class KimiExecutor(Executor):
         # Byte-offset checkpoints into each kimi session's persisted wire log,
         # so a turn only sums the usage records new since the prior turn.
         self._wire_offsets: dict[str, int] = {}
+        # Sessions whose usage collection already failed (no/empty wire):
+        # maps to the FIRST failed turn's start, so a later first read bills
+        # those turns' late-appearing rows instead of gating on the current
+        # turn's start (and seeding must not snapshot EOF past them).
+        self._first_read_floor_ms: dict[str, int] = {}
         # Tracks whether we've already warned this session about tools
         # being declared without a provider-injection bridge (one warning
         # per session; the tool-injection bridge is a deferred follow-up).
@@ -524,6 +529,12 @@ class KimiExecutor(Executor):
         session_id = self._session_id
         if not session_id or session_id in self._wire_offsets:
             return
+        if session_id in self._first_read_floor_ms:
+            # An earlier turn's collection already failed for this session, so
+            # rows written since that turn are still unbilled: snapshotting
+            # EOF now would skip them forever. The first read starts at 0,
+            # gated on the recorded floor instead.
+            return
         try:
             wire = _find_wire_log(resolve_user_kimi_home(), session_id)
             if wire is not None:
@@ -556,12 +567,21 @@ class KimiExecutor(Executor):
                     "this turn; retried next turn)",
                     session_id,
                 )
+                # Remember the FIRST failed turn's start: its rows may appear
+                # late and must still bill on the eventual first read.
+                self._first_read_floor_ms.setdefault(session_id, turn_start_ms)
                 return None
             offset = self._wire_offsets.get(session_id, 0)
+            floor_ms = self._first_read_floor_ms.get(session_id, turn_start_ms)
             totals, model, new_offset = _sum_wire_usage(
-                wire_path, offset=offset, turn_start_ms=turn_start_ms
+                wire_path, offset=offset, turn_start_ms=floor_ms
             )
             self._wire_offsets[session_id] = new_offset
+            if totals is not None or new_offset != offset:
+                # A read actually consumed the log; the pending-first-read
+                # floor has served its purpose (kept while the file is
+                # missing, unreadable, or still empty).
+                self._first_read_floor_ms.pop(session_id, None)
             if totals is None:
                 return None
             usage: dict[str, object] = dict(totals)

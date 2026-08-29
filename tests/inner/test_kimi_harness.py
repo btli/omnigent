@@ -937,22 +937,37 @@ def test_run_turn_missing_wire_log_reports_no_usage(
     assert not [e for e in events if isinstance(e, ExecutorError)]
     assert any("no wire log found" in r.message for r in caplog.records)
 
-    # The wire log shows up during a later turn (kimi created the session
-    # mid-run): that turn reports usage — proving the None above was the
-    # missing file, not a missing feature.
+    # The wire log shows up BETWEEN turns (kimi created it late), already
+    # holding a row stamped during turn 1. The next turn's checkpoint seeding
+    # must not snapshot EOF past that unbilled row: the eventual first read
+    # bills it (gated on the FIRST failed turn's floor, not this turn's
+    # start) together with the new turn's own row.
+    late_turn1_ms = int(time.time() * 1000)
+    _write_wire(
+        tmp_path,
+        "session_missing-1",
+        [_usage_row(input_other=6, output=2, time_ms=late_turn1_ms)],
+    )
+
+    def _append_turn2_row() -> None:
+        wire = _wire_path(tmp_path, "session_missing-1")
+        with wire.open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(_usage_row(input_other=4, output=1, time_ms=int(time.time() * 1000)))
+                + "\n"
+            )
+
     events2 = _collect_stubbed_turn(
         monkeypatch,
         ex,
         session_id="session_missing-1",
-        on_spawn=lambda: _write_wire(
-            tmp_path,
-            "session_missing-1",
-            [_usage_row(input_other=6, output=2, time_ms=int(time.time() * 1000))],
-        ),
+        on_spawn=_append_turn2_row,
     )
     turn2 = next(e for e in events2 if isinstance(e, TurnComplete))
     assert turn2.usage is not None
-    assert turn2.usage["input_tokens"] == 6
+    # Both the late-appearing turn-1 row AND turn 2's row bill exactly once.
+    assert turn2.usage["input_tokens"] == 6 + 4
+    assert turn2.usage["output_tokens"] == 2 + 1
 
 
 def test_run_turn_malformed_wire_rows_are_skipped_whole(
