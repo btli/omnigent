@@ -10409,36 +10409,37 @@ def test_claude_catalog_selection_rejects_an_unrecognized_claude_looking_id() ->
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("probe_outcome", "expected_status", "expected_rows"),
+    ("probe_outcome", "expected_freshness", "expected_kind"),
     [
         pytest.param(
             [{"id": "opus", "model": "claude-opus-5"}],
-            claude_native.ClaudeLaunchCatalogStatus.FRESH,
-            [{"id": "opus", "model": "claude-opus-5"}],
+            "fresh",
+            None,
             id="fresh",
         ),
         pytest.param(
             "empty-error",
-            claude_native.ClaudeLaunchCatalogStatus.EMPTY,
-            [],
+            "stale",
+            "empty",
             id="empty",
         ),
         pytest.param(
             "refresh-error",
-            claude_native.ClaudeLaunchCatalogStatus.REFRESH_FAILED,
-            [],
+            "stale",
+            "other",
             id="refresh-failed",
         ),
     ],
 )
-async def test_claude_launch_catalog_result_ignores_stale_rows_and_reports_refresh_outcome(
+async def test_claude_launch_catalog_result_reports_authoritative_provenance(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     probe_outcome: list[dict[str, object]] | str,
-    expected_status: claude_native.ClaudeLaunchCatalogStatus,
-    expected_rows: list[dict[str, object]],
+    expected_freshness: str,
+    expected_kind: str | None,
 ) -> None:
-    """Launch selection sees fresh rows and distinguishes empty from failed refreshes."""
+    """Launch selection sees fresh rows, and a failed refresh keeps stale rows
+    marked stale with the sanitized failure kind — never as fresh authority."""
     import time
 
     from omnigent import model_catalog_store
@@ -10451,24 +10452,17 @@ async def test_claude_launch_catalog_result_ignores_stale_rows_and_reports_refre
     stale_time = time.time() - model_catalog_store.CATALOG_STALE_AFTER_S - 1
     os.utime(path, (stale_time, stale_time))
 
-    class _EmptyKind:
-        value = "empty"
-
-    class CatalogRefreshError(Exception):
-        kind = _EmptyKind()
-
-    monkeypatch.setattr(
-        model_catalog_store,
-        "CatalogRefreshError",
-        CatalogRefreshError,
-        raising=False,
-    )
-
     async def _probe(_config: object) -> list[dict[str, object]]:
         if probe_outcome == "empty-error":
-            raise CatalogRefreshError("model catalog refresh returned no models")
+            raise model_catalog_store.CatalogRefreshError(
+                model_catalog_store.CatalogRefreshFailureKind.EMPTY,
+                "model catalog refresh returned no models",
+            )
         if probe_outcome == "refresh-error":
-            raise RuntimeError("catalog refresh unavailable")
+            raise model_catalog_store.CatalogRefreshError(
+                model_catalog_store.CatalogRefreshFailureKind.OTHER,
+                "catalog refresh unavailable",
+            )
         assert isinstance(probe_outcome, list)
         return probe_outcome
 
@@ -10476,6 +10470,13 @@ async def test_claude_launch_catalog_result_ignores_stale_rows_and_reports_refre
 
     result = await claude_native.claude_launch_catalog_result(None)
 
-    assert result.status is expected_status
-    assert result.rows == expected_rows
-    assert result.rows != stale_rows
+    assert result.freshness.value == expected_freshness
+    if expected_kind is None:
+        assert result.refresh_error is None
+        assert result.rows == probe_outcome
+    else:
+        assert result.refresh_error is not None
+        assert result.refresh_error.kind.value == expected_kind
+        # A failed refresh preserves the cached rows, but never as fresh
+        # authority: launch selection must see the STALE provenance.
+        assert result.rows == stale_rows
