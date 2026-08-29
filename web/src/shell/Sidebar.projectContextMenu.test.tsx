@@ -320,7 +320,11 @@ describe("project folder header context menu", () => {
       expect(screen.queryByTestId("rename-project")).toBeNull();
       act(() => vi.advanceTimersByTime(1));
 
+      // All four kebab actions, so nothing is stranded without the kebab.
+      expect(screen.getByTestId("project-new-session-menu")).toBeInTheDocument();
       expect(screen.getByTestId("rename-project")).toBeInTheDocument();
+      expect(screen.getByTestId("project-settings")).toBeInTheDocument();
+      expect(screen.getByTestId("delete-project")).toBeInTheDocument();
       expect(document.body).toHaveStyle({ pointerEvents: "none" });
       dispatchTouchPointer(header, "pointerup");
       expect(header).toHaveAttribute("aria-expanded", before);

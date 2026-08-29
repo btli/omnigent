@@ -2024,6 +2024,29 @@ describe("Sidebar project sections", () => {
     }
     expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
   });
+
+  it("renders the project kebab only where a fine hover pointer can reveal it", () => {
+    // Every kebab item also lives in the header's context menu, which touch
+    // reaches with a long-press — so the kebab renders only on md+ displays
+    // with a fine, hover-capable primary pointer (the same condition that
+    // reveals it from its at-rest fade). Everywhere else, at ANY width, it
+    // stays hidden: narrow phones and unfolded foldables (md+, no hover)
+    // alike. jsdom doesn't evaluate media queries, so the responsive classes
+    // are asserted here; effective geometry is e2e/demo territory.
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
+    ]);
+    renderSidebar();
+
+    const kebab = screen.getByTestId("project-actions");
+    expect(kebab).toHaveClass("hidden", "[@media((hover:hover)_and_(pointer:fine))]:md:flex");
+    // No width-only gate: a bare md:flex would re-show the kebab on an
+    // unfolded foldable (md+ width, no hover) — the reported defect.
+    for (const cls of kebab.classList) {
+      expect(cls).not.toMatch(/^md:(inline-)?flex$/);
+    }
+  });
 });
 
 // A collapsed project bubbles up its hidden rows' marker, using the same
@@ -2092,16 +2115,23 @@ describe("Sidebar collapsed project marker", () => {
     // Fixed centered box so the dot centers on the same vertical line as the
     // rows' dots.
     expect(slot).toHaveClass("w-6", "justify-center");
-    // Margins live on the right-pinned badge cluster, not the slot. Folder
-    // headers use px-2, so at rest on fine-pointer hover desktops the cluster
-    // trims the trailing padding to the rows' right-1 (4px) edge. The header's
-    // kebab is painted whenever a fine hover pointer isn't primary — touch
-    // viewports at any width, coarse-pointer convertibles — so the mr-14
-    // reserve is the default and the -mr-1 reset is gated on the pointer
-    // capability, not just width.
+    // Margins live on the right-pinned badge cluster, not the slot. The folder
+    // kebab is hover-only (touch reaches its items via the header's long-press
+    // context menu), so nothing paints the control column at rest at ANY
+    // capability or width — no mr-14 reserve; the cluster always trims the
+    // folder button's px-2 to the rows' right-1 (4px) edge.
     const cluster = screen.getByTestId("section-collapsed-badges");
     expect(cluster).toBe(slot.parentElement);
-    expect(cluster).toHaveClass("mr-14", "[@media((hover:hover)_and_(pointer:fine))]:md:-mr-1");
+    expect(cluster).toHaveClass("-mr-1");
+    expect(cluster).not.toHaveClass("mr-14");
+    expect(cluster).not.toHaveClass("[@media((hover:hover)_and_(pointer:fine))]:md:-mr-1");
+    // On fine-hover desktops the marker still fades as the revealed kebab
+    // takes its slot — the conversation-row swap, unchanged.
+    expect(slot).toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/section:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-0",
+    );
   });
 
   // The "awaiting" pill is wider than the dot markers; constraining it to the
