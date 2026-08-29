@@ -205,9 +205,19 @@ export function useResizableInlinePanel(
   }, []);
 
   const resizeEnabled = enabled && persistEnabled && resolvedWidth !== 0;
+  // Cancellation restores the pre-drag width: onMove writes the live store on
+  // every pointermove, so an abort (Escape, blur, session switch) must undo
+  // those writes.
+  const dragStartWidth = useRef<number | null>(null);
   const resizeDrag = useResizeDrag({
     enabled: resizeEnabled,
     overlay: true,
+    onStart: useCallback(() => {
+      dragStartWidth.current = widthStore.getSnapshot();
+    }, []),
+    onCancel: useCallback(() => {
+      widthStore.set(dragStartWidth.current);
+    }, []),
     onCommit: widthStore.persist,
     onMove: useCallback((e: React.PointerEvent<HTMLElement>) => {
       widthStore.set(

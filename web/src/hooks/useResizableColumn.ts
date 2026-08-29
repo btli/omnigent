@@ -33,8 +33,20 @@ export function useResizableColumn(
     [minWidth, maxWidth],
   );
 
+  // Cancellation restores the pre-drag width: onMove applies each pointermove
+  // live, so an abort (Escape, blur, …) must undo those writes rather than
+  // silently keeping the dragged width.
+  const widthRef = useRef(width);
+  widthRef.current = width;
+  const dragStartWidth = useRef(defaultWidth);
   const resizeDrag = useResizeDrag({
     enabled,
+    onStart: useCallback(() => {
+      dragStartWidth.current = widthRef.current;
+    }, []),
+    onCancel: useCallback(() => {
+      setWidth(dragStartWidth.current);
+    }, []),
     onMove: useCallback(
       (e: React.PointerEvent) => {
         if (!containerRef.current) return;

@@ -254,7 +254,7 @@ describe("useResizableCommentsPanel pointer drag", () => {
     act(() => void document.dispatchEvent(docPointerEvent("pointercancel", 5)));
 
     expect(overlaySelector()).toBeNull();
-    expect(result.current.width).toBe(300);
+    expect(result.current.width).toBe(240);
     expect(readPanelSizePreference("commentsPanelWidthPx")).toBeNull();
     unmount();
   });
@@ -342,7 +342,7 @@ describe("useResizableCommentsPanel pointer drag", () => {
   it.each([
     ["pointercancel", "onPointerCancel"],
     ["lostpointercapture", "onLostPointerCapture"],
-  ] as const)("aborts cleanly at the last applied width on %s", (_name, handler) => {
+  ] as const)("aborts cleanly at the pre-drag width on %s", (_name, handler) => {
     const { result, unmount } = renderHook(() => useResizableCommentsPanel());
     attachContainer(result.current.containerRef);
     const target = makeHandleTarget();
@@ -355,10 +355,10 @@ describe("useResizableCommentsPanel pointer drag", () => {
     );
     act(() => result.current.handleProps[handler](pointerEvent(target, { pointerId: 3 })));
 
-    // Never a half-state: width settles, body styles restore, drag is over so
-    // later moves from the same pointer are inert. An abort is not a choice —
-    // the last applied width stays on screen but is never persisted.
-    expect(result.current.width).toBe(300);
+    // Never a half-state: the pre-drag width is restored, body styles
+    // recover, and the drag is over so later moves from the same pointer are
+    // inert. An abort is not a choice — nothing is persisted.
+    expect(result.current.width).toBe(240);
     expect(readPanelSizePreference("commentsPanelWidthPx")).toBeNull();
     expect(document.body.style.cursor).toBe("");
     expect(document.body.style.userSelect).toBe("");
@@ -367,7 +367,7 @@ describe("useResizableCommentsPanel pointer drag", () => {
         pointerEvent(target, { pointerId: 3, clientX: 500 }),
       ),
     );
-    expect(result.current.width).toBe(300);
+    expect(result.current.width).toBe(240);
     unmount();
   });
 });

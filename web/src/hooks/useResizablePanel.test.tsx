@@ -272,7 +272,8 @@ describe("useResizablePanel persistence", () => {
         );
       });
 
-      expect(result.current.panelWidth).toBe(800);
+      // The abort restores the pre-drag width (the viewport-derived default).
+      expect(result.current.panelWidth).toBe(1000);
       expect(readPanelSizePreference("pushPanelWidthPx")).toBeNull();
       expect(document.body.style.cursor).toBe("");
       expect(document.body.style.userSelect).toBe("");

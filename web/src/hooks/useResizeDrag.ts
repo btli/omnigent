@@ -2,8 +2,17 @@ import { useCallback, useEffect, useRef } from "react";
 
 interface ResizeDragOptions<T extends Element> {
   enabled?: boolean;
+  /** Fires when a drag claims the pointer — snapshot the pre-drag width here. */
+  onStart?: () => void;
   onMove: (event: React.PointerEvent<T>) => void;
   onCommit?: () => void;
+  /**
+   * Fires instead of `onCommit` when the drag aborts (Escape, blur, …).
+   * Every `onMove` has already applied its width live, so cancellation must
+   * actively restore the `onStart` snapshot or the abort silently keeps the
+   * dragged width on screen while storage still holds the old one.
+   */
+  onCancel?: () => void;
   overlay?: boolean;
   observeHandleRemoval?: boolean;
 }
@@ -35,8 +44,10 @@ function releaseBodyStyles(owner: symbol): void {
 /** Shared pointer lifecycle for resize handles; callers provide only sizing policy. */
 export function useResizeDrag<T extends Element = Element>({
   enabled = true,
+  onStart,
   onMove,
   onCommit,
+  onCancel,
   overlay = false,
   observeHandleRemoval = false,
 }: ResizeDragOptions<T>) {
@@ -45,10 +56,14 @@ export function useResizeDrag<T extends Element = Element>({
   const cleanup = useRef<(() => void) | null>(null);
   const overlayElement = useRef<HTMLDivElement | null>(null);
   const bodyStyleOwner = useRef(Symbol("resize-drag"));
+  const onStartRef = useRef(onStart);
   const onMoveRef = useRef(onMove);
   const onCommitRef = useRef(onCommit);
+  const onCancelRef = useRef(onCancel);
+  onStartRef.current = onStart;
   onMoveRef.current = onMove;
   onCommitRef.current = onCommit;
+  onCancelRef.current = onCancel;
 
   const finishDrag = useCallback((commit: boolean) => {
     const pointerId = activePointerId.current;
@@ -70,6 +85,7 @@ export function useResizeDrag<T extends Element = Element>({
 
     releaseBodyStyles(bodyStyleOwner.current);
     if (commit) onCommitRef.current?.();
+    else onCancelRef.current?.();
   }, []);
 
   const cancelDrag = useCallback(() => finishDrag(false), [finishDrag]);
@@ -89,6 +105,7 @@ export function useResizeDrag<T extends Element = Element>({
       event.preventDefault();
       activePointerId.current = event.pointerId;
       activeHandle.current = event.currentTarget;
+      onStartRef.current?.();
 
       const onDocumentPointerUp = (documentEvent: PointerEvent) => {
         if (documentEvent.pointerId === activePointerId.current) {

@@ -118,7 +118,7 @@ describe("useResizableColumn pointer dragging", () => {
   });
 
   it.each(["onPointerCancel", "onLostPointerCapture"] as const)(
-    "aborts cleanly on %s, keeping the last applied width",
+    "aborts cleanly on %s, restoring the pre-drag width",
     (name) => {
       const { result } = renderColumn(0);
 
@@ -129,10 +129,11 @@ describe("useResizableColumn pointer dragging", () => {
       act(() => result.current.handleProps[name](pointerEvent(3)));
       expect(document.body.style.cursor).toBe("");
       expect(document.body.style.userSelect).toBe("");
+      expect(result.current.width).toBe(176);
 
       // The aborted pointer is dead: further moves must not resize.
       act(() => result.current.handleProps.onPointerMove(pointerEvent(3, 400)));
-      expect(result.current.width).toBe(250);
+      expect(result.current.width).toBe(176);
     },
   );
 
@@ -235,9 +236,10 @@ describe("useResizableColumn pointer dragging", () => {
     rendered.rerender({ enabled: false });
     expect(document.body.style.cursor).toBe("");
     expect(document.body.style.userSelect).toBe("");
+    expect(rendered.result.current.width).toBe(176);
 
     act(() => rendered.result.current.handleProps.onPointerMove(pointerEvent(12, 400)));
-    expect(rendered.result.current.width).toBe(260);
+    expect(rendered.result.current.width).toBe(176);
   });
 });
 

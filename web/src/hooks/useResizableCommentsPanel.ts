@@ -132,9 +132,18 @@ export function useResizableCommentsPanel() {
     return () => observer.disconnect();
   }, [clampWidth]);
 
+  // Cancellation restores the pre-drag width: onMove writes the live store on
+  // every pointermove, so an abort (Escape, blur, …) must undo those writes.
+  const dragStartWidth = useRef<number | null>(null);
   const resizeDrag = useResizeDrag({
     enabled: isDesktop,
     overlay: true,
+    onStart: useCallback(() => {
+      dragStartWidth.current = widthStore.getSnapshot();
+    }, []),
+    onCancel: useCallback(() => {
+      widthStore.set(dragStartWidth.current);
+    }, []),
     onCommit: widthStore.persist,
     onMove: useCallback(
       (e: React.PointerEvent) => {

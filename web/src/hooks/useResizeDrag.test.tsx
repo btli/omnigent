@@ -101,3 +101,59 @@ describe("useResizeDrag cancellation", () => {
     expect(document.body.style.userSelect).toBe("text");
   });
 });
+
+function LifecycleHandle({
+  onStart,
+  onCommit,
+  onCancel,
+}: {
+  onStart: () => void;
+  onCommit: () => void;
+  onCancel: () => void;
+}) {
+  const { handleProps } = useResizeDrag<HTMLDivElement>({
+    onStart,
+    onMove: () => {},
+    onCommit,
+    onCancel,
+  });
+  return <div aria-label="Lifecycle handle" {...handleProps} />;
+}
+
+describe("useResizeDrag lifecycle callbacks", () => {
+  it("fires onStart at pointer down and onCommit (not onCancel) on release", () => {
+    const onStart = vi.fn();
+    const onCommit = vi.fn();
+    const onCancel = vi.fn();
+    render(<LifecycleHandle onStart={onStart} onCommit={onCommit} onCancel={onCancel} />);
+    const handle = screen.getByLabelText("Lifecycle handle");
+    installPointerCapture(handle);
+
+    startDrag(handle, 21);
+    expect(onStart).toHaveBeenCalledTimes(1);
+
+    fireEvent.pointerUp(handle, { pointerId: 21 });
+    expect(onCommit).toHaveBeenCalledTimes(1);
+    expect(onCancel).not.toHaveBeenCalled();
+  });
+
+  it("fires onCancel (not onCommit) when the drag aborts on Escape", () => {
+    const onStart = vi.fn();
+    const onCommit = vi.fn();
+    const onCancel = vi.fn();
+    render(<LifecycleHandle onStart={onStart} onCommit={onCommit} onCancel={onCancel} />);
+    const handle = screen.getByLabelText("Lifecycle handle");
+    installPointerCapture(handle);
+
+    startDrag(handle, 22);
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    expect(onCancel).toHaveBeenCalledTimes(1);
+    expect(onCommit).not.toHaveBeenCalled();
+
+    // A dead drag does not re-fire callbacks on a stray release.
+    fireEvent.pointerUp(handle, { pointerId: 22 });
+    expect(onCommit).not.toHaveBeenCalled();
+    expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+});

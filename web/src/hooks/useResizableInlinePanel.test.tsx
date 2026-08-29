@@ -338,7 +338,7 @@ describe("useResizableInlinePanel pointer drag", () => {
   it.each(["onPointerCancel", "onLostPointerCapture"] as const)(
     "aborts cleanly without persisting through %s",
     (abortHandler) => {
-      // Browser cancellation or capture loss keeps the last applied width,
+      // Browser cancellation or capture loss restores the pre-drag width,
       // ends the drag, and never persists a half-finished resize.
       const { result } = renderHook(() => useResizableInlinePanel(SESSION));
       const handle = createPointerHandle();
@@ -358,7 +358,7 @@ describe("useResizableInlinePanel pointer drag", () => {
         );
       });
 
-      expect(result.current.panelWidth).toBe(800);
+      expect(result.current.panelWidth).toBe(600);
       expect(readSessionWorkspaceState(SESSION).widthPx).toBeUndefined();
       expect(document.body.style.cursor).toBe("");
       expect(document.body.style.userSelect).toBe("");
@@ -427,7 +427,7 @@ describe("useResizableInlinePanel pointer drag", () => {
 
     rerender({ enabled: false });
 
-    expect(result.current.panelWidth).toBe(800);
+    expect(result.current.panelWidth).toBe(600);
     expect(readSessionWorkspaceState(SESSION).widthPx).toBeUndefined();
     expect(overlaySelector()).toBeNull();
     expect(document.body.style.cursor).toBe("");
@@ -449,7 +449,7 @@ describe("useResizableInlinePanel pointer drag", () => {
 
     rerender({ persistEnabled: false });
 
-    expect(result.current.panelWidth).toBe(800);
+    expect(result.current.panelWidth).toBe(600);
     expect(readSessionWorkspaceState(SESSION).widthPx).toBeUndefined();
     expect(overlaySelector()).toBeNull();
     expect(document.body.style.cursor).toBe("");

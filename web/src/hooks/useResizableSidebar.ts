@@ -9,7 +9,7 @@
 // Unlike the inline panel this has no "boost" machinery — nothing auto-widens
 // the sidebar — so the store is just a persisted, viewport-clamped width.
 
-import { useCallback, useEffect, useReducer, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useReducer, useRef, useSyncExternalStore } from "react";
 import { createResizableWidthStore } from "@/hooks/resizableWidthStore";
 import { useInputCapabilities } from "@/hooks/useInputCapabilities";
 import { useResizeDrag } from "@/hooks/useResizeDrag";
@@ -96,7 +96,18 @@ export function useResizableSidebar() {
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
+  // Cancellation (Escape, blur, …) restores the width the drag started from —
+  // onMove writes the live store on every pointermove, so without the
+  // snapshot an aborted drag would keep the dragged width on screen while the
+  // persisted preference still held the old one.
+  const dragStartWidth = useRef<number | null>(null);
   const resizeDrag = useResizeDrag({
+    onStart: useCallback(() => {
+      dragStartWidth.current = widthStore.getSnapshot();
+    }, []),
+    onCancel: useCallback(() => {
+      widthStore.set(dragStartWidth.current);
+    }, []),
     onCommit: widthStore.persist,
     onMove: useCallback((e: React.PointerEvent<HTMLElement>) => {
       widthStore.set(clamp(e.clientX));

@@ -326,7 +326,7 @@ describe("useResizableSidebar", () => {
   });
 
   it.each(["onPointerCancel", "onLostPointerCapture"] as const)(
-    "keeps the last applied width without persisting on %s",
+    "restores the pre-drag width without persisting on %s",
     (abortHandler) => {
       const { result } = renderHook(() => useResizableSidebar());
       const handle = createHandle();
@@ -340,14 +340,36 @@ describe("useResizableSidebar", () => {
       expect(result.current.width).toBe(500);
 
       act(() => result.current.handleProps[abortHandler](pointerEvent(handle, { pointerId: 3 })));
-      expect(result.current.width).toBe(500);
+      expect(result.current.width).toBe(320);
       expect(readPanelSizePreference("sidebarWidthPx")).toBeNull();
       expect(document.body.style.cursor).toBe("");
       expect(document.body.style.userSelect).toBe("");
     },
   );
 
-  it("keeps the last applied width without persisting on unmount", () => {
+  it("restores the persisted width when Escape cancels a drag", () => {
+    const { result } = renderHook(() => useResizableSidebar());
+    dragTo(result, 500);
+    expect(result.current.width).toBe(500);
+    expect(readPanelSizePreference("sidebarWidthPx")).toBe(500);
+
+    const handle = createHandle();
+    startDrag(result, handle, { pointerId: 4 });
+    act(() =>
+      result.current.handleProps.onPointerMove(
+        pointerEvent(handle, { pointerId: 4, clientX: 700 }),
+      ),
+    );
+    expect(result.current.width).toBe(700);
+
+    act(() => {
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    });
+    expect(result.current.width).toBe(500);
+    expect(readPanelSizePreference("sidebarWidthPx")).toBe(500);
+  });
+
+  it("restores the pre-drag width without persisting on unmount", () => {
     const { result, unmount } = renderHook(() => useResizableSidebar());
     const handle = createHandle();
 
@@ -365,7 +387,7 @@ describe("useResizableSidebar", () => {
     expect(document.body.style.userSelect).toBe("");
 
     const remounted = renderHook(() => useResizableSidebar());
-    expect(remounted.result.current.width).toBe(560);
+    expect(remounted.result.current.width).toBe(320);
     remounted.unmount();
   });
 
