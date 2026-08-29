@@ -2882,10 +2882,12 @@ _DEFAULT_IGNORABLE_CODE_POINT_RANGES = frozenset(
     }
 )
 _DEFAULT_IGNORABLE_CODE_POINT_RE = re.compile(
-    "[\u00ad\u034f\u061c\u115f-\u1160\u17b4-\u17b5\u180b-\u180f"
-    "\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f"
-    "\ufeff\uffa0\ufff0-\ufff8\U0001bca0-\U0001bca3"
-    "\U0001d173-\U0001d17a\U000e0000-\U000e0fff]"
+    "["
+    + "".join(
+        re.escape(chr(start)) if start == end else f"{re.escape(chr(start))}-{re.escape(chr(end))}"
+        for start, end in sorted(_DEFAULT_IGNORABLE_CODE_POINT_RANGES)
+    )
+    + "]"
 )
 
 
@@ -2975,6 +2977,18 @@ def _redactor_changes(text: str) -> bool:
     return _redact_hook_failure_secrets(text) != text
 
 
+def _redacts_as_credential(candidate: str, previous_word: str) -> bool:
+    """Return whether *candidate* redacts on its own or as a Bearer value.
+
+    A ``Bearer`` anchor in the preceding word can only be matched once the
+    candidate is re-joined to it, so the same candidate is retried with the
+    anchor restored when the previous word was ``bearer``.
+    """
+    return _redactor_changes(candidate) or (
+        previous_word.casefold() == "bearer" and _redactor_changes(f"Bearer {candidate}")
+    )
+
+
 def _redact_hook_failure_secrets(text: str) -> str:
     """Redact hook text while retaining trusted soft-gap provenance."""
     return redact_secrets(
@@ -2987,10 +3001,7 @@ def _canonicalize_hook_failure_chunk(chunk: str, previous_word: str) -> str:
     """Normalize one hard-whitespace-bounded chunk without mangling prose."""
     compact = chunk.replace(_HOOK_FAILURE_SEPARATOR_MARKER, "")
     has_soft_separator = compact != chunk
-    if has_soft_separator and (
-        _redactor_changes(compact)
-        or (previous_word.casefold() == "bearer" and _redactor_changes(f"Bearer {compact}"))
-    ):
+    if has_soft_separator and _redacts_as_credential(compact, previous_word):
         return compact
     if len(compact) > _HOOK_FAILURE_DETAIL_RAW_LIMIT:
         return compact
@@ -2999,10 +3010,7 @@ def _canonicalize_hook_failure_chunk(chunk: str, previous_word: str) -> str:
     skeleton = "".join(
         char for char in decomposed if unicodedata.category(char) not in {"Mn", "Mc", "Me"}
     )
-    if skeleton != compact and (
-        _redactor_changes(skeleton)
-        or (previous_word.casefold() == "bearer" and _redactor_changes(f"Bearer {skeleton}"))
-    ):
+    if skeleton != compact and _redacts_as_credential(skeleton, previous_word):
         return skeleton
 
     if not has_soft_separator:
