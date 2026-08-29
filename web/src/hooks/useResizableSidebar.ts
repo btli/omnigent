@@ -9,8 +9,8 @@
 // Unlike the inline panel this has no "boost" machinery — nothing auto-widens
 // the sidebar — so the store is just a persisted, viewport-clamped width.
 
-import { useCallback, useEffect, useReducer, useRef, useSyncExternalStore } from "react";
-import { createResizableWidthStore } from "@/hooks/resizableWidthStore";
+import { useCallback, useEffect, useReducer, useRef } from "react";
+import { createResizableWidthStore, useResizableWidthSnapshot } from "@/hooks/resizableWidthStore";
 import { useInputCapabilities } from "@/hooks/useInputCapabilities";
 import { useResizeDrag } from "@/hooks/useResizeDrag";
 import { MD_MIN_WIDTH_QUERY, isMobileViewport, subscribeMatchMedia } from "@/lib/breakpoints";
@@ -86,11 +86,7 @@ export function resetSidebarWidthStoreForTesting(): void {
  */
 export function useResizableSidebar() {
   const { anyCoarse } = useInputCapabilities();
-  const raw = useSyncExternalStore(
-    widthStore.subscribe,
-    widthStore.getSnapshot,
-    widthStore.getServerSnapshot,
-  );
+  const raw = useResizableWidthSnapshot(widthStore);
   const width = clamp(raw ?? DEFAULT_WIDTH_PX);
   const [, bumpViewport] = useReducer((version: number) => version + 1, 0);
 

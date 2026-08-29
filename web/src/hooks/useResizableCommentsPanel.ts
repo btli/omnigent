@@ -14,8 +14,8 @@
 // file is opened, matching the other panel-resize hooks. Explicit user
 // resizes are also persisted so a full page reload restores the width.
 
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { createResizableWidthStore } from "@/hooks/resizableWidthStore";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createResizableWidthStore, useResizableWidthSnapshot } from "@/hooks/resizableWidthStore";
 import { useInputCapabilities } from "@/hooks/useInputCapabilities";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizeDrag } from "@/hooks/useResizeDrag";
@@ -86,11 +86,7 @@ export function useResizableCommentsPanel() {
   const { anyCoarse } = useInputCapabilities();
   const mobileViewport = useIsMobileViewport();
   const isDesktop = typeof window !== "undefined" && !mobileViewport;
-  const raw = useSyncExternalStore(
-    widthStore.subscribe,
-    widthStore.getSnapshot,
-    widthStore.getServerSnapshot,
-  );
+  const raw = useResizableWidthSnapshot(widthStore);
   const width = Math.max(MIN_WIDTH_PX, Math.min(raw ?? DEFAULT_WIDTH_PX, MAX_WIDTH_PX));
   const containerRef = useRef<HTMLDivElement | null>(null);
 

@@ -5,8 +5,8 @@
 // ExecutionLogsPanel / FilesPanelDrawer — those open at ~50 % by default
 // while the inline panel starts at a compact sidebar width.
 
-import { useCallback, useEffect, useReducer, useRef, useSyncExternalStore } from "react";
-import { createResizableWidthStore } from "@/hooks/resizableWidthStore";
+import { useCallback, useEffect, useReducer, useRef } from "react";
+import { createResizableWidthStore, useResizableWidthSnapshot } from "@/hooks/resizableWidthStore";
 import { useInputCapabilities } from "@/hooks/useInputCapabilities";
 import { useResizeDrag } from "@/hooks/useResizeDrag";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
@@ -154,11 +154,7 @@ export function useResizableInlinePanel(
   persistEnabled = true,
 ) {
   const { anyCoarse } = useInputCapabilities();
-  const raw = useSyncExternalStore(
-    widthStore.subscribe,
-    widthStore.getSnapshot,
-    widthStore.getServerSnapshot,
-  );
+  const raw = useResizableWidthSnapshot(widthStore);
   // On a session switch the module store still holds the previous session's
   // width until the effect below re-seeds it after commit. Derive this render's
   // width straight from the incoming session's saved value so the panel doesn't

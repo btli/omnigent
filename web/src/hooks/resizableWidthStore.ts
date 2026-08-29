@@ -1,3 +1,5 @@
+import { useSyncExternalStore } from "react";
+
 type WidthUpdater = number | null | ((previous: number | null) => number | null);
 
 /** External width store shared by independently mounted resize-hook consumers. */
@@ -40,4 +42,11 @@ export function createResizableWidthStore(
       set(value);
     },
   };
+}
+
+export type ResizableWidthStore = ReturnType<typeof createResizableWidthStore>;
+
+/** Subscribe a component to a width store's live (effective) width. */
+export function useResizableWidthSnapshot(store: ResizableWidthStore): number | null {
+  return useSyncExternalStore(store.subscribe, store.getSnapshot, store.getServerSnapshot);
 }

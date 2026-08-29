@@ -1,16 +1,13 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readPanelSizePreference } from "@/lib/panelSizePreferences";
+import { mockMatchMedia, setInnerWidth } from "./resizeHookTestHelpers";
 import {
   resetCommentsWidthStoreForTesting,
   useResizableCommentsPanel,
 } from "./useResizableCommentsPanel";
 
 const originalInnerWidth = window.innerWidth;
-
-function setInnerWidth(px: number): void {
-  Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: px });
-}
 
 // jsdom has no pointer capture, so tests drive the returned handlers directly
 // with a stub handle element that tracks capture state.
@@ -41,34 +38,6 @@ function pointerEvent(
 }
 
 const originalMatchMedia = window.matchMedia;
-
-type MediaListener = (e: MediaQueryListEvent) => void;
-
-/** Controllable matchMedia mock: per-query matches plus a change-event firer. */
-function mockMatchMedia(matches: Record<string, boolean> = {}) {
-  const listeners = new Map<string, Set<MediaListener>>();
-  window.matchMedia = ((query: string) => ({
-    matches: matches[query] ?? false,
-    media: query,
-    onchange: null,
-    addEventListener: (_: string, cb: MediaListener) => {
-      if (!listeners.has(query)) listeners.set(query, new Set());
-      listeners.get(query)?.add(cb);
-    },
-    removeEventListener: (_: string, cb: MediaListener) => listeners.get(query)?.delete(cb),
-    addListener: () => {},
-    removeListener: () => {},
-    dispatchEvent: () => false,
-  })) as typeof window.matchMedia;
-  return {
-    fire(query: string, value: boolean) {
-      matches[query] = value;
-      for (const cb of listeners.get(query) ?? new Set<MediaListener>()) {
-        cb({ matches: value } as MediaQueryListEvent);
-      }
-    },
-  };
-}
 
 /** jsdom has no PointerEvent constructor; a plain Event with pointerId works
  * for the hook's document-level fallback listeners. */

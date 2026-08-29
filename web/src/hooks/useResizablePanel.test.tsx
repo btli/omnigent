@@ -1,6 +1,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readPanelSizePreference } from "@/lib/panelSizePreferences";
+import { setInnerWidth } from "./resizeHookTestHelpers";
 import {
   HANDLE_COARSE_GUTTER_PX,
   HANDLE_FINE_GUTTER_PX,
@@ -16,10 +17,6 @@ let desktopMatches = true;
 let coarsePointer = false;
 const desktopChangeListeners = new Set<(event: MediaQueryListEvent) => void>();
 const coarseChangeListeners = new Set<(event: MediaQueryListEvent) => void>();
-
-function setInnerWidth(px: number): void {
-  Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: px });
-}
 
 function installMatchMedia(): void {
   window.matchMedia = vi.fn((query: string) => ({

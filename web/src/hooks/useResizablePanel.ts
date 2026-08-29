@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useReducer, useRef, useSyncExternalStore } from "react";
-import { createResizableWidthStore } from "@/hooks/resizableWidthStore";
+import { useCallback, useEffect, useReducer, useRef } from "react";
+import { createResizableWidthStore, useResizableWidthSnapshot } from "@/hooks/resizableWidthStore";
 import { useInputCapabilities } from "@/hooks/useInputCapabilities";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizeDrag } from "@/hooks/useResizeDrag";
@@ -73,11 +73,7 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
   const { anyCoarse } = useInputCapabilities();
   const mobileViewport = useIsMobileViewport();
   const isDesktop = typeof window !== "undefined" && !mobileViewport;
-  const width = useSyncExternalStore(
-    widthStore.subscribe,
-    widthStore.getSnapshot,
-    widthStore.getServerSnapshot,
-  );
+  const width = useResizableWidthSnapshot(widthStore);
   const minWidthRef = useRef(minWidthPx);
   minWidthRef.current = minWidthPx;
   const [, bumpViewport] = useReducer((version: number) => version + 1, 0);

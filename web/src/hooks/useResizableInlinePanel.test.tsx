@@ -1,6 +1,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { setInnerWidth } from "./resizeHookTestHelpers";
 import { resetWidthStoreForTesting, useResizableInlinePanel } from "./useResizableInlinePanel";
 
 // useResizableInlinePanel keeps its width in a module-level store shared across
@@ -11,10 +12,6 @@ import { resetWidthStoreForTesting, useResizableInlinePanel } from "./useResizab
 
 const SESSION = "conv_test";
 const originalInnerWidth = window.innerWidth;
-
-function setInnerWidth(px: number): void {
-  Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: px });
-}
 
 // Simulate a manual resize via the public keyboard handle (ArrowLeft widens by
 // 20px). Returns the resulting panelWidth.
