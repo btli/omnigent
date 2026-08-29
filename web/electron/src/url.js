@@ -1,13 +1,8 @@
 // Shared URL-normalization helpers for the desktop shell.
 //
-// Loaded by both the Electron main process (`require("./url")` in
-// `src/main.js`) and the bundled setup page (`<script src="../src/url.js">` in
-// `setup/index.html`, where it publishes `window.omnigentUrl`). One copy keeps
-// the two from drifting — the setup page's plain-http warning and the main
-// process's navigation must agree on what a bare URL means.
-//
-// Only web/Node globals (URL, fetch, AbortSignal) are used, so the same source
-// runs unchanged under CommonJS (main) and in the renderer (setup page).
+// Loaded by the Electron main process for URL decisions. Only web/Node globals
+// (URL, fetch, AbortSignal) are used, keeping the helpers easy to test and the
+// two sandbox-safe preload copies straightforward to mirror.
 (function (root, factory) {
   const api = factory();
   if (typeof module === "object" && module.exports) {
@@ -25,6 +20,14 @@
    * http, and the setup placeholder shows http://localhost.
    */
   const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+
+  function isLoopbackServer(serverUrl) {
+    try {
+      return LOCAL_HOSTS.has(new URL(serverUrl).hostname);
+    } catch {
+      return false;
+    }
+  }
 
   /**
    * The scheme a schemeless input should default to: http:// for loopback
@@ -102,8 +105,9 @@
       } catch {
         continue;
       }
-      if (seen.has(url)) continue;
-      seen.add(url);
+      const identity = workspaceIdentityKey(url);
+      if (!identity || seen.has(identity)) continue;
+      seen.add(identity);
       normalized.push(url);
     }
     return normalized;
@@ -176,6 +180,67 @@
     return WORKSPACE_DOMAINS.some(
       (domain) => normalized === domain || normalized.endsWith(`.${domain}`),
     );
+  }
+
+  /** Copy only Databricks' workspace selector into a fresh query. */
+  function workspaceOrganizationSearch(url) {
+    const query = new URLSearchParams();
+    if (isDatabricksWorkspaceHost(url.hostname)) {
+      for (const organization of url.searchParams.getAll("o")) {
+        query.append("o", organization);
+      }
+    }
+    return query;
+  }
+
+  /**
+   * Stable server identity for workspace-scoped state. Browser origins discard
+   * queries, but Databricks uses ``o`` to select a workspace on shared hosts.
+   * Every other query remains deliberately outside the identity boundary.
+   *
+   * @param {string | null | undefined} rawUrl
+   * @returns {string | null}
+   */
+  function workspaceIdentityKey(rawUrl) {
+    let url;
+    try {
+      url = new URL(rawUrl);
+    } catch {
+      return null;
+    }
+    const query = workspaceOrganizationSearch(url).toString();
+    return `${url.origin}${query ? `?${query}` : ""}`;
+  }
+
+  /**
+   * Join an internal path onto a server URL without string-concatenating after
+   * its query. The server's mount is retained by default; origin-scoped routes
+   * such as ``/.well-known`` opt out. Only a Databricks ``o`` selector is
+   * inherited, and it is emitted once even if a route also carries ``o``.
+   *
+   * @param {string} serverUrl
+   * @param {string} routePath
+   * @param {{ fromOrigin?: boolean }} [options]
+   * @returns {string}
+   */
+  function joinServerUrl(serverUrl, routePath, { fromOrigin = false } = {}) {
+    const server = new URL(serverUrl);
+    const route = new URL(routePath.startsWith("/") ? routePath : `/${routePath}`, server.origin);
+    const destination = new URL(server.origin);
+    const basePath = fromOrigin ? "" : server.pathname.replace(/\/+$/, "");
+    destination.pathname = `${basePath}${route.pathname}` || "/";
+
+    const inheritedOrganizations = workspaceOrganizationSearch(server).toString();
+    let routeQuery = route.search.slice(1);
+    if (inheritedOrganizations) {
+      routeQuery = routeQuery
+        .split("&")
+        .filter((part) => part && new URLSearchParams(part).keys().next().value !== "o")
+        .join("&");
+    }
+    destination.search = [inheritedOrganizations, routeQuery].filter(Boolean).join("&");
+    destination.hash = route.hash;
+    return destination.toString();
   }
 
   /**
@@ -257,22 +322,6 @@
     return isDatabricksWorkspaceHost(host);
   }
 
-  /** Browser OAuth/session bridging is workspace/account-only, not Databricks Apps. */
-  function isDatabricksOAuthServerUrl(rawUrl) {
-    try {
-      const url = new URL(rawUrl);
-      return (
-        url.protocol === "https:" &&
-        !url.username &&
-        !url.password &&
-        !url.port &&
-        WORKSPACE_DOMAINS.some((domain) => url.hostname.endsWith(`.${domain}`))
-      );
-    } catch {
-      return false;
-    }
-  }
-
   /**
    * Probe timeout for Databricks workspace detection. Deliberately short: a
    * slow or unreachable host must not stall the connect flow — on timeout we
@@ -295,12 +344,10 @@
    * loads the web UI, so it appends the SPA mount instead.
    *
    * @param {string} normalized A normalized http(s) URL from normalizeUrl().
-   * @param {{ signal?: AbortSignal }} [options] Optional connection cancellation.
    * @returns {Promise<string>} The workspace UI URL when expansion applies,
    *   else the input unchanged.
    */
-  async function expandDatabricksWorkspaceUrl(normalized, { signal } = {}) {
-    signal?.throwIfAborted();
+  async function expandDatabricksWorkspaceUrl(normalized) {
     let url;
     try {
       url = new URL(normalized);
@@ -321,16 +368,14 @@
     }
     let probe;
     try {
-      probe = await fetch(`${url.origin}/`, {
+      probe = await fetch(joinServerUrl(normalized, "/", { fromOrigin: true }), {
         method: "HEAD",
         redirect: "manual",
-        signal: signal
-          ? AbortSignal.any([signal, AbortSignal.timeout(WORKSPACE_PROBE_TIMEOUT_MS)])
-          : AbortSignal.timeout(WORKSPACE_PROBE_TIMEOUT_MS),
+        signal: AbortSignal.timeout(WORKSPACE_PROBE_TIMEOUT_MS),
       });
     } catch {
-      // Explicit cancellation must not become an ordinary failed probe.
-      signal?.throwIfAborted();
+      // Unreachable / DNS / TLS / timeout: connect to the URL as given and let
+      // the did-fail-load fallback surface any real failure.
       return normalized;
     }
     if ((probe.headers.get("server") ?? "").toLowerCase() !== "databricks") {
@@ -370,7 +415,7 @@
    * Read a server's version manifest, so the shell can adapt to the server it
    * actually reached instead of assuming its own release's behavior.
    *
-   * Unless explicitly cancelled, this never throws or blocks a connection. Anything short of a
+   * TOTAL: this never throws and never blocks a connection. Anything short of a
    * well-formed manifest — 404 (older server), unreachable host, HTML from an
    * SPA catch-all, malformed JSON, wrong types — yields
    * {@link PRE_MANIFEST_BASELINE}. "I could not learn anything" and "this
@@ -382,29 +427,24 @@
    * bumps the envelope stays usable by a shell that predates the bump.
    *
    * @param {string} serverUrl A normalized absolute http(s) server URL.
-   * @param {{ signal?: AbortSignal }} [options] Optional connection cancellation.
    * @returns {Promise<{manifestVersion: number, serverVersion: string | null,
    *   minDesktopVersion: string | null, ui: Record<string, unknown>}>}
    */
-  async function fetchServerManifest(serverUrl, { signal } = {}) {
-    signal?.throwIfAborted();
-    let origin;
+  async function fetchServerManifest(serverUrl) {
+    let manifestUrl;
     try {
-      origin = new URL(serverUrl).origin;
+      manifestUrl = joinServerUrl(serverUrl, WELL_KNOWN_MANIFEST_PATH, { fromOrigin: true });
     } catch {
       return PRE_MANIFEST_BASELINE;
     }
     let response;
     try {
-      response = await fetch(`${origin}${WELL_KNOWN_MANIFEST_PATH}`, {
+      response = await fetch(manifestUrl, {
         // A redirect to a login page is not a manifest; don't follow it.
         redirect: "manual",
-        signal: signal
-          ? AbortSignal.any([signal, AbortSignal.timeout(MANIFEST_FETCH_TIMEOUT_MS)])
-          : AbortSignal.timeout(MANIFEST_FETCH_TIMEOUT_MS),
+        signal: AbortSignal.timeout(MANIFEST_FETCH_TIMEOUT_MS),
       });
     } catch {
-      signal?.throwIfAborted();
       return PRE_MANIFEST_BASELINE;
     }
     if (!response.ok) return PRE_MANIFEST_BASELINE;
@@ -419,7 +459,6 @@
     try {
       body = await response.json();
     } catch {
-      signal?.throwIfAborted();
       return PRE_MANIFEST_BASELINE;
     }
     if (body === null || typeof body !== "object") return PRE_MANIFEST_BASELINE;
@@ -441,18 +480,21 @@
 
   return {
     LOCAL_HOSTS,
+    isLoopbackServer,
     defaultSchemeFor,
     normalizeUrl,
     normalizeRecentServers,
     serverDisplayLabel,
     isPlainHttpRemote,
     normalizeSavedServerUrl,
+    isDatabricksWorkspaceHost,
+    workspaceIdentityKey,
+    joinServerUrl,
     WORKSPACE_UI_PATH,
     WORKSPACE_PROBE_TIMEOUT_MS,
     databricksWorkspaceUiUrl,
     expandDatabricksWorkspaceUrl,
     isDatabricksManagedServerUrl,
-    isDatabricksOAuthServerUrl,
     WELL_KNOWN_MANIFEST_PATH,
     MANIFEST_FETCH_TIMEOUT_MS,
     PRE_MANIFEST_BASELINE,
