@@ -14,7 +14,8 @@ and a PEP 440 ``vX.Y.Z.devYYYYMMDD`` tag at the same commit;
 The refs ever pushed are ``staging``, the ``nightly-*`` pin, the dev tag,
 and (rescues only) the rescued PR's own fork branch. ``--ring production``
 composes the production ring instead: open
-non-draft PRs only, no extras, branch ``production`` + immutable
+non-draft PRs plus the ``extras-production.txt`` pins (a listed draft is
+force-promoted past the draft gate), branch ``production`` + immutable
 ``production-YYYYMMDD`` pins, no dev tag, and no hourly mode
 (``--staging-only`` is rejected for it). A production composition
 that touches DB migrations is BLOCKED before any ref moves unless
@@ -52,6 +53,7 @@ UPSTREAM_REPO = "omnigent-ai/omnigent"
 PR_AUTHOR = "btli"
 PR_LIST_LIMIT = 300
 EXTRAS_FILE = Path(__file__).resolve().parent / "extras.txt"
+PRODUCTION_EXTRAS_FILE = Path(__file__).resolve().parent / "extras-production.txt"
 EXCLUDE_FILE = Path(__file__).resolve().parent / "exclude.txt"
 # Two different answers about a pinned extra: only a ref confirmed absent
 # invites editing the manifest, and only a failure to reach the remote blocks
@@ -88,6 +90,13 @@ class Ring:
     # Rewriting PR branches is a staging-ring convenience only; production
     # composes what the PRs actually say.
     rebase_rescue: bool = False
+    # The ring's extras manifest (consulted only when use_extras is set);
+    # per-ring so a production pin never drags staging's pins along.
+    extras_file: Path = EXTRAS_FILE
+    # Whether ``branch:<name>`` pins are legal in the manifest. PR pins are
+    # reviewable upstream refs; a raw fork branch is not, so production
+    # refuses them.
+    branch_extras: bool = True
 
 
 # The staging ring — the composer's only ring today; every function defaults to
@@ -104,17 +113,21 @@ STAGING = Ring(
 )
 
 
-# The production ring: upstream main + open NON-draft PRs only — draft status
-# is the promotion gate. No extras (nothing hand-pinned reaches prod), no dev
-# tag (nothing downstream consumes one), immutable production-YYYYMMDD pins.
+# The production ring: upstream main + open NON-draft PRs — draft status is
+# the promotion gate — plus the extras-production.txt pins (its own manifest,
+# so nothing staged-only reaches prod by accident; a listed draft is
+# force-promoted past the gate). No dev tag (nothing downstream consumes
+# one), immutable production-YYYYMMDD pins.
 PRODUCTION = Ring(
     name="production",
     branch="production",
     merge_subject_prefix="production",
     pin_prefix="production-",
-    use_extras=False,
+    use_extras=True,
     exclude_drafts=True,
     mint_dev_tag=False,
+    extras_file=PRODUCTION_EXTRAS_FILE,
+    branch_extras=False,
 )
 
 RINGS = {r.name: r for r in (STAGING, PRODUCTION)}
@@ -335,6 +348,10 @@ def parse_extras(path: Path, ring: Ring = STAGING) -> tuple[list[int], list[str]
             numbers.append(int(entry))
             continue
         if entry.startswith("branch:"):
+            if not ring.branch_extras:
+                raise StageError(
+                    f"{path}:{lineno}: branch pins are not valid {ring.name} extras {entry!r}"
+                )
             name = entry[len("branch:") :]
             reason = _validate_branch_pin(name, ring)
             if reason:
@@ -817,9 +834,11 @@ def assert_production_identity(
     ).returncode:
         raise StageError("production identity: upstream is not an ancestor of the candidate")
 
-    if any(p.get("source") in {"extra", "extra-branch"} for p in applied):
-        raise StageError("production identity: extras are not valid production inputs")
-    expected = [p for p in applied if p.get("source") == "open" and p.get("minted") is True]
+    if any(p.get("source") == "extra-branch" for p in applied):
+        raise StageError("production identity: branch extras are not valid production inputs")
+    expected = [
+        p for p in applied if p.get("source") in {"open", "extra"} and p.get("minted") is True
+    ]
     commits = git(
         cwd,
         "rev-list",
@@ -922,8 +941,8 @@ def stage(
 ) -> dict:
     datestamp = date.strftime("%Y%m%d")
 
-    if ring == PRODUCTION and any(p.get("source") in {"extra", "extra-branch"} for p in prs):
-        raise StageError("production compositions do not accept extras")
+    if ring == PRODUCTION and any(p.get("source") == "extra-branch" for p in prs):
+        raise StageError("production compositions do not accept branch extras")
 
     # Seed before the detach: the seed directory is part of the trusted fork
     # checkout and disappears from the worktree once HEAD moves to upstream.
@@ -1234,8 +1253,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_stage.add_argument(
         "--extras",
-        default=str(EXTRAS_FILE),
-        help="extras manifest path (missing file == no extras)",
+        default=None,
+        help="extras manifest path (default: the ring's own manifest; missing file == no extras)",
     )
     p_stage.add_argument(
         "--exclude",
@@ -1311,9 +1330,8 @@ def main(argv: list[str] | None = None) -> int:
         # Extras are read here, before any merge touches the worktree, so the
         # manifest always comes from the trusted checkout. A ring without
         # extras never opens the manifest at all.
-        pr_extras, branch_extras = (
-            parse_extras(Path(args.extras), ring) if ring.use_extras else ([], [])
-        )
+        extras_path = Path(args.extras) if args.extras else ring.extras_file
+        pr_extras, branch_extras = parse_extras(extras_path, ring) if ring.use_extras else ([], [])
         prs = merge_stream(prs, pr_extras)
         for name in dict.fromkeys(branch_extras):
             prs.append({"source": "extra-branch", "headRefName": name, "number": None})

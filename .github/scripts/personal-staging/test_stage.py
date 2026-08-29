@@ -1214,9 +1214,9 @@ def test_production_excludes_drafts(env, tmp_path, monkeypatch, capsys):
     capsys.readouterr()
 
 
-def test_production_reads_no_extras(env, tmp_path, monkeypatch, capsys):
-    """A present extras manifest with a valid pin is not consulted at all for
-    production: nothing fetched, nothing merged, nothing reported."""
+def test_production_reads_its_own_extras(env, tmp_path, monkeypatch, capsys):
+    """Production consults the manifest handed to it: a PR pin is fetched via
+    refs/pull/N/head and composed as an ``extra`` alongside the open stream."""
     open_pr = {**env.add_pr(11, "i.txt", "i\n"), "isDraft": False}
     env.add_pr(12, "j.txt", "j\n")  # reachable only through the manifest
     prs_json = tmp_path / "prs.json"
@@ -1250,16 +1250,25 @@ def test_production_reads_no_extras(env, tmp_path, monkeypatch, capsys):
     )
     assert rc == 0
     report = json.loads(report_path.read_text())
-    assert [(p["pr"], p["source"]) for p in report["applied"]] == [(11, "open")]
+    assert [(p["pr"], p["source"]) for p in report["applied"]] == [(11, "open"), (12, "extra")]
     assert report["skipped"] == []
-    assert fetched == []
-    # were extras ever consulted, the ring's own branch is still a self-reference
+    assert len(fetched) == 1
+    # the ring's own branch is still a self-reference for any branch pin
     assert "self-reference" in stage_mod._validate_branch_pin("production", stage_mod.PRODUCTION)
     capsys.readouterr()
 
 
-@pytest.mark.parametrize("source", ["extra", "extra-branch"])
-def test_direct_production_stage_rejects_extras_before_git(env, source):
+def test_production_extras_reject_branch_pins(tmp_path):
+    """PR pins are reviewable upstream refs; a raw fork branch is not — a
+    ``branch:`` line in the production manifest fails loud at parse time."""
+    manifest = tmp_path / "extras-production.txt"
+    manifest.write_text("3182\nbranch:homelab\n")
+    with pytest.raises(stage_mod.StageError, match=r"branch pins are not valid production"):
+        stage_mod.parse_extras(manifest, stage_mod.PRODUCTION)
+
+
+@pytest.mark.parametrize("source", ["extra-branch"])
+def test_direct_production_stage_rejects_branch_extras_before_git(env, source):
     with pytest.raises(stage_mod.StageError, match=r"production.*extras"):
         env.run([{"source": source}], ring=stage_mod.PRODUCTION)
 
@@ -1359,6 +1368,26 @@ def test_production_rejects_missing_isdraft():
     ):
         with pytest.raises(stage_mod.StageError, match=r"#7"):
             stage_mod.filter_drafts([ok, bad])
+
+
+def test_production_ring_has_its_own_extras_manifest():
+    """Production consults extras, but never staging's manifest: the two are
+    separate files so a staging pin cannot reach production by accident."""
+    assert stage_mod.PRODUCTION.use_extras
+    assert stage_mod.PRODUCTION.extras_file.name == "extras-production.txt"
+    assert stage_mod.STAGING.extras_file.name == "extras.txt"
+    assert stage_mod.PRODUCTION.extras_file != stage_mod.STAGING.extras_file
+
+
+def test_production_extra_promotes_a_draft_past_the_gate():
+    """A pin in the production extras manifest force-includes a draft PR:
+    filter_drafts drops it from the open stream, and merge_stream re-adds it
+    as an ``extra`` (composed from refs/pull/N/head) — the manifest, not the
+    draft bit, is the override."""
+    draft = {"number": 3182, "isDraft": True, "headRefName": "b", "headRefOid": "a" * 40}
+    ready = {"number": 5, "isDraft": False, "headRefName": "r", "headRefOid": "b" * 40}
+    stream = stage_mod.merge_stream(stage_mod.filter_drafts([draft, ready]), [3182])
+    assert [(p["number"], p["source"]) for p in stream] == [(5, "open"), (3182, "extra")]
 
 
 def test_production_commit_identity(env):

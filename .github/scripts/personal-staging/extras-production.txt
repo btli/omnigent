@@ -1,0 +1,10 @@
+# Personal-PRODUCTION extras manifest: one pin per line, same format as
+# extras.txt (staging's manifest — the two are deliberately separate files
+# so a staging pin never reaches production by accident).
+#
+# A pin here is force-included in the production composition, overriding
+# the draft gate: a listed open draft PR is composed from its live
+# refs/pull/N/head. Use sparingly and remove the entry once the PR is
+# marked ready for review (the open-PR stream then covers it) or lands
+# upstream.
+3182              # android workmanager poller — run in production while still draft
