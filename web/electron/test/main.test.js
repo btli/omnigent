@@ -41,6 +41,7 @@ function loadNavigationHarness({
   ensureSession = async (_ses, origin) => origin,
   expandWorkspace = async (url) => url,
   realBrowserRegistry = false,
+  rejectAuthSideEffects = false,
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
