@@ -379,6 +379,10 @@ function loadNavigationHarness({
     setUrl: (url) => {
       currentUrl = url;
     },
+    waitForPin: async () => {
+      await api.windows.get(win)?.pendingLoad;
+      assert.ok(api.windows.get(win)?.origin, "window did not finish its authenticated pin");
+    },
     win,
     cleanup: () => {
       api.windows.clear();
@@ -519,6 +523,7 @@ describe("return-to-server banner wiring (src/main.js)", () => {
     const harness = loadNavigationHarness({ registerFallbacks: false });
     harness.api.setAwayBannerDelayMs(5);
     harness.api.createWindow("https://host.example/ml/omnigents");
+    await harness.waitForPin();
 
     // SSO navigates the window to the IdP and leaves it there.
     harness.setUrl("https://company.okta.com/login");
@@ -548,6 +553,7 @@ describe("return-to-server banner wiring (src/main.js)", () => {
     const harness = loadNavigationHarness({ registerFallbacks: false });
     harness.api.setAwayBannerDelayMs(5);
     harness.api.createWindow("https://host.example/ml/omnigents");
+    await harness.waitForPin();
 
     harness.setUrl("https://host.example/ml/omnigents");
     harness.emit("did-navigate", "https://host.example/ml/omnigents", 200, "OK");
@@ -576,6 +582,7 @@ describe("return-to-server banner wiring (src/main.js)", () => {
     const harness = loadNavigationHarness({ registerFallbacks: false });
     harness.api.setAwayBannerDelayMs(50);
     harness.api.createWindow("https://host.example/ml/omnigents");
+    await harness.waitForPin();
 
     harness.setUrl("https://company.okta.com/login");
     harness.emit("did-navigate", "https://company.okta.com/login", 200, "OK");
@@ -2423,22 +2430,21 @@ describe("deep-link workspace identity (src/main.js)", () => {
   });
 
   it("excludes destroyed and closing windows from adoption and dispatch", async () => {
-    for (const unavailable of [{ destroyed: true }, { closing: true }]) {
-      const { decisions } = await runDeepLink(
-        "omnigent://ws.cloud.databricks.com/c/conv_abc",
-        {
+    await Promise.all(
+      [{ destroyed: true }, { closing: true }].map(async (unavailable) => {
+        const { decisions } = await runDeepLink("omnigent://ws.cloud.databricks.com/c/conv_abc", {
           liveIdentities: [
             {
               identity: "https://ws.cloud.databricks.com?o=222",
               ...unavailable,
             },
           ],
-        },
-      );
+        });
 
-      assert.equal(decisions[0].targetOrigin, "https://ws.cloud.databricks.com");
-      assert.deepEqual(Array.from(decisions[0].windows), []);
-    }
+        assert.equal(decisions[0].targetOrigin, "https://ws.cloud.databricks.com");
+        assert.deepEqual(Array.from(decisions[0].windows), []);
+      }),
+    );
   });
 
   it("lists live workspaces among the consent candidates", async () => {
