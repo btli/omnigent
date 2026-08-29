@@ -8,7 +8,9 @@ import binascii
 import contextlib
 import importlib.metadata
 import io
+import itertools
 import json
+import logging
 import os
 import re
 import shlex
@@ -27,7 +29,7 @@ import yaml
 from websockets.exceptions import ConnectionClosedError
 from websockets.frames import Close
 
-from omnigent import claude_native
+from omnigent import claude_native, model_catalog_store
 from omnigent._runner_startup import RunnerStartupProgress
 from omnigent._startup_profile import StartupProfiler
 from omnigent._terminal_picker_theme import PICKER_ACCENT, PICKER_MUTED
@@ -9490,13 +9492,13 @@ async def test_probe_claude_model_options_resolves_each_alias_via_the_harness(
     label from the printed line); rows show only the resolved label with
     1M-context resolutions marked, aliases resolving to a model an
     earlier row already covers are dropped (``best``, ``fable[1m]``, and
-    ``opusplan`` here), ``default`` never becomes a row (the picker has
-    its own Default choice), and a failing resolution leaves that alias's
-    bare row, never the whole probe.
+    ``opusplan`` here), and ``default`` never becomes a row (the picker has
+    its own Default choice).
     """
     resolutions = {
         "sonnet": ("claude-sonnet-5", "Sonnet 5"),
         "opus": ("claude-opus-5", "Opus 5"),
+        "haiku": ("claude-haiku-4-5", "Haiku 4.5"),
         "fable": ("claude-fable-5", "Fable 5"),
         "best": ("claude-fable-5", "Fable 5"),
         "sonnet[1m]": ("claude-sonnet-5[1m]", "Sonnet 5"),
@@ -9522,8 +9524,6 @@ async def test_probe_claude_model_options_resolves_each_alias_via_the_harness(
         assert "--output-format" in args and "stream-json" in args and "--verbose" in args
         alias = args[args.index("--model") + 1]
         assert alias != "default", "the skipped alias must not spawn a resolution run"
-        if alias == "haiku":
-            return _Run(b"", returncode=1)
         model, label = resolutions[alias]
         events = [
             {"type": "system", "subtype": "init", "model": model},
@@ -9540,7 +9540,7 @@ async def test_probe_claude_model_options_resolves_each_alias_via_the_harness(
     assert alias_rows == [
         {"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet 5"},
         {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5"},
-        {"id": "haiku", "model": "haiku", "displayName": "haiku"},
+        {"id": "haiku", "model": "claude-haiku-4-5", "displayName": "Haiku 4.5"},
         {"id": "fable", "model": "claude-fable-5", "displayName": "Fable 5"},
         {
             "id": "sonnet[1m]",
@@ -9549,6 +9549,35 @@ async def test_probe_claude_model_options_resolves_each_alias_via_the_harness(
         },
         {"id": "opus[1m]", "model": "claude-opus-5[1m]", "displayName": "Opus 5 (1M context)"},
     ]
+
+
+async def test_probe_claude_model_options_propagates_alias_auth_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed alias resolution makes the refresh stale with auth provenance."""
+
+    class _Run:
+        def __init__(self, stdout: bytes, stderr: bytes = b"", returncode: int = 0) -> None:
+            self.returncode = returncode
+            self._stdout = stdout
+            self._stderr = stderr
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return self._stdout, self._stderr
+
+    async def _fake_exec(command: str, *args: str, **kwargs: Any) -> _Run:
+        del command, kwargs
+        if "--model" not in args:
+            return _Run(b"Usage: /model <name>. Available: opus, or a full model ID.\n")
+        return _Run(b"", b"HTTP 401 bearer=super-secret", returncode=1)
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+
+    with pytest.raises(model_catalog_store.CatalogRefreshError) as exc_info:
+        await claude_native.probe_claude_model_options(None)
+
+    assert exc_info.value.kind is model_catalog_store.CatalogRefreshFailureKind.AUTH
+    assert "super-secret" not in exc_info.value.message
 
 
 async def test_probe_claude_model_options_runs_the_harness_under_the_launch_env(
@@ -9755,24 +9784,143 @@ async def test_claude_launch_catalog_reads_the_store_then_probes_once(
     assert len(calls) == 1, "the second read must come from the store, not a re-probe"
 
 
-async def test_probe_claude_model_options_returns_none_on_probe_failure(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize(
+    ("stderr", "expected_kind"),
+    [
+        pytest.param(
+            b"HTTP 401 Unauthorized bearer=super-secret",
+            model_catalog_store.CatalogRefreshFailureKind.AUTH,
+            id="auth",
+        ),
+        pytest.param(
+            b"HTTP 403 Forbidden quota exceeded bearer=super-secret",
+            model_catalog_store.CatalogRefreshFailureKind.AUTH,
+            id="forbidden-auth",
+        ),
+        pytest.param(
+            b"gateway 500 body=super-secret",
+            model_catalog_store.CatalogRefreshFailureKind.OTHER,
+            id="other",
+        ),
+    ],
+)
+async def test_probe_claude_model_options_classifies_nonzero_exit_without_leaking_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stderr: bytes,
+    expected_kind: model_catalog_store.CatalogRefreshFailureKind,
 ) -> None:
-    """A failing harness run yields None so callers keep configured rows."""
+    """Non-zero probe exits retain only a structured, sanitized reason."""
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
 
     class _FailedProcess:
         returncode = 1
 
         async def communicate(self) -> tuple[bytes, bytes]:
-            return b"", b"boom"
+            return b"", stderr
 
     async def _fake_exec(command: str, *args: str, **kwargs: Any) -> _FailedProcess:
         return _FailedProcess()
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
 
-    assert await claude_native.probe_claude_model_options(_gateway_probe_config()) is None
+    with pytest.raises(model_catalog_store.CatalogRefreshError) as exc_info:
+        await claude_native.probe_claude_model_options(_gateway_probe_config())
+
+    assert exc_info.value.kind is expected_kind
+    assert "super-secret" not in exc_info.value.message
+
+
+async def test_probe_claude_model_options_classifies_missing_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A missing Claude executable is distinct from auth and connectivity failures."""
+
+    async def _missing(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise FileNotFoundError("secret executable path")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _missing)
+
+    with pytest.raises(model_catalog_store.CatalogRefreshError) as exc_info:
+        await claude_native.probe_claude_model_options(None)
+
+    assert exc_info.value.kind is model_catalog_store.CatalogRefreshFailureKind.CLI_ABSENT
+    assert "secret executable path" not in exc_info.value.message
+    assert "secret executable path" not in caplog.text
+
+
+async def test_probe_claude_model_options_classifies_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timed-out Claude process retains timeout provenance and is reaped."""
+
+    class _TimedOutProcess:
+        returncode: int | None = None
+        killed = False
+        waited = False
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            raise TimeoutError("secret timeout detail")
+
+        def kill(self) -> None:
+            self.killed = True
+
+        async def wait(self) -> None:
+            self.waited = True
+
+    process = _TimedOutProcess()
+
+    async def _fake_exec(*args: object, **kwargs: object) -> _TimedOutProcess:
+        del args, kwargs
+        return process
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+
+    with pytest.raises(model_catalog_store.CatalogRefreshError) as exc_info:
+        await claude_native.probe_claude_model_options(None)
+
+    assert exc_info.value.kind is model_catalog_store.CatalogRefreshFailureKind.TIMEOUT
+    assert "secret timeout detail" not in exc_info.value.message
+    assert process.killed and process.waited
+
+
+async def test_probe_claude_model_options_classifies_empty_enumeration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful process with no model rows is an empty refresh, not auth."""
+
+    class _EmptyProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"no model rows", b""
+
+    async def _fake_exec(*args: object, **kwargs: object) -> _EmptyProcess:
+        del args, kwargs
+        return _EmptyProcess()
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+
+    with pytest.raises(model_catalog_store.CatalogRefreshError) as exc_info:
+        await claude_native.probe_claude_model_options(None)
+
+    assert exc_info.value.kind is model_catalog_store.CatalogRefreshFailureKind.EMPTY
+
+
+def test_resolve_claude_catalog_model_fails_closed_on_ambiguous_normalized_rows() -> None:
+    """Equivalent normalization cannot choose between distinct wire models."""
+    rows = [
+        {"id": "opus", "model": "system.ai.claude-opus-4-8"},
+        {"id": "opus[1m]", "model": "system.ai.claude-opus-4-8[1m]"},
+    ]
+
+    assert claude_native.resolve_claude_catalog_model(rows, "databricks-claude-opus-4-8") is None
+    assert (
+        claude_native.resolve_claude_catalog_model(rows, "system.ai.claude-opus-4-8[1m]")
+        == "system.ai.claude-opus-4-8[1m]"
+    )
 
 
 def _subscription_catalog() -> list[dict[str, object]]:
@@ -9848,3 +9996,487 @@ def test_claude_catalog_serves_model(
     assert (
         claude_native.claude_catalog_serves_model(_subscription_catalog(), model, config) is served
     )
+
+
+def test_claude_catalog_selection_honors_an_available_concrete_pin(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An exact live pin is launched unchanged and emits no downgrade warning."""
+    requested = "system.ai.claude-opus-4-8[1m]"
+    catalog: list[dict[str, object]] = [
+        {"id": "opus", "model": "system.ai.claude-opus-5"},
+        {"id": requested, "model": requested},
+    ]
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.claude_native"):
+        selection = claude_native.resolve_claude_native_catalog_selection(
+            requested,
+            catalog,
+            config,
+        )
+
+    assert selection == (requested, None)
+    assert not [record for record in caplog.records if "substitut" in record.getMessage()]
+
+
+def test_claude_catalog_selection_surfaces_an_equivalent_context_marker_change(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An equivalent generation with a different context marker is visible."""
+    requested = "databricks-claude-opus-4-8"
+    equivalent = "system.ai.claude-opus-4-8[1m]"
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.claude_native"):
+        selected, notice = claude_native.resolve_claude_native_catalog_selection(
+            requested,
+            [
+                {"id": "opus", "model": "system.ai.claude-opus-5"},
+                {"id": equivalent, "model": equivalent},
+            ],
+            claude_native.ClaudeNativeUcodeConfig(
+                env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}
+            ),
+        )
+
+    assert selected == equivalent
+    assert notice is not None
+    assert "different [1m] context marker" in notice
+    warnings = [record for record in caplog.records if "substituting" in record.getMessage()]
+    assert len(warnings) == 1
+    assert repr(requested) in warnings[0].getMessage()
+    assert repr(equivalent) in warnings[0].getMessage()
+
+
+def test_claude_catalog_selection_uses_verified_case_with_notice(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A wrong-case legacy pin launches the catalog's verified spelling visibly."""
+    requested = "Claude-Opus-4-8"
+    verified = "claude-opus-4-8"
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.claude_native"):
+        selected, notice = claude_native.resolve_claude_native_catalog_selection(
+            requested,
+            [{"id": verified, "model": verified}],
+            None,
+        )
+
+    assert selected == verified
+    assert notice is not None
+    assert "host's verified spelling" in notice
+    warnings = [record for record in caplog.records if "substituting" in record.getMessage()]
+    assert len(warnings) == 1
+    assert repr(requested) in warnings[0].getMessage()
+    assert repr(verified) in warnings[0].getMessage()
+
+
+@pytest.mark.parametrize(
+    ("requested", "catalog_model"),
+    [
+        pytest.param("opus[1m]", "opus", id="long-to-standard"),
+        pytest.param("opus", "opus[1m]", id="standard-to-long"),
+    ],
+)
+def test_claude_catalog_selection_surfaces_alias_context_marker_change(
+    requested: str,
+    catalog_model: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An alias's explicit context marker cannot change silently."""
+    with caplog.at_level(logging.WARNING, logger="omnigent.claude_native"):
+        selected, notice = claude_native.resolve_claude_native_catalog_selection(
+            requested,
+            [{"id": catalog_model, "model": catalog_model}],
+            claude_native.ClaudeNativeUcodeConfig(
+                env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}
+            ),
+        )
+
+    assert selected == catalog_model
+    assert notice is not None
+    assert "different [1m] context marker" in notice
+    warnings = [record for record in caplog.records if "substituting" in record.getMessage()]
+    assert len(warnings) == 1
+    assert repr(requested) in warnings[0].getMessage()
+    assert repr(catalog_model) in warnings[0].getMessage()
+
+
+def test_claude_tier_fallback_order_is_capability_descending() -> None:
+    """Launch policy has explicit order and exactly the documented tier membership."""
+    from omnigent.claude_model_vocabulary import CLAUDE_MODEL_ALIASES
+
+    assert claude_native._CLAUDE_TIER_FALLBACK_ORDER == (
+        "fable",
+        "opus",
+        "sonnet",
+        "haiku",
+    )
+    assert set(claude_native._CLAUDE_TIER_FALLBACK_ORDER) == set(CLAUDE_MODEL_ALIASES)
+    assert claude_native._CLAUDE_TIER_FALLBACK_ORDER is not CLAUDE_MODEL_ALIASES
+
+
+def test_claude_tier_fallback_is_stable_across_catalog_order() -> None:
+    """Newest standard-context model wins within a tier regardless of row order."""
+    catalog: list[dict[str, object]] = [
+        {"id": "opus-4-8", "model": "system.ai.claude-opus-4-8"},
+        {"id": "opus-4-8-1m", "model": "system.ai.claude-opus-4-8[1m]"},
+        {"id": "opus-5-1m", "model": "system.ai.claude-opus-5[1m]"},
+        {"id": "opus-5", "model": "system.ai.claude-opus-5"},
+    ]
+
+    for permuted in itertools.permutations(catalog):
+        selection, notice = claude_native.resolve_claude_native_catalog_selection(
+            "fable",
+            list(permuted),
+            None,
+        )
+        assert selection == "system.ai.claude-opus-5"
+        assert notice is not None
+
+
+def test_claude_tier_fallback_is_stable_for_case_distinct_rows() -> None:
+    """Original-case tie-breakers make case-distinct rows deterministic."""
+    catalog: list[dict[str, object]] = [
+        {"id": "OPUS-5", "model": "SYSTEM.AI.CLAUDE-OPUS-5"},
+        {"id": "opus-5", "model": "system.ai.claude-opus-5"},
+    ]
+
+    for permuted in itertools.permutations(catalog):
+        selection, notice = claude_native.resolve_claude_native_catalog_selection(
+            "fable",
+            list(permuted),
+            None,
+        )
+        assert selection == "SYSTEM.AI.CLAUDE-OPUS-5"
+        assert notice is not None
+
+
+@pytest.mark.parametrize(
+    ("catalog", "launchable"),
+    [
+        pytest.param([], "none", id="empty"),
+        pytest.param(
+            [{"id": "gpt-row", "model": "gpt-5.4"}],
+            "'gpt-5.4', 'gpt-row'",
+            id="non-claude",
+        ),
+    ],
+)
+def test_claude_catalog_selection_keeps_loud_failure_without_a_claude_tier(
+    catalog: list[dict[str, object]],
+    launchable: str,
+) -> None:
+    """A catalog with no Claude tier preserves the actionable launch failure."""
+    with pytest.raises(click.ClickException) as exc_info:
+        claude_native.resolve_claude_native_catalog_selection(
+            "fable",
+            catalog,
+            None,
+        )
+
+    assert exc_info.value.message == (
+        "the requested model 'fable' is not in this host's current model list — "
+        "it may have changed since the pick. Launchable model ids: "
+        f"{launchable}. Pick again from the model menu."
+    )
+
+
+@pytest.mark.parametrize(
+    ("catalog", "requested", "expected"),
+    [
+        pytest.param(
+            [
+                {"id": "claude-3-opus-20240229", "model": "claude-3-opus-20240229"},
+                {"id": "claude-opus-4-8", "model": "claude-opus-4-8"},
+            ],
+            "fable",
+            "claude-opus-4-8",
+            id="opus",
+        ),
+        pytest.param(
+            [
+                {"id": "claude-3-5-sonnet-20241022", "model": "claude-3-5-sonnet-20241022"},
+                {"id": "claude-sonnet-4-6", "model": "claude-sonnet-4-6"},
+            ],
+            "fable",
+            "claude-sonnet-4-6",
+            id="sonnet",
+        ),
+        pytest.param(
+            [
+                {"id": "claude-3-opus-20240229", "model": "claude-3-opus-20240229"},
+                {"id": "claude-3-opus-20240307", "model": "claude-3-opus-20240307"},
+            ],
+            "fable",
+            "claude-3-opus-20240307",
+            id="date-tiebreak-within-generation",
+        ),
+        pytest.param(
+            [
+                {"id": "v2-system.ai.claude-opus-4-8", "model": "v2-system.ai.claude-opus-4-8"},
+                {"id": "v1-system.ai.claude-opus-5", "model": "v1-system.ai.claude-opus-5"},
+            ],
+            "fable",
+            "v1-system.ai.claude-opus-5",
+            id="unstripped-provider-qualifier-digits-do-not-count",
+        ),
+        pytest.param(
+            [
+                {"id": "sonnet-5", "model": "sonnet2.gw.claude-sonnet-5"},
+                {"id": "sonnet-4-6", "model": "claude-sonnet-4-6"},
+            ],
+            "fable",
+            "sonnet2.gw.claude-sonnet-5",
+            id="tier-token-in-provider-prefix-does-not-count",
+        ),
+        pytest.param(
+            [
+                {"id": "opus-4-8", "model": "provider-opus-9.claude-opus-4-8"},
+                {"id": "opus-5", "model": "claude-opus-5"},
+            ],
+            "fable",
+            "claude-opus-5",
+            id="tier-generation-in-provider-prefix-does-not-count",
+        ),
+    ],
+)
+def test_claude_tier_ladder_prefers_current_generation_over_dated_legacy_ids(
+    catalog: list[dict[str, object]],
+    requested: str,
+    expected: str,
+) -> None:
+    """A dated legacy id must never outrank a newer generation on alias-less rows.
+
+    The legacy ``claude-G[-x]-<tier>-<date>`` shape carries its release date
+    as a huge digit group; ranking raw digit groups let Opus 3's date beat
+    Opus 4.8's generation. The date may only break ties within a generation.
+    """
+    launch_model, notice = claude_native.resolve_claude_native_catalog_selection(
+        requested,
+        catalog,
+        None,
+    )
+
+    assert launch_model == expected
+    assert notice is not None
+
+
+def test_claude_tier_ladder_accepts_an_authoritative_alias_id() -> None:
+    """A tier alias row remains launchable when its wire model omits `claude`."""
+    launch_model, notice = claude_native.resolve_claude_native_catalog_selection(
+        "fable",
+        [
+            {"id": "opus", "model": "gateway-opus-5"},
+            {"id": "sonnet", "model": "claude-sonnet-4-6"},
+        ],
+        None,
+    )
+
+    assert launch_model == "gateway-opus-5"
+    assert notice is not None
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        pytest.param(b"Please run /login", id="run-login"),
+        pytest.param(b"Error: not authenticated", id="not-authenticated"),
+        pytest.param(b"OAuth token expired. Run /login again.", id="oauth-token-expired"),
+        pytest.param(b"your credentials have expired", id="credentials-expired"),
+        pytest.param(b"HTTP/2 401", id="http2-401"),
+        pytest.param(b"HTTPS 401", id="https-401"),
+        pytest.param(b"status_code=401", id="status-code-401"),
+        pytest.param(b"http_401", id="http-underscore-401"),
+        pytest.param(b"HTTP/2 403", id="http2-403"),
+        pytest.param(b"status_code=403", id="status-code-403"),
+        pytest.param(b"http_403", id="http-underscore-403"),
+        pytest.param(b'{"type":"authentication_error"}', id="authentication-error"),
+        pytest.param(b"Invalid x-api-key", id="invalid-x-api-key"),
+        pytest.param(b"API key is invalid", id="api-key-is-invalid"),
+        pytest.param(b"api key expired", id="api-key-expired"),
+    ],
+)
+def test_probe_error_classifies_established_auth_messages_as_auth(stderr: bytes) -> None:
+    """Claude's own login prompts classify as AUTH, never as a transient OTHER."""
+    error = claude_native._claude_probe_process_error(stderr)
+
+    assert error.kind is model_catalog_store.CatalogRefreshFailureKind.AUTH
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        pytest.param(b"retry after 401 seconds", id="401-retry-delay"),
+        pytest.param(b"connect 10.0.4.1:401 refused", id="401-ip-port"),
+        pytest.param(b"Error: retry 401 seconds", id="error-401-retry-delay"),
+        pytest.param(b"retry after 403 seconds", id="403-retry-delay"),
+        pytest.param(b"connect 10.0.4.3:403 refused", id="403-ip-port"),
+        pytest.param(b"token bucket lease expired", id="rate-limit-token-bucket"),
+    ],
+)
+def test_probe_error_keeps_non_auth_outages_out_of_the_auth_class(stderr: bytes) -> None:
+    """A 401 without auth context and a rate-limit token bucket stay OTHER."""
+    error = claude_native._claude_probe_process_error(stderr)
+
+    assert error.kind is model_catalog_store.CatalogRefreshFailureKind.OTHER
+
+
+def test_fold_notice_is_silent_for_an_exact_picker_id_resolution() -> None:
+    """Resolving a picker id to its own [1m] custom option substitutes nothing."""
+    custom_model = "system.ai.claude-sonnet-5[1m]"
+    assert (
+        claude_native.claude_model_fold_notice(
+            "sonnet_5",
+            custom_model,
+            custom_model,
+            claude_native.ClaudeNativeUcodeConfig(
+                env={"ANTHROPIC_CUSTOM_MODEL_OPTION": custom_model}
+            ),
+        )
+        is None
+    )
+
+
+def test_picker_id_resolution_to_its_1m_custom_option_launches_without_a_banner() -> None:
+    """The persisted custom-slot pick must not fire a destructive substitution notice."""
+    from omnigent.claude_native import ClaudeNativeUcodeConfig
+
+    config = ClaudeNativeUcodeConfig(
+        env={
+            "ANTHROPIC_BASE_URL": "https://gateway.example/anthropic",
+            "ANTHROPIC_CUSTOM_MODEL_OPTION": "system.ai.claude-sonnet-5[1m]",
+        }
+    )
+    rows: list[dict[str, object]] = [
+        {"id": "system.ai.claude-sonnet-5[1m]", "model": "system.ai.claude-sonnet-5[1m]"}
+    ]
+
+    launch_model, notice = claude_native.resolve_claude_native_catalog_selection(
+        "sonnet_5",
+        rows,
+        config,
+    )
+
+    assert launch_model == "system.ai.claude-sonnet-5[1m]"
+    assert notice is None
+
+
+def test_picker_id_resolution_surfaces_a_missing_custom_option_fallback() -> None:
+    """A saved custom-slot pick cannot silently become the Sonnet family pin."""
+    fallback = "system.ai.claude-sonnet-4-6"
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={
+            "ANTHROPIC_BASE_URL": "https://gateway.example/anthropic",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": fallback,
+        }
+    )
+
+    launch_model, notice = claude_native.resolve_claude_native_catalog_selection(
+        "sonnet_5",
+        [{"id": "sonnet", "model": fallback}],
+        config,
+    )
+
+    assert launch_model == fallback
+    assert notice is not None
+    assert "saved picker option" in notice
+
+
+def test_claude_catalog_selection_rejects_an_unrecognized_claude_looking_id() -> None:
+    """Only documented tier aliases can degrade after catalog matching fails."""
+    catalog: list[dict[str, object]] = [
+        {"id": "opus", "model": "system.ai.claude-opus-5"},
+        {"id": "sonnet", "model": "system.ai.claude-sonnet-4-6[1m]"},
+    ]
+
+    with pytest.raises(click.ClickException) as exc_info:
+        claude_native.resolve_claude_native_catalog_selection(
+            "claude-opus-bogus",
+            catalog,
+            None,
+        )
+
+    assert exc_info.value.message == (
+        "the requested model 'claude-opus-bogus' is not in this host's current "
+        "model list — it may have changed since the pick. Launchable model ids: "
+        "'opus', 'sonnet', 'system.ai.claude-opus-5', "
+        "'system.ai.claude-sonnet-4-6[1m]'. Pick again from the model menu."
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("probe_outcome", "expected_freshness", "expected_kind"),
+    [
+        pytest.param(
+            [{"id": "opus", "model": "claude-opus-5"}],
+            "fresh",
+            None,
+            id="fresh",
+        ),
+        pytest.param(
+            "empty-error",
+            "stale",
+            "empty",
+            id="empty",
+        ),
+        pytest.param(
+            "refresh-error",
+            "stale",
+            "other",
+            id="refresh-failed",
+        ),
+    ],
+)
+async def test_claude_launch_catalog_result_reports_authoritative_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    probe_outcome: list[dict[str, object]] | str,
+    expected_freshness: str,
+    expected_kind: str | None,
+) -> None:
+    """Launch selection sees fresh rows, and a failed refresh keeps stale rows
+    marked stale with the sanitized failure kind — never as fresh authority."""
+    import time
+
+    from omnigent import model_catalog_store
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    fingerprint = claude_native.claude_catalog_fingerprint(None)
+    stale_rows = [{"id": "fable", "model": "claude-fable-retired"}]
+    model_catalog_store.write_catalog("claude-native", fingerprint, stale_rows)
+    path = model_catalog_store.catalog_path("claude-native", fingerprint)
+    stale_time = time.time() - model_catalog_store.CATALOG_STALE_AFTER_S - 1
+    os.utime(path, (stale_time, stale_time))
+
+    async def _probe(_config: object) -> list[dict[str, object]]:
+        if probe_outcome == "empty-error":
+            raise model_catalog_store.CatalogRefreshError(
+                model_catalog_store.CatalogRefreshFailureKind.EMPTY,
+                "model catalog refresh returned no models",
+            )
+        if probe_outcome == "refresh-error":
+            raise model_catalog_store.CatalogRefreshError(
+                model_catalog_store.CatalogRefreshFailureKind.OTHER,
+                "catalog refresh unavailable",
+            )
+        assert isinstance(probe_outcome, list)
+        return probe_outcome
+
+    monkeypatch.setattr(claude_native, "claude_model_catalog", _probe)
+
+    result = await claude_native.claude_launch_catalog_result(None)
+
+    assert result.freshness.value == expected_freshness
+    if expected_kind is None:
+        assert result.refresh_error is None
+        assert result.rows == probe_outcome
+    else:
+        assert result.refresh_error is not None
+        assert result.refresh_error.kind.value == expected_kind
+        # A failed refresh preserves the cached rows, but never as fresh
+        # authority: launch selection must see the STALE provenance.
+        assert result.rows == stale_rows

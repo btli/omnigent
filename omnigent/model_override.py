@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 
+from omnigent.claude_model_vocabulary import CLAUDE_MODEL_ALIASES
 from omnigent.harness_aliases import canonicalize_harness, is_native_harness
 from omnigent.harness_availability import CODEX_CANONICAL_HARNESSES
 from omnigent.harness_plugins import model_env_keys
@@ -152,9 +153,10 @@ def model_family_mismatch(harness: str, model: str) -> str | None:
     """
     Return a rejection reason when *model*'s family cannot run on *harness*.
 
-    Family is detected by vendor token: Claude ids contain ``"claude"``
-    (``databricks-claude-opus-4-8``); codex-compatible ids name gpt,
-    codex, glm, or kimi (``databricks-gpt-5-4``, ``system.ai.glm-5-2``).
+    Family is detected by vendor token or Claude's documented tier aliases:
+    Claude ids contain ``"claude"`` (``databricks-claude-opus-4-8``), while
+    codex-compatible ids name gpt, codex, glm, or kimi
+    (``databricks-gpt-5-4``, ``system.ai.glm-5-2``).
     Single-vendor harnesses reject the other family and ids whose family
     cannot be determined — failing loud at dispatch beats an opaque
     harness/gateway error after spawn.
@@ -171,7 +173,11 @@ def model_family_mismatch(harness: str, model: str) -> str | None:
     """
     canon = canonicalize_harness(harness)
     lower = model.lower()
-    is_claude = "claude" in lower
+    alias_base = lower.removesuffix("[1m]")
+    is_claude_native_alias = (
+        canon in {"claude-native", "native-claude"} and alias_base in CLAUDE_MODEL_ALIASES
+    )
+    is_claude = is_claude_native_alias or "claude" in lower
     # Antigravity's reject-list stays the narrow GPT/codex rule: GLM and Kimi
     # ids carry no Gemini-native verdict, so they are not newly excluded here.
     is_gpt = "gpt" in lower or "codex" in lower
