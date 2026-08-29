@@ -42,6 +42,7 @@ import click
 import httpx
 from fastapi.responses import JSONResponse, Response
 
+from omnigent import model_catalog_store
 from omnigent._platform import IS_WINDOWS
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.entities.session_resources import (
@@ -2272,21 +2273,25 @@ async def _auto_create_pi_terminal(
     # message silently fails to reach the model — the user sees no reply and no
     # reason. Best-effort: a delivery failure must not fail the launch.
     if credential_warning is not None:
-        await _post_pi_native_credential_warning(
+        await _post_native_session_error_notice(
             session_id=session_id,
             server_client=server_client,
-            warning=credential_warning,
+            code="pi_credentials_unresolved",
+            message=credential_warning,
+            log_prefix="pi-native: failed to surface credential warning",
         )
     return terminal_view
 
 
-async def _post_pi_native_credential_warning(
+async def _post_native_session_error_notice(
     *,
     session_id: str,
     server_client: httpx.AsyncClient | None,
-    warning: str,
+    code: str,
+    message: str,
+    log_prefix: str,
 ) -> None:
-    """Surface a credential warning into the session as an error banner.
+    """Surface a native-launch warning into the session as an error banner.
 
     Posts an ``error`` item via ``external_conversation_item`` so the notice
     renders as the web UI's distinct destructive banner (not a misleading
@@ -2297,7 +2302,9 @@ async def _post_pi_native_credential_warning(
 
     :param session_id: Session/conversation identifier.
     :param server_client: Runner Omnigent server client (``None`` in tests).
-    :param warning: The user-facing warning text to surface.
+    :param code: Stable error item code.
+    :param message: User-facing warning text.
+    :param log_prefix: Harness-specific delivery failure description.
     """
     if server_client is None:
         return
@@ -2310,8 +2317,8 @@ async def _post_pi_native_credential_warning(
                     "item_type": "error",
                     "item_data": {
                         "source": "execution",
-                        "code": "pi_credentials_unresolved",
-                        "message": warning,
+                        "code": code,
+                        "message": message,
                     },
                 },
             },
@@ -2320,7 +2327,8 @@ async def _post_pi_native_credential_warning(
         resp.raise_for_status()
     except httpx.HTTPError:
         _logger.warning(
-            "pi-native: failed to surface credential warning for session %s",
+            "%s for session %s",
+            log_prefix,
             session_id,
             exc_info=True,
         )
@@ -3719,6 +3727,48 @@ async def _auto_create_kimi_terminal(
     return terminal_view
 
 
+def _resolve_codex_launch_model_override(requested: str, catalog: list[_JsonObject]) -> str:
+    """Resolve an explicit codex model pin to the id its catalog advertises.
+
+    An orchestrator-selected id can arrive in gateway vocabulary
+    (``system.ai.gpt-5.6-sol``) or with dashed version digits
+    (``system.ai.gpt-5-6-sol``) while codex's own ``model/list`` spells the
+    same model ``gpt-5.6-sol``. Fold both sides to codex's comparison form and
+    return the catalog's own spelling so the launch pins what codex serves. A
+    model no row names is rejected with the launchable ids enumerated.
+    """
+    from omnigent.codex_model_vocabulary import codex_reachable_model_slug
+    from omnigent.model_catalog_store import launchable_ids_text
+
+    # A selectable id is stronger than another row's model alias.
+    exact_model_ids: set[str] = set()
+    for row in catalog:
+        row_id = row.get("id")
+        if not isinstance(row_id, str) or not (row_id := row_id.strip()):
+            continue
+        if requested == row_id:
+            return row_id
+        if requested == row.get("model"):
+            exact_model_ids.add(row_id)
+    if len(exact_model_ids) == 1:
+        return next(iter(exact_model_ids))
+    if len(exact_model_ids) > 1:
+        raise click.ClickException(
+            f"the requested model {requested!r} exactly matches catalog rows that "
+            "do not resolve to exactly one valid catalog id. Launchable model ids: "
+            f"{launchable_ids_text(catalog)}. Pick again from the model menu."
+        )
+
+    resolved = codex_reachable_model_slug(requested, catalog)
+    if resolved is not None:
+        return resolved
+    raise click.ClickException(
+        f"the requested model {requested!r} is not in this host's current model "
+        f"list — it may have changed since the pick. Launchable model ids: "
+        f"{launchable_ids_text(catalog)}. Pick again from the model menu."
+    )
+
+
 async def _auto_create_codex_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -3830,19 +3880,26 @@ async def _auto_create_codex_terminal(
             codex_launch_catalog,
             codex_launch_catalog_is_stale,
         )
-        from omnigent.model_catalog_store import catalog_contains, default_row
+        from omnigent.model_catalog_store import default_row
 
         # Read staleness BEFORE the fetch — the fetch kicks the background
         # re-probe, which could land between the two reads.
         _codex_catalog_was_stale = await codex_launch_catalog_is_stale()
         _codex_catalog = await codex_launch_catalog(codex_path=_codex_cli_path)
         if launch_config.model_override and _codex_catalog:
-            if not catalog_contains(_codex_catalog, launch_config.model_override):
-                raise click.ClickException(
-                    f"the requested model {launch_config.model_override!r} is not in "
-                    "this host's current model list — it may have changed since the "
-                    "pick. Pick again from the model menu."
+            # Fold gateway/dashed vocabulary onto codex's own spelling before
+            # accepting or rejecting, and pin the id codex actually advertises.
+            _resolved_model = _resolve_codex_launch_model_override(
+                launch_config.model_override, _codex_catalog
+            )
+            if _resolved_model != _codex_launch.model:
+                _logger.info(
+                    "codex launch for session=%s: resolved requested model %r to catalog id %r",
+                    session_id,
+                    launch_config.model_override,
+                    _resolved_model,
                 )
+                _codex_launch = _dataclass_replace(_codex_launch, model=_resolved_model)
         if _codex_launch.model is None and _codex_launch.profile is None and _codex_catalog:
             # Same staleness rule as the claude branch: never convert a stale
             # entry's default into an explicit model pin.
@@ -5666,6 +5723,36 @@ def _is_runner_owned_antigravity_terminal(
     )
 
 
+def _claude_model_from_launch_args(terminal_launch_args: list[str] | None) -> str | None:
+    """Return the last valid explicit ``--model`` value in launch argv."""
+    model: str | None = None
+    args = terminal_launch_args or []
+    for index, arg in enumerate(args):
+        if arg == "--model" and index + 1 < len(args) and args[index + 1]:
+            model = args[index + 1]
+        elif arg.startswith("--model=") and arg.partition("=")[2]:
+            model = arg.partition("=")[2]
+    return model
+
+
+def _claude_launch_args_with_model(
+    terminal_launch_args: list[str] | None,
+    model: str,
+) -> list[str] | None:
+    """Replace the effective explicit ``--model`` value with *model*."""
+    if terminal_launch_args is None:
+        return None
+    args = list(terminal_launch_args)
+    for index in range(len(args) - 1, -1, -1):
+        if args[index].startswith("--model="):
+            args[index] = f"--model={model}"
+            return args
+        if args[index] == "--model" and index + 1 < len(args):
+            args[index + 1] = model
+            return args
+    return args
+
+
 def _build_claude_native_base_args(
     *,
     reasoning_effort: str | None,
@@ -6186,6 +6273,270 @@ async def _load_claude_launch_metadata(
     return metadata
 
 
+_CLAUDE_CATALOG_AUTH_REMEDIATION = "Restore provider credentials and retry."
+_CLAUDE_CATALOG_DATABRICKS_AUTH_REMEDIATION = (
+    " For Databricks, run `databricks auth login --profile <PROFILE>`."
+)
+_CLAUDE_CATALOG_RETRY_REMEDIATION = (
+    "Retry after checking Claude CLI availability and provider connectivity."
+)
+
+
+def _claude_catalog_refresh_remediation(
+    error: model_catalog_store.CatalogRefreshError,
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> str:
+    """Return endpoint-specific guidance for a sanitized refresh failure."""
+    from omnigent.claude_native import claude_config_uses_databricks
+
+    if error.kind is not model_catalog_store.CatalogRefreshFailureKind.AUTH:
+        return _CLAUDE_CATALOG_RETRY_REMEDIATION
+    remediation = _CLAUDE_CATALOG_AUTH_REMEDIATION
+    if claude_config_uses_databricks(claude_config):
+        remediation += _CLAUDE_CATALOG_DATABRICKS_AUTH_REMEDIATION
+    return remediation
+
+
+def _claude_launch_catalog_selection_rows(
+    *,
+    selected_model: str | None,
+    claude_config: ClaudeNativeUcodeConfig | None,
+    catalog: model_catalog_store.CatalogResult | None,
+) -> list[dict[str, object]] | None:
+    """Apply refresh-failure policy once for every launch selection path."""
+    if catalog is None:
+        return None
+    if (
+        catalog.freshness is model_catalog_store.CatalogFreshness.FRESH
+        and catalog.rows is not None
+    ):
+        return catalog.rows
+
+    refresh_error = catalog.refresh_error
+    if refresh_error is None:
+        return None
+    if refresh_error.kind in {
+        model_catalog_store.CatalogRefreshFailureKind.TIMEOUT,
+        model_catalog_store.CatalogRefreshFailureKind.OTHER,
+    }:
+        if (
+            catalog.freshness is model_catalog_store.CatalogFreshness.STALE
+            and catalog.rows is not None
+        ):
+            return catalog.rows
+        return None
+
+    subject = f"the requested model {selected_model!r}" if selected_model else "the default model"
+    if refresh_error.kind is model_catalog_store.CatalogRefreshFailureKind.EMPTY:
+        raise click.ClickException(
+            f"{subject} is not available from this host's current model list — it may have "
+            "been removed since the pick. Pick again from the model menu."
+        )
+    raise click.ClickException(
+        f"{subject} could not be validated against a fresh model list ({refresh_error}). "
+        f"{_claude_catalog_refresh_remediation(refresh_error, claude_config)}"
+    )
+
+
+def _configured_claude_model_unverified_notice(model: str, reason: str) -> str:
+    """Warn visibly when an outage prevents configured-model verification."""
+    _logger.warning(
+        "native-claude: launching configured model %r without fresh-catalog verification; %s",
+        model,
+        reason,
+    )
+    return (
+        f"Configured Claude model {model!r} could not be verified against a fresh model list. "
+        f"Launching it unchanged because {reason}."
+    )
+
+
+def _configured_claude_model_fallback_notice(
+    configured_model: str,
+    launch_model: str | None,
+) -> str:
+    """Warn visibly when fresh authority replaces a configured model."""
+    if launch_model is None:
+        _logger.warning(
+            "native-claude: configured model %r is unavailable; launching without an "
+            "explicit model because the fresh catalog has no default",
+            configured_model,
+        )
+        return (
+            f"Configured Claude model {configured_model!r} is unavailable on this host. "
+            "Launched without an explicit model because the fresh catalog has no default."
+        )
+    _logger.warning(
+        "native-claude: configured model %r is unavailable; using fresh catalog default %r",
+        configured_model,
+        launch_model,
+    )
+    return (
+        f"Configured Claude model {configured_model!r} is unavailable on this host. "
+        f"Launched with fresh catalog default {launch_model!r} instead."
+    )
+
+
+def _select_authoritative_claude_launch_model(
+    *,
+    explicit_model: str | None,
+    configured_model: str | None,
+    claude_config: ClaudeNativeUcodeConfig | None,
+    catalog: model_catalog_store.CatalogResult | None,
+) -> tuple[str | None, str | None]:
+    """Select a launch model from an explicit pin or authoritative catalog.
+
+    :returns: ``(launch_model, notice)``; ``notice`` is set when selection
+        substitutes a model or launches an unverified configured pin.
+    """
+    from omnigent.claude_native import (
+        claude_catalog_serves_model,
+        claude_config_serves_canonical_ids,
+        claude_model_fold_notice,
+        is_canonical_claude_pin,
+        resolve_claude_catalog_model,
+        resolve_claude_native_catalog_selection,
+        resolve_claude_native_model_selection,
+    )
+
+    selected_model = explicit_model if explicit_model is not None else configured_model
+    validation_rows = _claude_launch_catalog_selection_rows(
+        selected_model=selected_model,
+        claude_config=claude_config,
+        catalog=catalog,
+    )
+    fresh_rows = (
+        validation_rows
+        if catalog is not None and catalog.freshness is model_catalog_store.CatalogFreshness.FRESH
+        else None
+    )
+
+    if explicit_model is not None:
+        resolved = (
+            resolve_claude_native_model_selection(explicit_model, claude_config) or explicit_model
+        )
+        if validation_rows is not None:
+            if (
+                is_canonical_claude_pin(resolved)
+                and resolved.lower().startswith("claude-")
+                and claude_config_serves_canonical_ids(claude_config)
+                and claude_catalog_serves_model(validation_rows, resolved, claude_config)
+            ):
+                # A recognized canonical id served by its family launches
+                # exactly as pinned; wrong-case or provider-prefixed
+                # spellings fall through to the visible catalog fold.
+                return resolved, None
+            if fresh_rows is not None:
+                # Fresh authoritative rows carry full selection authority:
+                # exact/equivalent resolution, visible substitution notices,
+                # the documented Claude tier fallback ladder, and the
+                # launchable-id refusal.
+                return resolve_claude_native_catalog_selection(
+                    explicit_model, fresh_rows, claude_config
+                )
+            # Stale rows validate opportunistically but never reject a pin:
+            # yesterday's list is not authority to refuse. An equivalent fold
+            # still substitutes visibly, exactly like the fresh path.
+            for candidate in dict.fromkeys((explicit_model, resolved)):
+                catalog_model = resolve_claude_catalog_model(validation_rows, candidate)
+                if catalog_model is not None:
+                    return catalog_model, claude_model_fold_notice(
+                        explicit_model,
+                        candidate,
+                        catalog_model,
+                        claude_config,
+                    )
+            if claude_catalog_serves_model(validation_rows, resolved, claude_config):
+                return resolved, None
+        refresh_error = catalog.refresh_error if catalog is not None else None
+        if claude_config_serves_canonical_ids(claude_config) and is_canonical_claude_pin(resolved):
+            # A recognized, canonically-spelled pin on an endpoint that takes
+            # canonical ids launches unchanged through a discovery outage.
+            return resolved, None
+        if refresh_error is not None:
+            raise click.ClickException(
+                f"the requested model {explicit_model!r} could not be validated against a "
+                f"fresh model list ({refresh_error}). "
+                f"{_claude_catalog_refresh_remediation(refresh_error, claude_config)}"
+            )
+        raise click.ClickException(
+            f"the requested model {explicit_model!r} could not be validated because this "
+            "host has no fresh model list. Pick again from the model menu."
+        )
+
+    configured = resolve_claude_native_model_selection(configured_model, claude_config)
+    if validation_rows is not None:
+        if configured is not None:
+            for candidate in dict.fromkeys((configured_model, configured)):
+                if candidate is None:
+                    continue
+                catalog_model = resolve_claude_catalog_model(validation_rows, candidate)
+                if catalog_model is not None:
+                    return catalog_model, claude_model_fold_notice(
+                        configured_model or configured,
+                        candidate,
+                        catalog_model,
+                        claude_config,
+                    )
+            if claude_catalog_serves_model(validation_rows, configured, claude_config):
+                return configured, None
+            if fresh_rows is None:
+                # Stale rows are not authority to drop the operator's
+                # configured pin: launch it, mirroring the explicit path's
+                # outage pass-through — loudly when it cannot be verified.
+                if not (
+                    claude_config_serves_canonical_ids(claude_config)
+                    and is_canonical_claude_pin(configured)
+                ):
+                    reason = "the catalog refresh failed and the stale rows do not list it"
+                    notice = _configured_claude_model_unverified_notice(
+                        configured,
+                        reason,
+                    )
+                    return configured, notice
+                return configured, None
+        if fresh_rows is not None:
+            row = model_catalog_store.default_row(fresh_rows)
+            default_model = (
+                str(row.get("model") or row.get("id") or "") or None if row is not None else None
+            )
+            if configured_model is not None:
+                return default_model, _configured_claude_model_fallback_notice(
+                    configured_model,
+                    default_model,
+                )
+            if default_model is not None:
+                return default_model, None
+        # A stale entry's default is yesterday's answer: pinning it as
+        # ``--model`` turns a provider-side retirement or entitlement change
+        # into a hard launch failure. Launch bare instead — the CLI's own
+        # default is servable by construction — while the store's next
+        # refresh converges the catalog.
+        return None, None
+    if configured is not None:
+        if not (
+            claude_config_serves_canonical_ids(claude_config)
+            and is_canonical_claude_pin(configured)
+        ):
+            reason = (
+                "the catalog refresh failed and no cached model list is available"
+                if catalog is not None and catalog.refresh_error is not None
+                else "the launch catalog is unavailable"
+            )
+            return configured, _configured_claude_model_unverified_notice(configured, reason)
+        return configured, None
+    return None, None
+
+
+def _log_claude_launch_catalog_unavailable(session_id: str) -> None:
+    """Log a catalog failure without serializing exception payloads."""
+    _logger.warning(
+        "claude launch catalog unavailable for session=%s",
+        session_id,
+        extra={"session_id": session_id},
+    )
+
+
 async def _auto_create_claude_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -6380,7 +6731,6 @@ async def _auto_create_claude_terminal(
         build_native_claude_terminal_env,
         claude_config_with_launch_model_pinned,
         claude_config_with_routed_arms_pinned,
-        resolve_claude_native_model_selection,
         resolve_native_claude_config,
     )
 
@@ -6619,75 +6969,25 @@ async def _auto_create_claude_terminal(
         from omnigent.server.smart_routing import task_v1_claude_arms
 
         claude_config = claude_config_with_routed_arms_pinned(claude_config, task_v1_claude_arms())
-    launch_model = resolve_claude_native_model_selection(
-        session_model_override
-        or _claude_native_model_from_spec(agent_spec)
-        or (claude_config.model if claude_config is not None else None),
-        claude_config,
-    )
-    # Explicit launches (model-flows design §4): consult the shared catalog
-    # only when it can change the outcome — to validate an explicit request,
-    # or to resolve a Default launch that would otherwise pass no ``--model``
-    # and leave the model to invisible CLI-private state.
-    if session_model_override or launch_model is None:
-        from omnigent.claude_native import (
-            claude_catalog_serves_model,
-            claude_launch_catalog,
-            claude_launch_catalog_is_stale,
-        )
-        from omnigent.model_catalog_store import default_row
+    argv_model = _claude_model_from_launch_args(session_launch_args)
+    spec_model = _claude_native_model_from_spec(agent_spec)
+    explicit_model = argv_model or session_model_override or spec_model
+    configured_model = claude_config.model if claude_config is not None else None
+    from omnigent.claude_native import claude_launch_catalog_result
 
-        launch_catalog: list[dict[str, object]] | None = None
-        launch_catalog_was_stale = False
-        try:
-            # Read staleness BEFORE the fetch: the fetch itself kicks the
-            # background re-probe, which could land between the two reads and
-            # make a same-launch check call yesterday's rows fresh.
-            launch_catalog_was_stale = claude_launch_catalog_is_stale(claude_config)
-            launch_catalog = await claude_launch_catalog(claude_config)
-        except Exception:  # noqa: BLE001 — no catalog means no validation/default
-            _logger.warning(
-                "claude launch catalog unavailable for session=%s",
-                session_id,
-                exc_info=True,
-                extra={"session_id": session_id},
-            )
-        if session_model_override and launch_catalog:
-            resolved_request = (
-                resolve_claude_native_model_selection(session_model_override, claude_config)
-                or session_model_override
-            )
-            # A pane's ``/model`` persists the exact id it runs; the catalog
-            # may spell that model only by its family alias.
-            if not (
-                claude_catalog_serves_model(launch_catalog, session_model_override, claude_config)
-                or claude_catalog_serves_model(launch_catalog, resolved_request, claude_config)
-            ):
-                raise click.ClickException(
-                    f"the requested model {session_model_override!r} is not in this "
-                    "host's current model list — it may have changed since the pick. "
-                    "Pick again from the model menu."
-                )
-        if launch_model is None and launch_catalog:
-            # A stale entry's default is yesterday's answer: pinning it as
-            # ``--model`` turns a provider-side retirement or entitlement
-            # change into a hard launch failure. Launch bare instead — the
-            # CLI's own default is servable by construction, and the
-            # harness's ``reported_model`` records what it actually ran —
-            # while the store's background re-probe converges the catalog.
-            if launch_catalog_was_stale:
-                _logger.info(
-                    "claude catalog for session=%s is stale; deferring the Default "
-                    "launch to the CLI's own default model",
-                    session_id,
-                )
-            else:
-                catalog_default = default_row(launch_catalog)
-                if catalog_default is not None:
-                    launch_model = (
-                        str(catalog_default.get("model") or catalog_default.get("id") or "")
-                        or None
-                    )
+    launch_catalog_result = None
+    try:
+        launch_catalog_result = await claude_launch_catalog_result(claude_config)
+    except Exception:  # noqa: BLE001 — no catalog means no validation/default
+        _log_claude_launch_catalog_unavailable(session_id)
+    launch_model, model_substitution_notice = _select_authoritative_claude_launch_model(
+        explicit_model=explicit_model,
+        configured_model=configured_model,
+        claude_config=claude_config,
+        catalog=launch_catalog_result,
+    )
+    if argv_model is not None and launch_model is not None and launch_model != argv_model:
+        session_launch_args = _claude_launch_args_with_model(session_launch_args, launch_model)
     # Give an exact launch model (a Smart Routing pick is resolved before the
     # terminal exists) a spelling of its own in the picker, so a later
     # ``/model`` can return to it instead of stepping onto whatever the family
@@ -6713,13 +7013,19 @@ async def _auto_create_claude_terminal(
     )
     _logger.info(
         "Claude terminal provider config resolved: session=%s configured=%s "
-        "env_keys=%s api_key_helper_set=%s model_set=%s launch_model=%s",
+        "env_keys=%s api_key_helper_set=%s model_set=%s launch_model=%s "
+        "catalog_freshness=%s",
         session_id,
         claude_config is not None,
         sorted(claude_config.env) if claude_config is not None else [],
         bool(claude_config.api_key_helper) if claude_config is not None else False,
         bool(claude_config.model) if claude_config is not None else False,
         launch_model,
+        (
+            launch_catalog_result.freshness.value
+            if launch_catalog_result is not None
+            else "unavailable"
+        ),
         extra={"session_id": session_id},
     )
     base_claude_args = _build_claude_native_base_args(
@@ -6905,6 +7211,14 @@ async def _auto_create_claude_terminal(
             "resource": terminal_payload,
         },
     )
+    if model_substitution_notice is not None:
+        await _post_native_session_error_notice(
+            session_id=session_id,
+            server_client=server_client,
+            code="claude_model_substituted",
+            message=model_substitution_notice,
+            log_prefix="claude-native: failed to surface model substitution",
+        )
     _publish_tmux_target_for_bridge(
         resource_registry=resource_registry,
         session_id=session_id,
