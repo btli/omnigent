@@ -8012,6 +8012,25 @@ def test_sanitize_hook_failure_detail_redacts_after_planted_marker() -> None:
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
+        (
+            "launch failed\ntoken:\neyJhbGciOiJIUzI1NiJ9.payload.sig",
+            "launch failed\ntoken:\n[REDACTED]",
+        ),
+        (
+            "provider said password=hunter2 rejected",
+            "provider said password=[REDACTED] rejected",
+        ),
+    ],
+    ids=["value-after-newline", "short-value"],
+)
+def test_sanitize_hook_failure_detail_redacts_keyed_env_values(text: str, expected: str) -> None:
+    """Keyed values fold across preserved line boundaries and have no floor."""
+    assert _sanitize_hook_failure_detail(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
         ("x\u2009Bearer\u2009abcdefghijk", "x Bearer [REDACTED]"),
         ("ghp_abcdefghijbearer\u2009klmnopqrst", "[REDACTED]"),
         ("Bearer\nabcdefghijk", "Bearer\nabcdefghijk"),
@@ -8019,8 +8038,8 @@ def test_sanitize_hook_failure_detail_redacts_after_planted_marker() -> None:
         ("bearer\ufeffabcdefghijk", "bearer[REDACTED]"),
         ("bearer\u2060abcdefghijk", "bearer[REDACTED]"),
         ("bearer\u200dabcdefghijk", "bearer[REDACTED]"),
-        ("Bearer\u2009of bad news", "Bearer of bad news"),
-        ("bearer\ufeffof bad news", "bearerof bad news"),
+        ("Bearer\u2009of bad news", "Bearer[REDACTED] bad news"),
+        ("bearer\ufeffof bad news", "bearer[REDACTED] bad news"),
         ("Bearer\nof bad news", "Bearer\nof bad news"),
     ],
     ids=[

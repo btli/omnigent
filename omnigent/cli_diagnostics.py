@@ -120,7 +120,12 @@ _SECRET_PATTERNS: list[re.Pattern[str]] = [
 _REDACTED = "[REDACTED]"
 _MAX_UNTERMINATED_AUTHORIZATION_FOLDS = 1
 _MAX_CREDENTIAL_WORD_GAPS = 1
-_ENV_VALUE_MIN_LENGTH = 8
+_MAX_ENV_VALUE_NEWLINE_FOLDS = 1
+# Keyed anchors (env-style ``key=``/``key:`` and ``Bearer``) redact any
+# non-empty value: the key names the value sensitive, so no length floor
+# applies (parity with the regexes this scanner replaced). Length floors
+# remain only on the unkeyed fixed-prefix families.
+_KEYED_VALUE_MIN_LENGTH = 1
 _WORD_GAP_TEXT = (
     "\t \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007"
     "\u2008\u2009\u200a\u202f\u205f\u3000"
@@ -144,20 +149,17 @@ _CREDENTIAL_ANCHORS_BY_INITIAL: dict[str, tuple[tuple[str, str, bool], ...]] = {
 _CREDENTIAL_ANCHOR_INITIAL_RE = re.compile(r"[gdxAsbB]")
 _CREDENTIAL_ANCHOR_INITIAL_WITHOUT_BEARER_RE = re.compile(r"[gdxAs]")
 _AUTHORIZATION_INITIAL_RE = re.compile(r"[aA]")
-_ENV_CREDENTIAL_ANCHOR_RE = re.compile(r"(?<!\w)\w*(?i:token|api_key|secret|password)[ \t]*[:=]")
+_ENV_CREDENTIAL_ANCHOR_RE = re.compile(
+    rf"(?<!\w)\w*(?i:token|api_key|secret|password)[{re.escape(_WORD_GAP_TEXT)}]*[:=]"
+)
 _BEARER_ALPHABET_RE = r"[A-Za-z0-9._~+/=-]"
 # Removing every non-gap splitter makes this a conservative impossibility
 # check; the forward scanner below remains the only redaction matcher.
 _BEARER_SHADOW_STRIP_RE = re.compile(rf"[^{re.escape(_WORD_GAP_TEXT)}A-Za-z0-9._~+/=\-\r\n]+")
 _BEARER_SHADOW_POSSIBLE_RE = re.compile(
-    rf"(?i)(?<![A-Za-z0-9_])bearer[{re.escape(_WORD_GAP_TEXT)}]?"
-    rf"(?:{_BEARER_ALPHABET_RE}{{8}}|"
-    + "|".join(
-        rf"{_BEARER_ALPHABET_RE}{{{left}}}[{re.escape(_WORD_GAP_TEXT)}]"
-        rf"{_BEARER_ALPHABET_RE}{{{8 - left}}}"
-        for left in range(8)
-    )
-    + ")"
+    rf"(?i)(?<![A-Za-z0-9_])bearer"
+    rf"[{re.escape(_WORD_GAP_TEXT)}]{{0,{1 + _MAX_CREDENTIAL_WORD_GAPS}}}"
+    rf"{_BEARER_ALPHABET_RE}"
 )
 _AUTHORIZATION_SHADOW_STRIP_RE = re.compile(rf"[^{re.escape(_WORD_GAP_TEXT)}A-Za-z0-9:=\r\n]+")
 _AUTHORIZATION_SHADOW_POSSIBLE_RE = re.compile(
@@ -330,11 +332,16 @@ def _redact_scanned_credentials(text: str) -> str:
             if not scan_bearer:
                 continue
             preserved_end, body_start = _bearer_value_start(text, anchor_end)
+            if text.startswith(_REDACTED, body_start):
+                # Our own emitted marker: the first pass already consumed
+                # exactly this value, so a repeated pass must not re-scan it
+                # (idempotence for double-redacting log paths).
+                continue
             span_end = _credential_span_end(
                 text,
                 body_start,
                 alphabet="._~+/=-",
-                minimum=8,
+                minimum=_KEYED_VALUE_MIN_LENGTH,
             )
             if span_end is not None:
                 parts.extend((text[cursor:preserved_end], _REDACTED))
@@ -354,13 +361,32 @@ def _redact_scanned_env_credentials(text: str) -> str:
     while match := _ENV_CREDENTIAL_ANCHOR_RE.search(text, search_start):
         search_start = match.end()
         body_start = match.end()
-        if body_start < len(text) and _is_word_gap(text[body_start]):
+        while body_start < len(text) and _is_word_gap(text[body_start]):
             body_start += 1
+        # Fold the value across a bounded number of newlines after the
+        # anchor, mirroring Authorization folding — hook text preserves
+        # line boundaries, so `password=\n<value>` must still match.
+        newline_folds = 0
+        while (
+            newline_folds < _MAX_ENV_VALUE_NEWLINE_FOLDS
+            and body_start < len(text)
+            and text[body_start] in "\r\n"
+        ):
+            newline_end = body_start + 1
+            if text[body_start] == "\r" and text.startswith("\n", newline_end):
+                newline_end += 1
+            body_start = newline_end
+            newline_folds += 1
+            while body_start < len(text) and _is_word_gap(text[body_start]):
+                body_start += 1
+        if text.startswith(_REDACTED, body_start):
+            # Our own emitted marker: already redacted on a previous pass.
+            continue
         span_end = _credential_span_end(
             text,
             body_start,
             alphabet="._~+/=-",
-            minimum=_ENV_VALUE_MIN_LENGTH,
+            minimum=_KEYED_VALUE_MIN_LENGTH,
         )
         if span_end is None:
             continue

@@ -267,10 +267,9 @@ def test_redact_secrets_scrubs_short_authorization_values(text: str) -> None:
     assert cli_diagnostics.redact_secrets(text) == "Authorization: [REDACTED]"
 
 
-def test_redact_secrets_preserves_authorization_prose() -> None:
-    """A keyless bearer phrase remains readable when it is ordinary prose."""
-    text = "bearer of bad news"
-    assert cli_diagnostics.redact_secrets(text) == text
+def test_redact_secrets_scrubs_short_keyless_bearer_value() -> None:
+    """A keyless Bearer redacts any non-empty value — even prose-shaped ones."""
+    assert cli_diagnostics.redact_secrets("bearer of bad news") == "bearer [REDACTED] bad news"
 
 
 def test_redact_secrets_handles_unterminated_quoted_authorization_linearly() -> None:
@@ -483,17 +482,9 @@ def test_redact_secrets_redacts_one_literal_interior_space(
     assert "[REDACTED]" in scrubbed
 
 
-@pytest.mark.parametrize(
-    "text",
-    [
-        "ghp_ is a prefix used in documentation",
-        "bearer of bad news",
-        "token= is not a credential value",
-    ],
-    ids=["github-prefix", "bearer", "env-key"],
-)
-def test_redact_secrets_preserves_prefixed_prose_with_word_gaps(text: str) -> None:
-    """Multiple real word gaps keep ordinary diagnostic prose readable."""
+def test_redact_secrets_preserves_prefixed_prose_with_word_gaps() -> None:
+    """A bare fixed-prefix anchor with only prose after it stays readable."""
+    text = "ghp_ is a prefix used in documentation"
     assert cli_diagnostics.redact_secrets(text) == text
 
 
@@ -503,27 +494,30 @@ def test_redact_secrets_rejects_bearer_repetition_in_linear_time() -> None:
     started_at = time.perf_counter()
     scrubbed = cli_diagnostics.redact_secrets(text)
     elapsed = time.perf_counter() - started_at
-    assert scrubbed == text
+    assert scrubbed == ("bearer [REDACTED] " * 1600) + "!"
     assert elapsed < 0.1
 
 
 @pytest.mark.parametrize(
     ("secret", "split_index"),
     [
-        ("Bearer abcdefghijk", 11),
         ("".join(("dapi", "FAKE", "TEST", "0123456789")), 7),
         ("".join(("xoxb", "-", "FAKE", "-", "TEST", "-", "TOKEN")), 9),
         ("".join(("ghp_", "FAKE", "TEST", "TOKEN", "PLACEHOLDER")), 12),
         ("".join(("AKIA", "FAKE", "TEST", "ONLY", "0000")), 10),
         ("".join(("ASIA", "FAKE", "TEST", "ONLY", "0000")), 10),
     ],
-    ids=["bearer", "dapi", "slack", "github", "aws-akia", "aws-asia"],
+    ids=["dapi", "slack", "github", "aws-akia", "aws-asia"],
 )
 def test_redact_secrets_rejects_multiple_interior_spaces(
     secret: str,
     split_index: int,
 ) -> None:
-    """Tolerance is bounded to one literal interior space."""
+    """Tolerance is bounded to one literal interior space (fixed-prefix families).
+
+    ``Bearer`` is keyed and floorless, so it redacts the pre-gap fragment
+    instead; its bounded-gap behavior is covered by the keyed-value tests.
+    """
     spaced = f"{secret[:split_index]}  {secret[split_index:]}"
     assert cli_diagnostics.redact_secrets(spaced) == spaced
 
@@ -556,6 +550,85 @@ def test_redact_secrets_is_idempotent() -> None:
     assert cli_diagnostics.redact_secrets(once) == once
     assert once == '{"Authorization": "[REDACTED]", "status": "request failed"}'
     assert "request failed" in once
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Bearer abcdefghijkl", "Bearer [REDACTED]"),
+        ("Bearer abc123", "Bearer [REDACTED]"),
+        ("API_TOKEN=abcdefghijkl", "API_TOKEN=[REDACTED]"),
+        ("password=hunter2", "password=[REDACTED]"),
+    ],
+    ids=["bearer", "short-bearer", "env", "short-env"],
+)
+def test_redact_secrets_is_idempotent_for_keyed_values(text: str, expected: str) -> None:
+    """Bearer and env redactions survive the double-redacting stderr path."""
+    once = cli_diagnostics.redact_secrets(text)
+    assert once == expected
+    assert cli_diagnostics.redact_secrets(once) == once
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("DATABASE_PASSWORD=hunter2", "DATABASE_PASSWORD=[REDACTED]"),
+        ("API_KEY=a1b2c3", "API_KEY=[REDACTED]"),
+        ("Bearer abc123", "Bearer [REDACTED]"),
+        ("password=x", "password=[REDACTED]"),
+    ],
+    ids=["password", "api-key", "bearer", "single-char"],
+)
+def test_redact_secrets_scrubs_short_keyed_values(text: str, expected: str) -> None:
+    """Keyed anchors redact any non-empty value — no length floor applies."""
+    assert cli_diagnostics.redact_secrets(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "password\u00a0=supersecretvalue",
+            "password\u00a0=[REDACTED]",
+        ),
+        (
+            "API_KEY\u2009= abcdefghijkl",
+            "API_KEY\u2009= [REDACTED]",
+        ),
+        (
+            "token:\neyJhbGciOiJIUzI1NiJ9.payload.signature",
+            "token:\n[REDACTED]",
+        ),
+        (
+            "password=\nsupersecretvalue",
+            "password=\n[REDACTED]",
+        ),
+        (
+            "password =\n  supersecretvalue",
+            "password =\n  [REDACTED]",
+        ),
+        (
+            "token:\r\nsecretvalue123",
+            "token:\r\n[REDACTED]",
+        ),
+        (
+            "password=\n\nnot the value",
+            "password=\n\nnot the value",
+        ),
+    ],
+    ids=[
+        "nbsp-before-equals",
+        "thin-space-before-equals",
+        "jwt-after-newline",
+        "value-after-newline",
+        "value-after-indented-fold",
+        "value-after-crlf",
+        "blank-line-ends-fold",
+    ],
+)
+def test_redact_secrets_scrubs_env_values_across_gaps_and_folds(text: str, expected: str) -> None:
+    """Unicode word gaps around ``:=`` and one folded newline still match."""
+    assert cli_diagnostics.redact_secrets(text) == expected
 
 
 @pytest.mark.parametrize("prefix", ["AKIA", "ASIA"])
