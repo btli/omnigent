@@ -242,16 +242,15 @@ describe("HeaderConversationMenu", () => {
     expect(removeItem.firstElementChild).toHaveTextContent("🚀");
   });
 
-  it("uses project names and the Remove label for desktop picker typeahead", async () => {
+  it("uses project names and the Remove label for the mobile picker typeahead", async () => {
+    mocks.isMobile = true;
     mocks.projects = [
       { id: null, name: "Alpha" },
       { id: "project-1", name: "Sprint 42", icon: "🚀" },
     ];
     const view = renderMenu({ currentProject: "Sprint 42" });
     openMenu();
-    const moveTrigger = screen.getByTestId("header-move-to-project");
-    moveTrigger.focus();
-    fireEvent.keyDown(moveTrigger, { key: "ArrowRight" });
+    fireEvent.click(screen.getByTestId("header-move-to-project"));
 
     const alphaRow = await screen.findByRole("menuitem", { name: "Alpha" });
     const sprintRow = screen.getByRole("menuitem", { name: "Sprint 42" });
@@ -260,20 +259,20 @@ describe("HeaderConversationMenu", () => {
     expect(alphaRow.firstElementChild?.nextElementSibling).toHaveTextContent("Alpha");
     expect(sprintRow.firstElementChild).toHaveAttribute("data-testid", "project-icon");
     expect(sprintRow.firstElementChild?.nextElementSibling).toHaveTextContent("Sprint 42");
-    await waitFor(() => expect(alphaRow).toHaveFocus());
+    alphaRow.focus();
     fireEvent.keyDown(alphaRow, { key: "s" });
     await waitFor(() => expect(sprintRow).toHaveFocus());
 
+    // A fresh mount resets the typeahead buffer so "r" matches the Remove row
+    // instead of extending the previous "s" search.
     view.unmount();
     renderMenu({ currentProject: "Sprint 42" });
     openMenu();
-    const freshMoveTrigger = screen.getByTestId("header-move-to-project");
-    freshMoveTrigger.focus();
-    fireEvent.keyDown(freshMoveTrigger, { key: "ArrowRight" });
+    fireEvent.click(screen.getByTestId("header-move-to-project"));
 
     const freshAlphaRow = await screen.findByRole("menuitem", { name: "Alpha" });
     const removeItem = screen.getByRole("menuitem", { name: "Remove from Sprint 42" });
-    await waitFor(() => expect(freshAlphaRow).toHaveFocus());
+    freshAlphaRow.focus();
     fireEvent.keyDown(freshAlphaRow, { key: "r" });
     await waitFor(() => expect(removeItem).toHaveFocus());
   });

@@ -11,6 +11,8 @@ from playwright.sync_api import Browser, Locator, Page, expect
 
 def _create_project(page: Page, name: str) -> None:
     """Create an empty project from the Projects header action."""
+    # Fine-pointer layouts reveal this control only while its header is hovered.
+    page.get_by_role("button", name="Projects", exact=True).hover()
     page.get_by_test_id("new-project").click()
     page.get_by_placeholder("Project name…").fill(name)
     page.get_by_test_id("new-project-confirm").click()
