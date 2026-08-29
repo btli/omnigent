@@ -294,24 +294,9 @@ class MainActivity : AppCompatActivity() {
         // session finishes or raises a prompt while the app isn't foregrounded.
         // Idempotent (KEEP), so scheduling every launch is safe.
         SessionPollScheduler.ensureScheduled(applicationContext)
-=======
-        livenessWatchdog.beginDocument()
->>>>>>>
         webView.loadUrl(serverUrl)
     }
 
-<<<<<<<
-    override fun onPause() {
-        livenessWatchdog.setActive(false)
-        super.onPause()
-    }
-
-    override fun onResume() {
-        super.onResume()
-        if (::webView.isInitialized) {
-            livenessWatchdog.setOnPinnedOrigin(originOf(webView.url) == pinnedOrigin)
-            livenessWatchdog.setActive(true)
-=======
     override fun onStop() {
         super.onStop()
         stopped = true
@@ -347,6 +332,21 @@ class MainActivity : AppCompatActivity() {
             // A notification tap that arrived while stopped deferred its deep
             // link (see onNewIntent); emit it now that JS timers run again.
             if (pageLoaded) flushPendingActivation()
+=======
+        livenessWatchdog.beginDocument()
+        webView.loadUrl(serverUrl)
+    }
+
+    override fun onPause() {
+        livenessWatchdog.setActive(false)
+        super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (::webView.isInitialized) {
+            livenessWatchdog.setOnPinnedOrigin(originOf(webView.url) == pinnedOrigin)
+            livenessWatchdog.setActive(true)
 >>>>>>>
         }
     }

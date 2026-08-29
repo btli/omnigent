@@ -742,12 +742,30 @@ export async function getServerPicker(): Promise<ServerPickerInfo | null> {
   }
 }
 
-/** Workspace identity using the Electron shell's canonical rule when present. */
+const DATABRICKS_WORKSPACE_DOMAINS = ["databricks.com", "azuredatabricks.net"];
+
+/** Serialized Databricks workspace selector, or null for non-workspace hosts. */
+function databricksWorkspaceSearch(url: URL): string | null {
+  const hostname = url.hostname.toLowerCase();
+  const isWorkspace = DATABRICKS_WORKSPACE_DOMAINS.some(
+    (domain) => hostname === domain || hostname.endsWith(`.${domain}`),
+  );
+  if (!isWorkspace) return null;
+  const query = new URLSearchParams();
+  for (const organization of url.searchParams.getAll("o")) query.append("o", organization);
+  return query.toString();
+}
+
+/** Picker identity: workspace-scoped for Databricks, mount-scoped otherwise. */
 export function workspaceIdentityKey(url: string): string | null {
   const electron = electronApi();
   try {
-    if (electron?.workspaceIdentityKey) return electron.workspaceIdentityKey(url);
     const parsed = new URL(url);
+    const workspaceSearch = databricksWorkspaceSearch(parsed);
+    if (workspaceSearch !== null) {
+      if (electron?.workspaceIdentityKey) return electron.workspaceIdentityKey(url);
+      return `${parsed.origin}${workspaceSearch ? `?${workspaceSearch}` : ""}`;
+    }
     parsed.hash = "";
     if (parsed.pathname.length > 1) parsed.pathname = parsed.pathname.replace(/\/$/, "");
     return parsed.href;
@@ -760,8 +778,12 @@ export function workspaceIdentityKey(url: string): string | null {
 export function serverDisplayLabel(url: string): string {
   const electron = electronApi();
   try {
-    if (electron?.serverDisplayLabel) return electron.serverDisplayLabel(url);
     const parsed = new URL(url);
+    const workspaceSearch = databricksWorkspaceSearch(parsed);
+    if (workspaceSearch !== null) {
+      if (electron?.serverDisplayLabel) return electron.serverDisplayLabel(url);
+      return `${parsed.host}${workspaceSearch ? `/?${workspaceSearch}` : ""}`;
+    }
     const path = parsed.pathname === "/" ? "" : parsed.pathname.replace(/\/$/, "");
     return `${parsed.host}${path}`;
   } catch {
