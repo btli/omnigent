@@ -1,6 +1,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { setInnerWidth } from "./resizeHookTestHelpers";
 import { resetWidthStoreForTesting, useResizableInlinePanel } from "./useResizableInlinePanel";
 
 // useResizableInlinePanel keeps its width in a module-level store shared across
@@ -11,10 +12,6 @@ import { resetWidthStoreForTesting, useResizableInlinePanel } from "./useResizab
 
 const SESSION = "conv_test";
 const originalInnerWidth = window.innerWidth;
-
-function setInnerWidth(px: number): void {
-  Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: px });
-}
 
 // Simulate a manual resize via the public keyboard handle (ArrowLeft widens by
 // 20px). Returns the resulting panelWidth.
@@ -338,7 +335,7 @@ describe("useResizableInlinePanel pointer drag", () => {
   it.each(["onPointerCancel", "onLostPointerCapture"] as const)(
     "aborts cleanly without persisting through %s",
     (abortHandler) => {
-      // Browser cancellation or capture loss keeps the last applied width,
+      // Browser cancellation or capture loss restores the pre-drag width,
       // ends the drag, and never persists a half-finished resize.
       const { result } = renderHook(() => useResizableInlinePanel(SESSION));
       const handle = createPointerHandle();
@@ -358,7 +355,7 @@ describe("useResizableInlinePanel pointer drag", () => {
         );
       });
 
-      expect(result.current.panelWidth).toBe(800);
+      expect(result.current.panelWidth).toBe(600);
       expect(readSessionWorkspaceState(SESSION).widthPx).toBeUndefined();
       expect(document.body.style.cursor).toBe("");
       expect(document.body.style.userSelect).toBe("");
@@ -427,7 +424,7 @@ describe("useResizableInlinePanel pointer drag", () => {
 
     rerender({ enabled: false });
 
-    expect(result.current.panelWidth).toBe(800);
+    expect(result.current.panelWidth).toBe(600);
     expect(readSessionWorkspaceState(SESSION).widthPx).toBeUndefined();
     expect(overlaySelector()).toBeNull();
     expect(document.body.style.cursor).toBe("");
@@ -449,7 +446,7 @@ describe("useResizableInlinePanel pointer drag", () => {
 
     rerender({ persistEnabled: false });
 
-    expect(result.current.panelWidth).toBe(800);
+    expect(result.current.panelWidth).toBe(600);
     expect(readSessionWorkspaceState(SESSION).widthPx).toBeUndefined();
     expect(overlaySelector()).toBeNull();
     expect(document.body.style.cursor).toBe("");
@@ -609,7 +606,9 @@ describe("useResizableInlinePanel pointer drag", () => {
     let coarse = false;
     let onChange: ((event: MediaQueryListEvent) => void) | undefined;
     window.matchMedia = ((query: string) => ({
-      matches: query === "(any-pointer: coarse)" ? coarse : false,
+      get matches() {
+        return query === "(any-pointer: coarse)" ? coarse : false;
+      },
       media: query,
       onchange: null,
       addListener: () => {},

@@ -311,6 +311,31 @@ describe("TerminalsPanel column resize handle", () => {
     );
   });
 
+  it("removes the handle when the panel closes (no focusable separator in aria-hidden)", () => {
+    const { rerender } = renderPanel({ initialTerminalKey: "terminal:terminal_main" });
+    expect(getHandle()).toBeInTheDocument();
+
+    rerender(
+      <TerminalsPanel
+        open={false}
+        conversationId="conv_terminal"
+        initialTerminalKey={null}
+        readOnly={false}
+        onClose={vi.fn()}
+      />,
+    );
+
+    // The closed aside is aria-hidden; a tabbable separator inside it would
+    // be an ARIA violation and would let keyboard users resize the
+    // off-screen column.
+    expect(
+      screen.queryByRole("separator", { name: /resize terminal list/i, hidden: true }),
+    ).toBeNull();
+    const panel = screen.getByTestId("terminals-panel");
+    expect(panel).toHaveAttribute("aria-hidden", "true");
+    expect(panel.querySelector('[tabindex="0"][role="separator"]')).toBeNull();
+  });
+
   it("adds no horizontally overflowing content to the list panel", () => {
     renderPanel({ initialTerminalKey: "terminal:terminal_main" });
 

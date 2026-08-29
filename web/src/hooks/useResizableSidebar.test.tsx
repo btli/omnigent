@@ -1,6 +1,7 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readPanelSizePreference } from "@/lib/panelSizePreferences";
+import { mockMatchMedia, setInnerWidth } from "./resizeHookTestHelpers";
 import { resetSidebarWidthStoreForTesting, useResizableSidebar } from "./useResizableSidebar";
 
 // useResizableSidebar keeps its width in a module-level store shared across all
@@ -8,10 +9,7 @@ import { resetSidebarWidthStoreForTesting, useResizableSidebar } from "./useResi
 // are independent. A 2000px viewport gives a 1000px ceiling (50vw).
 
 const originalInnerWidth = window.innerWidth;
-
-function setInnerWidth(px: number): void {
-  Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: px });
-}
+const originalMatchMedia = window.matchMedia;
 
 // Simulate one keyboard step on the public handle. ArrowRight widens by 20px
 // (right edge of a left panel), ArrowLeft narrows. Returns the resulting width.
@@ -98,6 +96,7 @@ afterEach(() => {
   localStorage.clear();
   resetSidebarWidthStoreForTesting();
   setInnerWidth(originalInnerWidth);
+  window.matchMedia = originalMatchMedia;
 });
 
 describe("useResizableSidebar", () => {
@@ -142,6 +141,18 @@ describe("useResizableSidebar", () => {
     // Drag below the floor — held at 220, not 50.
     dragTo(result, 50);
     expect(result.current.width).toBe(220);
+  });
+
+  it("measures an RTL drag from the viewport's right edge", () => {
+    setInnerWidth(1440);
+    const { result } = renderHook(() => useResizableSidebar());
+    const handle = createHandle();
+    handle.dir = "rtl";
+
+    startDrag(result, handle);
+    act(() => result.current.handleProps.onPointerMove(pointerEvent(handle, { clientX: 1120 })));
+
+    expect(result.current.width).toBe(320);
   });
 
   it("persists a drag and restores it after a store reset (reload)", () => {
@@ -206,12 +217,30 @@ describe("useResizableSidebar", () => {
     expect(result.current.handleProps.style).toEqual({
       touchAction: "none",
       boxSizing: "content-box",
-      paddingInlineStart: 9,
+      paddingInlineStart: 5,
       paddingInlineEnd: 11,
-      marginInlineStart: -8,
-      marginInlineEnd: -10,
+      insetInlineEnd: -11,
       backgroundClip: "content-box",
     });
+
+    // Effective offsets of the absolutely anchored handle (not class names):
+    // with `insetInlineEnd` overriding the class's `right: 0`, the border box
+    // right edge sits at seam + outward reach, and the box must span
+    // [seam − INWARD_SLIVER − inset, seam + OUTWARD_SLIVER + inset] with the
+    // 4px painted strip's right edge flush at the seam — clear of the
+    // conversation rows' hover kebab.
+    const style = result.current.handleProps.style;
+    const paintedStripPx = 4;
+    const outwardReach = -Number(style.insetInlineEnd);
+    const boxWidth =
+      Number(style.paddingInlineStart) + paintedStripPx + Number(style.paddingInlineEnd);
+    const inwardReach = boxWidth - outwardReach;
+    expect(outwardReach).toBe(11); // OUTWARD_SLIVER (10) + fine inset (1)
+    expect(inwardReach).toBe(9); // INWARD_SLIVER (8) + fine inset (1)
+    // Strip right edge = box right − end padding = seam exactly.
+    expect(outwardReach - Number(style.paddingInlineEnd)).toBe(0);
+    expect(style.marginInlineStart).toBeUndefined();
+    expect(style.marginInlineEnd).toBeUndefined();
 
     act(() =>
       result.current.handleProps.onPointerMove(
@@ -256,13 +285,15 @@ describe("useResizableSidebar", () => {
     );
     const { result, unmount } = renderHook(() => useResizableSidebar());
 
-    expect(result.current.handleProps.style.paddingInlineStart).toBe(9);
+    expect(result.current.handleProps.style.paddingInlineStart).toBe(5);
     expect(result.current.handleProps.style.paddingInlineEnd).toBe(11);
+    expect(result.current.handleProps.style.insetInlineEnd).toBe(-11);
 
     coarse = true;
     act(() => listeners.forEach((listener) => listener()));
-    expect(result.current.handleProps.style.paddingInlineStart).toBe(10);
+    expect(result.current.handleProps.style.paddingInlineStart).toBe(6);
     expect(result.current.handleProps.style.paddingInlineEnd).toBe(12);
+    expect(result.current.handleProps.style.insetInlineEnd).toBe(-12);
 
     unmount();
     expect(query.removeEventListener).toHaveBeenCalledWith("change", expect.any(Function));
@@ -326,7 +357,7 @@ describe("useResizableSidebar", () => {
   });
 
   it.each(["onPointerCancel", "onLostPointerCapture"] as const)(
-    "keeps the last applied width without persisting on %s",
+    "restores the pre-drag width without persisting on %s",
     (abortHandler) => {
       const { result } = renderHook(() => useResizableSidebar());
       const handle = createHandle();
@@ -340,14 +371,65 @@ describe("useResizableSidebar", () => {
       expect(result.current.width).toBe(500);
 
       act(() => result.current.handleProps[abortHandler](pointerEvent(handle, { pointerId: 3 })));
-      expect(result.current.width).toBe(500);
+      expect(result.current.width).toBe(320);
       expect(readPanelSizePreference("sidebarWidthPx")).toBeNull();
       expect(document.body.style.cursor).toBe("");
       expect(document.body.style.userSelect).toBe("");
     },
   );
 
-  it("keeps the last applied width without persisting on unmount", () => {
+  it("cancels a drag with restore when the viewport crosses below the md breakpoint", () => {
+    // A touch/pen drag started at desktop width must not survive the layout
+    // flip to mobile: the handle hides but capture would persist, and release
+    // would write an unintended width.
+    const mm = mockMatchMedia({ "(min-width: 768px)": true });
+    const { result, unmount } = renderHook(() => useResizableSidebar());
+    const handle = createHandle();
+
+    startDrag(result, handle, { pointerId: 5 });
+    act(() =>
+      result.current.handleProps.onPointerMove(
+        pointerEvent(handle, { pointerId: 5, clientX: 600 }),
+      ),
+    );
+    expect(result.current.width).toBe(600);
+    expect(document.body.style.cursor).toBe("col-resize");
+
+    act(() => mm.fire("(min-width: 768px)", false));
+
+    expect(result.current.width).toBe(320);
+    expect(readPanelSizePreference("sidebarWidthPx")).toBeNull();
+    expect(document.body.style.cursor).toBe("");
+
+    // A stray release from the dead drag must not commit anything.
+    act(() => result.current.handleProps.onPointerUp(pointerEvent(handle, { pointerId: 5 })));
+    expect(readPanelSizePreference("sidebarWidthPx")).toBeNull();
+    unmount();
+  });
+
+  it("restores the persisted width when Escape cancels a drag", () => {
+    const { result } = renderHook(() => useResizableSidebar());
+    dragTo(result, 500);
+    expect(result.current.width).toBe(500);
+    expect(readPanelSizePreference("sidebarWidthPx")).toBe(500);
+
+    const handle = createHandle();
+    startDrag(result, handle, { pointerId: 4 });
+    act(() =>
+      result.current.handleProps.onPointerMove(
+        pointerEvent(handle, { pointerId: 4, clientX: 700 }),
+      ),
+    );
+    expect(result.current.width).toBe(700);
+
+    act(() => {
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    });
+    expect(result.current.width).toBe(500);
+    expect(readPanelSizePreference("sidebarWidthPx")).toBe(500);
+  });
+
+  it("restores the pre-drag width without persisting on unmount", () => {
     const { result, unmount } = renderHook(() => useResizableSidebar());
     const handle = createHandle();
 
@@ -365,7 +447,7 @@ describe("useResizableSidebar", () => {
     expect(document.body.style.userSelect).toBe("");
 
     const remounted = renderHook(() => useResizableSidebar());
-    expect(remounted.result.current.width).toBe(560);
+    expect(remounted.result.current.width).toBe(320);
     remounted.unmount();
   });
 

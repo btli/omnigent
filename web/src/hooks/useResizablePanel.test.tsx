@@ -1,6 +1,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readPanelSizePreference } from "@/lib/panelSizePreferences";
+import { setInnerWidth } from "./resizeHookTestHelpers";
 import {
   HANDLE_COARSE_GUTTER_PX,
   HANDLE_FINE_GUTTER_PX,
@@ -17,20 +18,17 @@ let coarsePointer = false;
 const desktopChangeListeners = new Set<(event: MediaQueryListEvent) => void>();
 const coarseChangeListeners = new Set<(event: MediaQueryListEvent) => void>();
 
-function setInnerWidth(px: number): void {
-  Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: px });
-}
-
 function installMatchMedia(): void {
   window.matchMedia = vi.fn((query: string) => ({
-    matches:
-      query === "(any-pointer: coarse)"
+    get matches() {
+      return query === "(any-pointer: coarse)"
         ? coarsePointer
         : query === "(pointer: coarse)"
           ? false
           : query.includes("min-width")
             ? desktopMatches
-            : false,
+            : false;
+    },
     media: query,
     onchange: null,
     addListener: () => {},
@@ -271,7 +269,8 @@ describe("useResizablePanel persistence", () => {
         );
       });
 
-      expect(result.current.panelWidth).toBe(800);
+      // The abort restores the pre-drag width (the viewport-derived default).
+      expect(result.current.panelWidth).toBe(1000);
       expect(readPanelSizePreference("pushPanelWidthPx")).toBeNull();
       expect(document.body.style.cursor).toBe("");
       expect(document.body.style.userSelect).toBe("");

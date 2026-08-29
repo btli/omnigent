@@ -33,8 +33,18 @@ export function useResizableColumn(
     [minWidth, maxWidth],
   );
 
+  // Cancellation restores the pre-drag width: onMove applies each pointermove
+  // live, so an abort (Escape, blur, …) must undo those writes rather than
+  // silently keeping the dragged width.
+  const dragStartWidth = useRef(defaultWidth);
   const resizeDrag = useResizeDrag({
     enabled,
+    onStart: useCallback(() => {
+      dragStartWidth.current = width;
+    }, [width]),
+    onCancel: useCallback(() => {
+      setWidth(clamp(dragStartWidth.current));
+    }, [clamp]),
     onMove: useCallback(
       (e: React.PointerEvent) => {
         if (!containerRef.current) return;
@@ -47,6 +57,9 @@ export function useResizableColumn(
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
+      // Keyboard resize obeys the same gate as pointer drags: a handle inside
+      // a closed (aria-hidden) panel must not resize the off-screen column.
+      if (!enabled) return;
       // Vertical separator between columns: ArrowRight widens the left
       // column, ArrowLeft narrows it, with the same clamps as dragging.
       if (e.key === "ArrowRight") {
@@ -57,7 +70,7 @@ export function useResizableColumn(
         setWidth((w) => clamp(w - KEYBOARD_STEP_PX));
       }
     },
-    [clamp],
+    [clamp, enabled],
   );
 
   return {
@@ -77,7 +90,10 @@ export function useResizableColumn(
       ...resizeDrag.handleProps,
       onKeyDown,
       role: "separator" as const,
-      tabIndex: 0,
+      // Focusable only while resizing is possible: a tabbable separator
+      // inside an aria-hidden closed panel is an ARIA violation, and a
+      // keyboard user could otherwise focus an invisible handle.
+      tabIndex: enabled ? 0 : -1,
       "aria-orientation": "vertical" as const,
       "aria-label": "Resize terminal list",
       "aria-valuenow": width,

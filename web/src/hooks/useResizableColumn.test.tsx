@@ -118,7 +118,7 @@ describe("useResizableColumn pointer dragging", () => {
   });
 
   it.each(["onPointerCancel", "onLostPointerCapture"] as const)(
-    "aborts cleanly on %s, keeping the last applied width",
+    "aborts cleanly on %s, restoring the pre-drag width",
     (name) => {
       const { result } = renderColumn(0);
 
@@ -129,12 +129,34 @@ describe("useResizableColumn pointer dragging", () => {
       act(() => result.current.handleProps[name](pointerEvent(3)));
       expect(document.body.style.cursor).toBe("");
       expect(document.body.style.userSelect).toBe("");
+      expect(result.current.width).toBe(176);
 
       // The aborted pointer is dead: further moves must not resize.
       act(() => result.current.handleProps.onPointerMove(pointerEvent(3, 400)));
-      expect(result.current.width).toBe(250);
+      expect(result.current.width).toBe(176);
     },
   );
+
+  it("clamps the restored width to bounds that change mid-drag", () => {
+    const rendered = renderHook(
+      ({ maxWidth }) => useResizableColumn(undefined, undefined, maxWidth),
+      { initialProps: { maxWidth: 480 } },
+    );
+    rendered.result.current.containerRef.current = {
+      getBoundingClientRect: () => ({ left: 0 }),
+    } as HTMLElement;
+
+    act(() => rendered.result.current.handleProps.onPointerDown(pointerEvent(13)));
+    act(() => rendered.result.current.handleProps.onPointerMove(pointerEvent(13, 140)));
+    expect(rendered.result.current.width).toBe(140);
+
+    rendered.rerender({ maxWidth: 150 });
+    act(() => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })));
+
+    expect(rendered.result.current.width).toBe(150);
+    expect(rendered.result.current.handleProps["aria-valuenow"]).toBe(150);
+    expect(rendered.result.current.handleProps["aria-valuemax"]).toBe(150);
+  });
 
   it("resets body cursor/selection when unmounted mid-drag", () => {
     const { result, unmount } = renderColumn(0);
@@ -235,9 +257,10 @@ describe("useResizableColumn pointer dragging", () => {
     rendered.rerender({ enabled: false });
     expect(document.body.style.cursor).toBe("");
     expect(document.body.style.userSelect).toBe("");
+    expect(rendered.result.current.width).toBe(176);
 
     act(() => rendered.result.current.handleProps.onPointerMove(pointerEvent(12, 400)));
-    expect(rendered.result.current.width).toBe(260);
+    expect(rendered.result.current.width).toBe(176);
   });
 });
 
@@ -270,6 +293,25 @@ describe("useResizableColumn keyboard resizing", () => {
     act(() => result.current.handleProps.onKeyDown(other));
     expect(result.current.width).toBe(480);
     expect(other.preventDefault).not.toHaveBeenCalled();
+  });
+
+  it("is neither focusable nor keyboard-resizable while disabled", () => {
+    // The handle can render inside a closed (aria-hidden) panel; it must not
+    // be reachable by Tab there, and arrow keys must not resize the
+    // off-screen column.
+    const { result } = renderHook(() => useResizableColumn(undefined, undefined, undefined, false));
+
+    expect(result.current.handleProps.tabIndex).toBe(-1);
+
+    const right = keyEvent("ArrowRight");
+    act(() => result.current.handleProps.onKeyDown(right));
+    expect(result.current.width).toBe(176);
+    expect(right.preventDefault).not.toHaveBeenCalled();
+  });
+
+  it("is focusable while enabled", () => {
+    const { result } = renderColumn(0);
+    expect(result.current.handleProps.tabIndex).toBe(0);
   });
 
   it("exposes a focusable separator with value semantics that track the width", () => {

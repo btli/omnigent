@@ -198,8 +198,11 @@ export function TerminalsPanel({
           ref={splitRef as React.RefObject<HTMLDivElement>}
           className="relative flex min-h-0 flex-1 flex-col md:flex-row overflow-hidden"
         >
-          {/* Keep the handle outside the scrolling list so its hit pad is not clipped. */}
-          {activeTerminal && isDesktop && (
+          {/* Keep the handle outside the scrolling list so its hit pad is not
+            clipped. Never render it while the panel is closed: a focusable
+            separator inside the aria-hidden aside would be an ARIA violation
+            and would let keyboard users resize an off-screen column. */}
+          {open && activeTerminal && isDesktop && (
             <div
               {...columnHandleProps}
               style={{ ...columnHandleProps.style, left: listWidth }}
