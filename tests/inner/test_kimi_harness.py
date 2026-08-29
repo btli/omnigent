@@ -1046,6 +1046,55 @@ def test_run_turn_malformed_wire_rows_are_skipped_whole(
     assert any("unparseable wire row" in r.message for r in caplog.records)
 
 
+def test_run_turn_timeless_historical_request_cannot_stamp_new_usage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A resumed log's TIMELESS historical request (real 0.34.0 shape) must
+    not attribute a later turn whose own request row is missing: its own
+    (uncounted) usage row consumed it, so the counted record's model wins."""
+
+    def _write_resumed() -> None:
+        now_ms = int(time.time() * 1000)
+        _write_wire(
+            tmp_path,
+            "session_stale-1",
+            [
+                # Yesterday's request — no ``time`` field, like real kimi.
+                {
+                    "type": "llm.request",
+                    "kind": "loop",
+                    "model": "system.ai.kimi-k3",
+                    "modelAlias": "kimi-k3-databricks",
+                },
+                # Its own usage row, pre-turn (gated out of billing).
+                _usage_row(input_other=999, output=99, time_ms=now_ms - 60_000),
+                # This turn's usage — its llm.request row went missing.
+                {
+                    "type": "usage.record",
+                    "model": "kimi-k2.7-databricks",
+                    "usage": {
+                        "inputOther": 9,
+                        "output": 1,
+                        "inputCacheRead": 0,
+                        "inputCacheCreation": 0,
+                    },
+                    "usageScope": "turn",
+                    "time": now_ms,
+                },
+            ],
+        )
+
+    events, _ex = _run_stubbed_turn(
+        monkeypatch, tmp_path, session_id="session_stale-1", on_spawn=_write_resumed
+    )
+    turn = next(e for e in events if isinstance(e, TurnComplete))
+    assert turn.usage is not None
+    assert turn.usage["input_tokens"] == 9
+    # The historical K3 request was consumed by ITS usage row; the counted
+    # record's own model attributes these tokens.
+    assert turn.usage["model"] == "kimi-k2.7-databricks"
+
+
 def test_run_turn_split_write_row_bills_after_completion(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

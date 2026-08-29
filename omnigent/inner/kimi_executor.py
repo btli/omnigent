@@ -162,10 +162,13 @@ def _sum_wire_usage(
     skipped whole and logged once — never partially counted.
 
     :returns: ``(token sums or None when no row counted, effective model or
-        None, new checkpoint offset)``. The model prefers the newest
-        ``llm.request`` (provider-resolved id, then alias) and falls back to
-        the newest counted record's model. Tolerant of a missing/unreadable
-        file and malformed rows.
+        None, new checkpoint offset)``. The model prefers the ``llm.request``
+        (provider-resolved id, then alias) PAIRED with a counted record —
+        each record consumes the request immediately preceding it — and
+        falls back to the newest counted record's own model, so a resumed
+        log's historical request can never stamp a later turn whose own
+        request row is missing. Tolerant of a missing/unreadable file and
+        malformed rows.
     """
     try:
         with wire_path.open("rb") as fh:
@@ -196,7 +199,13 @@ def _sum_wire_usage(
         "cache_creation_input_tokens": 0,
     }
     counted = False
+    # Request→usage pairing: each usage.record is produced by the llm.request
+    # immediately preceding it, so a request only attributes tokens when one
+    # of ITS usage rows is counted. A timeless historical request followed by
+    # its own (uncounted, pre-turn) usage row is consumed by that row and can
+    # never mis-stamp a later counted row whose own request went missing.
     request_model: str | None = None
+    pending_request: str | None = None
     record_model: str | None = None
     for raw in blob.decode("utf-8", errors="replace").splitlines():
         line = raw.strip()
@@ -237,10 +246,13 @@ def _sum_wire_usage(
             if not (isinstance(candidate, str) and candidate):
                 candidate = row.get("modelAlias")
             if isinstance(candidate, str) and candidate:
-                request_model = candidate
+                pending_request = candidate
             continue
         if row_type != "usage.record" or row.get("usageScope") != "turn":
             continue
+        # This record consumes the request that produced it — counted or not
+        # (a gated/drifted record still represents that request's call).
+        consumed_request, pending_request = pending_request, None
         model = row.get("model")
         row_time = _token_count(row.get("time"))
         usage = row.get("usage")
@@ -274,6 +286,8 @@ def _sum_wire_usage(
         for out_key, value in counts.items():
             totals[out_key] += value
         record_model = model
+        if consumed_request is not None:
+            request_model = consumed_request
         counted = True
     if counted:
         # The relay path stores total_tokens as its own accumulator (never
