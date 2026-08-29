@@ -705,6 +705,55 @@ async def test_codex_launch_catalog_reads_the_store_then_probes_once(
     assert len(calls) == 1, "the second read must come from the store, not a re-probe"
 
 
+async def test_codex_launch_catalog_serves_stale_rows_while_refresh_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-Claude shared-store reader never waits on stale revalidation."""
+    import asyncio
+    import os
+    import time
+
+    from omnigent import codex_native_app_server, model_catalog_store
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    launch = codex_native_app_server.NativeCodexLaunch(
+        config_overrides=['model_provider="openai"'], model=None, profile=None
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "resolve_native_codex_launch",
+        lambda *, model, spec=None: launch,
+    )
+    old_rows = [{"id": "gpt-5.4-yesterday", "isDefault": True}]
+    fingerprint = codex_native_app_server.codex_catalog_fingerprint(launch)
+    model_catalog_store.write_catalog("codex-native", fingerprint, old_rows)
+    path = model_catalog_store.catalog_path("codex-native", fingerprint)
+    stale_time = time.time() - model_catalog_store.CATALOG_STALE_AFTER_S - 1.0
+    os.utime(path, (stale_time, stale_time))
+    started = asyncio.Event()
+    release = asyncio.Event()
+    refreshed = [{"id": "gpt-5.6-terra", "isDefault": True}]
+
+    async def _fake_probe(*, codex_path: str | None = None) -> list[dict[str, object]]:
+        del codex_path
+        started.set()
+        await release.wait()
+        return refreshed
+
+    monkeypatch.setattr(codex_native_app_server, "probe_codex_model_options", _fake_probe)
+
+    rows = await asyncio.wait_for(codex_native_app_server.codex_launch_catalog(), timeout=1.0)
+
+    assert rows == old_rows
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    refresh = model_catalog_store._inflight[("codex-native", fingerprint)]
+    assert not refresh.done()
+    release.set()
+    await refresh
+    assert model_catalog_store.read_catalog("codex-native", fingerprint) == refreshed
+
+
 async def test_codex_launch_catalog_is_stale_reads_the_default_shape(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
