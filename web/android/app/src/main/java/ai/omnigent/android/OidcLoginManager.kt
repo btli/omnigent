@@ -51,7 +51,22 @@ class OidcLoginManager {
     // The in-flight HTTP request, so cancel() can force blocking I/O to abort:
     // shutdownNow() only interrupts the polling sleeps, not a thread blocked
     // in HttpURLConnection connect/read (or a slow-trickle response body).
-    @Volatile private var activeConnection: HttpURLConnection? = null
+    // Guarded by [connectionLock]: an abandoned flow's cleanup must never
+    // clear (or a cancel disconnect never miss) a successor flow's connection
+    // — publish and clear are identity-checked under the lock.
+    private val connectionLock = Any()
+    private var activeConnection: HttpURLConnection? = null
+
+    private fun publishConnection(conn: HttpURLConnection) {
+        synchronized(connectionLock) { activeConnection = conn }
+    }
+
+    private fun retireConnection(conn: HttpURLConnection) {
+        synchronized(connectionLock) {
+            if (activeConnection === conn) activeConnection = null
+        }
+        conn.disconnect()
+    }
 
     // Monotonic clock for login deadlines — unlike wall-clock
     // System.currentTimeMillis(), it can't jump with NTP/user adjustments and
@@ -143,7 +158,10 @@ class OidcLoginManager {
         // shutdownNow() cannot interrupt blocking HttpURLConnection I/O —
         // tear the in-flight connection down so the flow thread exits promptly
         // instead of waiting out a read timeout (or a slow-trickle body).
-        runCatching { activeConnection?.disconnect() }
+        synchronized(connectionLock) {
+            runCatching { activeConnection?.disconnect() }
+            activeConnection = null
+        }
         flow = null
     }
 
@@ -167,7 +185,7 @@ class OidcLoginManager {
             conn.setRequestProperty("Content-Length", "0")
             conn.connectTimeout = HTTP_TIMEOUT_MS
             conn.readTimeout = HTTP_TIMEOUT_MS
-            activeConnection = conn
+            publishConnection(conn)
             try {
                 val status = conn.responseCode
                 if (status !in TRANSIENT_STATUSES) {
@@ -183,8 +201,7 @@ class OidcLoginManager {
                     return Ticket(id, loginUrl)
                 }
             } finally {
-                activeConnection = null
-                conn.disconnect()
+                retireConnection(conn)
             }
             // A transient gate/proxy hiccup (same status set as the desktop
             // shell) — wait out one interval and retry until the login deadline.
@@ -229,7 +246,7 @@ class OidcLoginManager {
             conn.requestMethod = "GET"
             conn.connectTimeout = HTTP_TIMEOUT_MS
             conn.readTimeout = HTTP_TIMEOUT_MS
-            activeConnection = conn
+            publishConnection(conn)
             try {
                 when (conn.responseCode) {
                     202 -> {
@@ -259,8 +276,7 @@ class OidcLoginManager {
                 if (Thread.currentThread().isInterrupted) return null // shutdown mid-request
                 continue // transient network error — keep polling until the deadline
             } finally {
-                activeConnection = null
-                conn.disconnect()
+                retireConnection(conn)
             }
         }
         return null

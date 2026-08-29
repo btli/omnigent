@@ -15,6 +15,7 @@ import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import java.net.InetSocketAddress
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -242,6 +243,73 @@ class OidcLoginManagerTest {
             assertNull(manager.pollForToken(origin, "t-1", clock() + 2_300))
             assertEquals(1, hits.get())
         } finally {
+            server.stop(0)
+        }
+    }
+
+    @Test
+    fun `an abandoned request's cleanup does not break the successor's cancel`() {
+        // Regression: the shared connection slot was cleared unconditionally in
+        // finally, so an old flow's cleanup running after a cancel-then-restart
+        // wiped the NEW flow's connection and the next cancel() had nothing to
+        // disconnect.
+        val firstArrived = CountDownLatch(1)
+        val releaseFirst = CountDownLatch(1)
+        val secondArrived = CountDownLatch(1)
+        val holdSecond = CountDownLatch(1)
+        val hits = AtomicInteger(0)
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        // Two requests are held concurrently — the default dispatcher thread
+        // would serialize (and deadlock) them.
+        server.executor = Executors.newCachedThreadPool()
+        server.createContext("/") { exchange ->
+            if (hits.incrementAndGet() == 1) {
+                firstArrived.countDown()
+                runCatching { releaseFirst.await(8, TimeUnit.SECONDS) }
+                val bytes =
+                    """{"ticket":"t-1","login_url":"/auth/login?ticket=t-1"}"""
+                        .toByteArray()
+                exchange.sendResponseHeaders(200, bytes.size.toLong())
+                exchange.responseBody.use { it.write(bytes) }
+            } else {
+                secondArrived.countDown()
+                runCatching { holdSecond.await(8, TimeUnit.SECONDS) }
+                exchange.sendResponseHeaders(200, -1)
+                exchange.close()
+            }
+        }
+        server.start()
+        try {
+            val manager = OidcLoginManager()
+            val clock = realClock(manager)
+            val origin = "http://127.0.0.1:${server.address.port}"
+            // An old request is in flight (its connection holds the slot)...
+            val first = Thread { runCatching { manager.requestTicket(origin, clock() + 30_000) } }
+            first.start()
+            assertTrue(firstArrived.await(2, TimeUnit.SECONDS))
+            // ...then a successor request publishes ITS connection...
+            var second: OidcLoginManager.Ticket? = OidcLoginManager.Ticket("sentinel", "/x")
+            val successor =
+                Thread {
+                    second =
+                        runCatching {
+                            manager.requestTicket(origin, clock() + 30_000)
+                        }.getOrNull()
+                }
+            successor.start()
+            assertTrue(secondArrived.await(2, TimeUnit.SECONDS))
+            // ...and the old request completes, running its cleanup.
+            releaseFirst.countDown()
+            first.join(3_000)
+            assertFalse(first.isAlive)
+            // cancel() must still find and abort the successor's blocked I/O.
+            manager.cancel()
+            successor.join(3_000)
+            assertFalse(successor.isAlive)
+            assertNull(second)
+        } finally {
+            releaseFirst.countDown()
+            holdSecond.countDown()
             server.stop(0)
         }
     }
