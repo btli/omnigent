@@ -2010,6 +2010,12 @@ describe("touch swipe actions", () => {
     fireEvent.pointerUp(li, { ...POINTER, clientX: 100, clientY: 100 });
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
     expect(mocks.del.mutate).not.toHaveBeenCalled();
+
+    // The mid-swipe capture loss must also arm click suppression: the
+    // browser's synthesized trailing click would otherwise navigate into the
+    // row that was being swiped away.
+    fireEvent.click(screen.getByRole("link", { name: /My Session/ }));
+    expect(screen.getByTestId("location-probe")).toHaveTextContent(/^\/$/);
     requestFrame.mockRestore();
   });
 

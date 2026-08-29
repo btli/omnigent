@@ -266,28 +266,6 @@ export function useRowGesture({
     }
   }, []);
 
-  const reset = useCallback(
-    (cancelDrag = false) => {
-      const gesture = state.current;
-      if (!gesture) return;
-      clearHoldTimer();
-      releaseCapture(gesture);
-      disarmTouchMoveGuard();
-      cancelDxFrame();
-      state.current = null;
-      setDx(0);
-      setPhase("idle");
-      setActiveActions(null);
-      if (cancelDrag) onCancel?.();
-      if (cancelDrag && gesture.phase === "drag") {
-        gesture.sensorTarget.dispatchEvent(
-          new Event("touchcancel", { bubbles: true, cancelable: true }),
-        );
-      }
-    },
-    [cancelDxFrame, clearHoldTimer, disarmTouchMoveGuard, onCancel, releaseCapture],
-  );
-
   const clearClickSuppression = useCallback(() => {
     suppressClick.current = false;
     const keydown = suppressionKeydown.current;
@@ -306,6 +284,41 @@ export function useRowGesture({
     suppressionKeydown.current = keydown;
     document.addEventListener("keydown", keydown, { capture: true, once: true });
   }, [clearClickSuppression]);
+
+  const reset = useCallback(
+    (cancelDrag = false) => {
+      const gesture = state.current;
+      if (!gesture) return;
+      // A cancellation that interrupts a resolved gesture (swipe, armed,
+      // drag) can still be followed by the browser's synthesized trailing
+      // click — e.g. mid-swipe capture loss — which would navigate into the
+      // row being swiped away. onPointerUp arms this itself for normal
+      // releases; cancel paths must too.
+      if (cancelDrag && gesture.phase !== "pending") suppressTrailingClick();
+      clearHoldTimer();
+      releaseCapture(gesture);
+      disarmTouchMoveGuard();
+      cancelDxFrame();
+      state.current = null;
+      setDx(0);
+      setPhase("idle");
+      setActiveActions(null);
+      if (cancelDrag) onCancel?.();
+      if (cancelDrag && gesture.phase === "drag") {
+        gesture.sensorTarget.dispatchEvent(
+          new Event("touchcancel", { bubbles: true, cancelable: true }),
+        );
+      }
+    },
+    [
+      cancelDxFrame,
+      clearHoldTimer,
+      disarmTouchMoveGuard,
+      onCancel,
+      releaseCapture,
+      suppressTrailingClick,
+    ],
+  );
 
   const consumeClick = useCallback(() => {
     if (!suppressClick.current) return false;
