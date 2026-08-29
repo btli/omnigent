@@ -1064,12 +1064,15 @@ def test_run_turn_yieldless_existing_wire_still_bills_late_rows(
 
     if failure == "unreadable":
         wire.chmod(0o600)
-    # Turn-1's row flushes late, between the turns.
+    # Turn-1's row flushes late, between the turns. The sleep pushes turn 2's
+    # start past this stamp at ms resolution, so the test discriminates: an
+    # unrecorded floor would gate this row out.
     late_turn1_ms = int(time.time() * 1000)
     wire.write_text(
         json.dumps(_usage_row(input_other=6, output=2, time_ms=late_turn1_ms)) + "\n",
         encoding="utf-8",
     )
+    time.sleep(0.005)
 
     def _append_turn2_row() -> None:
         with wire.open("a", encoding="utf-8") as fh:
