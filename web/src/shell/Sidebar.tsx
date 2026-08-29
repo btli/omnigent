@@ -844,7 +844,10 @@ export function Sidebar({
           <div
             {...resizeHandleProps}
             data-testid="sidebar-resize-handle"
-            className="z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:absolute md:inset-y-0 md:right-0 md:block"
+            // Horizontal anchoring comes from the hook's inline
+            // `insetInlineEnd` (seam + outward sliver) — no `md:right-0`
+            // here, or the class would fight the inline offset.
+            className="z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:absolute md:inset-y-0 md:block"
           />
         )}
         {/* The content wrapper owns clipping while the absolutely positioned

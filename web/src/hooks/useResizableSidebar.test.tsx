@@ -236,12 +236,30 @@ describe("useResizableSidebar", () => {
     expect(result.current.handleProps.style).toEqual({
       touchAction: "none",
       boxSizing: "content-box",
-      paddingInlineStart: 9,
+      paddingInlineStart: 5,
       paddingInlineEnd: 11,
-      marginInlineStart: -8,
-      marginInlineEnd: -10,
+      insetInlineEnd: -11,
       backgroundClip: "content-box",
     });
+
+    // Effective offsets of the absolutely anchored handle (not class names):
+    // with `insetInlineEnd` overriding the class's `right: 0`, the border box
+    // right edge sits at seam + outward reach, and the box must span
+    // [seam − INWARD_SLIVER − inset, seam + OUTWARD_SLIVER + inset] with the
+    // 4px painted strip's right edge flush at the seam — clear of the
+    // conversation rows' hover kebab.
+    const style = result.current.handleProps.style;
+    const paintedStripPx = 4;
+    const outwardReach = -Number(style.insetInlineEnd);
+    const boxWidth =
+      Number(style.paddingInlineStart) + paintedStripPx + Number(style.paddingInlineEnd);
+    const inwardReach = boxWidth - outwardReach;
+    expect(outwardReach).toBe(11); // OUTWARD_SLIVER (10) + fine inset (1)
+    expect(inwardReach).toBe(9); // INWARD_SLIVER (8) + fine inset (1)
+    // Strip right edge = box right − end padding = seam exactly.
+    expect(outwardReach - Number(style.paddingInlineEnd)).toBe(0);
+    expect(style.marginInlineStart).toBeUndefined();
+    expect(style.marginInlineEnd).toBeUndefined();
 
     act(() =>
       result.current.handleProps.onPointerMove(
@@ -286,13 +304,15 @@ describe("useResizableSidebar", () => {
     );
     const { result, unmount } = renderHook(() => useResizableSidebar());
 
-    expect(result.current.handleProps.style.paddingInlineStart).toBe(9);
+    expect(result.current.handleProps.style.paddingInlineStart).toBe(5);
     expect(result.current.handleProps.style.paddingInlineEnd).toBe(11);
+    expect(result.current.handleProps.style.insetInlineEnd).toBe(-11);
 
     coarse = true;
     act(() => listeners.forEach((listener) => listener()));
-    expect(result.current.handleProps.style.paddingInlineStart).toBe(10);
+    expect(result.current.handleProps.style.paddingInlineStart).toBe(6);
     expect(result.current.handleProps.style.paddingInlineEnd).toBe(12);
+    expect(result.current.handleProps.style.insetInlineEnd).toBe(-12);
 
     unmount();
     expect(query.removeEventListener).toHaveBeenCalledWith("change", expect.any(Function));

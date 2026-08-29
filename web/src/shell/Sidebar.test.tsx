@@ -332,22 +332,38 @@ describe("Sidebar resize handle geometry", () => {
     expect(sidebar).toHaveClass("md:flex-row");
     expect(sidebar).not.toHaveClass("md:overflow-hidden");
     expect(clippedContent).toHaveClass("md:overflow-hidden");
-    expect(handle).toHaveClass("md:absolute", "md:inset-y-0", "md:right-0");
+    expect(handle).toHaveClass("md:absolute", "md:inset-y-0");
     expect(handle).not.toHaveClass("shrink-0", "md:order-2");
     expect(clippedContent).not.toHaveClass("md:order-1");
   });
 
-  it("caps transcript annexation at 10px without reserving flex space", () => {
+  it("anchors the hit box at the seam without reserving flex space", () => {
     mockConversations([conv("edge-session", "Claude Code")]);
     renderSidebar();
 
+    // Effective offsets, not class names: the border box's right edge sits at
+    // seam + |insetInlineEnd|, so the hit box spans
+    // [seam − inward reach, seam + outward reach] with the 4px painted strip
+    // flush at the seam (outward reach − end padding = 0). Margins must stay
+    // absent — on an absolutely positioned right-anchored box a negative
+    // marginInlineStart is absorbed by the auto left inset and shifts the
+    // whole box inward over the rows' hover kebab.
     const handle = screen.getByTestId("sidebar-resize-handle");
-    expect(handle.style.paddingInlineStart).toBe("9px");
+    expect(handle.style.paddingInlineStart).toBe("5px");
     expect(handle.style.paddingInlineEnd).toBe("11px");
-    expect(handle.style.marginInlineStart).toBe("-8px");
-    expect(handle.style.marginInlineEnd).toBe("-10px");
+    expect(handle.style.insetInlineEnd).toBe("-11px");
+    expect(handle.style.marginInlineStart).toBe("");
+    expect(handle.style.marginInlineEnd).toBe("");
+    const outwardReach = -Number.parseFloat(handle.style.insetInlineEnd);
+    const boxWidth =
+      Number.parseFloat(handle.style.paddingInlineStart) +
+      4 +
+      Number.parseFloat(handle.style.paddingInlineEnd);
+    expect(outwardReach).toBeLessThanOrEqual(11);
+    expect(boxWidth - outwardReach).toBeLessThanOrEqual(9); // inward reach clears the kebab
+    expect(outwardReach - Number.parseFloat(handle.style.paddingInlineEnd)).toBe(0);
     expect(handle).toHaveClass("md:absolute");
-    expect(Math.abs(Number.parseInt(handle.style.marginInlineEnd, 10))).toBeLessThanOrEqual(10);
+    expect(handle).not.toHaveClass("md:right-0");
     expect(screen.getByText("edge-session")).not.toBe(handle);
   });
 
@@ -366,7 +382,6 @@ describe("Sidebar resize handle geometry", () => {
       "active:bg-primary/50",
       "md:absolute",
       "md:inset-y-0",
-      "md:right-0",
       "md:block",
     );
     expect(handle).not.toHaveClass("absolute", "inset-y-0", "right-0");
