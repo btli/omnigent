@@ -275,11 +275,14 @@ def fetch_model_pricing(model: str) -> ModelPricing | None:
             ),
         )
 
-    prices = {
-        price for info in find_catalog_models(model) if (price := _extract(info)) is not None
-    }
+    matches = find_catalog_models(model)
+    prices = {price for info in matches if (price := _extract(info)) is not None}
     if len(prices) == 1:
         return next(iter(prices))
+    if matches:
+        # Contradictory or unpriced catalog metadata is authoritative uncertainty,
+        # not a miss that may be replaced with a static provider rate.
+        return None
     lowered = model.lower()
     for key, posted in _KIMI_POSTED_PRICING.items():
         if key in lowered:

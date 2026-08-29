@@ -185,13 +185,9 @@ def _sum_wire_usage(
         )
         return None, None, offset
     first_read = start == 0
-    # Never checkpoint past an unterminated trailing line: kimi may still be
-    # mid-append, and consuming the fragment now would restart the next read
-    # mid-JSON and lose the completed row (the forwarder's incremental reader
-    # applies the same rule). The fragment is left for the next read.
-    if blob and not blob.endswith(b"\n"):
-        cut = blob.rfind(b"\n") + 1
-        blob = blob[:cut]
+    # Collection runs only after the subprocess has exited, so these bytes are
+    # stable: a valid final JSON row without a newline must bill, while an
+    # invalid fragment is deliberately consumed because no writer can finish it.
     totals = {
         "input_tokens": 0,
         "output_tokens": 0,
@@ -248,11 +244,19 @@ def _sum_wire_usage(
             if isinstance(candidate, str) and candidate:
                 pending_request = candidate
             continue
-        if row_type != "usage.record" or row.get("usageScope") != "turn":
+        if row_type == "turn.ended":
+            # Failed turns can end without usage; their request must not stamp a
+            # later record whose own request row is absent.
+            pending_request = None
             continue
-        # This record consumes the request that produced it — counted or not
-        # (a gated/drifted record still represents that request's call).
+        if row_type != "usage.record":
+            continue
+        # Every usage scope consumes the request that produced it. Aggregate
+        # records are not billed here, but leaving their request pending would
+        # misattribute the next turn-scoped row.
         consumed_request, pending_request = pending_request, None
+        if row.get("usageScope") != "turn":
+            continue
         model = row.get("model")
         row_time = _token_count(row.get("time"))
         usage = row.get("usage")

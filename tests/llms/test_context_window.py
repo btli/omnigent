@@ -263,6 +263,32 @@ def test_fetch_model_pricing_catalog_beats_kimi_posted_rates(
     assert pricing.output_per_token == pytest.approx(9.0e-6)
 
 
+def test_fetch_model_pricing_ambiguous_catalog_does_not_use_kimi_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A populated but contradictory catalog is not a catalog miss."""
+    monkeypatch.setattr(
+        context_window,
+        "find_catalog_models",
+        lambda _model: [
+            ModelInfo(
+                name="system.ai.kimi-k3-a",
+                provider="system.ai",
+                input_price=2.0,
+                output_price=9.0,
+            ),
+            ModelInfo(
+                name="system.ai.kimi-k3-b",
+                provider="system.ai",
+                input_price=3.0,
+                output_price=15.0,
+            ),
+        ],
+    )
+
+    assert fetch_model_pricing("system.ai.kimi-k3") is None
+
+
 def test_fetch_model_pricing_omits_cache_rates_when_absent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

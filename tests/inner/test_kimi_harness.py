@@ -1095,23 +1095,16 @@ def test_run_turn_timeless_historical_request_cannot_stamp_new_usage(
     assert turn.usage["model"] == "kimi-k2.7-databricks"
 
 
-def test_run_turn_split_write_row_bills_after_completion(
+def test_run_turn_dead_writer_discards_torn_final_row(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A row caught mid-append is deferred, not lost.
-
-    The checkpoint must stop at the last complete line: consuming the
-    unterminated fragment would restart the next read mid-JSON and the row
-    would never bill."""
-    half = ""
+    """After process exit, an invalid final fragment is consumed deliberately."""
 
     def _write_split() -> None:
-        nonlocal half
         now_ms = int(time.time() * 1000)
         full = json.dumps(_usage_row(input_other=6, output=2, time_ms=now_ms))
         fragment = json.dumps(_usage_row(input_other=4, output=1, time_ms=now_ms))
         cut = len(fragment) // 2
-        half = fragment[cut:]
         _wire_path(tmp_path, "session_split-1").parent.mkdir(parents=True, exist_ok=True)
         _wire_path(tmp_path, "session_split-1").write_text(
             full + "\n" + fragment[:cut], encoding="utf-8"
@@ -1122,16 +1115,20 @@ def test_run_turn_split_write_row_bills_after_completion(
     )
     turn = next(e for e in events if isinstance(e, TurnComplete))
     assert turn.usage is not None
-    # Only the complete row billed; the fragment is deferred, never dropped.
+    # Only the complete row bills; the dead writer cannot finish its fragment.
     assert turn.usage["input_tokens"] == 6
     assert turn.usage["output_tokens"] == 2
 
-    def _complete_fragment() -> None:
+    def _append_next_turn_row() -> None:
         with _wire_path(tmp_path, "session_split-1").open("a", encoding="utf-8") as fh:
-            fh.write(half + "\n")
+            fh.write(
+                "\n"
+                + json.dumps(_usage_row(input_other=4, output=1, time_ms=int(time.time() * 1000)))
+                + "\n"
+            )
 
     events2 = _collect_stubbed_turn(
-        monkeypatch, ex, session_id="session_split-1", on_spawn=_complete_fragment
+        monkeypatch, ex, session_id="session_split-1", on_spawn=_append_next_turn_row
     )
     turn2 = next(e for e in events2 if isinstance(e, TurnComplete))
     assert turn2.usage is not None
@@ -1317,6 +1314,52 @@ def test_sum_wire_usage_unreadable_file_logs_once(
 
     warnings = [r for r in caplog.records if "cannot read wire log" in r.message]
     assert len(warnings) == 1
+
+
+def test_sum_wire_usage_counts_valid_final_row_without_newline(tmp_path: Path) -> None:
+    from omnigent.inner.kimi_executor import _sum_wire_usage
+
+    wire = tmp_path / "wire.jsonl"
+    row = _usage_row(input_other=7, output=2, time_ms=10)
+    wire.write_text(json.dumps(row), encoding="utf-8")
+
+    totals, model, offset = _sum_wire_usage(wire, offset=0, turn_start_ms=0)
+
+    assert totals is not None
+    assert totals["input_tokens"] == 7
+    assert totals["output_tokens"] == 2
+    assert model == "kimi-k3-databricks"
+    assert offset == wire.stat().st_size
+
+
+@pytest.mark.parametrize("boundary", ["turn.ended", "aggregate-usage"])
+def test_sum_wire_usage_clears_stale_request_at_nonbillable_boundary(
+    tmp_path: Path, boundary: str
+) -> None:
+    from omnigent.inner.kimi_executor import _sum_wire_usage
+
+    stale_request = {
+        "type": "llm.request",
+        "kind": "loop",
+        "model": "system.ai.stale-model",
+    }
+    if boundary == "turn.ended":
+        boundary_row: dict[str, Any] = {"type": "turn.ended", "reason": "failed"}
+    else:
+        boundary_row = _usage_row(input_other=50, output=5, time_ms=5)
+        boundary_row["usageScope"] = "aggregate"
+    current = _usage_row(input_other=7, output=2, time_ms=10)
+    wire = tmp_path / "wire.jsonl"
+    wire.write_text(
+        "\n".join(json.dumps(row) for row in (stale_request, boundary_row, current)) + "\n",
+        encoding="utf-8",
+    )
+
+    totals, model, _offset = _sum_wire_usage(wire, offset=0, turn_start_ms=0)
+
+    assert totals is not None
+    assert totals["input_tokens"] == 7
+    assert model == "kimi-k3-databricks"
 
 
 def _usage_row(*, input_other: int, output: int, time_ms: int) -> dict[str, Any]:

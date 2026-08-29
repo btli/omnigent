@@ -253,7 +253,8 @@ def _main_permission_request(argv: list[str]) -> int:
         f"{ap_server_url.rstrip('/')}/v1/sessions/"
         f"{_url_component(session_id)}/hooks/permission-request"
     )
-    verdict = _request_web_approval(url, headers, body, bridge_dir=bridge_dir)
+    deadline = time.monotonic() + _PERMISSION_RETRY_WINDOW_S
+    verdict = _request_web_approval(url, headers, body, bridge_dir=bridge_dir, deadline=deadline)
     if verdict is None:
         # No web verdict: leave kimi's own TUI prompt for manual approval.
         return 0
@@ -269,7 +270,9 @@ def _main_permission_request(argv: list[str]) -> int:
                     "re-parking the same request",
                     file=sys.stderr,
                 )
-                verdict = _request_web_approval(url, headers, body, bridge_dir=bridge_dir)
+                verdict = _request_web_approval(
+                    url, headers, body, bridge_dir=bridge_dir, deadline=deadline
+                )
                 if verdict is None:
                     return 0
                 key = APPROVE_KEY if verdict == "allow" else DENY_KEY
@@ -294,13 +297,15 @@ def _request_web_approval(
     body: dict[str, object],
     *,
     bridge_dir: Path | None = None,
+    deadline: float | None = None,
 ) -> str | None:
     """POST the approval card and long-poll for the web verdict.
 
     :returns: ``"allow"`` / ``"deny"``, or ``None`` after the bounded re-park
         window, a transport failure, or an unparseable verdict.
     """
-    deadline = time.monotonic() + _PERMISSION_RETRY_WINDOW_S
+    if deadline is None:
+        deadline = time.monotonic() + _PERMISSION_RETRY_WINDOW_S
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= _PERMISSION_DEADLINE_MARGIN_S:

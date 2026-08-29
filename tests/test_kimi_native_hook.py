@@ -216,13 +216,15 @@ def test_permission_request_reparks_after_injection_miss(
     _feed_stdin(monkeypatch, {"hook_event_name": "PermissionRequest", "tool_name": "Bash"})
     verdicts = iter(["allow", "deny"])
     posted: list[dict[str, object]] = []
+    deadlines: list[object] = []
     keys: list[str] = []
 
     def _request(
         url: str, headers: dict[str, str], body: dict[str, object], **kwargs: object
     ) -> str:
-        del url, headers, kwargs
+        del url, headers
         posted.append(body.copy())
+        deadlines.append(kwargs.get("deadline"))
         return next(verdicts)
 
     def _inject(bridge_dir: Path, *, key: str, timeout_s: float) -> bool:
@@ -235,11 +237,16 @@ def test_permission_request_reparks_after_injection_miss(
     monkeypatch.setattr(kimi_native_hook, "_request_web_approval", _request)
     monkeypatch.setattr(kimi_native_hook, "inject_approval_keystroke", _inject)
     monkeypatch.setattr(kimi_native_hook, "_approval_still_pending", lambda _bridge: True)
+    monkeypatch.setattr(kimi_native_hook.time, "monotonic", lambda: 100.0)
 
     assert kimi_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)]) == 0
     assert keys == [APPROVE_KEY, DENY_KEY]
     assert len(posted) == 2
     assert posted[0]["_omnigent_elicitation_id"] == posted[1]["_omnigent_elicitation_id"]
+    assert deadlines == [
+        100.0 + kimi_native_hook._PERMISSION_RETRY_WINDOW_S,
+        100.0 + kimi_native_hook._PERMISSION_RETRY_WINDOW_S,
+    ]
 
 
 def test_permission_request_does_not_repark_ambiguous_injection(

@@ -878,6 +878,47 @@ class TestUserMessageInjection:
         inject_user_message(tmp_path / "bridge", content=content)
         assert [args[-1] for args in sent if args[-1] == "Enter"] == ["Enter"]
 
+    @pytest.mark.parametrize(
+        ("content", "stale_draft"),
+        [
+            pytest.param("ok", "old streaming draft", id="short-message"),
+            pytest.param(
+                "please fix the flaky test now",
+                "please fix the flaky test yesterday",
+                id="shared-prefix",
+            ),
+        ],
+    )
+    def test_streaming_paste_must_change_preexisting_draft_before_submit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        content: str,
+        stale_draft: str,
+    ) -> None:
+        stale_pane = "\n".join(
+            [
+                " ╭────────────────────╮",
+                f" │ > {stale_draft} │",
+                " ╰────────────────────╯",
+                " context: 0%",
+            ]
+        )
+        sent = self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=1,
+            content=content,
+            initial_content=stale_draft,
+            post_paste_captures=(stale_pane,),
+            sticky_post_paste=True,
+        )
+
+        with pytest.raises(RuntimeError, match="not delivered"):
+            inject_user_message(tmp_path / "bridge", content=content, turn_streaming=True)
+
+        assert not any(args[-1] == "Enter" for args in sent)
+
     def test_submits_long_multi_row_draft(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

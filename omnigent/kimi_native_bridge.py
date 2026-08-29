@@ -614,12 +614,16 @@ def _draft_visible_in_editor(
     state: _KimiPaneState,
     needle: str,
     *,
+    expected_content: str | None = None,
+    pre_paste_content: str | None = None,
     pre_paste_placeholders: frozenset[str] = frozenset(),
     expected_line_count: int | None = None,
     expected_char_count: int | None = None,
 ) -> bool:
     content = state.editor_content
     if not content:
+        return False
+    if pre_paste_content is not None and content == pre_paste_content:
         return False
     placeholders = _paste_placeholder_counts(content)
     if placeholders and content.strip() in placeholders:
@@ -631,6 +635,14 @@ def _draft_visible_in_editor(
             )
             for token, (kind, count) in placeholders.items()
         )
+    if expected_content is not None:
+        normalized_content = _normalize_screen_text(content)
+        normalized_expected = _normalize_screen_text(
+            _paste_payload_bytes(expected_content).decode("utf-8")
+        )
+        if normalized_expected in normalized_content:
+            return True
+        return normalized_expected.replace(" ", "") in normalized_content.replace(" ", "")
     if needle:
         normalized_content = _normalize_screen_text(content)
         normalized_needle = _normalize_screen_text(needle)
@@ -932,6 +944,7 @@ def inject_user_message(
         expected_line_count = _paste_line_count(content)
         expected_char_count = _paste_char_count(content)
         pre_paste_placeholders: frozenset[str] = frozenset()
+        pre_paste_content: str | None = None
         with tempfile.NamedTemporaryFile(
             dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
         ) as paste_file:
@@ -956,6 +969,7 @@ def inject_user_message(
                     "the message was not delivered"
                 )
             pre_paste_placeholders = frozenset(_paste_placeholder_counts(state.editor_content))
+            pre_paste_content = state.editor_content
             _raise_if_injection_cancelled(cancellation)
             _run_tmux(
                 socket_path,
@@ -990,6 +1004,8 @@ def inject_user_message(
             if _draft_visible_in_editor(
                 state,
                 needle,
+                expected_content=content,
+                pre_paste_content=pre_paste_content,
                 pre_paste_placeholders=pre_paste_placeholders,
                 expected_line_count=expected_line_count,
                 expected_char_count=expected_char_count,
@@ -1022,6 +1038,8 @@ def inject_user_message(
             if _draft_visible_in_editor(
                 state,
                 needle,
+                expected_content=content,
+                pre_paste_content=pre_paste_content,
                 pre_paste_placeholders=pre_paste_placeholders,
                 expected_line_count=expected_line_count,
                 expected_char_count=expected_char_count,
@@ -1044,6 +1062,8 @@ def inject_user_message(
                     _draft_visible_in_editor(
                         state,
                         needle,
+                        expected_content=content,
+                        pre_paste_content=pre_paste_content,
                         pre_paste_placeholders=pre_paste_placeholders,
                         expected_line_count=expected_line_count,
                         expected_char_count=expected_char_count,
