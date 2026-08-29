@@ -58,7 +58,11 @@ from omnigent._platform import stable_user_id
 from omnigent.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.claude_native_status import CONTEXT_RAW_FILE
-from omnigent.cli_diagnostics import _redact_authorization_values, redact_secrets
+from omnigent.cli_diagnostics import (
+    _is_ascii_credential_character,
+    _redact_authorization_values,
+    redact_secrets,
+)
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.kiro_native_bridge import bridge_root as kiro_bridge_root
 
@@ -2891,10 +2895,10 @@ _DEFAULT_IGNORABLE_CODE_POINT_RE = re.compile(
 )
 
 
-def _raw_hook_failure_window(text: str) -> tuple[str, bool]:
-    """Bound raw text while retaining both ends of a long provider error."""
+def _raw_hook_failure_window(text: str) -> tuple[str, bool, str]:
+    """Bound raw text, returning the retained text, truncation state, and head."""
     if len(text) <= _HOOK_FAILURE_DETAIL_RAW_LIMIT:
-        return text, False
+        return text, False, text
     head = re.sub(r"\S+$", "", text[:_HOOK_FAILURE_DETAIL_RAW_HEAD_CHARS])
     tail = text[-_HOOK_FAILURE_DETAIL_RAW_TAIL_CHARS:]
     while tail:
@@ -2905,7 +2909,9 @@ def _raw_hook_failure_window(text: str) -> tuple[str, bool]:
             break
         if not tail.startswith((" ", "\t")):
             break
-    return "\n".join(part.strip() for part in (head, tail) if part.strip()), True
+    head = head.strip()
+    tail = tail.strip()
+    return "\n".join(part for part in (head, tail) if part), True, head
 
 
 def _is_default_ignorable_code_point(char: str) -> bool:
@@ -2989,6 +2995,11 @@ def _redacts_as_credential(candidate: str, previous_word: str) -> bool:
     )
 
 
+def _redacts_with_following_value(candidate: str) -> bool:
+    """Return whether *candidate* becomes a keyed anchor before a value."""
+    return _redactor_changes(f"{candidate} x")
+
+
 def _redact_hook_failure_secrets(text: str) -> str:
     """Redact hook text while retaining trusted soft-gap provenance."""
     return redact_secrets(
@@ -3006,16 +3017,29 @@ def _canonicalize_hook_failure_chunk(chunk: str, previous_word: str) -> str:
     if len(compact) > _HOOK_FAILURE_DETAIL_RAW_LIMIT:
         return compact
 
-    decomposed = unicodedata.normalize("NFKD", compact)
+    decomposed = unicodedata.normalize("NFKD", chunk)
     skeleton = "".join(
         char for char in decomposed if unicodedata.category(char) not in {"Mn", "Mc", "Me"}
     )
-    if skeleton != compact and _redacts_as_credential(skeleton, previous_word):
-        return skeleton
+    skeleton_with_gaps = re.sub(f"{_HOOK_FAILURE_SEPARATOR_MARKER}+", " ", skeleton)
+    if skeleton != chunk and (
+        _redacts_as_credential(skeleton_with_gaps, previous_word)
+        or _redacts_with_following_value(skeleton_with_gaps)
+    ):
+        return skeleton_with_gaps
 
     if not has_soft_separator:
         return chunk
     return re.sub(f"{_HOOK_FAILURE_SEPARATOR_MARKER}+", " ", chunk)
+
+
+def _ends_with_bearer_skeleton(text: str) -> bool:
+    """Return whether *text* ends in a combining-insensitive Bearer anchor."""
+    decomposed = unicodedata.normalize("NFKD", text)
+    skeleton = "".join(
+        char for char in decomposed if unicodedata.category(char) not in {"Mn", "Mc", "Me"}
+    )
+    return skeleton.casefold().endswith("bearer")
 
 
 def _canonicalize_hook_failure_detail(text: str) -> str:
@@ -3027,13 +3051,24 @@ def _canonicalize_hook_failure_detail(text: str) -> str:
         prepared_text = line_normalized
     else:
         prepared: list[str] = []
+        bearer_check_length = -1
+        prepared_ends_with_bearer = False
         for char in line_normalized:
             if char in {" ", "\n"}:
                 prepared.append(char)
                 continue
+            if char in {
+                _HOOK_FAILURE_EARLY_REDACTION_MARKER,
+                _HOOK_FAILURE_BEARER_SOFT_GAP_MARKER,
+            }:
+                prepared.append(_HOOK_FAILURE_SEPARATOR_MARKER)
+                continue
             category = unicodedata.category(char)
             if _is_default_ignorable_code_point(char):
-                if "".join(prepared[-len("bearer") :]).casefold() == "bearer":
+                if bearer_check_length != len(prepared):
+                    bearer_check_length = len(prepared)
+                    prepared_ends_with_bearer = _ends_with_bearer_skeleton("".join(prepared))
+                if prepared_ends_with_bearer:
                     prepared.append(_HOOK_FAILURE_BEARER_SOFT_GAP_MARKER)
                 continue
             if category == "Cs":
@@ -3096,16 +3131,16 @@ def _cap_hook_failure_detail(text: str, *, raw_truncated: bool) -> str:
 _HOOK_FAILURE_REMNANT_TOKEN_MIN_CHARS = 4
 
 
-def _redaction_removed_fragments(original: str, redacted: str) -> list[str] | None:
+def _redaction_removed_fragments(original: str, redacted: str) -> list[tuple[int, str]] | None:
     """
     Recover the fragments of *original* that redaction replaced with markers.
 
     :param original: Text before :func:`redact_secrets`.
     :param redacted: The same text after :func:`redact_secrets`.
-    :returns: The removed fragments in order, or ``None`` when the two texts
-        cannot be aligned unambiguously.
+    :returns: The removed fragments and their original offsets in order, or
+        ``None`` when the two texts cannot be aligned unambiguously.
     """
-    fragments: list[str] = []
+    fragments: list[tuple[int, str]] = []
     original_index = 0
     redacted_index = 0
     while redacted_index < len(redacted):
@@ -3120,13 +3155,13 @@ def _redaction_removed_fragments(original: str, redacted: str) -> list[str] | No
             if not preserved:
                 if next_marker >= 0:
                     return None
-                fragments.append(original[original_index:])
+                fragments.append((original_index, original[original_index:]))
                 original_index = len(original)
                 break
             resume = original.find(preserved, original_index)
             if resume < 0:
                 return None
-            fragments.append(original[original_index:resume])
+            fragments.append((original_index, original[original_index:resume]))
             original_index = resume
         elif (
             original_index < len(original) and original[original_index] == redacted[redacted_index]
@@ -3139,7 +3174,9 @@ def _redaction_removed_fragments(original: str, redacted: str) -> list[str] | No
 
 
 def _window_with_detection_remnants_redacted(
-    window_canonical: str, detection_canonical: str
+    window_canonical: str,
+    detection_canonical: str,
+    window_head_canonical: str,
 ) -> str | None:
     """
     Accept the head/tail window unless the detection match survives inside it.
@@ -3147,12 +3184,15 @@ def _window_with_detection_remnants_redacted(
     The head/tail window may bisect the very credential the detection pass
     matched, leaving an un-redacted remnant (e.g. a prefix that no longer
     meets its family's length floor). Each removed detection fragment is
-    checked against the window's redacted form; a surviving remnant token is
-    replaced with the early redaction marker instead of discarding the tail.
+    checked at its original offset in the retained head; a surviving remnant
+    token is replaced with the early redaction marker instead of discarding
+    the tail.
 
     :param window_canonical: Canonicalized head/tail window text.
     :param detection_canonical: Canonicalized detection-window text whose
         redaction is known to change it.
+    :param window_head_canonical: Canonicalized retained head of the raw
+        head/tail window.
     :returns: The window with remnants redacted, or ``None`` when the
         detection redaction cannot be aligned and the caller must fall back
         to the detection window.
@@ -3165,19 +3205,43 @@ def _window_with_detection_remnants_redacted(
     if fragments is None:
         return None
     neutral_window = _HOOK_FAILURE_PLANTED_REDACTION_RE.sub("(REDACTED)", window_canonical)
-    window_redacted = _redact_hook_failure_secrets(neutral_window)
+    neutral_head = _HOOK_FAILURE_PLANTED_REDACTION_RE.sub("(REDACTED)", window_head_canonical)
+    if not neutral_window.startswith(neutral_head):
+        return None
+    if not neutral_head:
+        return window_canonical
+    head_offset = neutral_detection.find(neutral_head)
+    if head_offset < 0 or neutral_detection[:head_offset].strip():
+        return None
+    detection_head_end = head_offset + len(neutral_head)
     result = window_canonical
-    # Raw head windowing can retain a shortened prefix of the first token in
-    # a credential match. A neighboring redaction may share its whitespace
-    # token, so consider each suffix after the marker without matching later
-    # prose words from the removed span.
-    for window_token in window_redacted.split():
-        for piece in window_token.split(_HOOK_FAILURE_REDACTION_MARKER):
-            for start in range(len(piece) - _HOOK_FAILURE_REMNANT_TOKEN_MIN_CHARS + 1):
-                candidate = piece[start:]
-                if any(fragment.startswith(candidate) for fragment in fragments):
-                    result = result.replace(candidate, _HOOK_FAILURE_EARLY_REDACTION_MARKER)
-                    break
+    replacements: list[tuple[int, int]] = []
+    for fragment_start, fragment in fragments:
+        fragment_end = fragment_start + len(fragment)
+        overlap_start = max(fragment_start, head_offset)
+        overlap_end = min(fragment_end, detection_head_end)
+        if overlap_end - overlap_start < _HOOK_FAILURE_REMNANT_TOKEN_MIN_CHARS:
+            continue
+        candidate_start = overlap_start - head_offset
+        candidate_end = overlap_end - head_offset
+        fragment_candidate_start = overlap_start - fragment_start
+        candidate = neutral_head[candidate_start:candidate_end]
+        if (
+            fragment[fragment_candidate_start : fragment_candidate_start + len(candidate)]
+            != candidate
+        ):
+            continue
+        before = neutral_head[candidate_start - 1] if candidate_start else ""
+        after = neutral_head[candidate_end] if candidate_end < len(neutral_head) else ""
+        if (before and (_is_ascii_credential_character(before) or before == "_")) or (
+            after and (_is_ascii_credential_character(after) or after == "_")
+        ):
+            continue
+        replacements.append((candidate_start, candidate_end))
+    for fragment_start, fragment_end in reversed(replacements):
+        result = (
+            result[:fragment_start] + _HOOK_FAILURE_EARLY_REDACTION_MARKER + result[fragment_end:]
+        )
     return result
 
 
@@ -3204,7 +3268,7 @@ def _sanitize_hook_failure_detail(text: str) -> str | None:
             _HOOK_FAILURE_REDACTION_MARKER,
             _HOOK_FAILURE_EARLY_REDACTION_MARKER,
         )
-    raw_preview, preview_truncated = _raw_hook_failure_window(without_ansi)
+    raw_preview, preview_truncated, raw_head = _raw_hook_failure_window(without_ansi)
     matched_detection: str | None = None
     detection_window = ""
     if preview_truncated:
@@ -3226,6 +3290,7 @@ def _sanitize_hook_failure_detail(text: str) -> str | None:
             window_canonical = _window_with_detection_remnants_redacted(
                 _canonicalize_hook_failure_detail(raw_preview),
                 matched_detection,
+                _canonicalize_hook_failure_detail(raw_head),
             )
             if window_canonical is not None:
                 canonical = window_canonical
@@ -3244,7 +3309,7 @@ def _sanitize_hook_failure_detail(text: str) -> str | None:
         return _HOOK_FAILURE_DETAIL_REMOVED_SENTINEL
     if not redacted:
         return None
-    bounded, bounded_truncated = _raw_hook_failure_window(redacted)
+    bounded, bounded_truncated, _ = _raw_hook_failure_window(redacted)
     raw_truncated = preview_truncated or bounded_truncated
     if raw_truncated and not bounded:
         return _HOOK_FAILURE_DETAIL_REMOVED_SENTINEL

@@ -249,6 +249,7 @@ def _credential_span_end(
     alphabet: str,
     minimum: int,
     allow_lowercase: bool = True,
+    max_word_gaps: int = _MAX_CREDENTIAL_WORD_GAPS,
 ) -> int | None:
     """
     Scan one credential body in a single forward pass.
@@ -277,7 +278,7 @@ def _credential_span_end(
             break
         if char in _WORD_GAP_CHARACTERS:
             word_gaps += 1
-            if word_gaps > _MAX_CREDENTIAL_WORD_GAPS:
+            if word_gaps > max_word_gaps:
                 break
         index += 1
     return index if alphabet_count >= minimum else None
@@ -329,6 +330,8 @@ def _marker_glue_span_start(text: str, start: int) -> int | None:
             if _is_keyed_value_character(char):
                 return boundary
             if _is_word_gap(char):
+                if marker == _REDACTED:
+                    return None
                 word_gaps += 1
                 if word_gaps > _MAX_CREDENTIAL_WORD_GAPS:
                     return None
@@ -389,6 +392,12 @@ def _redact_scanned_credentials(
             else:
                 soft_gapped = False
                 preserved_end, body_start = _bearer_value_start(text, anchor_end)
+            exotic_gapped = (
+                anchor_end < len(text)
+                and text[anchor_end] not in "\r\n"
+                and not _is_keyed_value_character(text[anchor_end])
+            )
+            floorless = gapped or soft_gapped or exotic_gapped
             span_start = _marker_glue_span_start(text, body_start)
             if span_start is None:
                 continue
@@ -396,11 +405,8 @@ def _redact_scanned_credentials(
                 text,
                 span_start,
                 alphabet=_KEYED_VALUE_ALPHABET,
-                minimum=(
-                    _KEYED_VALUE_MIN_LENGTH
-                    if gapped or soft_gapped
-                    else _GAPLESS_BEARER_MIN_LENGTH
-                ),
+                minimum=_KEYED_VALUE_MIN_LENGTH if floorless else _GAPLESS_BEARER_MIN_LENGTH,
+                max_word_gaps=_MAX_CREDENTIAL_WORD_GAPS if floorless else 0,
             )
             if span_end is not None:
                 if (
@@ -418,6 +424,14 @@ def _redact_scanned_credentials(
 
     parts.append(text[cursor:])
     return _redact_scanned_env_credentials("".join(parts))
+
+
+def _unquoted_keyed_value_end(text: str, start: int) -> int | None:
+    """Return the end of one non-empty, whitespace-bounded keyed value."""
+    index = start
+    while index < len(text) and not text[index].isspace():
+        index += 1
+    return index if index > start else None
 
 
 def _redact_scanned_env_credentials(text: str) -> str:
@@ -465,12 +479,7 @@ def _redact_scanned_env_credentials(text: str) -> str:
                 cursor = value_end
             search_start = cursor
             continue
-        span_end = _credential_span_end(
-            text,
-            span_start,
-            alphabet=_KEYED_VALUE_ALPHABET,
-            minimum=_KEYED_VALUE_MIN_LENGTH,
-        )
+        span_end = _unquoted_keyed_value_end(text, span_start)
         if span_end is None:
             continue
         parts.extend((text[cursor:body_start], _REDACTED))

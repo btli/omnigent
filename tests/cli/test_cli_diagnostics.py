@@ -569,6 +569,15 @@ def test_redact_secrets_is_idempotent_for_keyed_values(text: str, expected: str)
     assert cli_diagnostics.redact_secrets(once) == once
 
 
+def test_redact_secrets_stops_at_existing_marker_on_repeat() -> None:
+    """A completed marker is a boundary, so a second pass keeps later fields."""
+    text = "password=hunter2 status=401"
+    once = cli_diagnostics.redact_secrets(text)
+
+    assert once == "password=[REDACTED] status=401"
+    assert cli_diagnostics.redact_secrets(once) == once
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
@@ -587,15 +596,13 @@ def test_redact_secrets_scrubs_marker_glued_values(text: str, expected: str) -> 
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
-        ("Bearer [REDACTED] actualsecret", "Bearer [REDACTED]"),
-        ("password= [REDACTED] hunter2", "password= [REDACTED]"),
         ("Bearer [REDACTED]\u2800actualsecret", "Bearer [REDACTED]"),
         ("password=[REDACTED]\u2800actualsecret", "password=[REDACTED]"),
     ],
-    ids=["bearer-gap", "env-gap", "bearer-splitter", "env-splitter"],
+    ids=["bearer-splitter", "env-splitter"],
 )
 def test_redact_secrets_scrubs_marker_separated_values(text: str, expected: str) -> None:
-    """A planted marker cannot shield a separated keyed value."""
+    """A planted marker cannot shield a suffix joined by a non-boundary splitter."""
     once = cli_diagnostics.redact_secrets(text)
     assert once == expected
     assert cli_diagnostics.redact_secrets(once) == once
@@ -644,6 +651,20 @@ def test_redact_secrets_preserves_gapless_bearer_prose() -> None:
 
 
 @pytest.mark.parametrize(
+    "text",
+    [
+        "the bearers submitted the tokens",
+        "bearers received",
+        "bearerform filed",
+    ],
+    ids=["plural-sentence", "plural-short", "compound"],
+)
+def test_redact_secrets_does_not_bridge_gapless_bearer_prose_across_words(text: str) -> None:
+    """The gapless length floor counts only characters glued to the anchor."""
+    assert cli_diagnostics.redact_secrets(text) == text
+
+
+@pytest.mark.parametrize(
     ("text", "expected"),
     [
         ("DATABASE_PASSWORD=hunter2", "DATABASE_PASSWORD=[REDACTED]"),
@@ -656,6 +677,20 @@ def test_redact_secrets_preserves_gapless_bearer_prose() -> None:
 def test_redact_secrets_scrubs_short_keyed_values(text: str, expected: str) -> None:
     """Keyed anchors redact any non-empty value — no length floor applies."""
     assert cli_diagnostics.redact_secrets(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("p@ssw0rd!", "[REDACTED]"),
+        ("https://user:pass@host/path", "[REDACTED]"),
+    ],
+    ids=["punctuation", "url-shaped"],
+)
+def test_redact_secrets_scrubs_full_unquoted_env_value(value: str, expected: str) -> None:
+    """An unquoted keyed value spans every non-whitespace character."""
+    text = f"DATABASE_PASSWORD={value} status=401"
+    assert cli_diagnostics.redact_secrets(text) == f"DATABASE_PASSWORD={expected} status=401"
 
 
 @pytest.mark.parametrize(

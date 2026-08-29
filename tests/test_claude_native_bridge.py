@@ -7764,6 +7764,46 @@ def test_sanitize_hook_failure_detail_preserves_prose_from_detection_fragment() 
 
 
 @pytest.mark.parametrize(
+    ("keyed_value", "tail"),
+    [
+        ("from", "Error from provider: model_not_found"),
+        ("fail", "FinalCause: fail missing"),
+    ],
+    ids=["whole-word", "word-prefix"],
+)
+def test_sanitize_hook_failure_detail_limits_remnant_recovery_to_head(
+    keyed_value: str,
+    tail: str,
+) -> None:
+    """Long-window remnant recovery cannot rewrite matching tail prose."""
+    text = f"boot failed password={keyed_value}\n" + "x" * 4500 + f"\n{tail}"
+    detail = _sanitize_hook_failure_detail(text)
+
+    assert detail is not None
+    assert "password=[REDACTED]" in detail
+    assert tail in detail
+
+
+@pytest.mark.parametrize(
+    ("prefix", "expected_prefix"),
+    [(" ", ""), ("é", "é")],
+    ids=["trimmed-leading-space", "non-ascii-boundary"],
+)
+def test_sanitize_hook_failure_detail_aligns_head_remnant_offsets(
+    prefix: str,
+    expected_prefix: str,
+) -> None:
+    """Remnant offsets stay head-relative and use scanner token boundaries."""
+    text = prefix + "ghp_" + "A" * 10 + " " + "x" * 4500 + "\nFinalCause: model_not_found"
+    detail = _sanitize_hook_failure_detail(text)
+
+    assert detail is not None
+    assert detail.startswith(f"{expected_prefix}[REDACTED]\n")
+    assert "ghp_" not in detail
+    assert detail.endswith(f"FinalCause: model_not_found {_HOOK_FAILURE_DETAIL_TRUNCATION_MARKER}")
+
+
+@pytest.mark.parametrize(
     ("text", "expected"),
     [
         ("Bearer [REDACTED]actualsecret", "Bearer [REDACTED]"),
@@ -7899,6 +7939,23 @@ def test_sanitize_hook_failure_detail_rejoins_all_combining_mark_categories(
     assert _sanitize_hook_failure_detail(f"launch rejected {obfuscated}") == (
         "launch rejected [REDACTED]"
     )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Bea\u0301rer abc123", "Bearer [REDACTED]"),
+        ("Bea\u0301rer\ue000abc123", "Bearer [REDACTED]"),
+        ("Bea\u0301rer\u200babc123", "Bearer[REDACTED]"),
+    ],
+    ids=["plain-gap", "private-use-gap", "default-ignorable-gap"],
+)
+def test_sanitize_hook_failure_detail_skeletonizes_combining_bearer_anchor(
+    text: str,
+    expected: str,
+) -> None:
+    """A combining mark in a standalone Bearer anchor cannot hide its value."""
+    assert _sanitize_hook_failure_detail(text) == expected
 
 
 @pytest.mark.parametrize(
@@ -8117,6 +8174,19 @@ def test_hook_failure_detail_drops_planted_early_redaction_sentinel() -> None:
 
     assert detail == "launch failed: Bearer [REDACTED]"
     assert "tok123" not in detail
+
+
+@pytest.mark.parametrize(
+    ("separator", "expected"),
+    [("\u2800", "Bearer[REDACTED]"), ("\ue000", "Bearer [REDACTED]")],
+    ids=["braille-blank", "private-use"],
+)
+def test_sanitize_hook_failure_detail_treats_exotic_bearer_separator_as_gap(
+    separator: str,
+    expected: str,
+) -> None:
+    """An exotic separator retains the floorless keyed Bearer semantics."""
+    assert _sanitize_hook_failure_detail(f"Bearer{separator}abc123") == expected
 
 
 @pytest.mark.parametrize(
