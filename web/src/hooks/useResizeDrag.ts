@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef } from "react";
 interface ResizeDragOptions<T extends Element> {
   enabled?: boolean;
   /** Fires when a drag claims the pointer — snapshot the pre-drag width here. */
-  onStart?: () => void;
+  onStart?: (event: React.PointerEvent<T>) => void;
   onMove: (event: React.PointerEvent<T>) => void;
   onCommit?: () => void;
   /**
@@ -105,7 +105,7 @@ export function useResizeDrag<T extends Element = Element>({
       event.preventDefault();
       activePointerId.current = event.pointerId;
       activeHandle.current = event.currentTarget;
-      onStartRef.current?.();
+      onStartRef.current?.(event);
 
       const onDocumentPointerUp = (documentEvent: PointerEvent) => {
         if (documentEvent.pointerId === activePointerId.current) {

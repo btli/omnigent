@@ -1206,6 +1206,32 @@ describe("right-click context menu", () => {
     }
   });
 
+  it("suppresses the trailing click when Escape cancels a touch drag before release", () => {
+    vi.useFakeTimers();
+    try {
+      mocks.anyCoarse = true;
+      renderSidebar();
+      const link = screen.getByRole("link", { name: /My Session/ });
+      const row = link.closest("li")!;
+      const touch = { pointerId: 1, pointerType: "touch", isPrimary: true, button: 0 };
+
+      fireEvent.pointerDown(link, { ...touch, clientX: 100, clientY: 100 });
+      act(() => vi.advanceTimersByTime(400));
+      fireEvent.pointerMove(link, { ...touch, clientX: 115, clientY: 100 });
+      expect(row).toHaveClass("opacity-40");
+
+      fireEvent.keyDown(document, { key: "Escape", code: "Escape" });
+      expect(row).not.toHaveClass("opacity-40");
+      act(() => vi.advanceTimersByTime(ROW_CLICK_SUPPRESS_WINDOW_MS + 1));
+      fireEvent.pointerUp(link, { ...touch, clientX: 115, clientY: 100 });
+      fireEvent.click(link);
+
+      expect(screen.getByTestId("location-probe")).toHaveTextContent(/^\/$/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("cancels an active touch drag when its row unmounts", () => {
     vi.useFakeTimers();
     try {
@@ -2068,6 +2094,25 @@ describe("touch swipe actions", () => {
     fireEvent.click(screen.getByRole("link", { name: /My Session/ }));
     expect(screen.getByTestId("location-probe")).toHaveTextContent(/^\/$/);
     requestFrame.mockRestore();
+  });
+
+  it("keeps capture-loss suppression armed until the original pointer releases", () => {
+    vi.useFakeTimers();
+    try {
+      renderSidebar();
+      const li = conversationRow();
+
+      fireEvent.pointerDown(li, { ...POINTER, clientX: 200, clientY: 100 });
+      fireEvent.pointerMove(li, { ...POINTER, clientX: 180, clientY: 100 });
+      fireEvent.lostPointerCapture(li, POINTER);
+      act(() => vi.advanceTimersByTime(ROW_CLICK_SUPPRESS_WINDOW_MS + 1));
+      fireEvent.pointerUp(li, { ...POINTER, clientX: 180, clientY: 100 });
+      fireEvent.click(screen.getByRole("link", { name: /My Session/ }));
+
+      expect(screen.getByTestId("location-probe")).toHaveTextContent(/^\/$/);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it.each([

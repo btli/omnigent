@@ -142,8 +142,8 @@ export function useResizableCommentsPanel() {
       dragStartWidth.current = widthStore.getSnapshot();
     }, []),
     onCancel: useCallback(() => {
-      widthStore.set(dragStartWidth.current);
-    }, []),
+      widthStore.set(dragStartWidth.current !== null ? clampWidth(dragStartWidth.current) : null);
+    }, [clampWidth]),
     onCommit: widthStore.persist,
     onMove: useCallback(
       (e: React.PointerEvent) => {

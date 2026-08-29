@@ -1955,7 +1955,7 @@ function ConversationList({
         onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
         onDragCancel={() => {
-          finishActiveRowGesture();
+          finishActiveRowGesture(true);
           setActiveDrag(null);
         }}
       >

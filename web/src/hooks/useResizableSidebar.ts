@@ -1,10 +1,10 @@
 // Resize hook for the always-visible left sidebar (the conversations aside in
 // AppShell/Sidebar). Mirrors useResizableInlinePanel's persistence + keyboard
-// behavior, but for a LEFT-edge panel: the drag handle lives on the sidebar's
-// right edge, so the live width tracks the cursor's distance from the
-// viewport's left edge (``e.clientX``) and ArrowRight grows / ArrowLeft
-// shrinks. It keeps its own module-level store + preference key so resizing the
-// sidebar never disturbs the right rail's inline-panel width (and vice versa).
+// behavior, but for the inline-start panel: the drag handle lives on the
+// sidebar's inline-end edge, so the live width tracks the cursor's distance
+// from the viewport's inline-start edge. It keeps its own module-level store +
+// preference key so resizing the sidebar never disturbs the right rail's
+// inline-panel width (and vice versa).
 //
 // Unlike the inline panel this has no "boost" machinery — nothing auto-widens
 // the sidebar — so the store is just a persisted, viewport-clamped width.
@@ -111,16 +111,21 @@ export function useResizableSidebar() {
   // snapshot an aborted drag would keep the dragged width on screen while the
   // persisted preference still held the old one.
   const dragStartWidth = useRef<number | null>(null);
+  const dragDirection = useRef<"ltr" | "rtl">("ltr");
   const resizeDrag = useResizeDrag({
-    onStart: useCallback(() => {
+    onStart: useCallback((event: React.PointerEvent<HTMLElement>) => {
       dragStartWidth.current = widthStore.getSnapshot();
+      dragDirection.current =
+        getComputedStyle(event.currentTarget).direction === "rtl" ? "rtl" : "ltr";
     }, []),
     onCancel: useCallback(() => {
       widthStore.set(dragStartWidth.current);
     }, []),
     onCommit: widthStore.persist,
     onMove: useCallback((e: React.PointerEvent<HTMLElement>) => {
-      widthStore.set(clamp(e.clientX));
+      const inlineStartDistance =
+        dragDirection.current === "rtl" ? window.innerWidth - e.clientX : e.clientX;
+      widthStore.set(clamp(inlineStartDistance));
     }, []),
     observeHandleRemoval: true,
   });

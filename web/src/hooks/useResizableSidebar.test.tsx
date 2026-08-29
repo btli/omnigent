@@ -174,6 +174,18 @@ describe("useResizableSidebar", () => {
     expect(result.current.width).toBe(220);
   });
 
+  it("measures an RTL drag from the viewport's right edge", () => {
+    setInnerWidth(1440);
+    const { result } = renderHook(() => useResizableSidebar());
+    const handle = createHandle();
+    handle.dir = "rtl";
+
+    startDrag(result, handle);
+    act(() => result.current.handleProps.onPointerMove(pointerEvent(handle, { clientX: 1120 })));
+
+    expect(result.current.width).toBe(320);
+  });
+
   it("persists a drag and restores it after a store reset (reload)", () => {
     const { result, unmount } = renderHook(() => useResizableSidebar());
 

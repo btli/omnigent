@@ -83,7 +83,7 @@ interface RowGestureActivationContext {
   active: { data: { current?: unknown } };
 }
 
-type RowGestureReset = (cancelDrag: boolean) => void;
+type RowGestureReset = (cancelDrag: boolean, releasePending?: boolean) => void;
 
 const rowGestureResets = new Set<RowGestureReset>();
 
@@ -104,8 +104,8 @@ function registerRowGestureReset(reset: RowGestureReset) {
 }
 
 /** Clears the recognizer after dnd-kit has ended or cancelled its drag. */
-export function finishActiveRowGesture() {
-  for (const reset of rowGestureResets) reset(false);
+export function finishActiveRowGesture(cancelledBeforeRelease = false) {
+  for (const reset of rowGestureResets) reset(cancelledBeforeRelease, cancelledBeforeRelease);
 }
 
 const rowGestureActivators = [
@@ -206,6 +206,7 @@ export function useRowGesture({
   const suppressClick = useRef(false);
   const suppressionKeydown = useRef<((event: KeyboardEvent) => void) | null>(null);
   const suppressionTimer = useRef<number | null>(null);
+  const suppressionReleaseCleanup = useRef<(() => void) | null>(null);
   const touchMoveGuard = useRef<(() => void) | null>(null);
   const dxFrame = useRef<number | null>(null);
   const pendingDx = useRef(0);
@@ -284,6 +285,8 @@ export function useRowGesture({
 
   const clearClickSuppression = useCallback(() => {
     suppressClick.current = false;
+    suppressionReleaseCleanup.current?.();
+    suppressionReleaseCleanup.current = null;
     if (suppressionTimer.current !== null) {
       window.clearTimeout(suppressionTimer.current);
       suppressionTimer.current = null;
@@ -295,27 +298,47 @@ export function useRowGesture({
   }, []);
 
   // Armed until the trailing click arrives, the next press/key clears it, or
-  // the bounded window elapses. A zero-delay timer would race the click
-  // (browsers need not dispatch it in the same task), so the window is a
-  // generous ROW_CLICK_SUPPRESS_WINDOW_MS — but it must exist: without it the
-  // armed flag survived indefinitely, and an assistive-technology activation
-  // that dispatches only `click` (no pointer, no key) was consumed as
-  // "trailing". Keyboard intent still clears early via a one-shot capture
-  // listener.
-  const suppressTrailingClick = useCallback(() => {
-    clearClickSuppression();
-    suppressClick.current = true;
-    const keydown = () => clearClickSuppression();
-    suppressionKeydown.current = keydown;
-    document.addEventListener("keydown", keydown, { capture: true, once: true });
-    suppressionTimer.current = window.setTimeout(
-      clearClickSuppression,
-      ROW_CLICK_SUPPRESS_WINDOW_MS,
-    );
-  }, [clearClickSuppression]);
+  // the bounded post-release window elapses. Cancellation can precede the
+  // actual finger lift (capture loss or dnd-kit Escape), so defer the timer
+  // until that pointer ends; otherwise a held finger can outlive the window.
+  const suppressTrailingClick = useCallback(
+    (pendingPointerId?: number) => {
+      clearClickSuppression();
+      suppressClick.current = true;
+      const keydown = () => clearClickSuppression();
+      suppressionKeydown.current = keydown;
+      document.addEventListener("keydown", keydown, { capture: true, once: true });
+
+      const startTimer = () => {
+        if (!suppressClick.current) return;
+        suppressionTimer.current = window.setTimeout(
+          clearClickSuppression,
+          ROW_CLICK_SUPPRESS_WINDOW_MS,
+        );
+      };
+      if (pendingPointerId === undefined) {
+        startTimer();
+        return;
+      }
+
+      const onPointerEnd = (event: PointerEvent) => {
+        if (event.pointerId !== pendingPointerId) return;
+        suppressionReleaseCleanup.current?.();
+        suppressionReleaseCleanup.current = null;
+        startTimer();
+      };
+      document.addEventListener("pointerup", onPointerEnd, true);
+      document.addEventListener("pointercancel", onPointerEnd, true);
+      suppressionReleaseCleanup.current = () => {
+        document.removeEventListener("pointerup", onPointerEnd, true);
+        document.removeEventListener("pointercancel", onPointerEnd, true);
+      };
+    },
+    [clearClickSuppression],
+  );
 
   const reset = useCallback(
-    (cancelDrag = false) => {
+    (cancelDrag = false, releasePending = cancelDrag) => {
       const gesture = state.current;
       if (!gesture) return;
       // A cancellation that interrupts a resolved gesture (swipe, armed,
@@ -323,7 +346,9 @@ export function useRowGesture({
       // click — e.g. mid-swipe capture loss — which would navigate into the
       // row being swiped away. onPointerUp arms this itself for normal
       // releases; cancel paths must too.
-      if (cancelDrag && gesture.phase !== "pending") suppressTrailingClick();
+      if (cancelDrag && gesture.phase !== "pending") {
+        suppressTrailingClick(releasePending ? gesture.pointerId : undefined);
+      }
       clearHoldTimer();
       releaseCapture(gesture);
       disarmTouchMoveGuard();
@@ -578,7 +603,7 @@ export function useRowGesture({
   const onPointerCancel = useCallback(
     (event: ReactPointerEvent) => {
       if (state.current?.pointerId !== event.pointerId) return;
-      reset(true);
+      reset(true, false);
     },
     [reset],
   );

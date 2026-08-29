@@ -370,6 +370,31 @@ describe("useResizableCommentsPanel pointer drag", () => {
     expect(result.current.width).toBe(240);
     unmount();
   });
+
+  it("re-clamps the drag snapshot when constraints tighten before an abort", () => {
+    const { result, unmount } = renderHook(() => useResizableCommentsPanel());
+    const { parentRect } = attachContainer(result.current.containerRef);
+    const target = makeHandleTarget();
+
+    act(() => result.current.handleProps.onPointerDown(pointerEvent(target, { pointerId: 8 })));
+    act(() =>
+      result.current.handleProps.onPointerMove(
+        pointerEvent(target, { pointerId: 8, clientX: 400 }),
+      ),
+    );
+    act(() => result.current.handleProps.onPointerUp(pointerEvent(target, { pointerId: 8 })));
+    expect(result.current.width).toBe(600);
+
+    act(() => result.current.handleProps.onPointerDown(pointerEvent(target, { pointerId: 9 })));
+    parentRect.mockReturnValue({ width: 700 } as DOMRect);
+    act(() => window.dispatchEvent(new Event("resize")));
+    expect(result.current.width).toBe(452);
+
+    act(() => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })));
+    expect(result.current.width).toBe(452);
+    expect(readPanelSizePreference("commentsPanelWidthPx")).toBe(600);
+    unmount();
+  });
 });
 
 describe("useResizableCommentsPanel touch affordances", () => {
