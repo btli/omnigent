@@ -53,6 +53,24 @@ The scoring configuration and component map are public in
 [`default_scoring.json`](.github/triage_v2/src/issue_prioritization/default_scoring.json)
 and [`areas.json`](.github/areas.json).
 
+## Response times and inactive issues
+
+Priority determines the order in which maintainers consider work; it does not
+set a response, review, or resolution deadline. We are working toward published
+response targets, but they are not yet an SLA. For now, we do not guarantee a
+specific response time for issues or pull requests.
+
+Issues with no activity for 30 days are marked `stale` and close after another
+14 days without activity. New activity restarts that inactivity window. Issues
+labeled `pinned`, `security`, or `bug` are exempt.
+
+If an issue is labeled `needs-info`, a comment from its author clears the label
+and triggers another triage pass. Without an author response, the normal stale
+policy applies unless the issue also has one of the exempt labels above.
+
+Pull requests waiting for an author response follow the separate 7-day policy
+described under [Review state labels](#review-state-labels).
+
 ## Development setup
 
 This is a Python package with an optional frontend under `web/`. Use
@@ -85,19 +103,23 @@ cd omnigent
 
 uv python install
 uv venv --python "$(cat .python-version)"
-uv sync --extra all --extra dev
+uv sync --extra all --group dev
 source .venv/bin/activate    # or prefix commands with `uv run`
 ```
+
+Repository-only dependencies use PEP 735 groups: `lint` for static checks and
+code generation, `test` for pytest, and `dev` for both. Product capabilities
+remain installable extras. Plain `uv sync` installs neither group by default.
 
 Common checks:
 
 Pyrefly is the canonical Python type checker for the repository.
 
 ```bash
-uv run pytest                      # Python tests (e2e/live skipped by default)
-uv run ruff check . && uv run ruff format --check .
-uv run --no-sync pyrefly check     # Python type checking (core and client SDK)
-uv run pre-commit run --all-files
+uv run --no-sync pytest                      # Python tests (e2e/live skipped by default)
+uv run --no-sync ruff check . && uv run --no-sync ruff format --check .
+uv run --no-sync pyrefly check               # Python type checking (core and client SDK)
+uv run --no-sync pre-commit run --all-files
 ```
 
 When touching `web/`:
@@ -135,7 +157,7 @@ test. A fresh worktree needs its own Python environment first:
 
 ```bash
 cd /path/to/omnigent-worktree
-uv sync --extra all --extra dev
+uv sync --extra all --group dev
 omnidev
 ```
 
@@ -345,7 +367,12 @@ your PR is, check that box under *Type of change* and no issue is needed.
 Anything that fixes a bug, adds a feature, or changes the UI needs an issue,
 even when it also touches docs or tests.
 
-A bot comments once on PRs that reference no issue. It never closes anything.
+A bot comments once on PRs that reference no issue and labels them `needs-issue`.
+Reference an issue and the label clears automatically. A PR still labeled
+`needs-issue` after **7 days** is closed, the same way and for the same reason as
+`waiting-on-author` below: to keep the review queue readable, not as a judgement
+on the change. It is reversible, so comment `/reopen` once you have added the
+reference.
 
 ### Review state labels
 
@@ -356,6 +383,10 @@ need to apply them.
 | --- | --- |
 | `waiting-on-author` | A maintainer has left feedback. The PR is in your court. |
 | `waiting-for-review` | You have responded. It is back in the reviewer's queue. |
+
+A third label, `needs-issue`, is separate from these two: it says the PR
+references no issue, not that anyone is waiting on a reply. See [Every PR needs an
+issue](#every-pr-needs-an-issue).
 
 A maintainer reviewing or commenting on your PR sets `waiting-on-author`. When
 you push a commit, comment, or reply to a review, that clears automatically and

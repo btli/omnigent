@@ -13,7 +13,9 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
+import type * as IdentityModule from "@/lib/identity";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 
 // Controllable rename mutation so the double-click test can assert the
 // committed title was forwarded to the PATCH. `isMobile` toggles the mocked
@@ -52,6 +54,10 @@ const mocks = vi.hoisted(() => {
     // mobile in-place project view test can assert both the list and the pick.
     projects: [] as string[],
     moveToProject: { mutate: vi.fn() },
+    leave: { mutate: vi.fn(), isPending: false },
+    // The signed-in viewer. Rows with no `owner` read as owned by them; a row
+    // owned by someone else is the shared case Leave applies to.
+    viewerId: "viewer@example.com" as string | null,
     conversations: [] as unknown[],
     pinnedStore,
   };
@@ -94,9 +100,11 @@ vi.mock("@/hooks/useConversations", () => ({
   setConversationPinned: vi.fn(() => Promise.resolve({})),
   PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
   useRenameConversation: () => mocks.rename,
+  useLeaveSession: () => mocks.leave,
   useArchiveConversation: () => ({ mutate: vi.fn() }),
   useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useStopSession: () => ({ mutate: vi.fn() }),
   useProjects: () => ({ data: mocks.projects.map((name: string) => ({ id: `p_${name}`, name })) }),
@@ -131,6 +139,15 @@ vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }
 // jsdom's default loopback origin would otherwise read as single-user and hide
 // the tabs the shared-session row actions rely on.
 vi.mock("@/lib/serverOrigin", () => ({ isCurrentServerLocal: () => false }));
+// Pin "who am I": ownership (and therefore Leave, which revokes the viewer's
+// own grant) is derived from this id. Unmocked it resolves to null in jsdom,
+// which reads as "not the owner" for shared rows but leaves Leave with no id
+// to revoke.
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof IdentityModule>()),
+  getCurrentUserId: () => mocks.viewerId,
+  resolveIdentity: () => Promise.resolve(mocks.viewerId),
+}));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { resetReadStateForTests, seedReadState } from "@/hooks/useUnseenConversations";
@@ -190,6 +207,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     server_version: null,
     smart_routing_enabled: false,
     smart_routing_sources: { external: false, oss: false },
+    features: {},
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -238,6 +256,7 @@ beforeEach(() => {
   mocks.rename.isSuccess = false;
   mocks.rename.isError = false;
   mocks.moveToProject.mutate.mockReset();
+  mocks.leave.mutate.mockReset();
   mocks.projects = [];
   // Default every test to the desktop viewport; the mobile flyout test opts in.
   mocks.isMobile = false;
@@ -326,6 +345,33 @@ describe("quick pin/unpin hover button", () => {
       expect(button).toHaveClass("size-6", "text-muted-foreground", "hover:text-foreground");
       expect(button).not.toHaveClass("size-7");
     }
+  });
+
+  it("keeps the Projects group-header actions visible without hover, hover-revealed on desktop", () => {
+    // The "New project" (+) button is the only way to create a project, so its
+    // group-header wrapper must stay visible wherever hover is unavailable —
+    // phones AND touch tablets at `md`+ widths — rather than fade out like the
+    // desktop-only session-header controls. jsdom doesn't evaluate media
+    // queries, so assert the responsive classes: base `flex` (shown at every
+    // breakpoint) with the fade + hover/focus reveals gated on hover
+    // capability, not just the `md` width.
+    mocks.projects = ["Sprint 42"];
+    renderSidebar();
+
+    const wrapper = screen.getByTestId("new-project").closest(".transition-opacity");
+    expect(wrapper).not.toBeNull();
+    // Visible without hover: base display is `flex`, never `hidden`, and the
+    // fade is not applied by viewport width alone.
+    expect(wrapper).toHaveClass("flex");
+    expect(wrapper).not.toHaveClass("hidden");
+    expect(wrapper).not.toHaveClass("md:opacity-0");
+    // Hover-capable desktop: fades out until the header is hovered / focused /
+    // a menu opens.
+    expect(wrapper).toHaveClass(
+      "[@media(hover:hover)]:md:opacity-0",
+      "[@media(hover:hover)]:md:group-hover/header:opacity-100",
+      "[@media(hover:hover)]:md:has-[:focus-visible]:opacity-100",
+    );
   });
 
   it("hides the Projects list-actions kebab when there are no projects", () => {
@@ -434,6 +480,19 @@ describe("quick pin/unpin hover button", () => {
     // classes actually take effect), rather than a block (which would not).
     expect(quickButton).toHaveClass("md:inline-flex");
     expect(quickButton).not.toHaveClass("md:block");
+  });
+
+  it("drops the row kebab on mobile, revealing it only from md up", () => {
+    // The per-row "..." menu is desktop-only: on mobile the chat page's own
+    // header menu covers these per-session actions, so the row kebab is hidden
+    // (`hidden`) and only surfaces from `md` up (`md:inline-flex`). It reveals
+    // like the quick-pin button — flex, not block — so its glyph stays
+    // centered.
+    renderSidebar();
+
+    const kebab = screen.getByTestId("conversation-actions");
+    expect(kebab).toHaveClass("hidden", "md:inline-flex");
+    expect(kebab).not.toHaveClass("md:block");
   });
 });
 
@@ -602,6 +661,92 @@ describe("double-click to rename", () => {
   });
 });
 
+describe("leave a shared session", () => {
+  // Every other row action is owner-only, so "Leave session" is the one thing
+  // a shared-with viewer can actually do: drop the session from their own
+  // sidebar without touching the owner's copy.
+
+  /** Switch to the "Shared with me" tab, where non-owned rows live. */
+  function openSharedTab() {
+    // Radix Tabs triggers activate on mousedown (primary button), not click.
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-shared"));
+  }
+
+  it("offers Leave on a shared row and calls the mutation after confirming", () => {
+    mockConversations([{ ...CONV, owner: "other@example.com" }]);
+    renderSidebar();
+    openSharedTab();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    fireEvent.click(screen.getByTestId("leave-conversation"));
+
+    // Destructive, and the row vanishes on success — so it confirms first.
+    expect(mocks.leave.mutate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("confirm-leave-conversation"));
+    // Leaving revokes the VIEWER's own grant, so the mutation carries their id
+    // — not the owner's. Sending the owner's id would be a revoke attempt the
+    // server rejects for lack of manage access.
+    expect(mocks.leave.mutate).toHaveBeenCalledWith(
+      { id: "conv_1", viewerId: "viewer@example.com" },
+      expect.anything(),
+    );
+  });
+
+  it("shows Delete instead of Leave on a row the viewer owns", () => {
+    // The owner grant is what keeps the session reachable — leaving would
+    // orphan it, so the owner deletes instead. One slot, not two items.
+    mockConversations([CONV]);
+    renderSidebar();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.getByTestId("delete-conversation")).toBeInTheDocument();
+    expect(screen.queryByTestId("leave-conversation")).toBeNull();
+  });
+
+  it("replaces the once-dead disabled Delete rather than adding an item", () => {
+    // The point of reusing the slot: a non-owner used to get Delete rendered
+    // disabled ("only the owner can delete"), a row that could never do
+    // anything. Leave takes that slot — so exactly ONE destructive item shows,
+    // and it is never a disabled Delete.
+    mockConversations([{ ...CONV, owner: "other@example.com" }]);
+    renderSidebar();
+    openSharedTab();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.getByTestId("leave-conversation")).toBeInTheDocument();
+    expect(screen.queryByTestId("delete-conversation")).toBeNull();
+  });
+
+  it("keeps the plain owner Delete in single-user mode, where nothing is shared", () => {
+    // Single-user mode has one identity and no sharing, so an unowned-looking
+    // row must not offer Leave — it falls back to Delete.
+    mockConversations([{ ...CONV, owner: "other@example.com" }]);
+    renderSidebar(undefined, serverInfo({ single_user: true }));
+
+    // The default filter is "My sessions", which scopes out this owner:other
+    // row; the single-user menu still offers "All sessions", so switch to it to
+    // surface the row this test is about.
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-all"));
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.queryByTestId("leave-conversation")).toBeNull();
+    expect(screen.getByTestId("delete-conversation")).toBeInTheDocument();
+  });
+});
+
 describe("pinned row project flyout", () => {
   // Pinning lifts a session out of its project folder into the flat "Pinned"
   // section, so the folder no longer conveys which project it came from. The
@@ -700,7 +845,7 @@ describe("mobile in-place project picker", () => {
     // actions are gone, and the picker (search + project list) plus a Back
     // control are shown.
     fireEvent.click(moveItem);
-    expect(screen.getByPlaceholderText("Search projects")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Search or create project")).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /Sprint 42/ })).toBeInTheDocument();
     expect(screen.getByTestId("project-picker-back")).toBeInTheDocument();
     // The main actions are no longer rendered — the body was replaced, not
@@ -713,7 +858,7 @@ describe("mobile in-place project picker", () => {
     fireEvent.click(screen.getByTestId("project-picker-back"));
     expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
     expect(screen.getByTestId("delete-conversation")).toBeInTheDocument();
-    expect(screen.queryByPlaceholderText("Search projects")).toBeNull();
+    expect(screen.queryByPlaceholderText("Search or create project")).toBeNull();
   });
 
   it("moves the session into a picked project just like desktop", () => {
@@ -730,6 +875,41 @@ describe("mobile in-place project picker", () => {
       id: "conv_1",
       project: "Sprint 42",
     });
+  });
+
+  it("creates a project from a typed name that matches nothing", () => {
+    mocks.isMobile = true;
+    mocks.projects = ["Sprint 42"];
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("move-to-project"));
+
+    fireEvent.change(screen.getByPlaceholderText("Search or create project"), {
+      target: { value: "Roadmap" },
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: /Create Roadmap/ }));
+
+    // The move resolves-or-creates the project id server-side, so filing into a
+    // brand-new name uses the same mutation contract as picking an existing one.
+    expect(mocks.moveToProject.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      project: "Roadmap",
+    });
+  });
+
+  it("offers no create row when the typed name already exists", () => {
+    mocks.isMobile = true;
+    mocks.projects = ["Sprint 42"];
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("move-to-project"));
+
+    fireEvent.change(screen.getByPlaceholderText("Search or create project"), {
+      target: { value: "sprint 42" },
+    });
+    expect(screen.queryByRole("menuitem", { name: /Create/ })).toBeNull();
   });
 
   it("keeps the desktop side-flyout submenu (no in-place swap)", () => {
@@ -865,6 +1045,7 @@ describe("right-click context menu", () => {
     fireEvent.contextMenu(links[0]);
     fireEvent.click(screen.getByTestId("rename-conversation"));
     const input = screen.getByTestId("rename-conversation-input") as HTMLInputElement;
+    expect(input).toHaveAttribute("maxLength", String(USER_SESSION_TITLE_MAX_CHARS));
     fireEvent.change(input, { target: { value: "Renamed A" } });
     fireEvent.keyDown(input, { key: "Enter" });
     expect(mocks.rename.mutate).toHaveBeenCalledWith({ id: "conv_a", title: "Renamed A" });

@@ -1,6 +1,7 @@
 """Conversation store — manages conversations and their items."""
 
 import hashlib
+import math
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -210,6 +211,12 @@ class SessionConnectivity:
         dot off while ``runner_id``/``host_id`` are still ``None`` so
         the UI prompts for a host + directory before the clone can run,
         rather than treating it as an in-process session.
+    :param imported: ``True`` when this session was imported from a local
+        harness transcript (the ``omnigent.import.source`` label is set).
+        Like ``needs_workspace``, forces the online dot off while unbound:
+        an imported transcript has no live executor anywhere, so it must
+        launch a runner on a host before it can run — reporting it offline
+        routes the first message into the resume picker.
     :param runner_last_seen: Epoch seconds the bound runner's tunnel was
         last observed alive, written by the replica holding the tunnel.
         ``None`` when never observed (or cleared on graceful disconnect).
@@ -221,6 +228,7 @@ class SessionConnectivity:
     runner_id: str | None
     host_id: str | None
     needs_workspace: bool
+    imported: bool = False
     runner_last_seen: int | None = None
 
 
@@ -278,6 +286,26 @@ class NameAlreadyExistsError(Exception):
     """
 
 
+def _is_addable_usage_increment(value: Any) -> bool:
+    """
+    Return whether *value* is a safe additive ``session_usage`` increment.
+
+    Every production caller (the relay ``_accumulate_session_usage`` path)
+    only ever adds a finite, non-negative count or cost. A negative or
+    non-finite increment is therefore corruption — applied additively it
+    would drive a cumulative counter backwards or poison it with ``NaN`` /
+    ``inf``, and the relay cost-budget gate reads these very totals — so
+    :func:`apply_session_usage_delta` drops it rather than merging it.
+
+    :param value: A flat or ``by_model`` sub-key increment from a delta.
+    :returns: ``True`` when *value* is a finite, non-negative, non-bool
+        number; ``False`` otherwise.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value) and value >= 0
+
+
 def apply_session_usage_delta(current: dict[str, Any], delta: dict[str, Any]) -> None:
     """
     Apply a usage *delta* to *current* in place (add semantics, nested-aware).
@@ -286,6 +314,11 @@ def apply_session_usage_delta(current: dict[str, Any], delta: dict[str, Any]) ->
     model id, summing each model's sub-keys independently. Used by
     :meth:`ConversationStore.increment_session_usage` implementations to
     keep the merge logic in one place.
+
+    Negative and non-finite increments are dropped (see
+    :func:`_is_addable_usage_increment`): they can only come from a forged
+    runner usage frame and would corrupt the cumulative totals the relay
+    cost-budget gate enforces on.
 
     :param current: Existing ``session_usage`` dict (mutated in place).
     :param delta: Increments to apply (same layout as ``session_usage``).
@@ -296,8 +329,10 @@ def apply_session_usage_delta(current: dict[str, Any], delta: dict[str, Any]) ->
             for model_id, model_delta in value.items():
                 bucket = by_model.setdefault(model_id, {})
                 for sub_key, sub_value in model_delta.items():
+                    if not _is_addable_usage_increment(sub_value):
+                        continue
                     bucket[sub_key] = bucket.get(sub_key, 0) + sub_value
-        else:
+        elif _is_addable_usage_increment(value):
             current[key] = current.get(key, 0) + value
 
 
@@ -769,6 +804,7 @@ class ConversationStore(ABC):
         _unset_harness_override: bool = False,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
+        reported_model: str | None = None,
     ) -> Conversation | None:
         """
         Update mutable fields on a conversation.
@@ -778,7 +814,9 @@ class ConversationStore(ABC):
         and ``harness_override``,
         ``None`` means "leave unchanged". To explicitly clear them
         back to ``None``, pass
-        the matching ``_unset_*`` flag.
+        the matching ``_unset_*`` flag. ``reported_model`` (the model
+        the harness last reported, verbatim) has no ``_unset`` variant:
+        reports only ever move forward.
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -838,6 +876,22 @@ class ConversationStore(ABC):
         :param title: Replacement title.
         :returns: The updated conversation, or ``None`` when the row is
             missing or its title changed before this call.
+        """
+        ...
+
+    @abstractmethod
+    def set_task_summary(
+        self,
+        conversation_id: str,
+        task_summary: str,
+    ) -> Conversation | None:
+        """Set a human-readable task summary on a sub-agent conversation.
+
+        :param conversation_id: Conversation to update.
+        :param task_summary: Short task-derived label, e.g.
+            ``"Investigate auth token refresh"``.
+        :returns: The updated conversation, or ``None`` when the row
+            does not exist.
         """
         ...
 
@@ -1093,6 +1147,18 @@ class ConversationStore(ABC):
             string ``"YYYY-MM-DD"``, e.g. ``"2026-06-05"``.
         :returns: The summed ``cost_usd`` across matching days, or ``0.0``
             when no rows fall in the range.
+        """
+        ...
+
+    @abstractmethod
+    def list_daily_costs(self, user_id: str, since_day_utc: str) -> list[tuple[str, float]]:
+        """
+        Return per-day cost rows for a user from ``since_day_utc`` onward.
+
+        :param user_id: The user to read, e.g. ``"alice@example.com"``.
+        :param since_day_utc: Inclusive lower-bound UTC day as ``"YYYY-MM-DD"``.
+        :returns: List of ``(day_utc, cost_usd)`` tuples, ascending by day.
+            Days with no spend are omitted.
         """
         ...
 
@@ -1465,6 +1531,14 @@ class ConversationStore(ABC):
         cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
         copy_terminal_launch_args: bool = True,
+        override_model_override: str | None = None,
+        override_model_override_set: bool = False,
+        override_reasoning_effort: str | None = None,
+        override_reasoning_effort_set: bool = False,
+        override_terminal_launch_args: list[str] | None = None,
+        override_terminal_launch_args_set: bool = False,
+        dropped_label_keys: frozenset[str] = frozenset(),
+        extra_labels: dict[str, str] | None = None,
         carry_history_into_native: bool = False,
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
@@ -1514,6 +1588,30 @@ class ConversationStore(ABC):
             with none — used when the fork switches to a different CLI, where
             the source's flags are meaningless or rejected (e.g. Claude Code's
             ``--permission-mode`` would make ``pi`` exit at launch).
+        :param override_model_override: Explicit ``model_override`` for the
+            fork, applied only when ``override_model_override_set`` — then it
+            supersedes the ``copy_model_settings`` copy.
+        :param override_model_override_set: Whether the caller chose an
+            explicit ``model_override`` (fork dialog's model picker).
+        :param override_reasoning_effort: Explicit ``reasoning_effort`` for
+            the fork, applied only when ``override_reasoning_effort_set``.
+        :param override_reasoning_effort_set: Whether the caller chose an
+            explicit ``reasoning_effort``.
+        :param override_terminal_launch_args: Explicit
+            ``terminal_launch_args`` for the fork (the permission-mode
+            selector), applied only when ``override_terminal_launch_args_set``
+            — then it supersedes the ``copy_terminal_launch_args`` copy.
+        :param override_terminal_launch_args_set: Whether the caller chose
+            explicit launch args.
+        :param dropped_label_keys: Source labels to NOT copy onto the fork,
+            beyond the always-dropped instance-scoped set (e.g. the
+            permission-mode / codex-bypass label keys when the dialog picks
+            explicit launch args, so a stale copied label can't shadow the
+            freshly chosen mode).
+        :param extra_labels: Labels stamped on the fork AFTER copy/drop, so a
+            deliberate opt-in beats the always-drop rule — e.g. the fork
+            dialog re-arming the DANGEROUS ``codex_native.bypass_sandbox``
+            label (the only path that sets it; the source's is always dropped).
         :param carry_history_into_native: When ``True``, stamp
             :data:`FORK_CARRY_HISTORY_LABEL_KEY` on the fork so a native
             target harness rebuilds its transcript (clone the source's
@@ -1619,6 +1717,35 @@ class ConversationStore(ABC):
         :returns: The updated :class:`Conversation`.
         :raises LookupError: If no conversation with *conversation_id*
             exists.
+        """
+        ...
+
+    @abstractmethod
+    def has_other_live_session_in_workspace(
+        self,
+        *,
+        host_id: str,
+        workspace: str,
+        exclude_conversation_id: str,
+    ) -> bool:
+        """
+        Is another non-archived conversation sitting in this ``(host_id, workspace)``?
+
+        Sessions routinely share one directory: a fork reusing the source's
+        worktree, or several sessions attached to the same existing worktree
+        via the picker. Worktree cleanup must not remove a directory a live
+        session still runs in, so this is the "is it in use?" gate.
+
+        Archived sessions do not count. They run nothing, so removing the
+        directory cannot wedge them, and counting them would mean a worktree
+        shared by two forks is never cleaned up once either is archived.
+
+        :param host_id: Host owning the worktree, e.g. ``"host_a1b2..."``.
+        :param workspace: Absolute worktree path, e.g. ``"/w/feature-login"``.
+        :param exclude_conversation_id: The conversation being deleted or
+            archived — its own row must not count as "another session".
+        :returns: ``True`` when at least one other live conversation
+            references the pair, else ``False``.
         """
         ...
 

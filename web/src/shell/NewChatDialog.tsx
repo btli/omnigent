@@ -47,7 +47,15 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
+  Command,
+  CommandEmpty,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command";
+import {
   CLAUDE_NATIVE_EFFORTS,
+  PI_NATIVE_EFFORTS,
   ConfigRow,
   DescribedSelect,
   EFFORT_SELECT_NONE,
@@ -55,7 +63,10 @@ import {
   MODEL_SELECT_DEFAULT,
   MODEL_SELECT_SMART,
   RoutingModelSelect,
+  defaultModelLabel,
+  nativeModelLabel,
 } from "@/components/HarnessConfigControls";
+import { ProjectLandingIcon } from "@/components/ProjectIconPicker";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -83,16 +94,19 @@ import {
 
 // Re-exported for tests that import the readiness helpers from this module.
 export { harnessUnavailableReasonOnHost, harnessUnconfiguredOnHost, harnessWarningBadgeText };
-import { sandboxOptionLabel } from "@/lib/capabilities";
+import { isFeatureEnabled, sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
+import { useHeading, usePoweredBy } from "@/lib/branding";
 import {
   isSlashCommandText,
   rankedSlashCommandNames,
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
 import { setPendingInitialPrompt } from "@/store/chatStore";
+import { markSessionCreated } from "@/store/interactionTelemetry";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { CliCommandBlock } from "./CliCommandBlock";
+import { CliCommandBlock, renderTextWithInlineCode } from "./CliCommandBlock";
 import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
 import {
   initialPrefillState,
@@ -102,16 +116,20 @@ import {
   type ProjectPrefillState,
 } from "./projectPrefill";
 import { getCliServerUrl, getOmnigentHostConfig } from "@/lib/host";
+import { quoteShellArgument } from "@/lib/shell";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
 import {
   readLastHostChoice,
   writeLastHostChoice,
+  readLastSandboxProvider,
+  writeLastSandboxProvider,
   SANDBOX_HOST_CHOICE,
 } from "@/lib/hostPreferences";
 import { readLastHarness, writeLastHarness } from "@/lib/harnessPreferences";
 import { readHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
 import { readDefaultBaseBranch } from "@/lib/baseBranchPreferences";
-import { readHarnessOptions, writeHarnessOption } from "@/lib/modePreferences";
+import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
+import { readHarnessOptions, writeHarnessOption, type HarnessOptions } from "@/lib/modePreferences";
 import {
   AUTO_HARNESS_DESCRIPTION,
   AUTO_HARNESS_ID,
@@ -129,8 +147,13 @@ import {
   type SmartRoutingUnavailableCause,
 } from "@/lib/smartRoutingAvailability";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
-import { partitionAgentsByKind, sortAgentsForDisplay } from "@/lib/agentGrouping";
+import {
+  isAcpHarnessAgent,
+  partitionAgentsByKind,
+  selectableSessionAgents,
+} from "@/lib/agentGrouping";
 import { cn } from "@/lib/utils";
+import { useOmnigentAnalytics } from "@/lib/analytics";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import {
   isFullySupportedNativeCodingAgent,
@@ -140,12 +163,32 @@ import {
   nativeCodingAgentForAvailableAgent,
   nativeWrapperLabelsForAgent,
 } from "@/lib/nativeCodingAgents";
+import {
+  CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
+  CLAUDE_NATIVE_PERMISSION_MODES,
+} from "@/lib/claudePermissionMode";
+import {
+  AGY_NATIVE_DEFAULT_SKIP_MODE,
+  AGY_NATIVE_SKIP_MODES,
+  AGY_NATIVE_SKIP_VALUE,
+  AUTO_PERMISSION_MODE,
+  AUTO_PERMISSION_MODE_OPTIONS,
+  CODEX_NATIVE_APPROVAL_MODES,
+  CODEX_NATIVE_BYPASS_APPROVAL_OPTION,
+  CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
+  CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+  CODEX_NATIVE_DEFAULT_APPROVAL_MODE,
+  CURSOR_NATIVE_DEFAULT_EXEC_MODE,
+  CURSOR_NATIVE_EXEC_MODES,
+} from "@/lib/nativeHarnessModes";
 import { useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
 import {
   controlHost,
   getHostIdentity,
   isElectronShell,
+  isIOSShell,
   onHostStatusChanged,
+  setNativeViewMode,
   type HostIdentity,
 } from "@/lib/nativeBridge";
 import {
@@ -166,6 +209,7 @@ import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
 import type { NativeModelOption } from "@/lib/types";
 import {
+  useConversations,
   useProjectConfig,
   useProjects,
   moveConversationToProject,
@@ -187,7 +231,8 @@ import {
   parseMentionToken,
   rankMentionEntries,
 } from "@/lib/composerMentions";
-import { OttoEyes } from "@/components/OttoEyes";
+import { BrandLogo } from "@/components/BrandLogo";
+import { PoweredByOmnigent } from "@/components/PoweredByOmnigent";
 import { SkillPills } from "@/components/SkillPills";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import type { CostControlMode } from "@/components/CostRoutingControl";
@@ -195,12 +240,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { AgentRowTooltip } from "@/components/AgentHoverCard";
 import { CreateAgentDialog } from "./CreateAgentDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
-import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
-
-// Hidden from the new-session picker only. `nessie` is superseded by polly.
-// `kimi` / `kimi-code` are the headless SDK harness (kept for sub-agent / `run
-// --harness kimi` use) — the picker offers only the native TUI (`kimi-native-ui`).
-const NEW_SESSION_HIDDEN_AGENTS = new Set(["nessie", "kimi", "kimi-code"]);
+import { createBundledSession, importLocalSessions, launchRunner } from "@/lib/sessionsApi";
 
 // Short picker-row blurbs — the spec descriptions are long paragraphs that
 // truncate badly in the dropdown; other dialogs keep the server values.
@@ -214,179 +254,61 @@ const AGENT_PICKER_DESCRIPTIONS: Record<string, string> = {
 // out — other agents keep the "/" menu as the only skill surface.
 const SKILL_PILL_AGENTS = new Set(["polly", "debby"]);
 
-// Claude Code's `claude --permission-mode` choices (v2.1). Claude-native
-// sessions only. "default" is Claude's own default and sends no flag; any
-// other value is passed through as `--permission-mode <value>` via the
-// session's terminal_launch_args. Keep in sync with `claude --help`.
-const CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE = "default";
-const CLAUDE_NATIVE_PERMISSION_MODES: { value: string; label: string; description: string }[] = [
-  { value: "default", label: "Default", description: "Prompts before edits and commands" },
-  {
-    value: "auto",
-    label: "Auto",
-    description: "Auto-runs; a classifier blocks risky actions",
-  },
-  {
-    value: "acceptEdits",
-    label: "Accept edits",
-    description: "Auto-applies file edits; commands still prompt",
-  },
-  { value: "plan", label: "Plan", description: "Plans only; makes no edits" },
-  { value: "dontAsk", label: "Don't ask", description: "Auto-denies anything not pre-approved" },
-  {
-    value: "bypassPermissions",
-    label: "Bypass permissions",
-    description: "Runs everything; no prompts or safety checks",
-  },
-];
+function createdHarnessOptions({
+  harness,
+  supportsPermissionMode,
+  supportsApprovalMode,
+  supportsCursorMode,
+  supportsAgySkipPermissions,
+  supportsModelPicker,
+  supportsEffortPicker,
+  permissionMode,
+  approvalMode,
+  bypassSandbox,
+  cursorExecMode,
+  agySkipMode,
+  pickedModel,
+  pickedEffort,
+  smartRoutingEligible,
+  costControlMode,
+}: {
+  harness: string | null;
+  supportsPermissionMode: boolean;
+  supportsApprovalMode: boolean;
+  supportsCursorMode: boolean;
+  supportsAgySkipPermissions: boolean;
+  supportsModelPicker: boolean;
+  supportsEffortPicker: boolean;
+  permissionMode: string;
+  approvalMode: string;
+  bypassSandbox: boolean;
+  cursorExecMode: string;
+  agySkipMode: string;
+  pickedModel: string;
+  pickedEffort: string;
+  smartRoutingEligible: boolean;
+  costControlMode: CostControlMode;
+}): HarnessOptions | null {
+  if (harness === null) return null;
 
-// Antigravity (agy) permission control. agy exposes exactly ONE pre-emptive
-// knob — `--dangerously-skip-permissions`, an all-or-nothing bypass — with no
-// per-tool equivalent of acceptEdits/plan, so this is a two-value toggle rather
-// than Claude's graded selector. "default" sends no flags and leaves agy's own
-// request-review prompt in place. Keep in sync with `agy --help`.
-const AGY_NATIVE_DEFAULT_SKIP_MODE = "default";
-const AGY_NATIVE_SKIP_VALUE = "skip";
-const AGY_NATIVE_SKIP_MODES: {
-  value: string;
-  label: string;
-  description: string;
-  args: string[];
-}[] = [
-  {
-    value: AGY_NATIVE_DEFAULT_SKIP_MODE,
-    label: "Ask every time",
-    description: "Prompts before each tool runs",
-    args: [],
-  },
-  {
-    value: AGY_NATIVE_SKIP_VALUE,
-    label: "Skip permissions",
-    description: "Runs everything; no prompts or safety checks",
-    args: ["--dangerously-skip-permissions"],
-  },
-];
+  const options: HarnessOptions = {};
+  if (supportsModelPicker) options.model = pickedModel;
+  if (supportsEffortPicker && !supportsPermissionMode) options.effort = pickedEffort;
+  if (supportsPermissionMode) {
+    options.mode = permissionMode;
+    options.effort = pickedEffort;
+  } else if (supportsApprovalMode) {
+    options.mode = bypassSandbox ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE : approvalMode;
+  } else if (supportsCursorMode) {
+    options.mode = cursorExecMode;
+  } else if (supportsAgySkipPermissions) {
+    options.mode = agySkipMode;
+  }
 
-// The Auto Harness's Permissions vocabulary: Default only. No cross-harness
-// permission mapping exists, so the row stays locked and the create call sends
-// no override — each CLI keeps the machine's own configuration.
-const AUTO_PERMISSION_MODE = {
-  value: CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
-  label: "Default",
-  description: "The picked harness keeps its own configured permissions",
-} as const;
-const AUTO_PERMISSION_MODE_OPTIONS = [AUTO_PERMISSION_MODE] as const;
-
-// Cursor execution modes. "default" sends no flags; other values map to CLI
-// args passed via terminal_launch_args. Keep in sync with `cursor-agent --help`.
-const CURSOR_NATIVE_DEFAULT_EXEC_MODE = "default";
-const CURSOR_NATIVE_EXEC_MODES: {
-  value: string;
-  label: string;
-  description: string;
-  args: string[];
-}[] = [
-  {
-    value: "default",
-    label: "Default",
-    description: "Normal agent mode; prompts before running commands",
-    args: [],
-  },
-  {
-    value: "auto-review",
-    label: "Auto-review",
-    description: "Smart Auto: auto-runs safe tool calls and prompts for the rest",
-    args: ["--auto-review"],
-  },
-  {
-    value: "plan",
-    label: "Plan",
-    description: "Read-only planning; analyzes and proposes plans, no edits",
-    args: ["--mode", "plan"],
-  },
-  {
-    value: "ask",
-    label: "Ask",
-    description: "Q&A style; explains and answers questions (read-only)",
-    args: ["--mode", "ask"],
-  },
-  {
-    value: "yolo",
-    label: "Yolo",
-    description: "Runs everything without prompts or safety checks",
-    args: ["--yolo"],
-  },
-];
-
-// Codex approval presets matching the `/permissions` TUI popup.
-// Each preset bundles a sandbox profile + approval policy, mirroring
-// codex-rs/utils/approval-presets/src/lib.rs. "default" is the auto
-// preset (workspace-write + on-request) and sends no flags so the
-// runner uses Codex's built-in default.
-// Keep in sync with `codex --help` and
-// https://developers.openai.com/codex/agent-approvals-security
-const CODEX_NATIVE_DEFAULT_APPROVAL_MODE = "default";
-const CODEX_NATIVE_APPROVAL_MODES: {
-  value: string;
-  label: string;
-  description: string;
-  args: string[];
-}[] = [
-  {
-    value: "default",
-    label: "Default",
-    description: "Read/edit/run in workspace; approval for external edits or network",
-    args: [],
-  },
-  {
-    value: "full-access",
-    label: "Full access",
-    description: "Edit any file and access the internet without approval",
-    args: ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
-  },
-  {
-    value: "read-only",
-    label: "Read only",
-    description: "Read files only; approval required for edits, commands, or network",
-    args: ["--sandbox", "read-only", "--ask-for-approval", "on-request"],
-  },
-];
-
-// Conversation-label key for the DANGEROUS codex full-bypass opt-in. When
-// set to "1" the runner launches Codex with
-// `--dangerously-bypass-approvals-and-sandbox` (no approval prompts, no
-// command sandbox) — see omnigent.stores.conversation_store
-// CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY. Stored as a label (cheap thread
-// metadata) so it survives reload. Mutually exclusive in spirit with the
-// approval-mode presets above: when bypass is on the runner strips any
-// `--sandbox` / `--ask-for-approval` flags those presets would emit.
-const CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox";
-// Bypass is the most-permissive Codex approval stance — presented as a 4th
-// option in the Codex approval dropdown (Codex only; OpenCode shares the
-// presets above but has no bypass). It rides as a conversation label, not
-// terminal_launch_args, so its `args` are empty and it's handled specially.
-const CODEX_NATIVE_BYPASS_APPROVAL_VALUE = "bypass";
-const CODEX_NATIVE_BYPASS_APPROVAL_OPTION = {
-  value: CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
-  label: "Bypass approvals & sandbox",
-  description: "Runs Codex with no approval prompts and no command sandbox",
-  args: [] as string[],
-};
-
-function displayModelId(option: Pick<NativeModelOption, "id">): string {
-  return option.id;
-}
-
-function displayModelName(option: Pick<NativeModelOption, "id" | "displayName">): string {
-  return option.displayName ?? option.id;
-}
-
-function defaultModelLabel(
-  options: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[],
-  display: (option: Pick<NativeModelOption, "id" | "displayName">) => string,
-): string {
-  const dflt = options.find((option) => option.isDefault);
-  return dflt ? `Default (${display(dflt)})` : "Default";
+  if (smartRoutingEligible) {
+    options.routing = costControlMode === "on" ? "on" : "off";
+  }
+  return Object.keys(options).length > 0 ? options : null;
 }
 
 /** Use a local-friendly label only when the desktop shell proves the host id is this machine. */
@@ -466,11 +388,12 @@ export function ConnectHostInstructions({
   // "loading" before the boot probe resolves → treat as OSS (no Databricks
   // hints) until known, so the clean UI shows first and lakebox never flashes.
   const databricksFeatures = info !== "loading" && info.databricks_features;
+  const quotedServerUrl = quoteShellArgument(serverUrl);
   return (
     <div className="flex flex-col gap-4 rounded-lg border border-dashed border-border p-4">
       {label && <p className="text-sm text-muted-foreground">{label}</p>}
       {databricksFeatures ? (
-        <Tabs defaultValue="local">
+        <Tabs defaultValue="local" componentId="new_chat.host_tabs">
           <TabsList className="w-full">
             <TabsTrigger value="local" className="text-sm">
               Local machine
@@ -481,7 +404,7 @@ export function ConnectHostInstructions({
           </TabsList>
           <TabsContent value="local">
             <CliCommandBlock
-              command={`omni host --server ${serverUrl}`}
+              command={`omni host --server ${quotedServerUrl}`}
               testIdPrefix="connect-host"
             />
           </TabsContent>
@@ -491,13 +414,16 @@ export function ConnectHostInstructions({
               testIdPrefix="connect-lakebox-create"
             />
             <CliCommandBlock
-              command={`omni sandbox connect --provider lakebox --sandbox-id <id> --server ${serverUrl}`}
+              command={`omni sandbox connect --provider lakebox --sandbox-id <id> --server ${quotedServerUrl}`}
               testIdPrefix="connect-lakebox-connect"
             />
           </TabsContent>
         </Tabs>
       ) : (
-        <CliCommandBlock command={`omni host --server ${serverUrl}`} testIdPrefix="connect-host" />
+        <CliCommandBlock
+          command={`omni host --server ${quotedServerUrl}`}
+          testIdPrefix="connect-host"
+        />
       )}
     </div>
   );
@@ -727,6 +653,7 @@ function HarnessSetupNotice({
   featureEnabled: boolean;
   onSetup: () => void;
 }) {
+  const { trackClick } = useOmnigentAnalytics();
   return (
     <p
       // pl-2 lines the icon up with the chips tray directly above (which has
@@ -746,7 +673,10 @@ function HarnessSetupNotice({
             type="button"
             data-testid="new-chat-landing-harness-setup"
             className="inline-flex h-5 shrink-0 items-center rounded-md border border-amber-300 px-2 text-sm font-medium text-amber-700 hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400 dark:border-amber-500/40 dark:text-amber-400 dark:hover:bg-amber-500/20"
-            onClick={onSetup}
+            onClick={() => {
+              trackClick("new_chat.setup", "button");
+              onSetup();
+            }}
           >
             Set up {agentName}
           </button>
@@ -1004,7 +934,7 @@ export function AgentHarnessPicker({
   const queryClient = useQueryClient();
   const info = useServerInfo();
   // Feature ON → single "needs setup" badge; OFF → per-reason original text.
-  const collapsedBadge = info !== "loading" && info.harness_install_enabled;
+  const collapsedBadge = isFeatureEnabled(info, "harness_install");
   const triggerRef = useRef<HTMLButtonElement>(null);
 
   // Touch devices can't hover, so the desktop submenu flyouts ("More",
@@ -1357,9 +1287,93 @@ export function AgentHarnessPicker({
   );
 }
 
+function SearchableModelPicker({
+  value,
+  options,
+  loading,
+  onValueChange,
+}: {
+  value: string;
+  options: readonly { id: string; displayName: string }[];
+  loading: boolean;
+  onValueChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const selectedLabel =
+    value === MODEL_SELECT_DEFAULT
+      ? "Default"
+      : (options.find((option) => option.id === value)?.displayName ?? value);
+  const select = (nextValue: string) => {
+    onValueChange(nextValue);
+    setOpen(false);
+  };
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <Button
+          type="button"
+          variant="outline"
+          role="combobox"
+          aria-expanded={open}
+          aria-label="Model"
+          className="h-8 w-full justify-between gap-2 px-2.5 font-normal"
+          data-testid="new-chat-landing-config-model"
+        >
+          <span className="min-w-0 truncate">{selectedLabel}</span>
+          <ChevronDownIcon className="size-4 shrink-0 text-muted-foreground" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent
+        align="start"
+        className="max-h-[var(--radix-popover-content-available-height)] w-[var(--radix-popover-trigger-width)] overflow-hidden p-0"
+      >
+        <Command className="h-auto min-h-0">
+          <CommandInput
+            placeholder="Search models…"
+            data-testid="new-chat-landing-config-model-search"
+          />
+          <CommandList
+            className="max-h-72 min-h-0 overflow-y-auto overscroll-contain"
+            onWheel={(event) => event.stopPropagation()}
+          >
+            <CommandItem
+              value={MODEL_SELECT_DEFAULT}
+              data-checked={value === MODEL_SELECT_DEFAULT}
+              onSelect={() => select(MODEL_SELECT_DEFAULT)}
+            >
+              Default
+            </CommandItem>
+            {options.map((option) => (
+              <CommandItem
+                key={option.id}
+                value={option.id}
+                keywords={[option.displayName]}
+                title={option.displayName}
+                data-model-id={option.id}
+                data-checked={value === option.id}
+                onSelect={() => select(option.id)}
+              >
+                <span className="min-w-0 truncate">{option.displayName}</span>
+              </CommandItem>
+            ))}
+            {!loading && <CommandEmpty>No models found</CommandEmpty>}
+            {loading && (
+              <div className="px-2 py-3 text-center text-xs text-muted-foreground">
+                Loading models…
+              </div>
+            )}
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
 /**
  * Harness-configuration modal opened from the composer's gear icon. Shows the
  * selected agent's run-config knobs — Claude: model / effort / permissions;
+ * Pi: model;
  * Codex/OpenCode: approval mode (+ Codex's dangerous full-bypass opt-in);
  * Cursor: exec mode; bundle agents: brain-harness override. On the fully-auto
  * harness the router owns harness and model, so every harness-specific knob
@@ -1387,8 +1401,12 @@ function HarnessConfigModal({
   pickedModel,
   claudeModelOptions,
   claudeModelsLoading,
+  claudeModelsError,
   codexModelOptions,
   codexModelsLoading,
+  codexModelsError,
+  piModelOptions,
+  piModelsLoading,
   pickedEffort,
   pickedHarness,
   costControlMode,
@@ -1417,8 +1435,12 @@ function HarnessConfigModal({
   pickedModel: string;
   claudeModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
   claudeModelsLoading: boolean;
+  claudeModelsError: string | null;
   codexModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
   codexModelsLoading: boolean;
+  codexModelsError: string | null;
+  piModelOptions: readonly { id: string; displayName: string }[];
+  piModelsLoading: boolean;
   pickedEffort: string;
   pickedHarness: string | null;
   costControlMode: CostControlMode;
@@ -1434,15 +1456,14 @@ function HarnessConfigModal({
 }) {
   const info = useServerInfo();
   // Feature ON → single "needs setup" badge; OFF → per-reason original text.
-  const collapsedBadge = info !== "loading" && info.harness_install_enabled;
+  const collapsedBadge = isFeatureEnabled(info, "harness_install");
   const entryHarness = nativeCodingAgentForAvailableAgent(agent)?.harness ?? null;
   const hasPermission = nativeAgentHasCapability(agent, "permissionMode");
   const hasApproval = nativeAgentHasCapability(agent, "approvalMode");
   const hasCursor = nativeAgentHasCapability(agent, "cursorMode");
   const hasAgySkip = nativeAgentHasCapability(agent, "skipPermissions");
+  const hasModelPicker = nativeAgentHasCapability(agent, "modelPicker");
   const isCodex = entryHarness === "codex-native";
-  const modelOptions = isCodex ? codexModelOptions : claudeModelOptions;
-  const modelsLoading = isCodex ? codexModelsLoading : claudeModelsLoading;
   const brainDefault =
     agent.harness != null && agent.harness in brainHarnessLabels ? agent.harness : null;
 
@@ -1492,11 +1513,11 @@ function HarnessConfigModal({
   const configTitleName = autoNative ? SMART_ROUTING_LABEL : agent.display_name;
   const modelValue = smartRoutingOn ? MODEL_SELECT_SMART : draftModel || MODEL_SELECT_DEFAULT;
   const claudeModelSelectOptions = useMemo(
-    () => claudeModelOptions.map((m) => ({ id: m.id, label: displayModelName(m) })),
+    () => claudeModelOptions.map((m) => ({ id: m.id, label: nativeModelLabel(m) })),
     [claudeModelOptions],
   );
   const codexModelSelectOptions = useMemo(
-    () => codexModelOptions.map((m) => ({ id: m.id, label: displayModelId(m) })),
+    () => codexModelOptions.map((m) => ({ id: m.id, label: nativeModelLabel(m) })),
     [codexModelOptions],
   );
   const onModelChange = (value: string) => {
@@ -1534,21 +1555,28 @@ function HarnessConfigModal({
       setPickedModel(draftModel);
       setPickedEffort(draftEffort);
       setPermissionMode(draftPermission);
-      if (entryHarness)
+      if (entryHarness) {
         writeHarnessOption(entryHarness, {
           model: draftModel,
           effort: draftEffort,
           mode: draftPermission,
         });
+      }
+    } else if (hasModelPicker) {
+      setPickedModel(draftModel);
+      setPickedEffort(draftEffort);
+      if (entryHarness)
+        writeHarnessOption(entryHarness, { model: draftModel, effort: draftEffort });
     } else if (hasApproval) {
       if (isCodex) setPickedModel(draftModel);
       setApprovalMode(draftApproval);
       setBypassSandbox(draftBypass);
-      if (entryHarness)
+      if (entryHarness) {
         writeHarnessOption(entryHarness, {
-          mode: draftApproval,
+          mode: isCodex && draftBypass ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE : draftApproval,
           ...(isCodex ? { model: draftModel } : {}),
         });
+      }
     } else if (hasCursor) {
       setCursorExecMode(draftCursor);
       if (entryHarness) writeHarnessOption(entryHarness, { mode: draftCursor });
@@ -1574,11 +1602,12 @@ function HarnessConfigModal({
         setPickedModel("");
         setPickedEffort("");
       }
-      if (entryHarness)
+      if (entryHarness) {
         writeHarnessOption(entryHarness, {
           routing: draftRouting === "on" ? "on" : "off",
           ...(draftRouting === "on" ? { model: "", effort: "" } : {}),
         });
+      }
     }
     onOpenChange(false);
   };
@@ -1594,7 +1623,10 @@ function HarnessConfigModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md" data-testid="new-chat-landing-config-modal">
+      <DialogContent
+        className={cn("sm:max-w-md", entryHarness === "pi-native" && "sm:max-w-xl")}
+        data-testid="new-chat-landing-config-modal"
+      >
         <DialogHeader>
           <DialogTitle>Configure {configTitleName}</DialogTitle>
           <DialogDescription className="sr-only">
@@ -1603,6 +1635,45 @@ function HarnessConfigModal({
         </DialogHeader>
 
         <div className="flex flex-col gap-5 py-1">
+          {!autoRouting && hasModelPicker && !hasPermission && (
+            <>
+              <ConfigRow label="Model" description="Underlying LLM" controlClassName="sm:w-80">
+                <SearchableModelPicker
+                  value={modelValue}
+                  options={piModelOptions}
+                  loading={piModelsLoading}
+                  onValueChange={onModelChange}
+                />
+              </ConfigRow>
+              <ConfigRow label="Thinking level" description="Reasoning depth vs. speed">
+                <Select
+                  value={draftEffort || EFFORT_SELECT_NONE}
+                  onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? "" : v)}
+                >
+                  <SelectTrigger
+                    className="w-full cursor-pointer"
+                    data-testid="new-chat-landing-config-pi-effort"
+                    aria-label="Thinking level"
+                  >
+                    <SelectValue placeholder={EFFORT_UNAVAILABLE_PLACEHOLDER} />
+                  </SelectTrigger>
+                  <SelectContent
+                    position="popper"
+                    align="start"
+                    className="w-(--radix-select-trigger-width) [&_[data-slot=select-item]]:pl-2.5"
+                  >
+                    <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
+                    {PI_NATIVE_EFFORTS.map((e) => (
+                      <SelectItem key={e.value} value={e.value}>
+                        {e.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </ConfigRow>
+            </>
+          )}
+
           {!autoRouting && hasPermission && (
             <>
               <ConfigRow label="Model" description="Underlying LLM">
@@ -1612,14 +1683,16 @@ function HarnessConfigModal({
                   offerSmartRouting={smartRoutingEligible}
                   testId="new-chat-landing-config-model"
                   models={claudeModelSelectOptions}
+                  defaultLabel={defaultModelLabel(claudeModelOptions)}
                   contentClassName="[&_[data-slot=select-item]]:pl-2.5"
+                  componentId="new_chat.config.model"
                 >
                   {claudeModelsLoading && (
                     <div className="px-2.5 py-1 text-sm text-muted-foreground">Loading models…</div>
                   )}
                   {!claudeModelsLoading && claudeModelOptions.length === 0 && (
                     <div className="px-2.5 py-1 text-sm text-muted-foreground">
-                      Models unavailable
+                      {claudeModelsError ?? "Models unavailable"}
                     </div>
                   )}
                 </RoutingModelSelect>
@@ -1664,6 +1737,7 @@ function HarnessConfigModal({
                   options={CLAUDE_NATIVE_PERMISSION_MODES}
                   testId="new-chat-landing-config-permission"
                   ariaLabel="Permissions"
+                  componentId="new_chat.config.permission"
                 />
               </ConfigRow>
             </>
@@ -1682,15 +1756,16 @@ function HarnessConfigModal({
                   offerSmartRouting={smartRoutingEligible}
                   testId="new-chat-landing-config-model"
                   models={codexModelSelectOptions}
-                  defaultLabel={defaultModelLabel(codexModelOptions, displayModelId)}
+                  defaultLabel={defaultModelLabel(codexModelOptions)}
                   contentClassName="[&_[data-slot=select-item]]:pl-2.5"
+                  componentId="new_chat.config.model"
                 >
-                  {modelsLoading && (
+                  {codexModelsLoading && (
                     <div className="px-2.5 py-1 text-sm text-muted-foreground">Loading models…</div>
                   )}
-                  {!modelsLoading && modelOptions.length === 0 && (
+                  {!codexModelsLoading && codexModelOptions.length === 0 && (
                     <div className="px-2.5 py-1 text-sm text-muted-foreground">
-                      Models unavailable
+                      {codexModelsError ?? "Models unavailable"}
                     </div>
                   )}
                 </RoutingModelSelect>
@@ -1717,6 +1792,7 @@ function HarnessConfigModal({
                   }
                   testId="new-chat-landing-config-approval"
                   ariaLabel="Approval"
+                  componentId="new_chat.config.approval"
                 />
               </ConfigRow>
             </>
@@ -1730,6 +1806,7 @@ function HarnessConfigModal({
                 options={CURSOR_NATIVE_EXEC_MODES}
                 testId="new-chat-landing-config-cursor-mode"
                 ariaLabel="Mode"
+                componentId="new_chat.config.cursor_mode"
               />
             </ConfigRow>
           )}
@@ -1743,6 +1820,7 @@ function HarnessConfigModal({
                   options={AGY_NATIVE_SKIP_MODES}
                   testId="new-chat-landing-config-agy-skip"
                   ariaLabel="Permissions"
+                  componentId="new_chat.config.permission"
                 />
               </ConfigRow>
               {/* Persistent danger banner while the bypass is selected. agy has
@@ -1769,7 +1847,12 @@ function HarnessConfigModal({
           read it back or switch away without cancelling. */}
           {!hasPermission && !hasApproval && !hasCursor && !hasAgySkip && brainDefault && (
             <ConfigRow label="Agent Harness" description="Underlying coding harness">
-              <Select value={draftHarness ?? brainDefault} onValueChange={setDraftHarness}>
+              <Select
+                value={draftHarness ?? brainDefault}
+                onValueChange={setDraftHarness}
+                componentId="new_chat.config.harness"
+                valueHasNoPii
+              >
                 <SelectTrigger
                   className="w-full cursor-pointer"
                   data-testid="new-chat-landing-config-harness"
@@ -1845,7 +1928,13 @@ function HarnessConfigModal({
           >
             Cancel
           </Button>
-          <Button type="button" onClick={save} data-testid="new-chat-landing-config-save" size="lg">
+          <Button
+            type="button"
+            onClick={save}
+            data-testid="new-chat-landing-config-save"
+            size="lg"
+            componentId="new_chat.save_config"
+          >
             Save
           </Button>
         </DialogFooter>
@@ -1859,15 +1948,22 @@ function HarnessConfigModal({
 // when the user navigates into an existing session and back. Module-scoped,
 // not persisted to storage (a page refresh starts clean); cleared on create.
 interface LandingDraft {
+  // `?project=` context the draft was composed under ("" = plain visit).
+  // A draft restored under a DIFFERENT project only brings back its text and
+  // attachments — the agent/host/workspace slots are discarded so the new
+  // project's stored defaults win (the prefill writes are fill-empty-only).
+  project: string;
   message: string;
   files: File[];
   pickedAgentId: string | null;
   selectedHostId: string | null;
   sandboxSelected: boolean;
+  sandboxProvider: string | null;
   sandboxRepoUrl: string;
   sandboxRepoBranch: string;
   workspace: string;
   branchName: string;
+  autoSeededBranch: string;
   prefilledBranch: string;
   permissionMode: string;
   approvalMode: string;
@@ -1889,32 +1985,133 @@ export function resetLandingDraft(): void {
   landingDraft = null;
 }
 
+// Sessions the empty-landing one-click import pulls (most recent, across all
+// harnesses). Named in the button so the count is explicit before clicking.
+const LANDING_QUICK_IMPORT_LIMIT = 25;
+
 export function NewChatLandingScreen() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
+  const isMobileViewport = useIsMobileViewport();
+  const isCoarsePointer = useIsCoarsePointer();
+  // Single send-telemetry point (see handleCreate). Emitting there rather than
+  // via the Start button's componentId covers Enter-key sends too, which never
+  // submit the form and would otherwise bypass the Button entirely.
+  const { trackClick } = useOmnigentAnalytics();
+  // No session here, so there is nothing to switch between: assert the iOS
+  // shell's native Chat/Terminal bar is hidden. ChatPage's own bar is driven by
+  // the session surface and hides itself on unmount, but that is the only thing
+  // holding the native state down — and the bar was showing over this screen,
+  // so state the truth for this route instead of trusting a teardown that runs
+  // elsewhere. Idempotent, and re-asserted on every mount of this screen.
+  useEffect(() => {
+    if (!isIOSShell()) return;
+    setNativeViewMode({
+      mode: "chat",
+      terminalEnabled: false,
+      terminalStartingUp: false,
+      visible: false,
+    });
+  }, []);
+  const heading = useHeading();
+  const poweredBy = usePoweredBy();
   const serverUrl = getCliServerUrl();
-  const { data: agents } = useAvailableAgents();
+
+  // Project driving this visit, when the sidebar's per-project "new session"
+  // pencil landed here with a `?project=` query param. Empty otherwise.
+  const projectParam = searchParams.get("project") ?? "";
+  // Project prefill source: a project-driven visit seeds the composer from the
+  // project's stored defaults (host / working directory / agent / worktree).
+  // `?project=` carries the project NAME, so resolve it to the first-class id
+  // the config endpoint needs; a label-only folder (id null) or plain visit
+  // has no config to read. Resolved before the agent catalog below so the
+  // configured agent can be pinned into discovery.
+  const { data: projectList, isLoading: projectListLoading } = useProjects();
+  const configProjectId = useMemo(
+    () =>
+      projectParam !== ""
+        ? ((projectList ?? []).find((p) => p.name === projectParam)?.id ?? null)
+        : null,
+    [projectList, projectParam],
+  );
+  const { data: storedProjectConfig, isLoading: projectConfigLoading } =
+    useProjectConfig(configProjectId);
+  // Normalize into the machine's shape. `undefined` = still loading (the machine
+  // waits so a generic default can't win the race); `{}` = nothing to wait for
+  // (plain visit / label-only folder / genuinely empty config), so it settles
+  // immediately and the generic defaults take over.
+  const prefillConfig = useMemo<ProjectPrefillConfig | undefined>(() => {
+    // A project-scoped visit must resolve name → id via the projects list
+    // before we know whether there's a config to read — until it loads, the id
+    // is falsely null, so wait rather than settle prematurely.
+    if (projectParam !== "" && projectListLoading) return undefined;
+    if (configProjectId !== null && projectConfigLoading) return undefined;
+    const c = storedProjectConfig;
+    if (!c) return {};
+    return {
+      hostId: c.host_id,
+      workspace: c.workspace,
+      agentId: c.agent_id,
+      useWorktree: c.use_worktree,
+    };
+  }, [
+    projectParam,
+    projectListLoading,
+    configProjectId,
+    projectConfigLoading,
+    storedProjectConfig,
+  ]);
+
+  // Pin the configured project agent into discovery so the recency-bounded
+  // session scan (or its same-name dedup) can't drop or id-swap it out of
+  // the picker — the config must seed the agent the project actually pinned.
+  const { data: agents } = useAvailableAgents({
+    pinnedAgentIds: prefillConfig?.agentId != null ? [prefillConfig.agentId] : [],
+  });
   // refetchOnFocus: returning from a terminal `omni setup` must clear the
   // readiness badge even if the live push was missed while the tab was hidden.
   const { data: hosts, isLoading: hostsLoading } = useHosts({ refetchOnFocus: true });
 
-  const agentList = useMemo(
-    () =>
-      sortAgentsForDisplay((agents ?? []).filter((a) => !NEW_SESSION_HIDDEN_AGENTS.has(a.name))),
-    [agents],
-  );
+  // Offer an import affordance on the empty landing: a brand-new user with no
+  // Omnigent sessions can pull in their existing local CLI history. Same query
+  // key ChatPage already holds, so this reuses the cache. Wait for data before
+  // deciding so the button doesn't flash for returning users.
+  const { data: conversationsData } = useConversations("", true);
+  const hasNoSessions =
+    conversationsData !== undefined &&
+    conversationsData.pages.every((page) => page.data.length === 0);
+  // One-click quick import for the empty landing: pull the recent sessions
+  // across every harness on the caller's online machine.
+  const [quickImporting, setQuickImporting] = useState(false);
+  const [quickImportError, setQuickImportError] = useState<string | null>(null);
+  const [quickImportedCount, setQuickImportedCount] = useState<number | null>(null);
+  // The server persists each session as its frame arrives, so refresh the
+  // sidebar list every 5s while importing — sessions show up as they land.
+  useEffect(() => {
+    if (!quickImporting) return;
+    const id = setInterval(() => {
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+    }, 5000);
+    return () => clearInterval(id);
+  }, [quickImporting, queryClient]);
 
-  // Split the picker into "Harnesses" (the native terminal CLIs) and
-  // "Agents" (SDK / bundle agents like Polly & Debby plus any custom
-  // user-registered agents). This is the isNativeCodingAgent split, NOT the
-  // builtins/customs split: Polly & Debby are built-ins but belong under
-  // "Agents", not "Harnesses".
+  const agentList = useMemo(() => selectableSessionAgents(agents ?? []), [agents]);
+
+  // Split the picker into "Harnesses" (harness-backed picks — the native
+  // terminal CLIs plus generic-ACP harness agents like Grok / Devin / Kilocode)
+  // and "Agents" (composed SDK / bundle agents like Polly & Debby plus custom
+  // user-registered agents). Harness-backed vs composed, NOT the builtins/customs
+  // split: Polly & Debby are built-ins but are composed agents, so they stay
+  // under "Agents". ACP agents aren't native, so they fold into "More".
   const harnessEntries = useMemo(
-    () => agentList.filter((a) => isNativeCodingAgent(a)),
+    () => agentList.filter((a) => isNativeCodingAgent(a) || isAcpHarnessAgent(a)),
     [agentList],
   );
-  const agentEntries = useMemo(() => agentList.filter((a) => !isNativeCodingAgent(a)), [agentList]);
+  const agentEntries = useMemo(
+    () => agentList.filter((a) => !isNativeCodingAgent(a) && !isAcpHarnessAgent(a)),
+    [agentList],
+  );
 
   // "Create custom agent" dialog state and pending bundle. When the user
   // creates a custom agent via the dialog, the bundle input is stored
@@ -1932,7 +2129,36 @@ export function NewChatLandingScreen() {
   const [landingSurface, setLandingSurface] = useState<HTMLElement | null>(null);
   useNativeServerSwitcherForMainSurface(landingSurface, true);
 
-  const [message, setMessage] = useState<string>(() => landingDraft?.message ?? "");
+  // Draft restore is project-scoped: the user's text and attachments always
+  // come back, but agent/host/workspace slots parked under another project's
+  // visit (or a plain one) must not beat THIS visit's project defaults —
+  // strip them so the prefill machine (fill-empty-only) can seed. Read once
+  // per mount; only the lazy state initializers below consume it.
+  const restoredDraft: LandingDraft | null =
+    landingDraft === null || landingDraft.project === projectParam
+      ? landingDraft
+      : {
+          ...landingDraft,
+          pickedAgentId: null,
+          pickedHarness: null,
+          selectedHostId: null,
+          sandboxSelected: false,
+          sandboxProvider: null,
+          // The repo inputs compose the managed create's workspace string, so
+          // they are location state too — keeping them would clone another
+          // project's repository into this project's sandbox.
+          sandboxRepoUrl: "",
+          sandboxRepoBranch: "",
+          workspace: "",
+          branchName: "",
+          // The branch may be the worktree-default's auto-seed, generated for
+          // the other visit's workspace — drop the marker with it so the
+          // seed/retract machinery starts clean for this visit.
+          autoSeededBranch: "",
+          prefilledBranch: "",
+        };
+
+  const [message, setMessage] = useState<string>(() => restoredDraft?.message ?? "");
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -1947,7 +2173,7 @@ export function NewChatLandingScreen() {
   // Attachments for the first message — same affordances as the in-session
   // composer (paperclip + paste); carried to ChatPage via the pending
   // initial prompt and sent with the auto-dispatched first turn.
-  const [files, setFiles] = useState<File[]>(() => landingDraft?.files ?? []);
+  const [files, setFiles] = useState<File[]>(() => restoredDraft?.files ?? []);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   // Reject unsupported types (only images, PDF, and text/code) and oversized
@@ -2012,7 +2238,7 @@ export function NewChatLandingScreen() {
   // Gates the whole UI-driven setup experience (Set up affordance + dialog +
   // collapsed badge). OFF → the composer/picker fall back to the original
   // "run omni setup" guidance, so a disabled flag is a no-op on the UI.
-  const harnessInstallEnabled = info !== "loading" && info.harness_install_enabled;
+  const harnessInstallEnabled = isFeatureEnabled(info, "harness_install");
   // Unfiltered brain-harness labels: safe for membership checks and for
   // labelling an existing pick, but the OPTIONS offered in the gear modal use
   // the gated `brainHarnessLabels` below, which drops the fully-auto row when
@@ -2022,6 +2248,22 @@ export function NewChatLandingScreen() {
   // falling back to the generic "New Sandbox" when the server names no
   // provider.
   const sandboxLabel = sandboxOptionLabel(info !== "loading" ? info.sandbox_provider : null);
+  // One picker row per configured provider; a single-provider server
+  // yields exactly one.
+  const sandboxProviderRows = useMemo(
+    () => (info !== "loading" ? sandboxProviderOptions(info) : []),
+    [info],
+  );
+  // The provider a sandbox pick defaults to: the sticky last pick when the
+  // server still offers it, else the first offered row. Mirrors the sticky
+  // host choice — the composer reopens on the provider used last. Null until
+  // the rows load (info still resolving) so callers hold off seeding.
+  const defaultSandboxProvider = useCallback((): string | null => {
+    if (sandboxProviderRows.length === 0) return null;
+    const stored = readLastSandboxProvider();
+    if (stored !== null && sandboxProviderRows.includes(stored)) return stored;
+    return sandboxProviderRows[0];
+  }, [sandboxProviderRows]);
   // Embed-only docs seam: when the host passes additional docs and managed
   // sandboxes are unavailable, keep the sandbox row visible but disabled and
   // attach a help tooltip with a clickable link.
@@ -2032,19 +2274,16 @@ export function NewChatLandingScreen() {
   const databricksGitCredentialsTooltipContent = docsLinks?.databricksGitCredentials;
   const showDisabledSandboxWithDocs = !managedSandboxesEnabled && !!newSandboxTooltipContent;
 
-  // Project driving this visit, when the sidebar's per-project "new session"
-  // pencil landed here with a `?project=` query param. Empty otherwise.
-  const projectParam = searchParams.get("project") ?? "";
   // Seeded from the persisted last pick so a returning user starts on the
   // agent they used last; validated against the live list in
   // effectiveAgentId below (a stale id falls back to the default). A
   // project-driven visit defers to the project-prefill effect instead
   // (which falls back to the same last pick).
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(
-    () => landingDraft?.pickedAgentId ?? (projectParam !== "" ? null : readLastAgentId()),
+    () => restoredDraft?.pickedAgentId ?? (projectParam !== "" ? null : readLastAgentId()),
   );
   const [selectedHostId, setSelectedHostId] = useState<string | null>(
-    () => landingDraft?.selectedHostId ?? null,
+    () => restoredDraft?.selectedHostId ?? null,
   );
   // Sessions on the selected host — fetched only when a host is selected,
   // to avoid registering hundreds of sessions into the health poll at idle.
@@ -2053,16 +2292,27 @@ export function NewChatLandingScreen() {
   // host — the server provisions a sandbox host at create time
   // (host_type: "managed"), so no host_id or workspace is sent.
   const [sandboxSelected, setSandboxSelected] = useState(
-    () => landingDraft?.sandboxSelected ?? false,
+    () => restoredDraft?.sandboxSelected ?? false,
   );
-  const { data: hostClaudeModelOptions, isLoading: hostClaudeModelsLoading } = useHostModelOptions(
-    selectedHostId,
-    "claude-native",
-    !sandboxSelected,
+  // Provider the sandbox pick launches on. Seeded to the sticky last pick (or
+  // the first offered row) once the picker rows load; null both before that
+  // seed and for a single-provider server that names no provider.
+  const [sandboxProvider, setSandboxProvider] = useState<string | null>(
+    () => restoredDraft?.sandboxProvider ?? null,
   );
-  const { data: hostCodexModelOptions, isLoading: hostCodexModelsLoading } = useHostModelOptions(
+  const {
+    data: hostClaudeModelOptions,
+    isLoading: hostClaudeModelsLoading,
+    error: hostClaudeModelsError,
+  } = useHostModelOptions(selectedHostId, "claude-native", !sandboxSelected);
+  const {
+    data: hostCodexModelOptions,
+    isLoading: hostCodexModelsLoading,
+    error: hostCodexModelsError,
+  } = useHostModelOptions(selectedHostId, "codex-native", !sandboxSelected);
+  const { data: hostPiModelOptions, isLoading: hostPiModelsLoading } = useHostModelOptions(
     selectedHostId,
-    "codex-native",
+    "pi-native",
     !sandboxSelected,
   );
   const claudeModelOptions = useMemo(
@@ -2075,6 +2325,9 @@ export function NewChatLandingScreen() {
         : (hostClaudeModelOptions ?? []).map((option) => ({
             id: option.id,
             displayName: option.displayName ?? option.id,
+            // Keep the catalog's default marker: the Default row names the
+            // model a bare launch truly runs, for claude exactly as codex.
+            isDefault: option.isDefault,
           })),
     [hostClaudeModelOptions, sandboxSelected],
   );
@@ -2082,10 +2335,25 @@ export function NewChatLandingScreen() {
     () => (sandboxSelected ? [] : (hostCodexModelOptions ?? [])),
     [hostCodexModelOptions, sandboxSelected],
   );
+  const piModelOptions = useMemo(
+    () =>
+      sandboxSelected
+        ? []
+        : (hostPiModelOptions ?? []).map((option) => ({
+            id: option.id,
+            displayName: option.displayName ?? option.id,
+          })),
+    [hostPiModelOptions, sandboxSelected],
+  );
   // Desktop-shell host status for THIS machine (null outside Electron), so the
   // picker can tag the current machine and offer to auto-connect it.
   const [desktopHost, setDesktopHost] = useState<HostIdentity | null>(null);
   const [connectingThisMachine, setConnectingThisMachine] = useState(false);
+  // Error surfaced when "Run on this machine" fails (sign-in needed, enrollment
+  // declined, server unreachable). Rendered in the composer body with a retry,
+  // so the failure isn't silently swallowed and the user isn't stranded on the
+  // "No hosts" state.
+  const [connectError, setConnectError] = useState<string | null>(null);
   // Defer the connect until the dropdown has actually closed (set on select,
   // consumed in the menu's onOpenChange) — connecting while the menu is open
   // looks janky. A ref so the close handler sees it synchronously.
@@ -2094,13 +2362,19 @@ export function NewChatLandingScreen() {
   // `workspace` string (`<url>[#<branch>]`); both blank = empty
   // server-created workspace.
   const [sandboxRepoUrl, setSandboxRepoUrl] = useState<string>(
-    () => landingDraft?.sandboxRepoUrl ?? "",
+    () => restoredDraft?.sandboxRepoUrl ?? "",
   );
   const [sandboxRepoBranch, setSandboxRepoBranch] = useState<string>(
-    () => landingDraft?.sandboxRepoBranch ?? "",
+    () => restoredDraft?.sandboxRepoBranch ?? "",
   );
-  const [workspace, setWorkspace] = useState<string>(() => landingDraft?.workspace ?? "");
-  const [branchName, setBranchName] = useState<string>(() => landingDraft?.branchName ?? "");
+  const [workspace, setWorkspace] = useState<string>(() => restoredDraft?.workspace ?? "");
+  const [branchName, setBranchName] = useState<string>(() => restoredDraft?.branchName ?? "");
+  // Branch the worktree-default effect auto-seeded (empty = none), so it can
+  // retract its own seed when the default turns off. In the preserved draft so
+  // it survives the composer unmounting (e.g. a trip to Settings) and remounting.
+  const [autoSeededBranch, setAutoSeededBranch] = useState<string>(
+    () => restoredDraft?.autoSeededBranch ?? "",
+  );
   // The base branch auto-fills from the configured default (Settings › Git)
   // when the user names a worktree branch, and is left alone once the user
   // touches it — clearing the branch name re-arms the auto-fill (see the effect
@@ -2117,7 +2391,7 @@ export function NewChatLandingScreen() {
   // that worktree (no git opts). Editing the field away from it means the user
   // wants a *new* worktree off that name.
   const [prefilledBranch, setPrefilledBranch] = useState<string>(
-    () => landingDraft?.prefilledBranch ?? "",
+    () => restoredDraft?.prefilledBranch ?? "",
   );
   // Project to file the new session under. Empty = unfiled. Stamped as the
   // `omni_project` label at create (so the row is filed from its first sidebar
@@ -2135,13 +2409,13 @@ export function NewChatLandingScreen() {
   // meaningful for the claude-native wrapper; ignored otherwise. Lives in
   // the footer tray's Advanced settings menu.
   const [permissionMode, setPermissionMode] = useState<string>(
-    () => landingDraft?.permissionMode ?? CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
+    () => restoredDraft?.permissionMode ?? CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
   );
   // Approval mode for Codex (codex --approval-mode). Only meaningful for
   // the codex-native wrapper; ignored otherwise. Lives in the footer
   // tray's Advanced settings menu.
   const [approvalMode, setApprovalMode] = useState<string>(
-    () => landingDraft?.approvalMode ?? CODEX_NATIVE_DEFAULT_APPROVAL_MODE,
+    () => restoredDraft?.approvalMode ?? CODEX_NATIVE_DEFAULT_APPROVAL_MODE,
   );
   // DANGEROUS codex full-bypass opt-in (Codex only). OFF by default and only
   // flippable on after the user types the confirmation phrase, so it can
@@ -2149,38 +2423,38 @@ export function NewChatLandingScreen() {
   // label so it survives reload. When on, a persistent red banner warns and
   // the runner ignores the approval-mode preset's flags.
   const [bypassSandbox, setBypassSandbox] = useState<boolean>(
-    () => landingDraft?.bypassSandbox ?? false,
+    () => restoredDraft?.bypassSandbox ?? false,
   );
   // Execution mode for Cursor (cursor-agent --mode / --yolo). Only meaningful
   // for the cursor-native wrapper; ignored otherwise.
   const [cursorExecMode, setCursorExecMode] = useState<string>(
-    () => landingDraft?.cursorExecMode ?? CURSOR_NATIVE_DEFAULT_EXEC_MODE,
+    () => restoredDraft?.cursorExecMode ?? CURSOR_NATIVE_DEFAULT_EXEC_MODE,
   );
   // agy's all-or-nothing `--dangerously-skip-permissions` toggle. Only
   // meaningful for the antigravity-native wrapper; ignored otherwise.
   const [agySkipMode, setAgySkipMode] = useState<string>(
-    () => landingDraft?.agySkipMode ?? AGY_NATIVE_DEFAULT_SKIP_MODE,
+    () => restoredDraft?.agySkipMode ?? AGY_NATIVE_DEFAULT_SKIP_MODE,
   );
   // Per-session brain-harness override for bundle agents (polly / debby).
   // null = the agent spec's declared harness (no override sent). On agent
   // switch, seeded from the user's last stored pick for that agent.
   const [pickedHarness, setPickedHarness] = useState<string | null>(
     () =>
-      landingDraft?.pickedHarness ??
-      readLastHarness(landingDraft?.pickedAgentId ?? readLastAgentId()),
+      restoredDraft?.pickedHarness ??
+      readLastHarness(restoredDraft?.pickedAgentId ?? readLastAgentId()),
   );
   // Per-session model + reasoning effort for the claude-native model picker.
   // "" = unselected: nothing is checked and `model_override` / `reasoning_effort`
   // are omitted from the create, so Claude Code uses its own configured model.
   // An explicit pick rides along and is remembered (seeded back on a later visit
   // via the harness-seed effect below).
-  const [pickedModel, _setPickedModel] = useState<string>(() => landingDraft?.pickedModel ?? "");
-  const [pickedEffort, setPickedEffort] = useState<string>(() => landingDraft?.pickedEffort ?? "");
+  const [pickedModel, _setPickedModel] = useState<string>(() => restoredDraft?.pickedModel ?? "");
+  const [pickedEffort, setPickedEffort] = useState<string>(() => restoredDraft?.pickedEffort ?? "");
   // Per-session cost-control switch ("Cost Optimized" pill). Unset
   // (null) defers to the agent spec's default and is omitted from
   // the create body.
   const [costControlMode, _setCostControlMode] = useState<CostControlMode>(
-    () => landingDraft?.costControlMode ?? null,
+    () => restoredDraft?.costControlMode ?? null,
   );
   // Model selection and smart routing are mutually exclusive: enabling
   // routing clears the explicit model pick, and picking a model turns
@@ -2222,15 +2496,18 @@ export function NewChatLandingScreen() {
   const onScreenRef = useRef(true);
   const draftRef = useRef<LandingDraft>(null as unknown as LandingDraft);
   draftRef.current = {
+    project: projectParam,
     message,
     files,
     pickedAgentId,
     selectedHostId,
     sandboxSelected,
+    sandboxProvider,
     sandboxRepoUrl,
     sandboxRepoBranch,
     workspace,
     branchName,
+    autoSeededBranch,
     prefilledBranch,
     permissionMode,
     approvalMode,
@@ -2292,46 +2569,6 @@ export function NewChatLandingScreen() {
     };
   }, []);
 
-  // Project prefill: a project-driven visit seeds the composer from the
-  // project's stored defaults (host / working directory / agent / worktree).
-  // `?project=` carries the project NAME, so resolve it to the first-class id
-  // the config endpoint needs; a label-only folder (id null) or plain visit
-  // has no config to read.
-  const { data: projectList, isLoading: projectListLoading } = useProjects();
-  const configProjectId = useMemo(
-    () =>
-      projectParam !== ""
-        ? ((projectList ?? []).find((p) => p.name === projectParam)?.id ?? null)
-        : null,
-    [projectList, projectParam],
-  );
-  const { data: storedProjectConfig, isLoading: projectConfigLoading } =
-    useProjectConfig(configProjectId);
-  // Normalize into the machine's shape. `undefined` = still loading (the machine
-  // waits so a generic default can't win the race); `{}` = nothing to wait for
-  // (plain visit / label-only folder / genuinely empty config), so it settles
-  // immediately and the generic defaults take over.
-  const prefillConfig = useMemo<ProjectPrefillConfig | undefined>(() => {
-    // A project-scoped visit must resolve name → id via the projects list
-    // before we know whether there's a config to read — until it loads, the id
-    // is falsely null, so wait rather than settle prematurely.
-    if (projectParam !== "" && projectListLoading) return undefined;
-    if (configProjectId !== null && projectConfigLoading) return undefined;
-    const c = storedProjectConfig;
-    if (!c) return {};
-    return {
-      hostId: c.host_id,
-      workspace: c.workspace,
-      agentId: c.agent_id,
-      useWorktree: c.use_worktree,
-    };
-  }, [
-    projectParam,
-    projectListLoading,
-    configProjectId,
-    projectConfigLoading,
-    storedProjectConfig,
-  ]);
   // State machine driving the project prefill: a location seed (host +
   // workspace from config) plus an independent agent seed. The generic
   // host/workspace defaults below hold off until it settles so they can't win
@@ -2379,6 +2616,12 @@ export function NewChatLandingScreen() {
     setPickedAgentId(projectParam !== "" ? null : readLastAgentId());
     setWorkspace("");
     setBranchName("");
+    setAutoSeededBranch("");
+    // Drafted sandbox repo fields are location state too — left in place they
+    // would clone the previous project's repo into this project's sandbox.
+    setSandboxRepoUrl("");
+    setSandboxRepoBranch("");
+    setPrefilledBranch("");
     seededHostRef.current = null;
     worktreeSeededForRef.current = null;
     seededConfigSigRef.current = prefillConfigSig;
@@ -2419,6 +2662,7 @@ export function NewChatLandingScreen() {
       if (info === "loading") return;
       if (managedSandboxesEnabled) {
         setSandboxSelected(true);
+        setSandboxProvider(defaultSandboxProvider());
         return;
       }
       // Sandbox no longer offered (e.g. an OSS server) — fall through.
@@ -2433,11 +2677,14 @@ export function NewChatLandingScreen() {
         setSelectedHostId(stored.host_id);
         return;
       }
-      // Stored host is gone or offline — fall through to the default.
+      // A transient host-list gap must not replace the saved VM with the local
+      // or sandbox default. Leave the slot empty until it returns or the user picks again.
+      return;
     }
 
     if (managedSandboxesEnabled) {
       setSandboxSelected(true);
+      setSandboxProvider(defaultSandboxProvider());
       return;
     }
     const firstOnline = (hosts ?? []).find((h) => h.status === "online");
@@ -2450,6 +2697,7 @@ export function NewChatLandingScreen() {
     managedSandboxesEnabled,
     info,
     prefillSettled,
+    defaultSandboxProvider,
   ]);
 
   // Fall back to the host's home directory when it has no recorded recents, so
@@ -2477,7 +2725,9 @@ export function NewChatLandingScreen() {
   // dir/branch readable (worktree-1a2b3c4d).
   const generateBranchName = useCallback(() => {
     const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
-    setBranchName(`worktree-${suffix}`);
+    const name = `worktree-${suffix}`;
+    setBranchName(name);
+    return name;
   }, []);
   // The project's stored default base branch (Project settings), trimmed. Wins
   // over the user-global default (Settings › Git); an unset project default
@@ -2568,6 +2818,9 @@ export function NewChatLandingScreen() {
       // name one here to fork fresh off the project default. Store the ref in
       // the raw representation that effect compares against (workspaceTrimmed).
       worktreeSeededForRef.current = candidate;
+      // Not tracked as a retractable auto-seed: this fork-fresh branch is driven
+      // by the project's base_branch (to fork off it), independent of the
+      // worktree default, so it must survive the default being toggled off.
       generateBranchName();
     }
   }, [
@@ -2589,11 +2842,24 @@ export function NewChatLandingScreen() {
   // bundled agent. So a pending pick made before switching to a sandbox is
   // dropped there, falling back to a real agent; off the sandbox it's kept.
   const pendingAgentAllowedOnTarget = !sandboxSelected;
+  // The project's configured agent could not be resolved: the catalog, the
+  // session scan, AND the pinned direct lookup all came up empty (deleted
+  // agent, or one the caller can't read). Never substitute another agent for
+  // it — the composer surfaces this state ("Agent unavailable" chip, blocked
+  // submit) until the user explicitly picks an agent instead.
+  const configuredAgentUnavailable =
+    projectParam !== "" &&
+    prefillConfig?.agentId != null &&
+    agents !== undefined &&
+    !agentList.some((a) => a.id === prefillConfig.agentId);
   const effectiveAgentId =
     pickedAgentId === PENDING_AGENT_ID && pendingAgentAllowedOnTarget
       ? PENDING_AGENT_ID
-      : ((agentList.some((a) => a.id === pickedAgentId) ? pickedAgentId : agentList[0]?.id) ??
-        null);
+      : agentList.some((a) => a.id === pickedAgentId)
+        ? pickedAgentId
+        : configuredAgentUnavailable
+          ? null
+          : (agentList[0]?.id ?? null);
   const selectedAgent = useMemo(
     () =>
       effectiveAgentId === PENDING_AGENT_ID && pendingAgent
@@ -2608,16 +2874,41 @@ export function NewChatLandingScreen() {
         : agentList.find((a) => a.id === effectiveAgentId),
     [agentList, effectiveAgentId, pendingAgent],
   );
+  const selectedNativeHarness = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness ?? null;
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
   const supportsAgySkipPermissions = nativeAgentHasCapability(selectedAgent, "skipPermissions");
+  const supportsModelPicker = nativeAgentHasCapability(selectedAgent, "modelPicker");
   const hideUnconfiguredHarnesses = useMemo(() => readHideUnconfiguredHarnesses(), []);
   // The selected native harness, used to persist/seed its option knobs (mode /
   // model / effort), which are harness-specific. null for non-native agents,
   // which have no knobs to remember.
-  const selectedNativeHarness = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness ?? null;
   const selectedHost = allHosts.find((h) => h.host_id === selectedHostId);
+
+  // Empty-landing one-click: import the last LANDING_QUICK_IMPORT_LIMIT sessions
+  // across all harnesses from the caller's online machine (prefer the selected
+  // one). With no online
+  // host there's nothing to read from, so send them to the Settings import
+  // section for the granular picker + its "start a host" guidance.
+  const handleQuickImport = async (): Promise<void> => {
+    const host = selectedHost?.status === "online" ? selectedHost : onlineHosts[0];
+    if (host === undefined) {
+      navigate("/settings/import");
+      return;
+    }
+    setQuickImporting(true);
+    setQuickImportError(null);
+    try {
+      const result = await importLocalSessions(host.host_id, "all", LANDING_QUICK_IMPORT_LIMIT);
+      setQuickImportedCount(result.imported);
+      await queryClient.invalidateQueries({ queryKey: ["conversations"] });
+    } catch (e) {
+      setQuickImportError(e instanceof Error ? e.message : "Import failed. Try again.");
+    } finally {
+      setQuickImporting(false);
+    }
+  };
   // Warn-only readiness signal for the agent picker: only meaningful when
   // a connected host is selected (a sandbox provisions its own tooling).
   // Selection stays allowed — the host re-checks at launch and the create
@@ -2654,6 +2945,7 @@ export function NewChatLandingScreen() {
     supportsApprovalMode ||
     supportsCursorMode ||
     supportsAgySkipPermissions ||
+    supportsModelPicker ||
     smartRoutingEligible ||
     (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll);
   // Label/value pairs summarizing the selected agent's current run-config, for
@@ -2680,10 +2972,16 @@ export function NewChatLandingScreen() {
       // previously selected native harness.
       return [{ label: "Permissions", value: AUTO_PERMISSION_MODE.label }];
     }
+    if (supportsModelPicker && !supportsPermissionMode) {
+      const modelValue =
+        piModelOptions.find((model) => model.id === pickedModel)?.displayName ?? "Default";
+      return [{ label: "Model", value: modelValue }];
+    }
     if (supportsPermissionMode) {
       const modelValue = routingOn
         ? SMART_ROUTING_LABEL
-        : (claudeModelOptions.find((m) => m.id === pickedModel)?.displayName ?? "Default");
+        : (claudeModelOptions.find((m) => m.id === pickedModel)?.displayName ??
+          defaultModelLabel(claudeModelOptions));
       // Routing picks the model + effort per turn, so mirror the modal's frozen
       // Effort row: an em-dash when routing is on, else the picked level.
       const effortValue = routingOn
@@ -2716,15 +3014,16 @@ export function NewChatLandingScreen() {
           ? CODEX_NATIVE_BYPASS_APPROVAL_OPTION.label
           : (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.label ??
             approvalMode);
+      const pickedCodexRow = codexModelOptions.find((m) => m.id === pickedModel);
       const modelRows =
         routingOn || !isCodex
           ? routingRow
           : [
               {
                 label: "Model",
-                value:
-                  codexModelOptions.find((m) => m.id === pickedModel)?.id ??
-                  defaultModelLabel(codexModelOptions, displayModelId),
+                value: pickedCodexRow
+                  ? nativeModelLabel(pickedCodexRow)
+                  : defaultModelLabel(codexModelOptions),
               },
             ];
       return [...modelRows, { label: "Approval", value: approvalValue }];
@@ -2753,12 +3052,14 @@ export function NewChatLandingScreen() {
     supportsApprovalMode,
     supportsCursorMode,
     supportsAgySkipPermissions,
+    supportsModelPicker,
     selectedAgent,
     brainHarnessLabelsAll,
     routingOn,
     pickedModel,
     claudeModelOptions,
     codexModelOptions,
+    piModelOptions,
     pickedEffort,
     permissionMode,
     approvalMode,
@@ -2778,10 +3079,13 @@ export function NewChatLandingScreen() {
   // first id, or a persisted/draft pick resolving on mount), which would wipe a
   // costControlMode/bypass restored from the landing draft.
   const prevAgentIdRef = useRef<string | null | undefined>(undefined);
+  const suppressBypassSeedRef = useRef(false);
   useEffect(() => {
     const prev = prevAgentIdRef.current;
     prevAgentIdRef.current = effectiveAgentId;
-    if (prev === undefined || prev === effectiveAgentId) return;
+    suppressBypassSeedRef.current =
+      prev !== undefined && prev !== null && prev !== effectiveAgentId;
+    if (!suppressBypassSeedRef.current) return;
     setBypassSandbox(false);
     setCostControlMode(null);
   }, [effectiveAgentId, setCostControlMode]);
@@ -2808,6 +3112,18 @@ export function NewChatLandingScreen() {
     // this holds on every run of this effect — including the re-run when the
     // model catalog resolves, which lands after the routing seed below.
     const storedRoutingOn = stored.routing === "on";
+    if (selectedNativeHarness === "pi-native") {
+      setPickedModel(
+        stored.model != null && piModelOptions.some((model) => model.id === stored.model)
+          ? stored.model
+          : "",
+      );
+      setPickedEffort(
+        stored.effort != null && PI_NATIVE_EFFORTS.some((e) => e.value === stored.effort)
+          ? stored.effort
+          : "",
+      );
+    }
     if (supportsPermissionMode) {
       setPermissionMode(
         resolve(CLAUDE_NATIVE_PERMISSION_MODES, CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE),
@@ -2831,6 +3147,11 @@ export function NewChatLandingScreen() {
           : "",
       );
     } else if (supportsApprovalMode) {
+      setBypassSandbox(
+        !suppressBypassSeedRef.current &&
+          selectedNativeHarness === "codex-native" &&
+          stored.mode === CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
+      );
       setApprovalMode(resolve(CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_DEFAULT_APPROVAL_MODE));
       // A remembered routing "on" outranks a remembered concrete model, and
       // also drops any model/effort left in the shared state (e.g. seeded for
@@ -2852,7 +3173,7 @@ export function NewChatLandingScreen() {
     // Reseed on harness changes and when the selected host's catalog resolves;
     // capability flags are derived from the same harness and stay omitted.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedNativeHarness, claudeModelOptions, codexModelOptions]);
+  }, [selectedNativeHarness, claudeModelOptions, codexModelOptions, piModelOptions]);
   // Smart Routing is remembered per harness alongside the mode/model
   // knobs, in its own effect because eligibility depends on the server flag
   // (which resolves after mount — this must reseed when it lands). A stored
@@ -3132,7 +3453,10 @@ export function NewChatLandingScreen() {
     });
     if (step === null) return;
     const { writes } = step;
-    if (writes.selectSandbox) setSandboxSelected(true);
+    if (writes.selectSandbox) {
+      setSandboxSelected(true);
+      setSandboxProvider(defaultSandboxProvider());
+    }
     if (writes.hostId !== undefined) setSelectedHostId((cur) => cur ?? writes.hostId!);
     if (writes.agentId !== undefined) {
       setPickedAgentId((cur) => cur ?? writes.agentId!);
@@ -3153,18 +3477,15 @@ export function NewChatLandingScreen() {
     selectedHostId,
     pickedAgentId,
     prefillConfig,
+    defaultSandboxProvider,
   ]);
 
-  // Opt-in worktree from the project's stored config. The inference machine
-  // settles a config-driven location without touching the branch, so this
-  // effect creates the fresh worktree once the workspace is fully in place —
-  // whether it came from the config's own workspace or the composer's
-  // home-fallback (which runs after the machine settles). Fires at most once
-  // per settled workspace (ref-guarded) and only into an empty branch, so a
-  // typed branch / existing-worktree prefill is never clobbered.
+  // Seed a fresh worktree branch once the workspace settles, from the effective
+  // default (project `use_worktree` wins, else the user-global setting).
+  // Ref-guarded to fire once per workspace and only into an empty branch.
   useEffect(() => {
-    if (prefillConfig?.useWorktree !== true) return;
     if (prefill.project !== projectParam || !prefillDone(prefill)) return;
+    if ((prefillConfig?.useWorktree ?? readAlwaysUseWorktree()) !== true) return;
     if (sandboxSelected || selectedHostId === null || workspaceTrimmed === "") return;
     if (branchName !== "" || prefilledBranch !== "") return;
     if (worktreeSeededForRef.current === workspaceTrimmed) return;
@@ -3172,7 +3493,7 @@ export function NewChatLandingScreen() {
     // anti-flicker placeholder from a previous path).
     if (hostWorktreesArePlaceholder || hostWorktrees === undefined) return;
     worktreeSeededForRef.current = workspaceTrimmed;
-    if (hostWorktrees.some((w) => w.is_main)) generateBranchName();
+    if (hostWorktrees.some((w) => w.is_main)) setAutoSeededBranch(generateBranchName());
   }, [
     prefillConfig,
     prefill,
@@ -3186,6 +3507,18 @@ export function NewChatLandingScreen() {
     hostWorktreesArePlaceholder,
     generateBranchName,
   ]);
+
+  // Retract our own auto-seeded branch when the effective default is now off
+  // (the seed effect only fills, never clears) — e.g. after flipping the global
+  // default off in Settings. Only clears while the field still holds OUR seed.
+  useEffect(() => {
+    if (autoSeededBranch === "" || branchName !== autoSeededBranch) return;
+    if ((prefillConfig?.useWorktree ?? readAlwaysUseWorktree()) === true) return;
+    setBranchName("");
+    setAutoSeededBranch("");
+    // Re-arm the seed guard so flipping the default back on can seed again.
+    worktreeSeededForRef.current = null;
+  }, [prefillConfig, branchName, autoSeededBranch]);
 
   // Sandbox repo inputs are valid when blank (empty workspace), or when
   // the URL passes the shape check; a branch without a URL is dangling.
@@ -3350,21 +3683,26 @@ export function NewChatLandingScreen() {
       ? "Please enter a valid repository URL"
       : !sandboxSelected && (!selectedHostId || !workspaceValid)
         ? "Please choose a host and working directory"
-        : message.trim().length === 0
-          ? "Enter a message to get started"
-          : null;
+        : configuredAgentUnavailable && selectedAgent == null
+          ? "This project's configured agent is unavailable — pick an agent to continue"
+          : message.trim().length === 0
+            ? "Enter a message to get started"
+            : null;
 
   // Chip display labels.
   const workspaceLabel = workspaceTrimmed
     ? (workspaceTrimmed.split("/").filter(Boolean).pop() ?? workspaceTrimmed)
     : "Working directory";
+  // Names the picked provider, else the server's default label.
+  const selectedSandboxLabel =
+    sandboxProvider !== null ? sandboxOptionLabel(sandboxProvider) : sandboxLabel;
   const selectedHostDisplayName = selectedHost
     ? displayNameForHost(selectedHost, thisMachineHostId, navigator.userAgent)
     : null;
   const hostLabel = connectingThisMachine
     ? "Connecting…"
     : sandboxSelected
-      ? sandboxLabel
+      ? selectedSandboxLabel
       : (selectedHostDisplayName ?? (onlineHosts.length === 0 ? "No hosts" : "Choose host"));
   // The chip shows just the branch (the "(existing)" distinction lives in the
   // popover's warning; appending it here only gets clipped by the chip's cap).
@@ -3388,7 +3726,9 @@ export function NewChatLandingScreen() {
     ? SMART_ROUTING_LABEL
     : selectedAgent
       ? selectedAgent.display_name
-      : "Select agent";
+      : configuredAgentUnavailable
+        ? "Agent unavailable"
+        : "Select agent";
 
   // Wrap the harness setter so every explicit pick is persisted to
   // localStorage. The caller can pass an explicit `agentId` for the
@@ -3473,11 +3813,15 @@ export function NewChatLandingScreen() {
     seededHostRef.current = null;
   }
 
-  function selectSandbox() {
+  function selectSandbox(provider: string | null = null) {
     // Persist the explicit sandbox pick (as the reserved sentinel) even when
     // it's already selected, mirroring selectHost — so the sandbox becomes the
-    // sticky default for the next visit.
+    // sticky default for the next visit, on the provider just picked.
     writeLastHostChoice(SANDBOX_HOST_CHOICE);
+    writeLastSandboxProvider(provider);
+    // Recorded even when already selected, so re-picking a different
+    // provider still switches which one launches.
+    setSandboxProvider(provider);
     if (sandboxSelected) return;
     // Mirror selectHost: a managed session's host and workspace are both
     // server-chosen, so clear any prior host pick and its workspace.
@@ -3494,9 +3838,24 @@ export function NewChatLandingScreen() {
   async function connectThisMachine() {
     if (connectingThisMachine) return;
     setConnectingThisMachine(true);
+    setConnectError(null);
     try {
+      // A single controlHost("start") blocks through the whole enrollment →
+      // sign-in (browser OAuth) → connect sequence, so on success the machine is
+      // already authed and connected — no separate retry needed. On failure we
+      // MUST surface it: this used to `return` silently, dropping the user back
+      // on "No hosts" with no clue why. An auth failure gets sign-in-flavored
+      // copy; the rendered error carries a "Try again" affordance.
       const res = await controlHost("start");
-      if (!res.ok) return;
+      if (!res.ok) {
+        setConnectError(
+          res.authError
+            ? (res.error ??
+                "Sign-in didn't complete. A browser should have opened — finish signing in, then try again.")
+            : (res.error ?? "Couldn't run on this machine."),
+        );
+        return;
+      }
       const identity = await getHostIdentity();
       setDesktopHost(identity);
       await queryClient.invalidateQueries({ queryKey: ["hosts"] });
@@ -3519,6 +3878,10 @@ export function NewChatLandingScreen() {
     // and form-submit paths that call this directly can't create a session with
     // a blank message, host, agent, or workspace.
     if (!canSubmit) return;
+    // A create is actually happening: report it for pointer clicks (via the
+    // form submit) and Enter-key sends alike. After the guard so guarded no-ops
+    // don't emit, matching the disabled Start button.
+    trackClick("new_chat.start_session", "button");
     setCreating(true);
     setCreateError(null);
     // The draft is spent from the moment it is submitted: it belongs to the
@@ -3541,6 +3904,7 @@ export function NewChatLandingScreen() {
       const agentSupportsApprovalMode = nativeAgentHasCapability(agent, "approvalMode");
       const agentSupportsCursorMode = nativeAgentHasCapability(agent, "cursorMode");
       const agentSupportsAgySkip = nativeAgentHasCapability(agent, "skipPermissions");
+      const agentSupportsModelPicker = nativeAgentHasCapability(agent, "modelPicker");
       // Smart Routing — server-side. The fully-auto harness always routes
       // (harness + model), so send "on" to keep the persisted state consistent
       // with the lit routing icon. Otherwise only send it when routing is
@@ -3619,6 +3983,10 @@ export function NewChatLandingScreen() {
           bundle,
           metadata as Parameters<typeof createBundledSession>[1],
         );
+        // Register create_session for the custom-agent (bundled) path too —
+        // otherwise both sandbox and computer bundled creates emit nothing. Split
+        // by the picked host; interactionTelemetry completes/settles the span.
+        markSessionCreated(data.id, sandboxSelected ? "sandbox" : "computer");
         // Launch the runner on the selected host. The multipart create
         // only stores DB rows — launchRunner binds + starts the runner.
         if (!sandboxSelected && selectedHostId && workspaceTrimmed) {
@@ -3671,6 +4039,8 @@ export function NewChatLandingScreen() {
               ? {
                   host_type: "managed",
                   workspace: composeSandboxWorkspace(sandboxRepoUrl, sandboxRepoBranch),
+                  // Omitted when null so a default create is unchanged.
+                  ...(sandboxProvider !== null ? { sandbox_provider: sandboxProvider } : {}),
                 }
               : {
                   host_id: selectedHostId,
@@ -3706,20 +4076,20 @@ export function NewChatLandingScreen() {
                       ? (AGY_NATIVE_SKIP_MODES.find((m) => m.value === agySkipMode)?.args ?? [])
                       : undefined,
             // Model + reasoning effort, persisted on the session row before
-            // the runner launches. Claude and Codex read model_override at
+            // the runner launches. Claude, Codex, and Pi read model_override at
             // terminal launch; an unselected ("") knob is omitted so the
             // harness keeps its own configured/default model.
             model_override:
               !smartRoutingHarnessSelected &&
               !routingOwnsModel &&
-              (agentSupportsPermissionMode || nativeAgent?.harness === "codex-native") &&
+              (agentSupportsModelPicker || nativeAgent?.harness === "codex-native") &&
               pickedModel
                 ? pickedModel
                 : undefined,
             reasoning_effort:
               !smartRoutingHarnessSelected &&
               !routingOwnsModel &&
-              agentSupportsPermissionMode &&
+              (agentSupportsPermissionMode || selectedNativeHarness === "pi-native") &&
               pickedEffort
                 ? pickedEffort
                 : undefined,
@@ -3772,6 +4142,37 @@ export function NewChatLandingScreen() {
           return;
         }
         data = { id: created.id };
+        // Register create_session (created → first AI activity), split by host.
+        // New Chat is the only create path that can produce a managed sandbox;
+        // interactionTelemetry completes/settles the span once the session runs.
+        markSessionCreated(created.id, sandboxSelected ? "sandbox" : "computer");
+      }
+      // Persist the configuration that actually launched. Modal Save updates
+      // storage eagerly so an immediate Send cannot observe stale state; this
+      // successful-create snapshot also covers restored drafts and every
+      // harness-specific creation path.
+      if (!smartRoutingHarnessSelected) {
+        const launchedOptions = createdHarnessOptions({
+          harness: selectedNativeHarness,
+          supportsPermissionMode: agentSupportsPermissionMode,
+          supportsApprovalMode: agentSupportsApprovalMode,
+          supportsCursorMode: agentSupportsCursorMode,
+          supportsAgySkipPermissions: agentSupportsAgySkip,
+          supportsModelPicker: agentSupportsModelPicker || nativeAgent?.harness === "codex-native",
+          supportsEffortPicker: selectedNativeHarness === "pi-native",
+          permissionMode,
+          approvalMode,
+          bypassSandbox,
+          cursorExecMode,
+          agySkipMode,
+          pickedModel,
+          pickedEffort,
+          smartRoutingEligible: effectiveAgentId !== PENDING_AGENT_ID && smartRoutingEligible,
+          costControlMode,
+        });
+        if (launchedOptions !== null) {
+          writeHarnessOption(selectedNativeHarness, launchedOptions);
+        }
       }
       // Promote the born-filed session to first-class project membership. The
       // create above already stamped the `omni_project` label (so the row
@@ -3869,7 +4270,7 @@ export function NewChatLandingScreen() {
     // the hero reads better optically.
     <div
       ref={setLandingSurface}
-      className="flex flex-1 items-center justify-center"
+      className="relative flex flex-1 items-center justify-center"
       data-testid="new-chat-landing"
     >
       {/* Padding lives inside the 840px cap, so the composer renders at
@@ -3879,21 +4280,31 @@ export function NewChatLandingScreen() {
       <div className="flex w-full max-w-[840px] flex-col items-center gap-6 px-4 pt-8 pb-16 md:select-none md:px-10">
         <div className="flex w-full flex-col items-center justify-center gap-3.5">
           {selectedProject ? (
-            // Landing inside a project: swap Otto's eyes for the same folder
-            // icon the sidebar uses for a project, and name the project. Sized
-            // to Otto's h-16 box so the centered composer doesn't shift when
-            // toggling between the two landings.
-            <span className="flex h-16 shrink-0 items-center">
-              <div className="w-14 h-14 flex rounded-xl bg-tag-pink items-center justify-center">
-                <FolderIcon className="size-6 text-brand-accent" />
-              </div>
-            </span>
+            // Landing inside a project: swap Otto's eyes for the project's
+            // icon — the default pink folder, or a chosen emoji — and name the
+            // project. Sized to Otto's h-16 box so the centered composer doesn't
+            // shift when toggling between the two landings.
+            <ProjectLandingIcon
+              projectId={configProjectId}
+              projectName={selectedProject}
+              config={storedProjectConfig}
+              // Gate editing until the config resolves: the PATCH replaces the
+              // whole blob, so a write before the name→id and config have loaded
+              // would wipe the project's other defaults. A label-only folder
+              // (`configProjectId === null`) has no first-class config to lose.
+              configReady={
+                !projectListLoading &&
+                (configProjectId === null || storedProjectConfig !== undefined)
+              }
+            />
           ) : (
-            <OttoEyes className="h-14 w-auto shrink-0" />
+            <BrandLogo variant="eyes" className="h-14 w-auto shrink-0" />
           )}
-          <h1 className="min-w-0 break-words text-center text-[1.5em] md:text-[2.15em] font-normal tracking-[-0.05em] text-foreground line-clamp-2 sm:text-left">
-            {selectedProject || "What should we build?"}
-          </h1>
+          {selectedProject || heading ? (
+            <h1 className="min-w-0 break-words text-center text-[1.5em] md:text-[2.15em] font-normal tracking-[-0.05em] text-foreground line-clamp-2 sm:text-left">
+              {selectedProject || heading}
+            </h1>
+          ) : null}
         </div>
         <div className="relative flex w-full flex-col gap-1">
           <form
@@ -3940,132 +4351,143 @@ export function NewChatLandingScreen() {
                 onAttach={attachMention}
               />
             )}
-            <textarea
-              ref={textareaRef}
-              value={message}
-              onChange={(e) => {
-                setMessage(e.target.value);
-                // A rejected attachment is never added, so there's no chip to
-                // remove and nothing else would ever clear this. Left sticky it
-                // reads as a blocker on a composer the user can actually submit.
-                if (attachmentError !== null) setAttachmentError(null);
-                // Recompute the active "@"-mention from the caret each keystroke
-                // (native terminal agents with a workspace — ``mentionEnabled``).
-                setMention(
-                  mentionEnabled
-                    ? detectMentionAt(
-                        e.target.value,
-                        e.target.selectionStart ?? e.target.value.length,
-                      )
-                    : null,
-                );
-              }}
-              onFocus={() => {
-                // From here the textarea's caret is one the user placed, so
-                // dictation inserts there instead of at the end of the draft.
-                dictation.noteFocus();
-              }}
-              onBlur={() => {
-                // Dismiss the mention menu when focus leaves the textarea; menu
-                // rows preventDefault on mousedown so selecting one doesn't blur.
-                dismissMention();
-              }}
-              onCompositionStart={() => {
-                isComposingRef.current = true;
-              }}
-              onCompositionEnd={() => {
-                isComposingRef.current = false;
-              }}
-              onKeyDown={(e) => {
-                if (isImeCompositionKeyEvent(e, isComposingRef.current)) {
-                  return;
-                }
+            <div className="relative overflow-hidden">
+              <textarea
+                ref={textareaRef}
+                value={message}
+                onChange={(e) => {
+                  setMessage(e.target.value);
+                  // A rejected attachment is never added, so there's no chip to
+                  // remove and nothing else would ever clear this. Left sticky it
+                  // reads as a blocker on a composer the user can actually submit.
+                  if (attachmentError !== null) setAttachmentError(null);
+                  // Recompute the active "@"-mention from the caret each keystroke
+                  // (native terminal agents with a workspace — ``mentionEnabled``).
+                  setMention(
+                    mentionEnabled
+                      ? detectMentionAt(
+                          e.target.value,
+                          e.target.selectionStart ?? e.target.value.length,
+                        )
+                      : null,
+                  );
+                }}
+                onFocus={() => {
+                  // From here the textarea's caret is one the user placed, so
+                  // dictation inserts there instead of at the end of the draft.
+                  dictation.noteFocus();
+                }}
+                onBlur={() => {
+                  // Dismiss the mention menu when focus leaves the textarea; menu
+                  // rows preventDefault on mousedown so selecting one doesn't blur.
+                  dismissMention();
+                }}
+                onCompositionStart={() => {
+                  isComposingRef.current = true;
+                }}
+                onCompositionEnd={() => {
+                  isComposingRef.current = false;
+                }}
+                onKeyDown={(e) => {
+                  if (isImeCompositionKeyEvent(e, isComposingRef.current)) {
+                    return;
+                  }
 
-                // "@"-mention menu navigation (shared useMentionBrowser) —
-                // mutually exclusive with the slash menu (a token can't be both)
-                // and takes priority over submission.
-                if (handleMentionKeyDown(e)) return;
+                  // "@"-mention menu navigation (shared useMentionBrowser) —
+                  // mutually exclusive with the slash menu (a token can't be both)
+                  // and takes priority over submission.
+                  if (handleMentionKeyDown(e)) return;
 
-                // While the skills menu is open, ArrowUp/Down navigate it and
-                // Enter/Tab complete the highlighted item — these take
-                // priority over submission (same UX as the in-session
-                // composer).
-                if (slashMenuOpen && slashMenuMatches.length > 0) {
-                  if (e.key === "ArrowDown") {
-                    e.preventDefault();
-                    setSlashMenuIndex((i) => (i + 1) % slashMenuMatches.length);
-                    return;
+                  // While the skills menu is open, ArrowUp/Down navigate it and
+                  // Enter/Tab complete the highlighted item — these take
+                  // priority over submission (same UX as the in-session
+                  // composer).
+                  if (slashMenuOpen && slashMenuMatches.length > 0) {
+                    if (e.key === "ArrowDown") {
+                      e.preventDefault();
+                      setSlashMenuIndex((i) => (i + 1) % slashMenuMatches.length);
+                      return;
+                    }
+                    if (e.key === "ArrowUp") {
+                      e.preventDefault();
+                      setSlashMenuIndex((i) => (i <= 0 ? slashMenuMatches.length - 1 : i - 1));
+                      return;
+                    }
+                    if (
+                      (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) &&
+                      slashMenuIndex >= 0
+                    ) {
+                      e.preventDefault();
+                      applySlashSelection(slashMenuMatches[slashMenuIndex]!);
+                      return;
+                    }
+                    if (e.key === "Escape") {
+                      e.preventDefault();
+                      // Dismiss the menu by clearing the draft so the user can
+                      // start fresh.
+                      setMessage("");
+                      setSlashMenuIndex(-1);
+                      return;
+                    }
                   }
-                  if (e.key === "ArrowUp") {
+                  // Enter sends; Shift+Enter inserts a newline. On touch-primary
+                  // devices there is no practical Shift+Enter and an accidental
+                  // submit is unrecoverable, so Enter only inserts a newline and
+                  // sending stays an explicit tap on the send button.
+                  if (e.key === "Enter" && !e.shiftKey && !isCoarsePointer) {
                     e.preventDefault();
-                    setSlashMenuIndex((i) => (i <= 0 ? slashMenuMatches.length - 1 : i - 1));
-                    return;
+                    // The mention menu is briefly closed while its listing loads;
+                    // swallow Enter so the in-progress "@dir/" token isn't sent.
+                    if (mentionListingPending) return;
+                    void handleCreate();
                   }
-                  if (
-                    (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) &&
-                    slashMenuIndex >= 0
-                  ) {
+                }}
+                onPaste={(e) => {
+                  // Pasted images/files attach instead of inserting as text,
+                  // mirroring the in-session composer.
+                  const pasted = Array.from(e.clipboardData.items)
+                    .filter((item) => item.kind === "file")
+                    .map((item) => item.getAsFile())
+                    .filter((f): f is File => f !== null);
+                  if (pasted.length > 0) {
                     e.preventDefault();
-                    applySlashSelection(slashMenuMatches[slashMenuIndex]!);
-                    return;
+                    addFiles(pasted);
                   }
-                  if (e.key === "Escape") {
-                    e.preventDefault();
-                    // Dismiss the menu by clearing the draft so the user can
-                    // start fresh.
-                    setMessage("");
-                    setSlashMenuIndex(-1);
-                    return;
-                  }
-                }
-                // Enter sends; Shift+Enter inserts a newline.
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  // The mention menu is briefly closed while its listing loads;
-                  // swallow Enter so the in-progress "@dir/" token isn't sent.
-                  if (mentionListingPending) return;
-                  void handleCreate();
-                }
-              }}
-              onPaste={(e) => {
-                // Pasted images/files attach instead of inserting as text,
-                // mirroring the in-session composer.
-                const pasted = Array.from(e.clipboardData.items)
-                  .filter((item) => item.kind === "file")
-                  .map((item) => item.getAsFile())
-                  .filter((f): f is File => f !== null);
-                if (pasted.length > 0) {
-                  e.preventDefault();
-                  addFiles(pasted);
-                }
-              }}
-              // Suppress the native placeholder when the overlay supplies its
-              // own prompt text; aria-label preserves the accessible name.
-              placeholder={pillSkills.length > 0 ? "" : placeholderText}
-              aria-label={placeholderText}
-              rows={1}
-              autoFocus
-              data-testid="new-chat-landing-input"
-              // Compose-pill text spec: SF Pro Text system stack at
-              // 14px/20px. (Note: sub-16px inputs make mobile Safari
-              // auto-zoom on focus — accepted tradeoff per the design.)
-              // Heights are border-box (12px top + 8px bottom padding lives
-              // inside them): max 200px = the spec's 180px of content.
-              // A 60px floor holds two 20px lines plus that padding;
-              // useAutoGrowTextarea expands from there to the unchanged cap.
-              className="min-h-[60px] max-h-[200px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-3 pb-2 font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-ui leading-5 text-foreground outline-none placeholder:text-muted-foreground md:select-text"
-            />
-            {/* Gated on an empty draft so it reads as the placeholder.
-                pointer-events-none lets clicks fall through to focus the
-                textarea; the pills themselves opt back in. */}
-            {pillSkills.length > 0 && message.length === 0 && (
-              <div className="pointer-events-none absolute inset-x-4 top-3 flex flex-wrap items-center gap-2">
-                <span className="font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-ui leading-5 text-muted-foreground">
-                  Describe a task, or try a skill
-                </span>
-                <SkillPills skills={pillSkills} onPick={applySkillPill} />
-              </div>
-            )}
+                }}
+                // Suppress the native placeholder when the overlay supplies its
+                // own prompt text; aria-label preserves the accessible name.
+                placeholder={pillSkills.length > 0 ? "" : placeholderText}
+                aria-label={placeholderText}
+                rows={1}
+                // Desktop only. This screen mounts on every arrival at "/" —
+                // including ones the user didn't make to type, like Back out of
+                // Settings — and on a phone focusing the field throws up the
+                // keyboard (and auto-zooms, per the note below) over whatever
+                // is on screen, sometimes with the sidebar drawer still open on
+                // top of it. Phones expect to be tapped before they type.
+                autoFocus={!isMobileViewport}
+                data-testid="new-chat-landing-input"
+                // Compose-pill text spec: inherited UI font at 14px/20px.
+                // (Note: sub-16px inputs make mobile Safari
+                // auto-zoom on focus — accepted tradeoff per the design.)
+                // Heights are border-box (12px top + 8px bottom padding lives
+                // inside them): max 200px = the spec's 180px of content.
+                // A 60px floor holds two 20px lines plus that padding;
+                // useAutoGrowTextarea expands from there to the unchanged cap.
+                className="block min-h-[60px] max-h-[200px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-3 pb-2 text-ui leading-5 text-foreground outline-none [scrollbar-width:none] placeholder:text-muted-foreground md:select-text [&::-webkit-scrollbar]:hidden"
+              />
+              {/* Gated on an empty draft so it reads as the placeholder.
+                  pointer-events-none lets clicks fall through to focus the
+                  textarea; the pills themselves opt back in. */}
+              {pillSkills.length > 0 && message.length === 0 && (
+                <div className="pointer-events-none absolute inset-x-4 top-3 flex flex-wrap items-center gap-2">
+                  <span className="text-ui leading-5 text-muted-foreground">
+                    Describe a task, or try a skill
+                  </span>
+                  <SkillPills skills={pillSkills} onPick={applySkillPill} />
+                </div>
+              )}
+            </div>
             {/* Hidden file input for the attach button. */}
             <input
               ref={fileInputRef}
@@ -4166,6 +4588,7 @@ export function NewChatLandingScreen() {
                   onClick={() => fileInputRef.current?.click()}
                   title="Attach files"
                   data-testid="new-chat-landing-attach"
+                  componentId="new_chat.attach_files"
                 >
                   <PaperclipIcon className="size-4" data-icon-size="16" />
                   <span className="sr-only">Attach files</span>
@@ -4233,6 +4656,7 @@ export function NewChatLandingScreen() {
                               disabled={creating}
                               onClick={() => setConfigOpen(true)}
                               data-testid="new-chat-landing-config-gear"
+                              componentId="new_chat.open_config"
                             >
                               <SettingsIcon className="size-4" data-icon-size="16" />
                               <span className="sr-only">
@@ -4278,9 +4702,19 @@ export function NewChatLandingScreen() {
                     claudeModelsLoading={
                       !sandboxSelected && selectedHostId !== null && hostClaudeModelsLoading
                     }
+                    claudeModelsError={
+                      !sandboxSelected ? (hostClaudeModelsError?.message ?? null) : null
+                    }
                     codexModelOptions={codexModelOptions}
                     codexModelsLoading={
                       !sandboxSelected && selectedHostId !== null && hostCodexModelsLoading
+                    }
+                    codexModelsError={
+                      !sandboxSelected ? (hostCodexModelsError?.message ?? null) : null
+                    }
+                    piModelOptions={piModelOptions}
+                    piModelsLoading={
+                      !sandboxSelected && selectedHostId !== null && hostPiModelsLoading
                     }
                     pickedEffort={pickedEffort}
                     pickedHarness={pickedHarness}
@@ -4373,17 +4807,28 @@ export function NewChatLandingScreen() {
                   {(managedSandboxesEnabled || showDisabledSandboxWithDocs) && (
                     <>
                       {managedSandboxesEnabled ? (
-                        <DropdownMenuItem
-                          onSelect={selectSandbox}
-                          data-testid="new-chat-landing-sandbox-option"
-                          data-active={sandboxSelected ? "true" : undefined}
-                          className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
-                        >
-                          <span className="flex items-center gap-2">
-                            <MonitorCloudIcon className="size-4 text-muted-foreground" />
-                            <span className="text-sm">{sandboxLabel}</span>
-                          </span>
-                        </DropdownMenuItem>
+                        sandboxProviderRows.map((provider, index) => (
+                          <DropdownMenuItem
+                            key={provider ?? "default"}
+                            onSelect={() => selectSandbox(provider)}
+                            // First row keeps the original testid; later
+                            // rows get a scoped one.
+                            data-testid={
+                              index === 0
+                                ? "new-chat-landing-sandbox-option"
+                                : `new-chat-landing-sandbox-option-${provider}`
+                            }
+                            data-active={
+                              sandboxSelected && sandboxProvider === provider ? "true" : undefined
+                            }
+                            className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
+                          >
+                            <span className="flex items-center gap-2">
+                              <MonitorCloudIcon className="size-4 text-muted-foreground" />
+                              <span className="text-sm">{sandboxOptionLabel(provider)}</span>
+                            </span>
+                          </DropdownMenuItem>
+                        ))
                       ) : (
                         <DropdownMenuItem
                           aria-disabled="true"
@@ -4850,8 +5295,67 @@ export function NewChatLandingScreen() {
               {createError}
             </p>
           )}
+
+          {connectError && (
+            <p
+              className="flex flex-wrap items-center gap-x-1.5 text-sm text-destructive select-text"
+              data-testid="new-chat-landing-connect-error"
+            >
+              <span>{renderTextWithInlineCode(connectError)}</span>
+              <button
+                type="button"
+                className="underline underline-offset-2 hover:no-underline disabled:opacity-60"
+                onClick={() => void connectThisMachine()}
+                disabled={connectingThisMachine}
+                data-testid="new-chat-landing-connect-error-retry"
+              >
+                Try again
+              </button>
+            </p>
+          )}
         </div>
+        {hasNoSessions ? (
+          <div className="flex flex-col items-center gap-2">
+            <Button
+              variant="outline"
+              loading={quickImporting}
+              onClick={() => void handleQuickImport()}
+              data-testid="landing-quick-import"
+            >
+              Import your {LANDING_QUICK_IMPORT_LIMIT} most recent sessions
+            </Button>
+            {quickImportedCount !== null ? (
+              <p
+                className="text-sm text-muted-foreground"
+                data-testid="landing-quick-import-result"
+              >
+                Imported {quickImportedCount} session{quickImportedCount === 1 ? "" : "s"}.
+              </p>
+            ) : quickImportError !== null ? (
+              <p className="text-sm text-destructive" data-testid="landing-quick-import-error">
+                {quickImportError}
+              </p>
+            ) : (
+              <button
+                type="button"
+                onClick={() => navigate("/settings/import")}
+                className="text-xs text-muted-foreground underline underline-offset-2 transition-colors hover:text-foreground hover:no-underline"
+                data-testid="landing-import-sessions"
+              >
+                Choose what to import
+              </button>
+            )}
+          </div>
+        ) : null}
       </div>
+
+      {poweredBy ? (
+        <footer className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center pb-4">
+          <div className="pointer-events-auto">
+            <PoweredByOmnigent />
+          </div>
+        </footer>
+      ) : null}
 
       {/* Connect-host instructions, reachable from the host dropdown even when
           no hosts are online — the zero-host escape hatch. */}
