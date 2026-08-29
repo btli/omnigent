@@ -571,8 +571,6 @@ def _claude_catalog_tier_rank(
     with a release date that must only break ties within a generation —
     a dated Claude 3 id must never outrank Claude 4.x.
     """
-    from omnigent.claude_model_vocabulary import normalized_model_id
-
     row_id = str(row.get("id") or "").strip()
     row_model = str(row.get("model") or "").strip()
     launch_model = row_model or row_id
@@ -693,8 +691,6 @@ def resolve_claude_native_catalog_selection(
     :returns: ``(launch_model, notice)``; ``notice`` is set only on substitution.
     :raises click.ClickException: If the request cannot stay in the Claude family.
     """
-    from omnigent.model_catalog_store import catalog_contains
-
     resolved_request = (
         resolve_claude_native_model_selection(requested_model, claude_config) or requested_model
     )
@@ -707,7 +703,7 @@ def resolve_claude_native_catalog_selection(
         else None
     )
     for candidate in dict.fromkeys((requested_model, resolved_request)):
-        exact_match = catalog_contains(rows, candidate)
+        exact_match = model_catalog_store.catalog_contains(rows, candidate)
         catalog_model = resolve_claude_catalog_model(rows, candidate)
         if catalog_model is not None:
             if exact_match or (

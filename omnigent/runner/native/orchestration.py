@@ -3740,9 +3740,6 @@ def _resolve_codex_launch_model_override(requested: str, catalog: list[_JsonObje
     from omnigent.codex_model_vocabulary import codex_reachable_model_slug
     from omnigent.model_catalog_store import launchable_ids_text
 
-    def _launchable_text() -> str:
-        return launchable_ids_text(catalog)
-
     # A selectable id is stronger than another row's model alias.
     exact_model_ids: set[str] = set()
     for row in catalog:
@@ -3759,7 +3756,7 @@ def _resolve_codex_launch_model_override(requested: str, catalog: list[_JsonObje
         raise click.ClickException(
             f"the requested model {requested!r} exactly matches catalog rows that "
             "do not resolve to exactly one valid catalog id. Launchable model ids: "
-            f"{_launchable_text()}. Pick again from the model menu."
+            f"{launchable_ids_text(catalog)}. Pick again from the model menu."
         )
 
     resolved = codex_reachable_model_slug(requested, catalog)
@@ -3768,7 +3765,7 @@ def _resolve_codex_launch_model_override(requested: str, catalog: list[_JsonObje
     raise click.ClickException(
         f"the requested model {requested!r} is not in this host's current model "
         f"list — it may have changed since the pick. Launchable model ids: "
-        f"{_launchable_text()}. Pick again from the model menu."
+        f"{launchable_ids_text(catalog)}. Pick again from the model menu."
     )
 
 
