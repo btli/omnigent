@@ -167,6 +167,20 @@ describe("registerSessionExpiryReload", () => {
     assert.deepEqual(reloaded, []);
   });
 
+  it("passes the issuing webContentsId through for window attribution", () => {
+    const ses = fakeSession();
+    const seen = [];
+    registerSessionExpiryReload(
+      ses,
+      () => true,
+      (identity, webContentsId) => seen.push([identity, webContentsId]),
+    );
+
+    ses.emit({ ...LOGIN_REDIRECT, webContentsId: 7 });
+
+    assert.deepEqual(seen, [["https://ws.databricks.com", 7]]);
+  });
+
   it("reloads a window pinned with ?o= when the failing request carries no o", () => {
     // The API request the gate 303s (e.g. .../ajax-api/...) has no `?o=`
     // selector even when the window's pinned identity does — matching must

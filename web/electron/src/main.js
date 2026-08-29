@@ -467,16 +467,28 @@ const EXPIRY_RELOAD_MIN_INTERVAL_MS = 15_000;
  * the resulting "Failed to load" state manually, so the shell does it.
  */
 function registerSessionExpiryAccess() {
-  registerSessionExpiryReload(session.defaultSession, isPinnedWorkspaceUrl, (identity) => {
-    const now = Date.now();
-    for (const [win, state] of windows) {
-      if (!expiredRequestMatchesIdentity(state.identity, identity) || win.isDestroyed()) continue;
-      const last = lastExpiryReloadAt.get(win) ?? 0;
-      if (now - last < EXPIRY_RELOAD_MIN_INTERVAL_MS) continue;
-      lastExpiryReloadAt.set(win, now);
-      win.webContents.reload();
-    }
-  });
+  registerSessionExpiryReload(
+    session.defaultSession,
+    isPinnedWorkspaceUrl,
+    (identity, webContentsId) => {
+      const now = Date.now();
+      for (const [win, state] of windows) {
+        if (win.isDestroyed()) continue;
+        // Attribute the redirect to the window whose webContents issued the
+        // request: the bare-origin identity match can fit several ?o= windows
+        // on one host, and a login-shaped redirect can be synthesized by a
+        // hostile embedded page — neither may reload windows that didn't make
+        // the request. Events from untracked webContents (embedded browser
+        // views, workers, or no id at all) reload nothing.
+        if (webContentsId == null || win.webContents.id !== webContentsId) continue;
+        if (!expiredRequestMatchesIdentity(state.identity, identity)) continue;
+        const last = lastExpiryReloadAt.get(win) ?? 0;
+        if (now - last < EXPIRY_RELOAD_MIN_INTERVAL_MS) continue;
+        lastExpiryReloadAt.set(win, now);
+        win.webContents.reload();
+      }
+    },
+  );
 }
 
 /**
@@ -1931,12 +1943,19 @@ function newWindow() {
   const current = win?.webContents.getURL();
   const state = win ? windows.get(win) : null;
   // A bundled file: page (setup, sign-in status) is not a clonable server
-  // destination — only pass a real http(s) page as the explicit target, so
-  // the clone falls back to the saved server instead of a file:// "server".
+  // destination, and neither is an http(s) page OFF the window's own server —
+  // mid-SSO the current URL is a foreign IdP authorization URL (often
+  // one-time), which must not become another window's load target. Clone the
+  // current URL only when it is actually on the window's server; otherwise
+  // fall back to state.serverUrl via opts.
   const isWebPage =
     typeof current === "string" &&
     (current.startsWith("http://") || current.startsWith("https://"));
-  const target = isWebPage ? current : undefined;
+  const pinnedIdentity = state?.serverUrl ? workspaceIdentityKey(state.serverUrl) : null;
+  const target =
+    isWebPage && pinnedIdentity !== null && workspaceIdentityKey(current) === pinnedIdentity
+      ? current
+      : undefined;
   // Cloning an ephemeral (multi-server) window keeps the clone
   // ephemeral, so Change Server… from it still won't touch saved settings.
   createWindow(target, {
@@ -3176,15 +3195,27 @@ function sendOpenPath(win, routePath) {
  *
  * @param {BrowserWindow} parent The window to parent the dialog on.
  * @param {string} targetOrigin The server origin to connect to.
+ * @param {string[]} [workspaceCandidates] Known workspace identities on this
+ *   origin when the link named none of them (ambiguous selector-less link) —
+ *   listed so the user can see the link doesn't say which workspace it means.
  * @returns {Promise<boolean>} True when the user chose Open.
  */
-async function confirmOpenDeepLink(parent, targetOrigin) {
+async function confirmOpenDeepLink(parent, targetOrigin, workspaceCandidates = []) {
   let host = targetOrigin;
   try {
     host = new URL(targetOrigin).host || targetOrigin;
   } catch {
     // Keep the full origin string if it somehow doesn't parse.
   }
+  const selectors = workspaceCandidates
+    .map((identity) => identity.slice(identity.indexOf("?") + 1))
+    .filter((selector) => selector.length > 0);
+  const ambiguityNote =
+    selectors.length > 1
+      ? `\n\nNote: you have ${selectors.length} saved workspaces on this host ` +
+        `(${selectors.join(", ")}) and this link does not name one, so it will ` +
+        `open the host's default workspace.`
+      : "";
   const icon = nativeImage.createFromPath(ICON_PNG);
   const { response } = await dialog.showMessageBox(parent, {
     type: "warning",
@@ -3194,7 +3225,8 @@ async function confirmOpenDeepLink(parent, targetOrigin) {
     detail:
       `This link will connect Omnigent to ${host} and open a conversation.\n\n` +
       `Only open links from a server you trust — once connected, it can show ` +
-      `notifications and (when you allow it) manage this machine as a runner.`,
+      `notifications and (when you allow it) manage this machine as a runner.` +
+      ambiguityNote,
     buttons: ["Cancel", "Open"],
     defaultId: 0, // Cancel is the safe default
     cancelId: 0,
@@ -3284,12 +3316,18 @@ async function handleDeepLink(raw) {
   if (!targetIdentity) return;
   const knownIdentities = knownWorkspaceIdentities();
   // A link WITHOUT a selector still belongs to a known workspace when only
-  // the selector differs — adopt the first known identity on that origin
-  // (saved default first, then recents) rather than treating the server as
-  // unknown (consent prompt, bare-origin probe, second window).
+  // the selector differs — but adopt it ONLY when exactly one known identity
+  // exists on that origin: with several, guessing (e.g. the saved default)
+  // could route the conversation into the wrong tenant, so the link stays a
+  // bare identity and goes through the consent prompt, which lists the known
+  // workspaces so the user can see the ambiguity.
+  let workspaceCandidates = [];
   if (!targetIdentity.includes("?") && !knownIdentities.includes(targetIdentity)) {
-    const byOrigin = knownIdentities.find((identity) => identity.startsWith(`${targetIdentity}?`));
-    if (byOrigin) targetIdentity = byOrigin;
+    const sameOrigin = knownIdentities.filter((identity) =>
+      identity.startsWith(`${targetIdentity}?`),
+    );
+    if (sameOrigin.length === 1) targetIdentity = sameOrigin[0];
+    else workspaceCandidates = sameOrigin;
   }
   // A KNOWN server: reuse its recorded URL (already mount-bearing, e.g.
   // `https://host/omnigent`) so we SKIP the probe entirely. null for an
@@ -3344,7 +3382,9 @@ async function handleDeepLink(raw) {
       // consent, or stays as the normal launch window on cancel).
       let parent = activeWindow();
       if (!parent) parent = createWindow();
-      if (!(await confirmOpenDeepLink(parent, parsed.origin))) return; // cancelled
+      if (!(await confirmOpenDeepLink(parent, parsed.origin, workspaceCandidates))) {
+        return; // cancelled
+      }
       const state = windows.get(parent);
       if (!state) return;
       const reuseParent = isSetupIdle(state);

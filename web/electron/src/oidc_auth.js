@@ -11,6 +11,11 @@ const MAX_PATH_DECODE_PASSES = 32;
 const TRANSIENT_AUTH_STATUSES = new Set([429, 502, 503, 504]);
 const cookieMutationQueues = new WeakMap();
 
+// Monotonic milliseconds for login deadlines: Date.now() is wall-clock and
+// jumps with NTP/DST/manual adjustments, which could silently expire — or
+// extend — a login window mid-flow.
+const monotonicNowMs = () => performance.now();
+
 // Keep API routes under workspace mounts, matching the CLI.
 function serverRoute(serverUrl, routePath) {
   if (oidcServerUrlError(serverUrl)) throw new Error("Invalid server URL.");
@@ -158,7 +163,7 @@ async function runOidcBrowserLogin(
   const serverUrlError = oidcServerUrlError(serverUrl);
   if (serverUrlError) return { ok: false, reason: serverUrlError };
 
-  const deadline = Date.now() + timeoutMs;
+  const deadline = monotonicNowMs() + timeoutMs;
   let ticket;
   let loginUrl;
   try {
@@ -176,9 +181,9 @@ async function runOidcBrowserLogin(
       } catch {
         // Progress reporting cannot terminate authentication.
       }
-      if (Date.now() >= deadline) return null;
+      if (monotonicNowMs() >= deadline) return null;
       await delay(pollIntervalMs, undefined, { signal });
-      return Date.now() < deadline ? createTicket() : null;
+      return monotonicNowMs() < deadline ? createTicket() : null;
     };
     const response = await createTicket();
     if (!response) return { ok: false, reason: "timed_out" };
@@ -198,7 +203,7 @@ async function runOidcBrowserLogin(
   const pollUrl = new URL(serverRoute(serverUrl, "/auth/cli-poll"));
   pollUrl.searchParams.set("ticket", ticket);
   const pollForCompletion = async () => {
-    if (Date.now() >= deadline) {
+    if (monotonicNowMs() >= deadline) {
       return { ok: false, reason: isUserAbort(signal) ? "cancelled" : "timed_out" };
     }
     try {
@@ -206,7 +211,7 @@ async function runOidcBrowserLogin(
     } catch {
       return { ok: false, reason: "cancelled" };
     }
-    if (Date.now() >= deadline) {
+    if (monotonicNowMs() >= deadline) {
       return { ok: false, reason: isUserAbort(signal) ? "cancelled" : "timed_out" };
     }
 

@@ -1922,7 +1922,7 @@ describe("deep-link ingestion wiring (src/main.js)", () => {
     // consent-unknown branch, and does NOT appear before chooseDeepLinkStrategy.
     assert.match(
       liveCode,
-      /confirmOpenDeepLink\(parent, parsed\.origin\)[\s\S]{0,700}expandDatabricksWorkspaceUrl\(targetIdentity\)/,
+      /confirmOpenDeepLink\(parent, parsed\.origin, workspaceCandidates\)[\s\S]{0,700}expandDatabricksWorkspaceUrl\(targetIdentity\)/,
       [
         "handleDeepLink no longer defers expandDatabricksWorkspaceUrl until AFTER",
         "confirmOpenDeepLink. A deep link to an unknown (attacker-chosen) server would",
@@ -2162,7 +2162,7 @@ describe("expired-session reload identity matching (src/main.js)", () => {
   it("wires expiredRequestMatchesIdentity into the reload loop", () => {
     assert.match(
       liveCode,
-      /registerSessionExpiryReload\([\s\S]{0,300}expiredRequestMatchesIdentity\(state\.identity,\s*identity\)/,
+      /registerSessionExpiryReload\([\s\S]{0,900}expiredRequestMatchesIdentity\(state\.identity,\s*identity\)/,
       [
         "The expiry-reload window loop no longer matches via",
         "expiredRequestMatchesIdentity, so ?o=-pinned windows are never reloaded",
@@ -2257,6 +2257,86 @@ describe("deep-link workspace identity (src/main.js)", () => {
 
     assert.equal(decisions[0].targetOrigin, "https://server.example");
   });
+
+  it("does not guess between several known ?o= workspaces on one origin", async () => {
+    // A selector-less link is ambiguous when the origin has several saved
+    // workspaces — silently adopting one (e.g. the saved default) could
+    // route the conversation into the wrong tenant. The identity stays bare
+    // so the link goes through the consent path instead.
+    const { decisions } = await runDeepLink("omnigent://ws.cloud.databricks.com/c/conv_abc", {
+      knownIdentities: [
+        "https://ws.cloud.databricks.com?o=111",
+        "https://ws.cloud.databricks.com?o=222",
+      ],
+      knownServerUrl: null,
+    });
+
+    assert.equal(decisions[0].targetOrigin, "https://ws.cloud.databricks.com");
+  });
+
+  it("passes the ambiguous workspace candidates to the consent dialog", async () => {
+    const confirmCalls = [];
+    const state = { serverUrl: null, pendingServerLoads: 0 };
+    const parent = { isDestroyed: () => false, webContents: { getURL: () => "file:///setup" } };
+    const handler = runInNewContext(`${deepLinkHandlerCode}; handleDeepLink`, {
+      BrowserWindow: { getFocusedWindow: () => null },
+      activeWindow: () => parent,
+      chooseDeepLinkStrategy: () => ({ strategy: "consent-unknown" }),
+      confirmOpenDeepLink: async (...args) => {
+        confirmCalls.push(args);
+        return false; // cancel — the candidates listing is what's under test
+      },
+      console: { log: () => {} },
+      findKnownServerUrl: () => null,
+      knownWorkspaceIdentities: () => [
+        "https://ws.cloud.databricks.com?o=111",
+        "https://ws.cloud.databricks.com?o=222",
+      ],
+      parseOmnigentDeepLink,
+      windows: new Map([[parent, state]]),
+      workspaceIdentityKey,
+    });
+
+    await handler("omnigent://ws.cloud.databricks.com/c/conv_abc");
+
+    assert.equal(confirmCalls.length, 1);
+    assert.deepEqual(confirmCalls[0][2], [
+      "https://ws.cloud.databricks.com?o=111",
+      "https://ws.cloud.databricks.com?o=222",
+    ]);
+  });
+
+  it("lists the candidate workspaces in the consent dialog detail", async () => {
+    const confirmCode = liveCode.match(
+      /async function confirmOpenDeepLink\(parent, targetOrigin, workspaceCandidates = \[\]\)[\s\S]*?\n\}/,
+    )?.[0];
+    assert.ok(confirmCode);
+    const boxes = [];
+    const confirm = runInNewContext(`${confirmCode}; confirmOpenDeepLink`, {
+      URL,
+      ICON_PNG: "/icon.png",
+      dialog: {
+        showMessageBox: async (_parent, options) => {
+          boxes.push(options);
+          return { response: 1 };
+        },
+      },
+      nativeImage: { createFromPath: () => ({ isEmpty: () => true }) },
+    });
+
+    const opened = await confirm({}, "https://ws.cloud.databricks.com", [
+      "https://ws.cloud.databricks.com?o=111",
+      "https://ws.cloud.databricks.com?o=222",
+    ]);
+
+    assert.equal(opened, true);
+    assert.match(boxes[0].detail, /2 saved workspaces/);
+    assert.match(boxes[0].detail, /o=111, o=222/);
+
+    // A single (or no) candidate adds no note — adoption handles that case.
+    await confirm({}, "https://ws.cloud.databricks.com", []);
+    assert.doesNotMatch(boxes[1].detail, /saved workspaces/);
+  });
 });
 
 describe("cold-start load failure fallback (src/main.js)", () => {
@@ -2292,6 +2372,7 @@ describe("New Window explicit target (src/main.js)", () => {
       activeWindow: () => win,
       createWindow: (target, opts) => created.push({ target, opts }),
       windows: new Map([[win, { ephemeral: false, serverUrl: null }]]),
+      workspaceIdentityKey,
     });
 
     newWindow();
@@ -2302,20 +2383,161 @@ describe("New Window explicit target (src/main.js)", () => {
   });
 
   it("still clones a real server page URL", () => {
-    const newWindowCode2 = liveCode.match(/function newWindow\(\)[\s\S]*?\n\}/)?.[0];
     const created = [];
     const win = {
       webContents: { getURL: () => "https://server.example/c/conv_abc" },
     };
-    const newWindow = runInNewContext(`${newWindowCode2}; newWindow`, {
+    const newWindow = runInNewContext(`${newWindowCode}; newWindow`, {
       activeWindow: () => win,
       createWindow: (target, opts) => created.push({ target, opts }),
       windows: new Map([[win, { ephemeral: false, serverUrl: "https://server.example" }]]),
+      workspaceIdentityKey,
     });
 
     newWindow();
 
     assert.equal(created[0].target, "https://server.example/c/conv_abc");
     assert.equal(created[0].opts.serverUrl, "https://server.example");
+  });
+
+  it("does not clone a mid-SSO foreign IdP page as the target", () => {
+    // While the window is off on its IdP, the current URL is a one-time
+    // authorization URL on a foreign origin — the clone must fall back to
+    // the window's own server, never load that URL again.
+    const created = [];
+    const win = {
+      webContents: {
+        getURL: () => "https://idp.example/authorize?client_id=x&code_challenge=y",
+      },
+    };
+    const newWindow = runInNewContext(`${newWindowCode}; newWindow`, {
+      activeWindow: () => win,
+      createWindow: (target, opts) => created.push({ target, opts }),
+      windows: new Map([[win, { ephemeral: false, serverUrl: "https://server.example" }]]),
+      workspaceIdentityKey,
+    });
+
+    newWindow();
+
+    assert.equal(created[0].target, undefined);
+    assert.equal(created[0].opts.serverUrl, "https://server.example");
+  });
+
+  it("does not clone across ?o= workspaces on one Databricks host", () => {
+    const created = [];
+    const win = {
+      webContents: {
+        getURL: () => "https://ws.cloud.databricks.com/omnigent/c/x?o=999",
+      },
+    };
+    const newWindow = runInNewContext(`${newWindowCode}; newWindow`, {
+      activeWindow: () => win,
+      createWindow: (target, opts) => created.push({ target, opts }),
+      windows: new Map([
+        [win, { ephemeral: false, serverUrl: "https://ws.cloud.databricks.com/omnigent?o=123" }],
+      ]),
+      workspaceIdentityKey,
+    });
+
+    newWindow();
+
+    assert.equal(created[0].target, undefined);
+  });
+});
+
+describe("expired-session reload attribution (src/main.js)", () => {
+  const accessCode = liveCode.match(/function registerSessionExpiryAccess\(\)[\s\S]*?\n\}/)?.[0];
+  const pinnedCode = liveCode.match(/function isPinnedWorkspaceUrl\(url\)[\s\S]*?\n\}/)?.[0];
+  const {
+    expiredRequestMatchesIdentity,
+    registerSessionExpiryReload,
+  } = require("../src/session-expiry");
+
+  const HOST_URL = "https://ws.databricks.com/ajax-api/2.0/omnigents/v1/sessions";
+  const LOGIN_REDIRECT = {
+    url: HOST_URL,
+    statusCode: 303,
+    redirectURL: "https://ws.databricks.com/login.html?next_url=%2Fajax-api",
+  };
+
+  function makeWindow(id, identity) {
+    let reloads = 0;
+    const win = {
+      isDestroyed: () => false,
+      webContents: {
+        id,
+        reload: () => {
+          reloads += 1;
+        },
+      },
+    };
+    return { win, state: { identity }, reloadCount: () => reloads };
+  }
+
+  function wire(windowsList) {
+    assert.ok(accessCode);
+    assert.ok(pinnedCode);
+    let listener = null;
+    const ses = {
+      webRequest: {
+        onBeforeRedirect: (cb) => {
+          listener = cb;
+        },
+      },
+    };
+    const windows = new Map(windowsList.map(({ win, state }) => [win, state]));
+    const register = runInNewContext(`${pinnedCode}; ${accessCode}; registerSessionExpiryAccess`, {
+      Date,
+      EXPIRY_RELOAD_MIN_INTERVAL_MS: 15_000,
+      expiredRequestMatchesIdentity,
+      lastExpiryReloadAt: new WeakMap(),
+      registerSessionExpiryReload,
+      session: { defaultSession: ses },
+      windows,
+      workspaceIdentityKey,
+    });
+    register();
+    return { emit: (details) => listener(details) };
+  }
+
+  it("reloads only the window whose webContents issued the request", () => {
+    // Two windows pinned to different ?o= workspaces on ONE host: a
+    // bare-origin login redirect matches both identities, so only the
+    // issuing webContents may decide which window reloads.
+    const a = makeWindow(1, "https://ws.databricks.com?o=111");
+    const b = makeWindow(2, "https://ws.databricks.com?o=222");
+    const { emit } = wire([a, b]);
+
+    emit({ ...LOGIN_REDIRECT, webContentsId: 1 });
+
+    assert.equal(a.reloadCount(), 1);
+    assert.equal(b.reloadCount(), 0);
+  });
+
+  it("reloads nothing for an untracked webContents", () => {
+    // A login-shaped redirect from contents the shell doesn't own (an
+    // embedded browser view, a worker, or a hostile page's synthesized
+    // request) must not reload any window.
+    const a = makeWindow(1, "https://ws.databricks.com?o=111");
+    const b = makeWindow(2, "https://ws.databricks.com?o=222");
+    const { emit } = wire([a, b]);
+
+    emit({ ...LOGIN_REDIRECT, webContentsId: 99 });
+    emit({ ...LOGIN_REDIRECT }); // no webContentsId at all
+
+    assert.equal(a.reloadCount(), 0);
+    assert.equal(b.reloadCount(), 0);
+  });
+
+  it("keeps the identity match as a secondary filter", () => {
+    // The issuing window still only reloads when the request identity fits
+    // its pinned identity (cross-origin requests from a pinned window's
+    // page must not reload it).
+    const a = makeWindow(1, "https://other.example");
+    const { emit } = wire([a]);
+
+    emit({ ...LOGIN_REDIRECT, webContentsId: 1 });
+
+    assert.equal(a.reloadCount(), 0);
   });
 });

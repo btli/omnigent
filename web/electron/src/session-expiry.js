@@ -58,18 +58,25 @@ function isLoginRedirect(details) {
  * the caller's ``reloadWindowsForOrigin``) so a persistently expired host does
  * not reload-loop.
  *
+ * The redirect's ``webContentsId`` is passed through so the caller can
+ * attribute the event to the window whose webContents issued the request —
+ * the session is app-global, so without attribution a login-shaped redirect
+ * from ANY contents (another window on the same host, or a hostile embedded
+ * page) would reload every identity-matching window.
+ *
  * @param {Electron.Session} ses The session whose redirects to watch.
  * @param {(origin: string) => boolean} isConnectedServerOrigin Whether an
  *   origin belongs to a server some window is connected to.
- * @param {(origin: string) => void} reloadWindowsForOrigin Reload every window
- *   pinned to the given origin (the caller owns the once-per-window guard).
+ * @param {(origin: string, webContentsId: number | undefined) => void}
+ *   reloadWindowsForOrigin Reload the matching window (the caller owns both
+ *   the webContents attribution and the once-per-window guard).
  */
 function registerSessionExpiryReload(ses, isConnectedServerOrigin, reloadWindowsForOrigin) {
   ses.webRequest.onBeforeRedirect((details) => {
     if (!isLoginRedirect(details)) return;
     const identity = workspaceIdentityKey(details.url);
     if (!identity || !isConnectedServerOrigin(identity)) return;
-    reloadWindowsForOrigin(identity);
+    reloadWindowsForOrigin(identity, details.webContentsId);
   });
 }
 
