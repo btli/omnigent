@@ -2006,7 +2006,7 @@ describe("Sidebar project sections", () => {
     renderSidebar();
 
     const pencil = screen.getByTestId("project-new-session");
-    expect(pencil).toHaveClass("hidden", "[@media((hover:hover)_and_(pointer:fine))]:md:flex");
+    expect(pencil).toHaveClass("sr-only", "[@media((hover:hover)_and_(pointer:fine))]:not-sr-only");
 
     // The menu remains a touch/long-press fallback even when the hover shortcut
     // is eligible, because a touchscreen tap cannot reveal that shortcut first.
@@ -2025,8 +2025,12 @@ describe("Sidebar project sections", () => {
     expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
   });
 
-  it("renders the project kebab only where a fine hover pointer can reveal it", () => {
-    // jsdom does not evaluate the media query, so assert its responsive classes.
+  it("keeps the project kebab off the row but reachable without a fine hover pointer", () => {
+    // jsdom can't evaluate @media, so the capability contract is asserted via
+    // classes; the recorded demo is the behavioral guardrail. The base classes
+    // stand for every pointer lacking fine hover — a 390px phone and an 810px
+    // unfolded foldable alike (coarse, hover:none) — where the kebab is
+    // sr-only: absent from the row, zero layout, yet in the a11y tree.
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
@@ -2034,10 +2038,79 @@ describe("Sidebar project sections", () => {
     renderSidebar();
 
     const kebab = screen.getByTestId("project-actions");
-    expect(kebab).toHaveClass("hidden", "[@media((hover:hover)_and_(pointer:fine))]:md:flex");
-    // A width-only display class would expose it on wide touch screens.
+    // sr-only at rest; revealed only where a fine hover pointer exists, at ANY
+    // width — no md gate that would drop it on a narrow hover desktop.
+    expect(kebab).toHaveClass(
+      "sr-only",
+      "[@media((hover:hover)_and_(pointer:fine))]:not-sr-only",
+      "[@media((hover:hover)_and_(pointer:fine))]:flex",
+    );
+    // Never display:none — that would strip it from the a11y tree and tab order
+    // on touch, where the long-press contextmenu isn't reliably dispatched.
+    expect(kebab).not.toHaveClass("hidden");
+    // No un-capability-gated display utility at md would re-expose it on a wide
+    // touch screen (the reported foldable bug) — broader than the one literal.
     for (const cls of kebab.classList) {
-      expect(cls).not.toMatch(/^md:(inline-)?flex$/);
+      expect(cls).not.toMatch(
+        /^md:(flex|inline-flex|block|inline-block|inline|grid|inline-grid|table|contents|flow-root)$/,
+      );
+    }
+  });
+
+  it("exposes the kebab to the accessibility tree without a fine hover pointer", () => {
+    // The touch/coarse case (390px and 810px). getByRole excludes display:none
+    // and aria-hidden nodes, so finding the button by role proves sr-only keeps
+    // it in the a11y tree — touch + screen-reader users reach the same actions
+    // even when the long-press contextmenu gesture isn't delivered.
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
+    ]);
+    renderSidebar();
+
+    const kebab = screen.getByRole("button", { name: "Project actions for Customer X" });
+    expect(kebab).toHaveClass("sr-only");
+    expect(kebab).not.toHaveClass("hidden");
+    kebab.focus();
+    expect(kebab).toHaveFocus();
+  });
+
+  it("reveals the folder kebab on hover at every width, narrow hover desktops included", () => {
+    // The regression case: a fine-pointer, hover-capable desktop narrower than
+    // md (~500px window) and a wide 1280px desktop share one gate. The reveal
+    // keys off the pointer capability alone (no md), so hover brings the kebab
+    // back at any width instead of stranding a mouse-only user in a narrow
+    // window. jsdom can't evaluate @media; the demo shows the effective reveal.
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_running", "Claude Code", {
+        labels: { omni_project: "Customer X" },
+        status: "running",
+      }),
+    ]);
+    renderSidebar();
+
+    const kebab = screen.getByTestId("project-actions");
+    const revealWrapper = kebab.closest("div[class*=transition-opacity]")!;
+    // Opacity reveal is capability-gated with NO md: hidden at rest, shown on
+    // hover, at every width for a fine hover pointer.
+    expect(revealWrapper).toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/header:opacity-100",
+    );
+    for (const cls of revealWrapper.classList) {
+      expect(cls).not.toMatch(/:md:opacity-0$/);
+    }
+    // A collapsed folder (marker shown) protects that marker from the kebab's
+    // at-rest hit target with the same capability-only (no md) gate, so a
+    // narrow hover desktop doesn't let an invisible control swallow the tap.
+    const outerBox = kebab.closest("div[class*=absolute]")!;
+    expect(outerBox).toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:pointer-events-none",
+      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/header:pointer-events-auto",
+    );
+    for (const cls of outerBox.classList) {
+      expect(cls).not.toMatch(/:md:pointer-events-none$/);
     }
   });
 });
