@@ -2850,13 +2850,15 @@ _HOOK_FAILURE_DETAIL_RAW_HEAD_CHARS = _HOOK_FAILURE_DETAIL_RAW_LIMIT // 2
 _HOOK_FAILURE_DETAIL_RAW_TAIL_CHARS = (
     _HOOK_FAILURE_DETAIL_RAW_LIMIT - _HOOK_FAILURE_DETAIL_RAW_HEAD_CHARS
 )
-# A long single token gets a small leading detection window before removal.
-_HOOK_FAILURE_DETAIL_DETECTION_CHARS = 128
+# Cover the retained raw head so a credential starting near its boundary is
+# still detected when raw windowing removes its continuation.
+_HOOK_FAILURE_DETAIL_DETECTION_CHARS = _HOOK_FAILURE_DETAIL_RAW_HEAD_CHARS
 _HOOK_FAILURE_FRAME_TRANSLATION = str.maketrans({"[": "(", "]": ")"})
 _HOOK_FAILURE_REDACTION_MARKER = "[REDACTED]"
 _HOOK_FAILURE_PLANTED_REDACTION_RE = re.compile(r"(?i)\[REDACTED\]")
 _HOOK_FAILURE_SEPARATOR_MARKER = "\x00"
 _HOOK_FAILURE_EARLY_REDACTION_MARKER = "\ue000"
+_HOOK_FAILURE_BEARER_SOFT_GAP_MARKER = "\ue001"
 # Unicode Default_Ignorable_Code_Point ranges from DerivedCoreProperties.txt.
 _DEFAULT_IGNORABLE_CODE_POINT_RANGES = frozenset(
     {
@@ -2970,7 +2972,15 @@ def _strip_ansi_escape_sequences(text: str) -> str:
 
 def _redactor_changes(text: str) -> bool:
     """Return whether shared secret matching redacts *text*."""
-    return redact_secrets(text) != text
+    return _redact_hook_failure_secrets(text) != text
+
+
+def _redact_hook_failure_secrets(text: str) -> str:
+    """Redact hook text while retaining trusted soft-gap provenance."""
+    return redact_secrets(
+        text,
+        bearer_soft_gap_marker=_HOOK_FAILURE_BEARER_SOFT_GAP_MARKER,
+    )
 
 
 def _canonicalize_hook_failure_chunk(chunk: str, previous_word: str) -> str:
@@ -3014,7 +3024,11 @@ def _canonicalize_hook_failure_detail(text: str) -> str:
                 prepared.append(char)
                 continue
             category = unicodedata.category(char)
-            if _is_default_ignorable_code_point(char) or category == "Cs":
+            if _is_default_ignorable_code_point(char):
+                if "".join(prepared[-len("bearer") :]).casefold() == "bearer":
+                    prepared.append(_HOOK_FAILURE_BEARER_SOFT_GAP_MARKER)
+                continue
+            if category == "Cs":
                 continue
             if char.isspace() or category == "Cc":
                 prepared.append(_HOOK_FAILURE_SEPARATOR_MARKER)
@@ -3038,7 +3052,7 @@ def _canonicalize_hook_failure_detail(text: str) -> str:
     while index < len(normalized):
         char = normalized[index]
         if char in {" ", "\n"}:
-            if char == "\n" or not canonical or canonical[-1] not in {" ", "\n"}:
+            if char == "\n" or not canonical or canonical[-1] != " ":
                 canonical.append(char)
             index += 1
             continue
@@ -3047,7 +3061,7 @@ def _canonicalize_hook_failure_detail(text: str) -> str:
             chunk_end += 1
         chunk = _canonicalize_hook_failure_chunk(normalized[index:chunk_end], previous_word)
         for chunk_char in chunk:
-            if chunk_char == " " and canonical and canonical[-1] in {" ", "\n"}:
+            if chunk_char == " " and canonical and canonical[-1] == " ":
                 continue
             canonical.append(chunk_char)
         previous_word = chunk.rsplit(" ", 1)[-1]
@@ -3136,21 +3150,26 @@ def _window_with_detection_remnants_redacted(
         to the detection window.
     """
     neutral_detection = _HOOK_FAILURE_PLANTED_REDACTION_RE.sub("(REDACTED)", detection_canonical)
-    fragments = _redaction_removed_fragments(neutral_detection, redact_secrets(neutral_detection))
+    fragments = _redaction_removed_fragments(
+        neutral_detection,
+        _redact_hook_failure_secrets(neutral_detection),
+    )
     if fragments is None:
         return None
     neutral_window = _HOOK_FAILURE_PLANTED_REDACTION_RE.sub("(REDACTED)", window_canonical)
-    window_redacted = redact_secrets(neutral_window)
+    window_redacted = _redact_hook_failure_secrets(neutral_window)
     result = window_canonical
-    # A remnant is a surviving window token that is part of a removed
-    # fragment — windowing can keep either a whole boundary token of a
-    # multi-token match or a truncated prefix of a single bisected token,
-    # so the containment test runs window-token-in-fragment.
-    for token in window_redacted.split():
-        if len(token) < _HOOK_FAILURE_REMNANT_TOKEN_MIN_CHARS or "REDACTED" in token:
-            continue
-        if any(token in fragment for fragment in fragments):
-            result = result.replace(token, _HOOK_FAILURE_EARLY_REDACTION_MARKER)
+    # Raw head windowing can retain a shortened prefix of the first token in
+    # a credential match. A neighboring redaction may share its whitespace
+    # token, so consider each suffix after the marker without matching later
+    # prose words from the removed span.
+    for window_token in window_redacted.split():
+        for piece in window_token.split(_HOOK_FAILURE_REDACTION_MARKER):
+            for start in range(len(piece) - _HOOK_FAILURE_REMNANT_TOKEN_MIN_CHARS + 1):
+                candidate = piece[start:]
+                if any(fragment.startswith(candidate) for fragment in fragments):
+                    result = result.replace(candidate, _HOOK_FAILURE_EARLY_REDACTION_MARKER)
+                    break
     return result
 
 
@@ -3183,7 +3202,7 @@ def _sanitize_hook_failure_detail(text: str) -> str | None:
     if preview_truncated:
         detection_window = without_ansi[:_HOOK_FAILURE_DETAIL_DETECTION_CHARS]
         detection_canonical = _canonicalize_hook_failure_detail(detection_window)
-        candidate = redact_secrets(detection_canonical)
+        candidate = _redact_hook_failure_secrets(detection_canonical)
         if candidate != detection_canonical:
             matched_detection = detection_canonical
     if matched_detection is not None:
@@ -3211,7 +3230,8 @@ def _sanitize_hook_failure_detail(text: str) -> str | None:
         _HOOK_FAILURE_EARLY_REDACTION_MARKER,
         _HOOK_FAILURE_REDACTION_MARKER,
     )
-    redacted = redact_secrets(canonical)
+    redacted = _redact_hook_failure_secrets(canonical)
+    redacted = redacted.replace(_HOOK_FAILURE_BEARER_SOFT_GAP_MARKER, "")
     if preview_truncated and not raw_preview and redacted == canonical:
         return _HOOK_FAILURE_DETAIL_REMOVED_SENTINEL
     if not redacted:

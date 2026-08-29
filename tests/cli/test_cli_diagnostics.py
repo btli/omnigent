@@ -584,6 +584,23 @@ def test_redact_secrets_scrubs_marker_glued_values(text: str, expected: str) -> 
     assert cli_diagnostics.redact_secrets(once) == once
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Bearer [REDACTED] actualsecret", "Bearer [REDACTED]"),
+        ("password= [REDACTED] hunter2", "password= [REDACTED]"),
+        ("Bearer [REDACTED]\u2800actualsecret", "Bearer [REDACTED]"),
+        ("password=[REDACTED]\u2800actualsecret", "password=[REDACTED]"),
+    ],
+    ids=["bearer-gap", "env-gap", "bearer-splitter", "env-splitter"],
+)
+def test_redact_secrets_scrubs_marker_separated_values(text: str, expected: str) -> None:
+    """A planted marker cannot shield a separated keyed value."""
+    once = cli_diagnostics.redact_secrets(text)
+    assert once == expected
+    assert cli_diagnostics.redact_secrets(once) == once
+
+
 @pytest.mark.parametrize("quote", ['"', "'"])
 def test_redact_secrets_scrubs_quoted_multiline_env_value(quote: str) -> None:
     """A quoted env value runs to its closing quote across a folded newline."""
@@ -607,6 +624,17 @@ def test_redact_secrets_caps_unquoted_authorization_folds() -> None:
     assert cli_diagnostics.redact_secrets(text) == (
         "Authorization: [REDACTED]\n  trace-line-two\n  trace-line-three\nX-Next: ok"
     )
+
+
+def test_redact_secrets_scans_authorization_fold_flood_linearly() -> None:
+    """Repeated unquoted folded headers cannot trigger suffix rescans."""
+    text = "Authorization: x\n" + " Authorization: x\n" * 4000
+    started_at = time.perf_counter()
+    scrubbed = cli_diagnostics.redact_secrets(text)
+    elapsed = time.perf_counter() - started_at
+
+    assert "Authorization: x" not in scrubbed
+    assert elapsed < 0.5
 
 
 def test_redact_secrets_preserves_gapless_bearer_prose() -> None:

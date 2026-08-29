@@ -321,15 +321,27 @@ def _marker_glue_span_start(text: str, start: int) -> int | None:
         if not text.startswith(marker, start):
             continue
         boundary = start + len(marker)
-        if boundary < len(text) and _is_keyed_value_character(text[boundary]):
-            return boundary
-        if marker == _REDACTED:
-            return None
-        break
+        word_gaps = 0
+        while boundary < len(text):
+            char = text[boundary]
+            if char in "\r\n":
+                return None
+            if _is_keyed_value_character(char):
+                return boundary
+            if _is_word_gap(char):
+                word_gaps += 1
+                if word_gaps > _MAX_CREDENTIAL_WORD_GAPS:
+                    return None
+            boundary += 1
+        return None
     return start
 
 
-def _redact_scanned_credentials(text: str) -> str:
+def _redact_scanned_credentials(
+    text: str,
+    *,
+    bearer_soft_gap_marker: str | None = None,
+) -> str:
     """Redact prefixed credentials with bounded, forward-only span scans."""
     parts: list[str] = []
     cursor = 0
@@ -368,7 +380,15 @@ def _redact_scanned_credentials(text: str) -> str:
             if not scan_bearer:
                 continue
             gapped = anchor_end < len(text) and _is_word_gap(text[anchor_end])
-            preserved_end, body_start = _bearer_value_start(text, anchor_end)
+            if bearer_soft_gap_marker is not None and text.startswith(
+                bearer_soft_gap_marker, anchor_end
+            ):
+                soft_gapped = True
+                preserved_end = anchor_end
+                body_start = anchor_end + len(bearer_soft_gap_marker)
+            else:
+                soft_gapped = False
+                preserved_end, body_start = _bearer_value_start(text, anchor_end)
             span_start = _marker_glue_span_start(text, body_start)
             if span_start is None:
                 continue
@@ -376,9 +396,21 @@ def _redact_scanned_credentials(text: str) -> str:
                 text,
                 span_start,
                 alphabet=_KEYED_VALUE_ALPHABET,
-                minimum=_KEYED_VALUE_MIN_LENGTH if gapped else _GAPLESS_BEARER_MIN_LENGTH,
+                minimum=(
+                    _KEYED_VALUE_MIN_LENGTH
+                    if gapped or soft_gapped
+                    else _GAPLESS_BEARER_MIN_LENGTH
+                ),
             )
             if span_end is not None:
+                if (
+                    soft_gapped
+                    and text[span_start:span_end].isascii()
+                    and text[span_start:span_end].isalpha()
+                    and span_end < len(text)
+                    and _is_word_gap(text[span_end])
+                ):
+                    continue
                 parts.extend((text[cursor:preserved_end], _REDACTED))
                 cursor = span_end
                 search_start = span_end
@@ -475,6 +507,8 @@ def _authorization_value_end(text: str, start: int, quote: str | None) -> tuple[
                 newline_end += 1
             if newline_end < len(text) and text[newline_end] in " \t":
                 folded_lines += 1
+                if quote is None and folded_lines > _MAX_UNTERMINATED_AUTHORIZATION_FOLDS:
+                    return index, False
                 if (
                     folded_lines > _MAX_UNTERMINATED_AUTHORIZATION_FOLDS
                     and unterminated_end is None
@@ -561,16 +595,25 @@ def _redact_authorization_values(text: str) -> str:
     return "".join(parts)
 
 
-def redact_secrets(text: str) -> str:
+def redact_secrets(
+    text: str,
+    *,
+    bearer_soft_gap_marker: str | None = None,
+) -> str:
     """
     Replace secret-shaped substrings in *text* with :data:`_REDACTED`.
 
     :param text: Arbitrary log text (may include tracebacks).
+    :param bearer_soft_gap_marker: Trusted bridge-only separator preserving
+        whether an invisible gap followed a ``Bearer`` anchor.
     :returns: Scrubbed text.
     """
 
     text = _redact_authorization_values(text)
-    text = _redact_scanned_credentials(text)
+    text = _redact_scanned_credentials(
+        text,
+        bearer_soft_gap_marker=bearer_soft_gap_marker,
+    )
     for pat in _SECRET_PATTERNS:
         text = pat.sub(
             lambda m: m.group(1) + _REDACTED if m.lastindex else _REDACTED,

@@ -7733,6 +7733,36 @@ def test_sanitize_hook_failure_detail_redacts_bisected_credential_prefix() -> No
     assert _HOOK_FAILURE_DETAIL_TRUNCATION_MARKER in detail
 
 
+def test_sanitize_hook_failure_detail_redacts_match_after_detection_slice() -> None:
+    """A match beginning after the small detection slice leaves no head remnant."""
+    text = "diagnostic " + "x" * 117 + " " + "ghp_ABCDEFGHIJKLMNOPQRS " + "y" * 5000
+    detail = _sanitize_hook_failure_detail(text)
+
+    assert detail is not None
+    assert "ghp_" not in detail
+    assert _HOOK_FAILURE_DETAIL_TRUNCATION_MARKER in detail
+
+
+def test_sanitize_hook_failure_detail_redacts_shared_token_remnant() -> None:
+    """A redacted neighbor cannot hide a second secret remnant in one token."""
+    text = "dapi" + "A" * 10 + ":ghp_ABCDEFGHIJKLMNOPQRS " + "x" * 5000
+    detail = _sanitize_hook_failure_detail(text)
+
+    assert detail is not None
+    assert "ghp_" not in detail
+    assert _HOOK_FAILURE_DETAIL_TRUNCATION_MARKER in detail
+
+
+def test_sanitize_hook_failure_detail_preserves_prose_from_detection_fragment() -> None:
+    """Remnant containment does not globally replace prose from a matched span."""
+    text = "ghp_" + "a" * 15 + " error\n" + "x" * 5000 + "\nFinalCause: credential error"
+    detail = _sanitize_hook_failure_detail(text)
+
+    assert detail is not None
+    assert "ghp_" not in detail
+    assert "FinalCause: credential error" in detail
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
@@ -8063,6 +8093,33 @@ def test_sanitize_hook_failure_detail_redacts_after_planted_marker() -> None:
 
 
 @pytest.mark.parametrize(
+    "message",
+    [
+        "password= [REDACTED] hunter2",
+        "Bearer [REDACTED] actualsecret",
+    ],
+    ids=["env", "bearer"],
+)
+def test_hook_failure_detail_redacts_after_gapped_planted_marker(message: str) -> None:
+    """A planted marker separated from a keyed value cannot shield it."""
+    detail = _hook_failure_detail({"error": "launch failed", "last_assistant_message": message})
+
+    assert detail is not None
+    assert "hunter2" not in detail
+    assert "actualsecret" not in detail
+
+
+def test_hook_failure_detail_drops_planted_early_redaction_sentinel() -> None:
+    """Provider input cannot promote a private-use character into a trusted marker."""
+    detail = _hook_failure_detail(
+        {"error": "launch failed", "last_assistant_message": "Bearer \ue000 tok123"}
+    )
+
+    assert detail == "launch failed: Bearer [REDACTED]"
+    assert "tok123" not in detail
+
+
+@pytest.mark.parametrize(
     ("text", "expected"),
     [
         (
@@ -8078,6 +8135,40 @@ def test_sanitize_hook_failure_detail_redacts_after_planted_marker() -> None:
 )
 def test_sanitize_hook_failure_detail_redacts_keyed_env_values(text: str, expected: str) -> None:
     """Keyed values fold across preserved line boundaries and have no floor."""
+    assert _sanitize_hook_failure_detail(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            'DATABASE_PASSWORD="part-one\n part-two" status=401',
+            'DATABASE_PASSWORD="[REDACTED]" status=401',
+        ),
+        (
+            'Authorization: "part-one\n part-two" status=401',
+            'Authorization: "[REDACTED]" status=401',
+        ),
+    ],
+    ids=["env", "authorization"],
+)
+def test_sanitize_hook_failure_detail_preserves_quoted_fold_boundaries(
+    text: str, expected: str
+) -> None:
+    """Canonicalization retains indentation that marks a quoted fold."""
+    assert _sanitize_hook_failure_detail(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Bearer\u2060abc123", "Bearer[REDACTED]"),
+        ("Bearer\u2060authentication failed", "Bearerauthentication failed"),
+    ],
+    ids=["short-secret", "prose"],
+)
+def test_sanitize_hook_failure_detail_classifies_soft_gap_bearer(text: str, expected: str) -> None:
+    """A removed soft gap neither leaks a short value nor widens prose."""
     assert _sanitize_hook_failure_detail(text) == expected
 
 
