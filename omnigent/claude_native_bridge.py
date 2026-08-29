@@ -3103,7 +3103,15 @@ def _sanitize_hook_failure_detail(text: str) -> str | None:
         if candidate != detection_canonical:
             matched_detection = detection_canonical
     if matched_detection is not None:
+        # The detection window redacts, proving matching works on this input.
+        # Keep the full head/tail window so the actionable tail survives —
+        # unless windowing itself bisected the match, in which case fall back
+        # to the detection window, whose redaction is proven.
         canonical = matched_detection
+        if raw_preview:
+            window_canonical = _canonicalize_hook_failure_detail(raw_preview)
+            if redact_secrets(window_canonical) != window_canonical:
+                canonical = window_canonical
     elif preview_truncated and not raw_preview:
         canonical = _canonicalize_hook_failure_detail(detection_window)
     else:

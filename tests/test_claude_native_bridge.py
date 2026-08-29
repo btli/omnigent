@@ -7695,6 +7695,23 @@ def test_sanitize_hook_failure_detail_drops_secret_straddling_raw_bound() -> Non
     assert "dapi" not in detail
 
 
+def test_sanitize_hook_failure_detail_keeps_tail_after_head_secret() -> None:
+    """A secret in the detection window redacts without dropping the tail."""
+    secret = "dapi" + "A" * 40
+    text = (
+        f"boot error {secret} then provider noise\n"
+        + ("x" * 80 + "\n") * 60
+        + "FinalCause: model_not_found"
+    )
+    assert len(text) > _HOOK_FAILURE_DETAIL_RAW_LIMIT
+    detail = _sanitize_hook_failure_detail(text)
+    assert detail is not None
+    assert "dapi" not in detail
+    assert detail.startswith("boot error [REDACTED] then provider noise")
+    assert detail.endswith("FinalCause: model_not_found")
+    assert _HOOK_FAILURE_DETAIL_TRUNCATION_MARKER in detail
+
+
 def test_sanitize_hook_failure_detail_keeps_newline_free_raw_tail() -> None:
     """A newline-free raw tail drops its partial token but keeps complete words."""
     text = (
