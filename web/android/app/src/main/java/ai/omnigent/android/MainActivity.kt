@@ -24,6 +24,7 @@ import android.widget.PopupMenu
 import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.VisibleForTesting
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
@@ -51,6 +52,18 @@ class MainActivity : AppCompatActivity() {
     private lateinit var blobSaver: BlobSaver
     private val loginManager = OidcLoginManager()
     private var pinnedOrigin: String? = null
+
+    // CookieManager.setCookie's completion is async; substitutable so a test
+    // can hold the callback across a server switch (SessionTokenBindingTest).
+    @VisibleForTesting
+    internal var installSessionCookie: (String, String, (Boolean) -> Unit) -> Unit =
+        {
+            url,
+            value,
+            callback,
+            ->
+            CookieManager.getInstance().setCookie(url, value) { callback(it) }
+        }
 
     // Bridge-dependent work deferred until the page (and its injected emit
     // callbacks) exist — see onPageReady.
@@ -419,9 +432,9 @@ class MainActivity : AppCompatActivity() {
         val cookies = CookieManager.getInstance()
         cookies.setAcceptCookie(true)
         authLog("onSessionToken: injecting $name (token len=${token.length})")
-        cookies.setCookie(origin, cookie) { accepted ->
+        installSessionCookie(origin, cookie) { accepted ->
             // setCookie's callback is async — re-check the WebView is still alive.
-            if (isDestroyed || !::webView.isInitialized) return@setCookie
+            if (isDestroyed || !::webView.isInitialized) return@installSessionCookie
             authLog(
                 "setCookie accepted=$accepted present=${cookies
                     .getCookie(
@@ -431,7 +444,14 @@ class MainActivity : AppCompatActivity() {
             // A rejected cookie means the reload would land unauthenticated,
             // bounce to login, and re-launch the browser — burning the retry
             // budget on a failure that retrying can't fix. Stay put instead.
-            if (!accepted) return@setCookie
+            if (!accepted) return@installSessionCookie
+            // The async install can also span a server switch. The cookie went
+            // to the old origin's store either way (harmless), but the WebView
+            // must never be steered back to an origin the user has left.
+            if (origin != pinnedOrigin) {
+                authLog("setCookie callback: origin changed during install — not reloading")
+                return@installSessionCookie
+            }
             cookies.flush()
             webView.loadUrl(origin)
         }

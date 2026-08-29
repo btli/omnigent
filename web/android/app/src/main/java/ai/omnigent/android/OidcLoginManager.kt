@@ -50,12 +50,12 @@ class OidcLoginManager {
     // The flow's two network steps, substitutable so tests can drive a token
     // through the completion path without a server.
     @VisibleForTesting
-    internal var requestTicket: (origin: String) -> Ticket? = { httpRequestTicket(it) }
+    internal var requestTicket: (origin: String, deadlineMs: Long) -> Ticket? =
+        { origin, deadlineMs -> httpRequestTicket(origin, deadlineMs) }
 
     @VisibleForTesting
-    internal var pollForToken: (origin: String, ticket: String) -> String? = { origin, ticket ->
-        httpPollForToken(origin, ticket)
-    }
+    internal var pollForToken: (origin: String, ticket: String, deadlineMs: Long) -> String? =
+        { origin, ticket, deadlineMs -> httpPollForToken(origin, ticket, deadlineMs) }
 
     /**
      * Begin a login against [origin] (the pinned server). Opens the browser and
@@ -75,14 +75,21 @@ class OidcLoginManager {
         if (flow != null) return false
         val current = Flow(Executors.newSingleThreadExecutor())
         flow = current
+        // One deadline bounds ticket creation AND polling, mirroring the
+        // desktop shell's single 5-minute login window.
+        val deadlineMs = System.currentTimeMillis() + LOGIN_TIMEOUT_MS
         current.executor.execute {
             var token: String? = null
             try {
-                val ticket = requestTicket(origin)
+                val ticket = requestTicket(origin, deadlineMs)
                 authLog("cli-login -> ${if (ticket != null) "ticket ok" else "FAILED"}")
                 if (ticket != null) {
-                    main.post { launchTab(activity, origin + ticket.loginUrl) }
-                    token = pollForToken(origin, ticket.id)
+                    main.post {
+                        // cancel() may have run after this launch was queued —
+                        // never open the browser for an abandoned flow's origin.
+                        if (!current.cancelled.get()) launchTab(activity, origin + ticket.loginUrl)
+                    }
+                    token = pollForToken(origin, ticket.id, deadlineMs)
                     authLog(
                         "poll -> ${if (token != null) "token (len=${token.length})" else "no token"}",
                     )
@@ -129,27 +136,40 @@ class OidcLoginManager {
         val loginUrl: String,
     )
 
-    private fun httpRequestTicket(origin: String): Ticket? {
-        val conn = (URL("$origin/auth/cli-login").openConnection() as HttpURLConnection)
-        conn.requestMethod = "POST"
-        // Bodyless POST — set Content-Length explicitly; some servers/WAFs reject
-        // a POST without it (411 Length Required).
-        conn.setRequestProperty("Content-Length", "0")
-        conn.connectTimeout = HTTP_TIMEOUT_MS
-        conn.readTimeout = HTTP_TIMEOUT_MS
-        return try {
-            if (conn.responseCode != 200) return null
-            val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
-            val id = json.optString("ticket").ifEmpty { return null }
-            val loginUrl = json.optString("login_url").ifEmpty { return null }
-            // The browser hand-off must stay on the pinned origin: [start]
-            // concatenates this onto it, so only a relative path may pass — an
-            // absolute URL or a scheme-relative `//host` would send the one-time
-            // ticket flow to a server-chosen destination instead.
-            if (!loginUrl.startsWith("/") || loginUrl.startsWith("//")) return null
-            Ticket(id, loginUrl)
-        } finally {
-            conn.disconnect()
+    private fun httpRequestTicket(
+        origin: String,
+        deadlineMs: Long,
+    ): Ticket? {
+        while (true) {
+            val conn = (URL("$origin/auth/cli-login").openConnection() as HttpURLConnection)
+            conn.requestMethod = "POST"
+            // Bodyless POST — set Content-Length explicitly; some servers/WAFs reject
+            // a POST without it (411 Length Required).
+            conn.setRequestProperty("Content-Length", "0")
+            conn.connectTimeout = HTTP_TIMEOUT_MS
+            conn.readTimeout = HTTP_TIMEOUT_MS
+            try {
+                val status = conn.responseCode
+                if (status !in TRANSIENT_STATUSES) {
+                    if (status != 200) return null
+                    val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
+                    val id = json.optString("ticket").ifEmpty { return null }
+                    val loginUrl = json.optString("login_url").ifEmpty { return null }
+                    // The browser hand-off must stay on the pinned origin: [start]
+                    // concatenates this onto it, so only a relative path may pass — an
+                    // absolute URL or a scheme-relative `//host` would send the one-time
+                    // ticket flow to a server-chosen destination instead.
+                    if (!loginUrl.startsWith("/") || loginUrl.startsWith("//")) return null
+                    return Ticket(id, loginUrl)
+                }
+            } finally {
+                conn.disconnect()
+            }
+            // A transient gate/proxy hiccup (same status set as the desktop
+            // shell) — wait out one interval and retry until the login deadline.
+            if (System.currentTimeMillis() >= deadlineMs) return null
+            Thread.sleep(POLL_INTERVAL_MS) // throws InterruptedException on shutdownNow()
+            if (System.currentTimeMillis() >= deadlineMs) return null
         }
     }
 
@@ -172,10 +192,10 @@ class OidcLoginManager {
     private fun httpPollForToken(
         origin: String,
         ticket: String,
+        deadlineMs: Long,
     ): String? {
-        val deadline = System.currentTimeMillis() + POLL_TIMEOUT_MS
         val encoded = Uri.encode(ticket)
-        while (System.currentTimeMillis() < deadline) {
+        while (System.currentTimeMillis() < deadlineMs) {
             Thread.sleep(POLL_INTERVAL_MS) // throws InterruptedException on shutdownNow()
             val conn = (
                 URL(
@@ -197,6 +217,12 @@ class OidcLoginManager {
                         return JSONObject(body).optString("token").ifEmpty { null }
                     }
 
+                    // Transient gate/proxy hiccup (same status set as the
+                    // desktop shell) — keep polling until the deadline.
+                    in TRANSIENT_STATUSES -> {
+                        continue
+                    }
+
                     else -> {
                         return null
                     } // 410 expired/rejected, or other
@@ -213,7 +239,13 @@ class OidcLoginManager {
 
     private companion object {
         const val POLL_INTERVAL_MS = 2_000L
-        const val POLL_TIMEOUT_MS = 5 * 60 * 1_000L // mirrors the CLI's 5-minute window
+        const val LOGIN_TIMEOUT_MS = 5 * 60 * 1_000L // mirrors the CLI's 5-minute window
         const val HTTP_TIMEOUT_MS = 10_000 // connect + read timeout for the login endpoints
+
+        // Retryable statuses — must match the desktop shell's
+        // TRANSIENT_AUTH_STATUSES (oidc_auth.js) so a single 503 from a gate
+        // or proxy doesn't abort the whole login. 410 (expired) and auth
+        // failures stay fatal per the shared contract.
+        val TRANSIENT_STATUSES = setOf(429, 502, 503, 504)
     }
 }
