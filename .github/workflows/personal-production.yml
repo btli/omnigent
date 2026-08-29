@@ -1,7 +1,8 @@
 # Nightly personal production ring for the btli fork.
 #
 # Composes fork branch `production` = upstream main + every open NON-draft
-# btli PR (no extras, no dev tag — draft status is the promotion gate) and
+# btli PR plus the extras-production.txt pins (its own manifest — a listed
+# draft is force-promoted past the draft gate; no dev tag) and
 # pins an immutable production-YYYYMMDD branch + tag, the pin homelab's
 # build-omnigent-production.yml resolves at 11:10 UTC. After the pin it
 # builds a debug APK and an unsigned macOS desktop app from the pinned
