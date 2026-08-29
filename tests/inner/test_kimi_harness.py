@@ -777,8 +777,11 @@ def test_run_turn_reports_wire_usage(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     so the executor reads the persisted wire log after the subprocess exits.
     ``input_tokens`` = Σ inputOther; cache reads/creation and output map to
     their own keys; the effective model comes from ``llm.request`` (the
-    provider-resolved id, not the alias). Rows are written at spawn time —
-    like real kimi — so the strict turn-start time gate admits them.
+    provider-resolved id, not the alias). Usage rows are written at spawn
+    time — like real kimi — so the strict turn-start time gate admits them;
+    the ``llm.request`` row carries NO ``time``, matching the pinned 0.34.0
+    schema (a fabricated ``time`` here previously masked the gate dropping
+    every real first-turn request).
     """
 
     def _rows() -> list[dict[str, Any]]:
@@ -791,7 +794,6 @@ def test_run_turn_reports_wire_usage(monkeypatch: pytest.MonkeyPatch, tmp_path: 
                 "model": "system.ai.kimi-k3",
                 "modelAlias": "kimi-k3-databricks",
                 "maxTokens": 65536,
-                "time": now_ms,
             },
             _usage_row(input_other=20559, output=160, time_ms=now_ms),
             {
@@ -1027,6 +1029,46 @@ def test_run_turn_malformed_wire_rows_are_skipped_whole(
     # Drifted records and non-JSON lines each leave a once-per-file diagnostic.
     assert any("not matching the pinned" in r.message for r in caplog.records)
     assert any("unparseable wire row" in r.message for r in caplog.records)
+
+
+def test_run_turn_first_read_attributes_model_from_real_fixture(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """First read of a real 0.34.0 wire attributes the provider-resolved model.
+
+    The sanitized real-session fixture's ``llm.request`` rows carry NO
+    ``time`` field; the first-read gate must keep them (dropping them
+    downgraded turn-1 attribution to the alias and missed catalog rates
+    keyed on the provider id). Only the ``usage.record`` timestamps are
+    re-stamped to now — the fixture predates the test run and usage rows
+    stay strictly time-gated.
+    """
+    fixture = Path(__file__).parent.parent / "fixtures" / "kimi_wire" / "completed.jsonl"
+
+    def _write_restamped() -> None:
+        # Built at spawn time so the re-stamped usage rows land inside the
+        # turn window (matching real kimi, which writes them mid-turn).
+        now_ms = int(time.time() * 1000)
+        rows: list[dict[str, Any]] = []
+        for line in fixture.read_text(encoding="utf-8").splitlines():
+            row = json.loads(line)
+            if row.get("type") == "usage.record":
+                row["time"] = now_ms
+            rows.append(row)
+        _write_wire(tmp_path, "session_fixture-1", rows)
+
+    events, _ex = _run_stubbed_turn(
+        monkeypatch,
+        tmp_path,
+        session_id="session_fixture-1",
+        on_spawn=_write_restamped,
+    )
+    turn = next(e for e in events if isinstance(e, TurnComplete))
+    assert turn.usage is not None
+    # Provider-resolved id from llm.request, never the kimi-k3-databricks alias.
+    assert turn.usage["model"] == "system.ai.kimi-k3"
+    assert turn.usage["input_tokens"] > 0
+    assert turn.usage["output_tokens"] > 0
 
 
 def test_run_turn_model_falls_back_to_usage_record(

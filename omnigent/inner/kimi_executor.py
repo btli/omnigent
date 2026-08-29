@@ -214,11 +214,16 @@ def _sum_wire_usage(
         row_type = row.get("type")
         if row_type == "llm.request":
             # A resumed log's historical requests must not attribute this
-            # turn: on a first read, only turn-window requests count (usage
-            # rows are gated the same way below).
+            # turn — but real 0.34.0 ``llm.request`` rows carry NO ``time``
+            # (pinned fixtures), so the first-read gate applies only to rows
+            # that DO have one. A timeless historical row is harmless: the
+            # newest request wins, and this turn's own (also timeless)
+            # request comes later in the log. Usage rows stay strictly
+            # time-gated below — attribution can tolerate this, billing
+            # cannot.
             if first_read:
                 request_time = _token_count(row.get("time"))
-                if request_time is None or request_time < turn_start_ms:
+                if request_time is not None and request_time < turn_start_ms:
                     continue
             # Provider-resolved model id, falling back to the configured alias.
             candidate = row.get("model")
