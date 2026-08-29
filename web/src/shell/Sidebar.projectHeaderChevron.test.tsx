@@ -116,20 +116,29 @@ function classOf(el: Element): string {
   return el.getAttribute("class") ?? "";
 }
 
-function stubInputScenario(width: number, anyCoarse: boolean, canHover: boolean) {
+function stubInputScenario(
+  width: number,
+  anyCoarse: boolean,
+  canHover: boolean,
+  coarsePrimary = anyCoarse,
+  anyHover = canHover,
+) {
   Object.defineProperty(window, "matchMedia", {
     writable: true,
     configurable: true,
     value: (query: string) => ({
-      matches: (() => {
-        if (query.includes("pointer: coarse")) return anyCoarse;
-        if (query.includes("hover: hover")) return canHover;
-        const min = query.match(/^\(min-width: ([\d.]+)px\)$/);
+      matches: query.split(/\s+and\s+/).every((condition) => {
+        const normalized = condition.trim();
+        if (normalized === "(pointer: coarse)") return coarsePrimary;
+        if (normalized === "(any-pointer: coarse)") return anyCoarse;
+        if (normalized === "(hover: hover)") return canHover;
+        if (normalized === "(any-hover: hover)") return anyHover;
+        const min = normalized.match(/^\(min-width: ([\d.]+)px\)$/);
         if (min) return width >= parseFloat(min[1]);
-        const max = query.match(/^\(max-width: ([\d.]+)px\)$/);
+        const max = normalized.match(/^\(max-width: ([\d.]+)px\)$/);
         if (max) return width <= parseFloat(max[1]);
         return false;
-      })(),
+      }),
       media: query,
       addEventListener: () => {},
       removeEventListener: () => {},
@@ -147,6 +156,8 @@ afterEach(() => {
 });
 
 describe("project folder header icon/chevron", () => {
+  // These are class-contract tests: jsdom does not evaluate @media (hover:hover).
+  // The recorded sidebar-project-row-fixes.gif demo is the behavioral guardrail.
   it("preserves the folder-to-chevron swap on a wide hover-capable device", () => {
     renderSidebar();
     const header = headerButton("My Project");
@@ -211,6 +222,7 @@ describe("project folder header icon/chevron", () => {
 
     expect(window.matchMedia("(any-pointer: coarse)").matches).toBe(true);
     expect(window.matchMedia("(hover: hover)").matches).toBe(false);
+    expect(window.matchMedia("(pointer: coarse) and (hover: hover)").matches).toBe(false);
     expect(window.matchMedia("(min-width: 768px)").matches).toBe(width >= 768);
 
     const chevrons = Array.from(header.querySelectorAll(".lucide-chevron-right"));

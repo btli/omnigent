@@ -374,6 +374,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   cleanup();
+  vi.unstubAllGlobals();
   // dnd-kit removes its capture-phase click blocker on a delayed task.
   await new Promise((resolve) => {
     setTimeout(resolve, 60);
@@ -455,6 +456,8 @@ describe("quick pin/unpin hover button", () => {
     }
   });
 
+  // These are class-contract tests: jsdom does not evaluate @media (hover:hover).
+  // The recorded sidebar-project-row-fixes.gif demo is the behavioral guardrail.
   it("keeps the Projects group-header actions visible without hover, hover-revealed on desktop", () => {
     // The "New project" (+) button is the only way to create a project, so its
     // group-header wrapper must stay visible wherever hover is unavailable —
@@ -483,6 +486,7 @@ describe("quick pin/unpin hover button", () => {
   });
 
   it("keeps Pinned and Sessions carets visible on a wide coarse-pointer device", () => {
+    vi.stubGlobal("innerWidth", 810);
     mocks.anyCoarse = true;
     mocks.pinnedStore.set([CONV.id]);
     mockConversations([
@@ -491,6 +495,7 @@ describe("quick pin/unpin hover button", () => {
     ]);
     renderSidebar();
 
+    expect(window.innerWidth).toBe(810);
     expect(mocks.anyCoarse).toBe(true);
     for (const name of ["Pinned", "Sessions"]) {
       const header = screen.getByRole("button", { name });
