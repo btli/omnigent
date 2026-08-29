@@ -1046,6 +1046,50 @@ def test_run_turn_malformed_wire_rows_are_skipped_whole(
     assert any("unparseable wire row" in r.message for r in caplog.records)
 
 
+def test_run_turn_split_write_row_bills_after_completion(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A row caught mid-append is deferred, not lost.
+
+    The checkpoint must stop at the last complete line: consuming the
+    unterminated fragment would restart the next read mid-JSON and the row
+    would never bill."""
+    half = ""
+
+    def _write_split() -> None:
+        nonlocal half
+        now_ms = int(time.time() * 1000)
+        full = json.dumps(_usage_row(input_other=6, output=2, time_ms=now_ms))
+        fragment = json.dumps(_usage_row(input_other=4, output=1, time_ms=now_ms))
+        cut = len(fragment) // 2
+        half = fragment[cut:]
+        _wire_path(tmp_path, "session_split-1").parent.mkdir(parents=True, exist_ok=True)
+        _wire_path(tmp_path, "session_split-1").write_text(
+            full + "\n" + fragment[:cut], encoding="utf-8"
+        )
+
+    events, ex = _run_stubbed_turn(
+        monkeypatch, tmp_path, session_id="session_split-1", on_spawn=_write_split
+    )
+    turn = next(e for e in events if isinstance(e, TurnComplete))
+    assert turn.usage is not None
+    # Only the complete row billed; the fragment is deferred, never dropped.
+    assert turn.usage["input_tokens"] == 6
+    assert turn.usage["output_tokens"] == 2
+
+    def _complete_fragment() -> None:
+        with _wire_path(tmp_path, "session_split-1").open("a", encoding="utf-8") as fh:
+            fh.write(half + "\n")
+
+    events2 = _collect_stubbed_turn(
+        monkeypatch, ex, session_id="session_split-1", on_spawn=_complete_fragment
+    )
+    turn2 = next(e for e in events2 if isinstance(e, TurnComplete))
+    assert turn2.usage is not None
+    assert turn2.usage["input_tokens"] == 4
+    assert turn2.usage["output_tokens"] == 1
+
+
 @pytest.mark.parametrize("failure", ["empty", "unreadable"])
 def test_run_turn_yieldless_existing_wire_still_bills_late_rows(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str

@@ -182,6 +182,13 @@ def _sum_wire_usage(
         )
         return None, None, offset
     first_read = start == 0
+    # Never checkpoint past an unterminated trailing line: kimi may still be
+    # mid-append, and consuming the fragment now would restart the next read
+    # mid-JSON and lose the completed row (the forwarder's incremental reader
+    # applies the same rule). The fragment is left for the next read.
+    if blob and not blob.endswith(b"\n"):
+        cut = blob.rfind(b"\n") + 1
+        blob = blob[:cut]
     totals = {
         "input_tokens": 0,
         "output_tokens": 0,
@@ -272,8 +279,8 @@ def _sum_wire_usage(
         # The relay path stores total_tokens as its own accumulator (never
         # derived), so omitting it would report 0 total forever.
         totals["total_tokens"] = sum(totals.values())
-    # Bytes appended between the size probe and the read must not be
-    # re-counted next turn: checkpoint what was actually consumed.
+    # Checkpoint exactly what was consumed: complete lines only (any trailing
+    # fragment was cut above), and never bytes appended after the read.
     return (totals if counted else None), (request_model or record_model), start + len(blob)
 
 
