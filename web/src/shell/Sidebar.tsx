@@ -2379,12 +2379,18 @@ export function SectionHeader({
   const markerFade = actionHoverOnly
     ? "[@media((hover:hover)_and_(pointer:fine))]:group-hover/section:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:opacity-0"
     : "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/section:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-0";
+  // The hover-only control's focus reveal (`focus-visible:not-sr-only`) is
+  // ungated by pointer type, so a coarse-pointer tablet with a keyboard can
+  // land focus on it. Its focus fade must therefore fire at every pointer type
+  // too — otherwise the focus-revealed kebab paints over a still-visible
+  // spinner/count. The hover-driven fades above stay pointer-gated (hover only
+  // exists on fine). Every other header keeps its width-gated focus fade.
   const actionFocusFade = actionFocusVisible
     ? actionHoverOnly
-      ? "[@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-header-controls]_:focus-visible]/header:opacity-0"
+      ? "group-has-[[data-header-controls]_:focus-visible]/header:opacity-0"
       : "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]_:focus-visible]/header:opacity-0"
     : actionHoverOnly
-      ? "[@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-header-controls]:focus-within]/header:opacity-0"
+      ? "group-has-[[data-header-controls]:focus-within]/header:opacity-0"
       : "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-0";
   const button = (
     <button
