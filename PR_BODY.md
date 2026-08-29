@@ -43,7 +43,8 @@ kimi TUI (tmux pane) ──appends──► wire.jsonl (session-private)
                                ├─ pane died mid-turn ─────────────► failed     ├─ external_model_change (deduped)
                                ├─ wire quiet 5 min (no tool) ─────► idle       └─ external_session_status
                                └─ tool in flight quiet 30 min ────► failed
-                                                              server prices tokens (catalog, else posted kimi rates)
+                                  cost: client-priced sum over per-model segments (cumulative_cost_usd);
+                                  server token-prices at the current model as fallback (catalog, else posted kimi rates)
 kimi -p (headless) ─► wire.jsonl ─► executor ─► TurnComplete.usage {tokens, model}
 ```
 
@@ -56,10 +57,11 @@ Recorded human rulings from the #4481 review tribunal — engines must not re-ra
 
 ## Test Plan
 
-- `uv run pytest tests/test_kimi_native_forwarder.py tests/inner/test_kimi_harness.py tests/inner/test_kimi_native_executor.py tests/llms/test_context_window.py tests/runner/test_app_sessions_native_workflow_init.py tests/terminals/test_pane_reaper.py tests/test_kimi_native_credentials.py tests/test_kimi_native_hook.py` — **427 passed** (the union of all three source PRs' suites plus the new pricing tests).
+- `uv run pytest tests/test_kimi_native_forwarder.py tests/inner/test_kimi_harness.py tests/inner/test_kimi_native_executor.py tests/llms/test_context_window.py tests/runner/test_app_sessions_native_workflow_init.py tests/terminals/test_pane_reaper.py tests/test_kimi_native_credentials.py tests/test_kimi_native_hook.py` — **445 passed** (the union of all three source PRs' suites plus the new pricing, per-model-segment cost, wire-recreation, restart, and first-read tests).
 - `pre-commit run --files <all changed files>` — all hooks pass except pyrefly, whose only errors are pre-existing environmental missing-imports (optional opentelemetry extras) in untouched `omnigent/runtime/telemetry.py`.
 - **Kimi rate verification:** fetched https://platform.kimi.ai/ on 2026-08-28 and pinned the posted per-MTok rates (K3 3.00/15.00/0.30, K2.7 Code 0.95/4.00/0.19, K2.6 0.95/4.00/0.16) into `_KIMI_POSTED_PRICING`; unit tests assert the exact values, the substring match on forwarder-reported ids (`system.ai.kimi-k3`, `kimi-k3-databricks`), and that a catalog entry still wins.
 - Merge reconciliation covered by tests: the real-wire fixtures now also exercise the usage/model parser (`failed.jsonl` yields `message → model → turn_failed`); the usage-sync live-loop tests run against the byte-offset loop from #4441.
+- Adversarial review round 1 (3 reviewers, 6 findings) applied: per-model segment-priced `cumulative_cost_usd` (mid-session model switches no longer mis-charge under the server's monotonic clamp), generation-dedupe reset on same-path wire recreation, first-read `llm.request` attribution without a fabricated `time`, persisted in-flight assistant text, wire-independent usage retry + fallback-close sync, and the pending-first-read billing floor — each with mutation-checked tests.
 - Deflaked `test_empty_capture_is_retried_before_menu_disappears` (patches the settle timeout/poll interval like the rest of its class; the real 0.5 s window left ~0.2 s of scheduling margin under load).
 
 ## Demo
