@@ -259,15 +259,20 @@ describe("project folder header context menu", () => {
     );
   });
 
-  it("links New session to the project composer on non-hover inputs", () => {
+  it("keeps New session reachable when a touch opens the menu on hover-capable hardware", () => {
     renderSidebar();
 
     fireEvent.contextMenu(folderHeader());
     const item = screen.getByTestId("project-new-session-menu");
 
     expect(item).toHaveAttribute("href", `/?project=${encodeURIComponent(PROJECT_NAME)}`);
-    expect(item).toHaveClass("[@media((hover:hover)_and_(pointer:fine))]:md:hidden");
-    expect(item).not.toHaveClass("md:hidden");
+    for (const hiddenClass of [
+      "hidden",
+      "md:hidden",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:hidden",
+    ]) {
+      expect(item).not.toHaveClass(hiddenClass);
+    }
   });
 
   it("still expands and collapses on plain left-click", () => {
@@ -404,6 +409,7 @@ describe("project folder header context menu", () => {
     fireEvent.click(screen.getByTestId("projects-select-sessions"));
 
     expect(folderHeader().closest('[data-slot="context-menu-trigger"]')).toBeNull();
+    expect(folderHeader()).toHaveClass("select-none", "[-webkit-touch-callout:none]");
     fireEvent.contextMenu(folderHeader());
     expect(screen.queryByTestId("rename-project")).toBeNull();
   });

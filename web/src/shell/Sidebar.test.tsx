@@ -747,6 +747,19 @@ describe("Sidebar session list", () => {
     expect(within(sessionsSection!).queryByRole("button", { name: "Select sessions" })).toBeNull();
   });
 
+  it("does not treat the persistent filter as a hover-revealed action", () => {
+    mockConversations([conv("conv_mine", "Claude Code")]);
+    renderSidebar();
+
+    fireEvent.click(screen.getByTestId("toggle-selection-mode"));
+    fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
+
+    const pill = screen.getByTestId("section-collapsed-count");
+    expect(pill.parentElement).toHaveClass("mr-7");
+    expect(pill.parentElement).not.toHaveClass("mr-14");
+    expect(pill.className).not.toContain("opacity-0");
+  });
+
   it("renders the 'Automations' nav row directly under 'New session' and routes to /tasks", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
@@ -1385,6 +1398,13 @@ describe("Sidebar collapsed section count pill", () => {
       "mr-14",
       "[@media((hover:hover)_and_(pointer:fine))]:md:mr-2",
     );
+    const pill = within(projectsSection).getByTestId("section-collapsed-count");
+    expect(pill).toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]_:focus-visible]/header:opacity-0",
+    );
+    expect(pill).not.toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-0",
+    );
   });
 
   // On fine-pointer hover desktops the header overlays are opacity-0 at rest
@@ -1958,7 +1978,7 @@ describe("Sidebar project sections", () => {
     );
   });
 
-  it("folds the new-session pencil into the kebab on mobile", async () => {
+  it("keeps New session in the project menu when the pencil requires hover", async () => {
     // The pencil is limited to fine-pointer hover desktops — the condition
     // that lets hovering reveal it. Everywhere else (including fine-pointer
     // touchscreen laptops, where a tap can't reveal the gated overlay) the
@@ -1972,15 +1992,20 @@ describe("Sidebar project sections", () => {
     const pencil = screen.getByTestId("project-new-session");
     expect(pencil).toHaveClass("hidden", "[@media((hover:hover)_and_(pointer:fine))]:md:flex");
 
-    // Open the kebab → a mobile-only "New session" item linking to the same
-    // pre-filed composer.
+    // The menu remains a touch/long-press fallback even when the hover shortcut
+    // is eligible, because a touchscreen tap cannot reveal that shortcut first.
     fireEvent.pointerDown(screen.getByRole("button", { name: "Project actions for Customer X" }), {
       button: 0,
       ctrlKey: false,
     });
     const menuItem = await screen.findByTestId("project-new-session-menu");
-    expect(menuItem).toHaveClass("[@media((hover:hover)_and_(pointer:fine))]:md:hidden");
-    expect(menuItem).not.toHaveClass("md:hidden");
+    for (const hiddenClass of [
+      "hidden",
+      "md:hidden",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:hidden",
+    ]) {
+      expect(menuItem).not.toHaveClass(hiddenClass);
+    }
     expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
   });
 });
