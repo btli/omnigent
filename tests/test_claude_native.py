@@ -10223,6 +10223,24 @@ def test_claude_catalog_selection_keeps_loud_failure_without_a_claude_tier(
             "v1-system.ai.claude-opus-5",
             id="unstripped-provider-qualifier-digits-do-not-count",
         ),
+        pytest.param(
+            [
+                {"id": "sonnet-5", "model": "sonnet2.gw.claude-sonnet-5"},
+                {"id": "sonnet-4-6", "model": "claude-sonnet-4-6"},
+            ],
+            "fable",
+            "sonnet2.gw.claude-sonnet-5",
+            id="tier-token-in-provider-prefix-does-not-count",
+        ),
+        pytest.param(
+            [
+                {"id": "opus-4-8", "model": "provider-opus-9.claude-opus-4-8"},
+                {"id": "opus-5", "model": "claude-opus-5"},
+            ],
+            "fable",
+            "claude-opus-5",
+            id="tier-generation-in-provider-prefix-does-not-count",
+        ),
     ],
 )
 def test_claude_tier_ladder_prefers_current_generation_over_dated_legacy_ids(
@@ -10246,6 +10264,21 @@ def test_claude_tier_ladder_prefers_current_generation_over_dated_legacy_ids(
     assert notice is not None
 
 
+def test_claude_tier_ladder_accepts_an_authoritative_alias_id() -> None:
+    """A tier alias row remains launchable when its wire model omits `claude`."""
+    launch_model, notice = claude_native.resolve_claude_native_catalog_selection(
+        "fable",
+        [
+            {"id": "opus", "model": "gateway-opus-5"},
+            {"id": "sonnet", "model": "claude-sonnet-4-6"},
+        ],
+        None,
+    )
+
+    assert launch_model == "gateway-opus-5"
+    assert notice is not None
+
+
 @pytest.mark.parametrize(
     "stderr",
     [
@@ -10253,6 +10286,17 @@ def test_claude_tier_ladder_prefers_current_generation_over_dated_legacy_ids(
         pytest.param(b"Error: not authenticated", id="not-authenticated"),
         pytest.param(b"OAuth token expired. Run /login again.", id="oauth-token-expired"),
         pytest.param(b"your credentials have expired", id="credentials-expired"),
+        pytest.param(b"HTTP/2 401", id="http2-401"),
+        pytest.param(b"HTTPS 401", id="https-401"),
+        pytest.param(b"status_code=401", id="status-code-401"),
+        pytest.param(b"http_401", id="http-underscore-401"),
+        pytest.param(b"HTTP/2 403", id="http2-403"),
+        pytest.param(b"status_code=403", id="status-code-403"),
+        pytest.param(b"http_403", id="http-underscore-403"),
+        pytest.param(b'{"type":"authentication_error"}', id="authentication-error"),
+        pytest.param(b"Invalid x-api-key", id="invalid-x-api-key"),
+        pytest.param(b"API key is invalid", id="api-key-is-invalid"),
+        pytest.param(b"api key expired", id="api-key-expired"),
     ],
 )
 def test_probe_error_classifies_established_auth_messages_as_auth(stderr: bytes) -> None:
@@ -10267,6 +10311,9 @@ def test_probe_error_classifies_established_auth_messages_as_auth(stderr: bytes)
     [
         pytest.param(b"retry after 401 seconds", id="401-retry-delay"),
         pytest.param(b"connect 10.0.4.1:401 refused", id="401-ip-port"),
+        pytest.param(b"Error: retry 401 seconds", id="error-401-retry-delay"),
+        pytest.param(b"retry after 403 seconds", id="403-retry-delay"),
+        pytest.param(b"connect 10.0.4.3:403 refused", id="403-ip-port"),
         pytest.param(b"token bucket lease expired", id="rate-limit-token-bucket"),
     ],
 )
@@ -10279,11 +10326,15 @@ def test_probe_error_keeps_non_auth_outages_out_of_the_auth_class(stderr: bytes)
 
 def test_fold_notice_is_silent_for_an_exact_picker_id_resolution() -> None:
     """Resolving a picker id to its own [1m] custom option substitutes nothing."""
+    custom_model = "system.ai.claude-sonnet-5[1m]"
     assert (
         claude_native.claude_model_fold_notice(
             "sonnet_5",
-            "system.ai.claude-sonnet-5[1m]",
-            "system.ai.claude-sonnet-5[1m]",
+            custom_model,
+            custom_model,
+            claude_native.ClaudeNativeUcodeConfig(
+                env={"ANTHROPIC_CUSTOM_MODEL_OPTION": custom_model}
+            ),
         )
         is None
     )
@@ -10311,6 +10362,27 @@ def test_picker_id_resolution_to_its_1m_custom_option_launches_without_a_banner(
 
     assert launch_model == "system.ai.claude-sonnet-5[1m]"
     assert notice is None
+
+
+def test_picker_id_resolution_surfaces_a_missing_custom_option_fallback() -> None:
+    """A saved custom-slot pick cannot silently become the Sonnet family pin."""
+    fallback = "system.ai.claude-sonnet-4-6"
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={
+            "ANTHROPIC_BASE_URL": "https://gateway.example/anthropic",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": fallback,
+        }
+    )
+
+    launch_model, notice = claude_native.resolve_claude_native_catalog_selection(
+        "sonnet_5",
+        [{"id": "sonnet", "model": fallback}],
+        config,
+    )
+
+    assert launch_model == fallback
+    assert notice is not None
+    assert "saved picker option" in notice
 
 
 def test_claude_catalog_selection_rejects_an_unrecognized_claude_looking_id() -> None:
