@@ -20,6 +20,7 @@ import {
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { ROW_CLICK_SUPPRESS_WINDOW_MS } from "@/hooks/useRowGesture";
 import type { ServerInfo } from "@/lib/capabilities";
 import type * as IdentityModule from "@/lib/identity";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -1546,6 +1547,27 @@ describe("touch swipe actions", () => {
     fireEvent.click(screen.getByRole("link", { name: /My Session/ }));
 
     expect(screen.getByTestId("location-probe")).toHaveTextContent("/c/conv_1");
+  });
+
+  it("lets a click through once the suppression window elapses (AT activation)", () => {
+    // An assistive-technology activation dispatches ONLY a click — no pointer
+    // events, no keydown, and (unlike a real swipe release) no browser
+    // trailing click before it to consume the armed flag. It arrives on a
+    // human timescale, long after the gesture, and must not be consumed as
+    // the swipe's "trailing" click: the suppression is time-bounded.
+    renderSidebar();
+    vi.useFakeTimers();
+    try {
+      const swipe = moveSwipeRow(-40);
+      pointerEventAt("pointerUp", swipe.li, { clientX: 60, clientY: 100 }, 1_500);
+      act(() => {
+        vi.advanceTimersByTime(ROW_CLICK_SUPPRESS_WINDOW_MS + 1);
+      });
+      fireEvent.click(screen.getByRole("link", { name: /My Session/ }));
+      expect(screen.getByTestId("location-probe")).toHaveTextContent("/c/conv_1");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("shows the unarchive glyph when swiping an archived row", () => {

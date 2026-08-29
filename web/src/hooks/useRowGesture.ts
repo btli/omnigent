@@ -35,6 +35,13 @@ export const ROW_MENU_SYNTHETIC = Symbol("row-menu-synthetic");
 const ROW_INTERACTIVE_CONTROL_SELECTOR =
   'button, input, select, textarea, [contenteditable]:not([contenteditable="false"])';
 
+// How long a resolved gesture's trailing-click suppression stays armed. The
+// browser's synthesized click lands within the same task chain as the release
+// (milliseconds), so this window is generous for it — while an
+// assistive-technology activation that dispatches only `click` arrives on a
+// human timescale, well past it, and must NOT be consumed as "trailing".
+export const ROW_CLICK_SUPPRESS_WINDOW_MS = 250;
+
 const ROW_SCROLL_ACTIVATE_PX = 25;
 const ROW_HOLD_TOLERANCE_PX = 20;
 const ROW_SWIPE_MAX_PX = 96;
@@ -190,6 +197,7 @@ export function useRowGesture({
   const holdTimer = useRef<number | null>(null);
   const suppressClick = useRef(false);
   const suppressionKeydown = useRef<((event: KeyboardEvent) => void) | null>(null);
+  const suppressionTimer = useRef<number | null>(null);
   const touchMoveGuard = useRef<(() => void) | null>(null);
   const dxFrame = useRef<number | null>(null);
   const pendingDx = useRef(0);
@@ -268,21 +276,34 @@ export function useRowGesture({
 
   const clearClickSuppression = useCallback(() => {
     suppressClick.current = false;
+    if (suppressionTimer.current !== null) {
+      window.clearTimeout(suppressionTimer.current);
+      suppressionTimer.current = null;
+    }
     const keydown = suppressionKeydown.current;
     if (!keydown) return;
     suppressionKeydown.current = null;
     document.removeEventListener("keydown", keydown, true);
   }, []);
 
-  // Armed until the trailing click arrives or the next press/key clears it. A
-  // timer would race the click because browsers need not dispatch it in the
-  // same task, so keyboard intent clears through a one-shot capture listener.
+  // Armed until the trailing click arrives, the next press/key clears it, or
+  // the bounded window elapses. A zero-delay timer would race the click
+  // (browsers need not dispatch it in the same task), so the window is a
+  // generous ROW_CLICK_SUPPRESS_WINDOW_MS — but it must exist: without it the
+  // armed flag survived indefinitely, and an assistive-technology activation
+  // that dispatches only `click` (no pointer, no key) was consumed as
+  // "trailing". Keyboard intent still clears early via a one-shot capture
+  // listener.
   const suppressTrailingClick = useCallback(() => {
     clearClickSuppression();
     suppressClick.current = true;
     const keydown = () => clearClickSuppression();
     suppressionKeydown.current = keydown;
     document.addEventListener("keydown", keydown, { capture: true, once: true });
+    suppressionTimer.current = window.setTimeout(
+      clearClickSuppression,
+      ROW_CLICK_SUPPRESS_WINDOW_MS,
+    );
   }, [clearClickSuppression]);
 
   const reset = useCallback(
