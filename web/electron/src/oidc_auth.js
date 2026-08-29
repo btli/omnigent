@@ -246,6 +246,12 @@ async function runOidcBrowserLogin(
 
     try {
       const body = await response.json();
+      // Reading the body can outlast the login window (slow-trickle response)
+      // — a token landing past the deadline is expired-flow output and must
+      // not install a session, matching the Android shell's late-token check.
+      if (monotonicNowMs() >= deadline) {
+        return { ok: false, reason: isUserAbort(signal) ? "cancelled" : "timed_out" };
+      }
       if (!body || typeof body.token !== "string" || body.token === "") {
         return { ok: false, reason: "failed" };
       }

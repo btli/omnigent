@@ -557,6 +557,37 @@ describe("OIDC browser ticket flow", () => {
     assert.deepEqual(result, { ok: false, reason: "timed_out" });
     assert.equal(fetches, 1);
   });
+
+  it("rejects a token whose body arrives past the login deadline", async () => {
+    // The poll request is issued in time, but the response body trickles in
+    // after the 5-minute window — expired-flow output must not become a
+    // session (parity with the Android shell's late-token check).
+    const electronSession = {
+      fetch: async (url) => {
+        if (url.endsWith("/auth/cli-login")) {
+          return response(200, { ticket: "late", login_url: "/auth/login?ticket=late" });
+        }
+        return {
+          status: 200,
+          json: async () => {
+            await new Promise((resolve) => {
+              setTimeout(resolve, 150);
+            });
+            return { token: "session-token" };
+          },
+        };
+      },
+    };
+
+    const result = await runOidcBrowserLogin(
+      electronSession,
+      "https://server.example",
+      async () => {},
+      { pollIntervalMs: 1, timeoutMs: 100 },
+    );
+
+    assert.deepEqual(result, { ok: false, reason: "timed_out" });
+  });
 });
 
 describe("OIDC session cookie installation", () => {
