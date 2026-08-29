@@ -1556,6 +1556,40 @@ describe("SectionHeader collapsed badge cluster", () => {
     }
   });
 
+  it("keeps the width-gated (md) badge fade for a non-hover-only header", () => {
+    // Pins the invariant half of the hover-only split: a header that does NOT
+    // set actionHoverOnly fades its count pill and marker only at md+, exactly
+    // as before. (The hover-only folder drops md so its fade matches its
+    // all-width reveal — see the "Sidebar collapsed project marker" suite.)
+    render(
+      <TooltipProvider>
+        <SectionHeader
+          title="Both"
+          count={3}
+          marker={{ kind: "running" }}
+          hasAction
+          collapsed
+          onToggleCollapsed={() => {}}
+        />
+      </TooltipProvider>,
+    );
+    const pill = screen.getByTestId("section-collapsed-count");
+    const markerSlot = screen.getByTestId("session-state-badge").parentElement!;
+    expect(pill).toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-0",
+    );
+    expect(markerSlot).toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/section:opacity-0",
+    );
+    // Never the capability-only (no md) form — that belongs to hover-only actions.
+    expect(pill).not.toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/header:opacity-0",
+    );
+    expect(markerSlot).not.toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/section:opacity-0",
+    );
+  });
+
   it("keeps the lone-pill offset when no marker renders", () => {
     render(
       <TooltipProvider>
@@ -2006,7 +2040,14 @@ describe("Sidebar project sections", () => {
     renderSidebar();
 
     const pencil = screen.getByTestId("project-new-session");
-    expect(pencil).toHaveClass("sr-only", "[@media((hover:hover)_and_(pointer:fine))]:not-sr-only");
+    expect(pencil).toHaveClass(
+      "sr-only",
+      "[@media((hover:hover)_and_(pointer:fine))]:not-sr-only",
+      "[@media((hover:hover)_and_(pointer:fine))]:flex",
+      // Keyboard focus un-clips it even without a fine hover pointer, so a
+      // touchscreen-plus-keyboard user gets a visible focus target.
+      "focus-visible:not-sr-only",
+    );
 
     // The menu remains a touch/long-press fallback even when the hover shortcut
     // is eligible, because a touchscreen tap cannot reveal that shortcut first.
@@ -2048,6 +2089,10 @@ describe("Sidebar project sections", () => {
     // Never display:none — that would strip it from the a11y tree and tab order
     // on touch, where the long-press contextmenu isn't reliably dispatched.
     expect(kebab).not.toHaveClass("hidden");
+    // Keyboard focus un-clips it (`:focus-visible` isn't raised by a touch tap),
+    // so a sighted keyboard/switch user on a touchscreen laptop gets a visible
+    // focus ring instead of one clipped off-screen.
+    expect(kebab).toHaveClass("focus-visible:not-sr-only");
     // No un-capability-gated display utility at md would re-expose it on a wide
     // touch screen (the reported foldable bug) — broader than the one literal.
     for (const cls of kebab.classList) {
@@ -2057,11 +2102,12 @@ describe("Sidebar project sections", () => {
     }
   });
 
-  it("exposes the kebab to the accessibility tree without a fine hover pointer", () => {
-    // The touch/coarse case (390px and 810px). getByRole excludes display:none
-    // and aria-hidden nodes, so finding the button by role proves sr-only keeps
-    // it in the a11y tree — touch + screen-reader users reach the same actions
-    // even when the long-press contextmenu gesture isn't delivered.
+  it("keeps the touch kebab in the a11y tree and focus-revealable, never display:none", () => {
+    // The touch/coarse case (390px and 810px). No CSS is loaded in jsdom, so a
+    // display:none button is equally findable/focusable here — the meaningful
+    // guard is the class contract: sr-only (kept in the a11y tree, unlike
+    // `hidden`) plus focus-visible:not-sr-only (a focused control becomes
+    // visible). The demo is the behavioral guardrail for the effective render.
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
@@ -2069,10 +2115,8 @@ describe("Sidebar project sections", () => {
     renderSidebar();
 
     const kebab = screen.getByRole("button", { name: "Project actions for Customer X" });
-    expect(kebab).toHaveClass("sr-only");
+    expect(kebab).toHaveClass("sr-only", "focus-visible:not-sr-only");
     expect(kebab).not.toHaveClass("hidden");
-    kebab.focus();
-    expect(kebab).toHaveFocus();
   });
 
   it("reveals the folder kebab on hover at every width, narrow hover desktops included", () => {
@@ -2188,13 +2232,20 @@ describe("Sidebar collapsed project marker", () => {
     expect(cluster).toHaveClass("-mr-1");
     expect(cluster).not.toHaveClass("mr-14");
     expect(cluster).not.toHaveClass("[@media((hover:hover)_and_(pointer:fine))]:md:-mr-1");
-    // On fine-hover desktops the marker still fades as the revealed kebab
-    // takes its slot — the conversation-row swap, unchanged.
+    // The kebab reveals on hover at every width for a fine hover pointer, so
+    // the marker must fade under the same capability-only condition (no md) —
+    // otherwise the revealed kebab paints over a still-visible spinner on a
+    // narrow hover desktop. The fade condition tracks the reveal condition.
     expect(slot).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/section:opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/section:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-header-controls]:focus-within]/header:opacity-0",
     );
+    // No width-gated fade survives for a hover-only action — that mismatch is
+    // the narrow-hover overlap regression.
+    for (const cls of slot.classList) {
+      expect(cls).not.toMatch(/:md:group-(hover|has-).*opacity-0$/);
+    }
   });
 
   // The "awaiting" pill is wider than the dot markers; constraining it to the

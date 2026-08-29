@@ -2368,9 +2368,24 @@ export function SectionHeader({
         ? "[@media((hover:hover)_and_(pointer:fine))]:md:-mr-1"
         : "[@media((hover:hover)_and_(pointer:fine))]:md:mr-1"
       : "[@media((hover:hover)_and_(pointer:fine))]:md:mr-2";
+  // A hover-only action reveals at every width on a fine hover pointer (no
+  // `md:`), so the badge it displaces must fade under the same condition — at
+  // every width too — or the revealed kebab paints over a still-visible marker
+  // on a narrow hover desktop. Every other header keeps the width-gated fade,
+  // byte-identical, matching its width-gated reveal.
+  const countFade = actionHoverOnly
+    ? "[@media((hover:hover)_and_(pointer:fine))]:group-hover/header:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-0"
+    : "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-0";
+  const markerFade = actionHoverOnly
+    ? "[@media((hover:hover)_and_(pointer:fine))]:group-hover/section:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:opacity-0"
+    : "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/section:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-0";
   const actionFocusFade = actionFocusVisible
-    ? "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]_:focus-visible]/header:opacity-0"
-    : "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-0";
+    ? actionHoverOnly
+      ? "[@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-header-controls]_:focus-visible]/header:opacity-0"
+      : "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]_:focus-visible]/header:opacity-0"
+    : actionHoverOnly
+      ? "[@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-header-controls]:focus-within]/header:opacity-0"
+      : "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-0";
   const button = (
     <button
       type="button"
@@ -2455,11 +2470,7 @@ export function SectionHeader({
               data-testid="section-collapsed-count"
               className={cn(
                 "inline-flex h-4 min-w-4 shrink-0 items-center justify-center rounded-full bg-[var(--sidebar-active)] px-1 font-medium text-10 text-[var(--sidebar-active-foreground)] tabular-nums transition-opacity",
-                hasAction &&
-                  cn(
-                    "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-0",
-                    actionFocusFade,
-                  ),
+                hasAction && cn(countFade, actionFocusFade),
               )}
             >
               {count}
@@ -2479,11 +2490,7 @@ export function SectionHeader({
                 // mirroring a row's time/marker slot — under the same reveal
                 // conditions and media gate as the count pill (hover keeps its
                 // historical whole-section scope).
-                hasAction &&
-                  cn(
-                    "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/section:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-0",
-                    actionFocusFade,
-                  ),
+                hasAction && cn(markerFade, actionFocusFade),
               )}
             >
               <SessionStateBadge state={marker} />
@@ -4198,7 +4205,7 @@ function ProjectFolderActions({
             size="icon-xs"
             aria-label={`New session in ${projectName}`}
             data-testid="project-new-session"
-            className="sr-only text-muted-foreground [@media((hover:hover)_and_(pointer:fine))]:not-sr-only [@media((hover:hover)_and_(pointer:fine))]:flex"
+            className="sr-only text-muted-foreground focus-visible:not-sr-only [@media((hover:hover)_and_(pointer:fine))]:not-sr-only [@media((hover:hover)_and_(pointer:fine))]:flex"
           >
             <Link
               to={`/?project=${encodeURIComponent(projectName)}`}
@@ -4597,7 +4604,7 @@ function ProjectFolderMenu({
           size="icon-xs"
           aria-label={`Project actions for ${projectName}`}
           data-testid="project-actions"
-          className="sr-only text-muted-foreground [@media((hover:hover)_and_(pointer:fine))]:not-sr-only [@media((hover:hover)_and_(pointer:fine))]:flex"
+          className="sr-only text-muted-foreground focus-visible:not-sr-only [@media((hover:hover)_and_(pointer:fine))]:not-sr-only [@media((hover:hover)_and_(pointer:fine))]:flex"
           onClick={(e) => e.stopPropagation()}
         >
           <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
