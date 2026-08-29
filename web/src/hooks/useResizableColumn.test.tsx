@@ -137,6 +137,27 @@ describe("useResizableColumn pointer dragging", () => {
     },
   );
 
+  it("clamps the restored width to bounds that change mid-drag", () => {
+    const rendered = renderHook(
+      ({ maxWidth }) => useResizableColumn(undefined, undefined, maxWidth),
+      { initialProps: { maxWidth: 480 } },
+    );
+    rendered.result.current.containerRef.current = {
+      getBoundingClientRect: () => ({ left: 0 }),
+    } as HTMLElement;
+
+    act(() => rendered.result.current.handleProps.onPointerDown(pointerEvent(13)));
+    act(() => rendered.result.current.handleProps.onPointerMove(pointerEvent(13, 140)));
+    expect(rendered.result.current.width).toBe(140);
+
+    rendered.rerender({ maxWidth: 150 });
+    act(() => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })));
+
+    expect(rendered.result.current.width).toBe(150);
+    expect(rendered.result.current.handleProps["aria-valuenow"]).toBe(150);
+    expect(rendered.result.current.handleProps["aria-valuemax"]).toBe(150);
+  });
+
   it("resets body cursor/selection when unmounted mid-drag", () => {
     const { result, unmount } = renderColumn(0);
 
