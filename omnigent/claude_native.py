@@ -82,6 +82,7 @@ from omnigent._wrapper_labels import (
 from omnigent.claude_launcher import resolve_claude_launch
 from omnigent.claude_model_vocabulary import (
     ALIAS_MODEL_ENV_VARS,
+    CLAUDE_MODEL_ALIASES,
     CUSTOM_MODEL_OPTION_ENV_VAR,
     CUSTOM_MODEL_OPTION_NAME_ENV_VAR,
     LEGACY_CUSTOM_SLOT_ROW_ID,
@@ -106,6 +107,7 @@ from omnigent.claude_native_state import (
     redirect_launch_state,
     write_launch_state,
 )
+from omnigent.cli_invocation import cli_invocation
 from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.host.daemon_launch import (
@@ -135,7 +137,8 @@ from omnigent.native_terminal import (
 from omnigent.native_terminal import (
     terminal_attach_url as _attach_url,
 )
-from omnigent.terminals.ws_bridge import (
+from omnigent.process_logging import log_info_once
+from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
 )
@@ -200,9 +203,24 @@ _CLAUDE_CODE_USE_GATEWAY_ENV = "CLAUDE_CODE_USE_GATEWAY"
 _CLAUDE_NONESSENTIAL_TRAFFIC_ENV = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
 _CLAUDE_MODEL_PROBE_TIMEOUT_S = 20.0
 _CLAUDE_AUTH_FAILURE_PATTERN = re.compile(
-    r"(?:\b401\b|unauthori[sz]ed|authentication(?:\s+\w+){0,2}\s+"
-    r"(?:failed|required)|invalid\s+(?:api[ _-]?key|token|credentials)|"
-    r"(?:login|sign[ -]?in)\s+required|not\s+(?:logged|signed)\s+in)",
+    # Numeric statuses need HTTP/status syntax; bare numbers also occur in
+    # retry delays and IP ports.
+    r"(?:(?:^|[^a-z0-9])https?(?:/\d+(?:\.\d+)?)?"
+    r"(?:[\s_:/=-]+(?:error|status|code))?[\s_:/=-]+(?:401|403)\b|"
+    r"(?:^|[^a-z0-9])status(?:[\s_-]*code)?[\s_:/=-]+(?:401|403)\b|"
+    r"\b(?:401\s+unauthori[sz]ed|403\s+forbidden)\b|"
+    r"unauthori[sz]ed|forbidden|auth(?:entication)?[ _-]+error|"
+    r"authentication(?:[\s_-]+\w+){0,2}[\s_-]+(?:failed|required)|"
+    r"(?:invalid|expired)\s+(?:x[-_]?api[-_]?key|api[ _-]?key)|"
+    r"(?:x[-_]?api[-_]?key|api[ _-]?key)(?:\s+\w+){0,2}\s+(?:invalid|expired)|"
+    r"invalid\s+(?:token|credentials)|"
+    r"(?:login|sign[ -]?in)\s+required|not\s+(?:logged|signed)\s+in|"
+    r"not\s+authenticated|run\s+/login|"
+    # "expired" needs an auth-ish noun: a bare "token ... expired" also
+    # matches rate-limit token buckets.
+    r"(?:oauth|auth(?:entication)?|login|api|access|refresh|session)"
+    r"\s+tokens?(?:\s+\w+){0,2}\s+expired|"
+    r"credentials?(?:\s+\w+){0,2}\s+expired|session\s+expired)",
     re.IGNORECASE,
 )
 #: Wall-clock cap for the per-alias resolution fan-out as a whole. Startup
@@ -233,16 +251,9 @@ _CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV = "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"
 # model ID.  When set, the /model picker shows these IDs as options rather
 # than normalising to canonical Anthropic names (which the Databricks gateway
 # rejects).  See https://code.claude.com/docs/en/model-config#override-model-ids-per-version
-_ANTHROPIC_DEFAULT_FABLE_MODEL_ENV = "ANTHROPIC_DEFAULT_FABLE_MODEL"
-_ANTHROPIC_DEFAULT_OPUS_MODEL_ENV = "ANTHROPIC_DEFAULT_OPUS_MODEL"
-_ANTHROPIC_DEFAULT_SONNET_MODEL_ENV = "ANTHROPIC_DEFAULT_SONNET_MODEL"
-_ANTHROPIC_DEFAULT_HAIKU_MODEL_ENV = "ANTHROPIC_DEFAULT_HAIKU_MODEL"
-_UCODE_CLAUDE_TIER_TO_ENV: dict[str, str] = {
-    "fable": _ANTHROPIC_DEFAULT_FABLE_MODEL_ENV,
-    "opus": _ANTHROPIC_DEFAULT_OPUS_MODEL_ENV,
-    "sonnet": _ANTHROPIC_DEFAULT_SONNET_MODEL_ENV,
-    "haiku": _ANTHROPIC_DEFAULT_HAIKU_MODEL_ENV,
-}
+_UCODE_CLAUDE_TIER_TO_ENV = dict(ALIAS_MODEL_ENV_VARS)
+# Capability-descending launch fallback policy. Vocabulary ordering is not policy.
+_CLAUDE_TIER_FALLBACK_ORDER: tuple[str, ...] = ("fable", "opus", "sonnet", "haiku")
 # The 4 family aliases above pin one model ID each. Claude Code has exactly
 # one more independently-selectable /model picker slot beyond those
 # families — ANTHROPIC_CUSTOM_MODEL_OPTION — used here to surface Sonnet 5
@@ -260,11 +271,24 @@ _SESSION_LABELS = {
     _WRAPPER_LABEL_KEY: _WRAPPER_LABEL_VALUE,
 }
 _CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
-_CLAUDE_CODE_MANAGED_SETTINGS_PATHS: tuple[Path, ...] = (
-    Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
-    Path("/etc/claude-code/managed-settings.json"),
-    Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) / "ClaudeCode" / "managed-settings.json",
-)
+# Test override for the managed-settings chain. ``None`` means "use the ambient
+# detector's chain" — the single canonical definition (``ambient`` owns both the
+# path list and the parser). Binding a *copy* here would create a second source
+# of host state that a test fixture could neutralize independently of the other,
+# so both readers below resolve through ``_managed_settings_paths`` at call time.
+_CLAUDE_CODE_MANAGED_SETTINGS_PATHS: tuple[Path, ...] | None = None
+
+
+def _managed_settings_paths() -> tuple[Path, ...]:
+    """The Claude Code managed-settings chain to read (ambient's, or a test override)."""
+    override = _CLAUDE_CODE_MANAGED_SETTINGS_PATHS
+    if override is not None:
+        return override
+    from omnigent.onboarding.ambient import CLAUDE_CODE_MANAGED_SETTINGS_PATHS
+
+    return CLAUDE_CODE_MANAGED_SETTINGS_PATHS
+
+
 _CLAUDE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _RESUME_ACTION_SWITCH = "switch"
 _RESUME_ACTION_MOVE = "move"
@@ -358,7 +382,7 @@ class PreparedClaudeTerminal:
         when the runner did not advertise a socket. Drives the
         same-machine direct ``tmux attach`` fast path; a remote
         runner's socket won't exist locally, so the attach falls back
-        to the WebSocket PTY bridge.
+        to the WebSocket terminal bridge.
     :param tmux_target: tmux ``-t`` target for the terminal pane,
         e.g. ``"main"``. ``None`` when unavailable. Paired with
         ``tmux_socket`` for the direct attach.
@@ -439,6 +463,25 @@ def claude_config_uses_databricks(claude_config: ClaudeNativeUcodeConfig | None)
     )
 
 
+def is_canonical_claude_pin(model: str) -> bool:
+    """Whether *model* is recognized and already uses Claude's canonical spelling."""
+    if model != model.strip() or model != model.lower():
+        return False
+    bare = model.removesuffix("[1m]")
+    if bare in CLAUDE_MODEL_ALIASES:
+        return True
+    parts = bare.split("-")
+    if not parts or parts[0] != "claude":
+        return False
+    model_parts = parts[1:]
+    tiers = [part for part in model_parts if part in CLAUDE_MODEL_ALIASES]
+    return (
+        len(tiers) == 1
+        and any(part.isdigit() for part in model_parts)
+        and all(part.isdigit() or part in CLAUDE_MODEL_ALIASES for part in model_parts)
+    )
+
+
 def _claude_family(token: str) -> str | None:
     """
     The family alias a model id or alias folds onto, bracket markers dropped.
@@ -471,8 +514,8 @@ def resolve_claude_catalog_model(
         return None
     matches: set[str] = set()
     for row in rows:
-        row_id = str(row.get("id") or "")
-        wire_model = str(row.get("model") or "")
+        row_id = str(row.get("id") or "").strip()
+        wire_model = str(row.get("model") or "").strip()
         if any(
             candidate and normalized_model_id(candidate) == normalized
             for candidate in (row_id, wire_model)
@@ -513,6 +556,197 @@ def claude_catalog_serves_model(
     family = _claude_family(model)
     return family is not None and any(
         _claude_family(str(row.get("id") or row.get("model") or "")) == family for row in rows
+    )
+
+
+def _claude_catalog_tier_rank(
+    row: dict[str, object],
+    tier: str,
+) -> tuple[bool, tuple[int, ...], tuple[int, ...], bool, str, str, str, str]:
+    """Rank a tier's alias first, then newest standard-context model.
+
+    Generation semantics span both id shapes: the modern
+    ``claude-<tier>-G-m`` carries the generation after the tier token,
+    while the legacy ``claude-G[-x]-<tier>-<date>`` carries it before,
+    with a release date that must only break ties within a generation —
+    a dated Claude 3 id must never outrank Claude 4.x.
+    """
+    from omnigent.claude_model_vocabulary import normalized_model_id
+
+    row_id = str(row.get("id") or "").strip()
+    row_model = str(row.get("model") or "").strip()
+    launch_model = row_model or row_id
+    normalized = normalized_model_id(launch_model)
+    # Generation digits are anchored to the tier token: the modern
+    # ``claude-<tier>-G-m`` carries them after it; the legacy
+    # ``claude-G[-x]-<tier>-<date>`` carries them between the claude token
+    # and the tier. Digits from provider qualifiers the shared
+    # normalization does not strip (``v2-system.ai....``) never count.
+    head, _, tail = normalized.rpartition(tier)
+    claude_head = head[head.rfind("claude") :] if "claude" in head else ""
+    tail_groups = re.findall(r"\d+", tail)
+    # Six-plus digit groups are a release date, a tiebreak only.
+    version = [-int(part) for part in tail_groups if len(part) < 6][:3]
+    if not version:
+        version = [-int(part) for part in re.findall(r"\d+", claude_head) if len(part) < 6][:3]
+    generation = tuple(version + [0] * (3 - len(version)))
+    release_date = tuple(
+        -int(part) for part in (*re.findall(r"\d+", claude_head), *tail_groups) if len(part) >= 6
+    ) or (0,)
+    return (
+        row_id.lower() != tier,
+        generation,
+        release_date,
+        launch_model.lower().endswith("[1m]"),
+        launch_model.lower(),
+        row_id.lower(),
+        launch_model,
+        row_id,
+    )
+
+
+def _claude_catalog_tier_model(rows: list[dict[str, object]], tier: str) -> str | None:
+    """Return the catalog's deterministic launch spelling for one Claude tier."""
+    candidates: list[dict[str, object]] = []
+    for row in rows:
+        row_id = str(row.get("id") or "").strip()
+        row_model = str(row.get("model") or "").strip()
+        family_token = row_model or row_id
+        if _claude_family(family_token) != tier:
+            continue
+        lower_token = family_token.lower()
+        if (
+            lower_token not in CLAUDE_MODEL_ALIASES
+            and "claude" not in lower_token
+            and row_id.lower() != tier
+        ):
+            continue
+        candidates.append(row)
+    if not candidates:
+        return None
+    selected = min(candidates, key=lambda row: _claude_catalog_tier_rank(row, tier))
+    return str(selected.get("model") or selected.get("id") or "").strip() or None
+
+
+def claude_model_fold_notice(
+    requested_model: str,
+    candidate: str,
+    launch_model: str,
+    claude_config: ClaudeNativeUcodeConfig | None = None,
+) -> str | None:
+    """Build (and WARN-log) the visible notice for an equivalent-spelling fold.
+
+    :param requested_model: The pin as the operator spelled it.
+    :param candidate: The spelling that matched the catalog (the request
+        itself, or its configured picker-id resolution).
+    :param launch_model: The spelling the launch will pin.
+    :param claude_config: Provider config used to verify a custom-slot picker
+        resolution.
+    :returns: The session-notice text, or ``None`` when nothing visible
+        changed.
+    """
+    if launch_model == candidate:
+        custom_model = (
+            claude_config.env.get(_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV)
+            if claude_config is not None
+            else None
+        )
+        if requested_model != _UCODE_CLAUDE_CUSTOM_TIER or custom_model == candidate:
+            return None
+        reason = "the saved picker option now resolves to a different configured model"
+    # Markers are compared against the candidate — the spelling the launch
+    # was resolved from — so a picker id's configured [1m] option does not
+    # read as a context change of its own resolution.
+    elif candidate.lower().endswith("[1m]") != launch_model.lower().endswith("[1m]"):
+        reason = "the equivalent catalog model uses a different [1m] context marker"
+    elif candidate == requested_model:
+        reason = "the equivalent catalog model uses the host's verified spelling"
+    else:
+        return None
+    _logger.warning(
+        "native-claude: substituting requested model %r with %r: %s",
+        requested_model,
+        launch_model,
+        reason,
+    )
+    return (
+        f"Requested Claude model {requested_model!r} was substituted with "
+        f"{launch_model!r} because {reason}."
+    )
+
+
+def resolve_claude_native_catalog_selection(
+    requested_model: str,
+    rows: list[dict[str, object]],
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> tuple[str, str | None]:
+    """Resolve an explicit Claude launch request against the host catalog.
+
+    Available requests retain their exact resolved spelling. An unavailable
+    Claude tier steps down through Fable, Opus, Sonnet, and Haiku, never across
+    vendors. When no lower Claude tier is available, the existing actionable
+    launch error is preserved.
+
+    :param requested_model: Persisted picker id or concrete Claude model id.
+    :param rows: The host's current launch catalog.
+    :param claude_config: Resolved provider config for the terminal.
+    :returns: ``(launch_model, notice)``; ``notice`` is set only on substitution.
+    :raises click.ClickException: If the request cannot stay in the Claude family.
+    """
+    from omnigent.model_catalog_store import catalog_contains
+
+    resolved_request = (
+        resolve_claude_native_model_selection(requested_model, claude_config) or requested_model
+    )
+    requested_alias = requested_model.strip().lower()
+    alias_base = requested_alias.removesuffix("[1m]")
+    requested_tier = (
+        alias_base
+        if alias_base in CLAUDE_MODEL_ALIASES
+        and requested_alias in {alias_base, f"{alias_base}[1m]"}
+        else None
+    )
+    for candidate in dict.fromkeys((requested_model, resolved_request)):
+        exact_match = catalog_contains(rows, candidate)
+        catalog_model = resolve_claude_catalog_model(rows, candidate)
+        if catalog_model is not None:
+            if exact_match or (
+                is_canonical_claude_pin(candidate)
+                and claude_config_serves_canonical_ids(claude_config)
+            ):
+                launch_model = candidate
+            else:
+                launch_model = catalog_model
+            return launch_model, claude_model_fold_notice(
+                requested_model,
+                candidate,
+                launch_model,
+                claude_config,
+            )
+
+    if requested_tier in _CLAUDE_TIER_FALLBACK_ORDER:
+        start = _CLAUDE_TIER_FALLBACK_ORDER.index(requested_tier)
+        for tier in _CLAUDE_TIER_FALLBACK_ORDER[start:]:
+            substitute = _claude_catalog_tier_model(rows, tier)
+            if substitute is None:
+                continue
+            reason = "the requested Claude model is absent from this host's current model list"
+            _logger.warning(
+                "native-claude: substituting unavailable requested model %r with %r: %s",
+                requested_model,
+                substitute,
+                reason,
+            )
+            notice = (
+                f"Requested Claude model {requested_model!r} is unavailable on this host. "
+                f"Launched with {substitute!r} instead because {reason}."
+            )
+            return substitute, notice
+
+    raise click.ClickException(
+        f"the requested model {requested_model!r} is not in this host's current "
+        "model list — it may have changed since the pick. Launchable model ids: "
+        f"{model_catalog_store.launchable_ids_text(rows)}. Pick again from the model menu."
     )
 
 
@@ -683,7 +917,7 @@ def _managed_claude_model_config() -> ClaudeNativeUcodeConfig | None:
         _ANTHROPIC_CUSTOM_MODEL_OPTION_ENV,
         _ANTHROPIC_CUSTOM_MODEL_OPTION_NAME_ENV,
     }
-    for path in _CLAUDE_CODE_MANAGED_SETTINGS_PATHS:
+    for path in _managed_settings_paths():
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -716,25 +950,9 @@ def managed_claude_gateway_signal() -> tuple[str | None, bool]:
     :returns: ``(base_url, has_credential)`` from the first readable managed
         settings file, or ``(None, False)`` when none is present or parseable.
     """
-    for path in _CLAUDE_CODE_MANAGED_SETTINGS_PATHS:
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        raw_env = payload.get("env")
-        env = raw_env if isinstance(raw_env, dict) else {}
-        raw_base_url = env.get("ANTHROPIC_BASE_URL")
-        base_url = raw_base_url.strip() if isinstance(raw_base_url, str) else None
-        has_helper = bool(payload.get("apiKeyHelper"))
-        use_gateway = str(env.get("CLAUDE_CODE_USE_GATEWAY", "")).strip().lower() not in (
-            "",
-            "0",
-            "false",
-        )
-        return base_url or None, has_helper or use_gateway
-    return None, False
+    from omnigent.onboarding.ambient import claude_managed_gateway
+
+    return claude_managed_gateway(_managed_settings_paths())
 
 
 def claude_native_model_options(
@@ -1062,8 +1280,7 @@ class ClaudeModelProbe:
 def _claude_probe_process_error(stderr: bytes) -> model_catalog_store.CatalogRefreshError:
     """Classify a failed Claude subprocess without retaining its output."""
     failure_text = stderr.decode(errors="replace")
-    forbidden = re.search(r"(?:\b403\b|forbidden)", failure_text, re.IGNORECASE)
-    if forbidden is not None or _CLAUDE_AUTH_FAILURE_PATTERN.search(failure_text):
+    if _CLAUDE_AUTH_FAILURE_PATTERN.search(failure_text):
         return model_catalog_store.CatalogRefreshError(
             model_catalog_store.CatalogRefreshFailureKind.AUTH,
             "Claude model catalog authentication failed",
@@ -2614,7 +2831,7 @@ def _ucode_config_for_profile(
     if agent_state is None:
         raise click.ClickException(
             f"ucode state for profile {profile!r} does not include a Claude agent entry. "
-            "Run `omnigent setup --internal-beta` to refresh ucode configuration."
+            f"Run `{cli_invocation()} setup --internal-beta` to refresh ucode configuration."
         )
 
     base_url = agent_state.env.get(_UCODE_CLAUDE_BASE_URL_ENV) or agent_state.base_url
@@ -2624,12 +2841,12 @@ def _ucode_config_for_profile(
         raise click.ClickException(
             f"ucode state for profile {profile!r} is missing Claude base URL "
             f"({_UCODE_CLAUDE_BASE_URL_ENV} / base_url). "
-            "Run `omnigent setup --internal-beta` to refresh ucode configuration."
+            f"Run `{cli_invocation()} setup --internal-beta` to refresh ucode configuration."
         )
     if not agent_state.auth_command:
         raise click.ClickException(
             f"ucode state for profile {profile!r} is missing Claude auth_command. "
-            "Run `omnigent setup --internal-beta` to refresh ucode configuration."
+            f"Run `{cli_invocation()} setup --internal-beta` to refresh ucode configuration."
         )
 
     refresh_interval_ms = (
@@ -2834,7 +3051,8 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
             entry.name,
         )
         return None
-    _logger.info(
+    log_info_once(
+        _logger,
         "native-claude routing: provider %r (base_url=%s, model=%s)",
         entry.name,
         family.base_url,
@@ -2963,7 +3181,8 @@ def _bedrock_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcode
             "Bedrock account. Set models.default to a Bedrock inference-profile id.",
             entry.name,
         )
-    _logger.info(
+    log_info_once(
+        _logger,
         "native-claude routing: bedrock provider %r (base_url=%s, model=%s)",
         entry.name,
         family.base_url,
@@ -3020,9 +3239,11 @@ def _native_claude_config_from_entry(
     if entry.kind == BEDROCK_KIND:
         return _bedrock_config_for_native_claude(entry)
     if entry.kind == DATABRICKS_KIND:
-        _logger.info("native-claude routing: Databricks ucode profile %r", entry.profile)
+        log_info_once(_logger, "native-claude routing: Databricks ucode profile %r", entry.profile)
         return _ucode_config_for_profile(entry.profile, refresh_models=refresh_models)
-    _logger.info("native-claude routing: Claude CLI login (subscription provider %r)", entry.name)
+    log_info_once(
+        _logger, "native-claude routing: Claude CLI login (subscription provider %r)", entry.name
+    )
     return None
 
 
@@ -3094,10 +3315,11 @@ def resolve_native_claude_config(
     entry = default_provider_for_harness(effective_config_with_detected(explicit), "claude-sdk")
     if entry is not None:
         return _native_claude_config_from_entry(entry, refresh_models=refresh_models)
-    _logger.info(
+    log_info_once(
+        _logger,
         "native-claude routing: Claude CLI login (no provider configured for the Claude "
         "harness, no Databricks profile). Run `omnigent setup --no-internal-beta` to route "
-        "through a provider."
+        "through a provider.",
     )
     return None
 
@@ -3151,6 +3373,37 @@ def _materialize_claude_agent_spec(tmpdir: Path) -> Path:
     }
     yaml_path.write_text(yaml.safe_dump(raw, sort_keys=False))
     return yaml_path
+
+
+def _wrapper_spec_raw_instructions(spec_path: Path) -> str | None:
+    """Resolve raw author instructions from the wrapper's agent spec.
+
+    Reuses :func:`omnigent.spec.load` (the same loader
+    :func:`~omnigent.cli._bundle` and the server use for both an agent-image
+    directory and a standalone single-file YAML) so the value matches exactly
+    what ``AgentSpec.instructions`` resolves to — including the
+    ``instructions:`` file precedence over ``prompt:`` — rather than
+    re-reading the raw YAML ad hoc.
+
+    :param spec_path: The generated/current wrapper agent spec (a
+        standalone YAML file or an agent-image directory).
+    :returns: The verbatim instructions text, or ``None`` if unresolvable
+        or absent/whitespace-only. Best-effort: a malformed spec must not
+        block the terminal launch, so load failures degrade to ``None``.
+    """
+    from omnigent.runtime.prompt import raw_author_instructions
+    from omnigent.spec import load as load_agent_spec
+
+    try:
+        spec = load_agent_spec(spec_path, expand_env=False)
+    except Exception:  # noqa: BLE001 — best-effort; never block the launch
+        _logger.warning(
+            "Could not resolve raw instructions from wrapper spec %s",
+            spec_path,
+            exc_info=True,
+        )
+        return None
+    return raw_author_instructions(spec)
 
 
 def _run_with_local_server(
@@ -3252,6 +3505,7 @@ def _run_with_local_server(
                     claude_config=claude_config,
                     startup_profiler=startup_profiler,
                     startup_progress=progress,
+                    append_system_prompt=_wrapper_spec_raw_instructions(spec_path),
                 )
             )
             _mark_startup_step(
@@ -3343,7 +3597,7 @@ def _can_attach_direct_tmux(prepared: PreparedClaudeTerminal) -> bool:
     socket exists on this host (so the runner shares this machine), and
     ``tmux`` is on PATH. This is the same-machine fast path: it wires the
     local TTY straight to the runner's tmux pane instead of relaying
-    every keystroke over the WebSocket PTY bridge. A remote runner's
+    every keystroke over the WebSocket terminal bridge. A remote runner's
     socket won't exist locally, so this returns ``False`` and the caller
     falls back to the WebSocket attach. Mirrors the Codex wrapper's
     :func:`omnigent.codex_native._can_attach_direct_tmux`.
@@ -3386,7 +3640,7 @@ async def _attach_direct_tmux(
         outlives the attach (user detached), else
         :attr:`_AttachOutcome.EXITED`.
     """
-    from omnigent.terminals.ws_bridge import _check_pane_dead_definitive, _tmux_session_alive
+    from omnigent.terminals.ws_common import _check_pane_dead_definitive, _tmux_session_alive
 
     startup_profiler = startup_profiler or StartupProfiler(name="omnigent claude", enabled=False)
     env = dict(os.environ)
@@ -3768,8 +4022,8 @@ async def _is_terminal_resource_gone(
     a clean tmux exit because Claude quit (the wrapper should stop).
     The runner's terminal-attach route emits close code ``4404`` when
     the resource is already marked stopped before attach, but a
-    teardown that races attach can produce a code-``1000`` close from
-    the PTY bridge instead. This GET disambiguates the two states.
+    teardown that races attach can produce a code-``1000`` bridge close.
+    This GET disambiguates the two states.
 
     HTTP / connection errors are treated as "not gone" so a server
     that's still bouncing (probe also fails) keeps the wrapper in the
@@ -3861,10 +4115,9 @@ def _is_terminal_detached_close(exc: ConnectionClosed) -> bool:
     """
     Return whether *exc* indicates the user detached from tmux.
 
-    The runner's PTY bridge closes the attach WebSocket with code
-    ``WS_CLOSE_TERMINAL_DETACHED`` (``4405``) when the ``tmux attach``
-    child exits but ``has-session`` confirms the session is still
-    alive — i.e. the user pressed the tmux detach key. Unlike a 4404
+    The runner's terminal bridge closes the attach WebSocket with code
+    ``WS_CLOSE_TERMINAL_DETACHED`` (``4405``) when the control client exits but
+    the tmux pane remains alive. Unlike a 4404
     (terminal gone), this must NOT end the session: the runner keeps
     running so the web UI stays connected.
 
@@ -4247,7 +4500,7 @@ def _run_with_remote_server(
     creates/resolves the session, persists the pass-through args, waits
     for the daemon-spawned runner + its auto-created terminal, and
     attaches (directly to the runner's tmux when it is local, else over
-    the WebSocket PTY bridge). See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
+    the WebSocket terminal bridge). See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
 
     :param base_url: Remote Omnigent server base URL without a trailing
         slash, e.g. ``"https://example.databricks.com"``.
@@ -4459,6 +4712,7 @@ async def _prepare_claude_terminal(
     claude_config: ClaudeNativeUcodeConfig | None = None,
     startup_profiler: StartupProfiler | None = None,
     startup_progress: RunnerStartupProgress | None = None,
+    append_system_prompt: str | None = None,
 ) -> PreparedClaudeTerminal:
     """
     Create/bind a session and launch its Claude terminal resource.
@@ -4476,6 +4730,10 @@ async def _prepare_claude_terminal(
         marks. ``None`` disables output.
     :param startup_progress: Optional user-visible progress renderer,
         e.g. a handle from :func:`runner_startup_progress`.
+    :param append_system_prompt: Raw author instructions for
+        ``--append-system-prompt``, applied on fresh launch and cold
+        resume only — the hot-reattach fast path below returns before
+        this is used, so it never relaunches or duplicates the flag.
     :returns: Prepared terminal details.
     :raises click.ClickException: If any server operation fails.
     """
@@ -4616,6 +4874,7 @@ async def _prepare_claude_terminal(
             command=command,
             bridge_dir=bridge_dir,
             claude_config=claude_config,
+            append_system_prompt=append_system_prompt,
         )
         _mark_startup_step(
             startup_profiler,
@@ -4659,7 +4918,7 @@ async def _fetch_claude_session_labels(
     if resp.status_code == 404:
         raise click.ClickException(
             f"Conversation {session_id!r} not found on the server. "
-            "Run `omnigent claude` (no --resume) to start a new session.",
+            f"Run `{cli_invocation()} claude` (no --resume) to start a new session.",
         )
     if resp.status_code >= 400:
         raise click.ClickException(
@@ -4703,7 +4962,7 @@ async def _resolve_cold_resume_args(
     if resp.status_code == 404:
         raise click.ClickException(
             f"Conversation {session_id!r} not found on the server. "
-            "Run `omnigent claude` (no --resume) to start a new session.",
+            f"Run `{cli_invocation()} claude` (no --resume) to start a new session.",
         )
     if resp.status_code >= 400:
         raise click.ClickException(
@@ -4721,7 +4980,7 @@ async def _resolve_cold_resume_args(
     if wrapper != _WRAPPER_LABEL_VALUE:
         raise click.ClickException(
             f"Conversation {session_id!r} is not a claude-native session "
-            f"(wrapper={wrapper!r}). Use `omnigent run --resume "
+            f"(wrapper={wrapper!r}). Use `{cli_invocation()} run --resume "
             f"{session_id}` to resume it through the right runtime.",
         )
     external_session_id = payload.get("external_session_id")
@@ -5541,8 +5800,9 @@ async def _launch_claude_terminal(
     :param bridge_dir: Bridge directory shared with Claude's MCP
         MCP server and the web-chat harness.
     :param claude_config: Optional ucode-derived Claude Code config.
-    :param append_system_prompt: Optional framework-owned instructions for
-        this fresh native session.
+    :param append_system_prompt: Optional raw ``AgentSpec.instructions``
+        (author-supplied, not framework-composed) for this fresh native
+        session.
     :param allowed_tools: Optional narrowly scoped Claude tools preapproved
         for this native session.
     :returns: Terminal resource id.
@@ -5649,7 +5909,7 @@ async def _read_claude_terminal_tmux(
 
     Lets the caller decide whether to attach to the runner's tmux
     directly (same machine, low latency) instead of relaying over the
-    WebSocket PTY bridge. Best-effort: any lookup failure, non-200, or
+    WebSocket terminal bridge. Best-effort: any lookup failure, non-200, or
     missing metadata yields ``(None, None)``, which callers treat as
     "not locally attachable" and fall back to the WebSocket path.
 
@@ -5704,8 +5964,9 @@ def _claude_terminal_request(
     :param ap_auth_headers: Auth headers for the
         ``PermissionRequest`` command hook.
     :param claude_config: Optional ucode-derived Claude Code config.
-    :param append_system_prompt: Optional framework-owned instructions to
-        append to Claude Code's system prompt.
+    :param append_system_prompt: Optional raw ``AgentSpec.instructions``
+        (author-supplied, not framework-composed) to append to Claude
+        Code's system prompt.
     :param allowed_tools: Optional narrowly scoped Claude tools preapproved
         for this native session.
     :returns: JSON body for ``POST /resources/terminals``.

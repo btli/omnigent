@@ -8,7 +8,9 @@ import binascii
 import contextlib
 import importlib.metadata
 import io
+import itertools
 import json
+import logging
 import os
 import re
 import shlex
@@ -35,7 +37,7 @@ from omnigent.databricks_model_discovery import DatabricksClaudeCatalog
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.runtime import tool_result_replay as trc
 from omnigent.spec import load_omnigent_yaml
-from omnigent.terminals.ws_bridge import (
+from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
 )
@@ -1423,6 +1425,180 @@ def test_local_run_persists_launch_state_on_fresh_session(
     assert resume_hint in captured.err
     assert captured.err.index(web_ui) < captured.err.index(resume_hint)
     assert opened == [("http://127.0.0.1:12345", "conv_local_fresh", True)]
+
+
+def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fresh(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    The real outer call site (``_run_with_local_server``) threads the
+    wrapper spec's raw instructions all the way into ``_prepare_claude_terminal``
+    on a FRESH session — with ``_prepare_claude_terminal`` itself REAL, not
+    faked, so the outer-to-inner threading is what is exercised rather than a
+    hand-supplied ``append_system_prompt``. Only ``_launch_claude_terminal``
+    — one level further in — is faked here, to observe what the real
+    ``_prepare_claude_terminal`` call actually forwards.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec_path = claude_native._materialize_claude_agent_spec(tmp_path)
+
+    class _Proc:
+        def poll(self) -> None:
+            return None
+
+    def fake_start_server(*args: object, **kwargs: object) -> Any:
+        del args, kwargs
+        return SimpleNamespace(proc=_Proc(), runner_id="runner_local", log_path=None)
+
+    launch_kwargs: dict[str, Any] = {}
+
+    async def _fake_create_session(
+        _client: object, _bundle: bytes, *, bridge_id: str, terminal_launch_args: object = None
+    ) -> str:
+        del _client, _bundle, bridge_id, terminal_launch_args
+        return "conv_local_fresh_raw"
+
+    async def _fake_bind_session_runner(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    async def _fake_launch_claude_terminal(
+        _client: object,
+        _session_id: str,
+        _claude_args: tuple[str, ...],
+        *,
+        command: str,
+        bridge_dir: Path,
+        claude_config: object = None,
+        append_system_prompt: str | None = None,
+        allowed_tools: tuple[str, ...] = (),
+    ) -> str:
+        del _client, _session_id, _claude_args, command, bridge_dir, claude_config, allowed_tools
+        launch_kwargs["append_system_prompt"] = append_system_prompt
+        return "terminal_claude_main"
+
+    async def fake_attach(
+        attach_url: str, *, headers: dict[str, str], terminal_gone_probe: object | None = None
+    ) -> bool:
+        del attach_url, headers, terminal_gone_probe
+        return True
+
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr("omnigent.chat._find_free_port", lambda: 12346)
+    monkeypatch.setattr("omnigent.chat._start_local_server", fake_start_server)
+    monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
+    monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
+    monkeypatch.setattr("omnigent.chat._bundle_agent", lambda path: b"bundle")
+    monkeypatch.setattr(claude_native, "_create_claude_session", _fake_create_session)
+    monkeypatch.setattr(claude_native, "_bind_session_runner", _fake_bind_session_runner)
+    monkeypatch.setattr(claude_native, "_launch_claude_terminal", _fake_launch_claude_terminal)
+    monkeypatch.setattr(claude_native, "attach_local_terminal", fake_attach)
+    monkeypatch.setattr(claude_native, "prepare_bridge_dir", lambda *a, **k: tmp_path / "bridge")
+    monkeypatch.setattr(claude_native, "reset_transcript_forward_state", lambda bridge_dir: None)
+    monkeypatch.setattr(claude_native, "open_conversation_link_if_enabled", lambda **kwargs: None)
+    monkeypatch.setattr(claude_native, "_record_launch_for_fresh_session", lambda session_id: None)
+
+    claude_native._run_with_local_server(
+        spec_path,
+        session_id=None,
+        resume_picker=False,
+        claude_args=(),
+        command="claude",
+        auto_open_conversation=False,
+    )
+
+    assert launch_kwargs.get("append_system_prompt") is not None
+    assert (
+        "Claude Code is running in the session terminal" in launch_kwargs["append_system_prompt"]
+    )
+
+
+def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold_resume(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Same as the fresh-session sibling, but for the COLD-RESUME branch: an
+    existing session with no live terminal launches a NEW one (unlike hot
+    reattach, which returns before ``_launch_claude_terminal`` is ever
+    called) and must still receive the wrapper's raw instructions.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec_path = claude_native._materialize_claude_agent_spec(tmp_path)
+
+    class _Proc:
+        def poll(self) -> None:
+            return None
+
+    def fake_start_server(*args: object, **kwargs: object) -> Any:
+        del args, kwargs
+        return SimpleNamespace(proc=_Proc(), runner_id="runner_local", log_path=None)
+
+    launch_kwargs: dict[str, Any] = {}
+
+    async def _fake_find_running(_client: object, _session_id: str) -> str | None:
+        return None
+
+    async def _fake_fetch_labels(_client: object, _session_id: str) -> dict[str, str]:
+        return {}
+
+    async def _fake_resolve_cold_resume_args(_client: object, _session_id: str) -> tuple[str, ...]:
+        return ("--resume", "claude-sid-cold")
+
+    async def _fake_bind_session_runner(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    async def _fake_launch_claude_terminal(
+        _client: object,
+        _session_id: str,
+        _claude_args: tuple[str, ...],
+        *,
+        command: str,
+        bridge_dir: Path,
+        claude_config: object = None,
+        append_system_prompt: str | None = None,
+        allowed_tools: tuple[str, ...] = (),
+    ) -> str:
+        del _client, _session_id, _claude_args, command, bridge_dir, claude_config, allowed_tools
+        launch_kwargs["append_system_prompt"] = append_system_prompt
+        return "terminal_claude_main"
+
+    async def fake_attach(
+        attach_url: str, *, headers: dict[str, str], terminal_gone_probe: object | None = None
+    ) -> bool:
+        del attach_url, headers, terminal_gone_probe
+        return True
+
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr("omnigent.chat._find_free_port", lambda: 12347)
+    monkeypatch.setattr("omnigent.chat._start_local_server", fake_start_server)
+    monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
+    monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
+    monkeypatch.setattr(claude_native, "_find_running_claude_terminal", _fake_find_running)
+    monkeypatch.setattr(claude_native, "_fetch_claude_session_labels", _fake_fetch_labels)
+    monkeypatch.setattr(claude_native, "_resolve_cold_resume_args", _fake_resolve_cold_resume_args)
+    monkeypatch.setattr(claude_native, "_bind_session_runner", _fake_bind_session_runner)
+    monkeypatch.setattr(claude_native, "_launch_claude_terminal", _fake_launch_claude_terminal)
+    monkeypatch.setattr(claude_native, "attach_local_terminal", fake_attach)
+    monkeypatch.setattr(claude_native, "prepare_bridge_dir", lambda *a, **k: tmp_path / "bridge")
+    monkeypatch.setattr(claude_native, "reset_transcript_forward_state", lambda bridge_dir: None)
+    monkeypatch.setattr(claude_native, "open_conversation_link_if_enabled", lambda **kwargs: None)
+
+    claude_native._run_with_local_server(
+        spec_path,
+        session_id="conv_cold_resume_raw",
+        resume_picker=False,
+        claude_args=(),
+        command="claude",
+        auto_open_conversation=False,
+    )
+
+    assert launch_kwargs.get("append_system_prompt") is not None
+    assert (
+        "Claude Code is running in the session terminal" in launch_kwargs["append_system_prompt"]
+    )
 
 
 def test_local_resume_does_not_print_redundant_resume_hint(
@@ -5178,6 +5354,7 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
             session_bundle=None,
             claude_args=("--print", "hello"),
             command="claude",
+            append_system_prompt="Wrapper bridge instructions.",
         )
         del http_client  # context-managed by the with block
 
@@ -5195,7 +5372,9 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
         "--print",
         "hello",
     )
-    assert captured_terminal_args["append_system_prompt"] is None
+    # Cold resume launches a new terminal (no early reattach return), so raw
+    # author instructions must reach --append-system-prompt exactly as given.
+    assert captured_terminal_args["append_system_prompt"] == "Wrapper bridge instructions."
     assert captured_terminal_args["allowed_tools"] == ()
 
     # Load-bearing for the duplicate-message bug: cold resume
@@ -5261,7 +5440,7 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
         allowed_tools: tuple[str, ...] = (),
     ) -> str:
         """Return a fixed terminal id without spawning anything."""
-        assert append_system_prompt is None
+        assert append_system_prompt == "Fresh session bridge instructions."
         assert allowed_tools == ()
         del _client, _session_id, _claude_args, command, bridge_dir, claude_config
         return "terminal_claude_main"
@@ -5291,6 +5470,7 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
             session_bundle=b"fake-bundle",
             claude_args=(),
             command="claude",
+            append_system_prompt="Fresh session bridge instructions.",
         )
         del http_client
 
@@ -5302,6 +5482,27 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
     # claude writes on cold start), the first turn would be dropped.
     assert prepared.cold_resumed is False
     assert prepared.reattached is False
+
+
+def test_wrapper_spec_raw_instructions_resolves_prompt(tmp_path: Path) -> None:
+    """The ``omnigent claude`` wrapper's own materialized spec is resolvable.
+
+    Its ``prompt`` field is real ``AgentSpec.instructions`` content (the
+    bridge-behavior description), not framework-composed text, so it must
+    reach ``--append-system-prompt`` like any other claude-native author
+    instructions.
+    """
+    spec_path = claude_native._materialize_claude_agent_spec(tmp_path)
+    result = claude_native._wrapper_spec_raw_instructions(spec_path)
+    assert result is not None
+    assert "Claude Code is running in the session terminal" in result
+
+
+def test_wrapper_spec_raw_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
+    """A malformed wrapper spec must not block the terminal launch."""
+    bad_spec = tmp_path / "bad.yaml"
+    bad_spec.write_text("not: [valid, agent, spec")
+    assert claude_native._wrapper_spec_raw_instructions(bad_spec) is None
 
 
 @pytest.mark.asyncio
@@ -7754,6 +7955,8 @@ def test_resolve_native_claude_config_ambient_key(
     """
     monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-ambient")
+    # The default-endpoint assertion must not inherit an ambient gateway URL.
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
 
     cfg = claude_native.resolve_native_claude_config(spec=None)
     assert cfg is not None
@@ -7768,6 +7971,8 @@ def test_resolve_native_claude_config_ambient_prefixed_key(
     """A prefixed Anthropic key routes native Claude without raw env exposure."""
     monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    # The default-endpoint assertion must not inherit an ambient gateway URL.
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     monkeypatch.setenv("OMNIGENT_ANTHROPIC_API_KEY", "sk-ant-prefixed")
 
     cfg = claude_native.resolve_native_claude_config(spec=None)
@@ -9791,3 +9996,285 @@ def test_claude_catalog_serves_model(
     assert (
         claude_native.claude_catalog_serves_model(_subscription_catalog(), model, config) is served
     )
+
+
+def test_claude_catalog_selection_honors_an_available_concrete_pin(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An exact live pin is launched unchanged and emits no downgrade warning."""
+    requested = "system.ai.claude-opus-4-8[1m]"
+    catalog: list[dict[str, object]] = [
+        {"id": "opus", "model": "system.ai.claude-opus-5"},
+        {"id": requested, "model": requested},
+    ]
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.claude_native"):
+        selection = claude_native.resolve_claude_native_catalog_selection(
+            requested,
+            catalog,
+            config,
+        )
+
+    assert selection == (requested, None)
+    assert not [record for record in caplog.records if "substitut" in record.getMessage()]
+
+
+def test_claude_catalog_selection_surfaces_an_equivalent_context_marker_change(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An equivalent generation with a different context marker is visible."""
+    requested = "databricks-claude-opus-4-8"
+    equivalent = "system.ai.claude-opus-4-8[1m]"
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.claude_native"):
+        selected, notice = claude_native.resolve_claude_native_catalog_selection(
+            requested,
+            [
+                {"id": "opus", "model": "system.ai.claude-opus-5"},
+                {"id": equivalent, "model": equivalent},
+            ],
+            claude_native.ClaudeNativeUcodeConfig(
+                env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}
+            ),
+        )
+
+    assert selected == equivalent
+    assert notice is not None
+    assert "different [1m] context marker" in notice
+    warnings = [record for record in caplog.records if "substituting" in record.getMessage()]
+    assert len(warnings) == 1
+    assert repr(requested) in warnings[0].getMessage()
+    assert repr(equivalent) in warnings[0].getMessage()
+
+
+def test_claude_catalog_selection_uses_verified_case_with_notice(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A wrong-case legacy pin launches the catalog's verified spelling visibly."""
+    requested = "Claude-Opus-4-8"
+    verified = "claude-opus-4-8"
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.claude_native"):
+        selected, notice = claude_native.resolve_claude_native_catalog_selection(
+            requested,
+            [{"id": verified, "model": verified}],
+            None,
+        )
+
+    assert selected == verified
+    assert notice is not None
+    assert "host's verified spelling" in notice
+    warnings = [record for record in caplog.records if "substituting" in record.getMessage()]
+    assert len(warnings) == 1
+    assert repr(requested) in warnings[0].getMessage()
+    assert repr(verified) in warnings[0].getMessage()
+
+
+@pytest.mark.parametrize(
+    ("requested", "catalog_model"),
+    [
+        pytest.param("opus[1m]", "opus", id="long-to-standard"),
+        pytest.param("opus", "opus[1m]", id="standard-to-long"),
+    ],
+)
+def test_claude_catalog_selection_surfaces_alias_context_marker_change(
+    requested: str,
+    catalog_model: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An alias's explicit context marker cannot change silently."""
+    with caplog.at_level(logging.WARNING, logger="omnigent.claude_native"):
+        selected, notice = claude_native.resolve_claude_native_catalog_selection(
+            requested,
+            [{"id": catalog_model, "model": catalog_model}],
+            claude_native.ClaudeNativeUcodeConfig(
+                env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}
+            ),
+        )
+
+    assert selected == catalog_model
+    assert notice is not None
+    assert "different [1m] context marker" in notice
+    warnings = [record for record in caplog.records if "substituting" in record.getMessage()]
+    assert len(warnings) == 1
+    assert repr(requested) in warnings[0].getMessage()
+    assert repr(catalog_model) in warnings[0].getMessage()
+
+
+def test_claude_tier_fallback_order_is_capability_descending() -> None:
+    """Launch policy has explicit order and exactly the documented tier membership."""
+    from omnigent.claude_model_vocabulary import CLAUDE_MODEL_ALIASES
+
+    assert claude_native._CLAUDE_TIER_FALLBACK_ORDER == (
+        "fable",
+        "opus",
+        "sonnet",
+        "haiku",
+    )
+    assert set(claude_native._CLAUDE_TIER_FALLBACK_ORDER) == set(CLAUDE_MODEL_ALIASES)
+    assert claude_native._CLAUDE_TIER_FALLBACK_ORDER is not CLAUDE_MODEL_ALIASES
+
+
+def test_claude_tier_fallback_is_stable_across_catalog_order() -> None:
+    """Newest standard-context model wins within a tier regardless of row order."""
+    catalog: list[dict[str, object]] = [
+        {"id": "opus-4-8", "model": "system.ai.claude-opus-4-8"},
+        {"id": "opus-4-8-1m", "model": "system.ai.claude-opus-4-8[1m]"},
+        {"id": "opus-5-1m", "model": "system.ai.claude-opus-5[1m]"},
+        {"id": "opus-5", "model": "system.ai.claude-opus-5"},
+    ]
+
+    for permuted in itertools.permutations(catalog):
+        selection, notice = claude_native.resolve_claude_native_catalog_selection(
+            "fable",
+            list(permuted),
+            None,
+        )
+        assert selection == "system.ai.claude-opus-5"
+        assert notice is not None
+
+
+def test_claude_tier_fallback_is_stable_for_case_distinct_rows() -> None:
+    """Original-case tie-breakers make case-distinct rows deterministic."""
+    catalog: list[dict[str, object]] = [
+        {"id": "OPUS-5", "model": "SYSTEM.AI.CLAUDE-OPUS-5"},
+        {"id": "opus-5", "model": "system.ai.claude-opus-5"},
+    ]
+
+    for permuted in itertools.permutations(catalog):
+        selection, notice = claude_native.resolve_claude_native_catalog_selection(
+            "fable",
+            list(permuted),
+            None,
+        )
+        assert selection == "SYSTEM.AI.CLAUDE-OPUS-5"
+        assert notice is not None
+
+
+@pytest.mark.parametrize(
+    ("catalog", "launchable"),
+    [
+        pytest.param([], "none", id="empty"),
+        pytest.param(
+            [{"id": "gpt-row", "model": "gpt-5.4"}],
+            "'gpt-5.4', 'gpt-row'",
+            id="non-claude",
+        ),
+    ],
+)
+def test_claude_catalog_selection_keeps_loud_failure_without_a_claude_tier(
+    catalog: list[dict[str, object]],
+    launchable: str,
+) -> None:
+    """A catalog with no Claude tier preserves the actionable launch failure."""
+    with pytest.raises(click.ClickException) as exc_info:
+        claude_native.resolve_claude_native_catalog_selection(
+            "fable",
+            catalog,
+            None,
+        )
+
+    assert exc_info.value.message == (
+        "the requested model 'fable' is not in this host's current model list — "
+        "it may have changed since the pick. Launchable model ids: "
+        f"{launchable}. Pick again from the model menu."
+    )
+
+
+def test_claude_catalog_selection_rejects_an_unrecognized_claude_looking_id() -> None:
+    """Only documented tier aliases can degrade after catalog matching fails."""
+    catalog: list[dict[str, object]] = [
+        {"id": "opus", "model": "system.ai.claude-opus-5"},
+        {"id": "sonnet", "model": "system.ai.claude-sonnet-4-6[1m]"},
+    ]
+
+    with pytest.raises(click.ClickException) as exc_info:
+        claude_native.resolve_claude_native_catalog_selection(
+            "claude-opus-bogus",
+            catalog,
+            None,
+        )
+
+    assert exc_info.value.message == (
+        "the requested model 'claude-opus-bogus' is not in this host's current "
+        "model list — it may have changed since the pick. Launchable model ids: "
+        "'opus', 'sonnet', 'system.ai.claude-opus-5', "
+        "'system.ai.claude-sonnet-4-6[1m]'. Pick again from the model menu."
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("probe_outcome", "expected_status", "expected_rows"),
+    [
+        pytest.param(
+            [{"id": "opus", "model": "claude-opus-5"}],
+            claude_native.ClaudeLaunchCatalogStatus.FRESH,
+            [{"id": "opus", "model": "claude-opus-5"}],
+            id="fresh",
+        ),
+        pytest.param(
+            "empty-error",
+            claude_native.ClaudeLaunchCatalogStatus.EMPTY,
+            [],
+            id="empty",
+        ),
+        pytest.param(
+            "refresh-error",
+            claude_native.ClaudeLaunchCatalogStatus.REFRESH_FAILED,
+            [],
+            id="refresh-failed",
+        ),
+    ],
+)
+async def test_claude_launch_catalog_result_ignores_stale_rows_and_reports_refresh_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    probe_outcome: list[dict[str, object]] | str,
+    expected_status: claude_native.ClaudeLaunchCatalogStatus,
+    expected_rows: list[dict[str, object]],
+) -> None:
+    """Launch selection sees fresh rows and distinguishes empty from failed refreshes."""
+    import time
+
+    from omnigent import model_catalog_store
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    fingerprint = claude_native.claude_catalog_fingerprint(None)
+    stale_rows = [{"id": "fable", "model": "claude-fable-retired"}]
+    model_catalog_store.write_catalog("claude-native", fingerprint, stale_rows)
+    path = model_catalog_store.catalog_path("claude-native", fingerprint)
+    stale_time = time.time() - model_catalog_store.CATALOG_STALE_AFTER_S - 1
+    os.utime(path, (stale_time, stale_time))
+
+    class _EmptyKind:
+        value = "empty"
+
+    class CatalogRefreshError(Exception):
+        kind = _EmptyKind()
+
+    monkeypatch.setattr(
+        model_catalog_store,
+        "CatalogRefreshError",
+        CatalogRefreshError,
+        raising=False,
+    )
+
+    async def _probe(_config: object) -> list[dict[str, object]]:
+        if probe_outcome == "empty-error":
+            raise CatalogRefreshError("model catalog refresh returned no models")
+        if probe_outcome == "refresh-error":
+            raise RuntimeError("catalog refresh unavailable")
+        assert isinstance(probe_outcome, list)
+        return probe_outcome
+
+    monkeypatch.setattr(claude_native, "claude_model_catalog", _probe)
+
+    result = await claude_native.claude_launch_catalog_result(None)
+
+    assert result.status is expected_status
+    assert result.rows == expected_rows
+    assert result.rows != stale_rows
