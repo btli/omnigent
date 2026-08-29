@@ -610,6 +610,20 @@ def _paste_char_count(content: str) -> int:
     return len(payload.encode("utf-16-le")) // 2
 
 
+def _normalized_contains(content: str, expected: str) -> bool:
+    """True when *expected* appears in *content*, tolerating screen line-wraps.
+
+    Compares whitespace-collapsed text first, then falls back to a
+    whitespace-stripped compare so a needle split across a wrapped pane row
+    (which inserts spaces) still matches.
+    """
+    normalized_content = _normalize_screen_text(content)
+    normalized_expected = _normalize_screen_text(expected)
+    if normalized_expected in normalized_content:
+        return True
+    return normalized_expected.replace(" ", "") in normalized_content.replace(" ", "")
+
+
 def _draft_visible_in_editor(
     state: _KimiPaneState,
     needle: str,
@@ -636,19 +650,10 @@ def _draft_visible_in_editor(
             for token, (kind, count) in placeholders.items()
         )
     if expected_content is not None:
-        normalized_content = _normalize_screen_text(content)
-        normalized_expected = _normalize_screen_text(
-            _paste_payload_bytes(expected_content).decode("utf-8")
-        )
-        if normalized_expected in normalized_content:
-            return True
-        return normalized_expected.replace(" ", "") in normalized_content.replace(" ", "")
+        expected = _paste_payload_bytes(expected_content).decode("utf-8")
+        return _normalized_contains(content, expected)
     if needle:
-        normalized_content = _normalize_screen_text(content)
-        normalized_needle = _normalize_screen_text(needle)
-        if normalized_needle in normalized_content:
-            return True
-        return normalized_needle.replace(" ", "") in normalized_content.replace(" ", "")
+        return _normalized_contains(content, needle)
     return not needle
 
 
