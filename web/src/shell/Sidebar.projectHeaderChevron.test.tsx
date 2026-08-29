@@ -120,26 +120,20 @@ function stubInputScenario(width: number, anyCoarse: boolean, canHover: boolean)
   Object.defineProperty(window, "matchMedia", {
     writable: true,
     configurable: true,
-    value: (query: string) =>
-      ({
-        matches: (() => {
-          if (query.includes("any-pointer: coarse")) return anyCoarse;
-          if (query.includes("pointer: coarse")) return anyCoarse;
-          if (query.includes("hover: hover")) return canHover;
-          const min = query.match(/^\(min-width: ([\d.]+)px\)$/);
-          if (min) return width >= parseFloat(min[1]);
-          const max = query.match(/^\(max-width: ([\d.]+)px\)$/);
-          if (max) return width <= parseFloat(max[1]);
-          return false;
-        })(),
-        media: query,
-        onchange: null,
-        addListener: () => {},
-        removeListener: () => {},
-        addEventListener: () => {},
-        removeEventListener: () => {},
-        dispatchEvent: () => false,
-      }) as MediaQueryList,
+    value: (query: string) => ({
+      matches: (() => {
+        if (query.includes("pointer: coarse")) return anyCoarse;
+        if (query.includes("hover: hover")) return canHover;
+        const min = query.match(/^\(min-width: ([\d.]+)px\)$/);
+        if (min) return width >= parseFloat(min[1]);
+        const max = query.match(/^\(max-width: ([\d.]+)px\)$/);
+        if (max) return width <= parseFloat(max[1]);
+        return false;
+      })(),
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    }),
   });
 }
 

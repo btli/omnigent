@@ -275,7 +275,6 @@ function stubViewportWidth(width: number, anyCoarse = false) {
     configurable: true,
     value: (query: string) => ({
       matches: (() => {
-        if (query.includes("any-pointer: coarse")) return anyCoarse;
         if (query.includes("pointer: coarse")) return anyCoarse;
         const min = query.match(/^\(min-width: ([\d.]+)px\)$/);
         if (min) return width >= parseFloat(min[1]);
