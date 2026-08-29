@@ -53,12 +53,40 @@ class OidcLoginManager {
     // in HttpURLConnection connect/read (or a slow-trickle response body).
     // Guarded by [connectionLock]: an abandoned flow's cleanup must never
     // clear (or a cancel disconnect never miss) a successor flow's connection
-    // — publish and clear are identity-checked under the lock.
+    // — publish and clear are generation/identity-checked under the lock.
     private val connectionLock = Any()
     private var activeConnection: HttpURLConnection? = null
+    private var connectionGeneration = 0L
 
-    private fun publishConnection(conn: HttpURLConnection) {
-        synchronized(connectionLock) { activeConnection = conn }
+    // The generation a flow's network calls publish under. Captured on the
+    // MAIN thread in [start] — where cancel() also runs, so a later cancel()
+    // always post-dates it — and carried to the flow's executor thread.
+    // Capturing on the flow thread instead would let a flow cancelled before
+    // its first request read the post-cancel generation and republish over a
+    // successor. Unset on threads that call the HTTP seams directly (tests),
+    // which publish under the current generation.
+    private val flowGeneration = ThreadLocal<Long>()
+
+    @VisibleForTesting
+    internal fun currentConnectionGeneration(): Long =
+        synchronized(connectionLock) { connectionGeneration }
+
+    @VisibleForTesting
+    internal fun publishConnection(
+        conn: HttpURLConnection,
+        generation: Long,
+    ): Boolean {
+        val published =
+            synchronized(connectionLock) {
+                if (generation != connectionGeneration) {
+                    false
+                } else {
+                    activeConnection = conn
+                    true
+                }
+            }
+        if (!published) conn.disconnect()
+        return published
     }
 
     private fun retireConnection(conn: HttpURLConnection) {
@@ -108,7 +136,9 @@ class OidcLoginManager {
         // One monotonic deadline bounds ticket creation AND polling, mirroring
         // the desktop shell's single 5-minute login window.
         val deadlineMs = monotonicNowMs() + LOGIN_TIMEOUT_MS
+        val generation = currentConnectionGeneration()
         current.executor.execute {
+            flowGeneration.set(generation)
             var token: String? = null
             try {
                 val ticket = requestTicket(origin, deadlineMs)
@@ -159,6 +189,7 @@ class OidcLoginManager {
         // tear the in-flight connection down so the flow thread exits promptly
         // instead of waiting out a read timeout (or a slow-trickle body).
         synchronized(connectionLock) {
+            connectionGeneration += 1
             runCatching { activeConnection?.disconnect() }
             activeConnection = null
         }
@@ -177,6 +208,7 @@ class OidcLoginManager {
         origin: String,
         deadlineMs: Long,
     ): Ticket? {
+        val generation = flowGeneration.get() ?: currentConnectionGeneration()
         while (true) {
             val conn = (URL("$origin/auth/cli-login").openConnection() as HttpURLConnection)
             conn.requestMethod = "POST"
@@ -185,12 +217,13 @@ class OidcLoginManager {
             conn.setRequestProperty("Content-Length", "0")
             conn.connectTimeout = HTTP_TIMEOUT_MS
             conn.readTimeout = HTTP_TIMEOUT_MS
-            publishConnection(conn)
+            if (!publishConnection(conn, generation)) return null
             try {
                 val status = conn.responseCode
                 if (status !in TRANSIENT_STATUSES) {
                     if (status != 200) return null
                     val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
+                    if (monotonicNowMs() >= deadlineMs) return null
                     val id = json.optString("ticket").ifEmpty { return null }
                     val loginUrl = json.optString("login_url").ifEmpty { return null }
                     // The browser hand-off must stay on the pinned origin: [start]
@@ -233,6 +266,7 @@ class OidcLoginManager {
         deadlineMs: Long,
     ): String? {
         val encoded = Uri.encode(ticket)
+        val generation = flowGeneration.get() ?: currentConnectionGeneration()
         while (monotonicNowMs() < deadlineMs) {
             Thread.sleep(POLL_INTERVAL_MS) // throws InterruptedException on shutdownNow()
             // The sleep itself can cross the deadline — never issue a request
@@ -246,7 +280,7 @@ class OidcLoginManager {
             conn.requestMethod = "GET"
             conn.connectTimeout = HTTP_TIMEOUT_MS
             conn.readTimeout = HTTP_TIMEOUT_MS
-            publishConnection(conn)
+            if (!publishConnection(conn, generation)) return null
             try {
                 when (conn.responseCode) {
                     202 -> {

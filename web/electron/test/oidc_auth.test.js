@@ -528,7 +528,7 @@ describe("OIDC browser ticket flow", () => {
           { fetch: async () => responses.shift() },
           "https://server.example",
           async () => {},
-          { pollIntervalMs: 1, timeoutMs: 100 },
+          { pollIntervalMs: 1, timeoutMs: 5_000 },
         );
       }),
     );
@@ -556,6 +556,36 @@ describe("OIDC browser ticket flow", () => {
 
     assert.deepEqual(result, { ok: false, reason: "timed_out" });
     assert.equal(fetches, 1);
+  });
+
+  it("rejects a ticket whose body arrives past the login deadline", async () => {
+    // Ticket creation is issued in time, but its response body trickles in
+    // after the 5-minute window — the system browser must not open for a
+    // login the shell has already abandoned.
+    let opened = 0;
+    const electronSession = {
+      fetch: async () => ({
+        status: 200,
+        json: async () => {
+          await new Promise((resolve) => {
+            setTimeout(resolve, 150);
+          });
+          return { ticket: "late", login_url: "/auth/login?ticket=late" };
+        },
+      }),
+    };
+
+    const result = await runOidcBrowserLogin(
+      electronSession,
+      "https://server.example",
+      async () => {
+        opened += 1;
+      },
+      { pollIntervalMs: 1, timeoutMs: 100 },
+    );
+
+    assert.deepEqual(result, { ok: false, reason: "timed_out" });
+    assert.equal(opened, 0);
   });
 
   it("rejects a token whose body arrives past the login deadline", async () => {

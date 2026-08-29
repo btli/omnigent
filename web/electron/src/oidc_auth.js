@@ -189,6 +189,13 @@ async function runOidcBrowserLogin(
     if (!response) return { ok: false, reason: "timed_out" };
     if (response.status !== 200) return { ok: false, reason: "failed" };
     const body = await response.json();
+    // Reading the ticket body can outlast the login window (slow-trickle
+    // response) — a ticket landing past the deadline belongs to an expired
+    // flow, and opening the system browser for it would start a login the
+    // shell has already abandoned. Same recheck as the token poll below.
+    if (monotonicNowMs() >= deadline) {
+      return { ok: false, reason: isUserAbort(signal) ? "cancelled" : "timed_out" };
+    }
     ticket = body && typeof body.ticket === "string" ? body.ticket : "";
     const loginPath = body && typeof body.login_url === "string" ? body.login_url : "";
     loginUrl = canonicalTicketLoginUrl(serverUrl, loginPath, ticket);

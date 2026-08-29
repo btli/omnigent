@@ -532,6 +532,8 @@ function applyDockIcon() {
  *   this window is pinned to, or null while it shows the bundled setup page.
  * @property {boolean} ephemeral True for multi-server windows whose
  *   connection must not be persisted to settings.
+ * @property {boolean} closing True after close begins and before closed removes
+ *   the window from this map.
  * @property {number} badgeCount The unread count this window's SPA last
  *   reported. Each SPA instance reports its server's app-wide unread count,
  *   so the OS badge aggregates per distinct ORIGIN (not per window — two
@@ -1301,7 +1303,7 @@ async function runWindowOidcBrowserHandoff(win, serverUrl) {
   return promise;
 }
 
-async function ensureWindowOidcSession(win, serverUrl) {
+async function ensureWindowOidcSession(win, serverUrl, { forceInteractive = false } = {}) {
   if (oidcServerUrlError(serverUrl)) return false;
   if (omnigentCli.isLoopbackServer(serverUrl)) {
     setWindowAuthenticationNavigation(win, false);
@@ -1320,16 +1322,20 @@ async function ensureWindowOidcSession(win, serverUrl) {
   setWindowAuthenticationNavigation(win, probe.kind === "other");
   if (probe.kind !== "oidc") return true;
 
-  const cachedAuth = omnigentCli.serverAuthEntry(serverUrl);
-  if (typeof cachedAuth?.token === "string") {
-    try {
-      await installAndVerifySessionCookie(session.defaultSession, serverUrl, cachedAuth.token);
-      console.log(
-        `[omnigent] OIDC session cookie accepted and verified for ${new URL(serverUrl).host}`,
-      );
-      return true;
-    } catch {
-      // A rejected cookie falls through to a fresh browser flow.
+  // Explicit /auth/login intent (sign-out/account switch) must not silently
+  // reinstall the cached CLI identity; use the cancellable browser flow.
+  if (!forceInteractive) {
+    const cachedAuth = omnigentCli.serverAuthEntry(serverUrl);
+    if (typeof cachedAuth?.token === "string") {
+      try {
+        await installAndVerifySessionCookie(session.defaultSession, serverUrl, cachedAuth.token);
+        console.log(
+          `[omnigent] OIDC session cookie accepted and verified for ${new URL(serverUrl).host}`,
+        );
+        return true;
+      } catch {
+        // A rejected cookie falls through to a fresh browser flow.
+      }
     }
   }
 
@@ -1349,12 +1355,14 @@ async function loadServerUrl(
   serverUrl,
   routePath,
   exactLoadUrl,
-  { beforeLoad, alreadyGated = false } = {},
+  { beforeLoad, alreadyGated = false, forceInteractiveAuth = false } = {},
 ) {
   const load = () =>
     loadServerAfterAuth({
       authenticate: async () =>
-        (await ensureWindowOidcSession(win, serverUrl)) && !win.isDestroyed(),
+        (await ensureWindowOidcSession(win, serverUrl, {
+          forceInteractive: forceInteractiveAuth,
+        })) && !win.isDestroyed(),
       beforeLoad,
       load: () => loadAuthenticatedServerUrl(win, serverUrl, routePath, exactLoadUrl),
     });
@@ -1539,6 +1547,10 @@ function createWindow(targetUrl, opts = {}) {
     // auth gate is pending; privileges still require the null origin to be set.
     serverUrl: destination ? serverUrl : null,
     authenticationNavigation: false,
+    // Set on `close`: the entry survives in `windows` until `closed`, and a
+    // window mid-teardown must stop contributing its identity to (or being a
+    // dispatch target of) deep-link decisions.
+    closing: false,
     ephemeral,
     badgeCount: 0,
     // Per-conversation embedded-browser view registry for this window.
@@ -1670,7 +1682,11 @@ function createWindow(targetUrl, opts = {}) {
       // window now; recovering (or showing the expired setup page when
       // withServerLoad refuses) would clobber it.
       if (windows.get(win)?.pendingServerLoads) return;
-      const loaded = await loadServerUrl(win, expiredServerUrl, undefined, returnUrl);
+      // The renderer's own /auth/login is explicit unauthenticated intent;
+      // bypass cached CLI credentials and retain the modal's Cancel path.
+      const loaded = await loadServerUrl(win, expiredServerUrl, undefined, returnUrl, {
+        forceInteractiveAuth: true,
+      });
       if (!loaded) {
         await loadSetupPage(win, {
           error: "Your session expired and sign-in did not complete.",
@@ -1710,6 +1726,12 @@ function createWindow(targetUrl, opts = {}) {
   // The desktop never auto-connects this machine as a runner — on launch or on
   // connect. Connecting is an explicit action from the host menu.
 
+  // Nothing in the shell prevents a close, so this never marks a window that
+  // goes on living.
+  win.on("close", () => {
+    const state = windows.get(win);
+    if (state) state.closing = true;
+  });
   win.on("closed", () => {
     // Destroy this window's embedded-browser views, else they leak webContents.
     try {
@@ -3334,9 +3356,15 @@ async function handleDeepLink(raw) {
   // count alongside persisted servers: an ephemeral window is pinned to an
   // identity settings never saw, and it must both block silent adoption and
   // appear in the ambiguity listing.
+  // Destroyed and closing entries are not reachable: adopting their identity
+  // or dispatching to them would lose the activation during teardown.
+  const liveWindows = [...windows.keys()].filter(
+    (win) => !win.isDestroyed() && windows.get(win).closing !== true,
+  );
   const reachableIdentities = new Set(knownIdentities);
-  for (const state of windows.values()) {
-    if (state.identity) reachableIdentities.add(state.identity);
+  for (const win of liveWindows) {
+    const identity = windows.get(win).identity;
+    if (identity) reachableIdentities.add(identity);
   }
   let workspaceCandidates = [];
   if (!targetIdentity.includes("?") && !reachableIdentities.has(targetIdentity)) {
@@ -3352,7 +3380,7 @@ async function handleDeepLink(raw) {
   const known = findKnownServerUrl(targetIdentity);
 
   // Snapshot the live windows (creation order) for the pure decision.
-  const winList = [...windows.keys()];
+  const winList = liveWindows;
   const focused = BrowserWindow.getFocusedWindow();
   const focusedIndex = focused && windows.has(focused) ? winList.indexOf(focused) : -1;
   const decision = chooseDeepLinkStrategy({

@@ -309,6 +309,46 @@ describe("self-hosted OIDC session expiry", () => {
     );
   });
 
+  it("lets a login navigation whose return_to targets another workspace pass through", () => {
+    // The destination itself is selector-less (it would match the pinned
+    // identity), but its return_to pins the login to a DIFFERENT workspace —
+    // a deliberate cross-workspace navigation, not this window's expiry.
+    assert.equal(
+      isOidcLoginNavigation(
+        "https://dbc-a.cloud.databricks.com/omnigent/auth/login" +
+          "?return_to=%2Fomnigent%2Fc%2Ftarget%3Fo%3D222",
+        "https://dbc-a.cloud.databricks.com/omnigent?o=111",
+      ),
+      false,
+    );
+    // An absolute return_to on another origin is not ours either.
+    assert.equal(
+      isOidcLoginNavigation(
+        "https://server.example/auth/login?return_to=https%3A%2F%2Fother.example%2Fc%2F1",
+        "https://server.example",
+      ),
+      false,
+    );
+    // A return_to on the SAME workspace still intercepts…
+    assert.equal(
+      isOidcLoginNavigation(
+        "https://dbc-a.cloud.databricks.com/omnigent/auth/login" +
+          "?return_to=%2Fomnigent%2Fc%2Ftarget%3Fo%3D111",
+        "https://dbc-a.cloud.databricks.com/omnigent?o=111",
+      ),
+      true,
+    );
+    // …as does a selector-less return_to (the SPA usually drops the query).
+    assert.equal(
+      isOidcLoginNavigation(
+        "https://dbc-a.cloud.databricks.com/omnigent/auth/login" +
+          "?return_to=%2Fomnigent%2Fc%2Ftarget",
+        "https://dbc-a.cloud.databricks.com/omnigent?o=111",
+      ),
+      true,
+    );
+  });
+
   it("blocks live-renderer login navigation and preserves the exact current route", async () => {
     class FakeWebContents extends EventEmitter {
       getURL() {

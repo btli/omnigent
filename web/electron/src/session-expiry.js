@@ -108,7 +108,9 @@ function expiredRequestMatchesIdentity(windowIdentity, requestIdentity) {
  * destination — the SPA's `/auth/login` assignment usually drops the `?o=`
  * query — still intercepts on a `?o=`-pinned window, while a destination
  * carrying a DIFFERENT selector never does. Query parameters such as the
- * SPA's `return_to` are allowed.
+ * SPA's `return_to` are allowed — but a `return_to` whose own workspace
+ * identity conflicts with the window's is a deliberate cross-workspace login
+ * navigation, not this window's expiry, and must pass through untouched.
  *
  * @param {string} destinationUrl
  * @param {string | null | undefined} serverUrl
@@ -119,12 +121,26 @@ function isOidcLoginNavigation(destinationUrl, serverUrl) {
   try {
     const destination = new URL(destinationUrl);
     const expected = new URL(joinServerUrl(serverUrl, "/auth/login"));
-    return (
-      expiredRequestMatchesIdentity(
-        workspaceIdentityKey(serverUrl),
-        workspaceIdentityKey(destinationUrl),
-      ) && destination.pathname === expected.pathname
-    );
+    if (destination.pathname !== expected.pathname) return false;
+    const windowIdentity = workspaceIdentityKey(serverUrl);
+    if (!expiredRequestMatchesIdentity(windowIdentity, workspaceIdentityKey(destinationUrl))) {
+      return false;
+    }
+    // A conflicting return_to identity is a deliberate cross-workspace login,
+    // not expiry recovery for this window.
+    const returnTo = destination.searchParams.get("return_to");
+    if (returnTo !== null) {
+      let returnIdentity = null;
+      try {
+        returnIdentity = workspaceIdentityKey(new URL(returnTo, destination).toString());
+      } catch {
+        // A malformed return_to carries no signal that should defeat recovery.
+      }
+      if (returnIdentity && !expiredRequestMatchesIdentity(windowIdentity, returnIdentity)) {
+        return false;
+      }
+    }
+    return true;
   } catch {
     return false;
   }

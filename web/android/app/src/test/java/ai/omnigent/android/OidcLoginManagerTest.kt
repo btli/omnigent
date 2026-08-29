@@ -13,7 +13,9 @@ import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import java.net.HttpURLConnection
 import java.net.InetSocketAddress
+import java.net.URL
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -191,6 +193,30 @@ class OidcLoginManagerTest {
     }
 
     @Test
+    fun `a ticket arriving past the deadline is rejected`() {
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val hits = AtomicInteger(0)
+        server.createContext("/") { exchange ->
+            hits.incrementAndGet()
+            Thread.sleep(500)
+            val bytes =
+                """{"ticket":"t-1","login_url":"/auth/login?ticket=t-1"}""".toByteArray()
+            exchange.sendResponseHeaders(200, bytes.size.toLong())
+            exchange.responseBody.use { it.write(bytes) }
+        }
+        server.start()
+        try {
+            val manager = OidcLoginManager()
+            val clock = realClock(manager)
+            val origin = "http://127.0.0.1:${server.address.port}"
+            assertNull(manager.requestTicket(origin, clock() + 300))
+            assertEquals(1, hits.get())
+        } finally {
+            server.stop(0)
+        }
+    }
+
+    @Test
     fun `polling rides out a transient 503 and returns the token from the next 200`() {
         val (server, hits) = transientThenOk(1, 503, """{"token":"session-jwt"}""")
         try {
@@ -312,6 +338,36 @@ class OidcLoginManagerTest {
             holdSecond.countDown()
             server.stop(0)
         }
+    }
+
+    @Test
+    fun `a cancelled generation cannot overwrite the successor connection`() {
+        class TrackingConnection : HttpURLConnection(URL("http://127.0.0.1")) {
+            var disconnected = false
+
+            override fun connect() = Unit
+
+            override fun disconnect() {
+                disconnected = true
+            }
+
+            override fun usingProxy(): Boolean = false
+        }
+
+        val manager = OidcLoginManager()
+        val abandonedGeneration = manager.currentConnectionGeneration()
+        manager.cancel()
+        val successorGeneration = manager.currentConnectionGeneration()
+        val successor = TrackingConnection()
+        val abandoned = TrackingConnection()
+
+        assertTrue(manager.publishConnection(successor, successorGeneration))
+        assertFalse(manager.publishConnection(abandoned, abandonedGeneration))
+        assertTrue(abandoned.disconnected)
+        assertFalse(successor.disconnected)
+
+        manager.cancel()
+        assertTrue(successor.disconnected)
     }
 
     @Test

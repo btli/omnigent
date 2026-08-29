@@ -1,11 +1,8 @@
 // Shared URL-normalization helpers for the desktop shell.
 //
-// Loaded by the Electron main process for URL decisions. The preload imports
-// only serverDisplayLabel for the bundled setup page, keeping normalization out
-// of the renderer while sharing the harmless display formatting.
-//
-// Only web/Node globals (URL, fetch, AbortSignal) are used, so the helpers stay
-// portable across the shell's main and preload contexts.
+// Loaded by the Electron main process for URL decisions. Only web/Node globals
+// (URL, fetch, AbortSignal) are used, keeping the helpers easy to test and the
+// two sandbox-safe preload copies straightforward to mirror.
 (function (root, factory) {
   const api = factory();
   if (typeof module === "object" && module.exports) {

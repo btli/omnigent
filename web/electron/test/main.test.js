@@ -780,6 +780,63 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     );
   });
 
+  it("bypasses the cached CLI token when the login navigation is explicit", async () => {
+    // The expiry handoff fires on the renderer's OWN /auth/login navigation —
+    // sign-out or account switch as much as expiry. Silently reinstalling a
+    // still-valid cached CLI token there signs the user straight back in with
+    // no way out; forceInteractive must skip the cache and run the modal flow.
+    const makeSession = () => {
+      const calls = { cacheReads: 0, installs: 0, dialogs: 0 };
+      const ensureWindowOidcSession = runInNewContext(
+        `${oidcSessionCode}; ensureWindowOidcSession`,
+        {
+          BrowserWindow: function BrowserWindow() {},
+          console: { log: () => {} },
+          installAndVerifySessionCookie: async () => {
+            calls.installs += 1;
+          },
+          ipcMain: {},
+          OIDC_LOGIN_PAGE: "/oidc_login.html",
+          OIDC_LOGIN_PRELOAD: "/oidc_login_preload.js",
+          OIDC_LOGIN_TIMEOUT_MS: 100,
+          oidcLoginFlows: new WeakMap(),
+          oidcServerUrlError,
+          omnigentCli: {
+            isLoopbackServer: () => false,
+            serverAuthEntry: () => {
+              calls.cacheReads += 1;
+              return { token: "cached-token" };
+            },
+          },
+          probeServerAuth: async () => ({ kind: "oidc" }),
+          runOidcBrowserLogin,
+          runOidcLoginDialog: async () => {
+            calls.dialogs += 1;
+            return true;
+          },
+          session: { defaultSession: {} },
+          setWindowAuthenticationNavigation() {},
+          shell: {},
+          URL,
+        },
+      );
+      return { ensureWindowOidcSession, calls };
+    };
+
+    const cached = makeSession();
+    assert.equal(await cached.ensureWindowOidcSession({}, "https://server.example"), true);
+    assert.deepEqual(cached.calls, { cacheReads: 1, installs: 1, dialogs: 0 });
+
+    const forced = makeSession();
+    assert.equal(
+      await forced.ensureWindowOidcSession({}, "https://server.example", {
+        forceInteractive: true,
+      }),
+      true,
+    );
+    assert.deepEqual(forced.calls, { cacheReads: 0, installs: 0, dialogs: 1 });
+  });
+
   it("preserves canonical loopback HTTP and HTTPS session detection", async () => {
     const probes = [];
     const ensureWindowOidcSession = runInNewContext(`${oidcSessionCode}; ensureWindowOidcSession`, {
@@ -1524,12 +1581,17 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     const callback = runInNewContext(`(${expiryHandoffCallbackCode})`, {
       loadServerUrl: async (...args) => {
         events.push("recovery");
-        assert.deepEqual(args, [
+        assert.deepEqual(args.slice(0, 4), [
           win,
           "https://server.example",
           undefined,
           "https://server.example/c/current",
         ]);
+        // Recovery follows the renderer's own /auth/login navigation — an
+        // explicit unauthenticated intent, so the cached-CLI-token fast path
+        // must be bypassed. (Options come from the vm realm, so compare the
+        // field, not the object.)
+        assert.equal(args[4]?.forceInteractiveAuth, true);
         return false;
       },
       loadSetupPage: async (...args) => setupLoads.push(args),
@@ -1603,9 +1665,15 @@ describe("remote OIDC browser handoff wiring (src/main.js)", () => {
     assert.deepEqual(switched.serverUrlCalls, []);
 
     const unchanged = await runInterleaving({ rejectPending: true });
-    assert.deepEqual(unchanged.recoveryLoads, [
-      [unchanged.win, expiredServerUrl, undefined, returnUrl],
+    assert.equal(unchanged.recoveryLoads.length, 1);
+    assert.deepEqual(unchanged.recoveryLoads[0].slice(0, 4), [
+      unchanged.win,
+      expiredServerUrl,
+      undefined,
+      returnUrl,
     ]);
+    // Options come from the vm realm, so compare the field, not the object.
+    assert.equal(unchanged.recoveryLoads[0][4]?.forceInteractiveAuth, true);
     assert.deepEqual(unchanged.setupLoads, []);
     assert.deepEqual(unchanged.pinCalls, []);
     assert.deepEqual(unchanged.serverUrlCalls, []);
@@ -2245,10 +2313,20 @@ describe("deep-link workspace identity (src/main.js)", () => {
     const created = [];
     const lookups = [];
     const windows = new Map(
-      liveIdentities.map((identity) => [
-        { isDestroyed: () => false, webContents: { getURL: () => `${identity.split("?")[0]}/` } },
-        { identity, serverUrl: identity },
-      ]),
+      liveIdentities.map((entry) => {
+        const descriptor = typeof entry === "string" ? { identity: entry } : entry;
+        return [
+          {
+            isDestroyed: () => descriptor.destroyed === true,
+            webContents: { getURL: () => `${descriptor.identity.split("?")[0]}/` },
+          },
+          {
+            closing: descriptor.closing === true,
+            identity: descriptor.identity,
+            serverUrl: descriptor.identity,
+          },
+        ];
+      }),
     );
     const handler = runInNewContext(`${deepLinkHandlerCode}; handleDeepLink`, {
       BrowserWindow: { getFocusedWindow: () => null },
@@ -2342,6 +2420,25 @@ describe("deep-link workspace identity (src/main.js)", () => {
     });
 
     assert.equal(decisions[0].targetOrigin, "https://ws.cloud.databricks.com?o=222");
+  });
+
+  it("excludes destroyed and closing windows from adoption and dispatch", async () => {
+    for (const unavailable of [{ destroyed: true }, { closing: true }]) {
+      const { decisions } = await runDeepLink(
+        "omnigent://ws.cloud.databricks.com/c/conv_abc",
+        {
+          liveIdentities: [
+            {
+              identity: "https://ws.cloud.databricks.com?o=222",
+              ...unavailable,
+            },
+          ],
+        },
+      );
+
+      assert.equal(decisions[0].targetOrigin, "https://ws.cloud.databricks.com");
+      assert.deepEqual(Array.from(decisions[0].windows), []);
+    }
   });
 
   it("lists live workspaces among the consent candidates", async () => {

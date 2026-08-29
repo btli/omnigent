@@ -15,7 +15,66 @@
 "use strict";
 
 const { contextBridge, ipcRenderer } = require("electron");
-const { serverDisplayLabel, workspaceIdentityKey } = require("./url");
+
+// Sandboxed preloads cannot require sibling files, so mirror the two URL
+// helpers the bridges expose. preload.test.js keeps them aligned with url.js.
+const WORKSPACE_DOMAINS = ["databricks.com", "azuredatabricks.net"];
+
+/** True when a host is, or sits under, a Databricks workspace domain. */
+function isDatabricksWorkspaceHost(host) {
+  const normalized = (host ?? "").toLowerCase();
+  return WORKSPACE_DOMAINS.some(
+    (domain) => normalized === domain || normalized.endsWith(`.${domain}`),
+  );
+}
+
+/** Copy only Databricks' workspace selector into a fresh query. */
+function workspaceOrganizationSearch(url) {
+  const query = new URLSearchParams();
+  if (isDatabricksWorkspaceHost(url.hostname)) {
+    for (const organization of url.searchParams.getAll("o")) {
+      query.append("o", organization);
+    }
+  }
+  return query;
+}
+
+/**
+ * Compact label for a server in the setup-page recent list: host (including
+ * a non-default port), plus `/?o=…` for a Databricks organization selector.
+ *
+ * @param {string} rawUrl
+ * @returns {string}
+ */
+function serverDisplayLabel(rawUrl) {
+  let url;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return String(rawUrl ?? "");
+  }
+  const serialized = workspaceOrganizationSearch(url).toString();
+  return `${url.host}${serialized ? `/?${serialized}` : ""}`;
+}
+
+/**
+ * Stable server identity for workspace-scoped state. Browser origins discard
+ * queries, but Databricks uses ``o`` to select a workspace on shared hosts.
+ * Every other query remains deliberately outside the identity boundary.
+ *
+ * @param {string | null | undefined} rawUrl
+ * @returns {string | null}
+ */
+function workspaceIdentityKey(rawUrl) {
+  let url;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return null;
+  }
+  const query = workspaceOrganizationSearch(url).toString();
+  return `${url.origin}${query ? `?${query}` : ""}`;
+}
 
 // Collapse the update states the in-page UpdateBanner renders on
 // (available / downloaded / error-security) to `idle` so the server page can
