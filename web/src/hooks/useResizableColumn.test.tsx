@@ -274,6 +274,27 @@ describe("useResizableColumn keyboard resizing", () => {
     expect(other.preventDefault).not.toHaveBeenCalled();
   });
 
+  it("is neither focusable nor keyboard-resizable while disabled", () => {
+    // The handle can render inside a closed (aria-hidden) panel; it must not
+    // be reachable by Tab there, and arrow keys must not resize the
+    // off-screen column.
+    const { result } = renderHook(() =>
+      useResizableColumn(undefined, undefined, undefined, false),
+    );
+
+    expect(result.current.handleProps.tabIndex).toBe(-1);
+
+    const right = keyEvent("ArrowRight");
+    act(() => result.current.handleProps.onKeyDown(right));
+    expect(result.current.width).toBe(176);
+    expect(right.preventDefault).not.toHaveBeenCalled();
+  });
+
+  it("is focusable while enabled", () => {
+    const { result } = renderColumn(0);
+    expect(result.current.handleProps.tabIndex).toBe(0);
+  });
+
   it("exposes a focusable separator with value semantics that track the width", () => {
     const { result } = renderColumn(0);
     const props = result.current.handleProps;
