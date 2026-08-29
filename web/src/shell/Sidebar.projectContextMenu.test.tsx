@@ -166,6 +166,13 @@ function dispatchTouchPointer(
   fireEvent(target, event);
 }
 
+function expectProjectMenuActions() {
+  expect(screen.getByTestId("project-new-session-menu")).toBeInTheDocument();
+  expect(screen.getByTestId("rename-project")).toBeInTheDocument();
+  expect(screen.getByTestId("project-settings")).toBeInTheDocument();
+  expect(screen.getByTestId("delete-project")).toBeInTheDocument();
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   useConversationsMock.mockReset();
@@ -183,10 +190,7 @@ describe("project folder header context menu", () => {
     expect(screen.queryByTestId("rename-project")).toBeNull();
     fireEvent.contextMenu(header);
 
-    expect(screen.getByTestId("project-new-session-menu")).toBeInTheDocument();
-    expect(screen.getByTestId("rename-project")).toBeInTheDocument();
-    expect(screen.getByTestId("project-settings")).toBeInTheDocument();
-    expect(screen.getByTestId("delete-project")).toBeInTheDocument();
+    expectProjectMenuActions();
     expect(header).toHaveAttribute("data-slot", "context-menu-trigger");
   });
 
@@ -320,11 +324,8 @@ describe("project folder header context menu", () => {
       expect(screen.queryByTestId("rename-project")).toBeNull();
       act(() => vi.advanceTimersByTime(1));
 
-      // All four kebab actions, so nothing is stranded without the kebab.
-      expect(screen.getByTestId("project-new-session-menu")).toBeInTheDocument();
-      expect(screen.getByTestId("rename-project")).toBeInTheDocument();
-      expect(screen.getByTestId("project-settings")).toBeInTheDocument();
-      expect(screen.getByTestId("delete-project")).toBeInTheDocument();
+      // Long-press exposes the complete action set on touch.
+      expectProjectMenuActions();
       expect(document.body).toHaveStyle({ pointerEvents: "none" });
       dispatchTouchPointer(header, "pointerup");
       expect(header).toHaveAttribute("aria-expanded", before);
