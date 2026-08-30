@@ -14,6 +14,7 @@ import {
   GitBranchIcon,
   KeyboardIcon,
   PaletteIcon,
+  SettingsIcon,
   Share2Icon,
   ShieldCheckIcon,
   TerminalIcon,
@@ -31,6 +32,7 @@ import { SIDEBAR_ROW } from "./sidebarStyles";
 
 export type SettingsSectionId =
   | "appearance"
+  | "general"
   | "git"
   | "shortcuts"
   | "import"
@@ -44,6 +46,7 @@ export type SettingsSectionId =
 
 const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
+  "general",
   "git",
   "shortcuts",
   "import",
@@ -85,6 +88,7 @@ export function settingsNavGroups(
   isSingleUser = false,
 ): SettingsNavGroup[] {
   const general: SettingsNavItem[] = [
+    { id: "general", label: "General", icon: SettingsIcon },
     { id: "appearance", label: "Appearance", icon: PaletteIcon },
     { id: "git", label: "Git", icon: GitBranchIcon },
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon, hideOnMobile: true },
