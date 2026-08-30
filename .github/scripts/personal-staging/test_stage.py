@@ -258,21 +258,26 @@ def test_conflicting_pr_rescued_by_rebase(env):
 def test_rebase_retry_git_lock_failure_is_loud(env, monkeypatch):
     pr = _rescuable_pr(env)
     real_git = stage_mod.git
+    merge_attempts = 0
 
     def lock_retry(cwd, *args, **kwargs):
-        if args[:2] == ("merge", "--no-ff"):
-            return subprocess.CompletedProcess(
-                args,
-                128,
-                "",
-                "fatal: Unable to create '.git/MERGE_RR.lock': File exists.\n",
-            )
+        nonlocal merge_attempts
+        if "merge" in args and "--no-ff" in args and "--no-commit" in args:
+            merge_attempts += 1
+            if merge_attempts == 2:
+                return subprocess.CompletedProcess(
+                    args,
+                    128,
+                    "",
+                    "fatal: Unable to create '.git/MERGE_RR.lock': File exists.\n",
+                )
         return real_git(cwd, *args, **kwargs)
 
     monkeypatch.setattr(stage_mod, "git", lock_retry)
 
     with pytest.raises(stage_mod.GitLockError, match=r"MERGE_RR\.lock"):
         env.run([pr])
+    assert merge_attempts == 2
 
 
 def test_rescue_is_reproducible_and_leased(env):
