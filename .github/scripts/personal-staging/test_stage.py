@@ -136,6 +136,31 @@ def no_backoff(monkeypatch):
     monkeypatch.setattr(stage_mod, "EXTRA_FETCH_BACKOFF_S", 0)
 
 
+def _drop_merge_rr_lock_after_fetch(monkeypatch, ref_fragment: str):
+    real_git = stage_mod.git
+    dropped = False
+
+    def lock_after_fetch(cwd, *args, **kwargs):
+        nonlocal dropped
+        result = real_git(cwd, *args, **kwargs)
+        if not dropped and args[:1] == ("fetch",) and ref_fragment in args:
+            lock = Path(cwd) / ".git" / "rr-cache" / "MERGE_RR.lock"
+            lock.parent.mkdir(parents=True, exist_ok=True)
+            lock.write_text("held by background maintenance\n")
+            dropped = True
+        lock = Path(cwd) / ".git" / "rr-cache" / "MERGE_RR.lock"
+        if dropped and "merge" in args and result.returncode != 0:
+            return subprocess.CompletedProcess(
+                args,
+                128,
+                result.stdout,
+                f"fatal: Unable to create '{lock}': File exists.\n",
+            )
+        return result
+
+    monkeypatch.setattr(stage_mod, "git", lock_after_fetch)
+
+
 def test_merges_prs_ascending_and_pushes_staging(env):
     pr9 = env.add_pr(9, "nine.txt", "9\n")
     pr4 = env.add_pr(4, "four.txt", "4\n")
@@ -161,6 +186,43 @@ def test_conflicting_pr_skipped_with_paths(env):
     ]
     # the good PR still landed on staging
     assert "merge PR #2" in env.fork_log("staging")
+
+
+def test_conflicting_extra_skipped_with_paths(env):
+    env.add_pr(3, "a.txt", "conflicting\n")
+    env.advance_main("a.txt", "moved on\n")
+
+    report = env.run(stage_mod.merge_stream([], [3]))
+
+    assert report["applied"] == []
+    assert report["skipped"] == [
+        {"pr": 3, "branch": "pull/3/head", "conflict_paths": ["a.txt"], "source": "extra"}
+    ]
+    rendered = stage_mod.notes(report, signed=True)
+    assert "## Skipped PRs (1)" in rendered
+    assert "#3" in rendered and "merge conflict: `a.txt`" in rendered
+
+
+@pytest.mark.parametrize("source", ["open", "extra"])
+def test_merge_rr_lock_failure_is_loud_for_open_and_extra_pins(env, monkeypatch, source):
+    first = env.add_pr(1, "a.txt", "first\n")
+    second = env.add_pr(2, "a.txt", "second\n")
+    prs = [first, second] if source == "open" else stage_mod.merge_stream([], [1, 2])
+    _drop_merge_rr_lock_after_fetch(monkeypatch, "refs/pull/2/head")
+
+    with pytest.raises(stage_mod.StageError, match=r"MERGE_RR\.lock"):
+        env.run(prs)
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "fatal: unable to create '.git/rr-cache/merge_rr.LOCK': file exists",
+        "fatal: Unable to create '.git/index.lock': File exists",
+    ],
+)
+def test_git_lock_failure_signatures_are_case_insensitive(stderr):
+    assert stage_mod._is_git_lock_failure(stderr)
 
 
 def _rescuable_pr(env) -> dict:
@@ -392,6 +454,12 @@ def test_non_conflict_merge_failure_raises(env):
     (env.work / "z.txt").write_text("local droppings\n")
     with pytest.raises(stage_mod.StageError, match="failed without conflicts"):
         env.run([pr])
+
+
+def test_stage_disables_auto_rerere_gc_in_compose_repo(env):
+    env.run([], staging_only=True)
+    configured = git(env.work, "config", "--local", "--get", "maintenance.rerere-gc.auto")
+    assert configured.stdout.strip() == "0"
 
 
 def test_already_merged_pr_applies_without_commit(env):
@@ -900,6 +968,44 @@ def test_summarize_hourly_blocked_labels_candidate_not_staging():
     assert "candidate (not pushed)" in text and f"| Remote staging | `{'r' * 40}` |" in text
     assert "| Skipped #4 |" in text
     assert "| Staging |" not in text.replace("Remote staging", "")
+
+
+def test_hourly_merge_lock_blocks_push_and_warns(env, tmp_path, monkeypatch, capsys):
+    env.add_pr(1, "a.txt", "first\n")
+    env.add_pr(2, "a.txt", "second\n")
+    extras = tmp_path / "extras.txt"
+    extras.write_text("1\n2\n")
+    prs_json = tmp_path / "prs.json"
+    prs_json.write_text("[]")
+    report_path = tmp_path / "report.json"
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    _drop_merge_rr_lock_after_fetch(monkeypatch, "refs/pull/2/head")
+
+    rc = stage_mod.main(
+        [
+            "stage",
+            "--workdir",
+            str(env.work),
+            "--date",
+            STAMP,
+            "--prs-json",
+            str(prs_json),
+            "--extras",
+            str(extras),
+            "--staging-only",
+            "--report",
+            str(report_path),
+        ]
+    )
+
+    assert rc == 0
+    report = json.loads(report_path.read_text())
+    assert report["pushed"] is False
+    assert "MERGE_RR.lock" in report["infrastructure_error"]
+    assert env.fork_ref("refs/heads/staging") == ""
+    assert "NOT pushed" in summary.read_text()
+    assert "MERGE_RR.lock" in capsys.readouterr().out
 
 
 def test_staging_only_reports_change_causes(env):

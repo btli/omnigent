@@ -166,6 +166,11 @@ class StageError(RuntimeError):
     pass
 
 
+def _is_git_lock_failure(stderr: str) -> bool:
+    error = stderr.casefold()
+    return "merge_rr.lock" in error or ("unable to create" in error and "file exists" in error)
+
+
 # Soft-failable ``git push --porcelain`` rejection reasons for refs/heads/main.
 # Distinct from ``[remote rejected]`` (hooks/auth policy), which must stay loud.
 _STALE_REF_REASONS = frozenset({"non-fast-forward", "fetch first", "stale info"})
@@ -631,10 +636,12 @@ def merge_prs(
         )
         rerere_paths: list[str] = []
         if merge.returncode != 0:
+            what = f"branch {branch}" if source == "extra-branch" else f"PR #{num}"
+            if _is_git_lock_failure(merge.stderr):
+                raise StageError(f"merge of {what} failed on a Git lock: {merge.stderr.strip()}")
             # Only a genuine content conflict (unmerged index entries) is
             # skippable; anything else is a broken workspace — fail loud.
             if not git(cwd, "ls-files", "-u").stdout.strip():
-                what = f"branch {branch}" if source == "extra-branch" else f"PR #{num}"
                 raise StageError(
                     f"merge of {what} failed without conflicts: {merge.stderr.strip()}"
                 )
@@ -947,11 +954,30 @@ def stage(
     # Seed before the detach: the seed directory is part of the trusted fork
     # checkout and disappears from the worktree once HEAD moves to upstream.
     seed_rerere(cwd, rr_cache_dir)
+    git(cwd, "config", "maintenance.rerere-gc.auto", "0")
     git(cwd, "fetch", upstream, "main")
     upstream_sha = git(cwd, "rev-parse", "FETCH_HEAD").stdout.strip()
     git(cwd, "checkout", "--detach", upstream_sha)
 
-    applied, skipped = merge_prs(cwd, prs, upstream, fork, ring, upstream_sha)
+    try:
+        applied, skipped = merge_prs(cwd, prs, upstream, fork, ring, upstream_sha)
+    except StageError as error:
+        if not staging_only or not _is_git_lock_failure(str(error)):
+            raise
+        staging_sha = git(cwd, "rev-parse", "HEAD").stdout.strip()
+        return {
+            "date": datestamp,
+            "upstream_sha": upstream_sha,
+            "staging_sha": staging_sha,
+            "remote_staging_sha": remote_ref(cwd, fork, f"refs/heads/{ring.branch}"),
+            "staging_only": True,
+            "blocked": [],
+            "infrastructure_error": str(error),
+            "pushed": False,
+            "causes": [],
+            "applied": [],
+            "skipped": [],
+        }
     staging_sha = git(cwd, "rev-parse", "HEAD").stdout.strip()
 
     # An extra we could not even reach is an infrastructure failure, not a
@@ -1152,8 +1178,15 @@ def summarize(report: dict, ring: Ring = STAGING) -> str:
         # A no-op hour produces the same ~19-row skip table every time; collapse
         # it to a one-line count so the few lines that matter stay visible.
         # Runs that push (or that block on unreachable extras) keep full detail.
-        noop = not report["pushed"] and not report["blocked"]
-        if report["blocked"]:
+        infrastructure_error = report.get("infrastructure_error")
+        noop = not report["pushed"] and not report["blocked"] and not infrastructure_error
+        if infrastructure_error:
+            result = (
+                "**NOT pushed** — composition infrastructure failure: "
+                + md_code(infrastructure_error)
+                + " (staging left at its previous commit)"
+            )
+        elif report["blocked"]:
             result = (
                 "**NOT pushed** — extras unreachable: "
                 + ", ".join(_blocked_label(n) for n in report["blocked"])
@@ -1183,7 +1216,7 @@ def summarize(report: dict, ring: Ring = STAGING) -> str:
             *sha_rows,
             f"| Result | {result} |",
         ]
-        if noop:
+        if noop or infrastructure_error:
             return "\n".join(rows) + "\n"
         rows += [
             f"| Applied / skipped | {len(report['applied'])} / {len(report['skipped'])} |",
@@ -1354,7 +1387,10 @@ def main(argv: list[str] | None = None) -> int:
         raise
     Path(args.report).write_text(json.dumps(report, indent=2) + "\n")
     append_summary(summarize(report, ring))
-    if report.get("blocked"):
+    if report.get("infrastructure_error"):
+        error = str(report["infrastructure_error"]).replace("\n", " ")
+        print(f"::warning::{error} — staging left unchanged")
+    elif report.get("blocked"):
         print(
             "::warning::could not reach remote for extras "
             + ", ".join(_blocked_label(n) for n in report["blocked"])
