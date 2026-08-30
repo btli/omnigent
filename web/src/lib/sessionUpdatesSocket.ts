@@ -59,9 +59,15 @@ export const HIDDEN_RECONNECT_MAX_MS = 60_000;
 export const HEARTBEAT_WATCHDOG_MS = 70_000;
 
 function nextReconnectDelay(failedAttempts: number): number {
-  const max =
-    typeof document !== "undefined" && document.hidden ? HIDDEN_RECONNECT_MAX_MS : RECONNECT_MAX_MS;
-  const base = Math.min(RECONNECT_BASE_MS * 2 ** (failedAttempts - 1), max);
+  // While hidden, EVERY retry waits the stretched cadence — not only the
+  // saturated one. Ramping up from the 250 ms base while nobody is looking
+  // still wakes the radio every few seconds mid-ramp; a hidden page never
+  // needs a fast retry because returning to the foreground reconnects
+  // immediately (see `onVisibilityChange`).
+  const base =
+    typeof document !== "undefined" && document.hidden
+      ? HIDDEN_RECONNECT_MAX_MS
+      : Math.min(RECONNECT_BASE_MS * 2 ** (failedAttempts - 1), RECONNECT_MAX_MS);
   return base / 2 + Math.random() * (base / 2);
 }
 

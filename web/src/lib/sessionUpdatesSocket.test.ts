@@ -223,7 +223,10 @@ describe("sessionUpdatesSocket hidden-page backoff", () => {
     exhaustBackoff();
 
     // A deliberate stop ends the campaign; the next start must not inherit
-    // the saturated (60 s hidden) delay from the finished outage.
+    // the saturated delay from the finished outage. Observed while visible:
+    // a hidden page always waits the stretched cadence regardless of the
+    // attempt count, so only the foreground ramp reveals the reset.
+    setDocumentHidden(false);
     sessionUpdatesSocket.stop();
     sessionUpdatesSocket.start();
 
@@ -233,6 +236,23 @@ describe("sessionUpdatesSocket hidden-page backoff", () => {
     // First failure of the new campaign: base delay (250 ms with jitter
     // pinned), not the inherited cap.
     vi.advanceTimersByTime(250);
+    expect(FakeWebSocket.instances.length).toBe(scheduled + 1);
+  });
+
+  it("waits the stretched hidden cadence from the very first failure", () => {
+    // A page hidden EARLY in the backoff ramp must not keep dialing at the
+    // fast foreground cadence until the doubling reaches the hidden cap —
+    // that mid-ramp window still wakes the radio every few seconds.
+    setDocumentHidden(true);
+    sessionUpdatesSocket.start();
+    latestWs().close();
+    const scheduled = FakeWebSocket.instances.length;
+
+    // One tick short of the hidden cap: no attempt, even on failure #1.
+    vi.advanceTimersByTime(HIDDEN_RECONNECT_MAX_MS - 1);
+    expect(FakeWebSocket.instances.length).toBe(scheduled);
+
+    vi.advanceTimersByTime(1);
     expect(FakeWebSocket.instances.length).toBe(scheduled + 1);
   });
 
