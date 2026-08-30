@@ -56,11 +56,15 @@ export function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
  * to the cap.
  */
 export function nextReconnectDelay(failedOpens: number): number {
-  const max =
+  // While hidden, EVERY failed-open retry waits the stretched cadence — not
+  // only the saturated one. Ramping up from the 250 ms base while nobody is
+  // looking still wakes the radio every few seconds mid-ramp; a hidden page
+  // never needs a fast retry because awaitReconnectDelay reconnects promptly
+  // on the visibility flip.
+  const base =
     typeof document !== "undefined" && document.hidden
       ? STREAM_HIDDEN_RECONNECT_MAX_MS
-      : STREAM_RECONNECT_MAX_MS;
-  const base = Math.min(STREAM_RECONNECT_BASE_MS * 2 ** (failedOpens - 1), max);
+      : Math.min(STREAM_RECONNECT_BASE_MS * 2 ** (failedOpens - 1), STREAM_RECONNECT_MAX_MS);
   return base / 2 + Math.random() * (base / 2);
 }
 
