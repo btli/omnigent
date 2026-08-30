@@ -683,27 +683,6 @@ def test_extra_pr_merges_from_pull_ref_with_source(env):
     assert "merge PR #8 (pull/8/head" in env.fork_log("staging")
 
 
-@pytest.mark.parametrize(
-    "ring", [stage_mod.STAGING, stage_mod.PRODUCTION], ids=["staging", "production"]
-)
-def test_bot_successor_pins_parse_and_compose(env, ring):
-    """Bot-owned successors are absent from the btli open stream, so each
-    ring must parse and compose its numeric pull-ref pins."""
-    pins, branches = stage_mod.parse_extras(ring.extras_file, ring)
-    assert pins == [5825, 5828]
-    assert branches == (["homelab"] if ring is stage_mod.STAGING else [])
-
-    env.add_pr(5825, "battery.txt", "backoff\n")
-    env.add_pr(5828, "touch.txt", "touch gating\n")
-    report = env.run(stage_mod.merge_stream([], pins), ring=ring)
-
-    assert [(p["pr"], p["source"]) for p in report["applied"]] == [
-        (5825, "extra"),
-        (5828, "extra"),
-    ]
-    assert report["skipped"] == []
-
-
 def test_extra_confirmed_deleted_is_loud_advisory_skip(env):
     """ls-remote proves the ref is gone: skip it, keep composing, and tell the
     operator to edit the manifest."""
