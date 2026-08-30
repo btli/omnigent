@@ -163,9 +163,11 @@ def commit_ident(ring: Ring = STAGING) -> list[str]:
 
 
 class StageError(RuntimeError):
-    def __init__(self, *args: object, git_lock_failure: bool = False):
-        super().__init__(*args)
-        self.git_lock_failure = git_lock_failure
+    pass
+
+
+class GitLockError(StageError):
+    pass
 
 
 def _is_git_lock_failure(stderr: str) -> bool:
@@ -640,10 +642,7 @@ def merge_prs(
         if merge.returncode != 0:
             what = f"branch {branch}" if source == "extra-branch" else f"PR #{num}"
             if _is_git_lock_failure(merge.stderr):
-                raise StageError(
-                    f"merge of {what} failed on a Git lock: {merge.stderr.strip()}",
-                    git_lock_failure=True,
-                )
+                raise GitLockError(f"merge of {what} failed on a Git lock: {merge.stderr.strip()}")
             # Only a genuine content conflict (unmerged index entries) is
             # skippable; anything else is a broken workspace — fail loud.
             if not git(cwd, "ls-files", "-u").stdout.strip():
@@ -668,12 +667,14 @@ def merge_prs(
                     if source == "open" and upstream_sha and ring.rebase_rescue
                     else ""
                 )
-                retried = rescued and (
-                    git(
-                        cwd, "merge", "--no-ff", "--no-commit", "--", rescued, check=False
-                    ).returncode
-                    == 0
-                )
+                retried = False
+                if rescued:
+                    retry = git(cwd, "merge", "--no-ff", "--no-commit", "--", rescued, check=False)
+                    if _is_git_lock_failure(retry.stderr):
+                        raise GitLockError(
+                            f"merge of {what} failed on a Git lock: {retry.stderr.strip()}"
+                        )
+                    retried = retry.returncode == 0
                 if not retried:
                     if rescued and git(cwd, "ls-files", "-u").stdout.strip():
                         git(cwd, "merge", "--abort")
@@ -959,6 +960,8 @@ def stage(
     # Seed before the detach: the seed directory is part of the trusted fork
     # checkout and disappears from the worktree once HEAD moves to upstream.
     seed_rerere(cwd, rr_cache_dir)
+    # Git 2.54+ uses this task key to prevent background rerere-gc races.
+    # The lock stderr classifier remains the backstop if maintenance changes.
     git(cwd, "config", "maintenance.rerere-gc.auto", "0")
     git(cwd, "fetch", upstream, "main")
     upstream_sha = git(cwd, "rev-parse", "FETCH_HEAD").stdout.strip()
@@ -967,8 +970,8 @@ def stage(
     infrastructure_error = None
     try:
         applied, skipped = merge_prs(cwd, prs, upstream, fork, ring, upstream_sha)
-    except StageError as error:
-        if not staging_only or not error.git_lock_failure:
+    except GitLockError as error:
+        if not staging_only:
             raise
         applied, skipped = [], []
         infrastructure_error = str(error)
@@ -982,7 +985,7 @@ def stage(
         if p.get("reason") == EXTRA_FETCH_FAILED
     ]
 
-    if ring == PRODUCTION and not infrastructure_error:
+    if ring == PRODUCTION:
         assert_production_identity(cwd, staging_sha, upstream_sha, applied)
 
     if staging_only:
