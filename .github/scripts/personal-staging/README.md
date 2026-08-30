@@ -177,16 +177,18 @@ sorted ascending — the same ordering rule as always. **Remove an entry
 once the change lands upstream.**
 
 When `omni-resolve-agent[bot]` closes a contributor PR and opens an upstream
-successor, neither side reaches the automatic stream: the original fails the
-open-state filter and the successor fails the `btli` author filter. Pin the
-successor number manually in each intended ring's extras manifest. Record its
-reviewed head SHA in the trailing comment because this is an **open**, bot-owned
-ref: `refs/pull/N/head` can move. The SHA is informational only: no tool compares
-it today; enforcement is a planned follow-up. The `stage.py` comment describing
-extras as frozen pins applies only to closed PRs whose pull refs no longer
-advance. If the bot force-pushes the ref, the recorded rerere preimage stops
-matching: the merge aborts, the bot pin appears under **Skipped PRs** with a
-merge conflict, and the nightly stays green. Re-record the resolution per
+successor, both miss the automatic stream: the original is closed and the
+bot-authored successor fails the `btli` author filter. Pin the successor in each
+intended ring and record its reviewed head SHA because this **open**, bot-owned
+ref can move. That SHA is informational: the only check today is manually
+comparing it with the applied `oid` in the run report; automating this is
+planned. The `stage.py` comment describing extras as frozen pins applies only to
+closed PR pull refs. A force-push that changes conflicting content breaks the
+recorded rerere match: the merge aborts, the pin appears under **Skipped PRs**,
+and the nightly stays green. If the conflict text stays byte-identical, the
+changed head lands using the recorded resolution; if the merge is now clean, it
+lands silently. Neither silent branch is detected today, and a conflict skip is
+only a symptom, not proof the head moved. Re-record a mismatched resolution per
 [Conflict resolutions](#conflict-resolutions-rr-cache), or remove the pin.
 
 If a pinned successor closes unmerged as `Superseded by #M`, move the pin to M,
