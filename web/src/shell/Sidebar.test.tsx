@@ -1358,8 +1358,7 @@ describe("Sidebar collapsed section count pill", () => {
   });
 
   // The Sessions header paints BOTH right-edge controls (Select sessions +
-  // the filter) whenever hover isn't available — `[@media(hover:hover)]:md:`
-  // only hides the Select control at rest on hover-capable md+ displays. The
+  // the filter) except at rest on md+ displays with fine-pointer hover. The
   // pill's cluster must therefore reserve the full two-control column by
   // default and narrow to clear just the always-visible filter only where
   // hover support exists. jsdom cannot evaluate the media-query variants, so
